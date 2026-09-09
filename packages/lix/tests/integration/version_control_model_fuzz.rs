@@ -27,7 +27,7 @@
 //!
 //! History is therefore only asserted immediately after a checkpoint, where the
 //! open interval is empty and the model's rule is exact. Asserting a modelled
-//! `lixcol_depth` is deliberately out of scope: depth is commit-graph distance,
+//! `lixcol_position` is deliberately out of scope: depth is commit-graph distance,
 //! which merges make multi-parent. The harness asserts the *sequence* of values
 //! and that depths increase strictly, which is what catches a dropped,
 //! duplicated, or reordered history entry.
@@ -126,7 +126,7 @@ struct BranchModel {
     checkpoint_state: BTreeMap<String, JsonValue>,
     /// Newest-first per-key value sequence across checkpoints. `None` is a
     /// delete, which the engine reports as a null value with
-    /// `lixcol_is_deleted = true`.
+    /// `diff_type = 'removed'`.
     history: BTreeMap<String, Vec<Option<JsonValue>>>,
     /// Keys written since the last checkpoint. Presence, not value: the value
     /// that matters at collapse time is the one in `state`.
@@ -692,26 +692,12 @@ async fn assert_working_diff(
     expected: &[(String, &'static str)],
     label: &str,
 ) {
-    let checkpoint = session
-        .execute(
-            "SELECT checkpoint.commit_id \
-             FROM lix_checkpoint AS checkpoint \
-             JOIN lix_commit_ancestry() AS ancestry \
-               ON ancestry.commit_id = checkpoint.commit_id \
-             ORDER BY ancestry.depth LIMIT 1",
-            &[],
-        )
-        .await
-        .unwrap_or_else(|error| panic!("{label}: checkpoint read failed: {error:?}"))
-        .rows()[0]
-        .get::<String>("commit_id")
-        .unwrap_or_else(|error| panic!("{label}: checkpoint ID should be text: {error:?}"));
     let rows = session
         .execute(
             "SELECT key, diff_type \
-             FROM lix_diff('lix_key_value', $1, lix_active_branch_commit_id()) \
+             FROM lix_diff('lix_key_value') \
              ORDER BY key",
-            &[Value::Text(checkpoint)],
+            &[],
         )
         .await
         .unwrap_or_else(|error| panic!("{label}: working diff read failed: {error:?}"));
@@ -740,16 +726,16 @@ async fn assert_working_diff(
 }
 
 /// Reads the newest-first `(value, is_deleted)` sequence per key, and asserts
-/// `lixcol_depth` is strictly increasing within a key.
+/// `lixcol_position` is strictly increasing within a key.
 async fn read_history(
     session: &SimSession,
     prefix: &str,
 ) -> BTreeMap<String, Vec<Option<JsonValue>>> {
     let rows = session
         .execute(
-            "SELECT key, value, lixcol_depth, lixcol_is_deleted \
+            "SELECT key, to_value AS value, lixcol_position, diff_type = 'removed' AS is_deleted \
              FROM lix_history('lix_key_value') WHERE key LIKE $1 \
-             ORDER BY key, lixcol_depth",
+             ORDER BY key, lixcol_position",
             &[Value::Text(format!("{prefix}%"))],
         )
         .await
@@ -762,15 +748,15 @@ async fn read_history(
             .get::<String>("key")
             .unwrap_or_else(|error| panic!("history key should be text: {error:?}"));
         let depth = row
-            .get::<i64>("lixcol_depth")
-            .unwrap_or_else(|error| panic!("lixcol_depth should be an integer: {error:?}"));
+            .get::<i64>("lixcol_position")
+            .unwrap_or_else(|error| panic!("lixcol_position should be an integer: {error:?}"));
         if let Some(previous) = last_depth.insert(key.clone(), depth) {
             assert!(
                 depth > previous,
-                "history for {key} repeated or reversed lixcol_depth: {previous} then {depth}"
+                "history for {key} repeated or reversed lixcol_position: {previous} then {depth}"
             );
         }
-        let deleted = row.get::<bool>("lixcol_is_deleted").unwrap_or(false);
+        let deleted = row.get::<bool>("is_deleted").unwrap_or(false);
         let value = if deleted {
             None
         } else {

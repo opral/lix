@@ -199,11 +199,7 @@ async fn run<StorageImpl>(
     let probe_file = file_ids[0].clone();
     let checkpoint = session
         .execute(
-            "SELECT checkpoint.commit_id \
-             FROM lix_checkpoint AS checkpoint \
-             JOIN lix_commit_ancestry() AS ancestry \
-               ON ancestry.commit_id = checkpoint.commit_id \
-             ORDER BY ancestry.depth LIMIT 1",
+            "SELECT working_base_commit_id AS commit_id FROM lix_branch WHERE id = lix_active_branch_id()",
             &[],
         )
         .await

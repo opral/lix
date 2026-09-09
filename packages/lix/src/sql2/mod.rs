@@ -11,8 +11,6 @@ mod dml;
 mod error;
 mod exec;
 mod file_view;
-mod history_projection;
-mod history_route;
 mod information_schema;
 mod parse;
 mod plan;
@@ -20,11 +18,9 @@ mod planning_cache;
 mod predicate_typecheck;
 mod providers;
 #[cfg(test)]
-pub(crate) use providers::{
-    arm_state_at_traversal_probe, file_history_anchor_probe_census,
-    file_history_bounded_frontier_census, file_history_raw_probe_limit_census,
-    reset_file_history_anchor_probe_census, take_state_at_traversal_probe,
-};
+pub(crate) use providers::take_mainline_work;
+#[cfg(test)]
+pub(crate) use providers::{arm_state_at_traversal_probe, take_state_at_traversal_probe};
 mod read_only;
 mod result_metadata;
 mod row_batch;
@@ -57,9 +53,8 @@ pub(crate) use checkpoint_function::{CheckpointFunctionPlan, checkpoint_function
 pub(crate) use context::WriteContextLiveness;
 pub(crate) use context::{
     ChangelogQuerySource, DiffCommand, DiffCommandOutcome, DiffCommandSelection,
-    HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext, SqlHistoryQuerySource,
-    SqlWriteContext, SqlWriteExecutionContext, WriteAccess, WriteContextBranchRefReader,
-    WriteContextHotStateReader,
+    SqlChangelogQuerySource, SqlExecutionContext, SqlWriteContext, SqlWriteExecutionContext,
+    WriteAccess, WriteContextBranchRefReader, WriteContextHotStateReader,
 };
 pub(crate) use exec::bound_public_write::PreparedPathValueReplacementProgram;
 #[cfg(feature = "storage-benches")]

@@ -43,10 +43,9 @@ if (reverted.rows.length > 0) {
 await lix.close();
 ```
 
-`lix_latest_checkpoint_commit_id()` uses the active branch's checkpoint, not
-the newest repository-global checkpoint marker. Before the branch has a
-checkpoint, it returns `lix_root_commit_id()`, so the same query also works
-for a new branch.
+The working baseline is `lix_branch.working_base_commit_id`. It can be an
+ordinary commit after a fork or restore, so use the one-argument diff for
+working changes.
 
 ## Diff rows
 
@@ -60,7 +59,7 @@ or renamed files.
 
 Projecting `from_content` or `to_content` for `lix_file` is unsupported because
 reconstructing historical file bytes would turn lightweight diff reads into blob
-materialization. Query `lix_history('lix_file', commit_id)` when file bytes are
+materialization. Query `lix_as_of('lix_file', commit_id)` when file bytes are
 required.
 
 `row_count` is `1` for a changed schema row. For a file it counts the underlying
@@ -69,9 +68,7 @@ descriptor and content rows contributing to the aggregate:
 ```sql
 SELECT count(*) AS changed_files, sum(row_count) AS changed_rows
 FROM lix_diff(
-  'lix_file',
-  lix_latest_checkpoint_commit_id(),
-  lix_active_branch_commit_id()
+  'lix_file'
 );
 ```
 

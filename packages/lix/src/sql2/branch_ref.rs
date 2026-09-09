@@ -95,6 +95,7 @@ mod tests {
 
     fn head(branch_id: &str, commit_id: &str) -> BranchHead {
         BranchHead {
+            working_base_commit_id: None,
             branch_id: branch_id.to_string(),
             commit_id: CommitId::for_test_label(commit_id),
         }

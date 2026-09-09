@@ -978,7 +978,7 @@ where
         if manifest.is_some() {
             physical_dependencies.insert(commit_id);
             graph_reachable_with_manifests.insert(commit_id);
-        } else {
+        } else if !crate::tracked_state::commit_history_is_deferred(store, commit_id).await? {
             history_manifests_missing += 1;
         }
     }
@@ -1233,9 +1233,9 @@ where
     control_reachability
         .history_dependencies
         .extend(crate::sync::load_replayable_repository_event_commit_ids(store).await?);
-    control_reachability.history_dependencies.extend(
-        crate::sync::load_pending_sync_export_commit_ids(store, controls).await?,
-    );
+    control_reachability
+        .history_dependencies
+        .extend(crate::sync::load_pending_sync_export_commit_ids(store, controls).await?);
     let mut chronology_roots = control_reachability.chronology_roots;
     chronology_roots.extend(
         load_recovery_refs(store)
@@ -1248,7 +1248,27 @@ where
                 ]
             }),
     );
-    let graph_reachable = collect_ref_reachable_commit_ids(store, &chronology_roots).await?;
+    let mut graph_reachable = collect_ref_reachable_commit_ids(store, &chronology_roots).await?;
+    // Existing branch history already has its authenticated retention closure.
+    // Inventory adds roots only for checkpoints abandoned by restore or branch
+    // deletion; it must not turn every historical checkpoint into a serving head.
+    let checkpoint_inventory = crate::checkpoint::checkpoint_commit_ids(store).await?;
+    let off_branch_checkpoints = checkpoint_inventory
+        .difference(&graph_reachable)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for checkpoint in &off_branch_checkpoints {
+        // Sparse headers have no local state yet. Preserve metadata for legacy
+        // missing history while healthy offbranch snapshots remain pinned.
+        if !crate::tracked_state::commit_history_is_deferred(store, *checkpoint).await?
+            && crate::tracked_state::load_commit_state_manifest(store, *checkpoint)
+                .await?
+                .is_some()
+        {
+            chronology_roots.insert(*checkpoint);
+        }
+    }
+    graph_reachable.extend(collect_ref_reachable_commit_ids(store, &off_branch_checkpoints).await?);
     load_authenticated_serving_dependency_closure(
         store,
         chronology_roots,
@@ -1262,17 +1282,10 @@ where
 /// Every commit reachable from the authenticated roots through canonical parent
 /// links.
 ///
-/// This is the reachability the public history surfaces actually read: a
-/// `_history()` query walks the commit graph, so a commit on that chain is
-/// load-bearing no matter how far below the serving checkpoint it sits — and
-/// load-bearing in **both** planes, because a row history row is served out
-/// of the commit delta while only the commit metadata comes from the
-/// projection. Retaining the projection alone leaves the walk finding the
-/// commit and reading zero members from it, which is silent truncation. The
-/// ledger expressed the same retention by pinning every checkpoint commit it
-/// had ever seen, forever, in a row it could never consume. Walking refs states
-/// it directly, costs one commit-record read per reachable commit, and shrinks
-/// as compaction shortens the chain.
+/// Retain canonical graph dependencies for branch and checkpoint roots. Loaded
+/// endpoints need both their metadata and physical state; intentionally deferred
+/// sync headers retain metadata until ordinary history demand hydrates state.
+/// Compaction shortens parent chains without changing checkpoint membership.
 async fn collect_ref_reachable_commit_ids<S>(
     store: &S,
     roots: &BTreeSet<CommitId>,
@@ -5219,6 +5232,7 @@ mod tests {
             LixTimestamp::expect_parse("tombstone alias timestamp", "2026-01-01T00:00:00Z");
         let commits = [
             CommitRecord {
+                is_checkpoint: false,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 base_commit_id: None,
@@ -5231,6 +5245,7 @@ mod tests {
                 created_at: timestamp,
             },
             CommitRecord {
+                is_checkpoint: false,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 base_commit_id: None,
@@ -5243,6 +5258,7 @@ mod tests {
                 created_at: timestamp,
             },
             CommitRecord {
+                is_checkpoint: false,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 base_commit_id: None,
@@ -5255,6 +5271,7 @@ mod tests {
                 created_at: timestamp,
             },
             CommitRecord {
+                is_checkpoint: false,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 base_commit_id: None,
@@ -5474,6 +5491,7 @@ mod tests {
             LixTimestamp::expect_parse("authority GC timestamp", "2026-01-01T00:00:00.000Z");
         let commits = vec![
             CommitRecord {
+                is_checkpoint: false,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 base_commit_id: None,
@@ -5486,6 +5504,7 @@ mod tests {
                 created_at: timestamp,
             },
             CommitRecord {
+                is_checkpoint: false,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 base_commit_id: None,
@@ -5498,6 +5517,7 @@ mod tests {
                 created_at: timestamp,
             },
             CommitRecord {
+                is_checkpoint: false,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 4,
                 base_commit_id: None,
@@ -5785,6 +5805,7 @@ mod tests {
     fn gc_authority_record(label: &str) -> CommitRecord {
         let commit_id = CommitId::for_test_label(label);
         CommitRecord {
+            is_checkpoint: false,
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
             base_commit_id: None,
@@ -5812,6 +5833,7 @@ mod tests {
         let (first_parent_jump_commit_id, first_parent_jump_span) =
             parent.map_or((commit_id, 0), |parent| (parent, 1));
         CommitRecord {
+            is_checkpoint: false,
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
             base_commit_id: None,

@@ -4,9 +4,9 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, OnceLock};
 #[cfg(test)]
 use std::sync::Mutex;
+use std::sync::{Arc, OnceLock};
 
 use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
@@ -376,14 +376,25 @@ impl TrackedStateDiff {
     /// live row. Otherwise an identity-only result can silently become SQL NULL.
     pub(crate) fn validate_live_payloads(&self) -> Result<(), LixError> {
         for row in self.entries.iter().flat_map(|entry| {
-            [entry.visible_before(), entry.after.as_ref().filter(|row| !row.deleted)]
-                .into_iter()
-                .flatten()
+            [
+                entry.visible_before(),
+                entry.after.as_ref().filter(|row| !row.deleted),
+            ]
+            .into_iter()
+            .flatten()
         }) {
-            if self.payloads.get(row.change_id).and_then(|payload| payload.snapshot).is_none() {
+            if self
+                .payloads
+                .get(row.change_id)
+                .and_then(|payload| payload.snapshot)
+                .is_none()
+            {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    format!("tracked-state diff is missing the requested live payload for change '{}'", row.change_id),
+                    format!(
+                        "tracked-state diff is missing the requested live payload for change '{}'",
+                        row.change_id
+                    ),
                 ));
             }
         }
@@ -394,8 +405,9 @@ impl TrackedStateDiff {
 /// Diffs two tracked-state commit roots with hash-guided subtree skipping.
 ///
 /// Commit-root first-parent metadata is bound to the changelog. Payload-
-/// retaining consumers validate every emitted row against its immutable
-/// change record. Identity-only SQL consumers validate the packed delta leaf
+/// retaining consumers validate every emitted row against its authenticated
+/// delta index and every live payload against its immutable change record.
+/// Identity-only SQL consumers validate the packed delta leaf
 /// and hydrate payloads only for live/live equality classification. Winner
 /// reachability, inherited creation time, and absence of omitted unchanged
 /// rows belong to the explicit full-root integrity audit; proving those here
@@ -405,6 +417,7 @@ pub(crate) async fn diff_commits<S>(
     left_commit_id: &str,
     right_commit_id: &str,
     request: &TrackedStateDiffRequest,
+    authored_members_only: bool,
 ) -> Result<TrackedStateDiff, LixError>
 where
     S: crate::storage_adapter::StorageAdapterRead,
@@ -415,9 +428,11 @@ where
     let mut tree_diff = reader
         .diff_semantic_tree_entries_at_commits(left_commit_id, right_commit_id, &scan_request)
         .await?;
-    reader
-        .suppress_collection_generation_cascade_tombstones(&mut tree_diff)
-        .await?;
+    if authored_members_only {
+        reader
+            .suppress_collection_generation_cascade_tombstones(&mut tree_diff)
+            .await?;
+    }
 
     // Validate only rows exposed by the hash-guided tree diff. Whole-root
     // coverage validation is an explicit integrity audit; doing it here would
@@ -1441,16 +1456,22 @@ mod tests {
         assert!(missing.validate_live_payloads().is_err());
         let tombstone_payload = TrackedStatePayloadBatch::from_payloads([(change_id, None, None)])
             .expect("payload batch");
-        assert!(TrackedStateDiff::from_entries_with_payloads(vec![entry.clone()], tombstone_payload)
-            .validate_live_payloads().is_err());
-        let live_payload = TrackedStatePayloadBatch::from_payloads([(change_id, Some(vec![1]), None)])
-            .expect("payload batch with nullable metadata");
+        assert!(
+            TrackedStateDiff::from_entries_with_payloads(vec![entry.clone()], tombstone_payload)
+                .validate_live_payloads()
+                .is_err()
+        );
+        let live_payload =
+            TrackedStatePayloadBatch::from_payloads([(change_id, Some(vec![1]), None)])
+                .expect("payload batch with nullable metadata");
         TrackedStateDiff::from_entries_with_payloads(vec![entry.clone()], live_payload)
-            .validate_live_payloads().expect("live snapshot is retained");
+            .validate_live_payloads()
+            .expect("live snapshot is retained");
         let mut deleted = entry;
         deleted.after.as_mut().expect("after row").deleted = true;
         TrackedStateDiff::from_entries(vec![deleted])
-            .validate_live_payloads().expect("absent sides need no live payload");
+            .validate_live_payloads()
+            .expect("absent sides need no live payload");
     }
 
     async fn stage_snapshot_authority_for_test(
@@ -2090,7 +2111,8 @@ mod tests {
                 .message
                 .contains("does not match changelog change identity")
                 || error.message.contains("changelog commit")
-                || error.message.contains("has no authoritative payload"),
+                || error.message.contains("has no authoritative payload")
+                || error.message.contains("delta index"),
             "unexpected error: {error}"
         );
     }
@@ -2379,7 +2401,8 @@ mod tests {
                 .message
                 .contains("does not match changelog change identity")
                 || error.message.contains("changelog commit")
-                || error.message.contains("has no authoritative payload"),
+                || error.message.contains("has no authoritative payload")
+                || error.message.contains("delta index"),
             "unexpected error: {error}"
         );
 

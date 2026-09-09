@@ -348,9 +348,8 @@ where
     // Replay owns a newly created output repository. Its initial file tree
     // must come entirely from Git, including when Git contains its own README.
     // Remove repository starter files before installing plugins or timing work.
-    db::block_on(lix.execute("DELETE FROM lix_file", &[])).map_err(|error| {
-        CliError::msg(format!("failed to clear replay starter files: {error}"))
-    })?;
+    db::block_on(lix.execute("DELETE FROM lix_file", &[]))
+        .map_err(|error| CliError::msg(format!("failed to clear replay starter files: {error}")))?;
 
     let plugin_install_started = Instant::now();
     if args.plugins == GitReplayPlugins::All {
@@ -2683,9 +2682,9 @@ mod tests {
         let lix = db::block_on(open_lix().with_storage(storage))
             .expect("replay Lix should reopen without Git");
         let marker_rows = db::block_on(lix.execute(
-            "SELECT value, lixcol_observed_commit_id \
+            "SELECT to_value, lixcol_to_commit_id \
              FROM lix_history('lix_key_value') \
-             WHERE key = $1 AND NOT lixcol_is_deleted",
+             WHERE key = $1 AND diff_type <> 'removed'",
             &[Value::Text(GIT_REPLAY_MARKER_KEY.to_string())],
         ))
         .expect("replay markers should be queryable without Git");
@@ -2717,8 +2716,8 @@ mod tests {
                 .get(git_sha)
                 .unwrap_or_else(|| panic!("missing Lix commit for Git version {version_index}"));
             let historical = db::block_on(lix.execute(
-                "SELECT content FROM lix_history('lix_file', $1) \
-                 WHERE path = '/asset.bin' AND lixcol_depth = 0 AND NOT lixcol_is_deleted",
+                "SELECT content FROM lix_as_of('lix_file', $1) \
+                 WHERE path = '/asset.bin'",
                 &[Value::Text(lix_commit.clone())],
             ))
             .expect("historical LFS bytes should query without Git");
@@ -3367,9 +3366,11 @@ mod tests {
         let storage = RocksDB::open(&output).expect("replay RocksDB should reopen");
         let lix = db::block_on(open_lix().with_storage(storage))
             .expect("replay Lix should reopen with installed plugin");
-        let checkpoint_rows =
-            db::block_on(lix.execute("SELECT count(*) AS count FROM lix_checkpoint", &[]))
-                .expect("checkpoint history should be queryable");
+        let checkpoint_rows = db::block_on(lix.execute(
+            "SELECT count(*) AS count FROM lix_commit WHERE is_checkpoint",
+            &[],
+        ))
+        .expect("checkpoint history should be queryable");
         assert_eq!(
             checkpoint_rows.rows()[0]
                 .get::<i64>("count")

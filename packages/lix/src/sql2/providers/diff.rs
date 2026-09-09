@@ -37,7 +37,8 @@ use crate::tracked_state::{
     MaterializedTrackedStateExactBatch, MaterializedTrackedStateRowRef, TrackedStateContext,
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind,
     TrackedStateDiffRequest, TrackedStateDiffRow, TrackedStateFilter, TrackedStateKey,
-    TrackedStatePayloadBatch, TrackedStateStoreReader,
+    TrackedStatePayloadBatch, TrackedStateReadColumns, TrackedStateScanRequest,
+    TrackedStateStoreReader,
 };
 
 use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters};
@@ -64,7 +65,7 @@ pub(super) fn register_diff_function<S>(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum DiffMode {
+pub(super) enum DiffMode {
     General,
     WorkingHot,
 }
@@ -143,7 +144,6 @@ fn text_argument(
         let value = match function.func.name() {
             "lix_root_commit_id" => slots.root_commit_id(),
             "lix_active_branch_commit_id" => slots.active_branch_commit_id(),
-            "lix_latest_checkpoint_commit_id" => slots.latest_checkpoint_commit_id(),
             _ => None,
         };
         if let Some(value) = value {
@@ -167,10 +167,10 @@ fn text_argument(
 }
 
 #[derive(Clone)]
-struct DiffRelation {
+pub(super) struct DiffRelation {
     name: String,
     kind: DiffRelationKind,
-    schema: SchemaRef,
+    pub(super) schema: SchemaRef,
     primary_key_columns: Vec<String>,
     schema_spec: Option<SchemaSurfaceSpec>,
 }
@@ -183,7 +183,7 @@ enum DiffRelationKind {
 }
 
 impl DiffRelation {
-    fn from_catalog(catalog: &PublicCatalog, name: &str) -> Result<Self> {
+    pub(super) fn from_catalog(catalog: &PublicCatalog, name: &str) -> Result<Self> {
         let surface = catalog.surface(name).ok_or_else(|| {
             DataFusionError::Plan(format!("lix_diff does not support relation '{name}'"))
         })?;
@@ -262,6 +262,8 @@ impl DiffRelation {
             }
         }
         fields.push(Field::new("row_count", DataType::Int64, false));
+        fields.push(Field::new("lixcol_from_commit_id", DataType::Utf8, false));
+        fields.push(Field::new("lixcol_to_commit_id", DataType::Utf8, false));
         Ok(Self {
             name: name.to_owned(),
             kind,
@@ -272,13 +274,13 @@ impl DiffRelation {
     }
 }
 
-struct DiffSpec<S> {
-    store: S,
-    relation: DiffRelation,
-    from_commit_id: String,
-    to_commit_id: String,
-    active_branch_id: Option<String>,
-    mode: DiffMode,
+pub(super) struct DiffSpec<S> {
+    pub(super) store: S,
+    pub(super) relation: DiffRelation,
+    pub(super) from_commit_id: String,
+    pub(super) to_commit_id: String,
+    pub(super) active_branch_id: Option<String>,
+    pub(super) mode: DiffMode,
 }
 
 #[async_trait]
@@ -328,7 +330,7 @@ where
                 .any(|field| matches!(field.name().as_str(), "from_content" | "to_content"))
         {
             return Err(DataFusionError::NotImplemented(
-                "lix_diff('lix_file', ...) does not support content projection; query lix_history('lix_file', commit_id) for file bytes"
+                "lix_diff('lix_file', ...) does not support content projection; query lix_as_of('lix_file', commit_id) for file bytes"
                     .to_string(),
             ));
         }
@@ -359,7 +361,13 @@ where
                     mode,
                 )| async move {
                     if limit == Some(0) || route.contradictory || from_commit_id == to_commit_id {
-                        return diff_record_batch(schema, &[], &relation);
+                        return diff_record_batch(
+                            schema,
+                            &[],
+                            &relation,
+                            &from_commit_id,
+                            &to_commit_id,
+                        );
                     }
                     let mut tracked = TrackedStateContext::new().reader(store.clone());
                     // A pinned base that is identical at both endpoints cannot
@@ -378,7 +386,7 @@ where
                             .fields()
                             .iter()
                             .any(|field| side_column(field.name()).is_some()),
-                        DiffRelationKind::Schema { .. } => false,
+                        DiffRelationKind::Schema { .. } => true,
                         DiffRelationKind::Directory => true,
                     };
                     let generic_descriptors = if mode == DiffMode::General {
@@ -399,11 +407,9 @@ where
                                 "lix_diff default range requires an active branch".to_string(),
                             ))
                         })?;
-                        let from_commit = CommitId::parse_lix(
-                            &from_commit_id,
-                            "lix_diff checkpoint commit ID",
-                        )
-                        .map_err(lix_error_to_datafusion_error)?;
+                        let from_commit =
+                            CommitId::parse_lix(&from_commit_id, "lix_diff checkpoint commit ID")
+                                .map_err(lix_error_to_datafusion_error)?;
                         let to_commit =
                             CommitId::parse_lix(&to_commit_id, "lix_diff head commit ID")
                                 .map_err(lix_error_to_datafusion_error)?;
@@ -434,8 +440,7 @@ where
                                 .map_err(hot_only_diff_error)?
                                 .ok_or_else(|| {
                                     hot_only_diff_error(DataFusionError::Execution(
-                                        "lix_diff certified HOT index is unavailable"
-                                            .to_string(),
+                                        "lix_diff certified HOT index is unavailable".to_string(),
                                     ))
                                 })?
                                 .diff,
@@ -484,7 +489,14 @@ where
                     let (from_descriptor, to_descriptor) =
                         if let Some(descriptors) = generic_descriptors {
                             descriptors
-                        } else if working_needs_endpoint_descriptors {
+                        } else if working_needs_endpoint_descriptors
+                            || needs_global_provenance
+                            || direct_candidates.as_ref().is_some_and(|diff| {
+                                diff.entries.iter().any(|entry| {
+                                    entry.identity.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+                                })
+                            })
+                        {
                             let descriptor_result = async {
                                 Ok::<_, DataFusionError>((
                                     commit_state_descriptor(&store, &from_commit_id).await?,
@@ -499,7 +511,7 @@ where
                                 CommitStateDescriptor::default(),
                             )
                         };
-                    let (diff, from_global_rows, to_global_rows) = effective_diff(
+                    let effective_result = effective_diff(
                         &mut tracked,
                         &from_commit_id,
                         &to_commit_id,
@@ -507,8 +519,14 @@ where
                         &to_descriptor,
                         &route.request,
                         direct_candidates,
+                        needs_global_provenance,
                     )
-                    .await?;
+                    .await;
+                    let (diff, from_global_rows, to_global_rows) = if mode == DiffMode::WorkingHot {
+                        effective_result.map_err(hot_only_diff_error)?
+                    } else {
+                        effective_result?
+                    };
                     if route.request.retain_payloads {
                         diff.validate_live_payloads()
                             .map_err(lix_error_to_datafusion_error)?;
@@ -526,6 +544,7 @@ where
                             let result = file_diff_rows(
                                 &mut tracked,
                                 diff,
+                                &route.request.filter.file_ids,
                                 &schema,
                                 &from_commit_id,
                                 &to_commit_id,
@@ -543,6 +562,7 @@ where
                             let result = directory_diff_rows(
                                 &mut tracked,
                                 diff,
+                                &route.request.filter.row_pks,
                                 &schema,
                                 &from_commit_id,
                                 &to_commit_id,
@@ -562,7 +582,7 @@ where
                     if let Some(limit) = limit {
                         rows.truncate(limit);
                     }
-                    diff_record_batch(schema, &rows, &relation)
+                    diff_record_batch(schema, &rows, &relation, &from_commit_id, &to_commit_id)
                 },
             ),
         })
@@ -644,9 +664,27 @@ impl DiffRoute {
                     }
                 }
                 file_ids.extend(ids.into_iter().map(NullableKeyFilter::Value));
+                // Directory descriptors have a null file owner. Include their
+                // sparse changes even for an exact file probe: ancestor moves
+                // can change that file's path without touching its own rows.
+                if !file_ids.is_empty() {
+                    file_ids.push(NullableKeyFilter::Null);
+                }
             }
             DiffRelationKind::Directory => {
                 schema_keys.push(DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string());
+                if let Some(ids) = id_values {
+                    let ids = ids
+                        .into_iter()
+                        .filter_map(|id| uuid_row_pk(&id).ok())
+                        .collect::<Vec<_>>();
+                    if row_pks.is_empty() {
+                        row_pks = ids;
+                    } else {
+                        row_pks.retain(|id| ids.contains(id));
+                    }
+                    contradictory |= row_pks.is_empty();
+                }
             }
         }
         // File sides come from two batched descriptor point reads, never from
@@ -790,33 +828,46 @@ async fn effective_diff<S: StorageAdapterRead>(
     to_descriptor: &CommitStateDescriptor,
     request: &TrackedStateDiffRequest,
     local_candidates: Option<TrackedStateDiff>,
+    needs_global_provenance: bool,
 ) -> Result<(
     TrackedStateDiff,
     HashSet<TrackedStateKey>,
     HashSet<TrackedStateKey>,
 )> {
-    if let Some(diff) = local_candidates {
-        // The HOT working-diff epoch is already an effective checkpoint-to-
-        // head comparison. Its pinned base is identical at both endpoints,
-        // so no base identity can enter or leave the result. Preserve this
-        // payload-local route instead of rehydrating cold commit owners merely
-        // to repeat the classification.
-        return Ok((diff, HashSet::new(), HashSet::new()));
-    }
-    // A composite commit has two immutable roots: its local overlay and its
-    // pinned global base. Hash-guided diffs of both root pairs produce a small
-    // superset of identities whose *effective* winner may have changed. Exact
-    // reads below remove false positives caused by a local shadow.
+    let hot_candidates = local_candidates.is_some();
+    let resolve_effective_winners = needs_global_provenance
+        || from_descriptor.base_commit_id.is_some()
+        || to_descriptor.base_commit_id.is_some();
+    let local_candidates = match local_candidates {
+        // HOT already owns both payloads when each side has a live local row.
+        // A pinned base cannot override either winner. Keep these snapshot-local
+        // payloads, including on sparse replicas whose authored owners are cold.
+        Some(diff)
+            if !resolve_effective_winners
+                || (!needs_global_provenance
+                    && diff.entries.iter().all(|entry| {
+                        entry.before.as_ref().is_some_and(|row| !row.deleted)
+                            && entry.after.as_ref().is_some_and(|row| !row.deleted)
+                    })) =>
+        {
+            return Ok((diff, HashSet::new(), HashSet::new()));
+        }
+        Some(diff) => diff,
+        None => tracked
+            .diff_commits(from_commit_id, to_commit_id, request)
+            .await
+            .map_err(lix_error_to_datafusion_error)?,
+    };
     let mut candidates = BTreeSet::new();
-    let local_candidates = tracked
-        .diff_commits(from_commit_id, to_commit_id, request)
-        .await
-        .map_err(lix_error_to_datafusion_error)?;
     extend_diff_keys(&mut candidates, &local_candidates);
 
+    // HOT supplies the complete bounded candidate set. Resolve those exact
+    // identities against endpoint overlays/bases below, without a history diff
+    // or a scan of either base. General ranges also compare changing bases.
     let from_base = effective_base_source(from_commit_id, from_descriptor);
     let to_base = effective_base_source(to_commit_id, to_descriptor);
-    if (from_descriptor.base_commit_id.is_some() || to_descriptor.base_commit_id.is_some())
+    if !hot_candidates
+        && (from_descriptor.base_commit_id.is_some() || to_descriptor.base_commit_id.is_some())
         && from_base != to_base
     {
         let base_candidates = tracked
@@ -1163,9 +1214,139 @@ struct FileDiffGroup<'a> {
     descriptor: Option<&'a TrackedStateDiffEntry>,
 }
 
+/// Find path-only rows independently of the requested output columns. Exact
+/// filesystem identity predicates stay point reads; unfiltered directory changes
+/// enumerate descriptor identities, never file contents or all tracked atoms.
+async fn path_changed_descriptors<S: StorageAdapterRead>(
+    tracked: &mut TrackedStateStoreReader<S>,
+    exact_ids: &BTreeSet<String>,
+    direct_ids: &BTreeSet<String>,
+    directory: bool,
+    from_commit_id: &str,
+    to_commit_id: &str,
+    from_descriptor: &CommitStateDescriptor,
+    to_descriptor: &CommitStateDescriptor,
+) -> Result<Vec<(String, DiffSide, DiffSide)>> {
+    let schema_key = if directory {
+        DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+    } else {
+        FILE_DESCRIPTOR_SCHEMA_KEY
+    };
+    let mut ids = exact_ids.clone();
+    if ids.is_empty() {
+        let mut sources = BTreeSet::from([from_commit_id.to_owned(), to_commit_id.to_owned()]);
+        sources.extend(
+            from_descriptor
+                .base_commit_id
+                .iter()
+                .chain(to_descriptor.base_commit_id.iter())
+                .map(ToString::to_string),
+        );
+        let request = TrackedStateScanRequest {
+            filter: TrackedStateFilter {
+                schema_keys: vec![schema_key.into()],
+                include_tombstones: true,
+                ..Default::default()
+            },
+            read_columns: TrackedStateReadColumns {
+                columns: vec!["row_pk".into()],
+            },
+            limit: None,
+        };
+        for source in sources {
+            let rows = tracked
+                .scan_batch_at_commit(&source, &request)
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
+            for row in rows.iter() {
+                if let Some(id) = single_row_pk_string(row.row_pk()) {
+                    ids.insert(id);
+                }
+            }
+        }
+    }
+    ids.retain(|id| !direct_ids.contains(id));
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let keys = ids
+        .iter()
+        .map(|id| descriptor_key(schema_key, id, (!directory).then_some(id.as_str())))
+        .collect::<Result<Vec<_>>>()?;
+    let projection = ChangeRecordProjection {
+        snapshot: true,
+        snapshot_content: false,
+        metadata: false,
+        raw_snapshot: false,
+    };
+    let from_rows = tracked
+        .load_projected_batch_at_commit(from_commit_id, &keys, &projection)
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
+    let to_rows = tracked
+        .load_projected_batch_at_commit(to_commit_id, &keys, &projection)
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
+    let from_base = load_base_rows(tracked, from_descriptor, &keys, &projection).await?;
+    let to_base = load_base_rows(tracked, to_descriptor, &keys, &projection).await?;
+    let from_replacements =
+        load_local_replacement_scopes_for_keys(tracked, from_commit_id, from_descriptor, &keys)
+            .await?;
+    let to_replacements =
+        load_local_replacement_scopes_for_keys(tracked, to_commit_id, to_descriptor, &keys).await?;
+    let mut from_cache = HashMap::new();
+    let mut to_cache = HashMap::new();
+    let mut changed = Vec::new();
+    for (index, id) in ids.into_iter().enumerate() {
+        let (from, from_global) = effective_row(
+            from_rows.row(index),
+            from_base.as_ref().and_then(|rows| rows.row(index)),
+            from_descriptor.global_scope,
+            base_key_suppressed(&keys[index], &from_replacements),
+        );
+        let (to, to_global) = effective_row(
+            to_rows.row(index),
+            to_base.as_ref().and_then(|rows| rows.row(index)),
+            to_descriptor.global_scope,
+            base_key_suppressed(&keys[index], &to_replacements),
+        );
+        let (Some(mut from), Some(mut to)) = (materialized_side(from)?, materialized_side(to)?)
+        else {
+            continue;
+        };
+        let from_path = filesystem_path(
+            tracked,
+            from_commit_id,
+            from_descriptor,
+            &from,
+            directory,
+            &mut from_cache,
+        )
+        .await?;
+        let to_path = filesystem_path(
+            tracked,
+            to_commit_id,
+            to_descriptor,
+            &to,
+            directory,
+            &mut to_cache,
+        )
+        .await?;
+        if from_path != to_path {
+            from.global = from_global;
+            to.global = to_global;
+            from.path = Some(from_path);
+            to.path = Some(to_path);
+            changed.push((id, from, to));
+        }
+    }
+    Ok(changed)
+}
+
 async fn file_diff_rows<S>(
     tracked: &mut TrackedStateStoreReader<S>,
     diff: TrackedStateDiff,
+    file_filter: &[NullableKeyFilter<String>],
     projection: &Schema,
     from_commit_id: &str,
     to_commit_id: &str,
@@ -1201,6 +1382,37 @@ where
             group.descriptor = Some(entry);
         }
         group.row_count += 1;
+    }
+
+    if diff
+        .entries
+        .iter()
+        .any(|entry| entry.identity.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
+    {
+        let exact_ids = file_filter
+            .iter()
+            .filter_map(|filter| match filter {
+                NullableKeyFilter::Value(id) => Some(id.clone()),
+                NullableKeyFilter::Null | NullableKeyFilter::Any => None,
+            })
+            .collect();
+        let path_changes = path_changed_descriptors(
+            tracked,
+            &exact_ids,
+            &groups.keys().cloned().collect(),
+            false,
+            from_commit_id,
+            to_commit_id,
+            from_descriptor,
+            to_descriptor,
+        )
+        .await?;
+        for (id, _, _) in path_changes {
+            groups.entry(id).or_insert(FileDiffGroup {
+                row_count: 0,
+                descriptor: None,
+            });
+        }
     }
 
     let needs_side = projection
@@ -1378,6 +1590,7 @@ where
 async fn directory_diff_rows<S>(
     tracked: &mut TrackedStateStoreReader<S>,
     diff: TrackedStateDiff,
+    exact_row_pks: &[RowPk],
     projection: &Schema,
     from_commit_id: &str,
     to_commit_id: &str,
@@ -1393,7 +1606,38 @@ where
         .fields()
         .iter()
         .any(|field| matches!(field.name().as_str(), "from_path" | "to_path"));
+    let should_expand = !diff.entries.is_empty() || !exact_row_pks.is_empty();
     let mut rows = schema_diff_rows(diff, projection, from_global_rows, to_global_rows)?;
+    if should_expand {
+        let exact_ids = exact_row_pks
+            .iter()
+            .filter_map(single_row_pk_string)
+            .collect();
+        let direct_ids = rows
+            .iter()
+            .filter_map(|row| single_row_pk_string(&row.row_pk))
+            .collect();
+        for (id, from, to) in path_changed_descriptors(
+            tracked,
+            &exact_ids,
+            &direct_ids,
+            true,
+            from_commit_id,
+            to_commit_id,
+            from_descriptor,
+            to_descriptor,
+        )
+        .await?
+        {
+            rows.push(DiffSqlRow {
+                row_pk: uuid_row_pk(&id)?,
+                diff_type: "modified",
+                row_count: 0,
+                from: Some(from),
+                to: Some(to),
+            });
+        }
+    }
     if needs_paths {
         let mut from_directory_cache = HashMap::new();
         let mut to_directory_cache = HashMap::new();
@@ -1462,7 +1706,7 @@ fn materialized_side(row: Option<MaterializedTrackedStateRowRef<'_>>) -> Result<
     Ok(Some(DiffSide {
         id: single_row_pk_string(row.row_pk()),
         schema_key: row.schema_key().to_string(),
-        global: row.schema_key() == crate::checkpoint::CHECKPOINT_SCHEMA_KEY,
+        global: false, // Filled from effective endpoint overlay provenance by the caller.
         file_id: row.file_id().map(str::to_string),
         created_at: row.created_at().to_string(),
         updated_at: row.updated_at().to_string(),
@@ -1581,6 +1825,8 @@ fn diff_record_batch(
     schema: SchemaRef,
     rows: &[DiffSqlRow],
     relation: &DiffRelation,
+    from_commit_id: &str,
+    to_commit_id: &str,
 ) -> Result<RecordBatch> {
     if schema.fields().is_empty() {
         return RecordBatch::try_new_with_options(
@@ -1593,7 +1839,18 @@ fn diff_record_batch(
     let arrays = schema
         .fields()
         .iter()
-        .map(|field| diff_column_array(field, rows, relation))
+        .map(|field| -> Result<ArrayRef> {
+            match field.name().as_str() {
+                "lixcol_from_commit_id" => Ok(Arc::new(StringArray::from(vec![
+                    from_commit_id;
+                    rows.len()
+                ]))),
+                "lixcol_to_commit_id" => {
+                    Ok(Arc::new(StringArray::from(vec![to_commit_id; rows.len()])))
+                }
+                _ => diff_column_array(field, rows, relation),
+            }
+        })
         .collect::<Result<Vec<_>>>()?;
     RecordBatch::try_new(schema, arrays).map_err(DataFusionError::from)
 }
@@ -1831,11 +2088,130 @@ mod tests {
     use super::*;
     use datafusion::logical_expr::{col, lit};
 
+    #[tokio::test]
+    async fn ancestor_moves_are_file_and_directory_changes_for_working_history_and_filtered_counts()
+    {
+        use crate::{Value, open_lix};
+        let lix = open_lix()
+            .with_storage(crate::storage::Memory::new())
+            .await
+            .expect("open memory repository");
+        let file_id = "0193182b-2a72-7ed5-9015-76bf271af333";
+        lix.execute(
+            "INSERT INTO lix_file (id, path, content) VALUES ($1, '/docs/nested/a.txt', $2)",
+            &[
+                Value::Text(file_id.into()),
+                Value::Blob(b"same bytes".to_vec().into()),
+            ],
+        )
+        .await
+        .expect("create nested file");
+        lix.execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/other.txt', $1)",
+            &[Value::Blob(b"unaffected".to_vec().into())],
+        )
+        .await
+        .expect("create unrelated file");
+        let nested = lix
+            .execute(
+                "SELECT id FROM lix_directory WHERE path = '/docs/nested'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let directory_id = nested.rows()[0].get::<String>("id").unwrap();
+        let checkpoint = lix
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .await
+            .expect("baseline checkpoint");
+        let baseline = checkpoint.rows()[0].get::<String>("commit_id").unwrap();
+        lix.execute(
+            "UPDATE lix_directory SET path = '/renamed' WHERE path = '/docs'",
+            &[],
+        )
+        .await
+        .expect("move ancestor");
+        for query in [
+            "SELECT count(*) AS n, sum(row_count) AS atoms FROM lix_diff('lix_file')".to_owned(),
+            format!(
+                "SELECT count(*) AS n, sum(row_count) AS atoms FROM lix_diff('lix_file') WHERE id = '{file_id}'"
+            ),
+        ] {
+            let result = lix.execute(&query, &[]).await.expect("path-only count");
+            assert_eq!(result.rows()[0].get::<i64>("n").unwrap(), 1);
+            assert_eq!(result.rows()[0].get::<i64>("atoms").unwrap(), 0);
+        }
+        for (filter, expected_rows, expected_atoms) in [
+            (String::new(), 2, 1),
+            (format!(" WHERE id = '{directory_id}'"), 1, 0),
+        ] {
+            let result = lix.execute(&format!("SELECT count(*) AS n, sum(row_count) AS atoms FROM lix_diff('lix_directory'){filter}"), &[]).await.unwrap();
+            assert_eq!(result.rows()[0].get::<i64>("n").unwrap(), expected_rows);
+            assert_eq!(
+                result.rows()[0].get::<i64>("atoms").unwrap(),
+                expected_atoms
+            );
+        }
+        let target = lix
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .await
+            .expect("seal ancestor move");
+        let target = target.rows()[0].get::<String>("commit_id").unwrap();
+        for source in [
+            format!("lix_diff('lix_file', '{baseline}', '{target}')"),
+            format!("lix_history('lix_file', '{target}')"),
+        ] {
+            let count_query = format!(
+                "SELECT count(*) AS n, sum(row_count) AS atoms FROM {source} WHERE lixcol_to_commit_id = '{target}'"
+            );
+            let count = lix
+                .execute(&count_query, &[])
+                .await
+                .expect("projection-independent historical count");
+            assert_eq!(count.rows()[0].get::<i64>("n").unwrap(), 1);
+            assert_eq!(count.rows()[0].get::<i64>("atoms").unwrap(), 0);
+            let query = format!(
+                "SELECT id, diff_type, row_count, from_path, to_path FROM {source} WHERE id = '{file_id}' AND lixcol_to_commit_id = '{target}'"
+            );
+            let result = lix
+                .execute(&query, &[])
+                .await
+                .expect("historical ancestor path difference");
+            assert_eq!(result.rows().len(), 1);
+            let rows = result.rows();
+            assert_eq!(rows[0].get::<String>("diff_type").unwrap(), "modified");
+            assert_eq!(rows[0].get::<i64>("row_count").unwrap(), 0);
+            assert_eq!(
+                rows[0].get::<String>("from_path").unwrap(),
+                "/docs/nested/a.txt"
+            );
+            assert_eq!(
+                rows[0].get::<String>("to_path").unwrap(),
+                "/renamed/nested/a.txt"
+            );
+        }
+        for source in [
+            format!("lix_diff('lix_directory', '{baseline}', '{target}')"),
+            format!("lix_history('lix_directory', '{target}')"),
+        ] {
+            let count = lix.execute(&format!("SELECT count(*) AS n, sum(row_count) AS atoms FROM {source} WHERE lixcol_to_commit_id = '{target}'"), &[]).await.unwrap();
+            assert_eq!(count.rows()[0].get::<i64>("n").unwrap(), 2);
+            assert_eq!(count.rows()[0].get::<i64>("atoms").unwrap(), 1);
+            let result = lix.execute(&format!("SELECT diff_type, row_count, from_path, to_path FROM {source} WHERE id = '{directory_id}' AND lixcol_to_commit_id = '{target}'"), &[]).await.unwrap();
+            assert_eq!(result.rows().len(), 1);
+            let rows = result.rows();
+            assert_eq!(rows[0].get::<String>("diff_type").unwrap(), "modified");
+            assert_eq!(rows[0].get::<i64>("row_count").unwrap(), 0);
+            assert_eq!(rows[0].get::<String>("from_path").unwrap(), "/docs/nested");
+            assert_eq!(rows[0].get::<String>("to_path").unwrap(), "/renamed/nested");
+        }
+        lix.close().await.expect("close repository");
+    }
+
     #[test]
     fn relation_diff_schema_pairs_public_columns_and_retires_legacy_columns() {
-        let relation =
-            DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_key_value")
-                .expect("key/value relation is registered");
+        let relation = DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_key_value")
+            .expect("key/value relation is registered");
         let names = relation
             .schema
             .fields()
@@ -1851,7 +2227,10 @@ mod tests {
         ));
         assert!(!names.contains(&"from_key"));
         assert!(!names.contains(&"to_key"));
-        assert_eq!(names.last(), Some(&"row_count"));
+        assert_eq!(
+            &names[names.len() - 3..],
+            &["row_count", "lixcol_from_commit_id", "lixcol_to_commit_id"]
+        );
         assert!(!names.contains(&"lixcol_diff_type"));
         assert!(!names.contains(&"lixcol_row_count"));
         assert!(!names.contains(&"diff_id"));
@@ -1868,7 +2247,10 @@ mod tests {
             relation.schema.field_with_name("from_value").unwrap()
         ));
 
-        for name in names.into_iter().filter(|name| name.contains("lixcol_")) {
+        for name in names
+            .into_iter()
+            .filter(|name| name.starts_with("from_lixcol_") || name.starts_with("to_lixcol_"))
+        {
             let system_name = name
                 .strip_prefix("from_")
                 .or_else(|| name.strip_prefix("to_"))
@@ -1923,19 +2305,17 @@ mod tests {
 
     #[test]
     fn relation_diff_rejects_non_relations() {
-        let error =
-            match DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_diff") {
-                Ok(_) => panic!("table functions are not diffable relations"),
-                Err(error) => error,
-            };
+        let error = match DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_diff") {
+            Ok(_) => panic!("table functions are not diffable relations"),
+            Err(error) => error,
+        };
         assert!(error.to_string().contains("does not support relation"));
     }
 
     #[test]
     fn relation_diff_pushes_schema_identity_without_loading_payloads() {
-        let relation =
-            DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_key_value")
-                .expect("key/value relation is registered");
+        let relation = DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_key_value")
+            .expect("key/value relation is registered");
         let projection = Schema::new(vec![Field::new("row_count", DataType::Int64, false)]);
         let route = DiffRoute::from_filters(&[], &relation, &projection);
 
@@ -1957,9 +2337,10 @@ mod tests {
 
         assert_eq!(
             route.request.filter.file_ids,
-            vec![NullableKeyFilter::Value(
-                "0193182b-2a72-7ed5-9015-76bf271af333".to_string()
-            )]
+            vec![
+                NullableKeyFilter::Value("0193182b-2a72-7ed5-9015-76bf271af333".to_string()),
+                NullableKeyFilter::Null
+            ]
         );
         assert!(route.request.filter.row_pks.is_empty());
         assert!(!route.request.retain_payloads);

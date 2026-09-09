@@ -95,7 +95,6 @@ pub(crate) async fn resolve_provider_branch_ids(
     .await
 }
 
-
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
@@ -107,6 +106,7 @@ mod tests {
     #[tokio::test]
     async fn active_scope_uses_session_branch() {
         let branch_ref = RowsBranchRefReader::new(vec![BranchHead {
+            working_base_commit_id: None,
             branch_id: "main".to_string(),
             commit_id: CommitId::for_test_label("commit-main"),
         }]);
@@ -130,17 +130,10 @@ mod tests {
         assert!(error.message.contains("branch 'main' was not found"));
     }
 
-
-
-
     #[test]
     fn write_scope_uses_fallback_branch_when_branch_is_implicit() {
-        let scope = resolve_write_branch_scope(
-            None,
-            Some("active-branch"),
-            "INSERT into surface",
-        )
-        .expect("scope should resolve");
+        let scope = resolve_write_branch_scope(None, Some("active-branch"), "INSERT into surface")
+            .expect("scope should resolve");
 
         assert_eq!(
             scope,
@@ -165,12 +158,8 @@ mod tests {
 
     #[test]
     fn write_scope_derives_global_from_global_branch_id() {
-        let scope = resolve_write_branch_scope(
-            None,
-            Some(GLOBAL_BRANCH_ID),
-            "INSERT into surface",
-        )
-        .expect("scope should resolve");
+        let scope = resolve_write_branch_scope(None, Some(GLOBAL_BRANCH_ID), "INSERT into surface")
+            .expect("scope should resolve");
 
         assert_eq!(
             scope,

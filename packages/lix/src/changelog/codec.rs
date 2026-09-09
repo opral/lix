@@ -158,12 +158,13 @@ mod tests {
     use crate::row_pk::RowPk;
 
     #[test]
-    fn commit_record_round_trip_preserves_first_parent_jump() {
+    fn commit_record_round_trip_preserves_checkpoint_membership_and_first_parent_jump() {
         let commit_id = CommitId::for_test_label("codec-segment-commit");
         let base_commit_id = CommitId::for_test_label("codec-segment-base");
         let record = CommitRecord {
+            is_checkpoint: true,
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
-            format_version: 4,
+            format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
             base_commit_id: None,
             commit_id,
             generation: 70,

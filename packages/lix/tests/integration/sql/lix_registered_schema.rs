@@ -408,7 +408,7 @@ simulation_test!(
             })
             .collect::<std::collections::BTreeSet<_>>();
 
-        for surface_name in ["lix_key_value", "lix_registered_schema", "lix_checkpoint"] {
+        for surface_name in ["lix_key_value", "lix_registered_schema", "lix_commit"] {
             assert!(
                 public_table_names.contains(surface_name),
                 "{surface_name} should remain public"
@@ -419,9 +419,9 @@ simulation_test!(
                 "SELECT function_name, source_relation \
                  FROM information_schema.table_functions \
                  WHERE (function_name = 'lix_history' \
-                        AND source_relation IN ('lix_checkpoint', 'lix_key_value', 'lix_registered_schema')) \
+                        AND source_relation IN ('lix_key_value', 'lix_registered_schema')) \
                     OR (function_name = 'lix_diff' \
-                        AND source_relation IN ('lix_checkpoint', 'lix_key_value', 'lix_registered_schema')) \
+                        AND source_relation IN ('lix_key_value', 'lix_registered_schema')) \
                  GROUP BY function_name, source_relation \
                  ORDER BY function_name, source_relation",
                 &[],
@@ -433,19 +433,11 @@ simulation_test!(
             vec![
                 vec![
                     Value::Text("lix_diff".to_string()),
-                    Value::Text("lix_checkpoint".to_string()),
-                ],
-                vec![
-                    Value::Text("lix_diff".to_string()),
                     Value::Text("lix_key_value".to_string()),
                 ],
                 vec![
                     Value::Text("lix_diff".to_string()),
                     Value::Text("lix_registered_schema".to_string()),
-                ],
-                vec![
-                    Value::Text("lix_history".to_string()),
-                    Value::Text("lix_checkpoint".to_string()),
                 ],
                 vec![
                     Value::Text("lix_history".to_string()),
@@ -604,10 +596,10 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT value, schema_key, lixcol_observed_commit_id, lixcol_depth \
+                    "SELECT to_value, schema_key, lixcol_to_commit_id, lixcol_position \
                      FROM lix_history('lix_registered_schema', '{second_commit_id}') \
                        WHERE schema_key = 'engine_schema_update_history' \
-                     ORDER BY lixcol_depth"
+                     ORDER BY lixcol_position"
                 ),
                 &[],
             )

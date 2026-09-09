@@ -175,6 +175,7 @@ mod tests {
     #[tokio::test]
     async fn require_existing_ref_returns_head() {
         let reader = RowsBranchRefReader::new(vec![BranchHead {
+            working_base_commit_id: None,
             branch_id: "01920000-0000-7000-8000-0000000000a1".to_string(),
             commit_id: CommitId::for_test_label("commit-a"),
         }]);

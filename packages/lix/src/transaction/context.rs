@@ -35,9 +35,7 @@ use crate::changelog::{
     ChangeId, ChangeRecord, ChangeRecordProjection, ChangelogReader, CommitId, CommitLoadRequest,
     load_change_records, materialize_known_change_payloads,
 };
-use crate::checkpoint::{
-    CHECKPOINT_SCHEMA_KEY, checkpoint_stage_row,
-};
+use crate::checkpoint::CHECKPOINT_SCHEMA_KEY;
 use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::domain::Domain;
@@ -84,9 +82,9 @@ use crate::session::{
     SessionBranch, encode_receipt,
 };
 use crate::sql2::{
-    ChangelogQuerySource, DiffCommand, DiffCommandSelection, HistoryQuerySource,
-    SessionFileViewKey, SessionFileViewMutation, SessionFileViews, SessionPluginFileView,
-    SqlChangelogQuerySource, SqlExecutionContext, SqlHistoryQuerySource,
+    ChangelogQuerySource, DiffCommand, DiffCommandSelection, SessionFileViewKey,
+    SessionFileViewMutation, SessionFileViews, SessionPluginFileView, SqlChangelogQuerySource,
+    SqlExecutionContext,
 };
 use crate::sql2::{SqlPlanningCache, SqlWriteExecutionContext};
 use crate::storage_adapter::Storage;
@@ -1081,7 +1079,10 @@ where
             // Compare it again in the atomic storage commit so another engine
             // cannot invalidate the decision after this coherent read.
             self.atomic_metadata_preconditions
-                .push(branch_head_control_precondition(branch_id, opening.raw_token)?);
+                .push(branch_head_control_precondition(
+                    branch_id,
+                    opening.raw_token,
+                )?);
         }
         Ok(())
     }
@@ -1703,58 +1704,58 @@ where
         );
         let staged_writes = Arc::new(TransactionWriteBuffer::new(functions.clone()));
         let transaction = Self {
-                    write_context_liveness: crate::sql2::WriteContextLiveness::new(),
-                    active_branch_id,
-                    active_account_id,
-                    hot_state,
-                    tracked_state,
-                    binary_cas,
-                    plugin_host,
-                    branch_ctx,
-                    schema_resolver,
-                    sql_schema_snapshot: sql_schema_catalog,
-                    tracked_schema_snapshot: tracked_schema_catalog,
-                    opening_plugin_registry,
-                    sql_planning_cache,
-                    prepared_mutation_program: None,
-                    prepared_mutation_membership: PreparedMutationMembership::Unprepared,
-                    prepared_mutation_overlay_empty: false,
-                    prepared_mutation_timestamp: None,
-                    mutation_journal: None,
-                    mutation_journal_compressor: None,
-                    mutation_journal_sealed_rows: 0,
-                    mutation_journal_seal_prefix_open: true,
-                    mutation_journal_terminal_error: None,
-                    staged_writes,
-                    filesystem_path_index_cache: Arc::new(FilesystemPathIndexCache::default()),
-                    filesystem_path_index_epoch: Arc::new(AtomicUsize::new(0)),
-                    branch_head_control_cache: Arc::new(BranchHeadControlCache::default()),
-                    opening_read,
-                    storage,
-                    functions,
-                    current_timestamp: None,
-                    opening_tracked_mutation_revision,
-                    opening_active_branch_head,
-                    opening_global_branch_head,
-                    protect_sql_write_snapshot: false,
-                    commit_boundary: None,
-                    trust_filesystem_planner: false,
-                    origin_key: None,
-                    idempotency_receipt: None,
-                    atomic_metadata_writes: None,
-                    atomic_metadata_preconditions: Vec::new(),
-                    sync_role: crate::sync::SyncRole::Disabled,
-                    sync_replica_remote_id: None,
-                    await_durable_commit: false,
-                    session_file_views,
-                    pending_file_view_mutations: BTreeMap::new(),
-                    pending_plugin_actor_publications: Vec::new(),
-                    pending_checkpoint_gc_sequence: None,
-                    pending_branch_checkpoint_replacements: BTreeMap::new(),
-                    pending_restore_targets: BTreeMap::new(),
-                    plugin_generation_read_guard: None,
-                    plugin_generation_upgrade_guard: None,
-                };
+            write_context_liveness: crate::sql2::WriteContextLiveness::new(),
+            active_branch_id,
+            active_account_id,
+            hot_state,
+            tracked_state,
+            binary_cas,
+            plugin_host,
+            branch_ctx,
+            schema_resolver,
+            sql_schema_snapshot: sql_schema_catalog,
+            tracked_schema_snapshot: tracked_schema_catalog,
+            opening_plugin_registry,
+            sql_planning_cache,
+            prepared_mutation_program: None,
+            prepared_mutation_membership: PreparedMutationMembership::Unprepared,
+            prepared_mutation_overlay_empty: false,
+            prepared_mutation_timestamp: None,
+            mutation_journal: None,
+            mutation_journal_compressor: None,
+            mutation_journal_sealed_rows: 0,
+            mutation_journal_seal_prefix_open: true,
+            mutation_journal_terminal_error: None,
+            staged_writes,
+            filesystem_path_index_cache: Arc::new(FilesystemPathIndexCache::default()),
+            filesystem_path_index_epoch: Arc::new(AtomicUsize::new(0)),
+            branch_head_control_cache: Arc::new(BranchHeadControlCache::default()),
+            opening_read,
+            storage,
+            functions,
+            current_timestamp: None,
+            opening_tracked_mutation_revision,
+            opening_active_branch_head,
+            opening_global_branch_head,
+            protect_sql_write_snapshot: false,
+            commit_boundary: None,
+            trust_filesystem_planner: false,
+            origin_key: None,
+            idempotency_receipt: None,
+            atomic_metadata_writes: None,
+            atomic_metadata_preconditions: Vec::new(),
+            sync_role: crate::sync::SyncRole::Disabled,
+            sync_replica_remote_id: None,
+            await_durable_commit: false,
+            session_file_views,
+            pending_file_view_mutations: BTreeMap::new(),
+            pending_plugin_actor_publications: Vec::new(),
+            pending_checkpoint_gc_sequence: None,
+            pending_branch_checkpoint_replacements: BTreeMap::new(),
+            pending_restore_targets: BTreeMap::new(),
+            plugin_generation_read_guard: None,
+            plugin_generation_upgrade_guard: None,
+        };
         Ok((
             OpenTransaction {
                 transaction,
@@ -1971,8 +1972,7 @@ where
             let previous_filesystem_revision = loaded_filesystem_revision.flatten();
             let mut automatic_sync_writes = transaction.storage.new_write_set();
             let mut automatic_sync_preconditions = Vec::new();
-            let capture_sync_commits =
-                transaction.sync_role == crate::sync::SyncRole::Authority;
+            let capture_sync_commits = transaction.sync_role == crate::sync::SyncRole::Authority;
             if transaction.sync_role == crate::sync::SyncRole::Replica {
                 // The immutable commit and ref are the durable outbox.
                 // `build_sync_push` discovers unpublished local heads; no second
@@ -8245,10 +8245,7 @@ where
     /// Returns the immutable Schema v1 plan used by plugin merge admission.
     /// Callers must use this plan rather than rebuilding a schema or guessing
     /// a fingerprint from row content.
-    pub(crate) fn plugin_schema_plan(
-        &self,
-        schema_key: &str,
-    ) -> Option<&SchemaPlan> {
+    pub(crate) fn plugin_schema_plan(&self, schema_key: &str) -> Option<&SchemaPlan> {
         self.sql_schema_snapshot
             .plan_for_key(schema_key)
             .map(|(_, plan)| plan)
@@ -8406,10 +8403,8 @@ where
     /// Creates a tracked-state reader scoped to this write transaction.
     pub(crate) async fn tracked_state_reader(
         &mut self,
-    ) -> Result<
-        TrackedStateStoreReader<SharedStorageAdapterRead<StorageImpl::Read<'_>>>,
-        LixError,
-    > {
+    ) -> Result<TrackedStateStoreReader<SharedStorageAdapterRead<StorageImpl::Read<'_>>>, LixError>
+    {
         let read = self
             .storage
             .begin_read(StorageReadOptions::default())
@@ -8437,10 +8432,8 @@ where
     /// Creates a commit-graph reader scoped to this write transaction.
     pub(crate) async fn commit_graph_reader(
         &mut self,
-    ) -> Result<
-        CommitGraphStoreReader<SharedStorageAdapterRead<StorageImpl::Read<'_>>>,
-        LixError,
-    > {
+    ) -> Result<CommitGraphStoreReader<SharedStorageAdapterRead<StorageImpl::Read<'_>>>, LixError>
+    {
         let read = self
             .storage
             .begin_read(StorageReadOptions::default())
@@ -8934,14 +8927,18 @@ where
                     let JsonValue::Array(parts) = selection.row_pk.as_json_array_value()? else {
                         unreachable!("RowPk always serializes as a JSON array")
                     };
-                    let typed_row_pk =
-                        RowPk::from_json_values(&parts, &spec.primary_key_component_types)
-                            .map_err(|error| {
-                                LixError::new(
-                                    LixError::CODE_TYPE_MISMATCH,
-                                    format!("row_ref primary key does not match relation '{relation}': {error}"),
-                                )
-                            })?;
+                    let typed_row_pk = RowPk::from_json_values(
+                        &parts,
+                        &spec.primary_key_component_types,
+                    )
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_TYPE_MISMATCH,
+                            format!(
+                                "row_ref primary key does not match relation '{relation}': {error}"
+                            ),
+                        )
+                    })?;
                     schema_selections
                         .entry(relation)
                         .or_default()
@@ -9084,19 +9081,14 @@ where
             }
         }
 
-        let selected_directory_ids =
-            if command == DiffCommand::CreateCheckpoint
-                && (!file_selections.is_empty() || !directory_selections.is_empty())
-            {
-                self.selected_directory_closure(
-                    &entries,
-                    &file_selections,
-                    &directory_selections,
-                )
-                    .await?
-            } else {
-                BTreeSet::new()
-            };
+        let selected_directory_ids = if command == DiffCommand::CreateCheckpoint
+            && (!file_selections.is_empty() || !directory_selections.is_empty())
+        {
+            self.selected_directory_closure(&entries, &file_selections, &directory_selections)
+                .await?
+        } else {
+            BTreeSet::new()
+        };
         let mut matched = BTreeSet::new();
         let mut resolved = Vec::new();
         for entry in &entries {
@@ -9126,8 +9118,7 @@ where
                 matched.insert(*index);
                 selected = true;
             }
-            if entry.identity.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
-            {
+            if entry.identity.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY {
                 if let Ok(directory_id) = entry.identity.row_pk().as_single_string_owned() {
                     if let Some(index) = directory_selections.get(directory_id.as_str()) {
                         matched.insert(*index);
@@ -9410,16 +9401,12 @@ where
         params: Vec<Value>,
     ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
         match plan {
-            crate::sql2::CheckpointFunctionPlan::Full => {
-                self.execute_checkpoint_plan(None).await
-            }
-            crate::sql2::CheckpointFunctionPlan::Empty => {
-                Ok(crate::sql2::DiffCommandOutcome {
-                    rows_affected: 0,
-                    commit_id: None,
-                    parent_commit_id: None,
-                })
-            }
+            crate::sql2::CheckpointFunctionPlan::Full => self.execute_checkpoint_plan(None).await,
+            crate::sql2::CheckpointFunctionPlan::Empty => Ok(crate::sql2::DiffCommandOutcome {
+                rows_affected: 0,
+                commit_id: None,
+                parent_commit_id: None,
+            }),
             crate::sql2::CheckpointFunctionPlan::SelectionQuery(query_sql) => {
                 self.execute_diff_command_query_owned(
                     DiffCommand::CreateCheckpoint,
@@ -9538,9 +9525,8 @@ where
                         "scoped checkpoint selection cannot be empty",
                     ));
                 }
-                let (before_snapshots, after_snapshots) = self
-                    .checkpoint_dependency_snapshots(&diff.entries)
-                    .await?;
+                let (before_snapshots, after_snapshots) =
+                    self.checkpoint_dependency_snapshots(&diff.entries).await?;
                 let closed = close_and_validate_diff_command_selection(
                     DiffCommand::CreateCheckpoint,
                     &diff.entries,
@@ -9556,8 +9542,10 @@ where
                     )
                 })?;
                 let mut matched = BTreeSet::new();
-                let mut selected = StagedCommitChangeBatchBuilder::with_capacity(diff.entries.len());
-                let mut unselected = StagedCommitChangeBatchBuilder::with_capacity(diff.entries.len());
+                let mut selected =
+                    StagedCommitChangeBatchBuilder::with_capacity(diff.entries.len());
+                let mut unselected =
+                    StagedCommitChangeBatchBuilder::with_capacity(diff.entries.len());
                 let mut selected_source_membership_exact = true;
                 let mut unselected_source_membership_exact = true;
                 for entry in diff.entries.into_iter().filter(|entry| {
@@ -9594,7 +9582,12 @@ where
                 } else {
                     unselected.finish()
                 };
-                (Some(selected), Some(unselected), rows_affected, hot_working_diff_certified)
+                (
+                    Some(selected),
+                    Some(unselected),
+                    rows_affected,
+                    hot_working_diff_certified,
+                )
             } else {
                 (None, None, 1, false)
             };
@@ -9653,17 +9646,6 @@ where
             }
             _ => unreachable!("checkpoint planner produces both selected partitions or neither"),
         };
-        let checkpoint_commit_id = CommitId::parse_lix(&commit_id, "checkpoint commit id")?;
-        let mut checkpoint_rows = RawWriteBatch::with_capacity(1);
-        checkpoint_rows.push(checkpoint_stage_row(
-            &checkpoint_commit_id,
-            self.functions.call_uuid_v7().to_string(),
-        ));
-        self.stage_write(TransactionWrite::Rows {
-            mode: TransactionWriteMode::Replace,
-            rows: checkpoint_rows,
-        })
-        .await?;
         Ok(crate::sql2::DiffCommandOutcome {
             rows_affected,
             commit_id: Some(commit_id),
@@ -9725,24 +9707,25 @@ where
             return Ok((BTreeMap::new(), BTreeMap::new()));
         }
         let read = SharedStorageAdapterRead::new(
-            self.storage.begin_read(StorageReadOptions::default()).await?,
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
         );
         let change_ids = changes
             .iter()
             .flat_map(|(_, before, after)| [*before, *after])
             .flatten()
             .collect::<BTreeSet<_>>();
-        let packed_records = futures_util::future::try_join_all(
-            change_ids.iter().copied().map(|change_id| {
+        let packed_records =
+            futures_util::future::try_join_all(change_ids.iter().copied().map(|change_id| {
                 let read = &read;
                 async move {
                     crate::tracked_state::load_change_record_by_id(read, change_id)
                         .await
                         .map(|record| (change_id, record))
                 }
-            }),
-        )
-        .await?;
+            }))
+            .await?;
         let mut records = packed_records
             .into_iter()
             .filter_map(|(change_id, record)| record.map(|record| (change_id, record)))
@@ -9763,7 +9746,9 @@ where
         )?;
         let snapshots_by_change_id = payloads
             .into_iter()
-            .filter_map(|(change_id, payload)| payload.snapshot_content.map(|value| (change_id, value)))
+            .filter_map(|(change_id, payload)| {
+                payload.snapshot_content.map(|value| (change_id, value))
+            })
             .map(|(change_id, snapshot)| {
                 serde_json::from_str(snapshot.as_ref())
                     .map(|snapshot| (change_id, snapshot))
@@ -9776,12 +9761,15 @@ where
             })
             .collect::<Result<HashMap<_, JsonValue>, LixError>>()?;
         let load = |change_id: ChangeId| {
-            snapshots_by_change_id.get(&change_id).cloned().ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("checkpoint dependency row '{change_id}' has no snapshot"),
-                )
-            })
+            snapshots_by_change_id
+                .get(&change_id)
+                .cloned()
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("checkpoint dependency row '{change_id}' has no snapshot"),
+                    )
+                })
         };
         let mut before_snapshots = BTreeMap::new();
         let mut after_snapshots = BTreeMap::new();
@@ -9875,35 +9863,26 @@ where
         let head = self.load_branch_head(&branch_id).await?.ok_or_else(|| {
             LixError::branch_not_found(&branch_id, "resolve diff source", "branch")
         })?;
-        let uses_latest_checkpoint = from == DiffCommandSourceCommit::LatestCheckpoint
-            || to == DiffCommandSourceCommit::LatestCheckpoint;
-        let latest_checkpoint = if uses_latest_checkpoint {
-            let opening_read = self.opening_read();
-            let hot_state = self.hot_state.transaction_reader(
-                opening_read.clone(),
-                Arc::clone(&self.branch_head_control_cache),
-            );
-            crate::checkpoint::latest_checkpoint_commit_id_at_head(
-                opening_read,
-                &hot_state,
-                &branch_id,
-                head,
-            )
-            .await?
-            .map(|commit_id| commit_id.to_string())
+        let uses_working_base = from == DiffCommandSourceCommit::WorkingBase
+            || to == DiffCommandSourceCommit::WorkingBase;
+        let working_base = if uses_working_base {
+            self.load_branch_working_base(&branch_id)
+                .await?
+                .ok_or_else(|| LixError::unknown("active branch has no working baseline"))?
+                .to_string()
         } else {
-            None
+            String::new()
         };
-        let needs_root = from == DiffCommandSourceCommit::Root
-            || to == DiffCommandSourceCommit::Root
-            || (uses_latest_checkpoint && latest_checkpoint.is_none());
+        let needs_root =
+            from == DiffCommandSourceCommit::Root || to == DiffCommandSourceCommit::Root;
         let root = if needs_root {
             let mut graph = CommitGraphContext::new().reader(self.opening_read());
             let mut current = head;
             loop {
-                let node = graph.load_node(&current).await?.ok_or_else(|| {
-                    crate::commit_graph::missing_commit_graph_error(&current)
-                })?;
+                let node = graph
+                    .load_node(&current)
+                    .await?
+                    .ok_or_else(|| crate::commit_graph::missing_commit_graph_error(&current))?;
                 let Some(first_parent) = node.parent_commit_ids.first().copied() else {
                     break Some(node.commit_id.to_string());
                 };
@@ -9922,10 +9901,7 @@ where
             DiffCommandSourceCommit::Root => root
                 .clone()
                 .expect("a repository root was resolved when either source requested it"),
-            DiffCommandSourceCommit::LatestCheckpoint => latest_checkpoint
-                .clone()
-                .or_else(|| root.clone())
-                .expect("a latest checkpoint or repository root was resolved when requested"),
+            DiffCommandSourceCommit::WorkingBase => working_base.clone(),
         };
         Ok((resolve(from), resolve(to)))
     }
@@ -9936,7 +9912,7 @@ enum DiffCommandSourceCommit {
     Literal(String),
     Root,
     ActiveHead,
-    LatestCheckpoint,
+    WorkingBase,
 }
 
 fn diff_command_source_commits(
@@ -9973,7 +9949,7 @@ fn diff_command_source_commits(
             }
             if arguments.args.len() == 1 {
                 self.sources.push((
-                    DiffCommandSourceCommit::LatestCheckpoint,
+                    DiffCommandSourceCommit::WorkingBase,
                     DiffCommandSourceCommit::ActiveHead,
                 ));
                 return ControlFlow::Continue(());
@@ -9985,7 +9961,7 @@ fn diff_command_source_commits(
                 let FunctionArg::Unnamed(FunctionArgExpr::Expr(expression)) = argument else {
                     return Err(LixError::new(
                         LixError::CODE_UNSUPPORTED_SQL,
-                        "diff command source commits must be text literals, parameters, or root/checkpoint/head functions",
+                        "diff command source commits must be text literals, parameters, or root/head functions",
                     ));
                 };
                 match expression {
@@ -10024,21 +10000,16 @@ fn diff_command_source_commits(
                             "lix_active_branch_commit_id",
                         ) {
                             Ok(DiffCommandSourceCommit::ActiveHead)
-                        } else if crate::sql2::object_name_is_public_function(
-                            &function.name,
-                            "lix_latest_checkpoint_commit_id",
-                        ) {
-                            Ok(DiffCommandSourceCommit::LatestCheckpoint)
                         } else {
                             Err(LixError::new(
                                 LixError::CODE_UNSUPPORTED_SQL,
-                                "diff command source commits only support lix_root_commit_id(), lix_latest_checkpoint_commit_id(), and lix_active_branch_commit_id() functions",
+                                "diff command source commits only support lix_root_commit_id() and lix_active_branch_commit_id() functions",
                             ))
                         }
                     }
                     _ => Err(LixError::new(
                         LixError::CODE_UNSUPPORTED_SQL,
-                        "diff command source commits must be text literals, parameters, or root/checkpoint/head functions",
+                        "diff command source commits must be text literals, parameters, or root/head functions",
                     )),
                 }
             };
@@ -10351,20 +10322,24 @@ fn close_and_validate_diff_command_selection(
         let diff_id = entry.diff_id()?;
         by_diff_id.insert(diff_id.clone(), entry);
         if entry.identity.schema_key() == REGISTERED_SCHEMA_KEY {
-            let registered_schema_key = entry
-                .identity
-                .row_pk()
-                .as_single_string_owned()
-                .map_err(|_| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "working lix_registered_schema row has an invalid primary key",
-                    )
-                })?;
+            let registered_schema_key =
+                entry
+                    .identity
+                    .row_pk()
+                    .as_single_string_owned()
+                    .map_err(|_| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "working lix_registered_schema row has an invalid primary key",
+                        )
+                    })?;
             registration_by_schema_key.insert(registered_schema_key, diff_id);
         }
     }
-    if requested.iter().any(|diff_id| !by_diff_id.contains_key(diff_id)) {
+    if requested
+        .iter()
+        .any(|diff_id| !by_diff_id.contains_key(diff_id))
+    {
         return Err(stale_or_unknown_diff_id());
     }
 
@@ -10465,9 +10440,10 @@ fn close_and_validate_diff_command_selection(
             if matches!(
                 entry.identity.schema_key(),
                 FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY
-            ) && let Some(parent_id) = after_snapshots.get(&selected_diff_id).and_then(|snapshot| {
-                checkpoint_descriptor_parent_id(entry.identity.schema_key(), snapshot)
-            })
+            ) && let Some(parent_id) =
+                after_snapshots.get(&selected_diff_id).and_then(|snapshot| {
+                    checkpoint_descriptor_parent_id(entry.identity.schema_key(), snapshot)
+                })
                 && let Some((parent_diff_id, _)) = by_diff_id.iter().find(|(_, candidate)| {
                     candidate.identity.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
                         && candidate
@@ -10530,8 +10506,7 @@ fn close_and_validate_diff_command_selection(
             ) && let Some(selected_path_key) = checkpoint_descriptor_namespace_key(
                 selected_entry.identity.schema_key(),
                 selected_snapshot,
-            )
-            {
+            ) {
                 for (candidate_diff_id, candidate_entry) in &by_diff_id {
                     if candidate_diff_id == &selected_diff_id
                         || !matches!(
@@ -10590,10 +10565,9 @@ fn close_and_validate_diff_command_selection(
                     // row identity. The complete working diff still lets us
                     // close over a changed live target by comparing its
                     // projected unique tuple.
-                    let Some(local_values) = checkpoint_json_pointer_values(
-                        snapshot,
-                        &foreign_key.local_properties,
-                    ) else {
+                    let Some(local_values) =
+                        checkpoint_json_pointer_values(snapshot, &foreign_key.local_properties)
+                    else {
                         continue;
                     };
                     for (target_diff_id, target_entry) in &by_diff_id {
@@ -10615,10 +10589,9 @@ fn close_and_validate_diff_command_selection(
                     }
                     continue;
                 }
-                let Some(local_values) = checkpoint_json_pointer_values(
-                    snapshot,
-                    &foreign_key.local_properties,
-                ) else {
+                let Some(local_values) =
+                    checkpoint_json_pointer_values(snapshot, &foreign_key.local_properties)
+                else {
                     continue;
                 };
                 let Some(component_types) = target_plan.primary_key_component_types.as_ref() else {
@@ -10634,10 +10607,12 @@ fn close_and_validate_diff_command_selection(
                             format!("{operation} foreign-key value is invalid: {error}"),
                         )
                     })?;
-                if let Some((target_diff_id, target_entry)) = by_diff_id.iter().find(|(_, target)| {
-                    target.identity.schema_key() == foreign_key.referenced_schema.schema_key
-                        && target.identity.row_pk() == &target_row_pk
-                }) {
+                if let Some((target_diff_id, target_entry)) =
+                    by_diff_id.iter().find(|(_, target)| {
+                        target.identity.schema_key() == foreign_key.referenced_schema.schema_key
+                            && target.identity.row_pk() == &target_row_pk
+                    })
+                {
                     if target_entry
                         .after
                         .as_ref()
@@ -10647,8 +10622,7 @@ fn close_and_validate_diff_command_selection(
                             LixError::CODE_CONSTRAINT_VIOLATION,
                             format!(
                                 "{operation} selection references removed row '{} {:?}'",
-                                foreign_key.referenced_schema.schema_key,
-                                target_row_pk
+                                foreign_key.referenced_schema.schema_key, target_row_pk
                             ),
                         ));
                     }
@@ -10800,8 +10774,7 @@ fn close_and_validate_diff_command_selection(
             Some((diff_id, *entry, snapshot))
         })
         .collect::<Vec<_>>();
-    for (index, (left_diff_id, left_entry, left_snapshot)) in
-        candidate_snapshots.iter().enumerate()
+    for (index, (left_diff_id, left_entry, left_snapshot)) in candidate_snapshots.iter().enumerate()
     {
         for (right_diff_id, right_entry, right_snapshot) in
             candidate_snapshots.iter().skip(index + 1)
@@ -10906,12 +10879,15 @@ fn checkpoint_foreign_key_references_target(
         return Ok(false);
     };
     if target_plan.primary_key.as_ref() == Some(&foreign_key.referenced_properties) {
-        let component_types = target_plan.primary_key_component_types.as_ref().ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "foreign-key target has no primary-key component types",
-            )
-        })?;
+        let component_types = target_plan
+            .primary_key_component_types
+            .as_ref()
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "foreign-key target has no primary-key component types",
+                )
+            })?;
         let row_pk = RowPk::from_json_values(&local_values, component_types).map_err(|error| {
             LixError::new(
                 LixError::CODE_CONSTRAINT_VIOLATION,
@@ -11058,16 +11034,6 @@ where
 
     fn functions(&self) -> FunctionProviderHandle {
         self.functions.clone()
-    }
-
-    fn history_query_source(
-        &self,
-        default_as_of_commit_id: String,
-    ) -> SqlHistoryQuerySource<Self::ReadStore> {
-        HistoryQuerySource {
-            store: self.read_store.clone(),
-            default_as_of_commit_id,
-        }
     }
 
     fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {
@@ -11756,6 +11722,17 @@ where
             .ref_reader(read)
             .load_head_commit_id(branch_id)
             .await
+    }
+
+    async fn load_branch_working_base(
+        &mut self,
+        branch_id: &str,
+    ) -> Result<Option<CommitId>, LixError> {
+        Ok(BranchHeadControlContext::new()
+            .reader(self.opening_read())
+            .load(branch_id)
+            .await?
+            .and_then(|control| control.working_diff_checkpoint_commit_id))
     }
 
     async fn load_collection_generation(
@@ -16787,7 +16764,10 @@ fallback={large_fallback} decoded={large_decoded}"
             CommitId::for_test_label(SCHEMA_FIXTURE_COMMIT_ID).to_string()
         );
         assert!(details.get("commit_id").is_none());
-        assert!(error.hint().is_some(), "visibility error should include a hint");
+        assert!(
+            error.hint().is_some(),
+            "visibility error should include a hint"
+        );
     }
 
     #[tokio::test]
@@ -16888,10 +16868,7 @@ fallback={large_fallback} decoded={large_decoded}"
         .await
         .expect("entity commit should retain its parent schema registration");
         storage_adapter
-            .commit_write_set(
-                entity_writes,
-                StorageWriteOptions::default(),
-            )
+            .commit_write_set(entity_writes, StorageWriteOptions::default())
             .await
             .expect("entity commit should persist");
 
@@ -16944,12 +16921,12 @@ fallback={large_fallback} decoded={large_decoded}"
             details["base_commit_id"],
             CommitId::for_test_label(BASE_COMMIT_ID).to_string()
         );
-        let hint = error.hint().expect("divergent visibility error should have a hint");
+        let hint = error
+            .hint()
+            .expect("divergent visibility error should have a hint");
         assert!(hint.contains("not an ancestor"), "{hint}");
         assert!(
-            hint.contains(
-                &CommitId::for_test_label(SCHEMA_REGISTRATION_COMMIT_ID).to_string()
-            ),
+            hint.contains(&CommitId::for_test_label(SCHEMA_REGISTRATION_COMMIT_ID).to_string()),
             "{hint}"
         );
     }
@@ -17370,22 +17347,12 @@ fallback={large_fallback} decoded={large_decoded}"
         commit_id: &str,
     ) {
         let rows = visible_schema_fixture_rows(commit_id);
-        crate::test_support::seed_branch_head_with_rows(
-            storage,
-            branch_id,
-            commit_id,
-            &rows,
-        )
-        .await;
+        crate::test_support::seed_branch_head_with_rows(storage, branch_id, commit_id, &rows).await;
     }
 
     async fn seed_visible_schema_rows(storage: StorageAdapter) {
-        seed_visible_schema_rows_for_branch(
-            storage,
-            GLOBAL_BRANCH_ID,
-            SCHEMA_FIXTURE_COMMIT_ID,
-        )
-        .await;
+        seed_visible_schema_rows_for_branch(storage, GLOBAL_BRANCH_ID, SCHEMA_FIXTURE_COMMIT_ID)
+            .await;
     }
 
     async fn assert_no_persistence_after_validation_failure(

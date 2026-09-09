@@ -12,7 +12,7 @@ test("adding an observation reconnects an established browser multiplex stream",
 				const pathname = new URL(request.url).pathname;
 				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					return Response.json({
-						protocolVersion: 6,
+						protocolVersion: 7,
 						activeBranchId: "main-id",
 						activeAccountId: "00000000-0000-7000-8000-000000000002",
 						sessionId: "session-1",

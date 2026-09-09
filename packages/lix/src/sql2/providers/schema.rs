@@ -61,9 +61,7 @@ use super::spec::{
     batch_stream_source_with_statistics_and_source, projected_schema, register_spec_table,
     row_source, scan_row_source, take_record_batch_rows,
 };
-use super::values::{
-    optional_bool_value, optional_string_value, string_expr_literal,
-};
+use super::values::{optional_bool_value, optional_string_value, string_expr_literal};
 
 /// Executes the already-proved unique registered-schema point shape without
 /// constructing a DataFusion plan or Arrow batch. The retained hot-state
@@ -1617,10 +1615,7 @@ fn row_pk_from_primary_key_columns(
                     | ScalarValue::LargeUtf8(Some(value))
                     | ScalarValue::Utf8View(Some(value)),
                 ) => Ok(value),
-                (
-                    crate::row_pk::RowPkComponentType::Integer,
-                    ScalarValue::Int64(Some(value)),
-                ) => {
+                (crate::row_pk::RowPkComponentType::Integer, ScalarValue::Int64(Some(value))) => {
                     Ok(value.to_string())
                 }
                 (
@@ -1665,12 +1660,8 @@ fn row_delete_stage_rows_from_batch(
                 .expect("active row surface has an active branch")
                 .to_owned()
         };
-        let row_pk = row_pk_from_primary_key_columns(
-            batch,
-            row_index,
-            spec,
-            SchemaRowIdentityUse::Delete,
-        )?;
+        let row_pk =
+            row_pk_from_primary_key_columns(batch, row_index, spec, SchemaRowIdentityUse::Delete)?;
         let metadata = optional_string_value(
             batch,
             row_index,
@@ -1740,12 +1731,8 @@ fn row_update_stage_rows_from_batch(
                 .expect("active row surface has an active branch")
                 .to_owned()
         };
-        let row_pk = row_pk_from_primary_key_columns(
-            batch,
-            row_index,
-            spec,
-            SchemaRowIdentityUse::Update,
-        )?;
+        let row_pk =
+            row_pk_from_primary_key_columns(batch, row_index, spec, SchemaRowIdentityUse::Update)?;
         let snapshot_content = update_snapshots
             .get(&RowUpdateSnapshotKey {
                 row_pk: row_pk.clone(),
@@ -4543,6 +4530,7 @@ mod tests {
     impl BranchRefReader for ActiveBranchRefReader {
         async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
             Ok((branch_id == "branch-a").then(|| BranchHead {
+                working_base_commit_id: None,
                 branch_id: branch_id.to_string(),
                 commit_id: CommitId::for_test_label("branch-a-head"),
             }))
@@ -4550,6 +4538,7 @@ mod tests {
 
         async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
             Ok(vec![BranchHead {
+                working_base_commit_id: None,
                 branch_id: "branch-a".to_string(),
                 commit_id: CommitId::for_test_label("branch-a-head"),
             }])
@@ -5311,7 +5300,7 @@ mod tests {
             assert!(!schema_exposed_as_history_surface(schema_key));
         }
         assert!(schema_exposed_as_schema_surface("project_message"));
-        assert!(schema_exposed_as_schema_surface("lix_checkpoint"));
+        assert!(!schema_exposed_as_schema_surface("lix_checkpoint"));
     }
 
     #[test]

@@ -34,7 +34,8 @@ use crate::tracked_state::{
 
 use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters};
 use super::schema::{
-    RowBatchProjection, RowPrimaryKeyFilterAnalyzer, catalog_schema_spec, row_pks_from_primary_key_filters,
+    RowBatchProjection, RowPrimaryKeyFilterAnalyzer, catalog_schema_spec,
+    row_pks_from_primary_key_filters,
 };
 use super::spec::{PlannedScan, SpecTableProvider, TableSpec, projected_schema, scan_row_source};
 
@@ -45,9 +46,7 @@ const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 
 #[cfg(test)]
 static STATE_AT_TRAVERSAL_PROBES: OnceLock<
-    Mutex<
-        std::collections::HashMap<(std::thread::ThreadId, String), Vec<(usize, usize)>>,
-    >,
+    Mutex<std::collections::HashMap<(std::thread::ThreadId, String), Vec<(usize, usize)>>>,
 > = OnceLock::new();
 
 #[cfg(test)]
@@ -114,7 +113,7 @@ pub(super) fn register_state_at_function<S>(
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     session.register_udtf(
-        "lix_state_at",
+        "lix_as_of",
         Arc::new(StateAtFunction {
             store: query_source.store,
             catalog,
@@ -135,7 +134,9 @@ struct StateAtFunction<S> {
 
 impl<S> fmt::Debug for StateAtFunction<S> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("StateAtFunction").finish_non_exhaustive()
+        formatter
+            .debug_struct("StateAtFunction")
+            .finish_non_exhaustive()
     }
 }
 
@@ -146,19 +147,19 @@ where
     fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
         let [relation, commit_id] = args else {
             return Err(DataFusionError::Plan(
-                "lix_state_at requires a relation and exactly one commit ID argument".into(),
+                "lix_as_of requires a relation and exactly one commit ID argument".into(),
             ));
         };
         let relation_name = text_argument(relation, 1, "relation name", None)?;
         let commit_id = text_argument(commit_id, 2, "commit ID", Some(&self.slots))?;
         let surface = self.catalog.surface(&relation_name).ok_or_else(|| {
             DataFusionError::Plan(format!(
-                "lix_state_at does not support relation '{relation_name}'"
+                "lix_as_of does not support relation '{relation_name}'"
             ))
         })?;
         let schema = self.catalog.surface_schema(&relation_name).ok_or_else(|| {
             DataFusionError::Plan(format!(
-                "lix_state_at does not support relation '{relation_name}'"
+                "lix_as_of does not support relation '{relation_name}'"
             ))
         })?;
         let kind = match &surface.kind {
@@ -171,7 +172,7 @@ where
             PublicSurfaceKind::Directory => StateRelationKind::Directory,
             _ => {
                 return Err(DataFusionError::Plan(format!(
-                    "lix_state_at does not support relation '{relation_name}'"
+                    "lix_as_of does not support relation '{relation_name}'"
                 )));
             }
         };
@@ -208,19 +209,26 @@ fn text_argument(
     }
     let Expr::Literal(value, _) = argument else {
         return Err(DataFusionError::Plan(format!(
-            "lix_state_at argument {position} must be a {expected} literal or parameter"
+            "lix_as_of argument {position} must be a {expected} literal or parameter"
         )));
     };
-    value.try_as_str().flatten().map(str::to_owned).ok_or_else(|| {
-        DataFusionError::Plan(format!(
-            "lix_state_at argument {position} must be a non-null text {expected}"
-        ))
-    })
+    value
+        .try_as_str()
+        .flatten()
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "lix_as_of argument {position} must be a non-null text {expected}"
+            ))
+        })
 }
 
 #[derive(Clone)]
 enum StateRelationKind {
-    Schema { schema_key: String, spec: Arc<SchemaSurfaceSpec> },
+    Schema {
+        schema_key: String,
+        spec: Arc<SchemaSurfaceSpec>,
+    },
     File,
     Directory,
 }
@@ -241,9 +249,15 @@ impl<S> TableSpec for StateAtSpec<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    fn table_name(&self) -> &str { "lix_state_at" }
-    fn schema(&self) -> SchemaRef { Arc::clone(&self.schema) }
-    fn table_type(&self) -> TableType { TableType::View }
+    fn table_name(&self) -> &str {
+        "lix_as_of"
+    }
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+    fn table_type(&self) -> TableType {
+        TableType::View
+    }
 
     fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
         match &self.kind {
@@ -279,12 +293,18 @@ where
         let output_schema = projected_schema(&self.schema, projection);
         let scan_limit = filters.is_empty().then_some(limit).flatten();
         let row_pks = match &self.kind {
-            StateRelationKind::Schema { spec, .. } => row_pks_from_primary_key_filters(spec, filters)?,
+            StateRelationKind::Schema { spec, .. } => {
+                row_pks_from_primary_key_filters(spec, filters)?
+            }
             StateRelationKind::File | StateRelationKind::Directory => {
                 match exact_string_column_constraint_from_filters(filters, "id")? {
                     FileIdConstraint::All => None,
                     FileIdConstraint::None => Some(Vec::new()),
-                    FileIdConstraint::Ids(ids) => Some(ids.iter().map(|id| uuid_row_pk(id)).collect::<Result<Vec<_>>>()?),
+                    FileIdConstraint::Ids(ids) => Some(
+                        ids.iter()
+                            .map(|id| uuid_row_pk(id))
+                            .collect::<Result<Vec<_>>>()?,
+                    ),
                 }
             }
         };
@@ -302,8 +322,28 @@ where
             ordering: None,
             source: scan_row_source(
                 Arc::clone(&output_schema),
-                (store, kind, schema, commit_id, root_commit_id, active_branch_id, blob_reader, row_pks, contradictory),
-                move |(store, kind, schema, commit_id, root_commit_id, active_branch_id, blob_reader, row_pks, contradictory)| async move {
+                (
+                    store,
+                    kind,
+                    schema,
+                    commit_id,
+                    root_commit_id,
+                    active_branch_id,
+                    blob_reader,
+                    row_pks,
+                    contradictory,
+                ),
+                move |(
+                    store,
+                    kind,
+                    schema,
+                    commit_id,
+                    root_commit_id,
+                    active_branch_id,
+                    blob_reader,
+                    row_pks,
+                    contradictory,
+                )| async move {
                     if root_commit_id.as_deref() == Some(commit_id.as_str()) {
                         return Ok(RecordBatch::new_empty(schema));
                     }
@@ -330,22 +370,21 @@ where
                         true,
                     )
                     .await?;
-                    let (base_batches, base_extra_rows) = if let Some(base_commit_id) =
-                        descriptor.base_commit_id
-                    {
-                        load_relation_at_commit(
-                            &mut tracked,
-                            &kind,
-                            &schema,
-                            &base_commit_id.to_string(),
-                            row_pks.as_ref(),
-                            root_scan_limit,
-                            false,
-                        )
-                        .await?
-                    } else {
-                        (Vec::new(), Vec::new())
-                    };
+                    let (base_batches, base_extra_rows) =
+                        if let Some(base_commit_id) = descriptor.base_commit_id {
+                            load_relation_at_commit(
+                                &mut tracked,
+                                &kind,
+                                &schema,
+                                &base_commit_id.to_string(),
+                                row_pks.as_ref(),
+                                root_scan_limit,
+                                false,
+                            )
+                            .await?
+                        } else {
+                            (Vec::new(), Vec::new())
+                        };
                     let local_replacement_scopes = if descriptor.base_commit_id.is_some() {
                         load_local_replacement_scopes(&mut tracked, &commit_id).await?
                     } else {
@@ -388,17 +427,29 @@ where
                     )?;
                     let mut result = match kind {
                         StateRelationKind::Schema { spec, .. } => {
-                            let request = HotStateScanRequest { projection: HotStateProjection::default(), ..Default::default() };
-                            super::schema::row_record_batch(&spec, schema, &hot, RowBatchProjection::for_request(&request))?
+                            let request = HotStateScanRequest {
+                                projection: HotStateProjection::default(),
+                                ..Default::default()
+                            };
+                            super::schema::row_record_batch(
+                                &spec,
+                                schema,
+                                &hot,
+                                RowBatchProjection::for_request(&request),
+                            )?
                         }
-                        StateRelationKind::Directory => super::directory::lix_directory_record_batch(&schema, &hot)
-                            .map_err(lix_error_to_datafusion_error)?,
+                        StateRelationKind::Directory => {
+                            super::directory::lix_directory_record_batch(&schema, &hot)
+                                .map_err(lix_error_to_datafusion_error)?
+                        }
                         StateRelationKind::File => super::file::lix_file_state_record_batch(
                             &schema,
                             &blob_reader,
                             schema.index_of("content").is_ok(),
                             hot.into_rows(),
-                        ).await.map_err(lix_error_to_datafusion_error)?,
+                        )
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?,
                     };
                     if let Some(limit) = scan_limit {
                         result = result.slice(0, result.num_rows().min(limit));
@@ -445,20 +496,18 @@ async fn load_relation_at_commit<S: StorageAdapterRead + Clone>(
     row_pks: Option<&Vec<RowPk>>,
     scan_limit: Option<usize>,
     record_probe: bool,
-) -> Result<(Vec<MaterializedTrackedStateBatch>, Vec<MaterializedTrackedStateRow>)> {
+) -> Result<(
+    Vec<MaterializedTrackedStateBatch>,
+    Vec<MaterializedTrackedStateRow>,
+)> {
     let (batches, ancestors) = match kind {
         StateRelationKind::Schema { schema_key, .. } => {
             if let Some(row_pks) = row_pks {
-                let rows = load_schema_points_at_commit(tracked, commit_id, schema_key, row_pks)
-                    .await?;
+                let rows =
+                    load_schema_points_at_commit(tracked, commit_id, schema_key, row_pks).await?;
                 (Vec::new(), rows)
             } else {
-                let request = tracked_request(
-                    vec![schema_key.clone()],
-                    None,
-                    None,
-                    scan_limit,
-                );
+                let request = tracked_request(vec![schema_key.clone()], None, None, scan_limit);
                 if record_probe {
                     record_state_at_traversal_probe(commit_id, &request);
                 }
@@ -511,7 +560,11 @@ async fn load_relation_at_commit<S: StorageAdapterRead + Clone>(
                 if record_probe {
                     record_state_at_traversal_probe(commit_id, &owner_request);
                 }
-                Some(tracked.scan_batch_at_commit(commit_id, &owner_request).await)
+                Some(
+                    tracked
+                        .scan_batch_at_commit(commit_id, &owner_request)
+                        .await,
+                )
             } else {
                 None
             };
@@ -558,7 +611,7 @@ async fn load_schema_points_at_commit<S: StorageAdapterRead + Clone>(
     schema_key: &str,
     row_pks: &[RowPk],
 ) -> Result<Vec<MaterializedTrackedStateRow>> {
-    let commit_id_typed = CommitId::parse_lix(commit_id, "lix_state_at commit ID")
+    let commit_id_typed = CommitId::parse_lix(commit_id, "lix_as_of commit ID")
         .map_err(lix_error_to_datafusion_error)?;
     let keys = tracked
         .enumerate_schema_row_pk_keys_at_commit(commit_id_typed, schema_key, row_pks)
@@ -603,22 +656,24 @@ async fn commit_state_descriptor<S: StorageAdapterRead + Clone>(
     store: S,
     commit_id: &str,
 ) -> Result<CommitStateDescriptor> {
-    let commit_id = CommitId::parse_lix(commit_id, "lix_state_at commit ID")
+    let commit_id = CommitId::parse_lix(commit_id, "lix_as_of commit ID")
         .map_err(lix_error_to_datafusion_error)?;
     let manifest = crate::tracked_state::load_published_commit_state_topology(&store, commit_id)
         .await
         .map_err(lix_error_to_datafusion_error)?
         .ok_or_else(|| {
-            lix_error_to_datafusion_error(
-                crate::tracked_state::sync_history_required_for_commits(&[commit_id]),
-            )
+            lix_error_to_datafusion_error(crate::tracked_state::sync_history_required_for_commits(
+                &[commit_id],
+            ))
         })?;
     let node = crate::commit_graph::CommitGraphContext::new()
         .reader(store)
         .load_node(&commit_id)
         .await
         .map_err(lix_error_to_datafusion_error)?
-        .ok_or_else(|| DataFusionError::Execution(format!("commit '{commit_id}' does not exist")))?;
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!("commit '{commit_id}' does not exist"))
+        })?;
     Ok(CommitStateDescriptor {
         base_commit_id: node.base_commit_id,
         global_scope: manifest.global_scope(),
@@ -629,7 +684,8 @@ fn uuid_row_pk(id: &str) -> Result<RowPk> {
     RowPk::from_json_values(
         &[serde_json::Value::String(id.to_owned())],
         &[RowPkComponentType::Uuid],
-    ).map_err(|error| DataFusionError::Plan(format!("invalid lix_state_at id: {error}")))
+    )
+    .map_err(|error| DataFusionError::Plan(format!("invalid lix_as_of id: {error}")))
 }
 
 fn single_row_pk_string(row_pk: &RowPk) -> Option<String> {
@@ -649,7 +705,10 @@ async fn load_effective_ancestor_directories<S: StorageAdapterRead>(
     local_batches: &[MaterializedTrackedStateBatch],
     base_batches: &[MaterializedTrackedStateBatch],
     parent_field: &str,
-) -> Result<(Vec<MaterializedTrackedStateRow>, Vec<MaterializedTrackedStateRow>)> {
+) -> Result<(
+    Vec<MaterializedTrackedStateRow>,
+    Vec<MaterializedTrackedStateRow>,
+)> {
     let descriptor_schema = if parent_field == "directory_id" {
         FILE_DESCRIPTOR_SCHEMA_KEY
     } else {
@@ -702,11 +761,7 @@ async fn load_effective_ancestor_directories<S: StorageAdapterRead>(
             })
             .collect::<Result<Vec<_>>>()?;
         let local = tracked
-            .load_projected_batch_at_commit(
-                local_commit_id,
-                &keys,
-                &ChangeRecordProjection::full(),
-            )
+            .load_projected_batch_at_commit(local_commit_id, &keys, &ChangeRecordProjection::full())
             .await
             .map_err(lix_error_to_datafusion_error)?;
         let base = if let Some(base_commit_id) = base_commit_id {
@@ -727,19 +782,14 @@ async fn load_effective_ancestor_directories<S: StorageAdapterRead>(
         for index in 0..keys.len() {
             let (row, global) = match local.row(index) {
                 Some(row) => (Some(row), false),
-                None => (
-                    base.as_ref().and_then(|rows| rows.row(index)),
-                    true,
-                ),
+                None => (base.as_ref().and_then(|rows| rows.row(index)), true),
             };
             let Some(row) = row.filter(|row| !row.deleted()) else {
                 continue;
             };
-            if let Some(parent) = snapshot_text(
-                row.decoded_snapshot(),
-                row.snapshot_content(),
-                "parent_id",
-            )? {
+            if let Some(parent) =
+                snapshot_text(row.decoded_snapshot(), row.snapshot_content(), "parent_id")?
+            {
                 pending.insert(parent);
             }
             if global {
@@ -753,7 +803,7 @@ async fn load_effective_ancestor_directories<S: StorageAdapterRead>(
         Ok((local_ancestors, base_ancestors))
     } else {
         Err(DataFusionError::Execution(format!(
-            "lix_state_at directory tree exceeds {} levels",
+            "lix_as_of directory tree exceeds {} levels",
             crate::transaction::MAX_DIRECTORY_PARENT_DEPTH
         )))
     }
@@ -770,7 +820,7 @@ fn snapshot_text(
             Some(lix_schema::Value::Text(value)) => Ok(Some(value.clone())),
             Some(lix_schema::Value::Uuid(value)) => Ok(Some(value.to_string())),
             _ => Err(DataFusionError::Execution(format!(
-                "lix_state_at field '{field}' is not text"
+                "lix_as_of field '{field}' is not text"
             ))),
         };
     }
@@ -778,7 +828,10 @@ fn snapshot_text(
     let value: serde_json::Value = serde_json::from_str(raw.as_str()).map_err(|error| {
         DataFusionError::Execution(format!("invalid historical filesystem descriptor: {error}"))
     })?;
-    Ok(value.get(field).and_then(serde_json::Value::as_str).map(str::to_owned))
+    Ok(value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned))
 }
 
 fn tracked_to_hot(
@@ -790,7 +843,7 @@ fn tracked_to_hot(
     commit_is_global: bool,
     local_replacement_scopes: &std::collections::BTreeSet<(String, Option<String>)>,
 ) -> Result<MaterializedHotStateBatch> {
-    const HISTORICAL_LOCAL_BRANCH_ID: &str = "__lix_state_at_local_overlay__";
+    const HISTORICAL_LOCAL_BRANCH_ID: &str = "__lix_as_of_local_overlay__";
     let branch_id = if commit_is_global {
         crate::GLOBAL_BRANCH_ID
     } else {
@@ -814,10 +867,7 @@ fn tracked_to_hot(
         } else {
             branch_id
         };
-        for row in batches
-            .iter()
-            .flat_map(MaterializedTrackedStateBatch::iter)
-        {
+        for row in batches.iter().flat_map(MaterializedTrackedStateBatch::iter) {
             if global
                 && !commit_is_global
                 && base_row_suppressed_by_local_replacement(

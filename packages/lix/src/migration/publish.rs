@@ -5,9 +5,9 @@ use bytes::Bytes;
 use crate::LixError;
 use crate::init::{REPOSITORY_PROTOCOL_KEY, REPOSITORY_PROTOCOL_SPACE, REPOSITORY_PROTOCOL_VALUE};
 use crate::storage_adapter::{
-    PutBatch, PutEntry, Storage, StorageError, StorageKey as Key, StorageKeyRange as KeyRange,
-    StoragePrecondition as Precondition, StorageSpace, StorageValue as StoredValue, StorageWrite,
-    StorageWriteOptions as WriteOptions, ValueSemantics, StorageAdapter,
+    PutBatch, PutEntry, Storage, StorageAdapter, StorageError, StorageKey as Key,
+    StorageKeyRange as KeyRange, StoragePrecondition as Precondition, StorageSpace,
+    StorageValue as StoredValue, StorageWrite, StorageWriteOptions as WriteOptions, ValueSemantics,
 };
 
 /// Fully preflighted physical mutations. Construction stays private so the
@@ -47,6 +47,38 @@ impl PublicationPlan {
         let batch = put_batch(entries)?;
         self.account(&batch)?;
         self.replacements.push((space, batch));
+        Ok(())
+    }
+
+    pub(super) fn put_mutable(
+        &mut self,
+        space: StorageSpace,
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), LixError> {
+        if space.value_semantics != ValueSemantics::Mutable {
+            return Err(plan_error("mutable put targeted immutable space"));
+        }
+        let batch = put_batch(entries)?;
+        self.account(&batch)?;
+        self.mutable_puts.push((space, batch));
+        Ok(())
+    }
+
+    /// Replace a derived mutable inventory in the same publication as its authority.
+    pub(super) fn replace_mutable_space(
+        &mut self,
+        space: StorageSpace,
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<(), LixError> {
+        if space.value_semantics != ValueSemantics::Mutable {
+            return Err(plan_error(
+                "mutable replacement targeted an immutable space",
+            ));
+        }
+        let batch = put_batch(entries)?;
+        self.account(&batch)?;
+        self.cleared_spaces.push(space);
+        self.mutable_puts.push((space, batch));
         Ok(())
     }
 
@@ -114,9 +146,7 @@ where
                     key: Key(Bytes::from_static(REPOSITORY_PROTOCOL_KEY)),
                     expected: Bytes::from_static(expected_protocol_value),
                 },
-                StorageAdapter::<S>::mutation_revision_precondition(
-                    expected_mutation_revision,
-                ),
+                StorageAdapter::<S>::mutation_revision_precondition(expected_mutation_revision),
             ],
             ..WriteOptions::default()
         })
@@ -309,9 +339,7 @@ mod tests {
         .expect_err("stale migration must be fenced");
         assert!(error.to_string().contains("precondition failed"));
         assert_eq!(
-            crate::migration::inspect_lix(&storage)
-                .await
-                .unwrap(),
+            crate::migration::inspect_lix(&storage).await.unwrap(),
             crate::migration::MigrationStatus::Required {
                 from_version: 68,
                 to_version: CURRENT_FORMAT_VERSION,

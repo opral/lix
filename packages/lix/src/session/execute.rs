@@ -6078,21 +6078,11 @@ mod tests {
             .await
             .expect("legacy cursor corruption should commit");
 
-        let fallback = session
-            .execute("SELECT lix_latest_checkpoint_commit_id() AS commit_id", &[])
+        let checkpoints = session
+            .execute("SELECT commit_id FROM lix_log() WHERE is_checkpoint", &[])
             .await
-            .expect("a missing checkpoint cursor should fall back to the repository root");
-        let repository_root = session
-            .execute("SELECT lix_root_commit_id() AS commit_id", &[])
-            .await
-            .expect("repository root should resolve")
-            .rows()[0]
-            .get::<String>("commit_id")
-            .unwrap();
-        assert_eq!(
-            fallback.rows()[0].get::<String>("commit_id").unwrap(),
-            repository_root
-        );
+            .expect("checkpoint membership is independent of the private cursor");
+        assert!(checkpoints.is_empty());
 
         let restored = session
             .execute(
@@ -6190,17 +6180,15 @@ mod tests {
             .working_diff_checkpoint_commit_id
             .expect("working diff cursor should exist")
             .to_string();
-        let public_latest = session
-            .execute("SELECT lix_latest_checkpoint_commit_id() AS commit_id", &[])
+        let public_checkpoints = session
+            .execute("SELECT commit_id FROM lix_log() WHERE is_checkpoint", &[])
             .await
-            .expect("public latest checkpoint should resolve")
-            .rows()[0]
-            .get::<String>("commit_id")
-            .expect("public latest checkpoint should be text");
-        assert_ne!(
-            public_latest, private_cursor,
-            "the public real checkpoint and private working cursor intentionally differ"
+            .expect("public checkpoint inventory should read");
+        assert!(
+            public_checkpoints.is_empty(),
+            "a private cursor does not create a checkpoint"
         );
+        assert!(!private_cursor.is_empty());
 
         let diff = session
             .execute(
@@ -6214,51 +6202,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn latest_checkpoint_reports_a_sparse_graph_miss_for_a_missing_cursor_commit() {
+    async fn mainline_reports_a_sparse_graph_miss_for_a_missing_anchor_commit() {
         let session = open_session().await;
-        let branch_id = session
-            .active_branch_id()
-            .await
-            .expect("active branch should load");
-        let read = session
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("branch control read should open");
-        let mut control = crate::branch::BranchHeadControlContext::new()
-            .reader(&read)
-            .load(&branch_id)
-            .await
-            .expect("branch control should read")
-            .expect("active branch control should exist");
-        let missing = crate::changelog::CommitId::for_test_label("missing-checkpoint-cursor");
-        control.working_diff_checkpoint_commit_id = Some(missing);
-        drop(read);
-        let mut corrupt = session.storage.new_write_set();
-        crate::branch::stage_branch_head_control(&mut corrupt, &branch_id, control)
-            .expect("missing cursor fixture should stage");
-        session
-            .storage
-            .commit_write_set(corrupt, StorageWriteOptions::default())
-            .await
-            .expect("missing cursor fixture should commit");
-
+        let missing = crate::changelog::CommitId::for_test_label("missing-mainline-anchor");
         let error = session
-            .execute("SELECT lix_latest_checkpoint_commit_id() AS commit_id", &[])
+            .execute(
+                "SELECT commit_id FROM lix_log($1)",
+                &[Value::Text(missing.to_string())],
+            )
             .await
-            .expect_err("missing cursor commit should surface a graph miss");
+            .expect_err("missing anchor commit should surface a graph miss");
         assert_eq!(error.code, LixError::CODE_COMMIT_NOT_FOUND);
         assert_eq!(
             error.details.as_ref().expect("graph miss details")["commit_id"],
             missing.to_string()
-        );
-        assert_eq!(
-            error.details.as_ref().expect("graph miss details")["operation"],
-            "walk_commit_graph"
-        );
-        assert_eq!(
-            error.details.as_ref().expect("graph miss details")["role"],
-            "graph_node"
         );
     }
 
@@ -7530,7 +7487,7 @@ mod tests {
                 &format!(
                     "SELECT COUNT(*) AS entries \
                      FROM lix_history('rootless_ordered_insert_probe', '{}') \
-                     WHERE lixcol_is_deleted = false",
+                     WHERE diff_type <> 'removed'",
                     head.commit_id
                 ),
                 &[],
@@ -7793,20 +7750,28 @@ mod tests {
                     "SELECT COUNT(DISTINCT id) AS entries \
                      FROM lix_history('rootless_ordered_insert_probe', '{rooted_fence}') \
                      WHERE id IN ('00000', '00001', '00002', '32767') \
-                       AND lixcol_is_deleted = false"
+                       AND diff_type <> 'removed'"
                 ),
                 &[],
             )
             .await
             .expect("history should cross the rebuilt root fence");
         assert_eq!(fence_history.rows()[0].get::<i64>("entries").unwrap(), 4);
+        let removed_history = main_session
+            .execute(
+                &format!("SELECT COUNT(*) AS entries FROM lix_history('rootless_ordered_insert_probe', '{rooted_fence}') WHERE id IN ('00000', '00001', '00002', '32767') AND diff_type = 'removed'"),
+                &[],
+            )
+            .await
+            .expect("collection generation deletion retains each endpoint removal");
+        assert_eq!(removed_history.rows()[0].get::<i64>("entries").unwrap(), 4);
         let merge_history = main_session
             .execute(
                 &format!(
                     "SELECT COUNT(*) AS entries \
                      FROM lix_history('rootless_ordered_insert_probe', '{rooted_fence}') \
-                     WHERE (id = '00001' AND value = 'draft') \
-                        OR (id = '32767' AND value = 'main')"
+                     WHERE (id = '00001' AND to_value = 'draft') \
+                        OR (id = '32767' AND to_value = 'main')"
                 ),
                 &[],
             )
@@ -8047,7 +8012,7 @@ mod tests {
                 &format!(
                     "SELECT COUNT(*) AS entries \
                      FROM lix_history('columnar_lifecycle_probe', '{inserted_head}') \
-                     WHERE lixcol_is_deleted = false"
+                     WHERE diff_type <> 'removed'"
                 ),
                 &[],
             )
@@ -8075,7 +8040,7 @@ mod tests {
                     "SELECT COUNT(DISTINCT id) AS entries \
                      FROM lix_history('columnar_lifecycle_probe', '{inserted_head}') \
                      WHERE id IN ('02047', '02048', '65535', '65536') \
-                       AND lixcol_is_deleted = false"
+                       AND diff_type <> 'removed'"
                 ),
                 &[],
             )
@@ -8210,9 +8175,9 @@ mod tests {
         let merged_history = main
             .execute(
                 &format!(
-                    "SELECT value, lixcol_depth \
+                    "SELECT to_value AS value, lixcol_position \
                      FROM lix_history('columnar_lifecycle_probe', '{merged_head}') \
-                     WHERE id = '00000' ORDER BY lixcol_depth"
+                     WHERE id = '00000' ORDER BY lixcol_position"
                 ),
                 &[],
             )
@@ -10511,8 +10476,8 @@ mod tests {
         let merged_history = session
             .execute(
                 &format!(
-                    "SELECT value FROM lix_history('packed_replacement_probe', '{merged_commit_id}') \
-                     WHERE path = '/00000' ORDER BY lixcol_depth"
+                    "SELECT to_value AS value FROM lix_history('packed_replacement_probe', '{merged_commit_id}') \
+                     WHERE path = '/00000' ORDER BY lixcol_position"
                 ),
                 &[],
             )
@@ -11674,7 +11639,7 @@ mod tests {
                 &[],
             ),
             (
-                "SELECT lixcol_depth \
+                "SELECT lixcol_position \
                  FROM lix_history('lix_key_value') \
                  WHERE key = 'batch-read'",
                 &[],
@@ -11702,7 +11667,7 @@ mod tests {
         );
         assert_eq!(
             batch.results[2].rows()[0]
-                .get::<i64>("lixcol_depth")
+                .get::<i64>("lixcol_position")
                 .unwrap(),
             0
         );
@@ -12519,7 +12484,9 @@ mod tests {
             .await
             .expect("rejected journal must leave the original row readable");
         assert_eq!(
-            unchanged.rows()[0].get::<serde_json::Value>("value").unwrap(),
+            unchanged.rows()[0]
+                .get::<serde_json::Value>("value")
+                .unwrap(),
             serde_json::json!({"state": "base"})
         );
 

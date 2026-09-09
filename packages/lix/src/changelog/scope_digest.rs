@@ -341,6 +341,7 @@ mod tests {
         );
 
         let new = crate::changelog::CommitRecord {
+            is_checkpoint: false,
             format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
             base_commit_id: None,
             commit_id,

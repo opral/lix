@@ -30,14 +30,14 @@ use crate::hot_state::{
 use crate::row_pk::RowPk;
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::tracked_state::{
-    CommitDeltaReplacementGeneration, CommitDeltaReplacementScope, CommitStateManifest,
-    CommitStateMutationInventory, CommitStateReplayDebt, MaterializedTrackedStateRow,
-    OrderedAddressableCommitDeltaStage, TrackedStateCommitDeltaRef, TrackedStateCommitRoot,
-    TrackedStateContext, TrackedStateDeltaRef, TrackedStateFilter, TrackedStateKey,
-    TrackedStateKeyRef, TrackedStateReadColumns, TrackedStateRootMutationRef,
+    AuthoritativeLiveChangeRequest, CommitDeltaReplacementGeneration, CommitDeltaReplacementScope,
+    CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
+    MaterializedTrackedStateRow, OrderedAddressableCommitDeltaStage, TrackedStateCommitDeltaRef,
+    TrackedStateCommitRoot, TrackedStateContext, TrackedStateDeltaRef, TrackedStateFilter,
+    TrackedStateKey, TrackedStateKeyRef, TrackedStateReadColumns, TrackedStateRootMutationRef,
     TrackedStateScanRequest, TrackedStateSingleStringReplacementRef, encode_key_ref,
-    AuthoritativeLiveChangeRequest, load_authoritative_live_change_records,
-    load_commit_delta_replay_metadata, stage_addressable_commit_deltas, stage_change_locators,
+    load_authoritative_live_change_records, load_commit_delta_replay_metadata,
+    stage_addressable_commit_deltas, stage_change_locators,
     stage_ordered_addressable_commit_deltas,
 };
 use crate::transaction::context::PendingRestoreIntent;
@@ -364,7 +364,15 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         "lix.perf.materialization.finalize_commit_rows"
     ))
     .await?;
-    let commit_rows = finalized.commit_rows;
+    let mut commit_rows = finalized.commit_rows;
+    let checkpoint_ids = prepared_writes
+        .checkpoint_publications
+        .iter()
+        .map(|publication| publication.recovery_ref.checkpoint_commit_id)
+        .collect::<BTreeSet<_>>();
+    for row in &mut commit_rows {
+        row.is_checkpoint = checkpoint_ids.contains(&row.commit_id);
+    }
     let mut tracked_roots = finalized.tracked_roots;
     assign_local_overlay_parents(&*read, &commit_rows, &mut tracked_roots).await?;
     // v69 certified batches are already native packet pages and do not need
@@ -1235,6 +1243,7 @@ async fn stage_changelog_commits(
         topology_records.insert(
             commit_id,
             CommitRecord {
+                is_checkpoint: commit.is_checkpoint,
                 format_version: COMMIT_RECORD_FORMAT_VERSION,
                 commit_id,
                 generation,
@@ -1305,6 +1314,7 @@ async fn stage_changelog_commits(
             })?;
         }
         let record = CommitRecord {
+            is_checkpoint: commit_row.is_checkpoint,
             format_version: COMMIT_RECORD_FORMAT_VERSION,
             commit_id: commit_row.commit_id,
             generation,
@@ -1687,18 +1697,12 @@ async fn stage_hot_index_writes_for_commit(
     generation: CommitId,
     parent_control: Option<&BranchHeadControl>,
 ) -> Result<(), LixError> {
-    let (entries, witnesses) =
-        hot_index_writes_for_commit(state_rows, branch_id, parent_control);
+    let (entries, witnesses) = hot_index_writes_for_commit(state_rows, branch_id, parent_control);
     if entries.is_empty() && witnesses.is_empty() {
         return Ok(());
     }
     crate::hot_state::stage_hot_index_entries(
-        read,
-        writes,
-        branch_id,
-        generation,
-        &entries,
-        &witnesses,
+        read, writes, branch_id, generation, &entries, &witnesses,
     )
     .await
 }
@@ -1780,20 +1784,20 @@ async fn load_selected_change_records(
         // HOT tombstones must carry no payload.
         .filter(|change_ref| !change_ref.deleted)
         .collect::<Vec<_>>();
-	let requests = change_refs
-		.iter()
-		.map(|change_ref| AuthoritativeLiveChangeRequest {
-			change_id: change_ref.change_id,
-			source_commit_id: change_ref.source_commit_id,
-			key: TrackedStateKey {
-				schema_key: change_ref.schema_key().to_owned(),
-				file_id: change_ref.file_id().map(str::to_owned),
-				row_pk: change_ref.row_pk().clone(),
-			},
-			updated_at: change_ref.updated_at,
-		})
-		.collect::<Vec<_>>();
-	let loaded = load_authoritative_live_change_records(read, &requests).await?;
+    let requests = change_refs
+        .iter()
+        .map(|change_ref| AuthoritativeLiveChangeRequest {
+            change_id: change_ref.change_id,
+            source_commit_id: change_ref.source_commit_id,
+            key: TrackedStateKey {
+                schema_key: change_ref.schema_key().to_owned(),
+                file_id: change_ref.file_id().map(str::to_owned),
+                row_pk: change_ref.row_pk().clone(),
+            },
+            updated_at: change_ref.updated_at,
+        })
+        .collect::<Vec<_>>();
+    let loaded = load_authoritative_live_change_records(read, &requests).await?;
 
     let mut records = HashMap::new();
     for (change_ref, record) in change_refs.into_iter().zip(loaded) {
@@ -2420,6 +2424,7 @@ fn materialize_staged_sync_commits(
             })
             .transpose()?;
         let commit = SyncCommit {
+            is_checkpoint: staged.record.is_checkpoint,
             commit_id: staged.record.commit_id.to_string(),
             parent_commit_ids: staged
                 .record
@@ -3246,12 +3251,9 @@ async fn load_local_overlay_with_inherited_catalog(
             )
         })?;
     if let Some(base_commit_id) = node.base_commit_id {
-        for (key, row) in load_persisted_lifecycle_tracked_snapshot(
-            read,
-            crate::GLOBAL_BRANCH_ID,
-            base_commit_id,
-        )
-        .await?
+        for (key, row) in
+            load_persisted_lifecycle_tracked_snapshot(read, crate::GLOBAL_BRANCH_ID, base_commit_id)
+                .await?
         {
             if row.schema_key == "lix_registered_schema" {
                 rows.entry(key).or_insert(row);
@@ -3792,8 +3794,11 @@ async fn stage_tracked_head(
                     Some(false),
                 )
                 .await?;
-            inherited_catalog_changed |= inherited_catalog
-                .inherited_catalog_differs_from(&previous_catalog, &local_catalog, refreshed_generation)?;
+            inherited_catalog_changed |= inherited_catalog.inherited_catalog_differs_from(
+                &previous_catalog,
+                &local_catalog,
+                refreshed_generation,
+            )?;
             let checkpoint_commit_id = parent_control
                 .working_diff_checkpoint_commit_id
                 .unwrap_or(root.parent_commit_id.expect("refresh has a parent"));
@@ -3927,8 +3932,8 @@ async fn stage_tracked_head(
                     .flat_map(StagedCommitChangeBatch::deleted_iter)
                     .zip(selected_deleted_rows.iter())
                     .zip(&selected_metadata)
-                    .map(|((change_ref, row), metadata)| {
-                        crate::hot_state::CurrentStateDeltaRef {
+                    .map(
+                        |((change_ref, row), metadata)| crate::hot_state::CurrentStateDeltaRef {
                             schema_key: &row.schema_key,
                             file_id: row.file_id.as_deref(),
                             row_pk: &row.row_pk,
@@ -3941,8 +3946,8 @@ async fn stage_tracked_head(
                             snapshot: None,
                             metadata: metadata.as_ref(),
                             columnar_base_coordinate: None,
-                        }
-                    }),
+                        },
+                    ),
             );
             let mut coverage = WorkingDiffIndexCoverage::default();
             let generation = if deleted_deltas.is_empty() {
@@ -3965,12 +3970,8 @@ async fn stage_tracked_head(
                     ))
                     .await?
             };
-            let control = normal_branch_head_control(
-                root,
-                parent_control,
-                generation,
-                checkpoint_commit_id,
-            )?;
+            let control =
+                normal_branch_head_control(root, parent_control, generation, checkpoint_commit_id)?;
             insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
             continue;
         }
@@ -3990,10 +3991,12 @@ async fn stage_tracked_head(
         .filter(|_| !tracked_snapshots.contains_key(&root.commit_id));
         if partial_checkpoint_commit_id.is_some()
             && (!state_row_indices.is_empty()
-                || engine_rows.iter().any(|row| row.branch_id == root.branch_id)
-                || state_rows.iter().any(|row| {
-                    row.untracked && row.branch_id.as_str() == root.branch_id
-                }))
+                || engine_rows
+                    .iter()
+                    .any(|row| row.branch_id == root.branch_id)
+                || state_rows
+                    .iter()
+                    .any(|row| row.untracked && row.branch_id.as_str() == root.branch_id))
         {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -4234,11 +4237,10 @@ async fn stage_tracked_head(
                     &mut coverage,
                 )
                 .await?;
-            if let Some(checkpoint_commit_id) = partial_checkpoint_epoch.or(
-                working_diff_epoch
-                    .as_ref()
-                    .map(|epoch| epoch.checkpoint_commit_id),
-            ) {
+            if let Some(checkpoint_commit_id) = partial_checkpoint_epoch.or(working_diff_epoch
+                .as_ref()
+                .map(|epoch| epoch.checkpoint_commit_id))
+            {
                 stage_tracked_working_diff_epoch(
                     writes,
                     &root.branch_id,
@@ -6790,10 +6792,7 @@ where
                 let base_id = row_pk_base_commit_id.expect("checked above");
                 let base_rows = TrackedStateContext::new()
                     .reader(&*read)
-                    .scan_batch_at_commit(
-                        &base_id.to_string(),
-                        &TrackedStateScanRequest::default(),
-                    )
+                    .scan_batch_at_commit(&base_id.to_string(), &TrackedStateScanRequest::default())
                     .await?
                     .into_rows();
                 row_pk_base_root = crate::tracked_state::stage_row_pk_index_from_deltas(
@@ -6814,12 +6813,11 @@ where
                 )
                 .await?;
             }
-            let staged_segments =
-                crate::tracked_state::staged_commit_delta_segment_bytes(
-                    writes,
-                    record.commit_id,
-                    &mutations,
-                )?;
+            let staged_segments = crate::tracked_state::staged_commit_delta_segment_bytes(
+                writes,
+                record.commit_id,
+                &mutations,
+            )?;
             let row_pk_members = crate::tracked_state::staged_commit_delta_members(
                 read,
                 record.commit_id,
@@ -7026,6 +7024,7 @@ struct FinalizedCommitRows {
 }
 
 struct FinalizedCommitRow {
+    is_checkpoint: bool,
     commit_id: CommitId,
     parent_commit_ids: Vec<CommitId>,
     base_commit_id: Option<CommitId>,
@@ -7078,6 +7077,7 @@ async fn finalize_commit_rows(
         let branch_ref_change_id = change_refs.branch_ref_change_id;
         let selected_change_batches = change_refs.into_selected_change_batches();
         commit_rows.push(FinalizedCommitRow {
+            is_checkpoint: false,
             commit_id,
             parent_commit_ids: vec![intermediate.parent_commit_id],
             base_commit_id: (intermediate.branch_id != crate::GLOBAL_BRANCH_ID)
@@ -7133,6 +7133,7 @@ async fn finalize_commit_rows(
         );
         let parent_commit_id = parent_commit_ids.first().copied();
         commit_rows.push(FinalizedCommitRow {
+            is_checkpoint: false,
             commit_id,
             parent_commit_ids: parent_commit_ids.clone(),
             base_commit_id: (branch_id != crate::GLOBAL_BRANCH_ID)
@@ -7285,9 +7286,7 @@ pub(crate) async fn resolve_prepared_commit_parent_heads(
                 "target",
             ));
         }
-        if commit_parent_branch_ids.contains(&branch_id)
-            || branch_id == crate::GLOBAL_BRANCH_ID
-        {
+        if commit_parent_branch_ids.contains(&branch_id) || branch_id == crate::GLOBAL_BRANCH_ID {
             parent_heads.insert(branch_id.to_string(), head);
         }
     }
@@ -7541,7 +7540,7 @@ mod tests {
     struct ChangeBatchCountingRead<R> {
         inner: R,
         change_batches: Arc<Mutex<Vec<usize>>>,
-		owner_authority_batches: Arc<Mutex<Vec<usize>>>,
+        owner_authority_batches: Arc<Mutex<Vec<usize>>>,
     }
 
     impl<R> StorageAdapterRead for ChangeBatchCountingRead<R>
@@ -7563,14 +7562,13 @@ mod tests {
                         .expect("change batch counter lock")
                         .push(request.keys.len());
                 }
-				if request.space
-					== crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
-				{
-					self.owner_authority_batches
-						.lock()
-						.expect("owner authority batch counter lock")
-						.push(request.keys.len());
-				}
+                if request.space == crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
+                {
+                    self.owner_authority_batches
+                        .lock()
+                        .expect("owner authority batch counter lock")
+                        .push(request.keys.len());
+                }
             }
             self.inner.get_many(requests)
         }
@@ -10182,6 +10180,7 @@ mod tests {
 
         let commits = vec![
             FinalizedCommitRow {
+                is_checkpoint: false,
                 commit_id: CommitId::for_test_label("child-commit"),
                 parent_commit_ids: vec![CommitId::for_test_label("parent-commit")],
                 base_commit_id: None,
@@ -10190,6 +10189,7 @@ mod tests {
                 global_scope: false,
             },
             FinalizedCommitRow {
+                is_checkpoint: false,
                 commit_id: CommitId::for_test_label("parent-commit"),
                 parent_commit_ids: Vec::new(),
                 base_commit_id: None,
@@ -10325,6 +10325,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, commit_id)| FinalizedCommitRow {
+                is_checkpoint: false,
                 commit_id: *commit_id,
                 parent_commit_ids: index
                     .checked_sub(1)
@@ -11255,16 +11256,16 @@ mod tests {
                 commits: (0..CHANGE_COUNT)
                     .map(|index| {
                         let commit_id = commit_id(&format!("missing-fallback-owner-{index}"));
-						CommitRecord {
-							format_version: COMMIT_RECORD_FORMAT_VERSION,
-							base_commit_id: None,
+                        CommitRecord {
+                            is_checkpoint: false,
+                            format_version: COMMIT_RECORD_FORMAT_VERSION,
+                            base_commit_id: None,
                             commit_id,
                             generation: 0,
                             parent_commit_ids: Vec::new(),
                             first_parent_jump_commit_id: commit_id,
                             first_parent_jump_span: 0,
-                            touched_scope_digest:
-								CommitTouchedScopeDigest::absent(),
+                            touched_scope_digest: CommitTouchedScopeDigest::absent(),
                             account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                             created_at: timestamp,
                         }
@@ -11274,12 +11275,12 @@ mod tests {
             })
             .await
             .expect("standalone selected changes should stage");
-		for index in 0..CHANGE_COUNT {
-			crate::tracked_state::stage_commit_history_deferred(
-				&mut writes,
-				commit_id(&format!("missing-fallback-owner-{index}")),
-			);
-		}
+        for index in 0..CHANGE_COUNT {
+            crate::tracked_state::stage_commit_history_deferred(
+                &mut writes,
+                commit_id(&format!("missing-fallback-owner-{index}")),
+            );
+        }
         drop(read);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -11287,16 +11288,17 @@ mod tests {
             .expect("standalone selected changes should publish");
 
         let change_batches = Arc::new(Mutex::new(Vec::new()));
-		let owner_authority_batches = Arc::new(Mutex::new(Vec::new()));
+        let owner_authority_batches = Arc::new(Mutex::new(Vec::new()));
         let read = ChangeBatchCountingRead {
             inner: storage
                 .begin_read(StorageReadOptions::default())
                 .await
                 .expect("counted fallback read should open"),
             change_batches: Arc::clone(&change_batches),
-			owner_authority_batches: Arc::clone(&owner_authority_batches),
+            owner_authority_batches: Arc::clone(&owner_authority_batches),
         };
         let commit_rows = [FinalizedCommitRow {
+            is_checkpoint: false,
             commit_id: commit_id("fallback-checkpoint"),
             parent_commit_ids: Vec::new(),
             base_commit_id: None,
@@ -11322,13 +11324,13 @@ mod tests {
             vec![CHANGE_COUNT],
             "all missing selected payloads must enter one physical changelog point batch",
         );
-		assert!(
-			owner_authority_batches
-				.lock()
-				.expect("owner authority batch counter lock")
-				.is_empty(),
-			"snapshot-local selected payloads must not probe their cold owner commits",
-		);
+        assert!(
+            owner_authority_batches
+                .lock()
+                .expect("owner authority batch counter lock")
+                .is_empty(),
+            "snapshot-local selected payloads must not probe their cold owner commits",
+        );
     }
 
     fn tracked_global_row(change_id: &str) -> TestPreparedStateRow {

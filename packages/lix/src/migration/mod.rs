@@ -5,6 +5,7 @@
 //! migration ordering, limits, or recovery rules.
 
 mod api;
+mod checkpoint_metadata;
 mod epoch;
 mod publish;
 mod registry;

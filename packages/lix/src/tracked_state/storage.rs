@@ -6698,9 +6698,7 @@ fn stage_commit_deltas_inner(
     while segment_start < entries.len() {
         let segment_limit =
             (segment_start + GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS).min(entries.len());
-        let first = crate::tracked_state::codec::decode_key_borrowed(
-            &entries[segment_start].key,
-        )?;
+        let first = crate::tracked_state::codec::decode_key_borrowed(&entries[segment_start].key)?;
         let schema_prefix = encode_schema_key_prefix(first.schema_key.as_ref());
         // Native projection certificates have one schema fingerprint and one
         // field layout. Preserve that physical invariant at construction time:
@@ -9698,11 +9696,9 @@ pub(crate) async fn missing_point_replay_commit_error(
 ) -> LixError {
     match commit_history_is_deferred(store, commit_id).await {
         Ok(true) => sync_history_required(commit_id),
-        Ok(false) => LixError::commit_not_found(
-            commit_id.to_string(),
-            "walk_commit_graph",
-            "graph_node",
-        ),
+        Ok(false) => {
+            LixError::commit_not_found(commit_id.to_string(), "walk_commit_graph", "graph_node")
+        }
         Err(error) => error,
     }
 }
@@ -9835,21 +9831,20 @@ async fn load_commit_delta_members_with_payloads_for_schemas_impl(
     max_segment_count: usize,
     expand_standalone_complete_state: bool,
 ) -> Result<Option<Vec<CommitDeltaMember>>, LixError> {
-    if let Some((mut diff, standalone_complete_state)) =
-        complete_state_fence_tree_diff(
-            store,
-            commit_id,
-            schema_keys,
-            false,
-            expand_standalone_complete_state,
-        )
-        .await?
+    if let Some((mut diff, standalone_complete_state)) = complete_state_fence_tree_diff(
+        store,
+        commit_id,
+        schema_keys,
+        false,
+        expand_standalone_complete_state,
+    )
+    .await?
     {
         // Collection-generation deletes synthesize physical tombstones for
         // every retired row, but only the generation marker is a logical
-        // commit member with a payload. Keep checkpoint wire/history deltas
-        // aligned with the ordinary tree-diff path by suppressing those
-        // derived tombstones before owner hydration.
+        // commit member with a payload. Keep checkpoint wire deltas limited
+        // to authored members by suppressing those derived tombstones before
+        // owner hydration; endpoint SQL diffs still expose each removed row.
         let mut reader = crate::tracked_state::TrackedStateContext::new().reader(store);
         reader
             .suppress_collection_generation_cascade_tombstones(&mut diff)
@@ -10639,13 +10634,15 @@ pub(crate) async fn complete_state_fence_change_owner_commit_ids(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
 ) -> Result<Option<BTreeSet<CommitId>>, LixError> {
-    Ok(complete_state_fence_tree_diff(store, commit_id, &[], true, false)
-        .await?
-        .map(|(diff, _)| {
-            diff.checkpoint_delta_rows()
-                .map(|row| row.commit_id())
-                .collect()
-        }))
+    Ok(
+        complete_state_fence_tree_diff(store, commit_id, &[], true, false)
+            .await?
+            .map(|(diff, _)| {
+                diff.checkpoint_delta_rows()
+                    .map(|row| row.commit_id())
+                    .collect()
+            }),
+    )
 }
 
 async fn complete_state_fence_tree_diff(
@@ -11633,10 +11630,10 @@ pub(crate) async fn load_owned_commit_delta_entries(
             .cloned()
             .flatten()
             .ok_or_else(|| {
-            replacement_payload_error(
-                "selected-source mutation authority references a missing source",
-            )
-        })?;
+                replacement_payload_error(
+                    "selected-source mutation authority references a missing source",
+                )
+            })?;
         if source.mutations.selected_source_commit_id().is_some() {
             return Err(replacement_payload_error(
                 "selected-source mutation authority cannot alias another source",
@@ -11716,9 +11713,7 @@ async fn load_local_owned_commit_delta_entries(
     store: &(impl StorageAdapterRead + ?Sized),
     requests: &[(CommitId, TrackedStateKey)],
     point_cache: Option<&CommitDeltaPointReadCache>,
-    authorities: Option<
-        &BTreeMap<CommitId, Option<Arc<AuthenticatedReplayCommitStateManifest>>>,
-    >,
+    authorities: Option<&BTreeMap<CommitId, Option<Arc<AuthenticatedReplayCommitStateManifest>>>>,
 ) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
     if requests.is_empty() {
         return Ok(Vec::new());
@@ -11889,9 +11884,7 @@ async fn load_local_owned_commit_delta_entries_one_ordered(
     commit_id: CommitId,
     keys: &[TrackedStateKeyRef<'_>],
     point_cache: Option<&CommitDeltaPointReadCache>,
-    authorities: Option<
-        &BTreeMap<CommitId, Option<Arc<AuthenticatedReplayCommitStateManifest>>>,
-    >,
+    authorities: Option<&BTreeMap<CommitId, Option<Arc<AuthenticatedReplayCommitStateManifest>>>>,
 ) -> Result<Vec<Option<LoadedCommitDeltaEntry>>, LixError> {
     #[cfg(feature = "storage-benches")]
     crate::storage_bench::record_commit_delta_ordered_load(keys.len());
@@ -17933,6 +17926,7 @@ mod tests {
         mutations: &CommitStateMutationInventory,
     ) -> Result<(), LixError> {
         let record = CommitRecord {
+            is_checkpoint: false,
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 3,
             base_commit_id: None,
@@ -18811,7 +18805,10 @@ mod tests {
 
     #[tokio::test]
     async fn imported_direct_ids_survive_schema_bounded_repacking() {
-        for selected_source in [None, Some(CommitId::for_test_label("imported-selected-source"))] {
+        for selected_source in [
+            None,
+            Some(CommitId::for_test_label("imported-selected-source")),
+        ] {
             let storage = StorageAdapter::new(Memory::new());
             let commit_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
                 0x0192_0000_0000_7000_8000_9876_0000_0000,
@@ -18852,11 +18849,19 @@ mod tests {
                 "migration must preserve v68 identities after schema-bounded repacking"
             );
             if selected_source.is_none() {
-                assert_eq!(staged.mutation_inventory().direct_part_row_counts, vec![1, 1]);
+                assert_eq!(
+                    staged.mutation_inventory().direct_part_row_counts,
+                    vec![1, 1]
+                );
                 assert_eq!(staged.locators.len(), 1);
                 assert_eq!(staged.locators[0].change_id, fixtures[1].change_id);
             } else {
-                assert!(staged.mutation_inventory().direct_part_row_counts.is_empty());
+                assert!(
+                    staged
+                        .mutation_inventory()
+                        .direct_part_row_counts
+                        .is_empty()
+                );
                 assert_eq!(staged.locators.len(), 2);
             }
             stage_change_locators(&mut writes, &staged.locators);
@@ -18998,12 +19003,9 @@ mod tests {
             fixture.row_pk = RowPk::single(format!("{label}-row-{index}"));
             fixture.deleted = false;
         }
-        fixtures[1].change_id = super::addressable_change_id(
-            commit_id,
-            authored_segment_index,
-            authored_ordinal,
-        )
-        .expect("authored test id should have direct-address geometry");
+        fixtures[1].change_id =
+            super::addressable_change_id(commit_id, authored_segment_index, authored_ordinal)
+                .expect("authored test id should have direct-address geometry");
 
         let deltas = commit_delta_refs(commit_id, &fixtures);
         let mut writes = storage.new_write_set();
@@ -23081,7 +23083,8 @@ mod tests {
             tree_height: 1,
             complete_state_fence: true,
         }));
-        let encoded = encode_commit_state_manifest(&manifest).expect("current fixture should encode");
+        let encoded =
+            encode_commit_state_manifest(&manifest).expect("current fixture should encode");
         let stored: super::StoredCommitStateManifest = storage_codec::decode(
             "tracked_state current commit_state_manifest fixture",
             encoded

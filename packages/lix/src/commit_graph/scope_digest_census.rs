@@ -99,10 +99,6 @@ pub(crate) mod by_projection {
         let mut table = table().lock().expect("projection census is not poisoned");
         *table.entry(label).or_default().entry(bucket).or_insert(0) += 1;
     }
-
-    pub(crate) fn take() -> Breakdown {
-        std::mem::take(&mut *table().lock().expect("projection census is not poisoned"))
-    }
 }
 
 pub(crate) fn record_scope_digest_outcome(outcome: ScopeDigestOutcome) {
@@ -135,16 +131,6 @@ pub(crate) struct ScopeDigestCensus {
 thread_local! {
     static THREAD_CENSUS: std::cell::Cell<ScopeDigestCensus> =
         const { std::cell::Cell::new(ScopeDigestCensus::empty()) };
-}
-
-#[cfg(test)]
-pub(crate) fn reset_thread_scope_digest_census() {
-    THREAD_CENSUS.with(|census| census.set(ScopeDigestCensus::empty()));
-}
-
-#[cfg(test)]
-pub(crate) fn thread_scope_digest_census() -> ScopeDigestCensus {
-    THREAD_CENSUS.with(std::cell::Cell::get)
 }
 
 /// Reads the process-wide census.

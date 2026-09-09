@@ -666,10 +666,15 @@ struct BranchRow {
     name: String,
     hidden: bool,
     commit_id: CommitId,
+    working_base_commit_id: Option<CommitId>,
 }
 
 static LIX_BRANCH_COLS: ColumnTable<BranchRow> = ColumnTable {
     columns: &[
+        (
+            "working_base_commit_id",
+            Col::Utf8Owned(|row| row.working_base_commit_id.map(|id| id.to_string())),
+        ),
         ("id", Col::Utf8(|row| Some(row.id.as_str()))),
         ("name", Col::Utf8(|row| Some(row.name.as_str()))),
         ("hidden", Col::Bool(|row| Some(row.hidden))),
@@ -894,11 +899,12 @@ async fn load_branch_rows_with_point_lookups(
 ) -> Result<Vec<BranchRow>, LixError> {
     let mut out = Vec::new();
     for descriptor in descriptors {
-        let Some(commit_id) = branch_ref.load_head_commit_id(&descriptor.id).await? else {
+        let Some(head) = branch_ref.load_head(&descriptor.id).await? else {
             continue;
         };
         out.push(BranchRow {
-            commit_id,
+            commit_id: head.commit_id,
+            working_base_commit_id: head.working_base_commit_id,
             id: descriptor.id,
             name: descriptor.name,
             hidden: descriptor.hidden,
@@ -914,14 +920,21 @@ fn join_branch_descriptors_with_heads(
 ) -> Vec<BranchRow> {
     let commit_ids_by_branch = heads
         .into_iter()
-        .map(|head| (head.branch_id, head.commit_id))
+        .map(|head| {
+            (
+                head.branch_id,
+                (head.commit_id, head.working_base_commit_id),
+            )
+        })
         .collect::<HashMap<_, _>>();
     descriptors
         .into_iter()
         .filter_map(|descriptor| {
-            let commit_id = commit_ids_by_branch.get(&descriptor.id).copied()?;
+            let (commit_id, working_base_commit_id) =
+                commit_ids_by_branch.get(&descriptor.id).copied()?;
             Some(BranchRow {
                 commit_id,
+                working_base_commit_id,
                 id: descriptor.id,
                 name: descriptor.name,
                 hidden: descriptor.hidden,
@@ -1027,6 +1040,7 @@ fn branch_insert_rows_from_batch(
             .transpose()?
             .unwrap_or(*default_commit_id);
             Ok(BranchRow {
+                working_base_commit_id: None,
                 metadata: optional_metadata_value(
                     batch,
                     row_index,
@@ -1046,6 +1060,7 @@ fn branch_rows_from_batch(batch: &RecordBatch) -> Result<Vec<BranchRow>> {
     (0..batch.num_rows())
         .map(|row_index| {
             Ok(BranchRow {
+                working_base_commit_id: None,
                 id: required_string_value(batch, row_index, "id", "DELETE lix_branch")?,
                 metadata: optional_metadata_value(
                     batch,
@@ -1149,6 +1164,7 @@ fn branch_update_rows_from_batch(
     (0..batch.num_rows())
         .map(|row_index| {
             Ok(BranchRow {
+                working_base_commit_id: None,
                 id: required_string_value(batch, row_index, "id", "UPDATE lix_branch")?,
                 metadata: update_optional_metadata_value(
                     batch,
@@ -1315,6 +1331,7 @@ pub(super) fn lix_branch_schema() -> SchemaRef {
         Field::new("name", DataType::Utf8, false),
         Field::new("hidden", DataType::Boolean, false),
         Field::new("commit_id", DataType::Utf8, false),
+        Field::new("working_base_commit_id", DataType::Utf8, true),
         json_field("lixcol_metadata", true),
     ]))
 }
@@ -1470,6 +1487,7 @@ mod tests {
 
     fn head(branch_id: &str) -> BranchHead {
         BranchHead {
+            working_base_commit_id: None,
             branch_id: branch_id.to_string(),
             commit_id: CommitId::for_test_label(&format!("commit-{branch_id}")),
         }
@@ -1483,6 +1501,7 @@ mod tests {
             push_branch_stage_rows(
                 &mut rows,
                 BranchRow {
+                    working_base_commit_id: None,
                     metadata: None,
                     name: format!("Branch {index}"),
                     commit_id: CommitId::for_test_label(&format!("commit-{index}")),
@@ -1559,6 +1578,7 @@ mod tests {
         push_branch_stage_rows(
             &mut rows,
             BranchRow {
+                working_base_commit_id: None,
                 id: "01920000-0000-7000-8000-0000000000a1".into(),
                 name: "branch".into(),
                 hidden: false,
@@ -1744,6 +1764,7 @@ mod tests {
             rows,
             vec![
                 BranchRow {
+                    working_base_commit_id: None,
                     metadata: None,
                     id: "01920000-0000-7000-8000-0000000000a1".to_string(),
                     name: "Branch A".to_string(),
@@ -1751,6 +1772,7 @@ mod tests {
                     commit_id: head("01920000-0000-7000-8000-0000000000a1").commit_id,
                 },
                 BranchRow {
+                    working_base_commit_id: None,
                     metadata: None,
                     id: "01920000-0000-7000-8000-0000000000b1".to_string(),
                     name: "Branch B".to_string(),

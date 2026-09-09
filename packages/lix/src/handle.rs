@@ -17,8 +17,8 @@ use std::{
 };
 
 use crate::authority_client::{
-    ClientCore, ProtocolClient, ProtocolExecuteOptions, ProtocolObserveEvents,
-    ProtocolTransaction, open_protocol_client,
+    ClientCore, ProtocolClient, ProtocolExecuteOptions, ProtocolObserveEvents, ProtocolTransaction,
+    open_protocol_client,
 };
 use crate::common::ExpiredReadRetryState;
 use crate::engine::{Engine, EngineOptions};
@@ -382,19 +382,19 @@ impl IntoFuture for RemoteOpenLixBuilder {
     type IntoFuture = crate::sync::SyncTransportFuture<'static, RemoteLix>;
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-                if self.open.wasm_runtime.is_some()
-                    || self.open.telemetry.is_some()
-                    || self.open.open_progress.is_some()
-                {
-                    return Err(LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        "remote execution cannot configure a local runtime, telemetry sink, or storage progress sink",
-                    ));
-                }
-                let http = crate::sync::authority_http(&self.server.headers)?;
-                let client = open_protocol_client(http, self.server.url, None).await?;
-                let account_id = client.active_account_id().await?;
-                Ok(RemoteLix { client, account_id })
+            if self.open.wasm_runtime.is_some()
+                || self.open.telemetry.is_some()
+                || self.open.open_progress.is_some()
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "remote execution cannot configure a local runtime, telemetry sink, or storage progress sink",
+                ));
+            }
+            let http = crate::sync::authority_http(&self.server.headers)?;
+            let client = open_protocol_client(http, self.server.url, None).await?;
+            let account_id = client.active_account_id().await?;
+            Ok(RemoteLix { client, account_id })
         })
     }
 }
@@ -410,7 +410,9 @@ impl RemoteLix {
     pub fn export_snapshot(&self) -> crate::snapshot::SnapshotExportBuilder<Memory> {
         crate::snapshot::SnapshotExportBuilder::remote(
             self.client.http().clone(),
-            self.client.ensure_usable().and_then(|_| self.client.join_path("snapshot")),
+            self.client
+                .ensure_usable()
+                .and_then(|_| self.client.join_path("snapshot")),
             self.client.session_id(),
         )
     }
@@ -612,13 +614,13 @@ impl<'a> IntoFuture for RemoteOpenAnotherSessionBuilder<'a> {
     type IntoFuture = crate::sync::SyncTransportFuture<'a, RemoteLix>;
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-                let client = self
-                    .lix
-                    .client
-                    .open_another_session(self.branch_id, self.account_id)
-                    .await?;
-                let account_id = client.active_account_id().await?;
-                Ok(RemoteLix { client, account_id })
+            let client = self
+                .lix
+                .client
+                .open_another_session(self.branch_id, self.account_id)
+                .await?;
+            let account_id = client.active_account_id().await?;
+            Ok(RemoteLix { client, account_id })
         })
     }
 }
@@ -642,11 +644,12 @@ impl<'a> IntoFuture for RemoteTransactionExecuteBuilder<'a> {
     type IntoFuture = crate::sync::SyncTransportFuture<'a, ExecuteResult>;
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-                self.transaction
-                    .transaction
-                    .as_ref().ok_or_else(closed_transaction_error)?
-                    .execute(self.sql, self.params, Some(self.options))
-                    .await
+            self.transaction
+                .transaction
+                .as_ref()
+                .ok_or_else(closed_transaction_error)?
+                .execute(self.sql, self.params, Some(self.options))
+                .await
         })
     }
 }
@@ -700,10 +703,10 @@ impl<'a> IntoFuture for RemoteExecuteBatchBuilder<'a> {
     type IntoFuture = crate::sync::SyncTransportFuture<'a, Vec<ExecuteResult>>;
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-                self.lix
-                    .client
-                    .execute_batch(self.statements, Some(self.options))
-                    .await
+            self.lix
+                .client
+                .execute_batch(self.statements, Some(self.options))
+                .await
         })
     }
 }
@@ -727,10 +730,10 @@ impl<'a> IntoFuture for RemoteExecuteBuilder<'a> {
     type IntoFuture = crate::sync::SyncTransportFuture<'a, ExecuteResult>;
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-                self.lix
-                    .client
-                    .execute(self.sql, self.params, Some(self.options))
-                    .await
+            self.lix
+                .client
+                .execute(self.sql, self.params, Some(self.options))
+                .await
         })
     }
 }
@@ -1206,8 +1209,7 @@ where
         } else {
             None
         };
-        let runtime =
-            crate::sync::activate_sync_mode(&mut lix, &server, initial_transport).await?;
+        let runtime = crate::sync::activate_sync_mode(&mut lix, &server, initial_transport).await?;
         lix.sync_demand_tx = Some(runtime.demand_tx.clone());
         lix.sync_lease = Some(SyncSessionLease::root(runtime));
         // Foreground execution belongs to the durable local replica.
@@ -2385,9 +2387,19 @@ mod tests {
     async fn server_without_storage_opens_remote_protocol_session() {
         use std::io::{Read, Write};
         let source = open_lix().await.unwrap();
-        source.execute("INSERT INTO lix_key_value (key, value) VALUES ('remote-snapshot', 'true'::jsonb)", &[]).await.unwrap();
+        source
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('remote-snapshot', 'true'::jsonb)",
+                &[],
+            )
+            .await
+            .unwrap();
         let mut snapshot = Vec::new();
-        source.export_snapshot().write_to(&mut snapshot).await.unwrap();
+        source
+            .export_snapshot()
+            .write_to(&mut snapshot)
+            .await
+            .unwrap();
         let expected_snapshot = snapshot.clone();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -2419,15 +2431,23 @@ mod tests {
             write!(connection, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
             drop(connection);
             let (mut connection, _) = listener.accept().unwrap();
-            connection.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            connection
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
             let mut request = Vec::new();
             loop {
                 let mut byte = [0];
                 connection.read_exact(&mut byte).unwrap();
                 request.push(byte[0]);
-                if request.ends_with(b"\r\n\r\n") { break; }
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
             }
-            assert!(String::from_utf8(request).unwrap().starts_with("GET /lix/v1/00000000-0000-4000-8000-000000000001/snapshot"));
+            assert!(
+                String::from_utf8(request)
+                    .unwrap()
+                    .starts_with("GET /lix/v1/00000000-0000-4000-8000-000000000001/snapshot")
+            );
             write!(connection, "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.lix.snapshot\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", snapshot.len()).unwrap();
             connection.write_all(&snapshot).unwrap();
         });
@@ -2442,7 +2462,10 @@ mod tests {
             .expect("remote open");
         assert_eq!(lix.client.session_id().as_deref(), Some("remote-session"));
         let mut exported = Vec::new();
-        lix.export_snapshot().write_to(&mut exported).await.expect("remote snapshot export");
+        lix.export_snapshot()
+            .write_to(&mut exported)
+            .await
+            .expect("remote snapshot export");
         assert_eq!(exported, expected_snapshot);
         assert_eq!(lix.active_account_id(), "account");
         thread.join().unwrap();
@@ -2746,7 +2769,10 @@ mod tests {
                 opening.abort();
                 assert!(opening.await.unwrap_err().is_cancelled());
             } else {
-                assert_eq!(opening.await.unwrap().unwrap_err().code, "TEST_BEGIN_FAILED");
+                assert_eq!(
+                    opening.await.unwrap().unwrap_err().code,
+                    "TEST_BEGIN_FAILED"
+                );
             }
             tokio::time::timeout(std::time::Duration::from_secs(5), closed_rx)
                 .await
@@ -2764,7 +2790,9 @@ mod tests {
     async fn remote_open_rejects_local_configuration_before_network_access() {
         let result = open_lix()
             .with_open_progress_sink(Arc::new(CallbackOpenProgressSink::new(|_| {})))
-            .with_server(ServerOptions::new("https://example.invalid/lix/00000000-0000-4000-8000-000000000001"))
+            .with_server(ServerOptions::new(
+                "https://example.invalid/lix/00000000-0000-4000-8000-000000000001",
+            ))
             .await;
         let error = result.expect_err("remote open must reject local progress configuration");
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
@@ -3030,7 +3058,7 @@ mod tests {
             .expect("mark replica");
 
         let params = [Value::Text(checkpoint.commit_id)];
-        let sql = "SELECT commit_id FROM lix_checkpoint WHERE commit_id = $1";
+        let sql = "SELECT id AS commit_id FROM lix_commit WHERE is_checkpoint AND id = $1";
         let local = lix
             .execute(sql, &params)
             .await

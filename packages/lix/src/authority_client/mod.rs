@@ -29,11 +29,11 @@ use crate::{
 use blobs::{BlobCache, PreparedRequestParams, request_blob_slot};
 use wire::{
     BLOB_BASE_MISSING_CODE, BeginTransactionResponse, CreateBranchRequestBody,
-    CreateBranchResponseBody, EmptyBody, ErrorEnvelope,
-    ExecuteBatchRequestBody, ExecuteBatchStatementBody, ExecuteOptionsBody, ExecuteRequestBody,
-    ExecuteResponseBody, HandshakeResponse, IDEMPOTENCY_KEY_HEADER, MergeBranchPreviewRequestBody,
+    CreateBranchResponseBody, EmptyBody, ErrorEnvelope, ExecuteBatchRequestBody,
+    ExecuteBatchStatementBody, ExecuteOptionsBody, ExecuteRequestBody, ExecuteResponseBody,
+    HandshakeResponse, IDEMPOTENCY_KEY_HEADER, MergeBranchPreviewRequestBody,
     MergeBranchPreviewResponseBody, MergeBranchRequestBody, MergeBranchResponseBody,
-    RedoResponseBody, SESSION_HEADER, SERVER_PROTOCOL_VERSION, SwitchBranchRequestBody,
+    RedoResponseBody, SERVER_PROTOCOL_VERSION, SESSION_HEADER, SwitchBranchRequestBody,
     SwitchBranchResponseBody, TRANSACTION_HEADER, UndoResponseBody, closed_error,
     encode_engine_values, is_recoverable_session_error, protocol_error, remote_error,
     unsupported_remote_operation, validate_session_id,
@@ -170,12 +170,12 @@ async fn open_protocol_client_at_base<H: ProtocolHttp + Clone + 'static>(
     let core = ClientCore {
         http: Arc::new(http),
         base_url,
-            state: Arc::new(std::sync::Mutex::new(ClientState {
-                session_id: None,
-                active_branch_id: None,
-                active_account_id: None,
-                terminal_error: None,
-                blobs: BlobCache::default(),
+        state: Arc::new(std::sync::Mutex::new(ClientState {
+            session_id: None,
+            active_branch_id: None,
+            active_account_id: None,
+            terminal_error: None,
+            blobs: BlobCache::default(),
         })),
         operation_lock: Arc::new(Mutex::new(())),
         accepting: Arc::new(AtomicBool::new(true)),
@@ -321,14 +321,8 @@ impl<H: ProtocolHttp> ClientCore<H> {
     ) -> Result<ExecuteResult, LixError> {
         self.enqueue(|| async {
             self.with_session_recovery(|| async {
-                self.execute_raw(
-                    sql,
-                    params,
-                    options.clone(),
-                    None,
-                    true,
-                )
-                .await
+                self.execute_raw(sql, params, options.clone(), None, true)
+                    .await
             })
             .await
         })
@@ -368,9 +362,12 @@ impl<H: ProtocolHttp> ClientCore<H> {
             }
         };
         let request_options = options.as_ref().and_then(|options| {
-            options.origin_key.as_ref().map(|origin_key| ExecuteOptionsBody {
-                origin_key: Some(origin_key.clone()),
-            })
+            options
+                .origin_key
+                .as_ref()
+                .map(|origin_key| ExecuteOptionsBody {
+                    origin_key: Some(origin_key.clone()),
+                })
         });
         let mut headers = extra_headers.unwrap_or_default();
         if cache_blobs {
@@ -436,9 +433,12 @@ impl<H: ProtocolHttp> ClientCore<H> {
             .iter()
             .any(|(_, _, item)| request_params_have_delta(&item.params));
         let request_options = options.as_ref().and_then(|options| {
-            options.origin_key.as_ref().map(|origin_key| ExecuteOptionsBody {
-                origin_key: Some(origin_key.clone()),
-            })
+            options
+                .origin_key
+                .as_ref()
+                .map(|origin_key| ExecuteOptionsBody {
+                    origin_key: Some(origin_key.clone()),
+                })
         });
         let headers = vec![(
             IDEMPOTENCY_KEY_HEADER.to_owned(),
@@ -473,7 +473,9 @@ impl<H: ProtocolHttp> ClientCore<H> {
             )
         };
         let value = match request(false).await {
-            Err(error) if has_delta && error.code == BLOB_BASE_MISSING_CODE => request(true).await?,
+            Err(error) if has_delta && error.code == BLOB_BASE_MISSING_CODE => {
+                request(true).await?
+            }
             other => other?,
         };
         self.state
@@ -620,9 +622,7 @@ impl<H: ProtocolHttp> ClientCore<H> {
                 }
                 self.apply_handshake(handshake)
             }
-            Err(error) if is_recoverable_session_error(&error) => {
-                self.recover_session_once().await
-            }
+            Err(error) if is_recoverable_session_error(&error) => self.recover_session_once().await,
             Err(error) => Err(error),
         }
     }
@@ -817,7 +817,13 @@ impl<H: ProtocolHttp> ClientCore<H> {
         T: serde::de::DeserializeOwned,
         B: Serialize,
     {
-        let mut headers = vec![("accept".to_owned(), "application/json".to_owned())];
+        let mut headers = vec![
+            ("accept".to_owned(), "application/json".to_owned()),
+            (
+                "lix-server-protocol-version".to_owned(),
+                SERVER_PROTOCOL_VERSION.to_string(),
+            ),
+        ];
         if include_session && let Some(session_id) = self.session_id() {
             headers.push((SESSION_HEADER.to_owned(), session_id));
         }
@@ -828,7 +834,9 @@ impl<H: ProtocolHttp> ClientCore<H> {
             None
         } else if let Some(body) = body {
             let encoded = serde_json::to_vec(&body).map_err(|error| {
-                protocol_error(format!("could not encode Lix Server Protocol body: {error}"))
+                protocol_error(format!(
+                    "could not encode Lix Server Protocol body: {error}"
+                ))
             })?;
             if encoded == b"{}" {
                 None
@@ -882,7 +890,10 @@ impl<H: ProtocolHttp + Clone + 'static> ProtocolClient<H> {
     ) -> Result<Self, LixError> {
         self.ensure_usable()?;
         let parent_account_id = self.active_account_id().await?;
-        if account_id.as_ref().is_some_and(|id| id != &parent_account_id) {
+        if account_id
+            .as_ref()
+            .is_some_and(|id| id != &parent_account_id)
+        {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
                 "remote sessions cannot override the authenticated account",
@@ -966,9 +977,12 @@ impl<H: ProtocolHttp> ProtocolTransaction<H> {
             .enqueue(|| async {
                 self.assert_active()?;
                 let request_options = options.as_ref().and_then(|options| {
-                    options.origin_key.as_ref().map(|origin_key| ExecuteOptionsBody {
-                        origin_key: Some(origin_key.clone()),
-                    })
+                    options
+                        .origin_key
+                        .as_ref()
+                        .map(|origin_key| ExecuteOptionsBody {
+                            origin_key: Some(origin_key.clone()),
+                        })
                 });
                 let body = ExecuteRequestBody {
                     sql: sql.to_owned(),
@@ -1061,9 +1075,7 @@ fn normalize_protocol_base_url(value: &str) -> Result<String, LixError> {
             "openLix() remote server url must be an absolute URL",
         )
     })?;
-    if parsed.scheme() != "https"
-        && !(parsed.scheme() == "http" && is_loopback_host(&parsed))
-    {
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && is_loopback_host(&parsed)) {
         return Err(LixError::new(
             LixError::CODE_INVALID_PARAM,
             "openLix() remote server url must use https (http is allowed only for loopback development)",
@@ -1136,7 +1148,9 @@ fn gzip_bytes(bytes: &[u8]) -> Result<Vec<u8>, LixError> {
     encoder
         .write_all(bytes)
         .and_then(|()| encoder.finish())
-        .map_err(|error| protocol_error(format!("could not gzip Lix Server Protocol body: {error}")))
+        .map_err(|error| {
+            protocol_error(format!("could not gzip Lix Server Protocol body: {error}"))
+        })
 }
 
 fn idempotency_key(options: Option<&ProtocolExecuteOptions>) -> Result<String, LixError> {
@@ -1144,9 +1158,7 @@ fn idempotency_key(options: Option<&ProtocolExecuteOptions>) -> Result<String, L
         Some(key) => key.to_owned(),
         None => uuid::Uuid::new_v4().to_string(),
     };
-    if !(1..=255).contains(&key.len())
-        || !key.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
-    {
+    if !(1..=255).contains(&key.len()) || !key.bytes().all(|byte| (0x21..=0x7e).contains(&byte)) {
         return Err(LixError::new(
             LixError::CODE_INVALID_PARAM,
             "options.idempotencyKey must contain 1 to 255 visible ASCII characters",
@@ -1175,10 +1187,7 @@ fn error_from_http_response(response: &ProtocolHttpResponse) -> LixError {
                 .code
                 .unwrap_or_else(|| "LIX_REMOTE_REQUEST_FAILED".to_owned()),
             envelope.error.message.unwrap_or_else(|| {
-                format!(
-                    "Remote Lix request failed with status {}",
-                    response.status
-                )
+                format!("Remote Lix request failed with status {}", response.status)
             }),
         )
         .with_details(details);
@@ -1197,10 +1206,7 @@ fn error_from_http_response(response: &ProtocolHttpResponse) -> LixError {
     };
     remote_error(
         "LIX_REMOTE_REQUEST_FAILED",
-        format!(
-            "Remote Lix request failed with status {}",
-            response.status
-        ),
+        format!("Remote Lix request failed with status {}", response.status),
     )
     .with_details(details)
 }

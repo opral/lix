@@ -46,12 +46,15 @@ simulation_test!(
             ],
         );
         assert_rows_eq(
-        session.execute(
-            "SELECT content, lixcol_depth FROM lix_history('lix_file', $1) WHERE path = '/.lix/README.md'",
-            &[Value::Text(initial_head.clone())],
-        ).await.unwrap(),
-        vec![vec![Value::Blob(readme.to_vec().into()), Value::Integer(0)]],
-    );
+            session
+                .execute(
+                    "SELECT content FROM lix_as_of('lix_file', $1) WHERE path = '/.lix/README.md'",
+                    &[Value::Text(initial_head.clone())],
+                )
+                .await
+                .unwrap(),
+            vec![vec![Value::Blob(readme.to_vec().into())]],
+        );
         assert!(
             session
                 .execute("SELECT id FROM lix_diff('lix_file')", &[])
@@ -104,12 +107,15 @@ simulation_test!(
             vec![vec![Value::Blob(b"custom guide".to_vec().into())]],
         );
         assert_rows_eq(
-        reopened.execute(
-            "SELECT content FROM lix_history('lix_file', $1) WHERE path = '/.lix/README.md'",
-            &[Value::Text(initial_head)],
-        ).await.unwrap(),
-        vec![vec![Value::Blob(readme.to_vec().into())]],
-    );
+            reopened
+                .execute(
+                    "SELECT content FROM lix_as_of('lix_file', $1) WHERE path = '/.lix/README.md'",
+                    &[Value::Text(initial_head)],
+                )
+                .await
+                .unwrap(),
+            vec![vec![Value::Blob(readme.to_vec().into())]],
+        );
     }
 );
 
@@ -2909,7 +2915,7 @@ simulation_test!(
             ]
         );
         assert_eq!(
-            file_descriptor_event_count(&session, &commit_id, file_id).await,
+            file_metadata_event_count(&session, &commit_id, file_id).await,
             0
         );
     }
@@ -2970,7 +2976,7 @@ simulation_test!(
             .expect("branch head should load")
             .expect("branch head should exist");
         assert_eq!(
-            file_descriptor_event_count(&session, &changed_commit_id, file_id).await,
+            file_metadata_event_count(&session, &changed_commit_id, file_id).await,
             1
         );
 
@@ -2991,7 +2997,7 @@ simulation_test!(
             .expect("branch head should load")
             .expect("branch head should exist");
         assert_eq!(
-            file_descriptor_event_count(&session, &removed_commit_id, file_id).await,
+            file_metadata_event_count(&session, &removed_commit_id, file_id).await,
             1
         );
 
@@ -3012,7 +3018,7 @@ simulation_test!(
             .expect("branch head should load")
             .expect("branch head should exist");
         assert_eq!(
-            file_descriptor_event_count(&session, &equal_null_commit_id, file_id).await,
+            file_metadata_event_count(&session, &equal_null_commit_id, file_id).await,
             0
         );
         let current = session
@@ -3030,42 +3036,13 @@ simulation_test!(
     }
 );
 
-async fn file_descriptor_event_count(
+async fn file_metadata_event_count(
     session: &crate::support::simulation_test::engine::SimSession,
     commit_id: &str,
     file_id: &str,
 ) -> usize {
-    let result = session
-        .execute(
-            &format!(
-                "SELECT lixcol_source_changes FROM lix_history('lix_file', '{commit_id}') \
-                   WHERE lixcol_depth = 0 \
-                   AND id = '{file_id}'"
-            ),
-            &[],
-        )
-        .await
-        .expect("file history should load");
-    let Some(row) = result.rows().first() else {
-        return 0;
-    };
-    let Value::Jsonb(source_changes) = row
-        .get::<Value>("lixcol_source_changes")
-        .expect("file history source changes should decode")
-    else {
-        panic!("file history source changes should be JSON");
-    };
-    let source_changes = source_changes.to_value();
-    source_changes
-        .as_array()
-        .expect("file history source changes should be an array")
-        .iter()
-        .filter(|source| {
-            source["row_pk"].as_array().is_some()
-                && source["snapshot_content"]["id"] == json!(file_id)
-                && source["snapshot_content"].get("name").is_some()
-        })
-        .count()
+    session.execute("SELECT id FROM lix_history('lix_file', $1) WHERE id = $2 AND lixcol_to_commit_id = $1 AND from_lixcol_metadata IS DISTINCT FROM to_lixcol_metadata",
+        &[Value::Text(commit_id.to_owned()), Value::Text(file_id.to_owned())]).await.expect("descriptor endpoint history").len()
 }
 
 simulation_test!(

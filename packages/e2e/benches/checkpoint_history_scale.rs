@@ -273,7 +273,7 @@ async fn run() {
                         commit_width,
                         samples,
                         warmups,
-                        query_checkpoint_count + 1,
+                        query_checkpoint_count,
                         None,
                     )
                     .await;
@@ -289,7 +289,7 @@ async fn run() {
                         commit_width,
                         samples,
                         warmups,
-                        query_checkpoint_count + 1,
+                        query_checkpoint_count,
                         Some(counters),
                     )
                     .await;
@@ -458,7 +458,10 @@ async fn measure_query<StorageImpl>(
         .expect("open checkpoint-query session");
     for _ in 0..warmups {
         let rows = session
-            .execute("SELECT commit_id FROM lix_checkpoint", &[])
+            .execute(
+                "SELECT id AS commit_id FROM lix_commit WHERE is_checkpoint",
+                &[],
+            )
             .await
             .expect("warm checkpoint query");
         assert_eq!(rows.len(), expected_checkpoints);
@@ -470,7 +473,10 @@ async fn measure_query<StorageImpl>(
     for _ in 0..samples {
         let started = Instant::now();
         let rows = session
-            .execute("SELECT commit_id FROM lix_checkpoint", &[])
+            .execute(
+                "SELECT id AS commit_id FROM lix_commit WHERE is_checkpoint",
+                &[],
+            )
             .await
             .expect("measure checkpoint query");
         timings.push(started.elapsed());
@@ -527,7 +533,7 @@ fn print_setup(
          list_operations={},listed_objects={},backend_bytes={}",
         history_changes / commit_width,
         id_shape.name(),
-        query_checkpoints + usize::from(initialized_repository),
+        query_checkpoints,
         seed.elapsed.as_millis(),
         history_changes as f64 / seed.elapsed.as_secs_f64(),
         seed.puts,

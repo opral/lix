@@ -6,8 +6,8 @@ use datafusion::sql::sqlparser::ast::{
     AssignmentTarget, BinaryOperator, CastKind, ConflictTarget, DataType as SqlDataType, Delete,
     Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Insert, ObjectName,
     ObjectNamePart, OnConflictAction, OnInsert, Query, SelectItem, SetExpr,
-    Statement as SqlStatement, TableFactor, TableObject, TableWithJoins,
-    UnaryOperator, Update, Value, Visit, Visitor, WildcardAdditionalOptions,
+    Statement as SqlStatement, TableFactor, TableObject, TableWithJoins, UnaryOperator, Update,
+    Value, Visit, Visitor, WildcardAdditionalOptions,
 };
 #[cfg(test)]
 use serde_json::Value as JsonValue;
@@ -95,10 +95,7 @@ pub(super) fn bind_insert_bound(
     // registered-schema base tables and the metadata-only full-checkpoint
     // command. Keep it distinct from `INSERT INTO table VALUES (...)`, whose
     // implicit public column list is deliberately unsupported.
-    let default_values = matches!(
-        table.surface.kind,
-        PublicSurfaceKind::SchemaBase { .. }
-    )
+    let default_values = matches!(table.surface.kind, PublicSurfaceKind::SchemaBase { .. })
         && insert.columns.is_empty()
         && insert.source.is_none();
     if insert.columns.is_empty() && !default_values {
@@ -311,9 +308,7 @@ fn bind_insert_returning(
 
     if !matches!(
         table.surface.kind,
-        PublicSurfaceKind::Revert
-            | PublicSurfaceKind::Apply
-            | PublicSurfaceKind::Restore
+        PublicSurfaceKind::Revert | PublicSurfaceKind::Apply | PublicSurfaceKind::Restore
     ) {
         return bind_returning(table, Some(returning), params, "INSERT");
     }
@@ -1354,6 +1349,7 @@ fn bound_write_target(kind: &PublicSurfaceKind) -> BoundWriteTarget {
         }
         PublicSurfaceKind::Apply => BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::Apply),
         PublicSurfaceKind::Change
+        | PublicSurfaceKind::LogFunction
         | PublicSurfaceKind::HistoryFunction
         | PublicSurfaceKind::DiffFunction
         | PublicSurfaceKind::CheckpointFunction
@@ -1468,9 +1464,8 @@ mod tests {
 
     #[test]
     fn bind_statement_binds_restore_command_sink() {
-        let statement = parse_statement(
-            "INSERT INTO lix_restore (commit_id) VALUES ($1) RETURNING commit_id",
-        );
+        let statement =
+            parse_statement("INSERT INTO lix_restore (commit_id) VALUES ($1) RETURNING commit_id");
         let bound = bind_statement(&statement, &[], "branch1").expect("restore should bind");
 
         assert!(matches!(
@@ -1580,9 +1575,7 @@ mod tests {
 
     #[test]
     fn bind_statement_rejects_row_insert_select() {
-        let statement = parse_statement(
-            "INSERT INTO test_state_schema (value) SELECT 'A'",
-        );
+        let statement = parse_statement("INSERT INTO test_state_schema (value) SELECT 'A'");
         let error = bind_statement(
             &statement,
             &[serde_json::json!({

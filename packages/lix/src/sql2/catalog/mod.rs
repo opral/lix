@@ -13,6 +13,6 @@ pub(crate) use schema_surface::{
     schema_exposed_as_history_surface, schema_exposed_as_schema_surface, schema_surface_schema,
 };
 pub(crate) use surface::{
-    PublicHistoryContract, PublicHistoryKind, PublicRelationKind, PublicScalarFunctionContract,
-    PublicSurfaceClass, PublicSurfaceContract, PublicSurfaceKind, PUBLIC_SCALAR_FUNCTION_NAMES,
+    PUBLIC_SCALAR_FUNCTION_NAMES, PublicHistoryContract, PublicRelationKind,
+    PublicScalarFunctionContract, PublicSurfaceClass, PublicSurfaceContract, PublicSurfaceKind,
 };

@@ -401,7 +401,7 @@ simulation_test!(
         let history = session
             .execute(
                 &format!(
-                    "SELECT note FROM lix_history('{REPLAY_GC_SCHEMA_KEY}') WHERE id = 'row-1'"
+                    "SELECT to_note FROM lix_history('{REPLAY_GC_SCHEMA_KEY}') WHERE id = 'row-1'"
                 ),
                 &[],
             )
@@ -424,7 +424,7 @@ simulation_test!(
         reopened
             .execute(
                 &format!(
-                    "SELECT note FROM lix_history('{REPLAY_GC_SCHEMA_KEY}') WHERE id = 'row-1'"
+                    "SELECT to_note FROM lix_history('{REPLAY_GC_SCHEMA_KEY}') WHERE id = 'row-1'"
                 ),
                 &[],
             )
@@ -506,7 +506,10 @@ async fn commit_parent_edges(
         .enumerate()
         .map(|(order, parent)| {
             (
-                parent.as_str().expect("parent id should be text").to_owned(),
+                parent
+                    .as_str()
+                    .expect("parent id should be text")
+                    .to_owned(),
                 i64::try_from(order).expect("parent order should fit an integer"),
             )
         })

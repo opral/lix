@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::LixError;
 use crate::branch::{BranchHead, BranchRefReader};
-use crate::checkpoint::{checkpoint_commit_id_at_head, latest_checkpoint_commit_id_at_head};
+use crate::checkpoint::checkpoint_commit_id_at_head;
 
 use super::branch_ref::CachingBranchRefReader;
 use super::planning_cache::PooledReadSession;
@@ -80,18 +80,6 @@ where
     } else {
         None
     };
-    let latest_checkpoint_commit_id = if statements.iter().any(|statement| {
-        statement_uses_execution_function(statement, "lix_latest_checkpoint_commit_id")
-    }) {
-        resolve_latest_checkpoint_commit_id(
-            ctx,
-            active_branch_commit_id.as_deref(),
-            root_commit_id.as_deref(),
-        )
-        .await?
-    } else {
-        None
-    };
     let working_diff_checkpoint_commit_id = if statements.iter().any(|statement| {
         statement_uses_execution_function(statement, "lix_working_diff_checkpoint_commit_id")
     }) {
@@ -105,7 +93,6 @@ where
         ctx.active_account_id(),
         Some(ctx.active_branch_id()),
         active_branch_commit_id.as_deref(),
-        latest_checkpoint_commit_id.as_deref(),
         working_diff_checkpoint_commit_id.as_deref(),
         root_commit_id.as_deref(),
     );
@@ -143,36 +130,19 @@ where
     } else {
         None
     };
-    let latest_checkpoint_commit_id =
-        if statement_uses_execution_function(statement, "lix_latest_checkpoint_commit_id") {
-            resolve_latest_checkpoint_commit_id(
-                read_ctx,
-                active_branch_commit_id.as_deref(),
-                root_commit_id.as_deref(),
-            )
-            .await?
+    let working_diff_checkpoint_commit_id =
+        if statement_uses_execution_function(statement, "lix_working_diff_checkpoint_commit_id") {
+            resolve_working_diff_checkpoint_commit_id(read_ctx, active_branch_commit_id.as_deref())
+                .await?
         } else {
             None
         };
-    let working_diff_checkpoint_commit_id = if statement_uses_execution_function(
-        statement,
-        "lix_working_diff_checkpoint_commit_id",
-    ) {
-        resolve_working_diff_checkpoint_commit_id(
-            read_ctx,
-            active_branch_commit_id.as_deref(),
-        )
-        .await?
-    } else {
-        None
-    };
     bind_execution_sql2_functions(
         session,
         read_ctx.functions(),
         read_ctx.active_account_id(),
         Some(read_ctx.active_branch_id()),
         active_branch_commit_id.as_deref(),
-        latest_checkpoint_commit_id.as_deref(),
         working_diff_checkpoint_commit_id.as_deref(),
         root_commit_id.as_deref(),
     );
@@ -256,7 +226,6 @@ pub(crate) async fn build_write_session_with_options(
         Some(&active_branch_commit_id.commit_id.to_string()),
         None,
         None,
-        None,
     );
     providers::register_write(&session, write_ctx, branch_ref, options, provider_selection).await?;
 
@@ -296,14 +265,13 @@ fn statement_uses_execution_function(statement: &DataFusionStatement, function_n
                     args: Some(_),
                     ..
                 } = table
-                && crate::sql2::parse::object_name_is_public_function(name, "lix_state_at")
+                && crate::sql2::parse::object_name_is_public_function(name, "lix_as_of")
             {
                 return ControlFlow::Break(());
             }
             if matches!(
                 self.function_name,
-                "lix_active_branch_commit_id"
-                    | "lix_working_diff_checkpoint_commit_id"
+                "lix_active_branch_commit_id" | "lix_working_diff_checkpoint_commit_id"
             ) && let TableFactor::Table {
                 name,
                 args: Some(arguments),
@@ -356,45 +324,6 @@ where
     )
     .await
     .map(|checkpoint_commit_id| Some(checkpoint_commit_id.to_string()))
-}
-
-async fn resolve_latest_checkpoint_commit_id<C>(
-    context: &C,
-    active_branch_commit_id: Option<&str>,
-    root_commit_id: Option<&str>,
-) -> Result<Option<String>, LixError>
-where
-    C: SqlExecutionContext + ?Sized,
-{
-    let Some(active_branch_commit_id) = active_branch_commit_id else {
-        return Ok(None);
-    };
-    let head_commit_id = active_branch_commit_id
-        .parse::<crate::changelog::CommitId>()
-        .map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "active branch commit ID is invalid while resolving the latest checkpoint: {error}"
-                ),
-            )
-        })?;
-    let hot_state = context.hot_state();
-    if let Some(checkpoint_commit_id) = latest_checkpoint_commit_id_at_head(
-        context.changelog_query_source().store,
-        hot_state.as_ref(),
-        context.active_branch_id(),
-        head_commit_id,
-    )
-    .await?
-    {
-        return Ok(Some(checkpoint_commit_id.to_string()));
-    }
-
-    if let Some(root_commit_id) = root_commit_id {
-        return Ok(Some(root_commit_id.to_string()));
-    }
-    resolve_root_commit_id(context, Some(active_branch_commit_id)).await
 }
 
 async fn resolve_root_commit_id<C>(

@@ -181,6 +181,7 @@ mod tests {
         CHECKPOINT_RECOVERY_REF_SPACE,
         CHECKPOINT_GC_STATE_SPACE,
         COMMIT_RETIREMENT_INTENT_SPACE,
+        crate::checkpoint::CHECKPOINT_INVENTORY_SPACE,
         REPOSITORY_EPOCH_SPACE,
     ];
 
@@ -194,8 +195,7 @@ mod tests {
     #[test]
     fn the_published_handles_are_exactly_the_registry() {
         assert_eq!(
-            PUBLISHED,
-            ALL_STORAGE_SPACES,
+            PUBLISHED, ALL_STORAGE_SPACES,
             "the published space handles drifted from ALL_STORAGE_SPACES; \
              add the new space here, or point the stale handle back at its \
              registry row",

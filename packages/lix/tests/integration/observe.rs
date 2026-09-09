@@ -47,8 +47,7 @@ where
 async fn expect_no_event<StorageImpl>(
     events: &mut crate::session::SessionObserveEvents<StorageImpl>,
     label: &str,
-)
-where
+) where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     match tokio::time::timeout(NO_EVENT_TIMEOUT, events.next()).await {
@@ -99,11 +98,7 @@ simulation_test!(
         let mut events = raw_session
             .observe(
                 "SELECT key, diff_type \
-                 FROM lix_diff(\
-                   'lix_key_value', \
-                   lix_latest_checkpoint_commit_id(), \
-                   lix_active_branch_commit_id()\
-                 ) \
+                 FROM lix_diff('lix_key_value') \
                  ORDER BY key",
                 &[],
             )
@@ -1085,9 +1080,7 @@ impl Storage for BlockingBeginReadStorage {
     where
         Self: 'a;
 
-    async fn acquire_session(
-        &self,
-    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+    async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
         self.inner.acquire_session().await
     }
 
@@ -1112,9 +1105,7 @@ impl Storage for BlockingBeginWriteStorage {
     where
         Self: 'a;
 
-    async fn acquire_session(
-        &self,
-    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+    async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
         self.inner.acquire_session().await
     }
 
@@ -1263,9 +1254,7 @@ impl Storage for CountingReadStorage {
     where
         Self: 'a;
 
-    async fn acquire_session(
-        &self,
-    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+    async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
         self.inner.acquire_session().await
     }
 

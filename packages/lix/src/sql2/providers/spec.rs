@@ -111,7 +111,7 @@ impl ScanSource {
         self.fetch_rebind.as_ref().map(|rebind| rebind(fetch))
     }
 
-    fn open(
+    pub(super) fn open(
         &self,
         partition: usize,
         context: Arc<TaskContext>,
@@ -178,56 +178,6 @@ where
             stream,
         )))
     })
-}
-
-/// Adapt a materializing loader that can use an execution-time fetch bound.
-///
-/// `ORDER BY ... LIMIT` is lowered to a physical top-k after table planning,
-/// so its bound is not present in [`TableSpec::plan_scan`]. DataFusion offers
-/// it later through [`ExecutionPlan::with_fetch`]; this source can be rebuilt
-/// with that bound without making an unbounded scan pretend it already knew
-/// the query's final cardinality.
-pub(super) fn fetchable_scan_row_source<S, F, Fut>(
-    schema: SchemaRef,
-    state: S,
-    initial_fetch: Option<usize>,
-    f: F,
-) -> ScanSource
-where
-    S: Clone + Send + Sync + 'static,
-    F: Fn(S, Option<usize>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<RecordBatch>> + Send + 'static,
-{
-    fetchable_scan_row_source_inner(schema, state, initial_fetch, Arc::new(f))
-}
-
-fn fetchable_scan_row_source_inner<S, F, Fut>(
-    schema: SchemaRef,
-    state: S,
-    fetch: Option<usize>,
-    f: Arc<F>,
-) -> ScanSource
-where
-    S: Clone + Send + Sync + 'static,
-    F: Fn(S, Option<usize>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<RecordBatch>> + Send + 'static,
-{
-    let load = row_source((state.clone(), Arc::clone(&f)), move |(state, f)| {
-        f(state, fetch)
-    });
-    let stream_schema = Arc::clone(&schema);
-    let mut source = batch_stream_source(Arc::clone(&schema), 1, move |_partition, _context| {
-        let load = Arc::clone(&load);
-        let stream = stream::once(async move { load().await });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            Arc::clone(&stream_schema),
-            stream,
-        )))
-    });
-    source.fetch_rebind = Some(Arc::new(move |fetch| {
-        fetchable_scan_row_source_inner(Arc::clone(&schema), state.clone(), fetch, Arc::clone(&f))
-    }));
-    source
 }
 
 /// Build a storage-originating streaming scan source.
@@ -441,14 +391,6 @@ pub(super) trait TableSpec: Send + Sync + 'static {
 
     fn schema(&self) -> SchemaRef;
 
-    /// Public column that routes a history scan to an explicit commit.
-    ///
-    /// This is provider identity, not a name heuristic: ordinary row
-    /// schemas may legitimately expose a property with the same name.
-    fn history_anchor_column(&self) -> Option<&'static str> {
-        None
-    }
-
     /// How the surface introspects in `information_schema.tables`.
     fn table_type(&self) -> TableType {
         TableType::Base
@@ -640,10 +582,6 @@ impl SpecTableProvider {
             schema: spec.schema(),
             spec,
         }
-    }
-
-    pub(super) fn history_anchor_column(&self) -> Option<&'static str> {
-        self.spec.history_anchor_column()
     }
 }
 

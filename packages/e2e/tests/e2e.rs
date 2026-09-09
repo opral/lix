@@ -177,7 +177,8 @@ where
     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
     fn register_callsite(&self, metadata: &'static tracing::Metadata<'static>) -> Interest {
-        if is_exported_or_debug_perf_target(metadata.target()) && is_import_perf_span(metadata.name())
+        if is_exported_or_debug_perf_target(metadata.target())
+            && is_import_perf_span(metadata.name())
         {
             Interest::always()
         } else {
@@ -296,27 +297,27 @@ async fn v2_file_history_reads_durable_materialized_bytes_without_plugin_executi
         .with_wasm_runtime(wasm_runtime)
         .await
         .expect("workspace should reopen without compiling installed plugins");
-    let result = history_lix
+    let events = history_lix
         .execute(
-            "SELECT content, lixcol_depth \
-             FROM lix_history('lix_file', $1) \
-             WHERE id = $2 \
-             ORDER BY lixcol_depth \
-             LIMIT 2",
-            &[Value::Text(head), Value::Text(file_id)],
+            "SELECT lixcol_to_commit_id FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_position LIMIT 2",
+            &[Value::Text(head), Value::Text(file_id.clone())],
         )
         .await
-        .expect("V2 file history should read durable materialized bytes");
-
-    assert_eq!(result.len(), 2);
-    assert_eq!(
-        result.rows()[0].values(),
-        &[Value::Blob(second.into()), Value::Integer(1)]
-    );
-    assert_eq!(
-        result.rows()[1].values(),
-        &[Value::Blob(first.into()), Value::Integer(2)]
-    );
+        .expect("file endpoint history should load");
+    assert_eq!(events.len(), 2);
+    for (event, expected) in events.rows().iter().zip([second, first]) {
+        let result = history_lix
+            .execute(
+                "SELECT content FROM lix_as_of('lix_file', $1) WHERE id = $2",
+                &[
+                    Value::Text(event.get("lixcol_to_commit_id").unwrap()),
+                    Value::Text(file_id.clone()),
+                ],
+            )
+            .await
+            .expect("historical snapshot should read durable materialized bytes");
+        assert_eq!(result.rows()[0].values(), &[Value::Blob(expected.into())]);
+    }
     assert_eq!(
         rejecting_runtime.compile_calls.load(Ordering::SeqCst),
         0,
@@ -1602,6 +1603,13 @@ async fn v3_markdown_certified_open_sparse_successor_history_and_reopen() {
 
     let after = b"# Heading\n\nParagraph with **bold** text and a tail.\n".to_vec();
 
+    let opening_commit: String = lix
+        .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get("id")
+        .unwrap();
     write_file(&lix, path, after.clone()).await.unwrap();
 
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(after.clone()));
@@ -1622,9 +1630,8 @@ async fn v3_markdown_certified_open_sparse_successor_history_and_reopen() {
     );
     let historical = lix
         .execute(
-            "SELECT kind, payload_json FROM lix_history('markdown_node') \
-             WHERE lixcol_depth = 1 ORDER BY kind",
-            &[],
+            "SELECT kind, payload_json FROM lix_as_of('markdown_node', $1) ORDER BY kind",
+            &[Value::Text(opening_commit)],
         )
         .await
         .unwrap();
@@ -4247,6 +4254,13 @@ async fn v3_json_certified_batch_survives_sparse_successor_and_time_travel() {
     );
 
     let after = br#"{"a":"ONE","b":"two"}"#.to_vec();
+    let opening_commit: String = lix
+        .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get("id")
+        .unwrap();
     write_file(&lix, path, after.clone()).await.unwrap();
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(after.clone()));
     let current = lix
@@ -4266,9 +4280,8 @@ async fn v3_json_certified_batch_survives_sparse_successor_and_time_travel() {
 
     let historical = lix
         .execute(
-            "SELECT key, scalar_json FROM lix_history('json_object_member') \
-             WHERE lixcol_depth = 1 ORDER BY key",
-            &[],
+            "SELECT key, scalar_json FROM lix_as_of('json_object_member', $1) ORDER BY key",
+            &[Value::Text(opening_commit)],
         )
         .await
         .unwrap();
@@ -5661,6 +5674,13 @@ async fn v3_excalidraw_certified_open_sparse_successor_history_and_reopen() {
         .replacen(r#""x":1.25"#, r#""x":123.5"#, 1)
         .into_bytes();
 
+    let opening_commit: String = lix
+        .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get("id")
+        .unwrap();
     write_file(&lix, path, after.clone()).await.unwrap();
 
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(after.clone()));
@@ -5679,9 +5699,8 @@ async fn v3_excalidraw_certified_open_sparse_successor_history_and_reopen() {
     );
     assert!(
         lix.execute(
-            "SELECT element_json FROM lix_history('excalidraw_element') \
-             WHERE id = 'a' AND lixcol_depth = 1",
-            &[],
+            "SELECT element_json FROM lix_as_of('excalidraw_element', $1) WHERE id = 'a'",
+            &[Value::Text(opening_commit)],
         )
         .await
         .unwrap()
@@ -6237,9 +6256,13 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
         &["csv_table", "csv_row"],
     )
     .await;
-    write_file(&lix, "/selected.csv", b"name,value\na,one\nb,two\n".to_vec())
-        .await
-        .unwrap();
+    write_file(
+        &lix,
+        "/selected.csv",
+        b"name,value\na,one\nb,two\n".to_vec(),
+    )
+    .await
+    .unwrap();
     write_file(
         &lix,
         "/remaining.csv",
@@ -6287,15 +6310,16 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
         .get::<i64>("count")
         .unwrap();
     assert!(selected_diff_count > 1, "CSV must fan out beyond lix_file");
-    let selected_checkpoint = lix.execute(
-        "SELECT commit_id FROM lix_create_checkpoint(ARRAY( \
+    let selected_checkpoint = lix
+        .execute(
+            "SELECT commit_id FROM lix_create_checkpoint(ARRAY( \
          SELECT row_ref \
          FROM lix_diff('lix_file', lix_root_commit_id(), lix_active_branch_commit_id()) \
          WHERE id = $1))",
-        &[Value::Text(selected_file_id.clone())],
-    )
-    .await
-    .expect("checkpoint all selected plugin rows");
+            &[Value::Text(selected_file_id.clone())],
+        )
+        .await
+        .expect("checkpoint all selected plugin rows");
 
     assert_eq!(
         lix.execute(
@@ -6304,14 +6328,18 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
              WHERE id = $1",
             &[
                 Value::Text(selected_file_id.clone()),
-                Value::Text(selected_checkpoint.rows()[0].get::<String>("commit_id").unwrap()),
+                Value::Text(
+                    selected_checkpoint.rows()[0]
+                        .get::<String>("commit_id")
+                        .unwrap()
+                ),
             ],
         )
         .await
         .unwrap()
         .rows()[0]
-        .get::<i64>("count")
-        .unwrap(),
+            .get::<i64>("count")
+            .unwrap(),
         0,
     );
     assert!(
@@ -6321,14 +6349,18 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
              WHERE id = $1",
             &[
                 Value::Text(remaining_file_id),
-                Value::Text(selected_checkpoint.rows()[0].get::<String>("commit_id").unwrap()),
+                Value::Text(
+                    selected_checkpoint.rows()[0]
+                        .get::<String>("commit_id")
+                        .unwrap()
+                ),
             ],
         )
         .await
         .unwrap()
         .rows()[0]
-        .get::<i64>("count")
-        .unwrap()
+            .get::<i64>("count")
+            .unwrap()
             > 0,
     );
     assert_eq!(active_csv_rows(&lix, &selected_file_id).await.len(), 4);

@@ -6713,7 +6713,6 @@ fn update_optional_string_value(
     }
 }
 
-
 fn update_required_binary_value(
     _batch: &RecordBatch,
     assignment_values: &UpdateAssignmentValues,
@@ -6786,7 +6785,6 @@ fn optional_string_value(
         ))),
     }
 }
-
 
 fn optional_bool_value(
     batch: &RecordBatch,
@@ -8862,6 +8860,7 @@ mod tests {
     impl BranchRefReader for TestBranchRefReader {
         async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
             Ok(Some(BranchHead {
+                working_base_commit_id: None,
                 branch_id: branch_id.to_string(),
                 commit_id: CommitId::for_test_label(&format!("commit-{branch_id}")),
             }))
@@ -9682,11 +9681,9 @@ mod tests {
             r#"{"id":"01920000-0000-7000-8000-000000000522","directory_id":null,"name":"empty.csv"}"#,
         );
 
-        let raw = super::prepare_lix_file_rows(
-            vec![descriptor.clone()],
-            &super::FilePathPredicate::All,
-        )
-        .expect("raw empty file should prepare");
+        let raw =
+            super::prepare_lix_file_rows(vec![descriptor.clone()], &super::FilePathPredicate::All)
+                .expect("raw empty file should prepare");
         assert!(!raw.historical_plugin_materialization_is_missing(true));
 
         let owned = super::prepare_lix_file_rows(

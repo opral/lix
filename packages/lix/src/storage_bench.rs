@@ -1639,7 +1639,7 @@ pub enum CommitGraphBenchMode {
     LegacyReachableNodes,
     /// Whole reachable history for one member schema.
     HistoryFull,
-    /// History restricted to the head commit (`lixcol_depth = 0`).
+    /// Internal graph provenance restricted to the head commit (depth zero).
     HistoryDepth0,
     /// History for a bounded row demand (`LIMIT 10`).
     HistoryLimit10,
@@ -1754,6 +1754,7 @@ where
         let (first_parent_jump_commit_id, first_parent_jump_span) =
             crate::changelog::next_first_parent_jump(commit_id, &parents, parent, parent_jump)?;
         records.push(crate::changelog::CommitRecord {
+            is_checkpoint: false,
             // A realistic full-width digest, not `absent()`. Every commit-topology
             // consumer pays for this field whether or not it benefits, and
             // merge-base is the guard for exactly that cost — an `absent()`
@@ -4114,10 +4115,7 @@ mod tests {
                 ), // mutation inventory authority
                 (crate::changelog::COMMIT_SPACE.id.0, 10), // branch-only commit projections
                 (crate::changelog::CHANGE_SPACE.id.0, 10), // their change facts
-                (
-                    crate::sync::SYNC_MATERIALIZED_STATE_ALIAS_SPACE.id.0,
-                    10,
-                ), // unconditional canonical sync-state alias cleanup descriptors
+                (crate::sync::SYNC_MATERIALIZED_STATE_ALIAS_SPACE.id.0, 10,), // unconditional canonical sync-state alias cleanup descriptors
                 (crate::sync::SYNC_CHECKPOINT_SOURCE_SPACE.id.0, 10), // private checkpoint provenance cleanup
             ]
         );
@@ -4152,10 +4150,8 @@ mod tests {
         let hot_row_deletes = 1;
         let working_diff_deletes = 100;
         let marker_deletes = 1;
-        let uuid_deletes = first.staged_deletes as usize
-            - hot_row_deletes
-            - working_diff_deletes
-            - marker_deletes;
+        let uuid_deletes =
+            first.staged_deletes as usize - hot_row_deletes - working_diff_deletes - marker_deletes;
         // The certified branch-ref hot-row descriptor retains its encoded
         // generation scope and row identity as two shared key buffers.
         assert_eq!(first.key_shared_buffers, uuid_deletes + 5);

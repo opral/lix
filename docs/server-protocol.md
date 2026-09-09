@@ -35,7 +35,7 @@ contract in another language. See [Hosting](./hosting.md).
 | SQL         | `/lix/v1/{lix_id}/execute`, `/lix/v1/{lix_id}/execute-batch`                    |
 | Transaction | `/lix/v1/{lix_id}/transaction/{begin,execute,commit,rollback}`                  |
 | Files       | `/lix/v1/{lix_id}/file`, `/lix/v1/{lix_id}/file/upsert{,-batch}`               |
-| Sync        | `/lix/v1/{lix_id}/sync/{push,pull,history,blob,chunk}`                          |
+| Sync        | `/lix/v1/{lix_id}/sync/{push,pull,history,checkpoints,blob,chunk}`                          |
 | Versioning  | `/lix/v1/{lix_id}/branch/{create,switch}`, `/lix/v1/{lix_id}/{undo,redo}`       |
 | Observation | `/lix/v1/{lix_id}/observe`, `/lix/v1/{lix_id}/observe/multiplex`                |
 | Snapshot    | `/lix/v1/{lix_id}/snapshot`                                                     |
@@ -70,6 +70,12 @@ The protocol does not read bearer tokens, cookies, API keys, or certificates. It
 receives an already-trusted principal in process and never derives identity from
 request headers.
 
+Protocol requests except snapshot download require exactly one
+`lix-server-protocol-version: 7` header. Missing, duplicate, malformed, or older
+versions return `426 LIX_PROTOCOL_VERSION_MISMATCH` before opening a session or
+executing SQL. Clients must upgrade together with the checkpoint metadata and
+SQL API changes.
+
 On session creation it ensures the Lix account exists, pins the session to it,
 and scopes mutation idempotency to that principal. A session reused through a
 different principal returns `403`. Clients cannot select `activeAccountId`
@@ -94,6 +100,13 @@ the resulting committed state into the local replica.
   continues the page scan. Each branch also carries a `hotStateRootId` over its
   live, tombstone-filtered rows so the replica can verify the assembled pages.
   With `after`, it long-polls the repository event sequence.
+- `GET /lix/v1/{lix_id}/sync/checkpoints?cursor=...&limit=...` pages the global
+  checkpoint inventory, including checkpoints outside current branch histories.
+  Use the repository cursor returned by metadata pull, then pass each response
+  `continuation` as `after`. Pages contain at most 512 immutable commit headers,
+  ordered by commit ID. If the repository cursor changes, the server returns
+  `409` and bootstrap restarts from fresh metadata. Inventory headers carry
+  `isCheckpoint: true`; they do not include historical state or binary content.
 - `GET /lix/v1/{lix_id}/sync/history` fetches exact immutable commits by repeated
   `commitId` parameters, together with bounded topology certificates. The
   bootstrap worker fetches the distinct branch-head bodies and current-row
@@ -105,6 +118,17 @@ the resulting committed state into the local replica.
 - `GET /lix/v1/{lix_id}/sync/chunk?chunkId=...` and
   `PUT /lix/v1/{lix_id}/sync/chunk?chunkId=...` transfer raw chunks. Both identities are
   64-character lowercase BLAKE3 hex digests; chunks are at most 4 MiB.
+
+All sync routes require exactly one `lix-sync-protocol-version: 9` header.
+Missing, duplicate, malformed, or incompatible versions are rejected before
+reading or publishing sync data. The handshake advertises
+`syncCheckpointInventory: true`. Commit bodies and headers both carry immutable
+`isCheckpoint` metadata; membership is preserved independently of branch refs.
+
+Bootstrap installs checkpoint headers alongside current branch heads and working
+bases. Historical checkpoint state remains deferred until an explicit history
+or snapshot read requests it; bootstrap does not scan every checkpoint state or
+fetch its binary content.
 
 The live pull protocol has one repository cursor. It has no schema or
 branch filter and no separate branch-catalog request. Commit payloads are
@@ -168,6 +192,6 @@ the implementation itself part of the protocol.
 
 To run a server, see [Hosting](./hosting.md).
 
-### Typed sync rows (sync protocol version 8)
+### Typed sync rows (sync protocol version 9)
 
-Every live sync member and snapshot row includes `snapshotPayload`, the base64-encoded canonical Schema v1 typed row, alongside its JSON `snapshot` projection. Tombstones encode both fields as null. Receivers verify canonical encoding, primary-key identity, and agreement with the JSON projection before installing the payload. Preserving type information and schema fingerprints lets custom and plugin-defined rows sync without rebuilding them against the engine's built-in catalog. A retained row may predate the currently registered schema, so import preserves its authoring fingerprint rather than validating it against the current catalog. SQL reads retain their existing resolved-schema validation. Storage compression does not affect the wire encoding. Sync protocol 7 peers must upgrade; there is no JSON-only fallback.
+Every live sync member and snapshot row includes `snapshotPayload`, the base64-encoded canonical Schema v1 typed row, alongside its JSON `snapshot` projection. Tombstones encode both fields as null. Receivers verify canonical encoding, primary-key identity, and agreement with the JSON projection before installing the payload. Preserving type information and schema fingerprints lets custom and plugin-defined rows sync without rebuilding them against the engine's built-in catalog. A retained row may predate the currently registered schema, so import preserves its authoring fingerprint rather than validating it against the current catalog. SQL reads retain their existing resolved-schema validation. Storage compression does not affect the wire encoding. Sync protocol 8 and earlier peers must upgrade; there is no JSON-only or checkpoint-marker fallback.

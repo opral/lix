@@ -1,8 +1,8 @@
 #![allow(clippy::match_wild_err_arm, clippy::option_if_let_else)]
 
 use std::future::Future;
-use std::sync::{Arc, RwLock};
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
@@ -29,16 +29,16 @@ use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::runtime::PluginRuntimeHost;
 use crate::row_pk::RowPk;
 use crate::sql2::{
-    ChangelogQuerySource, HistoryQuerySource, SessionFileViews, SqlChangelogQuerySource,
-    SqlExecutionContext, SqlHistoryQuerySource, SqlPlanningCache,
+    ChangelogQuerySource, SessionFileViews, SqlChangelogQuerySource, SqlExecutionContext,
+    SqlPlanningCache,
 };
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{Memory, StorageWriteSetStats};
 use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead};
 use crate::sync::SyncModeState;
 use crate::telemetry::{
-    ActiveTelemetrySpan, TelemetryAttribute, TelemetrySink, Status, instrument_value,
-    TRANSACTION_NOTIFY, TRANSACTION_WAIT,
+    ActiveTelemetrySpan, Status, TRANSACTION_NOTIFY, TRANSACTION_WAIT, TelemetryAttribute,
+    TelemetrySink, instrument_value,
 };
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::{Transaction, open_transaction};
@@ -738,16 +738,6 @@ where
         let reader: Arc<dyn FilesystemPathIndexReader> =
             Arc::new(self.hot_state.reader(self.read_store.clone()));
         reader
-    }
-
-    fn history_query_source(
-        &self,
-        default_as_of_commit_id: String,
-    ) -> SqlHistoryQuerySource<Self::ReadStore> {
-        HistoryQuerySource {
-            store: self.read_store.clone(),
-            default_as_of_commit_id,
-        }
     }
 
     fn changelog_query_source(&self) -> SqlChangelogQuerySource<Self::ReadStore> {

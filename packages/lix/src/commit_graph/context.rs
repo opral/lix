@@ -81,8 +81,7 @@ where
     /// result from the unbounded one, but an already materialized unbounded
     /// walk answers every bounded request without touching storage again.
     reachable_nodes_cache: HashMap<(CommitId, Option<u32>), Arc<[ReachableCommitGraphNode]>>,
-    state_dependency_nodes_cache:
-        HashMap<(CommitId, Option<u32>), Arc<[ReachableCommitGraphNode]>>,
+    state_dependency_nodes_cache: HashMap<(CommitId, Option<u32>), Arc<[ReachableCommitGraphNode]>>,
     // A reader is bound to one pinned storage snapshot for the duration of a
     // SQL statement. File-history shaping asks the same reader for distinct
     // schema slices of that history, so retain immutable change records here.
@@ -558,8 +557,7 @@ where
                     })
                     .map(|reachable| reachable.commit.commit_id)
                     .collect::<Vec<_>>();
-                for candidate_batch in
-                    candidates.chunks(DEFERRED_HISTORY_DEMAND_CENSUS_BATCH_SIZE)
+                for candidate_batch in candidates.chunks(DEFERRED_HISTORY_DEMAND_CENSUS_BATCH_SIZE)
                 {
                     let deferred = crate::tracked_state::deferred_commit_history_ids(
                         &self.store,
@@ -820,6 +818,7 @@ fn commit_graph_node_from_record(
         return Ok(None);
     };
     let node = CommitGraphNode {
+        is_checkpoint: record.is_checkpoint,
         commit_id: record.commit_id,
         change_id: record.change_id(),
         account_id: record.account_id,
@@ -948,14 +947,6 @@ where
     ) -> Result<Arc<[ReachableCommitGraphNode]>, LixError> {
         Self::reachable_nodes_within_depth(self, head_commit_id, Some(max_depth)).await
     }
-
-    async fn change_history_from_commit(
-        &mut self,
-        start_commit_id: &CommitId,
-        request: &CommitGraphChangeHistoryRequest,
-    ) -> Result<CommitGraphHistory, LixError> {
-        Self::change_history_from_commit(self, start_commit_id, request).await
-    }
 }
 
 fn depth_matches(depth: u32, request: &CommitGraphChangeHistoryRequest) -> bool {
@@ -1069,6 +1060,8 @@ pub(crate) fn canonical_commit_change(node: &CommitGraphNode) -> CommitGraphChan
         &node.commit_id.to_string(),
         &node.parent_commit_ids,
         node.base_commit_id,
+        node.is_checkpoint,
+        node.created_at,
     )
     .expect("lix_commit snapshot serialization should not fail");
     let snapshot: serde_json::Value = serde_json::from_str(&snapshot_content)
@@ -1706,6 +1699,7 @@ mod tests {
             .stage_append(ChangelogAppend {
                 changes: Vec::new(),
                 commits: vec![CommitRecord {
+                    is_checkpoint: false,
                     touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                     format_version: 3,
                     base_commit_id: None,
@@ -2255,6 +2249,7 @@ mod tests {
             }
 
             let record = CommitRecord {
+                is_checkpoint: false,
                 touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
                 format_version: 3,
                 base_commit_id: None,
@@ -2346,6 +2341,7 @@ mod tests {
 
     fn append_empty_commit(append: &mut ChangelogAppend, commit_id: CommitId) {
         append.commits.push(CommitRecord {
+            is_checkpoint: false,
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             format_version: 4,
             base_commit_id: None,
@@ -2390,6 +2386,7 @@ mod tests {
     ) -> crate::commit_graph::CommitGraphNode {
         let commit_id = CommitId::for_test_label(commit_label);
         crate::commit_graph::CommitGraphNode {
+            is_checkpoint: false,
             touched_scope_digest: crate::changelog::CommitTouchedScopeDigest::absent(),
             commit_id,
             change_id: ChangeId::for_test_label(&format!("{commit_label}-change")),

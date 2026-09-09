@@ -2236,6 +2236,10 @@ mod tests {
             .protocol_router()
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .uri("/lix/v1/11111111-1111-4111-8111-111111111111/")
                     .body(Body::empty())
                     .expect("handshake request"),
@@ -2268,6 +2272,10 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .uri("/lix/v1/11111111-1111-4111-8111-111111111111/")
                     .body(Body::empty())
                     .expect("handshake request"),
@@ -2292,6 +2300,10 @@ mod tests {
         let observation = protocol_router
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .method("POST")
                     .uri("/lix/v1/11111111-1111-4111-8111-111111111111/observe")
                     .header(header::CONTENT_TYPE, "application/json")
@@ -2337,6 +2349,10 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .uri("/lix/v1/11111111-1111-4111-8111-111111111111/")
                     .body(Body::empty())
                     .expect("handshake request"),
@@ -2361,6 +2377,10 @@ mod tests {
         let observation = protocol_router
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .method("POST")
                     .uri("/lix/v1/11111111-1111-4111-8111-111111111111/observe")
                     .header(header::CONTENT_TYPE, "application/json")
@@ -2406,6 +2426,10 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .uri("/lix/v1/11111111-1111-4111-8111-111111111111/")
                     .body(Body::empty())
                     .expect("handshake request"),
@@ -2430,6 +2454,10 @@ mod tests {
         let observation = protocol_router
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .method("POST")
                     .uri("/lix/v1/11111111-1111-4111-8111-111111111111/observe")
                     .header(header::CONTENT_TYPE, "application/json")
@@ -2482,6 +2510,10 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .method("POST")
                     .uri("/lix/v1/11111111-1111-4111-8111-111111111111/observe")
                     .header(lix_sdk::server_protocol::SESSION_ID_HEADER, session)
@@ -2592,6 +2624,10 @@ mod tests {
             .protocol_router()
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .uri("/lix/v1/11111111-1111-4111-8111-111111111111/")
                     .body(Body::empty())
                     .expect("handshake request"),
@@ -3128,6 +3164,10 @@ mod tests {
                 .clone()
                 .oneshot(
                     Request::builder()
+                        .header(
+                            lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                            lix_sdk::server_protocol::PROTOCOL_VERSION,
+                        )
                         .method("POST")
                         .uri("/lix/v1/11111111-1111-4111-8111-111111111111/execute")
                         .header(lix_sdk::server_protocol::SESSION_ID_HEADER, &session)
@@ -3193,6 +3233,10 @@ mod tests {
         let reopened = app
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .method("POST")
                     .uri("/lix/v1/11111111-1111-4111-8111-111111111111/execute")
                     .header(
@@ -3213,6 +3257,10 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .uri(format!("/lix/v1/{lix_id}/"))
                     .body(Body::empty())
                     .expect("protocol handshake request"),

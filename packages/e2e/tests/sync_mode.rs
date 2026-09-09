@@ -804,7 +804,10 @@ async fn connected_api_routes_local_work_and_hot_reads_need_no_round_trip() {
         "SELECT current_timestamp",
     ] {
         let error = replica
-            .execute_coherent_read_batch(&[("SELECT * FROM lix_checkpoint", &[]), (sql, &[])])
+            .execute_coherent_read_batch(&[
+                ("SELECT * FROM lix_commit WHERE is_checkpoint", &[]),
+                (sql, &[]),
+            ])
             .await
             .expect_err("connected coherent batches must reject mutations");
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM, "{sql}");
@@ -1631,7 +1634,7 @@ async fn scoped_checkpoint_from_uncheckpointed_authority_survives_reconnect(
     assert_eq!(
         remote
             .execute(
-                "SELECT path FROM lix_state_at('lix_file', $1) ORDER BY path",
+                "SELECT path FROM lix_as_of('lix_file', $1) ORDER BY path",
                 &checkpoint_params
             )
             .await,
@@ -1645,7 +1648,7 @@ async fn scoped_checkpoint_from_uncheckpointed_authority_survives_reconnect(
         assert!(
             remote
                 .execute(
-                    "SELECT key FROM lix_state_at('lix_key_value', $1) WHERE key = 'unselected'",
+                    "SELECT key FROM lix_as_of('lix_key_value', $1) WHERE key = 'unselected'",
                     &checkpoint_params,
                 )
                 .await
@@ -1712,7 +1715,7 @@ async fn fetched_immutable_history_is_cached_across_offline_reopen() {
     let (url, server_task) = serve(storage, Arc::clone(&probe)).await;
     let directory = TempDir::new().unwrap();
     let replica = open_replica(directory.path(), &url).await;
-    let sql = "SELECT value FROM lix_state_at('lix_key_value', $1) WHERE key = 'history-marker'";
+    let sql = "SELECT value FROM lix_as_of('lix_key_value', $1) WHERE key = 'history-marker'";
     let params = [Value::Text(checkpoint)];
     let historical = replica
         .execute(sql, &params)
@@ -2416,7 +2419,7 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
     let commit_id = first_checkpoint.clone();
     let files = replica
         .execute(
-            "SELECT name, directory_id FROM lix_state_at('lix_file', $1)",
+            "SELECT name, directory_id FROM lix_as_of('lix_file', $1)",
             &[Value::Text(commit_id.clone())],
         )
         .await
@@ -2440,7 +2443,7 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
 
     let directories = replica
         .execute(
-            "SELECT id, name FROM lix_state_at('lix_directory', $1)",
+            "SELECT id, name FROM lix_as_of('lix_directory', $1)",
             &[Value::Text(commit_id.clone())],
         )
         .await
@@ -2520,7 +2523,7 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
     // product opens first.
     let latest_directories = replica
         .execute(
-            "SELECT name FROM lix_state_at('lix_directory', $1) ORDER BY name",
+            "SELECT name FROM lix_as_of('lix_directory', $1) ORDER BY name",
             &[Value::Text(second_checkpoint.clone())],
         )
         .await
@@ -2568,7 +2571,7 @@ async fn migrated_partial_checkpoint_repository_reads_state_on_a_sparse_replica(
     );
     let checkpoints = authority
         .execute(
-            "SELECT commit_id FROM lix_checkpoint ORDER BY lixcol_created_at ASC",
+            "SELECT id AS commit_id FROM lix_commit WHERE is_checkpoint ORDER BY created_at ASC",
             &[],
         )
         .await
@@ -2601,7 +2604,7 @@ async fn migrated_partial_checkpoint_repository_reads_state_on_a_sparse_replica(
     // Read the historical anchor through the connected authority handle.
     replica
         .execute(
-            "SELECT path FROM lix_history('lix_file', $1) WHERE id = $2 ORDER BY lixcol_depth ASC LIMIT 1",
+            "SELECT path FROM lix_as_of('lix_file', $1) WHERE id = $2",
             &[
                 Value::Text(last_checkpoint.clone()),
                 Value::Text(brand_file_id.clone()),
@@ -2612,14 +2615,14 @@ async fn migrated_partial_checkpoint_repository_reads_state_on_a_sparse_replica(
 
     let files = replica
         .execute(
-            "SELECT name, directory_id FROM lix_state_at('lix_file', $1)",
+            "SELECT name, directory_id FROM lix_as_of('lix_file', $1)",
             &[Value::Text(last_checkpoint.clone())],
         )
         .await
         .expect("file state at the migrated partial checkpoint executes on the authority");
     let directories = replica
         .execute(
-            "SELECT id, name FROM lix_state_at('lix_directory', $1)",
+            "SELECT id, name FROM lix_as_of('lix_directory', $1)",
             &[Value::Text(last_checkpoint.clone())],
         )
         .await

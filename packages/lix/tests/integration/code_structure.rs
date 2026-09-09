@@ -2757,13 +2757,10 @@ fn sql2_read_session_does_not_register_write_surfaces() {
         &[
             "mod change;",
             "mod directory;",
-            "mod directory_history;",
             "mod schema;",
-            "mod schema_history;",
             "mod file;",
-            "mod file_history;",
-            "mod history_util;",
             "mod branch;",
+            "mod mainline;",
         ],
     );
     assert_source_contains_none(
@@ -2788,11 +2785,9 @@ fn sql2_read_session_does_not_register_write_surfaces() {
             "PublicSurfaceKind::File",
             "PublicSurfaceKind::Directory",
             "PublicSurfaceKind::HistoryFunction",
+            "mainline::register_functions",
             "branch::register_lix_branch_read_provider",
             "change::register_lix_change_read_provider",
-            "file_history::build_lix_file_history_provider",
-            "directory_history::build_lix_directory_history_provider",
-            "history_table_function::register_history_table_function",
             "directory::register_lix_directory_active_provider",
             "file::register_lix_file_active_provider",
             "schema::register_row_providers",

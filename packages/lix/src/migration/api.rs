@@ -11,17 +11,16 @@ use crate::init::{
     RepositoryProtocolStatus, parse_repository_protocol,
 };
 use crate::storage_adapter::{
-    SharedStorageAdapterRead, Storage, StorageCoreProjection as CoreProjection, StorageError,
-    StorageGetManyRequest as GetManyRequest, StorageGetOptions as GetOptions, StorageKey as Key,
+    SharedStorageAdapterRead, Storage, StorageAdapterRead as _, StorageBeginScanOptions,
+    StorageCoreProjection as CoreProjection, StorageError, StorageGetManyRequest as GetManyRequest,
+    StorageGetOptions as GetOptions, StorageKey as Key, StorageKeyRange,
     StoragePrecondition as Precondition, StorageProjectedValue as ProjectedValue,
-    StorageAdapterRead as _, StorageBeginScanOptions, StorageKeyRange,
-    StorageReadOptions as ReadOptions, StorageWrite,
-    StorageWriteOptions as WriteOptions,
+    StorageReadOptions as ReadOptions, StorageWrite, StorageWriteOptions as WriteOptions,
 };
 use crate::tracked_state::{
     CommitStateReplayDebt, TrackedStateContext, TrackedStateFilter, TrackedStateKeyRef,
-    TrackedStateReadColumns, TrackedStateScanRequest,
-    backfill_row_pk_index_for_commit, encode_commit_state_manifest_replacement_for_migration,
+    TrackedStateReadColumns, TrackedStateScanRequest, backfill_row_pk_index_for_commit,
+    encode_commit_state_manifest_replacement_for_migration,
 };
 
 const REPOSITORY_PROTOCOL_V72: &[u8] = b"tracked-default-branch.v72";
@@ -183,7 +182,7 @@ where
     }
     let from_version = match protocol_status {
         RepositoryProtocolStatus::MigrationRequired {
-            found_version: found_version @ (72 | 73 | 74 | 75 | 76),
+            found_version: found_version @ (72 | 73 | 74 | 75 | 76 | 77),
         } => found_version,
         RepositoryProtocolStatus::Current => {
             return Ok(MigrationReport {
@@ -247,31 +246,35 @@ where
         )
         .await?;
     }
-    // v77 deliberately does not rewrite or validate historical built-in
-    // registration rows. Those rows describe the engine version that authored
-    // each commit; the current engine's immutable catalog is authoritative.
-    // Custom schemas are still loaded from the repository and validated when
-    // the migrated engine opens it.
-    let read = adapter
-        .begin_read(ReadOptions::default())
-        .await
-        .map_err(storage_error)?;
-    let expected_revision = crate::storage_adapter::load_repository_mutation_revision(&read)
-        .await
-        .map_err(storage_error)?;
-    drop(read);
-    crate::migration::publish::publish(
-        &adapter,
-        expected_revision,
-        crate::init::REPOSITORY_PROTOCOL_V76,
-        crate::init::REPOSITORY_PROTOCOL_VALUE,
-        crate::migration::publish::PublicationPlan::bounded(0, 0),
-    )
-    .await?;
+    if from_version <= 76 {
+        // v77 deliberately does not rewrite or validate historical built-in
+        // registration rows. Those rows describe the engine version that authored
+        // each commit; the current engine's immutable catalog is authoritative.
+        // Custom schemas are still loaded from the repository and validated when
+        // the migrated engine opens it.
+        let read = adapter
+            .begin_read(ReadOptions::default())
+            .await
+            .map_err(storage_error)?;
+        let expected_revision = crate::storage_adapter::load_repository_mutation_revision(&read)
+            .await
+            .map_err(storage_error)?;
+        drop(read);
+        crate::migration::publish::publish(
+            &adapter,
+            expected_revision,
+            crate::init::REPOSITORY_PROTOCOL_V76,
+            crate::init::REPOSITORY_PROTOCOL_V77,
+            crate::migration::publish::PublicationPlan::bounded(0, 0),
+        )
+        .await?;
+    }
+    let checkpoint_records_rewritten =
+        super::checkpoint_metadata::migrate(&adapter, options).await?;
     Ok(MigrationReport {
         from_version,
         to_version: CURRENT_FORMAT_VERSION,
-        changes_rewritten: commit_records_rewritten,
+        changes_rewritten: commit_records_rewritten + checkpoint_records_rewritten,
         commit_members_rewritten,
     })
 }
@@ -443,7 +446,7 @@ where
     .await
 }
 
-async fn load_repository_protocol_marker<S>(
+pub(super) async fn load_repository_protocol_marker<S>(
     adapter: &crate::storage_adapter::StorageAdapter<S>,
 ) -> Result<Option<Bytes>, LixError>
 where
@@ -460,12 +463,15 @@ where
     .materialize(&read, GetOptions::default())
     .await
     .map_err(storage_error)?;
-    Ok(values.value.into_iter().next().flatten().and_then(|value| {
-        match value {
+    Ok(values
+        .value
+        .into_iter()
+        .next()
+        .flatten()
+        .and_then(|value| match value {
             ProjectedValue::FullValue(value) => Some(value),
             ProjectedValue::KeyOnly => None,
-        }
-    }))
+        }))
 }
 
 /// Backfills every commit authority's row-PK permutation before publishing
@@ -632,13 +638,12 @@ fn resolve_missing_directory_closure(
     ancestors: &BTreeSet<crate::changelog::CommitId>,
     candidates: &BTreeMap<String, Vec<crate::tracked_state::MaterializedTrackedStateRow>>,
     commit_graph: &BTreeMap<crate::changelog::CommitId, CommitGraphNode>,
-) -> Result<BTreeMap<String, crate::tracked_state::MaterializedTrackedStateRow>, (String, &'static str)>
-{
+) -> Result<
+    BTreeMap<String, crate::tracked_state::MaterializedTrackedStateRow>,
+    (String, &'static str),
+> {
     let mut resolved = BTreeMap::new();
-    let mut worklist = referenced
-        .difference(present)
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut worklist = referenced.difference(present).cloned().collect::<Vec<_>>();
     while let Some(id) = worklist.pop() {
         if resolved.contains_key(&id) {
             continue;
@@ -989,9 +994,10 @@ where
                 ));
             }
             visited_rows = visited_rows.saturating_add(full_rows.len());
-            let mut full = crate::tracked_state::TrackedStateMutationBatchBuilder::with_row_capacity(
-                full_rows.len() + missing.len(),
-            );
+            let mut full =
+                crate::tracked_state::TrackedStateMutationBatchBuilder::with_row_capacity(
+                    full_rows.len() + missing.len(),
+                );
             for row in &full_rows {
                 full.push(
                     TrackedStateKeyRef {
@@ -1013,16 +1019,15 @@ where
                     Some(&commit_key),
                 )
                 .await?;
-            manifest.snapshot_root =
-                Some(Box::new(crate::tracked_state::TrackedStateCommitRoot {
-                    commit_id,
-                    root_id: result.root_id,
-                    parent_roots: Vec::new(),
-                    changed_key_count: result.row_count as u64,
-                    row_count_estimate: result.row_count as u64,
-                    tree_height: result.tree_height as u32,
-                    complete_state_fence: true,
-                }));
+            manifest.snapshot_root = Some(Box::new(crate::tracked_state::TrackedStateCommitRoot {
+                commit_id,
+                root_id: result.root_id,
+                parent_roots: Vec::new(),
+                changed_key_count: result.row_count as u64,
+                row_count_estimate: result.row_count as u64,
+                tree_height: result.tree_height as u32,
+                complete_state_fence: true,
+            }));
             manifest.replay_debt = CommitStateReplayDebt::default();
         }
 
@@ -1165,6 +1170,7 @@ where
         .await
         .map_err(storage_error)?;
     let mut pending = Vec::new();
+    let mut pending_v6 = Vec::new();
     let mut chronology = BTreeMap::new();
     while let Some(entries) = cursor.next_chunk().await.map_err(storage_error)? {
         for entry in entries {
@@ -1203,13 +1209,24 @@ where
                 );
                 continue;
             }
-            let record =
-                crate::storage_codec::decode::<CommitRecordV5>("v5 commit record", &value)
-                    .map_err(|error| {
-                        migration_error(format!(
-                            "{operation} could not decode a commit record as v5: {error}"
-                        ))
-                    })?;
+            if let Some(record) = super::checkpoint_metadata::decode_v6(&value) {
+                chronology.insert(
+                    record.commit_id,
+                    CommitChronology {
+                        created_at: record.created_at,
+                        generation: record.generation,
+                        first_parent: record.parent_commit_ids.first().copied(),
+                    },
+                );
+                pending_v6.push((entry.key, record));
+                continue;
+            }
+            let record = crate::storage_codec::decode::<CommitRecordV5>("v5 commit record", &value)
+                .map_err(|error| {
+                    migration_error(format!(
+                        "{operation} could not decode a commit record as v5: {error}"
+                    ))
+                })?;
             if record.format_version != 5 {
                 return Err(migration_error(format!(
                     "{operation} commit '{}' has unsupported record format v{}",
@@ -1228,7 +1245,7 @@ where
         }
     }
     drop(cursor);
-    if pending.is_empty() {
+    if pending.is_empty() && pending_v6.is_empty() {
         read.finish().map_err(storage_error)?;
         return Ok(0);
     }
@@ -1281,6 +1298,14 @@ where
     let mut writes = adapter.new_write_set();
     writes.put(REPOSITORY_PROTOCOL_SPACE, REPOSITORY_PROTOCOL_KEY, fence);
     let mut rewritten = 0_u64;
+    for (key, record) in pending_v6 {
+        writes.put(
+            crate::changelog::COMMIT_SPACE,
+            key.0.to_vec(),
+            crate::storage_codec::encode("commit record", &record)?,
+        );
+        rewritten += 1;
+    }
     for (key, record) in pending {
         let base_commit_id = if global_commits.contains(&record.commit_id) {
             None
@@ -1305,6 +1330,7 @@ where
             Some(*base)
         };
         let upgraded = crate::changelog::CommitRecord {
+            is_checkpoint: false,
             format_version: crate::changelog::COMMIT_RECORD_FORMAT_VERSION,
             commit_id: record.commit_id,
             generation: record.generation,
@@ -1453,9 +1479,9 @@ where
             options.max_changes.saturating_sub(visited_rows),
         )
         .await?;
-        visited_rows = visited_rows.checked_add(row_count).ok_or_else(|| {
-            migration_error(format!("{operation} row count exceeds usize"))
-        })?;
+        visited_rows = visited_rows
+            .checked_add(row_count)
+            .ok_or_else(|| migration_error(format!("{operation} row count exceeds usize")))?;
         manifest.global_scope = global_commits.contains(&commit_id);
         manifest.row_pk_index_root_id = root;
         replacements.push(manifest);
@@ -1560,15 +1586,13 @@ async fn preflight_v74_registered_schemas(
                 },
             )
             .await?;
-        inspected = inspected.checked_add(rows.len()).ok_or_else(|| {
-            migration_error("v74 schema preflight row count exceeds usize")
-        })?;
+        inspected = inspected
+            .checked_add(rows.len())
+            .ok_or_else(|| migration_error("v74 schema preflight row count exceeds usize"))?;
         if inspected > options.max_changes {
             return Err(LixError::new(
                 "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
-                format!(
-                    "v74 schema preflight exceeds configured row bound: {inspected} rows"
-                ),
+                format!("v74 schema preflight exceeds configured row bound: {inspected} rows"),
             ));
         }
         for row in rows.iter() {
@@ -1639,7 +1663,7 @@ fn migration_error(message: impl Into<String>) -> LixError {
 mod tests {
     use super::*;
     use crate::changelog::CommitId;
-    
+
     use crate::storage::{Memory, StorageWrite, WriteOptions};
     use crate::storage_adapter::{PutBatch, PutEntry, StorageValue};
     use crate::tracked_state::TrackedStateRootId;
@@ -1682,8 +1706,8 @@ mod tests {
             adapter.clone(),
             MigrationOptions::default(),
         )
-            .await
-            .expect_err("v75 intentionally has no in-place migration from v69");
+        .await
+        .expect_err("v75 intentionally has no in-place migration from v69");
         assert_eq!(error.code, "LIX_ERROR_MIGRATION_FAILED");
         assert_eq!(
             inspect_lix_with_adapter(&adapter).await.unwrap(),
@@ -1728,12 +1752,10 @@ mod tests {
                 version: CURRENT_FORMAT_VERSION,
             }
         );
-        let engine = crate::engine::Engine::new_with_adapter(
-            adapter,
-            crate::engine::EngineOptions::new(),
-        )
-        .await
-        .expect("migrated repository should open");
+        let engine =
+            crate::engine::Engine::new_with_adapter(adapter, crate::engine::EngineOptions::new())
+                .await
+                .expect("migrated repository should open");
         let session = engine.open_session().await.expect("session should open");
         session
             .execute(
@@ -1748,11 +1770,8 @@ mod tests {
     async fn v73_repository_migrates_through_the_v74_backfill() {
         let storage = Memory::new();
         let (adapter, _branch_id, _head_commit_id, rootless_commit_id, _) =
-            seed_rooted_head_with_rootless_checkpoint_cursor(
-                &storage,
-                REPOSITORY_PROTOCOL_V73,
-            )
-            .await;
+            seed_rooted_head_with_rootless_checkpoint_cursor(&storage, REPOSITORY_PROTOCOL_V73)
+                .await;
         assert_eq!(
             inspect_lix_with_adapter(&adapter).await.unwrap(),
             MigrationStatus::Required {
@@ -1779,15 +1798,12 @@ mod tests {
             );
         }
         assert!(
-            crate::tracked_state::load_commit_state_manifest(
-                &pre_migration,
-                rootless_commit_id,
-            )
-            .await
-            .unwrap()
-            .unwrap()
-            .snapshot_root
-            .is_none()
+            crate::tracked_state::load_commit_state_manifest(&pre_migration, rootless_commit_id,)
+                .await
+                .unwrap()
+                .unwrap()
+                .snapshot_root
+                .is_none()
         );
         pre_migration.finish().unwrap();
         let report = migrate_lix_with_adapter(
@@ -1795,8 +1811,8 @@ mod tests {
             adapter.clone(),
             MigrationOptions::default(),
         )
-            .await
-            .expect("a v73 repository migrates through the v74 backfill to v75");
+        .await
+        .expect("a v73 repository migrates through the v74 backfill to v75");
         assert_eq!(report.from_version, 73);
         assert_eq!(report.to_version, CURRENT_FORMAT_VERSION);
         assert_eq!(
@@ -1843,8 +1859,8 @@ mod tests {
             adapter.clone(),
             MigrationOptions::default(),
         )
-            .await
-            .expect("an interrupted v72 bootstrap resumes through the chain to v75");
+        .await
+        .expect("an interrupted v72 bootstrap resumes through the chain to v75");
         assert_eq!(report.from_version, 72);
         assert_eq!(report.to_version, CURRENT_FORMAT_VERSION);
         assert_eq!(
@@ -1875,8 +1891,8 @@ mod tests {
             adapter.clone(),
             MigrationOptions::default(),
         )
-            .await
-            .expect("an interrupted v74 rewrite resumes to v75");
+        .await
+        .expect("an interrupted v74 rewrite resumes to v75");
         assert_eq!(report.from_version, 74);
         assert_eq!(report.to_version, CURRENT_FORMAT_VERSION);
         assert_eq!(
@@ -1900,8 +1916,8 @@ mod tests {
             adapter.clone(),
             MigrationOptions::default(),
         )
-            .await
-            .expect("an interrupted v72 rewrite resumes through the chain to v75");
+        .await
+        .expect("an interrupted v72 rewrite resumes through the chain to v75");
         assert_eq!(report.from_version, 72);
         assert_eq!(report.to_version, CURRENT_FORMAT_VERSION);
         assert_eq!(
@@ -1946,9 +1962,27 @@ mod tests {
         let b = repair_test_commit(0xB2);
         let c = repair_test_commit(0xC3);
         let mut graph = BTreeMap::new();
-        graph.insert(a, CommitGraphNode { parents: vec![], base: None });
-        graph.insert(b, CommitGraphNode { parents: vec![a], base: None });
-        graph.insert(c, CommitGraphNode { parents: vec![b], base: None });
+        graph.insert(
+            a,
+            CommitGraphNode {
+                parents: vec![],
+                base: None,
+            },
+        );
+        graph.insert(
+            b,
+            CommitGraphNode {
+                parents: vec![a],
+                base: None,
+            },
+        );
+        graph.insert(
+            c,
+            CommitGraphNode {
+                parents: vec![b],
+                base: None,
+            },
+        );
         let mut candidates = BTreeMap::new();
         candidates.insert(
             "d1".to_string(),
@@ -1961,9 +1995,14 @@ mod tests {
         let referenced = BTreeSet::from(["d1".to_string()]);
         let ancestors = commit_ancestors(c, &graph);
 
-        let resolved =
-            resolve_missing_directory_closure(&present, &referenced, &ancestors, &candidates, &graph)
-                .expect("linear versions resolve");
+        let resolved = resolve_missing_directory_closure(
+            &present,
+            &referenced,
+            &ancestors,
+            &candidates,
+            &graph,
+        )
+        .expect("linear versions resolve");
         assert_eq!(
             resolved["d1"].change_id,
             crate::changelog::ChangeId::for_test_label("current-early-clock"),
@@ -1981,10 +2020,34 @@ mod tests {
         let d = repair_test_commit(0xD4);
         let m = repair_test_commit(0xE5);
         let mut graph = BTreeMap::new();
-        graph.insert(a, CommitGraphNode { parents: vec![], base: None });
-        graph.insert(b, CommitGraphNode { parents: vec![a], base: None });
-        graph.insert(d, CommitGraphNode { parents: vec![a], base: None });
-        graph.insert(m, CommitGraphNode { parents: vec![b, d], base: None });
+        graph.insert(
+            a,
+            CommitGraphNode {
+                parents: vec![],
+                base: None,
+            },
+        );
+        graph.insert(
+            b,
+            CommitGraphNode {
+                parents: vec![a],
+                base: None,
+            },
+        );
+        graph.insert(
+            d,
+            CommitGraphNode {
+                parents: vec![a],
+                base: None,
+            },
+        );
+        graph.insert(
+            m,
+            CommitGraphNode {
+                parents: vec![b, d],
+                base: None,
+            },
+        );
         let mut candidates = BTreeMap::new();
         candidates.insert(
             "d1".to_string(),
@@ -1997,9 +2060,14 @@ mod tests {
         let referenced = BTreeSet::from(["d1".to_string()]);
         let ancestors = commit_ancestors(m, &graph);
 
-        let (id, reason) =
-            resolve_missing_directory_closure(&present, &referenced, &ancestors, &candidates, &graph)
-                .expect_err("incomparable merge-ancestor versions must fail closed");
+        let (id, reason) = resolve_missing_directory_closure(
+            &present,
+            &referenced,
+            &ancestors,
+            &candidates,
+            &graph,
+        )
+        .expect_err("incomparable merge-ancestor versions must fail closed");
         assert_eq!(id, "d1");
         assert!(reason.contains("incomparable"), "got reason: {reason}");
     }
@@ -2094,11 +2162,10 @@ mod tests {
             .expect("fixture branch should retain its initial checkpoint cursor");
         assert_ne!(head_commit_id, checkpoint_commit_id);
 
-        let head_manifest =
-            crate::tracked_state::load_commit_state_manifest(&read, head_commit_id)
-                .await
-                .unwrap()
-                .unwrap();
+        let head_manifest = crate::tracked_state::load_commit_state_manifest(&read, head_commit_id)
+            .await
+            .unwrap()
+            .unwrap();
         let head_root_id = head_manifest
             .snapshot_root
             .as_ref()
@@ -2181,5 +2248,4 @@ mod tests {
             head_root_id,
         )
     }
-
 }

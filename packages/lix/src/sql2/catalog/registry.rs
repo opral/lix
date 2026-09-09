@@ -8,20 +8,14 @@ use serde_json::Value as JsonValue;
 use crate::LixError;
 
 use super::{
-    PUBLIC_SCALAR_FUNCTION_NAMES, PublicColumn, PublicHistoryContract, PublicHistoryKind,
-    PublicRelationKind, PublicScalarFunctionContract, PublicSurfaceClass, PublicSurfaceContract,
-    PublicSurfaceKind, SurfaceCapabilities,
+    PUBLIC_SCALAR_FUNCTION_NAMES, PublicColumn, PublicHistoryContract, PublicRelationKind,
+    PublicScalarFunctionContract, PublicSurfaceClass, PublicSurfaceContract, PublicSurfaceKind,
+    SurfaceCapabilities,
 };
 use crate::sql2::catalog::schema_surface_schema;
 use crate::sql2::catalog::{
     SchemaSurfaceShape, SchemaSurfaceSpec, derive_schema_surface_spec_from_schema,
     schema_exposed_as_history_surface, schema_exposed_as_schema_surface,
-};
-use crate::sql2::history_route::{
-    HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT, HISTORY_COL_CHANGE_ID,
-    HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_FILE_ID, HISTORY_COL_IS_DELETED,
-    HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID, HISTORY_COL_ORIGIN_KEY,
-    HISTORY_COL_ROW_PK, HISTORY_COL_SCHEMA_KEY, HISTORY_COL_SOURCE_CHANGES,
 };
 use crate::sql2::result_metadata::{json_field, row_ref_field};
 
@@ -150,9 +144,11 @@ impl PublicCatalog {
                 Field::new("name", DataType::Utf8, false),
                 Field::new("hidden", DataType::Boolean, false),
                 Field::new("commit_id", DataType::Utf8, false),
+                Field::new("working_base_commit_id", DataType::Utf8, true),
                 json_field("lixcol_metadata", true),
             ])),
-            PublicSurfaceKind::HistoryFunction
+            PublicSurfaceKind::LogFunction
+            | PublicSurfaceKind::HistoryFunction
             | PublicSurfaceKind::DiffFunction
             | PublicSurfaceKind::CheckpointFunction
             | PublicSurfaceKind::StateAtFunction
@@ -185,15 +181,18 @@ impl PublicCatalog {
     }
 
     pub(crate) fn history_relation_schema(&self, relation_name: &str) -> Option<SchemaRef> {
-        let history = self.history_relation(relation_name)?;
-        match &history.kind {
-            PublicHistoryKind::File => Some(history_filesystem_schema(true)),
-            PublicHistoryKind::Directory => Some(history_filesystem_schema(false)),
-            PublicHistoryKind::Schema { schema_key } => Some(schema_surface_schema(
-                self.schema_spec(schema_key)?,
-                SchemaSurfaceShape::History,
-            )),
-        }
+        self.history_relation(relation_name)?;
+        crate::sql2::providers::relation_history_schema(self, relation_name).ok()
+    }
+
+    fn history_columns(&self, relation_name: &str) -> Result<Vec<PublicColumn>, LixError> {
+        let schema = crate::sql2::providers::relation_history_schema(self, relation_name)
+            .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+        Ok(schema
+            .fields()
+            .iter()
+            .map(|field| PublicColumn::public_read_only(field.name(), field.is_nullable()))
+            .collect())
     }
 
     fn insert_history(&mut self, mut history: PublicHistoryContract) -> Result<(), LixError> {
@@ -253,6 +252,7 @@ impl PublicCatalog {
                 PublicColumn::public("hidden", false).with_default("FALSE"),
                 PublicColumn::public("commit_id", false)
                     .with_default("lix_active_branch_commit_id()"),
+                PublicColumn::public_read_only("working_base_commit_id", true),
                 PublicColumn::public("lixcol_metadata", true).optional_on_insert(),
             ],
             SurfaceCapabilities::read_write(),
@@ -272,6 +272,13 @@ impl PublicCatalog {
                 ("origin_key", true),
                 ("snapshot_content", true),
             ]),
+            SurfaceCapabilities::read_only(),
+        ))?;
+        self.insert(surface(
+            "lix_log",
+            PublicSurfaceClass::TableFunction,
+            PublicSurfaceKind::LogFunction,
+            Vec::new(),
             SurfaceCapabilities::read_only(),
         ))?;
         self.insert(surface(
@@ -296,7 +303,7 @@ impl PublicCatalog {
             SurfaceCapabilities::read_only(),
         ))?;
         self.insert(surface(
-            "lix_state_at",
+            "lix_as_of",
             PublicSurfaceClass::TableFunction,
             PublicSurfaceKind::StateAtFunction,
             Vec::new(),
@@ -344,13 +351,11 @@ impl PublicCatalog {
         }
         self.insert_history(PublicHistoryContract {
             relation_name: "lix_file".to_string(),
-            kind: PublicHistoryKind::File,
-            columns: file_history_columns(),
+            columns: self.history_columns("lix_file")?,
         })?;
         self.insert_history(PublicHistoryContract {
             relation_name: "lix_directory".to_string(),
-            kind: PublicHistoryKind::Directory,
-            columns: directory_history_columns(),
+            columns: self.history_columns("lix_directory")?,
         })?;
         Ok(())
     }
@@ -405,30 +410,15 @@ impl PublicCatalog {
             capabilities.clone(),
         ))?;
 
+        self.schema_specs
+            .insert(spec.schema_key.clone(), spec.clone());
         if schema_exposed_as_history_surface(&spec.schema_key) {
-            let history_identity_roots = primary_key_roots(&spec);
-            let mut history_columns = spec
-                .columns
-                .iter()
-                .map(|column| {
-                    PublicColumn::public(
-                        column.name.as_str(),
-                        !history_identity_roots.contains(&column.name),
-                    )
-                })
-                .collect::<Vec<_>>();
-            history_columns.extend(row_history_system_columns());
-
             self.insert_history(PublicHistoryContract {
                 relation_name: spec.schema_key.clone(),
-                kind: PublicHistoryKind::Schema {
-                    schema_key: spec.schema_key.clone(),
-                },
-                columns: history_columns,
+                columns: self.history_columns(&spec.schema_key)?,
             })?;
         }
 
-        self.schema_specs.insert(spec.schema_key.clone(), spec);
         Ok(())
     }
 }
@@ -460,35 +450,6 @@ fn filesystem_schema(include_data: bool) -> SchemaRef {
         Field::new("lixcol_commit_id", DataType::Utf8, true),
         Field::new("lixcol_untracked", DataType::Boolean, true),
         json_field("lixcol_metadata", true),
-    ]);
-    Arc::new(Schema::new(fields))
-}
-
-fn history_filesystem_schema(include_data: bool) -> SchemaRef {
-    let mut fields = if include_data {
-        vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("path", DataType::Utf8, true),
-            Field::new("directory_id", DataType::Utf8, true),
-            Field::new("name", DataType::Utf8, true),
-            Field::new("content", DataType::LargeBinary, true),
-        ]
-    } else {
-        vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("path", DataType::Utf8, true),
-            Field::new("parent_id", DataType::Utf8, true),
-            Field::new("name", DataType::Utf8, true),
-        ]
-    };
-    fields.extend([
-        row_ref_field(HISTORY_COL_ROW_PK, false),
-        json_field(HISTORY_COL_SOURCE_CHANGES, false),
-        Field::new(HISTORY_COL_OBSERVED_COMMIT_ID, DataType::Utf8, false),
-        Field::new(HISTORY_COL_COMMIT_CREATED_AT, DataType::Utf8, false),
-        Field::new(HISTORY_COL_AS_OF_COMMIT_ID, DataType::Utf8, false),
-        Field::new(HISTORY_COL_DEPTH, DataType::Int64, false),
-        Field::new(HISTORY_COL_IS_DELETED, DataType::Boolean, false),
     ]);
     Arc::new(Schema::new(fields))
 }
@@ -593,8 +554,10 @@ fn filesystem_system_columns() -> Vec<PublicColumn> {
     ]
 }
 
-fn row_system_columns(_spec: &SchemaSurfaceSpec, variant: SchemaSurfaceShape) -> Vec<PublicColumn> {
-    debug_assert_ne!(variant, SchemaSurfaceShape::History);
+fn row_system_columns(
+    _spec: &SchemaSurfaceSpec,
+    _variant: SchemaSurfaceShape,
+) -> Vec<PublicColumn> {
     vec![
         PublicColumn::public_read_only("lixcol_schema_key", false),
         PublicColumn::public_insert_only("lixcol_file_id", true).optional_on_insert(),
@@ -608,69 +571,6 @@ fn row_system_columns(_spec: &SchemaSurfaceSpec, variant: SchemaSurfaceShape) ->
     ]
 }
 
-fn row_history_system_columns() -> Vec<PublicColumn> {
-    history_columns([
-        (HISTORY_COL_ROW_PK, false),
-        (HISTORY_COL_SCHEMA_KEY, false),
-        (HISTORY_COL_FILE_ID, true),
-        (HISTORY_COL_METADATA, true),
-        (HISTORY_COL_CHANGE_ID, false),
-        (HISTORY_COL_CHANGE_CREATED_AT, false),
-        (HISTORY_COL_ORIGIN_KEY, true),
-        (HISTORY_COL_OBSERVED_COMMIT_ID, false),
-        (HISTORY_COL_COMMIT_CREATED_AT, false),
-        (HISTORY_COL_AS_OF_COMMIT_ID, false),
-        (HISTORY_COL_DEPTH, false),
-        (HISTORY_COL_IS_DELETED, false),
-    ])
-}
-
-fn file_history_columns() -> Vec<PublicColumn> {
-    history_columns([
-        ("id", false),
-        ("path", true),
-        ("directory_id", true),
-        ("name", true),
-        ("content", true),
-        (HISTORY_COL_ROW_PK, false),
-        (HISTORY_COL_SOURCE_CHANGES, false),
-        (HISTORY_COL_OBSERVED_COMMIT_ID, false),
-        (HISTORY_COL_COMMIT_CREATED_AT, false),
-        (HISTORY_COL_AS_OF_COMMIT_ID, false),
-        (HISTORY_COL_DEPTH, false),
-        (HISTORY_COL_IS_DELETED, false),
-    ])
-}
-
-fn directory_history_columns() -> Vec<PublicColumn> {
-    history_columns([
-        ("id", false),
-        ("path", true),
-        ("parent_id", true),
-        ("name", true),
-        (HISTORY_COL_ROW_PK, false),
-        (HISTORY_COL_SOURCE_CHANGES, false),
-        (HISTORY_COL_OBSERVED_COMMIT_ID, false),
-        (HISTORY_COL_COMMIT_CREATED_AT, false),
-        (HISTORY_COL_AS_OF_COMMIT_ID, false),
-        (HISTORY_COL_DEPTH, false),
-        (HISTORY_COL_IS_DELETED, false),
-    ])
-}
-
-fn history_columns<const N: usize>(columns: [(&str, bool); N]) -> Vec<PublicColumn> {
-    columns
-        .into_iter()
-        .map(|(name, nullable)| {
-            if name == HISTORY_COL_AS_OF_COMMIT_ID {
-                PublicColumn::hidden(name, nullable)
-            } else {
-                PublicColumn::public_read_only(name, nullable)
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -680,13 +580,6 @@ mod tests {
     use super::{PublicCatalog, PublicSurfaceKind};
     use crate::LixError;
     use crate::sql2::catalog::TRACKED_ROW_SYSTEM_COLUMN_NAMES;
-    use crate::sql2::history_route::{
-        HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT, HISTORY_COL_CHANGE_ID,
-        HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_FILE_ID,
-        HISTORY_COL_IS_DELETED, HISTORY_COL_METADATA, HISTORY_COL_OBSERVED_COMMIT_ID,
-        HISTORY_COL_ORIGIN_KEY, HISTORY_COL_ROW_PK, HISTORY_COL_SCHEMA_KEY,
-        HISTORY_COL_SOURCE_CHANGES,
-    };
 
     #[test]
     fn lixcol_names_are_reserved_for_system_metadata() {
@@ -731,19 +624,11 @@ mod tests {
         }
 
         let history_system = [
-            HISTORY_COL_ROW_PK,
-            HISTORY_COL_SCHEMA_KEY,
-            HISTORY_COL_FILE_ID,
-            HISTORY_COL_METADATA,
-            HISTORY_COL_CHANGE_ID,
-            HISTORY_COL_CHANGE_CREATED_AT,
-            HISTORY_COL_SOURCE_CHANGES,
-            HISTORY_COL_ORIGIN_KEY,
-            HISTORY_COL_OBSERVED_COMMIT_ID,
-            HISTORY_COL_COMMIT_CREATED_AT,
-            HISTORY_COL_AS_OF_COMMIT_ID,
-            HISTORY_COL_DEPTH,
-            HISTORY_COL_IS_DELETED,
+            "lixcol_from_commit_id",
+            "lixcol_to_commit_id",
+            "lixcol_commit_created_at",
+            "lixcol_commit_is_checkpoint",
+            "lixcol_position",
         ];
         assert!(
             history_system
@@ -757,7 +642,7 @@ mod tests {
                 .columns
                 .iter()
                 .map(|column| column.name.as_str())
-                .filter(|name| name.contains("lixcol_"))
+                .filter(|name| name.starts_with("lixcol_"))
                 .collect::<Vec<_>>();
             let lixcol_names = lixcol_columns.iter().copied().collect::<BTreeSet<_>>();
             assert_eq!(

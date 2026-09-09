@@ -1003,6 +1003,10 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .uri("/lix/v1/")
                     .body(Body::empty())
                     .expect("unscoped request"),
@@ -1015,6 +1019,10 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .uri("/lixes/11111111-1111-4111-8111-111111111111/lix/v1/")
                     .body(Body::empty())
                     .expect("legacy request"),
@@ -1026,6 +1034,10 @@ mod tests {
         let handshake = app
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .uri("/lix/v1/11111111-1111-4111-8111-111111111111/")
                     .body(Body::empty())
                     .expect("handshake request"),
@@ -1060,6 +1072,10 @@ mod tests {
             .await
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .uri("/lix/v1/11111111-1111-4111-8111-111111111111/snapshot")
                     .header(
                         header::AUTHORIZATION,
@@ -1106,6 +1122,10 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .uri("/lix/v1/not-a-uuid/snapshot")
                     .body(Body::empty())
                     .expect("malformed target request"),
@@ -1125,6 +1145,10 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .uri("/lix/v1/22222222-2222-4222-8222-222222222222/")
                     .header(
                         header::AUTHORIZATION,
@@ -1145,6 +1169,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER, lix_sdk::server_protocol::PROTOCOL_VERSION)
                     .method("POST")
                     .uri("/lix/v1/22222222-2222-4222-8222-222222222222/execute")
                     .header(server_protocol::SESSION_ID_HEADER, session_id)
@@ -1170,6 +1195,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER, lix_sdk::server_protocol::PROTOCOL_VERSION)
                     .method("POST")
                     .uri("/lix/v1/22222222-2222-4222-8222-222222222222/execute")
                     .header(server_protocol::SESSION_ID_HEADER, session_id)
@@ -1192,6 +1218,10 @@ mod tests {
         let cross_account = app
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .uri("/lix/v1/22222222-2222-4222-8222-222222222222/")
                     .header(server_protocol::SESSION_ID_HEADER, session_id)
                     .header(
@@ -1218,6 +1248,10 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .uri("/lix/v1/33333333-3333-4333-8333-333333333333/")
                     .body(Body::empty())
                     .expect("handshake request"),
@@ -1237,6 +1271,10 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .method("POST")
                     .uri("/lix/v1/33333333-3333-4333-8333-333333333333/execute")
                     .header(server_protocol::SESSION_ID_HEADER, session_id)
@@ -1258,6 +1296,10 @@ mod tests {
             .await
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .uri("/healthz")
                     .body(Body::empty())
                     .expect("health request"),
@@ -1292,6 +1334,10 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .uri("/lix/v1/11111111-1111-4111-8111-111111111111/")
                     .body(Body::empty())
                     .expect("unauthorized request"),
@@ -1310,6 +1356,10 @@ mod tests {
         let authorized = app
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .uri("/lix/v1/11111111-1111-4111-8111-111111111111/")
                     .header(header::AUTHORIZATION, "Bearer secret")
                     .body(Body::empty())
@@ -1328,6 +1378,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER, lix_sdk::server_protocol::PROTOCOL_VERSION)
                     .method("POST")
                     .uri("/lix/v1/11111111-1111-4111-8111-111111111111/execute")
                     .header(
@@ -1360,6 +1411,7 @@ mod tests {
                 .clone()
                 .oneshot(
                     Request::builder()
+                    .header(lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER, lix_sdk::server_protocol::PROTOCOL_VERSION)
                         .method("POST")
                         .uri(format!(
                             "/lix/v1/{lix_id}/execute"
@@ -1499,6 +1551,10 @@ mod tests {
             .await
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .uri("/lix/v1/contains%20space/")
                     .body(Body::empty())
                     .expect("unsafe request"),
@@ -1664,6 +1720,10 @@ mod tests {
     #[test]
     fn trusted_principal_is_removed_from_headers_before_protocol_dispatch() {
         let mut request = Request::builder()
+            .header(
+                lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                lix_sdk::server_protocol::PROTOCOL_VERSION,
+            )
             .header(TRUSTED_ACCOUNT_ID_HEADER, "user-123")
             .header(TRUSTED_IDEMPOTENCY_SCOPE_HEADER, "provider:user-123")
             .body(Body::empty())
@@ -1687,6 +1747,10 @@ mod tests {
     #[test]
     fn trusted_principal_is_rejected_without_internal_auth() {
         let mut request = Request::builder()
+            .header(
+                lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                lix_sdk::server_protocol::PROTOCOL_VERSION,
+            )
             .header(TRUSTED_ACCOUNT_ID_HEADER, "user-123")
             .body(Body::empty())
             .expect("untrusted principal request");
@@ -1705,6 +1769,10 @@ mod tests {
             .await
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .uri("/lix/v1/11111111-1111-4111-8111-111111111111?activeAccountId=spoofed")
                     .body(Body::empty())
                     .expect("handshake request"),
@@ -1819,6 +1887,10 @@ mod tests {
     ) -> Response {
         app.oneshot(
             Request::builder()
+                .header(
+                    lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                    lix_sdk::server_protocol::PROTOCOL_VERSION,
+                )
                 .method("POST")
                 .uri(format!("/lix/v1/{lix_id}/execute"))
                 .header(server_protocol::SESSION_ID_HEADER, session_id)
@@ -1869,6 +1941,10 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .uri(format!("/lix/v1/{lix_id}/"))
                     .body(Body::empty())
                     .expect("protocol handshake request"),

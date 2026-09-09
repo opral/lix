@@ -207,7 +207,13 @@ simulation_test!(
             .await
             .unwrap();
         assert_eq!(draft.execute("SELECT schema_key FROM lix_registered_schema WHERE schema_key = 'shared_catalog'", &[]).await.unwrap().len(), 1, "refreshed schema must be visible before any local write");
-        draft.execute("INSERT INTO shared_catalog (id, extra) VALUES ('probe', 'before-local-write')", &[]).await.expect("refreshed inherited schema validates before another local write");
+        draft
+            .execute(
+                "INSERT INTO shared_catalog (id, extra) VALUES ('probe', 'before-local-write')",
+                &[],
+            )
+            .await
+            .expect("refreshed inherited schema validates before another local write");
         draft
             .execute(
                 "INSERT INTO overridden_catalog (id, extra) VALUES ('local', 'local-column')",
@@ -1367,7 +1373,7 @@ simulation_test!(
             .expect("draft checkpoint should succeed");
         assert_eq!(
             main.execute(
-                "SELECT commit_id FROM lix_checkpoint WHERE commit_id = $1",
+                "SELECT id AS commit_id FROM lix_commit WHERE is_checkpoint AND id = $1",
                 &[Value::Text(checkpoint.commit_id.clone())],
             )
             .await
@@ -1375,7 +1381,7 @@ simulation_test!(
             .rows()[0]
                 .values(),
             &[Value::Text(checkpoint.commit_id.clone())],
-            "a checkpoint is a global row inherited by every branch"
+            "checkpoint metadata is visible from every branch"
         );
 
         let receipt = main
@@ -1398,7 +1404,7 @@ simulation_test!(
 
         let checkpoints = main
             .execute(
-                "SELECT commit_id FROM lix_checkpoint WHERE commit_id = $1",
+                "SELECT id AS commit_id FROM lix_commit WHERE is_checkpoint AND id = $1",
                 &[Value::Text(checkpoint.commit_id.clone())],
             )
             .await
@@ -1663,10 +1669,10 @@ simulation_test!(
 
         let history = main
             .execute(
-                "SELECT value \
+                "SELECT to_value \
 	             FROM lix_history('lix_key_value') \
 	               WHERE key = 'merge-select-change' \
-	             ORDER BY lixcol_depth",
+	             ORDER BY lixcol_position",
                 &[],
             )
             .await
@@ -2315,36 +2321,20 @@ async fn commit_parent_edges(
         .enumerate()
         .map(|(order, parent)| {
             (
-                parent.as_str().expect("parent id should be text").to_owned(),
+                parent
+                    .as_str()
+                    .expect("parent id should be text")
+                    .to_owned(),
                 i64::try_from(order).expect("parent order should fit an integer"),
             )
         })
         .collect()
 }
 
-async fn key_value_diff_relation(session: &support::simulation_test::engine::SimSession) -> String {
-    let checkpoint = session
-        .execute(
-            "SELECT checkpoint.commit_id \
-             FROM lix_checkpoint AS checkpoint \
-             JOIN lix_commit_ancestry() AS ancestry \
-               ON ancestry.commit_id = checkpoint.commit_id \
-             ORDER BY ancestry.depth LIMIT 1",
-            &[],
-        )
-        .await
-        .expect("latest checkpoint should resolve")
-        .rows()[0]
-        .get::<String>("commit_id")
-        .expect("checkpoint commit ID should decode");
-    let head = session
-        .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
-        .await
-        .expect("active head should resolve")
-        .rows()[0]
-        .get::<String>("commit_id")
-        .expect("active head commit ID should decode");
-    format!("lix_diff('lix_key_value', '{checkpoint}', '{head}')")
+async fn key_value_diff_relation(
+    _session: &support::simulation_test::engine::SimSession,
+) -> String {
+    "lix_diff('lix_key_value')".to_owned()
 }
 
 async fn assert_empty_merge_commit(
@@ -2891,10 +2881,7 @@ simulation_test!(
         assert_key_value(&draft, "branch-checkpoint", Some("\"after\"")).await;
         let rows = draft
             .execute(
-                &format!(
-                    "SELECT key FROM {}",
-                    key_value_diff_relation(&draft).await
-                ),
+                &format!("SELECT key FROM {}", key_value_diff_relation(&draft).await),
                 &[],
             )
             .await

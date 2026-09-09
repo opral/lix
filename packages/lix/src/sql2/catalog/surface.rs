@@ -40,11 +40,10 @@ pub(crate) struct PublicScalarFunctionContract {
     pub(crate) class: PublicSurfaceClass,
 }
 
-pub(crate) const PUBLIC_SCALAR_FUNCTION_NAMES: [&str; 7] = [
+pub(crate) const PUBLIC_SCALAR_FUNCTION_NAMES: [&str; 6] = [
     "lix_active_account_id",
     "lix_active_branch_commit_id",
     "lix_active_branch_id",
-    "lix_latest_checkpoint_commit_id",
     "lix_root_commit_id",
     "lix_row_ref",
     "uuidv7",
@@ -53,15 +52,7 @@ pub(crate) const PUBLIC_SCALAR_FUNCTION_NAMES: [&str; 7] = [
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PublicHistoryContract {
     pub(crate) relation_name: String,
-    pub(crate) kind: PublicHistoryKind,
     pub(crate) columns: Vec<PublicColumn>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum PublicHistoryKind {
-    Schema { schema_key: String },
-    File,
-    Directory,
 }
 
 impl PublicSurfaceContract {
@@ -84,6 +75,7 @@ pub(crate) enum PublicSurfaceKind {
     File,
     Directory,
     Branch,
+    LogFunction,
     HistoryFunction,
     DiffFunction,
     CheckpointFunction,
@@ -103,7 +95,8 @@ impl PublicSurfaceKind {
             | Self::Directory
             | Self::Branch
             | Self::Change => matches!(class, PublicSurfaceClass::Relation(_)),
-            Self::HistoryFunction
+            Self::LogFunction
+            | Self::HistoryFunction
             | Self::DiffFunction
             | Self::CheckpointFunction
             | Self::StateAtFunction

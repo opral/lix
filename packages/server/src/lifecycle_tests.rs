@@ -21,6 +21,10 @@ fn empty_host() -> (Arc<LixRuntimeManager>, Router) {
 }
 async fn create(app: &Router, key: &str, snapshot: Option<Vec<u8>>) -> (StatusCode, Value) {
     let mut request = Request::builder()
+        .header(
+            lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+            lix_sdk::server_protocol::PROTOCOL_VERSION,
+        )
         .method("POST")
         .uri("/lix/v1")
         .header("idempotency-key", key);
@@ -50,6 +54,10 @@ async fn lifecycle_create_retry_delete_and_missing_open() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(
+                    lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                    lix_sdk::server_protocol::PROTOCOL_VERSION,
+                )
                 .uri("/lix/v1/11111111-1111-4111-8111-111111111111")
                 .body(Body::empty())
                 .unwrap(),
@@ -68,6 +76,10 @@ async fn lifecycle_create_retry_delete_and_missing_open() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(
+                    lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                    lix_sdk::server_protocol::PROTOCOL_VERSION,
+                )
                 .uri(format!("/lix/v1/{id}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -80,6 +92,10 @@ async fn lifecycle_create_retry_delete_and_missing_open() {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(
+                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .method("DELETE")
                     .uri(format!("/lix/v1/{id}"))
                     .body(Body::empty())
@@ -93,6 +109,10 @@ async fn lifecycle_create_retry_delete_and_missing_open() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(
+                    lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                    lix_sdk::server_protocol::PROTOCOL_VERSION,
+                )
                 .uri(format!("/lix/v1/{id}"))
                 .body(Body::empty())
                 .unwrap(),
@@ -143,6 +163,10 @@ async fn lifecycle_snapshot_import_rejects_corruption_and_retries() {
     let response = protected
         .oneshot(
             Request::builder()
+                .header(
+                    lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                    lix_sdk::server_protocol::PROTOCOL_VERSION,
+                )
                 .uri(format!("/lix/v1/{id}/snapshot"))
                 .header("authorization", "Bearer test-token")
                 .header("x-lix-account-id", "01920000-0000-7000-8000-000000000601")

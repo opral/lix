@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Breaking:** checkpoint membership is immutable commit metadata (`is_checkpoint`), replacing the `lix_checkpoint` relation and marker writes. Repository migration preserves existing checkpoint IDs and inventory. Upgrade clients and synchronization peers together.
+- **Breaking:** `lix_history(relation [, anchor])` now returns first-parent endpoint differences with change kinds, before/after columns, endpoint commit IDs, checkpoint membership, and position. `lix_log([anchor])` lists retained mainline commits, including empty checkpoints.
+- **Breaking:** rename `lix_state_at` to `lix_as_of` and remove `lix_latest_checkpoint_commit_id`. Use filtered log queries for checkpoints and `lix_branch.working_base_commit_id` for working comparison context.
+- Diff results expose their actual endpoint commit IDs. Checkpoint creation no longer emits a separate source record; global checkpoint metrics use `lix_commit WHERE is_checkpoint` and commit creation time.
+
 ### Breaking
 
 - Unify repository opening around storage and server connections. Server-only opening executes remotely; explicit storage plus server selects synchronization. Remove the mode option and its types without compatibility aliases.

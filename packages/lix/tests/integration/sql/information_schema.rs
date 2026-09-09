@@ -20,7 +20,7 @@ simulation_test!(
              FROM information_schema.lix_surfaces \
              WHERE surface_name IN (\
                'lix_active_branch_id', 'lix_create_checkpoint', 'lix_diff',\
-               'lix_file', 'lix_latest_checkpoint_commit_id', \
+               'lix_file', 'lix_log', \
                'lix_restore', 'lix_root_commit_id'\
              ) \
              ORDER BY surface_name",
@@ -65,8 +65,8 @@ simulation_test!(
                     Value::Boolean(false),
                 ],
                 vec![
-                    Value::Text("lix_latest_checkpoint_commit_id".to_string()),
-                    Value::Text("SCALAR_FUNCTION".to_string()),
+                    Value::Text("lix_log".to_string()),
+                    Value::Text("TABLE_FUNCTION".to_string()),
                     Value::Null,
                     Value::Boolean(true),
                     Value::Boolean(false),
@@ -831,7 +831,7 @@ simulation_test!(
                  FROM information_schema.table_functions \
                  WHERE function_name = 'lix_history' \
                    AND source_relation = 'engine_column_contract' \
-                   AND result_column IN ('id', 'title') \
+                   AND result_column IN ('id', 'to_title') \
                  ORDER BY result_column",
                 &[],
             )
@@ -842,7 +842,7 @@ simulation_test!(
             vec![
                 vec![Value::Text("id".to_string()), Value::Text("NO".to_string())],
                 vec![
-                    Value::Text("title".to_string()),
+                    Value::Text("to_title".to_string()),
                     Value::Text("YES".to_string()),
                 ],
             ],
@@ -1578,7 +1578,7 @@ simulation_test!(
             .expect("seed insert should succeed");
         session
             .execute(
-                 "INSERT INTO engine_excluded_typed_default (id) VALUES ('same') \
+                "INSERT INTO engine_excluded_typed_default (id) VALUES ('same') \
                  ON CONFLICT (id) DO UPDATE \
                  SET mirror = excluded.status, \
                      identity_copy = CAST('\"same\"' AS JSONB)",
@@ -1825,7 +1825,7 @@ simulation_test!(
         assert_rows_eq(
             session
                 .execute(
-                    "SELECT count FROM lix_history('engine_bigint_contract') \
+                    "SELECT to_count FROM lix_history('engine_bigint_contract') \
                        WHERE id = 'integral-real'",
                     &[],
                 )

@@ -85,7 +85,8 @@ fn is_certified_hot_surface(
             !matches!(surface.name.as_str(), "lix_checkpoint" | "lix_commit")
         }
         PublicSurfaceKind::DiffFunction => argument_count == Some(1),
-        PublicSurfaceKind::HistoryFunction
+        PublicSurfaceKind::LogFunction
+        | PublicSurfaceKind::HistoryFunction
         | PublicSurfaceKind::CheckpointFunction
         | PublicSurfaceKind::StateAtFunction
         | PublicSurfaceKind::CommitAncestryFunction
@@ -123,10 +124,10 @@ mod tests {
     fn routes_history_and_mutations_to_the_authority() {
         for sql in [
             "SELECT * FROM lix_change",
-            "SELECT * FROM lix_checkpoint",
+            "SELECT * FROM lix_log()",
             "SELECT * FROM lix_commit",
             "SELECT * FROM lix_history('lix_file')",
-            "SELECT * FROM lix_state_at('lix_file', $1)",
+            "SELECT * FROM lix_as_of('lix_file', $1)",
             "SELECT * FROM lix_diff('lix_file', $1, $2)",
             "SELECT * FROM lix_commit_ancestry($1)",
         ] {
@@ -145,7 +146,8 @@ mod tests {
     fn every_fixed_catalog_surface_has_explicit_ownership() {
         for surface in PublicCatalog::fixed_system().surfaces() {
             let argument_count = match surface.kind {
-                PublicSurfaceKind::HistoryFunction
+                PublicSurfaceKind::LogFunction
+                | PublicSurfaceKind::HistoryFunction
                 | PublicSurfaceKind::DiffFunction
                 | PublicSurfaceKind::CheckpointFunction
                 | PublicSurfaceKind::StateAtFunction

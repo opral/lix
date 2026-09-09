@@ -90,6 +90,11 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
         "gc.commit_retirement_intent.v1",
         ValueSemantics::Mutable,
     ),
+    StorageSpace::declare(
+        StorageSpaceId(0x0008_0009),
+        "checkpoint.inventory.v1",
+        ValueSemantics::Mutable,
+    ),
     crate::storage_adapter::REPOSITORY_EPOCH_SPACE,
 ];
 
@@ -159,6 +164,11 @@ pub(crate) const SNAPSHOT_STORAGE_SPACES: &[StorageSpace] = &[
     StorageSpace::declare(
         StorageSpaceId(0x0008_0008),
         "gc.commit_retirement_intent.v1",
+        ValueSemantics::Mutable,
+    ),
+    StorageSpace::declare(
+        StorageSpaceId(0x0008_0009),
+        "checkpoint.inventory.v1",
         ValueSemantics::Mutable,
     ),
 ];
@@ -237,10 +247,7 @@ pub(crate) const RETIRED_STORAGE_SPACES: &[RetiredStorageSpace] = &[
     retired(0x0002_0002, "json_store.untracked_reclaim_candidate.v1"),
     retired(0x0004_0005, "live_state.index.branch_root.v1"),
     retired(0x0004_001f, "hot_state.certified_row_batch.v1"),
-    retired(
-        0x0004_0021,
-        "hot_state.certified_row_batch_manifest.v2",
-    ),
+    retired(0x0004_0021, "hot_state.certified_row_batch_manifest.v2"),
     retired(0x0004_0022, "hot_state.certified_row_batch_page.v1"),
     retired(0x0004_0026, "plugin.current_checkpoint.v2"),
     retired(0x0008_0003, "gc.reachability_delta.v1"),
@@ -365,12 +372,16 @@ mod tests {
 
     #[test]
     fn snapshot_and_retired_space_registries_are_permanent_and_disjoint() {
-        assert!(SNAPSHOT_STORAGE_SPACES
-            .windows(2)
-            .all(|pair| pair[0].id.0 < pair[1].id.0));
-        assert!(RETIRED_STORAGE_SPACES
-            .windows(2)
-            .all(|pair| pair[0].space.id.0 < pair[1].space.id.0));
+        assert!(
+            SNAPSHOT_STORAGE_SPACES
+                .windows(2)
+                .all(|pair| pair[0].id.0 < pair[1].id.0)
+        );
+        assert!(
+            RETIRED_STORAGE_SPACES
+                .windows(2)
+                .all(|pair| pair[0].space.id.0 < pair[1].space.id.0)
+        );
 
         for retired in RETIRED_STORAGE_SPACES {
             assert_eq!(retired.space.value_semantics, ValueSemantics::Mutable);
@@ -458,7 +469,11 @@ mod tests {
         let registered = ALL_STORAGE_SPACES
             .iter()
             .map(|space| space.id.0)
-            .chain(RETIRED_STORAGE_SPACES.iter().map(|retired| retired.space.id.0))
+            .chain(
+                RETIRED_STORAGE_SPACES
+                    .iter()
+                    .map(|retired| retired.space.id.0),
+            )
             .chain(TEST_ONLY_SPACE_IDS.iter().copied())
             .collect::<std::collections::BTreeSet<_>>();
         let mut unregistered = Vec::new();
@@ -636,6 +651,7 @@ mod tests {
             crate::gc::CHECKPOINT_RECOVERY_REF_SPACE,
             crate::gc::CHECKPOINT_GC_STATE_SPACE,
             crate::gc::COMMIT_RETIREMENT_INTENT_SPACE,
+            crate::checkpoint::CHECKPOINT_INVENTORY_SPACE,
         ] {
             let row = ALL_STORAGE_SPACES
                 .iter()

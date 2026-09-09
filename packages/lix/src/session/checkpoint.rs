@@ -14,8 +14,6 @@ use super::context::SessionContext;
 pub(crate) struct CreateCheckpointReceipt {
     /// Commit containing the branch state captured by this checkpoint.
     pub commit_id: String,
-    /// Logical change that published the repository-global checkpoint row.
-    pub change_id: String,
 }
 
 /// Reclaim when the estimated retirable set reaches this fraction of the live
@@ -53,71 +51,54 @@ where
             )
         })?;
         let commit_id = checkpoint_row.get::<String>("commit_id")?;
-        let marker = self
-            .execute(
-                "SELECT lixcol_change_id FROM lix_checkpoint WHERE commit_id = $1",
-                &[crate::Value::Text(commit_id.clone())],
-            )
-            .await?;
-        let marker_row = marker.rows().first().ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "checkpoint SQL function published no checkpoint marker",
-            )
-        })?;
-        let change_id = marker_row.get::<String>("lixcol_change_id")?;
-        Ok(CreateCheckpointReceipt {
-            commit_id,
-            change_id,
-        })
+        Ok(CreateCheckpointReceipt { commit_id })
     }
 
     /// Consumes the post-commit checkpoint effect published by the transaction
     /// planner. Every checkpoint entry point, including explicit transactions
     /// and remote SQL, reaches this hook after durability.
-    pub(super) async fn schedule_checkpoint_gc_after_commit(
-        &self,
-        checkpoint_sequence: u64,
-    ) {
+    pub(super) async fn schedule_checkpoint_gc_after_commit(&self, checkpoint_sequence: u64) {
         #[cfg(test)]
         self.commit_coordinator
             .record_checkpoint_gc_post_commit_hook();
         let result = async {
-        let read = SharedStorageAdapterRead::new(
-            self.storage.begin_read(StorageReadOptions::default()).await?,
-        );
-        let gc_state = load_checkpoint_gc_state(&read).await?;
-        if gc_state.checkpoint_sequence < checkpoint_sequence {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "committed checkpoint GC sequence is not visible after commit",
-            ));
-        }
-        if checkpoint_gc_due(gc_state)?
-            && self
-                .commit_coordinator
-                .try_begin_checkpoint_gc(gc_state.checkpoint_sequence)
-        {
-            // GC debt is durable in the checkpoint transaction. The sweep is
-            // therefore safely retryable and does not need to delay the user
-            // checkpoint. A clone shares the same storage and collaboration
-            // coordinator. Concurrent schedules coalesce, and only the first
-            // one that still sees debt performs work. Repository-scale GC
-            // planning runs without the foreground session gate; its prepared
-            // commit relies on storage conflict detection.
-            let gc_session = self.clone();
-            let gc_coordinator = self.commit_coordinator.clone();
-            if let Err(error) =
-                crate::background_task::spawn("lix-checkpoint-gc", move || async move {
-                    gc_session.collect_checkpoint_garbage_best_effort().await;
-                    gc_coordinator.finish_checkpoint_gc();
-                })
-            {
-                self.commit_coordinator.finish_checkpoint_gc();
-                return Err(error);
+            let read = SharedStorageAdapterRead::new(
+                self.storage
+                    .begin_read(StorageReadOptions::default())
+                    .await?,
+            );
+            let gc_state = load_checkpoint_gc_state(&read).await?;
+            if gc_state.checkpoint_sequence < checkpoint_sequence {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "committed checkpoint GC sequence is not visible after commit",
+                ));
             }
-        }
-        Ok::<_, LixError>(())
+            if checkpoint_gc_due(gc_state)?
+                && self
+                    .commit_coordinator
+                    .try_begin_checkpoint_gc(gc_state.checkpoint_sequence)
+            {
+                // GC debt is durable in the checkpoint transaction. The sweep is
+                // therefore safely retryable and does not need to delay the user
+                // checkpoint. A clone shares the same storage and collaboration
+                // coordinator. Concurrent schedules coalesce, and only the first
+                // one that still sees debt performs work. Repository-scale GC
+                // planning runs without the foreground session gate; its prepared
+                // commit relies on storage conflict detection.
+                let gc_session = self.clone();
+                let gc_coordinator = self.commit_coordinator.clone();
+                if let Err(error) =
+                    crate::background_task::spawn("lix-checkpoint-gc", move || async move {
+                        gc_session.collect_checkpoint_garbage_best_effort().await;
+                        gc_coordinator.finish_checkpoint_gc();
+                    })
+                {
+                    self.commit_coordinator.finish_checkpoint_gc();
+                    return Err(error);
+                }
+            }
+            Ok::<_, LixError>(())
         }
         .await;
         if let Err(error) = result {
@@ -269,10 +250,7 @@ mod tests {
         let engine = crate::engine::Engine::new(storage)
             .await
             .expect("repository opens");
-        let session = engine
-            .open_session()
-            .await
-            .expect("session opens");
+        let session = engine.open_session().await.expect("session opens");
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) VALUES ('gc-hook', 'working')",

@@ -222,9 +222,9 @@ mod tests {
         let expected = vec![
             "lix_account",
             "lix_apply",
+            "lix_as_of",
             "lix_branch",
             "lix_change",
-            "lix_checkpoint",
             "lix_commit",
             "lix_commit_ancestry",
             "lix_create_checkpoint",
@@ -233,10 +233,10 @@ mod tests {
             "lix_file",
             "lix_history",
             "lix_key_value",
+            "lix_log",
             "lix_registered_schema",
             "lix_restore",
             "lix_revert",
-            "lix_state_at",
         ];
 
         assert_eq!(actual, expected);
@@ -252,7 +252,7 @@ mod tests {
         for surface_name in [
             "lix_key_value",
             "lix_registered_schema",
-            "lix_checkpoint",
+            "lix_log",
             "lix_history",
         ] {
             assert!(
@@ -260,13 +260,14 @@ mod tests {
                 "{surface_name} should remain public"
             );
         }
-        for relation_name in ["lix_key_value", "lix_registered_schema", "lix_checkpoint"] {
+        for relation_name in ["lix_key_value", "lix_registered_schema"] {
             assert!(
                 catalog.history_relation(relation_name).is_some(),
                 "{relation_name} should support lix_history"
             );
         }
         for surface_name in [
+            "lix_checkpoint",
             "lix_key_value_by_branch",
             "lix_registered_schema_by_branch",
             "lix_working_diff_by_branch",
@@ -335,7 +336,7 @@ mod tests {
             history
                 .columns
                 .iter()
-                .any(|column| { column.name == "lixcol_row_ref" && column.is_public() })
+                .any(|column| { column.name == "row_ref" && column.is_public() })
         );
         assert!(
             !history

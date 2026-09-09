@@ -12,10 +12,10 @@ Lix exposes logical application data through typed SQL relations:
 | Files                           | `lix_file`                   | `lix_history('lix_file')`                   |
 | Directories                     | `lix_directory`              | `lix_history('lix_directory')`              |
 | Relation diffs                  | One row per changed relation row | `lix_diff(relation, from_commit, to_commit)` |
-| Checkpoints                     | `lix_checkpoint`             | `lix_history('lix_checkpoint')` for row-authorship history |
+| Checkpoints | `lix_commit WHERE is_checkpoint` | `lix_log()` filtered by `is_checkpoint` |
 | Commit graph                    | `lix_commit.parent_commit_ids` | `lix_commit_ancestry()` for active-head reachability |
 
-The history functions read row revisions reachable from a commit;
+History reads endpoint differences along a commit’s first-parent chain;
 `lix_commit_ancestry()` reads the reachable commit set, and `lix_diff` compares
 one relation across two arbitrary commits. `lix_registered_schema` and its history
 function provide schema discovery; `lix_key_value` and its history function
@@ -48,10 +48,9 @@ the `lix_revert` and `lix_apply` command sinks or to the
 `lix_create_checkpoint()` function. See [Checkpoints](./checkpoints.md) and
 [Diff commands](./diff-commands.md).
 
-For branch-scoped working changes, use `lix_latest_checkpoint_commit_id()` and
-`lix_active_branch_commit_id()` as the commit arguments to `lix_diff()`. The
-latest-checkpoint accessor returns the repository root when the active branch
-has no checkpoint.
+For working changes, use `lix_diff(relation)`. Its actual baseline is exposed
+as `lix_branch.working_base_commit_id`; it can differ from the latest marked
+checkpoint after a fork or restore.
 
 The rule is: `lixcol_` prefixes only engine-owned system metadata, while
 relation-specific payload always uses ordinary names such as `diff_type`,
@@ -107,11 +106,11 @@ schema contributes another `RELATION` / `BASE` surface.
 
 | Class | Fixed surfaces |
 | --- | --- |
-| Relation / base | `lix_account`, `lix_checkpoint`, `lix_commit`, `lix_key_value`, `lix_registered_schema` |
+| Relation / base | `lix_account`, `lix_commit`, `lix_key_value`, `lix_registered_schema` |
 | Relation / view | `lix_branch`, `lix_change`, `lix_directory`, `lix_file` |
-| Table function | `lix_commit_ancestry`, `lix_create_checkpoint` (mutating), `lix_diff`, `lix_history` |
+| Table function | `lix_commit_ancestry`, `lix_create_checkpoint` (mutating), `lix_diff`, `lix_history`, `lix_log`, `lix_as_of` |
 | Command sink | `lix_apply`, `lix_restore`, `lix_revert` |
-| Scalar function | `lix_active_account_id`, `lix_active_branch_commit_id`, `lix_active_branch_id`, `lix_latest_checkpoint_commit_id`, `lix_root_commit_id`, `lix_row_ref`, `uuidv7` |
+| Scalar function | `lix_active_account_id`, `lix_active_branch_commit_id`, `lix_active_branch_id`, `lix_root_commit_id`, `lix_row_ref`, `uuidv7` |
 
 Standard SQL value expressions such as `CURRENT_TIMESTAMP` are supported SQL
 syntax, not Lix-owned scalar-function surfaces, and are therefore omitted from
@@ -151,8 +150,8 @@ Registering a Schema v1 document with `key: "acme_task"` produces:
 | Surface                              | Use for                                                |
 | :----------------------------------- | :----------------------------------------------------- |
 | `acme_task`                          | Read and mutate tasks in the current session.          |
-| `lix_history('acme_task')`           | Read revisions reachable from the active head.         |
-| `lix_history('acme_task', $commit)`  | Read revisions reachable from an explicit commit.      |
+| `lix_history('acme_task')`           | Read endpoint changes along the active mainline.         |
+| `lix_history('acme_task', $commit)`  | Read endpoint changes along an explicit mainline.      |
 
 User properties become ordinary typed columns:
 
@@ -168,8 +167,8 @@ session's active branch. Open another session to work on another branch.
 Every public history read calls `lix_history` with a relation-name text literal
 and an optional commit-id argument; there are no generated history functions or
 bare history table aliases.
-[History](./history.md) documents the history columns, depth ordering,
-composite-key lookups, and tombstones.
+[History](./history.md) documents the endpoint columns, position ordering,
+composite-key lookups, and removals.
 
 ## Schema discovery and interoperability
 
@@ -202,7 +201,7 @@ settings and interoperability metadata.
 | Surface              | Use for                                 |
 | :------------------- | :-------------------------------------- |
 | `lix_file`           | Current files on the active branch.     |
-| `lix_history('lix_file')` | File revisions reachable from a commit. |
+| `lix_history('lix_file')` | File endpoint changes along a mainline. |
 
 User columns are `id`, `path`, `directory_id`, `name`, and `content`.
 
@@ -226,8 +225,7 @@ when the file contains arbitrary non-UTF-8 bytes, and read `content` with
 the standard `OCTET_LENGTH(content)` function to verify the stored byte count;
 for example, `aé—` has length `3` and octet length `6`.
 
-File history records revisions of the composed file projection with structured
-`lixcol_source_changes` provenance; see
+File history records changes between complete composed file states; see
 [History](./history.md#file-and-directory-history).
 
 ## Directories
@@ -237,7 +235,7 @@ Directories use the same three scopes:
 | Surface                   | Use for                                      |
 | :------------------------ | :------------------------------------------- |
 | `lix_directory`           | Current directories on the active branch.    |
-| `lix_history('lix_directory')` | Directory revisions reachable from a commit. |
+| `lix_history('lix_directory')` | Directory endpoint changes along a mainline. |
 
 User columns are `id`, `path`, `parent_id`, and `name`. Directory and file
 paths share the same canonical syntax: non-root paths do not end with a slash.

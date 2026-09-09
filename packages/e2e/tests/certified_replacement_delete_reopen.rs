@@ -128,7 +128,10 @@ async fn replacement_delete_checkpoint_reopens<S: ReopenStorage>() {
         .expect("reopen durable Lix");
     assert_collection_empty(&lix).await;
     let checkpoints = lix
-        .execute("SELECT COUNT(*) AS count FROM lix_checkpoint", &[])
+        .execute(
+            "SELECT COUNT(*) AS count FROM lix_commit WHERE is_checkpoint",
+            &[],
+        )
         .await
         .expect("read checkpoints after reopen");
     assert!(checkpoints.rows()[0].get::<i64>("count").unwrap() >= 1);

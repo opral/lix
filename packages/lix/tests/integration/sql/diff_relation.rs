@@ -148,9 +148,9 @@ simulation_test!(
             .expect("local head should exist")
             .to_string();
         session
-            .create_checkpoint()
+            .execute("INSERT INTO lix_key_value (key, value, lixcol_global) VALUES ('global-scope', 'value', TRUE)", &[])
             .await
-            .expect("checkpoint should publish a global row");
+            .expect("global row should publish");
         let global_after = engine
             .load_branch_head_commit_id(lix::GLOBAL_BRANCH_ID)
             .await
@@ -163,24 +163,24 @@ simulation_test!(
                 &session,
                 &format!(
                     "SELECT from_lixcol_global, to_lixcol_global \
-                 FROM lix_diff('lix_checkpoint', '{global_before}', '{global_after}')"
+                 FROM lix_diff('lix_key_value', '{global_before}', '{global_after}')"
                 ),
             )
             .await,
             vec![vec![Value::Null, Value::Boolean(true)]],
-            "global checkpoint additions preserve the source relation's scope",
+            "global additions preserve the source relation's scope",
         );
         assert_eq!(
             select_rows(
                 &session,
                 &format!(
                     "SELECT from_lixcol_global, to_lixcol_global \
-                 FROM lix_diff('lix_checkpoint', '{global_after}', '{global_before}')"
+                 FROM lix_diff('lix_key_value', '{global_after}', '{global_before}')"
                 ),
             )
             .await,
             vec![vec![Value::Boolean(true), Value::Null]],
-            "reversing a global checkpoint diff preserves its global before-side",
+            "reversing a global diff preserves its global before-side",
         );
         assert_eq!(
             select_rows(
@@ -231,16 +231,23 @@ simulation_test!(
             .expect("active upsert should shadow the inherited global row");
 
         assert_eq!(
-        select_rows(
-            &session,
-            "SELECT from_lixcol_global, to_lixcol_global \
-             FROM lix_diff('lix_key_value', lix_latest_checkpoint_commit_id(), lix_active_branch_commit_id()) \
+            select_rows(&session,
+                "SELECT diff_type, from_value, to_value FROM lix_diff('lix_key_value') WHERE key = 'shadowed'",
+            ).await,
+            vec![vec![Value::Text("modified".into()), Value::Jsonb(json!("global-value").into()), Value::Jsonb(json!("local-shadow").into())]],
+            "effective classification and values do not depend on projecting provenance",
+        );
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT from_lixcol_global, to_lixcol_global \
+             FROM lix_diff('lix_key_value') \
              WHERE key = 'shadowed'",
-        )
-        .await,
-        vec![vec![Value::Boolean(true), Value::Boolean(false)]],
-        "the shadowed row's before-side is the inherited global version",
-    );
+            )
+            .await,
+            vec![vec![Value::Boolean(true), Value::Boolean(false)]],
+            "the shadowed row's before-side is the inherited global version",
+        );
     }
 );
 
@@ -426,11 +433,16 @@ simulation_test!(
         }
 
         let error = session
-            .execute("SELECT from_content, to_content FROM lix_diff('lix_file')", &[])
+            .execute(
+                "SELECT from_content, to_content FROM lix_diff('lix_file')",
+                &[],
+            )
             .await
             .expect_err("the existing diff schema must keep file content unsupported");
         assert!(
-            error.message.contains("does not support content projection"),
+            error
+                .message
+                .contains("does not support content projection"),
             "unexpected error: {error:?}"
         );
     }
@@ -462,12 +474,9 @@ simulation_test!(
             .expect("file delete should succeed");
 
         assert!(
-            select_rows(
-                &session,
-                "SELECT id, diff_type FROM lix_diff('lix_file')",
-            )
-            .await
-            .is_empty(),
+            select_rows(&session, "SELECT id, diff_type FROM lix_diff('lix_file')",)
+                .await
+                .is_empty(),
             "net-zero file churn must not appear in working review",
         );
     }
@@ -606,7 +615,7 @@ simulation_test!(
                 .message
                 .contains("does not support content projection")
         );
-        assert!(file_content.message.contains("lix_history"));
+        assert!(file_content.message.contains("lix_as_of"));
     }
 );
 
@@ -742,60 +751,90 @@ simulation_test!(
             )
             .await
             .expect("baseline rows should insert");
-        session.create_checkpoint().await.expect("checkpoint should succeed");
+        session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should succeed");
         for sql in [
             "INSERT INTO lix_key_value (key, value) VALUES ('added', 'new')",
             "UPDATE lix_key_value SET value = 'after', lixcol_metadata = '{\"stage\":\"after\"}' WHERE key = 'modified'",
             "DELETE FROM lix_key_value WHERE key = 'removed'",
         ] {
-            session.execute(sql, &[]).await.expect("working edit should succeed");
+            session
+                .execute(sql, &[])
+                .await
+                .expect("working edit should succeed");
         }
         assert_eq!(
-            select_rows(&session,
+            select_rows(
+                &session,
                 "SELECT key, diff_type FROM lix_diff('lix_key_value') ORDER BY key"
-            ).await,
+            )
+            .await,
             vec![
                 vec![Value::Text("added".into()), Value::Text("added".into())],
-                vec![Value::Text("modified".into()), Value::Text("modified".into())],
+                vec![
+                    Value::Text("modified".into()),
+                    Value::Text("modified".into())
+                ],
                 vec![Value::Text("removed".into()), Value::Text("removed".into())],
             ],
             "identity-only projections must preserve the same changed rows",
         );
-        let projection = "key, diff_type, from_value, to_value, from_lixcol_global, to_lixcol_global";
+        let projection =
+            "key, diff_type, from_value, to_value, from_lixcol_global, to_lixcol_global";
         let expected = vec![
             vec![
-                Value::Text("added".into()), Value::Text("added".into()),
-                Value::Null, Value::Jsonb(json!("new").into()),
-                Value::Null, Value::Boolean(false),
+                Value::Text("added".into()),
+                Value::Text("added".into()),
+                Value::Null,
+                Value::Jsonb(json!("new").into()),
+                Value::Null,
+                Value::Boolean(false),
             ],
             vec![
-                Value::Text("modified".into()), Value::Text("modified".into()),
-                Value::Jsonb(json!("before").into()), Value::Jsonb(json!("after").into()),
-                Value::Boolean(false), Value::Boolean(false),
+                Value::Text("modified".into()),
+                Value::Text("modified".into()),
+                Value::Jsonb(json!("before").into()),
+                Value::Jsonb(json!("after").into()),
+                Value::Boolean(false),
+                Value::Boolean(false),
             ],
             vec![
-                Value::Text("removed".into()), Value::Text("removed".into()),
-                Value::Jsonb(json!("deleted").into()), Value::Null,
-                Value::Boolean(false), Value::Null,
+                Value::Text("removed".into()),
+                Value::Text("removed".into()),
+                Value::Jsonb(json!("deleted").into()),
+                Value::Null,
+                Value::Boolean(false),
+                Value::Null,
             ],
         ];
+        let coordinates = session.execute("SELECT working_base_commit_id, commit_id FROM lix_branch WHERE id = lix_active_branch_id()", &[]).await.unwrap();
+        let from = coordinates.rows()[0]
+            .get::<String>("working_base_commit_id")
+            .unwrap();
+        let to = coordinates.rows()[0].get::<String>("commit_id").unwrap();
         for arguments in [
-            "'lix_key_value'",
-            "'lix_key_value', lix_latest_checkpoint_commit_id(), lix_active_branch_commit_id()",
+            "'lix_key_value'".to_string(),
+            format!("'lix_key_value', '{from}', '{to}'"),
         ] {
             assert_eq!(
-                select_rows(&session, &format!(
-                    "SELECT {projection} FROM lix_diff({arguments}) ORDER BY key"
-                )).await,
+                select_rows(
+                    &session,
+                    &format!("SELECT {projection} FROM lix_diff({arguments}) ORDER BY key")
+                )
+                .await,
                 expected,
                 "working and explicit ranges must preserve payload values and side presence: {arguments}",
             );
         }
         assert_eq!(
-            select_rows(&session,
+            select_rows(
+                &session,
                 "SELECT from_lixcol_metadata, to_lixcol_metadata \
                  FROM lix_diff('lix_key_value') WHERE key = 'modified'"
-            ).await,
+            )
+            .await,
             vec![vec![
                 Value::Jsonb(json!({"stage": "before"}).into()),
                 Value::Jsonb(json!({"stage": "after"}).into()),
@@ -827,37 +866,61 @@ simulation_test!(
             )
             .await
             .expect("nested baseline directories should insert");
-        session.create_checkpoint().await.expect("checkpoint should succeed");
+        session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should succeed");
         for sql in [
             "INSERT INTO lix_directory (path) VALUES ('/docs/added')",
             "UPDATE lix_directory SET path = '/docs/renamed' WHERE path = '/docs/original'",
             "DELETE FROM lix_directory WHERE path = '/docs/removed'",
         ] {
-            session.execute(sql, &[]).await.expect("working edit should succeed");
+            session
+                .execute(sql, &[])
+                .await
+                .expect("working edit should succeed");
         }
         let expected = vec![
             vec![
-                Value::Text("added".into()), Value::Null, Value::Text("added".into()),
-                Value::Null, Value::Text("/docs/added".into()),
+                Value::Text("added".into()),
+                Value::Null,
+                Value::Text("added".into()),
+                Value::Null,
+                Value::Text("/docs/added".into()),
             ],
             vec![
-                Value::Text("removed".into()), Value::Text("removed".into()), Value::Null,
-                Value::Text("/docs/removed".into()), Value::Null,
+                Value::Text("removed".into()),
+                Value::Text("removed".into()),
+                Value::Null,
+                Value::Text("/docs/removed".into()),
+                Value::Null,
             ],
             vec![
-                Value::Text("modified".into()), Value::Text("original".into()), Value::Text("renamed".into()),
-                Value::Text("/docs/original".into()), Value::Text("/docs/renamed".into()),
+                Value::Text("modified".into()),
+                Value::Text("original".into()),
+                Value::Text("renamed".into()),
+                Value::Text("/docs/original".into()),
+                Value::Text("/docs/renamed".into()),
             ],
         ];
+        let coordinates = session.execute("SELECT working_base_commit_id, commit_id FROM lix_branch WHERE id = lix_active_branch_id()", &[]).await.unwrap();
+        let from = coordinates.rows()[0]
+            .get::<String>("working_base_commit_id")
+            .unwrap();
+        let to = coordinates.rows()[0].get::<String>("commit_id").unwrap();
         for arguments in [
-            "'lix_directory'",
-            "'lix_directory', lix_latest_checkpoint_commit_id(), lix_active_branch_commit_id()",
+            "'lix_directory'".to_string(),
+            format!("'lix_directory', '{from}', '{to}'"),
         ] {
             assert_eq!(
-                select_rows(&session, &format!(
-                    "SELECT diff_type, from_name, to_name, from_path, to_path \
+                select_rows(
+                    &session,
+                    &format!(
+                        "SELECT diff_type, from_name, to_name, from_path, to_path \
                      FROM lix_diff({arguments}) ORDER BY coalesce(to_path, from_path)"
-                )).await,
+                    )
+                )
+                .await,
                 expected,
                 "working and explicit ranges must reconstruct paths through unchanged parents: {arguments}",
             );

@@ -38,6 +38,10 @@ fn sink(provider: &SdkTracerProvider) -> Arc<dyn TelemetrySink> {
 
 async fn handshake(app: &Router, account: Option<&str>, session: Option<&str>) -> String {
     let mut request = Request::builder()
+        .header(
+            lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+            lix_sdk::server_protocol::PROTOCOL_VERSION,
+        )
         .uri(format!("/lix/v1/{LIX_ID}/"))
         .header("authorization", "Bearer test-internal-token");
     if let Some(account) = account {
@@ -134,6 +138,10 @@ async fn authenticated_protocol_bind_reaches_otlp() {
         .clone()
         .oneshot(
             Request::builder()
+                .header(
+                    lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                    lix_sdk::server_protocol::PROTOCOL_VERSION,
+                )
                 .method("POST")
                 .uri(format!("/lix/v1/{LIX_ID}/execute"))
                 .header("authorization", "Bearer test-internal-token")

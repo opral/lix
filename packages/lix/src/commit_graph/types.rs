@@ -25,6 +25,7 @@ pub(crate) struct CommitGraphChange {
 /// by history APIs that explicitly request them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitGraphNode {
+    pub(crate) is_checkpoint: bool,
     pub(crate) commit_id: CommitId,
     pub(crate) change_id: ChangeId,
     pub(crate) account_id: String,
@@ -164,10 +165,4 @@ pub(crate) trait CommitGraphReader: Send + Sync {
             .cloned()
             .collect())
     }
-
-    async fn change_history_from_commit(
-        &mut self,
-        start_commit_id: &CommitId,
-        request: &CommitGraphChangeHistoryRequest,
-    ) -> Result<CommitGraphHistory, LixError>;
 }

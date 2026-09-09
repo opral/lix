@@ -17,13 +17,10 @@ mod types;
 pub(crate) use codec::decode_change_record;
 #[cfg(test)]
 pub(crate) use codec::encode_commit_record;
-pub(crate) use context::ChangelogContext;
+pub(crate) use context::{CHECKPOINT_INVENTORY_SPACE, ChangelogContext};
 #[cfg(test)]
 pub(crate) use gc::{stage_delete_changes, stage_delete_commits};
-pub(crate) use gc::{
-    stage_delete_commit_projection,
-    stage_delete_standalone_change,
-};
+pub(crate) use gc::{stage_delete_commit_projection, stage_delete_standalone_change};
 #[cfg(test)]
 pub(crate) use materialization::MaterializedChangeIdentity;
 pub(crate) use materialization::{
@@ -34,7 +31,6 @@ pub(crate) use scope_digest::{CommitScopeKey, CommitTouchedScopeDigest};
 pub(crate) use store::{CHANGE_SPACE, COMMIT_SPACE, commit_key};
 pub(crate) use store::{ChangelogReader, ChangelogWriter};
 pub(crate) use types::COMMIT_RECORD_FORMAT_VERSION;
-pub(crate) use types::{jsonb_option_ref_storage, jsonb_option_storage};
 pub(crate) use types::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeScanBatch, ChangeScanRequest,
     ChangelogAppend, CommitId, CommitLoadBatch, CommitLoadRequest, CommitRecord, CommitScanBatch,
@@ -42,3 +38,4 @@ pub(crate) use types::{
     commit_row_snapshot_json, next_first_parent_jump,
 };
 pub(crate) use types::{GcLiveSet, GcPlan, GcRoot, GcSweepSet};
+pub(crate) use types::{jsonb_option_ref_storage, jsonb_option_storage};
