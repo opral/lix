@@ -1,18 +1,36 @@
 ---
 date: "2026-09-09"
 authors: ["samuelstroschein"]
-og:description: "Lix is deployed through inlang to over 100,000 users. Repository benchmarks against Git and tracked and untracked SQL performance against SQLite-WASM."
+og:description: "Lix crossed 500k weekly npm downloads and is deployed through inlang to over 100,000 users. What changed since v0.7, plus Git and SQLite-WASM benchmarks."
 og:image: "./cover.png"
-og:image:alt: "Lix v0.16: 100k+ users"
+og:image:alt: "lix v0.16: Over 500k weekly downloads"
 ---
 
-# Lix v0.16: Used by over 100,000 users
+# lix v0.16: Over 500k weekly downloads
 
-![Lix v0.16 — 100k+ users.](./cover.png)
+![lix v0.16 — Over 500k weekly downloads.](./cover.png)
 
-Lix is now running in production through inlang, reaching over 100,000 users. This is a major milestone: Lix is ready for production as an embedded repository backend.
+Lix crossed **500k weekly downloads on npm**. The `@lix-js/sdk` package recorded **509,341 downloads from August 31 to September 6, 2026**, according to the [npm downloads API](https://api.npmjs.org/downloads/point/2026-08-31:2026-09-06/@lix-js/sdk).
+
+![Weekly npm downloads for @lix-js/sdk, reaching 509,341 in August 31–September 6, 2026.](./npm-downloads.png)
+
+*Source: [npm download counts](https://api.npmjs.org/downloads/range/2026-08-10:2026-09-06/@lix-js/sdk), retrieved September 9, 2026. Downloads include repeated installs and CI runs; they are not unique users or installs of v0.16 alone.*
+
+This is a major milestone. From inlang, we also know Lix is deployed to **over 100,000 users**. That production use is why we’re calling Lix ready as an embedded repository backend.
 
 Inlang is our proof point. We ran an A/B comparison against the previous inlang version, which used SQLite-WASM. With Lix, inlang maintains application performance while adding version control to its data.
+
+## What changed since v0.7
+
+Since our last release post, Lix has added:
+
+- **Local-first sync and hosting.** A deployable reference server, local reads and writes with background uploads, offline reopening, and history fetched on demand. Custom and plugin-defined rows sync with their schemas and typed values.
+- **More control over history.** Persistent undo and redo, account attribution, full repository snapshots, and SQL functions for logs, history, and point-in-time reads.
+- **Typed SQL.** PostgreSQL syntax, native column types, `$1` parameters, and `RETURNING` for writes, with faster queries and CRUD operations.
+- **More capable file plugins.** Structural JSON edits and improvements to CSV, Markdown, and Excalidraw that preserve file content and formatting when editing rows.
+- **Faster repository operations.** Less copying and scanning during branches, checkpoints, merges, and history queries, plus more efficient binary storage.
+
+v0.16 includes breaking repository and sync changes. Upgrade clients and servers together. `lix_as_of` replaces `lix_state_at`, and checkpoint membership now lives on `lix_commit.is_checkpoint`. See the [changelog](https://github.com/opral/lix/blob/main/CHANGELOG.md) for migration details and the full release history.
 
 With production performance established in inlang, we also wanted to see how Lix compares against Git for repository operations.
 

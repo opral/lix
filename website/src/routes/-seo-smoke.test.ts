@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { parse } from "@opral/markdown-wc";
 import { describe, expect, test } from "vitest";
 import { getBlogDescription, getBlogTitle } from "../blog/blogMetadata";
-import { resolveOgImageUrl } from "../blog/og-image";
+import { resolveBlogAssetPath, resolveOgImageUrl } from "../blog/og-image";
 import {
   getMarkdownDescription,
   getMarkdownTitle,
@@ -118,6 +118,10 @@ describe("SEO route smoke tests", () => {
         authors: undefined,
         readingTime: 4,
         ogImage,
+        coverImage: resolveBlogAssetPath(
+          parsed.frontmatter?.["og:image"] as string,
+          slug,
+        ),
         ogImageAlt: parsed.frontmatter?.["og:image:alt"] as string | undefined,
         imports: undefined,
       },
