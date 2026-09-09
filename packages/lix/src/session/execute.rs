@@ -1909,32 +1909,21 @@ where
         metadata: ExecuteStatementMetadata,
         idempotency: ExecuteIdempotency,
     ) -> Result<ExecuteResult, LixError> {
-        let mut expired_read_retries = ExpiredReadRetryState::default();
-        if let IdempotencyReceiptResolution::Replay(receipt) = self
-            .resolve_idempotency_receipt_with_expired_read_retry(
-                &idempotency,
-                &mut expired_read_retries,
-            )
-            .await?
-        {
-            return receipt.into_single_result();
-        }
-
-        let sql_for_error = sql.to_string();
-        let params = params.to_vec();
-        loop {
-            let write_access = self.begin_session_write_access().await?;
-            let sql_for_planning = sql_for_error.clone();
-            let statement = statement.clone();
-            let params = params.clone();
-            let options = options.clone();
-            let metadata = metadata.clone();
-            // Every retry retains the original identity. A transaction closure
-            // owns its copy because its future may outlive this call's immediate
-            // stack frame while the write lease is held.
-            let idempotency_for_commit = idempotency.clone();
-            let result = self
-                .with_write_transaction_reserved_lending(
+        self.execute_with_idempotency_recovery(
+            &idempotency,
+            ExecuteIdempotencyReceipt::into_single_result,
+            || async {
+                let write_access = self.begin_session_write_access().await?;
+                let sql_for_planning = sql.to_owned();
+                let statement = statement.clone();
+                let params = params.to_vec();
+                let options = options.clone();
+                let metadata = metadata.clone();
+                // Every retry retains the original identity. A transaction closure
+                // owns its copy because its future may outlive this call's immediate
+                // stack frame while the write lease is held.
+                let idempotency_for_commit = idempotency.clone();
+                self.with_write_transaction_reserved_lending(
                     write_access,
                     async move |transaction| {
                         let previous_origin_key =
@@ -1967,8 +1956,36 @@ where
                     |_| Ok(()),
                 )
                 .await
-                .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
+                .map_err(|error| normalize_sql_surface_error(error, sql))
+            },
+        )
+        .await
+    }
 
+    /// One retry budget covers receipt preflight, expired transaction reads,
+    /// and durable proof after an ambiguous commit for both SQL APIs.
+    async fn execute_with_idempotency_recovery<T, F, Fut>(
+        &self,
+        idempotency: &ExecuteIdempotency,
+        replay: fn(ExecuteIdempotencyReceipt) -> Result<T, LixError>,
+        mut execute: F,
+    ) -> Result<T, LixError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, LixError>>,
+    {
+        let mut expired_read_retries = ExpiredReadRetryState::default();
+        if let IdempotencyReceiptResolution::Replay(receipt) = self
+            .resolve_idempotency_receipt_with_expired_read_retry(
+                idempotency,
+                &mut expired_read_retries,
+            )
+            .await?
+        {
+            return replay(receipt);
+        }
+        loop {
+            let result = execute().await;
             match result {
                 Ok(result) => return Ok(result),
                 Err(error)
@@ -1986,14 +2003,14 @@ where
                 {
                     return match self
                         .resolve_idempotency_receipt_with_expired_read_retry(
-                            &idempotency,
+                            idempotency,
                             &mut expired_read_retries,
                         )
                         .await
                     {
                         Ok(IdempotencyReceiptResolution::Replay(receipt)) => {
                             // `Transaction::commit` did not return normally, so
-                            // its usual invalidation path was skipped. A remote
+                            // its usual invalidation path was skipped. A durable
                             // receipt proves that this transaction did publish;
                             // wake local observers before acknowledging recovery.
                             self.observe_invalidation.bump();
@@ -2002,7 +2019,7 @@ where
                             // rather than let a stale acknowledgement poison the
                             // next plugin-backed edit.
                             self.file_views.clear();
-                            receipt.into_single_result()
+                            replay(receipt)
                         }
                         Ok(IdempotencyReceiptResolution::Absent) => Err(error),
                         Err(recovery_error) => Err(recovery_error),
@@ -2339,65 +2356,20 @@ where
                         )
                         .await;
                 };
-                let mut expired_read_retries = ExpiredReadRetryState::default();
-                if let IdempotencyReceiptResolution::Replay(receipt) = self
-                    .resolve_idempotency_receipt_with_expired_read_retry(
-                        &idempotency,
-                        &mut expired_read_retries,
-                    )
-                    .await?
-                {
-                    return receipt.into_results();
-                }
-                loop {
-                    let result = self
-                        .execute_transaction_batch(
+                self.execute_with_idempotency_recovery(
+                    &idempotency,
+                    ExecuteIdempotencyReceipt::into_results,
+                    || {
+                        self.execute_transaction_batch(
                             statements,
                             parsed.clone(),
                             options.clone(),
                             statement_metadata.clone(),
                             Some(idempotency.clone()),
                         )
-                        .await;
-                    match result {
-                        Ok(results) => return Ok(results),
-                        Err(error)
-                            if error.code == LixError::CODE_STORAGE_READ_EXPIRED
-                                && retry_expired_auto_commit(&mut expired_read_retries, &error)
-                                    .await =>
-                        {
-                            continue;
-                        }
-                        Err(error)
-                            if matches!(
-                                error.code.as_str(),
-                                LixError::CODE_TRANSACTION_CONFLICT
-                                    | LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
-                            ) =>
-                        {
-                            return match self
-                                .resolve_idempotency_receipt_with_expired_read_retry(
-                                    &idempotency,
-                                    &mut expired_read_retries,
-                                )
-                                .await
-                            {
-                                Ok(IdempotencyReceiptResolution::Replay(receipt)) => {
-                                    // See the single-statement recovery path:
-                                    // positive receipt proof means a commit
-                                    // happened after its normal invalidation
-                                    // callback was bypassed by an ambiguous error.
-                                    self.observe_invalidation.bump();
-                                    self.file_views.clear();
-                                    receipt.into_results()
-                                }
-                                Ok(IdempotencyReceiptResolution::Absent) => Err(error),
-                                Err(recovery_error) => Err(recovery_error),
-                            };
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
+                    },
+                )
+                .await
             }
         }
     }

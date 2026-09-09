@@ -6260,6 +6260,7 @@ mod tests {
     #[derive(Clone)]
     struct PostCommitUnknownStorage {
         inner: Memory,
+        durable_reads: bool,
         fail_next_commit: Arc<AtomicBool>,
     }
 
@@ -6267,6 +6268,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 inner: Memory::new(),
+                durable_reads: false,
                 fail_next_commit: Arc::new(AtomicBool::new(false)),
             }
         }
@@ -6295,7 +6297,14 @@ mod tests {
             self.inner.acquire_session().await
         }
 
-        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+        async fn begin_read(
+            &self,
+            mut options: ReadOptions,
+        ) -> Result<Self::Read<'_>, StorageError> {
+            if self.durable_reads {
+                // Same test-only durable tier as DurableMemoryStorage above.
+                options.durability = ReadDurability::Visible;
+            }
             self.inner.begin_read(options).await
         }
 
@@ -7612,58 +7621,115 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keyed_write_without_durable_receipt_proof_is_not_acknowledged() {
-        let storage = PostCommitUnknownStorage::new();
-        let server = open_lix()
-            .with_storage(storage.clone())
-            .serve()
-            .with_embedded_lix_id()
-            .await
-            .expect("serve Lix");
-        let router = handler(server);
-        let (session_id, _) = new_session(&router).await;
-        let headers = [(IDEMPOTENCY_KEY_HEADER, "memory-has-no-durable-proof")];
+    async fn single_and_batch_writes_recover_and_replay_a_durable_ambiguous_commit() {
+        for batch in [false, true] {
+            let storage = PostCommitUnknownStorage {
+                durable_reads: true,
+                ..PostCommitUnknownStorage::new()
+            };
+            let router = router_with_storage(storage.clone()).await;
+            let (session_id, _) = new_session(&router).await;
+            let headers = [(IDEMPOTENCY_KEY_HEADER, "recover-once")];
+            let sql = "INSERT INTO lix_key_value (key, value) VALUES ('recovered-once', 'value') RETURNING key";
+            let (path, body) = if batch {
+                (
+                    "/lix/v1/execute-batch",
+                    json!({"statements": [{"sql": sql}]}),
+                )
+            } else {
+                ("/lix/v1/execute", json!({"sql": sql}))
+            };
+            storage.fail_next_commit();
+            let recovered = request_with_headers(
+                &router,
+                "POST",
+                path,
+                Some(&session_id),
+                &headers,
+                Some(body.clone()),
+            )
+            .await;
+            assert_eq!(recovered.status(), StatusCode::OK, "{path}");
+            let recovered = response_json(recovered).await;
+            let replay = request_with_headers(
+                &router,
+                "POST",
+                path,
+                Some(&session_id),
+                &headers,
+                Some(body),
+            )
+            .await;
+            assert_eq!(replay.status(), StatusCode::OK, "{path}");
+            assert_eq!(response_json(replay).await, recovered);
+            let count = request(&router, "POST", "/lix/v1/execute", Some(&session_id), Some(json!({
+                "sql": "SELECT COUNT(*) FROM lix_history('lix_key_value') WHERE key = 'recovered-once'"
+            }))).await;
+            assert_eq!(count.status(), StatusCode::OK);
+            assert_eq!(
+                response_json(count).await["rows"][0][0],
+                json!({"kind": "int", "value": 1})
+            );
+        }
+    }
 
-        storage.fail_next_commit();
-        let response = request_with_headers(
+    #[tokio::test]
+    async fn keyed_write_without_durable_receipt_proof_is_not_acknowledged() {
+        for batch in [false, true] {
+            let storage = PostCommitUnknownStorage::new();
+            let server = open_lix()
+                .with_storage(storage.clone())
+                .serve()
+                .with_embedded_lix_id()
+                .await
+                .expect("serve Lix");
+            let router = handler(server);
+            let (session_id, _) = new_session(&router).await;
+            let headers = [(IDEMPOTENCY_KEY_HEADER, "memory-has-no-durable-proof")];
+
+            storage.fail_next_commit();
+            let response = request_with_headers(
             &router,
             "POST",
-            "/lix/v1/execute",
+            if batch { "/lix/v1/execute-batch" } else { "/lix/v1/execute" },
             Some(&session_id),
             &headers,
-            Some(json!({
-                "sql": "INSERT INTO lix_key_value (key, value) VALUES ('unknown-commit', 'written')"
-            })),
+            Some(if batch {
+                json!({"statements": [{"sql": "INSERT INTO lix_key_value (key, value) VALUES ('unknown-commit', 'written')"}]})
+            } else {
+                json!({"sql": "INSERT INTO lix_key_value (key, value) VALUES ('unknown-commit', 'written')"})
+            }),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let error = response_json(response).await;
-        assert_eq!(
-            error["error"]["code"],
-            LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
-        );
-        assert_eq!(error["error"]["details"]["retryable"], true);
-        assert_eq!(
-            error["error"]["details"]["retryScope"],
-            "same-idempotency-key"
-        );
-        assert_eq!(error["error"]["details"]["outcome"], "unknown");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let error = response_json(response).await;
+            assert_eq!(
+                error["error"]["code"],
+                LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
+            );
+            assert_eq!(error["error"]["details"]["retryable"], true);
+            assert_eq!(
+                error["error"]["details"]["retryScope"],
+                "same-idempotency-key"
+            );
+            assert_eq!(error["error"]["details"]["outcome"], "unknown");
 
-        let persisted = request(
-            &router,
-            "POST",
-            "/lix/v1/execute",
-            Some(&session_id),
-            Some(json!({
-                "sql": "SELECT COUNT(*) FROM lix_key_value WHERE key = 'unknown-commit'"
-            })),
-        )
-        .await;
-        assert_eq!(persisted.status(), StatusCode::OK);
-        assert_eq!(
-            response_json(persisted).await["rows"][0][0],
-            json!({ "kind": "int", "value": 1 })
-        );
+            let persisted = request(
+                &router,
+                "POST",
+                "/lix/v1/execute",
+                Some(&session_id),
+                Some(json!({
+                    "sql": "SELECT COUNT(*) FROM lix_key_value WHERE key = 'unknown-commit'"
+                })),
+            )
+            .await;
+            assert_eq!(persisted.status(), StatusCode::OK);
+            assert_eq!(
+                response_json(persisted).await["rows"][0][0],
+                json!({ "kind": "int", "value": 1 })
+            );
+        }
     }
 
     async fn app_with_tracing_telemetry() -> TestApp {
