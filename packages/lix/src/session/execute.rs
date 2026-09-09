@@ -2641,7 +2641,7 @@ where
                         let ctx = SessionSqlExecutionContext {
                             active_branch_id: &active_branch_id,
                             active_account_id: self.active_account_id(),
-                            read_store,
+                            read_store: read_store.clone(),
                             hot_state: Arc::clone(&self.hot_state),
                             binary_cas: Arc::clone(&self.binary_cas),
                             branch_ctx: Arc::clone(&self.branch_ctx),
@@ -2673,6 +2673,33 @@ where
                                 Some(statement_index),
                             );
                             let operation = async {
+                                if let Some(plan) = late_materialized_lix_file_content_read(&parsed) {
+                                    // Resolve filters and LIMIT on file metadata first. A
+                                    // provider scan may render files absent from the result;
+                                    // only hydrate (and acknowledge) returned paths.
+                                    let (result, mutations, _) = self
+                                        .execute_read_statement_with_store(
+                                            read_store.clone(),
+                                            &statement.sql,
+                                            parsed,
+                                            &statement.params,
+                                            true,
+                                            None,
+                                            None,
+                                            None,
+                                            Some(plan),
+                                            false,
+                                        )
+                                        .await
+                                        .map_err(|error| {
+                                            with_batch_statement_index(
+                                                normalize_sql_surface_error(error, &statement.sql),
+                                                statement_index,
+                                            )
+                                        })?;
+                                    file_view_mutations.extend(mutations);
+                                    return Ok(ExecuteResult::from_session_read_result(result));
+                                }
                                 sql2::execute_read_statement_in_session_from_parsed(
                                     &read_session,
                                     &statement.sql,
@@ -2867,7 +2894,7 @@ where
                         let ctx = SessionSqlExecutionContext {
                             active_branch_id: &active_branch_id,
                             active_account_id: self.active_account_id(),
-                            read_store,
+                            read_store: read_store.clone(),
                             hot_state: Arc::clone(&self.hot_state),
                             binary_cas: Arc::clone(&self.binary_cas),
                             branch_ctx: Arc::clone(&self.branch_ctx),
@@ -2901,6 +2928,28 @@ where
                                 Some(statement_index),
                             );
                             let operation = async {
+                                if let Some(plan) = late_materialized_lix_file_content_read(&statement) {
+                                    // Resolve filters and LIMIT on file metadata first. A
+                                    // provider scan may render files absent from the result;
+                                    // only hydrate (and acknowledge) returned paths.
+                                    let (result, mutations, _) = self
+                                        .execute_read_statement_with_store(
+                                            read_store.clone(),
+                                            sql,
+                                            statement,
+                                            params,
+                                            true,
+                                            None,
+                                            None,
+                                            None,
+                                            Some(plan),
+                                            false,
+                                        )
+                                        .await
+                                        .map_err(|error| normalize_sql_surface_error(error, sql))?;
+                                    file_view_mutations.extend(mutations);
+                                    return Ok(ExecuteResult::from_session_read_result(result));
+                                }
                                 sql2::execute_read_statement_in_session_from_parsed(
                                     &read_session,
                                     sql,

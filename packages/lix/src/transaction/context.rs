@@ -5645,9 +5645,45 @@ where
                     };
                     if cold_successor_candidate {
                         let cold_limits = cold_successor_transition_limits(submitted_bytes.len());
-                        let cold_before_descriptor = acknowledged_observation
-                            .map(|observation| v2_file_descriptor_from_actor_key(observation.key()))
-                            .unwrap_or_else(|| v2_file_descriptor_from_actor_key(&actor_key));
+                        let cold_before_descriptor = if let Some(observation) =
+                            acknowledged_observation
+                        {
+                            v2_file_descriptor_from_actor_key(observation.key())
+                        } else {
+                            // The incoming write already carries the successor path. A cold
+                            // session has no observed actor key, so resolve the predecessor
+                            // from the transaction view before this write batch is staged.
+                            // Otherwise a CSV-to-TSV rename looks like TSV-to-TSV and the
+                            // plugin silently retains the old dialect.
+                            let request =
+                                FilesystemPathIndexRequest::new(vec![write.branch_id.clone()]);
+                            let path_index = self.filesystem_path_index(&request).await?;
+                            let entries = path_index
+                                .exact_file_id_entries(&write.file_id)
+                                .into_iter()
+                                .filter(|entry| {
+                                    let live = entry.live_row();
+                                    entry.kind == FilesystemPathKind::File
+                                        && entry.id() == write.file_id
+                                        && live.branch_id.as_ref() == write.branch_id
+                                        && !live.global
+                                        && live.untracked == write.untracked
+                                })
+                                .collect::<Vec<_>>();
+                            let [entry] = entries.as_slice() else {
+                                return Err(LixError::new(
+                                    LixError::CODE_CONSTRAINT_VIOLATION,
+                                    format!(
+                                        "owned component plugin file '{}' must resolve to exactly one predecessor path in its own lane; found {}",
+                                        write.file_id,
+                                        entries.len()
+                                    ),
+                                ));
+                            };
+                            let mut predecessor = v2_file_descriptor_from_actor_key(&actor_key);
+                            predecessor.path = Some(entry.path.clone());
+                            predecessor
+                        };
                         let cold_open_guard = cache.cold_open_guard().await;
                         let visible_materialization = self
                         .visible_materialization(&file_key)

@@ -3183,19 +3183,24 @@ async fn v2_csv_rename_and_same_row_edit_fail_without_a_cross_row_conflict_api()
     )
     .await
     .expect("source same-row edit should commit under the TSV descriptor");
+    assert_eq!(
+        read_file(&lix, tsv_path).await.unwrap(),
+        Some(b"SOURCE\tone\tred\n".to_vec()),
+        "source bytes before merge"
+    );
     lix.switch_branch(SwitchBranchOptions {
         branch_id: target_branch_id,
     })
     .await
     .unwrap();
 
-    let preview = lix
+    let preview_error = lix
         .merge_branch_preview(MergeBranchPreviewOptions {
             source_branch_id: source.id.clone(),
         })
         .await
-        .expect("descriptor rename and row edit should preview");
-    assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
+        .expect_err("preview must reject unsupported descriptor-plus-row reconciliation");
+    assert_eq!(preview_error.code, LixError::CODE_MERGE_CONFLICT);
 
     let error = lix
         .merge_branch(MergeBranchOptions {
@@ -3203,14 +3208,104 @@ async fn v2_csv_rename_and_same_row_edit_fail_without_a_cross_row_conflict_api()
         })
         .await
         .expect_err("descriptor-plus-row reconciliation needs a future cross-row API");
-    assert_eq!(error.code, LixError::CODE_UNIQUE);
+    assert_eq!(error.code, LixError::CODE_MERGE_CONFLICT);
 
     assert_eq!(
         read_file(&lix, csv_path).await.unwrap(),
         Some(b"TARGET,one,red\n".to_vec())
     );
     assert_eq!(read_file(&lix, tsv_path).await.unwrap(), None);
+    assert_eq!(file_id_at_path(&lix, csv_path).await, file_id);
 
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v2_csv_rename_and_disjoint_row_edits_fail_without_cross_row_materialization() {
+    let lix = open_lix().await.unwrap();
+    install_plugin(&lix, "plugin_csv", &build_csv_plugin_archive())
+        .await
+        .unwrap();
+    let before_path = "/disjoint-before.csv";
+    let after_path = "/disjoint-after.csv";
+    write_file(&lix, before_path, b"alpha,one\nbeta,two\n".to_vec())
+        .await
+        .unwrap();
+    let file_id = file_id_at_path(&lix, before_path).await;
+    let rows = active_csv_rows(&lix, &file_id).await;
+    let first_id = csv_row_id(&rows, &["alpha", "one"]);
+    let second_id = csv_row_id(&rows, &["beta", "two"]);
+    let target = lix.active_branch_id().await.unwrap();
+    let source = lix
+        .create_branch(CreateBranchOptions {
+            id: None,
+            name: "Disjoint renamed source".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .unwrap();
+    lix.execute(
+        "UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
+        &[
+            Value::Jsonb(serde_json::json!(["TARGET", "one"]).into()),
+            Value::Text(first_id),
+            Value::Text(file_id.clone()),
+        ],
+    )
+    .await
+    .unwrap();
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: source.id.clone(),
+    })
+    .await
+    .unwrap();
+    lix.execute(
+        "UPDATE lix_file SET path = $1 WHERE path = $2",
+        &[
+            Value::Text(after_path.to_owned()),
+            Value::Text(before_path.to_owned()),
+        ],
+    )
+    .await
+    .unwrap();
+    lix.execute(
+        "UPDATE csv_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
+        &[
+            Value::Jsonb(serde_json::json!(["SOURCE", "two"]).into()),
+            Value::Text(second_id),
+            Value::Text(file_id.clone()),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read_file(&lix, after_path).await.unwrap(),
+        Some(b"alpha,one\nSOURCE,two\n".to_vec())
+    );
+    lix.switch_branch(SwitchBranchOptions { branch_id: target })
+        .await
+        .unwrap();
+    let before_rows = active_csv_rows(&lix, &file_id).await;
+    let preview_error = lix
+        .merge_branch_preview(MergeBranchPreviewOptions {
+            source_branch_id: source.id.clone(),
+        })
+        .await
+        .expect_err("renamed disjoint edits still require derived-blob materialization");
+    assert_eq!(preview_error.code, LixError::CODE_MERGE_CONFLICT);
+    let error = lix
+        .merge_branch(MergeBranchOptions {
+            source_branch_id: source.id,
+        })
+        .await
+        .expect_err("must not choose one branch's blob for merged disjoint rows");
+    assert_eq!(error.code, LixError::CODE_MERGE_CONFLICT);
+    assert_eq!(
+        read_file(&lix, before_path).await.unwrap(),
+        Some(b"TARGET,one\nbeta,two\n".to_vec())
+    );
+    assert_eq!(read_file(&lix, after_path).await.unwrap(), None);
+    assert_eq!(active_csv_rows(&lix, &file_id).await, before_rows);
     lix.close().await.unwrap();
 }
 

@@ -211,3 +211,87 @@ async fn mixed_read_batches_do_not_acknowledge_aggregate_file_bytes() {
         primary.close().await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn mixed_read_batches_only_acknowledge_returned_file_bytes() {
+    for coherent in [true, false] {
+        for file_query in [
+            "SELECT content FROM lix_file WHERE name='a.md' LIMIT 1",
+            "SELECT content FROM lix_file WHERE name LIKE '_.md' ORDER BY name LIMIT 1",
+        ] {
+            for files_first in [true, false] {
+                let storage = Memory::new();
+                let primary = open_lix().with_storage(storage.clone()).await.unwrap();
+                install_markdown(&primary).await;
+                let backing = primary.open_storage_session(storage).await.unwrap();
+                backing
+                    .execute(
+                        "INSERT INTO lix_file(path,content) VALUES('/a.md',$1),('/b.md',$1)",
+                        &[Value::Blob(b"initial\n".to_vec().into())],
+                    )
+                    .await
+                    .unwrap();
+                semantic_edit(&primary, "primary edit").await;
+                let mut statements: [(&str, &[Value]); 2] = [
+                    ("SELECT path FROM lix_directory ORDER BY path", &[]),
+                    (file_query, &[]),
+                ];
+                if files_first {
+                    statements.reverse();
+                }
+                let results = if coherent {
+                    backing
+                        .execute_coherent_read_batch(&statements)
+                        .await
+                        .unwrap()
+                        .results
+                } else {
+                    backing
+                        .execute_batch(
+                            &statements
+                                .iter()
+                                .map(|(sql, params)| ExecuteBatchStatement {
+                                    label: None,
+                                    sql: (*sql).to_owned(),
+                                    params: params.to_vec(),
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .await
+                        .unwrap()
+                };
+                let result = &results[usize::from(!files_first)];
+                assert_eq!(result.len(), 1);
+                assert_eq!(
+                    result.rows()[0].get::<Vec<u8>>("content").unwrap(),
+                    b"primary edit\n"
+                );
+                backing
+                    .execute(
+                        "UPDATE lix_file SET content=$1 WHERE path='/a.md'",
+                        &[Value::Blob(b"seen replacement\n".to_vec().into())],
+                    )
+                    .await
+                    .expect("the returned file must be acknowledged");
+                let error = backing
+                    .execute(
+                        "UPDATE lix_file SET content=$1 WHERE path='/b.md'",
+                        &[Value::Blob(b"unseen replacement\n".to_vec().into())],
+                    )
+                    .await
+                    .expect_err("a filtered or limited-out file must retain its stale observation");
+                assert_eq!(error.code, lix::LixError::CODE_PLUGIN_OBSERVATION_STALE);
+                let rows = primary
+                    .execute("SELECT content FROM lix_file WHERE path='/b.md'", &[])
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    rows.rows()[0].get::<Vec<u8>>("content").unwrap(),
+                    b"primary edit\n"
+                );
+                backing.close().await.unwrap();
+                primary.close().await.unwrap();
+            }
+        }
+    }
+}
