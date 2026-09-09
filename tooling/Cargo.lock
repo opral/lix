@@ -3128,7 +3128,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
 name = "lix"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "ahash",
  "async-stream",
@@ -3188,7 +3188,7 @@ dependencies = [
 
 [[package]]
 name = "lix-schema"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -3201,7 +3201,7 @@ dependencies = [
 
 [[package]]
 name = "lix-storage-filesystem"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "lix",
  "lix-storage-rocksdb",
@@ -3211,7 +3211,7 @@ dependencies = [
 
 [[package]]
 name = "lix-storage-rocksdb"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "blake3",
  "bytes",
@@ -3223,7 +3223,7 @@ dependencies = [
 
 [[package]]
 name = "lix-storage-slatedb"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3264,7 +3264,7 @@ dependencies = [
 
 [[package]]
 name = "lix_collaboration_test_support"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -3938,7 +3938,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_csv"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "base64 0.22.1",
  "lix",
@@ -3949,7 +3949,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_excalidraw"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "lix",
  "serde_json",
@@ -3958,7 +3958,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_json"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -3969,7 +3969,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_markdown"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "base64 0.22.1",
  "chardetng",
@@ -3982,7 +3982,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_text"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "base64 0.22.1",
  "lix",

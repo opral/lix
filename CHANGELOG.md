@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.16.0 - 2026-09-09
+
+### Minor
+
+- Consolidate checkpoint storage and version-control SQL with a breaking repository migration.
+
+  Checkpoint membership is immutable `lix_commit.is_checkpoint`; remove `lix_checkpoint` marker writes. Add first-parent `lix_log`, redefine `lix_history` as endpoint changes with checkpoint flags, and rename `lix_state_at` to `lix_as_of`. Working diffs expose their actual endpoints and branches expose `working_base_commit_id`. Replace the latest-checkpoint scalar with filtered logs or the working baseline, according to the query's purpose. Upgrade clients and synchronization peers together.
+
+  Reference hosts can explicitly provision control-plane repository IDs through an internal authenticated operation. Creation and legacy-storage adoption are separate; adoption validates and migrates existing repositories without replacing their data. Quiesce old writers and adopt legacy repositories before switching public traffic to the lifecycle catalog.
+
+  Sparse checkpoint inventory bootstrap preserves deferred jump topology, including checkpoints created from unmarked restore/fork baselines. Validate header graphs without repeated full-inventory scans.
+- Synchronize custom and plugin-defined rows, including Markdown, with their schema and typed values intact.
+
+  Sync peers must upgrade together to sync protocol version 8. Older sync peers are rejected during negotiation rather than accepting a session that cannot exchange rows.
+- Support structural JSON row edits, including insertion, deletion, reordering, moves, and scalar/container conversion. Structural batches validate and rebuild the final tree, preserve row identities and unchanged scalar spelling, and stream the replacement file. Existing scalar updates retain their byte-splice fast path.
+
+  Container deletion requires removing or moving descendants in the same plugin row batch; invalid trees reject atomically. SQL projects each statement separately. Structural upserts follow normal row last-write-wins behavior, including recreating a previously deleted key.
+
+  Repeated row updates honor the final update even when it restores the original value. Renames adapt existing key-formatting hints, and scalar conversions ignore obsolete empty-container whitespace. File-derived row deltas use deterministic key order so stale edits across multiple parents can compose reliably.
+- Sync clients commit edits and checkpoints locally and upload them in the background.
+
+  Current-state reads and writes no longer wait for a server round trip. Durable replicas reopen offline, and historical data is fetched on demand and cached. The server remains authoritative: incompatible concurrent branch updates replace pending local work without a merge-conflict workflow. Upgrade sync clients and servers together for sync protocol version 7.
+- Simplified plugin development with native lifecycle testing, validated file edits, and scoped state cleanup.
+
+  Plugin authors can test projection hooks without compiling WebAssembly, read edited file ranges without rebuilding the whole file, and clear related private state in one operation. Markdown and CSV use the shared helpers to reduce duplicated edit and cache bookkeeping. Rebuild plugin components against the updated SDK to use the new state cleanup host operation.
+
+### Patch
+
+- Large offline sync queues reuse a metadata-only upload plan across pages and load only the commit payloads being sent. Ordinary edits remain local and join the next upload wave; restores and server resets invalidate cached work. Checkpoint acknowledgment metadata is retired after all branches converge.
+- Fixed CSV edits and reopen operations losing cells, formatting, or the stored dialect.
+
+  CSV now preserves UTF-8 BOMs, literal quote spelling, empty final cells, and missing final line endings when rows move. Multiline and adjacent file edits reconcile the correct rows, and unsupported NUL bytes are rejected before unreadable state is stored.
+- Fix synchronization of edits made on disk while a filesystem repository is connected to a server.
+
+  The filesystem watcher now shares the connected repository's write admission and authenticated account, and wakes its existing sync worker after an edit.
+- Fixed explicit transactions failing on SlateDB-backed servers when reading cached file and directory state.
+
+  SlateDB reads, writes, and flushes now also work when called from an executor without a Tokio runtime.
+- Git replay clears starter files from its fresh output before importing a Git tree, so repositories without Lix's bootstrap README still replay and verify exactly.
+- Keep ordinary reads and live queries available while an explicit transaction is open.
+
+  Transactions now use an independent context on the originating handle's branch and account. Transaction reads see staged writes, while ordinary reads and observers see committed data. Commit publishes the changes; rollback leaves observers unaffected. Each originating handle still allows one explicit transaction at a time and must finish it before closing.
+- Improved JSON and Excalidraw data and formatting preservation when alternating file and row edits.
+
+  JSON retains number spelling and string escapes when rebuilding files from rows, and inserted array items remain writable after later insertions. Excalidraw preserves unchanged element and embedded-file formatting, including unknown fields. Rebuilt plugin indexes discard stale offsets so subsequent edits address the correct bytes.
+- Fixed Markdown edits losing literal content, unrelated formatting, or the original file encoding.
+
+  No-op row updates now preserve file bytes, reference-definition edits refresh affected links, and cached block content no longer reappears after subsequent edits.
+
 ## Unreleased
 
 - **Breaking:** checkpoint membership is immutable commit metadata (`is_checkpoint`), replacing the `lix_checkpoint` relation and marker writes. Repository migration preserves existing checkpoint IDs and inventory. Upgrade clients and synchronization peers together.
