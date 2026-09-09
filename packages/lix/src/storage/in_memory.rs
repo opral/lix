@@ -435,7 +435,6 @@ fn check_preconditions(
                         .entries_range(lower_bound(&range), upper_bound(&range), 1)
                         .is_empty()
                 }
-                Precondition::BranchEquals { .. } => false,
             };
             (!matches).then_some(PreconditionFailure { index })
         })
