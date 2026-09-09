@@ -26,9 +26,7 @@ mod tests {
     use bytes::Bytes;
     use futures_lite::io::Cursor;
 
-    use crate::storage_adapter::{
-        StorageAdapter, StorageKey, StorageValue, StorageWriteOptions,
-    };
+    use crate::storage_adapter::{StorageAdapter, StorageKey, StorageValue, StorageWriteOptions};
     use crate::{Memory, open_lix};
 
     #[test]
@@ -40,9 +38,10 @@ mod tests {
 
         let wire = crate::storage_spaces::SNAPSHOT_STORAGE_SPACES;
         assert!(wire.windows(2).all(|pair| pair[0].id.0 < pair[1].id.0));
-        assert!(wire
-            .iter()
-            .all(|space| space.id != crate::storage_adapter::REPOSITORY_EPOCH_SPACE.id));
+        assert!(
+            wire.iter()
+                .all(|space| space.id != crate::storage_adapter::REPOSITORY_EPOCH_SPACE.id)
+        );
         for active in super::snapshot_spaces() {
             assert_eq!(super::snapshot_space(active.id.0), Some(active));
         }
@@ -62,6 +61,18 @@ mod tests {
             .create_checkpoint()
             .await
             .expect("checkpoint snapshot state");
+
+        let adapter = source.storage_adapter();
+        let mut writes = adapter.new_write_set();
+        writes.put(
+            crate::storage_spaces::RETIRED_JSON_SPACE,
+            &b"historical-json"[..],
+            &b"opaque historical JSON storage bytes"[..],
+        );
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("seed opaque retired storage");
 
         let mut bytes = Vec::new();
         let report = source
@@ -113,7 +124,8 @@ mod tests {
 
         let server = open_lix()
             .with_storage(storage)
-            .serve().with_embedded_lix_id()
+            .serve()
+            .with_embedded_lix_id()
             .await
             .expect("serve source Lix");
         let mut bytes = Vec::new();

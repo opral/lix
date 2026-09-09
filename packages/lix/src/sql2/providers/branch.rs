@@ -17,8 +17,8 @@ use serde_json::Value as JsonValue;
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::branch::{
-    BranchHead, BranchRefReader, branch_descriptor_stage_row, branch_descriptor_tombstone_row,
-    branch_ref_stage_row, branch_ref_tombstone_row,
+    BranchHead, BranchHeadWrite, BranchRefReader, branch_descriptor_stage_row,
+    branch_descriptor_tombstone_row,
 };
 use crate::changelog::CommitId;
 use crate::hot_state::{
@@ -1231,15 +1231,20 @@ fn push_branch_stage_rows(
             branch_descriptor_tombstone_row(&row.id),
             origin.clone(),
         ));
-        rows.push(with_origin(branch_ref_tombstone_row(&row.id), origin));
+        rows.push_branch_head(BranchHeadWrite {
+            branch_id: row.id,
+            head_commit_id: None,
+            origin,
+        });
     } else {
         let mut descriptor = branch_descriptor_stage_row(&row.id, &row.name, row.hidden);
         descriptor.metadata = row.metadata;
         rows.push(with_origin(descriptor, origin.clone()));
-        rows.push(with_origin(
-            branch_ref_stage_row(&row.id, &row.commit_id),
+        rows.push_branch_head(BranchHeadWrite {
+            branch_id: row.id,
+            head_commit_id: Some(row.commit_id),
             origin,
-        ));
+        });
     }
 }
 
@@ -1513,11 +1518,12 @@ mod tests {
             );
         }
 
-        assert_eq!(rows.len(), 200);
+        assert_eq!(rows.len(), 100);
+        assert_eq!(rows.take_branch_heads().len(), 100);
         assert_eq!(
             rows.shared_string_count(),
-            3,
-            "descriptor schema, ref schema, and global branch are batch-wide dictionary values"
+            2,
+            "descriptor schema and global branch are batch-wide dictionary values"
         );
         assert!(std::ptr::eq(
             rows.row(0).branch_id,
@@ -1590,8 +1596,13 @@ mod tests {
         );
         assert_eq!(rows.row(0).schema_key, "lix_branch_descriptor");
         assert_eq!(rows.row(0).metadata, Some(&metadata));
-        assert_eq!(rows.row(1).schema_key, "lix_branch_ref");
-        assert_eq!(rows.row(1).metadata, None);
+        assert_eq!(rows.len(), 1);
+        let heads = rows.take_branch_heads();
+        assert_eq!(heads.len(), 1);
+        assert_eq!(
+            heads[0].head_commit_id,
+            Some(CommitId::for_test_label("head"))
+        );
     }
 
     #[tokio::test]

@@ -8644,7 +8644,7 @@ mod tests {
                         serde_json::from_str(snapshot).map_err(|error| {
                             LixError::unknown(format!("invalid test live-row JSON: {error}"))
                         })?;
-                    crate::plugin::runtime::WasmTypedRow::from_builtin_json(
+                    crate::row_payload::TypedRow::from_builtin_json(
                         &row.schema_key,
                         &row.row_pk,
                         &value,

@@ -32,7 +32,8 @@ use crate::hot_state::{
     HotStateReadDomain, HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
     MaterializedHotStateRowRef,
 };
-use crate::plugin::runtime::{PLUGIN_OWNER_KEY, WasmTypedRow};
+use crate::plugin::runtime::PLUGIN_OWNER_KEY;
+use crate::row_payload::TypedRow as WasmTypedRow;
 use crate::row_pk::{RowPk, RowPkError, canonical_json_text};
 #[cfg(test)]
 use crate::schema::{SchemaKey, validate_lix_schema, validate_lix_schema_definition};
@@ -40,12 +41,12 @@ use crate::schema::{schema_from_registered_snapshot, validate_schema_amendment};
 use crate::transaction::normalization::{
     reject_reserved_schema_namespace, reject_reserved_schema_namespace_unless_exact_builtin,
 };
-use crate::transaction::staging::duplicate_insert_identity_message;
 use crate::transaction::staging::{
     PreparedInsertRef, PreparedValidationRow, PreparedWriteSet, PreparedWriteValidationSet,
 };
 #[cfg(test)]
 use crate::transaction_types::TransactionWriteOrigin;
+use crate::transaction_types::duplicate_insert_identity_message;
 use crate::transaction_types::{
     PreparedStateBatch, PreparedStateRowRef, StagedIndexRow, StagedIndexValues,
     TransactionWriteOperation,
@@ -55,7 +56,7 @@ const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
-pub(crate) const MAX_DIRECTORY_PARENT_DEPTH: usize = 1024;
+use crate::filesystem::MAX_DIRECTORY_PARENT_DEPTH;
 
 /// Immutable view of the final transaction write set before persistence.
 ///
@@ -3152,13 +3153,15 @@ fn committed_snapshot_json(
     if row.deleted() {
         return Ok(None);
     }
-    row.snapshot_json_value()?.map(Some).ok_or_else(|| LixError::new(
+    row.snapshot_json_value()?.map(Some).ok_or_else(|| {
+        LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
                 "live committed row for schema '{}' has no payload",
                 row.schema_key()
             ),
-        ))
+        )
+    })
 }
 
 fn committed_constraint_value(
@@ -4237,6 +4240,7 @@ mod tests {
         committed_rows: Vec<MaterializedHotStateRow>,
     ) -> Result<bool, LixError> {
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: PreparedStateBatch::from_test_rows(staged_rows),
             ..empty_staged_write_set()
         };
@@ -4563,6 +4567,7 @@ mod tests {
             }),
         ];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![pending_registered_schema_row("pending_schema")],
             ..empty_staged_write_set()
         };
@@ -4735,6 +4740,7 @@ mod tests {
         );
         deleted.snapshot = None;
         let delete_write = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![deleted.clone()],
             ..empty_staged_write_set()
         };
@@ -4747,6 +4753,7 @@ mod tests {
         );
 
         let mixed_write = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 deleted,
                 staged_file_descriptor_row(
@@ -4791,6 +4798,7 @@ mod tests {
             };
             logical_insert.origin = Some(filesystem_insert_origin(surface, row_id));
             let untrusted_transaction_write = PreparedWriteSet {
+                branch_heads: Default::default(),
                 state_rows: prepared_rows![logical_insert.clone()],
                 ..empty_staged_write_set()
             };
@@ -4805,6 +4813,7 @@ mod tests {
                 "{surface} must be revalidated when planning was not serialized"
             );
             let logical_write = PreparedWriteSet {
+                branch_heads: Default::default(),
                 state_rows: prepared_rows![logical_insert],
                 ..empty_staged_write_set()
             };
@@ -4870,6 +4879,7 @@ mod tests {
             (near_match, "near-match surface"),
         ] {
             let staged_writes = PreparedWriteSet {
+                branch_heads: Default::default(),
                 state_rows: prepared_rows![row],
                 ..empty_staged_write_set()
             };
@@ -4890,6 +4900,7 @@ mod tests {
             "01920000-0000-7000-8000-0000000000a1",
         );
         let mut explicit_write = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![explicit_insert.clone()],
             ..empty_staged_write_set()
         };
@@ -4911,6 +4922,7 @@ mod tests {
             "01920000-0000-7000-8000-000000000292",
         ));
         let mixed_write = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![logical_insert, explicit_insert],
             ..empty_staged_write_set()
         };
@@ -4935,6 +4947,7 @@ mod tests {
             primary_key: None,
         });
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![inserted],
             ..empty_staged_write_set()
         };
@@ -4993,6 +5006,7 @@ mod tests {
             r#"{"id":"01920000-0000-7000-8000-000000000172","directory_id":null,"name":"occupied"}"#,
         ));
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![inserted],
             ..empty_staged_write_set()
         };
@@ -5048,6 +5062,7 @@ mod tests {
             }),
         ];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![pending_registered_schema_row("same_schema")],
             ..empty_staged_write_set()
         };
@@ -5137,6 +5152,7 @@ mod tests {
             registered_schema_row_pk("duplicate_schema_duplicate"),
         );
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 pending_registered_schema_row("duplicate_schema"),
                 duplicate
@@ -5154,6 +5170,7 @@ mod tests {
     #[test]
     fn schema_catalog_allows_pending_foreign_key_to_pending_schema() {
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 pending_registered_schema_from_definition(fk_parent_schema()),
                 pending_registered_schema_from_definition(fk_child_schema()),
@@ -5173,6 +5190,7 @@ mod tests {
     #[test]
     fn schema_catalog_rejects_foreign_key_missing_target_schema() {
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 pending_registered_schema_from_definition(fk_child_schema())
             ],
@@ -5201,6 +5219,7 @@ mod tests {
         let mut child = fk_child_schema();
         child["foreign_keys"][0]["references"]["columns"] = json!(["missing_id"]);
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 pending_registered_schema_from_definition(fk_parent_schema()),
                 pending_registered_schema_from_definition(child),
@@ -5225,6 +5244,7 @@ mod tests {
         let mut child = fk_child_schema();
         child["foreign_keys"][0]["references"]["columns"] = json!(["name"]);
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 pending_registered_schema_from_definition(parent),
                 pending_registered_schema_from_definition(child),
@@ -5243,6 +5263,7 @@ mod tests {
     async fn validation_rejects_unknown_schema_key() {
         let visible_schemas = vec![key_value_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![staged_row("unknown_schema", Some(json!({}).to_string()))],
             ..empty_staged_write_set()
         };
@@ -5258,6 +5279,7 @@ mod tests {
     async fn validation_checks_schema_existence_for_tombstones() {
         let visible_schemas = vec![key_value_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![staged_row("unknown_schema", None)],
             ..empty_staged_write_set()
         };
@@ -5273,6 +5295,7 @@ mod tests {
     async fn validation_allows_pending_registered_schema_to_validate_later_rows() {
         let visible_schemas = vec![key_value_schema(), registered_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 pending_registered_schema_row("pending_schema"),
                 staged_row("pending_schema", Some(json!({ "id": "row-1" }).to_string()),),
@@ -5318,6 +5341,7 @@ mod tests {
             row
         };
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 pending_registered_schema_from_definition(unique_schema()),
                 global_unique_row("row-1", "slug-1"),
@@ -5393,6 +5417,7 @@ mod tests {
         );
         retarget_test_row(&mut row, RowPk::single("row-1"));
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![pending_registered_schema_from_definition(schema), row,],
             ..empty_staged_write_set()
         };
@@ -5451,6 +5476,7 @@ mod tests {
         );
         retarget_test_row(&mut tracked_row, RowPk::single("row-1"));
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![untracked_schema, tracked_row],
             ..empty_staged_write_set()
         };
@@ -5466,6 +5492,7 @@ mod tests {
     async fn validation_validates_snapshot_content_against_schema() {
         let visible_schemas = vec![key_value_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![staged_row(
                 "lix_key_value",
                 Some(json!({ "key": "k", "extra": true }).to_string()),
@@ -5492,6 +5519,7 @@ mod tests {
     async fn validation_skips_snapshot_validation_for_tombstones() {
         let visible_schemas = vec![key_value_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![staged_row("lix_key_value", None)],
             ..empty_staged_write_set()
         };
@@ -5505,6 +5533,7 @@ mod tests {
     async fn validation_rejects_missing_file_owner_reference() {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![unique_row("post-1", "hello-world", "first")],
             ..empty_staged_write_set()
         };
@@ -5529,6 +5558,7 @@ mod tests {
             directory_descriptor_schema(),
         ];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 staged_file_descriptor_row(
                     "01920000-0000-7000-8000-0000000000a2",
@@ -5561,6 +5591,7 @@ mod tests {
         );
         mark_prepared_row_untracked(&mut untracked_file_descriptor);
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 untracked_file_descriptor,
                 unique_row("post-1", "hello-world", "first"),
@@ -5599,6 +5630,7 @@ mod tests {
         let mut untracked_row = unique_row("post-1", "hello-world", "first");
         mark_prepared_row_untracked(&mut untracked_row);
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 staged_file_descriptor_row(
                     "01920000-0000-7000-8000-0000000000a2",
@@ -5639,6 +5671,7 @@ mod tests {
         );
         file_descriptor_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 file_descriptor_delete,
                 unique_row("post-1", "hello-world", "first"),
@@ -5663,6 +5696,7 @@ mod tests {
     async fn validation_allows_committed_file_owner_reference() {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![unique_row("post-1", "hello-world", "first")],
             ..empty_staged_write_set()
         };
@@ -5686,6 +5720,7 @@ mod tests {
     async fn validation_caches_committed_file_owner_reference_by_domain() {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 unique_row("post-1", "hello-world", "first"),
                 unique_row("post-2", "second-slug", "second"),
@@ -5712,6 +5747,7 @@ mod tests {
     async fn validation_rejects_tracked_file_owner_reference_committed_only_as_untracked() {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![unique_row("post-1", "hello-world", "first")],
             ..empty_staged_write_set()
         };
@@ -5757,6 +5793,7 @@ mod tests {
         let mut untracked_row = unique_row("post-1", "hello-world", "first");
         mark_prepared_row_untracked(&mut untracked_row);
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![untracked_row],
             ..empty_staged_write_set()
         };
@@ -5788,6 +5825,7 @@ mod tests {
     async fn validation_allows_tracked_file_owner_reference_committed_behind_untracked_overlay() {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![unique_row("post-1", "hello-world", "first")],
             ..empty_staged_write_set()
         };
@@ -5827,6 +5865,7 @@ mod tests {
         );
         file_descriptor_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![file_descriptor_delete],
             ..empty_staged_write_set()
         };
@@ -5856,6 +5895,7 @@ mod tests {
         );
         file_descriptor_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![file_descriptor_delete],
             ..empty_staged_write_set()
         };
@@ -5898,6 +5938,7 @@ mod tests {
         );
         mark_prepared_row_untracked(&mut untracked_child);
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![tracked_parent, untracked_child],
             ..empty_staged_write_set()
         };
@@ -5911,6 +5952,7 @@ mod tests {
     async fn validation_rejects_file_owner_reference_that_exists_only_in_global() {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![unique_row("post-1", "hello-world", "first")],
             ..empty_staged_write_set()
         };
@@ -5939,6 +5981,7 @@ mod tests {
         let mut conflicting = unique_row("post-1", "hello-world", "first");
         conflicting.row_pk = RowPk::single("post-2");
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![unique_row("post-1", "hello-world", "first"), conflicting],
             ..empty_staged_write_set()
         };
@@ -5954,6 +5997,7 @@ mod tests {
     async fn validation_rejects_pending_unique_value_duplicate() {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 unique_row("post-1", "hello-world", "first"),
                 unique_row("post-2", "hello-world", "second"),
@@ -5972,6 +6016,7 @@ mod tests {
     async fn validation_rejects_pending_unique_duplicate_with_null_component() {
         let visible_schemas = vec![nullable_unique_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 nullable_unique_row("row-1", None, "root-name"),
                 nullable_unique_row("row-2", None, "root-name"),
@@ -5992,6 +6037,7 @@ mod tests {
         let mut duplicate = unique_row("post-2", "hello-world", "second");
         duplicate.branch_id = "01920000-0000-7000-8000-0000000000a1".into();
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![unique_row("post-1", "hello-world", "first"), duplicate],
             ..empty_staged_write_set()
         };
@@ -6009,6 +6055,7 @@ mod tests {
         let mut branch_b = unique_row("post-2", "hello-world", "second");
         branch_b.branch_id = "01920000-0000-7000-8000-0000000000b1".into();
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![unique_row("post-1", "hello-world", "first"), branch_b],
             ..empty_staged_write_set()
         };
@@ -6022,6 +6069,7 @@ mod tests {
     async fn validation_allows_pending_unique_overwrite_of_same_identity() {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 unique_row("post-1", "hello-world", "first"),
                 unique_row("post-1", "hello-world", "updated"),
@@ -6040,6 +6088,7 @@ mod tests {
         let mut tombstone = unique_row("post-1", "hello-world", "deleted");
         tombstone.snapshot = None;
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![tombstone, unique_row("post-2", "hello-world", "second")],
             ..empty_staged_write_set()
         };
@@ -6057,6 +6106,7 @@ mod tests {
         let mut different_branch = unique_row("post-3", "hello-world", "third");
         different_branch.branch_id = "01920000-0000-7000-8000-0000000000b1".into();
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 unique_row("post-1", "hello-world", "first"),
                 different_file,
@@ -6074,6 +6124,7 @@ mod tests {
     async fn validation_rejects_committed_visible_unique_value_duplicate() {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![unique_row("post-2", "hello-world", "second")],
             ..empty_staged_write_set()
         };
@@ -6097,6 +6148,7 @@ mod tests {
     async fn validation_rejects_committed_tracked_unique_duplicate_behind_untracked_overlay() {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![unique_row("post-2", "hello-world", "second")],
             ..empty_staged_write_set()
         };
@@ -6127,6 +6179,7 @@ mod tests {
         untracked_tombstone.snapshot = None;
         mark_prepared_row_untracked(&mut untracked_tombstone);
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 untracked_tombstone,
                 unique_row("post-2", "hello-world", "second"),
@@ -6153,6 +6206,7 @@ mod tests {
     async fn validation_rejects_committed_unique_duplicate_with_null_component() {
         let visible_schemas = vec![nullable_unique_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![nullable_unique_row("row-2", None, "root-name")],
             ..empty_staged_write_set()
         };
@@ -6176,6 +6230,7 @@ mod tests {
     async fn validation_rejects_committed_unique_same_value_in_same_branch() {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![unique_row("post-2", "hello-world", "second")],
             ..empty_staged_write_set()
         };
@@ -6201,6 +6256,7 @@ mod tests {
         let mut branch_b = unique_row("post-2", "hello-world", "second");
         branch_b.branch_id = "01920000-0000-7000-8000-0000000000b1".into();
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![branch_b],
             ..empty_staged_write_set()
         };
@@ -6221,6 +6277,7 @@ mod tests {
     async fn validation_ignores_projected_hot_state_rows_for_unique_constraints() {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![unique_row("post-2", "hello-world", "second")],
             ..empty_staged_write_set()
         };
@@ -6244,6 +6301,7 @@ mod tests {
     async fn validation_allows_committed_visible_unique_update_of_same_identity() {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![unique_row("post-1", "hello-world", "updated")],
             ..empty_staged_write_set()
         };
@@ -6264,6 +6322,7 @@ mod tests {
     async fn validation_rejects_unique_update_to_another_committed_value() {
         let visible_schemas = vec![unique_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![unique_row("post-1", "second-slug", "updated")],
             ..empty_staged_write_set()
         };
@@ -6299,6 +6358,7 @@ mod tests {
             primary_key: None,
         });
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![inserted],
             ..empty_staged_write_set()
         };
@@ -6332,6 +6392,7 @@ mod tests {
         let mut committed_two = committed_unique_row("post-2", "second-slug", "second");
         committed_two.file_id = None;
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![staged_one, staged_two],
             ..empty_staged_write_set()
         };
@@ -6357,6 +6418,7 @@ mod tests {
         let mut tombstone = unique_row("post-1", "hello-world", "deleted");
         tombstone.snapshot = None;
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![tombstone, unique_row("post-2", "hello-world", "second")],
             ..empty_staged_write_set()
         };
@@ -6381,6 +6443,7 @@ mod tests {
         let mut different_branch = unique_row("post-3", "hello-world", "third");
         different_branch.branch_id = "01920000-0000-7000-8000-0000000000b1".into();
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![different_file, different_branch],
             ..empty_staged_write_set()
         };
@@ -6401,6 +6464,7 @@ mod tests {
     async fn validation_rejects_foreign_key_target_missing_in_same_branch() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![fk_child_row(
                 "child-1",
                 "parent-1",
@@ -6420,6 +6484,7 @@ mod tests {
     async fn validation_allows_foreign_key_target_in_same_branch() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1"),
                 fk_child_row(
@@ -6453,6 +6518,7 @@ mod tests {
         );
         mark_prepared_row_untracked(&mut untracked_file_descriptor);
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 untracked_file_descriptor,
                 untracked_parent,
@@ -6497,6 +6563,7 @@ mod tests {
         );
         mark_prepared_row_untracked(&mut untracked_child);
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 tracked_file_descriptor,
                 tracked_parent,
@@ -6515,6 +6582,7 @@ mod tests {
     async fn validation_rejects_foreign_key_target_that_exists_only_in_different_branch() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000b1"),
                 fk_child_row(
@@ -6537,6 +6605,7 @@ mod tests {
     async fn validation_primary_key_fk_point_lookup_ignores_unrelated_rows() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![fk_child_row(
                 "child-1",
                 "parent-1",
@@ -6574,6 +6643,7 @@ mod tests {
     async fn validation_rejects_tracked_foreign_key_target_committed_only_as_untracked() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![fk_child_row(
                 "child-1",
                 "parent-1",
@@ -6622,6 +6692,7 @@ mod tests {
         );
         mark_prepared_row_untracked(&mut untracked_child);
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![untracked_file_descriptor, untracked_child],
             ..empty_staged_write_set()
         };
@@ -6651,6 +6722,7 @@ mod tests {
     async fn validation_allows_tracked_foreign_key_target_committed_behind_untracked_overlay() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![fk_child_row(
                 "child-1",
                 "parent-1",
@@ -6688,6 +6760,7 @@ mod tests {
         let mut parent_delete = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
         parent_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![parent_delete],
             ..empty_staged_write_set()
         };
@@ -6728,6 +6801,7 @@ mod tests {
         let mut parent_delete = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
         parent_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![parent_delete],
             ..empty_staged_write_set()
         };
@@ -6761,6 +6835,7 @@ mod tests {
     async fn validation_rejects_foreign_key_target_committed_only_in_different_branch() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![fk_child_row(
                 "child-1",
                 "parent-1",
@@ -6795,6 +6870,7 @@ mod tests {
         let mut parent_delete = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
         parent_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 parent_delete,
                 fk_child_row(
@@ -6832,6 +6908,7 @@ mod tests {
         untracked_parent_delete.snapshot = None;
         mark_prepared_row_untracked(&mut untracked_parent_delete);
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 untracked_parent_delete,
                 fk_child_row(
@@ -6864,6 +6941,7 @@ mod tests {
         let mut parent_delete = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
         parent_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 parent_delete,
                 fk_child_row(
@@ -6899,6 +6977,7 @@ mod tests {
         let mut parent_delete = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
         parent_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![
                 parent_delete,
                 fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000b1"),
@@ -6935,6 +7014,7 @@ mod tests {
             ],
         };
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![parent_delete],
             ..empty_staged_write_set()
         };
@@ -6968,6 +7048,7 @@ mod tests {
             scan_count: AtomicUsize::new(0),
         };
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![parent_one_delete, parent_two_delete],
             ..empty_staged_write_set()
         };
@@ -7029,6 +7110,7 @@ mod tests {
         committed_rows: Vec<MaterializedHotStateRow>,
     ) -> Result<(), LixError> {
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: PreparedStateBatch::from_test_rows(staged_rows),
             ..empty_staged_write_set()
         };
@@ -7304,6 +7386,7 @@ mod tests {
         staged_rows: Vec<TestPreparedStateRow>,
     ) -> Result<(), LixError> {
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: PreparedStateBatch::from_test_rows(staged_rows),
             ..empty_staged_write_set()
         };
@@ -7418,6 +7501,7 @@ mod tests {
             ],
         };
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![parent_delete],
             ..empty_staged_write_set()
         };
@@ -7456,6 +7540,7 @@ mod tests {
             ],
         };
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![parent_delete, child_delete],
             ..empty_staged_write_set()
         };
@@ -7484,6 +7569,7 @@ mod tests {
             ],
         };
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![parent_delete, child_update],
             ..empty_staged_write_set()
         };
@@ -7955,6 +8041,7 @@ mod tests {
 
     fn empty_staged_write_set() -> PreparedWriteSet {
         PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: PreparedStateBatch::new(),
             insert_selection: crate::transaction::staging::PreparedInsertSelection::new(),
             commit_change_refs_by_branch: BTreeMap::new(),
@@ -8385,6 +8472,7 @@ mod tests {
         semantic.origin = Some(plugin_reconciliation_update_origin());
 
         let mut writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows: prepared_rows![descriptor.clone(), blob_ref.clone(), owner, semantic],
             file_content_writes: vec![crate::transaction_types::TransactionFileContent::new(
                 "01920000-0000-7000-8000-0000000000a2".to_string(),
@@ -8673,6 +8761,7 @@ mod tests {
             ],
         );
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows,
             ..empty_staged_write_set()
         };
@@ -8711,6 +8800,7 @@ mod tests {
             )],
         );
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows,
             ..empty_staged_write_set()
         };
@@ -8758,6 +8848,7 @@ mod tests {
             ],
         );
         let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
             state_rows,
             ..empty_staged_write_set()
         };

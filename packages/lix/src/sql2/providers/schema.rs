@@ -32,7 +32,7 @@ use crate::hot_state::{
     HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter, HotStateProjection,
     HotStateReader, HotStateRowFilter, HotStateScanRequest,
 };
-use crate::plugin::runtime::WasmTypedRow;
+use crate::row_payload::TypedRow as WasmTypedRow;
 use crate::row_pk::RowPk;
 use crate::sql2::branch_scope::{BranchBinding, resolve_provider_branch_ids};
 use crate::sql2::catalog::{
@@ -4675,7 +4675,7 @@ mod tests {
         batch.push_owned(row);
         batch.set_decoded_snapshot(
             0,
-            Some(Arc::new(crate::plugin::runtime::WasmTypedRow {
+            Some(Arc::new(crate::row_payload::TypedRow {
                 schema_fingerprint: spec.schema_fingerprint,
                 row_pk: vec![lix_schema::Value::Text("row-1".to_owned())].into(),
                 row: lix_schema::Row::from([
@@ -4732,7 +4732,7 @@ mod tests {
         batch.push_owned(row);
         batch.set_decoded_snapshot(
             0,
-            Some(Arc::new(crate::plugin::runtime::WasmTypedRow {
+            Some(Arc::new(crate::row_payload::TypedRow {
                 schema_fingerprint,
                 row_pk: vec![lix_schema::Value::Text("row-1".to_owned())].into(),
                 row: lix_schema::Row::from([

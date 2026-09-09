@@ -8,6 +8,9 @@
     clippy::unused_self
 )]
 
+use crate::transaction_types::{
+    duplicate_insert_identity_message, logical_primary_key_violation_message,
+};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -15,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use smallvec::SmallVec;
 
+use super::branch_heads::PreparedBranchHeads;
 use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::{BlobBytesBatch, BlobId};
 use crate::catalog::SchemaPlanId;
@@ -34,15 +38,15 @@ use crate::hot_state::{
 };
 #[cfg(test)]
 use crate::hot_state::{MaterializedHotStateRow, MaterializedHotStateRowRef};
-use crate::plugin::runtime::WasmTypedRow;
+use crate::row_payload::TypedRow as WasmTypedRow;
 use crate::row_pk::RowPk;
 use crate::transaction::staged_commit_changes::StagedCommitChangeBatch;
 use crate::transaction::staged_commit_changes::StagedCommitChangeRefs;
 #[cfg(test)]
 use crate::transaction_types::TestPreparedStateRow;
 use crate::transaction_types::{
-    CompleteCollectionReplacementProof, LogicalPrimaryKey, PreparedRowFacts, PreparedStateBatch,
-    PreparedStateRowRef, PreparedTransactionWrite, TransactionFileContent, TransactionWriteMode,
+    CompleteCollectionReplacementProof, PreparedRowFacts, PreparedStateBatch, PreparedStateRowRef,
+    PreparedTransactionWrite, TransactionFileContent, TransactionWriteMode,
     TransactionWriteOperation, TransactionWriteOrigin, TransactionWriteOutcome,
     materialize_jsonb_shared,
 };
@@ -57,6 +61,7 @@ pub(crate) const MUTATION_JOURNAL_CHUNK_MAX_ROWS: usize = 4 * 1_024;
 /// transaction prepares it into a stable `PreparedStateBatch`, reads build a
 /// `PreparedStateRowOverlay` over that batch, and commit drains the same owner.
 pub(crate) struct TransactionWriteBuffer {
+    branch_heads: Mutex<PreparedBranchHeads>,
     functions: FunctionProviderHandle,
     rows: Mutex<StagedPreparedRows>,
     ordered_mutations: Mutex<Option<OrderedMutationJournal>>,
@@ -75,6 +80,7 @@ pub(crate) struct TransactionWriteBuffer {
 /// This owns the prepared-row owners and transaction control structures needed
 /// to restore an explicit transaction after a post-stage SQL error.
 pub(crate) struct TransactionWriteBufferCheckpoint {
+    branch_heads: PreparedBranchHeads,
     rows: StagedPreparedRows,
     ordered_mutations: Option<OrderedMutationJournal>,
     commit_change_refs_by_branch: BTreeMap<String, StagedCommitChangeRefs>,
@@ -1034,6 +1040,7 @@ impl TrackedStateKey {
 /// Drained prepared transaction writes ready for commit.
 #[derive(Clone)]
 pub(crate) struct PreparedWriteSet {
+    pub(crate) branch_heads: PreparedBranchHeads,
     pub(crate) state_rows: PreparedStateBatch,
     pub(crate) insert_selection: PreparedInsertSelection,
     pub(crate) commit_change_refs_by_branch: BTreeMap<String, StagedCommitChangeRefs>,
@@ -1206,7 +1213,7 @@ impl PreparedInsertSelection {
             .reserve(final_words.saturating_sub(self.bits.len()));
     }
 
-    fn resize_rows(&mut self, row_count: usize) {
+    pub(super) fn resize_rows(&mut self, row_count: usize) {
         debug_assert!(row_count >= self.row_count);
         if !self.origins.is_empty() {
             self.origins.resize(row_count, None);
@@ -1221,7 +1228,7 @@ impl PreparedInsertSelection {
         self.row_count = row_count;
     }
 
-    fn mark(
+    pub(super) fn mark(
         &mut self,
         row_index: usize,
         origin: Option<&TransactionWriteOrigin>,
@@ -1584,7 +1591,8 @@ impl PreparedWriteSet {
         branch_id: &str,
         cohort_commit_id: CommitId,
     ) -> Result<(), LixError> {
-        if !other.first_commit_parent_override_by_branch.is_empty()
+        if !other.branch_heads.is_empty()
+            || !other.first_commit_parent_override_by_branch.is_empty()
             || !other.checkpoint_publications.is_empty()
             || !other.extra_commit_parents_by_branch.is_empty()
             || !other.intermediate_commits.is_empty()
@@ -1752,8 +1760,16 @@ impl PreparedWriteSet {
 }
 
 impl TransactionWriteBuffer {
+    pub(crate) fn stage_branch_heads(&self, heads: PreparedBranchHeads) {
+        self.branch_heads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .append(heads)
+    }
+
     pub(crate) fn new(functions: FunctionProviderHandle) -> Self {
         Self {
+            branch_heads: Mutex::new(PreparedBranchHeads::default()),
             functions,
             rows: Mutex::new(StagedPreparedRows::default()),
             ordered_mutations: Mutex::new(None),
@@ -2081,6 +2097,14 @@ impl TransactionWriteBuffer {
     }
 
     pub(crate) fn is_file_cohort_eligible(&self, branch_id: &str) -> bool {
+        if !self
+            .branch_heads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
+            return false;
+        }
         let rows = self.rows.lock().unwrap_or_else(|error| error.into_inner());
         let rows = match &*rows {
             StagedPreparedRows::AppendOnly { rows, .. }
@@ -2176,6 +2200,11 @@ impl TransactionWriteBuffer {
         })?;
 
         Ok(TransactionWriteBufferCheckpoint {
+            branch_heads: self
+                .branch_heads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
             rows: rows.clone(),
             ordered_mutations: ordered_mutations.clone(),
             commit_change_refs_by_branch: commit_change_refs_by_branch.clone(),
@@ -2195,6 +2224,7 @@ impl TransactionWriteBuffer {
         checkpoint: TransactionWriteBufferCheckpoint,
     ) -> Result<(), LixError> {
         let TransactionWriteBufferCheckpoint {
+            branch_heads,
             rows,
             ordered_mutations,
             commit_change_refs_by_branch,
@@ -2204,6 +2234,7 @@ impl TransactionWriteBuffer {
             intermediate_commits,
             file_content_writes,
         } = checkpoint;
+        *self.branch_heads.lock().unwrap_or_else(|e| e.into_inner()) = branch_heads;
         let mut rows_guard = self.rows.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -2766,6 +2797,9 @@ impl TransactionWriteBuffer {
             refs.attach_ordered_mutation_journal(Arc::new(journal))?;
         }
         Ok(PreparedWriteSet {
+            branch_heads: std::mem::take(
+                &mut *self.branch_heads.lock().unwrap_or_else(|e| e.into_inner()),
+            ),
             state_rows,
             insert_selection,
             commit_change_refs_by_branch: std::mem::take(&mut *commit_change_refs_guard),
@@ -4299,25 +4333,6 @@ fn duplicate_staged_present_row_error(
     LixError::new(LixError::CODE_UNIQUE, message)
 }
 
-pub(crate) fn duplicate_insert_identity_message(
-    schema_key: &str,
-    _row_pk: &RowPk,
-    branch_id: Option<&str>,
-    origin: Option<&TransactionWriteOrigin>,
-) -> String {
-    if let Some(message) = logical_primary_key_violation_message(origin) {
-        return message;
-    }
-    match branch_id {
-        Some(branch_id) => format!(
-            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate a primary key in branch '{branch_id}'"
-        ),
-        None => format!(
-            "primary-key constraint violation on schema '{schema_key}': INSERT would duplicate a primary key"
-        ),
-    }
-}
-
 fn duplicate_insert_identity_error(row: PreparedStateRowRef<'_>) -> LixError {
     let message = duplicate_insert_identity_message(
         row.schema_key,
@@ -4326,38 +4341,6 @@ fn duplicate_insert_identity_error(row: PreparedStateRowRef<'_>) -> LixError {
         row.origin,
     );
     LixError::new(LixError::CODE_UNIQUE, message)
-}
-
-fn logical_primary_key_violation_message(
-    origin: Option<&TransactionWriteOrigin>,
-) -> Option<String> {
-    let origin = origin?;
-    if origin.operation != TransactionWriteOperation::Insert {
-        return None;
-    }
-    let primary_key = origin.primary_key.as_ref()?;
-    Some(format!(
-        "primary-key constraint violation on table '{}': INSERT would duplicate {}",
-        origin.surface,
-        format_logical_primary_key(primary_key)
-    ))
-}
-
-fn format_logical_primary_key(primary_key: &LogicalPrimaryKey) -> String {
-    primary_key
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(index, column)| {
-            let value = primary_key
-                .values
-                .get(index)
-                .map(String::as_str)
-                .unwrap_or("<missing>");
-            format!("{column} '{value}'")
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 fn add_row_to_commit_change_refs(
@@ -4824,10 +4807,7 @@ mod tests {
             let start = snapshots.len();
             if row + 1 == ROW_COUNT {
                 snapshots.extend_from_slice(b"{\"value\":\"");
-                snapshots.extend(std::iter::repeat_n(
-                    b'x',
-                    crate::json_store::JSON_INLINE_MAX_BYTES + 1,
-                ));
+                snapshots.extend(std::iter::repeat_n(b'x', 1024 + 1));
                 snapshots.extend_from_slice(b"\"}");
             } else {
                 snapshots.extend_from_slice(b"{}");
@@ -4850,7 +4830,7 @@ mod tests {
         )
         .expect("journal chunk above the u16 row boundary");
 
-        assert!(chunk.snapshot(ROW_COUNT - 1).len() > crate::json_store::JSON_INLINE_MAX_BYTES);
+        assert!(chunk.snapshot(ROW_COUNT - 1).len() > 1024);
     }
 
     #[test]
@@ -5420,12 +5400,10 @@ mod tests {
         assert_eq!(drained.state_rows.len(), 2);
         assert!(drained.state_rows.iter().any(|row| {
             row.row_pk == &RowPk::single("row-b")
-                && crate::transaction_types::materialized_hot_state_row_with_snapshot_projection(
-                    row,
-                )
-                .ok()
-                .and_then(|row| row.snapshot_content)
-                .as_deref()
+                && crate::hot_state::materialized_hot_state_row_with_snapshot_projection(row)
+                    .ok()
+                    .and_then(|row| row.snapshot_content)
+                    .as_deref()
                     == Some("{\"key\":\"row-b\",\"value\":\"after\"}")
         }));
         assert_eq!(
@@ -5734,22 +5712,18 @@ mod tests {
         assert_eq!(drained.state_rows.len(), 2);
         assert!(drained.state_rows.iter().any(|row| {
             row.row_pk == &RowPk::single("sql2-key-a")
-                && crate::transaction_types::materialized_hot_state_row_with_snapshot_projection(
-                    row,
-                )
-                .ok()
-                .and_then(|row| row.snapshot_content)
-                .as_deref()
+                && crate::hot_state::materialized_hot_state_row_with_snapshot_projection(row)
+                    .ok()
+                    .and_then(|row| row.snapshot_content)
+                    .as_deref()
                     == Some("{\"key\":\"sql2-key-a\",\"value\":\"second\"}")
         }));
         assert!(drained.state_rows.iter().any(|row| {
             row.row_pk == &RowPk::single("sql2-key-b")
-                && crate::transaction_types::materialized_hot_state_row_with_snapshot_projection(
-                    row,
-                )
-                .ok()
-                .and_then(|row| row.snapshot_content)
-                .as_deref()
+                && crate::hot_state::materialized_hot_state_row_with_snapshot_projection(row)
+                    .ok()
+                    .and_then(|row| row.snapshot_content)
+                    .as_deref()
                     == Some("{\"key\":\"sql2-key-b\",\"value\":\"only\"}")
         }));
     }
