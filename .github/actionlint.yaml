@@ -1,6 +1,8 @@
 self-hosted-runner:
   # Labels of self-hosted runner in array of strings.
   labels:
+    - ubicloud-standard-2-ubuntu-2404
+    - ubicloud-standard-30-ubuntu-2404
     - blacksmith-4vcpu-ubuntu-2404
     - blacksmith-16vcpu-ubuntu-2404
     - blacksmith-32vcpu-ubuntu-2404
