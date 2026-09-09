@@ -4776,10 +4776,7 @@ mod tests {
             let start = snapshots.len();
             if row + 1 == ROW_COUNT {
                 snapshots.extend_from_slice(b"{\"value\":\"");
-                snapshots.extend(std::iter::repeat_n(
-                    b'x',
-                    crate::json_store::JSON_INLINE_MAX_BYTES + 1,
-                ));
+                snapshots.extend(std::iter::repeat_n(b'x', 1024 + 1));
                 snapshots.extend_from_slice(b"\"}");
             } else {
                 snapshots.extend_from_slice(b"{}");
@@ -4802,7 +4799,7 @@ mod tests {
         )
         .expect("journal chunk above the u16 row boundary");
 
-        assert!(chunk.snapshot(ROW_COUNT - 1).len() > crate::json_store::JSON_INLINE_MAX_BYTES);
+        assert!(chunk.snapshot(ROW_COUNT - 1).len() > 1024);
     }
 
     #[test]

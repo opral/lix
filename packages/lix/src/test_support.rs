@@ -5,7 +5,6 @@ use crate::changelog::{
     ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogReader, ChangelogWriter,
     CommitLoadRequest, CommitRecord,
 };
-use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 #[cfg(test)]
 use crate::storage_adapter::StorageAdapter;
 use crate::storage_adapter::StorageAdapterRead;
@@ -17,9 +16,6 @@ use crate::tracked_state::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-fn prepare_json_ref(value: &str) -> JsonRef {
-    JsonRef::for_content(value.as_bytes())
-}
 #[cfg(test)]
 use crate::GLOBAL_BRANCH_ID;
 #[cfg(test)]
@@ -869,18 +865,10 @@ async fn stage_test_changelog_commit(
     let winner_indices = final_state_row_winner_indices(rows)?;
     let mut append = ChangelogAppend::default();
     let mut change_commit_ids = Vec::new();
-    let mut json_payloads = Vec::new();
-    let mut seen_json_refs = BTreeSet::new();
     for &row_index in &winner_indices {
         let row = &rows[row_index];
-        for (json_ref, payload) in json_payloads_from_materialized(row) {
-            if seen_json_refs.insert(json_ref.as_hash_bytes().to_vec()) {
-                json_payloads.push((json_ref, payload));
-            }
-        }
         change_commit_ids.push((row_index, row.commit_id));
     }
-    stage_json_payloads(writes, &json_payloads)?;
     let created_at = rows
         .first()
         .map(|row| crate::common::LixTimestamp::expect_parse("created_at", &row.created_at))
@@ -937,35 +925,6 @@ fn final_state_row_winner_indices(
     let mut indices = winners.into_values().collect::<Vec<_>>();
     indices.sort_unstable();
     Ok(indices)
-}
-
-fn json_payloads_from_materialized(row: &MaterializedTrackedStateRow) -> Vec<(JsonRef, String)> {
-    // Native row payloads never enter json_store. Metadata remains an
-    // independently encoded JSON boundary.
-    let mut payloads = Vec::new();
-    if let Some(metadata) = row.metadata.as_ref() {
-        let serialized = crate::serialize_row_metadata(metadata);
-        if serialized.len() > crate::json_store::JSON_INLINE_MAX_BYTES {
-            payloads.push((prepare_json_ref(&serialized), serialized));
-        }
-    }
-    payloads
-}
-
-fn stage_json_payloads(
-    writes: &mut StorageWriteSet,
-    payloads: &[(JsonRef, String)],
-) -> Result<(), crate::LixError> {
-    let payloads = payloads
-        .iter()
-        .map(|(json_ref, payload)| NormalizedJsonRef::trusted_prehashed(payload, *json_ref))
-        .collect::<Vec<_>>();
-    JsonStoreContext::new().writer().stage_batch(
-        writes,
-        JsonWritePlacementRef::OutOfBand,
-        payloads,
-    )?;
-    Ok(())
 }
 
 pub(crate) fn tracked_change_from_materialized(

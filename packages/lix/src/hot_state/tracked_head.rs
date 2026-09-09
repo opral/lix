@@ -58,7 +58,6 @@ use crate::hot_state::{
     MaterializedHotStateBatch, MaterializedHotStateBatchBuilder, MaterializedHotStateExactBatch,
     MaterializedHotStateRow, MaterializedHotStateRowRef,
 };
-use crate::json_store::JsonRef;
 #[cfg(any(test, feature = "storage-benches"))]
 use crate::plugin::wire::typed as typed_wire;
 use crate::row_payload::TypedRow as WasmTypedRow;
@@ -103,14 +102,14 @@ pub(crate) struct TrackedWorkingDiffEpoch {
 #[musli(packed)]
 pub(crate) struct WorkingDiffIndexCoverage {
     group_count: u64,
-    group_key_xor: JsonRef,
+    group_key_xor: [u8; CONTENT_HASH_BYTES],
 }
 
 impl Default for WorkingDiffIndexCoverage {
     fn default() -> Self {
         Self {
             group_count: 0,
-            group_key_xor: JsonRef::from_hash_bytes([0; JSON_REF_BYTES]),
+            group_key_xor: [0; CONTENT_HASH_BYTES],
         }
     }
 }
@@ -119,21 +118,21 @@ impl WorkingDiffIndexCoverage {
     fn add_encoded_group_key(&mut self, key: &[u8]) -> Option<()> {
         self.group_count = self.group_count.checked_add(1)?;
         let hash = blake3::hash(key);
-        let mut group_key_xor = *self.group_key_xor.as_hash_array();
+        let mut group_key_xor = self.group_key_xor;
         for (target, source) in group_key_xor.iter_mut().zip(hash.as_bytes()) {
             *target ^= source;
         }
-        self.group_key_xor = JsonRef::from_hash_bytes(group_key_xor);
+        self.group_key_xor = group_key_xor;
         Some(())
     }
 
     fn remove_encoded_group_key(&mut self, key: &[u8]) -> Option<()> {
         self.group_count = self.group_count.checked_sub(1)?;
-        let mut group_key_xor = *self.group_key_xor.as_hash_array();
+        let mut group_key_xor = self.group_key_xor;
         for (target, source) in group_key_xor.iter_mut().zip(blake3::hash(key).as_bytes()) {
             *target ^= source;
         }
-        self.group_key_xor = JsonRef::from_hash_bytes(group_key_xor);
+        self.group_key_xor = group_key_xor;
         Some(())
     }
 }
@@ -184,7 +183,7 @@ enum WorkingDiffBaseline {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WorkingDiffSlotFingerprint {
     kind: u8,
-    hash: [u8; JSON_REF_BYTES],
+    hash: [u8; CONTENT_HASH_BYTES],
 }
 
 const WORKING_DIFF_SLOT_NONE: u8 = 0;
@@ -199,7 +198,7 @@ const WORKING_DIFF_SLOT_INLINE: u8 = 2;
 /// the accelerator in favor of canonical diff.
 const WORKING_DIFF_SLOT_UNRESOLVED: u8 = 3;
 const WORKING_DIFF_VERSION_BYTES: usize =
-    16 + 16 + 1 + 8 + 8 + 1 + JSON_REF_BYTES + 1 + JSON_REF_BYTES;
+    16 + 16 + 1 + 8 + 8 + 1 + CONTENT_HASH_BYTES + 1 + CONTENT_HASH_BYTES;
 const WORKING_DIFF_CHECKPOINT_BYTES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, musli::Encode, musli::Decode)]
@@ -1290,11 +1289,12 @@ fn decode_working_diff_slot(
     ) {
         return Err(working_diff_error(&format!("{field} slot kind is invalid")));
     }
-    let hash: [u8; JSON_REF_BYTES] = take_working_diff_bytes(bytes, offset, JSON_REF_BYTES)?
-        .try_into()
-        .map_err(|_| working_diff_error(&format!("{field} hash is invalid")))?;
+    let hash: [u8; CONTENT_HASH_BYTES] =
+        take_working_diff_bytes(bytes, offset, CONTENT_HASH_BYTES)?
+            .try_into()
+            .map_err(|_| working_diff_error(&format!("{field} hash is invalid")))?;
     if matches!(kind, WORKING_DIFF_SLOT_NONE | WORKING_DIFF_SLOT_UNRESOLVED)
-        && hash != [0; JSON_REF_BYTES]
+        && hash != [0; CONTENT_HASH_BYTES]
     {
         return Err(working_diff_error(&format!(
             "{field} slot kind must have a zero hash"
@@ -1368,7 +1368,7 @@ const HEAD_WORKING_DIFF_CLEAN: u8 = 1;
 const HEAD_WORKING_DIFF_BEFORE_ABSENT: u8 = 2;
 const HEAD_WORKING_DIFF_BEFORE_PRESENT: u8 = 3;
 const UUID_BYTES: usize = 16;
-const JSON_REF_BYTES: usize = 32;
+const CONTENT_HASH_BYTES: usize = 32;
 
 #[derive(Debug, Clone, Copy)]
 struct HeadValueView<'a> {
@@ -1447,14 +1447,14 @@ impl WorkingDiffSlotFingerprint {
     fn unresolved() -> Self {
         Self {
             kind: WORKING_DIFF_SLOT_UNRESOLVED,
-            hash: [0; JSON_REF_BYTES],
+            hash: [0; CONTENT_HASH_BYTES],
         }
     }
 
     fn none() -> Self {
         Self {
             kind: WORKING_DIFF_SLOT_NONE,
-            hash: [0; JSON_REF_BYTES],
+            hash: [0; CONTENT_HASH_BYTES],
         }
     }
 }
@@ -1571,7 +1571,7 @@ fn working_diff_snapshot_fingerprint(payload: Option<&[u8]>) -> WorkingDiffSlotF
     payload.map_or_else(WorkingDiffSlotFingerprint::none, |payload| {
         WorkingDiffSlotFingerprint {
             kind: WORKING_DIFF_SLOT_INLINE,
-            hash: *JsonRef::for_content(payload).as_hash_array(),
+            hash: *blake3::hash(payload).as_bytes(),
         }
     })
 }
@@ -2402,6 +2402,26 @@ mod tests {
     }
 
     #[test]
+    fn working_diff_coverage_preserves_the_legacy_json_ref_encoding() {
+        // Frozen with the pre-retirement JsonRef::encode implementation and
+        // packed WorkingDiffIndexCoverage from 2da8a31e6. This is persisted
+        // auxiliary state: removing the wrapper must not change its bytes.
+        const LEGACY: &[u8] = &[
+            172, 2, 32, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90,
+            90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90,
+        ];
+        let coverage: WorkingDiffIndexCoverage =
+            crate::storage_codec::decode("legacy working-diff coverage", LEGACY)
+                .expect("decode existing coverage without a format migration");
+        assert_eq!(coverage.group_count, 300);
+        assert_eq!(coverage.group_key_xor, [0x5a; 32]);
+        assert_eq!(
+            crate::storage_codec::encode("working-diff coverage", &coverage).unwrap(),
+            LEGACY,
+        );
+    }
+
+    #[test]
     fn v10_value_codec_roundtrips_clean_inline_ref_and_base_coordinate() {
         let metadata = lix_schema::Jsonb::from_value(serde_json::json!({"source": "test"}));
         let typed = typed_row(&RowPk::single("row"), "{\"snapshot\":true}");
@@ -2547,11 +2567,11 @@ mod tests {
             updated_at: ts("2026-01-01T00:00:01Z"),
             snapshot: WorkingDiffSlotFingerprint {
                 kind: WORKING_DIFF_SLOT_INLINE,
-                hash: [3; JSON_REF_BYTES],
+                hash: [3; CONTENT_HASH_BYTES],
             },
             metadata: WorkingDiffSlotFingerprint {
                 kind: WORKING_DIFF_SLOT_NONE,
-                hash: [0; JSON_REF_BYTES],
+                hash: [0; CONTENT_HASH_BYTES],
             },
         };
         let typed = typed_row(&RowPk::single("row"), "{\"current\":true}");
@@ -2593,11 +2613,11 @@ mod tests {
     fn working_diff_payload_equality_matches_canonical_change_identity_semantics() {
         let slot = WorkingDiffSlotFingerprint {
             kind: WORKING_DIFF_SLOT_INLINE,
-            hash: [1; JSON_REF_BYTES],
+            hash: [1; CONTENT_HASH_BYTES],
         };
         let other_slot = WorkingDiffSlotFingerprint {
             kind: WORKING_DIFF_SLOT_INLINE,
-            hash: [2; JSON_REF_BYTES],
+            hash: [2; CONTENT_HASH_BYTES],
         };
         let baseline = WorkingDiffVersion {
             change_id: ChangeId::for_test_label("same-change"),
