@@ -28,8 +28,8 @@ mod materializer;
 mod publication;
 mod registry;
 pub(crate) use publication::{
-    PendingPluginActorPublication, PluginPublicationPolicy, PluginPublicationReceipt,
-    discard_plugin_actor_publications, retire_oldest_completed_actor,
+    ChainablePublication, PendingPluginActorPublication, PluginPublicationPolicy,
+    PluginPublicationReceipt, discard_plugin_actor_publications, retire_oldest_completed_actor,
 };
 mod row_reconcile;
 mod storage;
