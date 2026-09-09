@@ -115,3 +115,13 @@ pub(crate) use row_columnar_layout::{
 };
 pub(crate) use row_projection::RowProjectionDecoder;
 mod aggregate_statistics;
+
+pub(crate) use plan::read::execute_native_read;
+#[cfg(test)]
+pub(crate) use plan::read::statement::ExactFilesystemRead;
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) use plan::read::statement::exact_filesystem_read_route;
+pub(crate) use plan::read::statement::{
+    StatementReadPlan, is_acknowledgeable_file_content_read,
+    late_materialized_lix_file_content_read, plan_read_statement,
+};

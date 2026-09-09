@@ -631,3 +631,20 @@ fn the_scanner_finds_the_references_it_is_supposed_to() {
         "canonical state must not read the hot plane",
     );
 }
+
+#[test]
+fn session_delegates_sql_ast_planning() {
+    let violations = engine_sources()
+        .into_iter()
+        .filter(|(module, _, _)| module == "session")
+        .filter_map(|(_, path, source)| {
+            production_source(&source)
+                .contains("sqlparser")
+                .then_some(path)
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        violations.is_empty(),
+        "SQL AST planning belongs in sql2, not session: {violations:?}"
+    );
+}
