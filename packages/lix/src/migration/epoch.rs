@@ -831,16 +831,16 @@ where
         let candidate_result = async {
             clear_bank(&target).await?;
             let _ = copy_repository(&migration_source, &target).await?;
-            let mut marker_write = target.new_write_set();
-            marker_write.put(
+            write_candidate_page(
+                &target,
                 crate::init::REPOSITORY_PROTOCOL_SPACE,
-                crate::init::REPOSITORY_PROTOCOL_KEY,
-                original_marker.as_ref(),
-            );
-            target
-                .commit_write_set(marker_write, durable_candidate_write_options())
-                .await
-                .map_err(|error| epoch_error(format!("candidate marker write failed: {error}")))?;
+                single_put(
+                    crate::init::REPOSITORY_PROTOCOL_KEY,
+                    original_marker.clone(),
+                ),
+            )
+            .await
+            .map_err(|error| epoch_error(format!("candidate marker write failed: {error}")))?;
             super::migrate_lix_with_adapter(
                 storage.clone(),
                 target.clone(),
@@ -1149,15 +1149,19 @@ where
                     .key
                     .clone(),
             );
-            let mut writes = target.new_write_set();
+            let mut batch = PutBatch {
+                entries: Vec::with_capacity(entries.len()),
+            };
             for entry in entries {
                 let ProjectedValue::FullValue(value) = entry.value else {
                     return Err(epoch_error("full-value epoch scan returned a key-only row"));
                 };
-                writes.put(space, entry.key, StoredValue { bytes: value });
+                batch.entries.push(PutEntry {
+                    key: entry.key,
+                    value: StoredValue { bytes: value },
+                });
             }
-            target
-                .commit_write_set(writes, durable_candidate_write_options())
+            write_candidate_page(target, space, batch)
                 .await
                 .map_err(|error| epoch_error(format!("copy target write failed: {error}")))?;
             if !has_more {
@@ -1167,6 +1171,23 @@ where
         }
     }
     Ok(revision)
+}
+
+// Copying an existing sync role is not an ordinary repository mutation. Its
+// replica/authority marker must not fence subsequent candidate writes. The
+// migration write retains the exact epoch claim and durable publication rules.
+async fn write_candidate_page<S: Storage>(
+    target: &StorageAdapter<S>,
+    space: StorageSpace,
+    batch: PutBatch,
+) -> Result<(), StorageError> {
+    let mut write = target
+        .begin_migration_write(durable_candidate_write_options())
+        .await?;
+    write.put_many(space, batch).await?;
+    crate::storage_adapter::stage_mutation_revision(&mut write).await?;
+    write.commit().await?;
+    Ok(())
 }
 
 async fn read_copy_page<S>(
@@ -2460,6 +2481,145 @@ mod tests {
         });
         publish_pointer_absent(storage, &active).await.unwrap();
         active
+    }
+
+    #[tokio::test]
+    async fn migration_preserves_sync_ownership_across_legacy_and_active_banks() {
+        let replica = Bytes::from_static(
+            br#"{
+            "activeAccountId": "migration-test",
+            "cursor": 0,
+            "authoritativeBranches": {},
+            "authorityKnownCommitIds": []
+        }"#,
+        );
+        for (ownership_key, ownership_value) in [
+            (
+                &b"authority"[..],
+                Bytes::from_static(crate::sync::AUTHORITY_STATE_VALUE),
+            ),
+            (&b"repository"[..], replica),
+        ] {
+            for bank in [EpochBank::Legacy, EpochBank::A] {
+                let storage = crate::Memory::new();
+                let active = seed_active_v75(&storage, bank, 7).await;
+                if bank == EpochBank::Legacy {
+                    delete_pointer(&storage, &active).await.unwrap();
+                }
+                let source = StorageAdapter::for_epoch_unfenced(storage.clone(), bank);
+                let mut write = source
+                    .begin_migration_write(WriteOptions::default())
+                    .await
+                    .unwrap();
+                write
+                    .put_many(
+                        crate::sync::SYNC_AUTHORITY_STATE_SPACE,
+                        single_put(ownership_key, ownership_value.clone()),
+                    )
+                    .await
+                    .unwrap();
+                // This space sorts after sync ownership, so copying it exercises
+                // the first write after the candidate acquires the source role.
+                write
+                    .put_many(
+                        crate::sync::SYNC_UPLOAD_GENERATION_SPACE,
+                        single_put(b"preserved-upload", Bytes::from_static(b"preserved-value")),
+                    )
+                    .await
+                    .unwrap();
+                write.commit().await.unwrap();
+
+                let admitted = admit_repository(&storage, None)
+                    .await
+                    .expect("owned repository must migrate");
+                assert_eq!(admitted.report.format, crate::init::CURRENT_FORMAT_VERSION);
+                for (space, key, expected) in [
+                    (
+                        crate::sync::SYNC_AUTHORITY_STATE_SPACE,
+                        Bytes::from_static(ownership_key),
+                        ownership_value.clone(),
+                    ),
+                    (
+                        crate::sync::SYNC_UPLOAD_GENERATION_SPACE,
+                        Bytes::from_static(b"preserved-upload"),
+                        Bytes::from_static(b"preserved-value"),
+                    ),
+                ] {
+                    let read = admitted
+                        .adapter
+                        .begin_read(ReadOptions::default())
+                        .await
+                        .unwrap();
+                    let keys = [Key(key)];
+                    let result = read
+                        .get_many(&[GetManyRequest {
+                            space,
+                            keys: &keys,
+                            opts: GetOptions::default(),
+                        }])
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        result.values,
+                        vec![Some(ProjectedValue::FullValue(expected))]
+                    );
+                }
+                let mut ordinary = admitted.adapter.new_write_set();
+                ordinary.put(
+                    crate::json_store::JSON_SPACE,
+                    &b"forbidden"[..],
+                    &b"write"[..],
+                );
+                assert!(
+                    admitted
+                        .adapter
+                        .commit_write_set(ordinary, WriteOptions::default())
+                        .await
+                        .is_err(),
+                    "migration must not grant ordinary writers authority"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_copy_cannot_write_after_losing_its_epoch_claim() {
+        let storage = crate::Memory::new();
+        let claim = encode_pointer(PointerState::Migrating {
+            source: EpochBank::Legacy,
+            source_format: 0,
+            target: EpochBank::A,
+            generation: 1,
+            attempt: uuid::Uuid::from_u128(90),
+        });
+        publish_migration_claim_absent(&storage, &claim)
+            .await
+            .unwrap();
+        let target =
+            StorageAdapter::for_epoch_migration(storage.clone(), EpochBank::A, claim.clone());
+        delete_pointer(&storage, &claim).await.unwrap();
+        assert_eq!(
+            write_candidate_page(
+                &target,
+                crate::json_store::JSON_SPACE,
+                single_put(b"late", Bytes::from_static(b"forbidden"))
+            )
+            .await
+            .unwrap_err(),
+            StorageError::Fenced,
+        );
+        let unfenced = StorageAdapter::for_epoch_unfenced(storage, EpochBank::A);
+        let read = unfenced.begin_read(ReadOptions::default()).await.unwrap();
+        let keys = [Key(Bytes::from_static(b"late"))];
+        let result = read
+            .get_many(&[GetManyRequest {
+                space: crate::json_store::JSON_SPACE,
+                keys: &keys,
+                opts: GetOptions::default(),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(result.values, vec![None]);
     }
 
     #[test]
