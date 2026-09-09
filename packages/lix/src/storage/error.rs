@@ -63,10 +63,6 @@ pub enum Precondition {
         space: StorageSpace,
         range: KeyRange,
     },
-    BranchEquals {
-        ref_key: Key,
-        expected: Bytes,
-    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
