@@ -5,7 +5,7 @@ import markdownPageCss from "../../components/markdown-page.style.css?url";
 import { getBlogDescription, getBlogTitle } from "../../blog/blogMetadata.js";
 import { Footer } from "../../components/footer.js";
 import { Header } from "../../components/header.js";
-import { resolveOgImageUrl } from "../../blog/og-image.js";
+import { resolveBlogAssetPath, resolveOgImageUrl } from "../../blog/og-image.js";
 import {
   buildCanonicalUrl,
   resolveOgImage,
@@ -175,6 +175,9 @@ async function loadBlogPost(slug: string) {
       authors,
       readingTime,
       ogImage: ogImageOverride,
+      coverImage: ogImageOverrideRaw
+        ? resolveBlogAssetPath(ogImageOverrideRaw, folderName)
+        : undefined,
       ogImageAlt,
       imports,
     },
@@ -402,9 +405,9 @@ function BlogPostPage() {
           </div>
         )}
 
-        {post.ogImage && (
+        {post.coverImage && (
           <img
-            src={post.ogImage}
+            src={post.coverImage}
             alt={post.ogImageAlt ?? `${post.title} cover`}
             className="mt-9 block h-auto w-full rounded-[10px] border border-line bg-white"
           />
