@@ -318,9 +318,31 @@ impl TypedRow {
             schema_key,
             &plan.compiled_schema,
             plan.fingerprint().bytes(),
-            stored_row_pk,
+            Some(stored_row_pk),
             row,
             true,
+        )
+    }
+
+    /// Validates an engine-owned native row and selects the same durable
+    /// encoding as catalog-backed JSON ingress, including compact builtin rows.
+    pub(crate) fn from_row(
+        plan: &crate::catalog::SchemaPlan,
+        row: lix_schema::Row,
+    ) -> Result<Self, LixError> {
+        plan.compiled_schema
+            .validate_complete_row(&row)
+            .map_err(|error| json_ingress_error(&plan.key.schema_key, error))?;
+        let engine_compact = crate::catalog::CatalogSnapshot::builtin()
+            .plan_for_key(&plan.key.schema_key)
+            .is_some_and(|(_, builtin)| builtin.fingerprint() == plan.fingerprint());
+        Self::from_compiled_row(
+            &plan.key.schema_key,
+            &plan.compiled_schema,
+            plan.fingerprint().bytes(),
+            None,
+            row,
+            engine_compact,
         )
     }
 
@@ -357,7 +379,7 @@ impl TypedRow {
             schema_key,
             compiled_schema,
             schema_fingerprint,
-            stored_row_pk,
+            Some(stored_row_pk),
             row,
             engine_compact,
         )
@@ -367,7 +389,7 @@ impl TypedRow {
         schema_key: &str,
         compiled_schema: &lix_schema::CompiledSchema,
         schema_fingerprint: [u8; 32],
-        stored_row_pk: &RowPk,
+        stored_row_pk: Option<&RowPk>,
         row: lix_schema::Row,
         engine_compact: bool,
     ) -> Result<Self, LixError> {
@@ -395,7 +417,7 @@ impl TypedRow {
                 ),
             )
         })?;
-        if &durable_row_pk != stored_row_pk {
+        if stored_row_pk.is_some_and(|stored| &durable_row_pk != stored) {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
@@ -906,6 +928,34 @@ mod tests {
             &std::collections::BTreeMap::new(),
         )
         .expect("path/value schema should compile")
+    }
+
+    #[test]
+    fn native_row_constructor_preserves_durable_encoding_for_builtin_and_registered_rows() {
+        let custom = path_value_plan();
+        let (_, builtin) = crate::catalog::CatalogSnapshot::builtin()
+            .plan_for_key("lix_key_value")
+            .unwrap();
+        for (plan, key_column) in [(&custom, "path"), (builtin, "key")] {
+            for size in [3, 8192] {
+                let value =
+                    serde_json::json!({"text": "β".repeat(size), "nested": [true, null, 42]});
+                let json = serde_json::json!({(key_column): "a", "value": value});
+                let pk = RowPk::from_validated_shared_string("a".into());
+                let expected = TypedRow::from_normalized_json(plan, &pk, &json).unwrap();
+                let row = lix_schema::Row::from([
+                    (key_column, lix_schema::Value::Text("a".into())),
+                    ("value", lix_schema::Value::Jsonb(value.into())),
+                ]);
+                let actual = TypedRow::from_row(plan, row).unwrap();
+                assert_eq!(actual.row, expected.row);
+                assert_eq!(actual.row_pk, expected.row_pk);
+                assert_eq!(
+                    actual.durable_payload().unwrap(),
+                    expected.durable_payload().unwrap()
+                );
+            }
+        }
     }
 
     #[test]

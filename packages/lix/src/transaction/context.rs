@@ -7471,9 +7471,7 @@ where
                 if rows
                     .iter()
                     .any(|row| row.schema_key() == "lix_branch_descriptor" && !row.deleted())
-                    && rows
-                        .iter()
-                        .any(|row| row.schema_key() == BRANCH_REF_SCHEMA_KEY && !row.deleted())
+                    && self.staged_writes.has_staged_live_branch_head(&branch_id)
                 {
                     continue;
                 }

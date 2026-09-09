@@ -1,4 +1,4 @@
-use crate::branch::{BranchRefReader as _, branch_descriptor_stage_row, branch_ref_stage_row};
+use crate::branch::{BranchRefReader as _, branch_descriptor_stage_row, BranchHeadWrite};
 use crate::transaction_types::{
     RawWriteBatch, TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteRow,
 };
@@ -37,7 +37,7 @@ async fn new_branch_with_missing_source_cannot_publish_partial_recovery() {
                 "invalid recovery",
                 false,
             ));
-            creation.push(branch_ref_stage_row(&branch, &absent));
+            creation.push_branch_head(BranchHeadWrite::new(&branch, Some(absent)));
             transaction
                 .stage_write(TransactionWrite::Rows {
                     mode: TransactionWriteMode::Insert,
@@ -108,7 +108,7 @@ async fn existing_branch_ref_and_normal_commit_remain_rejected_atomically() {
                 "must not rename",
                 false,
             ));
-            lifecycle.push(branch_ref_stage_row(&branch, &head));
+            lifecycle.push_branch_head(BranchHeadWrite::new(&branch, Some(head)));
             transaction
                 .stage_write(TransactionWrite::Rows {
                     mode: TransactionWriteMode::Replace,

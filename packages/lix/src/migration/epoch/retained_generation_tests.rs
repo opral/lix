@@ -30,7 +30,7 @@ async fn seed_data(adapter: &StorageAdapter<crate::Memory>, value: &'static [u8]
         .unwrap();
     write
         .put_many(
-            crate::json_store::JSON_SPACE,
+            crate::storage_spaces::RETIRED_JSON_SPACE,
             single_put(b"local-only", Bytes::from_static(value)),
         )
         .await
@@ -42,7 +42,7 @@ async fn local_value(adapter: &StorageAdapter<crate::Memory>) -> Bytes {
     let read = adapter.begin_read(ReadOptions::default()).await.unwrap();
     let value = read
         .get_many(&[GetManyRequest {
-            space: crate::json_store::JSON_SPACE,
+            space: crate::storage_spaces::RETIRED_JSON_SPACE,
             keys: &[Key(Bytes::from_static(b"local-only"))],
             opts: GetOptions {
                 projection: CoreProjection::FullValue,

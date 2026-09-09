@@ -1760,6 +1760,11 @@ impl PreparedWriteSet {
 }
 
 impl TransactionWriteBuffer {
+    pub(crate) fn has_staged_live_branch_head(&self, branch_id: &str) -> bool {
+        self.branch_heads.lock().unwrap_or_else(|e| e.into_inner())
+            .targets.get(branch_id).is_some_and(|target| target.head_commit_id.is_some())
+    }
+
     pub(crate) fn stage_branch_heads(&self, heads: PreparedBranchHeads) {
         self.branch_heads
             .lock()

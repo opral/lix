@@ -168,7 +168,7 @@ where
         &self,
         opts: WriteOptions,
     ) -> Result<EpochStorageWrite<StorageImpl::Write<'_>>, StorageError> {
-        let (opts, fence_precondition_index) = self.routing.route_write_options(opts);
+        let (opts, fence_precondition_index) = self.routing.route_write_options(opts)?;
         let write = self.storage.begin_write(opts).await?;
         Ok(EpochStorageWrite::new(
             write,
@@ -268,7 +268,7 @@ where
         opts.batch_capacity_hint_bytes = opts
             .batch_capacity_hint_bytes
             .max(write_set.backend_batch_capacity_hint_bytes());
-        let (opts, fence_precondition_index) = self.routing.route_write_options(opts);
+        let (opts, fence_precondition_index) = self.routing.route_write_options(opts)?;
         let write = self
             .storage
             .begin_write(opts)
@@ -373,7 +373,7 @@ where
         range: KeyRange,
         opts: WriteOptions,
     ) -> Result<CommitResult, StorageError> {
-        let (opts, fence_precondition_index) = self.routing.route_write_options(opts);
+        let (opts, fence_precondition_index) = self.routing.route_write_options(opts)?;
         let write = self.storage.begin_write(opts).await?;
         let mut write =
             EpochStorageWrite::new(write, self.routing.clone(), fence_precondition_index);

@@ -177,7 +177,7 @@ impl EpochRouting {
                 expected: expected.clone(),
             });
         }
-        (options, fence_precondition_index)
+        Ok((options, fence_precondition_index))
     }
 
     fn map_precondition(&self, precondition: Precondition) -> Precondition {
@@ -387,7 +387,8 @@ mod tests {
         let expected = Bytes::from_static(b"active-v76-a");
         let (options, fence_precondition_index) =
             EpochRouting::fenced(EpochBank::A, expected.clone())
-                .route_write_options(WriteOptions::default());
+                .route_write_options(WriteOptions::default())
+                .expect("writable epoch");
         assert_eq!(fence_precondition_index, Some(0));
         assert_eq!(
             options.preconditions,

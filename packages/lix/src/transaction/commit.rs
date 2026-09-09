@@ -7150,6 +7150,9 @@ async fn assign_local_overlay_parents(
 fn staged_branch_creation_parent_heads(
     prepared: &PreparedWriteSet,
 ) -> Result<BTreeMap<String, CommitId>, LixError> {
+    if prepared.branch_heads.is_empty() {
+        return Ok(BTreeMap::new());
+    }
     let targets = &prepared.branch_heads.targets;
     let projected = prepared.branch_heads.validation_projection(prepared);
     let prepared = &projected;

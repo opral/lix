@@ -3604,7 +3604,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
     ) -> Result<(), LixError> {
         use crate::branch::{
             BranchLifecycle, BranchOperation, BranchReferenceRole, branch_descriptor_stage_row,
-            branch_ref_stage_row,
+            BranchHeadWrite,
         };
         use crate::transaction_types::{
             RawWriteBatch, TransactionJson, TransactionWrite, TransactionWriteMode,
@@ -3658,7 +3658,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
                 .with_write_transaction_lending(async |transaction| {
                     let mut creation = RawWriteBatch::with_capacity(2);
                     creation.push(branch_descriptor_stage_row(branch_id, name, false));
-                    creation.push(branch_ref_stage_row(branch_id, &head));
+                    creation.push_branch_head(BranchHeadWrite::new(branch_id, Some(head)));
                     transaction
                         .stage_write(TransactionWrite::Rows {
                             mode: TransactionWriteMode::Insert,

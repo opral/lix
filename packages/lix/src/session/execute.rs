@@ -2659,10 +2659,11 @@ where
                                             parsed,
                                             &statement.params,
                                             true,
-                                            None,
-                                            None,
-                                            None,
-                                            Some(plan),
+                                            sql2::StatementReadPlan {
+                                                native: None,
+                                                late_content: Some(plan),
+                                                acknowledge_file_views: true,
+                                            },
                                             false,
                                         )
                                         .await
@@ -2914,10 +2915,11 @@ where
                                             statement,
                                             params,
                                             true,
-                                            None,
-                                            None,
-                                            None,
-                                            Some(plan),
+                                            sql2::StatementReadPlan {
+                                                native: None,
+                                                late_content: Some(plan),
+                                                acknowledge_file_views: true,
+                                            },
                                             false,
                                         )
                                         .await
