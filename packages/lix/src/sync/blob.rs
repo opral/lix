@@ -9,9 +9,7 @@ use crate::binary_cas::{
     stage_verified_canonical_manifest, stage_verified_inline_canonical_blob,
     stage_verified_raw_chunk,
 };
-use crate::storage_adapter::{
-    Storage, StorageReadOptions, StorageWriteOptions, StorageWriteSet,
-};
+use crate::storage_adapter::{Storage, StorageReadOptions, StorageWriteOptions, StorageWriteSet};
 use crate::{Lix, LixError};
 
 use super::{SyncBlobChunk, SyncBlobManifest, SyncBlobRegistration};
@@ -163,7 +161,10 @@ where
         if canonical.blob_id != blob_id {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                format!("sync inline blob '{}' failed authentication", blob_id.to_hex()),
+                format!(
+                    "sync inline blob '{}' failed authentication",
+                    blob_id.to_hex()
+                ),
             ));
         }
         if canonical.chunks.len() > 1 {
@@ -180,9 +181,7 @@ where
                     size_bytes: chunk.size_bytes,
                 })
                 .collect(),
-            inline_bytes_base64: Some(
-                base64::engine::general_purpose::STANDARD.encode(&bytes),
-            ),
+            inline_bytes_base64: Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
         }))
     }
 

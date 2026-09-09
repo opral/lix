@@ -30,6 +30,7 @@ import {
 } from "./buffered-write.js";
 import { StorageChangeNotifier } from "./change-watch.js";
 import { restoreSynchronousModeBestEffort } from "./sqlite-cleanup.js";
+import { initializeBundledSqlite } from "./sqlite-initialize.js";
 import {
 	configureSqliteOpfsDurability,
 	fenceSqliteOpfsDurability,
@@ -542,25 +543,12 @@ async function initializeSqlite(): Promise<SqliteInit> {
 		const { default: sqlite3InitModule } = await import(
 			"@sqlite.org/sqlite-wasm"
 		);
-		sqliteModule = (
-			sqlite3InitModule as unknown as (options: {
-				instantiateWasm(
-					imports: WebAssembly.Imports,
-					onSuccess: (
-						instance: WebAssembly.Instance,
-						module: WebAssembly.Module,
-					) => void,
-				): object;
-			}) => Promise<SqliteInit>
-		)({
-			instantiateWasm(imports, onSuccess) {
-				void WebAssembly.compile(decodeDataUrl(sqliteWasmUrl)).then(
-					async (module) =>
-						onSuccess(await WebAssembly.instantiate(module, imports), module),
-				);
-				return {};
-			},
-		});
+		sqliteModule = initializeBundledSqlite(
+			sqlite3InitModule as unknown as Parameters<
+				typeof initializeBundledSqlite<SqliteInit>
+			>[0],
+			decodeDataUrl(sqliteWasmUrl),
+		);
 	}
 	return sqliteModule;
 }

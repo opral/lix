@@ -23,6 +23,38 @@ export function registerMemoryStorageContract({
 		withTimeout(promise, operation, operationTimeoutMs);
 
 	describe(`${name} memory-storage public contract`, () => {
+		test("recovery APIs preserve active data when no retained source exists", async () => {
+			const { openLix } = await loadSdk();
+			const lix = await wait((openStorage ?? openLix)(), "open Lix");
+			try {
+				await lix.execute(
+					"INSERT INTO lix_key_value (key, value) VALUES ('recovery-check', 'keep me')",
+				);
+				await expect(lix.replicaRecoverySources()).resolves.toEqual([]);
+				await expect(
+					lix.exportReplicaRecovery("missing-generation"),
+				).rejects.toMatchObject({
+					code: "LIX_INVALID_PARAM",
+					message: "retained replica not found",
+				});
+				await expect(
+					lix.recoverReplica("missing-generation"),
+				).rejects.toMatchObject({
+					code: "LIX_INVALID_PARAM",
+					message: "retained replica not found",
+				});
+				expect(
+					(
+						await lix.execute(
+							"SELECT value FROM lix_key_value WHERE key = 'recovery-check'",
+						)
+					).rows[0]?.value,
+				).toBe("keep me");
+			} finally {
+				await lix.close();
+			}
+		});
+
 		test("round-trips values, blobs, and JSON and preserves structured errors", async () => {
 			const { openLix, Value } = await loadSdk();
 			const lix = await wait((openStorage ?? openLix)(), "open Lix");

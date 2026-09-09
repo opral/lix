@@ -107,3 +107,6 @@ pub(crate) struct InstalledPluginMetadata {
     pub content: Option<PluginContentMatcher>,
     pub schema_keys: Vec<String>,
 }
+
+#[cfg(test)]
+pub(crate) use install::recovery_test_plugin_archive;

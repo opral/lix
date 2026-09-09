@@ -26,6 +26,9 @@ import type {
 	ObserveEvent,
 	OpenAnotherSessionOptions,
 	LixOpenReport,
+	ReplicaRecoverySource,
+	ReplicaRecoveryExport,
+	ReplicaRecoveryReceipt,
 	SqlParam,
 	ResultArrayRow,
 	ResultObjectRow,
@@ -215,6 +218,21 @@ export class Lix {
 				this.#transactionsOpening -= 1;
 			}
 		});
+	}
+
+	/** Lists preserved generations belonging to this local repository. */
+	async replicaRecoverySources(): Promise<ReplicaRecoverySource[]> {
+		return this.#runOperation(() => this.binding.replicaRecoverySources());
+	}
+
+	/** Exports retained work without deleting or changing its source. */
+	async exportReplicaRecovery(id: string): Promise<ReplicaRecoveryExport> {
+		return this.#runOperation(() => this.binding.exportReplicaRecovery(id));
+	}
+
+	/** Restores supported rows onto separate recovery branches; preserves the source. */
+	async recoverReplica(id: string): Promise<ReplicaRecoveryReceipt> {
+		return this.#runOperation(() => this.binding.recoverReplica(id));
 	}
 
 	async activeBranchId(): Promise<string> {

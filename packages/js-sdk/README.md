@@ -90,20 +90,51 @@ See [Collaboration and Sync](https://lix.dev/docs/collaboration-and-sync).
 
 ### Upgrading a local replica
 
-Keep using the same storage name across SDK upgrades. When a supported older
-replica needs a format upgrade, Lix checks its durable synchronization receipts
-before replacing downloaded data. A replica whose local work is fully
-acknowledged is bootstrapped from the same server into a separate storage epoch.
-The replacement becomes active only after bootstrap and validation succeed;
-the previous epoch is retained. This requires a connection to the server.
+Keep the same storage name across SDK upgrades. For a supported older synchronized
+replica, Lix preserves its existing storage generation and bootstraps a separate
+generation from the same authoritative repository and account. The replacement
+becomes active only after bootstrap and validation succeed. Pending work and
+local-only rows remain in the preserved generation; they do not block opening the
+current server state. An upgrade requires a server connection and enough local
+storage for both generations.
 
-If Lix cannot prove that local work is safe to replace, opening fails with
-`LIX_ERROR_REPLICA_UPGRADE_BLOCKED`. Preserve the storage and arrange recovery
-of the local work before upgrading. Do not catch this error by deleting the
-storage or changing its name: that can abandon unsynchronized changes.
-Automatic conversion of pending local work is not part of this upgrade path.
-Standalone and authoritative repositories continue to use history-preserving
-format migrations.
+Recovery is explicit and separate from opening:
+
+```ts
+const sources = await lix.replicaRecoverySources();
+for (const source of sources.filter((source) => source.recoveryRequired)) {
+  const exported = await lix.exportReplicaRecovery(source.id);
+  // Save exported as JSON when the user requests a portable recovery copy.
+  console.log(exported.unresolved);
+
+  const receipt = await lix.recoverReplica(source.id);
+  // Present these separate branches for review; the active branch is unchanged.
+  console.log(receipt.branchIds, receipt.restoredRows, receipt.unresolved);
+}
+```
+
+`exportReplicaRecovery()` captures available logical rows, blob contents, and
+original branch/checkpoint coordinates. `recoverReplica()` restores supported
+tracked rows into separate recovery branches. It does not automatically publish
+local-only rows or merge recovered work into the active branch. Inspect
+`unresolved`: original history and any unavailable content remain in the retained
+source. A recovery receipt describes local restoration, not a server durability
+acknowledgement. Neither operation deletes the retained generation, and retries
+reuse recovery branch receipts rather than overwriting previously recovered work.
+
+Recovery export currently allows up to 100,000 logical rows across all branches,
+64 MiB per blob, and 128 MiB of blob content in total. Unfinished upload parts
+have a separate 128 MiB content budget. A row-limit or upload-limit error leaves
+the source intact; omitted blob content is identified in `unresolved`. Exported
+JSON can be larger than these content budgets because binary data uses base64.
+This recovery file is not a complete repository backup.
+
+These methods require a local storage-backed handle; remote-only handles reject
+with `LIX_ERROR_LOCAL_STORAGE_REQUIRED`. Do not clear browser storage to resolve
+upgrade or recovery errors. Browser storage eviction or an unsupported old format
+can still require external recovery; retaining bytes alone is not proof that all
+work has been recovered. Standalone and authoritative repositories continue to
+use history-preserving format migrations.
 
 ## Remote repositories
 

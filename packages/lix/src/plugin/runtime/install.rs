@@ -247,7 +247,7 @@ mod tests {
         }
     }
 
-    fn plugin_archive(content: Option<&str>) -> Vec<u8> {
+    pub(super) fn plugin_archive(content: Option<&str>) -> Vec<u8> {
         plugin_archive_for("plugin_test", "*.test", content)
     }
 
@@ -300,4 +300,9 @@ mod tests {
         );
         component.finish()
     }
+}
+
+#[cfg(test)]
+pub(crate) fn recovery_test_plugin_archive() -> Vec<u8> {
+    tests::plugin_archive(None)
 }

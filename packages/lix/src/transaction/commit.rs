@@ -285,6 +285,13 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         .values()
         .flat_map(StagedCommitChangeRefs::selected_changes)
         .any(|change_ref| change_ref.schema_key() == ACCOUNT_SCHEMA_KEY);
+    let staged_creation_parents = staged_branch_creation_parent_heads(&prepared_writes)?;
+    let authored_branch_ids = prepared_writes
+        .commit_change_refs_by_branch
+        .iter()
+        .filter(|(_, refs)| !refs.is_empty() || refs.allow_empty)
+        .map(|(branch, _)| branch.clone())
+        .collect::<BTreeSet<_>>();
     let mut state_rows = prepared_writes.state_rows;
     if let Some(file_id) = certified_fresh_plugin_file_id.as_deref() {
         state_rows.certify_fresh_file_direct_addresses(file_id)?;
@@ -295,7 +302,21 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     // decoded JSON. Project them into one typed batch map before dropping the
     // shared parsed column; every later materialization stage consumes this
     // map plus canonical arena slices.
-    let explicit_branch_targets = explicit_branch_head_targets(&state_rows)?;
+    let mut explicit_branch_targets = explicit_branch_head_targets(&state_rows)?;
+    // Creating a branch and authoring its first commit is one publication. Its
+    // initial ref supplies ancestry, while the normal commit publishes the head.
+    // Existing branches still reject explicit ref + normal commit combinations.
+    for branch_id in staged_creation_parents.keys() {
+        if authored_branch_ids.contains(branch_id)
+            && BranchContext::new()
+                .ref_reader(&*read)
+                .load_head_commit_id(branch_id)
+                .await?
+                .is_none()
+        {
+            explicit_branch_targets.remove(branch_id);
+        }
+    }
     validate_restore_targets(&explicit_branch_targets, restore_targets)?;
     let mut deleted_checkpoint_files = state_rows
         .iter()
@@ -616,6 +637,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &insert_selection,
         certified_fresh_plugin_file_id.as_deref(),
         &explicit_branch_targets,
+        &staged_creation_parents,
         &branch_control_observations,
         &checkpoint_epochs,
         &staged_delta_index.inventories,
@@ -3651,6 +3673,7 @@ async fn stage_tracked_head(
     insert_selection: &PreparedInsertSelection,
     certified_fresh_plugin_file_id: Option<&str>,
     explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
+    staged_creation_parents: &BTreeMap<String, CommitId>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
     checkpoint_epochs: &BTreeMap<String, CheckpointEpochBinding>,
     mutation_inventories: &BTreeMap<CommitId, CommitStateMutationInventory>,
@@ -4157,7 +4180,29 @@ async fn stage_tracked_head(
             parent_control,
             parent_generation,
         )
-        .await?;
+        .await?
+        .or_else(|| {
+            // A branch created together with its first authored commit starts
+            // its private working interval at the validated initial ref, just
+            // like standalone branch creation. This does not mark a commit as
+            // a checkpoint. Complete publication rebases against that source.
+            parent_control
+                .is_none()
+                .then(|| {
+                    staged_creation_parents.get(&root.branch_id).map(|source| {
+                        TrackedWorkingDiffEpoch {
+                            checkpoint_commit_id: *source,
+                            generation: lifecycle_generation(
+                                &root.branch_id,
+                                root.commit_id,
+                                root.ref_change_id,
+                            ),
+                            coverage: WorkingDiffIndexCoverage::default(),
+                        }
+                    })
+                })
+                .flatten()
+        });
         let working_diff_capture_checkpoint_commit_id = working_diff_epoch
             .as_ref()
             .map(|epoch| epoch.checkpoint_commit_id);
@@ -7220,6 +7265,48 @@ async fn assign_local_overlay_parents(
     Ok(())
 }
 
+/// Only a paired, inserted live descriptor and inserted ref can introduce a
+/// branch during this transaction. A ref alone cannot authorize writes to an
+/// otherwise absent branch, and normal schema/FK validation remains mandatory.
+fn staged_branch_creation_parent_heads(
+    prepared: &PreparedWriteSet,
+) -> Result<BTreeMap<String, CommitId>, LixError> {
+    let descriptors = prepared
+        .state_rows
+        .iter()
+        .enumerate()
+        .filter(|(index, row)| {
+            prepared.insert_selection.contains(*index)
+                && row.schema_key == crate::branch::BRANCH_DESCRIPTOR_SCHEMA_KEY
+                && row.branch_id == crate::GLOBAL_BRANCH_ID
+                && row.global
+                && !row.untracked
+                && row.has_payload()
+        })
+        .map(|(_, row)| row.row_pk.as_single_string_owned())
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let inserted_refs = prepared
+        .state_rows
+        .iter()
+        .enumerate()
+        .filter(|(index, row)| {
+            prepared.insert_selection.contains(*index)
+                && row.schema_key == BRANCH_REF_SCHEMA_KEY
+                && row.branch_id == crate::GLOBAL_BRANCH_ID
+                && row.untracked
+                && row.has_payload()
+        })
+        .map(|(_, row)| row.row_pk.as_single_string_owned())
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    Ok(explicit_branch_head_targets(&prepared.state_rows)?
+        .into_iter()
+        .filter_map(|(branch, target)| {
+            (descriptors.contains(&branch) && inserted_refs.contains(&branch))
+                .then_some((branch, target.head_commit_id?))
+        })
+        .collect())
+}
+
 /// Resolves every branch touched by a prepared commit from the same coherent
 /// read that validation and materialization use. Production callers require
 /// non-global targets to exist; low-level materialization may opt out to
@@ -7273,9 +7360,13 @@ pub(crate) async fn resolve_prepared_commit_parent_heads(
     }
 
     let branch_ref = branch_ctx.ref_reader(read);
+    let staged_creation_parents = staged_branch_creation_parent_heads(prepared_writes)?;
     let mut parent_heads = BTreeMap::new();
     for branch_id in required_branch_ids {
-        let head = branch_ref.load_head_commit_id(branch_id).await?;
+        let head = branch_ref
+            .load_head_commit_id(branch_id)
+            .await?
+            .or_else(|| staged_creation_parents.get(branch_id).copied());
         if require_existing_non_global_targets
             && branch_id != crate::GLOBAL_BRANCH_ID
             && head.is_none()

@@ -95,6 +95,9 @@ export type WorkerOperation =
 	  }
 	| { kind: "transaction.commit"; transactionId: number }
 	| { kind: "transaction.rollback"; transactionId: number }
+	| { kind: "replicaRecoverySources" }
+	| { kind: "exportReplicaRecovery"; id: string }
+	| { kind: "recoverReplica"; id: string }
 	| { kind: "activeBranchId" }
 	| { kind: "activeAccountId" }
 	| { kind: "createBranch"; options: CreateBranchOptions }

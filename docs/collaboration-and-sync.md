@@ -70,26 +70,49 @@ content are unavailable. Pending commits upload after reconnect.
 
 ### Replica format upgrades
 
-When an older local replica needs a supported format upgrade, Lix first checks
-whether its local work is acknowledged by the server. A clean replica downloads
-current server state into a separate storage epoch instead of migrating its
-partial history. The new epoch becomes active only after bootstrap and validation
-succeed. The previous epoch is retained, and an unsuccessful download leaves it
-intact for retry. Upgrading this way requires the server to be reachable.
+A format upgrade in sync mode replaces the replica's cached server state. Lix
+retains the old storage generation, bootstraps a fresh generation from the same
+authority/repository/account, and activates it only after durable validation.
+Pending local work is preserved independently and does not prevent opening the
+server-backed repository. Standalone and authoritative repositories retain their
+ordinary data migration path. This policy applies to every storage backend.
 
-If local work is pending, or Lix cannot prove that replacing the replica is safe,
-opening returns `LIX_ERROR_REPLICA_UPGRADE_BLOCKED`. Keep the local storage and
-recover that work before upgrading. Do not delete browser storage or change its
-name to bypass the error. This path does not automatically translate pending
-work between formats. Standalone and server repositories still migrate their
-stored history.
+Replacement needs a reachable server. An unsuccessful bootstrap leaves the old
+source intact. Retained generations are never recycled as later migration banks,
+and stale writers are fenced by the active-generation pointer.
 
-The current rebuild proof supports format v77. It requires matching acknowledged
-head and checkpoint coordinates for all branches, including the global branch,
-and rejects pending restores, local-only rows (including tombstones), incomplete
-uploads, and checkpoint recovery references. Unknown older replica metadata is
-preserved and blocked. Supporting a future format requires checking its receipt
-and local-work representation; a format number alone never permits a reset.
+Use the local recovery API after opening:
+
+```ts
+const sources = await lix.replicaRecoverySources();
+for (const source of sources.filter((item) => item.recoveryRequired)) {
+  const data = await lix.exportReplicaRecovery(source.id);
+  // Save data locally, including its unresolved-content descriptions.
+  const receipt = await lix.recoverReplica(source.id);
+  // Review receipt.branchIds separately from the user's current branch.
+}
+```
+
+Recovery restores captured tracked rows onto separate branches with stable
+identities, based on the repository root. Their captured state is independent of
+the branch from which recovery is requested. A retry returns its existing receipt rather than overwriting edits
+made on a recovery branch. Local-only data remains in the local export/source;
+it is not uploaded by restoration. The export also records original branch and
+checkpoint coordinates and available commit/blob data. Unavailable content is
+reported explicitly. Export and restoration do not delete the source, and a
+local restoration receipt is not a server acknowledgement or proof that all
+historical content was recovered.
+
+Recovery exports are materialized in memory and bounded: 100,000 current rows,
+64 MiB per blob and 128 MiB of blob content, with a separate 128 MiB budget for
+unfinished upload content. Exceeding a limit either reports unavailable content
+or fails the export without changing the source. Retained sources currently have
+no automatic cleanup, so successive upgrades can increase local storage use.
+
+Completed upload receipts and redundant checkpoint bookkeeping do not by
+themselves indicate unsynced edits. Pending writes and local-only data remain
+reachable through recovery. Permanent push rejection reports an error while
+preserving pending work; it never silently discards those edits.
 
 ## Receive collaborative updates
 

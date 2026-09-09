@@ -14,7 +14,12 @@ mod contract;
 mod http;
 mod platform;
 mod protocol;
+mod recovery;
 mod repository;
+pub use recovery::{
+    ReplicaRecoveryBlob, ReplicaRecoveryBranch, ReplicaRecoveryExport, ReplicaRecoveryFile,
+    ReplicaRecoveryReceipt, ReplicaRecoveryRow, ReplicaRecoverySource,
+};
 mod runtime;
 #[cfg(test)]
 mod simulation_tests;
@@ -66,13 +71,15 @@ pub(crate) use protocol::{
 #[cfg(feature = "server-protocol")]
 pub(crate) use repository::admit_sync_authority_storage;
 pub(crate) use repository::has_any_sync_replica_state;
-pub(crate) use repository::{CleanReplicaProof, inspect_replica_rebuild_safety, replica_upgrade_blocked};
 pub(crate) use repository::{
     AUTHORITY_STATE_VALUE, SYNC_AUTHORITY_STATE_SPACE, SYNC_REPLICA_STATE_SPACE,
     SYNC_REPOSITORY_EVENT_SPACE, SYNC_SEQUENCE_SPACE, authority_state_key,
     load_pending_sync_export_commit_ids, load_replayable_repository_event_commit_ids,
     replica_state_key, stage_repository_transaction_event, stage_sync_restore_intents,
     validate_repository_transaction_event_transfer,
+};
+pub(crate) use repository::{
+    ReplicaRebuildSource, inspect_replica_rebuild_source, replica_replacement_unavailable,
 };
 pub(crate) use runtime::{SyncDemand, SyncDemandRetry, SyncRuntime, activate_sync_mode};
 pub(crate) use upload_plan::{
@@ -257,3 +264,6 @@ impl SyncModeState {
             .send_modify(|version| *version = version.wrapping_add(1));
     }
 }
+
+#[cfg(test)]
+pub(crate) use bootstrap::durable_memory_for_test;

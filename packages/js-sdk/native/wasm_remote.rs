@@ -151,6 +151,30 @@ pub async fn open_remote(
 
 #[wasm_bindgen]
 impl WasmRemoteLix {
+    #[wasm_bindgen(js_name = replicaRecoverySources)]
+    pub async fn replica_recovery_sources(&self) -> Result<JsValue, JsValue> {
+        Err(lix_error_to_js(LixError::new(
+            "LIX_ERROR_LOCAL_STORAGE_REQUIRED",
+            "Replica recovery requires a local storage-backed Lix handle",
+        )))
+    }
+
+    #[wasm_bindgen(js_name = exportReplicaRecovery)]
+    pub async fn export_replica_recovery(&self, _id: String) -> Result<JsValue, JsValue> {
+        Err(lix_error_to_js(LixError::new(
+            "LIX_ERROR_LOCAL_STORAGE_REQUIRED",
+            "Replica recovery requires a local storage-backed Lix handle",
+        )))
+    }
+
+    #[wasm_bindgen(js_name = recoverReplica)]
+    pub async fn recover_replica(&self, _id: String) -> Result<JsValue, JsValue> {
+        Err(lix_error_to_js(LixError::new(
+            "LIX_ERROR_LOCAL_STORAGE_REQUIRED",
+            "Replica recovery requires a local storage-backed Lix handle",
+        )))
+    }
+
     #[wasm_bindgen(js_name = setTelemetryParent)]
     pub fn set_telemetry_parent(&self, _parent: Option<JsValue>) {
         // Remote repositories execute in the server process and do not own a

@@ -206,6 +206,10 @@ pub(crate) use session::VerifiedRequestBlob;
 #[cfg(feature = "storage-benches")]
 pub(crate) use sql_profile::SqlReadProfile;
 pub use storage::Memory;
+pub use sync::{
+    ReplicaRecoveryBlob, ReplicaRecoveryBranch, ReplicaRecoveryExport, ReplicaRecoveryFile,
+    ReplicaRecoveryReceipt, ReplicaRecoveryRow, ReplicaRecoverySource,
+};
 
 /// Reserved high UUID sentinel for repository-global state.
 pub const GLOBAL_BRANCH_ID: &str = "ffffffff-ffff-7fff-bfff-ffffffffffff";

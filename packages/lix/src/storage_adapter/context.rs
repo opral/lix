@@ -95,6 +95,20 @@ where
         }
     }
 
+    /// Recovery may read an old generation but must never mutate its only copy.
+    pub(crate) fn for_retained_epoch(
+        storage: StorageImpl,
+        bank: EpochBank,
+        expected_pointer: Bytes,
+    ) -> Self {
+        Self {
+            storage,
+            routing: EpochRouting::retained(bank, expected_pointer),
+            authority_writer: Arc::new(AtomicBool::new(false)),
+            replica_writer: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// Routes candidate construction into an epoch bank, fences every write
     /// on the exact migration claim, and forces each commit durable before the
     /// active pointer can publish the candidate.

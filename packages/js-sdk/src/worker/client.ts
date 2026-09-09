@@ -382,6 +382,10 @@ export function workerBinding(
 			});
 			return workerTransactionBinding(request, transactionId);
 		},
+		replicaRecoverySources: () => request({ kind: "replicaRecoverySources" }),
+		exportReplicaRecovery: (id) =>
+			request({ kind: "exportReplicaRecovery", id }),
+		recoverReplica: (id) => request({ kind: "recoverReplica", id }),
 		activeBranchId: () => request({ kind: "activeBranchId" }),
 		activeAccountId: () => request({ kind: "activeAccountId" }),
 		createBranch: (options) => request({ kind: "createBranch", options }),

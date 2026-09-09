@@ -326,6 +326,12 @@ export function startWorkerHost(
 				await transaction.rollback();
 				return undefined;
 			}
+			case "replicaRecoverySources":
+				return requiredLix(sessionId).replicaRecoverySources();
+			case "exportReplicaRecovery":
+				return requiredLix(sessionId).exportReplicaRecovery(operation.id);
+			case "recoverReplica":
+				return requiredLix(sessionId).recoverReplica(operation.id);
 			case "activeBranchId":
 				return requiredLix(sessionId).activeBranchId();
 			case "activeAccountId":

@@ -1914,3 +1914,26 @@ function deferred<T>() {
 	});
 	return { promise, resolve };
 }
+
+test("remote-only handles reject local replica recovery without sending requests", async () => {
+	const fetch = vi.fn(async () => handshakeResponse());
+	const binding = await openRemoteLixBinding({
+		url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+		fetch,
+	});
+	try {
+		const requestCount = fetch.mock.calls.length;
+		for (const operation of [
+			() => binding.replicaRecoverySources(),
+			() => binding.exportReplicaRecovery("retained"),
+			() => binding.recoverReplica("retained"),
+		]) {
+			await expect(operation()).rejects.toMatchObject({
+				code: "LIX_ERROR_LOCAL_STORAGE_REQUIRED",
+			});
+		}
+		expect(fetch).toHaveBeenCalledTimes(requestCount);
+	} finally {
+		await binding.close();
+	}
+});

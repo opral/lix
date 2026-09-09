@@ -1841,3 +1841,184 @@ mod tests {
         }
     }
 }
+
+/// Completed upload receipts are bookkeeping; only unfinished or unknown state
+/// needs user recovery. This does not inspect or download payload bytes at open.
+pub(crate) async fn has_recoverable_uploads(
+    read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+) -> Result<bool, LixError> {
+    let mut cursor = read
+        .begin_scan(
+            UPLOAD_STATE_SPACE,
+            StorageKeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            StorageBeginScanOptions::default(),
+        )
+        .await?;
+    while let Some(page) = cursor.next_chunk().await? {
+        for entry in page {
+            let StorageProjectedValue::FullValue(raw) = entry.value else {
+                return Ok(true);
+            };
+            if !matches!(
+                serde_json::from_slice::<UploadState>(&raw),
+                Ok(UploadState::Complete(_))
+            ) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Explicit recovery export includes the bytes of available unfinished parts.
+/// These parts have never become files and must not be silently published.
+pub(crate) async fn export_recoverable_uploads(
+    read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+) -> Result<Vec<serde_json::Value>, LixError> {
+    use base64::Engine as _;
+    let mut exported_bytes = 0_u64;
+    let mut result = BTreeMap::<String, serde_json::Value>::new();
+    let mut cursor = read
+        .begin_scan(
+            UPLOAD_STATE_SPACE,
+            StorageKeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            StorageBeginScanOptions::default(),
+        )
+        .await?;
+    while let Some(page) = cursor.next_chunk().await? {
+        for entry in page {
+            let StorageProjectedValue::FullValue(raw) = entry.value else {
+                continue;
+            };
+            let state = serde_json::from_slice::<serde_json::Value>(&raw)
+                .map_err(|error| invalid_upload_storage(error.to_string()))?;
+            if state.get("state").and_then(serde_json::Value::as_str) == Some("complete") {
+                continue;
+            }
+            let id = std::str::from_utf8(&entry.key.0)
+                .map_err(|error| invalid_upload_storage(error.to_string()))?
+                .to_owned();
+            result.insert(
+                id.clone(),
+                serde_json::json!({"id":id,"state":state,"parts":[]}),
+            );
+        }
+    }
+    let mut leaves = read
+        .begin_scan(
+            UPLOAD_MANIFEST_LEAF_SPACE,
+            StorageKeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            StorageBeginScanOptions::default(),
+        )
+        .await?;
+    while let Some(page) = leaves.next_chunk().await? {
+        for entry in page {
+            let id = decode_upload_manifest_leaf_upload_id(&entry.key)?;
+            let Some(upload) = result.get_mut(&id) else {
+                continue;
+            };
+            let StorageProjectedValue::FullValue(raw) = entry.value else {
+                return Err(invalid_upload_storage("recovery part has no manifest"));
+            };
+            let leaf = decode_upload_manifest_leaf(&raw)?;
+            let part = u32::from_be_bytes(
+                entry.key.0[entry.key.0.len() - 4..]
+                    .try_into()
+                    .expect("validated upload part key"),
+            );
+            let mut chunks = Vec::new();
+            for chunk in leaf.chunks {
+                exported_bytes = exported_bytes.saturating_add(chunk.size_bytes);
+                if exported_bytes > 128 * 1024 * 1024 {
+                    return Err(LixError::new(
+                        "LIX_RECOVERY_EXPORT_TOO_LARGE",
+                        "Unfinished upload export exceeds the memory budget; the complete source remains retained",
+                    ));
+                }
+                let bytes = crate::binary_cas::load_verified_chunk(read, chunk.hash).await?;
+                chunks.push(serde_json::json!({"id":chunk.hash.to_hex(),"sizeBytes":chunk.size_bytes,"contentBase64":bytes.map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))}));
+            }
+            upload["parts"].as_array_mut().expect("recovery parts array").push(serde_json::json!({"partNumber":part,"offset":u64::from(part)*FILE_UPLOAD_PART_BYTES as u64,"sizeBytes":leaf.part_size,"chunks":chunks}));
+        }
+    }
+    Ok(result.into_values().collect())
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn recovery_distinguishes_completed_receipts_and_exports_unfinished_part_bytes() {
+        let lix = crate::open_lix().await.unwrap();
+        let adapter = lix.storage_adapter();
+        let mut writes = adapter.new_write_set();
+        writes.put(
+            UPLOAD_STATE_SPACE,
+            upload_state_key("completed").unwrap(),
+            serde_json::to_vec(&UploadState::Complete(UploadComplete {
+                path: "/completed.bin".to_owned(),
+                total_size: 0,
+                blob_id: [0; 32],
+                part_identities: Vec::new(),
+            }))
+            .unwrap(),
+        );
+        adapter
+            .commit_write_set(writes, Default::default())
+            .await
+            .unwrap();
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        assert!(!has_recoverable_uploads(&read).await.unwrap());
+        drop(read);
+        let mut writes = adapter.new_write_set();
+        writes.put(
+            UPLOAD_STATE_SPACE,
+            upload_state_key("unfinished").unwrap(),
+            serde_json::to_vec(&UploadState::Open(UploadOpen {
+                path: "/unfinished.bin".to_owned(),
+                total_size: 20,
+            }))
+            .unwrap(),
+        );
+        let chunk = crate::binary_cas::stage_verified_raw_chunk(
+            &mut writes,
+            ChunkHash::from_content(b"part"),
+            b"part",
+        )
+        .unwrap();
+        stage_upload_manifest_leaf(
+            &mut writes,
+            upload_manifest_leaf_key("unfinished", 0).unwrap(),
+            &UploadManifestLeaf {
+                part_size: 4,
+                chunks: vec![chunk],
+            },
+        )
+        .unwrap();
+        adapter
+            .commit_write_set(writes, Default::default())
+            .await
+            .unwrap();
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        assert!(has_recoverable_uploads(&read).await.unwrap());
+        let export = export_recoverable_uploads(&read).await.unwrap();
+        assert_eq!(export.len(), 1);
+        assert_eq!(export[0]["state"]["path"], "/unfinished.bin");
+        assert_eq!(
+            export[0]["parts"][0]["chunks"][0]["contentBase64"],
+            "cGFydA=="
+        );
+        drop(read);
+        lix.close().await.unwrap();
+    }
+}
