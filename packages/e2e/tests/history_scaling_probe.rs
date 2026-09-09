@@ -315,16 +315,10 @@ async fn history_member_scan_census() {
     }
 }
 
-/// Descriptor snapshots parsed by path resolution, swept over file count.
-///
-/// Counted at the `serde_json::from_str` the prefilter is meant to avoid, not
-/// at the resolved id set -- that set is the same either way and cannot tell a
-/// skipped parse from a performed one. `prefilter_on/off` is printed so a zero
-/// `prefiltered` is readable: it means either "every descriptor matched" or
-/// "the prefilter refused these names", which are different findings.
+/// Endpoint path-filter latency swept over file count at fixed history size.
 #[tokio::test]
 #[ignore = "manual history-scaling probe"]
-async fn history_path_resolver_census() {
+async fn history_path_filter_latency() {
     let file_bytes = env_usize("LIX_HISTORY_SCALE_FILE_BYTES", 4 * 1024);
     let edits = env_usize("LIX_HISTORY_SCALE_EDITS", 20);
     let depth = env_usize("LIX_HISTORY_SCALE_DEPTH", 20);
@@ -344,20 +338,17 @@ async fn history_path_resolver_census() {
             .execute(&by_path, &params)
             .await
             .expect("warm probe query");
-        let _ = lix::storage_bench::take_path_resolver_census();
+        let started = std::time::Instant::now();
         let rows = lix
             .execute(&by_path, &params)
             .await
             .expect("probe query")
             .rows()
             .len();
-        let (seen, parsed, prefiltered, metadata_present, prefilter_on, prefilter_off) =
-            lix::storage_bench::take_path_resolver_census();
         eprintln!(
-            "path_resolver_census files={files} commits={} rows={rows} seen={seen} \
-             parsed={parsed} prefiltered={prefiltered} metadata_slots={metadata_present} \
-             prefilter_on={prefilter_on} prefilter_off={prefilter_off}",
+            "history_path_filter files={files} commits={} rows={rows} elapsed_us={}",
             edits + 1,
+            started.elapsed().as_micros()
         );
         lix.close().await.expect("close probe");
     }

@@ -1004,8 +1004,8 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .header(
-                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
-                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                        server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        server_protocol::PROTOCOL_VERSION,
                     )
                     .uri("/lix/v1/")
                     .body(Body::empty())
@@ -1020,8 +1020,8 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .header(
-                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
-                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                        server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        server_protocol::PROTOCOL_VERSION,
                     )
                     .uri("/lixes/11111111-1111-4111-8111-111111111111/lix/v1/")
                     .body(Body::empty())
@@ -1035,8 +1035,8 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .header(
-                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
-                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                        server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        server_protocol::PROTOCOL_VERSION,
                     )
                     .uri("/lix/v1/11111111-1111-4111-8111-111111111111/")
                     .body(Body::empty())
@@ -1073,8 +1073,8 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .header(
-                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
-                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                        server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        server_protocol::PROTOCOL_VERSION,
                     )
                     .uri("/lix/v1/11111111-1111-4111-8111-111111111111/snapshot")
                     .header(
@@ -1123,8 +1123,8 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .header(
-                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
-                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                        server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        server_protocol::PROTOCOL_VERSION,
                     )
                     .uri("/lix/v1/not-a-uuid/snapshot")
                     .body(Body::empty())
@@ -1146,8 +1146,8 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .header(
-                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
-                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                        server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        server_protocol::PROTOCOL_VERSION,
                     )
                     .uri("/lix/v1/22222222-2222-4222-8222-222222222222/")
                     .header(
@@ -1169,7 +1169,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .header(lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER, lix_sdk::server_protocol::PROTOCOL_VERSION)
+                    .header(server_protocol::SERVER_PROTOCOL_VERSION_HEADER, server_protocol::PROTOCOL_VERSION)
                     .method("POST")
                     .uri("/lix/v1/22222222-2222-4222-8222-222222222222/execute")
                     .header(server_protocol::SESSION_ID_HEADER, session_id)
@@ -1195,7 +1195,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .header(lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER, lix_sdk::server_protocol::PROTOCOL_VERSION)
+                    .header(server_protocol::SERVER_PROTOCOL_VERSION_HEADER, server_protocol::PROTOCOL_VERSION)
                     .method("POST")
                     .uri("/lix/v1/22222222-2222-4222-8222-222222222222/execute")
                     .header(server_protocol::SESSION_ID_HEADER, session_id)
@@ -1219,8 +1219,8 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .header(
-                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
-                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                        server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        server_protocol::PROTOCOL_VERSION,
                     )
                     .uri("/lix/v1/22222222-2222-4222-8222-222222222222/")
                     .header(server_protocol::SESSION_ID_HEADER, session_id)
@@ -1249,8 +1249,8 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .header(
-                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
-                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                        server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        server_protocol::PROTOCOL_VERSION,
                     )
                     .uri("/lix/v1/33333333-3333-4333-8333-333333333333/")
                     .body(Body::empty())
@@ -1272,8 +1272,8 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .header(
-                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
-                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                        server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        server_protocol::PROTOCOL_VERSION,
                     )
                     .method("POST")
                     .uri("/lix/v1/33333333-3333-4333-8333-333333333333/execute")
@@ -1297,8 +1297,8 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .header(
-                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
-                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                        server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        server_protocol::PROTOCOL_VERSION,
                     )
                     .uri("/healthz")
                     .body(Body::empty())
@@ -1335,8 +1335,8 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .header(
-                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
-                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                        server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        server_protocol::PROTOCOL_VERSION,
                     )
                     .uri("/lix/v1/11111111-1111-4111-8111-111111111111/")
                     .body(Body::empty())
@@ -1357,8 +1357,8 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .header(
-                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
-                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                        server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        server_protocol::PROTOCOL_VERSION,
                     )
                     .uri("/lix/v1/11111111-1111-4111-8111-111111111111/")
                     .header(header::AUTHORIZATION, "Bearer secret")
@@ -1378,7 +1378,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .header(lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER, lix_sdk::server_protocol::PROTOCOL_VERSION)
+                    .header(server_protocol::SERVER_PROTOCOL_VERSION_HEADER, server_protocol::PROTOCOL_VERSION)
                     .method("POST")
                     .uri("/lix/v1/11111111-1111-4111-8111-111111111111/execute")
                     .header(
@@ -1411,7 +1411,7 @@ mod tests {
                 .clone()
                 .oneshot(
                     Request::builder()
-                    .header(lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER, lix_sdk::server_protocol::PROTOCOL_VERSION)
+                    .header(server_protocol::SERVER_PROTOCOL_VERSION_HEADER, server_protocol::PROTOCOL_VERSION)
                         .method("POST")
                         .uri(format!(
                             "/lix/v1/{lix_id}/execute"
@@ -1552,8 +1552,8 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .header(
-                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
-                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                        server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        server_protocol::PROTOCOL_VERSION,
                     )
                     .uri("/lix/v1/contains%20space/")
                     .body(Body::empty())
@@ -1721,8 +1721,8 @@ mod tests {
     fn trusted_principal_is_removed_from_headers_before_protocol_dispatch() {
         let mut request = Request::builder()
             .header(
-                lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
-                lix_sdk::server_protocol::PROTOCOL_VERSION,
+                server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                server_protocol::PROTOCOL_VERSION,
             )
             .header(TRUSTED_ACCOUNT_ID_HEADER, "user-123")
             .header(TRUSTED_IDEMPOTENCY_SCOPE_HEADER, "provider:user-123")
@@ -1748,8 +1748,8 @@ mod tests {
     fn trusted_principal_is_rejected_without_internal_auth() {
         let mut request = Request::builder()
             .header(
-                lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
-                lix_sdk::server_protocol::PROTOCOL_VERSION,
+                server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                server_protocol::PROTOCOL_VERSION,
             )
             .header(TRUSTED_ACCOUNT_ID_HEADER, "user-123")
             .body(Body::empty())
@@ -1770,8 +1770,8 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .header(
-                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
-                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                        server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        server_protocol::PROTOCOL_VERSION,
                     )
                     .uri("/lix/v1/11111111-1111-4111-8111-111111111111?activeAccountId=spoofed")
                     .body(Body::empty())
@@ -1888,8 +1888,8 @@ mod tests {
         app.oneshot(
             Request::builder()
                 .header(
-                    lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
-                    lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                    server_protocol::PROTOCOL_VERSION,
                 )
                 .method("POST")
                 .uri(format!("/lix/v1/{lix_id}/execute"))
@@ -1942,8 +1942,8 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .header(
-                        lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
-                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                        server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                        server_protocol::PROTOCOL_VERSION,
                     )
                     .uri(format!("/lix/v1/{lix_id}/"))
                     .body(Body::empty())
