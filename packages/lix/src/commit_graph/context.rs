@@ -1068,12 +1068,9 @@ pub(crate) fn canonical_commit_change(node: &CommitGraphNode) -> CommitGraphChan
         .expect("canonical lix_commit snapshot is valid JSON");
     let row_pk = RowPk::uuid_from_canonical(&node.commit_id.to_string())
         .expect("commit IDs are canonical UUIDs");
-    let typed = crate::plugin::runtime::WasmTypedRow::from_builtin_json(
-        COMMIT_SCHEMA_KEY,
-        &row_pk,
-        &snapshot,
-    )
-    .expect("derived lix_commit row satisfies its embedded schema");
+    let typed =
+        crate::row_payload::TypedRow::from_builtin_json(COMMIT_SCHEMA_KEY, &row_pk, &snapshot)
+            .expect("derived lix_commit row satisfies its embedded schema");
     let snapshot = typed
         .durable_payload()
         .expect("derived lix_commit row has a native payload")
@@ -2129,10 +2126,9 @@ mod tests {
             let snapshot = snapshot_content.map(|content| {
                 let snapshot = serde_json::from_str(content)
                     .expect("commit-graph fixture snapshot should be valid JSON");
-                let row = crate::plugin::runtime::WasmTypedRow::from_test_json_unchecked(
-                    &row_pk, &snapshot,
-                )
-                .expect("commit-graph fixture should construct a typed row");
+                let row =
+                    crate::row_payload::TypedRow::from_test_json_unchecked(&row_pk, &snapshot)
+                        .expect("commit-graph fixture should construct a typed row");
                 row.durable_payload()
                     .map(|payload| payload.to_vec())
                     .expect("commit-graph fixture should encode a durable typed payload")

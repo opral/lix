@@ -10,7 +10,7 @@ use crate::storage_adapter::{
 };
 
 use super::{CHANGE_SPACE, ChangeId, ChangeRecord, decode_change_record};
-use crate::plugin::runtime::WasmTypedRow;
+use crate::row_payload::TypedRow as WasmTypedRow;
 use crate::row_pk::RowPk;
 
 const CHANGE_STORAGE_KEY_BYTES: usize = 16;

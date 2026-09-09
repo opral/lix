@@ -664,7 +664,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     // unconditionally for the same reason: payload rows are content addressed,
     // so this transition may resolve onto a row it did not write, and a sweep
     // planned before it must not be able to reclaim that row underneath it.
-    crate::json_store::stage_json_publication_fence(read, &mut writes, &mut preconditions).await?;
     if !published_branch_controls.contains_key(crate::GLOBAL_BRANCH_ID) {
         let global = branch_control_observations
             .get(crate::GLOBAL_BRANCH_ID)
@@ -713,7 +712,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
                     "lix_file_descriptor" | "lix_directory_descriptor" | "lix_binary_blob_ref"
                 )
             })
-            .map(crate::transaction_types::materialized_hot_state_row_with_snapshot_projection)
+            .map(crate::hot_state::materialized_hot_state_row_with_snapshot_projection)
             .collect::<Result<Vec<_>, _>>()?
     } else {
         Vec::new()
@@ -1480,7 +1479,7 @@ fn deterministic_sequence_current_row(
         "key": crate::functions::DETERMINISTIC_SEQUENCE_KEY,
         "value": highest_seen,
     });
-    let decoded_snapshot = Arc::new(crate::plugin::runtime::WasmTypedRow::from_builtin_json(
+    let decoded_snapshot = Arc::new(crate::row_payload::TypedRow::from_builtin_json(
         "lix_key_value",
         &row_pk,
         &snapshot,
@@ -1518,8 +1517,7 @@ fn encode_builtin_snapshot(
     row_pk: &RowPk,
     snapshot: &serde_json::Value,
 ) -> Result<Vec<u8>, LixError> {
-    let typed =
-        crate::plugin::runtime::WasmTypedRow::from_builtin_json(schema_key, row_pk, snapshot)?;
+    let typed = crate::row_payload::TypedRow::from_builtin_json(schema_key, row_pk, snapshot)?;
     typed
         .durable_payload()
         .map(|payload| payload.to_vec())
@@ -2333,12 +2331,11 @@ fn materialize_staged_sync_commits(
                 })?;
             for (row, &change_id) in journal.iter().zip(change_ids) {
                 let row_pk = RowPk::single(row.identity());
-                let decoded_snapshot =
-                    crate::plugin::runtime::WasmTypedRow::decode_durable_payload(
-                        Arc::from(row.snapshot()),
-                        journal.schema_key(),
-                        &row_pk,
-                    )?;
+                let decoded_snapshot = crate::row_payload::TypedRow::decode_durable_payload(
+                    Arc::from(row.snapshot()),
+                    journal.schema_key(),
+                    &row_pk,
+                )?;
                 let snapshot_json = decoded_snapshot.to_json_shared()?;
                 members.push(encode_sync_commit_member(SyncCommitMemberRef {
                     change_id,
@@ -5917,10 +5914,10 @@ fn prepare_row_columnar_write_sets(
         if layout_is_current {
             let (row_group_set, input_locations) = row_groups.into_parts();
             let mut encoded = match input_locations {
-                crate::sql2::RowGroupLocations::Dense { row_count } => {
+                crate::row_columnar::RowGroupLocations::Dense { row_count } => {
                     crate::hot_state::RowColumnarWriteSets::with_dense_state_rows(row_count)
                 }
-                crate::sql2::RowGroupLocations::Explicit(locations) => {
+                crate::row_columnar::RowGroupLocations::Explicit(locations) => {
                     let mut encoded = crate::hot_state::RowColumnarWriteSets::with_state_row_count(
                         state_rows.len(),
                     );
@@ -11338,7 +11335,7 @@ mod tests {
     }
 
     fn test_snapshot(row_pk: &RowPk, value: &serde_json::Value) -> bytes::Bytes {
-        let typed = crate::plugin::runtime::WasmTypedRow::from_test_json_unchecked(row_pk, value)
+        let typed = crate::row_payload::TypedRow::from_test_json_unchecked(row_pk, value)
             .expect("test snapshot should become typed");
         bytes::Bytes::from_owner(
             typed

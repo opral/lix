@@ -21,7 +21,7 @@ use crate::hot_state::TrackedHeadContext;
 use crate::hot_state::{
     stage_collect_stale_working_diff_indexes, stage_compact_checkpoint_tombstones,
 };
-use crate::json_store::{JsonRef, JsonStoreContext};
+
 #[cfg(test)]
 use crate::storage_adapter::StorageCoreProjection;
 use crate::storage_adapter::{
@@ -1594,13 +1594,11 @@ where
             live: GcLiveSet {
                 commits: retained_root_ids.into_iter().collect(),
                 changes: Vec::new(),
-                payloads: Vec::new(),
             },
             sweep: GcSweepSet {
                 commits: Vec::new(),
                 commit_change_ids: Vec::new(),
                 changes: Vec::new(),
-                json_payloads: Vec::new(),
             },
         },
         sweep: RepositoryGcSweep {
@@ -1645,13 +1643,7 @@ where
         .reader(store.clone())
         .scan()
         .await?;
-    let mut roots = TrackedHeadContext::new()
-        .reader(store.clone())
-        .untracked_json_refs(&controls)
-        .await?
-        .into_iter()
-        .map(GcRoot::CurrentPayload)
-        .collect::<Vec<_>>();
+    let mut roots = Vec::new();
     // Branch controls, not their public `lix_branch_ref` projection rows,
     // are the authoritative tracked-history roots.
     for (_branch_id, control) in &controls {
@@ -1740,7 +1732,7 @@ where
         .iter()
         .filter_map(|root| match root {
             GcRoot::BranchHead(commit_id) => Some(*commit_id),
-            GcRoot::StandaloneChange(_) | GcRoot::CurrentPayload(_) => None,
+            GcRoot::StandaloneChange(_) => None,
         })
         .collect::<Vec<_>>();
     while let Some(commit_id) = pending.pop() {
@@ -2053,7 +2045,7 @@ where
         .iter()
         .filter_map(|root| match root {
             GcRoot::StandaloneChange(change_id) => Some(*change_id),
-            GcRoot::BranchHead(_) | GcRoot::CurrentPayload(_) => None,
+            GcRoot::BranchHead(_) => None,
         })
         .collect::<BTreeSet<_>>();
     if let Some(change_id) = standalone_root_ids
@@ -2067,13 +2059,6 @@ where
     }
 
     let mut live_change_ids = standalone_root_ids.clone();
-    let live_payload_hashes = roots
-        .iter()
-        .filter_map(|root| match root {
-            GcRoot::CurrentPayload(json_ref) => Some(*json_ref.as_hash_array()),
-            GcRoot::BranchHead(_) | GcRoot::StandaloneChange(_) => None,
-        })
-        .collect::<BTreeSet<_>>();
     for commit_id in &retained_authority_commits {
         let entry = packed
             .commits
@@ -2094,8 +2079,6 @@ where
         .filter(|change_id| !standalone_root_ids.contains(change_id))
         .copied()
         .collect::<Vec<_>>();
-
-    let sweep_json_payloads = Vec::new();
 
     let dead_packed_change_ids = sweep_authority_commits
         .iter()
@@ -2170,9 +2153,6 @@ where
         }
     }
     crate::changelog::stage_delete_changes(writes, sweep_changes.iter().copied());
-    JsonStoreContext::new()
-        .writer()
-        .stage_delete_refs(writes, sweep_json_payloads.iter().copied());
     writes.seal_changelog_gc();
 
     Ok(GcPlan {
@@ -2180,16 +2160,11 @@ where
         live: GcLiveSet {
             commits: live_commits.into_iter().collect(),
             changes: live_change_ids.into_iter().collect(),
-            payloads: live_payload_hashes
-                .into_iter()
-                .map(JsonRef::from_hash_bytes)
-                .collect(),
         },
         sweep: GcSweepSet {
             commits: sweep_commits,
             commit_change_ids: sweep_commit_change_ids,
             changes: sweep_changes,
-            json_payloads: sweep_json_payloads,
         },
     })
 }
@@ -2343,10 +2318,7 @@ mod tests {
     };
     use crate::common::LixTimestamp;
     use crate::hot_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
-    use crate::json_store::{
-        JsonRef, JsonStoreContext, JsonWritePlacementRef, LegacyJsonValue, NormalizedJson,
-        NormalizedJsonRef,
-    };
+
     use crate::row_pk::RowPk;
     #[cfg(feature = "storage-benches")]
     use crate::storage_adapter::StorageCoreProjection;
@@ -3094,7 +3066,7 @@ mod tests {
         let selected_change = packed_change(
             "rootless-selected-owner-change",
             "rootless-selected-owner-row",
-            LegacyJsonValue::Inline(r#"{"selected":true}"#.into()),
+            true,
         );
         let storage = StorageAdapter::new(Memory::new());
         let mut writes = storage.new_write_set();
@@ -3199,11 +3171,7 @@ mod tests {
             Some(base.commit_id),
             timestamp,
         );
-        let selected_change = packed_change(
-            "selected-owner-change",
-            "selected-owner-row",
-            LegacyJsonValue::Inline(r#"{"selected":true}"#.into()),
-        );
+        let selected_change = packed_change("selected-owner-change", "selected-owner-row", true);
 
         let mut writes = storage.new_write_set();
         let owner_deltas =
@@ -4006,7 +3974,7 @@ mod tests {
         let mut retired_change = packed_change(
             "shared-offline-retired-ref",
             "shared-offline-retired-row",
-            LegacyJsonValue::Inline(r#"{"retained":true}"#.into()),
+            true,
         );
         retired_change.change_id = retired_ref;
         let mut read = storage
@@ -4844,7 +4812,7 @@ mod tests {
         let timestamp =
             LixTimestamp::expect_parse("corrupt registry timestamp", "2026-01-01T00:00:00Z");
         let row_pk = RowPk::single(crate::plugin::runtime::PLUGIN_REGISTRY_KEY);
-        let corrupt_typed = crate::plugin::runtime::WasmTypedRow::from_builtin_json(
+        let corrupt_typed = crate::row_payload::TypedRow::from_builtin_json(
             "lix_key_value",
             &row_pk,
             &corrupt_registry,
@@ -5221,12 +5189,12 @@ mod tests {
         let source_change = packed_change(
             "gc-tombstone-alias-source-change",
             "deleted-source-member",
-            LegacyJsonValue::None,
+            false,
         );
         let marker_change = packed_change(
             "gc-tombstone-alias-marker-change",
             "deleted-local-marker",
-            LegacyJsonValue::None,
+            false,
         );
         let timestamp =
             LixTimestamp::expect_parse("tombstone alias timestamp", "2026-01-01T00:00:00Z");
@@ -5458,35 +5426,18 @@ mod tests {
     async fn authority_gc_retains_immutable_packed_owner_and_sweeps_dead_standalone_fact() {
         let storage = Memory::new();
         let storage_adapter = StorageAdapter::new(storage.clone());
-        let shared_ref = stage_bare_json(&storage, r#"{"payload":"shared"}"#).await;
-        let dead_only_ref = stage_bare_json(&storage, r#"{"payload":"dead-only"}"#).await;
-        let live_standalone_ref =
-            stage_bare_json(&storage, r#"{"payload":"live-standalone"}"#).await;
 
         let live_parent = CommitId::for_test_label("authority-gc-live-parent");
         let live_head = CommitId::for_test_label("authority-gc-live-head");
         let dead_commit = CommitId::for_test_label("authority-gc-dead");
-        let live_member = packed_change(
-            "authority-gc-live-member",
-            "live-member",
-            LegacyJsonValue::Ref(shared_ref),
-        );
+        let live_member = packed_change("authority-gc-live-member", "live-member", true);
         let dead_shared_member = live_member.clone();
-        let dead_only_member = packed_change(
-            "authority-gc-dead-only-member",
-            "dead-only-member",
-            LegacyJsonValue::Ref(dead_only_ref),
-        );
-        let live_standalone = packed_change(
-            "authority-gc-live-standalone",
-            "live-standalone",
-            LegacyJsonValue::Ref(live_standalone_ref),
-        );
-        let dead_standalone = packed_change(
-            "authority-gc-dead-standalone",
-            "dead-standalone",
-            LegacyJsonValue::Ref(dead_only_ref),
-        );
+        let dead_only_member =
+            packed_change("authority-gc-dead-only-member", "dead-only-member", true);
+        let live_standalone =
+            packed_change("authority-gc-live-standalone", "live-standalone", true);
+        let dead_standalone =
+            packed_change("authority-gc-dead-standalone", "dead-standalone", true);
         let timestamp =
             LixTimestamp::expect_parse("authority GC timestamp", "2026-01-01T00:00:00.000Z");
         let commits = vec![
@@ -5622,14 +5573,6 @@ mod tests {
         .expect("authority GC should plan");
         assert_eq!(plan.sweep.commits, vec![dead_commit]);
         assert_eq!(plan.sweep.changes, vec![dead_standalone.change_id]);
-        assert!(
-            !plan.sweep.json_payloads.contains(&shared_ref),
-            "a payload shared with live packed history must stay live"
-        );
-        assert!(
-            !plan.sweep.json_payloads.contains(&dead_only_ref),
-            "co-resident immutable part members and their payloads remain reachable"
-        );
         storage_adapter
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -5740,51 +5683,9 @@ mod tests {
             "sidecars co-owned by retained immutable authority must survive"
         );
         drop(read);
-        assert!(json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, shared_ref).await);
-        assert!(
-            json_ref_exists(
-                &storage,
-                crate::json_store::store::JSON_SPACE,
-                dead_only_ref,
-            )
-            .await
-        );
-        assert!(
-            json_ref_exists(
-                &storage,
-                crate::json_store::store::JSON_SPACE,
-                live_standalone_ref,
-            )
-            .await
-        );
     }
 
-    async fn stage_bare_json(storage: &Memory, content: &str) -> JsonRef {
-        let storage_adapter = StorageAdapter::new(storage.clone());
-        let normalized = NormalizedJson::from_arc_unchecked(Arc::from(content));
-        let mut writes = storage_adapter.new_write_set();
-        let json_ref = JsonStoreContext::new()
-            .writer()
-            .stage_batch(
-                &mut writes,
-                JsonWritePlacementRef::OutOfBand,
-                [NormalizedJsonRef::from(&normalized)],
-            )
-            .expect("bare JSON should stage")
-            .pop()
-            .expect("one bare JSON ref should be returned");
-        storage_adapter
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("bare JSON should persist");
-        json_ref
-    }
-
-    fn packed_change(
-        change_label: &str,
-        row_label: &str,
-        snapshot: LegacyJsonValue,
-    ) -> ChangeRecord {
+    fn packed_change(change_label: &str, row_label: &str, has_snapshot: bool) -> ChangeRecord {
         ChangeRecord {
             format_version: 2,
             change_id: ChangeId::for_test_label(change_label),
@@ -5793,7 +5694,7 @@ mod tests {
             schema_key: "authority_gc".to_string(),
             file_id: None,
             metadata: None,
-            snapshot: (!snapshot.is_none()).then(|| vec![1]),
+            snapshot: has_snapshot.then(|| vec![1]),
             created_at: LixTimestamp::expect_parse(
                 "authority GC change timestamp",
                 "2026-01-01T00:00:00.000Z",
@@ -6411,26 +6312,6 @@ mod tests {
         )
         .await;
         assert_retention_closure_and_audit_fail_closed(&storage, "dependency cycle").await;
-    }
-
-    async fn json_ref_exists(storage: &Memory, space: StorageSpace, json_ref: JsonRef) -> bool {
-        let storage_adapter = StorageAdapter::new(storage.clone());
-        let read = storage_adapter
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("JSON verification read should open");
-        PointReadPlan::new(
-            space,
-            &[StorageKey(Bytes::copy_from_slice(json_ref.as_hash_bytes()))],
-        )
-        .materialize(&read, StorageGetOptions::default())
-        .await
-        .expect("JSON verification read should succeed")
-        .value
-        .into_iter()
-        .next()
-        .flatten()
-        .is_some()
     }
 
     fn recovery(branch_id: &str, recovered_head: &str, checkpoint: &str) -> CheckpointRecoveryRef {
