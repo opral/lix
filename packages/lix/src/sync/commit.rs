@@ -255,6 +255,8 @@ pub struct SyncCommitMember {
     pub row_pk: serde_json::Value,
     pub deleted: bool,
     pub snapshot: Option<serde_json::Value>,
+    /// Canonical Schema v1 typed row payload, base64 encoded; absent for tombstones.
+    pub snapshot_payload: Option<String>,
     pub metadata: Option<serde_json::Value>,
     pub row_created_at: String,
     pub row_updated_at: String,
@@ -271,6 +273,7 @@ pub(crate) struct SyncCommitMemberRef<'a> {
     pub(crate) row_pk: &'a RowPk,
     pub(crate) deleted: bool,
     pub(crate) snapshot_json: Option<&'a str>,
+    pub(crate) decoded_snapshot: Option<&'a crate::plugin::runtime::WasmTypedRow>,
     pub(crate) metadata_json: Option<&'a str>,
     pub(crate) row_created_at: LixTimestamp,
     pub(crate) row_updated_at: LixTimestamp,
@@ -293,6 +296,10 @@ pub(crate) fn encode_sync_commit_member(
         row_pk: member.row_pk.as_typed_json_array_value()?,
         deleted: member.deleted,
         snapshot: parse_materialized_json(member.snapshot_json, member.change_id, "snapshot")?,
+        snapshot_payload: member
+            .decoded_snapshot
+            .map(encode_sync_row_payload)
+            .transpose()?,
         metadata: parse_materialized_json(member.metadata_json, member.change_id, "metadata")?,
         row_created_at: member.row_created_at.to_string(),
         row_updated_at: member.row_updated_at.to_string(),
@@ -300,6 +307,71 @@ pub(crate) fn encode_sync_commit_member(
         change_created_at: member.change_created_at.to_string(),
         origin_key: member.origin_key.map(str::to_owned),
     })
+}
+
+/// Re-encode the logical typed row so compression and storage caches do not
+/// change immutable wire identity between preflight and later export.
+pub(crate) fn encode_sync_row_payload(
+    row: &crate::plugin::runtime::WasmTypedRow,
+) -> Result<String, LixError> {
+    use base64::Engine as _;
+    let bytes = crate::plugin::wire::typed::encode_native_row_payload_with_identity(
+        &row.schema_fingerprint,
+        &row.row_pk,
+        &row.row,
+    )
+    .map_err(|error| {
+        LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!("encode sync typed row: {error:?}"),
+        )
+    })?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+pub(crate) fn decode_sync_row_payload(
+    schema_key: &str,
+    row_pk: &RowPk,
+    snapshot: &serde_json::Value,
+    payload: Option<&str>,
+) -> Result<Vec<u8>, LixError> {
+    use base64::Engine as _;
+    let invalid = |message: String| LixError::new(LixError::CODE_INVALID_PARAM, message);
+    let payload =
+        payload.ok_or_else(|| invalid("live sync row is missing snapshotPayload".into()))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|error| invalid(format!("invalid sync snapshotPayload: {error}")))?;
+    let row = crate::plugin::runtime::WasmTypedRow::decode_durable_payload(
+        std::sync::Arc::from(bytes.clone()),
+        schema_key,
+        row_pk,
+    )
+    .map_err(|error| invalid(format!("invalid sync snapshotPayload: {}", error.message)))?;
+    if let Some((_, plan)) = crate::catalog::CatalogSnapshot::builtin().plan_for_key(schema_key) {
+        let expected =
+            crate::plugin::runtime::WasmTypedRow::from_normalized_json(plan, row_pk, snapshot)
+                .map_err(|error| invalid(format!("invalid sync snapshot: {}", error.message)))?;
+        if encode_sync_row_payload(&expected).map_err(|error| invalid(error.message))? != payload {
+            return Err(invalid(format!(
+                "sync row for schema '{schema_key}' does not match its built-in schema"
+            )));
+        }
+    }
+    let decoded_pk = RowPk::from_schema_values(&row.row_pk)
+        .map_err(|error| invalid(format!("invalid sync primary key: {error:?}")))?;
+    if decoded_pk != *row_pk
+        || row
+            .to_json_value()
+            .map_err(|error| invalid(error.message))?
+            != *snapshot
+        || encode_sync_row_payload(&row).map_err(|error| invalid(error.message))? != payload
+    {
+        return Err(invalid(format!(
+            "sync row for schema '{schema_key}' has different content than its declared Schema v1 identity"
+        )));
+    }
+    Ok(bytes)
 }
 
 impl SyncCommit {
@@ -396,7 +468,9 @@ impl SyncCommit {
                 return invalid("sync member rowCreatedAt must not follow rowUpdatedAt");
             }
             parse_timestamp("sync member changeCreatedAt", &member.change_created_at)?;
-            if member.deleted == member.snapshot.is_some() {
+            if member.deleted == member.snapshot.is_some()
+                || member.deleted == member.snapshot_payload.is_some()
+            {
                 return invalid(
                     "sync commit member must have a snapshot exactly when it is not deleted",
                 );
@@ -529,6 +603,7 @@ where
                 row_pk: &member.key.row_pk,
                 deleted: member.value.deleted,
                 snapshot_json: payload.snapshot_content.as_deref(),
+                decoded_snapshot: payload.decoded_snapshot.as_deref(),
                 metadata_json: payload.metadata.as_deref(),
                 row_created_at: member.value.created_at,
                 row_updated_at: member.value.updated_at,
@@ -591,6 +666,52 @@ fn parse_materialized_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_sync_payload_preserves_custom_schema_and_rejects_tampering() {
+        let schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json", "key": "custom_sync",
+            "columns": [{"name":"id","type":"text","nullable":false}, {"name":"count","type":"int8","nullable":false}],
+            "primary_key": ["id"]
+        });
+        let catalog = crate::catalog::CatalogSnapshot::from_visible_schemas(&[schema]).unwrap();
+        let (_, plan) = catalog.plan_for_key("custom_sync").unwrap();
+        let pk = RowPk::single("one");
+        let json = serde_json::json!({"id":"one", "count":42});
+        let row =
+            crate::plugin::runtime::WasmTypedRow::from_normalized_json(plan, &pk, &json).unwrap();
+        let payload = encode_sync_row_payload(&row).unwrap();
+        decode_sync_row_payload("custom_sync", &pk, &json, Some(&payload)).unwrap();
+        assert!(decode_sync_row_payload("custom_sync", &pk, &json, None).is_err());
+        assert!(decode_sync_row_payload("custom_sync", &pk, &json, Some("invalid")).is_err());
+        assert!(
+            decode_sync_row_payload(
+                "custom_sync",
+                &pk,
+                &serde_json::json!({"id":"one", "count":43}),
+                Some(&payload)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            decode_sync_row_payload(
+                "custom_sync",
+                &RowPk::single("other"),
+                &json,
+                Some(&payload)
+            )
+            .unwrap_err()
+            .code,
+            LixError::CODE_INVALID_PARAM,
+        );
+        assert_eq!(
+            decode_sync_row_payload("custom_sync", &pk, &json, Some("Ag=="))
+                .unwrap_err()
+                .code,
+            LixError::CODE_INVALID_PARAM,
+            "malformed typed bytes are caller input errors, not internal failures",
+        );
+    }
 
     async fn exported_key_value_commit() -> (Lix, SyncCommit) {
         let lix = crate::open_lix().await.expect("open lix");
@@ -927,6 +1048,7 @@ mod tests {
                 row_pk: serde_json::json!([{ "type": "string", "value": label }]),
                 deleted: false,
                 snapshot: Some(serde_json::json!({"id": label})),
+                snapshot_payload: Some(String::new()),
                 metadata: None,
                 row_created_at: "2026-08-19T00:00:00Z".to_owned(),
                 row_updated_at: "2026-08-19T00:00:00Z".to_owned(),
@@ -1032,6 +1154,7 @@ mod tests {
             row_pk: serde_json::json!([{ "type": "string", "value": "row" }]),
             deleted: false,
             snapshot: Some(serde_json::json!({ "id": "row" })),
+            snapshot_payload: Some(String::new()),
             metadata: None,
             row_created_at: "2026-08-19T00:00:00Z".to_owned(),
             row_updated_at: "2026-08-19T00:00:00Z".to_owned(),

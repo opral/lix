@@ -167,3 +167,7 @@ implementation and its tests demonstrate those requirements; they do not make
 the implementation itself part of the protocol.
 
 To run a server, see [Hosting](./hosting.md).
+
+### Typed sync rows (sync protocol version 8)
+
+Every live sync member and snapshot row includes `snapshotPayload`, the base64-encoded canonical Schema v1 typed row, alongside its JSON `snapshot` projection. Tombstones encode both fields as null. Receivers verify canonical encoding, primary-key identity, and agreement with the JSON projection before installing the payload. Preserving type information and schema fingerprints lets custom and plugin-defined rows sync without rebuilding them against the engine's built-in catalog. A retained row may predate the currently registered schema, so import preserves its authoring fingerprint rather than validating it against the current catalog. SQL reads retain their existing resolved-schema validation. Storage compression does not affect the wire encoding. Sync protocol 7 peers must upgrade; there is no JSON-only fallback.

@@ -1839,6 +1839,7 @@ fn selected_payload_matches_authored(selected: &ParsedMember, authored: &ParsedM
         && selected.row_pk == authored.row_pk
         && selected.deleted == authored.deleted
         && selected.snapshot_json == authored.snapshot_json
+        && selected.snapshot == authored.snapshot
         && selected.metadata_json == authored.metadata_json
         && selected.change_account_id == authored.change_account_id
         && selected.change_created_at == authored.change_created_at
@@ -2181,7 +2182,14 @@ fn parse_sync_member(member: &SyncCommitMember) -> Result<ParsedMember, LixError
     let snapshot = member
         .snapshot
         .as_ref()
-        .map(|value| encode_sync_typed_snapshot(&member.schema_key, &row_pk, value))
+        .map(|value| {
+            super::commit::decode_sync_row_payload(
+                &member.schema_key,
+                &row_pk,
+                value,
+                member.snapshot_payload.as_deref(),
+            )
+        })
         .transpose()?;
     let metadata = member.metadata.clone().map(lix_schema::Jsonb::from_value);
     Ok(ParsedMember {
@@ -2341,6 +2349,54 @@ async fn load_sync_live_value_rows_at_commit(
     Ok(rows)
 }
 
+fn encode_sync_snapshot_row(
+    branch_id: &str,
+    row: crate::tracked_state::MaterializedTrackedStateRowRef<'_>,
+    change: ChangeRecord,
+) -> Result<SyncSnapshotRow, LixError> {
+    Ok(SyncSnapshotRow {
+        branch_id: branch_id.to_owned(),
+        // The by-ID record supplies provenance, not the row payload:
+        // eager plugin rows may share a source change ID while having
+        // distinct identities and typed snapshots.
+        snapshot_payload: Some(super::commit::encode_sync_row_payload(
+            row.decoded_snapshot().ok_or_else(|| {
+                LixError::unknown("live sync row lacks a materialized typed snapshot")
+            })?,
+        )?),
+        schema_key: row.schema_key().to_owned(),
+        file_id: row.file_id().map(str::to_owned),
+        row_pk: row.row_pk().as_typed_json_array_value()?,
+        snapshot: row
+            .snapshot_content()
+            .map(|value| serde_json::from_str(value.as_str()))
+            .transpose()
+            .map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("decode sync snapshot row: {error}"),
+                )
+            })?,
+        metadata: row
+            .metadata()
+            .map(|value| serde_json::from_str(value.as_str()))
+            .transpose()
+            .map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("decode sync snapshot metadata: {error}"),
+                )
+            })?,
+        change_id: row.change_id().to_string(),
+        commit_id: row.commit_id().to_string(),
+        created_at: row.created_at().to_string(),
+        updated_at: row.updated_at().to_string(),
+        change_account_id: change.account_id,
+        change_created_at: change.created_at.to_string(),
+        origin_key: change.origin_key,
+    })
+}
+
 fn parse_snapshot_row(row: &SyncSnapshotRow) -> Result<ParsedSnapshotRow, LixError> {
     let snapshot = row
         .snapshot
@@ -2370,7 +2426,12 @@ fn parse_snapshot_row(row: &SyncSnapshotRow) -> Result<ParsedSnapshotRow, LixErr
         .snapshot
         .as_ref()
         .expect("live sync snapshot was checked above");
-    let typed_snapshot = encode_sync_typed_snapshot(&row.schema_key, &row_pk, snapshot_value)?;
+    let typed_snapshot = super::commit::decode_sync_row_payload(
+        &row.schema_key,
+        &row_pk,
+        snapshot_value,
+        row.snapshot_payload.as_deref(),
+    )?;
     Ok(ParsedSnapshotRow {
         branch_id: row.branch_id.clone(),
         schema_key: row.schema_key.clone(),
@@ -7240,39 +7301,7 @@ where
                         format!("sync snapshot row change '{}' is missing", row.change_id()),
                     )
                 })?;
-            rows.push(SyncSnapshotRow {
-                branch_id: branch_id.to_owned(),
-                schema_key: row.schema_key().to_owned(),
-                file_id: row.file_id().map(str::to_owned),
-                row_pk: row.row_pk().as_typed_json_array_value()?,
-                snapshot: row
-                    .snapshot_content()
-                    .map(|value| serde_json::from_str(value.as_str()))
-                    .transpose()
-                    .map_err(|error| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!("decode sync snapshot row: {error}"),
-                        )
-                    })?,
-                metadata: row
-                    .metadata()
-                    .map(|value| serde_json::from_str(value.as_str()))
-                    .transpose()
-                    .map_err(|error| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!("decode sync snapshot metadata: {error}"),
-                        )
-                    })?,
-                change_id: row.change_id().to_string(),
-                commit_id: row.commit_id().to_string(),
-                created_at: row.created_at().to_string(),
-                updated_at: row.updated_at().to_string(),
-                change_account_id: change.account_id,
-                change_created_at: change.created_at.to_string(),
-                origin_key: change.origin_key,
-            });
+            rows.push(encode_sync_snapshot_row(branch_id, row, change)?);
         }
         Ok(SyncSnapshotRowPage {
             branch_id: branch_id.to_owned(),
@@ -9385,6 +9414,173 @@ mod tests {
         });
     }
 
+    #[test]
+    fn snapshot_encoding_preserves_distinct_rows_sharing_a_source_change() {
+        let source_pk = RowPk::single("source-row");
+        let source_payload = crate::plugin::runtime::WasmTypedRow::from_test_json_unchecked(
+            &source_pk,
+            &serde_json::json!({"value": "source"}),
+        )
+        .unwrap()
+        .durable_payload()
+        .unwrap();
+        let source = ChangeRecord {
+            format_version: 2,
+            change_id: ChangeId::for_test_label("shared-source-change"),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            schema_key: "source_row".to_owned(),
+            row_pk: source_pk,
+            file_id: None,
+            snapshot: Some(source_payload.to_vec()),
+            metadata: None,
+            created_at: LixTimestamp::expect_parse("created_at", "2026-05-12T00:00:00Z"),
+            origin_key: None,
+        };
+        let commit_id = CommitId::for_test_label("shared-source-snapshot");
+        let materialized = crate::tracked_state::MaterializedTrackedStateBatch::from_rows(
+            ["derived-one", "derived-two"]
+                .into_iter()
+                .map(|identity| {
+                    let row_pk = RowPk::single(identity);
+                    let json = serde_json::json!({"id": identity});
+                    let typed = crate::plugin::runtime::WasmTypedRow::from_test_json_unchecked(
+                        &row_pk, &json,
+                    )
+                    .unwrap();
+                    MaterializedTrackedStateRow {
+                        row_pk,
+                        schema_key: "derived_row".into(),
+                        file_id: None,
+                        snapshot_content: Some(typed.to_json_shared().unwrap()),
+                        decoded_snapshot: Some(Arc::new(typed)),
+                        metadata: None,
+                        deleted: false,
+                        created_at: source.created_at.to_string(),
+                        updated_at: source.created_at.to_string(),
+                        change_id: source.change_id,
+                        commit_id,
+                    }
+                })
+                .collect(),
+        )
+        .unwrap();
+        let mut payloads = Vec::new();
+        for row in materialized.iter() {
+            // The source record has another schema/PK and payload entirely;
+            // only its account, timestamp, and origin apply to the derived row.
+            let wire = encode_sync_snapshot_row(GLOBAL_BRANCH_ID, row, source.clone()).unwrap();
+            let parsed = parse_snapshot_row(&wire).unwrap();
+            assert_eq!(parsed.row_pk, *row.row_pk());
+            assert_eq!(
+                wire.snapshot.unwrap(),
+                serde_json::from_str::<serde_json::Value>(row.snapshot_content().unwrap().as_str())
+                    .unwrap()
+            );
+            assert_eq!(wire.change_account_id, source.account_id);
+            assert_eq!(wire.change_id, source.change_id.to_string());
+            payloads.push(wire.snapshot_payload.unwrap());
+        }
+        assert_ne!(
+            payloads[0], payloads[1],
+            "shared source IDs must not collapse identity-specific payloads"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_schema_snapshot_retains_rows_from_before_schema_amendment() {
+        let authority = open_lix().await.unwrap();
+        let mut schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json", "key": "amended_sync_row",
+            "columns": [{"name":"id","type":"text","nullable":false}],
+            "primary_key": ["id"]
+        });
+        authority.execute("INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))", &[Value::Text(schema.to_string())]).await.unwrap();
+        authority.execute("INSERT INTO amended_sync_row (id) VALUES ('old')", &[]).await.unwrap();
+        let (_, old_head) = default_head(&authority.pull_sync_repository(None, 128).await.unwrap());
+        schema["columns"].as_array_mut().unwrap().push(serde_json::json!({"name":"extra","type":"text","nullable":true}));
+        authority.execute("UPDATE lix_registered_schema SET value = CAST($1 AS JSONB) WHERE schema_key = 'amended_sync_row'", &[Value::Text(schema.to_string())]).await.unwrap();
+        authority.execute("INSERT INTO amended_sync_row (id, extra) VALUES ('new', 'value')", &[]).await.unwrap();
+        let snapshot = authority.pull_sync_repository(None, 128).await.unwrap();
+        let replica = replica_from_snapshot(&authority, &snapshot).await;
+        let query = "SELECT id FROM amended_sync_row ORDER BY id";
+        assert_eq!(replica.execute(query, &[]).await.unwrap().rows(), authority.execute(query, &[]).await.unwrap().rows());
+        hydrate_history_commit(&authority, &replica, &old_head).await;
+        assert_eq!(
+            export_sync_commit(&replica, &old_head).await.unwrap(),
+            export_sync_commit(&authority, &old_head).await.unwrap(),
+            "lazy history preserves the immutable row's original schema fingerprint"
+        );
+        replica.close().await.unwrap();
+        authority.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn custom_schema_rows_sync_bootstrap_and_bidirectional_edits() {
+        let authority = open_lix().await.unwrap();
+        authority
+            .set_sync_role(super::super::SyncRole::Authority)
+            .unwrap();
+        let schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json", "key": "sync_custom_row",
+            "columns": [{"name":"id","type":"text","nullable":false}, {"name":"value","type":"text","nullable":false}],
+            "primary_key": ["id"]
+        });
+        authority.execute("INSERT INTO lix_registered_schema (schema_key, value, lixcol_global) VALUES ('sync_custom_row', CAST($1 AS JSONB), false)", &[Value::Text(schema.to_string())]).await.unwrap();
+        authority
+            .execute(
+                "INSERT INTO sync_custom_row (id, value) VALUES ('row', 'initial')",
+                &[],
+            )
+            .await
+            .unwrap();
+        let initial = authority.pull_sync_repository(None, 128).await.unwrap();
+        let replica = replica_from_snapshot(&authority, &initial).await;
+        let query = "SELECT value FROM sync_custom_row WHERE id = 'row'";
+        assert_eq!(
+            replica.execute(query, &[]).await.unwrap().rows(),
+            authority.execute(query, &[]).await.unwrap().rows()
+        );
+        authority
+            .execute(
+                "UPDATE sync_custom_row SET value = 'server-edit' WHERE id = 'row'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let cursor = replica
+            .load_sync_repository_cursor(TEST_REMOTE)
+            .await
+            .unwrap();
+        let delta = authority.pull_sync_repository(cursor, 128).await.unwrap();
+        replica
+            .apply_sync_repository_pull(TEST_REMOTE, &delta)
+            .await
+            .unwrap();
+        assert_eq!(
+            replica.execute(query, &[]).await.unwrap().rows(),
+            authority.execute(query, &[]).await.unwrap().rows()
+        );
+        replica
+            .execute(
+                "UPDATE sync_custom_row SET value = 'local-edit' WHERE id = 'row'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let push = replica
+            .build_sync_push(TEST_REMOTE, 128)
+            .await
+            .unwrap()
+            .unwrap();
+        authority.push_sync_repository(&push).await.unwrap();
+        assert_eq!(
+            replica.execute(query, &[]).await.unwrap().rows(),
+            authority.execute(query, &[]).await.unwrap().rows()
+        );
+        replica.close().await.unwrap();
+        authority.close().await.unwrap();
+    }
+
     async fn replica_from_snapshot<AuthorityStorage>(
         authority: &Lix<AuthorityStorage>,
         snapshot: &SyncRepositoryPullResponse,
@@ -10641,6 +10837,7 @@ mod tests {
                 row_pk: row.row_pk.clone(),
                 deleted: false,
                 snapshot: row.snapshot.clone(),
+                snapshot_payload: row.snapshot_payload.clone(),
                 metadata: row.metadata.clone(),
                 row_created_at: row.created_at.clone(),
                 row_updated_at: row.updated_at.clone(),
@@ -11388,17 +11585,13 @@ mod tests {
             .expect("exact replay should be idempotent");
         assert_eq!(second.cursor, first.cursor);
         let mut conflicting = request.clone();
-        conflicting
-            .commits
-            .iter_mut()
-            .flat_map(|commit| &mut commit.members)
-            .find(|member| member.schema_key == "lix_key_value")
-            .expect("dependency closure contains the key-value member")
-            .snapshot
-            .as_mut()
-            .and_then(serde_json::Value::as_object_mut)
-            .expect("key-value snapshot is an object")
+        let member = conflicting.commits.iter_mut().flat_map(|commit| &mut commit.members)
+            .find(|member| member.schema_key == "lix_key_value").unwrap();
+        member.snapshot.as_mut().unwrap().as_object_mut().unwrap()
             .insert("value".to_owned(), serde_json::json!("different"));
+        let pk = RowPk::from_typed_json_array_value(&member.row_pk).unwrap();
+        let row = crate::plugin::runtime::WasmTypedRow::from_builtin_json(&member.schema_key, &pk, member.snapshot.as_ref().unwrap()).unwrap();
+        member.snapshot_payload = Some(super::super::commit::encode_sync_row_payload(&row).unwrap());
         let error = target
             .push_sync_repository(&conflicting)
             .await
