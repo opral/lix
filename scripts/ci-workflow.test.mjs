@@ -63,7 +63,7 @@ test("Rust scope gates only Rust jobs and keeps both SDK integration suites", ()
 		.split("\n  cargo:\n")[1]
 		.split("\n  js-sdk-test:\n")[0];
 	assert.match(cargo, /needs: changelog/);
-	assert.match(cargo, /if: needs\.changelog\.outputs\.rust != 'false'/);
+	assert.match(cargo, /if: inputs\.artifacts_only != true && needs\.changelog\.outputs\.rust != 'false'/);
 	const sdk = workflow
 		.split("\n  js-sdk-test:\n")[1]
 		.split("\n  preview-artifact-changes:\n")[0];
@@ -116,19 +116,10 @@ test("short Linux support jobs use small Ubicloud runners", () => {
 	}
 });
 
-test("SDK CI uses large Ubicloud runners for native and browser compilation", () => {
-	assert.match(
-		workflow,
-		/- name: Native\n\s+runtime: native\n\s+runner: ubicloud-standard-30-ubuntu-2404/,
-	);
-	assert.match(
-		workflow,
-		/- name: Browser\n\s+runtime: browser\n\s+runner: ubicloud-standard-30-ubuntu-2404/,
-	);
-	assert.match(
-		workflow,
-		/name: JS SDK \$\{\{ matrix\.name \}\} Test[\s\S]*?runs-on: \$\{\{ matrix\.runner \}\}/,
-	);
+test("SDK CI uses a large Ubicloud runner for both runtime modes", () => {
+    const sdk = workflow.split("\n  js-sdk-test:\n")[1].split("\n  preview-artifact-changes:\n")[0];
+    assert.match(sdk, /runs-on: ubicloud-standard-30-ubuntu-2404/);
+    assert.match(sdk, /runtime: .*\["native", "browser"\]/);
 });
 
 test("green SDK jobs retain exact-revision artifacts for submodule consumers", () => {
@@ -338,4 +329,21 @@ test("ARM64 release artifacts are tested on ARM hardware before publishing", () 
 	assert.match(armTest, /npx vitest run src\/binding\.node\.test\.ts/);
 	const rustPublish = publishWorkflow.split("\n  publish-rust-crates:\n")[1].split("\n  publish-js-sdk:\n")[0];
 	assert.match(rustPublish, /needs:[\s\S]*?- build-js-sdk-arm64/);
+});
+
+
+test("explicit artifact mode reuses producers without emitting release readiness", () => {
+    assert.match(workflow, /artifacts_only:\n\s+description:/);
+    assert.match(workflow, /source_revision:/);
+    assert.match(workflow, /Artifacts only - not release validation/);
+    assert.match(workflow, /if: always\(\) && inputs\.artifacts_only != true/);
+    assert.match(workflow, /'artifacts' \|\| 'validation'/);
+    assert.match(workflow, /assertArtifactRequest/);
+    const sdk = workflow.split("\n  js-sdk-test:\n")[1].split("\n  preview-artifact-changes:\n")[0];
+    assert.match(sdk, /runtime: .*inputs\.artifacts_only && '\["browser"\]'/);
+    assert.doesNotMatch(sdk, /include:/);
+    const selector = workflow.split("\n  preview-artifact-changes:\n")[1].split("\n  preview-server-image:\n")[0];
+    assert.match(selector, /needs: merge-reuse/);
+    assert.match(selector, /inputs\.artifacts_only == true/);
+    assert.match(selector, /echo 'server=true'/);
 });

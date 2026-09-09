@@ -38,3 +38,37 @@ Existing release PRs created before this change must be returned to draft and
 refreshed through **Release PR** once to pick up the workflow changes. Do not
 merge based on an older green run that skipped validation. Adding the job to YAML
 alone does not make it a required GitHub check.
+
+## Build exact artifacts for a consumer
+
+Draft PRs defer full CI. To prepare the browser SDK and Linux server image for a
+consumer such as LixRay, explicitly dispatch CI from the source branch or tag:
+
+```sh
+source_revision=$(git rev-parse HEAD)
+gh workflow run ci.yml --repo opral/lix --ref codex/my-branch \
+  -f artifacts_only=true -f source_revision="$source_revision"
+```
+
+The full lowercase SHA must equal the dispatched ref's commit. If the branch
+advanced, the run fails before either producer starts; update the SHA and dispatch
+again. The workflow file must be available on the selected ref. Arbitrary historical
+SHAs are not supported: use a branch or tag pointing at the intended commit.
+
+The run uses the existing Browser SDK build and functional tests, then uploads
+`lix-browser-sdk-<SHA>` (90-day retention), including SDK/OPFS distributions and
+`ci-artifact/browser.json`. It also uses the existing Linux x64 Docker producer,
+verifies the image revision label, and uploads
+`lix-server-image-linux-x64-<SHA>` (14-day retention), containing the image tar and
+`ci-artifact/server-linux-x64.json`. Both manifests retain their normal exact-source
+provenance. Download from this completed successful run, for example:
+
+```sh
+gh run download RUN_ID --repo opral/lix --name "lix-browser-sdk-$source_revision"
+gh run download RUN_ID --repo opral/lix --name "lix-server-image-linux-x64-$source_revision"
+```
+
+Artifact-only runs have separate concurrency and do not emit **Release ready**,
+run the native SDK or full Rust validation, publish packages, or deploy anything.
+They are preparation for consumer testing, not release approval. Ordinary PR,
+main-push, and default manual CI validation retain their existing behavior.

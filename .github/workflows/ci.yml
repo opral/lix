@@ -2,6 +2,15 @@ name: CI
 
 on:
   workflow_dispatch:
+    inputs:
+      artifacts_only:
+        description: Build tested browser SDK and server artifacts without full release validation
+        type: boolean
+        default: false
+      source_revision:
+        description: Exact 40-character commit SHA at the dispatched ref (required for artifacts_only)
+        type: string
+        required: false
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
   push:
@@ -12,7 +21,7 @@ on:
 concurrency:
   # A rerun retains its original event payload. Draft reruns must never cancel
   # ready-candidate validation, even when they reference the same head commit.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.draft && 'draft' || 'ready' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.draft && 'draft' || 'ready' }}-${{ inputs.artifacts_only && 'artifacts' || 'validation' }}
   cancel-in-progress: true
 
 permissions:
@@ -27,8 +36,8 @@ defaults:
 jobs:
   release-ready:
     # Draft reruns must not overwrite the required ready-candidate check.
-    name: ${{ github.event.pull_request.draft && 'Draft - full CI deferred' || 'Release ready' }}
-    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    name: ${{ inputs.artifacts_only && 'Artifacts only - not release validation' || github.event.pull_request.draft && 'Draft - full CI deferred' || 'Release ready' }}
+    if: always() && inputs.artifacts_only != true && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     needs: [merge-reuse, promote-browser-sdk, changelog, cargo-config, cargo, js-sdk-test, preview-artifact-changes, preview-server-image]
     runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 5
@@ -67,6 +76,20 @@ jobs:
       revision: ${{ steps.reuse.outputs.revision }}
     steps:
       - uses: actions/checkout@v4
+      - name: Validate explicit artifact source
+        uses: actions/github-script@v7
+        env:
+          ARTIFACTS_ONLY: ${{ inputs.artifacts_only || false }}
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        with:
+          script: |
+            const { assertArtifactRequest } = await import(`${process.env.GITHUB_WORKSPACE}/scripts/ci-artifact-request.mjs`);
+            assertArtifactRequest({
+              artifactsOnly: process.env.ARTIFACTS_ONLY === 'true',
+              eventName: context.eventName,
+              requestedRevision: process.env.SOURCE_REVISION,
+              workflowRevision: context.sha,
+            });
       - name: Find successful PR validation of the exact merged tree
         id: reuse
         uses: actions/github-script@v7
@@ -122,7 +145,7 @@ jobs:
   changelog:
     name: Changelog
     needs: merge-reuse
-    if: needs.merge-reuse.outputs.reuse != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    if: inputs.artifacts_only != true && needs.merge-reuse.outputs.reuse != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     runs-on: ubicloud-standard-2-ubuntu-2404
     outputs:
       rust: ${{ steps.scope.outputs.rust }}
@@ -173,7 +196,7 @@ jobs:
   cargo-config:
     name: Cargo config (${{ matrix.name }})
     needs: merge-reuse
-    if: needs.merge-reuse.outputs.reuse != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    if: inputs.artifacts_only != true && needs.merge-reuse.outputs.reuse != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -199,7 +222,7 @@ jobs:
     # Large Rust builds need memory and parallel compilation to target <10 min.
     name: Cargo ${{ matrix.name }}
     needs: changelog
-    if: needs.changelog.outputs.rust != 'false' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    if: inputs.artifacts_only != true && needs.changelog.outputs.rust != 'false' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     env:
@@ -449,10 +472,10 @@ jobs:
           free -h
 
   js-sdk-test:
-    name: JS SDK ${{ matrix.name }} Test
+    name: JS SDK ${{ matrix.runtime == 'browser' && 'Browser' || 'Native' }} Test
     needs: merge-reuse
     if: needs.merge-reuse.outputs.reuse != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubicloud-standard-30-ubuntu-2404
     timeout-minutes: 45
     env:
       # Pull request workflows normally check out GitHub's synthetic merge
@@ -462,13 +485,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: Native
-            runtime: native
-            runner: ubicloud-standard-30-ubuntu-2404
-          - name: Browser
-            runtime: browser
-            runner: ubicloud-standard-30-ubuntu-2404
+        runtime: ${{ fromJSON(inputs.artifacts_only && '["browser"]' || '["native", "browser"]') }}
 
     steps:
       - name: Checkout repository
@@ -694,7 +711,8 @@ jobs:
 
   preview-artifact-changes:
     name: Select preview artifacts
-    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    if: (github.event_name == 'pull_request' && github.event.pull_request.draft == false) || inputs.artifacts_only == true
+    needs: merge-reuse
     runs-on: ubicloud-standard-2-ubuntu-2404
     outputs:
       server: ${{ steps.changes.outputs.server }}
@@ -704,14 +722,19 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Detect reference server inputs
         id: changes
         env:
+          ARTIFACTS_ONLY: ${{ inputs.artifacts_only || false }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
+          if [ "$ARTIFACTS_ONLY" = true ]; then
+            echo 'server=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- \
             .github/workflows/ci.yml \
             .github/workflows/publish-packages.yml \
@@ -739,7 +762,7 @@ jobs:
     runs-on: ubicloud-standard-30-ubuntu-2404
     timeout-minutes: 45
     env:
-      LIX_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+      LIX_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
     steps:
       - name: Checkout feature revision
