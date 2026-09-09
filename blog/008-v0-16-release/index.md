@@ -16,7 +16,7 @@ Lix crossed **500k weekly downloads on npm**. The `@lix-js/sdk` package recorded
 
 *Source: [npm download counts](https://api.npmjs.org/downloads/range/2026-01-01:2026-09-06/@lix-js/sdk), retrieved September 9, 2026. Downloads include repeated installs and CI runs; they are not unique users or installs of v0.16 alone.*
 
-This is a major milestone. From inlang, we also know Lix is deployed to **over 100,000 users**. That production use is why we’re calling Lix ready as an embedded repository backend.
+This is a major milestone. From inlang, we also know Lix is deployed to **over 100,000 users**.
 
 Inlang is our proof point. We ran an A/B comparison against the previous inlang version, which used SQLite-WASM. With Lix, inlang maintains application performance while adding version control to its data.
 
