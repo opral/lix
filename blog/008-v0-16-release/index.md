@@ -12,9 +12,9 @@ og:image:alt: "lix v0.16: Over 500k weekly downloads"
 
 Lix crossed **500k weekly downloads on npm**. The `@lix-js/sdk` package recorded **509,341 downloads from August 31 to September 6, 2026**, according to the [npm downloads API](https://api.npmjs.org/downloads/point/2026-08-31:2026-09-06/@lix-js/sdk).
 
-![Weekly npm downloads for @lix-js/sdk, reaching 509,341 in August 31–September 6, 2026.](./npm-downloads.png)
+![Weekly npm downloads for @lix-js/sdk from January 2026, reaching 509,341 in August 31–September 6, 2026.](./npm-downloads.png)
 
-*Source: [npm download counts](https://api.npmjs.org/downloads/range/2026-08-10:2026-09-06/@lix-js/sdk), retrieved September 9, 2026. Downloads include repeated installs and CI runs; they are not unique users or installs of v0.16 alone.*
+*Source: [npm download counts](https://api.npmjs.org/downloads/range/2026-01-01:2026-09-06/@lix-js/sdk), retrieved September 9, 2026. Downloads include repeated installs and CI runs; they are not unique users or installs of v0.16 alone.*
 
 This is a major milestone. From inlang, we also know Lix is deployed to **over 100,000 users**. That production use is why we’re calling Lix ready as an embedded repository backend.
 
