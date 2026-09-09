@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -7,7 +9,8 @@ use http::{Request, StatusCode, header::CONTENT_TYPE};
 use http_body_util::BodyExt as _;
 use lix::{
     server_protocol::{
-        LixServerProtocol, ServerProtocolBody, ServerProtocolContext, ServerProtocolResponse,
+        LixServerProtocol, PROTOCOL_VERSION, SERVER_PROTOCOL_VERSION_HEADER, ServerProtocolBody,
+        ServerProtocolContext, ServerProtocolResponse,
     },
     storage::{
         CommitResult, Key, KeyRange, PutBatch, ReadOptions, Storage, StorageError, StorageSpace,
@@ -61,9 +64,7 @@ impl Storage for PostCommitUnknownSlateDB {
     where
         Self: 'a;
 
-    async fn acquire_session(
-        &self,
-    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+    async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
         self.inner.acquire_session().await
     }
 
@@ -133,7 +134,10 @@ async fn request(
 ) -> ServerProtocolResponse {
     let suffix = path.strip_prefix("/lix/v1").expect("protocol test path");
     let targeted_path = format!("/lix/v1/{}{}", server.lix_id(), suffix);
-    let mut builder = Request::builder().method(method).uri(targeted_path);
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(targeted_path)
+        .header(SERVER_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION);
     if let Some(session_id) = session_id {
         builder = builder.header(SESSION_ID_HEADER, session_id);
     }
@@ -172,7 +176,8 @@ async fn open_server() -> (
     let storage = PostCommitUnknownSlateDB::new();
     let server = lix::open_lix()
         .with_storage(storage.clone())
-        .serve().with_embedded_lix_id()
+        .serve()
+        .with_embedded_lix_id()
         .await
         .expect("serve Lix");
     let handshake = request(&server, "GET", "/lix/v1", None, None, None).await;

@@ -305,7 +305,7 @@ async fn assert_generation<S: Storage + Clone + Send + Sync + 'static>(
 async fn assert_history_readable<S: Storage + Clone + Send + Sync + 'static>(lix: &lix::Lix<S>) {
     let history = lix
         .execute(
-            &format!("SELECT note FROM lix_history('{SCHEMA_KEY}') WHERE id = 'row-1'"),
+            &format!("SELECT to_note AS note FROM lix_history('{SCHEMA_KEY}') WHERE diff_type <> 'removed' AND id = 'row-1'"),
             &[],
         )
         .await

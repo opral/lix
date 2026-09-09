@@ -18,7 +18,8 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use lix::server_protocol::{
-    LixServerProtocol, ServerProtocolBody, ServerProtocolContext, ServerProtocolPrincipal,
+    LixServerProtocol, PROTOCOL_VERSION, SERVER_PROTOCOL_VERSION_HEADER, ServerProtocolBody,
+    ServerProtocolContext, ServerProtocolPrincipal,
 };
 use lix::storage::Storage;
 use lix::{
@@ -1481,9 +1482,12 @@ async fn local_writes_checkpoints_and_folder_moves_survive_offline_reopen() {
     tokio::time::timeout(WAIT_TIMEOUT, async {
         loop {
             let rows = remote
-                .execute("SELECT lix_latest_checkpoint_commit_id()", &[])
+                .execute(
+                    "SELECT commit_id FROM lix_log() WHERE is_checkpoint ORDER BY position LIMIT 1",
+                    &[],
+                )
                 .await;
-            if rows[0][0] == Value::Text(full.clone()) {
+            if rows.first().and_then(|row| row.first()) == Some(&Value::Text(full.clone())) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1496,7 +1500,7 @@ async fn local_writes_checkpoints_and_folder_moves_survive_offline_reopen() {
     let replica = open_replica(directory.path(), &url).await;
     assert_eq!(
         replica
-            .execute("SELECT lix_latest_checkpoint_commit_id() AS id", &[])
+            .execute("SELECT commit_id AS id FROM lix_log() WHERE is_checkpoint ORDER BY position LIMIT 1", &[])
             .await
             .unwrap()
             .rows()[0]
@@ -1537,7 +1541,7 @@ async fn scoped_checkpoint_from_uncheckpointed_authority_survives_reconnect(
     // compacts already accepted working commits out of its canonical ancestry.
     let coordinates = authority
         .execute(
-            "SELECT lix_active_branch_commit_id() AS head, lix_latest_checkpoint_commit_id() AS checkpoint",
+            "SELECT commit_id AS head, working_base_commit_id AS checkpoint FROM lix_branch WHERE id = lix_active_branch_id()",
             &[],
         )
         .await
@@ -1589,7 +1593,7 @@ async fn scoped_checkpoint_from_uncheckpointed_authority_survives_reconnect(
     let replica = open_replica(directory.path(), &url).await;
     assert_eq!(
         replica
-            .execute("SELECT lix_latest_checkpoint_commit_id() AS id", &[])
+            .execute("SELECT commit_id AS id FROM lix_log() WHERE is_checkpoint ORDER BY position LIMIT 1", &[])
             .await
             .unwrap()
             .rows()[0]
@@ -1611,9 +1615,12 @@ async fn scoped_checkpoint_from_uncheckpointed_authority_survives_reconnect(
     tokio::time::timeout(WAIT_TIMEOUT, async {
         loop {
             let rows = remote
-                .execute("SELECT lix_latest_checkpoint_commit_id()", &[])
+                .execute(
+                    "SELECT commit_id FROM lix_log() WHERE is_checkpoint ORDER BY position LIMIT 1",
+                    &[],
+                )
                 .await;
-            if rows[0][0] == Value::Text(checkpoint.clone()) {
+            if rows.first().and_then(|row| row.first()) == Some(&Value::Text(checkpoint.clone())) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2016,6 +2023,7 @@ impl ProtocolAuthority {
         let response = protocol
             .handle(
                 Request::builder()
+                    .header(SERVER_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
                     .method("GET")
                     .uri(format!("/lix/v1/{}", protocol.lix_id()))
                     .body(ServerProtocolBody::empty())
@@ -2053,6 +2061,7 @@ impl ProtocolAuthority {
             .protocol
             .handle(
                 Request::builder()
+                    .header(SERVER_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
                     .method("POST")
                     .uri(format!("/lix/v1/{}/execute", self.protocol.lix_id()))
                     .header("lix-session-id", &self.session_id)
@@ -2094,6 +2103,7 @@ impl ProtocolAuthority {
             .protocol
             .handle(
                 Request::builder()
+                    .header(SERVER_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
                     .method("POST")
                     .uri(format!("/lix/v1/{}/branch/create", self.protocol.lix_id()))
                     .header("lix-session-id", &self.session_id)
@@ -2130,6 +2140,7 @@ impl ProtocolAuthority {
             .protocol
             .handle(
                 Request::builder()
+                    .header(SERVER_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
                     .method("POST")
                     .uri(format!("/lix/v1/{}/branch/switch", self.protocol.lix_id()))
                     .header("lix-session-id", &self.session_id)
@@ -2259,7 +2270,7 @@ where
         probe.handshakes.fetch_add(1, Ordering::Release);
         if probe.mismatch_handshake_protocol.load(Ordering::Acquire) {
             let body = serde_json::to_vec(&json!({
-                "protocolVersion": lix::server_protocol::PROTOCOL_VERSION,
+                "protocolVersion": PROTOCOL_VERSION,
                 "syncProtocolVersion": 999,
                 "lixId": "01920000-0000-7000-8000-000000001234",
                 "sessionId": "incompatible-test-session",

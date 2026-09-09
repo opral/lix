@@ -92,7 +92,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use lix::server_protocol::{
-    FILE_UPLOAD_ID_HEADER, SESSION_ID_HEADER, ServerProtocolBody, ServerProtocolContext,
+    FILE_UPLOAD_ID_HEADER, PROTOCOL_VERSION, SERVER_PROTOCOL_VERSION_HEADER, SESSION_ID_HEADER,
+    ServerProtocolBody, ServerProtocolContext,
 };
 use lix::storage::{
     CommitResult, Key, KeyRange, PutBatch, ReadOptions, Storage, StorageError, StorageSpace,
@@ -699,7 +700,7 @@ async fn verify_after_crash<B: CrashBackend>(
         let history_rows = scalar_i64(
             &lix,
             &format!(
-                "SELECT COUNT(*) AS n FROM lix_history('{SCHEMA_KEY}') WHERE generation = $1"
+                "SELECT COUNT(*) AS n FROM lix_history('{SCHEMA_KEY}') WHERE to_generation = $1"
             ),
             &[Value::Integer(visible)],
         )
@@ -1332,12 +1333,14 @@ fn await_durable_publication_round_trips_through_the_resumable_upload_path() {
             let storage = RocksDB::open(&path).expect("open durable round-trip store");
             let server = open_lix()
                 .with_storage(storage.clone())
-                .serve().with_embedded_lix_id()
+                .serve()
+                .with_embedded_lix_id()
                 .await
                 .expect("serve durable round-trip Lix");
             let handshake = server
                 .handle(
                     http::Request::builder()
+                        .header(SERVER_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
                         .method("GET")
                         .uri(format!("/lix/v1/{}", server.lix_id()))
                         .body(ServerProtocolBody::empty())
@@ -1358,6 +1361,7 @@ fn await_durable_publication_round_trips_through_the_resumable_upload_path() {
             let response = server
                 .handle(
                     http::Request::builder()
+                        .header(SERVER_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
                         .method("POST")
                         .uri(format!(
                             "/lix/v1/{}/file/upsert?path=%2Fdurable-round-trip.bin",

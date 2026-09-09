@@ -652,3 +652,110 @@ async fn observe_error_event_recovers_once_then_fails() {
     events.close();
     client.close().await.expect("close");
 }
+
+#[cfg(feature = "server-protocol")]
+#[tokio::test]
+async fn observe_client_request_passes_server_version_gate_and_streams_initial_result() {
+    use super::observe::ObserveTransport as _;
+    use crate::server_protocol::{
+        SERVER_PROTOCOL_VERSION_HEADER, ServerProtocolBody, ServerProtocolContext,
+    };
+    use http_body_util::BodyExt as _;
+
+    let server = crate::open_lix()
+        .with_storage(crate::Memory::new())
+        .serve()
+        .with_embedded_lix_id()
+        .await
+        .expect("serve observation fixture");
+    let handshake_response = server
+        .handle(
+            http::Request::builder()
+                .uri(format!("/lix/v1/{}", server.lix_id()))
+                .header(SERVER_PROTOCOL_VERSION_HEADER, SERVER_PROTOCOL_VERSION)
+                .body(ServerProtocolBody::empty())
+                .expect("handshake request"),
+            ServerProtocolContext::anonymous(),
+        )
+        .await;
+    assert_eq!(handshake_response.status(), http::StatusCode::OK);
+    let handshake_body = handshake_response
+        .into_body()
+        .collect()
+        .await
+        .expect("handshake body")
+        .to_bytes();
+    let http = ScriptHttp::default();
+    http.push_json(
+        200,
+        serde_json::from_slice(&handshake_body).expect("handshake JSON"),
+    );
+    http.push_stream(200, "");
+    let client = open_protocol_client(
+        http.clone(),
+        format!("https://lix.test/lix/{}", server.lix_id()),
+        None,
+    )
+    .await
+    .expect("open client with real server session");
+    let captured_stream = client
+        .core
+        .open_observe_stream(vec![super::wire::MultiplexObserveSubscription {
+            id: "version-gate".to_owned(),
+            sql: "SELECT 42 AS answer".to_owned(),
+            params: Vec::new(),
+        }])
+        .await
+        .expect("capture actual client observe request");
+    (captured_stream.cancel)();
+    let request = http.requests().pop().expect("captured observe request");
+    assert_eq!(
+        request.header(SERVER_PROTOCOL_VERSION_HEADER),
+        Some(SERVER_PROTOCOL_VERSION.to_string().as_str())
+    );
+
+    // Replay the actual client request without fixture-injected headers. The
+    // negative control proves this route enforces the version before streaming.
+    let replay = |include_version: bool| {
+        let mut builder = http::Request::builder()
+            .method(request.method.as_str())
+            .uri(&request.url);
+        for (name, value) in &request.headers {
+            if include_version || !name.eq_ignore_ascii_case(SERVER_PROTOCOL_VERSION_HEADER) {
+                builder = builder.header(name, value);
+            }
+        }
+        builder
+            .body(ServerProtocolBody::from(
+                request.body.clone().expect("observe body"),
+            ))
+            .expect("replayed observe request")
+    };
+    let rejected = server
+        .handle(replay(false), ServerProtocolContext::anonymous())
+        .await;
+    assert_eq!(rejected.status(), http::StatusCode::UPGRADE_REQUIRED);
+    let response = server
+        .handle(replay(true), ServerProtocolContext::anonymous())
+        .await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let mut body = response.into_body();
+    let frame = tokio::time::timeout(Duration::from_secs(2), body.frame())
+        .await
+        .expect("initial result timeout")
+        .expect("initial frame")
+        .expect("valid frame")
+        .into_data()
+        .expect("SSE data");
+    let event = std::str::from_utf8(&frame).expect("UTF-8 SSE");
+    assert!(
+        event.contains("event: next"),
+        "expected initial result, got {event}"
+    );
+    assert!(
+        event.contains("version-gate") && event.contains("42"),
+        "unexpected result: {event}"
+    );
+    drop(body);
+    server.close().await.expect("close server");
+}

@@ -3375,8 +3375,8 @@ mod tests {
             checkpoint_rows.rows()[0]
                 .get::<i64>("count")
                 .expect("checkpoint count should decode"),
-            5,
-            "initialization plus four replayed commits should publish five checkpoints"
+            4,
+            "four replayed commits should publish four checkpoints; bootstrap is unmarked"
         );
         let text_rows = db::block_on(lix.execute(
             "SELECT id FROM text_line WHERE lixcol_file_id = $1",

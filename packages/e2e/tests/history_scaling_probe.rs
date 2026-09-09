@@ -338,7 +338,7 @@ async fn history_path_filter_latency() {
             .execute(&by_path, &params)
             .await
             .expect("warm probe query");
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let rows = lix
             .execute(&by_path, &params)
             .await

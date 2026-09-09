@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use http::{Request, StatusCode, header::CONTENT_TYPE};
 use http_body_util::BodyExt as _;
 use lix::server_protocol::{
@@ -233,7 +235,10 @@ async fn request(
 ) -> ServerProtocolResponse {
     let suffix = path.strip_prefix("/lix/v1").expect("protocol test path");
     let targeted_path = format!("/lix/v1/{}{}", protocol.lix_id(), suffix);
-    let mut builder = Request::builder().method(method).uri(targeted_path);
+    let mut builder = Request::builder().method(method).uri(targeted_path).header(
+        lix::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+        lix::server_protocol::PROTOCOL_VERSION,
+    );
     if let Some(session) = session {
         builder = builder.header(SESSION_ID_HEADER, session);
     }

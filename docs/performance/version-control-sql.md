@@ -21,6 +21,12 @@ descriptors, and A be ancestor directory descriptors needed to resolve paths.
 - The supported left-join page shape uses the existing probe-key join optimizer
   to pass page IDs into history before opening endpoint diffs. The equivalent
   two-query IN form has the same destination pruning.
+- Global checkpoint counts and daily activity metrics over `lix_commit WHERE
+  is_checkpoint` scan retained canonical commit metadata, O(C) for C retained
+  commits. They do not load historical row snapshots. Ordering the full result
+  costs O(C log C); a bounded top-P sort can reduce sorting work to O(C log P),
+  but the count still visits the complete inventory. These global metrics do
+  not inherit the recent mainline page guarantee.
 - Full checkpoint publication performs constant logical work with respect to
   the number of working changes: capture/alias a state root, publish immutable
   metadata, advance control and stage the inventory index. Physical index writes

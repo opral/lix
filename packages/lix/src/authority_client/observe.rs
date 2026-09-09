@@ -1140,6 +1140,10 @@ where
         let (body, compressed) = super::maybe_compress_json(body)?;
         let mut headers = vec![
             ("accept".to_owned(), "text/event-stream".to_owned()),
+            (
+                "lix-server-protocol-version".to_owned(),
+                super::wire::SERVER_PROTOCOL_VERSION.to_string(),
+            ),
             ("content-type".to_owned(), "application/json".to_owned()),
             (super::wire::SESSION_HEADER.to_owned(), session_id),
         ];
