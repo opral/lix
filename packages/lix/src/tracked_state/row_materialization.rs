@@ -11,13 +11,11 @@ use crate::changelog::{
     CommitId, MaterializedChangePayload, materialize_known_change_payloads,
 };
 use crate::common::{LixTimestamp, SharedStr, StringDictionary, StringDictionaryBuilder};
-use crate::plugin::runtime::WasmTypedRow;
+use crate::row_payload::TypedRow as WasmTypedRow;
 use crate::row_pk::RowPk;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::types::{TrackedStateIndexValue, TrackedStateKey, TrackedStateKeyRef};
-use crate::tracked_state::{
-    MaterializedTrackedStateRow, load_published_commit_state_topology,
-};
+use crate::tracked_state::{MaterializedTrackedStateRow, load_published_commit_state_topology};
 
 #[derive(Debug)]
 struct MaterializedTrackedStateDescriptor {
@@ -441,21 +439,20 @@ where
         let materialized_sparse_boundary = authority.as_ref().is_some_and(|authority| {
             authority.mutation_member_count() == 0 && authority.complete_state_fence()
         });
-        let mut snapshot_records = if missing_ids.is_empty()
-            || (authority.is_some() && !materialized_sparse_boundary)
-        {
-            HashMap::new()
-        } else {
-            ChangelogContext::new()
-                .reader(store)
-                .load_changes(ChangeLoadRequest {
-                    change_ids: &missing_ids,
-                })
-                .await?
-                .into_iter()
-                .filter_map(|(change_id, record)| record.map(|record| (change_id, record)))
-                .collect::<HashMap<_, _>>()
-        };
+        let mut snapshot_records =
+            if missing_ids.is_empty() || (authority.is_some() && !materialized_sparse_boundary) {
+                HashMap::new()
+            } else {
+                ChangelogContext::new()
+                    .reader(store)
+                    .load_changes(ChangeLoadRequest {
+                        change_ids: &missing_ids,
+                    })
+                    .await?
+                    .into_iter()
+                    .filter_map(|(change_id, record)| record.map(|record| (change_id, record)))
+                    .collect::<HashMap<_, _>>()
+            };
         for ((key, change_id, updated_at), record) in expected.into_iter().zip(loaded) {
             let record = record.or_else(|| snapshot_records.remove(&change_id)).ok_or_else(|| {
                 LixError::internal_invariant(

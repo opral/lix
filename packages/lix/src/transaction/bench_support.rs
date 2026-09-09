@@ -382,12 +382,9 @@ where
         .expect("global branch control should exist");
     let snapshot_value: serde_json::Value =
         serde_json::from_str(&snapshot_content).expect("deterministic mode snapshot should parse");
-    let decoded_snapshot = crate::plugin::runtime::WasmTypedRow::from_builtin_json(
-        "lix_key_value",
-        &row_pk,
-        &snapshot_value,
-    )
-    .expect("deterministic mode snapshot should type");
+    let decoded_snapshot =
+        crate::row_payload::TypedRow::from_builtin_json("lix_key_value", &row_pk, &snapshot_value)
+            .expect("deterministic mode snapshot should type");
     let snapshot = decoded_snapshot
         .durable_payload_ref()
         .expect("deterministic mode snapshot should encode");
@@ -486,7 +483,7 @@ async fn seed_visible_schema_rows<StorageImpl>(
             });
             let row_pk = crate::schema::registered_schema_row_pk(&key.schema_key)
                 .expect("registered schema identity should derive");
-            let typed = crate::plugin::runtime::WasmTypedRow::from_builtin_json(
+            let typed = crate::row_payload::TypedRow::from_builtin_json(
                 "lix_registered_schema",
                 &row_pk,
                 &snapshot,
@@ -561,7 +558,7 @@ async fn seed_visible_schema_rows<StorageImpl>(
                     schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY.to_string(),
                     file_id: None,
                     snapshot: Some(
-                        crate::plugin::runtime::WasmTypedRow::from_test_json_unchecked(
+                        crate::row_payload::TypedRow::from_test_json_unchecked(
                             row_pk,
                             &serde_json::from_str(snapshot)
                                 .expect("branch-ref benchmark row is JSON"),
@@ -699,27 +696,10 @@ mod tests {
 
         let point_update = fixture.update_one_by_pk_accounting().await;
         assert_eq!(point_update.logical_rows, 1);
-        // The point write keeps the compact current-state certificate,
-        // publishes its authenticated branch control, rotates the two
-        // mandatory publication epochs — binary-CAS and json_store — and
-        // durably records the fixed checkpoint-retirement authority. It touches
-        // nine spaces, not eleven: the epochs and tracked mutation fence
-        // are all keys in the one revision space, the retirement candidates a
-        // sweep needs are derived from the commit graph instead of being
-        // published into a reachability delta row plus its queue control, and
-        // the commit-derived change id is computed from the commit id instead
-        // of being mirrored into a reverse-index space.
-        //
-        // The json_store epoch is the tenth staged put; the two retirement
-        // authority records and two row-PK index updates bring the fixed total
-        // to fourteen. They add one
-        // space, batch, and storage call independent of repository scale. The
-        // json_store epoch itself costs no extra space, batch, or call — the
-        // revision space is already in this write set and its one-byte keys are
-        // adjacent — and it is what lets the payload sweep reclaim superseded
-        // out-of-band JSON at all: those rows are content addressed, so a
-        // publisher can resolve onto a row an earlier sweep plan marked dead.
-        assert_eq!(point_update.staged_puts, 14, "{point_update:?}");
+        // Point publication retains the authenticated state/branch controls,
+        // binary-CAS and tracked-mutation fences, checkpoint retirement and
+        // row-PK index updates. Typed rows need no JSON-store publication put.
+        assert_eq!(point_update.staged_puts, 13, "{point_update:?}");
         assert_eq!(point_update.touched_spaces, 9, "{point_update:?}");
         assert_eq!(point_update.put_batches, 9, "{point_update:?}");
 

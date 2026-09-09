@@ -3,7 +3,7 @@ use crate::row_pk::RowPk;
 
 pub(crate) fn test_change_record() -> ChangeRecord {
     let row_pk = RowPk::single("row-1");
-    let snapshot = crate::plugin::runtime::WasmTypedRow::from_test_json_unchecked(
+    let snapshot = crate::row_payload::TypedRow::from_test_json_unchecked(
         &row_pk,
         &serde_json::json!({"value": 1}),
     )

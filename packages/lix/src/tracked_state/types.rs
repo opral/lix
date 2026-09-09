@@ -1,7 +1,7 @@
 use crate::NullableKeyFilter;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, SharedStr};
-use crate::plugin::runtime::WasmTypedRow;
+use crate::row_payload::TypedRow as WasmTypedRow;
 use crate::row_pk::RowPk;
 use bytes::Bytes;
 use std::sync::Arc;
