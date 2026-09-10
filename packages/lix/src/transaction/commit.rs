@@ -30,13 +30,13 @@ use crate::hot_state::{
 use crate::row_pk::RowPk;
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::tracked_state::{
-    AuthoritativeLiveChangeRequest, CommitDeltaReplacementGeneration, CommitDeltaReplacementScope,
-    CommitStateManifest, CommitStateMutationInventory, CommitStateReplayDebt,
-    MaterializedTrackedStateRow, OrderedAddressableCommitDeltaStage, TrackedStateCommitDeltaRef,
-    TrackedStateCommitRoot, TrackedStateContext, TrackedStateDeltaRef, TrackedStateFilter,
-    TrackedStateKey, TrackedStateKeyRef, TrackedStateReadColumns, TrackedStateRootMutationRef,
-    TrackedStateScanRequest, TrackedStateSingleStringReplacementRef, encode_key_ref,
-    load_authoritative_live_change_records, load_commit_delta_replay_metadata,
+    AuthoritativeLiveChangeRequest, CommitDeltaLifecycleSummary, CommitDeltaReplacementGeneration,
+    CommitDeltaReplacementScope, CommitStateManifest, CommitStateMutationInventory,
+    CommitStateReplayDebt, MaterializedTrackedStateRow, OrderedAddressableCommitDeltaStage,
+    TrackedStateCommitDeltaRef, TrackedStateCommitRoot, TrackedStateContext, TrackedStateDeltaRef,
+    TrackedStateFilter, TrackedStateKey, TrackedStateKeyRef, TrackedStateReadColumns,
+    TrackedStateRootMutationRef, TrackedStateScanRequest, TrackedStateSingleStringReplacementRef,
+    encode_key_ref, load_authoritative_live_change_records, load_commit_delta_replay_metadata,
     stage_addressable_commit_deltas, stage_change_locators,
     stage_ordered_addressable_commit_deltas,
 };
@@ -2553,6 +2553,112 @@ fn try_stage_lossless_columnar_mutations(
     .map(Some)
 }
 
+/// Both replacement representations prove the same ancestry interval. The
+/// callers retain their distinct admission policies: a prepared batch may
+/// decline certification, while an immutable journal requires a proof.
+async fn certify_replacement_ancestry(
+    read: &(impl StorageAdapterRead + ?Sized),
+    root: &PendingTrackedRoot,
+    scope: CommitDeltaReplacementScope,
+    row_count: usize,
+    ordered_identity_digest: [u8; 32],
+    mut lifecycle_summary: Option<CommitDeltaLifecycleSummary>,
+    description: &str,
+) -> Result<Option<CommitDeltaReplacementGeneration>, LixError> {
+    let mut current = root.state_parent_commit_id;
+    let mut seen = BTreeSet::new();
+    let fallback_commit_id = loop {
+        let Some(commit_id) = current else {
+            break None;
+        };
+        if !seen.insert(commit_id) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "cannot certify {description} '{}': first-parent cycle includes '{commit_id}'",
+                    root.commit_id
+                ),
+            ));
+        }
+        let commit_ids = [commit_id];
+        let record = ChangelogContext::new()
+            .reader(read)
+            .load_commits(ChangelogCommitLoadRequest {
+                commit_ids: &commit_ids,
+            })
+            .await?
+            .into_iter()
+            .next()
+            .and_then(|(_, record)| record)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "{description} '{}' has missing parent '{commit_id}'",
+                        root.commit_id
+                    ),
+                )
+            })?;
+        let manifest = crate::tracked_state::load_published_commit_state_topology(read, commit_id)
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("{description} parent '{commit_id}' has no physical authority"),
+                )
+            })?;
+        if let Some(source_commit_id) = manifest.complete_state_source_commit_id() {
+            current = Some(source_commit_id);
+            continue;
+        }
+        let Some(metadata) = load_commit_delta_replay_metadata(read, commit_id).await? else {
+            // Missing replay evidence cannot certify that this interval
+            // belongs exclusively to the replaced partition.
+            break Some(commit_id);
+        };
+        if metadata.single_partition.as_ref() != Some(&scope) {
+            // Resetting global replay accounting is safe only when the
+            // entire skipped interval belongs to the replaced partition.
+            break Some(commit_id);
+        }
+        if let Some(parent_generation) = metadata.replacement_generation {
+            if parent_generation.scope != scope {
+                break Some(commit_id);
+            }
+            if usize::try_from(metadata.member_count).ok() != Some(row_count)
+                || parent_generation.lifecycle_summary.ordered_identity_digest
+                    != ordered_identity_digest
+            {
+                break Some(commit_id);
+            }
+            lifecycle_summary = Some(parent_generation.lifecycle_summary);
+            break parent_generation.fallback_commit_id;
+        }
+        let Some(summary) = metadata.lifecycle_summary.as_ref() else {
+            // A same-partition sparse commit may have deleted and later
+            // reinserted one identity with a new lifecycle. Do not carry
+            // an older full-set summary across any commit that does not
+            // itself prove the complete ordered identity set.
+            break Some(commit_id);
+        };
+        if usize::try_from(metadata.member_count).ok() != Some(row_count)
+            || summary.scope != scope
+            || summary.ordered_identity_digest != ordered_identity_digest
+        {
+            break Some(commit_id);
+        }
+        lifecycle_summary = Some(summary.clone());
+        current = record.parent_commit_ids.first().copied();
+    };
+    Ok(
+        lifecycle_summary.map(|lifecycle_summary| CommitDeltaReplacementGeneration {
+            scope,
+            fallback_commit_id,
+            lifecycle_summary,
+        }),
+    )
+}
+
 async fn certify_complete_replacement_generations(
     read: &(impl StorageAdapterRead + ?Sized),
     state_rows: &PreparedStateBatch,
@@ -2583,107 +2689,19 @@ async fn certify_complete_replacement_generations(
             )
         );
         let ordered_identity_digest = replacement_proof.ordered_identity_digest;
-        let mut current = root.state_parent_commit_id;
-        let mut seen = BTreeSet::new();
-        let mut lifecycle_summary = None;
-        let fallback_commit_id = loop {
-            let Some(commit_id) = current else {
-                break None;
-            };
-            if !seen.insert(commit_id) {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "cannot certify replacement generation '{}': first-parent cycle includes '{commit_id}'",
-                        root.commit_id
-                    ),
-                ));
-            }
-            let commit_ids = [commit_id];
-            let record = ChangelogContext::new()
-                .reader(read)
-                .load_commits(ChangelogCommitLoadRequest {
-                    commit_ids: &commit_ids,
-                })
-                .await?
-                .into_iter()
-                .next()
-                .and_then(|(_, record)| record)
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!(
-                            "replacement generation '{}' has missing parent '{commit_id}'",
-                            root.commit_id
-                        ),
-                    )
-                })?;
-            let manifest = crate::tracked_state::load_published_commit_state_topology(
-                read, commit_id,
-            )
-            .await?
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "replacement generation parent '{commit_id}' has no physical authority"
-                    ),
-                )
-            })?;
-            if let Some(source_commit_id) = manifest.complete_state_source_commit_id() {
-                current = Some(source_commit_id);
-                continue;
-            }
-            let Some(metadata) = load_commit_delta_replay_metadata(read, commit_id).await? else {
-                // Missing replay evidence cannot certify that this interval
-                // belongs exclusively to the replaced partition.
-                break Some(commit_id);
-            };
-            if metadata.single_partition.as_ref() != Some(&scope) {
-                // Resetting global replay accounting is safe only when the
-                // entire skipped interval belongs to the replaced partition.
-                break Some(commit_id);
-            }
-            if let Some(parent_generation) = metadata.replacement_generation {
-                if parent_generation.scope != scope {
-                    break Some(commit_id);
-                }
-                if usize::try_from(metadata.member_count).ok() != Some(row_indices.len())
-                    || parent_generation.lifecycle_summary.ordered_identity_digest
-                        != ordered_identity_digest
-                {
-                    break Some(commit_id);
-                }
-                lifecycle_summary = Some(parent_generation.lifecycle_summary);
-                break parent_generation.fallback_commit_id;
-            }
-            let Some(summary) = metadata.lifecycle_summary.as_ref() else {
-                // A same-partition sparse commit may have deleted and later
-                // reinserted one identity with a new lifecycle. Do not carry
-                // an older full-set summary across any commit that does not
-                // itself prove the complete ordered identity set.
-                break Some(commit_id);
-            };
-            if usize::try_from(metadata.member_count).ok() != Some(row_indices.len())
-                || summary.scope != scope
-                || summary.ordered_identity_digest != ordered_identity_digest
-            {
-                break Some(commit_id);
-            }
-            lifecycle_summary = Some(summary.clone());
-            current = record.parent_commit_ids.first().copied();
-        };
-        let Some(lifecycle_summary) = lifecycle_summary else {
-            continue;
-        };
-        generations.insert(
-            root.commit_id,
-            CommitDeltaReplacementGeneration {
-                scope,
-                fallback_commit_id,
-                lifecycle_summary,
-            },
-        );
+        if let Some(generation) = certify_replacement_ancestry(
+            read,
+            root,
+            scope,
+            row_indices.len(),
+            ordered_identity_digest,
+            None,
+            "replacement generation",
+        )
+        .await?
+        {
+            generations.insert(root.commit_id, generation);
+        }
     }
     Ok(generations)
 }
@@ -2709,18 +2727,15 @@ async fn certify_ordered_journal_replacement_generations(
             file_id: None,
         };
         let proof = journal.replacement_proof();
-        let mut current = root.state_parent_commit_id;
-        let mut seen = BTreeSet::new();
-        let mut lifecycle_summary = journal
+        let current = root.state_parent_commit_id;
+        let lifecycle_summary = journal
             .overlay_lifecycle_certificate()
             .filter(|(source_parent_commit_id, _)| Some(*source_parent_commit_id) == current)
-            .map(
-                |(_, created_at)| crate::tracked_state::CommitDeltaLifecycleSummary {
-                    scope: scope.clone(),
-                    ordered_identity_digest: proof.ordered_identity_digest,
-                    uniform_created_at: created_at,
-                },
-            );
+            .map(|(_, created_at)| CommitDeltaLifecycleSummary {
+                scope: scope.clone(),
+                ordered_identity_digest: proof.ordered_identity_digest,
+                uniform_created_at: created_at,
+            });
         #[cfg(feature = "storage-benches")]
         if std::env::var_os("LIX_TRACKED_STATE_CRUD_TRACE_CERTIFICATE").is_some() {
             eprintln!(
@@ -2731,96 +2746,14 @@ async fn certify_ordered_journal_replacement_generations(
                 lifecycle_summary.is_some()
             );
         }
-        let fallback_commit_id = loop {
-            let Some(commit_id) = current else {
-                break None;
-            };
-            if !seen.insert(commit_id) {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "cannot certify immutable replacement '{}': first-parent cycle includes '{commit_id}'",
-                        root.commit_id
-                    ),
-                ));
-            }
-            let record = ChangelogContext::new()
-                .reader(read)
-                .load_commits(ChangelogCommitLoadRequest {
-                    commit_ids: &[commit_id],
-                })
-                .await?
-                .into_iter()
-                .next()
-                .and_then(|(_, record)| record)
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!(
-                            "immutable replacement '{}' has missing parent '{commit_id}'",
-                            root.commit_id
-                        ),
-                    )
-                })?;
-            let manifest = crate::tracked_state::load_published_commit_state_topology(
-                read, commit_id,
-            )
-            .await?
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("immutable replacement parent '{commit_id}' has no physical authority"),
-                )
-            })?;
-            if let Some(source_commit_id) = manifest.complete_state_source_commit_id() {
-                current = Some(source_commit_id);
-                continue;
-            }
-            let Some(metadata) = load_commit_delta_replay_metadata(read, commit_id).await? else {
-                break Some(commit_id);
-            };
-            if metadata.single_partition.as_ref() != Some(&scope) {
-                break Some(commit_id);
-            }
-            if let Some(parent_generation) = metadata.replacement_generation {
-                if parent_generation.scope != scope {
-                    break Some(commit_id);
-                }
-                if usize::try_from(metadata.member_count).ok() != Some(journal.row_count())
-                    || parent_generation.lifecycle_summary.ordered_identity_digest
-                        != proof.ordered_identity_digest
-                {
-                    break Some(commit_id);
-                }
-                lifecycle_summary = Some(parent_generation.lifecycle_summary);
-                break parent_generation.fallback_commit_id;
-            }
-            let Some(summary) = metadata.lifecycle_summary.as_ref() else {
-                break Some(commit_id);
-            };
-            if usize::try_from(metadata.member_count).ok() != Some(journal.row_count())
-                || summary.scope != scope
-                || summary.ordered_identity_digest != proof.ordered_identity_digest
-            {
-                break Some(commit_id);
-            }
-            lifecycle_summary = Some(summary.clone());
-            current = record.parent_commit_ids.first().copied();
-        };
-        let Some(lifecycle_summary) = lifecycle_summary else {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "immutable replacement journal lacks parent lifecycle authority; hydrate predecessors and lower it before commit",
-            ));
-        };
-        generations.insert(
-            root.commit_id,
-            CommitDeltaReplacementGeneration {
-                scope,
-                fallback_commit_id,
-                lifecycle_summary,
-            },
-        );
+        let generation = certify_replacement_ancestry(
+            read, root, scope, journal.row_count(), proof.ordered_identity_digest,
+            lifecycle_summary, "immutable replacement",
+        ).await?.ok_or_else(|| LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "immutable replacement journal lacks parent lifecycle authority; hydrate predecessors and lower it before commit",
+        ))?;
+        generations.insert(root.commit_id, generation);
     }
     Ok(generations)
 }
@@ -3624,6 +3557,14 @@ async fn load_working_diff_epoch_for_publication(
     }
 }
 
+/// Schema bookkeeping returned by the packed writers to their shared
+/// epoch/control publication step. No row materialization is needed here.
+enum PackedHeadSchemas<'a> {
+    Single(&'a str),
+    ExclusiveColumnar(&'a str),
+    PreparedRows,
+}
+
 async fn stage_tracked_head(
     read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
@@ -4284,7 +4225,7 @@ async fn stage_tracked_head(
             .as_ref()
             .map(|epoch| epoch.coverage)
             .unwrap_or_default();
-        if let Some(journal) = ordered_replacements.get(&root.commit_id) {
+        let packed_publication = if let Some(journal) = ordered_replacements.get(&root.commit_id) {
             if is_checkpoint_publication
                 || !staged.selected_change_batches.is_empty()
                 || !untracked_deltas.is_empty()
@@ -4323,27 +4264,8 @@ async fn stage_tracked_head(
                     retirements.set(retirements.get().saturating_add(1));
                 });
             }
-            if let Some(epoch) = working_diff_epoch {
-                let next_epoch = TrackedWorkingDiffEpoch {
-                    checkpoint_commit_id: epoch.checkpoint_commit_id,
-                    generation,
-                    coverage,
-                };
-                if next_epoch != epoch {
-                    stage_tracked_working_diff_epoch(writes, &root.branch_id, next_epoch)?;
-                }
-            }
-            let mut control = normal_branch_head_control(
-                root,
-                parent_control,
-                generation,
-                working_diff_checkpoint_commit_id,
-            )?;
-            control.note_schemas(std::iter::once(journal.schema_key()));
-            insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
-            continue;
-        }
-        if can_publish_ordered_packed_current_base {
+            Some((generation, PackedHeadSchemas::Single(journal.schema_key())))
+        } else if can_publish_ordered_packed_current_base {
             #[cfg(any(test, feature = "storage-benches"))]
             ORDERED_PACKED_CURRENT_BASE_PUBLICATIONS.with(|publications| {
                 publications.set(publications.get().saturating_add(1));
@@ -4398,45 +4320,12 @@ async fn stage_tracked_head(
                     ))
                     .await?
             };
-            if let Some(epoch) = working_diff_epoch {
-                let next_epoch = TrackedWorkingDiffEpoch {
-                    checkpoint_commit_id: epoch.checkpoint_commit_id,
-                    generation,
-                    coverage,
-                };
-                if next_epoch != epoch {
-                    stage_tracked_working_diff_epoch(writes, &root.branch_id, next_epoch)?;
-                }
-            }
-            let mut control = normal_branch_head_control(
-                root,
-                parent_control,
-                generation,
-                working_diff_checkpoint_commit_id,
-            )?;
-            if let Some(parts) = certified_columnar_parts {
-                control.note_schemas(std::iter::once(parts.schema_key.as_str()));
-                debug_assert!(
-                    state_row_indices.len() == state_rows.len()
-                        && insert_selection.len() == state_rows.len()
-                        && untracked_deltas.is_empty()
-                        && engine_rows.is_empty(),
-                    "exclusive columnar publication must cover the whole prepared state batch"
-                );
-                // The same exclusivity proof makes the later global scan for
-                // untracked-only branches redundant.
-                exclusive_certified_columnar_publication = true;
-            } else {
-                control.note_schemas(
-                    state_row_indices
-                        .iter()
-                        .map(|&row_index| state_rows.row(row_index).schema_key.as_str()),
-                );
-            }
-            insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
-            continue;
-        }
-        if let Some(schema_key) = complete_replacement_schema {
+            let schemas = certified_columnar_parts
+                .map_or(PackedHeadSchemas::PreparedRows, |parts| {
+                    PackedHeadSchemas::ExclusiveColumnar(parts.schema_key.as_str())
+                });
+            Some((generation, schemas))
+        } else if let Some(schema_key) = complete_replacement_schema {
             #[cfg(any(test, feature = "storage-benches"))]
             COMPLETE_REPLACEMENT_PACKED_CURRENT_BASE_PUBLICATIONS.with(|publications| {
                 publications.set(publications.get().saturating_add(1));
@@ -4464,6 +4353,11 @@ async fn stage_tracked_head(
                     retirements.set(retirements.get().saturating_add(1));
                 });
             }
+            Some((generation, PackedHeadSchemas::Single(schema_key)))
+        } else {
+            None
+        };
+        if let Some((generation, schemas)) = packed_publication {
             if let Some(epoch) = working_diff_epoch {
                 let next_epoch = TrackedWorkingDiffEpoch {
                     checkpoint_commit_id: epoch.checkpoint_commit_id,
@@ -4480,7 +4374,29 @@ async fn stage_tracked_head(
                 generation,
                 working_diff_checkpoint_commit_id,
             )?;
-            control.note_schemas(std::iter::once(schema_key));
+            match schemas {
+                PackedHeadSchemas::Single(schema_key) => {
+                    control.note_schemas(std::iter::once(schema_key))
+                }
+                PackedHeadSchemas::ExclusiveColumnar(schema_key) => {
+                    control.note_schemas(std::iter::once(schema_key));
+                    debug_assert!(
+                        state_row_indices.len() == state_rows.len()
+                            && insert_selection.len() == state_rows.len()
+                            && untracked_deltas.is_empty()
+                            && engine_rows.is_empty(),
+                        "exclusive columnar publication must cover the whole prepared state batch"
+                    );
+                    // The same exclusivity proof makes the later global scan for
+                    // untracked-only branches redundant.
+                    exclusive_certified_columnar_publication = true;
+                }
+                PackedHeadSchemas::PreparedRows => control.note_schemas(
+                    state_row_indices
+                        .iter()
+                        .map(|&row_index| state_rows.row(row_index).schema_key.as_str()),
+                ),
+            }
             insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
             continue;
         }
@@ -11047,6 +10963,89 @@ mod tests {
             extra_commit_parents_by_branch: BTreeMap::new(),
             intermediate_commits: Vec::new(),
             file_content_writes: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_ancestry_seed_preserves_unproven_boundary_and_missing_parent_errors() {
+        let storage = StorageAdapter::new(Memory::new());
+        seed_empty_commit(&storage, "replacement-boundary").await;
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let boundary = commit_id("replacement-boundary");
+        let mut root = PendingTrackedRoot {
+            branch_id: "replacement-branch".into(),
+            commit_id: commit_id("replacement-successor"),
+            parent_commit_id: Some(boundary),
+            state_parent_commit_id: Some(boundary),
+            ref_change_id: change_id("replacement-ref"),
+            ref_updated_at: ts("2026-01-01T00:00:00Z"),
+            publish_head: true,
+        };
+        let scope = CommitDeltaReplacementScope {
+            schema_key: "replacement-test".into(),
+            file_id: None,
+        };
+        let seed = CommitDeltaLifecycleSummary {
+            scope: scope.clone(),
+            ordered_identity_digest: [7; 32],
+            uniform_created_at: ts("2025-01-01T00:00:00Z"),
+        };
+        // An ordinary materialized parent has no same-partition replay proof.
+        // Prepared rows must decline; a parent-bound journal seed may certify
+        // the successor but must keep that parent as the fallback boundary.
+        assert!(
+            certify_replacement_ancestry(
+                &read,
+                &root,
+                scope.clone(),
+                10,
+                [7; 32],
+                None,
+                "replacement generation",
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        let certified = certify_replacement_ancestry(
+            &read,
+            &root,
+            scope.clone(),
+            10,
+            [7; 32],
+            Some(seed.clone()),
+            "immutable replacement",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(certified.fallback_commit_id, Some(boundary));
+        assert_eq!(certified.lifecycle_summary, seed);
+        assert_eq!(certified.scope, scope);
+
+        // A seed never authorizes ignoring an unreadable/missing ancestry node.
+        root.state_parent_commit_id = Some(commit_id("missing-replacement-parent"));
+        for (description, initial) in [
+            ("replacement generation", None),
+            ("immutable replacement", Some(seed)),
+        ] {
+            let error = certify_replacement_ancestry(
+                &read,
+                &root,
+                scope.clone(),
+                10,
+                [7; 32],
+                initial,
+                description,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+            assert!(error.message.starts_with(description));
+            assert!(error.message.contains("has missing parent"));
         }
     }
 
