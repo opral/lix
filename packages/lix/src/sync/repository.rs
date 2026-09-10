@@ -2304,11 +2304,52 @@ fn validate_sync_header_set(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SyncImportPurpose {
-    AuthorityPush,
-    ReplicaDelta,
-    History,
+/// Each import admits only the policy data its publication path needs.
+enum SyncImport<'a> {
+    AuthorityPush {
+        request: &'a SyncPushRequest,
+        authorship: SyncImportAuthorship<'a>,
+    },
+    HistoryHydration {
+        commits: &'a [SyncCommit],
+        boundaries: &'a [SyncHistoryBoundary],
+        rows: &'a [SyncSnapshotRow],
+    },
+    ReplicaPublication {
+        request: &'a SyncPushRequest,
+        publication: ReplicaStatePublication<'a>,
+    },
+    /// Reconcile already-imported authority heads without consuming a receipt.
+    ReplicaRefRepair { updates: &'a [SyncRefUpdate] },
+}
+
+enum SyncImportAuthorship<'a> {
+    Authenticated(&'a str),
+    #[cfg(test)]
+    TrustedFixture,
+}
+
+impl SyncImport<'_> {
+    fn is_authority_push(&self) -> bool {
+        matches!(self, Self::AuthorityPush { .. })
+    }
+
+    fn expected_account_id(&self) -> Option<&str> {
+        match self {
+            Self::AuthorityPush {
+                authorship: SyncImportAuthorship::Authenticated(account),
+                ..
+            } => Some(account),
+            _ => None,
+        }
+    }
+
+    fn replica_publication(&self) -> Option<&ReplicaStatePublication<'_>> {
+        match self {
+            Self::ReplicaPublication { publication, .. } => Some(publication),
+            _ => None,
+        }
+    }
 }
 
 impl ParsedCommit {
@@ -3620,24 +3661,20 @@ where
                                 format!("sync authority branch '{branch_id}' has no checkpoint"),
                             )
                         })?;
-                    Box::pin(self.import_sync_repository(
-                        &SyncPushRequest {
-                            commits: Vec::new(),
-                            inline_blobs: Vec::new(),
-                            ref_updates: vec![SyncRefUpdate {
-                            branch_id: branch_id.clone(),
-                            expected_head_commit_id: Some(local_head.to_string()),
-                            expected_checkpoint_commit_id: local_controls.get(&branch_id)
-                                .and_then(|control| control.working_diff_checkpoint_commit_id)
-                                .map(|checkpoint| checkpoint.to_string()),
-                            head_commit_id: Some(authoritative_head.to_string()),
-                            checkpoint_commit_id: Some(authoritative_checkpoint.to_owned()),
-                        }],
-                        },
-                        SyncImportPurpose::ReplicaDelta,
-                        None,
-                        None,
-                    ))
+                    Box::pin(
+                        self.import_sync_repository(SyncImport::ReplicaRefRepair {
+                            updates: &[SyncRefUpdate {
+                                branch_id: branch_id.clone(),
+                                expected_head_commit_id: Some(local_head.to_string()),
+                                expected_checkpoint_commit_id: local_controls
+                                    .get(&branch_id)
+                                    .and_then(|control| control.working_diff_checkpoint_commit_id)
+                                    .map(|checkpoint| checkpoint.to_string()),
+                                head_commit_id: Some(authoritative_head.to_string()),
+                                checkpoint_commit_id: Some(authoritative_checkpoint.to_owned()),
+                            }],
+                        }),
+                    )
                     .await?;
                     continue;
                 }
@@ -4428,23 +4465,22 @@ where
                 let retired_upload_proof_branches = retired_upload_proof_branches
                     .into_iter()
                     .collect::<Vec<_>>();
-                let publication = Box::pin(self.import_sync_repository(
-                    &SyncPushRequest {
-                        commits,
-                        ref_updates: applicable_refs,
-                        inline_blobs,
-                    },
-                    SyncImportPurpose::ReplicaDelta,
-                    None,
-                    Some(ReplicaStatePublication {
-                        retired_upload_proof_branches: &retired_upload_proof_branches,
-                        reset_pending: reset_pending_dependents,
-                        expected_cursor,
-                        expected_state_raw: &expected_state_raw,
-                        state: &state,
-                    }),
-                ))
-                .await;
+                let publication =
+                    Box::pin(self.import_sync_repository(SyncImport::ReplicaPublication {
+                        request: &SyncPushRequest {
+                            commits,
+                            ref_updates: applicable_refs,
+                            inline_blobs,
+                        },
+                        publication: ReplicaStatePublication {
+                            retired_upload_proof_branches: &retired_upload_proof_branches,
+                            reset_pending: reset_pending_dependents,
+                            expected_cursor,
+                            expected_state_raw: &expected_state_raw,
+                            state: &state,
+                        },
+                    }))
+                    .await;
                 match publication {
                     Ok(_) => return Ok(()),
                     // A sibling worker may have won the durable receipt CAS
@@ -5335,12 +5371,16 @@ where
         Ok(InitialSyncSnapshotInstall::Installed)
     }
 
+    #[cfg(test)]
     pub(crate) async fn push_sync_repository(
         &self,
         request: &SyncPushRequest,
     ) -> Result<SyncPushResponse, LixError> {
-        Box::pin(self.import_sync_repository(request, SyncImportPurpose::AuthorityPush, None, None))
-            .await
+        Box::pin(self.import_sync_repository(SyncImport::AuthorityPush {
+            request,
+            authorship: SyncImportAuthorship::TrustedFixture,
+        }))
+        .await
     }
 
     pub(crate) async fn import_sync_history_boundaries(
@@ -5349,16 +5389,11 @@ where
         boundaries: &[SyncHistoryBoundary],
         rows: &[SyncSnapshotRow],
     ) -> Result<(), LixError> {
-        Box::pin(self.import_sync_repository(
-            &SyncPushRequest {
-                commits: commits.to_vec(),
-                ref_updates: Vec::new(),
-                inline_blobs: Vec::new(),
-            },
-            SyncImportPurpose::History,
-            Some((boundaries, rows)),
-            None,
-        ))
+        Box::pin(self.import_sync_repository(SyncImport::HistoryHydration {
+            commits,
+            boundaries,
+            rows,
+        }))
         .await?;
         Ok(())
     }
@@ -5435,53 +5470,46 @@ where
         request: &SyncPushRequest,
         account_id: &str,
     ) -> Result<SyncPushResponse, LixError> {
-        Box::pin(self.import_sync_repository_for_account(
+        Box::pin(self.import_sync_repository(SyncImport::AuthorityPush {
             request,
-            SyncImportPurpose::AuthorityPush,
-            None,
-            None,
-            Some(account_id),
-        ))
+            authorship: SyncImportAuthorship::Authenticated(account_id),
+        }))
         .await
     }
 
     async fn import_sync_repository(
         &self,
-        request: &SyncPushRequest,
-        purpose: SyncImportPurpose,
-        history_boundaries: Option<(&[SyncHistoryBoundary], &[SyncSnapshotRow])>,
-        replica_publication: Option<ReplicaStatePublication<'_>>,
+        import: SyncImport<'_>,
     ) -> Result<SyncPushResponse, LixError> {
-        self.import_sync_repository_for_account(
-            request,
-            purpose,
-            history_boundaries,
-            replica_publication,
-            None,
-        )
-        .await
-    }
-
-    async fn import_sync_repository_for_account(
-        &self,
-        request: &SyncPushRequest,
-        purpose: SyncImportPurpose,
-        history_boundaries: Option<(&[SyncHistoryBoundary], &[SyncSnapshotRow])>,
-        replica_publication: Option<ReplicaStatePublication<'_>>,
-        expected_account_id: Option<&str>,
-    ) -> Result<SyncPushResponse, LixError> {
+        // Normalize payloads only; admission and publication policy stays in
+        // the variant throughout the shared validation pipeline.
+        let payload;
+        let request = match &import {
+            SyncImport::AuthorityPush { request, .. }
+            | SyncImport::ReplicaPublication { request, .. } => *request,
+            SyncImport::HistoryHydration { commits, .. } => {
+                payload = SyncPushRequest {
+                    commits: commits.to_vec(),
+                    ref_updates: Vec::new(),
+                    inline_blobs: Vec::new(),
+                };
+                &payload
+            }
+            SyncImport::ReplicaRefRepair { updates } => {
+                payload = SyncPushRequest {
+                    commits: Vec::new(),
+                    ref_updates: updates.to_vec(),
+                    inline_blobs: Vec::new(),
+                };
+                &payload
+            }
+        };
         // Sync imports publish the same repository state that foreground
         // auto-commit and checkpoint transactions read. Serialize at this
         // direct writer boundary so a read that has entered its quiescent
         // retry cannot be expired repeatedly by the sync worker. Do not hold
         // this guard across network preparation or outbox construction.
         let _collaboration_guard = self.lock_collaboration_writes().await;
-        if purpose == SyncImportPurpose::History && !request.ref_updates.is_empty() {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "sync history import cannot update refs",
-            ));
-        }
         let referenced_blob_ids = sync_commit_blob_ids(&request.commits)?;
         let mut inline_blob_ids = BTreeSet::new();
         for manifest in &request.inline_blobs {
@@ -5523,14 +5551,11 @@ where
         let mut boundary_roots = BTreeMap::new();
         let mut boundary_rows = BTreeMap::<CommitId, Vec<ParsedSnapshotRow>>::new();
         let mut boundary_coordinates = BTreeSet::new();
-        if let Some((boundaries, rows)) = history_boundaries {
-            if purpose != SyncImportPurpose::History {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    "sync snapshot boundaries are only valid for history import",
-                ));
-            }
-            for boundary in boundaries {
+        if let SyncImport::HistoryHydration {
+            boundaries, rows, ..
+        } = &import
+        {
+            for boundary in *boundaries {
                 let commit_id =
                     CommitId::parse_lix(&boundary.commit_id, "sync history boundary commit id")?;
                 let root = parse_sync_state_root_id(&boundary.live_state_root_id)?;
@@ -5565,7 +5590,7 @@ where
                     ));
                 }
             }
-            for row in rows {
+            for row in *rows {
                 let commit_id =
                     CommitId::parse_lix(&row.branch_id, "sync history boundary snapshot branch")?;
                 let parsed_row = parse_snapshot_row(row)?;
@@ -5659,8 +5684,8 @@ where
                 "sync push cannot delete the repository default or global branch",
             ));
         }
-        if replica_publication
-            .as_ref()
+        if import
+            .replica_publication()
             .is_some_and(|publication| publication.reset_pending)
         {
             let admitted = branch_ids
@@ -5737,12 +5762,14 @@ where
                         )
                     })?;
                 let available = inline_blob_ids.contains(&blob_hash)
-                    || match purpose {
-                        SyncImportPurpose::AuthorityPush => self
+                    || match &import {
+                        SyncImport::AuthorityPush { .. } => self
                             .get_sync_blob_manifest_with_collaboration_guard(&blob_hash)
                             .await?
                             .is_some(),
-                        SyncImportPurpose::ReplicaDelta | SyncImportPurpose::History => {
+                        SyncImport::ReplicaPublication { .. }
+                        | SyncImport::ReplicaRefRepair { .. }
+                        | SyncImport::HistoryHydration { .. } => {
                             self.has_sync_blob_manifest(&blob_hash).await?
                         }
                     };
@@ -5794,7 +5821,9 @@ where
                     );
                 }
                 Ok(None) => {
-                    if expected_account_id.is_some_and(|account| account != commit.wire.account_id)
+                    if import
+                        .expected_account_id()
+                        .is_some_and(|account| account != commit.wire.account_id)
                     {
                         return Err(LixError::new(
                             "LIX_SYNC_ACCOUNT_MISMATCH",
@@ -5803,7 +5832,9 @@ where
                     }
                 }
                 Err(error) if error.code == "LIX_SYNC_HISTORY_REQUIRED" => {
-                    if expected_account_id.is_some_and(|account| account != commit.wire.account_id)
+                    if import
+                        .expected_account_id()
+                        .is_some_and(|account| account != commit.wire.account_id)
                     {
                         return Err(LixError::new(
                             "LIX_SYNC_ACCOUNT_MISMATCH",
@@ -5840,7 +5871,7 @@ where
                 Err(error) => return Err(error),
             }
         }
-        if purpose == SyncImportPurpose::History
+        if matches!(import, SyncImport::HistoryHydration { .. })
             && parsed.keys().any(|commit_id| {
                 !existing.contains(commit_id) && !deferred_existing.contains(commit_id)
             })
@@ -6173,7 +6204,7 @@ where
             imported_roots.insert(commit_id, root);
             root_remaining.remove(&commit_id);
         }
-        if purpose == SyncImportPurpose::AuthorityPush {
+        if import.is_authority_push() {
             let authored_by_change = parsed
                 .values()
                 .flat_map(|commit| commit.members.iter())
@@ -6721,8 +6752,7 @@ where
         // transaction adds a crash boundary without adding validation. Derive
         // the hot delta from the authenticated child commit and let the branch
         // control CAS publish commit, head, and replica receipt atomically.
-        let certified_replica_delta =
-            purpose == SyncImportPurpose::ReplicaDelta && replica_publication.is_some();
+        let certified_replica_delta = matches!(import, SyncImport::ReplicaPublication { .. });
         let atomic_fast_forward = !certified_replica_delta
             && !changed_refs.is_empty()
             && changed_refs.iter().all(|(update, head, checkpoint)| {
@@ -6759,7 +6789,7 @@ where
                 ..StorageWriteOptions::default()
             };
             if self.sync_mode_state().role() == super::SyncRole::Replica
-                && purpose != SyncImportPurpose::AuthorityPush
+                && !import.is_authority_push()
             {
                 adapter
                     .commit_certified_replica_write_set(
@@ -7062,7 +7092,7 @@ where
             published_ref_updates.push(update.clone());
         }
 
-        if replica_publication.is_some() {
+        if import.replica_publication().is_some() {
             // Even an unchanged visible ref participates in receipt admission:
             // a concurrent local writer must not escape a global-dependent reset.
             for (branch_id, observation) in branch_ids.iter().zip(&observations) {
@@ -7072,7 +7102,7 @@ where
                 )?);
             }
         }
-        if let Some(publication) = &replica_publication {
+        if let Some(publication) = import.replica_publication() {
             if publication.state.cursor < publication.expected_cursor
                 || (publication.state.cursor == publication.expected_cursor
                     && !publication.reset_pending)
@@ -7100,19 +7130,18 @@ where
             }
             stage_replica_state(&mut writes, &mut preconditions, publication.state, previous)?;
         }
-        if purpose == SyncImportPurpose::ReplicaDelta
-            && (replica_publication
-                .as_ref()
-                .is_some_and(|publication| publication.reset_pending)
-                || (replica_publication.is_none() && !changed_refs.is_empty()))
-        {
+        if match &import {
+            SyncImport::ReplicaPublication { publication, .. } => publication.reset_pending,
+            SyncImport::ReplicaRefRepair { .. } => !changed_refs.is_empty(),
+            SyncImport::AuthorityPush { .. } | SyncImport::HistoryHydration { .. } => false,
+        } {
             super::upload_plan::stage_invalidate(&mut writes);
         }
         let (current_cursor, _) = load_sequence(&read).await?;
         if newly_imported.is_empty()
             && published_ref_updates.is_empty()
             && !hydrated_history
-            && replica_publication.is_none()
+            && import.replica_publication().is_none()
         {
             return Ok(SyncPushResponse {
                 cursor: current_cursor,
@@ -7126,7 +7155,7 @@ where
             crate::filesystem::stage_path_index_revision(&mut writes);
             crate::account::stage_account_revision(&mut writes);
         }
-        let cursor = if purpose == SyncImportPurpose::AuthorityPush
+        let cursor = if import.is_authority_push()
             && (!newly_imported.is_empty() || !published_ref_updates.is_empty())
         {
             let event_commit_ids = if published_ref_updates.is_empty() {
@@ -7156,8 +7185,7 @@ where
             await_durable: true,
             ..StorageWriteOptions::default()
         };
-        if self.sync_mode_state().role() == super::SyncRole::Replica
-            && purpose != SyncImportPurpose::AuthorityPush
+        if self.sync_mode_state().role() == super::SyncRole::Replica && !import.is_authority_push()
         {
             adapter
                 .commit_certified_replica_write_set(
@@ -8622,19 +8650,9 @@ mod tests {
             .head_commit_id
             .clone()
             .expect("the updated branch should remain headed");
-        replica
-            .import_sync_repository(
-                &SyncPushRequest {
-                    commits: event.commits.clone(),
-                    ref_updates: Vec::new(),
-                    inline_blobs: event.inline_blobs.clone(),
-                },
-                SyncImportPurpose::ReplicaDelta,
-                None,
-                None,
-            )
-            .await
-            .expect("fixture should preload immutable commit bodies");
+        for commit in &event.commits {
+            hydrate_history_commit(&authority, &replica, &commit.commit_id).await;
+        }
         storage.reset();
         replica
             .apply_sync_repository_pull(TEST_REMOTE, &delta)
@@ -10696,11 +10714,13 @@ mod tests {
         request
     }
 
-    async fn hydrate_history_commit(
+    async fn hydrate_history_commit<ReplicaStorage>(
         authority: &Lix<Memory>,
-        replica: &Lix<Memory>,
+        replica: &Lix<ReplicaStorage>,
         commit_id: &str,
-    ) {
+    ) where
+        ReplicaStorage: Storage + Clone + Send + Sync + 'static,
+    {
         let page = authority
             .sync_history(commit_id, 1)
             .await
@@ -13907,6 +13927,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replica_ref_repair_preserves_receipt_and_invalidates_only_changed_refs() {
+        let authority = open_lix().await.expect("authority should open");
+        write_key_value(&authority, "repair", "before").await;
+        let snapshot = authority
+            .pull_sync_repository(None, 1)
+            .await
+            .expect("snapshot should load");
+        let (branch_id, old_head) = default_head(&snapshot);
+        let replica = replica_from_snapshot(&authority, &snapshot).await;
+        write_key_value(&authority, "repair", "after").await;
+        let new_head = authority
+            .create_checkpoint()
+            .await
+            .expect("authority checkpoint should advance both coordinates")
+            .commit_id;
+        hydrate_history_commit(&authority, &replica, &new_head).await;
+
+        let adapter = replica.storage_adapter();
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let before = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(&branch_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let receipt = load_replica_state(&read).await.unwrap().1;
+        assert!(receipt.is_some(), "fixture must have a durable receipt");
+        let sequence = load_sequence(&read).await.unwrap().0;
+        let generation = super::super::upload_plan::load_generation(&read)
+            .await
+            .unwrap();
+        drop(read);
+        let update = SyncRefUpdate {
+            branch_id: branch_id.clone(),
+            expected_head_commit_id: Some(old_head.clone()),
+            expected_checkpoint_commit_id: before
+                .working_diff_checkpoint_commit_id
+                .map(|id| id.to_string()),
+            head_commit_id: Some(new_head.clone()),
+            checkpoint_commit_id: Some(new_head.clone()),
+        };
+        let mut stale = update.clone();
+        stale.expected_head_commit_id = Some(new_head.clone());
+        let error = replica
+            .import_sync_repository(SyncImport::ReplicaRefRepair { updates: &[stale] })
+            .await
+            .expect_err("repair must respect the expected local ref");
+        assert_eq!(error.code, LixError::CODE_TRANSACTION_CONFLICT);
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            super::super::upload_plan::load_generation(&read)
+                .await
+                .unwrap(),
+            generation
+        );
+        assert_eq!(load_replica_state(&read).await.unwrap().1, receipt);
+        assert_eq!(load_sequence(&read).await.unwrap().0, sequence);
+        assert_eq!(
+            BranchHeadControlContext::new()
+                .reader(&read)
+                .load(&branch_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .head_commit_id
+                .to_string(),
+            old_head
+        );
+        drop(read);
+
+        let response = replica
+            .import_sync_repository(SyncImport::ReplicaRefRepair {
+                updates: std::slice::from_ref(&update),
+            })
+            .await
+            .expect("ref repair needs no new publication receipt");
+        assert_eq!(response.cursor, sequence);
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let repaired = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(&branch_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired.head_commit_id.to_string(), new_head);
+        assert_eq!(
+            repaired
+                .working_diff_checkpoint_commit_id
+                .unwrap()
+                .to_string(),
+            new_head
+        );
+        assert_ne!(repaired.head_commit_id, before.head_commit_id);
+        assert_ne!(
+            repaired.working_diff_checkpoint_commit_id,
+            before.working_diff_checkpoint_commit_id
+        );
+        assert_eq!(
+            load_replica_state(&read).await.unwrap().1,
+            receipt,
+            "repair must preserve the exact receipt bytes"
+        );
+        assert_eq!(
+            load_sequence(&read).await.unwrap().0,
+            sequence,
+            "repair must not publish an authority event"
+        );
+        let repaired_generation = super::super::upload_plan::load_generation(&read)
+            .await
+            .unwrap();
+        assert_ne!(
+            repaired_generation, generation,
+            "changed refs invalidate pending upload plans"
+        );
+        drop(read);
+        assert_eq!(read_key_value(&replica, "repair").await, "after");
+
+        replica
+            .import_sync_repository(SyncImport::ReplicaRefRepair { updates: &[update] })
+            .await
+            .expect("repeating an already-applied repair is a no-op");
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            super::super::upload_plan::load_generation(&read)
+                .await
+                .unwrap(),
+            repaired_generation,
+            "a no-op repair must retain the upload plan"
+        );
+        assert_eq!(load_replica_state(&read).await.unwrap().1, receipt);
+        assert_eq!(load_sequence(&read).await.unwrap().0, sequence);
+    }
+
+    #[tokio::test]
     async fn pull_publication_rejects_same_cursor_replica_state_change() {
         let replica = open_lix().await.expect("replica should open");
         let original = SyncReplicaState {
@@ -13945,22 +14111,20 @@ mod tests {
             .expect("same-cursor metadata update should store");
 
         let error = replica
-            .import_sync_repository(
-                &SyncPushRequest {
+            .import_sync_repository(SyncImport::ReplicaPublication {
+                request: &SyncPushRequest {
                     commits: Vec::new(),
                     ref_updates: Vec::new(),
                     inline_blobs: Vec::new(),
                 },
-                SyncImportPurpose::ReplicaDelta,
-                None,
-                Some(ReplicaStatePublication {
+                publication: ReplicaStatePublication {
                     retired_upload_proof_branches: &[],
                     reset_pending: false,
                     expected_cursor: 7,
                     expected_state_raw: &expected_state_raw,
                     state: &folded,
-                }),
-            )
+                },
+            })
             .await
             .expect_err("stale full-state admission must conflict");
         assert_eq!(error.code, LixError::CODE_TRANSACTION_CONFLICT);
@@ -14067,19 +14231,9 @@ mod tests {
             .head_commit_id
             .clone()
             .expect("remote push should advance authority");
-        local
-            .import_sync_repository(
-                &SyncPushRequest {
-                    commits: published.commits.clone(),
-                    ref_updates: Vec::new(),
-                    inline_blobs: published.inline_blobs.clone(),
-                },
-                SyncImportPurpose::ReplicaDelta,
-                None,
-                None,
-            )
-            .await
-            .expect("consumed delta commits should be locally available");
+        for commit in &published.commits {
+            hydrate_history_commit(&authority, &local, &commit.commit_id).await;
+        }
 
         // Model a consumed cursor whose authority receipt was persisted before
         // local reconciliation (the same graph shape as reset-to-old + write).
@@ -14184,19 +14338,9 @@ mod tests {
             .head_commit_id
             .clone()
             .expect("remote push should advance authority");
-        local
-            .import_sync_repository(
-                &SyncPushRequest {
-                    commits: published.commits,
-                    ref_updates: Vec::new(),
-                    inline_blobs: published.inline_blobs,
-                },
-                SyncImportPurpose::ReplicaDelta,
-                None,
-                None,
-            )
-            .await
-            .expect("authority commits should import without moving local refs");
+        for commit in &published.commits {
+            hydrate_history_commit(&authority, &local, &commit.commit_id).await;
+        }
 
         let SyncRepositoryPullResponse::Snapshot { branches, .. } = &snapshot else {
             unreachable!("fixture response is a snapshot");
