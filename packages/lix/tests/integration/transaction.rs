@@ -176,8 +176,7 @@ async fn assert_stale_publication_decision_discards_audit(sql: &str, affected: u
 }
 
 #[tokio::test]
-async fn conditional_publication_warm_prepared_batch_rejects_stale_transaction() {
-    use crate::prepared_dml::PreparedDmlParameterBatch;
+async fn conditional_publication_warm_parameterized_update_rejects_stale_transaction() {
     use lix::Value;
 
     let engine = publication_test_engine().await;
@@ -186,24 +185,18 @@ async fn conditional_publication_warm_prepared_batch_rejects_stale_transaction()
     let sql: Arc<str> =
         "UPDATE publication_cas SET revision = $1 WHERE id = $2 AND revision = $3".into();
     let parameters = || {
-        PreparedDmlParameterBatch::from_rows([vec![
+        vec![
             Value::Text("stale".into()),
             Value::Text("canon".into()),
             Value::Text("base".into()),
-        ]])
-        .unwrap()
+        ]
     };
     let mut warm = stale_session.begin_transaction().await.unwrap();
-    warm.execute_prepared_dml_batch(Arc::clone(&sql), parameters())
-        .await
-        .unwrap();
+    warm.execute(&sql, &parameters()).await.unwrap();
     warm.rollback().await.unwrap();
     let mut stale = stale_session.begin_transaction().await.unwrap();
-    let updates = stale
-        .execute_prepared_dml_batch(sql, parameters())
-        .await
-        .unwrap();
-    assert_eq!(updates[0].rows_affected(), 1);
+    let updates = stale.execute(&sql, &parameters()).await.unwrap();
+    assert_eq!(updates.rows_affected(), 1);
     winner_session
         .execute(
             "UPDATE publication_cas SET revision = 'winner' WHERE id = 'canon'",

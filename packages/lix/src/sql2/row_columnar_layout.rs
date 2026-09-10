@@ -6,20 +6,26 @@
 //! module only chooses physical row groups and delegates their encoding.
 
 use crate::row_columnar::{EncodedRowGroups, RowGroupLocations};
-use std::collections::{BTreeMap, HashMap};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{ArrayRef, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
+#[cfg(test)]
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
-use crate::columnar_row_group::{
-    ROW_GROUP_MAX_ROWS, RowGroupRowLocation, encode_row_group_set_preserving_batches,
-};
+#[cfg(test)]
+use crate::columnar_row_group::RowGroupRowLocation;
+use crate::columnar_row_group::{ROW_GROUP_MAX_ROWS, encode_row_group_set_preserving_batches};
+#[cfg(test)]
 use crate::row_pk::RowPk;
-use crate::sql2::{RowProjectionDecoder, SchemaColumnType, SchemaSurfaceSpec, row_visible_fields};
+#[cfg(test)]
+use crate::sql2::RowProjectionDecoder;
+use crate::sql2::{SchemaColumnType, SchemaSurfaceSpec, row_visible_fields};
 
 pub(crate) const ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY: &str =
     "lix.row_columnar.layout_fingerprint.v1";
@@ -29,14 +35,18 @@ pub(crate) use crate::row_columnar::{
     ROW_COLUMNAR_IDENTITY_FIELD, ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY,
 };
 pub(crate) const LOW_CARDINALITY_CLUSTER_MAX_VALUES: usize = 64;
+#[cfg(test)]
 const LOW_CARDINALITY_CLUSTER_MAX_BUCKETS: usize = 8;
+#[cfg(test)]
 const ROW_COLUMNAR_MAX_CLUSTER_PARTITIONS: usize = 64;
 
+#[cfg(test)]
 enum ClusterField<'a> {
     Boolean(&'a str),
     String(&'a str, BTreeMap<String, u8>),
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 pub(crate) struct RowColumnarRowRef<'a> {
     pub(crate) row_pk: &'a RowPk,
@@ -45,6 +55,7 @@ pub(crate) struct RowColumnarRowRef<'a> {
     pub(crate) typed_row: Option<&'a lix_schema::Row>,
 }
 
+#[cfg(test)]
 impl RowColumnarRowRef<'_> {
     fn boolean(&self, name: &str) -> Option<bool> {
         self.typed_row
@@ -65,6 +76,9 @@ impl RowColumnarRowRef<'_> {
     }
 }
 
+// Independent fixture encoder for projection, corruption, and layout equivalence tests.
+// Runtime publication uses the certified unclustered encoder or canonical rows.
+#[cfg(test)]
 pub(crate) fn encode_registered_row_groups<'a, I>(
     spec: &SchemaSurfaceSpec,
     rows: I,
@@ -86,7 +100,7 @@ where
 /// Encodes frontend-owned Arrow columns without reconstructing them from
 /// canonical snapshot JSON. The fast contract is deliberately limited to
 /// layouts whose established encoder would not reorder rows for clustering;
-/// clustered layouts retain the general encoder and identical physical
+/// clustered layouts retain canonical row staging and identical physical
 /// behavior.
 pub(crate) fn encode_unclustered_registered_row_groups(
     spec: &SchemaSurfaceSpec,
@@ -163,6 +177,7 @@ pub(crate) fn encode_unclustered_registered_row_groups(
     }))
 }
 
+#[cfg(test)]
 fn encode_registered_row_groups_impl<'a, I>(
     spec: &SchemaSurfaceSpec,
     rows: I,
@@ -304,6 +319,7 @@ where
     })
 }
 
+#[cfg(test)]
 fn optional_derived_row_group_set(
     encoded: Result<EncodedRowGroups, LixError>,
 ) -> Option<EncodedRowGroups> {
@@ -349,6 +365,7 @@ mod tests {
 
     use super::*;
     use crate::columnar_row_group::RowGroupScalar;
+    #[cfg(test)]
     use crate::row_pk::RowPk;
     use crate::sql2::derive_schema_surface_spec_from_schema;
 
