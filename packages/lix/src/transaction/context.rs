@@ -4036,6 +4036,72 @@ where
         Ok(())
     }
 
+    /// Finish host admission after guest output validation. This must precede
+    /// row-authority derivation because keyless creates acquire their IDs here.
+    async fn prepare_plugin_file_changes(
+        &mut self,
+        validated: ValidatedFileTransition,
+        selected: &PluginRegistryEntry,
+        create_context: BoundCreateContext,
+        file_key: &PluginFileWriteKey,
+        existing_create_reservation: Option<&MaterializedHotStateRow>,
+        classified_bytes: u64,
+        create_rows_span: tracing::Span,
+    ) -> Result<PreparedPluginFileChanges, LixError> {
+        let mut changes = validated.changes;
+        let create_rows = self
+            .v2_create_rows(
+                selected,
+                &mut changes,
+                create_context,
+                file_key,
+                existing_create_reservation,
+                None,
+            )
+            .instrument(create_rows_span)
+            .await?;
+        let row_authorities =
+            plugin_row_authorities_from_transition(&changes, create_context.creates());
+        let mut counters = validated.counters;
+        counters.host_content_classification_bytes = classified_bytes;
+        counters.full_document_reparses = 1;
+        counters.durable_semantic_changes =
+            u64::try_from(changes.row_change_count()).unwrap_or(u64::MAX);
+        self.plugin_host.record_transition_counters(counters);
+        Ok(PreparedPluginFileChanges {
+            changes,
+            create_rows,
+            document: validated.document,
+            row_authorities,
+        })
+    }
+
+    /// Checkpoint at the caller's existing publication boundary: fresh imports
+    /// stage their rows first, while reselection checkpoints before row staging.
+    async fn checkpoint_new_plugin_file(
+        &mut self,
+        mut store: PluginActorStore,
+        document: WasmDocumentHandle,
+        actor_key: PluginActorKey,
+        submitted_bytes: crate::Blob,
+        materialization_version: Arc<str>,
+        row_authorities: PluginRowAuthorities,
+        view: PluginPublicationPolicy,
+    ) -> Result<PendingPluginActorPublication, LixError> {
+        let checkpoint = store.actor_mut().checkpoint_document(document).await?;
+        Ok(PendingPluginActorPublication::new(
+            actor_key,
+            self.plugin_host.actor_cache(),
+            store,
+            document,
+            checkpoint,
+            submitted_bytes,
+            materialization_version,
+            row_authorities,
+            view,
+        ))
+    }
+
     /// Reconciles plugin lifecycle, ownership, and state for one logical write
     /// batch against one storage snapshot.
     ///
@@ -5279,30 +5345,28 @@ where
                     .inline_payload()
                     .expect("selected plugin writes require inline content")
                     .shared_bytes();
-                let cold_limits = WasmTransitionLimits::for_cold_file_bytes(
-                    u64::try_from(submitted_bytes.len()).unwrap_or(u64::MAX),
-                );
                 prepared_opens.push(PreparedFreshPluginOpen {
-                    file_index,
-                    file_key,
-                    selected,
-                    owner_row,
-                    actor_key,
-                    view,
-                    materialization_version,
-                    submitted_bytes,
-                    create_context,
-                    existing_create_reservation: None,
+                    file: FreshPluginFile {
+                        file_index,
+                        file_key,
+                        selected,
+                        owner_row,
+                        actor_key,
+                        view,
+                        materialization_version,
+                        submitted_bytes,
+                        create_context,
+                        existing_create_reservation: None,
+                    },
                     factory,
                     descriptor,
                     schemas,
-                    cold_limits,
                 });
             }
 
             let preflight_requests = prepared_opens
                 .iter()
-                .map(|prepared| (prepared.create_context, prepared.file_key.clone()))
+                .map(|prepared| (prepared.file.create_context, prepared.file.file_key.clone()))
                 .collect::<Vec<_>>();
             let existing_rows = match self.preflight_creates(&preflight_requests).await {
                 Ok(existing_rows) => existing_rows,
@@ -5315,7 +5379,7 @@ where
                 }
             };
             for (prepared, existing) in prepared_opens.iter_mut().zip(existing_rows) {
-                prepared.existing_create_reservation = existing;
+                prepared.file.existing_create_reservation = existing;
             }
 
             let mut store_permits = Vec::with_capacity(prepared_opens.len());
@@ -5340,70 +5404,25 @@ where
                 .zip(store_permits)
                 .map(|(prepared, store_permit)| {
                     let PreparedFreshPluginOpen {
-                        file_index,
-                        file_key,
-                        selected,
-                        owner_row,
-                        actor_key,
-                        view,
-                        materialization_version,
-                        submitted_bytes,
-                        create_context,
-                        existing_create_reservation,
+                        file,
                         factory,
                         descriptor,
                         schemas,
-                        cold_limits,
                     } = prepared;
-                    let source_bytes = submitted_bytes.clone();
-                    let creates = create_context.creates();
+                    let source_bytes = file.submitted_bytes.clone();
+                    let creates = file.create_context.creates();
                     let task = tokio::spawn(async move {
-                        let mut actor = factory
-                            .instantiate_actor()
-                            .instrument(tracing::debug_span!(
-                                target: "lix_perf",
-                                "lix.perf.plugin_actor_instantiate"
-                            ))
-                            .await?;
-                        let transition = actor
-                            .open_file(
-                                cold_limits,
-                                WasmOpenFileInput {
-                                    descriptor,
-                                    file: Arc::new(ArcByteSource::new(source_bytes)),
-                                    creates,
-                                },
-                            )
-                            .instrument(tracing::debug_span!(
-                                target: "lix_perf",
-                                "lix.perf.plugin_open_file"
-                            ))
-                            .await?;
-                        let validated = drain_file_transition_changes(
-                            actor.as_mut(),
-                            transition,
+                        open_plugin_file(
+                            factory.as_ref(),
+                            descriptor,
+                            source_bytes,
                             creates,
                             &schemas,
-                            cold_limits,
                         )
-                        .instrument(tracing::debug_span!(
-                            target: "lix_perf",
-                            "lix.perf.plugin_open_file_drain"
-                        ))
-                        .await?;
-                        Ok((actor, validated))
+                        .await
                     });
                     PendingFreshPluginOpen {
-                        file_index,
-                        file_key,
-                        selected,
-                        owner_row,
-                        actor_key,
-                        view,
-                        materialization_version,
-                        submitted_bytes,
-                        create_context,
-                        existing_create_reservation,
+                        file,
                         store_permit,
                         task: Some(task),
                     }
@@ -5443,31 +5462,30 @@ where
                 return Err(error);
             }
 
-            for (pending, mut actor, validated) in completed_opens {
-                let mut changes = validated.changes;
-                let create_rows = self
-                    .v2_create_rows(
+            for (pending, actor, validated) in completed_opens {
+                // Keep Store destruction ahead of permit release on every
+                // host validation/checkpoint failure and cancellation path.
+                let store = PluginActorStore::new(actor, pending.store_permit);
+                let pending = pending.file;
+                let PreparedPluginFileChanges {
+                    changes,
+                    create_rows,
+                    document,
+                    row_authorities,
+                } = self
+                    .prepare_plugin_file_changes(
+                        validated,
                         &pending.selected,
-                        &mut changes,
                         pending.create_context,
                         &pending.file_key,
                         pending.existing_create_reservation.as_ref(),
-                        None,
+                        content_classification_bytes
+                            .get(&pending.file_key)
+                            .copied()
+                            .unwrap_or(0),
+                        tracing::Span::none(),
                     )
                     .await?;
-                let row_authorities = plugin_row_authorities_from_transition(
-                    &changes,
-                    pending.create_context.creates(),
-                );
-                let mut counters = validated.counters;
-                counters.host_content_classification_bytes = content_classification_bytes
-                    .get(&pending.file_key)
-                    .copied()
-                    .unwrap_or(0);
-                counters.full_document_reparses = 1;
-                counters.durable_semantic_changes =
-                    u64::try_from(changes.row_change_count()).unwrap_or(u64::MAX);
-                self.plugin_host.record_transition_counters(counters);
 
                 rows.push(pending.owner_row);
                 rows.append(create_rows);
@@ -5493,20 +5511,18 @@ where
                     pending.file_key.clone(),
                     pending.materialization_version.clone(),
                 );
-                let checkpoint = actor.checkpoint_document(validated.document).await?;
-                reconciliation
-                    .actor_publications
-                    .push(PendingPluginActorPublication::new(
+                reconciliation.actor_publications.push(
+                    self.checkpoint_new_plugin_file(
+                        store,
+                        document,
                         pending.actor_key,
-                        self.plugin_host.actor_cache(),
-                        PluginActorStore::new(actor, pending.store_permit),
-                        validated.document,
-                        checkpoint,
                         pending.submitted_bytes,
                         Arc::from(pending.materialization_version),
                         row_authorities,
                         pending.view,
-                    ));
+                    )
+                    .await?,
+                );
                 reconciled_file_keys.insert(pending.file_key);
             }
         }
@@ -6401,86 +6417,46 @@ where
                 let store_permit = self
                     .admit_fresh_plugin_store(&mut reconciliation.actor_publications)
                     .await?;
-                let mut actor = factory
-                    .instantiate_actor()
-                    .instrument(tracing::debug_span!(
-                        target: "lix_perf",
-                        "lix.perf.plugin_actor_instantiate"
-                    ))
-                    .await?;
-                let source = ArcByteSource::new(submitted_bytes.clone());
-                let cold_limits = WasmTransitionLimits::for_cold_file_bytes(
-                    u64::try_from(submitted_bytes.len()).unwrap_or(u64::MAX),
-                );
-                let transition = actor
-                    .open_file(
-                        cold_limits,
-                        WasmOpenFileInput {
-                            descriptor,
-                            file: Arc::new(source),
-                            creates,
-                        },
-                    )
-                    .instrument(tracing::debug_span!(
-                        target: "lix_perf",
-                        "lix.perf.plugin_open_file"
-                    ))
-                    .await?;
-                let validated = drain_file_transition_changes(
-                    actor.as_mut(),
-                    transition,
+                let (actor, validated) = open_plugin_file(
+                    factory.as_ref(),
+                    descriptor,
+                    submitted_bytes.clone(),
                     creates,
                     &schemas,
-                    cold_limits,
                 )
-                .instrument(tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.plugin_open_file_drain"
-                ))
                 .await?;
-                let mut changes = validated.changes;
-                let create_rows = self
-                    .v2_create_rows(
+                let store = PluginActorStore::new(actor, store_permit);
+                let PreparedPluginFileChanges {
+                    changes,
+                    create_rows,
+                    document,
+                    row_authorities,
+                } = self
+                    .prepare_plugin_file_changes(
+                        validated,
                         selected,
-                        &mut changes,
                         create_context,
                         &file_key,
                         existing_create_reservation.as_ref(),
-                        None,
+                        content_classification_bytes
+                            .get(&file_key)
+                            .copied()
+                            .unwrap_or(0),
+                        tracing::debug_span!(target: "lix_perf", "lix.perf.plugin_create_rows"),
                     )
-                    .instrument(tracing::debug_span!(
-                        target: "lix_perf",
-                        "lix.perf.plugin_create_rows"
-                    ))
                     .await?;
-                let row_authorities =
-                    plugin_row_authorities_from_transition(&changes, create_context.creates());
-                let mut counters = validated.counters;
-                counters.host_content_classification_bytes = content_classification_bytes
-                    .get(&file_key)
-                    .copied()
-                    .unwrap_or(0);
-                counters.full_document_reparses = 1;
-                counters.durable_semantic_changes =
-                    u64::try_from(changes.row_change_count()).unwrap_or(u64::MAX);
-                self.plugin_host.record_transition_counters(counters);
-                let checkpoint = actor.checkpoint_document(validated.document).await?;
-                (
-                    changes,
-                    PendingPluginActorPublication::new(
+                let publication = self
+                    .checkpoint_new_plugin_file(
+                        store,
+                        document,
                         actor_key,
-                        self.plugin_host.actor_cache(),
-                        PluginActorStore::new(actor, store_permit),
-                        validated.document,
-                        checkpoint,
                         submitted_bytes.clone(),
                         Arc::from(materialization_version.clone()),
                         row_authorities,
                         view,
-                    ),
-                    submitted_bytes.clone(),
-                    create_rows,
-                )
+                    )
+                    .await?;
+                (changes, publication, submitted_bytes.clone(), create_rows)
             };
             rows.append(create_rows);
             let change_rows = tracing::debug_span!(
@@ -13531,7 +13507,58 @@ struct PluginWriteReconciliation {
     reconciled_rows: Option<ReconciledRowBatch>,
 }
 
-struct PreparedFreshPluginOpen {
+/// The guest protocol is identical for a fresh file and a newly selected
+/// owner. Scheduling, reservation admission and owner cleanup stay with the
+/// caller; in particular, fresh files still open in bounded parallel chunks.
+async fn open_plugin_file(
+    factory: &dyn WasmComponentFactory,
+    descriptor: WasmFileDescriptor,
+    submitted_bytes: crate::Blob,
+    creates: WasmCreateContext,
+    schemas: &SchemaAllowlist,
+) -> Result<(Box<dyn WasmComponentActor>, ValidatedFileTransition), LixError> {
+    let mut actor = factory
+        .instantiate_actor()
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.plugin_actor_instantiate"
+        ))
+        .await?;
+    let cold_limits = WasmTransitionLimits::for_cold_file_bytes(
+        u64::try_from(submitted_bytes.len()).unwrap_or(u64::MAX),
+    );
+    let transition = actor
+        .open_file(
+            cold_limits,
+            WasmOpenFileInput {
+                descriptor,
+                file: Arc::new(ArcByteSource::new(submitted_bytes)),
+                creates,
+            },
+        )
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.plugin_open_file"
+        ))
+        .await?;
+    let validated =
+        drain_file_transition_changes(actor.as_mut(), transition, creates, schemas, cold_limits)
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.plugin_open_file_drain"
+            ))
+            .await?;
+    Ok((actor, validated))
+}
+
+struct PreparedPluginFileChanges {
+    changes: WasmHostRowChanges,
+    create_rows: RawWriteBatch,
+    document: WasmDocumentHandle,
+    row_authorities: PluginRowAuthorities,
+}
+
+struct FreshPluginFile {
     file_index: usize,
     file_key: PluginFileWriteKey,
     selected: PluginRegistryEntry,
@@ -13542,23 +13569,17 @@ struct PreparedFreshPluginOpen {
     submitted_bytes: crate::Blob,
     create_context: BoundCreateContext,
     existing_create_reservation: Option<MaterializedHotStateRow>,
+}
+
+struct PreparedFreshPluginOpen {
+    file: FreshPluginFile,
     factory: Arc<dyn WasmComponentFactory>,
     descriptor: WasmFileDescriptor,
     schemas: SchemaAllowlist,
-    cold_limits: WasmTransitionLimits,
 }
 
 struct PendingFreshPluginOpen {
-    file_index: usize,
-    file_key: PluginFileWriteKey,
-    selected: PluginRegistryEntry,
-    owner_row: TransactionWriteRow,
-    actor_key: PluginActorKey,
-    view: PluginPublicationPolicy,
-    materialization_version: String,
-    submitted_bytes: crate::Blob,
-    create_context: BoundCreateContext,
-    existing_create_reservation: Option<MaterializedHotStateRow>,
+    file: FreshPluginFile,
     store_permit: PluginActorStorePermit,
     task: Option<
         tokio::task::JoinHandle<
