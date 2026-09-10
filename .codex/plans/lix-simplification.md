@@ -28,4 +28,4 @@ All four PRs were created and merged as drafts, using local merge commits with C
 
 Local validation: 3,727 engine tests with all-simulations and server-protocol enabled passed (69 skipped), 10 doctests passed, 108 RocksDB/SlateDB adapter tests passed, and all four plugin file-observation regressions passed. The final engine runs used eight test workers after earlier concurrent runs exposed GC/recovery test races; full reruns passed. CI/CD was intentionally skipped for this rebase and these follow-ups.
 
-Next decision: review [the sync import mode proposal](lix-sync-import-modes.md). No sync-mode refactor is included in these four PRs.
+Completed #1743: [explicit internal sync import variants](lix-sync-import-modes.md), reviewed by a sub-agent and merged while draft. This follow-up preserves public APIs, wire/storage formats and shared admission/publication logic. Ref repair remains supported without a receipt. Final validation passed all 3,728 engine tests (69 skipped) and 10 doctests, including the new active repair/CAS/receipt/cursor/upload-plan regression. CI/CD remains skipped; integration remains draft.
