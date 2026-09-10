@@ -18,6 +18,7 @@ mod markdown_file;
 )]
 mod markdown_syntax;
 mod model;
+#[path = "../../../packages/plugin-utils/order_key.rs"]
 mod order_key;
 mod schemas;
 
