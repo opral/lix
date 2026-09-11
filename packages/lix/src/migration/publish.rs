@@ -212,6 +212,11 @@ fn plan_error(message: impl Into<String>) -> LixError {
 }
 
 fn storage_error(error: StorageError) -> LixError {
+    // Preserve the restartable storage failure without conflating it with
+    // publication conflicts or an unknown durable commit outcome.
+    if matches!(error, StorageError::ReadExpired) {
+        return LixError::from(error);
+    }
     let code = match &error {
         StorageError::CommitOutcomeUnknown(_) => "LIX_ERROR_MIGRATION_COMMIT_OUTCOME_UNKNOWN",
         StorageError::PreconditionFailed(_)

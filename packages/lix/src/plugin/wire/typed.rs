@@ -479,6 +479,10 @@ impl CertifiedNativeProjectionSegment {
         })
     }
 
+    pub(crate) fn into_validated_payloads(self) -> Box<[ValidatedNativePayload]> {
+        validated_payload_ranges(self.owner, self.payload_ranges)
+    }
+
     pub(crate) fn owner_len(&self) -> usize {
         self.owner.len()
     }
@@ -508,15 +512,42 @@ impl CertifiedNativeProjectionSegment {
     }
 }
 
-/// Fully validates native payload ranges once and records direct scalar
-/// locators. No schema or storage-envelope authority is inferred here.
+/// Wire validity does not imply a common layout. Both outcomes certify every
+/// payload; only a uniform segment can expose direct column locators.
+#[derive(Debug)]
+pub(crate) enum NativeProjectionCertification {
+    Uniform(CertifiedNativeProjectionSegment),
+    Heterogeneous(Box<[ValidatedNativePayload]>),
+}
+
+// Only called after every range passed full wire validation, or by consuming
+// an existing projection certificate. Never construct these proofs from input
+// whose remaining rows were skipped after a layout mismatch.
+fn validated_payload_ranges(
+    owner: NativePayloadOwner,
+    ranges: Box<[Range<u32>]>,
+) -> Box<[ValidatedNativePayload]> {
+    ranges
+        .into_iter()
+        .map(|range| ValidatedNativePayload {
+            bytes: owner.clone(),
+            range: range.start as usize..range.end as usize,
+        })
+        .collect()
+}
+
+/// Fully validates every native payload, retaining direct scalar locators when
+/// all rows share one layout. Layout differences disable projection, not wire
+/// validation: even a malformed row after a layout change must be rejected.
+/// No schema or storage-envelope authority is inferred here.
 pub(crate) fn certify_native_projection_segment(
     owner: NativePayloadOwner,
     payload_ranges: Box<[Range<u32>]>,
-) -> Result<CertifiedNativeProjectionSegment, Error> {
+) -> Result<NativeProjectionCertification, Error> {
     use std::cell::Cell;
 
     let row_capacity = payload_ranges.len();
+    let uniform = Cell::new(true);
     let mut schema_fingerprint = None;
     let mut key_kinds = Vec::new();
     let mut fields = Vec::<CertifiedNativeFieldShape>::new();
@@ -535,6 +566,9 @@ pub(crate) fn certify_native_projection_segment(
         let fingerprint = visit_native_row_payload(
             payload,
             |index, value| {
+                if !uniform.get() {
+                    return;
+                }
                 let Ok(value) = CertifiedNativeValue::from_borrowed(&owner, value) else {
                     invalid.set(Some("native key locator is outside its owner"));
                     return;
@@ -546,11 +580,14 @@ pub(crate) fn certify_native_projection_segment(
                 if row_ordinal == 0 {
                     key_kinds.push(kind);
                 } else if key_kinds.get(index) != Some(&kind) {
-                    invalid.set(Some("native primary-key layout differs between rows"));
+                    uniform.set(false);
                 }
                 keys.push(value);
             },
             |name, value| {
+                if !uniform.get() {
+                    return;
+                }
                 let field_ordinal = values.len().saturating_sub(value_start);
                 let Ok(value) = CertifiedNativeValue::from_borrowed(&owner, value) else {
                     invalid.set(Some("native field locator is outside its owner"));
@@ -564,20 +601,18 @@ pub(crate) fn certify_native_projection_segment(
                     });
                 } else if let Some(field) = fields.get_mut(field_ordinal) {
                     if field.name.as_ref() != name {
-                        invalid.set(Some("native field layout differs between rows"));
+                        uniform.set(false);
                     }
                     match value.kind() {
                         Some(kind) => match field.observed_non_null_kind {
-                            Some(expected) if expected != kind => {
-                                invalid.set(Some("native field scalar kind differs between rows"))
-                            }
+                            Some(expected) if expected != kind => uniform.set(false),
                             None => field.observed_non_null_kind = Some(kind),
                             _ => {}
                         },
                         None => field.saw_null = true,
                     }
                 } else {
-                    invalid.set(Some("native field count differs between rows"));
+                    uniform.set(false);
                 }
                 values.push(value);
             },
@@ -589,9 +624,7 @@ pub(crate) fn certify_native_projection_segment(
         let row_field_count = values.len().saturating_sub(value_start);
         if row_ordinal > 0 && (row_key_count != key_kinds.len() || row_field_count != fields.len())
         {
-            return Err(Error::Invalid(
-                "native row layout differs between segment members",
-            ));
+            uniform.set(false);
         }
         if row_ordinal == 0 {
             let remaining = row_capacity.saturating_sub(1);
@@ -600,13 +633,16 @@ pub(crate) fn certify_native_projection_segment(
         }
         if let Some(expected) = schema_fingerprint {
             if expected != fingerprint {
-                return Err(Error::Invalid(
-                    "native schema fingerprint differs between segment members",
-                ));
+                uniform.set(false);
             }
         } else {
             schema_fingerprint = Some(fingerprint);
             key_field_equal.resize(row_key_count.saturating_mul(row_field_count), true);
+        }
+        if !uniform.get() {
+            // The full visitor continues validating subsequent rows without
+            // retaining unused projection locators.
+            continue;
         }
         for (key_ordinal, key) in keys[key_start..].iter().enumerate() {
             let row_fields = &values[value_start..];
@@ -621,17 +657,24 @@ pub(crate) fn certify_native_projection_segment(
     let schema_fingerprint = schema_fingerprint.ok_or(Error::Invalid(
         "native projection segment must contain at least one row",
     ))?;
-    Ok(CertifiedNativeProjectionSegment {
-        owner,
-        payload_ranges,
-        schema_fingerprint,
-        key_kinds: key_kinds.into_boxed_slice(),
-        fields: fields.into_boxed_slice(),
-        keys: keys.into_boxed_slice(),
-        values: values.into_boxed_slice(),
-        key_field_equal: key_field_equal.into_boxed_slice(),
-        row_count,
-    })
+    if !uniform.get() {
+        return Ok(NativeProjectionCertification::Heterogeneous(
+            validated_payload_ranges(owner, payload_ranges),
+        ));
+    }
+    Ok(NativeProjectionCertification::Uniform(
+        CertifiedNativeProjectionSegment {
+            owner,
+            payload_ranges,
+            schema_fingerprint,
+            key_kinds: key_kinds.into_boxed_slice(),
+            fields: fields.into_boxed_slice(),
+            keys: keys.into_boxed_slice(),
+            values: values.into_boxed_slice(),
+            key_field_equal: key_field_equal.into_boxed_slice(),
+            row_count,
+        },
+    ))
 }
 
 /// Validates and streams a durable native row without constructing an owned
@@ -1953,6 +1996,9 @@ mod tests {
         )
         .expect("uniform native segment certifies");
 
+        let super::NativeProjectionCertification::Uniform(certified) = certified else {
+            panic!("uniform native segment must retain its projection");
+        };
         assert_eq!(certified.row_count(), 2);
         assert_eq!(certified.schema_fingerprint(), [7; 32]);
         assert_eq!(
@@ -1988,7 +2034,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_certificate_rejects_mixed_fingerprints() {
+    fn projection_certificate_retains_mixed_fingerprints_as_validated_rows() {
         let value: lix_schema::Jsonb = serde_json::json!(null).into();
         let first = super::encode_native_path_value_payload(&[1; 32], "/a", &value)
             .expect("first native row encodes");
@@ -2004,12 +2050,132 @@ mod tests {
                 end: u32::try_from(first.len() + second.len()).unwrap(),
             },
         ];
-        let error = super::certify_native_projection_segment(
+        let expected = [first.clone(), second.clone()];
+        let certified = super::certify_native_projection_segment(
             bytes::Bytes::from([first, second].concat()),
             Box::new(ranges),
         )
-        .expect_err("mixed fingerprints must not certify");
-        assert!(matches!(error, super::Error::Invalid(_)));
+        .expect("mixed fingerprints are valid native rows");
+        let super::NativeProjectionCertification::Heterogeneous(rows) = certified else {
+            panic!("mixed fingerprints must not share a projection");
+        };
+        for (row, expected) in rows.iter().zip(expected) {
+            assert_eq!(row.as_bytes(), expected);
+        }
+    }
+
+    #[test]
+    fn heterogeneous_projection_validates_all_layouts_and_the_entire_tail() {
+        use super::{NativeProjectionCertification, certify_native_projection_segment};
+
+        let encode = |key: Vec<Value>, row: Row| {
+            super::encode_native_row_payload_with_identity(&[9; 32], &key, &row).unwrap()
+        };
+        let first = encode(
+            vec![Value::Text("a".into())],
+            Row::from([("value", Value::Text("one".into()))]),
+        );
+        // These all have valid wire encodings but cannot use the first row's
+        // locators. A schema fingerprint alone is not a layout proof.
+        let variants = [
+            encode(
+                vec![Value::Text("b".into())],
+                Row::from([
+                    ("value", Value::Text("two".into())),
+                    ("extra", Value::Boolean(true)),
+                ]),
+            ),
+            encode(
+                vec![Value::Text("b".into())],
+                Row::from([("other", Value::Text("two".into()))]),
+            ),
+            encode(
+                vec![Value::Text("b".into())],
+                Row::from([("value", Value::Int8(2))]),
+            ),
+            encode(
+                vec![Value::Int8(2)],
+                Row::from([("value", Value::Text("two".into()))]),
+            ),
+            encode(
+                vec![Value::Text("b".into()), Value::Int8(2)],
+                Row::from([("value", Value::Text("two".into()))]),
+            ),
+            super::encode_native_row_payload(
+                &[9; 32],
+                &[Value::Text("b".into())],
+                &Row::from([("value", Value::Text("two".into()))]),
+            )
+            .unwrap(),
+        ];
+        let certify = |rows: &[Vec<u8>]| {
+            let mut owner = Vec::new();
+            let ranges = rows
+                .iter()
+                .map(|row| {
+                    let start = owner.len() as u32;
+                    owner.extend_from_slice(row);
+                    start..owner.len() as u32
+                })
+                .collect();
+            certify_native_projection_segment(bytes::Bytes::from(owner), ranges)
+        };
+        for other in variants {
+            // Exercise both more/fewer fields and native/storage ordering.
+            for pair in [
+                [first.clone(), other.clone()],
+                [other.clone(), first.clone()],
+            ] {
+                let NativeProjectionCertification::Heterogeneous(validated) =
+                    certify(&pair).expect("layout diversity is valid wire")
+                else {
+                    panic!("different layouts must not share column locators");
+                };
+                for (row, expected) in validated.iter().zip(&pair) {
+                    assert_eq!(row.as_bytes(), expected);
+                }
+                let mut malformed = first.clone();
+                malformed.push(0);
+                assert!(
+                    certify(&[pair[0].clone(), pair[1].clone(), malformed]).is_err(),
+                    "layout ineligibility must not skip malformed trailing rows"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn projection_certificate_preserves_nullable_uniform_columns() {
+        let first = super::encode_native_row_payload(
+            &[4; 32],
+            &[Value::Text("row".into())],
+            &Row::from([("value", Value::Null)]),
+        )
+        .unwrap();
+        let second = super::encode_native_row_payload(
+            &[4; 32],
+            &[Value::Text("row".into())],
+            &Row::from([("value", Value::Text("present".into()))]),
+        )
+        .unwrap();
+        let split = first.len() as u32;
+        let end = split + second.len() as u32;
+        let certified = super::certify_native_projection_segment(
+            bytes::Bytes::from([first, second].concat()),
+            Box::new([0..split, split..end]),
+        )
+        .unwrap();
+        let super::NativeProjectionCertification::Uniform(projection) = certified else {
+            panic!("null is compatible with the observed non-null kind");
+        };
+        assert_eq!(
+            projection.field_value(0, 0),
+            Some(super::BorrowedNativeValue::Null)
+        );
+        assert_eq!(
+            projection.field_value(1, 0),
+            Some(super::BorrowedNativeValue::Text("present"))
+        );
     }
 
     #[test]

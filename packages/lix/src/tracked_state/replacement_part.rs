@@ -796,28 +796,34 @@ pub(crate) fn decode_native_replacement_part(
     encoded: Bytes,
 ) -> Result<Option<Arc<PreparedReplacementNativePart>>, LixError> {
     let decoded = decode_raw_replacement_part(expected_digest, encoded)?;
-    if decoded.payload_ranges.iter().any(|range| {
-        !matches!(
-            decoded.payload_arena.get(range.start).copied(),
+    let owner = decoded.payload_arena.clone();
+    let mut payloads = Vec::with_capacity(decoded.payload_ranges.len());
+    for range in &decoded.payload_ranges {
+        if !matches!(
+            owner.get(range.start).copied(),
             Some(crate::plugin::wire::typed::NATIVE_ROW_PAYLOAD_VERSION)
                 | Some(crate::plugin::wire::typed::STORAGE_ROW_PAYLOAD_VERSION)
-        )
-    }) {
+        ) {
+            continue;
+        }
+        // Projection eligibility is separate from wire validity. Even when a
+        // non-native member prevents this fast path, malformed native members
+        // must fail validation rather than disappear into the fallback.
+        payloads.push(
+            crate::plugin::wire::typed::ValidatedNativePayload::try_new_range(
+                owner.clone(),
+                range.clone(),
+            )
+            .map_err(|error| {
+                replacement_part_error(format!(
+                    "native payload failed canonical wire validation: {error:?}"
+                ))
+            })?,
+        );
+    }
+    if payloads.len() != decoded.payload_ranges.len() {
         return Ok(None);
     }
-    let owner = decoded.payload_arena.clone();
-    let Ok(payloads) = decoded
-        .payload_ranges
-        .iter()
-        .cloned()
-        .map(|range| {
-            crate::plugin::wire::typed::ValidatedNativePayload::try_new_range(owner.clone(), range)
-                .map_err(|_| ())
-        })
-        .collect::<Result<Vec<_>, _>>()
-    else {
-        return Ok(None);
-    };
     Ok(Some(Arc::new(PreparedReplacementNativePart {
         key_arena: decoded.key_arena,
         key_ranges: decoded.key_ranges,
@@ -1105,6 +1111,91 @@ mod tests {
                 .expect("native descriptor should be recognized");
         assert_eq!(decoded_native.key(0), Some(b"typed-row".as_slice()));
         assert_eq!(decoded_native.payload(0).unwrap().as_bytes(), payload);
+    }
+
+    #[test]
+    fn native_part_rejects_malformed_wire_even_with_non_native_members() {
+        use crate::plugin::wire::typed::{NATIVE_ROW_PAYLOAD_VERSION, STORAGE_ROW_PAYLOAD_VERSION};
+
+        for version in [NATIVE_ROW_PAYLOAD_VERSION, STORAGE_ROW_PAYLOAD_VERSION] {
+            let malformed = [version];
+            for snapshots in [
+                vec![malformed.as_slice()],
+                vec![b"typed".as_slice(), malformed.as_slice()],
+                vec![malformed.as_slice(), b"typed".as_slice()],
+            ] {
+                let keys = [b"alpha".as_slice(), b"beta".as_slice()];
+                let rows = snapshots
+                    .iter()
+                    .zip(keys)
+                    .map(|(snapshot, encoded_key)| ReplacementPartRowRef {
+                        encoded_key,
+                        metadata: None,
+                        snapshot,
+                    })
+                    .collect::<Vec<_>>();
+                let encoded = encode_replacement_part(&rows).expect("physical part encodes");
+                let error = super::decode_native_replacement_part(
+                    encoded.digest(),
+                    encoded.bytes().clone(),
+                )
+                .expect_err("malformed native wire must not select the fallback");
+                assert!(error.message.contains("canonical wire validation"));
+            }
+        }
+    }
+
+    #[test]
+    fn native_part_accepts_heterogeneous_rows_and_falls_back_for_non_native_wire() {
+        let first = crate::plugin::wire::typed::encode_native_row_payload_with_identity(
+            &[1; 32],
+            &[lix_schema::Value::Text("alpha".to_owned())],
+            &lix_schema::Row::from([("id", lix_schema::Value::Text("alpha".to_owned()))]),
+        )
+        .expect("native payload encodes");
+        let second = crate::plugin::wire::typed::encode_native_row_payload(
+            &[2; 32],
+            &[lix_schema::Value::Int8(42)],
+            &lix_schema::Row::from([
+                ("id", lix_schema::Value::Int8(42)),
+                ("value", lix_schema::Value::Boolean(true)),
+            ]),
+        )
+        .expect("storage payload encodes");
+        let rows = [
+            ReplacementPartRowRef {
+                encoded_key: b"alpha",
+                metadata: None,
+                snapshot: &first,
+            },
+            ReplacementPartRowRef {
+                encoded_key: b"beta",
+                metadata: None,
+                snapshot: &second,
+            },
+        ];
+        let encoded = encode_replacement_part(&rows).expect("heterogeneous part encodes");
+        let decoded =
+            super::decode_native_replacement_part(encoded.digest(), encoded.bytes().clone())
+                .expect("heterogeneous native wire is valid")
+                .expect("all rows carry native wire proofs");
+        assert_eq!(decoded.payload(0).unwrap().as_bytes(), first);
+        assert_eq!(decoded.payload(1).unwrap().as_bytes(), second);
+
+        let rows = [
+            rows[0],
+            ReplacementPartRowRef {
+                encoded_key: b"beta",
+                metadata: None,
+                snapshot: b"typed",
+            },
+        ];
+        let encoded = encode_replacement_part(&rows).expect("mixed part encodes");
+        assert!(
+            super::decode_native_replacement_part(encoded.digest(), encoded.bytes().clone())
+                .expect("valid mixed part is not corruption")
+                .is_none()
+        );
     }
 
     #[test]
