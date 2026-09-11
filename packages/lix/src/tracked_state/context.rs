@@ -2200,9 +2200,9 @@ where
             })
             .await?;
         let Some(_) = batch.into_iter().next().and_then(|(_, value)| value) else {
-            return Err(LixError::unknown(format!(
+            return Err(super::NativeMetadataRef::CommitGraphRecord(commit_id.to_owned()).annotate_missing(LixError::unknown(format!(
                 "changelog commit '{commit_id}' is missing while validating tracked-state commit-root rows"
-            )));
+            ))));
         };
         let topology =
             match storage::load_published_commit_state_topology(&self.store, commit_id_typed)
@@ -2327,9 +2327,9 @@ where
             })
             .await?;
         let Some(entry) = batch.into_iter().next().and_then(|(_, value)| value) else {
-            return Err(LixError::unknown(format!(
+            return Err(super::NativeMetadataRef::CommitGraphRecord(commit_id.to_owned()).annotate_missing(LixError::unknown(format!(
                 "changelog commit '{commit_id}' is missing while validating tracked-state commit-root metadata"
-            )));
+            ))));
         };
         let record = entry;
         let parent_id = record.parent_commit_ids.first().copied();
@@ -9137,6 +9137,12 @@ mod tests {
         assert!(
             error.message.contains("missing from owning commit"),
             "unexpected error: {error}"
+        );
+        assert!(
+            crate::tracked_state::NativeMetadataRef::from_missing_error(&error)
+                .unwrap()
+                .is_none(),
+            "present but incomplete authority is corruption, not a native fetch demand"
         );
         let details = error
             .details

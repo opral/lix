@@ -5,6 +5,25 @@
 //! recovered commit alive. The checkpoint transaction stages the rotation in
 //! the same storage write set that publishes the compacted checkpoint.
 
+mod native_baseline_lease;
+mod native_global_retention;
+pub(crate) use native_global_retention::{
+    NATIVE_GLOBAL_RETENTION_SPACE, require_complete_global_migration_pin,
+    stage_abandon_global_migration_pin, stage_cleanup_global_migration_pin, stage_global_body_pin,
+};
+mod native_upload_attempt;
+pub(crate) use native_baseline_lease::{
+    NATIVE_BASELINE_LEASE_SPACE, NATIVE_BASELINE_LEASE_TTL_MS, NativeBaselineLease,
+    require_native_baseline_lease, stage_acquire_native_baseline_lease,
+    stage_renew_native_baseline_lease,
+};
+pub(crate) use native_upload_attempt::{
+    NATIVE_UPLOAD_ATTEMPT_SPACE, NativeUploadAttempt, NativeUploadAttemptIdentity,
+    load_native_upload_attempt, require_native_upload_attempt, stage_accepted_native_upload_wave,
+    stage_finalize_native_upload_attempt, stage_renew_native_upload_attempt,
+    stage_revoke_expired_upload_attempt,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
@@ -189,8 +208,9 @@ impl CheckpointGcState {
 pub(crate) struct CheckpointPublication {
     pub(crate) recovery_ref: CheckpointRecoveryRef,
     pub(crate) gc_state: CheckpointGcState,
-    /// The selected interval came from the certified HOT working-diff index,
-    /// so a partial checkpoint may rebind its remaining dirty rows in place.
+    /// The selected interval came from the certified HOT index, or a complete
+    /// canonical diff over an admitted partial replica root plus HOT overlay.
+    /// Both permit rebinding remaining dirty rows through exact current reads.
     pub(crate) hot_working_diff_certified: bool,
 }
 
@@ -887,6 +907,10 @@ where
 /// never additional roots.
 #[derive(Debug)]
 struct AuthenticatedServingDependencyClosure {
+    expired_upload_attempts: Vec<crate::storage_adapter::StorageKey>,
+    more_expired_upload_attempts: bool,
+    expired_baseline_leases: Vec<crate::storage_adapter::StorageKey>,
+    more_expired_baseline_leases: bool,
     chronology_roots: BTreeSet<CommitId>,
     physical_authorities: BTreeSet<CommitId>,
     physical_dependencies: BTreeSet<CommitId>,
@@ -1206,6 +1230,10 @@ where
     }
 
     Ok(AuthenticatedServingDependencyClosure {
+        expired_baseline_leases: Vec::new(),
+        more_expired_baseline_leases: false,
+        expired_upload_attempts: Vec::new(),
+        more_expired_upload_attempts: false,
         chronology_roots,
         physical_authorities,
         physical_dependencies,
@@ -1237,6 +1265,19 @@ where
         .history_dependencies
         .extend(crate::sync::load_pending_sync_export_commit_ids(store, controls).await?);
     let mut chronology_roots = control_reachability.chronology_roots;
+    let leases = native_baseline_lease::load_native_baseline_retention(
+        store,
+        crate::telemetry::unix_time_ms(),
+    )
+    .await?;
+    chronology_roots.extend(leases.roots);
+    let uploads = native_upload_attempt::load_native_upload_retention(
+        store,
+        crate::telemetry::unix_time_ms(),
+    )
+    .await?;
+    chronology_roots.extend(uploads.roots);
+    chronology_roots.extend(native_global_retention::load_global_migration_roots(store).await?);
     chronology_roots.extend(
         load_recovery_refs(store)
             .await?
@@ -1269,14 +1310,19 @@ where
         }
     }
     graph_reachable.extend(collect_ref_reachable_commit_ids(store, &off_branch_checkpoints).await?);
-    load_authenticated_serving_dependency_closure(
+    let mut closure = load_authenticated_serving_dependency_closure(
         store,
         chronology_roots,
         control_reachability.serving_dependencies,
         control_reachability.history_dependencies,
         graph_reachable,
     )
-    .await
+    .await?;
+    closure.expired_upload_attempts = uploads.expired_keys;
+    closure.more_expired_upload_attempts = uploads.more_expired;
+    closure.expired_baseline_leases = leases.expired_keys;
+    closure.more_expired_baseline_leases = leases.more_expired;
+    Ok(closure)
 }
 
 /// Every commit reachable from the authenticated roots through canonical parent
@@ -1373,6 +1419,19 @@ pub(crate) async fn stage_repository_gc_with_preconditions<S>(
 where
     S: StorageAdapterRead + Clone + Send + Sync,
 {
+    // Authority reachability requires a complete semantic/native inventory.
+    // A partial replica's absent keys are not evidence of unreachability.
+    // Its cache eviction and local-owned object reclamation need an explicit
+    // ownership/pinning planner before this destructive path can be used.
+    if crate::sync::load_partial_replica_state(&store)
+        .await?
+        .is_some()
+    {
+        return Err(LixError::new(
+            "LIX_PARTIAL_REPLICA_GC_UNAVAILABLE",
+            "partial replica garbage collection requires native object ownership coverage",
+        ));
+    }
     const MAX_SLICE_MUTATIONS: u64 = 4_000;
     const MAX_SLICE_WRITTEN_BYTES: u64 = 3 * 1024 * 1024;
     let started = Instant::now();
@@ -1388,6 +1447,10 @@ where
         .scan()
         .await?;
     let AuthenticatedServingDependencyClosure {
+        expired_baseline_leases,
+        more_expired_baseline_leases,
+        expired_upload_attempts,
+        more_expired_upload_attempts,
         chronology_roots: active_roots,
         physical_authorities: active_authority_ids,
         physical_dependencies: active_dependency_ids,
@@ -1539,6 +1602,15 @@ where
         Default::default()
     } else {
         let mut auxiliary_writes = StorageWriteSet::new();
+        // Expired pins were discovered during the existing root scan. Deletes
+        // share the GC revision fence, so a concurrent renewal cannot be erased.
+        for key in expired_upload_attempts {
+            auxiliary_writes.delete(native_upload_attempt::NATIVE_UPLOAD_ATTEMPT_SPACE, key);
+        }
+        for key in expired_baseline_leases {
+            auxiliary_writes.delete(native_baseline_lease::NATIVE_BASELINE_LEASE_SPACE, key);
+        }
+
         let mut auxiliary_preconditions = Vec::new();
         let upload_chunks = crate::session::stage_reclaimable_upload_receipts(
             &store,
@@ -1574,8 +1646,15 @@ where
         } else {
             writes.extend(auxiliary_slice);
             staged_preconditions.extend(auxiliary_preconditions);
-            has_more |= auxiliary_has_more || tombstones_have_more;
-            if auxiliary_has_more || tombstones_have_more {
+            has_more |= auxiliary_has_more
+                || tombstones_have_more
+                || more_expired_baseline_leases
+                || more_expired_upload_attempts;
+            if auxiliary_has_more
+                || tombstones_have_more
+                || more_expired_baseline_leases
+                || more_expired_upload_attempts
+            {
                 Default::default()
             } else {
                 binary_cas
@@ -2305,6 +2384,49 @@ fn retirement_is_proven(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn authority_gc_refuses_partial_inventory_before_staging_any_mutation() {
+        let authority = crate::open_lix().await.unwrap();
+        let state = crate::sync::PartialReplicaState::new(
+            format!("https://example.test/lix/{}", authority.lix_id()),
+            crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            "00000000-0000-7000-8000-000000000099".to_owned(),
+            authority.partial_replica_descriptor(None).await.unwrap(),
+        )
+        .unwrap();
+        let adapter = crate::storage_adapter::StorageAdapter::new(crate::Memory::new());
+        let mut seed = adapter.new_write_set();
+        seed.put(
+            crate::sync::PARTIAL_REPLICA_STATE_SPACE,
+            crate::sync::partial_replica_state_key(),
+            crate::storage_adapter::StorageValue {
+                bytes: serde_json::to_vec(&state).unwrap().into(),
+            },
+        );
+        adapter
+            .commit_write_set(seed, crate::storage_adapter::StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = crate::storage_adapter::SharedStorageAdapterRead::new(
+            adapter
+                .begin_read(crate::storage_adapter::StorageReadOptions::default())
+                .await
+                .unwrap(),
+        );
+        let mut writes = adapter.new_write_set();
+        let mut preconditions = Vec::new();
+        let error =
+            super::stage_repository_gc_with_preconditions(read, &mut writes, &mut preconditions)
+                .await
+                .unwrap_err();
+        assert_eq!(error.code, "LIX_PARTIAL_REPLICA_GC_UNAVAILABLE");
+        assert_eq!(
+            writes.stats().staged_puts + writes.stats().staged_deletes,
+            0
+        );
+        assert!(preconditions.is_empty());
+    }
+
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
@@ -6323,3 +6445,5 @@ mod tests {
         }
     }
 }
+
+pub(crate) use native_global_retention::global_migration_pin_absence;

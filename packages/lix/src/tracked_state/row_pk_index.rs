@@ -5,13 +5,13 @@
 //! same persistent tree implementation serve row-primary-key prefix lookups.
 
 use crate::row_pk::RowPk;
+use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use crate::tracked_state::codec::{decode_key, encode_key_ref};
 use crate::tracked_state::types::{
     CommitStateManifest, TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef,
     TrackedStateMutation, TrackedStateMutationBatch, TrackedStateRootId,
     TrackedStateTreeScanRequest,
 };
-use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use crate::{LixError, NullableKeyFilter};
 
 const NULL_FILE_ID_TAG: &str = "n";
@@ -126,9 +126,10 @@ pub(crate) async fn stage_row_pk_index_from_members(
     members: &[super::storage::CommitDeltaMember],
     commit_id: crate::changelog::CommitId,
 ) -> Result<Option<TrackedStateRootId>, LixError> {
-    let mut primary = crate::tracked_state::codec::TrackedStateMutationBatchBuilder::with_row_capacity(
-        members.len(),
-    );
+    let mut primary =
+        crate::tracked_state::codec::TrackedStateMutationBatchBuilder::with_row_capacity(
+            members.len(),
+        );
     for member in members {
         primary.push(
             TrackedStateKeyRef {
@@ -171,9 +172,10 @@ pub(crate) async fn stage_row_pk_index_from_deltas<'a>(
     commit_id: crate::changelog::CommitId,
 ) -> Result<Option<TrackedStateRootId>, LixError> {
     let deltas = deltas.into_iter().collect::<Vec<_>>();
-    let mut primary = crate::tracked_state::codec::TrackedStateMutationBatchBuilder::with_row_capacity(
-        deltas.len(),
-    );
+    let mut primary =
+        crate::tracked_state::codec::TrackedStateMutationBatchBuilder::with_row_capacity(
+            deltas.len(),
+        );
     for delta in deltas {
         primary.push(
             TrackedStateKeyRef {
@@ -264,9 +266,10 @@ pub(crate) async fn backfill_row_pk_index_for_commit(
             ),
         ));
     }
-    let mut primary = crate::tracked_state::codec::TrackedStateMutationBatchBuilder::with_row_capacity(
-        rows.len(),
-    );
+    let mut primary =
+        crate::tracked_state::codec::TrackedStateMutationBatchBuilder::with_row_capacity(
+            rows.len(),
+        );
     for row in &rows {
         primary.push(
             TrackedStateKeyRef {
@@ -335,8 +338,7 @@ mod tests {
             TrackedStateKey {
                 schema_key: "schema\0escaped".to_owned(),
                 file_id: Some("file\0escaped".to_owned()),
-                row_pk: RowPk::uuid_from_canonical("01920000-0000-7000-8000-000000000002")
-                    .unwrap(),
+                row_pk: RowPk::uuid_from_canonical("01920000-0000-7000-8000-000000000002").unwrap(),
             },
         ]
     }
@@ -358,7 +360,10 @@ mod tests {
     fn typed_row_pk_prefix_does_not_alias_uuid_and_text() {
         let uuid = RowPk::uuid_from_canonical("01920000-0000-7000-8000-000000000002").unwrap();
         let text = RowPk::single("01920000-0000-7000-8000-000000000002");
-        assert_ne!(typed_row_pk_text(&uuid).unwrap(), typed_row_pk_text(&text).unwrap());
+        assert_ne!(
+            typed_row_pk_text(&uuid).unwrap(),
+            typed_row_pk_text(&text).unwrap()
+        );
     }
 
     #[test]
@@ -406,6 +411,32 @@ mod tests {
             decode_row_pk_index_key(&secondary.as_slice()[0].encoded_key).unwrap(),
             key
         );
-        assert_eq!(secondary.as_slice()[0].encoded_value, encode_value_ref(value));
+        assert_eq!(
+            secondary.as_slice()[0].encoded_value,
+            encode_value_ref(value)
+        );
     }
+}
+
+/// Prepare the secondary identity catalog's mutation paths for a retained
+/// native identity set. This is separate from primary/scoped row materialization.
+pub(crate) async fn prepare_row_pk_index_mutation_inputs(
+    store: &(impl StorageAdapterRead + ?Sized),
+    root: &TrackedStateRootId,
+    keys: &[TrackedStateKey],
+) -> Result<(), LixError> {
+    let encoded = keys
+        .iter()
+        .map(|key| {
+            encode_row_pk_index_key(TrackedStateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                row_pk: &key.row_pk,
+            })
+            .map(bytes::Bytes::from)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    super::tree::TrackedStateTree::new()
+        .prepare_existing_key_mutation_inputs(store, root, &encoded)
+        .await
 }

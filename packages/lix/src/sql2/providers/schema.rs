@@ -305,6 +305,12 @@ impl SchemaSpec {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<(SchemaRef, HotStateScanRequest, Vec<RowFilter>)> {
+        if self.spec.schema_key == "lix_commit" && self.hot_state.is_partial_replica() {
+            return Err(lix_error_to_datafusion_error(LixError::new(
+                "LIX_PARTIAL_REPLICA_SCOPE_UNSUPPORTED",
+                "lix_commit requires authoritative commit inventory; resident graph records do not prove completeness",
+            )));
+        }
         let projected_schema = projected_schema(&self.schema, projection);
         // A predicate that resolves to a complete identity set is applied in
         // full by the `row_pks` access path below, and `filter_pushdown`

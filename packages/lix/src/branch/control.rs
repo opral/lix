@@ -220,6 +220,24 @@ where
             .materialize(&self.store, StorageGetOptions::default())
             .await?
             .value;
+        if values.iter().any(Option::is_none)
+            && let Some((state, _)) = crate::sync::load_partial_replica_state(&self.store).await?
+        {
+            let missing = branch_ids
+                .iter()
+                .zip(&values)
+                .filter_map(|(id, value)| value.is_none().then_some(id))
+                .collect::<Vec<_>>();
+            return Err(LixError::new(
+                "LIX_SYNC_BRANCH_CONTROLS_REQUIRED",
+                "branch coordinates are not resident in this partial replica",
+            )
+            .with_details(serde_json::json!({
+                "repositoryId": state.repository_id(),
+                "epochId": state.epoch_id(),
+                "branchIds": missing,
+            })));
+        }
         branch_ids
             .into_iter()
             .zip(values)
@@ -245,6 +263,16 @@ where
 
     /// Returns every durable branch control in deterministic branch-id order.
     pub(crate) async fn scan(&self) -> Result<Vec<(String, BranchHeadControl)>, LixError> {
+        if let Some((state, _)) = crate::sync::load_partial_replica_state(&self.store).await? {
+            return Err(LixError::new(
+                "LIX_SYNC_BRANCH_INVENTORY_REQUIRED",
+                "complete branch inventory is not resident in this partial replica",
+            )
+            .with_details(serde_json::json!({
+                "repositoryId": state.repository_id(),
+                "epochId": state.epoch_id(),
+            })));
+        }
         let range = StoragePrefix {
             bytes: Bytes::new(),
         }

@@ -1,3 +1,4 @@
+import { PartialOwnerLifetimes } from "./partial-owner.js";
 import type {
 	LixStorageCommitResult,
 	LixStorageChangeWatch,
@@ -42,6 +43,7 @@ export class OpfsStorageClient implements LixStorageProvider {
 	#heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 	#heartbeatPending = false;
 	#closed = false;
+	readonly #partialOwners = new PartialOwnerLifetimes();
 
 	private constructor(
 		private readonly name: string,
@@ -86,6 +88,12 @@ export class OpfsStorageClient implements LixStorageProvider {
 			client.#channel.close();
 			throw error;
 		}
+	}
+
+	acquirePartialReplicaOwner(sessionToken: string) {
+		this.#assertOpen();
+		this.#assertSession(sessionToken);
+		return this.#partialOwners.acquire(this.name);
 	}
 
 	async acquireSession(): Promise<string> {
@@ -140,6 +148,7 @@ export class OpfsStorageClient implements LixStorageProvider {
 	}
 
 	async close(): Promise<void> {
+		await this.#partialOwners.close();
 		if (this.#closed) return;
 		this.#closed = true;
 		try { await this.#rpc("close", undefined, false); }

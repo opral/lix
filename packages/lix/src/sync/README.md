@@ -68,3 +68,14 @@ case per recovered branch for H historical ancestors without jump metadata,
 with O(1) cursor
 state. Each cold graph node uses normal authenticated sync-demand retries while
 retaining the cursor, so hydration does not rescan the previously visited path.
+
+
+A partial replica with on-demand sync keeps local commits while authority changes
+arrive. The initial background reconciliation scope is ordinary unfiled
+`lix_key_value` rows with unchanged global schema/checkpoint coordinates.
+`POST /sync/retained-bodies` atomically pins each complete accepted native wave;
+`POST /sync/merge` derives an exact three-way plan and publishes `[R,L]` plus its
+immutable attempt receipt in one native transaction. Conflicts preserve both
+heads. A newer local `L2` remains pending until client candidate adoption proves
+its exact serving basis; receiving a merge receipt alone never advances ordinary
+upload confirmation. These endpoints require sync protocol11/server protocol8.

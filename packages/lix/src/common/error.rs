@@ -281,7 +281,9 @@ impl LixError {
         let branch_id = branch_id.into();
         let scope = format!("branch:{branch_id}");
         let hint = match (entity_commit_id.as_deref(), base_commit_id.as_deref()) {
-            (Some(entity_commit_id), Some(base_commit_id)) if entity_commit_id != base_commit_id => {
+            (Some(entity_commit_id), Some(base_commit_id))
+                if entity_commit_id != base_commit_id =>
+            {
                 format!(
                     "The entity comes from commit {entity_commit_id}, but schema '{schema_key}' is not visible from this transaction's base commit {base_commit_id} in {scope} ({} lane). This usually indicates that the entity commit is not an ancestor of the transaction base, or that the schema was registered in a different branch or durability scope.",
                     if untracked { "untracked" } else { "tracked" }
@@ -297,7 +299,10 @@ impl LixError {
             ),
         };
         let mut details = serde_json::Map::from_iter([
-            ("schema_key".to_string(), JsonValue::String(schema_key.clone())),
+            (
+                "schema_key".to_string(),
+                JsonValue::String(schema_key.clone()),
+            ),
             ("scope".to_string(), JsonValue::String(scope)),
             (
                 "durability".to_string(),
@@ -413,6 +418,10 @@ impl LixError {
 impl From<crate::storage_adapter::StorageError> for LixError {
     fn from(error: crate::storage_adapter::StorageError) -> Self {
         match error {
+            crate::storage_adapter::StorageError::InUse => Self::new(
+                "LIX_STORAGE_IN_USE",
+                "storage already has an active partial replica engine owner",
+            ),
             crate::storage_adapter::StorageError::WriteConflict
             | crate::storage_adapter::StorageError::PreconditionFailed(_) => Self::new(
                 Self::CODE_TRANSACTION_CONFLICT,

@@ -364,6 +364,7 @@ export function workerBinding(
 			lease.retain();
 			return workerBinding(client, lease, openedSessionId);
 		},
+		prepare: (sql, params) => request({ kind: "prepare", sql, params }),
 		execute: (sql, params, options) =>
 			request({ kind: "execute", sql, params, options }),
 		executeBatch: (statements, options) =>
@@ -386,6 +387,7 @@ export function workerBinding(
 		exportReplicaRecovery: (id) =>
 			request({ kind: "exportReplicaRecovery", id }),
 		recoverReplica: (id) => request({ kind: "recoverReplica", id }),
+        recoverReplicaWithServer: (id, server) => client.withRecoveryServer(server, (transportScope, serialized) => request({kind:"recoverReplicaWithServer",id,server:serialized,transportScope})),
 		activeBranchId: () => request({ kind: "activeBranchId" }),
 		activeAccountId: () => request({ kind: "activeAccountId" }),
 		createBranch: (options) => request({ kind: "createBranch", options }),
@@ -486,6 +488,15 @@ export class LixWorkerClient {
 	private onDisposed?: () => void;
 	private telemetry?: LixTelemetryOptions;
 	private syncServer?: SyncServerRuntimeOptions;
+    private scopedServers = new Map<number, SyncServerRuntimeOptions>();
+    private nextTransportScope = 1;
+    async withRecoveryServer<T>(server: import("../binding-types.js").SyncServerBindingOptions, operation: (scope: number, server: WorkerSyncServerOptions) => Promise<T>): Promise<T> {
+        const scope = this.nextTransportScope++;
+        const runtime = {url: server.url, headers: server.headerProvider ?? server.headers, fetch: server.fetch};
+        this.scopedServers.set(scope, runtime);
+        try { return await operation(scope, serializeSyncServer(runtime)!); }
+        finally { this.scopedServers.delete(scope); }
+    }
 	private onProgress?: (progress: LixOpenProgress) => void;
 	openReport: LixOpenReport | undefined;
 	private readonly syncFetchControllers = new Map<number, AbortController>();
@@ -620,10 +631,10 @@ export class LixWorkerClient {
 				}
 				break;
 			case "sync.headers":
-				void this.resolveSyncHeaders(message.requestId);
+				void this.resolveSyncHeaders(message.requestId, message.transportScope);
 				break;
 			case "sync.fetch":
-				void this.resolveSyncFetch(message.requestId, message.request);
+				void this.resolveSyncFetch(message.requestId, message.request, message.transportScope);
 				break;
 			case "sync.fetch.stream.pull":
 				void this.resolveSyncFetchStreamPull(message.requestId);
@@ -634,9 +645,9 @@ export class LixWorkerClient {
 		}
 	}
 
-	private async resolveSyncHeaders(requestId: number): Promise<void> {
+	private async resolveSyncHeaders(requestId: number, transportScope?: number): Promise<void> {
 		try {
-			const source = this.syncServer?.headers;
+			if (transportScope !== undefined && !this.scopedServers.has(transportScope)) throw workerClosedError(); const source = (transportScope === undefined ? this.syncServer : this.scopedServers.get(transportScope))?.headers;
 			const headers = typeof source === "function" ? await source() : source;
 			this.notify({
 				kind: "sync.headers.result",
@@ -655,8 +666,9 @@ export class LixWorkerClient {
 	private async resolveSyncFetch(
 		requestId: number,
 		request: import("./protocol.js").WorkerSyncFetchRequest,
+        transportScope?: number,
 	): Promise<void> {
-		const fetcher: RemoteLixFetch | undefined = this.syncServer?.fetch;
+		const fetcher: RemoteLixFetch | undefined = (transportScope === undefined ? this.syncServer : this.scopedServers.get(transportScope))?.fetch;
 		if (!fetcher) {
 			this.notify({
 				kind: "sync.fetch.result",
@@ -929,4 +941,18 @@ export async function hostedLixWorkerOperation<T>(
 	} finally {
 		await client.terminate();
 	}
+}
+
+export async function convertReplicaWorkerOperation(storage:LixStorageConfig,server:SyncServerRuntimeOptions,branchId?:string):Promise<void> {
+ const client=new LixWorkerClient();
+ client.beginLease(undefined,undefined,server);
+ try { await client.request({kind:"replica.convert",storage,server:serializeSyncServer(server)!,branchId},0); }
+ finally { await client.terminate(); }
+}
+
+export async function retryReplicaMigrationCleanupWorkerOperation(storage:LixStorageConfig,server:SyncServerRuntimeOptions):Promise<number> {
+ const client=new LixWorkerClient();
+ client.beginLease(undefined,undefined,server);
+ try {return await client.request<number>({kind:"replica.cleanup",storage,server:serializeSyncServer(server)!},0);}
+ finally {await client.terminate();}
 }

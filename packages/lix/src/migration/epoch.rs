@@ -1,3 +1,16 @@
+mod pending_conversion;
+mod pending_conversion_journal;
+pub(crate) use pending_conversion_journal::{
+    PendingConversionJournal, retry_published_conversion_cleanup,
+};
+mod partial_conversion;
+pub(crate) use partial_conversion::convert_clean_replica_to_partial;
+mod partial;
+pub(crate) use partial::{
+    PartialEpochAdmission, admit_partial_epoch, has_partial_replica_marker,
+    install_fresh_partial_epoch, partial_epoch_has_no_markers,
+};
+
 use std::{ops::Bound, sync::Arc, time::Duration};
 
 use bytes::Bytes;
@@ -479,7 +492,9 @@ where
                     }
                 }
             }
-            None => return Box::pin(admit_legacy(storage, progress, server)).await,
+            None => {
+                return Box::pin(admit_legacy(storage, progress, server)).await;
+            }
         }
     }
 }
@@ -1364,7 +1379,8 @@ where
     else {
         return Ok(None);
     };
-    let server = server.ok_or_else(|| crate::sync::replica_replacement_unavailable("server_required"))?;
+    let server =
+        server.ok_or_else(|| crate::sync::replica_replacement_unavailable("server_required"))?;
     Ok(Some((proof, server)))
 }
 
@@ -3097,7 +3113,11 @@ mod tests {
             Ok(_) => panic!("incomplete candidate must fail validation"),
             Err(error) => error,
         };
-        assert!(error.message.contains("no global branch"));
+        assert_eq!(error.code, "LIX_ERROR_MIGRATION_FAILED");
+        assert!(
+            error.message.contains("global branch control is absent"),
+            "{error:?}"
+        );
         assert!(load_pointer(&storage).await.unwrap().is_none());
         assert_eq!(
             super::super::inspect_lix(&storage).await.unwrap(),
@@ -3605,3 +3625,9 @@ mod replica_upgrade_tests;
 
 #[cfg(test)]
 mod retained_generation_tests;
+
+mod native_global_conversion_journal;
+
+mod native_global_epoch_owner;
+mod native_global_journal_io;
+pub(crate) use native_global_conversion_journal::GlobalConversionJournal;

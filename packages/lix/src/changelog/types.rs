@@ -507,6 +507,95 @@ mod topology_tests {
         );
     }
 
+    /// A prepared remote jump spine is closed under every future append:
+    /// the recurrence chooses either the local parent or jump(jump(parent)).
+    /// No remote first-parent walk or fixed number of traced edits is needed.
+    #[test]
+    fn prepared_myers_jump_spine_supports_unbounded_append_rule() {
+        use std::collections::{BTreeMap, BTreeSet};
+        for merge_root in [false, true] {
+            let root_depth = if merge_root { 100_000 } else { 0 };
+            let mut root = record(root_depth, None, None);
+            if merge_root {
+                root.parent_commit_ids = vec![id(root_depth - 1), id(root_depth - 2)];
+                let jump =
+                    next_first_parent_jump(root.commit_id, &root.parent_commit_ids, None, None)
+                        .unwrap();
+                root.first_parent_jump_commit_id = jump.0;
+                root.first_parent_jump_span = jump.1;
+            }
+            let mut authority = BTreeMap::from([(root.commit_id, root.clone())]);
+            let mut heads = vec![root.commit_id];
+            for offset in 1..=4096u64 {
+                let parent = &authority[heads.last().unwrap()];
+                let jump = &authority[&parent.first_parent_jump_commit_id];
+                let depth = root_depth + offset;
+                let next = next_first_parent_jump(
+                    id(depth),
+                    &[parent.commit_id],
+                    Some(parent),
+                    Some(jump),
+                )
+                .unwrap();
+                let child = record(depth, Some(parent.commit_id), Some(next));
+                heads.push(child.commit_id);
+                authority.insert(child.commit_id, child);
+            }
+            // Every small prefix, plus both sides of large jump boundaries.
+            let mut baselines = (0..=128usize).collect::<BTreeSet<_>>();
+            for power in 8..=12 {
+                let boundary = 1usize << power;
+                baselines.extend([boundary - 2, boundary - 1, boundary]);
+            }
+            for baseline in baselines {
+                let mut resident = BTreeMap::new();
+                let mut cursor = heads[baseline];
+                loop {
+                    let header = authority[&cursor].clone();
+                    let next = header.first_parent_jump_commit_id;
+                    resident.insert(cursor, header);
+                    if next == cursor {
+                        break;
+                    }
+                    cursor = next;
+                }
+                let prepared_count = resident.len();
+                assert!(
+                    prepared_count
+                        <= 2 * (usize::BITS - (baseline + 1).leading_zeros()) as usize + 1
+                );
+                if merge_root {
+                    assert!(
+                        resident
+                            .values()
+                            .all(|header| header.generation >= root_depth),
+                        "merge boundary must stop preparation before earlier ancestry"
+                    );
+                }
+                let mut head = heads[baseline];
+                // Many writes exercise repeated carry/merge boundaries. The
+                // closure assertion below is the general inductive invariant.
+                for offset in 1..=1024u64 {
+                    let parent = &resident[&head];
+                    let jump = resident
+                        .get(&parent.first_parent_jump_commit_id)
+                        .expect("prepared spine supplies parent jump target");
+                    let depth = root_depth + baseline as u64 + offset;
+                    let next = next_first_parent_jump(id(depth), &[head], Some(parent), Some(jump))
+                        .unwrap();
+                    assert!(
+                        resident.contains_key(&next.0),
+                        "new jump must stay in prepared spine plus authored descendants"
+                    );
+                    let child = record(depth, Some(head), Some(next));
+                    head = child.commit_id;
+                    resident.insert(head, child);
+                }
+                assert_eq!(resident.len(), prepared_count + 1024);
+            }
+        }
+    }
+
     #[test]
     fn myers_lca_matches_parent_walker_for_exhaustive_branch_splits() {
         #[derive(Clone, Copy)]

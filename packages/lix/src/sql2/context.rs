@@ -92,6 +92,9 @@ pub(crate) trait SqlExecutionContext: Sync {
     fn active_account_id(&self) -> &str {
         crate::ANONYMOUS_ACCOUNT_ID
     }
+    fn read_interest_registry(&self) -> Option<Arc<crate::hot_state::ReadInterestRegistry>> {
+        None
+    }
     fn hot_state(&self) -> Arc<dyn HotStateReader>;
     /// Supplies the committed tracked-head row snapshot capability when the
     /// read context can prove it is scoped to one immutable storage snapshot.
@@ -140,6 +143,13 @@ pub(crate) trait SqlExecutionContext: Sync {
 /// authority without adding another translation layer.
 #[async_trait]
 pub(crate) trait SqlWriteExecutionContext: Send {
+    fn is_partial_replica(&self) -> bool {
+        false
+    }
+    fn read_interest_registry(&self) -> Option<Arc<crate::hot_state::ReadInterestRegistry>> {
+        None
+    }
+
     fn ensure_statement_allowed_after_restore(&self) -> Result<(), LixError> {
         Ok(())
     }
@@ -191,6 +201,10 @@ pub(crate) trait SqlWriteExecutionContext: Send {
 
     fn session_file_views(&self) -> Option<SessionFileViews> {
         None
+    }
+
+    async fn require_referenced_manifests(&mut self, _hashes: &[BlobId]) -> Result<(), LixError> {
+        Ok(())
     }
 
     async fn load_bytes_many(&mut self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError>;
@@ -384,6 +398,8 @@ impl Default for WriteContextLiveness {
 /// capturing them here removes that shared borrow outright rather than
 /// serializing it. Nothing below reads through the raw pointer.
 struct SqlWriteContextShared {
+    read_interest_registry: Option<Arc<crate::hot_state::ReadInterestRegistry>>,
+    is_partial_replica: bool,
     functions: FunctionProviderHandle,
     /// Stored as the `Result` it was: the underlying catalog is memoized on a
     /// fingerprint that is fixed for the context's lifetime
@@ -455,6 +471,8 @@ impl SqlWriteContext {
         // Capture the shared surface while the `&mut` borrow is still held
         // legitimately, so no later call has to forge one.
         let shared = Arc::new(SqlWriteContextShared {
+            read_interest_registry: ctx.read_interest_registry(),
+            is_partial_replica: ctx.is_partial_replica(),
             functions: ctx.functions(),
             public_catalog: ctx.public_catalog(),
             active_branch_id: ctx.active_branch_id().to_string(),
@@ -563,6 +581,23 @@ impl SqlWriteContext {
                 .as_mut()
                 .unwrap()
                 .load_exact_hot_state_batch(request)
+                .await
+        }
+    }
+
+    pub(crate) async fn require_referenced_manifests(
+        &self,
+        hashes: &[BlobId],
+    ) -> Result<(), LixError> {
+        let _guard = self.gate.lock().await;
+        self.ensure_context_live("require_referenced_manifests")?;
+        unsafe {
+            self.ptr
+                .0
+                .as_ptr()
+                .as_mut()
+                .unwrap()
+                .require_referenced_manifests(hashes)
                 .await
         }
     }
@@ -683,6 +718,9 @@ impl WriteContextBlobDataReader {
 
 #[async_trait]
 impl BlobDataReader for WriteContextBlobDataReader {
+    async fn require_referenced_manifests(&self, hashes: &[BlobId]) -> Result<(), LixError> {
+        self.ctx.require_referenced_manifests(hashes).await
+    }
     async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
         self.ctx.load_bytes_many(hashes).await
     }
@@ -723,6 +761,13 @@ impl WriteContextHotStateReader {
 
 #[async_trait]
 impl HotStateReader for WriteContextHotStateReader {
+    fn is_partial_replica(&self) -> bool {
+        self.ctx.shared.is_partial_replica
+    }
+    fn read_interest_registry(&self) -> Option<Arc<crate::hot_state::ReadInterestRegistry>> {
+        self.ctx.shared.read_interest_registry.clone()
+    }
+
     async fn scan_batch(
         &self,
         request: &HotStateScanRequest,

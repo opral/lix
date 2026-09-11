@@ -18,9 +18,12 @@ pub(crate) use codec::decode_change_record;
 #[cfg(test)]
 pub(crate) use codec::encode_commit_record;
 pub(crate) use context::{CHECKPOINT_INVENTORY_SPACE, ChangelogContext};
+pub(crate) use gc::{
+    stage_delete_cached_standalone_change, stage_delete_commit_projection,
+    stage_delete_standalone_change,
+};
 #[cfg(test)]
 pub(crate) use gc::{stage_delete_changes, stage_delete_commits};
-pub(crate) use gc::{stage_delete_commit_projection, stage_delete_standalone_change};
 #[cfg(test)]
 pub(crate) use materialization::MaterializedChangeIdentity;
 pub(crate) use materialization::{

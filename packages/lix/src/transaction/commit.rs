@@ -1007,19 +1007,23 @@ async fn stage_changelog_commits(
     let mut rootless_bytes = BTreeMap::new();
     for (commit_id, record) in external_parent_records {
         let record = record.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("commit '{commit_id}' has a missing parent"),
-            )
+            crate::tracked_state::NativeMetadataRef::CommitGraphRecord(commit_id.to_string())
+                .annotate_missing(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("commit '{commit_id}' has a missing parent"),
+                ))
         })?;
         let published =
             crate::tracked_state::load_published_commit_state_topology(read, *commit_id)
                 .await?
                 .ok_or_else(|| {
-                    LixError::new(
+                    crate::tracked_state::NativeMetadataRef::CommitStateHeader(
+                        commit_id.to_string(),
+                    )
+                    .annotate_missing(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         format!("commit '{commit_id}' has no commit-state authority"),
-                    )
+                    ))
                 })?;
         // Replay debt is physical layout policy. Rootless commits remain
         // bounded-replay layouts; rooted commits publish their canonical
@@ -1108,10 +1112,11 @@ async fn stage_changelog_commits(
                 .next()
                 .and_then(|(_, record)| record)
                 .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!("commit '{commit_id}' has a missing jump target '{jump_id}'"),
-                    )
+                    crate::tracked_state::NativeMetadataRef::CommitGraphRecord(jump_id.to_string())
+                        .annotate_missing(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("commit '{commit_id}' has a missing jump target '{jump_id}'"),
+                        ))
                 })?;
             topology_records.insert(jump_id, jump);
         }
@@ -3534,12 +3539,30 @@ async fn load_working_diff_epoch_for_publication(
         {
             Ok(Some(epoch))
         }
-        (Some(checkpoint_commit_id), None) => Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "branch '{branch_id}' checkpoint cursor '{checkpoint_commit_id}' has no working-diff epoch"
-            ),
-        )),
+        (Some(checkpoint_commit_id), None) => {
+            if TrackedHeadContext::new()
+                .reader(read)
+                .root_current_base_commit(branch_id, parent_generation)
+                .await?
+                .is_some()
+            {
+                // The first local edit starts an overlay-only index. The
+                // root-backed reader refuses this index as a complete diff
+                // proof and resolves checkpoint comparisons canonically.
+                Ok(Some(TrackedWorkingDiffEpoch {
+                    checkpoint_commit_id,
+                    generation: parent_generation,
+                    coverage: WorkingDiffIndexCoverage::default(),
+                }))
+            } else {
+                Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "branch '{branch_id}' checkpoint cursor '{checkpoint_commit_id}' has no working-diff epoch"
+                    ),
+                ))
+            }
+        }
         (None, Some(epoch)) => Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
@@ -5706,12 +5729,39 @@ async fn stage_branch_head_control_publications(
             if desired
                 .is_none_or(|new_control| new_control.ref_change_id != old_control.ref_change_id)
             {
-                crate::changelog::stage_delete_standalone_change(
-                    read,
-                    writes,
-                    old_control.ref_change_id,
-                )
-                .await?;
+                let remote_baseline_ref = crate::sync::load_partial_replica_state(read)
+                    .await?
+                    .is_some_and(|(state, _)| {
+                        let descriptor = state.descriptor();
+                        [&descriptor.selected_branch, &descriptor.global_branch]
+                            .iter()
+                            .any(|branch| {
+                                branch.branch_id == *branch_id
+                                    && branch.ref_change_id == old_control.ref_change_id.to_string()
+                                    && branch.head.commit_id
+                                        == old_control.head_commit_id.to_string()
+                                    && state.serving_generation(branch_id).ok()
+                                        == Some(old_control.tracked_generation)
+                                    && old_control.working_diff_checkpoint_commit_id.is_some_and(
+                                        |checkpoint| {
+                                            checkpoint.to_string() == branch.checkpoint.commit_id
+                                        },
+                                    )
+                            })
+                    });
+                if remote_baseline_ref {
+                    crate::changelog::stage_delete_cached_standalone_change(
+                        writes,
+                        old_control.ref_change_id,
+                    );
+                } else {
+                    crate::changelog::stage_delete_standalone_change(
+                        read,
+                        writes,
+                        old_control.ref_change_id,
+                    )
+                    .await?;
+                }
             }
         }
         match desired {
@@ -7260,6 +7310,7 @@ async fn validate_active_account_and_account_rows(
         crate::account::record_account_proven_active(account_revision.as_ref(), active_account_id);
     } else if crate::init::repository_protocol_status(&*read).await?
         == crate::init::RepositoryProtocolStatus::Current
+        || crate::init::is_partial_repository_protocol(&*read).await?
     {
         return Err(LixError::new(
             "LIX_ACCOUNT_NOT_FOUND",
@@ -7427,6 +7478,127 @@ mod tests {
         ($($row:expr),* $(,)?) => {
             PreparedStateBatch::from_test_rows(vec![$($row),*])
         };
+    }
+
+    #[tokio::test]
+    async fn partial_layout_does_not_allow_the_uninitialized_missing_account_exception() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = storage.new_write_set();
+        crate::init::stage_partial_repository_protocol(&mut writes);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let prepared = PreparedWriteSet {
+            branch_heads: Default::default(),
+            state_rows: prepared_rows![],
+            insert_selection: PreparedInsertSelection::new(),
+            commit_change_refs_by_branch: BTreeMap::new(),
+            first_commit_parent_override_by_branch: BTreeMap::new(),
+            checkpoint_publications: Vec::new(),
+            extra_commit_parents_by_branch: BTreeMap::new(),
+            intermediate_commits: Vec::new(),
+            file_content_writes: Vec::new(),
+        };
+        let error = validate_active_account_and_account_rows(
+            &mut read,
+            &prepared,
+            "00000000-0000-7000-8000-000000000699",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "LIX_ACCOUNT_NOT_FOUND");
+    }
+
+    // A resident proof must need only its revision point read, even if native
+    // account rows are unavailable. Rotation must force the real read again.
+    #[tokio::test]
+    async fn warm_account_proof_uses_one_point_read_and_rotation_invalidates_it() {
+        struct RevisionOnlyRead<R> {
+            inner: R,
+            keys: std::sync::atomic::AtomicUsize,
+        }
+        impl<R: StorageAdapterRead> StorageAdapterRead for RevisionOnlyRead<R> {
+            async fn get_many(
+                &self,
+                requests: &[crate::storage::GetManyRequest<'_>],
+            ) -> Result<GetManyResult, StorageError> {
+                for request in requests {
+                    assert_eq!(
+                        request.space,
+                        crate::storage_adapter::REVISION_SPACE,
+                        "warm account validation unexpectedly loads native inputs"
+                    );
+                    self.keys
+                        .fetch_add(request.keys.len(), std::sync::atomic::Ordering::Relaxed);
+                }
+                self.inner.get_many(requests).await
+            }
+            async fn begin_scan(
+                &self,
+                _space: StorageSpace,
+                _range: KeyRange,
+                _opts: BeginScanOptions,
+            ) -> Result<ScanCursor<'_>, StorageError> {
+                panic!("warm account validation must not scan")
+            }
+        }
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = storage.new_write_set();
+        crate::init::stage_partial_repository_protocol(&mut writes);
+        crate::account::stage_account_revision(&mut writes);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let revision = crate::account::load_account_revision(&read)
+            .await
+            .unwrap()
+            .unwrap();
+        let account = uuid::Uuid::now_v7().to_string();
+        crate::account::record_account_proven_active(Some(&revision), &account);
+        let mut read = RevisionOnlyRead {
+            inner: read,
+            keys: Default::default(),
+        };
+        let prepared = PreparedWriteSet {
+            branch_heads: Default::default(),
+            state_rows: prepared_rows![],
+            insert_selection: PreparedInsertSelection::new(),
+            commit_change_refs_by_branch: BTreeMap::new(),
+            first_commit_parent_override_by_branch: BTreeMap::new(),
+            checkpoint_publications: Vec::new(),
+            extra_commit_parents_by_branch: BTreeMap::new(),
+            intermediate_commits: Vec::new(),
+            file_content_writes: Vec::new(),
+        };
+        validate_active_account_and_account_rows(&mut read, &prepared, &account)
+            .await
+            .unwrap();
+        assert_eq!(read.keys.load(std::sync::atomic::Ordering::Relaxed), 1);
+        drop(read);
+        let mut writes = storage.new_write_set();
+        crate::account::stage_account_revision(&mut writes);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let error = validate_active_account_and_account_rows(&mut read, &prepared, &account)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "LIX_ACCOUNT_NOT_FOUND");
     }
 
     struct ChangeBatchCountingRead<R> {

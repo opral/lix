@@ -48,6 +48,16 @@ impl Storage for BrowserStorage {
         }
     }
 
+    async fn acquire_partial_replica_owner(
+        &self,
+        token: StorageSessionToken,
+    ) -> Result<lix::storage::StorageOwnerLease, StorageError> {
+        match self {
+            Self::Memory(storage) => storage.acquire_partial_replica_owner(token).await,
+            Self::Js(storage) => storage.acquire_partial_replica_owner(token).await,
+        }
+    }
+
     async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
         match self {
             Self::Memory(storage) => storage.begin_read(opts).await.map(BrowserRead::Memory),

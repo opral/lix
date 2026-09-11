@@ -575,18 +575,16 @@ where
             // files needing semantic or derived-blob conflict resolution. Even
             // disjoint row edits require rerendering their combined bytes;
             // choosing either blob would lose the other branch's edits.
-            let needs_materialization = conflict_indices_by_file[&file_id]
-                .iter()
-                .any(|&index| {
-                    let schema_key = analysis
-                        .merge_plan()
-                        .expect("conflicts have a merge plan")
-                        .conflicts[index]
-                        .identity
-                        .schema_key();
-                    schema_key == BLOB_REF_SCHEMA_KEY
-                        || owner.schema_keys().iter().any(|owned| owned == schema_key)
-                });
+            let needs_materialization = conflict_indices_by_file[&file_id].iter().any(|&index| {
+                let schema_key = analysis
+                    .merge_plan()
+                    .expect("conflicts have a merge plan")
+                    .conflicts[index]
+                    .identity
+                    .schema_key();
+                schema_key == BLOB_REF_SCHEMA_KEY
+                    || owner.schema_keys().iter().any(|owned| owned == schema_key)
+            });
             if needs_materialization {
                 return Err(LixError::new(
                     LixError::CODE_MERGE_CONFLICT,
@@ -2185,3 +2183,6 @@ mod tests {
         );
     }
 }
+
+mod native_migration;
+pub(crate) use native_migration::stage_merge_native_heads;

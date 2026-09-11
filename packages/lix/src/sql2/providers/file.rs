@@ -10,6 +10,9 @@
     clippy::useless_let_if_seq
 )]
 
+mod interest;
+pub(crate) use interest::prepare_native_file_content_interest;
+
 use super::values::{optional_metadata_value, update_optional_metadata_value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -476,6 +479,19 @@ impl LixFileSpec {
             .iter()
             .map(|key| key.id.clone())
             .collect::<BTreeSet<_>>();
+        if needs_data {
+            interest::retain_content(
+                &WriteContextHotStateReader::new(write_ctx.clone()),
+                &request,
+                &FileIdConstraint::Ids(file_ids.clone()),
+                &FileIdConstraint::All,
+                false,
+                &FilePathPredicate::All,
+                false,
+                None,
+            )
+            .map_err(lix_error_to_datafusion_error)?;
+        }
         let captured: SharedLixFileDmlSourceState = Arc::new(Mutex::new(None));
         let source = self.dml_source(
             write_ctx,
@@ -553,6 +569,28 @@ pub(crate) async fn execute_exact_lix_file_read(
     )
     .await?;
 
+    if column == ExactLixFileReadColumn::Content {
+        let (ids, path) = match selector {
+            ExactLixFileReadSelector::Id(id) => (
+                FileIdConstraint::Ids(BTreeSet::from([id.clone()])),
+                FilePathPredicate::All,
+            ),
+            ExactLixFileReadSelector::Path(path) => (
+                FileIdConstraint::All,
+                FilePathPredicate::In(BTreeSet::from([path.clone()])),
+            ),
+        };
+        interest::retain_content(
+            hot_state.as_ref(),
+            &request,
+            &ids,
+            &FileIdConstraint::All,
+            false,
+            &path,
+            true,
+            None,
+        )?;
+    }
     let index = filesystem_path_index
         .path_index(
             &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
@@ -709,6 +747,16 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     )
     .await?;
 
+    interest::retain_content(
+        hot_state.as_ref(),
+        &request,
+        &FileIdConstraint::All,
+        &FileIdConstraint::All,
+        false,
+        &FilePathPredicate::In(paths.clone()),
+        true,
+        data_range.as_ref(),
+    )?;
     let index = filesystem_path_index
         .path_index(
             &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
@@ -812,6 +860,16 @@ pub(crate) async fn execute_exact_lix_file_id_manifest_batch_read(
     )
     .await?;
 
+    interest::retain_content(
+        hot_state.as_ref(),
+        &request,
+        &FileIdConstraint::Ids(file_ids.clone()),
+        &FileIdConstraint::All,
+        false,
+        &FilePathPredicate::All,
+        true,
+        None,
+    )?;
     let index = filesystem_path_index
         .path_index(
             &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
@@ -995,6 +1053,19 @@ impl TableSpec for LixFileSpec {
                 Some(matches)
             }
         };
+        if needs_data {
+            interest::retain_content(
+                self.hot_state.as_ref(),
+                &request,
+                &target_file_ids,
+                &target_directory_ids,
+                root_directory_filter,
+                &indexed_path_predicate,
+                indexed_matches.is_some(),
+                None,
+            )
+            .map_err(lix_error_to_datafusion_error)?;
+        }
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
         validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_filters = filters
@@ -1335,6 +1406,19 @@ impl TableSpec for LixFileSpec {
         let indexed_matches = self
             .indexed_dml_matches(&request, filters, &target_file_ids)
             .await?;
+        if needs_data {
+            interest::retain_content(
+                &WriteContextHotStateReader::new(write_ctx.clone()),
+                &request,
+                &target_file_ids,
+                &FileIdConstraint::All,
+                false,
+                &file_path_predicate_from_filters(filters),
+                indexed_matches.is_some(),
+                None,
+            )
+            .map_err(lix_error_to_datafusion_error)?;
+        }
 
         let captured: SharedLixFileDmlSourceState = Arc::new(Mutex::new(None));
         let source = self.dml_source(
@@ -1433,6 +1517,19 @@ impl LixFileSpec {
         let indexed_matches = self
             .indexed_dml_matches(&request, filters, &target_file_ids)
             .await?;
+        if needs_data {
+            interest::retain_content(
+                &WriteContextHotStateReader::new(write_ctx.clone()),
+                &request,
+                &target_file_ids,
+                &FileIdConstraint::All,
+                false,
+                &file_path_predicate_from_filters(filters),
+                indexed_matches.is_some(),
+                None,
+            )
+            .map_err(lix_error_to_datafusion_error)?;
+        }
 
         let update_columns = LixFileUpdateColumns::from_assignments(&assignments);
         let capture_path_resolver_rows = update_columns.requires_path_resolver()
@@ -5219,6 +5316,11 @@ async fn load_blob_ranges_for_files(
         }
     }
     if !keys.is_empty() {
+        blob_reader
+            .require_referenced_manifests(
+                &requests.iter().map(|(hash, _)| *hash).collect::<Vec<_>>(),
+            )
+            .await?;
         let values = blob_reader.load_ranges_many(&requests).await?.into_vec();
         if values.len() != keys.len() {
             return Err(LixError::new(
@@ -5267,6 +5369,7 @@ async fn load_blob_bytes_for_files(
         }
     }
     if !keys.is_empty() {
+        blob_reader.require_referenced_manifests(&hashes).await?;
         let values = blob_reader.load_bytes_many(&hashes).await?.into_vec();
         if values.len() != keys.len() {
             return Err(LixError::new(

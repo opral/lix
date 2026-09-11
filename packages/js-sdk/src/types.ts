@@ -5,6 +5,8 @@ export type RemoteLixFetch = (
 
 /** A Lix protocol endpoint. Host URL for creation; repository URL for opening/deletion. */
 export type LixServerOptions = {
+	/** Defaults to remote SQL execution. Partial replicas require storage. */
+	mode?: "remote" | "partial_replica";
 	url: string | URL;
 	headers?: HeadersInit | (() => HeadersInit | Promise<HeadersInit>);
 	fetch?: RemoteLixFetch;
@@ -158,7 +160,15 @@ export type LixOpenProgressOptions = {
 	onProgress?(progress: LixOpenProgress): void;
 };
 
-/** No options: memory. Storage: local. Server: remote. Storage + server: sync. */
+export type RemoteLixServerOptions = Omit<LixServerOptions, "mode"> & {
+	mode?: "remote";
+};
+
+export type PartialReplicaLixServerOptions = Omit<LixServerOptions, "mode"> & {
+	mode: "partial_replica";
+};
+
+/** Server defaults to remote. Partial replicas explicitly opt in and require storage. */
 export type OpenLixOptions =
 	| ({
 			storage?: import("./storage-adapter.js").LixStorage;
@@ -167,13 +177,13 @@ export type OpenLixOptions =
 	  } & LixOpenProgressOptions)
 	| {
 			storage?: never;
-			server: LixServerOptions;
+			server: RemoteLixServerOptions;
 			telemetry?: never;
 			onProgress?: never;
 	  }
 	| ({
 			storage: import("./storage-adapter.js").LixStorage;
-			server: LixServerOptions;
+			server: PartialReplicaLixServerOptions;
 			telemetry?: LixTelemetryOptions;
 	  } & LixOpenProgressOptions);
 

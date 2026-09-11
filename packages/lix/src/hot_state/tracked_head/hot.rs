@@ -7,6 +7,10 @@
 //! the physical mutation unit, and stores each value only in the authoritative
 //! file-first row index.
 
+mod root_exact_cache;
+#[cfg(test)]
+#[path = "root_exact_profile.rs"]
+pub(crate) mod root_exact_profile;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -86,6 +90,21 @@ pub(crate) const COLLECTION_CONTROL_SPACE: StorageSpace = StorageSpace::declare(
     COLLECTION_CONTROL_NAMESPACE,
     ValueSemantics::Mutable,
 );
+
+/// Exact deterministic-setting presence, bound to the complete native control.
+/// Mandatory in current repositories; only migration may backfill old scopes.
+pub(crate) const DETERMINISTIC_IDENTITY_WITNESS_SPACE: StorageSpace = StorageSpace::declare(
+    StorageSpaceId(0x0004_0034),
+    "hot_state.deterministic_identity_witness.v1",
+    ValueSemantics::Mutable,
+);
+
+#[derive(musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct DeterministicIdentityWitness {
+    collection_control: Vec<u8>,
+    presence: u8,
+}
 
 /// Engagement counters for the canonical `created_at` recovery that shares the
 /// retention fence's batch.
@@ -1525,6 +1544,202 @@ fn scope_requires_exact_closure(branch_id: &str, schema_key: &str, file_id: Opti
 
 const EXACT_CLOSURE_SCHEMA_KEY: &str = "lix_key_value";
 
+/// Migration-only backfill. The caller must additionally fence the observed
+/// global branch control (including current_state_revision) in the same commit.
+/// Existing identity closure is verified before publishing any witness; this
+/// never repairs a corrupt collection and is not invoked by ordinary reads.
+pub(crate) async fn stage_deterministic_identity_witness_migration(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    generation: CommitId,
+    current_state_revision: u64,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<Vec<crate::storage_adapter::StoragePrecondition>, LixError> {
+    use crate::storage_adapter::StoragePrecondition;
+    let scope = crate::collection_generation::CollectionScopeRef {
+        schema_key: EXACT_CLOSURE_SCHEMA_KEY,
+        file_id: None,
+    };
+    let key = StorageKey(Bytes::from(hot_collection_control_key(
+        crate::GLOBAL_BRANCH_ID,
+        generation,
+        scope,
+    )));
+    let values = PointReadPlan::new(COLLECTION_CONTROL_SPACE, &[key.clone()])
+        .materialize(read, StorageGetOptions::default())
+        .await?
+        .value;
+    let Some(Some(StorageProjectedValue::FullValue(control_bytes))) = values.first() else {
+        if current_state_revision != 0 {
+            return Err(head_value_error(
+                "migration deterministic collection control is missing",
+            ));
+        }
+        // No scope exists at an untouched bootstrap; there is no control to
+        // certify. The caller's branch revision fence preserves that state.
+        return Ok(vec![StoragePrecondition::KeyAbsent {
+            space: COLLECTION_CONTROL_SPACE,
+            key,
+        }]);
+    };
+    let control: HotCollectionControl =
+        storage_codec::decode("hot collection control", control_bytes)?;
+    if control.live_count == DEFERRED_ROOT_LIVE_COUNT || control.ordered_identity_digest.is_none() {
+        return Err(head_value_error(
+            "migration requires a complete deterministic collection control",
+        ));
+    }
+    let prefix = hot_scope_prefix(crate::GLOBAL_BRANCH_ID, generation);
+    let mut selected = prefix.clone();
+    write_key_string(&mut selected, EXACT_CLOSURE_SCHEMA_KEY, KEY_PART_FINAL);
+    let mut cursor = read
+        .begin_scan(
+            ROW_SPACE,
+            StoragePrefix {
+                bytes: Bytes::from(selected),
+            }
+            .to_range()?,
+            StorageBeginScanOptions::default(),
+        )
+        .await?;
+    let mut digest = CompleteHotCollectionDigest::new(crate::GLOBAL_BRANCH_ID, generation, scope);
+    let (mut count, mut rows, mut bytes, mut presence) = (0_u64, 0_usize, 0_usize, 0_u8);
+    let mut file_controls = BTreeMap::new();
+    loop {
+        let (page, more) = cursor
+            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+            .await?
+            .into_parts();
+        for entry in page {
+            let raw = full_value_bytes(entry.value)?;
+            rows = rows
+                .checked_add(1)
+                .ok_or_else(|| head_value_error("witness migration row budget overflow"))?;
+            bytes = bytes
+                .checked_add(entry.key.0.len())
+                .and_then(|n| n.checked_add(raw.len()))
+                .ok_or_else(|| head_value_error("witness migration byte budget overflow"))?;
+            if rows > max_rows || bytes > max_bytes {
+                return Err(LixError::new(
+                    "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
+                    "witness migration exceeds caller budget",
+                ));
+            }
+            let identity = decode_hot_row_key_in_scope(&entry.key.0, &prefix)?;
+            if identity.schema_key != EXACT_CLOSURE_SCHEMA_KEY {
+                return Err(head_value_error("witness migration escaped exact scope"));
+            }
+            let canonical = encode_hot_row_key_parts(
+                crate::GLOBAL_BRANCH_ID,
+                generation,
+                &identity.schema_key,
+                &identity.row_pk,
+                identity.file_id.as_deref(),
+            );
+            validate_canonical_exact_collection_key(&entry.key.0, &canonical)?;
+            let value = decode_head_value(&raw)?;
+            if identity.file_id.is_none() {
+                presence |= deterministic_identity_bit(&identity.row_pk).unwrap_or(0);
+            }
+            let schema_active = control.active_generation == generation
+                || survives_collection_generation_fence(
+                    value.untracked,
+                    value.commit_id,
+                    control.active_generation,
+                    false,
+                );
+            let file_active = if let Some(file_id) = identity.file_id.as_deref() {
+                let file_control = if let Some(cached) = file_controls.get(file_id) {
+                    *cached
+                } else {
+                    let loaded = load_hot_collection_control(
+                        read,
+                        crate::GLOBAL_BRANCH_ID,
+                        generation,
+                        crate::collection_generation::CollectionScopeRef {
+                            schema_key: EXACT_CLOSURE_SCHEMA_KEY,
+                            file_id: Some(file_id),
+                        },
+                    )
+                    .await?;
+                    file_controls.insert(file_id.to_owned(), loaded);
+                    loaded
+                };
+                file_control.active_generation == generation
+                    || survives_collection_generation_fence(
+                        value.untracked,
+                        value.commit_id,
+                        file_control.active_generation,
+                        false,
+                    )
+            } else {
+                true
+            };
+            if !value.deleted && schema_active && file_active {
+                digest.push(&identity, &entry.key.0)?;
+                count += 1;
+            }
+        }
+        if !more {
+            break;
+        }
+    }
+    if count != control.live_count || Some(digest.finish()) != control.ordered_identity_digest {
+        return Err(head_value_error(
+            "witness migration collection identity closure mismatch",
+        ));
+    }
+    let prior = PointReadPlan::new(DETERMINISTIC_IDENTITY_WITNESS_SPACE, &[key.clone()])
+        .materialize(read, StorageGetOptions::default())
+        .await?
+        .value;
+    let witness_guard = match prior.into_iter().next().flatten() {
+        Some(StorageProjectedValue::FullValue(expected)) => StoragePrecondition::KeyValueEquals {
+            space: DETERMINISTIC_IDENTITY_WITNESS_SPACE,
+            key: key.clone(),
+            expected,
+        },
+        None => StoragePrecondition::KeyAbsent {
+            space: DETERMINISTIC_IDENTITY_WITNESS_SPACE,
+            key: key.clone(),
+        },
+        _ => return Err(head_value_error("witness migration omitted native value")),
+    };
+    let witness = DeterministicIdentityWitness {
+        collection_control: control_bytes.to_vec(),
+        presence,
+    };
+    writes.put(
+        DETERMINISTIC_IDENTITY_WITNESS_SPACE,
+        key.clone(),
+        StorageValue {
+            bytes: Bytes::from(storage_codec::encode(
+                "deterministic identity witness",
+                &witness,
+            )?),
+        },
+    );
+    Ok(vec![
+        StoragePrecondition::KeyValueEquals {
+            space: COLLECTION_CONTROL_SPACE,
+            key,
+            expected: control_bytes.clone(),
+        },
+        witness_guard,
+    ])
+}
+
+fn deterministic_identity_bit(pk: &RowPk) -> Option<u8> {
+    if pk == &RowPk::single("lix_deterministic_mode") {
+        Some(1)
+    } else if pk == &RowPk::single("lix_deterministic_sequence_number") {
+        Some(2)
+    } else {
+        None
+    }
+}
+
 /// Recomputes the complete collection control for an exact-closure scope from
 /// its stored pre-image plus the values this publication is staging.
 ///
@@ -1723,6 +1938,39 @@ fn stage_complete_collection_controls(
                 .expect("complete collection digest was initialized above")
                 .finish(),
         );
+        if scope_requires_exact_closure(branch_id, &schema_key, file_id.as_deref()) {
+            // Physical tombstones and wrong-domain members also witness an
+            // identity: a point miss must fail closed for either one.
+            let presence = rows
+                .keys()
+                .filter(|identity| {
+                    identity.schema_key == EXACT_CLOSURE_SCHEMA_KEY && identity.file_id.is_none()
+                })
+                .fold(0, |mask, identity| {
+                    mask | deterministic_identity_bit(&identity.row_pk).unwrap_or(0)
+                });
+            let witness = DeterministicIdentityWitness {
+                collection_control: storage_codec::encode("hot collection control", &control)?,
+                presence,
+            };
+            writes.put(
+                DETERMINISTIC_IDENTITY_WITNESS_SPACE,
+                StorageKey(Bytes::from(hot_collection_control_key(
+                    branch_id,
+                    branch_generation,
+                    CollectionScopeRef {
+                        schema_key: &schema_key,
+                        file_id: file_id.as_deref(),
+                    },
+                ))),
+                StorageValue {
+                    bytes: Bytes::from(storage_codec::encode(
+                        "deterministic identity witness",
+                        &witness,
+                    )?),
+                },
+            );
+        }
         stage_hot_collection_control(
             writes,
             branch_id,
@@ -2493,7 +2741,12 @@ async fn load_root_current_base_exact(
     active_checkpoint_commit_id: Option<CommitId>,
     keys: &[TrackedStateKeyRef<'_>],
     projection: ChangeRecordProjection,
+    cache: Option<&RootBaseBatchCache>,
 ) -> Result<MaterializedHotStateExactBatch, LixError> {
+    #[cfg(test)]
+    let profile_read = root_exact_profile::Read::new(store, keys.len());
+    #[cfg(test)]
+    let store = &profile_read;
     let Some(base_commit_id) = load_root_current_base_commit(store, branch_id, generation).await?
     else {
         return MaterializedHotStateExactBatch::new(
@@ -2501,13 +2754,7 @@ async fn load_root_current_base_exact(
             vec![None; keys.len()],
         );
     };
-    let mut reader = crate::tracked_state::TrackedStateContext::new().reader(store);
-    let tracked = Box::pin(reader.load_projected_batch_at_commit_refs(
-        &base_commit_id.to_string(),
-        keys,
-        &projection,
-    ))
-    .await?;
+    let tracked = load_cached_root_exact(store, base_commit_id, keys, projection, cache).await?;
     let scopes = keys
         .iter()
         .filter(|key| {
@@ -2532,9 +2779,13 @@ async fn load_root_current_base_exact(
             },
         )
         .collect::<Vec<_>>();
-    let active_generations =
-        load_root_active_collection_generations(store, base_commit_id, scope_refs.iter().copied())
-            .await?;
+    let active_generations = load_root_active_collection_generations_cached(
+        store,
+        base_commit_id,
+        scope_refs.iter().copied(),
+        cache,
+    )
+    .await?;
     let stored_control_values =
         load_stored_hot_collection_controls(store, branch_id, generation, &scope_refs).await?;
     let stored_controls = scopes
@@ -2575,10 +2826,40 @@ async fn load_root_current_base_exact(
     MaterializedHotStateExactBatch::new(rows.finish(), slots)
 }
 
+async fn load_cached_root_exact(
+    store: &(impl StorageAdapterRead + ?Sized),
+    base: CommitId,
+    keys: &[TrackedStateKeyRef<'_>],
+    projection: ChangeRecordProjection,
+    cache: Option<&RootBaseBatchCache>,
+) -> Result<Arc<crate::tracked_state::MaterializedTrackedStateExactBatch>, LixError> {
+    if let Some(batch) = cache.and_then(|cache| cache.exact.get(base, keys, projection)) {
+        return Ok(batch);
+    }
+    let mut reader = crate::tracked_state::TrackedStateContext::new().reader(store);
+    let batch = Arc::new(
+        Box::pin(reader.load_projected_batch_at_commit_refs(&base.to_string(), keys, &projection))
+            .await?,
+    );
+    if let Some(cache) = cache {
+        cache.exact.insert(base, keys, projection, batch.clone());
+    }
+    Ok(batch)
+}
+
 async fn load_root_active_collection_generations<'a>(
     store: &(impl StorageAdapterRead + ?Sized),
     base_commit_id: CommitId,
     scopes: impl IntoIterator<Item = crate::collection_generation::CollectionScopeRef<'a>>,
+) -> Result<BTreeMap<(String, Option<String>), RootCollectionGeneration>, LixError> {
+    load_root_active_collection_generations_cached(store, base_commit_id, scopes, None).await
+}
+
+async fn load_root_active_collection_generations_cached<'a>(
+    store: &(impl StorageAdapterRead + ?Sized),
+    base_commit_id: CommitId,
+    scopes: impl IntoIterator<Item = crate::collection_generation::CollectionScopeRef<'a>>,
+    cache: Option<&RootBaseBatchCache>,
 ) -> Result<BTreeMap<(String, Option<String>), RootCollectionGeneration>, LixError> {
     let scopes = scopes
         .into_iter()
@@ -2613,12 +2894,13 @@ async fn load_root_active_collection_generations<'a>(
             row_pk: &key.row_pk,
         })
         .collect::<Vec<_>>();
-    let mut reader = crate::tracked_state::TrackedStateContext::new().reader(store);
-    let markers = Box::pin(reader.load_projected_batch_at_commit_refs(
-        &base_commit_id.to_string(),
+    let markers = load_cached_root_exact(
+        store,
+        base_commit_id,
         &marker_refs,
-        &ChangeRecordProjection::identity_only(),
-    ))
+        ChangeRecordProjection::identity_only(),
+        cache,
+    )
     .await?;
     Ok(scopes
         .into_iter()
@@ -3663,6 +3945,7 @@ fn exclude_ordered_live_batch_identities(
 /// materialization once instead of every read paying it forever.
 #[derive(Default)]
 pub(crate) struct RootBaseBatchCache {
+    exact: root_exact_cache::Cache,
     entries: std::sync::Mutex<RootBaseBatchCacheEntries>,
 }
 
@@ -3914,6 +4197,80 @@ where
     /// Required engine authority can call this after a point miss to
     /// distinguish legitimate absence from a missing selected HOT member
     /// without introducing another locator or persisted owner.
+    /// Proves absence of a deterministic setting from the native complete
+    /// collection witness without reading unrelated global key-value members.
+    pub(crate) async fn validate_deterministic_setting_absence(
+        &self,
+        branch_generation: CommitId,
+        required_identity: TrackedStateKeyRef<'_>,
+        allow_bootstrap_absence: bool,
+    ) -> Result<(), LixError> {
+        let bit = deterministic_identity_bit(required_identity.row_pk)
+            .filter(|_| {
+                required_identity.schema_key == EXACT_CLOSURE_SCHEMA_KEY
+                    && required_identity.file_id.is_none()
+            })
+            .ok_or_else(|| head_value_error("unsupported deterministic setting identity"))?;
+        let scope = crate::collection_generation::CollectionScopeRef {
+            schema_key: EXACT_CLOSURE_SCHEMA_KEY,
+            file_id: None,
+        };
+        let control = load_stored_hot_collection_control(
+            &self.store,
+            crate::GLOBAL_BRANCH_ID,
+            branch_generation,
+            scope,
+        )
+        .await?;
+        let Some(control) = control else {
+            return if allow_bootstrap_absence {
+                Ok(())
+            } else {
+                Err(head_value_error(
+                    "deterministic setting collection control is missing",
+                ))
+            };
+        };
+        if control.active_generation != branch_generation
+            || control.live_count == DEFERRED_ROOT_LIVE_COUNT
+            || control.ordered_identity_digest.is_none()
+        {
+            return Err(head_value_error(
+                "deterministic setting collection closure is invalid",
+            ));
+        }
+        let key = StorageKey(Bytes::from(hot_collection_control_key(
+            crate::GLOBAL_BRANCH_ID,
+            branch_generation,
+            scope,
+        )));
+        let witness = PointReadPlan::new(DETERMINISTIC_IDENTITY_WITNESS_SPACE, &[key])
+            .materialize(&self.store, StorageGetOptions::default())
+            .await?
+            .value;
+        let Some(Some(StorageProjectedValue::FullValue(bytes))) = witness.first() else {
+            return Err(head_value_error(
+                "deterministic setting identity witness is missing",
+            ));
+        };
+        let witness: DeterministicIdentityWitness =
+            storage_codec::decode("deterministic identity witness", bytes)?;
+        if witness.collection_control != storage_codec::encode("hot collection control", &control)?
+            || witness.presence & !3 != 0
+        {
+            return Err(head_value_error(
+                "deterministic setting identity witness is invalid or stale",
+            ));
+        }
+        let presence = witness.presence;
+        if presence & bit != 0 {
+            return Err(head_value_error(
+                "required point miss omitted a collection authority identity",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn validate_exact_collection_closure(
         &self,
         branch_id: &str,
@@ -5186,6 +5543,7 @@ where
                 active_checkpoint_commit_id,
                 keys,
                 *projection,
+                self.root_base_cache.as_deref(),
             ))
             .await?
         } else {
@@ -5255,12 +5613,31 @@ where
         load_tracked_working_diff_epoch(&self.store, branch_id).await
     }
 
+    pub(crate) async fn root_current_base_commit(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+    ) -> Result<Option<CommitId>, LixError> {
+        load_root_current_base_commit(&self.store, branch_id, generation).await
+    }
+
     pub(crate) async fn working_diff_for_control(
         &self,
         branch_id: &str,
         control: BranchHeadControl,
         request: &TrackedStateDiffRequest,
     ) -> Result<Option<TrackedWorkingDiff>, LixError> {
+        // A root-backed generation can index local overlay edits without
+        // indexing the immutable base's differences from its checkpoint.
+        // Its local index therefore cannot prove the complete working diff,
+        // including when the index contains zero groups.
+        if self
+            .root_current_base_commit(branch_id, control.tracked_generation)
+            .await?
+            .is_some()
+        {
+            return Ok(None);
+        }
         // Expiration is a coherent-read retry signal, not missing coverage.
         // Turning it into None strands callers behind a false HOT failure.
         let Some(epoch) = self.working_diff_epoch(branch_id).await? else {
@@ -5610,6 +5987,59 @@ where
             self.transaction_global_schema_keys,
         )
         .await
+    }
+
+    /// Copies locally owned untracked rows into an unpublished root generation.
+    /// This stages no tracked completeness or working-diff coverage. The caller
+    /// must CAS the source branch control and fence the target generation empty
+    /// when publishing this exact write set.
+    pub(crate) async fn stage_untracked_for_root_generation(
+        &mut self,
+        branch_id: &str,
+        source_generation: CommitId,
+        target_generation: CommitId,
+        target_head: CommitId,
+    ) -> Result<(), LixError> {
+        if source_generation == target_generation {
+            return Err(head_value_error(
+                "untracked transfer requires a fresh generation",
+            ));
+        }
+        let rows = load_hot_untracked_generation(self.store, branch_id, source_generation).await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let keys = rows
+            .keys()
+            .map(|identity| TrackedStateKeyRef {
+                schema_key: &identity.schema_key,
+                file_id: identity.file_id.as_deref(),
+                row_pk: &identity.row_pk,
+            })
+            .collect::<Vec<_>>();
+        let mut reader = crate::tracked_state::TrackedStateContext::new().reader(self.store);
+        let tracked = reader
+            .load_projected_batch_at_commit_refs(
+                &target_head.to_string(),
+                &keys,
+                &ChangeRecordProjection::identity_only(),
+            )
+            .await?;
+        for (index, identity) in rows.keys().enumerate() {
+            // Retention is immutable even when the remote tracked identity is
+            // tombstoned: it cannot silently hide local untracked user data.
+            if tracked.row(index).is_some() {
+                return Err(LixError::new(
+                    LixError::CODE_UNIQUE,
+                    format!(
+                        "candidate tracked identity conflicts with local untracked row in schema '{}'",
+                        identity.schema_key,
+                    ),
+                ));
+            }
+        }
+        stage_complete_hot_rows(self.writes, branch_id, target_generation, rows);
+        Ok(())
     }
 
     /// Publishes an immutable tracked root as the baseline of a new sparse
@@ -7210,6 +7640,7 @@ where
                 predecessor_checkpoint_commit_id,
                 &packed_previous_keys,
                 ChangeRecordProjection::identity_only(),
+                None,
             ))
             .await?
         } else {
@@ -7610,6 +8041,76 @@ where
         // validation and the checkpoint first-before decision.  `HOT_DIFF`
         // is an empty dirty-key index, so there is deliberately no second
         // point-read batch against it here.
+        // A partial replica may inherit dirty rows from an authority head
+        // newer than its checkpoint. Root-backed predecessors intentionally
+        // carry no complete dirty-index proof. Rebase the exact remainder
+        // against canonical checkpoint inputs rather than treating that root
+        // value as a clean/absent before image or rebuilding every HOT row.
+        let mut root_rebase_baselines = vec![None; sorted.len()];
+        if rebase_working_diff_baselines
+            && load_root_current_base_commit(self.store, branch_id, generation)
+                .await?
+                .is_some()
+        {
+            let keys = sorted
+                .iter()
+                .filter(|delta| !delta.untracked)
+                .map(|delta| TrackedStateKeyRef {
+                    schema_key: delta.schema_key,
+                    file_id: delta.file_id,
+                    row_pk: delta.row_pk,
+                })
+                .collect::<Vec<_>>();
+            let mut reader = crate::tracked_state::TrackedStateContext::new().reader(self.store);
+            let before = reader
+                .load_projected_batch_at_commit_refs(
+                    &predecessor_checkpoint_commit_id
+                        .expect("rebase has a previous checkpoint")
+                        .to_string(),
+                    &keys,
+                    &ChangeRecordProjection::identity_only(),
+                )
+                .await?;
+            let checkpoint_commit_id =
+                working_diff_capture_checkpoint_commit_id.expect("rebase has a new checkpoint");
+            let mut slot = 0;
+            for (index, delta) in sorted.iter().enumerate() {
+                if delta.untracked {
+                    continue;
+                }
+                let row = before.row(slot);
+                slot += 1;
+                root_rebase_baselines[index] = Some(match row {
+                    Some(row) => {
+                        if Some(row.change_id()) == delta.change_id {
+                            return Err(head_value_error(
+                                "partial-checkpoint remainder is unchanged at its canonical checkpoint",
+                            ));
+                        }
+                        WorkingDiffBaseline::BeforePresent {
+                            checkpoint_commit_id,
+                            version: WorkingDiffVersion {
+                                change_id: row.change_id(),
+                                commit_id: row.commit_id(),
+                                deleted: row.deleted(),
+                                created_at: row.created_at(),
+                                updated_at: row.updated_at(),
+                                snapshot: WorkingDiffSlotFingerprint::unresolved(),
+                                metadata: WorkingDiffSlotFingerprint::unresolved(),
+                            },
+                        }
+                    }
+                    None if !delta.deleted => WorkingDiffBaseline::BeforeAbsent {
+                        checkpoint_commit_id,
+                    },
+                    None => {
+                        return Err(head_value_error(
+                            "partial-checkpoint remainder deletes a canonically absent row",
+                        ));
+                    }
+                });
+            }
+        }
         let mut next_coverage = *coverage;
         let diff_scope = working_diff_capture_checkpoint_commit_id.map(|checkpoint_commit_id| {
             encode_working_diff_scope_prefix(branch_id, checkpoint_commit_id, generation)
@@ -7673,6 +8174,8 @@ where
                     && !delta.untracked
                 {
                     (WorkingDiffBaseline::Clean, false)
+                } else if let Some(baseline) = root_rebase_baselines[index] {
+                    (baseline, true)
                 } else if rebase_working_diff_baselines && !delta.untracked {
                     let previous = previous
                         .as_ref()
@@ -12632,15 +13135,48 @@ const GENERATION_SCOPED_SPACES: &[StorageSpace] = &[
     ROW_SPACE,
     FILE_SPACE,
     COLLECTION_CONTROL_SPACE,
+    DETERMINISTIC_IDENTITY_WITNESS_SPACE,
     PACKED_CURRENT_BASE_SPACE,
     PACKED_CURRENT_BASE_CONTROL_SPACE,
     PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
     ROOT_CURRENT_BASE_SPACE,
 ];
 
+/// Fixed publication guards for every generation-addressed serving plane.
+pub(crate) fn root_generation_absence_preconditions(
+    branch_id: &str,
+    generation: CommitId,
+    checkpoint: CommitId,
+) -> Result<Vec<crate::storage_adapter::StoragePrecondition>, LixError> {
+    let range = StoragePrefix {
+        bytes: Bytes::from(encode_scope_prefix(branch_id, generation)),
+    }
+    .to_range()?;
+    let mut guards = GENERATION_SCOPED_SPACES
+        .iter()
+        .map(
+            |space| crate::storage_adapter::StoragePrecondition::RangeEmpty {
+                space: *space,
+                range: range.clone(),
+            },
+        )
+        .collect::<Vec<_>>();
+    // Working-diff keys include checkpoint before generation, unlike the
+    // serving planes above. Fence the only epoch the new control may select.
+    guards.push(crate::storage_adapter::StoragePrecondition::RangeEmpty {
+        space: DIFF_SPACE,
+        range: StoragePrefix {
+            bytes: Bytes::from(encode_working_diff_scope_prefix(
+                branch_id, checkpoint, generation,
+            )),
+        }
+        .to_range()?,
+    });
+    Ok(guards)
+}
+
 /// The `(branch_id, generation)` key prefix that scopes every derived serving
-/// plane. Exposed for GC census assertions.
-#[cfg(test)]
+/// plane. Used by bounded root-backed bootstrap/adoption and GC census.
 pub(crate) fn hot_generation_scope_prefix(branch_id: &str, generation: CommitId) -> Vec<u8> {
     encode_scope_prefix(branch_id, generation)
 }
@@ -14251,6 +14787,128 @@ mod tests {
     /// and untracked rows share one serving generation, a tracked collection
     /// replacement would silently delete the branch's history-free rows in the
     /// same schema scope unless they are exempt.
+    #[tokio::test]
+    async fn witness_migration_preserves_replaced_global_collection_with_existing_settings() {
+        let generation = CommitId::for_test_label("witness-replaced-serving");
+        let mut ordered = [
+            CommitId::for_test_label("witness-old"),
+            CommitId::for_test_label("witness-fence"),
+        ];
+        ordered.sort();
+        let [old, fence] = ordered;
+        assert_ne!(generation, fence);
+        let scope = crate::collection_generation::CollectionScopeRef {
+            schema_key: EXACT_CLOSURE_SCHEMA_KEY,
+            file_id: None,
+        };
+        let mut rows = HotRowMap::new();
+        for name in [
+            "lix_deterministic_mode",
+            "lix_deterministic_sequence_number",
+        ] {
+            rows.insert(
+                HeadRowIdentity {
+                    schema_key: EXACT_CLOSURE_SCHEMA_KEY.to_owned(),
+                    row_pk: RowPk::single(name),
+                    file_id: None,
+                },
+                encoded_test_hot_value(generation, true, false),
+            );
+        }
+        rows.insert(
+            HeadRowIdentity {
+                schema_key: EXACT_CLOSURE_SCHEMA_KEY.to_owned(),
+                row_pk: RowPk::single("retired"),
+                file_id: None,
+            },
+            encoded_test_hot_value(old, false, false),
+        );
+        rows.insert(
+            HeadRowIdentity {
+                schema_key: crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+                    .to_owned(),
+                row_pk: RowPk::single(crate::collection_generation::collection_scope_key(scope)),
+                file_id: None,
+            },
+            encoded_test_hot_value(fence, false, false),
+        );
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = storage.new_write_set();
+        stage_complete_collection_controls(&mut writes, crate::GLOBAL_BRANCH_ID, generation, &rows)
+            .unwrap();
+        stage_complete_hot_rows(&mut writes, crate::GLOBAL_BRANCH_ID, generation, rows);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let key = StorageKey(Bytes::from(hot_collection_control_key(
+            crate::GLOBAL_BRANCH_ID,
+            generation,
+            scope,
+        )));
+        let mut remove = storage.new_write_set();
+        remove.delete(DETERMINISTIC_IDENTITY_WITNESS_SPACE, key.clone());
+        storage
+            .commit_write_set(remove, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let control =
+            load_stored_hot_collection_control(&read, crate::GLOBAL_BRANCH_ID, generation, scope)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(control.active_generation, fence);
+        assert_eq!(
+            control.live_count, 2,
+            "retired physical member must not enter the closure"
+        );
+        let mut migration = storage.new_write_set();
+        let preconditions = stage_deterministic_identity_witness_migration(
+            &read,
+            &mut migration,
+            generation,
+            1,
+            100,
+            1024 * 1024,
+        )
+        .await
+        .unwrap();
+        drop(read);
+        storage
+            .commit_write_set(
+                migration,
+                StorageWriteOptions {
+                    preconditions,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let witness = PointReadPlan::new(DETERMINISTIC_IDENTITY_WITNESS_SPACE, &[key])
+            .materialize(&read, StorageGetOptions::default())
+            .await
+            .unwrap()
+            .value;
+        let Some(Some(StorageProjectedValue::FullValue(bytes))) = witness.first() else {
+            panic!("migration must produce witness");
+        };
+        let witness: DeterministicIdentityWitness =
+            storage_codec::decode("witness", bytes).unwrap();
+        assert_eq!(witness.presence, 3);
+        assert_eq!(
+            witness.collection_control,
+            storage_codec::encode("control", &control).unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn collection_generation_fence_retires_stale_tracked_rows_but_not_untracked_rows() {
         const BRANCH_ID: &str = "fence-branch";

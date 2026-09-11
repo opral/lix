@@ -1,9 +1,19 @@
 mod context;
 mod derived;
+mod read_interests;
+mod read_interests_codec;
 mod reader;
+#[allow(unused_imports)]
+pub(crate) use read_interests::{
+    DiffInterestEndpoint, FilePathInterest, FilePathInterestComparison, InterestDomain,
+    LogicalReadInterest, ReadInterestOperation, ReadInterestPublication, ReadInterestRegistry,
+    ReadInterestSnapshot,
+};
 mod row_columnar_cache;
 mod row_decoded_column_cache;
 mod tracked_head;
+#[cfg(test)]
+pub(crate) use tracked_head::root_exact_profile;
 pub(crate) mod typed_slots;
 #[cfg(test)]
 pub(crate) use tracked_head::{head_decode_row_pk_probe, hot_decode_row_pk_probe};
@@ -33,7 +43,6 @@ pub(crate) use tracked_head::TrackedHeadDeltaRef;
 pub(crate) use tracked_head::WORKING_DIFF_PATH_HITS;
 #[cfg(test)]
 pub(crate) use tracked_head::encode_hot_row_key_for_test;
-#[cfg(test)]
 pub(crate) use tracked_head::hot_generation_scope_prefix;
 pub(crate) use tracked_head::stage_retire_hot_generation;
 pub(crate) use tracked_head::{
@@ -60,12 +69,13 @@ pub(crate) use tracked_head::{
     CERTIFIED_ROW_BATCH_MANIFEST_SPACE, CERTIFIED_ROW_BATCH_PAGE_SPACE, CERTIFIED_ROW_BATCH_SPACE,
     COLLECTION_CONTROL_SPACE, CertifiedCurrentStatePredecessor,
     CertifiedCurrentStatePredecessorRef, CertifiedRowBatchFileRef, ColumnarBaseCoordinate,
-    CompleteWorkingDiffMode, CurrentStateDeltaRef, DIFF_SPACE, FILE_SPACE, HotIndexEntry,
-    HotIndexValue, HotTrackedSnapshot, INDEX_SPACE, PACKED_CURRENT_BASE_CONTROL_SPACE,
-    PACKED_CURRENT_BASE_SPACE, PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
-    PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE, ROW_SPACE, RowColumnarOverlayRow,
-    TRACKED_WORKING_DIFF_MARKER_SPACE, TrackedHeadContext, TrackedWorkingDiff,
-    TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage, stage_certified_row_batches,
+    CompleteWorkingDiffMode, CurrentStateDeltaRef, DETERMINISTIC_IDENTITY_WITNESS_SPACE,
+    DIFF_SPACE, FILE_SPACE, HotIndexEntry, HotIndexValue, HotTrackedSnapshot, INDEX_SPACE,
+    PACKED_CURRENT_BASE_CONTROL_SPACE, PACKED_CURRENT_BASE_SPACE,
+    PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE,
+    ROW_SPACE, RowColumnarOverlayRow, TRACKED_WORKING_DIFF_MARKER_SPACE, TrackedHeadContext,
+    TrackedWorkingDiff, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
+    stage_certified_row_batches, stage_deterministic_identity_witness_migration,
     stage_hot_index_entries, stage_tracked_working_diff_epoch,
 };
 #[allow(unused_imports)]
@@ -86,3 +96,10 @@ pub(crate) use visibility::{
 pub(crate) use visibility::{blob_ref_probe_stats, reset_blob_ref_probe_stats};
 
 pub(crate) use types::materialized_hot_state_row_with_snapshot_projection;
+
+mod partial_scope_policy;
+use partial_scope_policy::PartialReadScopePolicy;
+
+pub(crate) use tracked_head::root_generation_absence_preconditions;
+
+pub(crate) use tracked_head::stage_root_working_diff_epoch;

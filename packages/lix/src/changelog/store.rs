@@ -264,6 +264,9 @@ mod tests {
             ("commit_graph/walker.rs .put(", 4),
             ("tracked_state/context.rs .put(", 1),
             ("tracked_state/storage.rs .put(", 1),
+            // Test-only synthetic local jump frontier; deliberately no state or
+            // checkpoint inventory is created or certified by this fixture.
+            ("sync/partial_upload.rs .put(", 1),
         ]
         .into_iter()
         .map(|(site, count)| (site.to_string(), count))

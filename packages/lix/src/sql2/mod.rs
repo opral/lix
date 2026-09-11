@@ -122,3 +122,7 @@ pub(crate) use plan::read::statement::{
     StatementReadPlan, is_acknowledgeable_file_content_read,
     late_materialized_lix_file_content_read, plan_read_statement,
 };
+
+pub(crate) use providers::{prepare_native_diff_interest, prepare_native_file_content_interest};
+
+pub(crate) use plan::prepare::validate_sql_preparation;

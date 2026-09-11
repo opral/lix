@@ -41,7 +41,7 @@ use crate::telemetry::{
     TelemetrySink, instrument_value,
 };
 use crate::tracked_state::TrackedStateContext;
-use crate::transaction::{Transaction, open_transaction};
+use crate::transaction::{Transaction, open_transaction_with_account_scope};
 
 use super::transaction::{SessionOperationGuard, SessionTransactionManager, SessionWriteLease};
 use crate::transaction::CommitCoordinator;
@@ -171,6 +171,7 @@ pub struct SessionContext<StorageImpl: Storage + 'static = Memory> {
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) branch_ctx: Arc<BranchContext>,
     pub(super) catalog_context: Arc<CatalogContext>,
+    pub(super) account_insertion: Option<Arc<crate::account::AccountInsertion>>,
     pub(super) sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     pub(super) deterministic_runtime_gate: Arc<tokio::sync::Mutex<()>>,
     pub(super) collaboration_write_gate: Arc<tokio::sync::Mutex<()>>,
@@ -263,6 +264,7 @@ where
             binary_cas,
             branch_ctx,
             catalog_context,
+            account_insertion: None,
             sql_planning_cache,
             deterministic_runtime_gate,
             collaboration_write_gate,
@@ -277,6 +279,14 @@ where
             telemetry,
             transaction_manager,
         }
+    }
+
+    pub(crate) fn with_account_insertion(
+        mut self,
+        operation: crate::account::AccountInsertion,
+    ) -> Self {
+        self.account_insertion = Some(Arc::new(operation));
+        self
     }
 
     /// Retains the caller's acknowledged plugin-file bases in a fresh
@@ -344,9 +354,14 @@ where
     pub(crate) async fn begin_waitable_session_operation(
         &self,
     ) -> Result<SessionOperationGuard, LixError> {
-        self.transaction_manager
+        let mut guard = self
+            .transaction_manager
             .begin_waitable_session_operation()
-            .await
+            .await?;
+        guard.read_interest_operation = self.hot_state.begin_read_interest_operation().await;
+        self.sync_mode.ensure_partial_admission_healthy()?;
+        self.ensure_open()?;
+        Ok(guard)
     }
 
     pub(super) async fn begin_session_write_lease(&self) -> Result<SessionWriteLease, LixError> {
@@ -380,6 +395,10 @@ where
         write_lease: SessionWriteLease,
         serialize_collaboration_write: bool,
     ) -> Result<SessionWriteAccess, LixError> {
+        // Acquire before the collaboration gate: publication uses the same
+        // interest-then-collaboration order, including expired-read retries.
+        let read_interest_operation = self.hot_state.begin_read_interest_operation().await;
+        self.sync_mode.ensure_partial_admission_healthy()?;
         let collaboration_write_guard = if serialize_collaboration_write {
             let span = self.telemetry.as_ref().and_then(|sink| {
                 ActiveTelemetrySpan::start_if_enabled(
@@ -403,10 +422,23 @@ where
         };
         let write_access = SessionWriteAccess {
             _write_lease: write_lease,
+            _read_interest_operation: read_interest_operation,
             collaboration_write_guard,
         };
         self.ensure_open()?;
         Ok(write_access)
+    }
+
+    /// Flush only after this operation's storage snapshot has been released.
+    /// Explicit transactions defer this until commit/rollback completion.
+    pub(super) async fn flush_partial_read_interests(&self) -> Result<(), LixError> {
+        if let (Some(state), Some(registry)) = (
+            self.sync_mode.partial_admission(),
+            self.sync_mode.read_interests(),
+        ) {
+            crate::sync::flush_partial_read_interests(&self.storage, &state, &registry).await?;
+        }
+        Ok(())
     }
 
     /// In-memory branch this session was bound with. Does not read storage.
@@ -495,7 +527,7 @@ where
         // functions; that coherent opening snapshot remains the source of
         // truth for the mode.
         let _deterministic_runtime_guard = self.lock_deterministic_runtime().await;
-        let opened = Box::pin(open_transaction(
+        let opened = Box::pin(open_transaction_with_account_scope(
             &self.branch,
             self.active_account_id.to_string(),
             self.storage.clone(),
@@ -507,6 +539,7 @@ where
             Arc::clone(&self.catalog_context),
             Arc::clone(&self.sql_planning_cache),
             self.file_views.clone(),
+            self.account_insertion.clone(),
         ))
         .instrument(tracing::debug_span!(
             target: "lix_perf",
@@ -516,10 +549,15 @@ where
         self.ensure_open()?;
         let mut transaction = opened.transaction;
         let sync_role = self.sync_mode.role();
-        let replica_remote_id = (sync_role == crate::sync::SyncRole::Replica)
+        let replica_remote_id = sync_role
+            .is_replica()
             .then(|| self.sync_mode.replica_remote_id())
             .flatten();
-        transaction.set_sync_mode(sync_role, replica_remote_id);
+        transaction.set_sync_mode(
+            sync_role,
+            replica_remote_id,
+            self.sync_mode.partial_admission(),
+        );
         transaction.attach_commit_boundary(self.transaction_commit_boundary());
         if planner_validation_is_serialized {
             transaction.trust_serialized_filesystem_planner();
@@ -548,13 +586,22 @@ where
                     self.schedule_checkpoint_gc_after_commit(checkpoint_sequence)
                         .await;
                 }
-                if self.branch.get()?.as_str() != GLOBAL_BRANCH_ID {
+                if self
+                    .branch
+                    .get()
+                    .map_err(non_retryable_after_commit)?
+                    .as_str()
+                    != GLOBAL_BRANCH_ID
+                {
                     self.base_refresh_generation.store(
                         self.observe_invalidation.generation(),
                         std::sync::atomic::Ordering::SeqCst,
                     );
                 }
-                after_commit_result?;
+                after_commit_result.map_err(non_retryable_after_commit)?;
+                self.flush_partial_read_interests()
+                    .await
+                    .map_err(non_retryable_after_commit)?;
                 Ok(value)
             }
             Err(error) => Err(error),
@@ -607,6 +654,7 @@ where
 
 pub(super) struct SessionWriteAccess {
     _write_lease: SessionWriteLease,
+    _read_interest_operation: Option<crate::hot_state::ReadInterestOperation>,
     collaboration_write_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
@@ -723,6 +771,10 @@ where
     }
 
     #[expect(trivial_casts)]
+    fn read_interest_registry(&self) -> Option<Arc<crate::hot_state::ReadInterestRegistry>> {
+        self.hot_state.read_interest_registry()
+    }
+
     fn hot_state(&self) -> Arc<dyn HotStateReader> {
         Arc::new(self.hot_state.reader(self.read_store.clone())) as Arc<dyn HotStateReader>
     }
@@ -788,6 +840,37 @@ where
     }
 }
 
+/// Marks operation completion failures after durable mutation. Preserve the
+/// original diagnostics for reporting, but never replay the operation for them.
+pub(super) fn non_retryable_after_commit(mut error: LixError) -> LixError {
+    let details = error.details.take();
+    let mut details = match details {
+        Some(serde_json::Value::Object(object)) => object,
+        Some(value) => serde_json::Map::from_iter([("originalDetails".to_owned(), value)]),
+        None => serde_json::Map::new(),
+    };
+    details.insert(
+        "nonRetryableAfterCommit".into(),
+        serde_json::Value::Bool(true),
+    );
+    error.with_details(serde_json::Value::Object(details))
+}
+
+/// Completed SQL must not be replayed because its later local journal flush failed.
+pub(super) fn non_retryable_after_execution(mut error: LixError) -> LixError {
+    let details = error.details.take();
+    let mut details = match details {
+        Some(serde_json::Value::Object(object)) => object,
+        Some(value) => serde_json::Map::from_iter([("originalDetails".to_owned(), value)]),
+        None => serde_json::Map::new(),
+    };
+    details.insert(
+        "nonRetryableAfterExecution".into(),
+        serde_json::Value::Bool(true),
+    );
+    error.with_details(serde_json::Value::Object(details))
+}
+
 #[cfg(test)]
 mod tests {
     use std::future::Future;
@@ -847,6 +930,58 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn committed_callback_demand_is_not_replayed() {
+        use crate::transaction_types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
+        let session = open_session().await;
+        let access = session.begin_session_write_access().await.unwrap();
+        let original =
+            crate::tracked_state::NativeObjectRef::TrackedStateTreeChunk([7; 32]).annotate_missing(
+                crate::LixError::new("typed-demand", "post-commit callback needs input"),
+            );
+        let callback_error = original.clone();
+        let error = session.with_write_transaction_reserved_lending(access, async |transaction| {
+            transaction.stage_engine_test_rows(RawWriteBatch::from_test_rows(vec![TransactionWriteRow {
+                row_pk: Some(crate::row_pk::RowPk::single("committed-once")), schema_key: "lix_key_value".into(), file_id: None,
+                snapshot: Some(TransactionJson::from_value_for_test(serde_json::json!({"key":"committed-once", "value":"persisted"}))),
+                metadata: None, origin: None, created_at: None, updated_at: None, global: true, change_id: None, commit_id: None, untracked: false, branch_id: crate::GLOBAL_BRANCH_ID.into(),
+            }])).await?;
+            Ok(())
+        }, |_| Err(callback_error)).await.unwrap_err();
+        assert_eq!(error.code, original.code);
+        assert_eq!(error.message, original.message);
+        assert_eq!(
+            error.details.as_ref().unwrap()["missingNativeObject"],
+            original.details.as_ref().unwrap()["missingNativeObject"]
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let mut retry = crate::sync::SyncDemandRetry::default();
+        let rejected = tokio::time::timeout(
+            Duration::from_secs(1),
+            retry.hydrate_for_retry(Some(&sender), error),
+        )
+        .await
+        .expect("postcommit errors must not wait for hydration")
+        .unwrap_err();
+        assert_eq!(rejected.code, original.code);
+        assert!(
+            receiver.try_recv().is_err(),
+            "no demand may cause the committed operation to replay"
+        );
+        let rows = session
+            .execute(
+                "SELECT key FROM lix_key_value WHERE key = 'committed-once'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the callback failure must not undo the durable mutation"
+        );
+    }
+
     async fn open_session() -> std::sync::Arc<super::SessionContext<Memory>> {
         let storage = Memory::default();
         let _receipt = Engine::initialize(storage.clone())
@@ -856,6 +991,161 @@ mod tests {
             .await
             .expect("initialized storage should create engine");
         std::sync::Arc::new(engine.open_session().await.expect("session should open"))
+    }
+
+    async fn session_with_read_interests() -> (
+        std::sync::Arc<super::SessionContext<Memory>>,
+        std::sync::Arc<crate::hot_state::ReadInterestRegistry>,
+    ) {
+        let mut session = open_session().await;
+        let registry = crate::hot_state::ReadInterestRegistry::new(256, 1024 * 1024);
+        let inner = std::sync::Arc::get_mut(&mut session).unwrap();
+        inner.hot_state = std::sync::Arc::new(
+            inner
+                .hot_state
+                .with_read_interest_registry(registry.clone()),
+        );
+        (session, registry)
+    }
+
+    #[tokio::test]
+    async fn independent_session_operations_do_not_join_an_older_publication_lease() {
+        let (session, registry) = session_with_read_interests().await;
+        let first = session.begin_waitable_session_operation().await.unwrap();
+        let revision = registry.snapshot().unwrap().revision;
+        let mut publication = Box::pin(registry.begin_publication(revision));
+        assert!(futures_util::poll!(publication.as_mut()).is_pending());
+        let mut second = Box::pin(session.begin_waitable_session_operation());
+        assert!(futures_util::poll!(second.as_mut()).is_pending());
+        drop(first);
+        let publishing = tokio::time::timeout(TEST_WAIT_TIMEOUT, publication)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(futures_util::poll!(second.as_mut()).is_pending());
+        drop(publishing);
+        drop(
+            tokio::time::timeout(TEST_WAIT_TIMEOUT, second)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_reads_and_explicit_transaction_keep_lexical_interest_admission() {
+        let (session, registry) = session_with_read_interests().await;
+        let sql = "SELECT key FROM lix_key_value WHERE key = 'retained-negative'";
+        session.execute(sql, &[]).await.unwrap();
+        let snapshot = registry.snapshot().unwrap();
+        assert!(!snapshot.interests.is_empty());
+        // Cached providers must not retain the completed statement's lease.
+        let publishing = tokio::time::timeout(
+            TEST_WAIT_TIMEOUT,
+            registry.begin_publication(snapshot.revision),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut warm = Box::pin(session.execute_for_observe(sql, &[]));
+        assert!(futures_util::poll!(warm.as_mut()).is_pending());
+        drop(publishing);
+        assert_eq!(
+            tokio::time::timeout(TEST_WAIT_TIMEOUT, warm)
+                .await
+                .unwrap()
+                .unwrap()
+                .len(),
+            0
+        );
+        let transaction = session.begin_transaction().await.unwrap();
+        let mut publication =
+            Box::pin(registry.begin_publication(registry.snapshot().unwrap().revision));
+        assert!(futures_util::poll!(publication.as_mut()).is_pending());
+        transaction.rollback().await.unwrap();
+        drop(
+            tokio::time::timeout(TEST_WAIT_TIMEOUT, publication)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn negative_diff_keeps_dynamic_endpoint_recipe_across_warm_plans() {
+        use crate::hot_state::{DiffInterestEndpoint, LogicalReadInterest};
+        let (session, registry) = session_with_read_interests().await;
+        let sql = "SELECT diff_type FROM lix_diff('lix_key_value') WHERE key = 'negative-diff-interest' LIMIT 1";
+        for _ in 0..2 {
+            assert_eq!(session.execute(sql, &[]).await.unwrap().len(), 0);
+        }
+        let snapshot = registry.snapshot().unwrap();
+        let diffs = snapshot
+            .interests
+            .iter()
+            .filter_map(|interest| match interest.as_ref() {
+                LogicalReadInterest::Diff {
+                    from,
+                    to,
+                    filter,
+                    projected_columns,
+                    ..
+                } => Some((from, to, filter, projected_columns)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            diffs.len(),
+            1,
+            "warm plans deduplicate the same native recipe"
+        );
+        let (from, to, filter, columns) = diffs[0];
+        assert_eq!(*from, DiffInterestEndpoint::WorkingCheckpoint);
+        assert_eq!(*to, DiffInterestEndpoint::ActiveHead);
+        assert_eq!(
+            filter.row_pks,
+            vec![crate::row_pk::RowPk::single("negative-diff-interest")]
+        );
+        assert!(columns.iter().any(|column| column == "diff_type"));
+    }
+
+    #[tokio::test]
+    async fn file_content_ranges_and_negative_paths_are_retained_before_loading() {
+        use crate::hot_state::{FilePathInterest, LogicalReadInterest};
+        let (session, registry) = session_with_read_interests().await;
+        session
+            .execute(
+                "INSERT INTO lix_file (path,content) VALUES ('/interest.bin',$1)",
+                &[crate::Value::Blob(vec![41u8; 128 * 1024].into())],
+            )
+            .await
+            .unwrap();
+        assert!(
+            session
+                .read_file_content("/interest.bin".into(), Some(8..20))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            session
+                .execute(
+                    "SELECT content FROM lix_file WHERE path='/future-interest.bin'",
+                    &[]
+                )
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        let snapshot = registry.snapshot().unwrap();
+        assert!(snapshot.interests.iter().any(|recipe| matches!(recipe.as_ref(),
+            LogicalReadInterest::FileContent { byte_range:Some((8,20)), path_predicate:FilePathInterest::In {values}, .. }
+                if values == &vec!["/interest.bin".to_string()])));
+        assert!(snapshot.interests.iter().any(|recipe| matches!(recipe.as_ref(),
+            LogicalReadInterest::FileContent { byte_range:None, path_predicate:FilePathInterest::Comparison {
+                operation: crate::hot_state::FilePathInterestComparison::Equal, value }, .. }
+                if value == "/future-interest.bin")), "captured recipes: {:?}", snapshot.interests);
     }
 
     async fn open_blocking_read_session() -> (

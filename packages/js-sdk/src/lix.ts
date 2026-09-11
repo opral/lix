@@ -120,6 +120,15 @@ export class Lix {
 		);
 	}
 
+	/** Hydrates supported SQL dependencies without publishing prospective writes.
+	 * Inputs changed after preparation may require further hydration. */
+	async prepare(sql: string, params: SqlParam[] = []): Promise<void> {
+		assertExecuteArgs("lix", sql, params, undefined);
+		return this.#runOperation(() => this.binding.prepare(sql,
+			params.map((param, index) => toNativeValue(normalizeParam(param, index))),
+		));
+	}
+
 	execute(
 		sql: string,
 		params: SqlParam[] | undefined,
@@ -234,6 +243,19 @@ export class Lix {
 	async recoverReplica(id: string): Promise<ReplicaRecoveryReceipt> {
 		return this.#runOperation(() => this.binding.recoverReplica(id));
 	}
+
+	/** Explicitly hydrates retained-source recovery dependencies; does not start sync. */
+    async recoverReplicaWithServer(id: string, server: import("./types.js").LixServerOptions): Promise<ReplicaRecoveryReceipt> {
+        const entries = (headers: HeadersInit | undefined): [string,string][] => {
+            const result: [string,string][] = []; new Headers(headers).forEach((value,key) => result.push([key,value])); return result;
+        };
+        return this.#runOperation(() => this.binding.recoverReplicaWithServer(id, {
+            url: new URL(server.url).toString(),
+            headers: typeof server.headers === "function" ? [] : entries(server.headers),
+            headerProvider: typeof server.headers === "function" ? async () => entries(await (server.headers as () => Promise<HeadersInit>)()) : undefined,
+            fetch: server.fetch as typeof fetch | undefined,
+        }));
+    }
 
 	async activeBranchId(): Promise<string> {
 		return this.#runOperation(() => this.binding.activeBranchId());

@@ -37,6 +37,12 @@ pub(crate) enum EpochBank {
 }
 
 impl EpochBank {
+    /// Physical address for a catalog-declared logical space. Migration uses
+    /// this to express atomic freshness predicates without duplicating routing.
+    pub(crate) fn map_space(self, space: StorageSpace) -> StorageSpace {
+        EpochRouting::unfenced(self).map_space(space)
+    }
+
     const fn prefix(self) -> u32 {
         match self {
             Self::Legacy => 0,

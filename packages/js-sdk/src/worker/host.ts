@@ -1,5 +1,7 @@
 import {
 	openLixBinding,
+	convertReplicaBinding,
+	retryReplicaMigrationCleanupBinding,
 	createHostedBinding,
 	deleteHostedBinding,
 } from "#binding";
@@ -239,6 +241,12 @@ export function startWorkerHost(
 		telemetryParent: WorkerRequest["telemetryParent"],
 	): Promise<unknown> {
 		switch (operation.kind) {
+            case "replica.cleanup":
+                if (sessions.size>0) throw workerStateError("Migration cleanup requires closed storage");
+                return retryReplicaMigrationCleanupBinding(operation.storage,createSyncServerBridge(operation.server)!);
+            case "replica.convert":
+                if (sessions.size>0) throw workerStateError("Conversion requires closed storage");
+                return convertReplicaBinding(operation.storage,createSyncServerBridge(operation.server)!,operation.branchId);
 			case "hosted.create":
 				return createHostedBinding(operation.server);
 			case "hosted.delete":
@@ -291,6 +299,8 @@ export function startWorkerHost(
 				sessions.set(openedSessionId, opened);
 				return openedSessionId;
 			}
+			case "prepare":
+				return requiredLix(sessionId).prepare(operation.sql, operation.params);
 			case "execute":
 				return requiredLix(sessionId).execute(
 					operation.sql,
@@ -331,7 +341,9 @@ export function startWorkerHost(
 			case "exportReplicaRecovery":
 				return requiredLix(sessionId).exportReplicaRecovery(operation.id);
 			case "recoverReplica":
-				return requiredLix(sessionId).recoverReplica(operation.id);
+                return requiredLix(sessionId).recoverReplica(operation.id);
+            case "recoverReplicaWithServer":
+                return requiredLix(sessionId).recoverReplicaWithServer(operation.id, createSyncServerBridge(operation.server, operation.transportScope)!);
 			case "activeBranchId":
 				return requiredLix(sessionId).activeBranchId();
 			case "activeAccountId":
@@ -439,7 +451,7 @@ export function startWorkerHost(
 		await input.writer.close();
 	}
 
-	function createSyncServerBridge(server: WorkerSyncServerOptions | undefined):
+	function createSyncServerBridge(server: WorkerSyncServerOptions | undefined, transportScope?: number):
 		| {
 				url: string;
 				headers: [string, string][];
@@ -456,17 +468,18 @@ export function startWorkerHost(
 						const requestId = nextSyncRequestId++;
 						return new Promise((resolve, reject) => {
 							pendingSyncHeaders.set(requestId, { resolve, reject });
-							endpoint.postMessage({ kind: "sync.headers", requestId });
+							endpoint.postMessage({ kind: "sync.headers", requestId, transportScope });
 						});
 					}
 				: undefined,
-			fetch: server.customFetch ? bridgeFetch : undefined,
+			fetch: server.customFetch ? (input, init) => bridgeFetch(input, init, transportScope) : undefined,
 		};
 	}
 
 	async function bridgeFetch(
 		input: RequestInfo | URL,
 		init?: RequestInit,
+        transportScope?: number,
 	): Promise<Response> {
 		const extension = init as
 			| (RequestInit & {
@@ -506,7 +519,7 @@ export function startWorkerHost(
 				};
 		const response = new Promise<WorkerSyncFetchResponse>((resolve, reject) => {
 			pendingSyncFetch.set(requestId, { resolve, reject });
-			endpoint.postMessage({ kind: "sync.fetch", requestId, request });
+			endpoint.postMessage({ kind: "sync.fetch", requestId, request, transportScope });
 		});
 		const abort = () => {
 			const pending = pendingSyncFetch.get(requestId);

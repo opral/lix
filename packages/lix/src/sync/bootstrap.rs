@@ -225,44 +225,46 @@ where
     }
 }
 
-pub(crate) async fn rebuild_replica_candidate<S>(
+pub(crate) fn rebuild_replica_candidate<'a, S>(
     target: StorageAdapter<S>,
-    server: &crate::ServerOptions,
-    expected_repository_id: &str,
-    expected_account_id: &str,
-) -> Result<(), LixError>
+    server: &'a crate::ServerOptions,
+    expected_repository_id: &'a str,
+    expected_account_id: &'a str,
+) -> super::SyncTransportFuture<'a, ()>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let mut prepared = prepare_sync_bootstrap(server).await?;
-    let result = async {
-        if prepared.lix_id != expected_repository_id {
-            return Err(super::sync_repository_id_mismatch(
-                expected_repository_id,
-                &prepared.lix_id,
-            ));
+    Box::pin(async move {
+        let mut prepared = prepare_sync_bootstrap(server).await?;
+        let result = async {
+            if prepared.lix_id != expected_repository_id {
+                return Err(super::sync_repository_id_mismatch(
+                    expected_repository_id,
+                    &prepared.lix_id,
+                ));
+            }
+            if prepared.transport.active_account_id() != expected_account_id {
+                return Err(LixError::new(
+                    "LIX_SYNC_ACCOUNT_MISMATCH",
+                    "Sign in with the account that owns this local replica before upgrading.",
+                )
+                .with_details(serde_json::json!({ "reason": "account_mismatch" })));
+            }
+            let mut candidate =
+                crate::handle::new_replica_migration_candidate(target, &prepared.default_branch_id)
+                    .await?;
+            let installed =
+                install_prepared_sync_bootstrap(&mut candidate, server, &mut prepared).await;
+            let closed = candidate.close().await;
+            installed?;
+            closed?;
+            Ok(())
         }
-        if prepared.transport.active_account_id() != expected_account_id {
-            return Err(LixError::new(
-                "LIX_SYNC_ACCOUNT_MISMATCH",
-                "Sign in with the account that owns this local replica before upgrading.",
-            )
-            .with_details(serde_json::json!({ "reason": "account_mismatch" })));
-        }
-        let mut candidate =
-            crate::handle::new_replica_migration_candidate(target, &prepared.default_branch_id)
-                .await?;
-        let installed =
-            install_prepared_sync_bootstrap(&mut candidate, server, &mut prepared).await;
-        let closed = candidate.close().await;
-        installed?;
-        closed?;
-        Ok(())
-    }
-    .await;
-    // No runtime takes ownership of this temporary bootstrap session.
-    let _ = prepared.transport.close_session().await;
-    result
+        .await;
+        // No runtime takes ownership of this temporary bootstrap session.
+        let _ = prepared.transport.close_session().await;
+        result
+    })
 }
 
 async fn reconcile_install_error<StorageImpl>(
@@ -332,6 +334,13 @@ mod tests {
             &self,
         ) -> Result<crate::storage::StorageSessionToken, StorageError> {
             self.inner.acquire_session().await
+        }
+
+        async fn acquire_partial_replica_owner(
+            &self,
+            token: crate::storage::StorageSessionToken,
+        ) -> Result<crate::storage::StorageOwnerLease, StorageError> {
+            self.inner.acquire_partial_replica_owner(token).await
         }
 
         async fn begin_read(

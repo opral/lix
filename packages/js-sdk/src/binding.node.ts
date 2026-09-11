@@ -14,6 +14,8 @@ import type {
 import { restoreSnapshot } from "./snapshot-restore.js";
 
 type NativeAddon = {
+ retryFilesystemReplicaMigrationCleanup(path:string,syncAllFiles:boolean,url:string,headers:[string,string][]):Promise<number>;
+ convertFilesystemReplicaToPartial(path:string,syncAllFiles:boolean,url:string,headers:[string,string][],branchId?:string):Promise<void>;
 	createHosted(
 		url: string,
 		headers: [string, string][],
@@ -59,7 +61,8 @@ type NativeObserveEventsBinding = Omit<
 	setTelemetryParent(parentJson?: string): void;
 };
 
-type NativeLixBinding = Omit<LixBinding, "observe" | "setTelemetryParent"> & {
+type NativeLixBinding = Omit<LixBinding, "observe" | "setTelemetryParent" | "recoverReplicaWithServer"> & {
+ recoverReplicaWithServer(id:string,url:string,headers:[string,string][]):Promise<import("./types.js").ReplicaRecoveryReceipt>;
 	setTelemetryParent(parentJson?: string): void;
 	observe(
 		sql: Parameters<LixBinding["observe"]>[0],
@@ -93,7 +96,14 @@ function normalizeNativeBinding(binding: NativeLixBinding): LixBinding {
 						parent === undefined ? undefined : JSON.stringify(parent),
 					);
 			}
-			if (property === "observe") {
+			if (property === "recoverReplicaWithServer") {
+                return async (id: string, server: import("./binding-types.js").SyncServerBindingOptions) => {
+                    if(server.fetch) throw new Error("Custom fetch is unsupported for native recovery");
+                    const headers = server.headerProvider ? await server.headerProvider() : server.headers;
+                    return target.recoverReplicaWithServer(id, server.url, headers);
+                };
+            }
+            if (property === "observe") {
 				return async (
 					sql: Parameters<LixBinding["observe"]>[0],
 					params: Parameters<LixBinding["observe"]>[1],
@@ -102,7 +112,7 @@ function normalizeNativeBinding(binding: NativeLixBinding): LixBinding {
 			const value = Reflect.get(target, property, receiver) as unknown;
 			return typeof value === "function" ? value.bind(target) : value;
 		},
-	}) as LixBinding;
+	}) as unknown as LixBinding;
 }
 
 const require = createRequire(import.meta.url);
@@ -323,4 +333,18 @@ export async function deleteHostedBinding(
 	server: import("./binding-types.js").HostedServerBindingOptions,
 ) {
 	await loadAddon().deleteHosted(server.url, server.headers);
+}
+
+export async function convertReplicaBinding(storage:LixStorageConfig,server:SyncServerBindingOptions,branchId?:string):Promise<void> {
+ if(storage.kind!=="filesystem")throw new TypeError("Node conversion requires FilesystemStorage");
+ if(server.fetch)throw new TypeError("Custom sync fetch is only supported in browsers");
+ const headers=server.headerProvider ? await server.headerProvider() : server.headers;
+ await loadAddon().convertFilesystemReplicaToPartial(storage.path,storage.syncAllFiles,server.url,headers,branchId);
+}
+
+export async function retryReplicaMigrationCleanupBinding(storage:LixStorageConfig,server:SyncServerBindingOptions):Promise<number> {
+ if(storage.kind!=="filesystem")throw new TypeError("Node migration cleanup requires FilesystemStorage");
+ if(server.fetch)throw new TypeError("Custom sync fetch is only supported in browsers");
+ const headers=server.headerProvider ? await server.headerProvider() : server.headers;
+ return loadAddon().retryFilesystemReplicaMigrationCleanup(storage.path,storage.syncAllFiles,server.url,headers);
 }

@@ -476,10 +476,9 @@ where
         .collect();
 
     let parent_commit_id = match manifest.snapshot_root.as_ref() {
-        Some(root) if !root.complete_state_fence => root
-            .parent_roots
-            .first()
-            .map(|parent| parent.commit_id),
+        Some(root) if !root.complete_state_fence => {
+            root.parent_roots.first().map(|parent| parent.commit_id)
+        }
         Some(_) => None,
         None => commit.as_ref().and_then(first_parent_commit_id),
     };

@@ -196,7 +196,7 @@ The response is a backpressured `application/vnd.lix.snapshot` stream with
 authenticated host principal even when selected files from the Lix are public.
 `lix.exportSnapshot()` on a remote or connected replica handle streams this
 authoritative snapshot. It includes the server's untracked rows, not any
-replica-local untracked rows. An offline sparse replica cannot export a complete
+replica-local untracked rows. An offline partial replica cannot export a complete
 snapshot; reconnect it to the authority first.
 
 Create a new hosted repository from a snapshot with `POST /lix/v1`, using

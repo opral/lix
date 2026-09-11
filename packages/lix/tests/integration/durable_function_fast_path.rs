@@ -53,9 +53,7 @@ impl Storage for CountingStorage {
     where
         Self: 'a;
 
-    async fn acquire_session(
-        &self,
-    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+    async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
         self.inner.acquire_session().await
     }
 
@@ -144,10 +142,18 @@ async fn pure_read_skips_durable_function_state_storage_work() {
          pure={pure_reads:?}, durable={durable_reads:?}"
     );
     assert_eq!(
-        durable_reads.scan_calls,
-        pure_reads.scan_calls + 1,
-        "a missing engine-owned durable key must validate its exact collection closure once, \
-         while a pure read must not scan durable state: \
+        pure_reads.scan_calls, 0,
+        "pure reads must not scan durable state"
+    );
+    assert_eq!(
+        durable_reads.get_many_calls - pure_reads.get_many_calls,
+        7,
+        "durable setup has a constant seven point batches including its setting witness"
+    );
+    assert_eq!(
+        durable_reads.scan_calls, 0,
+        "a missing engine-owned durable key must use its bounded native presence proof, \
+         without scanning the global collection: \
          pure={pure_reads:?}, durable={durable_reads:?}"
     );
 }

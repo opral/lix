@@ -278,6 +278,7 @@ pub const SNAPSHOT_MEDIA_TYPE: &str = "application/vnd.lix.snapshot";
 enum RequestBodyPolicy {
     None,
     Json,
+    NativeObjects,
     Binary,
     Chunk,
 }
@@ -309,6 +310,20 @@ protocol_routes! {
    Execute => ("POST", "/execute", Json),
    ExecuteBatch => ("POST", "/execute-batch", Json),
    SyncPush => ("POST", "/sync/push", Json),
+   SyncRetainedBodies => ("POST", "/sync/retained-bodies", Json),
+   SyncPartialMergeRestart => ("POST", "/sync/merge/restart", NativeObjects),
+   SyncPartialMerge => ("POST", "/sync/merge", NativeObjects),
+   SyncNativeGlobalMigrationRestart => ("POST", "/sync/migration/global/restart", Json),
+   SyncNativeGlobalMigrationCleanup => ("POST", "/sync/migration/global/cleanup", Json),
+   SyncNativeGlobalMigrationMerge => ("POST", "/sync/migration/global/merge", Json),
+   SyncNativeGlobalMigrationBodies => ("POST", "/sync/migration/global/bodies", Json),
+   SyncNativeMigrationMerge => ("POST", "/sync/migration/merge", NativeObjects),
+   SyncNativeMigrationCleanup => ("POST", "/sync/migration/cleanup", NativeObjects),
+   SyncNativeMetadata => ("POST", "/sync/native-metadata", NativeObjects),
+   SyncNativeObjectRange => ("POST", "/sync/native-object-range", NativeObjects),
+   SyncNativeObjects => ("POST", "/sync/native-objects", NativeObjects),
+   SyncRenewBaselineLease => ("POST", "/sync/baseline-lease/renew", NativeObjects),
+   SyncDescriptor => ("GET", "/sync/descriptor", None),
    SyncPull => ("GET", "/sync/pull", None),
    SyncHistory => ("GET", "/sync/history", None),
    SyncCheckpoints => ("GET", "/sync/checkpoints", None),
@@ -1906,7 +1921,7 @@ where
             .map(ProtocolRoute::body)
             .unwrap_or(RequestBodyPolicy::None);
         match body_policy {
-            RequestBodyPolicy::Json => {
+            RequestBodyPolicy::Json | RequestBodyPolicy::NativeObjects => {
                 if let Err(error) = require_json_content_type(&parts.headers) {
                     return error.into_response();
                 }
@@ -1920,6 +1935,9 @@ where
         }
         let body = if body_policy != RequestBodyPolicy::None {
             let body_limit = match body_policy {
+                RequestBodyPolicy::NativeObjects => {
+                    (16 * 1024).min(self.inner.options.max_request_body_bytes)
+                }
                 RequestBodyPolicy::Chunk => {
                     MAX_SYNC_CHUNK_BYTES.min(self.inner.options.max_request_body_bytes)
                 }
@@ -1961,6 +1979,195 @@ where
             Some(ProtocolRoute::SyncPush) => {
                 result_response(sync_push(lease, json_request!(SyncPushRequest)).await)
             }
+            Some(ProtocolRoute::SyncRetainedBodies) => {
+                if parts.uri.query().is_some() {
+                    return ApiError::bad_request(
+                        "retained body upload does not accept query parameters",
+                    )
+                    .into_response();
+                }
+                result_response(
+                    partial_merge::retained_bodies(
+                        lease,
+                        json_request!(crate::sync::RetainedBodyWaveRequest),
+                    )
+                    .await,
+                )
+            }
+            Some(ProtocolRoute::SyncPartialMergeRestart) => {
+                if parts.uri.query().is_some() {
+                    return ApiError::bad_request(
+                        "partial restart does not accept query parameters",
+                    )
+                    .into_response();
+                }
+                result_response(
+                    partial_merge::restart(
+                        lease,
+                        json_request!(crate::sync::PartialAttemptRestartRequest),
+                    )
+                    .await,
+                )
+            }
+            Some(ProtocolRoute::SyncNativeMigrationCleanup) => {
+                if parts.uri.query().is_some() {
+                    return ApiError::bad_request(
+                        "migration cleanup does not accept query parameters",
+                    )
+                    .into_response();
+                }
+                result_response(
+                    Box::pin(partial_merge::native_migration_cleanup(
+                        lease,
+                        json_request!(crate::sync::NativeMigrationCleanupRequest),
+                    ))
+                    .await,
+                )
+            }
+            Some(ProtocolRoute::SyncNativeGlobalMigrationRestart) => {
+                if parts.uri.query().is_some() {
+                    return ApiError::bad_request(
+                        "global migration restart does not accept query parameters",
+                    )
+                    .into_response();
+                }
+                result_response(
+                    partial_merge::native_global_migration_restart(
+                        lease,
+                        json_request!(crate::sync::NativeGlobalRestartRequest),
+                    )
+                    .await,
+                )
+            }
+            Some(ProtocolRoute::SyncNativeGlobalMigrationCleanup) => {
+                if parts.uri.query().is_some() {
+                    return ApiError::bad_request(
+                        "global migration cleanup does not accept query parameters",
+                    )
+                    .into_response();
+                }
+                result_response(
+                    partial_merge::native_global_migration_cleanup(
+                        lease,
+                        json_request!(crate::sync::NativeGlobalMigrationRequest),
+                    )
+                    .await,
+                )
+            }
+            Some(ProtocolRoute::SyncNativeGlobalMigrationMerge) => {
+                if parts.uri.query().is_some() {
+                    return ApiError::bad_request(
+                        "global migration merge does not accept query parameters",
+                    )
+                    .into_response();
+                }
+                result_response(
+                    partial_merge::native_global_migration_merge(
+                        lease,
+                        json_request!(crate::sync::NativeGlobalMigrationRequest),
+                    )
+                    .await,
+                )
+            }
+            Some(ProtocolRoute::SyncNativeGlobalMigrationBodies) => {
+                if parts.uri.query().is_some() {
+                    return ApiError::bad_request(
+                        "global migration bodies do not accept query parameters",
+                    )
+                    .into_response();
+                }
+                result_response(
+                    partial_merge::native_global_migration_bodies(
+                        lease,
+                        json_request!(crate::sync::NativeGlobalBodyWaveRequest),
+                    )
+                    .await,
+                )
+            }
+            Some(ProtocolRoute::SyncNativeMigrationMerge) => {
+                if parts.uri.query().is_some() {
+                    return ApiError::bad_request(
+                        "migration merge does not accept query parameters",
+                    )
+                    .into_response();
+                }
+                result_response(
+                    Box::pin(partial_merge::native_migration_merge(
+                        lease,
+                        json_request!(crate::sync::NativeMigrationMergeRequest),
+                    ))
+                    .await,
+                )
+            }
+            Some(ProtocolRoute::SyncPartialMerge) => {
+                if parts.uri.query().is_some() {
+                    return ApiError::bad_request("partial merge does not accept query parameters")
+                        .into_response();
+                }
+                result_response(
+                    partial_merge::merge(lease, json_request!(crate::sync::PartialMergeRequest))
+                        .await,
+                )
+            }
+            Some(ProtocolRoute::SyncNativeMetadata) => {
+                if parts.uri.query().is_some() {
+                    return ApiError::bad_request(
+                        "native metadata reads do not accept query parameters",
+                    )
+                    .into_response();
+                }
+                result_response(
+                    sync_native_metadata(
+                        lease,
+                        parts.headers,
+                        json_request!(crate::sync::NativeMetadataRequest),
+                    )
+                    .await,
+                )
+            }
+            Some(ProtocolRoute::SyncNativeObjectRange) => {
+                if parts.uri.query().is_some() {
+                    return ApiError::bad_request(
+                        "native object ranges do not accept query parameters",
+                    )
+                    .into_response();
+                }
+                result_response(
+                    sync_native_object_range(
+                        lease,
+                        parts.headers,
+                        json_request!(crate::sync::NativeObjectRangeRequest),
+                    )
+                    .await,
+                )
+            }
+            Some(ProtocolRoute::SyncNativeObjects) => {
+                if parts.uri.query().is_some() {
+                    return ApiError::bad_request(
+                        "native object reads do not accept query parameters",
+                    )
+                    .into_response();
+                }
+                result_response(
+                    sync_native_objects(
+                        lease,
+                        parts.headers,
+                        json_request!(SyncNativeObjectsRequest),
+                    )
+                    .await,
+                )
+            }
+            Some(ProtocolRoute::SyncRenewBaselineLease) => result_response(
+                sync_renew_baseline_lease(lease, json_request!(SyncRenewBaselineLeaseRequest))
+                    .await,
+            ),
+            Some(ProtocolRoute::SyncDescriptor) => {
+                let query = match decode_query::<SyncDescriptorQuery>(parts.uri.query()) {
+                    Ok(query) => query,
+                    Err(error) => return error.into_response(),
+                };
+                result_response(sync_descriptor(lease, query).await)
+            }
             Some(ProtocolRoute::SyncPull) => {
                 let query = match decode_query::<SyncPullRequest>(parts.uri.query()) {
                     Ok(query) => query,
@@ -1997,7 +2204,7 @@ where
                     Ok(query) => query,
                     Err(error) => return error.into_response(),
                 };
-                result_response(sync_get_blobs(lease, query).await)
+                result_response(sync_get_blobs(lease, parts.headers, query).await)
             }
             Some(ProtocolRoute::SyncRegisterBlob) => {
                 if parts.uri.query().is_some() {
@@ -2013,7 +2220,7 @@ where
                     Ok(query) => query,
                     Err(error) => return error.into_response(),
                 };
-                result_response(sync_get_chunk(lease, query).await)
+                result_response(sync_get_chunk(lease, parts.headers, query).await)
             }
             Some(ProtocolRoute::SyncPutChunk) => {
                 let query = match decode_query::<SyncChunkQuery>(parts.uri.query()) {
@@ -2649,102 +2856,114 @@ where
     }
 }
 
-async fn execute<S>(
+// Construct large SQL execution futures outside the dispatcher poll frame.
+// Call-site boxing alone still reserves their construction temporaries there.
+#[cfg(not(target_arch = "wasm32"))]
+type SqlHandlerFuture<T> = futures_util::future::BoxFuture<'static, Result<T, ApiError>>;
+#[cfg(target_arch = "wasm32")]
+type SqlHandlerFuture<T> = futures_util::future::LocalBoxFuture<'static, Result<T, ApiError>>;
+
+fn execute<S>(
     lease: SessionLease<S>,
     scope: Option<String>,
     headers: HeaderMap,
     Json(request): Json<ExecuteRequest>,
-) -> Result<Json<ExecuteResponse>, ApiError>
+) -> SqlHandlerFuture<Json<ExecuteResponse>>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let sql = required_non_empty(request.sql, "sql")?;
-    let reconstructed_bytes_limit = lease.record.max_reconstructed_request_blob_bytes;
-    let mut reconstructed_bytes_remaining = reconstructed_bytes_limit;
-    let mut cache_candidate_bytes_remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
-    let mut cache_candidates = Vec::new();
-    let decoded = decode_request_params(
-        request.params,
-        None,
-        request.cache_blobs,
-        reconstructed_bytes_limit,
-        &mut reconstructed_bytes_remaining,
-        &mut cache_candidate_bytes_remaining,
-        &mut cache_candidates,
-        |sha256| lease.record.request_blob(sha256),
-    )?;
-    let options: ExecuteOptions = request.options.into();
-    let params = decoded.values;
-    let metadata = decoded.metadata;
-    let idempotency = execute_idempotency(
-        &headers,
-        scope,
-        &sql,
-        &params,
-        options.origin_key.as_deref(),
-    )?;
-    let result = lease
-        .execute(sql, params, options, metadata, idempotency)
-        .await?;
-    lease.record.cache_request_blobs(cache_candidates);
-    Ok(Json(ExecuteResponse::try_from(result)?))
+    Box::pin(async move {
+        let sql = required_non_empty(request.sql, "sql")?;
+        let reconstructed_bytes_limit = lease.record.max_reconstructed_request_blob_bytes;
+        let mut reconstructed_bytes_remaining = reconstructed_bytes_limit;
+        let mut cache_candidate_bytes_remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
+        let mut cache_candidates = Vec::new();
+        let decoded = decode_request_params(
+            request.params,
+            None,
+            request.cache_blobs,
+            reconstructed_bytes_limit,
+            &mut reconstructed_bytes_remaining,
+            &mut cache_candidate_bytes_remaining,
+            &mut cache_candidates,
+            |sha256| lease.record.request_blob(sha256),
+        )?;
+        let options: ExecuteOptions = request.options.into();
+        let params = decoded.values;
+        let metadata = decoded.metadata;
+        let idempotency = execute_idempotency(
+            &headers,
+            scope,
+            &sql,
+            &params,
+            options.origin_key.as_deref(),
+        )?;
+        let result = lease
+            .execute(sql, params, options, metadata, idempotency)
+            .await?;
+        lease.record.cache_request_blobs(cache_candidates);
+        Ok(Json(ExecuteResponse::try_from(result)?))
+    })
 }
 
-async fn execute_batch<S>(
+fn execute_batch<S>(
     lease: SessionLease<S>,
     scope: Option<String>,
     headers: HeaderMap,
     Json(request): Json<ExecuteBatchRequest>,
-) -> Result<Json<Vec<ExecuteResponse>>, ApiError>
+) -> SqlHandlerFuture<Json<Vec<ExecuteResponse>>>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    if request.statements.is_empty() {
-        return Err(ApiError::bad_request("statements must not be empty"));
-    }
-    let mut cache_candidates = Vec::new();
-    let reconstructed_bytes_limit = lease.record.max_reconstructed_request_blob_bytes;
-    let mut reconstructed_bytes_remaining = reconstructed_bytes_limit;
-    let mut cache_candidate_bytes_remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
-    let decoded_statements = request
-        .statements
-        .into_iter()
-        .enumerate()
-        .map(|(index, statement)| {
-            let decoded = decode_request_params(
-                statement.params,
-                Some(index),
-                request.cache_blobs,
-                reconstructed_bytes_limit,
-                &mut reconstructed_bytes_remaining,
-                &mut cache_candidate_bytes_remaining,
-                &mut cache_candidates,
-                |sha256| lease.record.request_blob(sha256),
-            )?;
-            Ok((
-                ExecuteBatchStatement {
-                    sql: required_non_empty(statement.sql, "statements[].sql")?,
-                    params: decoded.values,
-                    label: statement.label,
-                },
-                decoded.metadata,
-            ))
-        })
-        .collect::<Result<Vec<_>, ApiError>>()?;
-    let (statements, statement_metadata): (Vec<_>, Vec<_>) = decoded_statements.into_iter().unzip();
-    let options: ExecuteOptions = request.options.into();
-    let idempotency =
-        execute_batch_idempotency(&headers, scope, &statements, options.origin_key.as_deref())?;
-    let results = lease
-        .execute_batch(statements, options, statement_metadata, idempotency)
-        .await?;
-    lease.record.cache_request_blobs(cache_candidates);
-    Ok(Json(
-        results
+    Box::pin(async move {
+        if request.statements.is_empty() {
+            return Err(ApiError::bad_request("statements must not be empty"));
+        }
+        let mut cache_candidates = Vec::new();
+        let reconstructed_bytes_limit = lease.record.max_reconstructed_request_blob_bytes;
+        let mut reconstructed_bytes_remaining = reconstructed_bytes_limit;
+        let mut cache_candidate_bytes_remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
+        let decoded_statements = request
+            .statements
             .into_iter()
-            .map(ExecuteResponse::try_from)
-            .collect::<Result<Vec<_>, _>>()?,
-    ))
+            .enumerate()
+            .map(|(index, statement)| {
+                let decoded = decode_request_params(
+                    statement.params,
+                    Some(index),
+                    request.cache_blobs,
+                    reconstructed_bytes_limit,
+                    &mut reconstructed_bytes_remaining,
+                    &mut cache_candidate_bytes_remaining,
+                    &mut cache_candidates,
+                    |sha256| lease.record.request_blob(sha256),
+                )?;
+                Ok((
+                    ExecuteBatchStatement {
+                        sql: required_non_empty(statement.sql, "statements[].sql")?,
+                        params: decoded.values,
+                        label: statement.label,
+                    },
+                    decoded.metadata,
+                ))
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
+        let (statements, statement_metadata): (Vec<_>, Vec<_>) =
+            decoded_statements.into_iter().unzip();
+        let options: ExecuteOptions = request.options.into();
+        let idempotency =
+            execute_batch_idempotency(&headers, scope, &statements, options.origin_key.as_deref())?;
+        let results = lease
+            .execute_batch(statements, options, statement_metadata, idempotency)
+            .await?;
+        lease.record.cache_request_blobs(cache_candidates);
+        Ok(Json(
+            results
+                .into_iter()
+                .map(ExecuteResponse::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+        ))
+    })
 }
 
 async fn sync_push<S>(
@@ -2801,6 +3020,118 @@ fn ensure_sync_push_event_fits(
         return Err(ApiError::sync_push_event_too_large(max_bytes));
     }
     Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncRenewBaselineLeaseRequest {
+    lease_id: String,
+}
+async fn sync_renew_baseline_lease<S: Storage + Clone + Send + Sync + 'static>(
+    lease: SessionLease<S>,
+    Json(request): Json<SyncRenewBaselineLeaseRequest>,
+) -> Result<Response, ApiError> {
+    let renewed = lease
+        .run_durable(move |lix| async move {
+            lix.renew_sync_native_baseline_lease(&request.lease_id)
+                .await
+        })
+        .await?;
+    bounded_sync_json_response(renewed, "native baseline lease", 1024)
+}
+
+fn required_native_baseline_header(headers: &HeaderMap) -> Result<String, ApiError> {
+    let value = headers
+        .get("lix-native-baseline-lease")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ApiError::bad_request("native reads require lix-native-baseline-lease"))?;
+    if uuid::Uuid::parse_str(value).is_err()
+        || uuid::Uuid::parse_str(value).is_ok_and(|id| id.to_string() != value)
+    {
+        return Err(ApiError::bad_request(
+            "baseline lease must be a canonical UUID",
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+async fn sync_native_metadata<S>(
+    lease: SessionLease<S>,
+    headers: HeaderMap,
+    Json(request): Json<crate::sync::NativeMetadataRequest>,
+) -> Result<Response, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let baseline_id = required_native_baseline_header(&headers)?;
+    let response = lease
+        .run_cancellable_read(move |lix| async move {
+            lix.read_sync_native_metadata_leased(&request, &baseline_id)
+                .await
+        })
+        .await?;
+    bounded_sync_json_response(
+        response,
+        "native metadata",
+        crate::sync::MAX_NATIVE_METADATA_RESPONSE_BYTES,
+    )
+}
+
+async fn sync_native_object_range<S>(
+    lease: SessionLease<S>,
+    headers: HeaderMap,
+    Json(request): Json<crate::sync::NativeObjectRangeRequest>,
+) -> Result<Response, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let baseline_id = required_native_baseline_header(&headers)?;
+    let response = lease
+        .run_cancellable_read(move |lix| async move {
+            lix.read_sync_native_object_range_leased(&request, &baseline_id)
+                .await
+        })
+        .await?;
+    bounded_sync_json_response(
+        response,
+        "native object range",
+        crate::sync::MAX_NATIVE_OBJECT_RESPONSE_BYTES,
+    )
+}
+
+async fn sync_native_objects<S>(
+    lease: SessionLease<S>,
+    headers: HeaderMap,
+    Json(request): Json<SyncNativeObjectsRequest>,
+) -> Result<Response, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let baseline_id = required_native_baseline_header(&headers)?;
+    let response = lease
+        .run_cancellable_read(move |lix| async move {
+            lix.read_sync_native_objects_leased(&request.objects, &baseline_id)
+                .await
+        })
+        .await?;
+    bounded_sync_json_response(
+        response,
+        "native objects",
+        crate::sync::MAX_NATIVE_OBJECT_RESPONSE_BYTES,
+    )
+}
+
+mod descriptor_wait;
+mod partial_merge;
+
+async fn sync_descriptor<S>(
+    lease: SessionLease<S>,
+    request: SyncDescriptorQuery,
+) -> Result<Response, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    descriptor_wait::wait_descriptor(lease, request.branch_id, request.after).await
 }
 
 async fn sync_pull<S>(
@@ -2961,11 +3292,17 @@ where
 
 async fn sync_get_blobs<S>(
     lease: SessionLease<S>,
+    headers: HeaderMap,
     request: SyncBlobQuery,
 ) -> Result<Response, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    let baseline_id = if headers.contains_key("lix-native-baseline-lease") {
+        Some(required_native_baseline_header(&headers)?)
+    } else {
+        None
+    };
     let encoded = request
         .blob_ids
         .ok_or_else(|| ApiError::bad_request("blobIds is required"))?;
@@ -2987,7 +3324,10 @@ where
         .run_cancellable_read(move |lix| async move {
             let mut manifests = Vec::with_capacity(blob_ids.len());
             for blob_id in blob_ids {
-                let manifest = lix.get_sync_blob_manifest(&blob_id).await?;
+                let manifest = match &baseline_id {
+                    Some(id) => lix.get_sync_blob_manifest_leased(&blob_id, id).await?,
+                    None => lix.get_sync_blob_manifest(&blob_id).await?,
+                };
                 manifests.push((blob_id, manifest));
             }
             Ok(manifests)
@@ -3020,17 +3360,26 @@ where
 
 async fn sync_get_chunk<S>(
     lease: SessionLease<S>,
+    headers: HeaderMap,
     request: SyncChunkQuery,
 ) -> Result<Response, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    let baseline_id = if headers.contains_key("lix-native-baseline-lease") {
+        Some(required_native_baseline_header(&headers)?)
+    } else {
+        None
+    };
     let chunk_id = required_sync_cas_id(request.chunk_id, "chunkId")?;
     let requested_chunk_id = chunk_id.clone();
     let bytes = lease
-        .run_cancellable_read(
-            move |lix| async move { lix.get_sync_chunk(&requested_chunk_id).await },
-        )
+        .run_cancellable_read(move |lix| async move {
+            match &baseline_id {
+                Some(id) => lix.get_sync_chunk_leased(&requested_chunk_id, id).await,
+                None => lix.get_sync_chunk(&requested_chunk_id).await,
+            }
+        })
         .await?
         .ok_or_else(|| sync_cas_not_found("chunk", &chunk_id))?;
     if bytes.is_empty() || bytes.len() > MAX_SYNC_CHUNK_BYTES {
@@ -4546,7 +4895,9 @@ fn status_for_lix_error(error: &LixError) -> StatusCode {
         LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
         | LixError::CODE_STORAGE_DURABILITY_UNAVAILABLE => StatusCode::SERVICE_UNAVAILABLE,
         LixError::CODE_IDEMPOTENCY_RESPONSE_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
-        LixError::CODE_PLUGIN_OBSERVATION_STALE => StatusCode::GONE,
+        LixError::CODE_PLUGIN_OBSERVATION_STALE | "LIX_PARTIAL_BASELINE_EXPIRED" => {
+            StatusCode::GONE
+        }
         LixError::CODE_INTERNAL_ERROR => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::BAD_REQUEST,
     }
@@ -4574,6 +4925,21 @@ struct HandshakeResponse {
 #[serde(rename_all = "camelCase")]
 struct BeginTransactionResponse {
     transaction_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncNativeObjectsRequest {
+    objects: Vec<crate::tracked_state::NativeObjectRef>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncDescriptorQuery {
+    #[serde(default)]
+    branch_id: Option<String>,
+    #[serde(default)]
+    after: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -5445,7 +5811,29 @@ mod tests {
                 ("POST", "/lix/v1/{lix_id}/execute") => "execute",
                 ("POST", "/lix/v1/{lix_id}/execute-batch") => "executeBatch",
                 ("POST", "/lix/v1/{lix_id}/sync/push") => "syncPush",
+                ("POST", "/lix/v1/{lix_id}/sync/retained-bodies") => "syncRetainedBodies",
+                ("POST", "/lix/v1/{lix_id}/sync/merge/restart") => "syncPartialMergeRestart",
+                ("POST", "/lix/v1/{lix_id}/sync/merge") => "syncPartialMerge",
+                ("POST", "/lix/v1/{lix_id}/sync/migration/global/restart") => {
+                    "syncNativeGlobalMigrationRestart"
+                }
+                ("POST", "/lix/v1/{lix_id}/sync/migration/global/cleanup") => {
+                    "syncNativeGlobalMigrationCleanup"
+                }
+                ("POST", "/lix/v1/{lix_id}/sync/migration/global/merge") => {
+                    "syncNativeGlobalMigrationMerge"
+                }
+                ("POST", "/lix/v1/{lix_id}/sync/migration/global/bodies") => {
+                    "syncNativeGlobalMigrationBodies"
+                }
+                ("POST", "/lix/v1/{lix_id}/sync/migration/merge") => "syncNativeMigrationMerge",
+                ("POST", "/lix/v1/{lix_id}/sync/migration/cleanup") => "syncNativeMigrationCleanup",
                 ("GET", "/lix/v1/{lix_id}/sync/pull") => "syncPull",
+                ("GET", "/lix/v1/{lix_id}/sync/descriptor") => "syncDescriptor",
+                ("POST", "/lix/v1/{lix_id}/sync/baseline-lease/renew") => "syncRenewBaselineLease",
+                ("POST", "/lix/v1/{lix_id}/sync/native-objects") => "syncNativeObjects",
+                ("POST", "/lix/v1/{lix_id}/sync/native-object-range") => "syncNativeObjectRange",
+                ("POST", "/lix/v1/{lix_id}/sync/native-metadata") => "syncNativeMetadata",
                 ("GET", "/lix/v1/{lix_id}/sync/history") => "syncHistory",
                 ("GET", "/lix/v1/{lix_id}/sync/checkpoints") => "syncCheckpointInventory",
                 ("GET", "/lix/v1/{lix_id}/sync/blob") => "syncGetBlobs",
@@ -5496,11 +5884,16 @@ mod tests {
             openapi
                 .matches("$ref: \"#/components/parameters/SyncProtocolVersion\"")
                 .count(),
-            8,
+            22,
             "every sync HTTP operation must declare the required version header",
         );
         for operation_id in [
             "syncPush",
+            "syncDescriptor",
+            "syncRenewBaselineLease",
+            "syncNativeObjects",
+            "syncNativeObjectRange",
+            "syncNativeMetadata",
             "syncPull",
             "syncHistory",
             "syncCheckpointInventory",
@@ -5700,7 +6093,12 @@ mod tests {
         request
             .headers_mut()
             .entry(SERVER_PROTOCOL_VERSION_HEADER)
-            .or_insert(http::HeaderValue::from_static("7"));
+            .or_insert_with(|| {
+                PROTOCOL_VERSION
+                    .to_string()
+                    .parse()
+                    .expect("protocol version header")
+            });
         let path = request.uri().path();
         let suffix = if path == PROTOCOL_PATH {
             ""
@@ -7777,6 +8175,24 @@ mod tests {
         session_id: Option<&str>,
         body: Option<JsonValue>,
     ) -> Response {
+        if method == "POST" && uri.starts_with("/lix/v1/sync/native-") && session_id.is_some() {
+            let descriptor =
+                request_with_headers(app, "GET", "/lix/v1/sync/descriptor", session_id, &[], None)
+                    .await;
+            if descriptor.status() == StatusCode::OK {
+                let envelope = response_json(descriptor).await;
+                let id = envelope["lease"]["leaseId"].as_str().unwrap();
+                return request_with_headers(
+                    app,
+                    method,
+                    uri,
+                    session_id,
+                    &[("lix-native-baseline-lease", id)],
+                    body,
+                )
+                .await;
+            }
+        }
         let idempotency_key = (method == "POST"
             && matches!(uri, "/lix/v1/execute" | "/lix/v1/execute-batch"))
         .then(|| {
@@ -8477,6 +8893,512 @@ mod tests {
             let response = request(&app.router, "GET", path, Some(&session_id), None).await;
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
         }
+    }
+
+    #[tokio::test]
+    async fn partial_replica_descriptor_route_is_bounded_metadata_only() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let response = request(
+            &app.router,
+            "GET",
+            "/lix/v1/sync/descriptor",
+            Some(&session_id),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let envelope = response_json(response).await;
+        assert!(envelope["lease"]["leaseId"].is_string());
+        let descriptor = envelope["descriptor"].clone();
+        assert_eq!(
+            descriptor["descriptorVersion"],
+            crate::sync::PARTIAL_REPLICA_DESCRIPTOR_VERSION
+        );
+        assert_eq!(
+            descriptor["selectedBranch"]["branchId"],
+            descriptor["defaultBranchId"]
+        );
+        assert_eq!(
+            descriptor["globalBranch"]["branchId"],
+            crate::GLOBAL_BRANCH_ID
+        );
+        assert!(
+            serde_json::to_vec(&descriptor).unwrap().len()
+                <= crate::sync::MAX_PARTIAL_REPLICA_DESCRIPTOR_BYTES
+        );
+        for field in ["branches", "rows", "blobs", "commits", "commitHeaders"] {
+            assert!(
+                descriptor.get(field).is_none(),
+                "descriptor must not enumerate {field}"
+            );
+        }
+        let selected = descriptor["selectedBranch"]["branchId"].as_str().unwrap();
+        let response = request(
+            &app.router,
+            "GET",
+            &format!("/lix/v1/sync/descriptor?branchId={selected}"),
+            Some(&session_id),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["descriptor"], descriptor);
+        for suffix in [
+            "?branchId=invalid",
+            "?limit=1",
+            "?branchId=01920000-0000-7000-8000-000000000999",
+        ] {
+            let response = request(
+                &app.router,
+                "GET",
+                &format!("/lix/v1/sync/descriptor{suffix}"),
+                Some(&session_id),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn descriptor_continuation_rejects_future_cursor_and_requires_selected_branch() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let lease = app.server.lease(&session_id, None).await.unwrap();
+        let descriptor = lease
+            .record
+            .lix
+            .partial_replica_descriptor(None)
+            .await
+            .unwrap();
+        drop(lease);
+        let branch = descriptor.selected_branch.branch_id;
+        for (path, status) in [
+            (
+                "/lix/v1/sync/descriptor?after=0".to_owned(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                format!(
+                    "/lix/v1/sync/descriptor?branchId={branch}&after={}",
+                    descriptor.cursor + 1
+                ),
+                StatusCode::CONFLICT,
+            ),
+        ] {
+            let response = request(&app.router, "GET", &path, Some(&session_id), None).await;
+            assert_eq!(response.status(), status);
+        }
+        let lease = app.server.lease(&session_id, None).await.unwrap();
+        let response = descriptor_wait::wait_descriptor_until(
+            lease,
+            Some(branch.clone()),
+            Some(descriptor.cursor),
+            tokio::time::Instant::now() + std::time::Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await["descriptor"]["cursor"],
+            descriptor.cursor
+        );
+        let lease = app.server.lease(&session_id, None).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                sync_descriptor(
+                    lease,
+                    SyncDescriptorQuery {
+                        branch_id: Some(branch),
+                        after: Some(descriptor.cursor)
+                    }
+                ),
+            )
+            .await
+            .is_err()
+        );
+        assert!(app.server.lease(&session_id, None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn descriptor_wait_wakes_on_commit_and_cursor_neutral_wakes_keep_deadline() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let lease = app.server.lease(&session_id, None).await.unwrap();
+        let descriptor = lease
+            .record
+            .lix
+            .partial_replica_descriptor(None)
+            .await
+            .unwrap();
+        let wait = sync_descriptor(
+            lease,
+            SyncDescriptorQuery {
+                branch_id: Some(descriptor.selected_branch.branch_id.clone()),
+                after: Some(descriptor.cursor),
+            },
+        );
+        let write = async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let response = request(&app.router, "POST", "/lix/v1/execute", Some(&session_id), Some(json!({
+                "sql": "INSERT INTO lix_key_value (key, value) VALUES ('descriptor-wake', 'true')"
+            }))).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        };
+        let (response, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(wait, write)
+        })
+        .await
+        .expect("commit wakes descriptor waiter");
+        let next = response_json(response.unwrap()).await["descriptor"].clone();
+        assert!(next["cursor"].as_u64().unwrap() > descriptor.cursor);
+        let neutral_lease = app.server.lease(&session_id, None).await.unwrap();
+        let lease = app.server.lease(&session_id, None).await.unwrap();
+        let wait = descriptor_wait::wait_descriptor_until(
+            lease,
+            Some(descriptor.selected_branch.branch_id),
+            Some(next["cursor"].as_u64().unwrap()),
+            tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+        );
+        let noise = async {
+            loop {
+                neutral_lease
+                    .record
+                    .lix
+                    .sync_mode_state()
+                    .notify_sync_change();
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        };
+        tokio::pin!(noise);
+        tokio::select! {
+            response = wait => assert_eq!(response.unwrap().status(), StatusCode::OK),
+            _ = &mut noise => unreachable!(),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => panic!("neutral wakes extended descriptor deadline"),
+        }
+    }
+
+    #[tokio::test]
+    async fn native_reads_require_lease_and_renewal_preserves_binding() {
+        let app = app().await;
+        let (session, _) = new_session(&app.router).await;
+        let envelope = response_json(
+            request(
+                &app.router,
+                "GET",
+                "/lix/v1/sync/descriptor",
+                Some(&session),
+                None,
+            )
+            .await,
+        )
+        .await;
+        let id = envelope["lease"]["leaseId"].as_str().unwrap();
+        let body = json!({"epochId":uuid::Uuid::now_v7().to_string(),"objects":[{"kind":"commit_state_header","commitId":envelope["descriptor"]["selectedBranch"]["head"]["commitId"]}]});
+        let missing = request_with_headers(
+            &app.router,
+            "POST",
+            "/lix/v1/sync/native-metadata",
+            Some(&session),
+            &[],
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let unknown_id = uuid::Uuid::now_v7().to_string();
+        let expired = request_with_headers(
+            &app.router,
+            "POST",
+            "/lix/v1/sync/native-metadata",
+            Some(&session),
+            &[("lix-native-baseline-lease", &unknown_id)],
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(expired.status(), StatusCode::GONE);
+        assert_eq!(
+            response_json(expired).await["error"]["code"],
+            "LIX_PARTIAL_BASELINE_EXPIRED"
+        );
+        let absent_hash = "00".repeat(32);
+        for path in [
+            format!("/lix/v1/sync/blob?blobIds={absent_hash}"),
+            format!("/lix/v1/sync/chunk?chunkId={absent_hash}"),
+        ] {
+            let bound = request_with_headers(
+                &app.router,
+                "GET",
+                &path,
+                Some(&session),
+                &[("lix-native-baseline-lease", &unknown_id)],
+                None,
+            )
+            .await;
+            assert_eq!(
+                bound.status(),
+                StatusCode::GONE,
+                "partial CAS reads must enforce the supplied baseline"
+            );
+            let full =
+                request_with_headers(&app.router, "GET", &path, Some(&session), &[], None).await;
+            assert_eq!(
+                full.status(),
+                StatusCode::NOT_FOUND,
+                "full CAS reads retain their explicit unleased behavior"
+            );
+        }
+
+        let valid = request_with_headers(
+            &app.router,
+            "POST",
+            "/lix/v1/sync/native-metadata",
+            Some(&session),
+            &[("lix-native-baseline-lease", id)],
+            Some(body),
+        )
+        .await;
+        assert_eq!(valid.status(), StatusCode::OK);
+        let renewed = request(
+            &app.router,
+            "POST",
+            "/lix/v1/sync/baseline-lease/renew",
+            Some(&session),
+            Some(json!({"leaseId":id})),
+        )
+        .await;
+        assert_eq!(renewed.status(), StatusCode::OK);
+        let renewed = response_json(renewed).await;
+        for field in ["version", "leaseId", "accountId", "roots"] {
+            assert_eq!(renewed[field], envelope["lease"][field]);
+        }
+        assert!(
+            renewed["expiresAtMs"].as_u64().unwrap()
+                >= envelope["lease"]["expiresAtMs"].as_u64().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_metadata_route_validates_records_epoch_and_session() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let descriptor = response_json(
+            request(
+                &app.router,
+                "GET",
+                "/lix/v1/sync/descriptor",
+                Some(&session_id),
+                None,
+            )
+            .await,
+        )
+        .await;
+        let descriptor = descriptor["descriptor"].clone();
+        let commit = descriptor["selectedBranch"]["head"]["commitId"].clone();
+        let body = json!({"epochId":"00000000-0000-7000-8000-000000000299", "objects":[
+            {"kind":"commit_state_header","commitId":commit},
+            {"kind":"commit_graph_record","commitId":commit}
+        ]});
+        let response = request(
+            &app.router,
+            "POST",
+            "/lix/v1/sync/native-metadata",
+            Some(&session_id),
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let result = response_json(response).await;
+        assert_eq!(result["lixId"], descriptor["lixId"]);
+        assert_eq!(result["epochId"], body["epochId"]);
+        for i in 0..2 {
+            assert_eq!(result["objects"][i]["address"], body["objects"][i]);
+            assert!(!result["objects"][i]["bytes"].as_str().unwrap().is_empty());
+        }
+        for mutation in 0..5 {
+            let mut invalid = body.clone();
+            match mutation {
+                0 => invalid["epochId"] = json!("invalid"),
+                1 => invalid["objects"][0]["commitId"] = json!("invalid"),
+                2 => invalid["objects"][0]["kind"] = json!("arbitrary_namespace"),
+                3 => invalid["objects"] = json!([]),
+                _ => invalid["objects"] = json!([body["objects"][0], body["objects"][0]]),
+            }
+            let response = request(
+                &app.router,
+                "POST",
+                "/lix/v1/sync/native-metadata",
+                Some(&session_id),
+                Some(invalid),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let response = request(
+            &app.router,
+            "POST",
+            "/lix/v1/sync/native-metadata",
+            None,
+            Some(body),
+        )
+        .await;
+        assert!(!response.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn native_object_route_rejects_untyped_or_unbounded_requests() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let address = json!({"kind":"tracked_state_tree_chunk", "key": vec![1u8;32]});
+        for body in [
+            json!({"objects": []}),
+            json!({"objects": vec![address.clone(); 33]}),
+            json!({"objects": [address.clone(), address]}),
+            json!({"objects": [{"kind":"arbitrary_storage_space", "key": vec![1u8;32]}]}),
+            json!({"objects": [], "space": "private"}),
+        ] {
+            let response = request(
+                &app.router,
+                "POST",
+                "/lix/v1/sync/native-objects",
+                Some(&session_id),
+                Some(body),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let response = request(
+            &app.router,
+            "POST",
+            "/lix/v1/sync/native-objects",
+            None,
+            Some(json!({"objects":[]})),
+        )
+        .await;
+        assert!(!response.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn native_object_range_route_enforces_request_and_session_contract() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let address = json!({"kind":"tracked_state_tree_chunk", "key": vec![1u8;32]});
+        for body in [
+            json!({"address":address, "offset":0, "maxBytes":0}),
+            json!({"address":address, "offset":0, "maxBytes":1048577}),
+            json!({"address":address, "offset":u64::MAX, "maxBytes":1}),
+            json!({"address":address, "offset":0, "maxBytes":1, "space":"private"}),
+            json!({"address":{"kind":"arbitrary_storage_space","key":vec![1u8;32]}, "offset":0,"maxBytes":1}),
+        ] {
+            let response = request(
+                &app.router,
+                "POST",
+                "/lix/v1/sync/native-object-range",
+                Some(&session_id),
+                Some(body),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let response = request(
+            &app.router,
+            "POST",
+            "/lix/v1/sync/native-object-range",
+            None,
+            Some(json!({"address":address,"offset":0,"maxBytes":1})),
+        )
+        .await;
+        assert!(!response.status().is_success());
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/lix/v1/sync/native-object-range")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn native_object_request_body_limit_precedes_json_parsing() {
+        for configured_limit in [64 * 1024, 1024] {
+            let app = app_with_options(ServerProtocolOptions {
+                max_request_body_bytes: configured_limit,
+                ..ServerProtocolOptions::default()
+            })
+            .await;
+            let (session_id, _) = new_session(&app.router).await;
+            let effective_limit = configured_limit.min(16 * 1024);
+            for path in [
+                "/lix/v1/sync/native-objects",
+                "/lix/v1/sync/native-object-range",
+                "/lix/v1/sync/native-metadata",
+            ] {
+                for (length, expected_status) in [
+                    (effective_limit, StatusCode::BAD_REQUEST),
+                    (effective_limit + 1, StatusCode::PAYLOAD_TOO_LARGE),
+                ] {
+                    // Deliberately invalid JSON distinguishes body admission from
+                    // JSON parsing: over-limit input must fail with 413, not 400.
+                    let response = app
+                        .router
+                        .clone()
+                        .oneshot(
+                            Request::builder()
+                                .method("POST")
+                                .uri(path)
+                                .header(SESSION_ID_HEADER, &session_id)
+                                .header(
+                                    SYNC_PROTOCOL_VERSION_HEADER,
+                                    crate::sync::SYNC_PROTOCOL_VERSION.to_string(),
+                                )
+                                .header(
+                                    SERVER_PROTOCOL_VERSION_HEADER,
+                                    crate::SERVER_PROTOCOL_VERSION.to_string(),
+                                )
+                                .header(CONTENT_TYPE, "application/json")
+                                .body(Body::from("!".repeat(length)))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        response.status(),
+                        expected_status,
+                        "configured limit {configured_limit}, input length {length}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_replica_descriptor_requires_sync_version_and_session() {
+        let app = app().await;
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/lix/v1/sync/descriptor")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            error_code(response).await,
+            crate::sync::SYNC_PROTOCOL_MISMATCH_CODE
+        );
+        let response = request(&app.router, "GET", "/lix/v1/sync/descriptor", None, None).await;
+        assert!(!response.status().is_success());
     }
 
     #[tokio::test]
@@ -14142,5 +15064,168 @@ mod tests {
             panic!("persisted sync replica must not be promoted to authority");
         };
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+    } // Insert within server_protocol/handler.rs tests.
+    #[tokio::test]
+    async fn http_retained_body_then_merge_is_durable_idempotent_and_requires_session() {
+        let memory = Memory::new();
+        let seed = open_lix().with_storage(memory.clone()).await.unwrap();
+        seed.execute(
+            "INSERT INTO lix_key_value(key,value) VALUES('http-merge-a','B'),('http-merge-b','B')",
+            &[],
+        )
+        .await
+        .unwrap();
+        let base = seed.partial_replica_descriptor(None).await.unwrap();
+        // Fork a writable client before serving installs authority ownership.
+        let local = open_lix()
+            .with_storage(memory.fork().unwrap())
+            .await
+            .unwrap();
+        seed.close().await.unwrap();
+        let server = open_lix()
+            .with_storage(memory)
+            .serve()
+            .with_embedded_lix_id()
+            .await
+            .unwrap();
+        let router = handler(server.clone());
+        let (session_id, _) = new_session(&router).await;
+        let lease = server.lease(&session_id, None).await.unwrap();
+        let authority = &lease.record.lix;
+        local
+            .execute(
+                "UPDATE lix_key_value SET value='L' WHERE key='http-merge-a'",
+                &[],
+            )
+            .await
+            .unwrap();
+        authority
+            .execute(
+                "UPDATE lix_key_value SET value='R' WHERE key='http-merge-b'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let remote = authority.partial_replica_descriptor(None).await.unwrap();
+        let source = local.partial_replica_descriptor(None).await.unwrap();
+        let merge = crate::sync::PartialMergeRequest {
+            attempt_id: uuid::Uuid::now_v7().to_string(),
+            branch_id: remote.selected_branch.branch_id,
+            base_commit_id: base.selected_branch.head.commit_id.clone(),
+            expected_authority_head_commit_id: remote.selected_branch.head.commit_id,
+            captured_local_head_commit_id: source.selected_branch.head.commit_id.clone(),
+            checkpoint_commit_id: remote.selected_branch.checkpoint.commit_id,
+            global_head_commit_id: remote.global_branch.head.commit_id,
+            global_checkpoint_commit_id: remote.global_branch.checkpoint.commit_id,
+        };
+        let commit =
+            crate::sync::export_sync_commit(&local, &source.selected_branch.head.commit_id)
+                .await
+                .unwrap()
+                .unwrap();
+        let wave = crate::sync::RetainedBodyWaveRequest {
+            request: merge.clone(),
+            expected_previous_commit_id: base.selected_branch.head.commit_id,
+            bodies: SyncPushRequest {
+                commits: vec![commit],
+                ref_updates: vec![],
+                inline_blobs: vec![],
+            },
+        };
+        let body = serde_json::to_value(&wave).unwrap();
+        let missing = request(
+            &router,
+            "POST",
+            "/lix/v1/sync/retained-bodies",
+            None,
+            Some(body.clone()),
+        )
+        .await;
+        assert!(!missing.status().is_success());
+        let response = request(
+            &router,
+            "POST",
+            "/lix/v1/sync/retained-bodies",
+            Some(&session_id),
+            Some(body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let accepted = response_json(response).await;
+        assert_eq!(accepted["acceptedTip"], merge.captured_local_head_commit_id);
+        let body = serde_json::to_value(&merge).unwrap();
+        let response = request(
+            &router,
+            "POST",
+            "/lix/v1/sync/merge",
+            Some(&session_id),
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let receipt = response_json(response).await;
+        let retry = request(
+            &router,
+            "POST",
+            "/lix/v1/sync/merge",
+            Some(&session_id),
+            Some(body),
+        )
+        .await;
+        assert_eq!(retry.status(), StatusCode::OK);
+        assert_eq!(response_json(retry).await, receipt);
+        let restart_body = serde_json::json!({"old":merge.clone(),"nextAttemptId":uuid::Uuid::now_v7().to_string()});
+        let denied = request(
+            &router,
+            "POST",
+            "/lix/v1/sync/merge/restart",
+            None,
+            Some(restart_body.clone()),
+        )
+        .await;
+        assert!(!denied.status().is_success());
+        let restarted = request(
+            &router,
+            "POST",
+            "/lix/v1/sync/merge/restart",
+            Some(&session_id),
+            Some(restart_body.clone()),
+        )
+        .await;
+        assert_eq!(restarted.status(), StatusCode::OK);
+        let outcome = response_json(restarted).await;
+        assert_eq!(outcome["outcome"], "committed");
+        assert_eq!(outcome["receipt"], receipt);
+        let query = request(
+            &router,
+            "POST",
+            "/lix/v1/sync/merge/restart?force=true",
+            Some(&session_id),
+            Some(restart_body.clone()),
+        )
+        .await;
+        assert_eq!(query.status(), StatusCode::BAD_REQUEST);
+        let mut unknown = restart_body;
+        unknown["force"] = true.into();
+        let unknown = request(
+            &router,
+            "POST",
+            "/lix/v1/sync/merge/restart",
+            Some(&session_id),
+            Some(unknown),
+        )
+        .await;
+        assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+        let mut changed = merge;
+        changed.captured_local_head_commit_id = uuid::Uuid::now_v7().to_string();
+        let reused = request(
+            &router,
+            "POST",
+            "/lix/v1/sync/merge",
+            Some(&session_id),
+            Some(serde_json::to_value(changed).unwrap()),
+        )
+        .await;
+        assert_eq!(reused.status(), StatusCode::CONFLICT);
     }
 }

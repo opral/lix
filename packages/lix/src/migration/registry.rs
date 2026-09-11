@@ -10,6 +10,10 @@ pub(crate) struct Migration {
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
+        from_version: 78,
+        to_version: 79,
+    },
+    Migration {
         from_version: 77,
         to_version: 78,
     },
@@ -103,7 +107,7 @@ mod tests {
                 to_version: 77,
             })
         );
-        assert_eq!(registered_migrations().len(), 6);
+        assert_eq!(registered_migrations().len(), 7);
         assert!(has_complete_migration_path(
             72,
             crate::init::CURRENT_FORMAT_VERSION

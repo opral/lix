@@ -5,7 +5,8 @@ mod types;
 mod walker;
 
 pub(crate) use context::{
-    CommitGraphContext, CommitGraphStoreReader, canonical_commit_change, missing_commit_graph_error,
+    CommitGraphContext, CommitGraphStoreReader, canonical_commit_change,
+    missing_commit_graph_error, validate_native_commit_graph_record,
 };
 pub(crate) use types::{
     CommitGraphChange, CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest,

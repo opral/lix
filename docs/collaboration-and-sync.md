@@ -18,28 +18,29 @@ See [storage adapters](./persistence.md#how-storage-adapters-fit) for persistenc
 
 <a id="choose-a-client-mode"></a>
 
-`openLix()` selects execution from the supplied connections: `server` alone
-executes remotely; `storage` plus `server` maintains a synchronized local replica.
-Both connect to the same hosted repository.
+`openLix()` defaults `server.mode` to `"remote"`, executing SQL on the server.
+Supply storage and `server.mode: "partial_replica"` to create a **partial replica
+with on-demand sync**. Remote mode rejects storage; partial-replica mode requires
+it. No `"sync"` alias or full `"replica"` mode is supported.
 
-| | `remote` | `sync` |
+| | `remote` | `partial_replica` |
 | --- | --- | --- |
 | Reads and writes execute | On the server | On a local replica |
 | Client storage | None; do not pass `storage` | An explicit durable adapter |
 | Network round trip | Every operation | Background synchronization; uncached data may need a fetch |
 | Successful write | Accepted by the server | Committed locally; may not yet be on the server |
-| Offline work | No | Cached reads and local writes |
+| Offline work | No | Covered reads and writes with resident dependencies |
 
 ### Remote mode
 
 Use `server: { url: lixConnectionUrl }` for SDK access with
 server-acknowledged writes. It creates no local repository or synchronized files.
 
-### Sync mode
+### Partial-replica mode
 
-Use `server: { url: lixConnectionUrl }` with `FilesystemStorage`
+Use `server: { url: lixConnectionUrl, mode: "partial_replica" }` with `FilesystemStorage`
 for files on disk or `OpfsStorage` for a browser replica. Current data and new
-commits sync automatically; older history and binary content download on demand.
+commits sync automatically; SQL fetches missing native inputs on demand.
 
 `await lix.execute(...)` confirms a local commit, not server receipt.
 Uploads run in the background; no `sync()` call is needed.
@@ -61,25 +62,21 @@ server: {
 
 ## Opening and reconnecting
 
-A fresh replica downloads current working state before `openLix()` resolves.
+A fresh partial replica loads bounded metadata before `openLix()` resolves.
+SQL hydrates missing native inputs on demand.
 Existing replicas can open locally and reconnect in the background, potentially
 starting behind the server.
 
-Offline, cached reads and local writes work; undownloaded history and binary
-content are unavailable. Pending commits upload after reconnect.
+Offline, covered reads and writes with resident dependencies work; operations
+requiring missing native inputs fail explicitly. Pending commits upload after reconnect.
 
 ### Replica format upgrades
 
-A format upgrade in sync mode replaces the replica's cached server state. Lix
-retains the old storage generation, bootstraps a fresh generation from the same
-authority/repository/account, and activates it only after durable validation.
-Pending local work is preserved independently and does not prevent opening the
-server-backed repository. Standalone and authoritative repositories retain their
-ordinary data migration path. This policy applies to every storage backend.
-
-Replacement needs a reachable server. An unsuccessful bootstrap leaves the old
-source intact. Retained generations are never recycled as later migration banks,
-and stale writers are fenced by the active-generation pointer.
+Existing full replicas require explicit conversion before opening with
+`server.mode: "partial_replica"`. Normal opening never falls back to eager full
+bootstrap. Conversion preserves the source and pending work; unsupported pending
+changes require explicit recovery. See the [migration guide](./partial-replica-migration.md)
+for supported formats, conversion, retained-source recovery and cleanup.
 
 Use the local recovery API after opening:
 

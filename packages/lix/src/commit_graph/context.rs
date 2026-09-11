@@ -811,6 +811,25 @@ fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphCh
     }
 }
 
+/// Validate one received compact graph record without reading parents or
+/// physical mutation manifests. Transport must separately bind its authority.
+pub(crate) fn validate_native_commit_graph_record(
+    commit_id: CommitId,
+    bytes: &[u8],
+) -> Result<(), LixError> {
+    let record: CommitRecord = storage_codec::decode("commit record", bytes)?;
+    if record.commit_id != commit_id
+        || record.format_version != crate::changelog::COMMIT_RECORD_FORMAT_VERSION
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "native commit graph record has incorrect identity or format",
+        ));
+    }
+    commit_graph_node_from_record(Some(record))?;
+    Ok(())
+}
+
 fn commit_graph_node_from_record(
     record: Option<CommitRecord>,
 ) -> Result<Option<CommitGraphNode>, LixError> {

@@ -180,6 +180,105 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
         self.restore_recovery_export(&export).await
     }
 
+    /// Explicitly restores a retained pre-native source, fetching only missing
+    /// recovery history and chunks from the authenticated authority. This does
+    /// not start synchronization or upload recovered branches.
+    pub async fn recover_replica_with_server(
+        &self,
+        id: &str,
+        server: crate::ServerOptions,
+    ) -> Result<ReplicaRecoveryReceipt, LixError> {
+        use super::SyncTransport as _;
+        use futures_util::FutureExt as _;
+        let export = self.export_replica_recovery(id).await?;
+        let adapter = self.storage_adapter();
+        let read = adapter.begin_read(StorageReadOptions::default()).await?;
+        if !matches!(
+            crate::init::repository_protocol_status(&read).await?,
+            crate::init::RepositoryProtocolStatus::Current
+        ) {
+            return Err(LixError::new(
+                "LIX_PARTIAL_REPLICA_MIGRATION_REQUIRED",
+                "explicit retained-source recovery requires the current full recovery layout",
+            ));
+        }
+        let identity =
+            super::inspect_replica_rebuild_source(&read, crate::init::CURRENT_FORMAT_VERSION)
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "recovery requires an identified full replica",
+                    )
+                })?;
+        if identity.repository_id != self.lix_id()
+            || identity.account_id != self.active_account_id()
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "recovery source identity differs from local account",
+            ));
+        }
+        drop(read);
+        let transport =
+            super::http::HttpSyncTransport::connect(&server.url, &server.headers).await?;
+        let result = async {
+            if transport.lix_id() != self.lix_id()
+                || transport.active_account_id() != self.active_account_id()
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "recovery authority changed repository or account",
+                ));
+            }
+            // A fresh adapter keeps the recovery writer capability out of the
+            // caller's engine and retains the exact active-epoch fence.
+            let fresh = crate::migration::admit_existing_repository(adapter.storage()).await?;
+            if fresh.epoch_bank() != adapter.epoch_bank() {
+                return Err(LixError::new(
+                    "LIX_RECOVERY_EPOCH_CHANGED",
+                    "repository epoch changed before explicit recovery",
+                ));
+            }
+            let branch_id = self.active_branch_id().await?;
+            let recovery = crate::handle::new_replica_recovery_context(
+                fresh,
+                &branch_id,
+                self.active_account_id(),
+            )
+            .await?;
+            let restored = async {
+                let mut seen = BTreeSet::new();
+                loop {
+                    match recovery.restore_recovery_export(&export).await {
+                        Ok(receipt) => return Ok(receipt),
+                        Err(error) => {
+                            super::runtime::hydrate_explicit_recovery_error(
+                                &recovery, &transport, error, &mut seen,
+                            )
+                            .await?
+                        }
+                    }
+                }
+            }
+            .await;
+            let close = recovery.close().await;
+            match restored {
+                Err(error) => Err(error),
+                Ok(receipt) => {
+                    close?;
+                    Ok(receipt)
+                }
+            }
+        }
+        .await;
+        let close = transport.close_session().fuse();
+        let timeout = super::sleep(std::time::Duration::from_secs(1)).fuse();
+        futures_util::pin_mut!(close, timeout);
+        futures_util::select_biased! { _ = close => {}, _ = timeout => {} }
+        result
+    }
+
     async fn restore_recovery_export(
         &self,
         export: &ReplicaRecoveryExport,

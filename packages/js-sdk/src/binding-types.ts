@@ -76,6 +76,7 @@ export type LixBinding = {
 	openReport?(): LixOpenReport | undefined;
 	setTelemetryParent(parent?: TelemetryParentContext): void;
 	openAnotherSession(options: OpenAnotherSessionOptions): Promise<LixBinding>;
+	prepare(sql: string, params: BindingParam[]): Promise<void>;
 	execute(
 		sql: string,
 		params: BindingParam[],
@@ -90,6 +91,7 @@ export type LixBinding = {
 	replicaRecoverySources(): Promise<ReplicaRecoverySource[]>;
 	exportReplicaRecovery(id: string): Promise<ReplicaRecoveryExport>;
 	recoverReplica(id: string): Promise<ReplicaRecoveryReceipt>;
+	recoverReplicaWithServer(id: string, server: SyncServerBindingOptions): Promise<ReplicaRecoveryReceipt>;
 	activeBranchId(): Promise<string>;
 	activeAccountId(): Promise<string>;
 	createBranch(options: CreateBranchOptions): Promise<CreateBranchReceipt>;

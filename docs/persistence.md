@@ -64,6 +64,7 @@ import { FilesystemStorage } from "@lix-js/storage-filesystem";
 const lix = await openLix({
   storage: new FilesystemStorage({ path: "/workspace/project" }),
   server: {
+    mode: "partial_replica",
     url: "https://example.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
   },
 });
@@ -126,6 +127,7 @@ import { OpfsStorage } from "@lix-js/storage-opfs";
 const lix = await openLix({
   storage: new OpfsStorage({ name: "acme" }),
   server: {
+    mode: "partial_replica",
     url: "https://example.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
   },
 });
@@ -137,9 +139,11 @@ SQLite Wasm persists the replica in the browser's Origin Private File System
 Omit `server` for a browser-only repository. Workers and tabs can share the
 same name through the package's storage worker and cross-tab Web Lock.
 
-Both sync setups download current working state on first open. Existing
-replicas reopen locally; older history and binary content load when needed.
-Mutations require server acceptance. See
+These configurations create a **partial replica with on-demand sync**. Opening
+loads bounded metadata; SQL fetches missing native inputs and caches them locally.
+Covered reads and prepared writes execute locally, including offline. Local
+commits upload in the background. `server.mode` defaults to `"remote"`, which
+rejects storage; the partial-replica opt-in is required. See
 [opening and reconnecting](./collaboration-and-sync.md#opening-and-reconnecting).
 
 ## How storage adapters fit

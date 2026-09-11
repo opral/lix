@@ -240,12 +240,19 @@ pub(crate) fn transactions_can_share_cohort<StorageImpl>(
 where
     StorageImpl: Storage + 'static,
 {
-    a.active_branch_id == b.active_branch_id
+    a.account_insertion.is_none()
+        && b.account_insertion.is_none()
+        && a.active_branch_id == b.active_branch_id
+        && a.active_account_id == b.active_account_id
+        && a.sync_role == b.sync_role
+        && a.sync_replica_remote_id == b.sync_replica_remote_id
+        && a.partial_replica_admission == b.partial_replica_admission
         && a.opening_active_branch_head == b.opening_active_branch_head
         && a.opening_global_branch_head == b.opening_global_branch_head
         && a.opening_tracked_mutation_revision == b.opening_tracked_mutation_revision
         && !a.protect_sql_write_snapshot
         && !b.protect_sql_write_snapshot
+        && a.native_migration_branch_bridges == b.native_migration_branch_bridges
         && a.idempotency_receipt.is_none()
         && b.idempotency_receipt.is_none()
         && a.atomic_metadata_writes.is_none()
@@ -662,6 +669,7 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     write_context_liveness: crate::sql2::WriteContextLiveness,
     active_branch_id: String,
     active_account_id: String,
+    account_insertion: Option<Arc<crate::account::AccountInsertion>>,
     hot_state: Arc<HotStateContext>,
     tracked_state: Arc<TrackedStateContext>,
     binary_cas: Arc<BinaryCasContext>,
@@ -725,6 +733,7 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// SQL UPDATE/DELETE predicates and computed values are decisions against
     /// the opening snapshot, not edits that may be silently reconciled later.
     protect_sql_write_snapshot: bool,
+    sql_preparation_only: bool,
     commit_boundary: Option<TransactionCommitBoundary>,
     trust_filesystem_planner: bool,
     origin_key: Option<SharedStr>,
@@ -732,10 +741,13 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// Storage-native metadata that must publish in the same backend commit as
     /// this transaction's file rows and history. Resumable media finalization
     /// uses this lane for its completed manifest and upload receipt.
+    native_migration_validation: bool,
+    native_migration_branch_bridges: BTreeMap<String, CheckpointRecoveryRef>,
     atomic_metadata_writes: Option<StorageWriteSet>,
     atomic_metadata_preconditions: Vec<StoragePrecondition>,
     sync_role: crate::sync::SyncRole,
     sync_replica_remote_id: Option<Arc<str>>,
+    partial_replica_admission: Option<Arc<crate::sync::PartialReplicaState>>,
     await_durable_commit: bool,
     session_file_views: SessionFileViews,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
@@ -940,6 +952,25 @@ impl Drop for CommitBoundaryGuard {
     }
 }
 
+// Resolve the native materializer's Send proof inside the library once, rather
+// than exposing its deeply nested storage-reader future to downstream callers.
+type NativePreparationResult = Result<
+    (
+        StorageWriteSet,
+        StorageWriteOptions,
+        Vec<crate::hot_state::MaterializedHotStateRow>,
+        Option<Vec<u8>>,
+        Option<crate::catalog::CatalogRevision>,
+    ),
+    LixError,
+>;
+#[cfg(not(target_family = "wasm"))]
+type NativePreparationFuture<'a> =
+    std::pin::Pin<Box<dyn Future<Output = NativePreparationResult> + Send + 'a>>;
+#[cfg(target_family = "wasm")]
+type NativePreparationFuture<'a> =
+    std::pin::Pin<Box<dyn Future<Output = NativePreparationResult> + 'a>>;
+
 pub(crate) fn begin_commit_boundary(
     boundary: Option<&TransactionCommitBoundary>,
 ) -> Option<CommitBoundaryGuard> {
@@ -991,6 +1022,428 @@ where
         self.pending_checkpoint_gc_sequence
     }
 
+    // Transaction owner. Only AdmittedNativeGlobalMigration constructs this path.
+    pub(crate) async fn reconcile_native_global_migration(
+        &mut self,
+        repository: &str,
+        request: crate::sync::NativeGlobalMigrationRequest,
+    ) -> Result<crate::sync::NativeGlobalMigrationReceipt, LixError> {
+        if self.sync_role != crate::sync::SyncRole::Authority
+            || self.active_branch_id != GLOBAL_BRANCH_ID
+        {
+            return Err(LixError::new(
+                "LIX_MIGRATION_GLOBAL_SCOPE_UNSUPPORTED",
+                "global migration requires the authenticated global authority session",
+            ));
+        }
+        let admission = crate::sync::admit_native_global_migration(
+            &self.opening_read(),
+            repository,
+            &self.active_account_id,
+            request,
+        )
+        .await?;
+        match admission {
+            crate::sync::NativeGlobalMigrationAdmission::Committed(receipt) => Ok(receipt),
+            crate::sync::NativeGlobalMigrationAdmission::Ready(plan) => {
+                self.stage_admitted_native_global_migration(plan).await
+            }
+        }
+    }
+    async fn stage_admitted_native_global_migration(
+        &mut self,
+        admission: crate::sync::AdmittedNativeGlobalMigration,
+    ) -> Result<crate::sync::NativeGlobalMigrationReceipt, LixError> {
+        if self.sync_role != crate::sync::SyncRole::Authority
+            || self.active_account_id != admission.account()
+            || self.active_branch_id != GLOBAL_BRANCH_ID
+            || self.staged_writes.has_staged_state_rows()?
+            || self.atomic_metadata_writes.is_some()
+            || self
+                .staged_writes
+                .commit_id_for_branch(GLOBAL_BRANCH_ID)?
+                .is_some()
+            || !self.native_migration_branch_bridges.is_empty()
+        {
+            return Err(LixError::new(
+                "LIX_MIGRATION_GLOBAL_SCOPE_UNSUPPORTED",
+                "global migration must own an empty authenticated transaction",
+            ));
+        }
+        let request = admission.request().clone();
+        self.native_migration_validation = true;
+        let outcome = crate::session::stage_merge_native_heads(
+            self,
+            GLOBAL_BRANCH_ID.into(),
+            CommitId::parse_lix(&request.base_commit_id, "migration base")?,
+            CommitId::parse_lix(&request.expected_authority_head_commit_id, "migration R")?,
+            CommitId::parse_lix(&request.captured_local_head_commit_id, "migration L")?,
+        )
+        .await?;
+        let merge = CommitId::parse_lix(
+            outcome
+                .created_merge_commit_id
+                .as_deref()
+                .ok_or_else(|| LixError::unknown("global migration omitted native M"))?,
+            "global merge outcome",
+        )?;
+        for branch in &request.new_branches {
+            let head = CommitId::parse_lix(&branch.head_commit_id, "new branch head")?;
+            let checkpoint =
+                CommitId::parse_lix(&branch.checkpoint_commit_id, "new branch checkpoint")?;
+            self.advance_branch_ref(&branch.branch_id, head).await?;
+            if head != checkpoint {
+                self.native_migration_branch_bridges.insert(
+                    branch.branch_id.clone(),
+                    CheckpointRecoveryRef {
+                        branch_id: branch.branch_id.clone(),
+                        recovered_head_commit_id: head,
+                        checkpoint_commit_id: checkpoint,
+                        interval_has_commits: true,
+                    },
+                );
+            }
+        }
+        let prepared = admission.into_receipt(merge)?;
+        if self.staged_writes.commit_id_for_branch(GLOBAL_BRANCH_ID)? != Some(merge) {
+            return Err(LixError::unknown(
+                "global outcome differs from staged native merge",
+            ));
+        }
+        let (writes, guards, receipt) = prepared.into_parts();
+        self.atomic_metadata_writes = Some(writes);
+        self.atomic_metadata_preconditions.extend(guards);
+        self.await_durable_commit = true;
+        Ok(receipt)
+    }
+
+    // Only typed authority admission enables validation of historical selections.
+    pub(crate) async fn stage_admitted_native_migration_merge(
+        &mut self,
+        admission: crate::sync::AdmittedNativeMigrationMerge,
+    ) -> Result<crate::sync::PartialMergeReceipt, LixError> {
+        if self.sync_role != crate::sync::SyncRole::Authority
+            || self.active_account_id != admission.account()
+            || self.active_branch_id != admission.branch()
+            || self.staged_writes.has_staged_state_rows()?
+            || self.atomic_metadata_writes.is_some()
+            || self
+                .staged_writes
+                .commit_id_for_branch(admission.branch())?
+                .is_some()
+        {
+            return Err(LixError::new(
+                "LIX_MIGRATION_MERGE_SCOPE_UNSUPPORTED",
+                "migration merge must own an empty authenticated authority transaction",
+            ));
+        }
+        let base = admission.base()?;
+        let remote = admission.remote()?;
+        let local = admission.local()?;
+        // Exact merge base is checked before staging plugin writes. Migration
+        // authors a validated native merge even when ordinary merge would fast-forward.
+        self.native_migration_validation = true;
+        let outcome = crate::session::stage_merge_native_heads(
+            self,
+            admission.source_branch().to_owned(),
+            base,
+            remote,
+            local,
+        )
+        .await?;
+        let merge = outcome.created_merge_commit_id.as_deref().ok_or_else(|| {
+            LixError::new(
+                "LIX_MIGRATION_MERGE_SCOPE_UNSUPPORTED",
+                "migration requires a validated native merge outcome",
+            )
+        })?;
+        let merge = crate::changelog::CommitId::parse_lix(merge, "native migration outcome")?;
+        self.stage_partial_authority_merge_receipt(admission.into_receipt(merge)?)
+    }
+
+    pub(crate) async fn reconcile_native_migration(
+        &mut self,
+        repository: &str,
+        source_branch: &str,
+        request: crate::sync::PartialMergeRequest,
+    ) -> Result<crate::sync::PartialMergeReceipt, LixError> {
+        if self.sync_role != crate::sync::SyncRole::Authority
+            || self.active_branch_id != request.branch_id
+        {
+            return Err(LixError::new(
+                "LIX_MIGRATION_MERGE_SCOPE_UNSUPPORTED",
+                "migration merge requires the captured authority session",
+            ));
+        }
+        let admission = crate::sync::admit_native_migration_merge(
+            &self.opening_read(),
+            repository,
+            &self.active_account_id,
+            source_branch,
+            request,
+        )
+        .await?;
+        match admission {
+            crate::sync::NativeMigrationAdmission::Committed(receipt) => Ok(receipt),
+            crate::sync::NativeMigrationAdmission::Ready(plan) => {
+                self.stage_admitted_native_migration_merge(plan).await
+            }
+        }
+    }
+
+    // Validate native historical selections against the candidate transaction.
+    // The emitted commit preserves original native changes; this projection is
+    // only used by existing unique/FK/index validation.
+    async fn native_migration_validation_projection(
+        &mut self,
+        read: &(impl StorageAdapterRead + ?Sized),
+        prepared: &PreparedWriteSet,
+    ) -> Result<PreparedWriteSet, LixError> {
+        if !prepared.intermediate_commits.is_empty() {
+            return Err(LixError::new(
+                "LIX_MIGRATION_MERGE_SCOPE_UNSUPPORTED",
+                "migration validation requires one captured merge commit",
+            ));
+        }
+        let mut identities = BTreeSet::new();
+        for row in &prepared.state_rows {
+            identities.insert((
+                row.branch_id.to_string(),
+                row.untracked,
+                row.schema_key.to_string(),
+                row.file_id.map(ToString::to_string),
+                row.row_pk.clone(),
+            ));
+        }
+        let mut raw = RawWriteBatch::new();
+        let mut native = TrackedStateContext::new().reader(read);
+        for (branch, refs) in &prepared.commit_change_refs_by_branch {
+            for selected in refs.selected_changes() {
+                if !identities.insert((
+                    branch.clone(),
+                    false,
+                    selected.schema_key().to_owned(),
+                    selected.file_id().map(str::to_owned),
+                    selected.row_pk().clone(),
+                )) {
+                    return Err(LixError::new(
+                        "LIX_MIGRATION_MERGE_SCOPE_UNSUPPORTED",
+                        "native historical selection overlaps a materialized semantic row",
+                    ));
+                }
+                let key = crate::tracked_state::TrackedStateKeyRef {
+                    schema_key: selected.schema_key(),
+                    file_id: selected.file_id(),
+                    row_pk: selected.row_pk(),
+                };
+                let rows = native
+                    .load_projected_batch_at_commit_refs(
+                        &selected.source_commit_id.to_string(),
+                        &[key],
+                        &crate::changelog::ChangeRecordProjection::full(),
+                    )
+                    .await?;
+                let row = rows.row(0).ok_or_else(|| {
+                    LixError::unknown("selected migration row missing from canonical native source")
+                })?;
+                if row.change_id() != selected.change_id || row.deleted() != selected.deleted {
+                    return Err(LixError::unknown(
+                        "migration native selection changed identity",
+                    ));
+                }
+                let metadata = row
+                    .metadata()
+                    .cloned()
+                    .map(TransactionJson::from_unvalidated_shared_normalized_content);
+                let created = Some(SharedStr::from(selected.created_at.to_string()));
+                let updated = Some(SharedStr::from(selected.updated_at.to_string()));
+                if selected.deleted {
+                    raw.push_parts(
+                        Some(selected.row_pk().clone()),
+                        row.schema_key_shared(),
+                        row.file_id_shared(),
+                        None,
+                        metadata,
+                        None,
+                        created,
+                        updated,
+                        branch.as_str() == GLOBAL_BRANCH_ID,
+                        Some(SharedStr::from(selected.change_id.to_string())),
+                        Some(SharedStr::from(selected.source_commit_id.to_string())),
+                        false,
+                        SharedStr::from(branch.as_str()),
+                    );
+                } else if let Some(decoded) = row.decoded_snapshot().cloned() {
+                    raw.push_typed_parts(
+                        Some(selected.row_pk().clone()),
+                        row.schema_key_shared(),
+                        row.file_id_shared(),
+                        Some(decoded),
+                        metadata,
+                        None,
+                        created,
+                        updated,
+                        branch.as_str() == GLOBAL_BRANCH_ID,
+                        Some(SharedStr::from(selected.change_id.to_string())),
+                        Some(SharedStr::from(selected.source_commit_id.to_string())),
+                        false,
+                        SharedStr::from(branch.as_str()),
+                    );
+                } else {
+                    raw.push_parts(
+                        Some(selected.row_pk().clone()),
+                        row.schema_key_shared(),
+                        row.file_id_shared(),
+                        row.snapshot_content()
+                            .cloned()
+                            .map(TransactionJson::from_unvalidated_shared_normalized_content),
+                        metadata,
+                        None,
+                        created,
+                        updated,
+                        branch.as_str() == GLOBAL_BRANCH_ID,
+                        Some(SharedStr::from(selected.change_id.to_string())),
+                        Some(SharedStr::from(selected.source_commit_id.to_string())),
+                        false,
+                        SharedStr::from(branch.as_str()),
+                    );
+                }
+            }
+        }
+        // Normalization resolves exact schemas and facts; no plugin replay here:
+        // plugin semantic resolution already ran in native merge preparation.
+        let rows = self
+            .prepare_transaction_rows_with_homogeneous(raw, false)
+            .await?;
+        let mut projection = prepared.clone();
+        projection.state_rows.append(rows);
+        projection
+            .insert_selection
+            .resize_rows(projection.state_rows.len());
+        Ok(projection)
+    }
+
+    // Compose the immutable outcome and exact source guards with native M/ref
+    // publication in one durable transaction.
+    pub(crate) fn stage_partial_authority_merge_receipt(
+        &mut self,
+        prepared: crate::sync::PreparedAuthorityMergeReceipt,
+    ) -> Result<crate::sync::PartialMergeReceipt, LixError> {
+        if self.sync_role != crate::sync::SyncRole::Authority
+            || self.active_account_id != prepared.account_id()
+            || self.active_branch_id != prepared.branch_id()
+            || self
+                .staged_writes
+                .commit_id_for_branch(prepared.branch_id())?
+                != Some(prepared.merge_commit_id()?)
+        {
+            return Err(LixError::new(
+                "LIX_PARTIAL_MERGE_RECEIPT_INVALID",
+                "authority merge receipt is not bound to this staged native transaction",
+            ));
+        }
+        if self.atomic_metadata_writes.is_some() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "atomic transaction metadata was staged more than once",
+            ));
+        }
+        let (writes, guards, receipt) = prepared.into_parts();
+        self.atomic_metadata_writes = Some(writes);
+        self.atomic_metadata_preconditions.extend(guards);
+        self.await_durable_commit = true;
+        Ok(receipt)
+    }
+
+    // The selected-ref path retains original change IDs. This entrypoint is
+    // intentionally confined to the authority-derived unchanged-catalog KV plan;
+    // it does not claim selected refs undergo general FK/unique revalidation.
+    pub(crate) async fn stage_partial_authority_kv_merge(
+        &mut self,
+        plan: crate::sync::AuthorityKvMergePlan,
+    ) -> Result<crate::sync::PartialMergeReceipt, LixError> {
+        if self.sync_role != crate::sync::SyncRole::Authority
+            || self.active_account_id != plan.account_id()
+            || self.active_branch_id != plan.branch_id()
+            || self.staged_writes.has_staged_state_rows()?
+            || self.atomic_metadata_writes.is_some()
+            || self
+                .staged_writes
+                .commit_id_for_branch(plan.branch_id())?
+                .is_some()
+        {
+            return Err(LixError::new(
+                "LIX_PARTIAL_MERGE_SCOPE_UNSUPPORTED",
+                "authority merge must own an otherwise unstaged selected transaction",
+            ));
+        }
+        if plan.has_conflicts() {
+            return Err(LixError::new(
+                "LIX_PARTIAL_MERGE_CONFLICT",
+                "divergent key/value edits require resolution; neither head was changed",
+            ));
+        }
+        let mut selected =
+        crate::transaction::staged_commit_changes::StagedCommitChangeBatchBuilder::with_capacity(
+            plan.groups().iter().map(|group| group.picks.len()).sum(),
+        );
+        for group in plan.groups() {
+            for pick in group.picks.iter() {
+                selected.push(
+                    pick.identity.clone(),
+                    pick.selected_row.commit_id,
+                    pick.change_id,
+                    pick.selected_row.deleted,
+                    pick.selected_row.created_at,
+                    pick.selected_row.updated_at,
+                );
+            }
+        }
+        let merge = self.stage_merge_commit(
+            plan.branch_id().into(),
+            plan.source_parent()?,
+            selected.finish(),
+        )?;
+        let prepared = plan.into_receipt(CommitId::parse_lix(&merge, "staged authority merge")?)?;
+        let prepared = prepared
+            .with_native_retention(&self.opening_read(), crate::telemetry::unix_time_ms())
+            .await?;
+        self.stage_partial_authority_merge_receipt(prepared)
+    }
+
+    pub(crate) async fn reconcile_partial_authority_kv(
+        &mut self,
+        repository: &str,
+        request: crate::sync::PartialMergeRequest,
+    ) -> Result<crate::sync::PartialMergeReceipt, LixError> {
+        if self.sync_role != crate::sync::SyncRole::Authority
+            || self.active_branch_id != request.branch_id
+        {
+            return Err(LixError::new(
+                "LIX_PARTIAL_MERGE_SCOPE_UNSUPPORTED",
+                "merge requires an account-bound selected authority transaction",
+            ));
+        }
+        let prepared = crate::sync::prepare_authority_kv_merge(
+            &self.opening_read(),
+            repository,
+            &self.active_account_id,
+            request,
+            crate::sync::PartialMergeBudget {
+                max_local_commits: 1024,
+                max_local_members: 65536,
+                max_local_payload_bytes: 64 * 1024 * 1024,
+                max_remote_graph_records: 1024,
+            },
+        )
+        .await?;
+        match prepared {
+            crate::sync::AuthorityMergePreparation::AlreadyCommitted(receipt) => Ok(receipt),
+            crate::sync::AuthorityMergePreparation::Ready(plan) => {
+                self.stage_partial_authority_kv_merge(plan).await
+            }
+        }
+    }
     pub(crate) fn stage_atomic_cas_publication(
         &mut self,
         writes: StorageWriteSet,
@@ -1535,6 +1988,16 @@ where
                 },
             );
         }
+        for (branch, bridge) in std::mem::take(&mut self.native_migration_branch_bridges) {
+            if self.sync_role != crate::sync::SyncRole::Authority
+                || branch_checkpoint_bridges.insert(branch, bridge).is_some()
+            {
+                return Err(LixError::new(
+                    "LIX_MIGRATION_GLOBAL_SCOPE_UNSUPPORTED",
+                    "migration checkpoint bridge conflicts with another lifecycle publication",
+                ));
+            }
+        }
         Ok(branch_checkpoint_bridges)
     }
 
@@ -1604,6 +2067,7 @@ where
         catalog_context: Arc<CatalogContext>,
         sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
         session_file_views: SessionFileViews,
+        account_insertion: Option<Arc<crate::account::AccountInsertion>>,
         runtime_boundary: F,
     ) -> Result<(OpenTransaction<StorageImpl>, T), LixError>
     where
@@ -1619,6 +2083,9 @@ where
         let read = opening_read.clone();
         let setup_result = async {
             let active_branch_id = session_branch.get()?;
+            if let Some(operation) = &account_insertion {
+                operation.ensure_session(&active_branch_id, &active_account_id)?;
+            }
             let runtime_functions =
                 FunctionContext::prepare(&read, Some(hot_state.global_key_value_rows())).await?;
             let runtime_boundary_result = runtime_boundary(&runtime_functions).await?;
@@ -1631,7 +2098,12 @@ where
                 load_revisions(&read, [REVISION_KEY_CATALOG, REVISION_KEY_TRACKED_MUTATION])
                     .await?;
             let catalog_revision = catalog_revision.map(CatalogRevision::from_storage_bytes);
-            let (sql_schema_catalog, tracked_schema_catalog) = {
+            let (sql_schema_catalog, tracked_schema_catalog) = if account_insertion.is_some() {
+                // Built-ins are immutable engine authority. This sealed INSERT
+                // cannot consult custom schemas, deletes, or plugin/file state.
+                let builtin = CatalogSnapshot::builtin_shared();
+                (builtin.clone(), builtin)
+            } else {
                 let visible_hot_state = hot_state.reader(&read);
                 let sql_schema_catalog = catalog_context
                     .compiled_catalog_for_transaction_open(
@@ -1661,7 +2133,9 @@ where
             } else {
                 branch_reader.load_head_commit_id(GLOBAL_BRANCH_ID).await?
             };
-            let opening_plugin_registry = if let Some(head) = opening_active_branch_head {
+            let opening_plugin_registry = if account_insertion.is_some() {
+                PluginRegistry::empty()
+            } else if let Some(head) = opening_active_branch_head {
                 let mut tracked = tracked_state.reader(&read);
                 load_plugin_registry_at_commit(&mut tracked, &head.to_string()).await?
             } else {
@@ -1713,6 +2187,7 @@ where
             write_context_liveness: crate::sql2::WriteContextLiveness::new(),
             active_branch_id,
             active_account_id,
+            account_insertion,
             hot_state,
             tracked_state,
             binary_cas,
@@ -1744,14 +2219,18 @@ where
             opening_active_branch_head,
             opening_global_branch_head,
             protect_sql_write_snapshot: false,
+            sql_preparation_only: false,
             commit_boundary: None,
             trust_filesystem_planner: false,
             origin_key: None,
             idempotency_receipt: None,
+            native_migration_validation: false,
+            native_migration_branch_bridges: BTreeMap::new(),
             atomic_metadata_writes: None,
             atomic_metadata_preconditions: Vec::new(),
             sync_role: crate::sync::SyncRole::Disabled,
             sync_replica_remote_id: None,
+            partial_replica_admission: None,
             await_durable_commit: false,
             session_file_views,
             pending_file_view_mutations: BTreeMap::new(),
@@ -1821,6 +2300,7 @@ where
         #[cfg(feature = "storage-benches")]
         let _phase =
             crate::storage_bench::enter_crud_phase(crate::storage_bench::CRUD_PHASE_COMMIT);
+        self.ensure_account_insertion_prepared(&prepared_writes)?;
         let commit_boundary = self.commit_boundary.clone();
         let _commit_guard = begin_commit_boundary(commit_boundary.as_ref());
         let result = async {
@@ -1831,252 +2311,9 @@ where
                 filesystem_delta_rows,
                 previous_filesystem_revision,
                 next_catalog_revision,
-            ) = instrument_lix_result(materialize_span, async {
-                transaction
-                    .uncache_completed_plugin_actors_for_large_file_writes(&prepared_writes)
-                    .await;
-                let tracked_state_changed =
-                    prepared_writes.state_rows.iter().any(|row| !row.untracked)
-                        || !prepared_writes.commit_change_refs_by_branch.is_empty()
-                        || !prepared_writes.extra_commit_parents_by_branch.is_empty();
-                let has_untracked_state_writes =
-                    prepared_writes.state_rows.iter().any(|row| row.untracked)
-                        || !prepared_writes.branch_heads.is_empty();
-                // Untracked rows are mutable current state, but their validation can read
-                // tracked schemas, parents, uniqueness owners, or filesystem state.
-                // Fence that snapshot without rotating the tracked revision: normal
-                // tracked transactions remain independent of untracked-only commits.
-                let requires_tracked_snapshot_fence =
-                    tracked_state_changed || has_untracked_state_writes;
-                let catalog_revision_changed = prepared_writes_change_catalog(&prepared_writes);
-                check_commit_boundary(commit_boundary.as_ref())?;
-                // Validate and materialize from one coherent storage snapshot. The
-                // final write's tracked-state precondition fences the decisions made
-                // here, including plugin-produced prepared rows.
-                let commit_read_storage = transaction.storage.clone();
-                let commit_read = commit_read_storage
-                    .begin_read(StorageReadOptions::default())
-                    .await?;
-                // SAFETY: `commit_read_storage` is an `Arc` retained through commit,
-                // and the transaction drops this read before its storage field.
-                let commit_read = unsafe { assume_static_storage_read::<StorageImpl>(commit_read) };
-                let mut read = SharedStorageAdapterRead::new(commit_read);
-                // Preserve the original statement snapshot until its SQL decisions
-                // have been fenced; reconciliation below uses the current read.
-                transaction.fence_sql_write_snapshot(&read).await?;
-                // Commit-time reconciliation and validation must all observe this
-                // current coherent snapshot, while user statements above observed the
-                // snapshot retained from transaction open.
-                transaction.opening_read = read.clone();
-                // Plain engines sharing replica storage remain fenced. An admitted
-                // sync engine may commit its durable pending suffix locally.
-                if transaction.sync_role != crate::sync::SyncRole::Replica
-                    && crate::sync::has_any_sync_replica_state(&read).await?
-                {
-                    return Err(LixError::new(
-                        "LIX_REPLICA_CACHE_READ_ONLY",
-                        "replica storage can only be changed by an admitted sync engine",
-                    ));
-                }
-                transaction
-                    .reconcile_stale_disjoint_writes(&read, &mut prepared_writes)
-                    .instrument(tracing::debug_span!(
-                        target: "lix_perf",
-                        "lix.perf.transaction_reconcile_stale"
-                    ))
-                    .await?;
-                let branch_checkpoint_bridges = transaction
-                    .resolve_pending_branch_checkpoint_replacements(&read, &prepared_writes)
-                    .await?;
-                let restore_targets = std::mem::take(&mut transaction.pending_restore_targets);
-                let commit_parent_heads = commit::resolve_prepared_commit_parent_heads(
-                    transaction.branch_ctx.as_ref(),
-                    &read,
-                    &prepared_writes,
-                    true,
-                )
+            ) = transaction
+                .prepare_storage_commit(runtime_functions, prepared_writes, materialize_span)
                 .await?;
-                Self::attach_checkpoint_branch_parents(
-                    &read,
-                    &mut prepared_writes,
-                    &commit_parent_heads,
-                )
-                .await?;
-                transaction
-                    .validate_prepared_writes_by_branch(&read, &mut prepared_writes)
-                    .instrument(tracing::debug_span!(
-                        target: "lix_perf",
-                        "lix.perf.transaction_validation"
-                    ))
-                    .await?;
-                // The delta itself is projected out of the commit below, once
-                // addressable rows hold their final commit-delta change ids. Only its
-                // *projectability* is decided here, because the revision the cached
-                // views are keyed on has to be read before the commit publishes its
-                // successor.
-                let stages_projectable_filesystem_rows =
-                    prepared_writes_stage_filesystem_rows(&prepared_writes)
-                        && !prepared_writes_require_filesystem_index_rebuild(&prepared_writes);
-                // A failed revision read must not collapse into "no revision yet".
-                // `None` is itself a live cache key — the state before the first
-                // filesystem commit — so treating an error as `None` would rekey
-                // entries built at an unknown revision onto this commit's successor and
-                // make a stale index reachable. The outer `Option` is "the read
-                // succeeded"; only that licenses a projection.
-                let loaded_filesystem_revision = if stages_projectable_filesystem_rows {
-                    load_path_index_revision(&read).await.ok()
-                } else {
-                    None
-                };
-                let filesystem_delta_projectable = loaded_filesystem_revision.is_some();
-                let previous_filesystem_revision = loaded_filesystem_revision.flatten();
-                let mut automatic_sync_writes = transaction.storage.new_write_set();
-                let mut automatic_sync_preconditions = Vec::new();
-                let capture_sync_commits =
-                    transaction.sync_role == crate::sync::SyncRole::Authority;
-                if transaction.sync_role == crate::sync::SyncRole::Replica {
-                    // The immutable commit and ref are the durable outbox.
-                    // `build_sync_push` discovers unpublished local heads; no second
-                    // row-pack queue is maintained.
-                    transaction.await_durable_commit = true;
-                }
-                if transaction.sync_role == crate::sync::SyncRole::Replica {
-                    for publication in &prepared_writes.checkpoint_publications {
-                        let recovery = &publication.recovery_ref;
-                        crate::sync::stage_sync_checkpoint_source(
-                            &mut automatic_sync_writes,
-                            &recovery.branch_id,
-                            recovery.checkpoint_commit_id,
-                            recovery.recovered_head_commit_id,
-                        )?;
-                    }
-                }
-                let materialized = commit::commit_prepared_writes_with_parent_heads(
-                    &transaction.binary_cas,
-                    &transaction.tracked_state,
-                    Some(transaction.sql_schema_snapshot.as_ref()),
-                    Some(runtime_functions),
-                    &transaction.active_account_id,
-                    &commit_parent_heads,
-                    &mut read,
-                    &branch_checkpoint_bridges,
-                    capture_sync_commits,
-                    &restore_targets,
-                    prepared_writes,
-                )
-                .instrument(tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.transaction_materialization"
-                ))
-                .await?;
-                let staged_sync_event = if capture_sync_commits {
-                    // Consume the exact controls produced by materialization instead
-                    // of predicting checkpoint/restore semantics from prepared rows.
-                    // The event still joins the same atomic storage commit below.
-                    crate::sync::stage_repository_transaction_event(
-                        &read,
-                        &mut automatic_sync_writes,
-                        &mut automatic_sync_preconditions,
-                        &materialized.sync_commits,
-                        &materialized.published_branch_controls,
-                    )
-                    .await?
-                } else {
-                    None
-                };
-                if transaction.sync_role == crate::sync::SyncRole::Replica
-                    && !restore_targets.is_empty()
-                {
-                    let targets = restore_targets
-                        .iter()
-                        .map(|(branch_id, intent)| (branch_id.clone(), intent.target_commit_id))
-                        .collect();
-                    let Some(remote_id) = transaction.sync_replica_remote_id.as_deref() else {
-                        return Err(LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            "sync replica restore has no active remote identity",
-                        ));
-                    };
-                    crate::sync::stage_sync_restore_intents(
-                        &read,
-                        &mut automatic_sync_writes,
-                        &mut automatic_sync_preconditions,
-                        remote_id,
-                        &targets,
-                    )
-                    .await?;
-                    transaction.await_durable_commit = true;
-                }
-                if staged_sync_event.is_some() {
-                    transaction.await_durable_commit = true;
-                }
-                if let Some(staged_sync_event) = &staged_sync_event
-                    && let Err(error) = crate::sync::validate_repository_transaction_event_transfer(
-                        staged_sync_event,
-                        &materialized.sync_commits,
-                    )
-                {
-                    return Err(error);
-                }
-                let mut writes = materialized.writes;
-                let materialization_preconditions = materialized.preconditions;
-                let filesystem_delta_rows = if filesystem_delta_projectable {
-                    materialized.filesystem_delta_rows
-                } else {
-                    Vec::new()
-                };
-                let next_catalog_revision = (catalog_revision_changed
-                    || materialized.inherited_catalog_changed)
-                    .then(|| stage_catalog_revision(&mut writes));
-                if tracked_state_changed {
-                    StorageAdapter::<StorageImpl>::stage_tracked_mutation_revision(&mut writes);
-                }
-                writes.extend(automatic_sync_writes);
-                if let Some(metadata_writes) = transaction.atomic_metadata_writes.take() {
-                    writes.extend(metadata_writes);
-                }
-                let mut write_options = StorageWriteOptions::default();
-                write_options.await_durable = transaction.await_durable_commit;
-                write_options
-                    .preconditions
-                    .extend(materialization_preconditions);
-                write_options
-                    .preconditions
-                    .append(&mut automatic_sync_preconditions);
-                write_options
-                    .preconditions
-                    .append(&mut transaction.atomic_metadata_preconditions);
-                if requires_tracked_snapshot_fence {
-                    write_options.preconditions.push(
-                        StorageAdapter::<StorageImpl>::tracked_mutation_revision_precondition(
-                            transaction.opening_tracked_mutation_revision.clone(),
-                        ),
-                    );
-                }
-                if let Some((key, value)) = transaction.idempotency_receipt.take() {
-                    writes.put(EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, key.clone(), value);
-                    // The mutation and this receipt share one atomic storage commit.
-                    // A protocol acknowledgement may replay only from a durable
-                    // receipt, so ask the storage to cross its durability boundary
-                    // before it reports this commit as successful.
-                    write_options.await_durable = true;
-                    write_options.idempotency_key = Some(key.0.clone());
-                    write_options
-                        .preconditions
-                        .push(StoragePrecondition::KeyAbsent {
-                            space: EXECUTE_IDEMPOTENCY_RECEIPT_SPACE,
-                            key,
-                        });
-                }
-                Ok((
-                    writes,
-                    write_options,
-                    filesystem_delta_rows,
-                    previous_filesystem_revision,
-                    next_catalog_revision,
-                ))
-            })
-            .await?;
             // Keep the prepared commit's storage borrow independent from the
             // transaction so deterministic preparation failures can still drain
             // prospective plugin actor documents before returning.
@@ -2212,6 +2449,331 @@ where
         result
     }
 
+    pub(crate) fn enable_sql_preparation(&mut self) {
+        self.sql_preparation_only = true;
+    }
+
+    /// Shared native preparation boundary. Returns prospective storage
+    /// mutations only; durable publication remains exclusively in commit_prepared.
+    fn prepare_storage_commit<'a>(
+        &'a mut self,
+        runtime_functions: &'a FunctionContext,
+        mut prepared_writes: PreparedWriteSet,
+        materialize_span: Option<ActiveTelemetrySpan>,
+    ) -> NativePreparationFuture<'a> {
+        Box::pin(async move {
+            let commit_boundary = self.commit_boundary.clone();
+            let transaction = self;
+            instrument_lix_result(materialize_span, async {
+
+                transaction
+                    .uncache_completed_plugin_actors_for_large_file_writes(&prepared_writes)
+                    .await;
+                let tracked_state_changed =
+                    prepared_writes.state_rows.iter().any(|row| !row.untracked)
+                        || !prepared_writes.commit_change_refs_by_branch.is_empty()
+                        || !prepared_writes.extra_commit_parents_by_branch.is_empty();
+                let has_untracked_state_writes =
+                    prepared_writes.state_rows.iter().any(|row| row.untracked)
+                        || !prepared_writes.branch_heads.is_empty();
+                // Untracked rows are mutable current state, but their validation can read
+                // tracked schemas, parents, uniqueness owners, or filesystem state.
+                // Fence that snapshot without rotating the tracked revision: normal
+                // tracked transactions remain independent of untracked-only commits.
+                let requires_tracked_snapshot_fence =
+                    tracked_state_changed || has_untracked_state_writes;
+                let catalog_revision_changed = prepared_writes_change_catalog(&prepared_writes);
+                check_commit_boundary(commit_boundary.as_ref())?;
+                // Validate and materialize from one coherent storage snapshot. The
+                // final write's tracked-state precondition fences the decisions made
+                // here, including plugin-produced prepared rows.
+                let commit_read_storage = transaction.storage.clone();
+                let commit_read = commit_read_storage
+                    .begin_read(StorageReadOptions::default())
+                    .await?;
+                // SAFETY: `commit_read_storage` is an `Arc` retained through commit,
+                // and the transaction drops this read before its storage field.
+                let commit_read = unsafe { assume_static_storage_read::<StorageImpl>(commit_read) };
+                let mut read = SharedStorageAdapterRead::new(commit_read);
+                // Preserve the original statement snapshot until its SQL decisions
+                // have been fenced; reconciliation below uses the current read.
+                transaction.fence_sql_write_snapshot(&read).await?;
+                // Commit-time reconciliation and validation must all observe this
+                // current coherent snapshot, while user statements above observed the
+                // snapshot retained from transaction open.
+                transaction.opening_read = read.clone();
+                // Plain engines sharing replica storage remain fenced. An admitted
+                // sync engine may commit its durable pending suffix locally.
+                if !transaction.sync_role.is_replica()
+                    && crate::sync::has_any_sync_replica_state(&read).await?
+                {
+                    return Err(LixError::new(
+                        "LIX_REPLICA_CACHE_READ_ONLY",
+                        "replica storage can only be changed by an admitted sync engine",
+                    ));
+                }
+                let partial_receipt_guard = if transaction.sync_role == crate::sync::SyncRole::PartialReplica {
+                    let mismatch = || LixError::new("LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH", "partial SQL writer admission no longer matches repository, remote, account and epoch");
+                    let bound = transaction.partial_replica_admission.as_ref().ok_or_else(mismatch)?;
+                    if transaction.active_account_id != bound.active_account_id()
+                        || transaction.sync_replica_remote_id.as_deref() != Some(bound.remote_id()) {
+                        return Err(mismatch());
+                    }
+                    let (current, raw) = crate::sync::load_partial_replica_state(&read).await?.ok_or_else(mismatch)?;
+                    if &current != bound.as_ref() {
+                        return Err(mismatch());
+                    }
+                    Some(crate::storage_adapter::StoragePrecondition::KeyValueEquals {
+                        space: crate::sync::PARTIAL_REPLICA_STATE_SPACE,
+                        key: crate::sync::partial_replica_state_key(), expected: raw,
+                    })
+                } else { None };
+                transaction
+                    .reconcile_stale_disjoint_writes(&read, &mut prepared_writes)
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.transaction_reconcile_stale"
+                    ))
+                    .await?;
+                let branch_checkpoint_bridges = transaction
+                    .resolve_pending_branch_checkpoint_replacements(&read, &prepared_writes)
+                    .await?;
+                let restore_targets = std::mem::take(&mut transaction.pending_restore_targets);
+                if transaction.sync_role == crate::sync::SyncRole::PartialReplica && !restore_targets.is_empty() {
+                    return Err(LixError::new(
+                        "LIX_PARTIAL_REPLICA_RESTORE_UNAVAILABLE",
+                        "partial replica restore requires native restore preparation and pending-source retention",
+                    ));
+                }
+                let commit_parent_heads = commit::resolve_prepared_commit_parent_heads(
+                    transaction.branch_ctx.as_ref(),
+                    &read,
+                    &prepared_writes,
+                    true,
+                )
+                .await?;
+                Self::attach_checkpoint_branch_parents(
+                    &read,
+                    &mut prepared_writes,
+                    &commit_parent_heads,
+                )
+                .await?;
+                if transaction.native_migration_validation {
+                    let mut projection = transaction.native_migration_validation_projection(&read, &prepared_writes).await?;
+                    transaction.validate_prepared_writes_by_branch(&read, &mut projection).await?;
+                    prepared_writes.state_rows.set_staged_index_values(projection.state_rows.staged_index_values().clone());
+                } else {
+                transaction
+                    .validate_prepared_writes_by_branch(&read, &mut prepared_writes)
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.transaction_validation"
+                    ))
+                    .await?;
+                }
+                // The delta itself is projected out of the commit below, once
+                // addressable rows hold their final commit-delta change ids. Only its
+                // *projectability* is decided here, because the revision the cached
+                // views are keyed on has to be read before the commit publishes its
+                // successor.
+                let stages_projectable_filesystem_rows =
+                    prepared_writes_stage_filesystem_rows(&prepared_writes)
+                        && !prepared_writes_require_filesystem_index_rebuild(&prepared_writes);
+                // A failed revision read must not collapse into "no revision yet".
+                // `None` is itself a live cache key — the state before the first
+                // filesystem commit — so treating an error as `None` would rekey
+                // entries built at an unknown revision onto this commit's successor and
+                // make a stale index reachable. The outer `Option` is "the read
+                // succeeded"; only that licenses a projection.
+                let loaded_filesystem_revision = if stages_projectable_filesystem_rows {
+                    load_path_index_revision(&read).await.ok()
+                } else {
+                    None
+                };
+                let filesystem_delta_projectable = loaded_filesystem_revision.is_some();
+                let previous_filesystem_revision = loaded_filesystem_revision.flatten();
+                let mut automatic_sync_writes = transaction.storage.new_write_set();
+                let mut automatic_sync_preconditions = Vec::new();
+                let capture_sync_commits =
+                    transaction.sync_role == crate::sync::SyncRole::Authority;
+                if transaction.sync_role.is_replica() {
+                    // The immutable commit and ref are the durable outbox.
+                    // `build_sync_push` discovers unpublished local heads; no second
+                    // row-pack queue is maintained.
+                    transaction.await_durable_commit = true;
+                }
+                if transaction.sync_role.is_replica() {
+                    for publication in &prepared_writes.checkpoint_publications {
+                        let recovery = &publication.recovery_ref;
+                        crate::sync::stage_sync_checkpoint_source(
+                            &mut automatic_sync_writes,
+                            &recovery.branch_id,
+                            recovery.checkpoint_commit_id,
+                            recovery.recovered_head_commit_id,
+                        )?;
+                    }
+                }
+                let materialized = commit::commit_prepared_writes_with_parent_heads(
+                    &transaction.binary_cas,
+                    &transaction.tracked_state,
+                    Some(transaction.sql_schema_snapshot.as_ref()),
+                    Some(runtime_functions),
+                    &transaction.active_account_id,
+                    &commit_parent_heads,
+                    &mut read,
+                    &branch_checkpoint_bridges,
+                    capture_sync_commits,
+                    &restore_targets,
+                    prepared_writes,
+                )
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.transaction_materialization"
+                ))
+                .await?;
+                let staged_sync_event = if capture_sync_commits {
+                    // Consume the exact controls produced by materialization instead
+                    // of predicting checkpoint/restore semantics from prepared rows.
+                    // The event still joins the same atomic storage commit below.
+                    crate::sync::stage_repository_transaction_event(
+                        &read,
+                        &mut automatic_sync_writes,
+                        &mut automatic_sync_preconditions,
+                        &materialized.sync_commits,
+                        &materialized.published_branch_controls,
+                    )
+                    .await?
+                } else {
+                    None
+                };
+                if transaction.sync_role == crate::sync::SyncRole::Replica
+                    && !restore_targets.is_empty()
+                {
+                    let targets = restore_targets
+                        .iter()
+                        .map(|(branch_id, intent)| (branch_id.clone(), intent.target_commit_id))
+                        .collect();
+                    let Some(remote_id) = transaction.sync_replica_remote_id.as_deref() else {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "sync replica restore has no active remote identity",
+                        ));
+                    };
+                    crate::sync::stage_sync_restore_intents(
+                        &read,
+                        &mut automatic_sync_writes,
+                        &mut automatic_sync_preconditions,
+                        remote_id,
+                        &targets,
+                    )
+                    .await?;
+                    transaction.await_durable_commit = true;
+                }
+                if staged_sync_event.is_some() {
+                    transaction.await_durable_commit = true;
+                }
+                if let Some(staged_sync_event) = &staged_sync_event
+                    && let Err(error) = crate::sync::validate_repository_transaction_event_transfer(
+                        staged_sync_event,
+                        &materialized.sync_commits,
+                    )
+                {
+                    return Err(error);
+                }
+                let mut writes = materialized.writes;
+                let materialization_preconditions = materialized.preconditions;
+                let filesystem_delta_rows = if filesystem_delta_projectable {
+                    materialized.filesystem_delta_rows
+                } else {
+                    Vec::new()
+                };
+                let next_catalog_revision = (catalog_revision_changed
+                    || materialized.inherited_catalog_changed)
+                    .then(|| stage_catalog_revision(&mut writes));
+                if tracked_state_changed {
+                    StorageAdapter::<StorageImpl>::stage_tracked_mutation_revision(&mut writes);
+                }
+                writes.extend(automatic_sync_writes);
+                if let Some(metadata_writes) = transaction.atomic_metadata_writes.take() {
+                    writes.extend(metadata_writes);
+                }
+                let mut write_options = StorageWriteOptions::default();
+                write_options.preconditions.extend(partial_receipt_guard);
+                write_options.await_durable = transaction.await_durable_commit;
+                write_options
+                    .preconditions
+                    .extend(materialization_preconditions);
+                write_options
+                    .preconditions
+                    .append(&mut automatic_sync_preconditions);
+                write_options
+                    .preconditions
+                    .append(&mut transaction.atomic_metadata_preconditions);
+                if requires_tracked_snapshot_fence {
+                    write_options.preconditions.push(
+                        StorageAdapter::<StorageImpl>::tracked_mutation_revision_precondition(
+                            transaction.opening_tracked_mutation_revision.clone(),
+                        ),
+                    );
+                }
+                if let Some((key, value)) = transaction.idempotency_receipt.take() {
+                    writes.put(EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, key.clone(), value);
+                    // The mutation and this receipt share one atomic storage commit.
+                    // A protocol acknowledgement may replay only from a durable
+                    // receipt, so ask the storage to cross its durability boundary
+                    // before it reports this commit as successful.
+                    write_options.await_durable = true;
+                    write_options.idempotency_key = Some(key.0.clone());
+                    write_options
+                        .preconditions
+                        .push(StoragePrecondition::KeyAbsent {
+                            space: EXECUTE_IDEMPOTENCY_RECEIPT_SPACE,
+                            key,
+                        });
+                }
+                Ok((
+                    writes,
+                    write_options,
+                    filesystem_delta_rows,
+                    previous_filesystem_revision,
+                    next_catalog_revision,
+                ))
+
+        }).await
+        })
+    }
+
+    /// Consume an isolated preparation transaction without publishing it.
+    /// The caller admits only deterministic UPDATE statements before execution.
+    pub(crate) async fn prepare_for_discard(
+        mut self,
+        runtime_functions: &FunctionContext,
+    ) -> Result<(), LixError> {
+        let result = async {
+            self.flush_prepared_mutations().await?;
+            let prepared = self.staged_writes.drain()?;
+            self.ensure_account_insertion_prepared(&prepared)?;
+            let (writes, _options, _, _, _) = self
+                .prepare_storage_commit(runtime_functions, prepared, None)
+                .await?;
+            if !self.pending_plugin_actor_publications.is_empty() {
+                return Err(LixError::new(
+                    "LIX_SQL_PREPARATION_UNSUPPORTED",
+                    "plugin-authored UPDATE preparation is not yet supported",
+                ));
+            }
+            // Every native dependency was read by the same materializer used
+            // for commit. Adapter lowering only emits mutations; opening its
+            // writer here would add no dependency coverage and would create an
+            // unnecessary cancellation/async-rollback obligation.
+            drop(writes);
+            Ok(())
+        }
+        .await;
+        self.discard_pending_plugin_actor_publications().await;
+        result
+    }
+
     /// Large import documents are more valuable as transient parser state than
     /// as cache entries. Release their completed Stores before validation and
     /// materialization so guest arenas do not overlap the atomic storage
@@ -2261,9 +2823,11 @@ where
         &mut self,
         role: crate::sync::SyncRole,
         replica_remote_id: Option<Arc<str>>,
+        partial_admission: Option<Arc<crate::sync::PartialReplicaState>>,
     ) {
         self.sync_role = role;
         self.sync_replica_remote_id = replica_remote_id;
+        self.partial_replica_admission = partial_admission;
     }
 
     pub(crate) fn trust_serialized_filesystem_planner(&mut self) {
@@ -2399,10 +2963,87 @@ where
     /// transaction owns the `RawWriteBatch` → `PreparedStateBatch` transition,
     /// so generated timestamps, change ids, commit ids, and commit change refs
     /// stay in one batch pipeline.
+    fn ensure_account_insertion_raw(&self, write: &TransactionWrite) -> Result<(), LixError> {
+        let Some(operation) = &self.account_insertion else {
+            return Ok(());
+        };
+        let TransactionWrite::Rows {
+            mode: TransactionWriteMode::Insert,
+            rows,
+        } = write
+        else {
+            return Err(crate::account::AccountInsertion::reject()
+                .with_details(serde_json::json!({"stage":"raw_mode"})));
+        };
+        let id = RowPk::uuid_from_canonical(operation.id())
+            .map_err(|_| crate::account::AccountInsertion::reject())?;
+        if rows.len() > 1
+            || rows.iter().any(|row| {
+                row.schema_key.as_str() != "lix_account"
+                    || row.file_id.is_some()
+                    || row.snapshot.is_none()
+                    || row.untracked
+                    || !row.global
+                    || row.branch_id.as_str() != GLOBAL_BRANCH_ID
+                    || row.row_pk.is_some_and(|pk| pk != &id)
+            })
+        {
+            return Err(crate::account::AccountInsertion::reject().with_details(serde_json::json!({"stage":"raw_identity","rows":rows.len(),"identities":rows.iter().map(|row|serde_json::json!({"schema":row.schema_key.as_str(),"file":row.file_id.is_some(),"payload":row.snapshot.is_some(),"untracked":row.untracked,"global":row.global,"globalBranch":row.branch_id.as_str()==GLOBAL_BRANCH_ID,"expectedPk":row.row_pk.is_none_or(|pk|pk==&id)})).collect::<Vec<_>>() })));
+        }
+        for row in rows.iter() {
+            if let Some(typed) = row.decoded_snapshot() {
+                operation.ensure_typed_snapshot(&typed.row)?;
+            } else if let Some(json) = row.snapshot_json() {
+                operation.ensure_json_snapshot(json.value())?;
+            } else {
+                return Err(crate::account::AccountInsertion::reject());
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_account_insertion_prepared(&self, writes: &PreparedWriteSet) -> Result<(), LixError> {
+        let Some(operation) = &self.account_insertion else {
+            return Ok(());
+        };
+        let id = RowPk::uuid_from_canonical(operation.id())
+            .map_err(|_| crate::account::AccountInsertion::reject())?;
+        if writes.state_rows.len() > 1
+            || writes.insert_selection.len() != writes.state_rows.len()
+            || !writes.branch_heads.is_empty()
+            || !writes.file_content_writes.is_empty()
+            || !writes.first_commit_parent_override_by_branch.is_empty()
+            || !writes.checkpoint_publications.is_empty()
+            || !writes.extra_commit_parents_by_branch.is_empty()
+            || !writes.intermediate_commits.is_empty()
+            || self.atomic_metadata_writes.is_some()
+            || !self.pending_plugin_actor_publications.is_empty()
+            || writes.state_rows.iter().any(|row| {
+                row.schema_key.as_str() != "lix_account"
+                    || row.file_id.is_some()
+                    || row.snapshot.is_none()
+                    || row.untracked
+                    || !row.global
+                    || row.branch_id.as_str() != GLOBAL_BRANCH_ID
+                    || row.row_pk != &id
+            })
+        {
+            return Err(crate::account::AccountInsertion::reject().with_details(serde_json::json!({"stage":"prepared_shape","rows":writes.state_rows.len(),"inserts":writes.insert_selection.len(),"hasBranchHeads":!writes.branch_heads.is_empty(),"files":writes.file_content_writes.len(),"parentOverrides":writes.first_commit_parent_override_by_branch.len(),"checkpoints":writes.checkpoint_publications.len(),"extraParents":writes.extra_commit_parents_by_branch.len(),"intermediateCommits":writes.intermediate_commits.len(),"metadataWrites":self.atomic_metadata_writes.is_some(),"pluginPublications":self.pending_plugin_actor_publications.len(),"identities":writes.state_rows.iter().map(|row|serde_json::json!({"schema":row.schema_key.as_str(),"file":row.file_id.is_some(),"payload":row.snapshot.is_some(),"untracked":row.untracked,"global":row.global,"globalBranch":row.branch_id.as_str()==GLOBAL_BRANCH_ID,"expectedPk":row.row_pk==&id})).collect::<Vec<_>>() })));
+        }
+        for row in writes.state_rows.iter() {
+            let typed = row
+                .materialize_decoded_snapshot()?
+                .ok_or_else(crate::account::AccountInsertion::reject)?;
+            operation.ensure_typed_snapshot(&typed.row)?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn stage_write(
         &mut self,
         mut write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError> {
+        self.ensure_account_insertion_raw(&write)?;
         let (heads, mode) = match &mut write {
             TransactionWrite::Rows { rows, mode }
             | TransactionWrite::RowsWithFileContent { rows, mode, .. } => {
@@ -2729,6 +3370,7 @@ where
         retained_recovery: bool,
         historical_files: BTreeSet<String>,
     ) -> Result<TransactionWriteOutcome, LixError> {
+        self.ensure_account_insertion_raw(&write)?;
         if let Some(statement_indices) = &statement_indices {
             debug_assert_eq!(statement_indices.len(), transaction_write_row_count(&write));
         }
@@ -4522,6 +5164,43 @@ where
             };
             registries.insert(branch_id.clone(), registry);
         }
+        if self.sql_preparation_only {
+            // Read-only native registry/path classification precedes generation
+            // upgrades, actor leases, actor creation and prospective documents.
+            for row in rows.iter() {
+                if registries
+                    .get(row.branch_id.as_str())
+                    .is_some_and(|registry| registry.owns_schema(row.schema_key.as_str()))
+                {
+                    return Err(LixError::new(
+                        "LIX_SQL_PREPARATION_UNSUPPORTED",
+                        "plugin-authored SQL preparation is not yet supported",
+                    ));
+                }
+            }
+            for write in file_content.iter() {
+                let Some(registry) = registries.get(&write.branch_id) else {
+                    continue;
+                };
+                let Some(path) = write.path.as_deref() else {
+                    return Err(LixError::new(
+                        "LIX_SQL_PREPARATION_UNSUPPORTED",
+                        "file preparation requires a resolved path",
+                    ));
+                };
+                let catalog = self.plugin_host.compiled_plugin_catalog(registry)?;
+                if registry
+                    .plugins()
+                    .iter()
+                    .any(|plugin| catalog.matches_plugin(plugin.key(), path))
+                {
+                    return Err(LixError::new(
+                        "LIX_SQL_PREPARATION_UNSUPPORTED",
+                        "plugin-matched file preparation is not yet supported",
+                    ));
+                }
+            }
+        }
         for (key, mutation) in lifecycle {
             let registry = registries
                 .get_mut(&key.branch_id)
@@ -4744,6 +5423,12 @@ where
             }
         }
 
+        if self.sql_preparation_only && !owners.is_empty() {
+            return Err(LixError::new(
+                "LIX_SQL_PREPARATION_UNSUPPORTED",
+                "plugin-owned file preparation is not yet supported",
+            ));
+        }
         let mut catalogs = BTreeMap::<String, Arc<CompiledPluginCatalog>>::new();
         for branch_id in &active_branch_ids {
             let registry = registries
@@ -9702,7 +10387,18 @@ where
                         },
                     )
                     .await?;
-                let hot_working_diff_certified = direct_diff.is_some();
+                // A partial replica's durable root plus its HOT overlay is an
+                // exact current view even when the HOT-only dirty index cannot
+                // certify it. The canonical diff below proves the whole dirty
+                // interval; rebase its requested keys through native root reads
+                // instead of rebuilding a complete repository generation.
+                let root_backed_current = self.partial_replica_admission.is_some()
+                    && TrackedHeadContext::new()
+                        .reader(self.opening_read())
+                        .root_current_base_commit(&branch_id, control.tracked_generation)
+                        .await?
+                        .is_some();
+                let hot_working_diff_certified = direct_diff.is_some() || root_backed_current;
                 let diff = match direct_diff {
                     Some(direct) => direct.diff,
                     None => {
@@ -10462,14 +11158,19 @@ async fn resolve_prepared_mutation_collection_generation(
     Ok(generation.map(|generation| (schema_key, generation)))
 }
 
-async fn load_opening_exact_hot_state_batch(
-    read: impl StorageAdapterRead + Send,
+// Keep native input loading behind a checked Send boundary. In particular,
+// SQL preparation must not expose the entire HOT scan future to downstream
+// consumers merely to prove its public future is movable.
+fn load_opening_exact_hot_state_batch<'a>(
+    read: impl StorageAdapterRead + Send + 'a,
     hot_state: Arc<HotStateContext>,
     branch_head_control_cache: Arc<BranchHeadControlCache>,
-    request: &HotStateExactBatchRequest,
-) -> Result<MaterializedHotStateExactBatch, LixError> {
-    let base = hot_state.transaction_reader(read, branch_head_control_cache);
-    base.load_exact_batch(request).await
+    request: &'a HotStateExactBatchRequest,
+) -> crate::sync::SyncTransportFuture<'a, MaterializedHotStateExactBatch> {
+    Box::pin(async move {
+        let base = hot_state.transaction_reader(read, branch_head_control_cache);
+        base.load_exact_batch(request).await
+    })
 }
 
 fn diff_record_identity(record: &ChangeRecord) -> (String, RowPk, Option<String>) {
@@ -11214,6 +11915,10 @@ where
         &self.active_account_id
     }
 
+    fn read_interest_registry(&self) -> Option<Arc<crate::hot_state::ReadInterestRegistry>> {
+        self.hot_state.read_interest_registry()
+    }
+
     fn hot_state(&self) -> Arc<dyn HotStateReader> {
         Arc::new(TransactionReadHotStateReader {
             base: self.hot_state.transaction_reader(
@@ -11281,9 +11986,27 @@ struct TransactionBlobDataReader {
 
 #[async_trait]
 impl BlobDataReader for TransactionBlobDataReader {
+    async fn require_referenced_manifests(&self, hashes: &[BlobId]) -> Result<(), LixError> {
+        require_transaction_blob_manifests(self.base.as_ref(), &self.staged_writes, hashes).await
+    }
+
     async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
         load_transaction_blob_bytes(self.base.as_ref(), &self.staged_writes, hashes).await
     }
+}
+
+async fn require_transaction_blob_manifests(
+    base: &dyn BlobDataReader,
+    staged: &TransactionWriteBuffer,
+    hashes: &[BlobId],
+) -> Result<(), LixError> {
+    let values = staged.load_staged_file_bytes_many(hashes)?.into_vec();
+    let missing = hashes
+        .iter()
+        .zip(values)
+        .filter_map(|(hash, bytes)| bytes.is_none().then_some(*hash))
+        .collect::<Vec<_>>();
+    base.require_referenced_manifests(&missing).await
 }
 
 async fn load_transaction_blob_bytes(
@@ -11336,6 +12059,12 @@ impl<R> HotStateReader for TransactionReadHotStateReader<R>
 where
     R: crate::storage_adapter::StorageRead + 'static,
 {
+    fn is_partial_replica(&self) -> bool {
+        self.base.is_partial_replica()
+    }
+    fn read_interest_registry(&self) -> Option<Arc<crate::hot_state::ReadInterestRegistry>> {
+        self.base.read_interest_registry()
+    }
     async fn scan_batch(
         &self,
         request: &HotStateScanRequest,
@@ -11738,6 +12467,40 @@ pub(crate) async fn open_transaction<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    open_transaction_with_account_scope(
+        session_branch,
+        active_account_id,
+        storage,
+        hot_state,
+        tracked_state,
+        binary_cas,
+        plugin_host,
+        branch_ctx,
+        catalog_context,
+        sql_planning_cache,
+        session_file_views,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn open_transaction_with_account_scope<StorageImpl>(
+    session_branch: &SessionBranch,
+    active_account_id: String,
+    storage: StorageAdapter<StorageImpl>,
+    hot_state: Arc<HotStateContext>,
+    tracked_state: Arc<TrackedStateContext>,
+    binary_cas: Arc<BinaryCasContext>,
+    plugin_host: PluginRuntimeHost,
+    branch_ctx: Arc<BranchContext>,
+    catalog_context: Arc<CatalogContext>,
+    sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
+    session_file_views: SessionFileViews,
+    account_insertion: Option<Arc<crate::account::AccountInsertion>>,
+) -> Result<OpenTransaction<StorageImpl>, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
     let (opened, ()) = Transaction::open(
         session_branch,
         active_account_id,
@@ -11750,6 +12513,7 @@ where
         catalog_context,
         sql_planning_cache,
         session_file_views,
+        account_insertion,
         async |_| Ok(()),
     )
     .await?;
@@ -11768,6 +12532,7 @@ pub(crate) async fn open_transaction_with_runtime_boundary<StorageImpl, T, F>(
     catalog_context: Arc<CatalogContext>,
     sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     session_file_views: SessionFileViews,
+    account_insertion: Option<Arc<crate::account::AccountInsertion>>,
     runtime_boundary: F,
 ) -> Result<(OpenTransaction<StorageImpl>, T), LixError>
 where
@@ -11786,6 +12551,7 @@ where
         catalog_context,
         sql_planning_cache,
         session_file_views,
+        account_insertion,
         runtime_boundary,
     )
     .await
@@ -11796,6 +12562,12 @@ impl<StorageImpl> SqlWriteExecutionContext for Transaction<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    fn is_partial_replica(&self) -> bool {
+        self.hot_state.is_partial_replica()
+    }
+    fn read_interest_registry(&self) -> Option<Arc<crate::hot_state::ReadInterestRegistry>> {
+        self.hot_state.read_interest_registry()
+    }
     fn ensure_statement_allowed_after_restore(&self) -> Result<(), LixError> {
         if self.pending_restore_targets.is_empty() {
             return Ok(());
@@ -11860,6 +12632,16 @@ where
         // Publishing that observation into the session would leak uncommitted
         // state and can wait forever behind this transaction's actor lease.
         None
+    }
+
+    async fn require_referenced_manifests(&mut self, hashes: &[BlobId]) -> Result<(), LixError> {
+        let read = SharedStorageAdapterRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
+        let base = self.binary_cas.reader(read);
+        require_transaction_blob_manifests(&base, &self.staged_writes, hashes).await
     }
 
     async fn load_bytes_many(&mut self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {

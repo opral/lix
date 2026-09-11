@@ -21,7 +21,9 @@ pub(crate) fn validate_sync_blob_manifest(manifest: &SyncBlobManifest) -> Result
     decode_manifest(manifest).map(|_| ())
 }
 
-fn decode_manifest(manifest: &SyncBlobManifest) -> Result<CanonicalBlobManifest, LixError> {
+pub(super) fn decode_manifest(
+    manifest: &SyncBlobManifest,
+) -> Result<CanonicalBlobManifest, LixError> {
     if manifest.chunks.len() > MAX_SYNC_BLOB_CHUNKS {
         return Err(LixError::new(
             LixError::CODE_INVALID_PARAM,
@@ -47,7 +49,7 @@ fn decode_manifest(manifest: &SyncBlobManifest) -> Result<CanonicalBlobManifest,
     Ok(canonical)
 }
 
-fn encode_manifest(
+pub(super) fn encode_manifest(
     blob_id: BlobId,
     chunks: &[CanonicalBlobChunk],
 ) -> Result<SyncBlobManifest, LixError> {
@@ -75,7 +77,7 @@ fn encode_manifest(
     })
 }
 
-fn decode_inline_bytes(wire: &SyncBlobManifest) -> Result<Option<Vec<u8>>, LixError> {
+pub(super) fn decode_inline_bytes(wire: &SyncBlobManifest) -> Result<Option<Vec<u8>>, LixError> {
     let Some(encoded) = wire.inline_bytes_base64.as_deref() else {
         return Ok(None);
     };
@@ -224,9 +226,38 @@ where
         &self,
         blob_id: &str,
     ) -> Result<Option<SyncBlobManifest>, LixError> {
+        self.get_sync_blob_manifest_with_baseline_lease(blob_id, None)
+            .await
+    }
+
+    pub(crate) async fn get_sync_blob_manifest_leased(
+        &self,
+        blob_id: &str,
+        lease_id: &str,
+    ) -> Result<Option<SyncBlobManifest>, LixError> {
+        let _collaboration_guard = self.lock_collaboration_writes().await;
+        self.get_sync_blob_manifest_with_baseline_lease(blob_id, Some(lease_id))
+            .await
+    }
+
+    async fn get_sync_blob_manifest_with_baseline_lease(
+        &self,
+        blob_id: &str,
+        lease_id: Option<&str>,
+    ) -> Result<Option<SyncBlobManifest>, LixError> {
         let blob_id = BlobId::from_hex(blob_id)?;
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
+        if let Some(id) = lease_id {
+            crate::gc::require_native_baseline_lease(
+                &read,
+                id,
+                self.active_account_id(),
+                crate::telemetry::unix_time_ms(),
+            )
+            .await?;
+        }
+
         let Some(chunks) = load_canonical_blob_chunks(&read, blob_id).await? else {
             return Ok(None);
         };
@@ -273,9 +304,35 @@ where
     }
 
     pub(crate) async fn get_sync_chunk(&self, chunk_id: &str) -> Result<Option<Vec<u8>>, LixError> {
+        self.get_sync_chunk_with_baseline_lease(chunk_id, None)
+            .await
+    }
+    pub(crate) async fn get_sync_chunk_leased(
+        &self,
+        chunk_id: &str,
+        lease_id: &str,
+    ) -> Result<Option<Vec<u8>>, LixError> {
+        self.get_sync_chunk_with_baseline_lease(chunk_id, Some(lease_id))
+            .await
+    }
+    async fn get_sync_chunk_with_baseline_lease(
+        &self,
+        chunk_id: &str,
+        lease_id: Option<&str>,
+    ) -> Result<Option<Vec<u8>>, LixError> {
         let chunk_id = ChunkHash::from_hex(chunk_id)?;
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
+        if let Some(id) = lease_id {
+            crate::gc::require_native_baseline_lease(
+                &read,
+                id,
+                self.active_account_id(),
+                crate::telemetry::unix_time_ms(),
+            )
+            .await?;
+        }
+
         load_verified_chunk(&read, chunk_id).await
     }
 

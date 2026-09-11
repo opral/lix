@@ -289,7 +289,7 @@ where
         adapter,
         revision,
         crate::init::REPOSITORY_PROTOCOL_V77_CHECKPOINT_REWRITE,
-        crate::init::REPOSITORY_PROTOCOL_VALUE,
+        crate::init::REPOSITORY_PROTOCOL_V78,
         plan,
     )
     .await?;
@@ -633,7 +633,10 @@ mod tests {
             super::super::api::inspect_lix_with_adapter(&adapter)
                 .await
                 .unwrap(),
-            super::super::api::MigrationStatus::Current { version: 78 }
+            super::super::api::MigrationStatus::Required {
+                from_version: 78,
+                to_version: crate::init::CURRENT_FORMAT_VERSION
+            }
         );
     }
 

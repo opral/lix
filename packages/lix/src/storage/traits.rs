@@ -1,7 +1,7 @@
 use crate::storage::{
     BeginScanOptions, Capability, CommitResult, GetManyRequest, GetManyResult, Key, KeyRange,
-    PutBatch, ReadOptions, ScanCursor, StorageChangeWatch, StorageError, StorageSpace,
-    StorageSessionToken, WriteOptions,
+    PutBatch, ReadOptions, ScanCursor, StorageChangeWatch, StorageError, StorageSessionToken,
+    StorageSpace, WriteOptions,
 };
 
 /// An ordered byte-key entry storage with coherent read views, batched point
@@ -35,6 +35,15 @@ pub trait Storage: Send + Sync {
     fn acquire_session(
         &self,
     ) -> impl Future<Output = Result<StorageSessionToken, StorageError>> + Send;
+
+    /// Acquires exclusive partial-engine ownership of this physical store.
+    /// Unsupported stores must refuse partial opening; ordinary sessions are unchanged.
+    fn acquire_partial_replica_owner(
+        &self,
+        _session: StorageSessionToken,
+    ) -> impl Future<Output = Result<crate::storage::StorageOwnerLease, StorageError>> + Send {
+        async { Err(StorageError::Unsupported(Capability::PartialReplicaOwner)) }
+    }
 
     fn begin_read(
         &self,

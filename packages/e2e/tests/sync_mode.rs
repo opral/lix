@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use futures_util::StreamExt as _;
 use futures_util::io::Cursor;
 use http::header::CONTENT_TYPE;
 use http::{Method, Request, Response, StatusCode};
@@ -39,6 +40,8 @@ const HOT_STATE_PROFILE_RECORD_PREFIX: &str = "LIX_HOT_STATE_PROFILE_JSON=";
 
 #[derive(Debug, Default)]
 struct HttpProbe {
+    attempted_requests: AtomicU64,
+    response_body_bytes: AtomicU64,
     handshakes: AtomicU64,
     delta_pulls: AtomicU64,
     publication_fences: AtomicU64,
@@ -1769,6 +1772,124 @@ async fn fetched_immutable_history_is_cached_across_offline_reopen() {
     stop_server(server_task).await;
 }
 
+/// Baseline diagnostic, not an assertion that opening is already size independent.
+/// Run alone; allocations and network counters include the background worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "manual partial replica opening baseline"]
+async fn partial_replica_open_profile() {
+    let mut records = Vec::new();
+    // Independently vary one dimension. Content is deterministic and distinct
+    // by block to avoid measuring a highly deduplicated all-zero fixture.
+    for (label, rows, branches, history, content_bytes) in [
+        ("base", 16usize, 0usize, 2usize, 1024usize),
+        ("rows", 1600, 0, 2, 1024),
+        ("branches", 16, 16, 2, 1024),
+        ("history", 16, 0, 200, 1024),
+        ("content", 16, 0, 2, 1024 * 1024),
+    ] {
+        let (storage, authority) = open_authority().await;
+        seed_hot_profile_rows(&authority, rows).await;
+        put_value(&authority, "partial-profile-marker", "before").await;
+        let payload = (0..content_bytes)
+            .map(|index| {
+                let mut value = (index as u64).wrapping_add(0x9e3779b97f4a7c15);
+                value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+                (value ^ (value >> 31)) as u8
+            })
+            .collect::<Vec<_>>();
+        authority
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ('/unopened-payload.bin', $1)",
+                &[Value::Blob(payload.into())],
+            )
+            .await
+            .unwrap();
+        for index in 0..history {
+            put_value(&authority, "unopened-history", &index.to_string()).await;
+        }
+        authority
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .await
+            .unwrap();
+        for index in 0..branches {
+            authority
+                .create_branch(CreateBranchOptions {
+                    id: None,
+                    name: format!("unopened-{index}"),
+                    from_commit_id: None,
+                })
+                .await
+                .unwrap();
+        }
+        authority.close().await.unwrap();
+        let probe = Arc::new(HttpProbe::default());
+        let (url, task) = serve(storage, Arc::clone(&probe)).await;
+        let directory = TempDir::new().unwrap();
+        let scope = AllocationScope::start();
+        let started = Instant::now();
+        let replica = open_replica(directory.path(), &url).await;
+        let elapsed_ns = duration_nanos(started.elapsed());
+        let allocation = scope.finish();
+        let opening = json!({"elapsed_ns": elapsed_ns,
+            "attempted_requests": probe.attempted_requests.load(Ordering::Relaxed),
+            "response_body_bytes": probe.response_body_bytes.load(Ordering::Relaxed),
+            "snapshot_row_pulls": probe.snapshot_row_pulls.load(Ordering::Relaxed),
+            "chunk_gets": probe.chunk_gets.load(Ordering::Relaxed),
+            "allocated_bytes": allocation.allocated_bytes,
+            "peak_live_bytes": allocation.peak_live_bytes_delta});
+        let mut operations = Vec::new();
+        for (operation, sql) in [
+            (
+                "first_point_read",
+                "SELECT value FROM lix_key_value WHERE key = 'partial-profile-marker'",
+            ),
+            (
+                "warm_point_read",
+                "SELECT value FROM lix_key_value WHERE key = 'partial-profile-marker'",
+            ),
+            (
+                "warm_point_write",
+                "UPDATE lix_key_value SET value = 'after' WHERE key = 'partial-profile-marker'",
+            ),
+            (
+                "read_own_write",
+                "SELECT value FROM lix_key_value WHERE key = 'partial-profile-marker'",
+            ),
+        ] {
+            let before = probe.attempted_requests.load(Ordering::Relaxed);
+            let bytes_before = probe.response_body_bytes.load(Ordering::Relaxed);
+            let started = Instant::now();
+            let result = replica.execute(sql, &[]).await.unwrap();
+            if operation == "read_own_write" {
+                let value = result.rows()[0].get::<Value>("value").unwrap();
+                let value = match value {
+                    Value::Jsonb(value) => value.as_json_string(),
+                    Value::Text(value) => Some(value),
+                    _ => None,
+                };
+                assert_eq!(value.as_deref(), Some("after"));
+            }
+            operations.push(json!({"operation": operation, "elapsed_ns": duration_nanos(started.elapsed()),
+                "attempted_requests_including_background": probe.attempted_requests.load(Ordering::Relaxed) - before,
+                "response_body_bytes_including_background": probe.response_body_bytes.load(Ordering::Relaxed) - bytes_before}));
+        }
+        records.push(json!({"case": label, "dimensions": {"file_rows": rows, "additional_branches": branches, "history_updates": history, "unopened_content_bytes": content_bytes}, "open": opening, "operations": operations}));
+        replica.close().await.unwrap();
+        stop_server(task).await;
+        println!(
+            "LIX_PARTIAL_REPLICA_PROFILE_CASE={}",
+            records.last().unwrap()
+        );
+    }
+    let artifact = json!({"schema": "lix.partial-replica-open-profile.v1", "samples_per_case": 1,
+        "limits": "Native filesystem replica with in-process memory authority; counters include background work, bytes are emitted HTTP body bytes excluding headers/offline errors; latency diagnostic, no browser result or zero-RTT attribution claimed; schemas not varied.", "records": records});
+    println!("LIX_PARTIAL_REPLICA_PROFILE_JSON={artifact}");
+    if let Ok(path) = std::env::var("LIX_PARTIAL_REPLICA_PROFILE_OUTPUT") {
+        std::fs::write(path, serde_json::to_vec_pretty(&artifact).unwrap()).unwrap();
+    }
+}
+
 /// Run alone: allocations include the in-process authority and sync worker.
 /// Latency is diagnostic; the offline regression above gates zero network
 /// dependency without fragile wall-clock limits on shared CI hosts.
@@ -2250,6 +2371,7 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let (parts, body) = request.into_parts();
+    probe.attempted_requests.fetch_add(1, Ordering::Relaxed);
     if probe.reject_requests.load(Ordering::Acquire) {
         return Ok(Response::builder()
             .status(503)
@@ -2349,7 +2471,19 @@ where
     // Observations are streaming responses. Collecting them here would wait
     // forever before sending headers and conceal authority-backed observers.
     tokio::time::sleep(one_way_delay).await;
-    Ok(Response::from_parts(parts, body))
+    // Count emitted data frames without collecting potentially unbounded SSE.
+    let counted = body.into_data_stream().map(move |chunk| {
+        if let Ok(bytes) = &chunk {
+            probe
+                .response_body_bytes
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        }
+        chunk
+    });
+    Ok(Response::from_parts(
+        parts,
+        ServerProtocolBody::stream(counted),
+    ))
 }
 
 /// Asserts every file row's `directory_id` resolves among the same tree's

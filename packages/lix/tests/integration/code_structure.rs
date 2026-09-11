@@ -2172,6 +2172,10 @@ fn is_allowed_raw_execute_boundary_path(relative_path: &str) -> bool {
         || relative_path.starts_with("sql")
         || relative_path.starts_with("execution")
         || relative_path == "server_protocol/mod.rs"
+        // SessionTransaction owns public SQL transaction orchestration,
+        // including isolated dependency preparation. Its execute method is
+        // the public SQL boundary, not a raw storage SQL executor.
+        || relative_path == "session/transaction.rs"
         || relative_path == "transaction/buffered_write_transaction.rs"
 }
 

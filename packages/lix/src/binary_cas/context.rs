@@ -10,6 +10,11 @@ use std::collections::HashSet;
 
 #[async_trait]
 pub(crate) trait BlobDataReader: Send + Sync {
+    /// Called only for hashes named by actual visible file/blob references.
+    async fn require_referenced_manifests(&self, _hashes: &[BlobId]) -> Result<(), LixError> {
+        Ok(())
+    }
+
     async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError>;
 
     async fn load_ranges_many(
@@ -72,11 +77,21 @@ fn materialize_blob_range(
 /// The context does not own storage. Callers explicitly provide a KV store via
 /// `reader(...)` or `writer_skipping_existing_chunks(...)`, keeping storage and
 /// transaction ownership at the execution layer.
-pub(crate) struct BinaryCasContext;
+pub(crate) struct BinaryCasContext {
+    referenced_manifest_demands: std::sync::atomic::AtomicBool,
+}
 
 impl BinaryCasContext {
     pub(crate) fn new() -> Self {
-        Self
+        Self {
+            referenced_manifest_demands: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Enable only after the engine validates durable partial admission.
+    pub(crate) fn enable_referenced_manifest_demands(&self) {
+        self.referenced_manifest_demands
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Creates a Binary CAS reader over any storage reader.
@@ -88,7 +103,12 @@ impl BinaryCasContext {
     where
         S: StorageAdapterRead,
     {
-        BinaryCasStoreReader { store }
+        BinaryCasStoreReader {
+            store,
+            referenced_manifest_demands: self
+                .referenced_manifest_demands
+                .load(std::sync::atomic::Ordering::Acquire),
+        }
     }
 
     pub(crate) fn writer_skipping_existing_chunks<'a, S>(
@@ -108,9 +128,25 @@ impl<S> BlobDataReader for BinaryCasStoreReader<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync,
 {
+    async fn require_referenced_manifests(&self, hashes: &[BlobId]) -> Result<(), LixError> {
+        if !self.referenced_manifest_demands {
+            return Ok(());
+        }
+        let metadata = crate::binary_cas::load_metadata_many(&self.store, hashes)
+            .await?
+            .into_vec();
+        for (hash, metadata) in hashes.iter().zip(metadata) {
+            if metadata.is_none() {
+                return Err(super::BlobManifestRequired(*hash).into_error());
+            }
+        }
+        Ok(())
+    }
+
     async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
         let mut reader = Self {
             store: self.store.clone(),
+            referenced_manifest_demands: self.referenced_manifest_demands,
         };
         Self::load_bytes_many(&mut reader, hashes).await
     }
@@ -126,6 +162,7 @@ where
 /// Binary CAS reader over a caller-supplied KV store.
 pub(crate) struct BinaryCasStoreReader<S> {
     store: S,
+    referenced_manifest_demands: bool,
 }
 
 impl<S> BinaryCasStoreReader<S>

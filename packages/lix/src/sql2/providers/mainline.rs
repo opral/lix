@@ -394,7 +394,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                         let Some(parent) = next else { continue; }; // root is a baseline, not a synthetic change
                         let diff_projection = schema.fields().iter().filter_map(|field| relation.schema.index_of(field.name()).ok()).collect::<Vec<_>>();
                         record_work(true);
-                        let diff = DiffSpec { store: store.clone(), relation: relation.clone(), from_commit_id: parent.to_string(),
+                        let diff = DiffSpec { store: store.clone(), read_interests: None, interest_endpoints: None, relation: relation.clone(), from_commit_id: parent.to_string(),
                             to_commit_id: id.to_string(), active_branch_id: active_branch_id.clone(), mode: DiffMode::General };
                         let plan = diff.plan_scan(Some(&diff_projection), &row_filters, None, &ExecutionProps::new()).await?;
                         let mut batches = plan.source.open(0, context.clone())?;

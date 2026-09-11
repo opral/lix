@@ -1,3 +1,5 @@
+mod partial_owner;
+pub(crate) use partial_owner::PartialOwnerLifetime;
 use std::sync::Arc;
 
 use crate::GLOBAL_BRANCH_ID;
@@ -47,6 +49,7 @@ pub(crate) struct Engine<StorageImpl: Storage + 'static = crate::storage_adapter
     observe_coordinator: Arc<ObserveCoordinator>,
     observe_invalidation: Arc<ObserveInvalidation>,
     sync_mode: SyncModeState,
+    partial_owner: PartialOwnerLifetime,
     plugin_host: PluginRuntimeHost,
     telemetry: Option<Arc<dyn TelemetrySink>>,
     lix_id: Arc<str>,
@@ -179,6 +182,50 @@ where
         options: EngineOptions,
         migration_source_version: Option<u32>,
     ) -> Result<Self, LixError> {
+        Self::construct(storage, options, migration_source_version, None).await
+    }
+
+    /// Open only the durable coordinates admitted by the on-demand sync caller.
+    /// This performs no SQL identity/account lookup and no repository scan.
+    /// The caller must bind the expected receipt to its authenticated authority
+    /// (or the same persisted offline admission), then install demand handling
+    /// before exposing this engine/session. This does not grant write capability.
+    pub(crate) async fn new_partial_replica(
+        storage: StorageAdapter<StorageImpl>,
+        options: EngineOptions,
+        expected: &crate::sync::PartialReplicaState,
+    ) -> Result<(Self, SessionContext<StorageImpl>), LixError> {
+        let engine = Self::construct(storage, options, None, Some(expected)).await?;
+        engine.binary_cas.enable_referenced_manifest_demands();
+        let session = engine.session_at_unchecked(
+            expected.descriptor().selected_branch.branch_id.clone(),
+            expected.active_account_id().to_owned(),
+        );
+        Ok((engine, session))
+    }
+
+    pub(crate) async fn prepare_partial_candidate(
+        &self,
+        read: crate::storage_adapter::StorageAdapterReadScope<StorageImpl::Read<'_>>,
+        target: &crate::sync::PartialReplicaState,
+        interests: &crate::hot_state::ReadInterestSnapshot,
+    ) -> Result<crate::sync::PreparedCandidateState, LixError> {
+        crate::session::prepare_partial_candidate_read_scope::<StorageImpl>(
+            read,
+            target,
+            interests,
+            self.plugin_host.clone(),
+            self.hot_state.fork_for_native_candidate(),
+        )
+        .await
+    }
+
+    async fn construct(
+        storage: StorageAdapter<StorageImpl>,
+        options: EngineOptions,
+        migration_source_version: Option<u32>,
+        partial_admission: Option<&crate::sync::PartialReplicaState>,
+    ) -> Result<Self, LixError> {
         let span = options
             .telemetry
             .as_ref()
@@ -199,13 +246,33 @@ where
                 tracked_state.as_ref().clone(),
                 commit_graph,
             ));
+            let sync_mode = SyncModeState::default();
+            let hot_state = if let Some(expected) = partial_admission {
+                let registry =
+                    crate::hot_state::ReadInterestRegistry::new_durable(4096, 4 * 1024 * 1024);
+                sync_mode.set_read_interests(Arc::clone(&registry));
+                Arc::new(
+                    hot_state
+                        .with_read_interest_registry(registry)
+                        .with_partial_scope_policy(
+                            &expected.descriptor().selected_branch.branch_id,
+                            &expected.descriptor().global_branch.branch_id,
+                        ),
+                )
+            } else {
+                hot_state
+            };
             let branch_ctx = Arc::new(BranchContext::new());
-            let lix_id = assert_initialized(
-                storage.clone(),
-                hot_state.as_ref(),
-                migration_source_version,
-            )
-            .await?;
+            let lix_id = if let Some(expected) = partial_admission {
+                assert_partial_admission(storage.clone(), expected).await?
+            } else {
+                assert_initialized(
+                    storage.clone(),
+                    hot_state.as_ref(),
+                    migration_source_version,
+                )
+                .await?
+            };
 
             // SessionContext::execute later projects these stable state contexts into one
             // execution-scoped SQL context, optionally wrapped by a transaction
@@ -231,8 +298,9 @@ where
                 commit_coordinator,
                 observe_coordinator: Arc::new(ObserveCoordinator::new()),
                 observe_invalidation,
-                sync_mode: SyncModeState::default(),
+                sync_mode,
                 plugin_host,
+                partial_owner: PartialOwnerLifetime::default(),
                 telemetry: options.telemetry,
                 lix_id,
             })
@@ -240,12 +308,32 @@ where
         .await
     }
 
+    pub(crate) fn install_partial_owner(&mut self, owner: PartialOwnerLifetime) {
+        self.partial_owner = owner;
+    }
+    pub(crate) fn partial_owner(&self) -> PartialOwnerLifetime {
+        self.partial_owner.clone()
+    }
+
     pub(crate) fn storage(&self) -> StorageAdapter<StorageImpl> {
         self.storage.clone()
     }
 
+    /// Storage adapter sessions retain the owning engine's runtime and plugin
+    /// resource policy before their final authenticated session is created.
+    pub(crate) fn inherit_partial_storage_runtime<Source>(&mut self, source: &Engine<Source>)
+    where
+        Source: Storage + Clone + Send + Sync + 'static,
+    {
+        self.plugin_host = source.plugin_host.clone();
+        self.partial_owner = source.partial_owner.clone();
+    }
+
     pub(crate) fn inherit_sync_mode(&mut self, mode: SyncModeState) {
         self.sync_mode = mode;
+        if let Some(registry) = self.sync_mode.read_interests() {
+            self.hot_state = Arc::new(self.hot_state.with_read_interest_registry(registry));
+        }
         if self.sync_mode.role() == crate::sync::SyncRole::Replica {
             self.storage().admit_sync_replica_writer();
         }
@@ -358,10 +446,62 @@ where
         instrument_lix_result(span, async move {
             let active_branch_id = active_branch_id.into();
             let active_account_id = active_account_id.into();
+            if let Some(session) = self
+                .admitted_partial_session(Some(&active_branch_id), &active_account_id)
+                .await?
+            {
+                return Ok(session);
+            }
             self.validate_active_account(&active_account_id).await?;
             Ok(self.session_at_unchecked(active_branch_id, active_account_id))
         })
         .await
+    }
+
+    /// Only an already-bound partial engine may reuse authenticated account
+    /// identity without querying cold account rows. Ordinary sessions retain
+    /// their native account validation. Recheck the exact receipt and roots
+    /// before constructing an additional session or transaction session.
+    async fn admitted_partial_session(
+        &self,
+        branch_id: Option<&str>,
+        account_id: &str,
+    ) -> Result<Option<SessionContext<StorageImpl>>, LixError> {
+        if self.sync_mode.role() != crate::sync::SyncRole::PartialReplica {
+            return Ok(None);
+        }
+        let state = self.sync_mode.partial_admission().ok_or_else(|| {
+            LixError::new(
+                "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
+                "partial session lacks its durable admission",
+            )
+        })?;
+        if account_id != state.active_account_id() {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "partial sessions cannot override the authority-authenticated account",
+            ));
+        }
+        let branch_id = branch_id.unwrap_or(&state.descriptor().selected_branch.branch_id);
+        if branch_id != state.descriptor().selected_branch.branch_id
+            && branch_id != state.descriptor().global_branch.branch_id
+        {
+            return Err(LixError::new(
+                "LIX_PARTIAL_REPLICA_SCOPE_NOT_PREPARED",
+                "target branch is outside this partial replica's admitted scopes",
+            ));
+        }
+        assert_partial_admission(self.storage.clone(), &state).await?;
+        if self.sync_mode.partial_admission().as_deref() != Some(state.as_ref()) {
+            return Err(LixError::new(
+                "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
+                "partial admission changed while opening a session",
+            ));
+        }
+        Ok(Some(self.session_at_unchecked(
+            branch_id.to_owned(),
+            account_id.to_owned(),
+        )))
     }
 
     /// Constructs the maintenance session needed to amend a historical
@@ -415,6 +555,12 @@ where
         });
         instrument_lix_result(span, async move {
             let active_account_id = active_account_id.into();
+            if let Some(session) = self
+                .admitted_partial_session(None, &active_account_id)
+                .await?
+            {
+                return Ok(session);
+            }
             self.validate_active_account(&active_account_id).await?;
             let read = SharedStorageAdapterRead::new(
                 self.storage
@@ -462,22 +608,21 @@ where
         name: &str,
         kind: &str,
     ) -> Result<(), LixError> {
+        // Existing authenticated principals need only the same exact active-
+        // account validation used by session admission. Avoid entering SQL's
+        // INSERT/ON CONFLICT preparation path for this common read-only case.
+        match self.validate_active_account(id).await {
+            Ok(()) => return Ok(()),
+            Err(error) if error.code == "LIX_ACCOUNT_NOT_FOUND" => {}
+            Err(error) => return Err(error),
+        }
+        let operation = crate::account::AccountInsertion::new(id, name, kind)?;
         let system = self
             .open_session_at_with_account(GLOBAL_BRANCH_ID, crate::SYSTEM_ACCOUNT_ID)
-            .await?;
+            .await?
+            .with_account_insertion(operation.clone());
         let execute_result = system
-            .execute(
-                "INSERT INTO lix_account \
-                 (id, name, kind, status, lixcol_global, lixcol_untracked) \
-                 VALUES ($1, $2, $3, 'active', true, false) \
-                 ON CONFLICT (id) \
-                 DO NOTHING",
-                &[
-                    crate::Value::Text(id.to_string()),
-                    crate::Value::Text(name.to_string()),
-                    crate::Value::Text(kind.to_string()),
-                ],
-            )
+            .execute(crate::account::AccountInsertion::SQL, operation.params())
             .await;
         let close_result = system.close().await;
         execute_result?;
@@ -611,6 +756,15 @@ where
 {
     let read =
         SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
+    if crate::sync::load_partial_replica_state(&read)
+        .await?
+        .is_some()
+    {
+        return Err(LixError::new(
+            "LIX_PARTIAL_REPLICA_REQUIRES_ON_DEMAND_SYNC",
+            "partial replica storage requires its admitted on-demand sync opener",
+        ));
+    }
     let protocol_status = crate::init::repository_protocol_status(&read).await?;
     let protocol_accepted = protocol_status == crate::init::RepositoryProtocolStatus::Current
         || matches!(
@@ -657,6 +811,77 @@ where
             }
         }
     }
+}
+
+async fn assert_partial_admission<StorageImpl>(
+    storage: StorageAdapter<StorageImpl>,
+    expected: &crate::sync::PartialReplicaState,
+) -> Result<Arc<str>, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let read = storage.begin_read(StorageReadOptions::default()).await?;
+    if !crate::init::is_partial_repository_protocol(&read).await? {
+        return Err(LixError::new(
+            "LIX_PARTIAL_REPLICA_MIGRATION_REQUIRED",
+            "partial replica layout requires explicit migration before opening",
+        ));
+    }
+    let stored = crate::sync::load_partial_replica_state(&read).await?;
+    if stored.as_ref().map(|(state, _)| state) != Some(expected) {
+        return Err(LixError::new(
+            "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
+            "partial replica admission does not match the durable repository, account, remote and epoch",
+        ));
+    }
+    // These are local authoritative serving coordinates, not optional cache
+    // entries. Without a root marker HOT can interpret an absent row as empty.
+    // Validate only the two admitted branches, never enumerate the repository.
+    for branch in [
+        &expected.descriptor().selected_branch,
+        &expected.descriptor().global_branch,
+    ] {
+        let control = crate::branch::BranchHeadControlContext::new()
+            .reader(&read)
+            .load(&branch.branch_id)
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
+                    "partial replica is missing its branch control",
+                )
+            })?;
+        let key = crate::storage_adapter::StorageKey(bytes::Bytes::from(
+            crate::hot_state::hot_generation_scope_prefix(
+                &branch.branch_id,
+                control.tracked_generation,
+            ),
+        ));
+        let marker = crate::storage_adapter::PointReadPlan::new(
+            crate::hot_state::ROOT_CURRENT_BASE_SPACE,
+            &[key],
+        )
+        .materialize(&read, Default::default())
+        .await?
+        .value
+        .pop()
+        .flatten();
+        let base = crate::changelog::CommitId::parse(&branch.head.commit_id).map_err(|_| {
+            LixError::new(
+                "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
+                "partial replica base ID is invalid",
+            )
+        })?;
+        if control.tracked_generation != expected.serving_generation(&branch.branch_id)?
+            || !matches!(marker, Some(crate::storage_adapter::StorageProjectedValue::FullValue(ref bytes)) if bytes.as_ref() == base.as_uuid().as_bytes())
+        {
+            return Err(LixError::new(
+                "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
+                "partial replica native root serving coordinates disagree with its admitted base",
+            ));
+        }
+    }
+    Ok(Arc::from(expected.repository_id()))
 }
 
 async fn repository_has_changelog_commit(
@@ -712,6 +937,9 @@ fn not_initialized_error() -> LixError {
         "engine storage is not initialized; call Engine::initialize(...) before Engine::new(...)",
     )
 }
+
+#[cfg(test)]
+mod account_admission_tests;
 
 #[cfg(test)]
 mod tests {

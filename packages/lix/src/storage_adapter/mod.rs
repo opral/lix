@@ -37,8 +37,9 @@ pub use crate::storage::{
     ReadDurability as StorageReadDurability, ReadEntry as StorageReadEntry,
     ReadOptions as StorageReadOptions, ScanChunk as StorageScanChunk,
     ScanCursor as StorageScanCursor, ScanOrder as StorageScanOrder, SpaceId as StorageSpaceId,
-    Storage, StorageError, StorageRead, StorageScanSource, StorageSessionToken, StorageSpace,
-    StorageSpaceRole, StoredValue as StorageValue, ValueIntegrity, ValueSemantics,
+    Storage, StorageError, StorageOwnerGate, StorageOwnerGuard, StorageOwnerLease, StorageRead,
+    StorageScanSource, StorageSessionToken, StorageSpace, StorageSpaceRole,
+    StoredValue as StorageValue, ValueIntegrity, ValueSemantics,
     WriteOptions as StorageWriteOptions,
 };
 pub(crate) use crate::storage::{

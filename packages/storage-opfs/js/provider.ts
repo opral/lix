@@ -1,3 +1,4 @@
+import { PartialOwnerLifetimes } from "./partial-owner.js";
 import type {
 	Database,
 	OpfsSAHPoolDatabase,
@@ -107,8 +108,10 @@ export class OpfsBackend implements LixStorageProvider {
 	#generation = 0;
 	#sessionToken: string | undefined;
 	#closed = false;
+	readonly #partialOwners = new PartialOwnerLifetimes();
 
 	private constructor(
+		private readonly storageName: string,
 		database: OpfsSAHPoolDatabase,
 		pool: SAHPoolUtil,
 		releaseLock: () => Promise<void>,
@@ -144,7 +147,7 @@ export class OpfsBackend implements LixStorageProvider {
 				"SELECT value FROM lix_storage_metadata WHERE key = ?",
 				[STORAGE_SESSION_METADATA_KEY],
 			) as string | undefined;
-			return new OpfsBackend(database, pool, releaseLock, sessionToken);
+			return new OpfsBackend(name, database, pool, releaseLock, sessionToken);
 		} catch (error) {
 			try {
 				database?.close();
@@ -155,6 +158,11 @@ export class OpfsBackend implements LixStorageProvider {
 			await releaseLock();
 			throw error;
 		}
+	}
+
+	acquirePartialReplicaOwner(sessionToken: string) {
+		this.assertSession(sessionToken);
+		return this.#partialOwners.acquire(this.storageName);
 	}
 
 	async acquireSession(): Promise<string> {
@@ -194,6 +202,7 @@ export class OpfsBackend implements LixStorageProvider {
 	}
 
 	async close(): Promise<void> {
+		await this.#partialOwners.close();
 		if (this.#closed) return;
 		this.#closed = true;
 		this.#changes.close(

@@ -486,7 +486,63 @@ impl TrackedStateTree {
         }
     }
 
-    #[cfg(test)]
+    /// Prepare the native read closure of existing-key value replacements.
+    /// Leaf boundaries depend on keys, not values; internal summaries retain
+    /// the same key ranges and sizes. At each level the real frontier starts
+    /// at the strict predecessor and stops after the first unchanged tail.
+    /// Read that predecessor, affected node, and unchanged successor without
+    /// inventing a mutation or publishing any node. Absent keys only prepare
+    /// their point path: arbitrary future insertions have a different scope.
+    pub(crate) async fn prepare_existing_key_mutation_inputs(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        root: &TrackedStateRootId,
+        encoded_keys: &[Bytes],
+    ) -> Result<(), LixError> {
+        if encoded_keys.is_empty() {
+            return Ok(());
+        }
+        let overlay = storage::TrackedStateChunkOverlay::new();
+        let height = self
+            .root_height_with_overlay(store, &overlay, *root.as_bytes())
+            .await?;
+        let values = self.get_many_encoded(store, root, encoded_keys).await?;
+        for (key, value) in encoded_keys.iter().zip(values) {
+            if value.is_none() {
+                continue;
+            }
+            let mut seek = key.clone();
+            for level in 0..height {
+                let mut cursor =
+                    FrontierLevelCursor::new(*root.as_bytes(), height - 1, level, seek.clone());
+                for ordinal in 0..3 {
+                    let Some((_, node)) = cursor.next(self, store, &overlay).await? else {
+                        break;
+                    };
+                    if ordinal == 0 {
+                        seek = match &node {
+                            DecodedNode::Leaf(leaf) => {
+                                Bytes::copy_from_slice(leaf.first_key().unwrap_or_default())
+                            }
+                            DecodedNode::Internal(internal) => internal
+                                .children()
+                                .first()
+                                .ok_or_else(|| {
+                                    LixError::new(
+                                        LixError::CODE_STORAGE_ERROR,
+                                        "empty mutation frontier internal node",
+                                    )
+                                })?
+                                .first_key
+                                .clone(),
+                        };
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn apply_mutations(
         &self,
         store: &(impl StorageAdapterRead + ?Sized),
@@ -1708,22 +1764,34 @@ impl TrackedStateTree {
                     }
                 }
                 DecodedNodeRef::Internal(internal) => {
+                    let mut missing = MissingTreeFrontier::default();
                     for child in internal.children() {
                         if scan_limit_reached(request, rows.len()) {
                             break;
                         }
                         if child_summary_overlaps_scan_ranges(child, ranges) {
-                            self.scan_node(
-                                store,
-                                child.child_hash,
-                                request,
-                                ranges,
-                                key_decode_hint,
-                                rows,
-                            )
-                            .await?;
+                            let result = self
+                                .scan_node(
+                                    store,
+                                    child.child_hash,
+                                    request,
+                                    ranges,
+                                    key_decode_hint,
+                                    rows,
+                                )
+                                .await;
+                            if let Err(error) = result {
+                                // Later LIMIT pages are not proven necessary.
+                                if request.limit.is_some() {
+                                    return Err(error);
+                                }
+                                if missing.push(error)? {
+                                    break;
+                                }
+                            }
                         }
                     }
+                    missing.finish()?;
                 }
             }
             Ok(())
@@ -1761,6 +1829,7 @@ impl TrackedStateTree {
                     }
                 }
                 DecodedNodeRef::Internal(internal) => {
+                    let mut missing = MissingTreeFrontier::default();
                     let mut start = 0usize;
                     let children = internal.children();
                     for (child_index, child) in children.iter().enumerate() {
@@ -1781,16 +1850,23 @@ impl TrackedStateTree {
                         };
 
                         if start < end {
-                            self.get_many_node(
-                                store,
-                                child.child_hash,
-                                &encoded_keys[start..end],
-                                values,
-                            )
-                            .await?;
+                            let result = self
+                                .get_many_node(
+                                    store,
+                                    child.child_hash,
+                                    &encoded_keys[start..end],
+                                    values,
+                                )
+                                .await;
+                            if let Err(error) = result {
+                                if missing.push(error)? {
+                                    break;
+                                }
+                            }
                         }
                         start = end;
                     }
+                    missing.finish()?;
                 }
             }
             Ok(())
@@ -1900,7 +1976,16 @@ impl TrackedStateTree {
         }
 
         let bytes = storage::read_chunk(store, hash).await?.ok_or_else(|| {
-            LixError::new("LIX_ERROR_UNKNOWN", "tracked-state tree chunk is missing")
+            #[cfg(test)]
+            if std::env::var_os("LIX_TRACE_PARTIAL_MISS").is_some() {
+                eprintln!(
+                    "missing native tree {hash:?} producer: {}",
+                    std::backtrace::Backtrace::force_capture()
+                );
+            }
+            super::native_object::NativeObjectRef::TrackedStateTreeChunk(*hash).annotate_missing(
+                LixError::new("LIX_ERROR_UNKNOWN", "tracked-state tree chunk is missing"),
+            )
         })?;
         // Verify once on a durable-store miss before making the bytes reusable.
         storage::verify_chunk_hash(hash, &bytes)?;
@@ -3034,6 +3119,55 @@ fn key_matches_scan_filters(request: &TrackedStateTreeScanRequest, key: &Tracked
     true
 }
 
+/// Accumulate only explicit native tree misses from already selected child
+/// traversals. No successful partial result escapes an incomplete traversal.
+#[derive(Default)]
+struct MissingTreeFrontier {
+    addresses: Vec<super::native_object::NativeObjectRef>,
+    first_error: Option<Box<LixError>>,
+}
+impl MissingTreeFrontier {
+    fn push(&mut self, error: LixError) -> Result<bool, LixError> {
+        use super::native_object::NativeObjectRef;
+        let addresses = match NativeObjectRef::batch_from_missing_error(&error)? {
+            Some(addresses) => addresses,
+            None => match NativeObjectRef::from_missing_error(&error)? {
+                Some(address) => vec![address],
+                None => return Err(error),
+            },
+        };
+        if !addresses
+            .iter()
+            .all(|address| matches!(address, NativeObjectRef::TrackedStateTreeChunk(_)))
+        {
+            return Err(error);
+        }
+        for address in addresses {
+            if !self.addresses.contains(&address) {
+                self.addresses.push(address);
+            }
+            if self.addresses.len() == NativeObjectRef::MAX_MISSING_BATCH {
+                break;
+            }
+        }
+        if self.first_error.is_none() {
+            self.first_error = Some(Box::new(error));
+        }
+        Ok(self.addresses.len() == NativeObjectRef::MAX_MISSING_BATCH)
+    }
+    fn finish(self) -> Result<(), LixError> {
+        match self.first_error {
+            Some(error) => Err(
+                super::native_object::NativeObjectRef::annotate_missing_batch(
+                    self.addresses,
+                    *error,
+                ),
+            ),
+            None => Ok(()),
+        }
+    }
+}
+
 fn scan_limit_reached(request: &TrackedStateTreeScanRequest, row_count: usize) -> bool {
     request.limit.is_some_and(|limit| row_count >= limit)
 }
@@ -3067,7 +3201,301 @@ pub(crate) fn test_gc_leaf_chunk(label: &[u8]) -> ([u8; TRACKED_STATE_HASH_BYTES
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn mixed_native_frontier_hydrates_then_returns_each_scan_row_once() {
+        use super::super::native_object::NativeObjectRef;
+        let adapter = StorageAdapter::new(Memory::new());
+        let identities = [
+            key("schema", None, "a"),
+            key("schema", None, "b"),
+            key("schema", None, "c"),
+        ];
+        let encoded = identities
+            .iter()
+            .map(encode_key)
+            .map(Bytes::from)
+            .collect::<Vec<_>>();
+        let leaves = encoded
+            .iter()
+            .map(|key| test_gc_leaf_chunk(key))
+            .collect::<Vec<_>>();
+        let summaries = encoded
+            .iter()
+            .zip(&leaves)
+            .map(|(key, (hash, _))| ChildSummary {
+                first_key: key.clone(),
+                last_key: key.clone(),
+                child_hash: *hash,
+                subtree_count: 1,
+            })
+            .collect::<Vec<_>>();
+        let root_bytes = Bytes::from(encode_internal_node(&summaries));
+        let root = TrackedStateRootId::new(hash_bytes(&root_bytes));
+        let mut writes = adapter.new_write_set();
+        for (hash, bytes) in [
+            (root.as_bytes(), &root_bytes),
+            (&leaves[0].0, &leaves[0].1),
+            (&leaves[2].0, &leaves[2].1),
+        ] {
+            writes.put(
+                storage::TRACKED_STATE_TREE_CHUNK_SPACE,
+                crate::storage_adapter::StorageKey(Bytes::copy_from_slice(hash)),
+                crate::storage_adapter::StorageValue {
+                    bytes: bytes.clone(),
+                },
+            );
+        }
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let tree = TrackedStateTree::new();
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let error = tree
+            .scan(&read, &root, &TrackedStateTreeScanRequest::default())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            NativeObjectRef::from_missing_error(&error).unwrap(),
+            Some(NativeObjectRef::TrackedStateTreeChunk(leaves[1].0))
+        );
+        assert!(
+            NativeObjectRef::batch_from_missing_error(&error)
+                .unwrap()
+                .is_none()
+        );
+        drop(read);
+        // Admit only the missing authenticated child, leaving resident siblings untouched.
+        NativeObjectRef::TrackedStateTreeChunk(leaves[1].0)
+            .validate(&leaves[1].1)
+            .unwrap();
+        let mut writes = adapter.new_write_set();
+        writes.put(
+            storage::TRACKED_STATE_TREE_CHUNK_SPACE,
+            crate::storage_adapter::StorageKey(Bytes::copy_from_slice(&leaves[1].0)),
+            crate::storage_adapter::StorageValue {
+                bytes: leaves[1].1.clone(),
+            },
+        );
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let rows = tree
+            .scan(&read, &root, &TrackedStateTreeScanRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+            identities.iter().collect::<Vec<_>>()
+        );
+        let request = [
+            encoded[2].clone(),
+            encoded[1].clone(),
+            encoded[0].clone(),
+            encoded[1].clone(),
+            Bytes::from(encode_key(&key("schema", None, "z"))),
+        ];
+        let values = tree.get_many_encoded(&read, &root, &request).await.unwrap();
+        assert_eq!(values.len(), 5);
+        assert!(values[..4].iter().all(Option::is_some));
+        assert!(values[4].is_none());
+        assert_eq!(values[1], values[3]);
+    }
+
+    #[tokio::test]
+    async fn native_tree_frontier_batches_only_selected_siblings_and_preserves_limit() {
+        use super::super::native_object::NativeObjectRef;
+        let adapter = StorageAdapter::new(Memory::new());
+        let children = (0..40)
+            .map(|index| {
+                let key = Bytes::from(format!("key-{index:03}"));
+                ChildSummary {
+                    first_key: key.clone(),
+                    last_key: key,
+                    child_hash: hash_bytes(format!("missing-{index}").as_bytes()),
+                    subtree_count: 1,
+                }
+            })
+            .collect::<Vec<_>>();
+        let bytes = Bytes::from(encode_internal_node(&children));
+        let root = TrackedStateRootId::new(hash_bytes(&bytes));
+        let mut writes = adapter.new_write_set();
+        writes.put(
+            storage::TRACKED_STATE_TREE_CHUNK_SPACE,
+            crate::storage_adapter::StorageKey(Bytes::copy_from_slice(root.as_bytes())),
+            crate::storage_adapter::StorageValue { bytes },
+        );
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let tree = TrackedStateTree::new();
+        let keys = children
+            .iter()
+            .map(|child| child.first_key.clone())
+            .collect::<Vec<_>>();
+        let error = tree
+            .get_many_encoded(&read, &root, &keys)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            NativeObjectRef::batch_from_missing_error(&error)
+                .unwrap()
+                .unwrap(),
+            children[..32]
+                .iter()
+                .map(|child| NativeObjectRef::TrackedStateTreeChunk(child.child_hash))
+                .collect::<Vec<_>>()
+        );
+        let error = tree
+            .get_many_encoded(&read, &root, &[keys[3].clone(), keys[17].clone()])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            NativeObjectRef::batch_from_missing_error(&error)
+                .unwrap()
+                .unwrap(),
+            vec![
+                NativeObjectRef::TrackedStateTreeChunk(children[3].child_hash),
+                NativeObjectRef::TrackedStateTreeChunk(children[17].child_hash)
+            ]
+        );
+        let error = tree
+            .scan(&read, &root, &TrackedStateTreeScanRequest::default())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            NativeObjectRef::batch_from_missing_error(&error)
+                .unwrap()
+                .unwrap()
+                .len(),
+            32
+        );
+        let error = tree
+            .scan(
+                &read,
+                &root,
+                &TrackedStateTreeScanRequest {
+                    limit: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            NativeObjectRef::batch_from_missing_error(&error)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            NativeObjectRef::from_missing_error(&error).unwrap(),
+            Some(NativeObjectRef::TrackedStateTreeChunk(
+                children[0].child_hash
+            ))
+        );
+        drop(read);
+        // A later required corrupt child must defeat an earlier genuine miss.
+        let mut writes = adapter.new_write_set();
+        writes.put(
+            storage::TRACKED_STATE_TREE_CHUNK_SPACE,
+            crate::storage_adapter::StorageKey(Bytes::copy_from_slice(&children[17].child_hash)),
+            crate::storage_adapter::StorageValue {
+                bytes: Bytes::from_static(b"corrupt"),
+            },
+        );
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let error = tree
+            .get_many_encoded(&read, &root, &[keys[3].clone(), keys[17].clone()])
+            .await
+            .unwrap_err();
+        assert!(
+            NativeObjectRef::from_missing_error(&error)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            NativeObjectRef::batch_from_missing_error(&error)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_native_object_diagnostic_does_not_mask_corrupt_content() {
+        let adapter = StorageAdapter::new(Memory::new());
+        let digest = [7u8; 32];
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let error = TrackedStateTree::new()
+            .load_node_bytes(&read, &digest)
+            .await
+            .err()
+            .expect("missing object must fail");
+        assert_eq!(
+            error.details.as_ref().unwrap()["missingNativeObject"]["key"],
+            "07".repeat(32)
+        );
+        assert_eq!(
+            error.details.as_ref().unwrap()["missingNativeObject"]["kind"],
+            "tracked_state_tree_chunk"
+        );
+        assert_eq!(error.code, "LIX_ERROR_UNKNOWN");
+        drop(read);
+        let mut writes = adapter.new_write_set();
+        writes.put(
+            storage::TRACKED_STATE_TREE_CHUNK_SPACE,
+            crate::storage_adapter::StorageKey(Bytes::copy_from_slice(&digest)),
+            crate::storage_adapter::StorageValue {
+                bytes: Bytes::from_static(b"corrupt native object"),
+            },
+        );
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let error = TrackedStateTree::new()
+            .load_node_bytes(&read, &digest)
+            .await
+            .err()
+            .expect("corrupt content must fail");
+        assert!(error.message.contains("chunk hash mismatch"));
+        assert!(
+            error
+                .details
+                .as_ref()
+                .and_then(|value| value.get("missingNativeObject"))
+                .is_none(),
+            "hash corruption must never be represented as fetchable absence"
+        );
+    }
+
     use super::*;
+    include!("tree_partial_replica_tests.rs");
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

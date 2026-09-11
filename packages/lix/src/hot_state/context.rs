@@ -56,10 +56,9 @@ pub(crate) struct BranchHeadControlCache {
 /// Engine bookkeeping rows that live in the global branch's untracked
 /// `lix_key_value` plane and are consulted on **every** transaction open.
 ///
-/// Resolving one costs a projected live batch read plus — on the expected
-/// miss, because the row is absent in a repository that never enabled the
-/// feature — a full `validate_exact_collection_closure` scan of the global
-/// `lix_key_value` collection. Both are functions of the global branch-head
+/// Resolving one costs a projected live batch read plus, on a miss, a point
+/// read of the native deterministic-identity presence witness. Both are
+/// functions of the global branch-head
 /// control's generation and current-state revision, and every write to that
 /// plane republishes the control under a CAS with a bumped
 /// `current_state_revision`. An unchanged control therefore proves the
@@ -322,7 +321,10 @@ fn estimated_row_columnar_layout_bytes(
 /// Normal rows are resolved from one durable hot-state projection. Each row
 /// carries its own tracked|untracked retention, so readers do not route
 /// through a separate retention index or merge retention candidates.
+#[derive(Clone)]
 pub(crate) struct HotStateContext {
+    read_interest_registry: Option<std::sync::Arc<super::ReadInterestRegistry>>,
+    partial_scope_policy: Option<super::PartialReadScopePolicy>,
     tracked_head: TrackedHeadContext,
     commit_graph: CommitGraphContext,
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
@@ -336,6 +338,41 @@ pub(crate) struct HotStateContext {
 }
 
 impl HotStateContext {
+    pub(crate) fn with_partial_scope_policy(&self, selected: &str, global: &str) -> Self {
+        let mut scoped = self.clone();
+        scoped.partial_scope_policy = Some(super::PartialReadScopePolicy::new(selected, global));
+        scoped
+    }
+    pub(crate) fn is_partial_replica(&self) -> bool {
+        self.partial_scope_policy.is_some()
+    }
+
+    /// Cached readers retain this stable registry, never an operation lease.
+    /// Session entry points hold separate leases before opening storage.
+    pub(crate) fn with_read_interest_registry(
+        &self,
+        registry: std::sync::Arc<super::ReadInterestRegistry>,
+    ) -> Self {
+        let mut scoped = self.clone();
+        scoped.read_interest_registry = Some(registry);
+        scoped
+    }
+
+    pub(crate) fn read_interest_registry(
+        &self,
+    ) -> Option<std::sync::Arc<super::ReadInterestRegistry>> {
+        self.read_interest_registry.clone()
+    }
+
+    pub(crate) async fn begin_read_interest_operation(
+        &self,
+    ) -> Option<super::ReadInterestOperation> {
+        match &self.read_interest_registry {
+            Some(registry) => Some(registry.begin_operation().await),
+            None => None,
+        }
+    }
+
     /// Engine-lifetime cache for the global untracked `lix_key_value` rows read
     /// at every transaction open, fenced by the global branch-head control.
     pub(crate) fn global_key_value_rows(&self) -> &GlobalKeyValueRowCache {
@@ -349,6 +386,8 @@ impl HotStateContext {
         let row_columnar_array_budget =
             std::sync::Arc::new(crate::hot_state::RowColumnarArrayBudget::default());
         Self {
+            read_interest_registry: None,
+            partial_scope_policy: None,
             tracked_head: TrackedHeadContext::new(),
             commit_graph,
             filesystem_path_index_cache: std::sync::Arc::new(FilesystemPathIndexCache::default()),
@@ -378,11 +417,24 @@ impl HotStateContext {
     }
 
     /// Creates a visible live-state reader over a caller-provided KV store.
+    /// Reuse completed immutable-root projections across candidate retries.
+    /// Every mutable serving cache and read-interest registry stays private.
+    pub(crate) fn fork_for_native_candidate(&self) -> Self {
+        let mut candidate = Self::new(
+            crate::tracked_state::TrackedStateContext::new(),
+            crate::commit_graph::CommitGraphContext::new(),
+        );
+        candidate.root_base_cache = std::sync::Arc::clone(&self.root_base_cache);
+        candidate
+    }
+
     pub(crate) fn reader<S>(&self, store: S) -> HotStateContextReader<S>
     where
         S: StorageAdapterRead,
     {
         HotStateContextReader {
+            read_interest_registry: self.read_interest_registry.clone(),
+            partial_scope_policy: self.partial_scope_policy.clone(),
             store,
             tracked_head: self.tracked_head,
             commit_graph: self.commit_graph.clone(),
@@ -407,6 +459,8 @@ impl HotStateContext {
         S: StorageAdapterRead,
     {
         HotStateContextReader {
+            read_interest_registry: self.read_interest_registry.clone(),
+            partial_scope_policy: self.partial_scope_policy.clone(),
             store,
             tracked_head: self.tracked_head,
             commit_graph: self.commit_graph.clone(),
@@ -441,6 +495,8 @@ impl HotStateContext {
         S: StorageAdapterRead,
     {
         HotStateContextReader {
+            read_interest_registry: self.read_interest_registry.clone(),
+            partial_scope_policy: self.partial_scope_policy.clone(),
             store,
             tracked_head: self.tracked_head,
             commit_graph: self.commit_graph.clone(),
@@ -467,6 +523,8 @@ impl HotStateContext {
 
 /// Visible live-state reader backed by a caller-provided KV store.
 pub(crate) struct HotStateContextReader<S> {
+    read_interest_registry: Option<std::sync::Arc<super::ReadInterestRegistry>>,
+    partial_scope_policy: Option<super::PartialReadScopePolicy>,
     store: S,
     tracked_head: TrackedHeadContext,
     commit_graph: CommitGraphContext,
@@ -486,6 +544,12 @@ where
         branch_id: &str,
         schema_key: &str,
     ) -> Result<Option<crate::hot_state::PackedIdentityMembership>, LixError> {
+        if let Some(registry) = &self.read_interest_registry {
+            registry.register(super::LogicalReadInterest::PackedIdentityMembership {
+                branch_id: branch_id.to_owned(),
+                schema_key: schema_key.to_owned(),
+            })?;
+        }
         let Some(cache) = self.branch_head_control_cache.as_ref() else {
             return Ok(None);
         };
@@ -660,6 +724,16 @@ where
         &self,
         request: &HotStateScanRequest,
     ) -> Result<Option<(String, BranchHeadControl, String)>, LixError> {
+        if let Some(operation) = &self.read_interest_registry {
+            operation.register(super::LogicalReadInterest::scan(
+                request,
+                match request.filter.untracked {
+                    Some(true) => HotStateReadDomain::Untracked,
+                    Some(false) => HotStateReadDomain::Tracked,
+                    None => HotStateReadDomain::Combined,
+                },
+            ))?;
+        }
         // The hot index carries tracked and untracked rows in one serving
         // plane, so this route never probes a separate retention index.
         if request.filter.untracked.is_some() || request_may_include_derived(request) {
@@ -668,6 +742,9 @@ where
         let [schema_key] = request.filter.schema_keys.as_slice() else {
             return Ok(None);
         };
+        if let Some(policy) = &self.partial_scope_policy {
+            policy.validate(&request.filter.branch_ids)?;
+        }
         let scope = scan_scope(
             &self.store,
             request,
@@ -716,8 +793,21 @@ where
         request: &HotStateScanRequest,
         skip_proven_empty_schema: bool,
     ) -> Result<MaterializedHotStateBatch, LixError> {
+        if let Some(operation) = &self.read_interest_registry {
+            operation.register(super::LogicalReadInterest::scan(
+                request,
+                match request.filter.untracked {
+                    Some(true) => HotStateReadDomain::Untracked,
+                    Some(false) => HotStateReadDomain::Tracked,
+                    None => HotStateReadDomain::Combined,
+                },
+            ))?;
+        }
         let store = &self.store;
         let reads_tracked = !is_derived_only_request(request);
+        if let Some(policy) = &self.partial_scope_policy {
+            policy.validate(&request.filter.branch_ids)?;
+        }
         let scope = scan_scope(
             store,
             request,
@@ -1030,6 +1120,9 @@ where
         &self,
         request: &HotStateExactBatchRequest,
     ) -> Result<MaterializedHotStateExactBatch, LixError> {
+        if let Some(operation) = &self.read_interest_registry {
+            operation.register(super::LogicalReadInterest::exact(request))?;
+        }
         if request.rows.is_empty() {
             return Ok(MaterializedHotStateExactBatch::default());
         }
@@ -1080,6 +1173,9 @@ where
         // controls that select the active generation; treating that request
         // as "not tracked" used to skip the controls entirely and made the
         // global untracked rows invisible after hot-index initialization.
+        if let Some(policy) = &self.partial_scope_policy {
+            policy.validate(&scope_request.filter.branch_ids)?;
+        }
         let scope = scan_scope(
             &self.store,
             &scope_request,
@@ -1151,6 +1247,7 @@ where
                     let rows = self
                         .tracked_head
                         .reader(&self.store)
+                        .with_root_base_cache(std::sync::Arc::clone(&self.root_base_cache))
                         .load_projected_live_batch_refs_for_domain(
                             branch_id,
                             control,
@@ -1232,6 +1329,7 @@ where
             let rows = self
                 .tracked_head
                 .reader(&self.store)
+                .with_root_base_cache(std::sync::Arc::clone(&self.root_base_cache))
                 .load_projected_live_batch_refs_for_domain(
                     GLOBAL_BRANCH_ID,
                     global_control,
@@ -1322,8 +1420,17 @@ where
         request: &HotStateScanRequest,
         skip_proven_empty_schema: bool,
     ) -> Result<MaterializedHotStateBatch, LixError> {
+        if let Some(registry) = &self.read_interest_registry {
+            registry.register(super::LogicalReadInterest::scan(
+                request,
+                HotStateReadDomain::Tracked,
+            ))?;
+        }
         let store = &self.store;
         let reads_tracked = !is_derived_only_request(request);
+        if let Some(policy) = &self.partial_scope_policy {
+            policy.validate(&request.filter.branch_ids)?;
+        }
         let scope = scan_scope(
             store,
             request,
@@ -1457,6 +1564,12 @@ impl<S> HotStateReader for HotStateContextReader<S>
 where
     S: StorageAdapterRead,
 {
+    fn is_partial_replica(&self) -> bool {
+        self.partial_scope_policy.is_some()
+    }
+    fn read_interest_registry(&self) -> Option<std::sync::Arc<super::ReadInterestRegistry>> {
+        self.read_interest_registry.clone()
+    }
     async fn scan_constraint_batch(
         &self,
         request: &HotStateScanRequest,
@@ -1493,6 +1606,13 @@ where
         branch_id: &str,
         scope: crate::collection_generation::CollectionScopeRef<'_>,
     ) -> Result<Option<crate::collection_generation::CollectionGeneration>, LixError> {
+        if let Some(registry) = &self.read_interest_registry {
+            registry.register(super::LogicalReadInterest::CollectionGeneration {
+                branch_id: branch_id.to_owned(),
+                schema_key: scope.schema_key.to_owned(),
+                file_id: scope.file_id.map(str::to_owned),
+            })?;
+        }
         let controls = load_branch_head_controls(
             &self.store,
             &[branch_id.to_owned()],
@@ -1526,6 +1646,13 @@ where
         &self,
         request: &FilesystemPathIndexRequest,
     ) -> Result<std::sync::Arc<FilesystemPathIndex>, LixError> {
+        if let Some(registry) = &self.read_interest_registry {
+            registry.register(super::LogicalReadInterest::FilesystemPaths {
+                branch_ids: request.branch_ids.clone(),
+                include_blob_refs: request.include_blob_refs,
+                cache_small_blob_data: request.cache_small_blob_data,
+            })?;
+        }
         let revision = load_path_index_revision(&self.store).await?;
         if let Some(index) = self
             .filesystem_path_index_cache
@@ -1859,6 +1986,74 @@ async fn load_branch_head_control_ids(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn candidate_fork_shares_only_immutable_roots_not_mutable_negative_proofs() {
+        let lix = crate::open_lix().await.unwrap();
+        let adapter = lix.storage_adapter();
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let control = crate::branch::BranchHeadControlContext::new()
+            .reader(&read)
+            .load(crate::GLOBAL_BRANCH_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        let original = HotStateContext::new(TrackedStateContext::new(), CommitGraphContext::new())
+            .with_read_interest_registry(crate::hot_state::ReadInterestRegistry::new_durable(
+                16, 4096,
+            ))
+            .with_partial_scope_policy(crate::GLOBAL_BRANCH_ID, crate::GLOBAL_BRANCH_ID);
+        original
+            .global_key_value_rows
+            .insert(control.clone(), "candidate-negative", None);
+        let candidate = original.fork_for_native_candidate();
+        assert!(Arc::ptr_eq(
+            &candidate.root_base_cache,
+            &original.root_base_cache
+        ));
+        assert_eq!(
+            original
+                .global_key_value_rows
+                .get(control.clone(), "candidate-negative"),
+            Some(None)
+        );
+        assert_eq!(
+            candidate
+                .global_key_value_rows
+                .get(control.clone(), "candidate-negative"),
+            None
+        );
+        candidate.global_key_value_rows.insert(
+            control.clone(),
+            "candidate-negative",
+            Some(serde_json::json!("target")),
+        );
+        assert_eq!(
+            original
+                .global_key_value_rows
+                .get(control, "candidate-negative"),
+            Some(None)
+        );
+        assert!(candidate.read_interest_registry.is_none());
+        assert!(
+            !candidate.is_partial_replica(),
+            "target scope must be explicitly rebound"
+        );
+        assert!(!Arc::ptr_eq(
+            &candidate.filesystem_path_index_cache,
+            &original.filesystem_path_index_cache
+        ));
+        assert!(!Arc::ptr_eq(
+            &candidate.row_columnar_layout_cache,
+            &original.row_columnar_layout_cache
+        ));
+        assert!(!Arc::ptr_eq(
+            &candidate.exclusive_certified_batch_cache,
+            &original.exclusive_certified_batch_cache
+        ));
+        drop(read);
+        lix.close().await.unwrap();
+    }
+
     use std::sync::Arc;
 
     use super::*;

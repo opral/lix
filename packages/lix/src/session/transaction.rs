@@ -78,6 +78,7 @@ where
                 Arc::clone(&self.catalog_context),
                 Arc::clone(&self.sql_planning_cache),
                 self.file_views.clone(),
+                self.account_insertion.clone(),
                 async |runtime_functions| {
                     if runtime_functions.deterministic_mode_enabled() {
                         Ok(Some(self.lock_deterministic_runtime().await))
@@ -96,12 +97,15 @@ where
             };
         self.ensure_open()?;
         let sync_role = self.sync_mode.role();
-        let replica_remote_id = (sync_role == crate::sync::SyncRole::Replica)
+        let replica_remote_id = sync_role
+            .is_replica()
             .then(|| self.sync_mode.replica_remote_id())
             .flatten();
-        opened
-            .transaction
-            .set_sync_mode(sync_role, replica_remote_id);
+        opened.transaction.set_sync_mode(
+            sync_role,
+            replica_remote_id,
+            self.sync_mode.partial_admission(),
+        );
         opened
             .transaction
             .attach_commit_boundary(self.transaction_commit_boundary());
@@ -214,7 +218,27 @@ where
                 .schedule_checkpoint_gc_after_commit(checkpoint_sequence)
                 .await;
         }
+        self.session
+            .flush_partial_read_interests()
+            .await
+            .map_err(super::context::non_retryable_after_commit)?;
         Ok(())
+    }
+
+    pub(crate) async fn prepare_for_discard(mut self) -> Result<(), LixError> {
+        let transaction = self
+            .transaction
+            .take()
+            .ok_or_else(|| transaction_state_error("Lix transaction is closed"))?;
+        // No coordinator commit, notification or change cursor advancement.
+        // Runtime functions are execution-scoped; their durable sequence rows
+        // remain in the discarded prospective write set.
+        let result = transaction
+            .prepare_for_discard(&self.runtime_functions)
+            .await;
+        drop(self.write_access.take());
+        result?;
+        self.session.flush_partial_read_interests().await
     }
 
     pub async fn rollback(mut self) -> Result<(), LixError> {
@@ -223,7 +247,8 @@ where
             .take()
             .ok_or_else(|| transaction_state_error("Lix transaction is closed"))?;
 
-        transaction.rollback().await
+        transaction.rollback().await?;
+        self.session.flush_partial_read_interests().await
     }
 
     pub(super) fn ensure_session_open(&self) -> Result<(), LixError> {
@@ -395,6 +420,7 @@ impl SessionTransactionManager {
 
             return Ok(SessionOperationGuard {
                 manager: self.clone(),
+                read_interest_operation: None,
             });
         }
     }
@@ -427,6 +453,7 @@ impl SessionTransactionManager {
 
         Ok(SessionOperationGuard {
             manager: self.clone(),
+            read_interest_operation: None,
         })
     }
 
@@ -473,6 +500,7 @@ impl SessionTransactionManager {
     fn open_reserved_write_lease(&self) -> Result<SessionWriteLease, LixError> {
         let operation_guard = SessionOperationGuard {
             manager: self.clone(),
+            read_interest_operation: None,
         };
         if let Err(error) = self.ensure_open() {
             drop(operation_guard);
@@ -758,6 +786,7 @@ impl Drop for SessionTransactionGuard {
 
 pub(crate) struct SessionOperationGuard {
     manager: SessionTransactionManager,
+    pub(super) read_interest_operation: Option<crate::hot_state::ReadInterestOperation>,
 }
 
 impl Drop for SessionOperationGuard {
@@ -765,3 +794,37 @@ impl Drop for SessionOperationGuard {
         self.manager.finish_operation();
     }
 }
+
+impl<S: Storage + Clone + Send + Sync + 'static> SessionContext<S> {
+    // Box each preparation attempt at its session boundary so caller layouts
+    // do not embed the entire SQL/commit future recursively.
+    pub(crate) fn prepare_sql_once<'a>(
+        &'a self,
+        sql: &'a str,
+        params: &'a [crate::Value],
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<(), LixError>> + 'a>> {
+        Box::pin(async move {
+            let update = crate::sql2::validate_sql_preparation(sql)?;
+            // Even SELECT stays inside a discarded transaction: the ordinary
+            // standalone read path may publish an automatic full-mode base refresh.
+            let mut transaction = self.begin_transaction().await?;
+            transaction
+                .transaction
+                .as_mut()
+                .expect("new preparation transaction")
+                .enable_sql_preparation();
+            if let Err(error) = transaction.execute(sql, params).await {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+            if update {
+                transaction.prepare_for_discard().await
+            } else {
+                transaction.rollback().await
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod prepare_tests;

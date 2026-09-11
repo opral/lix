@@ -21,6 +21,13 @@ pub(crate) enum HotStateReadDomain {
 /// into sessions or SQL providers.
 #[async_trait]
 pub(crate) trait HotStateReader: Send + Sync {
+    fn is_partial_replica(&self) -> bool {
+        false
+    }
+    fn read_interest_registry(&self) -> Option<std::sync::Arc<super::ReadInterestRegistry>> {
+        None
+    }
+
     /// Columnar scan lane used by live-state composition and SQL providers.
     ///
     async fn scan_batch(

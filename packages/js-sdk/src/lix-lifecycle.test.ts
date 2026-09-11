@@ -144,3 +144,23 @@ function deferred<T>() {
 	});
 	return { promise, resolve, reject };
 }
+
+
+test("prepare normalizes parameters and close drains preparation before binding shutdown", async () => {
+    const pending = deferred<void>();
+    const prepare = vi.fn(() => pending.promise);
+    const close = vi.fn(async () => undefined);
+    const lix = new Lix({ prepare, close } as unknown as LixBinding);
+    const work = lix.prepare("UPDATE lix_file SET content=$1 WHERE path=$2", [new Uint8Array([1,2]), "/file"]);
+    await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce());
+    expect(prepare).toHaveBeenCalledWith("UPDATE lix_file SET content=$1 WHERE path=$2", [
+        {kind:"blob",value:null,blob:new Uint8Array([1,2])}, {kind:"text",value:"/file"},
+    ]);
+    const closing = lix.close();
+    await expect(lix.prepare("SELECT 1")).rejects.toMatchObject({code:"LIX_ERROR_CLOSED"});
+    expect(close).not.toHaveBeenCalled();
+    pending.resolve();
+    await expect(work).resolves.toBeUndefined();
+    await closing;
+    expect(close).toHaveBeenCalledOnce();
+});

@@ -7,6 +7,7 @@ mod error;
 #[doc(hidden)]
 pub mod immutable;
 mod in_memory;
+mod partial_owner;
 mod predicate;
 mod session;
 mod traits;
@@ -19,13 +20,12 @@ pub use error::{
     PreconditionSupportReport, StorageError,
 };
 pub use in_memory::{Memory, MemoryFactory, MemoryFixture, MemoryRead, MemoryWrite};
+pub use partial_owner::{StorageOwnerGate, StorageOwnerGuard, StorageOwnerLease};
 pub use predicate::{
     HeaderFieldId, HeaderPredicate, KeyPredicate, PredicateExpr, PredicateId,
     PredicateSupportLevel, RefKind, RefsPredicate, ScalarValue, StoragePredicate, Support,
 };
-pub use session::{
-    StorageSession, StorageSessionGate, StorageSessionPermit, StorageSessionToken,
-};
+pub use session::{StorageSession, StorageSessionGate, StorageSessionPermit, StorageSessionToken};
 pub use traits::{Storage, StorageRead, StorageWrite};
 pub use types::{
     BeginScanOptions, BufferRange, CommitResult, CoreProjection, EncodedMutationBatch,

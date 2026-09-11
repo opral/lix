@@ -509,6 +509,13 @@ impl Storage for FilesystemStorage {
         self.inner.acquire_session()
     }
 
+    fn acquire_partial_replica_owner(
+        &self,
+        token: StorageSessionToken,
+    ) -> impl Future<Output = Result<lix::storage::StorageOwnerLease, StorageError>> + Send {
+        self.inner.acquire_partial_replica_owner(token)
+    }
+
     fn begin_read(
         &self,
         opts: ReadOptions,

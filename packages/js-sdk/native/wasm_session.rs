@@ -5,6 +5,18 @@ macro_rules! wasm_session_methods {
     ($wrapper:ty) => {
         #[wasm_bindgen::prelude::wasm_bindgen]
         impl $wrapper {
+            #[wasm_bindgen(js_name = prepare)]
+            pub async fn prepare(&self, sql: String, params: JsValue) -> Result<(), JsValue> {
+                let params = crate::wasm::values_from_js(params)?;
+                self.instrument_operation(crate::session::SessionOperations::prepare(
+                    &self.inner,
+                    &sql,
+                    &params,
+                ))
+                .await
+                .map_err(crate::wasm::lix_error_to_js)
+            }
+
             #[wasm_bindgen(js_name = execute)]
             pub async fn execute(
                 &self,

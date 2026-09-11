@@ -49,6 +49,7 @@ fn physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
 pub struct Memory {
     entries: Arc<Mutex<InMemoryMap>>,
     sessions: Arc<StorageSessionGate>,
+    partial_owner: Arc<crate::storage::StorageOwnerGate>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -58,6 +59,7 @@ pub struct MemoryFactory;
 pub struct MemoryFixture {
     entries: Arc<Mutex<InMemoryMap>>,
     sessions: Arc<StorageSessionGate>,
+    partial_owner: Arc<crate::storage::StorageOwnerGate>,
 }
 
 #[derive(Clone)]
@@ -102,6 +104,7 @@ impl Memory {
         Ok(Self {
             entries: Arc::new(Mutex::new(self.snapshot()?)),
             sessions: Arc::new(StorageSessionGate::default()),
+            partial_owner: Arc::default(),
         })
     }
 
@@ -137,6 +140,7 @@ impl StorageFixture for MemoryFixture {
         Memory {
             entries: Arc::clone(&self.entries),
             sessions: Arc::clone(&self.sessions),
+            partial_owner: Arc::clone(&self.partial_owner),
         }
     }
 }
@@ -153,6 +157,14 @@ impl Storage for Memory {
         Self: 'a;
     async fn acquire_session(&self) -> Result<StorageSessionToken, StorageError> {
         self.sessions.acquire()
+    }
+
+    async fn acquire_partial_replica_owner(
+        &self,
+        token: StorageSessionToken,
+    ) -> Result<crate::storage::StorageOwnerLease, StorageError> {
+        let _permit = self.sessions.validate(Some(token))?;
+        self.partial_owner.try_acquire()
     }
 
     async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
@@ -659,5 +671,4 @@ mod tests {
         assert!(chunk.is_empty());
         assert!(!chunk_has_more);
     }
-
 }

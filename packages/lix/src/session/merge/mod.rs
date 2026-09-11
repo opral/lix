@@ -13,3 +13,5 @@ pub use branch::{
     MergeBranchReceipt, MergeChangeStats, MergeConflict, MergeConflictChangeKind,
     MergeConflictKind, MergeConflictSide,
 };
+
+pub(crate) use branch::stage_merge_native_heads;

@@ -32,7 +32,7 @@
     )
 )]
 
-pub(crate) const SERVER_PROTOCOL_VERSION: u32 = 7;
+pub(crate) const SERVER_PROTOCOL_VERSION: u32 = 8;
 
 // Let implementation modules use the same `lix::...` paths as external
 // consumers now that the former engine and SDK share one crate.
@@ -152,6 +152,7 @@ pub use plugin::runtime::default::runtime as default_wasm_runtime;
 mod lifecycle;
 pub use lifecycle::{create_lix, delete_lix, CreateLixBuilder, DeleteLixBuilder, HostedLix};
 pub use handle::{
+    convert_replica_to_partial, retry_replica_migration_cleanup,
     CallbackOpenProgressSink, ExecuteBatchBuilder, ExecuteBuilder, Lix, LixTransaction,
     ObserveEvents, OpenAnotherSessionBuilder, OpenLixBuilder, OpenLixFromSnapshotBuilder,
     ServerOptions, TransactionExecuteBuilder, UnconfiguredOpenLixBuilder, RemoteOpenLixBuilder,
@@ -206,6 +207,7 @@ pub(crate) use session::{
 pub(crate) use session::VerifiedRequestBlob;
 #[cfg(feature = "storage-benches")]
 pub(crate) use sql_profile::SqlReadProfile;
+pub use migration::upgrade_authority_for_partial_sync;
 pub use storage::Memory;
 pub use sync::{
     ReplicaRecoveryBlob, ReplicaRecoveryBranch, ReplicaRecoveryExport, ReplicaRecoveryFile,
@@ -230,4 +232,9 @@ mod support;
 #[cfg(test)]
 #[path = "../tests/integration/main.rs"]
 mod integration_tests;
+
+#[cfg(test)]
+mod native_partial_sql_tests;
+#[cfg(test)]
+mod native_partial_bootstrap_tests;
 }

@@ -7,12 +7,89 @@
 //! demand. Platform-specific code is limited to tasks, timers, HTTP, and
 //! cancellation.
 
+mod partial_attempt_restart;
+pub(crate) use partial_attempt_restart::{
+    PARTIAL_ATTEMPT_RESTART_SPACE, PartialAttemptRestartOutcome, PartialAttemptRestartReceipt,
+    PartialAttemptRestartRequest, require_unrestarted_attempt, require_unrestarted_identity,
+    stage_restart_expired_attempt,
+};
+
 mod blob;
 mod bootstrap;
 mod commit;
+mod partial_checkpoint_upload;
+#[cfg(test)]
+pub(crate) use commit::export_sync_commit;
 mod contract;
+mod current_coverage;
 mod http;
+pub(crate) mod native_metadata;
+pub(crate) use native_metadata::{MAX_NATIVE_METADATA_RESPONSE_BYTES, NativeMetadataRequest};
+pub(crate) mod native_object;
+pub(crate) use native_object::MAX_NATIVE_OBJECT_RESPONSE_BYTES;
+pub(crate) mod native_object_range;
+pub(crate) use native_object_range::NativeObjectRangeRequest;
+mod partial_bootstrap;
+pub(crate) use partial_bootstrap::stage_partial_bootstrap;
+mod partial_blob;
+mod partial_blob_upload;
+mod partial_hydration;
+mod partial_interest_journal;
+mod partial_merge_analysis;
+mod partial_open;
+mod partial_publication;
+mod partial_push_state;
+pub(crate) use partial_merge_analysis::PartialMergeBudget;
+mod partial_authority_merge;
+mod partial_authority_merge_receipt;
+pub(crate) use partial_authority_merge::{
+    AuthorityKvMergePlan, AuthorityMergePreparation, prepare_authority_kv_merge,
+};
+pub(crate) use partial_authority_merge_receipt::{
+    PARTIAL_AUTHORITY_MERGE_RECEIPT_SPACE, PreparedAuthorityMergeReceipt,
+    load_authority_merge_receipt,
+};
+pub(crate) use repository::VerifiedRetainedBodyWave;
+mod partial_merge_protocol;
+mod partial_merge_runtime;
+mod partial_merge_settlement;
+mod partial_merge_state;
+pub(crate) use partial_merge_protocol::{
+    PartialMergeReceipt, PartialMergeRequest, RetainedBodyWaveRequest, RetainedBodyWaveResponse,
+};
+pub(crate) use partial_merge_state::PARTIAL_BRANCH_MERGE_SPACE;
+mod partial_reconcile;
+pub(crate) use partial_interest_journal::{
+    PARTIAL_READ_INTEREST_SPACE, flush_partial_read_interests,
+};
+mod leased_descriptor;
+mod partial_replica;
+pub(crate) use leased_descriptor::{LeasedPartialReplicaDescriptor, MAX_LEASED_DESCRIPTOR_BYTES};
+mod partial_runtime;
+pub(crate) use partial_open::{
+    AuthenticatedPartialConversion, FinalizedPartialConversion, admit_partial_storage_session,
+    authenticate_partial_conversion, prepare_partial_open,
+};
+#[cfg(test)]
+mod partial_scope_tests;
+mod partial_upload;
+mod partial_upload_cycle;
+#[cfg(test)]
+mod partial_working_diff_tests;
+pub(crate) use partial_runtime::{start_partial_runtime, start_partial_runtime_lazy};
+#[cfg(test)]
+mod partial_sql_tests;
+pub(crate) use partial_push_state::PARTIAL_BRANCH_PUSH_SPACE;
+mod partial_state;
+pub(crate) use partial_state::{
+    PARTIAL_REPLICA_STATE_SPACE, PartialReplicaState, load_partial_replica_state,
+    partial_replica_state_key,
+};
 mod platform;
+pub(crate) use partial_replica::{
+    MAX_PARTIAL_REPLICA_DESCRIPTOR_BYTES, PARTIAL_REPLICA_DESCRIPTOR_VERSION,
+    PartialReplicaDescriptor,
+};
 mod protocol;
 mod recovery;
 mod repository;
@@ -94,7 +171,7 @@ pub(crate) const MAX_SYNC_REQUEST_ITEMS: usize = 512;
 pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 // v9 requires canonical checkpoint membership and its global inventory.
 // Older writers cannot publish commits without this metadata.
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 9;
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 11;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str = "LIX_SYNC_REPOSITORY_ID_MISMATCH";
@@ -107,6 +184,16 @@ const MAX_SYNC_REMOTE_ID_BYTES: usize = 4 * 1024;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CertifiedReplicaWriteCapability {
     _private: (),
+}
+
+/// Only the partial sync owner can bypass the ordinary receipt write fence.
+/// This capability proves ownership of installation, never full-state coverage.
+pub(crate) struct PartialReplicaWriteCapability {
+    _private: (),
+}
+
+fn partial_replica_write_capability() -> PartialReplicaWriteCapability {
+    PartialReplicaWriteCapability { _private: () }
 }
 
 fn certified_replica_write_capability() -> CertifiedReplicaWriteCapability {
@@ -208,18 +295,27 @@ pub(crate) enum SyncRole {
     Disabled,
     Authority,
     Replica,
+    PartialReplica,
+}
+
+impl SyncRole {
+    pub(crate) fn is_replica(self) -> bool {
+        matches!(self, Self::Replica | Self::PartialReplica)
+    }
 }
 
 /// The complete process-local sync coordination state.
 ///
-/// There are no query scopes, hydration registries, branch bindings, or file
-/// projection caches. SQL always reads the local hot state. This object only
-/// identifies the role and wakes long-polls after local commits. The single
-/// runtime worker serializes remote repository events.
+/// SQL reads local native state. Partial engines additionally share their
+/// bounded in-memory logical-interest registry with the sync owner; this is
+/// not a durable coverage receipt or permission to publish remote roots.
 #[derive(Clone, Debug)]
 pub(crate) struct SyncModeState {
     role: Arc<AtomicU8>,
     replica_remote_id: Arc<RwLock<Option<Arc<str>>>>,
+    partial_admission: Arc<RwLock<Option<Arc<PartialReplicaState>>>>,
+    partial_failure: Arc<RwLock<Option<LixError>>>,
+    read_interests: Arc<RwLock<Option<Arc<crate::hot_state::ReadInterestRegistry>>>>,
     change_watch: tokio::sync::watch::Sender<u64>,
 }
 
@@ -228,17 +324,28 @@ impl Default for SyncModeState {
         Self {
             role: Arc::new(AtomicU8::new(SyncRole::Disabled as u8)),
             replica_remote_id: Arc::new(RwLock::new(None)),
+            partial_admission: Arc::new(RwLock::new(None)),
+            partial_failure: Arc::new(RwLock::new(None)),
+            read_interests: Arc::new(RwLock::new(None)),
             change_watch: tokio::sync::watch::channel(0).0,
         }
     }
 }
 
 impl SyncModeState {
+    pub(crate) fn read_interests(&self) -> Option<Arc<crate::hot_state::ReadInterestRegistry>> {
+        self.read_interests.read().clone()
+    }
+    pub(crate) fn set_read_interests(&self, registry: Arc<crate::hot_state::ReadInterestRegistry>) {
+        *self.read_interests.write() = Some(registry);
+    }
+
     pub(crate) fn role(&self) -> SyncRole {
         match self.role.load(Ordering::Acquire) {
             value if value == SyncRole::Disabled as u8 => SyncRole::Disabled,
             value if value == SyncRole::Authority as u8 => SyncRole::Authority,
             value if value == SyncRole::Replica as u8 => SyncRole::Replica,
+            value if value == SyncRole::PartialReplica as u8 => SyncRole::PartialReplica,
             _ => unreachable!("sync role stores only enum discriminants"),
         }
     }
@@ -255,6 +362,35 @@ impl SyncModeState {
         *self.replica_remote_id.write() = Some(remote_id.into());
     }
 
+    /// Capture the authenticated admission before exposing partial SQL writes.
+    /// Each transaction retains this immutable binding across later resets.
+    pub(crate) fn admit_partial_replica(
+        &self,
+        state: Arc<PartialReplicaState>,
+        _capability: PartialReplicaWriteCapability,
+    ) {
+        self.set_replica_remote_id(state.remote_id());
+        *self.partial_admission.write() = Some(state);
+        self.set_role(SyncRole::PartialReplica);
+    }
+
+    /// Terminal for this engine instance. Reopen from the durable receipt to
+    /// recover; re-admission must not accidentally clear an ambiguous outcome.
+    pub(crate) fn fail_partial_admission(&self, error: LixError) {
+        self.partial_failure.write().get_or_insert(error);
+    }
+
+    pub(crate) fn ensure_partial_admission_healthy(&self) -> Result<(), LixError> {
+        match self.partial_failure.read().as_ref() {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn partial_admission(&self) -> Option<Arc<PartialReplicaState>> {
+        self.partial_admission.read().clone()
+    }
+
     pub(crate) fn change_watcher(&self) -> tokio::sync::watch::Receiver<u64> {
         self.change_watch.subscribe()
     }
@@ -267,3 +403,81 @@ impl SyncModeState {
 
 #[cfg(test)]
 pub(crate) use bootstrap::durable_memory_for_test;
+
+mod partial_write_frontier;
+
+mod partial_candidate_prepare;
+pub(crate) use partial_candidate_prepare::{
+    PreparedCandidateState, prepare_candidate_native_interests,
+};
+
+mod pending_conversion;
+pub(crate) use pending_conversion::{
+    ConversionJournalOwner, ReconciledPendingConversion, cleanup_pending_conversion_authenticated,
+    finish_conversion_cleanup_bounded, reconcile_pending_conversion_authenticated,
+};
+pub(crate) use repository::{
+    FullConversionManifest, InspectedFullConversion, inspect_full_conversion_manifest,
+    ordinary_pending_conversion_branches, pending_selected_conversion_request,
+};
+
+mod native_migration_admission;
+mod native_migration_pin_upload;
+pub(crate) use native_migration_admission::{
+    AdmittedNativeMigrationMerge, NativeMigrationAdmission, admit_native_migration_merge,
+};
+
+mod native_migration_protocol;
+pub(crate) use native_migration_protocol::NativeMigrationMergeRequest;
+
+mod native_migration_cleanup;
+pub(crate) use native_migration_cleanup::NativeMigrationCleanupRequest;
+
+#[cfg(test)]
+pub(crate) use native_migration_cleanup::native_migration_cleanup_guards;
+
+mod native_global_migration_protocol;
+pub(crate) use native_global_migration_protocol::{
+    NativeGlobalBodyWaveRequest, NativeGlobalMigrationReceipt, NativeGlobalMigrationRequest,
+    NativeNewBranchCoordinate,
+};
+mod migration_global_descriptor_proof;
+
+mod native_global_migration_receipt;
+pub(crate) use native_global_migration_receipt::NATIVE_GLOBAL_MIGRATION_RECEIPT_SPACE;
+pub(crate) use repository::VerifiedGlobalMigrationBody;
+
+pub(crate) use native_global_migration_receipt::uncommitted_global_migration_guard;
+
+mod native_global_migration_admission;
+pub(crate) use native_global_migration_admission::{
+    AdmittedNativeGlobalMigration, NativeGlobalMigrationAdmission, admit_native_global_migration,
+};
+pub(crate) use native_global_migration_receipt::load_native_global_migration_receipt;
+
+mod native_global_migration_cleanup;
+pub(crate) use native_global_migration_cleanup::{
+    AuthorizedGlobalMigrationCleanup, authorize_global_migration_cleanup,
+};
+
+mod native_global_migration_restart;
+pub(crate) use native_global_migration_restart::{
+    AuthorizedGlobalRestart, NativeGlobalRestartReceipt, NativeGlobalRestartRequest,
+    require_unaborted_global_migration, stage_restart_native_global_migration,
+};
+
+mod native_global_conversion_driver;
+pub(crate) use migration_global_descriptor_proof::prove_local_descriptor_global_source;
+pub(crate) use native_global_conversion_driver::{
+    GlobalConversionJournalOwner, ReconciledGlobalConversion,
+    cleanup_global_conversion_authenticated, global_new_branch_upload_boundaries,
+    reconcile_global_conversion_authenticated, verify_global_conversion_baseline_authenticated,
+    verify_resumed_global_basis_authenticated,
+};
+pub(crate) use pending_conversion::MigrationGlobalSuccessor;
+pub(crate) use repository::{
+    DescriptorGlobalConversion, classify_descriptor_global_conversion,
+    pending_conversion_request_after_global,
+};
+
+pub(crate) use partial_open::authenticate_partial_source_conversion;
