@@ -1010,6 +1010,7 @@ fn apply_observe_delta(
                 vec![vec![Value::Blob(next.into())]],
                 0,
                 Vec::new(),
+                None,
             ))
         }
         ObserveDelta::RowSplice {
@@ -1061,6 +1062,7 @@ fn apply_observe_delta(
                 rows,
                 base.rows.rows_affected(),
                 base.rows.notices().to_vec(),
+                base.rows.commit().cloned(),
             ))
         }
     }

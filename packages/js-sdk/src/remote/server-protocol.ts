@@ -2,6 +2,7 @@ import type {
 	BindingExecuteResult,
 	BindingObserveEvent,
 } from "../binding-types.js";
+import type { CommitSpan } from "../types.js";
 import type { NativeLixValue } from "../value.js";
 
 export const SERVER_PROTOCOL_VERSION = 7;
@@ -61,6 +62,7 @@ export type ServerProtocolExecuteResponse = {
 	rows: WireValue[][];
 	rowsAffected: number;
 	notices: Array<{ code: string; message: string; hint?: string }>;
+	commit?: CommitSpan;
 };
 
 export type ServerProtocolExecuteBatchResponse =
@@ -253,7 +255,25 @@ export function decodeExecuteResult(value: unknown): BindingExecuteResult {
 			...(item.hint === undefined ? {} : { hint: item.hint }),
 		};
 	});
-	return { columns, rows, rowsAffected: result.rowsAffected, notices };
+	// Servers that predate commit spans send none; a present span must be
+	// two commit ids.
+	let commit: CommitSpan | undefined;
+	if (result.commit !== undefined) {
+		const span = record(result.commit, "execute result commit");
+		if (typeof span.before !== "string" || typeof span.after !== "string") {
+			throw protocolError(
+				"execute result commit requires before and after commit ids",
+			);
+		}
+		commit = { before: span.before, after: span.after };
+	}
+	return {
+		columns,
+		rows,
+		rowsAffected: result.rowsAffected,
+		notices,
+		...(commit === undefined ? {} : { commit }),
+	};
 }
 
 function isResultColumnType(

@@ -1752,6 +1752,22 @@ impl PreparedWriteSet {
 }
 
 impl TransactionWriteBuffer {
+    /// The commit this buffer will publish on `branch_id`, once anything is
+    /// staged there. A branch with nothing staged publishes no commit unless
+    /// it was explicitly allowed to publish an empty one.
+    pub(crate) fn staged_commit_id(&self, branch_id: &str) -> Result<Option<CommitId>, LixError> {
+        let commit_change_refs = self.commit_change_refs_by_branch.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged commit change refs",
+            )
+        })?;
+        Ok(commit_change_refs
+            .get(branch_id)
+            .filter(|refs| !refs.is_empty() || refs.allow_empty)
+            .map(|refs| refs.commit_id))
+    }
+
     pub(crate) fn new(functions: FunctionProviderHandle) -> Self {
         Self {
             functions,

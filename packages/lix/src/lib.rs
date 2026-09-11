@@ -193,7 +193,8 @@ pub use session::{
     RedoReceipt, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt,
 };
 pub use session::{
-    ExecuteBatchStatement, ExecuteResult, ObserveEvent, ResultRowRef, Row, TryFromValue,
+    CommitSpan, ExecuteBatchStatement, ExecuteResult, ObserveEvent, ResultRowRef, Row,
+    TryFromValue,
 };
 #[doc(hidden)]
 pub use session::CoherentReadBatch;
