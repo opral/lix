@@ -90,6 +90,7 @@ const LIX_DIRECTORY_PATH_IDENTITY: &[&str] = &["path"];
 /// directly from the shared path index.
 pub(crate) async fn execute_exact_lix_directory_root_listing(
     active_branch_id: &str,
+    hot_state: Arc<dyn HotStateReader>,
     filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
 ) -> Result<SqlQueryResult, LixError> {
@@ -100,10 +101,20 @@ pub(crate) async fn execute_exact_lix_directory_root_listing(
         vec![active_branch_id.to_string()],
     )
     .await?;
+    super::file::retain_metadata(
+        hot_state.as_ref(),
+        true,
+        &branch_ids,
+        &FileIdConstraint::All,
+        &FileIdConstraint::All,
+        true,
+        &FilePathPredicate::All,
+    )?;
     let index = filesystem_path_index
         .path_index(&FilesystemPathIndexRequest::new(branch_ids))
         .await?;
     let matches = indexed_directory_root_matches(index);
+    super::file::retain_selected_entries(hot_state.as_ref(), matches.entries(), false)?;
     let mut entries = matches.entries().collect::<Vec<_>>();
     entries.sort_unstable_by(|left, right| {
         left.name
@@ -467,6 +478,19 @@ impl TableSpec for LixDirectorySpec {
         let root_parent_filter = filters
             .iter()
             .any(|filter| is_null_column_filter(filter, "parent_id"));
+        if !output_schema.fields().is_empty() {
+            let target_ids = exact_string_column_constraint_from_filters(&filters, "id")?;
+            super::file::retain_metadata(
+                self.hot_state.as_ref(),
+                true,
+                &request.filter.branch_ids,
+                &target_ids,
+                &target_parent_ids,
+                root_parent_filter,
+                &file_path_predicate_from_filters(&filters),
+            )
+            .map_err(lix_error_to_datafusion_error)?;
+        }
         let mut indexed_matches = self
             .indexed_path_matches(&request, &filters)
             .await?
@@ -533,7 +557,7 @@ impl TableSpec for LixDirectorySpec {
                 |(
                     hot_state,
                     batch_schema,
-                    _output_schema,
+                    output_schema,
                     projection,
                     request,
                     indexed_matches,
@@ -556,13 +580,19 @@ impl TableSpec for LixDirectorySpec {
                             "sql2 lix_directory batch build failed: {error}"
                         ))
                     })?;
-                    finish_scan_batch(
-                        batch,
-                        &physical_filters,
-                        projection.as_deref(),
-                        limit,
-                        "lix_directory",
-                    )
+                    let selected =
+                        finish_scan_batch(batch, &physical_filters, None, limit, "lix_directory")?;
+                    if !output_schema.fields().is_empty()
+                        && let Some(matches) = indexed_matches.as_ref()
+                    {
+                        super::file::retain_selected_batch(
+                            hot_state.as_ref(),
+                            matches,
+                            &selected,
+                            false,
+                        )?;
+                    }
+                    finish_scan_batch(selected, &[], projection.as_deref(), None, "lix_directory")
                 },
             ),
         })

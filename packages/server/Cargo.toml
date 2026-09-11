@@ -34,6 +34,8 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 uuid = { version = "1.19.0", features = ["v4"] }
 
 [dev-dependencies]
+lix_filesystem_storage = { package = "lix-storage-filesystem", path = "../storage-filesystem" }
+tempfile = "3"
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "trace"] }
 prost = "0.14"
 async-trait = "0.1.89"

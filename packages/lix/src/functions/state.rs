@@ -191,15 +191,9 @@ async fn load_key_value_payload(
             .await?;
         let Some(row) = rows.row(0) else {
             reader
-                .validate_exact_collection_closure(
-                    GLOBAL_BRANCH_ID,
+                .validate_deterministic_setting_absence(
                     control.tracked_generation,
-                    crate::collection_generation::CollectionScopeRef {
-                        schema_key: KEY_VALUE_SCHEMA_KEY,
-                        file_id: None,
-                    },
                     key_refs[0],
-                    HotStateReadDomain::Untracked,
                     control.current_state_revision == 0,
                 )
                 .await?;
@@ -495,9 +489,128 @@ mod tests {
         assert!(
             error
                 .message
-                .contains("identity digest does not match its canonical members"),
+                .contains("required point miss omitted a collection authority identity"),
             "unexpected closure error: {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn missing_setting_witness_fails_closed_until_explicit_migration() {
+        let storage = StorageAdapter::new(Memory::new());
+        crate::test_support::seed_global_branch_head(storage.clone()).await;
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let mut writes = storage.new_write_set();
+        stage_sequence(
+            &read,
+            &mut writes,
+            DeterministicSequence { highest_seen: 7 },
+            test_timestamp(),
+            ChangeId::for_test_label("witness-migration"),
+        )
+        .await
+        .unwrap();
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            load_mode(&read, None).await.unwrap(),
+            DeterministicMode::disabled()
+        );
+        let control = BranchHeadControlContext::new()
+            .reader(&read)
+            .load(GLOBAL_BRANCH_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut cursor = read
+            .begin_scan(
+                crate::hot_state::DETERMINISTIC_IDENTITY_WITNESS_SPACE,
+                crate::storage_adapter::StoragePrefix {
+                    bytes: bytes::Bytes::new(),
+                }
+                .to_range()
+                .unwrap(),
+                StorageBeginScanOptions::default(),
+            )
+            .await
+            .unwrap();
+        let witnesses = cursor.collect_all().await.unwrap();
+        assert_eq!(witnesses.len(), 1);
+        drop(cursor);
+        drop(read);
+        let mut remove = storage.new_write_set();
+        remove.delete(
+            crate::hot_state::DETERMINISTIC_IDENTITY_WITNESS_SPACE,
+            witnesses[0].key.clone(),
+        );
+        storage
+            .commit_write_set(remove, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        assert!(
+            load_mode(&read, None)
+                .await
+                .unwrap_err()
+                .message
+                .contains("witness is missing")
+        );
+        let mut repair = storage.new_write_set();
+        assert!(
+            crate::hot_state::stage_deterministic_identity_witness_migration(
+                &read,
+                &mut repair,
+                control.tracked_generation,
+                control.current_state_revision,
+                0,
+                0
+            )
+            .await
+            .is_err()
+        );
+        assert!(repair.is_empty());
+        let preconditions = crate::hot_state::stage_deterministic_identity_witness_migration(
+            &read,
+            &mut repair,
+            control.tracked_generation,
+            control.current_state_revision,
+            100,
+            1024 * 1024,
+        )
+        .await
+        .unwrap();
+        drop(read);
+        storage
+            .commit_write_set(
+                repair,
+                StorageWriteOptions {
+                    preconditions,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            load_mode(&read, None).await.unwrap(),
+            DeterministicMode::disabled()
+        );
+        assert_eq!(load_sequence(&read, None).await.unwrap().highest_seen, 7);
     }
 
     #[tokio::test]

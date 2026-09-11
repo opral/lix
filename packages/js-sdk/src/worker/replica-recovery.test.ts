@@ -119,3 +119,35 @@ test("close waits for in-flight recovery and rejects subsequent recovery work", 
 	await closing;
 	expect(closed).toHaveBeenCalledOnce();
 });
+
+test("explicit recovery keeps concurrent authentication and fetch scopes separate", async () => {
+ const requests: string[] = [];
+ const lix = await openHarness({
+  recoverReplicaWithServer: async (id, server) => {
+   const headers = await server.headerProvider!();
+   const response = await server.fetch!(server.url, {
+    headers, lixResponseLimit: 4096,
+   } as RequestInit);
+   expect(await response.text()).toBe(id);
+   return {branchIds:[id],restoredFiles:0,restoredRows:1,unresolved:[]};
+  }, close: async () => {},
+ });
+ const server = (id:string) => ({
+  url:`https://${id}.example.test/lix/repo`,
+  headers:async () => ({Authorization:`Bearer ${id}`}),
+  fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+   expect(new Headers(init?.headers).get("authorization")).toBe(`Bearer ${id}`);
+   expect(String(input)).toContain(`${id}.example.test`);
+   requests.push(id);
+   return new Response(id);
+  },
+ });
+ try {
+  const [a,b] = await Promise.all([
+   lix.recoverReplicaWithServer("a",server("a")),
+   lix.recoverReplicaWithServer("b",server("b")),
+  ]);
+  expect(a.branchIds).toEqual(["a"]); expect(b.branchIds).toEqual(["b"]);
+  expect(requests.sort()).toEqual(["a","b"]);
+ } finally {await lix.close();}
+});

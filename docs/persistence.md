@@ -50,7 +50,7 @@ For selective sync, pass `syncAllFiles: false` and import paths with
 
 <a id="sync-a-filesystem-with-a-server"></a>
 
-Sync mode runs a local Lix replica alongside the authoritative server.
+A partial replica with on-demand sync runs locally alongside the authoritative server.
 Use `FilesystemStorage` for project directories or mounted sandbox volumes.
 It keeps ordinary files synchronized with the replica, which exchanges commits
 with the server in the background.
@@ -64,6 +64,7 @@ import { FilesystemStorage } from "@lix-js/storage-filesystem";
 const lix = await openLix({
   storage: new FilesystemStorage({ path: "/workspace/project" }),
   server: {
+    mode: "partial_replica",
     url: "https://example.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
   },
 });
@@ -73,7 +74,7 @@ Point `path` at the directory your infrastructure mounts into the sandbox.
 Each machine keeps its own replica. Share a branch to exchange changes, or
 use separate branches for review. See
 [opening and reconnecting](./collaboration-and-sync.md#opening-and-reconnecting)
-for initial downloads and offline behavior.
+for on-demand loading and offline behavior.
 
 ## Remote mode
 
@@ -110,12 +111,14 @@ by the server. For ordinary files on disk, use [filesystem sync](#filesystem-syn
 
 <a id="sync-a-browser-with-a-server"></a>
 
-`OpfsStorage` persists Lix in the browser across reloads. Add `server` alongside `storage`
-to keep that local replica synchronized with a server.
+`OpfsStorage` persists Lix in the browser across reloads. Add
+`server: { url: repositoryUrl, mode: "partial_replica" }` alongside `storage`
+to create a **partial replica with on-demand sync**.
 
-Certified current-state reads can use local data. Mutations and history execute
-on the server; the replica receives certified updates. Uncached data and reads
-requiring a newer certificate can require a network fetch.
+Opening loads bounded metadata. SQL fetches missing native inputs and retains
+them locally. Reads and writes whose dependencies are resident run locally, including offline;
+local commits upload in the background. Background synchronization advances the
+local state without making warm foreground operations wait for the server.
 
 <img src="../website/public/assets/browser-server-storage.webp" alt="A browser runs Replica Lix with a SQLite storage adapter backed by OPFS. It synchronizes with Authoritative Lix on a server, whose SlateDB storage adapter uses S3." width="760" decoding="async" loading="lazy" />
 
@@ -126,6 +129,7 @@ import { OpfsStorage } from "@lix-js/storage-opfs";
 const lix = await openLix({
   storage: new OpfsStorage({ name: "acme" }),
   server: {
+    mode: "partial_replica",
     url: "https://example.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
   },
 });
@@ -137,9 +141,11 @@ SQLite Wasm persists the replica in the browser's Origin Private File System
 Omit `server` for a browser-only repository. Workers and tabs can share the
 same name through the package's storage worker and cross-tab Web Lock.
 
-Both sync setups download current working state on first open. Existing
-replicas reopen locally; older history and binary content load when needed.
-Mutations require server acceptance. See
+These configurations create a **partial replica with on-demand sync**. Opening
+loads bounded metadata; SQL fetches missing native inputs and caches them locally.
+Reads and writes whose dependencies are resident execute locally, including offline. Local
+commits upload in the background. `server.mode` defaults to `"remote"`, which
+rejects storage; the partial-replica opt-in is required. See
 [opening and reconnecting](./collaboration-and-sync.md#opening-and-reconnecting).
 
 ## How storage adapters fit

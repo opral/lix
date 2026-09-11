@@ -7,7 +7,7 @@ async function resolveServer(server: CreateLixOptions["server"]) {
 		throw new TypeError("A server is required");
 	if ("fetch" in server && server.fetch !== undefined)
 		throw new TypeError("hosted lifecycle does not accept a custom fetch");
-	if ("mode" in server) throw new TypeError("server.mode was removed");
+	if ("mode" in server) throw new TypeError("hosted lifecycle does not accept server.mode; mode selects openLix execution");
 	const url = new URL(server.url).toString();
 	const headers = new Headers(
 		typeof server.headers === "function"

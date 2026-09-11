@@ -122,6 +122,14 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
     ),
     ("lib", "crate root"),
     ("module_layers", "this guard"),
+    (
+        "native_partial_bootstrap_tests",
+        "cfg(test) bounded opening diagnostic",
+    ),
+    (
+        "native_partial_sql_tests",
+        "cfg(test) native SQL dependency diagnostic",
+    ),
     ("migration", "offline repository format migration"),
     ("observe_coordinator", "not yet analysed"),
     ("observe_invalidation", "not yet analysed"),

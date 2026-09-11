@@ -143,9 +143,14 @@ where
         .execute("SELECT uuidv7()", &[])
         .await
         .expect_err("missing selected sequence member must fail closed");
+    // Format 79 detects this corruption through its generation-bound presence
+    // witness, before the old collection-wide canonical-member scan.
+    assert_eq!(error.code, lix::LixError::CODE_INTERNAL_ERROR);
     assert!(
-        error.message.contains("identity digest") && error.message.contains("canonical members"),
-        "unexpected member-closure error: {error:?}"
+        error
+            .message
+            .contains("required point miss omitted a collection authority identity"),
+        "unexpected member-presence error: {error:?}"
     );
 }
 

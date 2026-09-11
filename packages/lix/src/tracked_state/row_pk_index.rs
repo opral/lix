@@ -5,13 +5,13 @@
 //! same persistent tree implementation serve row-primary-key prefix lookups.
 
 use crate::row_pk::RowPk;
+use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use crate::tracked_state::codec::{decode_key, encode_key_ref};
 use crate::tracked_state::types::{
     CommitStateManifest, TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef,
     TrackedStateMutation, TrackedStateMutationBatch, TrackedStateRootId,
     TrackedStateTreeScanRequest,
 };
-use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use crate::{LixError, NullableKeyFilter};
 
 const NULL_FILE_ID_TAG: &str = "n";
@@ -126,9 +126,10 @@ pub(crate) async fn stage_row_pk_index_from_members(
     members: &[super::storage::CommitDeltaMember],
     commit_id: crate::changelog::CommitId,
 ) -> Result<Option<TrackedStateRootId>, LixError> {
-    let mut primary = crate::tracked_state::codec::TrackedStateMutationBatchBuilder::with_row_capacity(
-        members.len(),
-    );
+    let mut primary =
+        crate::tracked_state::codec::TrackedStateMutationBatchBuilder::with_row_capacity(
+            members.len(),
+        );
     for member in members {
         primary.push(
             TrackedStateKeyRef {
@@ -170,10 +171,23 @@ pub(crate) async fn stage_row_pk_index_from_deltas<'a>(
     deltas: impl IntoIterator<Item = crate::tracked_state::TrackedStateDeltaRef<'a>>,
     commit_id: crate::changelog::CommitId,
 ) -> Result<Option<TrackedStateRootId>, LixError> {
+    stage_row_pk_index_from_deltas_with_base(store, writes, overlay, None, deltas, commit_id).await
+}
+
+/// Adds prepared native identities to the inherited immutable catalog.
+pub(crate) async fn stage_row_pk_index_from_deltas_with_base<'a>(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    overlay: &mut super::storage::TrackedStateChunkOverlay,
+    base_root: Option<&TrackedStateRootId>,
+    deltas: impl IntoIterator<Item = crate::tracked_state::TrackedStateDeltaRef<'a>>,
+    commit_id: crate::changelog::CommitId,
+) -> Result<Option<TrackedStateRootId>, LixError> {
     let deltas = deltas.into_iter().collect::<Vec<_>>();
-    let mut primary = crate::tracked_state::codec::TrackedStateMutationBatchBuilder::with_row_capacity(
-        deltas.len(),
-    );
+    let mut primary =
+        crate::tracked_state::codec::TrackedStateMutationBatchBuilder::with_row_capacity(
+            deltas.len(),
+        );
     for delta in deltas {
         primary.push(
             TrackedStateKeyRef {
@@ -196,7 +210,7 @@ pub(crate) async fn stage_row_pk_index_from_deltas<'a>(
             store,
             writes,
             overlay,
-            None,
+            base_root,
             secondary,
             Some(&commit_id.to_string()),
         )
@@ -204,7 +218,7 @@ pub(crate) async fn stage_row_pk_index_from_deltas<'a>(
     Ok(Some(result.root_id))
 }
 
-/// Offline v73 backfill for one immutable commit authority.
+/// Rebuilds one immutable commit catalog from authoritative state, including explicit tombstones.
 pub(crate) async fn backfill_row_pk_index_for_commit(
     store: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
@@ -218,6 +232,10 @@ pub(crate) async fn backfill_row_pk_index_for_commit(
             .scan_batch_at_commit(
                 &manifest.commit_id.to_string(),
                 &crate::tracked_state::TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        include_tombstones: true,
+                        ..Default::default()
+                    },
                     limit: Some(max_rows.saturating_add(1)),
                     ..Default::default()
                 },
@@ -229,6 +247,10 @@ pub(crate) async fn backfill_row_pk_index_for_commit(
         loop {
             let remaining = max_rows.saturating_sub(rows.len());
             let request = crate::tracked_state::TrackedStateScanRequest {
+                filter: crate::tracked_state::TrackedStateFilter {
+                    include_tombstones: true,
+                    ..Default::default()
+                },
                 limit: Some(remaining.saturating_add(1).min(4096)),
                 ..Default::default()
             };
@@ -259,14 +281,15 @@ pub(crate) async fn backfill_row_pk_index_for_commit(
         return Err(LixError::new(
             "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
             format!(
-                "v73 row-PK-index migration exceeds configured row bound while scanning commit '{}'",
+                "row-PK-index migration exceeds configured row bound while scanning commit '{}'",
                 manifest.commit_id
             ),
         ));
     }
-    let mut primary = crate::tracked_state::codec::TrackedStateMutationBatchBuilder::with_row_capacity(
-        rows.len(),
-    );
+    let mut primary =
+        crate::tracked_state::codec::TrackedStateMutationBatchBuilder::with_row_capacity(
+            rows.len(),
+        );
     for row in &rows {
         primary.push(
             TrackedStateKeyRef {
@@ -335,8 +358,7 @@ mod tests {
             TrackedStateKey {
                 schema_key: "schema\0escaped".to_owned(),
                 file_id: Some("file\0escaped".to_owned()),
-                row_pk: RowPk::uuid_from_canonical("01920000-0000-7000-8000-000000000002")
-                    .unwrap(),
+                row_pk: RowPk::uuid_from_canonical("01920000-0000-7000-8000-000000000002").unwrap(),
             },
         ]
     }
@@ -358,7 +380,10 @@ mod tests {
     fn typed_row_pk_prefix_does_not_alias_uuid_and_text() {
         let uuid = RowPk::uuid_from_canonical("01920000-0000-7000-8000-000000000002").unwrap();
         let text = RowPk::single("01920000-0000-7000-8000-000000000002");
-        assert_ne!(typed_row_pk_text(&uuid).unwrap(), typed_row_pk_text(&text).unwrap());
+        assert_ne!(
+            typed_row_pk_text(&uuid).unwrap(),
+            typed_row_pk_text(&text).unwrap()
+        );
     }
 
     #[test]
@@ -406,6 +431,88 @@ mod tests {
             decode_row_pk_index_key(&secondary.as_slice()[0].encoded_key).unwrap(),
             key
         );
-        assert_eq!(secondary.as_slice()[0].encoded_value, encode_value_ref(value));
+        assert_eq!(
+            secondary.as_slice()[0].encoded_value,
+            encode_value_ref(value)
+        );
     }
+}
+
+/// Prepare the secondary identity catalog's mutation paths for a retained
+/// native identity set. This is separate from primary/scoped row materialization.
+pub(crate) async fn prepare_row_pk_index_mutation_inputs(
+    store: &(impl StorageAdapterRead + ?Sized),
+    root: &TrackedStateRootId,
+    keys: &[TrackedStateKey],
+) -> Result<(), LixError> {
+    let encoded = keys
+        .iter()
+        .map(|key| {
+            encode_row_pk_index_key(TrackedStateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                row_pk: &key.row_pk,
+            })
+            .map(bytes::Bytes::from)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    super::tree::TrackedStateTree::new()
+        .prepare_existing_key_mutation_inputs(store, root, &encoded)
+        .await
+}
+
+/// Prepare the secondary identity paths used when publishing selected changes
+/// against an existing checkpoint. This reads no primary snapshot or inventory.
+pub(crate) async fn prepare_row_pk_mutation_inputs_at_commit(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: crate::changelog::CommitId,
+    keys: &[TrackedStateKey],
+) -> Result<(), LixError> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let topology = super::storage::load_published_commit_state_topology(store, commit_id)
+        .await?
+        .ok_or_else(|| {
+            super::NativeMetadataRef::CommitStateHeader(commit_id.to_string()).annotate_missing(
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "current mutation preparation lacks its native header",
+                ),
+            )
+        })?;
+    if let Some(root) = topology.row_pk_index_root_id() {
+        prepare_row_pk_index_mutation_inputs(store, root, keys).await?;
+    }
+    Ok(())
+}
+
+/// Prepare only mutation paths for exact returned identities at the coherent
+/// current branch head. Header lookup avoids loading the mutation inventory.
+pub(crate) async fn prepare_current_row_mutation_inputs(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: crate::changelog::CommitId,
+    keys: &[TrackedStateKey],
+) -> Result<(), LixError> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    prepare_row_pk_mutation_inputs_at_commit(store, commit_id, keys).await?;
+    if let Some(root) = super::storage::load_manifest_snapshot_commit_root(store, commit_id).await?
+    {
+        let encoded = keys
+            .iter()
+            .map(|key| {
+                bytes::Bytes::from(encode_key_ref(TrackedStateKeyRef {
+                    schema_key: &key.schema_key,
+                    file_id: key.file_id.as_deref(),
+                    row_pk: &key.row_pk,
+                }))
+            })
+            .collect::<Vec<_>>();
+        super::tree::TrackedStateTree::new()
+            .prepare_existing_key_mutation_inputs(store, &root.root_id, &encoded)
+            .await?;
+    }
+    Ok(())
 }

@@ -92,6 +92,7 @@ export type LixBinding = {
 	replicaRecoverySources(): Promise<ReplicaRecoverySource[]>;
 	exportReplicaRecovery(id: string): Promise<ReplicaRecoveryExport>;
 	recoverReplica(id: string): Promise<ReplicaRecoveryReceipt>;
+	recoverReplicaWithServer(id: string, server: SyncServerBindingOptions): Promise<ReplicaRecoveryReceipt>;
 	activeBranchId(): Promise<string>;
 	activeAccountId(): Promise<string>;
 	createBranch(options: CreateBranchOptions): Promise<CreateBranchReceipt>;

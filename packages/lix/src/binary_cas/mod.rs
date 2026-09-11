@@ -1,6 +1,8 @@
 mod chunking;
 mod codec;
 mod context;
+mod demand;
+pub(crate) use demand::BlobManifestRequired;
 mod kv;
 pub(crate) mod metrics;
 #[cfg(test)]

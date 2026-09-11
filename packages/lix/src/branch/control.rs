@@ -220,6 +220,31 @@ where
             .materialize(&self.store, StorageGetOptions::default())
             .await?
             .value;
+        if branch_ids
+            .iter()
+            .zip(&values)
+            .any(|(_, value)| value.is_none())
+            && let Some((state, _)) = crate::sync::load_partial_replica_state(&self.store).await?
+        {
+            let mut missing = branch_ids
+                .iter()
+                .zip(&values)
+                .filter_map(|(id, value)| (value.is_none()).then_some(id))
+                .collect::<Vec<_>>();
+            let absent = absent_native_branch_descriptors(&self.store, &missing).await?;
+            missing.retain(|id| !absent.contains(*id));
+            if !missing.is_empty() {
+                return Err(LixError::new(
+                    "LIX_SYNC_BRANCH_CONTROLS_REQUIRED",
+                    "branch coordinates are not resident in this partial replica",
+                )
+                .with_details(serde_json::json!({
+                    "repositoryId": state.repository_id(),
+                    "epochId": state.epoch_id(),
+                    "branchIds": missing,
+                })));
+            }
+        }
         branch_ids
             .into_iter()
             .zip(values)
@@ -245,6 +270,16 @@ where
 
     /// Returns every durable branch control in deterministic branch-id order.
     pub(crate) async fn scan(&self) -> Result<Vec<(String, BranchHeadControl)>, LixError> {
+        if let Some((state, _)) = crate::sync::load_partial_replica_state(&self.store).await? {
+            return Err(LixError::new(
+                "LIX_SYNC_BRANCH_INVENTORY_REQUIRED",
+                "complete branch inventory is not resident in this partial replica",
+            )
+            .with_details(serde_json::json!({
+                "repositoryId": state.repository_id(),
+                "epochId": state.epoch_id(),
+            })));
+        }
         let range = StoragePrefix {
             bytes: Bytes::new(),
         }
@@ -381,6 +416,65 @@ fn decode_control(branch_id: &str, bytes: &[u8]) -> Result<BranchHeadControl, Li
     )
 }
 
+// Keep this native-input operation behind an erased owner boundary: branch
+// reads sit beneath public adapter futures whose consumers use default limits.
+// StorageAdapterRead and its futures are Send on every engine target.
+type DescriptorAbsenceFuture<'a> =
+    futures_util::future::BoxFuture<'a, Result<std::collections::BTreeSet<String>, LixError>>;
+
+fn absent_native_branch_descriptors<'a, S: StorageAdapterRead + ?Sized>(
+    store: &'a S,
+    missing: &'a [&'a String],
+) -> DescriptorAbsenceFuture<'a> {
+    Box::pin(async move {
+        // Read the global control directly to avoid reentering branch lookup.
+        let global_key = StorageKey(Bytes::from(encode_key(crate::GLOBAL_BRANCH_ID)?));
+        let global = PointReadPlan::new(BRANCH_HEAD_CONTROL_SPACE, &[global_key])
+            .materialize(store, StorageGetOptions::default())
+            .await?
+            .value;
+        let Some(Some(StorageProjectedValue::FullValue(bytes))) = global.into_iter().next() else {
+            return Ok(std::collections::BTreeSet::new());
+        };
+        let global = decode_control(crate::GLOBAL_BRANCH_ID, &bytes)?;
+        let candidates = missing
+            .iter()
+            .filter_map(|id| {
+                crate::row_pk::RowPk::uuid_from_canonical(id)
+                    .ok()
+                    .map(|row_pk| {
+                        (
+                            (*id).clone(),
+                            crate::tracked_state::TrackedStateKey {
+                                schema_key: crate::branch::BRANCH_DESCRIPTOR_SCHEMA_KEY.to_owned(),
+                                file_id: None,
+                                row_pk,
+                            },
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(std::collections::BTreeSet::new());
+        }
+        let keys = candidates
+            .iter()
+            .map(|(_, key)| key.clone())
+            .collect::<Vec<_>>();
+        // Missing native inputs propagate demand; only complete index facts
+        // establish absence. Existing descriptors still require real controls.
+        let facts = crate::tracked_state::TrackedStateContext::new()
+            .reader(store)
+            .index_values_at_commit(&global.head_commit_id.to_string(), &keys)
+            .await?;
+        Ok(candidates
+            .into_iter()
+            .zip(facts)
+            .filter_map(|((id, _), fact)| fact.is_none_or(|fact| fact.deleted).then_some(id))
+            .collect())
+    })
+}
+
 fn control_digest(branch_id: &str, authenticated: &[u8]) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new_derive_key(BRANCH_HEAD_CONTROL_DIGEST_CONTEXT);
     hasher.update(&(branch_id.len() as u64).to_be_bytes());
@@ -414,6 +508,101 @@ mod tests {
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
 
     use super::*;
+
+    #[tokio::test]
+    async fn native_descriptor_absence_distinguishes_new_branch_from_unseen_existing_control() {
+        let authority = crate::open_lix().await.unwrap();
+        let existing = authority
+            .create_branch(crate::CreateBranchOptions {
+                id: None,
+                name: "existing-unseen".into(),
+                from_commit_id: None,
+            })
+            .await
+            .unwrap();
+        let state = crate::sync::PartialReplicaState::new(
+            format!("https://example.test/lix/{}", authority.lix_id()),
+            crate::ANONYMOUS_ACCOUNT_ID.into(),
+            "00000000-0000-7000-8000-000000000099".into(),
+            authority.partial_replica_descriptor(None).await.unwrap(),
+        )
+        .unwrap();
+        let storage = authority.storage_adapter();
+        let mut writes = storage.new_write_set();
+        writes.put(
+            crate::sync::PARTIAL_REPLICA_STATE_SPACE,
+            crate::sync::partial_replica_state_key(),
+            serde_json::to_vec(&state).unwrap(),
+        );
+        writes.delete(
+            BRANCH_HEAD_CONTROL_SPACE,
+            StorageKey(Bytes::from(encode_key(&existing.id).unwrap())),
+        );
+        storage
+            .commit_write_set(writes, Default::default())
+            .await
+            .unwrap();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let reader = BranchHeadControlContext::new().reader(&read);
+        let fresh = "00000000-0000-7000-8000-000000000098";
+        let observed = reader
+            .load_observed(&[fresh.to_owned()])
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(observed.control.is_none());
+        assert!(matches!(
+            branch_head_control_precondition(fresh, observed.raw_token).unwrap(),
+            StoragePrecondition::KeyAbsent { .. }
+        ));
+        assert_eq!(
+            reader.load(&existing.id).await.unwrap_err().code,
+            "LIX_SYNC_BRANCH_CONTROLS_REQUIRED"
+        );
+        drop(read);
+        authority.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn partial_missing_control_without_native_absence_proof_stays_unknown() {
+        let authority = crate::open_lix().await.unwrap();
+        let state = crate::sync::PartialReplicaState::new(
+            format!("https://example.test/lix/{}", authority.lix_id()),
+            crate::ANONYMOUS_ACCOUNT_ID.into(),
+            "00000000-0000-7000-8000-000000000099".into(),
+            authority.partial_replica_descriptor(None).await.unwrap(),
+        )
+        .unwrap();
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = storage.new_write_set();
+        writes.put(
+            crate::sync::PARTIAL_REPLICA_STATE_SPACE,
+            crate::sync::partial_replica_state_key(),
+            serde_json::to_vec(&state).unwrap(),
+        );
+        storage
+            .commit_write_set(writes, Default::default())
+            .await
+            .unwrap();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let reader = BranchHeadControlContext::new().reader(&read);
+        let fresh = "00000000-0000-7000-8000-000000000098".to_string();
+        let unknown = "00000000-0000-7000-8000-000000000097".to_string();
+        assert_eq!(
+            reader.load(&fresh).await.unwrap_err().code,
+            "LIX_SYNC_BRANCH_CONTROLS_REQUIRED"
+        );
+        assert_eq!(
+            reader
+                .load_observed(&[fresh, unknown])
+                .await
+                .unwrap_err()
+                .code,
+            "LIX_SYNC_BRANCH_CONTROLS_REQUIRED"
+        );
+        authority.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn point_reads_scans_and_exact_byte_cas_controls() {
@@ -560,5 +749,34 @@ mod tests {
             .await
             .expect_err("corrupt branch control must fail closed");
         assert!(error.to_string().contains("authentication digest mismatch"));
+    }
+}
+
+// Storage-owner observation only. This does not prove logical branch absence.
+// Use only when a separately authenticated native admission supplies the target.
+pub(crate) async fn observe_branch_control_coordinate(
+    read: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+) -> Result<BranchHeadControlObservation, LixError> {
+    let key = StorageKey(Bytes::from(encode_key(branch_id)?));
+    let value = PointReadPlan::new(BRANCH_HEAD_CONTROL_SPACE, &[key])
+        .materialize(read, StorageGetOptions::default())
+        .await?
+        .value
+        .pop()
+        .flatten();
+    match value {
+        None => Ok(BranchHeadControlObservation {
+            control: None,
+            raw_token: None,
+        }),
+        Some(StorageProjectedValue::FullValue(bytes)) => Ok(BranchHeadControlObservation {
+            control: Some(decode_control(branch_id, &bytes)?),
+            raw_token: Some(bytes),
+        }),
+        Some(StorageProjectedValue::KeyOnly) => Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "branch control observation omitted its value",
+        )),
     }
 }

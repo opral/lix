@@ -1,3 +1,16 @@
+mod pending_conversion;
+mod pending_conversion_journal;
+pub(crate) use pending_conversion_journal::{
+    PendingConversionJournal, retry_published_conversion_cleanup,
+};
+mod partial_conversion;
+pub(crate) use partial_conversion::convert_clean_replica_to_partial;
+mod partial;
+pub(crate) use partial::{
+    PartialEpochAdmission, admit_partial_epoch, has_partial_replica_marker,
+    install_fresh_partial_epoch, partial_epoch_has_no_markers,
+};
+
 use std::{ops::Bound, sync::Arc, time::Duration};
 
 use bytes::Bytes;
@@ -341,6 +354,31 @@ enum PointerState {
     },
 }
 
+/// Inspect the existing source without admitting or migrating it. Operator
+/// upgrades use this to reject an ineligible authority before changing storage.
+pub(super) async fn inspect_existing_epoch_adapter<S>(
+    storage: &S,
+) -> Result<StorageAdapter<S>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    match load_pointer(storage).await? {
+        None => Ok(StorageAdapter::new(storage.clone())),
+        Some((PointerState::Active { bank, .. }, bytes)) => {
+            Ok(StorageAdapter::for_epoch(storage.clone(), bank, bytes))
+        }
+        Some((PointerState::Migrating { source, .. }, bytes)) => {
+            // Inspect only the retained source. Ordinary admission owns claim
+            // recovery; this probe neither renews nor publishes that claim.
+            Ok(StorageAdapter::for_epoch_migration(
+                storage.clone(),
+                source,
+                bytes,
+            ))
+        }
+    }
+}
+
 /// Adoption may migrate existing banks but must never claim a fresh bank.
 pub(crate) async fn admit_existing_repository<S>(storage: &S) -> Result<StorageAdapter<S>, LixError>
 where
@@ -479,7 +517,9 @@ where
                     }
                 }
             }
-            None => return Box::pin(admit_legacy(storage, progress, server)).await,
+            None => {
+                return Box::pin(admit_legacy(storage, progress, server)).await;
+            }
         }
     }
 }
@@ -885,11 +925,14 @@ where
                 )
                 .await
                 .map_err(|error| epoch_error(format!("candidate marker write failed: {error}")))?;
-                super::migrate_lix_with_adapter(
+                // Keep the multi-version migration state machine off this
+                // candidate frame. Its inactive repair phases otherwise inflate
+                // the stack while an older migration runs ordinary SQL.
+                Box::pin(super::migrate_lix_with_adapter(
                     storage.clone(),
                     target.clone(),
                     super::MigrationOptions::automatic(),
-                )
+                ))
                 .await?;
             }
             emit_validating(progress, from_format);
@@ -1069,11 +1112,14 @@ where
                 .await?;
             } else {
                 let _ = copy_repository(&migration_source, &target).await?;
-                super::migrate_lix_with_adapter(
+                // Keep the multi-version migration state machine off this
+                // candidate frame. Its inactive repair phases otherwise inflate
+                // the stack while an older migration runs ordinary SQL.
+                Box::pin(super::migrate_lix_with_adapter(
                     storage.clone(),
                     target.clone(),
                     super::MigrationOptions::automatic(),
-                )
+                ))
                 .await?;
             }
             emit_validating(progress, from_format);
@@ -1364,7 +1410,8 @@ where
     else {
         return Ok(None);
     };
-    let server = server.ok_or_else(|| crate::sync::replica_replacement_unavailable("server_required"))?;
+    let server =
+        server.ok_or_else(|| crate::sync::replica_replacement_unavailable("server_required"))?;
     Ok(Some((proof, server)))
 }
 
@@ -3097,7 +3144,11 @@ mod tests {
             Ok(_) => panic!("incomplete candidate must fail validation"),
             Err(error) => error,
         };
-        assert!(error.message.contains("no global branch"));
+        assert_eq!(error.code, "LIX_ERROR_MIGRATION_FAILED");
+        assert!(
+            error.message.contains("global branch control is absent"),
+            "{error:?}"
+        );
         assert!(load_pointer(&storage).await.unwrap().is_none());
         assert_eq!(
             super::super::inspect_lix(&storage).await.unwrap(),
@@ -3605,3 +3656,9 @@ mod replica_upgrade_tests;
 
 #[cfg(test)]
 mod retained_generation_tests;
+
+mod native_global_conversion_journal;
+
+mod native_global_epoch_owner;
+mod native_global_journal_io;
+pub(crate) use native_global_conversion_journal::GlobalConversionJournal;

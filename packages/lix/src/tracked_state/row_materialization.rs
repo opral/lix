@@ -455,7 +455,7 @@ where
             };
         for ((key, change_id, updated_at), record) in expected.into_iter().zip(loaded) {
             let record = record.or_else(|| snapshot_records.remove(&change_id)).ok_or_else(|| {
-                LixError::internal_invariant(
+                let error = LixError::internal_invariant(
                     format!(
                         "tracked-state row references change '{change_id}' that is missing from owning commit '{commit_id}'"
                     ),
@@ -465,7 +465,17 @@ where
                         "row_ref": crate::row_ref::schema_identity_detail(&key.schema_key, &key.row_pk),
                         "file_id": key.file_id,
                     }),
-                )
+                );
+                // The immutable index proves this exact owner's payload is
+                // required. Only an actually absent authority header is a
+                // missing input; a present authority lacking its member is
+                // corruption and must never trigger network repair.
+                if authority.is_none() {
+                    super::NativeMetadataRef::CommitStateHeader(commit_id.to_string())
+                        .annotate_missing(error)
+                } else {
+                    error
+                }
             })?;
             #[cfg(feature = "storage-benches")]
             crate::storage_bench::record_materialize_reverify_row();
@@ -678,6 +688,38 @@ mod tests {
     fn integer_row_pk(value: i64) -> RowPk {
         RowPk::from_components(smallvec::smallvec![RowPkComponent::Integer(value)])
             .expect("one integer is a valid row primary key")
+    }
+
+    #[tokio::test]
+    async fn missing_referenced_owner_header_exposes_exact_native_metadata_demand() {
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let key = TrackedStateKey {
+            schema_key: "lix_key_value".into(),
+            file_id: None,
+            row_pk: RowPk::single("heading"),
+        };
+        let owner = CommitId::for_test_label("absent-owner");
+        let mut value = index_value(7);
+        value.commit_id = owner;
+        let error = materialize_batch_from_index_entries(
+            &read,
+            vec![(key, value)],
+            &ChangeRecordProjection::full(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+        assert!(error.message.contains("missing from owning commit"));
+        assert_eq!(
+            super::super::NativeMetadataRef::from_missing_error(&error).unwrap(),
+            Some(super::super::NativeMetadataRef::CommitStateHeader(
+                owner.to_string()
+            ))
+        );
     }
 
     #[tokio::test]

@@ -2140,12 +2140,10 @@ async fn load_node(
     )
     .materialize(store, StorageGetOptions::default())
     .await?;
-    let value = result
-        .value
-        .into_iter()
-        .next()
-        .flatten()
-        .ok_or_else(|| scoped_range_error("tree references a missing node"))?;
+    let value = result.value.into_iter().next().flatten().ok_or_else(|| {
+        super::native_object::NativeObjectRef::ScopedRangeNode(node_id)
+            .annotate_missing(scoped_range_error("tree references a missing node"))
+    })?;
     let StorageProjectedValue::FullValue(bytes) = value else {
         return Err(scoped_range_error("node read omitted its value"));
     };
@@ -2223,12 +2221,22 @@ async fn load_authenticated_nodes(
     let result = PointReadPlan::new(SCOPED_RANGE_NODE_SPACE, &keys)
         .materialize(store, StorageGetOptions::default())
         .await?;
+    super::NativeObjectRef::check_selected_read_batch(
+        node_ids
+            .iter()
+            .copied()
+            .map(super::NativeObjectRef::ScopedRangeNode),
+        &result.value,
+        scoped_range_error("tree references a missing node"),
+    )?;
     node_ids
         .iter()
         .zip(result.value)
         .map(|(node_id, value)| {
-            let value =
-                value.ok_or_else(|| scoped_range_error("tree references a missing node"))?;
+            let value = value.ok_or_else(|| {
+                super::native_object::NativeObjectRef::ScopedRangeNode(*node_id)
+                    .annotate_missing(scoped_range_error("tree references a missing node"))
+            })?;
             let StorageProjectedValue::FullValue(bytes) = value else {
                 return Err(scoped_range_error("node read omitted its value"));
             };
@@ -2845,6 +2853,13 @@ fn balanced_chunks<T>(values: &[T]) -> Vec<&[T]> {
         .collect()
 }
 
+pub(crate) fn validate_node_digest(expected: &[u8; 32], bytes: &[u8]) -> Result<(), LixError> {
+    if node_digest(bytes) != *expected {
+        return Err(scoped_range_error("node content digest mismatch"));
+    }
+    Ok(())
+}
+
 fn node_digest(bytes: &[u8]) -> [u8; 32] {
     *blake3::Hasher::new_derive_key(NODE_HASH_CONTEXT)
         .update(bytes)
@@ -2899,6 +2914,97 @@ fn scoped_range_error(message: impl std::fmt::Display) -> LixError {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn missing_native_object_diagnostic_does_not_mask_corrupt_content() {
+        let adapter = StorageAdapter::new(Memory::new());
+        let digest = [7u8; 32];
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let error = load_node(&read, digest)
+            .await
+            .err()
+            .expect("missing object must fail");
+        assert_eq!(
+            error.details.as_ref().unwrap()["missingNativeObject"]["key"],
+            "07".repeat(32)
+        );
+        assert_eq!(
+            error.details.as_ref().unwrap()["missingNativeObject"]["kind"],
+            "scoped_range_node"
+        );
+        assert_eq!(error.code, LixError::CODE_INTERNAL_ERROR);
+        let batch_error = load_authenticated_nodes(&read, &[digest])
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(batch_error.details, error.details);
+        let selected = (20u8..60).map(|n| [n; 32]).collect::<Vec<_>>();
+        let error = load_authenticated_nodes(&read, &selected)
+            .await
+            .err()
+            .unwrap();
+        let missing = super::super::NativeObjectRef::batch_from_missing_error(&error)
+            .unwrap()
+            .unwrap();
+        assert_eq!(missing.len(), 32);
+        assert_eq!(
+            missing,
+            selected[..32]
+                .iter()
+                .copied()
+                .map(super::super::NativeObjectRef::ScopedRangeNode)
+                .collect::<Vec<_>>()
+        );
+
+        drop(read);
+        let mut writes = adapter.new_write_set();
+        writes.put(
+            SCOPED_RANGE_NODE_SPACE,
+            StorageKey(Bytes::copy_from_slice(&digest)),
+            StorageValue {
+                bytes: Bytes::from_static(b"corrupt native object"),
+            },
+        );
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let error = load_node(&read, digest)
+            .await
+            .err()
+            .expect("corrupt content must fail");
+        assert!(error.message.contains("node content digest mismatch"));
+        assert!(
+            error
+                .details
+                .as_ref()
+                .and_then(|value| value.get("missingNativeObject"))
+                .is_none(),
+            "hash corruption must never be represented as fetchable absence"
+        );
+        let mixed = load_authenticated_nodes(&read, &[[61; 32], digest, [62; 32]])
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            super::super::NativeObjectRef::batch_from_missing_error(&mixed)
+                .unwrap()
+                .is_none(),
+            "resident corruption must dominate missing siblings"
+        );
+        assert!(
+            super::super::NativeObjectRef::from_missing_error(&mixed)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     use std::future::Future;
     use std::sync::{Arc, Mutex};
 

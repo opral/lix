@@ -2961,8 +2961,17 @@ impl CommitDeltaLiveMembershipCursor {
                         .flatten()
                         .and_then(full_value_bytes)
                         .ok_or_else(|| {
-                            replacement_payload_error(
-                                "bounded membership cursor references a missing immutable part",
+                            super::NativeObjectRef::CommitDeltaPart {
+                                commit_id: *self.commit_id.as_uuid().as_bytes(),
+                                part_index: u32::try_from(segment_index)
+                                    .expect("native part key already checked u32 index"),
+                                expected_digest: bounds.content_digest,
+                                replacement: bounds.replacement_part.is_some(),
+                            }
+                            .annotate_missing(
+                                replacement_payload_error(
+                                    "bounded membership cursor references a missing immutable part",
+                                ),
                             )
                         })?;
                     self.segment = Some(decode_owned_commit_delta_segment(&bytes, Some(bounds))?);
@@ -4851,6 +4860,24 @@ pub(crate) async fn load_commit_state_manifest(
     let (header, inventory) = match (header, inventory) {
         (None, None) => return Ok(None),
         (Some(header), Some(inventory)) => (header, inventory),
+        (Some(header), None) => {
+            let stored = decode_stored_commit_state_manifest(&header)?;
+            if stored.commit_id != commit_id {
+                return Err(replacement_payload_error(
+                    "commit state header identity mismatch",
+                ));
+            }
+            return Err(super::NativeObjectRef::MutationCatalog {
+                commit_id: *commit_id.as_uuid().as_bytes(),
+                expected_digest: stored.mutation_inventory_digest,
+            }
+            .annotate_missing(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state commit '{commit_id}' has incomplete split physical authority"
+                ),
+            )));
+        }
         _ => {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -5123,6 +5150,24 @@ fn decode_point_replay_commit_state_values(
     let (header, inventory) = match (header, inventory) {
         (None, None) => return Ok(None),
         (Some(header), Some(inventory)) => (header, inventory),
+        (Some(header), None) => {
+            let stored = decode_stored_commit_state_manifest(&header)?;
+            if stored.commit_id != commit_id {
+                return Err(replacement_payload_error(
+                    "commit state header identity mismatch",
+                ));
+            }
+            return Err(super::NativeObjectRef::MutationCatalog {
+                commit_id: *commit_id.as_uuid().as_bytes(),
+                expected_digest: stored.mutation_inventory_digest,
+            }
+            .annotate_missing(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state commit '{commit_id}' has incomplete split physical authority"
+                ),
+            )));
+        }
         _ => {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -5266,6 +5311,25 @@ pub(crate) async fn load_commit_state_manifests(
                 continue;
             }
             (Some(header), Some(inventory)) => (header, inventory),
+            (Some(header), None) => {
+                let stored = decode_stored_commit_state_manifest(&header)?;
+                if stored.commit_id != commit_id {
+                    return Err(replacement_payload_error(
+                        "commit state header identity mismatch",
+                    ));
+                }
+                return Err(super::NativeObjectRef::MutationCatalog {
+                    commit_id: *commit_id.as_uuid().as_bytes(),
+                    expected_digest: stored.mutation_inventory_digest,
+                }
+                .annotate_missing(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "tracked_state commit '{commit_id}' has incomplete split physical authority"
+                    ),
+                )));
+            }
+
             _ => {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -7725,6 +7789,38 @@ async fn load_columnar_direct_change_records(
         .collect()
 }
 
+fn native_mutation_part_address(
+    commit_id: CommitId,
+    run: &super::mutation_directory::MutationDirectoryPartRun,
+) -> Option<super::NativeObjectRef> {
+    use super::mutation_directory::MutationDirectoryEntry;
+    let (expected_digest, replacement) = match &run.entry {
+        MutationDirectoryEntry::Bounded { part, .. } => {
+            (part.content_digest, part.replacement_part.is_some())
+        }
+        MutationDirectoryEntry::CompactReplacement { content_digest, .. } => {
+            (*content_digest, true)
+        }
+        MutationDirectoryEntry::DirectAddress { .. } => return None,
+    };
+    Some(super::NativeObjectRef::CommitDeltaPart {
+        commit_id: *commit_id.as_uuid().as_bytes(),
+        part_index: run.entry_index,
+        expected_digest,
+        replacement,
+    })
+}
+fn annotate_missing_mutation_part(
+    commit_id: CommitId,
+    run: &super::mutation_directory::MutationDirectoryPartRun,
+    error: LixError,
+) -> LixError {
+    match native_mutation_part_address(commit_id, run) {
+        Some(address) => address.annotate_missing(error),
+        None => error,
+    }
+}
+
 async fn load_physical_direct_change_records(
     store: &(impl StorageAdapterRead + ?Sized),
     state: &AuthenticatedReplayCommitStateManifest,
@@ -7768,10 +7864,20 @@ async fn load_physical_direct_change_records(
         PointReadPlan::from_unique_keys(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, storage_keys)
             .materialize(store, StorageGetOptions::default())
             .await?;
+    super::NativeObjectRef::check_selected_read_batch(
+        runs.iter()
+            .filter_map(|run| native_mutation_part_address(state.commit_id, run)),
+        &values.value,
+        replacement_payload_error("direct coordinate references a missing immutable part"),
+    )?;
     let mut output = Vec::with_capacity(coordinates.len());
     for (run, value) in runs.into_iter().zip(values.value) {
         let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
-            replacement_payload_error("direct coordinate references a missing immutable part")
+            annotate_missing_mutation_part(
+                state.commit_id,
+                &run,
+                replacement_payload_error("direct coordinate references a missing immutable part"),
+            )
         })?;
         let super::mutation_directory::MutationDirectoryPartRun {
             entry_index,
@@ -7965,7 +8071,20 @@ fn hydrate_compact_replacement_direct_run(
     Ok(())
 }
 
-pub(crate) async fn load_change_records_by_ids(
+// The selected native loader is shared by current reads, history, and commit
+// preparation. Erase its recursive decoding graph at this owner boundary.
+// StorageAdapterRead and its futures are Send on every engine target.
+type SelectedChangeRecordsFuture<'a> =
+    futures_util::future::BoxFuture<'a, Result<Vec<crate::changelog::ChangeRecord>, LixError>>;
+
+pub(crate) fn load_change_records_by_ids<'a>(
+    store: &'a (impl StorageAdapterRead + ?Sized),
+    change_ids: &'a [crate::changelog::ChangeId],
+) -> SelectedChangeRecordsFuture<'a> {
+    Box::pin(load_change_records_by_ids_inner(store, change_ids))
+}
+
+async fn load_change_records_by_ids_inner(
     store: &(impl StorageAdapterRead + ?Sized),
     change_ids: &[crate::changelog::ChangeId],
 ) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
@@ -8060,9 +8179,11 @@ pub(crate) async fn load_change_records_by_ids(
             .zip(locator_values.value)
             .map(|((_, change_id), value)| {
                 let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
-                    replacement_payload_error(&format!(
-                        "selected change '{change_id}' has no authoritative locator"
-                    ))
+                    super::NativeMetadataRef::ChangeLocator(change_id.to_string()).annotate_missing(
+                        replacement_payload_error(&format!(
+                            "selected change '{change_id}' has no authoritative locator"
+                        )),
+                    )
                 })?;
                 decode_change_locator(*change_id, &bytes)
             })
@@ -8102,10 +8223,12 @@ async fn load_explicit_change_records_at_locators_selected(
         let state = load_point_replay_commit_state(store, commit_id)
             .await?
             .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "tracked_state selected change references missing commit '{commit_id}'"
+                super::NativeMetadataRef::CommitStateHeader(commit_id.to_string()).annotate_missing(
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "tracked_state selected change references missing commit '{commit_id}'"
+                        ),
                     ),
                 )
             })?;
@@ -8113,10 +8236,11 @@ async fn load_explicit_change_records_at_locators_selected(
             let source = load_point_replay_commit_state(store, source_commit_id)
                 .await?
                 .ok_or_else(|| {
-                    replacement_payload_error(&format!(
-                        "selected-source commit '{}' references missing authority '{}'",
-                        state.commit_id, source_commit_id
-                    ))
+                    super::NativeMetadataRef::CommitStateHeader(source_commit_id.to_string())
+                        .annotate_missing(replacement_payload_error(&format!(
+                            "selected-source commit '{}' references missing authority '{}'",
+                            state.commit_id, source_commit_id
+                        )))
                 })?;
             if source.mutations.selected_source_commit_id().is_some() {
                 return Err(replacement_payload_error(
@@ -8757,7 +8881,7 @@ pub(crate) fn decode_change_locator(
     })
 }
 
-fn encode_change_locator(locator: CommitDeltaChangeLocator) -> Vec<u8> {
+pub(crate) fn encode_change_locator(locator: CommitDeltaChangeLocator) -> Vec<u8> {
     let packed_ordinal = u64::from(locator.segment_index)
         * u64::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS).expect("segment row limit fits u64")
         + u64::from(locator.ordinal);
@@ -9025,9 +9149,24 @@ async fn load_bounded_directory_values_encoded(
             .await?;
     let mut output = vec![None; encoded_keys.len()];
     for (run, value) in runs.into_iter().zip(loaded.value) {
-        let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
-            replacement_payload_error("bounded mutation directory references a missing part")
-        })?;
+        let bytes = value
+            .and_then(full_value_bytes)
+            .ok_or_else(|| match &run.entry {
+                super::mutation_directory::MutationDirectoryEntry::Bounded { part, .. } => {
+                    super::NativeObjectRef::CommitDeltaPart {
+                        commit_id: *state.commit_id.as_uuid().as_bytes(),
+                        part_index: run.entry_index,
+                        expected_digest: part.content_digest,
+                        replacement: part.replacement_part.is_some(),
+                    }
+                    .annotate_missing(replacement_payload_error(
+                        "bounded mutation directory references a missing part",
+                    ))
+                }
+                _ => replacement_payload_error(
+                    "bounded mutation directory references a missing part",
+                ),
+            })?;
         let super::mutation_directory::MutationDirectoryEntry::Bounded {
             part,
             direct_row_count,
@@ -9750,13 +9889,14 @@ pub(crate) async fn missing_point_replay_commit_error(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
 ) -> LixError {
-    match commit_history_is_deferred(store, commit_id).await {
+    let error = match commit_history_is_deferred(store, commit_id).await {
         Ok(true) => sync_history_required(commit_id),
         Ok(false) => {
             LixError::commit_not_found(commit_id.to_string(), "walk_commit_graph", "graph_node")
         }
-        Err(error) => error,
-    }
+        Err(error) => return error,
+    };
+    super::NativeMetadataRef::CommitGraphRecord(commit_id.to_string()).annotate_missing(error)
 }
 
 /// Classifies a missing commit-state manifest without confusing intentionally
@@ -9765,14 +9905,15 @@ pub(crate) async fn missing_commit_state_manifest_error(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
 ) -> LixError {
-    match commit_history_is_deferred(store, commit_id).await {
+    let error = match commit_history_is_deferred(store, commit_id).await {
         Ok(true) => sync_history_required(commit_id),
         Ok(false) => LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!("tracked_state commit_state_manifest is missing for commit '{commit_id}'"),
         ),
-        Err(error) => error,
-    }
+        Err(error) => return error,
+    };
+    super::NativeMetadataRef::CommitStateHeader(commit_id.to_string()).annotate_missing(error)
 }
 
 /// Loads every tracked member of one physical commit delta.
@@ -10212,11 +10353,24 @@ async fn load_compact_exclusive_row_snapshots(
             .await?
             .value
     };
+    super::NativeObjectRef::check_selected_read_batch(
+        missing
+            .iter()
+            .filter_map(|index| native_mutation_part_address(state.commit_id, &runs[*index])),
+        &loaded_values,
+        replacement_payload_error("compact payload scan references a missing immutable part"),
+    )?;
     for (run_index, value) in missing.into_iter().zip(loaded_values) {
-        let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
-            replacement_payload_error("compact payload scan references a missing immutable part")
-        })?;
         let run = &runs[run_index];
+        let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
+            annotate_missing_mutation_part(
+                state.commit_id,
+                run,
+                replacement_payload_error(
+                    "compact payload scan references a missing immutable part",
+                ),
+            )
+        })?;
         let super::mutation_directory::MutationDirectoryEntry::CompactReplacement {
             content_digest,
             direct_row_count,
@@ -10390,6 +10544,16 @@ async fn load_bounded_exclusive_row_snapshots(
             .await?
             .value
     };
+    super::NativeObjectRef::check_selected_read_batch(
+        runs.iter().zip(&cached).filter_map(|(run, cached)| {
+            cached
+                .is_none()
+                .then(|| native_mutation_part_address(state.commit_id, run))
+                .flatten()
+        }),
+        &loaded_values,
+        replacement_payload_error("bounded payload scan references a missing immutable part"),
+    )?;
     let mut loaded_values = loaded_values.into_iter();
     let fully_owned_direct = root.layout == super::mutation_directory::LAYOUT_BOUNDED_DIRECT
         && state.mutations.direct_addresses_are_fully_owned();
@@ -10435,9 +10599,15 @@ async fn load_bounded_exclusive_row_snapshots(
                 .flatten()
                 .and_then(full_value_bytes)
                 .ok_or_else(|| {
-                    replacement_payload_error(
+                    super::NativeObjectRef::CommitDeltaPart {
+                        commit_id: *state.commit_id.as_uuid().as_bytes(),
+                        part_index: run.entry_index,
+                        expected_digest: bounds.content_digest,
+                        replacement: bounds.replacement_part.is_some(),
+                    }
+                    .annotate_missing(replacement_payload_error(
                         "bounded payload scan references a missing immutable part",
-                    )
+                    ))
                 })?;
             if *blake3::hash(&bytes).as_bytes() != bounds.content_digest {
                 return Err(replacement_payload_error(
@@ -10929,10 +11099,13 @@ pub(crate) async fn load_local_selected_change_owner_commit_ids(
             explicit_locators[index]
                 .map(|locator| (index, locator))
                 .ok_or_else(|| {
-                    replacement_payload_error(&format!(
+                    super::NativeMetadataRef::ChangeLocator(
+                        selected[index].value.change_id.to_string(),
+                    )
+                    .annotate_missing(replacement_payload_error(&format!(
                         "selected change '{}' has no authoritative locator",
                         selected[index].value.change_id
-                    ))
+                    )))
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -11283,7 +11456,13 @@ async fn load_bounded_commit_delta_members_for_schemas(
     let mut members = Vec::new();
     for (run, value) in runs.into_iter().zip(segments.value) {
         let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
-            replacement_payload_error("bounded payload scan references a missing immutable part")
+            annotate_missing_mutation_part(
+                state.commit_id,
+                &run,
+                replacement_payload_error(
+                    "bounded payload scan references a missing immutable part",
+                ),
+            )
         })?;
         let super::mutation_directory::MutationDirectoryEntry::Bounded {
             part,
@@ -11896,9 +12075,24 @@ async fn load_inventory_part_entries_one_ordered(
             .await?;
     let mut output = (0..keys.len()).map(|_| None).collect::<Vec<_>>();
     for (run, value) in runs.into_iter().zip(loaded.value) {
-        let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
-            replacement_payload_error("mutation inventory references a missing immutable part")
-        })?;
+        let bytes = value
+            .and_then(full_value_bytes)
+            .ok_or_else(|| match &run.entry {
+                super::mutation_directory::MutationDirectoryEntry::Bounded { part, .. } => {
+                    super::NativeObjectRef::CommitDeltaPart {
+                        commit_id: *commit_id.as_uuid().as_bytes(),
+                        part_index: run.entry_index,
+                        expected_digest: part.content_digest,
+                        replacement: part.replacement_part.is_some(),
+                    }
+                    .annotate_missing(replacement_payload_error(
+                        "mutation inventory references a missing immutable part",
+                    ))
+                }
+                _ => replacement_payload_error(
+                    "mutation inventory references a missing immutable part",
+                ),
+            })?;
         let super::mutation_directory::MutationDirectoryEntry::Bounded {
             part,
             direct_row_count,
@@ -12641,9 +12835,24 @@ async fn scan_bounded_commit_delta_values(
         runs.len(),
     );
     for (run, value) in runs.into_iter().zip(segments.value) {
-        let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
-            replacement_payload_error("bounded mutation scan references a missing immutable part")
-        })?;
+        let bytes = value
+            .and_then(full_value_bytes)
+            .ok_or_else(|| match &run.entry {
+                super::mutation_directory::MutationDirectoryEntry::Bounded { part, .. } => {
+                    super::NativeObjectRef::CommitDeltaPart {
+                        commit_id: *state.commit_id.as_uuid().as_bytes(),
+                        part_index: run.entry_index,
+                        expected_digest: part.content_digest,
+                        replacement: part.replacement_part.is_some(),
+                    }
+                    .annotate_missing(replacement_payload_error(
+                        "bounded mutation scan references a missing immutable part",
+                    ))
+                }
+                _ => replacement_payload_error(
+                    "bounded mutation scan references a missing immutable part",
+                ),
+            })?;
         let super::mutation_directory::MutationDirectoryEntry::Bounded {
             part,
             direct_row_count,

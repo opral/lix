@@ -78,6 +78,7 @@ where
                 Arc::clone(&self.catalog_context),
                 Arc::clone(&self.sql_planning_cache),
                 self.file_views.clone(),
+                self.account_insertion.clone(),
                 async |runtime_functions| {
                     if runtime_functions.deterministic_mode_enabled() {
                         Ok(Some(self.lock_deterministic_runtime().await))
@@ -96,12 +97,15 @@ where
             };
         self.ensure_open()?;
         let sync_role = self.sync_mode.role();
-        let replica_remote_id = (sync_role == crate::sync::SyncRole::Replica)
+        let replica_remote_id = sync_role
+            .is_replica()
             .then(|| self.sync_mode.replica_remote_id())
             .flatten();
-        opened
-            .transaction
-            .set_sync_mode(sync_role, replica_remote_id);
+        opened.transaction.set_sync_mode(
+            sync_role,
+            replica_remote_id,
+            self.sync_mode.partial_admission(),
+        );
         opened
             .transaction
             .attach_commit_boundary(self.transaction_commit_boundary());
@@ -214,6 +218,10 @@ where
                 .schedule_checkpoint_gc_after_commit(checkpoint_sequence)
                 .await;
         }
+        self.session
+            .flush_partial_read_interests()
+            .await
+            .map_err(super::context::non_retryable_after_commit)?;
         Ok(())
     }
 
@@ -223,7 +231,8 @@ where
             .take()
             .ok_or_else(|| transaction_state_error("Lix transaction is closed"))?;
 
-        transaction.rollback().await
+        transaction.rollback().await?;
+        self.session.flush_partial_read_interests().await
     }
 
     pub(super) fn ensure_session_open(&self) -> Result<(), LixError> {
@@ -395,6 +404,7 @@ impl SessionTransactionManager {
 
             return Ok(SessionOperationGuard {
                 manager: self.clone(),
+                read_interest_operation: None,
             });
         }
     }
@@ -427,6 +437,7 @@ impl SessionTransactionManager {
 
         Ok(SessionOperationGuard {
             manager: self.clone(),
+            read_interest_operation: None,
         })
     }
 
@@ -473,6 +484,7 @@ impl SessionTransactionManager {
     fn open_reserved_write_lease(&self) -> Result<SessionWriteLease, LixError> {
         let operation_guard = SessionOperationGuard {
             manager: self.clone(),
+            read_interest_operation: None,
         };
         if let Err(error) = self.ensure_open() {
             drop(operation_guard);
@@ -758,6 +770,7 @@ impl Drop for SessionTransactionGuard {
 
 pub(crate) struct SessionOperationGuard {
     manager: SessionTransactionManager,
+    pub(super) read_interest_operation: Option<crate::hot_state::ReadInterestOperation>,
 }
 
 impl Drop for SessionOperationGuard {

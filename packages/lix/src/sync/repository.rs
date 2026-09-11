@@ -4,6 +4,20 @@
 //! increasing repository sequence and one replica receipt. Branch heads stay
 //! in Lix's ordinary branch controls and commits stay in the changelog.
 
+mod native_global_conversion_manifest;
+mod verified_global_migration_body;
+pub(crate) use verified_global_migration_body::VerifiedGlobalMigrationBody;
+mod full_conversion_manifest;
+mod retained_body_wave;
+pub(crate) use full_conversion_manifest::{
+    FullConversionManifest, InspectedFullConversion, inspect_full_conversion_manifest,
+    ordinary_pending_conversion_branches, pending_selected_conversion_request,
+};
+pub(crate) use retained_body_wave::VerifiedRetainedBodyWave;
+struct RetainedBodyImport<'a> {
+    wave: &'a super::RetainedBodyWaveRequest,
+    accepted: &'a std::sync::Mutex<Option<crate::gc::NativeUploadAttempt>>,
+}
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -612,7 +626,7 @@ pub(crate) const SYNC_AUTHORITY_STATE_SPACE: StorageSpace = SYNC_REPLICA_STATE_S
 const SEQUENCE_KEY: &[u8] = b"repository";
 const REPLICA_STATE_KEY: &[u8] = b"repository";
 const AUTHORITY_STATE_KEY: &[u8] = b"authority";
-pub(crate) const AUTHORITY_STATE_VALUE: &[u8] = b"certified-authority-v4";
+pub(crate) const AUTHORITY_STATE_VALUE: &[u8] = b"certified-authority-v5-native-baseline-leases";
 const AMBIGUOUS_REPLICA_STATE_CODE: &str = "LIX_ERROR_SYNC_REPLICA_STATE_AMBIGUOUS";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -872,10 +886,12 @@ where
 {
     for _ in 0..2 {
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
-        if load_replica_state(&read).await?.0.is_some() {
+        if load_replica_state(&read).await?.0.is_some()
+            || super::load_partial_replica_state(&read).await?.is_some()
+        {
             return Err(LixError::new(
                 super::SYNC_PROTOCOL_MISMATCH_CODE,
-                "a certified replica cache cannot be opened as repository authority",
+                "a replica cache cannot be opened as repository authority",
             ));
         }
         match load_authority_state(&read).await? {
@@ -1157,6 +1173,12 @@ pub(crate) async fn load_sync_replica_account(
 pub(super) async fn inspect_sync_replica_binding(
     read: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<SyncReplicaBinding, LixError> {
+    if super::load_partial_replica_state(read).await?.is_some() {
+        return Err(LixError::new(
+            "LIX_PARTIAL_REPLICA_REQUIRES_ON_DEMAND_SYNC",
+            "a partial replica must use on-demand admission, not complete-state bootstrap",
+        ));
+    }
     let exact = load_replica_state(read).await?.0;
     let range = StoragePrefix {
         bytes: Bytes::new(),
@@ -1292,6 +1314,9 @@ fn ambiguous_replica_state_error() -> LixError {
 pub(crate) async fn has_any_sync_replica_state(
     read: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<bool, LixError> {
+    if super::load_partial_replica_state(read).await?.is_some() {
+        return Ok(true);
+    }
     let range = StoragePrefix {
         bytes: Bytes::new(),
     }
@@ -1744,7 +1769,7 @@ fn event_key(cursor: u64) -> StorageKey {
     StorageKey(Bytes::copy_from_slice(&cursor.to_be_bytes()))
 }
 
-async fn load_sequence(
+pub(super) async fn load_sequence(
     read: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<(u64, Option<Bytes>), LixError> {
     let key = sequence_key();
@@ -2309,6 +2334,9 @@ enum SyncImport<'a> {
     AuthorityPush {
         request: &'a SyncPushRequest,
         authorship: SyncImportAuthorship<'a>,
+        retained: Option<RetainedBodyImport<'a>>,
+        global_migration: Option<&'a super::NativeGlobalBodyWaveRequest>,
+        migration_cleanup: Option<&'a super::NativeMigrationCleanupRequest>,
     },
     HistoryHydration {
         commits: &'a [SyncCommit],
@@ -2344,6 +2372,28 @@ impl SyncImport<'_> {
         }
     }
 
+    fn global_migration(&self) -> Option<&super::NativeGlobalBodyWaveRequest> {
+        match self {
+            Self::AuthorityPush {
+                global_migration, ..
+            } => *global_migration,
+            _ => None,
+        }
+    }
+    fn migration_cleanup(&self) -> Option<&super::NativeMigrationCleanupRequest> {
+        match self {
+            Self::AuthorityPush {
+                migration_cleanup, ..
+            } => *migration_cleanup,
+            _ => None,
+        }
+    }
+    fn retained_body_import(&self) -> Option<&RetainedBodyImport<'_>> {
+        match self {
+            Self::AuthorityPush { retained, .. } => retained.as_ref(),
+            _ => None,
+        }
+    }
     fn replica_publication(&self) -> Option<&ReplicaStatePublication<'_>> {
         match self {
             Self::ReplicaPublication { publication, .. } => Some(publication),
@@ -5379,6 +5429,9 @@ where
         Box::pin(self.import_sync_repository(SyncImport::AuthorityPush {
             request,
             authorship: SyncImportAuthorship::TrustedFixture,
+            retained: None,
+            global_migration: None,
+            migration_cleanup: None,
         }))
         .await
     }
@@ -5473,8 +5526,90 @@ where
         Box::pin(self.import_sync_repository(SyncImport::AuthorityPush {
             request,
             authorship: SyncImportAuthorship::Authenticated(account_id),
+            retained: None,
+            global_migration: None,
+            migration_cleanup: None,
         }))
         .await
+    }
+
+    pub(crate) async fn cleanup_native_migration_for_account(
+        &self,
+        cleanup: &super::NativeMigrationCleanupRequest,
+        account: &str,
+    ) -> Result<SyncPushResponse, LixError> {
+        if self.sync_mode_state().role() != super::SyncRole::Authority {
+            return Err(LixError::new(
+                "LIX_MIGRATION_CLEANUP_UNRESOLVED",
+                "cleanup requires an authority",
+            ));
+        }
+        let request = cleanup.deletion()?;
+        Box::pin(self.import_sync_repository(SyncImport::AuthorityPush {
+            request: &request,
+            authorship: SyncImportAuthorship::Authenticated(account),
+            retained: None,
+            global_migration: None,
+            migration_cleanup: Some(cleanup),
+        }))
+        .await
+    }
+    pub(crate) async fn push_global_migration_body_wave_for_account(
+        &self,
+        wave: &super::NativeGlobalBodyWaveRequest,
+        account: &str,
+    ) -> Result<SyncPushResponse, LixError> {
+        wave.validate()?;
+        if self.sync_mode_state().role() != super::SyncRole::Authority {
+            return Err(LixError::new(
+                "LIX_MIGRATION_GLOBAL_BODY_INVALID",
+                "global migration import requires an authority",
+            ));
+        }
+        Box::pin(self.import_sync_repository(SyncImport::AuthorityPush {
+            request: &wave.bodies,
+            authorship: SyncImportAuthorship::Authenticated(account),
+            retained: None,
+            global_migration: Some(wave),
+            migration_cleanup: None,
+        }))
+        .await
+    }
+    pub(crate) async fn push_retained_body_wave_for_account(
+        &self,
+        wave: &super::RetainedBodyWaveRequest,
+        account_id: &str,
+    ) -> Result<super::RetainedBodyWaveResponse, LixError> {
+        wave.validate()?;
+        if self.sync_mode_state().role() != super::SyncRole::Authority {
+            return Err(LixError::new(
+                "LIX_PARTIAL_UPLOAD_ATTEMPT_INVALID",
+                "retained upload requires an authority",
+            ));
+        }
+        let accepted = std::sync::Mutex::new(None);
+        let push = Box::pin(self.import_sync_repository(SyncImport::AuthorityPush {
+            request: &wave.bodies,
+            authorship: SyncImportAuthorship::Authenticated(account_id),
+            retained: Some(RetainedBodyImport {
+                wave,
+                accepted: &accepted,
+            }),
+            global_migration: None,
+            migration_cleanup: None,
+        }))
+        .await?;
+        let state = accepted
+            .into_inner()
+            .map_err(|_| LixError::unknown("retained upload acknowledgment lock failed"))?
+            .ok_or_else(|| {
+                LixError::unknown("retained upload omitted its atomic acknowledgment")
+            })?;
+        Ok(super::RetainedBodyWaveResponse {
+            push,
+            accepted_tip: state.accepted_tip()?.to_string(),
+            expires_at_ms: state.expires_at_ms,
+        })
     }
 
     async fn import_sync_repository(
@@ -7137,11 +7272,85 @@ where
         } {
             super::upload_plan::stage_invalidate(&mut writes);
         }
+        let retained_ack = if let Some(retained) = import.retained_body_import() {
+            let account = import.expected_account_id().ok_or_else(|| {
+                LixError::unknown("retained upload requires authenticated authorship")
+            })?;
+            let identity = crate::gc::NativeUploadAttemptIdentity {
+                repository_id: self.lix_id().into(),
+                account_id: account.into(),
+                branch_id: retained.wave.request.branch_id.clone(),
+                attempt_id: retained.wave.request.attempt_id.clone(),
+            };
+            let initial = crate::gc::load_native_upload_attempt(&read, &identity)
+                .await?
+                .is_none();
+            let proof = VerifiedRetainedBodyWave::from_validated_import(
+                &read,
+                initial,
+                self.lix_id(),
+                &retained.wave.request,
+                request,
+                account,
+                CommitId::parse_lix(
+                    &retained.wave.expected_previous_commit_id,
+                    "retained wave predecessor",
+                )?,
+                &staged_manifests,
+                &existing,
+            )
+            .await?;
+            let (state, guards) = crate::gc::stage_accepted_native_upload_wave(
+                &read,
+                &mut writes,
+                &identity,
+                &proof,
+                crate::telemetry::unix_time_ms(),
+            )
+            .await?;
+            preconditions.extend(guards);
+            Some(state)
+        } else {
+            None
+        };
+        if let Some(wave) = import.global_migration() {
+            let account = import.expected_account_id().ok_or_else(|| {
+                LixError::unknown("global migration requires authenticated authorship")
+            })?;
+            let proof = VerifiedGlobalMigrationBody::from_validated_import(
+                &read,
+                self.lix_id(),
+                account,
+                wave,
+                &staged_manifests,
+                &existing,
+            )
+            .await?;
+            preconditions
+                .extend(crate::gc::stage_global_body_pin(&read, &mut writes, &proof).await?);
+        }
+        if let Some(cleanup) = import.migration_cleanup() {
+            let account = import.expected_account_id().ok_or_else(|| {
+                LixError::unknown("migration cleanup requires authenticated authorship")
+            })?;
+            preconditions.extend(
+                super::native_migration_cleanup::native_migration_cleanup_guards(
+                    &read,
+                    self.lix_id(),
+                    account,
+                    cleanup,
+                    request,
+                )
+                .await?,
+            );
+        }
         let (current_cursor, _) = load_sequence(&read).await?;
         if newly_imported.is_empty()
             && published_ref_updates.is_empty()
             && !hydrated_history
             && import.replica_publication().is_none()
+            && retained_ack.is_none()
+            && import.global_migration().is_none()
         {
             return Ok(SyncPushResponse {
                 cursor: current_cursor,
@@ -7196,6 +7405,13 @@ where
                 .await?;
         } else {
             adapter.commit_write_set(writes, options).await?;
+        }
+        if let (Some(retained), Some(state)) = (import.retained_body_import(), retained_ack) {
+            *retained
+                .accepted
+                .lock()
+                .map_err(|_| LixError::unknown("retained upload acknowledgment lock failed"))? =
+                Some(state);
         }
         self.notify_observers_for_sync();
         self.sync_mode_state().notify_sync_change();
@@ -15584,3 +15800,8 @@ mod tests {
         assert_eq!(read_key_value(&authority, "shared").await, "authority-wins",);
     }
 }
+
+pub(crate) use full_conversion_manifest::pending_conversion_request_after_global;
+pub(crate) use native_global_conversion_manifest::{
+    DescriptorGlobalConversion, classify_descriptor_global_conversion,
+};

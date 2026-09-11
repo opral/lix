@@ -73,6 +73,8 @@ export type {
 	ReplicaRecoveryReceipt,
 	RemoteLixFetch,
 	LixServerOptions,
+	RemoteLixServerOptions,
+	PartialReplicaLixServerOptions,
 	HostedLix,
 	CreateLixOptions,
 	DeleteLixOptions,
@@ -83,3 +85,7 @@ export type {
 } from "./types.js";
 
 export { createLix, deleteLix } from "./hosted-lix.js";
+
+export { convertReplicaToPartial, type ConvertReplicaToPartialOptions } from "./open-lix.js";
+
+export { retryReplicaMigrationCleanup, type RetryReplicaMigrationCleanupOptions } from "./open-lix.js";

@@ -71,7 +71,12 @@ where
         .surface("lix_diff")
         .is_some_and(|surface| selection.includes(surface))
     {
-        diff::register_diff_function(session, ctx.changelog_query_source(), Arc::clone(&catalog));
+        diff::register_diff_function(
+            session,
+            ctx.changelog_query_source(),
+            Arc::clone(&catalog),
+            ctx.read_interest_registry(),
+        );
     }
     if catalog
         .surface("lix_as_of")
@@ -468,6 +473,7 @@ where
                     session,
                     &surface.name,
                     ctx.changelog_query_source(),
+                    ctx.hot_state().is_partial_replica(),
                 )
                 .await?;
             }
@@ -587,6 +593,7 @@ where
             session,
             read_ctx.changelog_query_source(),
             Arc::clone(&catalog),
+            read_ctx.read_interest_registry(),
         );
     }
     if catalog
@@ -1190,3 +1197,8 @@ mod tests {
         }
     }
 }
+
+pub(crate) use diff::prepare_native_diff_interest;
+pub(crate) use file::{
+    prepare_native_file_content_interest, prepare_native_file_metadata_interest,
+};

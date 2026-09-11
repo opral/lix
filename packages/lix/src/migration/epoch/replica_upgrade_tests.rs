@@ -565,11 +565,20 @@ async fn recovery_hydrates_sparse_global_history_without_inheriting_caller_rows(
     let old_session =
         old_replica_with_recovery_data(&authority, EpochBank::A, false, true, memory.clone()).await;
     drop(old_session);
-    let lix = crate::open_lix()
-        .with_storage(crate::sync::durable_memory_for_test(memory))
-        .with_server(authority.options())
+    let storage = crate::sync::durable_memory_for_test(memory);
+    // Public conversion performs the explicit format migration, then refuses
+    // to discard the retained pre-native edits. Normal opening never rebuilds.
+    let error = crate::convert_replica_to_partial(storage.clone(), authority.options(), None)
         .await
-        .unwrap();
+        .unwrap_err();
+    assert_eq!(
+        error.code,
+        "LIX_PARTIAL_REPLICA_CONVERSION_RECOVERY_REQUIRED"
+    );
+    let lix = crate::open_lix().with_storage(storage).await.unwrap();
+    // Fixture-only authoring admission creates unrelated caller state. The
+    // recovery API independently authenticates its isolated writer context.
+    lix.set_sync_role(crate::sync::SyncRole::Replica).unwrap();
     lix.execute(
         "INSERT INTO lix_key_value (key, value) VALUES ('caller-only', 'unrelated')",
         &[],
@@ -615,11 +624,30 @@ async fn recovery_hydrates_sparse_global_history_without_inheriting_caller_rows(
         "global ancestry must start cold"
     );
     drop(read);
-    let receipt =
-        tokio::time::timeout(Duration::from_secs(15), lix.recover_replica(&sources[0].id))
+    // An authority with a different repository must not hydrate or publish.
+    let wrong_authority = Authority::new().await;
+    let mismatch = lix
+        .recover_replica_with_server(&sources[0].id, wrong_authority.options())
+        .await
+        .unwrap_err();
+    assert_eq!(mismatch.code, LixError::CODE_INVALID_PARAM);
+    let read = adapter.begin_read(ReadOptions::default()).await.unwrap();
+    assert!(
+        crate::commit_graph::CommitGraphContext::new()
+            .reader(&read)
+            .load_node(&global.head_commit_id)
             .await
             .unwrap()
-            .unwrap();
+            .is_none()
+    );
+    drop(read);
+    let receipt = tokio::time::timeout(
+        Duration::from_secs(15),
+        lix.recover_replica_with_server(&sources[0].id, authority.options()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(receipt.branch_ids.len(), 1, "{:?}", receipt.unresolved);
     let recovered = lix
         .open_internal_session(&receipt.branch_ids[0], lix.active_account_id())

@@ -26,7 +26,8 @@
 		"test:browser": "npm run build && npm run test:browser:built",
 		"test:browser:built": "vitest run --config vitest.browser.config.ts --exclude 'tests/*.bench.browser.test.ts'",
 		"test:browser:production": "node ./scripts/test-packed-vite.js",
-		"typecheck": "tsc -p tsconfig.test.json --noEmit"
+		"typecheck": "tsc -p tsconfig.test.json --noEmit",
+		"benchmark:partial-sync": "vitest run --config vitest.partial-sync.config.ts --reporter=verbose"
 	},
 	"dependencies": {
 		"@sqlite.org/sqlite-wasm": "3.53.0-build1"

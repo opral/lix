@@ -1,3 +1,6 @@
+mod partial;
+mod partial_merge;
+
 use lix::plugin::runtime::WasmRuntime;
 use lix::storage::{Storage, StorageSession};
 use lix::telemetry::TelemetrySink;
@@ -923,7 +926,10 @@ where
         // SAFETY: the builder owns the SQL, parameters, and options. The only
         // borrowed value retained across suspension is a shared reference to
         // the Sync session; storage handles are Send by the Storage contract.
-        if self.lix.engine.sync_mode().role() != crate::sync::SyncRole::Replica {
+        if !matches!(
+            self.lix.engine.sync_mode().role(),
+            crate::sync::SyncRole::Replica | crate::sync::SyncRole::PartialReplica
+        ) {
             return Box::pin(unsafe {
                 crate::session::AssumeSendFuture::new(async move {
                     self.lix
@@ -984,7 +990,10 @@ where
     fn into_future(self) -> Self::IntoFuture {
         // SAFETY: as above, the builder owns every request value and borrows
         // only the Sync session across suspension.
-        if self.lix.engine.sync_mode().role() != crate::sync::SyncRole::Replica {
+        if !matches!(
+            self.lix.engine.sync_mode().role(),
+            crate::sync::SyncRole::Replica | crate::sync::SyncRole::PartialReplica
+        ) {
             return Box::pin(unsafe {
                 crate::session::AssumeSendFuture::new(async move {
                     self.lix
@@ -996,7 +1005,10 @@ where
         }
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
-                let route = self.lix.session.execute_batch_disposition(&self.statements)?;
+                let route = self
+                    .lix
+                    .session
+                    .execute_batch_disposition(&self.statements)?;
                 self.lix
                     .retry_replica_read(route, || {
                         self.lix.retry_sync_demands(|| {
@@ -1094,14 +1106,19 @@ where
 struct SyncSessionLease {
     runtime: Arc<crate::sync::SyncRuntime>,
     active_sessions: Arc<AtomicUsize>,
+    partial_owner: Option<crate::engine::PartialOwnerLifetime>,
     released: AtomicBool,
 }
 
 impl SyncSessionLease {
-    fn root(runtime: Arc<crate::sync::SyncRuntime>) -> Arc<Self> {
+    fn root_with_owner(
+        runtime: Arc<crate::sync::SyncRuntime>,
+        owner: crate::engine::PartialOwnerLifetime,
+    ) -> Arc<Self> {
         Arc::new(Self {
             runtime,
             active_sessions: Arc::new(AtomicUsize::new(1)),
+            partial_owner: Some(owner),
             released: AtomicBool::new(false),
         })
     }
@@ -1111,6 +1128,7 @@ impl SyncSessionLease {
         Arc::new(Self {
             runtime: self.runtime.clone(),
             active_sessions: self.active_sessions.clone(),
+            partial_owner: self.partial_owner.clone(),
             released: AtomicBool::new(false),
         })
     }
@@ -1120,6 +1138,9 @@ impl SyncSessionLease {
             return Ok(());
         }
         if self.active_sessions.fetch_sub(1, Ordering::AcqRel) == 1 {
+            if let Some(owner) = &self.partial_owner {
+                owner.close();
+            }
             self.runtime.stop_and_join().await?;
         }
         Ok(())
@@ -1144,6 +1165,34 @@ where
         None => None,
     };
     let open_progress: Arc<dyn OpenProgressSink> = retained_progress.clone();
+    // Sync opening is a partial replica with on-demand sync. A metadata-only
+    // default-read probe recognizes offline partial storage without requiring
+    // Durable reads from ordinary standalone Memory repositories.
+    if server.is_some() || crate::migration::has_partial_replica_marker(&storage).await? {
+        emit_open_progress(
+            Some(&open_progress),
+            OpenProgress {
+                phase: OpenPhase::Opening,
+                from_format: None,
+                to_format: crate::init::CURRENT_FORMAT_VERSION,
+                completed: None,
+                total: None,
+            },
+        );
+        let lix = partial::open_partial_lix(storage, wasm_runtime, telemetry, server).await?;
+        retained_progress.retain_initialized(lix.open_report.initialized);
+        emit_open_progress(
+            Some(&open_progress),
+            OpenProgress {
+                phase: OpenPhase::Complete,
+                from_format: None,
+                to_format: crate::init::CURRENT_FORMAT_VERSION,
+                completed: None,
+                total: None,
+            },
+        );
+        return Ok(lix);
+    }
     let admission =
         ensure_current_repository(&storage, Some(&open_progress), server.as_ref()).await?;
     let mut open_report = admission.report;
@@ -1159,43 +1208,20 @@ where
             total: None,
         },
     );
-    // A fresh repository or one left in the initialization/bootstrap crash
-    // window needs one handshake and snapshot before its application session
-    // can be bound to the authority's account. Reopens with durable state for
-    // this repository remain entirely local even when its transport URL changes.
-    let (reopened_sync_account_id, mut prepared_sync) = if let Some(server) = server.as_ref() {
-        match crate::sync::inspect_sync_bootstrap_with_adapter(&admission.adapter, &server.url)
-            .await?
-        {
-            crate::sync::SyncBootstrapAdmission::Prepare => (
-                None,
-                Some(crate::sync::prepare_sync_bootstrap(server).await?),
-            ),
-            crate::sync::SyncBootstrapAdmission::Ready { account_id } => (Some(account_id), None),
-        }
-    } else {
-        (None, None)
-    };
-    let initial_sync_branch_id = prepared_sync
-        .as_ref()
-        .map(|prepared| prepared.default_branch_id.clone());
     let (engine, engine_initialized) = open_or_initialize_engine_with_adapter(
         admission.adapter,
         wasm_runtime,
         telemetry,
         None,
-        initial_sync_branch_id.as_deref(),
+        None,
     )
     .await?;
     if engine_initialized {
         open_report.initialized = true;
         retained_progress.retain_initialized(true);
     }
-    let session = match reopened_sync_account_id {
-        Some(account_id) => engine.open_session_with_account(account_id).await?,
-        None => engine.open_session().await?,
-    };
-    let mut lix = Lix {
+    let session = engine.open_session().await?;
+    let lix = Lix {
         engine: Arc::new(engine),
         session: Arc::new(session),
         transaction_lifecycle: Arc::default(),
@@ -1205,18 +1231,6 @@ where
         server: server.clone(),
         open_report: Arc::new(open_report),
     };
-    if let Some(server) = server {
-        let initial_transport = if let Some(prepared) = prepared_sync.take() {
-            Some(crate::sync::install_sync_bootstrap(&mut lix, &server, prepared).await?)
-        } else {
-            None
-        };
-        let runtime = crate::sync::activate_sync_mode(&mut lix, &server, initial_transport).await?;
-        lix.sync_demand_tx = Some(runtime.demand_tx.clone());
-        lix.sync_lease = Some(SyncSessionLease::root(runtime));
-        // Foreground execution belongs to the durable local replica.
-        // The sync worker owns all server traffic, including lazy history.
-    }
     lix.bind_session();
     emit_open_progress(
         Some(&open_progress),
@@ -1261,6 +1275,30 @@ where
     })
 }
 
+/// Isolated writer admission for an explicit authenticated recovery operation.
+/// No worker, pull loop or upload loop is installed on this context.
+pub(crate) async fn new_replica_recovery_context<S>(
+    adapter: crate::storage_adapter::StorageAdapter<S>,
+    branch_id: &str,
+    account_id: &str,
+) -> Result<Lix<S>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let candidate = new_replica_migration_candidate(adapter, branch_id).await?;
+    let opened = candidate.open_internal_session(branch_id, account_id).await;
+    let recovery = match opened {
+        Ok(recovery) => recovery,
+        Err(error) => {
+            let _ = candidate.close().await;
+            return Err(error);
+        }
+    };
+    recovery.set_sync_role(crate::sync::SyncRole::Replica)?;
+    candidate.close().await?;
+    Ok(recovery)
+}
+
 struct RepositoryAdmission<StorageImpl> {
     adapter: crate::storage_adapter::StorageAdapter<StorageImpl>,
     report: OpenReport,
@@ -1302,7 +1340,7 @@ where
         let export = crate::snapshot::SnapshotExportBuilder::new(self.engine.storage());
         if let Some(server) = &self.server {
             export.from_sync_server(server.clone(), self.active_account_id().to_owned())
-        } else if self.engine.sync_mode().role() == crate::sync::SyncRole::Replica {
+        } else if self.engine.sync_mode().role().is_replica() {
             export.reject_connected_replica()
         } else {
             export
@@ -1394,10 +1432,6 @@ where
         self.engine.notify_observers();
     }
 
-    pub(crate) fn fail_observers_for_sync(&self, error: LixError) {
-        self.engine.fail_observers(error);
-    }
-
     pub(crate) async fn repository_default_branch_id_for_sync(
         &self,
         read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
@@ -1445,8 +1479,10 @@ where
             None => Arc::clone(&self.session).active_branch_id_owned().await?,
         };
         let active_account_id = account_id.unwrap_or_else(|| self.active_account_id().to_owned());
-        if self.engine.sync_mode().role() == crate::sync::SyncRole::Replica
-            && active_account_id != self.active_account_id()
+        if matches!(
+            self.engine.sync_mode().role(),
+            crate::sync::SyncRole::Replica | crate::sync::SyncRole::PartialReplica
+        ) && active_account_id != self.active_account_id()
         {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
@@ -1480,6 +1516,9 @@ where
                 "cannot open a storage session from a closed handle",
             ));
         }
+        if self.engine.sync_mode().role() == crate::sync::SyncRole::PartialReplica {
+            return partial::open_partial_storage_session(self, storage).await;
+        }
         let mut opened = open_lix().with_storage(storage).await?;
         if opened.lix_id() != self.lix_id() {
             opened.close().await?;
@@ -1496,7 +1535,10 @@ where
                 )
             })?
             .inherit_sync_mode(self.engine.sync_mode());
-        let account = if self.engine.sync_mode().role() == crate::sync::SyncRole::Replica {
+        let account = if matches!(
+            self.engine.sync_mode().role(),
+            crate::sync::SyncRole::Replica | crate::sync::SyncRole::PartialReplica
+        ) {
             self.active_account_id()
         } else {
             crate::SYSTEM_ACCOUNT_ID
@@ -1702,7 +1744,10 @@ where
         metadata: ExecuteStatementMetadata,
         idempotency: Option<ExecuteIdempotency>,
     ) -> Pin<Box<dyn Future<Output = Result<ExecuteResult, LixError>> + Send + 'static>> {
-        if self.engine.sync_mode().role() != crate::sync::SyncRole::Replica {
+        if !matches!(
+            self.engine.sync_mode().role(),
+            crate::sync::SyncRole::Replica | crate::sync::SyncRole::PartialReplica
+        ) {
             return Box::pin(
                 Arc::clone(&self.session).execute_with_idempotency_and_options_and_metadata(
                     sql,
@@ -1820,7 +1865,10 @@ where
         statement_metadata: Vec<ExecuteStatementMetadata>,
         idempotency: Option<ExecuteIdempotency>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<ExecuteResult>, LixError>> + Send + 'static>> {
-        if self.engine.sync_mode().role() != crate::sync::SyncRole::Replica {
+        if !matches!(
+            self.engine.sync_mode().role(),
+            crate::sync::SyncRole::Replica | crate::sync::SyncRole::PartialReplica
+        ) {
             return Box::pin(
                 Arc::clone(&self.session).execute_batch_with_idempotency_and_options_and_metadata(
                     statements,
@@ -1991,11 +2039,36 @@ where
         unsafe {
             crate::session::AssumeSendFuture::new(async move {
                 let _primary_switch_guard = match &self.primary_switch_gate {
-                    Some(gate) => Some(gate.lock().await),
+                    Some(gate) => Some(gate.clone().lock_owned().await),
                     None => None,
                 };
 
-                self.session.switch_branch(options).await
+                if let Some(state) = self.engine.sync_mode().partial_admission() {
+                    if options.branch_id != state.descriptor().selected_branch.branch_id
+                        && options.branch_id != state.descriptor().global_branch.branch_id
+                    {
+                        let server = self.server.clone().ok_or_else(|| {
+                            LixError::new(
+                                "LIX_PARTIAL_REPLICA_OFFLINE",
+                                "admitting another branch requires its authority",
+                            )
+                        })?;
+                        let target = options.branch_id.clone();
+                        let completion = self
+                            .session
+                            .partial_switch_completion(target.clone(), _primary_switch_guard)
+                            .await?;
+                        crate::sync::switch_existing_branch(
+                            self.engine.clone(),
+                            server,
+                            completion,
+                        )
+                        .await?;
+                        return Ok(SwitchBranchReceipt { branch_id: target });
+                    }
+                }
+                self.retry_sync_demands(|| self.session.switch_branch(options.clone()))
+                    .await
             })
         }
     }
@@ -2031,7 +2104,10 @@ where
         OperationFuture: Future<Output = Result<T, LixError>>,
     {
         if route != ExecutionDisposition::Durable
-            && self.engine.sync_mode().role() == crate::sync::SyncRole::Replica
+            && matches!(
+                self.engine.sync_mode().role(),
+                crate::sync::SyncRole::Replica | crate::sync::SyncRole::PartialReplica
+            )
         {
             retry_expired_read(operation).await
         } else {
@@ -3603,8 +3679,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
         receipt: serde_json::Value,
     ) -> Result<(), LixError> {
         use crate::branch::{
-            BranchLifecycle, BranchOperation, BranchReferenceRole, branch_descriptor_stage_row,
-            BranchHeadWrite,
+            BranchHeadWrite, BranchLifecycle, BranchOperation, BranchReferenceRole,
+            branch_descriptor_stage_row,
         };
         use crate::transaction_types::{
             RawWriteBatch, TransactionJson, TransactionWrite, TransactionWriteMode,
@@ -3737,3 +3813,33 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
 
 #[cfg(test)]
 mod recovery_branch_publication_tests;
+
+/// Converts closed full-replica storage to a partial replica with on-demand sync.
+/// Ordinary pending edits and new branches whose global changes contain only
+/// branch-descriptor additions reconcile natively before publication. Other
+/// unsupported global/checkpoint/reset changes preserve the full
+/// source and return an explicit recovery error. Migration may inspect all data.
+pub async fn convert_replica_to_partial<S>(
+    storage: S,
+    server: ServerOptions,
+    branch_id: Option<&str>,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    partial::convert_full_replica_for_partial_open(storage, server, branch_id).await
+}
+
+/// Retries temporary native migration-pin cleanup on closed partial storage.
+/// This explicit maintenance may inspect journals and contact the authority;
+/// ordinary opening and the published local working set remain unchanged.
+/// Returns the number of newly acknowledged cleanup records.
+pub async fn retry_replica_migration_cleanup<S>(
+    storage: S,
+    server: ServerOptions,
+) -> Result<usize, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    partial::retry_partial_migration_cleanup(storage, server).await
+}

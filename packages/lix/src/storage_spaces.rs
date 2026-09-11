@@ -61,6 +61,7 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
     crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
     crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
     crate::hot_state::INDEX_SPACE,
+    crate::hot_state::DETERMINISTIC_IDENTITY_WITNESS_SPACE,
     crate::binary_cas::BINARY_CAS_MANIFEST_SPACE,
     crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE,
     crate::binary_cas::BINARY_CAS_CHUNK_SPACE,
@@ -79,6 +80,14 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
     crate::sync::SYNC_CHECKPOINT_SOURCE_SPACE,
     crate::sync::SYNC_UPLOAD_GENERATION_SPACE,
     crate::sync::SYNC_UPLOAD_PROOF_SPACE,
+    crate::sync::PARTIAL_REPLICA_STATE_SPACE,
+    crate::sync::PARTIAL_BRANCH_PUSH_SPACE,
+    crate::sync::PARTIAL_READ_INTEREST_SPACE,
+    crate::sync::PARTIAL_BRANCH_MERGE_SPACE,
+    crate::sync::PARTIAL_AUTHORITY_MERGE_RECEIPT_SPACE,
+    crate::sync::PARTIAL_ATTEMPT_RESTART_SPACE,
+    crate::sync::NATIVE_GLOBAL_MIGRATION_RECEIPT_SPACE,
+    crate::sync::PARTIAL_GLOBAL_MERGE_SPACE,
     // `gc.rs` declares these through the checked constructors rather than
     // `StorageSpace::declare`, so referencing its constants here would make
     // `may_declare` read a registry it is in the middle of evaluating. The
@@ -102,6 +111,21 @@ pub(crate) const ALL_STORAGE_SPACES: &[StorageSpace] = &[
     StorageSpace::declare(
         StorageSpaceId(0x0008_0009),
         "checkpoint.inventory.v1",
+        ValueSemantics::Mutable,
+    ),
+    StorageSpace::declare(
+        StorageSpaceId(0x0008_000a),
+        "gc.native_baseline_lease.v1",
+        ValueSemantics::Mutable,
+    ),
+    StorageSpace::declare(
+        StorageSpaceId(0x0008_000b),
+        "gc.native_upload_attempt.v1",
+        ValueSemantics::Mutable,
+    ),
+    StorageSpace::declare(
+        StorageSpaceId(0x0008_000c),
+        "gc.native_global_migration_retention.v1",
         ValueSemantics::Mutable,
     ),
     crate::storage_adapter::REPOSITORY_EPOCH_SPACE,
@@ -142,6 +166,7 @@ pub(crate) const SNAPSHOT_STORAGE_SPACES: &[StorageSpace] = &[
     crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE,
     crate::tracked_state::SCOPED_RANGE_NODE_SPACE,
     crate::hot_state::INDEX_SPACE,
+    crate::hot_state::DETERMINISTIC_IDENTITY_WITNESS_SPACE,
     crate::binary_cas::BINARY_CAS_MANIFEST_SPACE,
     crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE,
     crate::binary_cas::BINARY_CAS_CHUNK_SPACE,
@@ -160,6 +185,14 @@ pub(crate) const SNAPSHOT_STORAGE_SPACES: &[StorageSpace] = &[
     crate::sync::SYNC_CHECKPOINT_SOURCE_SPACE,
     crate::sync::SYNC_UPLOAD_GENERATION_SPACE,
     crate::sync::SYNC_UPLOAD_PROOF_SPACE,
+    crate::sync::PARTIAL_REPLICA_STATE_SPACE,
+    crate::sync::PARTIAL_BRANCH_PUSH_SPACE,
+    crate::sync::PARTIAL_READ_INTEREST_SPACE,
+    crate::sync::PARTIAL_BRANCH_MERGE_SPACE,
+    crate::sync::PARTIAL_AUTHORITY_MERGE_RECEIPT_SPACE,
+    crate::sync::PARTIAL_ATTEMPT_RESTART_SPACE,
+    crate::sync::NATIVE_GLOBAL_MIGRATION_RECEIPT_SPACE,
+    crate::sync::PARTIAL_GLOBAL_MERGE_SPACE,
     StorageSpace::declare(
         StorageSpaceId(0x0008_0001),
         "checkpoint.recovery_ref.v3",
@@ -178,6 +211,21 @@ pub(crate) const SNAPSHOT_STORAGE_SPACES: &[StorageSpace] = &[
     StorageSpace::declare(
         StorageSpaceId(0x0008_0009),
         "checkpoint.inventory.v1",
+        ValueSemantics::Mutable,
+    ),
+    StorageSpace::declare(
+        StorageSpaceId(0x0008_000a),
+        "gc.native_baseline_lease.v1",
+        ValueSemantics::Mutable,
+    ),
+    StorageSpace::declare(
+        StorageSpaceId(0x0008_000b),
+        "gc.native_upload_attempt.v1",
+        ValueSemantics::Mutable,
+    ),
+    StorageSpace::declare(
+        StorageSpaceId(0x0008_000c),
+        "gc.native_global_migration_retention.v1",
         ValueSemantics::Mutable,
     ),
 ];
@@ -664,6 +712,9 @@ mod tests {
             crate::gc::CHECKPOINT_RECOVERY_REF_SPACE,
             crate::gc::CHECKPOINT_GC_STATE_SPACE,
             crate::gc::COMMIT_RETIREMENT_INTENT_SPACE,
+            crate::gc::NATIVE_BASELINE_LEASE_SPACE,
+            crate::gc::NATIVE_UPLOAD_ATTEMPT_SPACE,
+            crate::gc::NATIVE_GLOBAL_RETENTION_SPACE,
             crate::checkpoint::CHECKPOINT_INVENTORY_SPACE,
         ] {
             let row = ALL_STORAGE_SPACES

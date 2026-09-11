@@ -53,14 +53,17 @@ async function openLixInternal(
 		throw new TypeError("openLix() onProgress must be a function");
 	}
 	if (options.server !== undefined) {
-		if ("mode" in options.server)
-			throw new TypeError(
-				"server.mode was removed; provide storage for synchronization or omit it for remote execution",
-			);
+		const mode = options.server.mode ?? "remote";
+		if (mode !== "remote" && mode !== "partial_replica") {
+			throw new TypeError('server.mode must be "remote" or "partial_replica"');
+		}
 		if (snapshot) {
 			throw new TypeError("openLix.fromSnapshot() does not accept server mode");
 		}
-		if (options.storage === undefined) {
+		if (mode === "remote") {
+			if (options.storage !== undefined) {
+				throw new TypeError('remote mode does not accept storage; set server.mode to "partial_replica" for on-demand sync');
+			}
 			if (options.telemetry !== undefined || options.onProgress !== undefined)
 				throw new TypeError(
 					"remote execution does not accept local telemetry or onProgress",
@@ -68,9 +71,12 @@ async function openLixInternal(
 			const { openRemoteLixBinding } = await import("./remote/client.js");
 			return new Lix(await openRemoteLixBinding(options.server));
 		}
+		if (options.storage === undefined) {
+			throw new TypeError('server.mode "partial_replica" requires storage');
+		}
 	}
 	const syncServer =
-		options.server !== undefined && options.storage !== undefined
+		options.server?.mode === "partial_replica"
 			? {
 					url: new URL(options.server.url).toString(),
 					headers: options.server.headers,
@@ -317,4 +323,36 @@ function storageAlreadyOpen(): Error & { code: string } {
 	error.name = "LixError";
 	error.code = "LIX_STORAGE_IN_USE";
 	return error;
+}
+
+export type ConvertReplicaToPartialOptions = {storage:LixStorage;server:LixServerOptions;branchId?:string};
+/** Explicit conversion of closed full-replica storage; pending edits are preserved. */
+export async function convertReplicaToPartial(options:ConvertReplicaToPartialOptions):Promise<void> {
+ if(!options||(!isLixStorage(options.storage)&&!isJsProviderLixStorage(options.storage))||!options.server)throw new TypeError("Conversion requires storage and server");
+ if(options.branchId!==undefined&&(typeof options.branchId!=="string"||!options.branchId))throw new TypeError("branchId must be a nonempty string");
+ const storage=options.storage;
+ if(openStorages.has(storage))throw storageAlreadyOpen();
+ openStorages.add(storage);
+ try {
+  const registration=storage.lixStorage;
+  const config=isJsProviderLixStorage(storage)?{kind:"jsStorage" as const,moduleUrl:storage.lixStorage.moduleUrl,options:storage.lixStorage.options}:
+   (registration as {config:import("./binding-types.js").LixStorageConfig}).config;
+  const {convertReplicaWorkerOperation}=await import("./worker/client.js");
+  await convertReplicaWorkerOperation(config,options.server,options.branchId);
+ }finally {openStorages.delete(storage);}
+}
+
+export type RetryReplicaMigrationCleanupOptions = {storage:LixStorage;server:LixServerOptions};
+/** Retry durable migration cleanup on closed storage. Returns newly completed cleanups. */
+export async function retryReplicaMigrationCleanup(options:RetryReplicaMigrationCleanupOptions):Promise<number> {
+ if(!options||(!isLixStorage(options.storage)&&!isJsProviderLixStorage(options.storage))||!options.server)throw new TypeError("Migration cleanup requires storage and server");
+ const storage=options.storage;
+ if(openStorages.has(storage))throw storageAlreadyOpen();
+ openStorages.add(storage);
+ try {
+  const config=isJsProviderLixStorage(storage)?{kind:"jsStorage" as const,moduleUrl:storage.lixStorage.moduleUrl,options:storage.lixStorage.options}:
+   (storage.lixStorage as {config:import("./binding-types.js").LixStorageConfig}).config;
+  const {retryReplicaMigrationCleanupWorkerOperation}=await import("./worker/client.js");
+  return await retryReplicaMigrationCleanupWorkerOperation(config,options.server);
+ }finally {openStorages.delete(storage);}
 }

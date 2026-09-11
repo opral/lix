@@ -186,6 +186,276 @@ paths:
           description: The encoded response exceeds the 64 MiB protocol limit.
           content: { application/json: { schema: { $ref: "#/components/schemas/ErrorEnvelope" } } }
         default: { $ref: "#/components/responses/Error" }
+  /lix/v1/{lix_id}/sync/retained-bodies:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
+    post:
+      operationId: syncRetainedBodies
+      description: Authenticated background upload of at most 32 contiguous ordinary key/value commits. Complete native bodies and an account-bound attempt retention frontier are committed atomically. No branch ref advances. Repeating the same wave is idempotent. JSON uses the server request limit and the encoded sync event must fit 64 MiB.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/RetainedBodyWaveRequest" } } }
+      responses:
+        "200":
+          description: Durable body acceptance with a five-minute server retention lease; bounded to 2048 bytes.
+          content: { application/json: { schema: { $ref: "#/components/schemas/RetainedBodyWaveResponse" } } }
+        "410": { description: Attempt retention expired; preserve local commits and restart reconciliation. }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/{lix_id}/sync/merge/restart:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
+    post:
+      operationId: syncPartialMergeRestart
+      description: Atomically fences one expired native merge attempt or returns its exact committed result. Immutable restart receipts prevent delayed old requests from resurrecting expired uploads. The client preserves captured local bodies and reuploads from the original base under the acknowledged successor ID. Request limit 16 KiB, response limit 4096 bytes.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/PartialAttemptRestartRequest" } } }
+      responses:
+        "200":
+          description: Exact authenticated terminal restart outcome.
+          content: { application/json: { schema: { $ref: "#/components/schemas/PartialAttemptRestartOutcome" } } }
+        "409": { description: Restart raced another authority operation or reused an attempt identity. }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/{lix_id}/sync/merge:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
+    post:
+      operationId: syncPartialMerge
+      description: Derives a native three-way key/value merge at the captured authority head. Native merge commit, expected-head CAS, retention transition and exact immutable attempt receipt publish atomically. Clients never supply selected rows. Conflicts leave both heads intact. Exact retries return the committed receipt even after later authority writes. Metadata request limit is 16 KiB.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/PartialMergeRequest" } } }
+      responses:
+        "200":
+          description: Exact native merge receipt; bounded to 4096 bytes.
+          content: { application/json: { schema: { $ref: "#/components/schemas/PartialMergeReceipt" } } }
+        "409": { description: Concurrent authority movement, divergent row conflict, or attempt ID reused with different coordinates. }
+        "410": { description: Accepted body retention expired. }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/{lix_id}/sync/migration/global/restart:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
+    post:
+      operationId: syncNativeGlobalMigrationRestart
+      description: Terminally abandons an exact uncommitted migration attempt and releases its pins under native GC CAS. A committed native outcome always wins; delayed body or merge requests cannot resurrect the aborted attempt.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/NativeGlobalRestartRequest" } } }
+      responses:
+        "200":
+          description: Exact authenticated operation acknowledgement.
+          content: { application/json: { schema: { $ref: "#/components/schemas/NativeGlobalRestartReceipt" } } }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/{lix_id}/sync/migration/global/cleanup:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
+    post:
+      operationId: syncNativeGlobalMigrationCleanup
+      description: Deletes exact migration pins only after every published native root survives under current authority refs. Returns true if cleanup was newly completed; false for an already removed pin.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/NativeGlobalMigrationRequest" } } }
+      responses:
+        "200":
+          description: Exact authenticated operation acknowledgement.
+          content: { application/json: { schema: { type: boolean } } }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/{lix_id}/sync/migration/global/merge:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
+    post:
+      operationId: syncNativeGlobalMigrationMerge
+      description: Atomically merges fresh global branch descriptors and creates the exact absent branch refs while preserving native heads and checkpoints. Explicit closed-storage migration only.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/NativeGlobalMigrationRequest" } } }
+      responses:
+        "200":
+          description: Exact authenticated operation acknowledgement.
+          content: { application/json: { schema: { $ref: "#/components/schemas/NativeGlobalMigrationReceipt" } } }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/{lix_id}/sync/migration/global/bodies:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
+    post:
+      operationId: syncNativeGlobalMigrationBodies
+      description: Imports original complete native bodies and durable migration GC pins atomically. No branch refs are published by this operation.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/NativeGlobalBodyWaveRequest" } } }
+      responses:
+        "200":
+          description: Exact authenticated operation acknowledgement.
+          content: { application/json: { schema: { $ref: "#/components/schemas/SyncPushResponse" } } }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/{lix_id}/sync/migration/merge:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
+    post:
+      operationId: syncNativeMigrationMerge
+      description: Explicit migration only: validates ordinary file/custom-schema native selections and plugin resolutions at captured heads. An isolated source branch pins uploaded native bodies. Selected/global coordinates and source pin are guarded with the native merge and immutable outcome atomically. Unchanged global/checkpoint scope; unsupported mutations preserve the original source. Metadata request limit is 16 KiB.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/NativeMigrationMergeRequest" } } }
+      responses:
+        "200":
+          description: Exact native merge receipt; bounded to 4096 bytes.
+          content: { application/json: { schema: { $ref: "#/components/schemas/PartialMergeReceipt" } } }
+        "409": { description: Concurrent authority movement, divergent row conflict, or attempt ID reused with different coordinates. }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/{lix_id}/sync/migration/cleanup:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
+    post:
+      operationId: syncNativeMigrationCleanup
+      description: Retires only the exact temporary migration source ref after an immutable native outcome. The surviving selected head must contain that outcome and participates in atomic CAS even though it is unchanged. Missing source ref is idempotent; changed source or surviving heads preserve the pin.
+
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/NativeMigrationCleanupRequest" } } }
+      responses:
+        "200":
+          description: Exact native merge receipt; bounded to 4096 bytes.
+          content: { application/json: { schema: { $ref: "#/components/schemas/SyncPushResponse" } } }
+        "409": { description: Concurrent authority movement, divergent row conflict, or attempt ID reused with different coordinates. }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/{lix_id}/sync/native-metadata:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
+    post:
+      operationId: syncNativeMetadata
+      description: Reads at most 32 explicitly identified native commit headers or commit graph records, without traversing parents or inventories. JSON requests are limited to 16 KiB; decoded response payload is limited to 256 KiB. The echoed caller epoch correlates a local receipt and does not establish a server retention lease. Installation requires native decoding and existing-value conflict checks.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
+        - $ref: "#/components/parameters/NativeBaselineLease"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/NativeMetadataRequest" } } }
+      responses:
+        "200":
+          description: Explicit native records bound to the repository and echoed caller epoch.
+          content: { application/json: { schema: { $ref: "#/components/schemas/NativeMetadataResponse" } } }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/{lix_id}/sync/native-object-range:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
+    post:
+      operationId: syncNativeObjectRange
+      description: Reads at most 1 MiB of an immutable native object at an explicit offset. Request JSON is limited to 16 KiB. Range bytes must be assembled and verified against the complete object's native digest before installation. Authority storage currently reads and hashes the whole object for each range.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
+        - $ref: "#/components/parameters/NativeBaselineLease"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/NativeObjectRangeRequest" } } }
+      responses:
+        "200":
+          description: Requested contiguous bytes, with immutable total length; zero bytes are permitted only at the object end.
+          content: { application/json: { schema: { $ref: "#/components/schemas/NativeObjectRangeResponse" } } }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/{lix_id}/sync/native-objects:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
+    post:
+      operationId: syncNativeObjects
+      description: Reads an explicitly addressed batch of immutable native tree/directory nodes, mutation catalogs or commit delta parts. The encoded request is limited to 16 KiB before JSON decoding. Does not accept arbitrary storage namespaces, publish refs, or establish logical coverage.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
+        - $ref: "#/components/parameters/NativeBaselineLease"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [objects]
+              properties:
+                objects: { type: array, minItems: 1, maxItems: 32, uniqueItems: true, items: { $ref: "#/components/schemas/NativeObjectRef" } }
+      responses:
+        "200":
+          description: Ordered objects, each verified against its requested native digest; total decoded payload at most 1 MiB. Encoded response and client collection are independently bounded.
+          content: { application/json: { schema: { $ref: "#/components/schemas/NativeObjectResponse" } } }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/{lix_id}/sync/baseline-lease/renew:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
+    post:
+      operationId: syncRenewBaselineLease
+      description: Renews an unexpired account-bound baseline lease with the protocol-10 fixed TTL of 300000 ms; expired leases cannot be resurrected. Does not change the admitted local receipt.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [leaseId]
+              properties:
+                leaseId: { type: string, format: uuid }
+      responses:
+        "200":
+          description: The same account and roots with a renewed deadline.
+          content: { application/json: { schema: { $ref: "#/components/schemas/NativeBaselineLease" } } }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/{lix_id}/sync/descriptor:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
+    get:
+      operationId: syncDescriptor
+      description: Returns at most 6144 encoded bytes of selected/default and global native root coordinates for a partial replica with on-demand sync. This metadata does not install a replica or certify local coverage; full sync bootstrap is unchanged.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
+        - name: branchId
+          in: query
+          description: Selected branch, defaulting to the repository default branch only when after is omitted. Required for continuation.
+          schema: { type: string, format: uuid }
+        - name: after
+          in: query
+          description: Last reconciled cursor. Waits up to 30 seconds for a newer descriptor, then returns current coordinates. Unrelated changes can advance the cursor without changing selected roots. A future cursor requires explicit baseline reconciliation.
+          schema: { type: integer, minimum: 0 }
+      responses:
+        "200":
+          description: Versioned opening coordinates from one coherent storage snapshot.
+          content: { application/json: { schema: { $ref: "#/components/schemas/LeasedPartialReplicaDescriptor" } } }
+        "409":
+          description: Requested cursor is ahead of the authority; preserve pending edits and reconcile the admitted baseline.
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        default: { $ref: "#/components/responses/Error" }
   /lix/v1/{lix_id}/sync/checkpoints:
     parameters:
       - $ref: "#/components/parameters/LixId"
@@ -250,6 +520,7 @@ paths:
       parameters:
         - $ref: "#/components/parameters/RequiredSessionId"
         - $ref: "#/components/parameters/SyncProtocolVersion"
+        - $ref: "#/components/parameters/OptionalNativeBaselineLease"
         - $ref: "#/components/parameters/BlobIds"
       responses:
         "200":
@@ -288,6 +559,7 @@ paths:
       parameters:
         - $ref: "#/components/parameters/RequiredSessionId"
         - $ref: "#/components/parameters/SyncProtocolVersion"
+        - $ref: "#/components/parameters/OptionalNativeBaselineLease"
         - $ref: "#/components/parameters/ChunkId"
       responses:
         "200":
@@ -603,7 +875,7 @@ components:
       in: header
       required: true
       description: Exact SQL protocol version. Missing or incompatible versions are rejected before session creation or writes; upgrade the client.
-      schema: { type: integer, const: 7 }
+      schema: { type: integer, const: 8 }
     SessionId:
       name: Lix-Session-Id
       in: header
@@ -614,12 +886,23 @@ components:
       in: header
       required: true
       schema: { type: string }
+    OptionalNativeBaselineLease:
+      name: lix-native-baseline-lease
+      in: header
+      required: false
+      description: Partial replica requests supply their admitted lease. When present it is checked in the same storage snapshot as the CAS read; expired leases return LIX_PARTIAL_BASELINE_EXPIRED.
+      schema: { type: string, format: uuid }
+    NativeBaselineLease:
+      name: lix-native-baseline-lease
+      in: header
+      required: true
+      schema: { type: string, format: uuid }
     SyncProtocolVersion:
       name: lix-sync-protocol-version
       in: header
       required: true
       description: Exact sync wire-protocol version advertised by the handshake.
-      schema: { type: integer, const: 9 }
+      schema: { type: integer, const: 11 }
     TransactionId:
       name: Lix-Transaction-Id
       in: header
@@ -676,8 +959,8 @@ components:
       type: object
       required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
-        protocolVersion: { type: integer, const: 7 }
-        syncProtocolVersion: { type: integer, const: 9 }
+        protocolVersion: { type: integer, const: 8 }
+        syncProtocolVersion: { type: integer, const: 11 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }
@@ -806,6 +1089,155 @@ components:
         checkpointCommitId:
           type: [string, "null"]
           description: Branch working-diff checkpoint at headCommitId. Required and non-null for a headed update; null only when deleting the branch.
+    PartialAttemptRestartRequest:
+      type: object
+      additionalProperties: false
+      required: [old, nextAttemptId]
+      properties:
+        old: { $ref: "#/components/schemas/PartialMergeRequest" }
+        nextAttemptId: { type: string, format: uuid }
+    PartialAttemptRestartReceipt:
+      type: object
+      additionalProperties: false
+      required: [version, repositoryId, accountId, request]
+      properties:
+        version: { type: integer, const: 1 }
+        repositoryId: { type: string, format: uuid }
+        accountId: { type: string, format: uuid }
+        request: { $ref: "#/components/schemas/PartialAttemptRestartRequest" }
+    PartialAttemptRestartOutcome:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [outcome, repositoryId, accountId, receipt]
+          properties:
+            outcome: { type: string, const: committed }
+            repositoryId: { type: string, format: uuid }
+            accountId: { type: string, format: uuid }
+            receipt: { $ref: "#/components/schemas/PartialMergeReceipt" }
+        - type: object
+          additionalProperties: false
+          required: [outcome, receipt]
+          properties:
+            outcome: { type: string, const: restarted }
+            receipt: { $ref: "#/components/schemas/PartialAttemptRestartReceipt" }
+    PartialMergeRequest:
+      type: object
+      additionalProperties: false
+      required: [attemptId, branchId, baseCommitId, expectedAuthorityHeadCommitId, capturedLocalHeadCommitId, checkpointCommitId, globalHeadCommitId, globalCheckpointCommitId]
+      properties:
+        attemptId: { type: string, format: uuid }
+        branchId: { type: string, format: uuid }
+        baseCommitId: { type: string, format: uuid }
+        expectedAuthorityHeadCommitId: { type: string, format: uuid }
+        capturedLocalHeadCommitId: { type: string, format: uuid }
+        checkpointCommitId: { type: string, format: uuid }
+        globalHeadCommitId: { type: string, format: uuid }
+        globalCheckpointCommitId: { type: string, format: uuid }
+    NativeMigrationCleanupRequest:
+      type: object
+      additionalProperties: false
+      required: [migration]
+      properties:
+        migration: { $ref: "#/components/schemas/NativeMigrationMergeRequest" }
+    NativeGlobalRestartRequest:
+      type: object
+      additionalProperties: false
+      required: [request, nextAttemptId]
+      properties:
+        request: { $ref: "#/components/schemas/NativeGlobalMigrationRequest" }
+        nextAttemptId: { type: string, format: uuid }
+    NativeGlobalRestartReceipt:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [outcome, receipt]
+          properties:
+            outcome: { const: committed }
+            receipt: { $ref: "#/components/schemas/NativeGlobalMigrationReceipt" }
+        - type: object
+          additionalProperties: false
+          required: [outcome, intent]
+          properties:
+            outcome: { const: restarted }
+            intent: { $ref: "#/components/schemas/NativeGlobalRestartRequest" }
+    NativeNewBranchCoordinate:
+      type: object
+      additionalProperties: false
+      required: [branchId, headCommitId, checkpointCommitId]
+      properties:
+        branchId: { type: string, format: uuid }
+        headCommitId: { type: string, format: uuid }
+        checkpointCommitId: { type: string, format: uuid }
+    NativeGlobalMigrationRequest:
+      type: object
+      additionalProperties: false
+      required: [attemptId, baseCommitId, expectedAuthorityHeadCommitId, capturedLocalHeadCommitId, checkpointCommitId, newBranches]
+      properties:
+        attemptId: { type: string, format: uuid }
+        baseCommitId: { type: string, format: uuid }
+        expectedAuthorityHeadCommitId: { type: string, format: uuid }
+        capturedLocalHeadCommitId: { type: string, format: uuid }
+        checkpointCommitId: { type: string, format: uuid }
+        newBranches:
+          type: array
+          minItems: 1
+          maxItems: 1024
+          description: Strict ascending branch UUID order, without duplicates.
+          items: { $ref: "#/components/schemas/NativeNewBranchCoordinate" }
+    NativeGlobalMigrationReceipt:
+      type: object
+      additionalProperties: false
+      required: [request, mergeCommitId]
+      properties:
+        request: { $ref: "#/components/schemas/NativeGlobalMigrationRequest" }
+        mergeCommitId: { type: string, format: uuid }
+    NativeGlobalBodyWaveRequest:
+      type: object
+      additionalProperties: false
+      required: [request, branchId, previousCommitId, bodies]
+      properties:
+        request: { $ref: "#/components/schemas/NativeGlobalMigrationRequest" }
+        branchId: { type: string, format: uuid }
+        previousCommitId: { type: string, format: uuid }
+        bodies: { $ref: "#/components/schemas/SyncPushRequest" }
+    NativeMigrationMergeRequest:
+      type: object
+      additionalProperties: false
+      required: [request, sourceBranchId]
+      properties:
+        request: { $ref: "#/components/schemas/PartialMergeRequest" }
+        sourceBranchId: { type: string, format: uuid }
+    PartialMergeReceipt:
+      type: object
+      additionalProperties: false
+      required: [request, mergeCommitId]
+      properties:
+        request: { $ref: "#/components/schemas/PartialMergeRequest" }
+        mergeCommitId: { type: string, format: uuid }
+    RetainedBodyWaveRequest:
+      type: object
+      additionalProperties: false
+      required: [request, expectedPreviousCommitId, bodies]
+      properties:
+        request: { $ref: "#/components/schemas/PartialMergeRequest" }
+        expectedPreviousCommitId: { type: string, format: uuid }
+        bodies:
+          allOf:
+            - { $ref: "#/components/schemas/SyncPushRequest" }
+            - type: object
+              properties:
+                commits: { type: array, minItems: 1, maxItems: 32, items: { $ref: "#/components/schemas/SyncCommit" } }
+                refUpdates: { type: array, maxItems: 0 }
+                inlineBlobs: { type: array, maxItems: 0 }
+    RetainedBodyWaveResponse:
+      type: object
+      additionalProperties: false
+      required: [push, acceptedTip, expiresAtMs]
+      properties:
+        push: { $ref: "#/components/schemas/SyncPushResponse" }
+        acceptedTip: { type: string, format: uuid }
+        expiresAtMs: { type: integer, minimum: 1 }
     SyncPushRequest:
       type: object
       required: [commits, refUpdates, inlineBlobs]
@@ -903,6 +1335,175 @@ components:
             kind: { type: string, const: delta }
             cursor: { type: integer, minimum: 0 }
             events: { type: array, maxItems: 512, items: { $ref: "#/components/schemas/SyncEvent" } }
+    NativeMetadataRef:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [kind, commitId]
+          properties:
+            kind: { type: string, enum: [commit_state_header, commit_graph_record] }
+            commitId: { type: string, format: uuid }
+        - type: object
+          additionalProperties: false
+          required: [kind, changeId]
+          properties:
+            kind: { type: string, const: change_locator }
+            changeId: { type: string, format: uuid }
+    NativeMetadataRequest:
+      type: object
+      additionalProperties: false
+      required: [epochId, objects]
+      properties:
+        epochId: { type: string, format: uuid }
+        objects:
+          type: array
+          minItems: 1
+          maxItems: 32
+          uniqueItems: true
+          items: { $ref: "#/components/schemas/NativeMetadataRef" }
+    NativeMetadataResponse:
+      type: object
+      required: [lixId, epochId, objects]
+      properties:
+        lixId: { type: string, format: uuid }
+        epochId: { type: string, format: uuid }
+        objects:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items:
+            type: object
+            required: [address, bytes]
+            properties:
+              address: { $ref: "#/components/schemas/NativeMetadataRef" }
+              bytes: { type: string, format: byte }
+    NativeObjectRangeRequest:
+      type: object
+      additionalProperties: false
+      required: [address, offset, maxBytes]
+      properties:
+        address: { $ref: "#/components/schemas/NativeObjectRef" }
+        offset: { type: integer, minimum: 0, maximum: 18446744073709551615 }
+        maxBytes: { type: integer, minimum: 1, maximum: 1048576 }
+    NativeObjectRangeResponse:
+      type: object
+      required: [lixId, address, offset, totalBytes, bytes]
+      properties:
+        lixId: { type: string, format: uuid }
+        address: { $ref: "#/components/schemas/NativeObjectRef" }
+        offset: { type: integer, minimum: 0 }
+        totalBytes: { type: integer, minimum: 0 }
+        bytes: { type: string, format: byte }
+    NativeObjectRef:
+      oneOf:
+        - type: object
+          required: [kind, key]
+          properties:
+            kind: { type: string, enum: [tracked_state_tree_chunk, scoped_range_node, mutation_directory_node] }
+            key: { $ref: "#/components/schemas/NativeDigest" }
+        - type: object
+          required: [kind, key]
+          properties:
+            kind: { type: string, const: mutation_catalog }
+            key:
+              type: object
+              required: [commit_id, expected_digest]
+              properties:
+                commit_id: { $ref: "#/components/schemas/NativeCommitId" }
+                expected_digest: { $ref: "#/components/schemas/NativeDigest" }
+        - type: object
+          required: [kind, key]
+          properties:
+            kind: { type: string, const: commit_delta_part }
+            key:
+              type: object
+              required: [commit_id, part_index, expected_digest, replacement]
+              properties:
+                commit_id: { $ref: "#/components/schemas/NativeCommitId" }
+                part_index: { type: integer, minimum: 0, maximum: 4294967295 }
+                expected_digest: { $ref: "#/components/schemas/NativeDigest" }
+                replacement: { type: boolean }
+    NativeDigest:
+      type: array
+      minItems: 32
+      maxItems: 32
+      items: { type: integer, minimum: 0, maximum: 255 }
+    NativeCommitId:
+      type: array
+      minItems: 16
+      maxItems: 16
+      items: { type: integer, minimum: 0, maximum: 255 }
+    NativeObjectResponse:
+      type: object
+      required: [lixId, objects]
+      properties:
+        lixId: { type: string, format: uuid }
+        objects:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items:
+            type: object
+            required: [address, bytes]
+            properties:
+              address: { $ref: "#/components/schemas/NativeObjectRef" }
+              bytes: { type: string, format: byte, description: Base64-encoded native immutable bytes. }
+    NativeBaselineLease:
+      type: object
+      additionalProperties: false
+      required: [version, leaseId, accountId, roots, expiresAtMs]
+      properties:
+        version: { type: integer, const: 1 }
+        leaseId: { type: string, format: uuid }
+        accountId: { type: string, format: uuid }
+        roots:
+          type: array
+          minItems: 1
+          maxItems: 4
+          uniqueItems: true
+          items: { type: string, format: uuid }
+        expiresAtMs: { type: integer, minimum: 1 }
+    LeasedPartialReplicaDescriptor:
+      type: object
+      additionalProperties: false
+      required: [descriptor, lease]
+      properties:
+        descriptor: { $ref: "#/components/schemas/PartialReplicaDescriptor" }
+        lease: { $ref: "#/components/schemas/NativeBaselineLease" }
+    PartialReplicaDescriptor:
+      type: object
+      required: [descriptorVersion, lixId, defaultBranchId, cursor, selectedBranch, globalBranch]
+      properties:
+        descriptorVersion: { type: integer, const: 1 }
+        lixId: { type: string, minLength: 1 }
+        defaultBranchId: { type: string, format: uuid }
+        cursor: { type: integer, minimum: 0 }
+        selectedBranch: { $ref: "#/components/schemas/PartialReplicaBranch" }
+        globalBranch: { $ref: "#/components/schemas/PartialReplicaBranch" }
+    PartialReplicaBranch:
+      type: object
+      required: [branchId, createdAt, updatedAt, refChangeId, head, checkpoint]
+      properties:
+        branchId: { type: string, format: uuid }
+        createdAt: { type: string, format: date-time, description: Canonical public branch-ref creation timestamp. }
+        updatedAt: { type: string, format: date-time, description: Canonical public branch-ref last-publication timestamp. }
+        refChangeId: { type: string, format: uuid, description: Canonical public branch-ref change identity. }
+        head: { $ref: "#/components/schemas/PartialReplicaCommitRoots" }
+        checkpoint: { $ref: "#/components/schemas/PartialReplicaCommitRoots" }
+    PartialReplicaCommitRoots:
+      type: object
+      description: Native immutable roots. Null roots mean unavailable metadata, never proof of an empty scope. Root bytes use their native order.
+      required: [commitId, scopedRangeRootId, scopedRangeRootDigest, rowPkIndexRootId]
+      properties:
+        commitId: { type: string, format: uuid }
+        scopedRangeRootId: { $ref: "#/components/schemas/NullableNativeRootId" }
+        scopedRangeRootDigest: { $ref: "#/components/schemas/NullableNativeRootId" }
+        rowPkIndexRootId: { $ref: "#/components/schemas/NullableNativeRootId" }
+    NullableNativeRootId:
+      type: [array, "null"]
+      minItems: 32
+      maxItems: 32
+      items: { type: integer, minimum: 0, maximum: 255 }
     SyncCheckpointInventoryPage:
       type: object
       required: [cursor, commitHeaders, continuation]

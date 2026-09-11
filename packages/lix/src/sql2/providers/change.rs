@@ -30,6 +30,7 @@ pub(super) async fn register_lix_change_read_provider<S>(
     session: &datafusion::prelude::SessionContext,
     surface_name: &str,
     query_source: SqlChangelogQuerySource<S>,
+    partial_replica: bool,
 ) -> Result<(), LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
@@ -37,7 +38,10 @@ where
     register_spec_table(
         session,
         surface_name,
-        Arc::new(ChangeSpec { query_source }),
+        Arc::new(ChangeSpec {
+            query_source,
+            partial_replica,
+        }),
         WriteAccess::read_only(),
     )
 }
@@ -49,6 +53,7 @@ where
 /// `changelog.commit`. It does not prove branch reachability. History
 /// providers are the reachability-aware SQL surfaces.
 struct ChangeSpec<S> {
+    partial_replica: bool,
     query_source: SqlChangelogQuerySource<S>,
 }
 
@@ -85,6 +90,12 @@ where
         limit: Option<usize>,
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
+        if self.partial_replica {
+            return Err(lix_error_to_datafusion_error(LixError::new(
+                "LIX_PARTIAL_REPLICA_SCOPE_UNSUPPORTED",
+                "lix_change requires authoritative change inventory; resident metadata does not prove completeness",
+            )));
+        }
         let pushed_limit = if filters.is_empty() { limit } else { None };
         let route = change_scan_route(filters);
         let schema = projected_schema(&lix_change_schema(), projection);

@@ -2548,6 +2548,7 @@ async fn row_upsert(
     let mut insert_rows = row_insert_batch(ctx, plan, spec, params, active_branch_commit_id)?;
     let candidates = scan_row_conflict_candidates(ctx, spec, &insert_rows).await?;
     let mut write_rows = RawWriteBatch::with_capacity(insert_rows.len());
+    let mut new_identities = std::collections::BTreeSet::new();
 
     for index in 0..insert_rows.len() {
         let insert_row = insert_rows.row(index);
@@ -2568,6 +2569,19 @@ async fn row_upsert(
                     active_branch_commit_id,
                 )?;
             }
+            (None, BoundConflictAction::DoNothing) => {
+                // SQL conflict identity excludes retention. Keep the first new
+                // row for each canonical identity, including within this input.
+                let identity = (
+                    inserted_row_pk,
+                    insert_row.file_id.cloned(),
+                    insert_row.branch_id.clone(),
+                    insert_row.global,
+                );
+                if new_identities.insert(identity) {
+                    write_rows.append_taken_row(&mut insert_rows, index);
+                }
+            }
             (None, _) => write_rows.append_taken_row(&mut insert_rows, index),
         }
     }
@@ -2578,7 +2592,14 @@ async fn row_upsert(
         spec,
         params,
         active_branch_commit_id,
-        TransactionWriteMode::Replace,
+        // DO NOTHING removed every existing candidate above. Remaining rows
+        // are insertions and must retain insertion validation/provenance;
+        // classifying them as replacements defeats sealed insertion scopes.
+        if matches!(&conflict.action, BoundConflictAction::DoNothing) {
+            TransactionWriteMode::Insert
+        } else {
+            TransactionWriteMode::Replace
+        },
         write_rows,
     )
     .await
@@ -7802,5 +7823,68 @@ mod constraints_unchanged_tests {
             "an assignment touching no declared column keeps the certificate, \
              which is what makes skipping extraction for it sound"
         );
+    }
+}
+
+#[cfg(test)]
+mod do_nothing_duplicate_input_tests {
+    #[tokio::test]
+    async fn first_new_identity_wins_and_only_inserted_rows_are_returned() {
+        let lix = crate::open_lix().await.unwrap();
+        lix.execute(
+            "INSERT INTO lix_key_value(key,value) VALUES('existing','original')",
+            &[],
+        )
+        .await
+        .unwrap();
+        let result = lix
+            .execute(
+                "INSERT INTO lix_key_value(key,value) VALUES \
+             ('first','winner'),('existing','ignored'),('first','loser'),\
+             ('second','second-winner'),('second','second-loser') \
+             ON CONFLICT(key) DO NOTHING RETURNING key,value",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.rows_affected(), 2);
+        let returned = result
+            .rows()
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<String>("key").unwrap(),
+                    row.get::<serde_json::Value>("value").unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            returned,
+            vec![
+                ("first".to_owned(), serde_json::json!("winner")),
+                ("second".to_owned(), serde_json::json!("second-winner")),
+            ]
+        );
+        let stored = lix.execute("SELECT key,value FROM lix_key_value WHERE key IN ('first','second','existing') ORDER BY key", &[])
+            .await.unwrap();
+        let stored = stored
+            .rows()
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<String>("key").unwrap(),
+                    row.get::<serde_json::Value>("value").unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stored,
+            vec![
+                ("existing".to_owned(), serde_json::json!("original")),
+                ("first".to_owned(), serde_json::json!("winner")),
+                ("second".to_owned(), serde_json::json!("second-winner")),
+            ]
+        );
+        lix.close().await.unwrap();
     }
 }

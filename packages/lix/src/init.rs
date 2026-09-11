@@ -111,9 +111,14 @@ pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
 /// branch, checkpoint, and sync visibility can no longer remove or redefine a
 /// schema required to interpret engine rows.
 /// v78 stores checkpoint membership in canonical v7 commit metadata.
-pub(crate) const CURRENT_FORMAT_VERSION: u32 = 78;
+/// v79 requires native deterministic-setting identity witnesses for bounded absence checks.
+pub(crate) const CURRENT_FORMAT_VERSION: u32 = 79;
 const REPOSITORY_PROTOCOL_PREFIX: &[u8] = b"tracked-default-branch.v";
-pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v78";
+pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v79";
+pub(crate) const REPOSITORY_PROTOCOL_V78: &[u8] = b"tracked-default-branch.v78";
+// Older full-layout parsers reject the nonnumeric suffix before reading rows.
+pub(crate) const PARTIAL_REPOSITORY_PROTOCOL_VALUE: &[u8] =
+    b"tracked-default-branch.v79-partial-replica.v1";
 pub(crate) const REPOSITORY_PROTOCOL_V77: &[u8] = b"tracked-default-branch.v77";
 pub(crate) const REPOSITORY_PROTOCOL_V77_CHECKPOINT_REWRITE: &[u8] =
     b"tracked-default-branch.v77-checkpoint-rewrite";
@@ -198,6 +203,30 @@ pub(crate) fn stage_repository_protocol(writes: &mut StorageWriteSet) {
         REPOSITORY_PROTOCOL_KEY,
         REPOSITORY_PROTOCOL_VALUE,
     );
+}
+
+/// Partial layout is deliberately not accepted by the ordinary full-layout
+/// parser. Only the admitted on-demand opening path accepts this exact marker.
+pub(crate) fn stage_partial_repository_protocol(writes: &mut StorageWriteSet) {
+    writes.put(
+        REPOSITORY_PROTOCOL_SPACE,
+        REPOSITORY_PROTOCOL_KEY,
+        PARTIAL_REPOSITORY_PROTOCOL_VALUE,
+    );
+}
+
+pub(crate) async fn is_partial_repository_protocol(
+    read: &(impl StorageAdapterRead + ?Sized),
+) -> Result<bool, LixError> {
+    let values = PointReadPlan::new(
+        REPOSITORY_PROTOCOL_SPACE,
+        &[StorageKey(Bytes::from_static(REPOSITORY_PROTOCOL_KEY))],
+    )
+    .materialize(read, StorageGetOptions::default())
+    .await?;
+    Ok(
+        matches!(values.value.into_iter().next().flatten(), Some(StorageProjectedValue::FullValue(value)) if value.as_ref() == PARTIAL_REPOSITORY_PROTOCOL_VALUE),
+    )
 }
 
 pub(crate) async fn repository_protocol_status(
@@ -1501,6 +1530,27 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn partial_protocol_is_distinct_and_rejected_by_full_layout_parser() {
+        assert_eq!(
+            parse_repository_protocol(PARTIAL_REPOSITORY_PROTOCOL_VALUE),
+            RepositoryProtocolStatus::Malformed
+        );
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = storage.new_write_set();
+        stage_partial_repository_protocol(&mut writes);
+        storage
+            .commit_write_set(writes, Default::default())
+            .await
+            .unwrap();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        assert!(is_partial_repository_protocol(&read).await.unwrap());
+        assert_eq!(
+            repository_protocol_status(&read).await.unwrap(),
+            RepositoryProtocolStatus::Malformed
+        );
+    }
+
     #[test]
     fn repository_protocol_parser_distinguishes_versions() {
         assert_eq!(
@@ -1537,11 +1587,15 @@ mod tests {
         );
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v78"),
-            RepositoryProtocolStatus::Current
+            RepositoryProtocolStatus::MigrationRequired { found_version: 78 }
         );
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v79"),
-            RepositoryProtocolStatus::TooNew { found_version: 79 }
+            RepositoryProtocolStatus::Current
+        );
+        assert_eq!(
+            parse_repository_protocol(b"tracked-default-branch.v80"),
+            RepositoryProtocolStatus::TooNew { found_version: 80 }
         );
         assert_eq!(
             parse_repository_protocol(b"not-a-lix-format"),

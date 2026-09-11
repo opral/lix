@@ -226,31 +226,42 @@ simulation_test!(
                 }
                 if seed == 2 && step == 12 {
                     let storage = engine.storage();
-                    let read = SharedStorageAdapterRead::new(
-                        storage
-                            .begin_read(StorageReadOptions::default())
-                            .await
-                            .unwrap(),
-                    );
-                    let mut writes = StorageWriteSet::new();
-                    let mut preconditions = Vec::new();
-                    crate::gc::stage_repository_gc_with_preconditions(
-                        read,
-                        &mut writes,
-                        &mut preconditions,
-                    )
-                    .await
-                    .unwrap();
-                    storage
-                        .commit_write_set(
-                            writes,
-                            StorageWriteOptions {
-                                preconditions,
-                                ..StorageWriteOptions::default()
-                            },
+                    // Automatic checkpoint maintenance may commit after our
+                    // snapshot. Re-plan only a real optimistic conflict; a stale
+                    // destructive write set must never be retried unchanged.
+                    for attempt in 0..8 {
+                        let read = SharedStorageAdapterRead::new(
+                            storage
+                                .begin_read(StorageReadOptions::default())
+                                .await
+                                .unwrap(),
+                        );
+                        let mut writes = StorageWriteSet::new();
+                        let mut preconditions = Vec::new();
+                        crate::gc::stage_repository_gc_with_preconditions(
+                            read,
+                            &mut writes,
+                            &mut preconditions,
                         )
                         .await
                         .unwrap();
+                        let result = storage
+                            .commit_write_set(
+                                writes,
+                                StorageWriteOptions {
+                                    preconditions,
+                                    ..StorageWriteOptions::default()
+                                },
+                            )
+                            .await;
+                        match result {
+                            Ok(_) => break,
+                            Err(crate::storage_adapter::StorageWriteSetError::Storage(
+                                crate::storage_adapter::StorageError::PreconditionFailed(failures),
+                            )) if !failures.is_empty() && attempt < 7 => continue,
+                            Err(error) => panic!("GC fixture sweep failed: {error:?}"),
+                        }
+                    }
                 }
                 assert_state(&main, &prefix, &model.state, "GC fixture").await;
             }

@@ -26,6 +26,8 @@ mod row_batch;
 mod row_columnar_layout;
 mod row_projection;
 mod runtime;
+// Host-side script inspection; execution remains the native single-statement path.
+pub(crate) mod script;
 mod session;
 #[cfg(test)]
 mod test_support;
@@ -121,4 +123,9 @@ pub(crate) use plan::read::statement::exact_filesystem_read_route;
 pub(crate) use plan::read::statement::{
     StatementReadPlan, is_acknowledgeable_file_content_read,
     late_materialized_lix_file_content_read, plan_read_statement,
+};
+
+pub(crate) use providers::{
+    prepare_native_diff_interest, prepare_native_file_content_interest,
+    prepare_native_file_metadata_interest,
 };

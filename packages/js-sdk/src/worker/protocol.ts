@@ -51,6 +51,8 @@ export type WorkerRequest = {
 };
 
 export type WorkerOperation =
+ | {kind:"replica.cleanup";storage:LixStorageConfig;server:WorkerSyncServerOptions}
+ | {kind:"replica.convert";storage:LixStorageConfig;server:WorkerSyncServerOptions;branchId?:string}
 	| {
 			kind: "hosted.create";
 			server: import("../binding-types.js").HostedServerBindingOptions;
@@ -98,6 +100,7 @@ export type WorkerOperation =
 	| { kind: "replicaRecoverySources" }
 	| { kind: "exportReplicaRecovery"; id: string }
 	| { kind: "recoverReplica"; id: string }
+	| { kind: "recoverReplicaWithServer"; id: string; server: WorkerSyncServerOptions; transportScope: number }
 	| { kind: "activeBranchId" }
 	| { kind: "activeAccountId" }
 	| { kind: "createBranch"; options: CreateBranchOptions }
@@ -172,8 +175,8 @@ export type WorkerResponse =
 	| { id: number; ok: false; error: SerializedWorkerError }
 	| { kind: "telemetry"; span: LixTelemetrySpan }
 	| { kind: "open.progress"; progress: LixOpenProgress }
-	| { kind: "sync.headers"; requestId: number }
-	| { kind: "sync.fetch"; requestId: number; request: WorkerSyncFetchRequest }
+	| { kind: "sync.headers"; requestId: number; transportScope?: number }
+	| { kind: "sync.fetch"; requestId: number; request: WorkerSyncFetchRequest; transportScope?: number }
 	| { kind: "sync.fetch.stream.pull"; requestId: number }
 	| { kind: "sync.fetch.cancel"; requestId: number };
 

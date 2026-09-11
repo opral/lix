@@ -29,6 +29,19 @@ use wasm_bindgen_futures::spawn_local;
 use crate::browser_storage::BrowserStorage;
 use crate::js_storage::{JsStorage, JsStorageProvider};
 
+/// Parse the engine SQL dialect for hosts that authorize public SQL.
+#[wasm_bindgen(js_name = parseSqlScript)]
+pub fn parse_sql_script(sql: String, provided_param_count: usize) -> Result<JsValue, JsValue> {
+    let plan = lix::parse_sql_script(&sql, provided_param_count).map_err(lix_error_to_js)?;
+    to_js(&serde_json::json!({
+        "statements": plan.statements.into_iter().map(|statement| serde_json::json!({
+            "sql": statement.sql,
+            "paramStart": statement.params.start,
+            "paramEnd": statement.params.end,
+        })).collect::<Vec<_>>()
+    }))
+}
+
 #[path = "wasm_remote.rs"]
 mod remote;
 #[path = "wasm_session.rs"]
@@ -760,6 +773,53 @@ impl WasmLix {
         let value = self
             .inner
             .export_replica_recovery(&id)
+            .await
+            .map_err(lix_error_to_js)?;
+        to_js(&value)
+    }
+
+    #[wasm_bindgen(js_name = recoverReplicaWithServer)]
+    pub async fn recover_replica_with_server(
+        &self,
+        id: String,
+        server: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        #[derive(Deserialize)]
+        struct Options {
+            url: String,
+            headers: Vec<(String, String)>,
+        }
+        let mut options = serde_wasm_bindgen::from_value::<Options>(server.clone())?;
+        let headers = optional_function_property(&server, "headerProvider")?;
+        let fetch = optional_function_property(&server, "fetch")?;
+        struct Registration(Option<String>);
+        impl Drop for Registration {
+            fn drop(&mut self) {
+                if let Some(id) = &self.0 {
+                    unregister_browser_sync_transport(id);
+                }
+            }
+        }
+        static NEXT_RECOVERY_TRANSPORT: AtomicU64 = AtomicU64::new(1);
+        let _registration = if headers.is_some() || fetch.is_some() {
+            let transport_id = format!(
+                "browser-recovery-{}",
+                NEXT_RECOVERY_TRANSPORT.fetch_add(1, Ordering::Relaxed)
+            );
+            register_browser_sync_transport(transport_id.clone(), headers, fetch);
+            options
+                .headers
+                .push((BROWSER_TRANSPORT_CONFIG_HEADER.into(), transport_id.clone()));
+            Registration(Some(transport_id))
+        } else {
+            Registration(None)
+        };
+        let value = self
+            .inner
+            .recover_replica_with_server(
+                &id,
+                ServerOptions::new(options.url).with_headers(options.headers),
+            )
             .await
             .map_err(lix_error_to_js)?;
         to_js(&value)
@@ -1648,4 +1708,77 @@ fn hosted_create_builder(value: JsValue) -> Result<lix::CreateLixBuilder, JsValu
         builder = builder.with_idempotency_key(key);
     }
     Ok(builder)
+}
+
+#[wasm_bindgen(js_name = convertJsStorageReplicaToPartial)]
+pub async fn convert_js_storage_replica_to_partial(
+    provider: JsStorageProvider,
+    server: JsValue,
+    branch_id: Option<String>,
+) -> Result<(), JsValue> {
+    closed_js_replica_operation(provider, server, branch_id, false)
+        .await
+        .map(|_| ())
+}
+#[wasm_bindgen(js_name = retryJsStorageReplicaMigrationCleanup)]
+pub async fn retry_js_storage_replica_migration_cleanup(
+    provider: JsStorageProvider,
+    server: JsValue,
+) -> Result<u32, JsValue> {
+    closed_js_replica_operation(provider, server, None, true).await
+}
+async fn closed_js_replica_operation(
+    provider: JsStorageProvider,
+    server: JsValue,
+    branch_id: Option<String>,
+    cleanup: bool,
+) -> Result<u32, JsValue> {
+    #[derive(Deserialize)]
+    struct Options {
+        url: String,
+        headers: Vec<(String, String)>,
+    }
+    let mut options = serde_wasm_bindgen::from_value::<Options>(server.clone())?;
+    let header_provider = optional_function_property(&server, "headerProvider")?;
+    let fetch = optional_function_property(&server, "fetch")?;
+    struct TransportRegistration(Option<String>);
+    impl Drop for TransportRegistration {
+        fn drop(&mut self) {
+            if let Some(id) = &self.0 {
+                unregister_browser_sync_transport(id);
+            }
+        }
+    }
+    static NEXT_BROWSER_CONVERSION_TRANSPORT_ID: AtomicU64 = AtomicU64::new(1);
+    let registration = if header_provider.is_some() || fetch.is_some() {
+        let id = format!(
+            "browser-conversion-{}",
+            NEXT_BROWSER_CONVERSION_TRANSPORT_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        register_browser_sync_transport(id.clone(), header_provider, fetch);
+        options
+            .headers
+            .push((BROWSER_TRANSPORT_CONFIG_HEADER.into(), id.clone()));
+        TransportRegistration(Some(id))
+    } else {
+        TransportRegistration(None)
+    };
+    let storage = BrowserStorage::Js(JsStorage::new(provider));
+    let server = ServerOptions::new(options.url).with_headers(options.headers);
+    let result = if cleanup {
+        lix::retry_replica_migration_cleanup(storage, server)
+            .await
+            .and_then(|count| {
+                u32::try_from(count).map_err(|_| {
+                    LixError::unknown("migration cleanup count exceeds JavaScript binding limit")
+                })
+            })
+    } else {
+        lix::convert_replica_to_partial(storage, server, branch_id.as_deref())
+            .await
+            .map(|_| 0)
+    };
+    // The JS binding owns provider close, including failures before this call.
+    drop(registration);
+    result.map_err(lix_error_to_js)
 }

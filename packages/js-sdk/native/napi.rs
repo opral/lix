@@ -277,6 +277,7 @@ enum LixCommand {
         telemetry_parent: Option<PendingTelemetryParent>,
         deferred: NativeLixDeferred,
     },
+
     Execute {
         sql: String,
         params: Vec<Value>,
@@ -302,6 +303,7 @@ enum LixCommand {
     },
     RecoverReplica {
         id: String,
+        server: Option<ServerOptions>,
         deferred: NativeDeferred<serde_json::Value>,
     },
     ActiveBranchId(NativeStringDeferred),
@@ -1039,8 +1041,12 @@ fn handle_lix_command(
             settle_deferred(deferred, block_on!(state.lix.export_replica_recovery(&id)));
             None
         }
-        LixCommand::RecoverReplica { id, deferred } => {
-            settle_deferred(deferred, block_on!(state.lix.recover_replica(&id)));
+        LixCommand::RecoverReplica {
+            id,
+            server,
+            deferred,
+        } => {
+            settle_deferred(deferred, block_on!(state.lix.recover_replica(&id, server)));
             None
         }
         LixCommand::ActiveBranchId(deferred) => {
@@ -1394,10 +1400,20 @@ impl NativeLixInner {
             .map_err(|error| LixError::new("LIX_ERROR_SERIALIZATION", error.to_string()))
     }
 
-    async fn recover_replica(&self, id: &str) -> std::result::Result<serde_json::Value, LixError> {
+    async fn recover_replica(
+        &self,
+        id: &str,
+        server: Option<ServerOptions>,
+    ) -> std::result::Result<serde_json::Value, LixError> {
         let value = match self {
-            Self::Memory(lix) => lix.recover_replica(id).await?,
-            Self::FilesystemStorage(lix, _, _) => lix.recover_replica(id).await?,
+            Self::Memory(lix) => match server {
+                Some(server) => lix.recover_replica_with_server(id, server).await?,
+                None => lix.recover_replica(id).await?,
+            },
+            Self::FilesystemStorage(lix, _, _) => match server {
+                Some(server) => lix.recover_replica_with_server(id, server).await?,
+                None => lix.recover_replica(id).await?,
+            },
         };
         serde_json::to_value(value)
             .map_err(|error| LixError::new("LIX_ERROR_SERIALIZATION", error.to_string()))
@@ -1955,6 +1971,26 @@ impl NativeLix {
         Ok(promise)
     }
 
+    #[napi(js_name = "recoverReplicaWithServer")]
+    pub fn recover_replica_with_server<'env>(
+        &self,
+        env: &'env Env,
+        id: String,
+        url: String,
+        headers: Vec<Vec<String>>,
+    ) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeDeferred<serde_json::Value>, Object<'env>) =
+            env.create_deferred()?;
+        let server = ServerOptions::new(url).with_headers(parse_server_headers(Some(headers))?);
+        self.actor
+            .send_with_deferred(deferred, |deferred| LixCommand::RecoverReplica {
+                id,
+                server: Some(server),
+                deferred,
+            });
+        Ok(promise)
+    }
+
     #[napi(js_name = "recoverReplica")]
     pub fn recover_replica<'env>(&self, env: &'env Env, id: String) -> Result<Object<'env>> {
         let (deferred, promise): (NativeDeferred<serde_json::Value>, Object<'env>) =
@@ -1962,6 +1998,7 @@ impl NativeLix {
         self.actor
             .send_with_deferred(deferred, |deferred| LixCommand::RecoverReplica {
                 id,
+                server: None,
                 deferred,
             });
         Ok(promise)
@@ -3402,4 +3439,101 @@ pub fn delete_hosted(
         server: Some(ServerOptions::new(url).with_headers(headers)),
         delete: true,
     })
+}
+
+// N-API registration is disabled in Rust test builds; JavaScript calls this task.
+#[cfg_attr(test, allow(dead_code))]
+#[derive(Debug)]
+pub struct ConvertReplicaToPartialTask {
+    path: String,
+    sync_all_files: bool,
+    server: ServerOptions,
+    branch_id: Option<String>,
+}
+impl Task for ConvertReplicaToPartialTask {
+    type Output = std::result::Result<(), LixError>;
+    type JsValue = ();
+    fn compute(&mut self) -> Result<Self::Output> {
+        Ok((|| {
+            let rt = Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| LixError::unknown(error.to_string()))?;
+            let storage = FilesystemStorage::new(self.path.clone())
+                .sync_all_files(self.sync_all_files)
+                .open()?;
+            rt.block_on(lix::convert_replica_to_partial(
+                storage,
+                self.server.clone(),
+                self.branch_id.as_deref(),
+            ))
+        })())
+    }
+    fn resolve(&mut self, env: Env, output: Self::Output) -> Result<()> {
+        output.map_err(|error| lix_error_to_napi_error(&env, error))
+    }
+}
+#[cfg_attr(test, allow(dead_code))]
+#[napi(js_name = "convertFilesystemReplicaToPartial")]
+pub fn convert_filesystem_replica_to_partial(
+    path: String,
+    sync_all_files: bool,
+    url: String,
+    headers: Option<Vec<Vec<String>>>,
+    branch_id: Option<String>,
+) -> Result<AsyncTask<ConvertReplicaToPartialTask>> {
+    Ok(AsyncTask::new(ConvertReplicaToPartialTask {
+        path,
+        sync_all_files,
+        server: ServerOptions::new(url).with_headers(parse_server_headers(headers)?),
+        branch_id,
+    }))
+}
+
+// N-API registration is disabled in Rust test builds; JavaScript calls this task.
+#[cfg_attr(test, allow(dead_code))]
+#[derive(Debug)]
+pub struct RetryReplicaMigrationCleanupTask {
+    path: String,
+    sync_all_files: bool,
+    server: ServerOptions,
+}
+impl Task for RetryReplicaMigrationCleanupTask {
+    type Output = std::result::Result<u32, LixError>;
+    type JsValue = u32;
+    fn compute(&mut self) -> Result<Self::Output> {
+        Ok((|| {
+            let rt = Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| LixError::unknown(error.to_string()))?;
+            let storage = FilesystemStorage::new(self.path.clone())
+                .sync_all_files(self.sync_all_files)
+                .open()?;
+            let count = rt.block_on(lix::retry_replica_migration_cleanup(
+                storage,
+                self.server.clone(),
+            ))?;
+            u32::try_from(count).map_err(|_| {
+                LixError::unknown("migration cleanup count exceeds JavaScript binding limit")
+            })
+        })())
+    }
+    fn resolve(&mut self, env: Env, output: Self::Output) -> Result<u32> {
+        output.map_err(|error| lix_error_to_napi_error(&env, error))
+    }
+}
+#[cfg_attr(test, allow(dead_code))]
+#[napi(js_name = "retryFilesystemReplicaMigrationCleanup")]
+pub fn retry_filesystem_replica_migration_cleanup(
+    path: String,
+    sync_all_files: bool,
+    url: String,
+    headers: Option<Vec<Vec<String>>>,
+) -> Result<AsyncTask<RetryReplicaMigrationCleanupTask>> {
+    Ok(AsyncTask::new(RetryReplicaMigrationCleanupTask {
+        path,
+        sync_all_files,
+        server: ServerOptions::new(url).with_headers(parse_server_headers(headers)?),
+    }))
 }

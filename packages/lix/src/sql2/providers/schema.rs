@@ -64,9 +64,10 @@ use super::spec::{
 };
 use super::values::{optional_bool_value, optional_string_value, string_expr_literal};
 
-/// Executes the already-proved unique registered-schema point shape without
+/// Executes a bound registered-schema primary-key predicate without
 /// constructing a DataFusion plan or Arrow batch. The retained hot-state
-/// reader remains the sole visibility/authentication authority.
+/// reader resolves every file-scoped identity and remains the sole
+/// visibility/authentication authority.
 pub(crate) async fn execute_exact_schema_point_read(
     spec: &SchemaSurfaceSpec,
     active_branch_id: &str,
@@ -75,35 +76,38 @@ pub(crate) async fn execute_exact_schema_point_read(
     projected_columns: &[String],
     output_columns: Vec<String>,
 ) -> Result<Option<crate::SqlQueryResult>, LixError> {
-    let request = HotStateExactBatchRequest {
-        rows: vec![HotStateExactRowRequest {
-            schema_key: spec.schema_key.clone(),
-            branch_id: active_branch_id.to_owned(),
-            row_pk,
-            file_id: None,
-        }],
+    let request = HotStateScanRequest {
+        filter: HotStateFilter {
+            schema_keys: vec![spec.schema_key.clone()],
+            branch_ids: vec![active_branch_id.to_owned()],
+            row_pks: vec![row_pk],
+            ..Default::default()
+        },
         projection: HotStateProjection {
             columns: vec!["snapshot_content".to_owned()],
         },
-        untracked: None,
-        include_tombstones: false,
+        ..Default::default()
     };
-    let exact = reader.load_exact_batch(&request).await?;
-    let Some(row) = exact.row(0) else {
-        return Ok(None);
-    };
+    let batch = reader.scan_batch(&request).await?;
     let decoder = RowProjectionDecoder::new(spec, projected_columns.iter().map(String::as_str))?;
     let column_types = decoder.column_types();
-    let rows = vec![if let Some(typed) = row.decoded_snapshot() {
-        typed.validate_resolved_schema_binding(
-            row.schema_key(),
-            &spec.schema_key,
-            &spec.schema_fingerprint,
-        )?;
-        decoder.decode_typed_public_values(&typed.row)?
-    } else {
-        decoder.decode_public_values(row.snapshot_content().map(|snapshot| snapshot.as_bytes()))?
-    }];
+    let rows = batch
+        .iter()
+        .map(|row| {
+            if let Some(typed) = row.decoded_snapshot() {
+                typed.validate_resolved_schema_binding(
+                    row.schema_key(),
+                    &spec.schema_key,
+                    &spec.schema_fingerprint,
+                )?;
+                decoder.decode_typed_public_values(&typed.row)
+            } else {
+                decoder.decode_public_values(
+                    row.snapshot_content().map(|snapshot| snapshot.as_bytes()),
+                )
+            }
+        })
+        .collect::<std::result::Result<Vec<_>, LixError>>()?;
     Ok(Some(crate::SqlQueryResult {
         rows,
         columns: output_columns,
@@ -305,6 +309,12 @@ impl SchemaSpec {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<(SchemaRef, HotStateScanRequest, Vec<RowFilter>)> {
+        if self.spec.schema_key == "lix_commit" && self.hot_state.is_partial_replica() {
+            return Err(lix_error_to_datafusion_error(LixError::new(
+                "LIX_PARTIAL_REPLICA_SCOPE_UNSUPPORTED",
+                "lix_commit requires authoritative commit inventory; resident graph records do not prove completeness",
+            )));
+        }
         let projected_schema = projected_schema(&self.schema, projection);
         // A predicate that resolves to a complete identity set is applied in
         // full by the `row_pks` access path below, and `filter_pushdown`
@@ -4165,6 +4175,68 @@ fn json_to_string(value: &JsonValue) -> Result<String> {
 #[cfg(test)]
 #[expect(trivial_casts)]
 mod tests {
+    #[tokio::test]
+    async fn primary_key_only_sql_preserves_all_file_scopes_and_limit() {
+        let lix = crate::open_lix()
+            .with_storage(crate::Memory::new())
+            .await
+            .unwrap();
+        lix.execute("INSERT INTO lix_file(id,path) VALUES ('01920000-0000-7000-8000-0000000000a1','/scope-a'), ('01920000-0000-7000-8000-0000000000a2','/scope-b')", &[]).await.unwrap();
+        lix.execute("INSERT INTO lix_key_value(key,value,lixcol_file_id) VALUES ('shared-pk','none',NULL), ('shared-pk','a','01920000-0000-7000-8000-0000000000a1'), ('shared-pk','b','01920000-0000-7000-8000-0000000000a2')", &[]).await.unwrap();
+        let result = lix
+            .execute("SELECT value FROM lix_key_value WHERE key='shared-pk'", &[])
+            .await
+            .unwrap();
+        let values = result
+            .rows()
+            .iter()
+            .map(|row| match row.get::<crate::Value>("value").unwrap() {
+                crate::Value::Jsonb(value) => value.as_json_string().unwrap(),
+                crate::Value::Text(value) => value,
+                value => panic!("unexpected value: {value:?}"),
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(result.rows().len(), 3);
+        assert_eq!(
+            values,
+            std::collections::BTreeSet::from(["none".to_owned(), "a".to_owned(), "b".to_owned()])
+        );
+        assert!(
+            lix.execute(
+                "SELECT value FROM lix_key_value WHERE key='shared-pk' LIMIT 0",
+                &[]
+            )
+            .await
+            .unwrap()
+            .rows()
+            .is_empty()
+        );
+        assert_eq!(
+            lix.execute(
+                "SELECT value FROM lix_key_value WHERE key='shared-pk' LIMIT 1",
+                &[]
+            )
+            .await
+            .unwrap()
+            .rows()
+            .len(),
+            1
+        );
+        assert_eq!(lix.execute("SELECT value FROM lix_key_value WHERE key='shared-pk' AND lixcol_file_id='01920000-0000-7000-8000-0000000000a1'", &[]).await.unwrap().rows().len(), 1);
+        assert_eq!(
+            lix.execute(
+                "SELECT value FROM lix_key_value WHERE key='shared-pk' AND lixcol_file_id IS NULL",
+                &[]
+            )
+            .await
+            .unwrap()
+            .rows()
+            .len(),
+            1
+        );
+        lix.close().await.unwrap();
+    }
+
     use crate::sql2::SchemaSurfaceSpec;
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};

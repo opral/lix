@@ -1,6 +1,6 @@
 use std::ops::Bound;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use bytes::Bytes;
 use tracing::Instrument as _;
@@ -21,12 +21,30 @@ use super::spaces::{
     revision_key,
 };
 
+/// One authoring role per engine and its clones; changing role replaces the
+/// previous admission rather than accumulating permissions across receipts.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplicaWriterMode {
+    None = 0,
+    Full = 1,
+    Partial = 2,
+}
+
+/// Installation authority never crosses full/partial receipt ownership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplicaWriteAdmission {
+    Ordinary,
+    FullInstaller,
+    PartialInstaller,
+}
+
 #[derive(Clone, Debug)]
 pub struct StorageAdapter<StorageImpl = Memory> {
     storage: StorageImpl,
     routing: EpochRouting,
     authority_writer: Arc<AtomicBool>,
-    replica_writer: Arc<AtomicBool>,
+    replica_writer: Arc<AtomicU8>,
 }
 
 #[expect(missing_debug_implementations)]
@@ -47,7 +65,7 @@ where
             storage,
             routing: EpochRouting::legacy(),
             authority_writer: Arc::new(AtomicBool::new(false)),
-            replica_writer: Arc::new(AtomicBool::new(false)),
+            replica_writer: Arc::new(AtomicU8::new(ReplicaWriterMode::None as u8)),
         }
     }
 
@@ -76,7 +94,7 @@ where
             storage,
             routing: EpochRouting::unfenced(bank),
             authority_writer: Arc::new(AtomicBool::new(false)),
-            replica_writer: Arc::new(AtomicBool::new(false)),
+            replica_writer: Arc::new(AtomicU8::new(ReplicaWriterMode::None as u8)),
         }
     }
 
@@ -91,7 +109,7 @@ where
             storage,
             routing: EpochRouting::fenced(bank, expected_pointer),
             authority_writer: Arc::new(AtomicBool::new(false)),
-            replica_writer: Arc::new(AtomicBool::new(false)),
+            replica_writer: Arc::new(AtomicU8::new(ReplicaWriterMode::None as u8)),
         }
     }
 
@@ -105,7 +123,7 @@ where
             storage,
             routing: EpochRouting::retained(bank, expected_pointer),
             authority_writer: Arc::new(AtomicBool::new(false)),
-            replica_writer: Arc::new(AtomicBool::new(false)),
+            replica_writer: Arc::new(AtomicU8::new(ReplicaWriterMode::None as u8)),
         }
     }
 
@@ -121,7 +139,7 @@ where
             storage,
             routing: EpochRouting::migration(bank, expected_pointer),
             authority_writer: Arc::new(AtomicBool::new(false)),
-            replica_writer: Arc::new(AtomicBool::new(false)),
+            replica_writer: Arc::new(AtomicU8::new(ReplicaWriterMode::None as u8)),
         }
     }
 
@@ -139,7 +157,18 @@ where
 
     /// Admits only an engine opened through the authenticated sync lifecycle.
     pub(crate) fn admit_sync_replica_writer(&self) {
-        self.replica_writer.store(true, Ordering::Release);
+        self.replica_writer
+            .store(ReplicaWriterMode::Full as u8, Ordering::Release);
+    }
+
+    /// Only the partial sync owner admits authoring after durable account,
+    /// remote and epoch checks. The capability is not full-state certification.
+    pub(crate) fn admit_partial_replica_writer(
+        &self,
+        _capability: crate::sync::PartialReplicaWriteCapability,
+    ) {
+        self.replica_writer
+            .store(ReplicaWriterMode::Partial as u8, Ordering::Release);
     }
 
     pub async fn begin_read(
@@ -217,7 +246,11 @@ where
         opts: WriteOptions,
     ) -> Result<(CommitResult, StorageWriteSetStats), StorageWriteSetError> {
         let prepared = self
-            .prepare_write_set_with_replica_capability(write_set, opts, true)
+            .prepare_write_set_with_replica_capability(
+                write_set,
+                opts,
+                ReplicaWriteAdmission::FullInstaller,
+            )
             .await?;
         prepared
             .commit()
@@ -230,17 +263,42 @@ where
         write_set: StorageWriteSet,
         opts: WriteOptions,
     ) -> Result<PreparedStorageCommit<'_, StorageImpl>, StorageWriteSetError> {
-        self.prepare_write_set_with_replica_capability(write_set, opts, false)
-            .await
+        self.prepare_write_set_with_replica_capability(
+            write_set,
+            opts,
+            ReplicaWriteAdmission::Ordinary,
+        )
+        .await
+    }
+
+    pub(crate) async fn commit_partial_replica_write_set(
+        &self,
+        _capability: crate::sync::PartialReplicaWriteCapability,
+        write_set: StorageWriteSet,
+        opts: WriteOptions,
+    ) -> Result<(CommitResult, StorageWriteSetStats), StorageWriteSetError> {
+        self.prepare_write_set_with_replica_capability(
+            write_set,
+            opts,
+            ReplicaWriteAdmission::PartialInstaller,
+        )
+        .await?
+        .commit()
+        .await
+        .map_err(StorageWriteSetError::Storage)
     }
 
     async fn prepare_write_set_with_replica_capability(
         &self,
         write_set: StorageWriteSet,
         mut opts: WriteOptions,
-        certified_replica_write: bool,
+        admission: ReplicaWriteAdmission,
     ) -> Result<PreparedStorageCommit<'_, StorageImpl>, StorageWriteSetError> {
-        if !certified_replica_write && !self.replica_writer.load(Ordering::Acquire) {
+        let writer_mode = self.replica_writer.load(Ordering::Acquire);
+        let may_write_full = admission == ReplicaWriteAdmission::FullInstaller
+            || (admission == ReplicaWriteAdmission::Ordinary
+                && writer_mode == ReplicaWriterMode::Full as u8);
+        if !may_write_full {
             // This atomic absence precondition closes the race between an
             // ordinary writer's coherent read and initial receipt install.
             // Plain engines sharing receipt-bound storage remain fenced. Only
@@ -248,6 +306,18 @@ where
             opts.preconditions.push(Precondition::KeyAbsent {
                 space: crate::sync::SYNC_REPLICA_STATE_SPACE,
                 key: crate::sync::replica_state_key(),
+            });
+        }
+        // An admitted full replica and its installer must still reject partial
+        // ownership. Conversely partial installation retains the full fence,
+        // even if the adapter previously admitted a full replica writer.
+        let may_write_partial = admission == ReplicaWriteAdmission::PartialInstaller
+            || (admission == ReplicaWriteAdmission::Ordinary
+                && writer_mode == ReplicaWriterMode::Partial as u8);
+        if !may_write_partial {
+            opts.preconditions.push(Precondition::KeyAbsent {
+                space: crate::sync::PARTIAL_REPLICA_STATE_SPACE,
+                key: crate::sync::partial_replica_state_key(),
             });
         }
         if self.authority_writer.load(Ordering::Acquire) {
@@ -592,6 +662,90 @@ mod tests {
 
     fn space() -> StorageSpace {
         StorageSpace::mutable(SpaceId(1), "test.space")
+    }
+
+    #[tokio::test]
+    async fn replica_write_admission_never_crosses_receipt_ownership() {
+        use super::{ReplicaWriteAdmission, ReplicaWriterMode};
+        for full_receipt in [false, true] {
+            for partial_receipt in [false, true] {
+                for writer_mode in [
+                    ReplicaWriterMode::None,
+                    ReplicaWriterMode::Full,
+                    ReplicaWriterMode::Partial,
+                ] {
+                    for admission in [
+                        ReplicaWriteAdmission::Ordinary,
+                        ReplicaWriteAdmission::FullInstaller,
+                        ReplicaWriteAdmission::PartialInstaller,
+                    ] {
+                        let storage = StorageAdapter::new(Memory::new());
+                        let mut seed = storage.new_write_set();
+                        if full_receipt {
+                            seed.put(
+                                crate::sync::SYNC_REPLICA_STATE_SPACE,
+                                crate::sync::replica_state_key(),
+                                value("full receipt"),
+                            );
+                        }
+                        if partial_receipt {
+                            seed.put(
+                                crate::sync::PARTIAL_REPLICA_STATE_SPACE,
+                                crate::sync::partial_replica_state_key(),
+                                value("partial receipt"),
+                            );
+                        }
+                        // Receipt contents are deliberately opaque here: the
+                        // storage fence tests ownership presence, not codecs.
+                        storage
+                            .commit_write_set(seed, WriteOptions::default())
+                            .await
+                            .unwrap();
+                        // Exercise the private role matrix without exposing a
+                        // test-only constructor for the sync capability.
+                        storage
+                            .replica_writer
+                            .store(writer_mode as u8, std::sync::atomic::Ordering::Release);
+                        let mut writes = storage.new_write_set();
+                        writes.put(space(), key("candidate"), value("must be atomic"));
+                        let result = match storage
+                            .prepare_write_set_with_replica_capability(
+                                writes,
+                                WriteOptions::default(),
+                                admission,
+                            )
+                            .await
+                        {
+                            Ok(prepared) => prepared.commit().await.is_ok(),
+                            Err(_) => false,
+                        };
+                        let full_allowed = !full_receipt
+                            || admission == ReplicaWriteAdmission::FullInstaller
+                            || (admission == ReplicaWriteAdmission::Ordinary
+                                && writer_mode == ReplicaWriterMode::Full);
+                        let partial_allowed = !partial_receipt
+                            || admission == ReplicaWriteAdmission::PartialInstaller
+                            || (admission == ReplicaWriteAdmission::Ordinary
+                                && writer_mode == ReplicaWriterMode::Partial);
+                        let expected = full_allowed && partial_allowed;
+                        assert_eq!(
+                            result, expected,
+                            "full={full_receipt} partial={partial_receipt} writer={writer_mode:?} installer={admission:?}"
+                        );
+                        let read = storage.begin_read(ReadOptions::default()).await.unwrap();
+                        let stored = PointReadPlan::new(space(), &[key("candidate")])
+                            .materialize(&read, GetOptions::default())
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            stored.value[0].is_some(),
+                            expected,
+                            "rejected publication must retain no mutation"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

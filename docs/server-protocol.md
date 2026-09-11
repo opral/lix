@@ -35,7 +35,7 @@ contract in another language. See [Hosting](./hosting.md).
 | SQL         | `/lix/v1/{lix_id}/execute`, `/lix/v1/{lix_id}/execute-batch`                    |
 | Transaction | `/lix/v1/{lix_id}/transaction/{begin,execute,commit,rollback}`                  |
 | Files       | `/lix/v1/{lix_id}/file`, `/lix/v1/{lix_id}/file/upsert{,-batch}`               |
-| Sync        | `/lix/v1/{lix_id}/sync/{push,pull,history,checkpoints,blob,chunk}`                          |
+| Sync        | `/lix/v1/{lix_id}/sync/{push,pull,history,checkpoints,descriptor,native-objects,native-object-range,native-metadata,baseline-lease/renew,blob,chunk,retained-bodies,merge,merge/restart,migration/merge,migration/cleanup,migration/global/restart,migration/global/cleanup,migration/global/merge,migration/global/bodies}`                          |
 | Versioning  | `/lix/v1/{lix_id}/branch/{create,switch,merge,merge-preview}`, `/lix/v1/{lix_id}/{undo,redo}`       |
 | Observation | `/lix/v1/{lix_id}/observe`, `/lix/v1/{lix_id}/observe/multiplex`                |
 | Snapshot    | `/lix/v1/{lix_id}/snapshot`                                                     |
@@ -130,7 +130,7 @@ the resulting committed state into the local replica.
   `PUT /lix/v1/{lix_id}/sync/chunk?chunkId=...` transfer raw chunks. Both identities are
   64-character lowercase BLAKE3 hex digests; chunks are at most 4 MiB.
 
-All sync routes require exactly one `lix-sync-protocol-version: 9` header.
+All sync routes require exactly one `lix-sync-protocol-version: 10` header.
 Missing, duplicate, malformed, or incompatible versions are rejected before
 reading or publishing sync data. The handshake advertises
 `syncCheckpointInventory: true`. Commit bodies and headers both carry immutable
@@ -147,6 +147,48 @@ complete; binary content remains referenced through the binary CAS rather than
 being embedded in commit JSON. Upload is one retryable loop: register the
 manifest, PUT only the returned missing chunks, then register the same manifest
 again. There is no separate presence request.
+
+### Partial replica with on-demand sync
+
+Sync protocol 10 also defines the native transport for a partial replica with
+on-demand sync. The public sync-opening path is not switched by merely adding
+these endpoints.
+
+- `GET /sync/descriptor` returns a required `{descriptor, lease}` envelope of at
+  most 6144 encoded bytes. The descriptor contains selected/default and global
+  native head/checkpoint coordinates, canonical branch-ref metadata, and a
+  cursor. It does not enumerate branches, rows, checkpoints, or blobs. The
+  authority durably pins those exact native roots before returning the envelope. Protocol
+  10 fixes the lease TTL at 300000 ms; changing this duration requires a protocol
+  version change. Candidate publication uses a process-local monotonic deadline
+  starting before the descriptor request, so waiting and transfer consume the
+  budget. The serialized `expiresAtMs` field alone is not a cross-clock proof.
+- `GET /sync/descriptor?branchId=...&after=...` waits up to 30 seconds for a newer
+  coherent descriptor. Unrelated repository changes may advance its cursor;
+  receiving the response does not publish a local baseline or certify coverage.
+  A candidate baseline has an independent lease until local publication.
+- `POST /sync/native-objects`, `/sync/native-object-range`, and
+  `/sync/native-metadata` fetch explicitly typed native inputs. They require
+  `lix-native-baseline-lease`, checked against the authenticated account in the
+  same storage snapshot as the native read. Request JSON is capped at 16 KiB;
+  object/range payloads are capped at 1 MiB and metadata payloads at 256 KiB.
+- `POST /sync/baseline-lease/renew` accepts `{leaseId}` and extends an unexpired
+  lease without changing its account or roots. Expired leases cannot be
+  resurrected. Cold requests return `LIX_PARTIAL_BASELINE_EXPIRED` (HTTP 410);
+  clients preserve pending edits and explicitly reconcile a new baseline.
+- Shared blob/chunk GET routes validate a supplied baseline lease in the same
+  read snapshot. Full-replica reads use their existing unleased path.
+
+Native objects must pass their native hash or codec validation and durable
+admission checks before installation. Caching inputs does not by itself prove
+SQL coverage. Warm resident reads do not consult the network lease clock.
+
+Existing authorities must explicitly upgrade their authority capability marker
+before serving protocol 10 baseline leases. In Rust, close existing handles and
+call `lix::upgrade_authority_for_partial_sync(storage).await?`. Complete any
+ordinary repository-format migration first. This operation preserves rows,
+atomically replaces the prior authority marker, and fences older authority
+writers (including their GC). It is not an implicit partial-opening fallback.
 
 Every commit member and snapshot row encodes its physical replication identity
 as `(schemaKey, fileId, rowPk)`. This is deliberately not the public SQL/SDK

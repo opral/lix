@@ -167,6 +167,18 @@ impl WasmRemoteLix {
         )))
     }
 
+    #[wasm_bindgen(js_name = recoverReplicaWithServer)]
+    pub async fn recover_replica_with_server(
+        &self,
+        _id: String,
+        _server: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        Err(lix_error_to_js(LixError::new(
+            "LIX_ERROR_LOCAL_STORAGE_REQUIRED",
+            "Replica recovery requires a local storage-backed Lix handle",
+        )))
+    }
+
     #[wasm_bindgen(js_name = recoverReplica)]
     pub async fn recover_replica(&self, _id: String) -> Result<JsValue, JsValue> {
         Err(lix_error_to_js(LixError::new(

@@ -24,14 +24,19 @@ await lix.close();
 
 ## Hosted lifecycle
 
-`openLix()` selects execution from the supplied locations:
+`openLix()` selects execution from storage and the explicit server mode:
 
 | Options | Behavior |
 | --- | --- |
 | Neither | Fresh in-memory repository |
 | `storage` | Local repository, initialized if empty |
-| `server` | Execute against an existing hosted repository |
-| `storage` and `server` | Local reads and writes with background synchronization |
+| `server`, mode omitted or `"remote"` | Execute SQL remotely against an existing hosted repository; no local storage |
+| `storage` and `server.mode: "partial_replica"` | Partial replica with on-demand sync; reads and writes whose dependencies are resident execute locally |
+
+`server.mode` defaults to `"remote"`. Supplying storage requires explicitly opting
+into `"partial_replica"`; remote mode rejects storage. Partial-replica mode requires
+storage. These are the only supported server modes. `"replica"` may be added later;
+the former `"sync"` mode is not an alias.
 
 Creation and deletion are explicit server operations:
 
@@ -64,9 +69,10 @@ execution do not require streaming uploads.
 
 ## Synchronized local repositories
 
-Combine storage with a server to keep a synchronized local replica. Reads and
-writes execute locally; background synchronization exchanges changes with the
-server:
+Provide storage and set `server.mode: "partial_replica"` to create a
+**partial replica with on-demand sync**. Opening loads bounded metadata. SQL fetches missing native inputs on
+demand and retains them locally; background synchronization updates the loaded
+working set:
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -75,6 +81,7 @@ import { OpfsStorage } from "@lix-js/storage-opfs";
 const lix = await openLix({
   storage: new OpfsStorage({ name: "acme" }),
   server: {
+    mode: "partial_replica",
     url: "https://example.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
     headers: async () => ({
       Authorization: `Bearer ${await accessToken()}`,
@@ -84,43 +91,105 @@ const lix = await openLix({
 ```
 
 A successful mutation confirms a local commit; it does not confirm server
-acceptance. Pending commits upload in the background. Cached reads and local
-writes work offline; older history and binary content load when needed.
+acceptance. Pending commits upload in the background. Covered reads and writes
+whose dependencies are resident work offline, with immediate local visibility.
+A statement requiring missing inputs needs a connection; missing data is never
+silently treated as an empty result. Current data means the coherently applied
+server state plus pending local writes.
+
+Prefetch a view on hover using the same ordinary SELECT it will display:
+
+```ts
+const sql = "SELECT content FROM lix_file WHERE path=$1";
+const params = ["/notes.txt"];
+await lix.execute(sql, params); // On hover: fetch missing read inputs.
+const result = await lix.execute(sql, params); // On open: resident reads stay local.
+```
+
+Use ordinary `execute()` for mutations. Reading a file does not promise that every
+later write's validation or commit dependencies are resident; cold operations can
+fetch additional inputs while connected.
+
 See [Collaboration and Sync](https://lix.dev/docs/collaboration-and-sync).
 
 ### Upgrading a local replica
 
-Keep the same storage name across SDK upgrades. For a supported older synchronized
-replica, Lix preserves its existing storage generation and bootstraps a separate
-generation from the same authoritative repository and account. The replacement
-becomes active only after bootstrap and validation succeed. Pending work and
-local-only rows remain in the preserved generation; they do not block opening the
-current server state. An upgrade requires a server connection and enough local
-storage for both generations.
-
-Recovery is explicit and separate from opening:
+Keep the same storage name across SDK upgrades. Opening an existing full replica
+with `server.mode: "partial_replica"` requires an explicit conversion; normal opening does not download a
+replacement repository. Run conversion while the storage has no open Lix handle:
 
 ```ts
-const sources = await lix.replicaRecoverySources();
-for (const source of sources.filter((source) => source.recoveryRequired)) {
-  const exported = await lix.exportReplicaRecovery(source.id);
-  // Save exported as JSON when the user requests a portable recovery copy.
-  console.log(exported.unresolved);
+import { convertReplicaToPartial, openLix } from "@lix-js/sdk";
 
-  const receipt = await lix.recoverReplica(source.id);
-  // Present these separate branches for review; the active branch is unchanged.
-  console.log(receipt.branchIds, receipt.restoredRows, receipt.unresolved);
+const storage = new OpfsStorage({ name: "acme" });
+const server = {
+  mode: "partial_replica" as const,
+  url: "https://example.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+  headers: async () => ({ Authorization: `Bearer ${await accessToken()}` }),
+};
+await convertReplicaToPartial({ storage, server });
+const lix = await openLix({ storage, server });
+```
+
+Conversion authenticates the repository and account, preserves the original
+storage generation, and publishes a separate partial replica only after its
+required reconciliation and validation succeed. It can require time and extra
+storage; measure it separately from ordinary opening. Unsupported pending work
+returns an error with the original source preserved. Do not clear storage to
+bypass that error.
+
+If authority cleanup is interrupted after conversion, retry it explicitly while
+storage is closed. Ordinary opening does not scan migration journals:
+
+```ts
+import { retryReplicaMigrationCleanup } from "@lix-js/sdk";
+const completed = await retryReplicaMigrationCleanup({ storage, server });
+```
+
+This returns the number of newly completed cleanup records; repeating a
+successful cleanup returns zero. It preserves the active replica and retained
+source generation.
+
+For retained pre-native sources, explicit format migration can succeed while
+partial conversion reports that recovery is required. Open the resulting local
+recovery repository without `server`, then inspect and restore retained work:
+
+```ts
+const recovery = await openLix({ storage });
+try {
+  const sources = await recovery.replicaRecoverySources();
+  for (const source of sources.filter((source) => source.recoveryRequired)) {
+    const exported = await recovery.exportReplicaRecovery(source.id);
+    console.log(exported.unresolved); // Save a portable copy when needed.
+
+    const receipt = await recovery.recoverReplicaWithServer(source.id, server);
+    console.log(receipt.branchIds, receipt.restoredRows, receipt.unresolved);
+  }
+} finally {
+  await recovery.close();
 }
 ```
 
+`recoverReplicaWithServer()` authenticates the same repository and account and
+fetches missing recovery history or chunks explicitly. It does not start a
+background sync worker or upload restored branches. Dynamic headers and custom
+fetch remain scoped to this operation in the browser. The native Node binding
+supports headers and rejects custom fetch.
+
 `exportReplicaRecovery()` captures available logical rows, blob contents, and
-original branch/checkpoint coordinates. `recoverReplica()` restores supported
-tracked rows into separate recovery branches. It does not automatically publish
-local-only rows or merge recovered work into the active branch. Inspect
-`unresolved`: original history and any unavailable content remain in the retained
-source. A recovery receipt describes local restoration, not a server durability
-acknowledgement. Neither operation deletes the retained generation, and retries
-reuse recovery branch receipts rather than overwriting previously recovered work.
+original branch/checkpoint coordinates. `recoverReplica()` performs local
+restoration; its server variant can hydrate missing dependencies. Both restore
+supported tracked rows into separate recovery branches without inheriting
+unrelated active-branch rows. Inspect `unresolved`: unavailable history/content
+and local-only rows remain in the retained source. Neither operation deletes
+that source, and retries reuse durable recovery receipts.
+
+A recovery receipt confirms local restoration, not server acceptance or
+eligibility for partial conversion. Conversion of every retained pending branch
+is still a release gate: restored additional branches and unresolved retained
+sources must not be silently discarded or marked acknowledged. The current
+selected-branch native reconciliation path does not establish that broader
+migration guarantee.
 
 Recovery export currently allows up to 100,000 logical rows across all branches,
 64 MiB per blob, and 128 MiB of blob content in total. Unfinished upload parts
@@ -163,7 +232,8 @@ files.close();
 await lix.close();
 ```
 
-Without `storage`, remote mode uses the server for all persistence and does not
+Remote mode is the default when `server.mode` is omitted. It rejects `storage`,
+uses the server for all persistence and does not
 open a local engine. Dynamic headers are resolved for every request and
 observation reconnect. An injected `fetch` can route requests through a service
 binding or another authorized server-side transport.

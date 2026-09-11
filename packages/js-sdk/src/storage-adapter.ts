@@ -168,6 +168,12 @@ export type LixStorageCommitResult = {
 export interface LixStorageProvider {
 	/** Joins the active generation and returns its canonical unsigned 64-bit base-10 token. */
 	acquireSession(): Promise<string>;
+	/** Optional exclusive physical-store owner for partial replicas. The handle
+	 * exists before asynchronous acquisition so close cancels even a granted lock. */
+	acquirePartialReplicaOwner?(sessionToken: string): {
+		readonly ready: Promise<void>;
+		close(): void;
+	};
 	beginRead(options: LixStorageReadOptions): Promise<LixStorageRead>;
 	beginWrite(options: LixStorageWriteOptions): Promise<LixStorageWrite>;
 	watchForChanges(): Promise<LixStorageChangeWatch>;
@@ -234,6 +240,7 @@ export type LixStorageErrorCode =
 	| "LIX_STORAGE_WRITE_CONFLICT"
 	| "LIX_STORAGE_PRECONDITION_FAILED"
 	| "LIX_STORAGE_DURABILITY"
+	| "LIX_STORAGE_IN_USE"
 	| "LIX_STORAGE_FENCED"
 	| "LIX_STORAGE_CLOSED"
 	| "LIX_STORAGE_COMMIT_OUTCOME_UNKNOWN"

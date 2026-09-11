@@ -40,12 +40,15 @@ test("no options opens memory; storage alone opens local", async () => {
 	await local.close();
 });
 
-test("server alone opens remote; adding storage selects synchronization", async () => {
+test("server defaults to remote; partial_replica explicitly opts into on-demand sync", async () => {
 	const remote = await openLix({ server });
 	expect(mocks.remote).toHaveBeenCalledWith(server);
 	expect(mocks.local).not.toHaveBeenCalled();
 	await remote.close();
-	const local = await openLix({ storage: storage(), server });
+	const local = await openLix({
+		storage: storage(),
+		server: { ...server, mode: "partial_replica" },
+	});
 	expect(mocks.local.mock.calls[0]?.[3]).toEqual({
 		url: server.url,
 		headers: undefined,
@@ -54,10 +57,10 @@ test("server alone opens remote; adding storage selects synchronization", async 
 	await local.close();
 });
 
-test("removed server.mode fails rather than silently changing execution", async () => {
+test.each(["sync", "replica", "unknown"])("unsupported mode %s fails before opening", async (mode) => {
 	await expect(
-		openLix({ server: { ...server, mode: "sync" } } as never),
-	).rejects.toThrow("server.mode was removed");
+		openLix({ server: { ...server, mode } } as never),
+	).rejects.toThrow("server.mode must be");
 	expect(mocks.local).not.toHaveBeenCalled();
 	expect(mocks.remote).not.toHaveBeenCalled();
 });
@@ -69,5 +72,22 @@ test("remote execution rejects local-only options before opening", async () => {
 	await expect(openLix({ server, onProgress() {} } as never)).rejects.toThrow(
 		"does not accept local telemetry or onProgress",
 	);
+	expect(mocks.remote).not.toHaveBeenCalled();
+});
+
+test("explicit remote opens remotely", async () => {
+	const remote = await openLix({server: {...server, mode: "remote"}});
+	expect(mocks.remote).toHaveBeenCalledOnce();
+	expect(mocks.local).not.toHaveBeenCalled();
+	await remote.close();
+});
+test.each([undefined, "remote"])("remote mode %s rejects storage before opening", async (mode) => {
+	await expect(openLix({storage: storage(), server: {...server, mode}} as never)).rejects.toThrow('set server.mode to "partial_replica"');
+	expect(mocks.local).not.toHaveBeenCalled();
+	expect(mocks.remote).not.toHaveBeenCalled();
+});
+test("partial_replica requires storage before opening", async () => {
+	await expect(openLix({server: {...server, mode: "partial_replica"}} as never)).rejects.toThrow('requires storage');
+	expect(mocks.local).not.toHaveBeenCalled();
 	expect(mocks.remote).not.toHaveBeenCalled();
 });

@@ -23,9 +23,9 @@ use crate::common::LixTimestamp;
 use crate::filesystem::stage_path_index_revision;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::hot_state::{
-    CompleteWorkingDiffMode, HotStateContext, HotStateRowRequest, HotTrackedSnapshot,
-    MaterializedHotStateRow, TrackedHeadContext, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
-    stage_tracked_working_diff_epoch,
+    CompleteWorkingDiffMode, HotStateContext, HotStateExactBatchRequest, HotStateProjection,
+    HotTrackedSnapshot, MaterializedHotStateRow, TrackedHeadContext, TrackedWorkingDiffEpoch,
+    WorkingDiffIndexCoverage, stage_tracked_working_diff_epoch,
 };
 use crate::row_pk::RowPk;
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
@@ -624,6 +624,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &staged_commits,
         &staged_snapshot_roots,
         &external_parent_manifests,
+        &state_rows,
+        &row_index.tracked_row_indices_by_commit,
     )
     .await?;
     // HOT publication has adapter-specific checkpoint, packed-base, and
@@ -1007,19 +1009,23 @@ async fn stage_changelog_commits(
     let mut rootless_bytes = BTreeMap::new();
     for (commit_id, record) in external_parent_records {
         let record = record.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("commit '{commit_id}' has a missing parent"),
-            )
+            crate::tracked_state::NativeMetadataRef::CommitGraphRecord(commit_id.to_string())
+                .annotate_missing(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("commit '{commit_id}' has a missing parent"),
+                ))
         })?;
         let published =
             crate::tracked_state::load_published_commit_state_topology(read, *commit_id)
                 .await?
                 .ok_or_else(|| {
-                    LixError::new(
+                    crate::tracked_state::NativeMetadataRef::CommitStateHeader(
+                        commit_id.to_string(),
+                    )
+                    .annotate_missing(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         format!("commit '{commit_id}' has no commit-state authority"),
-                    )
+                    ))
                 })?;
         // Replay debt is physical layout policy. Rootless commits remain
         // bounded-replay layouts; rooted commits publish their canonical
@@ -1108,10 +1114,11 @@ async fn stage_changelog_commits(
                 .next()
                 .and_then(|(_, record)| record)
                 .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!("commit '{commit_id}' has a missing jump target '{jump_id}'"),
-                    )
+                    crate::tracked_state::NativeMetadataRef::CommitGraphRecord(jump_id.to_string())
+                        .annotate_missing(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("commit '{commit_id}' has a missing jump target '{jump_id}'"),
+                        ))
                 })?;
             topology_records.insert(jump_id, jump);
         }
@@ -2900,7 +2907,6 @@ fn lifecycle_snapshot_commit_ids(
                 .is_some();
         let partial_checkpoint_can_reuse_generation = partial_checkpoint_rebase_commit_id(
             root,
-            staged,
             staged_commits,
             observations,
             checkpoint_epochs,
@@ -2963,7 +2969,6 @@ fn selected_refs_require_complete_snapshot(
 
 fn partial_checkpoint_rebase_commit_id(
     root: &PendingTrackedRoot,
-    staged: &StagedChangelogCommit,
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
     checkpoint_epochs: &BTreeMap<String, CheckpointEpochBinding>,
@@ -2978,12 +2983,12 @@ fn partial_checkpoint_rebase_commit_id(
             .get(&root.branch_id)
             .and_then(|observation| observation.control)
             .is_some()
-        && !selected_refs_require_complete_snapshot(&staged.selected_change_batches)
-        && staged_commits
-            .get(&checkpoint_commit_id)
-            .is_some_and(|checkpoint| {
-                !selected_refs_require_complete_snapshot(&checkpoint.selected_change_batches)
-            }))
+        // The certified checkpoint selection already closes filesystem
+        // dependencies over the before/after snapshots. Its child preserves
+        // current file/directory values: only ownership and the working-diff
+        // baseline change. Reuse the admitted native generation instead of
+        // reconstructing a complete filesystem snapshot and losing its root.
+        && staged_commits.contains_key(&checkpoint_commit_id))
     .then_some(checkpoint_commit_id)
 }
 
@@ -3534,12 +3539,30 @@ async fn load_working_diff_epoch_for_publication(
         {
             Ok(Some(epoch))
         }
-        (Some(checkpoint_commit_id), None) => Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "branch '{branch_id}' checkpoint cursor '{checkpoint_commit_id}' has no working-diff epoch"
-            ),
-        )),
+        (Some(checkpoint_commit_id), None) => {
+            if TrackedHeadContext::new()
+                .reader(read)
+                .root_current_base_commit(branch_id, parent_generation)
+                .await?
+                .is_some()
+            {
+                // The first local edit starts an overlay-only index. The
+                // root-backed reader refuses this index as a complete diff
+                // proof and resolves checkpoint comparisons canonically.
+                Ok(Some(TrackedWorkingDiffEpoch {
+                    checkpoint_commit_id,
+                    generation: parent_generation,
+                    coverage: WorkingDiffIndexCoverage::default(),
+                }))
+            } else {
+                Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "branch '{branch_id}' checkpoint cursor '{checkpoint_commit_id}' has no working-diff epoch"
+                    ),
+                ))
+            }
+        }
         (None, Some(epoch)) => Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!(
@@ -3915,7 +3938,6 @@ async fn stage_tracked_head(
         // instead of rebuilding the complete branch snapshot from history.
         let partial_checkpoint_commit_id = partial_checkpoint_rebase_commit_id(
             root,
-            staged,
             staged_commits,
             observations,
             checkpoint_epochs,
@@ -5706,12 +5728,36 @@ async fn stage_branch_head_control_publications(
             if desired
                 .is_none_or(|new_control| new_control.ref_change_id != old_control.ref_change_id)
             {
-                crate::changelog::stage_delete_standalone_change(
-                    read,
-                    writes,
-                    old_control.ref_change_id,
-                )
-                .await?;
+                let remote_baseline_ref = crate::sync::load_partial_replica_state(read)
+                    .await?
+                    .is_some_and(|(state, _)| {
+                        let descriptor = state.descriptor();
+                        [&descriptor.selected_branch, &descriptor.global_branch]
+                            .iter()
+                            .any(|branch| {
+                                branch.branch_id == *branch_id
+                                    && branch.ref_change_id == old_control.ref_change_id
+                                    && branch.head.commit_id == old_control.head_commit_id
+                                    && state.serving_generation(branch_id).ok()
+                                        == Some(old_control.tracked_generation)
+                                    && old_control.working_diff_checkpoint_commit_id.is_some_and(
+                                        |checkpoint| checkpoint == branch.checkpoint.commit_id,
+                                    )
+                            })
+                    });
+                if remote_baseline_ref {
+                    crate::changelog::stage_delete_cached_standalone_change(
+                        writes,
+                        old_control.ref_change_id,
+                    );
+                } else {
+                    crate::changelog::stage_delete_standalone_change(
+                        read,
+                        writes,
+                        old_control.ref_change_id,
+                    )
+                    .await?;
+                }
             }
         }
         match desired {
@@ -6333,6 +6379,8 @@ fn stage_commit_state_manifests<'a, S>(
         CommitId,
         crate::tracked_state::PublishedCommitStateTopology,
     >,
+    state_rows: &'a PreparedStateBatch,
+    row_indices: &'a BTreeMap<CommitId, Vec<RowIndex>>,
 ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
 where
     S: StorageAdapterRead + ?Sized + 'a,
@@ -6603,7 +6651,14 @@ where
                     .and_then(|root| root.parent_roots.first())
                     .map(|source| source.commit_id)
             } else {
-                mutations.selected_source_commit_id().or(first_parent)
+                // The visible state inherits the first parent. Selected-source
+                // provenance identifies imported members, not the inherited
+                // identity catalog: those member keys are added below. Using
+                // the selected source here loses untouched first-parent rows.
+                // `first_parent` above intentionally means a single-parent
+                // replay interval; native merge/branch bases still inherit
+                // parent zero even when their topology has multiple parents.
+                record.parent_commit_ids.first().copied()
             };
             let loaded_row_pk_base = if let Some(base_id) = row_pk_base_commit_id
                 && !published_manifests.contains_key(&base_id)
@@ -6653,28 +6708,58 @@ where
                 )
                 .await?;
             }
-            let staged_segments = crate::tracked_state::staged_commit_delta_segment_bytes(
-                writes,
-                record.commit_id,
-                &mutations,
-            )?;
-            let row_pk_members = crate::tracked_state::staged_commit_delta_members(
-                read,
-                record.commit_id,
-                &record.account_id,
-                &mutations,
-                staged_segments,
-            )
-            .await?;
-            let row_pk_index_root_id = crate::tracked_state::stage_row_pk_index_from_members(
-                read,
-                writes,
-                &mut row_pk_index_overlay,
-                row_pk_base_root.as_ref(),
-                &row_pk_members,
-                record.commit_id,
-            )
-            .await?;
+            let row_pk_index_root_id = if let Some(columnar) = mutations.columnar_parts.as_ref() {
+                // Columnar mutation authority has no ordinary delta segments.
+                // Use the same validated prepared identities that produced it;
+                // interpreting an empty segment list as an empty catalog loses
+                // the rows when a later branch leaves the packed HOT path.
+                let indices = row_indices
+                    .get(&record.commit_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                if indices.len() != columnar.row_count as usize {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "columnar publication is missing its prepared identity closure",
+                    ));
+                }
+                let deltas = indices
+                    .iter()
+                    .map(|&index| tracked_delta_from_state_row(state_rows.row(index)))
+                    .collect::<Result<Vec<_>, _>>()?;
+                crate::tracked_state::stage_row_pk_index_from_deltas_with_base(
+                    read,
+                    writes,
+                    &mut row_pk_index_overlay,
+                    row_pk_base_root.as_ref(),
+                    deltas,
+                    record.commit_id,
+                )
+                .await?
+            } else {
+                let staged_segments = crate::tracked_state::staged_commit_delta_segment_bytes(
+                    writes,
+                    record.commit_id,
+                    &mutations,
+                )?;
+                let row_pk_members = crate::tracked_state::staged_commit_delta_members(
+                    read,
+                    record.commit_id,
+                    &record.account_id,
+                    &mutations,
+                    staged_segments,
+                )
+                .await?;
+                crate::tracked_state::stage_row_pk_index_from_members(
+                    read,
+                    writes,
+                    &mut row_pk_index_overlay,
+                    row_pk_base_root.as_ref(),
+                    &row_pk_members,
+                    record.commit_id,
+                )
+                .await?
+            };
             if mutations.replacement_generation.is_some() {
                 mutations.parts.clear();
             }
@@ -7226,13 +7311,22 @@ async fn validate_active_account_and_account_rows(
         crate::commit_graph::CommitGraphContext::new(),
     )
     .reader(&*read)
-    .load_row(&HotStateRowRequest {
-        schema_key: "lix_account".to_string(),
-        branch_id: crate::GLOBAL_BRANCH_ID.to_string(),
-        row_pk: account_pk,
-        file_id: NullableKeyFilter::Null,
+    .load_exact_batch(&HotStateExactBatchRequest {
+        rows: vec![crate::hot_state::HotStateExactRowRequest {
+            schema_key: "lix_account".to_string(),
+            branch_id: crate::GLOBAL_BRANCH_ID.to_string(),
+            row_pk: account_pk,
+            file_id: None,
+        }],
+        projection: HotStateProjection {
+            columns: vec!["snapshot_content".to_owned()],
+        },
+        untracked: None,
+        include_tombstones: false,
     })
-    .await?;
+    .await?
+    .row(0)
+    .map(crate::hot_state::MaterializedHotStateRowRef::to_owned);
     if let Some(account) = account {
         let account_snapshot = account.snapshot_content.ok_or_else(|| {
             LixError::new(
@@ -7260,6 +7354,7 @@ async fn validate_active_account_and_account_rows(
         crate::account::record_account_proven_active(account_revision.as_ref(), active_account_id);
     } else if crate::init::repository_protocol_status(&*read).await?
         == crate::init::RepositoryProtocolStatus::Current
+        || crate::init::is_partial_repository_protocol(&*read).await?
     {
         return Err(LixError::new(
             "LIX_ACCOUNT_NOT_FOUND",
@@ -7427,6 +7522,126 @@ mod tests {
         ($($row:expr),* $(,)?) => {
             PreparedStateBatch::from_test_rows(vec![$($row),*])
         };
+    }
+
+    #[tokio::test]
+    async fn partial_layout_does_not_allow_the_uninitialized_missing_account_exception() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = storage.new_write_set();
+        crate::init::stage_partial_repository_protocol(&mut writes);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let prepared = PreparedWriteSet {
+            branch_heads: Default::default(),
+            state_rows: prepared_rows![],
+            insert_selection: PreparedInsertSelection::new(),
+            commit_change_refs_by_branch: BTreeMap::new(),
+            first_commit_parent_override_by_branch: BTreeMap::new(),
+            checkpoint_publications: Vec::new(),
+            extra_commit_parents_by_branch: BTreeMap::new(),
+            intermediate_commits: Vec::new(),
+            file_content_writes: Vec::new(),
+        };
+        let error = validate_active_account_and_account_rows(
+            &mut read,
+            &prepared,
+            "00000000-0000-7000-8000-000000000699",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "LIX_ACCOUNT_NOT_FOUND");
+    }
+
+    // A resident proof must need only its revision point read, even if native
+    // account rows are unavailable. Rotation must force the real read again.
+    #[tokio::test]
+    async fn warm_account_proof_uses_one_point_read_and_rotation_invalidates_it() {
+        struct RevisionOnlyRead<R> {
+            inner: R,
+            keys: AtomicUsize,
+        }
+        impl<R: StorageAdapterRead> StorageAdapterRead for RevisionOnlyRead<R> {
+            async fn get_many(
+                &self,
+                requests: &[crate::storage::GetManyRequest<'_>],
+            ) -> Result<GetManyResult, StorageError> {
+                for request in requests {
+                    assert_eq!(
+                        request.space,
+                        crate::storage_adapter::REVISION_SPACE,
+                        "warm account validation unexpectedly loads native inputs"
+                    );
+                    self.keys.fetch_add(request.keys.len(), Ordering::Relaxed);
+                }
+                self.inner.get_many(requests).await
+            }
+            async fn begin_scan(
+                &self,
+                _space: StorageSpace,
+                _range: KeyRange,
+                _opts: BeginScanOptions,
+            ) -> Result<ScanCursor<'_>, StorageError> {
+                panic!("warm account validation must not scan")
+            }
+        }
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = storage.new_write_set();
+        crate::init::stage_partial_repository_protocol(&mut writes);
+        crate::account::stage_account_revision(&mut writes);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let revision = crate::account::load_account_revision(&read)
+            .await
+            .unwrap()
+            .unwrap();
+        let account = uuid::Uuid::now_v7().to_string();
+        crate::account::record_account_proven_active(Some(&revision), &account);
+        let mut read = RevisionOnlyRead {
+            inner: read,
+            keys: Default::default(),
+        };
+        let prepared = PreparedWriteSet {
+            branch_heads: Default::default(),
+            state_rows: prepared_rows![],
+            insert_selection: PreparedInsertSelection::new(),
+            commit_change_refs_by_branch: BTreeMap::new(),
+            first_commit_parent_override_by_branch: BTreeMap::new(),
+            checkpoint_publications: Vec::new(),
+            extra_commit_parents_by_branch: BTreeMap::new(),
+            intermediate_commits: Vec::new(),
+            file_content_writes: Vec::new(),
+        };
+        validate_active_account_and_account_rows(&mut read, &prepared, &account)
+            .await
+            .unwrap();
+        assert_eq!(read.keys.load(Ordering::Relaxed), 1);
+        drop(read);
+        let mut writes = storage.new_write_set();
+        crate::account::stage_account_revision(&mut writes);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let error = validate_active_account_and_account_rows(&mut read, &prepared, &account)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "LIX_ACCOUNT_NOT_FOUND");
     }
 
     struct ChangeBatchCountingRead<R> {
@@ -10152,6 +10367,8 @@ mod tests {
             &staged,
             &BTreeMap::new(),
             &external_parent_manifests,
+            &PreparedStateBatch::default(),
+            &BTreeMap::new(),
         )
         .await
         .expect("child-before-parent manifests should publish parent authority first");

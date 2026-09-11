@@ -66,14 +66,24 @@ impl CatalogSnapshot {
     /// `lix_registered_schema` rows for the same keys are only discoverability
     /// projections retained in repository history.
     pub(crate) fn builtin() -> &'static Self {
-        static BUILTIN: OnceLock<CatalogSnapshot> = OnceLock::new();
+        Self::builtin_arc().as_ref()
+    }
+
+    pub(crate) fn builtin_shared() -> Arc<Self> {
+        Arc::clone(Self::builtin_arc())
+    }
+
+    fn builtin_arc() -> &'static Arc<Self> {
+        static BUILTIN: OnceLock<Arc<CatalogSnapshot>> = OnceLock::new();
         BUILTIN.get_or_init(|| {
             let schemas = crate::schema::seed_schema_definitions()
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            Self::from_visible_schemas(&schemas)
-                .expect("embedded Schema v1 definitions must compile as one catalog")
+            Arc::new(
+                Self::from_visible_schemas(&schemas)
+                    .expect("embedded Schema v1 definitions must compile as one catalog"),
+            )
         })
     }
 

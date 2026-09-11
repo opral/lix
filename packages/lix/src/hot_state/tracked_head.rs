@@ -14,13 +14,14 @@ pub(crate) use crate::row_state::{
 };
 #[cfg(test)]
 pub(crate) use hot::hot_decode_row_pk_probe;
+#[cfg(test)]
+pub(crate) use hot::root_exact_profile;
 
 pub(crate) use crate::hot_state::HotStateReadDomain;
 #[cfg(test)]
 pub(crate) use hot::WORKING_DIFF_PATH_HITS;
 #[cfg(test)]
 pub(crate) use hot::encode_hot_row_key_for_test;
-#[cfg(test)]
 pub(crate) use hot::hot_generation_scope_prefix;
 #[cfg(any(test, feature = "storage-benches"))]
 pub(crate) use hot::{
@@ -33,12 +34,14 @@ pub(crate) use hot::{
 };
 pub(crate) use hot::{
     CERTIFIED_ROW_BATCH_MANIFEST_SPACE, CERTIFIED_ROW_BATCH_PAGE_SPACE, CERTIFIED_ROW_BATCH_SPACE,
-    COLLECTION_CONTROL_SPACE, CertifiedRowBatchFileRef, CompleteWorkingDiffMode, DIFF_SPACE,
-    FILE_SPACE, HotIndexEntry, HotIndexValue, HotStateTransactionCache, HotTrackedSnapshot,
-    INDEX_SPACE, PACKED_CURRENT_BASE_CONTROL_SPACE, PACKED_CURRENT_BASE_SPACE,
-    PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE,
-    ROW_SPACE, RootBaseBatchCache, RowColumnarOverlayRow, stage_certified_row_batches,
-    stage_hot_index_entries, stage_retire_hot_generation,
+    COLLECTION_CONTROL_SPACE, CertifiedRowBatchFileRef, CompleteWorkingDiffMode,
+    DETERMINISTIC_IDENTITY_WITNESS_SPACE, DIFF_SPACE, FILE_SPACE, HotIndexEntry, HotIndexValue,
+    HotStateTransactionCache, HotTrackedSnapshot, INDEX_SPACE, PACKED_CURRENT_BASE_CONTROL_SPACE,
+    PACKED_CURRENT_BASE_SPACE, PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
+    PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE, ROW_SPACE, RootBaseBatchCache,
+    RowColumnarOverlayRow, stage_certified_row_batches,
+    stage_deterministic_identity_witness_migration, stage_hot_index_entries,
+    stage_retire_hot_generation,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -5193,4 +5196,59 @@ mod tests {
             assert!(value.is_none(), "malformed auxiliary key must be reclaimed");
         }
     }
+}
+
+pub(crate) use hot::root_generation_absence_preconditions;
+
+/// Atomically resets only the local overlay index epoch at a new root basis.
+/// Root-backed readers never interpret this empty overlay as complete diff.
+pub(crate) async fn stage_root_working_diff_epoch(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    generation: CommitId,
+    checkpoint: CommitId,
+) -> Result<crate::storage_adapter::StoragePrecondition, LixError> {
+    let key = StorageKey(Bytes::from(working_diff_marker_key(branch_id)?));
+    let value = PointReadPlan::new(
+        TRACKED_WORKING_DIFF_MARKER_SPACE,
+        std::slice::from_ref(&key),
+    )
+    .materialize(store, StorageGetOptions::default())
+    .await?
+    .value
+    .into_iter()
+    .next()
+    .flatten();
+    let guard = match value {
+        None => crate::storage_adapter::StoragePrecondition::KeyAbsent {
+            space: TRACKED_WORKING_DIFF_MARKER_SPACE,
+            key,
+        },
+        Some(StorageProjectedValue::FullValue(bytes)) => {
+            let _: TrackedWorkingDiffEpoch =
+                storage_codec::decode("tracked working-diff marker", &bytes)?;
+            crate::storage_adapter::StoragePrecondition::KeyValueEquals {
+                space: TRACKED_WORKING_DIFF_MARKER_SPACE,
+                key,
+                expected: bytes,
+            }
+        }
+        Some(StorageProjectedValue::KeyOnly) => {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "working-diff epoch omitted value",
+            ));
+        }
+    };
+    stage_tracked_working_diff_epoch(
+        writes,
+        branch_id,
+        TrackedWorkingDiffEpoch {
+            checkpoint_commit_id: checkpoint,
+            generation,
+            coverage: WorkingDiffIndexCoverage::default(),
+        },
+    )?;
+    Ok(guard)
 }

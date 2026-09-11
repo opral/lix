@@ -420,8 +420,8 @@ test("filesystem storage is owned by its adapter package", async () => {
 	expect("LocalFilesystem" in sdk).toBe(false);
 });
 
-test("server.mode is removed from the public API", async () => {
- await expect(openLix({ server: { url: "https://sync.example/lix/id", mode: "sync" } } as never)).rejects.toThrow("server.mode was removed");
+test("legacy sync mode is unsupported", async () => {
+ await expect(openLix({ server: { url: "https://sync.example/lix/id", mode: "sync" } } as never)).rejects.toThrow("server.mode must be");
 });
 
 test("openLix forwards opt-in SQL telemetry from the engine", async () => {

@@ -1,3 +1,5 @@
+mod interest;
+pub(crate) use interest::prepare_native_diff_interest;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -51,6 +53,7 @@ pub(super) fn register_diff_function<S>(
     session: &datafusion::prelude::SessionContext,
     query_source: SqlChangelogQuerySource<S>,
     catalog: Arc<PublicCatalog>,
+    read_interests: Option<Arc<crate::hot_state::ReadInterestRegistry>>,
 ) where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
@@ -58,6 +61,7 @@ pub(super) fn register_diff_function<S>(
         "lix_diff",
         Arc::new(DiffFunction {
             store: query_source.store,
+            read_interests,
             catalog,
             slots: execution_slots(session),
         }),
@@ -72,6 +76,7 @@ pub(super) enum DiffMode {
 
 struct DiffFunction<S> {
     store: S,
+    read_interests: Option<Arc<crate::hot_state::ReadInterestRegistry>>,
     catalog: Arc<PublicCatalog>,
     slots: Arc<ExecutionSlots>,
 }
@@ -119,10 +124,34 @@ where
                 ));
             }
         };
+        use crate::hot_state::DiffInterestEndpoint;
+        let endpoint = |argument: &Expr, resolved: &String| {
+            if let Expr::ScalarFunction(function) = argument
+                && function.args.is_empty()
+                && function.func.name() == "lix_active_branch_commit_id"
+            {
+                DiffInterestEndpoint::ActiveHead
+            } else {
+                DiffInterestEndpoint::Fixed(resolved.clone())
+            }
+        };
+        let interest_endpoints = if mode == DiffMode::WorkingHot {
+            (
+                DiffInterestEndpoint::WorkingCheckpoint,
+                DiffInterestEndpoint::ActiveHead,
+            )
+        } else {
+            (
+                endpoint(&args[1], &from_commit_id),
+                endpoint(&args[2], &to_commit_id),
+            )
+        };
         let relation_name = text_argument(relation, 1, "relation name", None)?;
         let relation = DiffRelation::from_catalog(&self.catalog, &relation_name)?;
         Ok(Arc::new(SpecTableProvider::new(Arc::new(DiffSpec {
             store: self.store.clone(),
+            read_interests: self.read_interests.clone(),
+            interest_endpoints: Some(interest_endpoints),
             relation,
             from_commit_id,
             to_commit_id,
@@ -276,6 +305,11 @@ impl DiffRelation {
 
 pub(super) struct DiffSpec<S> {
     pub(super) store: S,
+    pub(super) read_interests: Option<Arc<crate::hot_state::ReadInterestRegistry>>,
+    pub(super) interest_endpoints: Option<(
+        crate::hot_state::DiffInterestEndpoint,
+        crate::hot_state::DiffInterestEndpoint,
+    )>,
     pub(super) relation: DiffRelation,
     pub(super) from_commit_id: String,
     pub(super) to_commit_id: String,
@@ -335,6 +369,25 @@ where
             ));
         }
         let route = DiffRoute::from_filters(filters, &self.relation, &schema);
+        if let (Some(registry), Some((from, to))) = (&self.read_interests, &self.interest_endpoints)
+        {
+            registry
+                .register(crate::hot_state::LogicalReadInterest::Diff {
+                    branch_id: self.active_branch_id.clone(),
+                    relation: self.relation.name.clone(),
+                    from: from.clone(),
+                    to: to.clone(),
+                    filter: route.request.filter.clone(),
+                    retain_payloads: route.request.retain_payloads,
+                    projected_columns: schema
+                        .fields()
+                        .iter()
+                        .map(|field| field.name().clone())
+                        .collect(),
+                    limit,
+                })
+                .map_err(lix_error_to_datafusion_error)?;
+        }
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
@@ -401,6 +454,7 @@ where
                     // resolution: the HOT epoch diff carries effective rows
                     // but not which side an inherited global row supplied, so
                     // provenance projections take the cold route.
+                    let mut root_backed_working = false;
                     let direct_candidates = if mode == DiffMode::WorkingHot {
                         let branch_id = active_branch_id.as_deref().ok_or_else(|| {
                             hot_only_diff_error(DataFusionError::Execution(
@@ -431,20 +485,34 @@ where
                                     .to_string(),
                             )));
                         }
-                        Some(
-                            TrackedHeadContext::new()
-                                .reader(store.clone())
-                                .working_diff_for_control(branch_id, control, &route.request)
-                                .await
-                                .map_err(lix_error_to_datafusion_error)
-                                .map_err(hot_only_diff_error)?
-                                .ok_or_else(|| {
-                                    hot_only_diff_error(DataFusionError::Execution(
-                                        "lix_diff certified HOT index is unavailable".to_string(),
-                                    ))
-                                })?
-                                .diff,
-                        )
+                        let tracked_head = TrackedHeadContext::new().reader(store.clone());
+                        root_backed_working = tracked_head
+                            .root_current_base_commit(branch_id, control.tracked_generation)
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?
+                            .is_some();
+                        if root_backed_working {
+                            // The local index contains only overlay edits, not
+                            // dirty rows inherited from the canonical base.
+                            // Preserve the routed schema/file/primary-key scope
+                            // and let native missing-input diagnostics hydrate it.
+                            None
+                        } else {
+                            Some(
+                                tracked_head
+                                    .working_diff_for_control(branch_id, control, &route.request)
+                                    .await
+                                    .map_err(lix_error_to_datafusion_error)
+                                    .map_err(hot_only_diff_error)?
+                                    .ok_or_else(|| {
+                                        hot_only_diff_error(DataFusionError::Execution(
+                                            "lix_diff certified HOT index is unavailable"
+                                                .to_string(),
+                                        ))
+                                    })?
+                                    .diff,
+                            )
+                        }
                     } else if !route.request.retain_payloads
                         && !needs_global_provenance
                         && generic_descriptors.as_ref().is_some_and(
@@ -481,15 +549,14 @@ where
                     } else {
                         None
                     };
-                    // Working diff may inspect exact checkpoint/head state to
-                    // render side columns, but it never asks generic diff to
-                    // replay commits. A sparse replica therefore either has
-                    // the locally installed endpoint snapshot or fails with a
-                    // HOT-unavailable error that cannot trigger history demand.
+                    // Full replicas require the certified local HOT index.
+                    // Root-backed replicas instead resolve canonical endpoint
+                    // inputs within the original native request scope.
                     let (from_descriptor, to_descriptor) =
                         if let Some(descriptors) = generic_descriptors {
                             descriptors
-                        } else if working_needs_endpoint_descriptors
+                        } else if root_backed_working
+                            || working_needs_endpoint_descriptors
                             || needs_global_provenance
                             || direct_candidates.as_ref().is_some_and(|diff| {
                                 diff.entries.iter().any(|entry| {
@@ -504,7 +571,11 @@ where
                                 ))
                             }
                             .await;
-                            descriptor_result.map_err(hot_only_diff_error)?
+                            if root_backed_working {
+                                descriptor_result?
+                            } else {
+                                descriptor_result.map_err(hot_only_diff_error)?
+                            }
                         } else {
                             (
                                 CommitStateDescriptor::default(),
@@ -522,11 +593,12 @@ where
                         needs_global_provenance,
                     )
                     .await;
-                    let (diff, from_global_rows, to_global_rows) = if mode == DiffMode::WorkingHot {
-                        effective_result.map_err(hot_only_diff_error)?
-                    } else {
-                        effective_result?
-                    };
+                    let (diff, from_global_rows, to_global_rows) =
+                        if mode == DiffMode::WorkingHot && !root_backed_working {
+                            effective_result.map_err(hot_only_diff_error)?
+                        } else {
+                            effective_result?
+                        };
                     if route.request.retain_payloads {
                         diff.validate_live_payloads()
                             .map_err(lix_error_to_datafusion_error)?;
@@ -552,7 +624,7 @@ where
                                 &to_descriptor,
                             )
                             .await;
-                            if mode == DiffMode::WorkingHot {
+                            if mode == DiffMode::WorkingHot && !root_backed_working {
                                 result.map_err(hot_only_diff_error)?
                             } else {
                                 result?
@@ -572,7 +644,7 @@ where
                                 &to_global_rows,
                             )
                             .await;
-                            if mode == DiffMode::WorkingHot {
+                            if mode == DiffMode::WorkingHot && !root_backed_working {
                                 result.map_err(hot_only_diff_error)?
                             } else {
                                 result?
@@ -801,9 +873,12 @@ async fn commit_state_descriptor(
         .map_err(lix_error_to_datafusion_error)?
         .map(|manifest| manifest.global_scope())
         .ok_or_else(|| {
-            lix_error_to_datafusion_error(crate::tracked_state::sync_history_required_for_commits(
-                &[commit_id],
-            ))
+            lix_error_to_datafusion_error(
+                crate::tracked_state::NativeMetadataRef::CommitStateHeader(commit_id.to_string())
+                    .annotate_missing(crate::tracked_state::sync_history_required_for_commits(&[
+                        commit_id,
+                    ])),
+            )
         })?;
     let node = crate::commit_graph::CommitGraphContext::new()
         .reader(store)
@@ -811,7 +886,13 @@ async fn commit_state_descriptor(
         .await
         .map_err(lix_error_to_datafusion_error)?
         .ok_or_else(|| {
-            DataFusionError::Execution(format!("commit '{commit_id}' does not exist"))
+            lix_error_to_datafusion_error(
+                crate::tracked_state::NativeMetadataRef::CommitGraphRecord(commit_id.to_string())
+                    .annotate_missing(crate::LixError::new(
+                        crate::LixError::CODE_INTERNAL_ERROR,
+                        format!("commit '{commit_id}' does not exist"),
+                    )),
+            )
         })?;
     Ok(CommitStateDescriptor {
         base_commit_id: node.base_commit_id,

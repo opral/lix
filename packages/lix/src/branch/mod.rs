@@ -19,3 +19,5 @@ pub(crate) use stage_rows::{
     branch_descriptor_tombstone_row,
 };
 pub(crate) use types::{BranchHead, BranchRefReader};
+
+pub(crate) use control::observe_branch_control_coordinate;

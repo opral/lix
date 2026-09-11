@@ -2054,7 +2054,10 @@ async fn load_nodes(
         .iter()
         .zip(values)
         .map(|(node_id, value)| {
-            let value = value.ok_or_else(|| directory_error("tree references a missing node"))?;
+            let value = value.ok_or_else(|| {
+                super::NativeObjectRef::MutationDirectoryNode(*node_id)
+                    .annotate_missing(directory_error("tree references a missing node"))
+            })?;
             let StorageProjectedValue::FullValue(bytes) = value else {
                 return Err(directory_error("node read omitted its value"));
             };
@@ -3699,4 +3702,12 @@ mod tests {
         .expect_err("content bytes must match their immutable node id");
         assert!(error.to_string().contains("content digest mismatch"));
     }
+}
+
+/// Verify the native domain-separated node identity without traversing children.
+pub(crate) fn validate_node_digest(expected: &[u8; 32], bytes: &[u8]) -> Result<(), LixError> {
+    if node_digest(bytes) != *expected {
+        return Err(directory_error("node content digest mismatch"));
+    }
+    decode_node(bytes).map(|_| ())
 }

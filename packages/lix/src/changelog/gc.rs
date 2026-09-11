@@ -91,6 +91,17 @@ where
     Ok(())
 }
 
+/// Retires a remotely owned branch-ref cache entry after its admitted control
+/// is superseded. Its absence is valid: admission transfers the control, not
+/// the authority's standalone changelog row. Locally authored refs must use
+/// `stage_delete_standalone_change`, which diagnoses a missing local fact.
+pub(crate) fn stage_delete_cached_standalone_change(
+    writes: &mut StorageWriteSet,
+    change_id: ChangeId,
+) {
+    writes.delete(CHANGE_SPACE, StorageKey(Bytes::from(change_key(change_id))));
+}
+
 /// Removes canonical commit projections in bulk.
 ///
 /// Only the whole-repository oracle collector reaches this: ordinary GC

@@ -65,6 +65,7 @@ struct RocksDBInner {
     db: DB,
     write_gate: WriteGate,
     sessions: StorageSessionGate,
+    partial_owner: lix::storage::StorageOwnerGate,
 }
 
 const BACKGROUND_MAINTENANCE_MAX_MUTATIONS: u64 = 4_096;
@@ -192,6 +193,14 @@ impl Storage for RocksDB {
             let _writer_permit = self.inner.write_gate.acquire(false).await;
             self.inner.sessions.acquire()
         }
+    }
+
+    async fn acquire_partial_replica_owner(
+        &self,
+        token: StorageSessionToken,
+    ) -> Result<lix::storage::StorageOwnerLease, StorageError> {
+        let _permit = self.inner.sessions.validate(Some(token))?;
+        self.inner.partial_owner.try_acquire()
     }
 
     fn begin_read(
@@ -918,6 +927,7 @@ fn open_shared_rocksdb(path: PathBuf) -> Result<Arc<RocksDBInner>, StorageError>
         db,
         write_gate: WriteGate::new(),
         sessions: StorageSessionGate::default(),
+        partial_owner: lix::storage::StorageOwnerGate::default(),
     });
     open_databases.insert(path, Arc::downgrade(&inner));
     Ok(inner)
@@ -1330,5 +1340,30 @@ impl WriteGate {
             drop(permit);
             tokio::task::yield_now().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod partial_owner_tests {
+    use super::*;
+    #[tokio::test]
+    async fn physical_database_handles_share_partial_owner_and_release_on_last_guard() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = RocksDB::open(directory.path()).unwrap();
+        let second = RocksDB::open(directory.path().join(".")).unwrap();
+        let token = first.acquire_session().await.unwrap();
+        let owner = first.acquire_partial_replica_owner(token).await.unwrap();
+        let child = owner.clone();
+        assert!(matches!(
+            second.acquire_partial_replica_owner(token).await,
+            Err(StorageError::InUse)
+        ));
+        drop(owner);
+        assert!(matches!(
+            second.acquire_partial_replica_owner(token).await,
+            Err(StorageError::InUse)
+        ));
+        drop(child);
+        let _next = second.acquire_partial_replica_owner(token).await.unwrap();
     }
 }

@@ -102,7 +102,7 @@ pub(crate) fn clear_validated_accounts_for_test() {
 mod tests {
     use super::*;
 
-    use crate::storage::{Storage, Memory};
+    use crate::storage::{Memory, Storage};
     use crate::storage_adapter::{StorageAdapter, StorageReadOptions};
     use crate::{Value, open_lix};
 
@@ -255,5 +255,106 @@ mod tests {
             !account_proven_active(Some(&token(0)), "account-a"),
             "the oldest entry must have been evicted"
         );
+    }
+}
+
+/// A sealed system operation: it may create one authenticated principal and
+/// cannot expose the reduced catalog to arbitrary SQL or transaction writes.
+#[derive(Clone, Debug)]
+pub(crate) struct AccountInsertion {
+    id: String,
+    params: [crate::Value; 3],
+}
+impl AccountInsertion {
+    pub(crate) const SQL: &'static str = "INSERT INTO lix_account (id, name, kind, status, lixcol_global, lixcol_untracked) VALUES ($1, $2, $3, 'active', true, false) ON CONFLICT (id) DO NOTHING";
+    pub(crate) fn new(id: &str, name: &str, kind: &str) -> Result<Self, LixError> {
+        if crate::storage_codec::id_string::uuid_bytes_from_canonical(id).is_none() {
+            return Err(LixError::new(
+                "LIX_INVALID_ACCOUNT_ID",
+                "account ID must be a canonical UUID",
+            ));
+        }
+        Ok(Self {
+            id: id.into(),
+            params: [
+                crate::Value::Text(id.into()),
+                crate::Value::Text(name.into()),
+                crate::Value::Text(kind.into()),
+            ],
+        })
+    }
+    pub(crate) fn params(&self) -> &[crate::Value] {
+        &self.params
+    }
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+    pub(crate) fn reject() -> LixError {
+        LixError::new(
+            "LIX_ACCOUNT_INSERTION_SCOPE",
+            "authenticated account preparation permits only its exact account insertion",
+        )
+    }
+    pub(crate) fn ensure_sql(&self, sql: &str, params: &[crate::Value]) -> Result<(), LixError> {
+        if sql != Self::SQL || params != self.params.as_slice() {
+            return Err(Self::reject());
+        }
+        Ok(())
+    }
+    pub(crate) fn ensure_typed_snapshot(&self, row: &lix_schema::Row) -> Result<(), LixError> {
+        let [
+            crate::Value::Text(_),
+            crate::Value::Text(name),
+            crate::Value::Text(kind),
+        ] = &self.params
+        else {
+            return Err(Self::reject());
+        };
+        let id = uuid::Uuid::parse_str(&self.id).map_err(|_| Self::reject())?;
+        if row.len() != 5
+            || row.get("id") != Some(&lix_schema::Value::Uuid(id))
+            || row.get("name") != Some(&lix_schema::Value::Text(name.clone()))
+            || row.get("kind") != Some(&lix_schema::Value::Text(kind.clone()))
+            || row.get("status") != Some(&lix_schema::Value::Text("active".into()))
+            || row.get("profile_uri") != Some(&lix_schema::Value::Null)
+        {
+            return Err(Self::reject().with_details(serde_json::json!({"stage":"typed_snapshot","columns":row.len(),"hasNullProfile":row.get("profile_uri")==Some(&lix_schema::Value::Null)})));
+        }
+        Ok(())
+    }
+    pub(crate) fn ensure_json_snapshot(&self, row: &serde_json::Value) -> Result<(), LixError> {
+        let [
+            crate::Value::Text(_),
+            crate::Value::Text(name),
+            crate::Value::Text(kind),
+        ] = &self.params
+        else {
+            return Err(Self::reject());
+        };
+        let Some(row) = row.as_object() else {
+            return Err(Self::reject());
+        };
+        if row.get("id").and_then(|v| v.as_str()) != Some(self.id.as_str())
+            || row.get("name").and_then(|v| v.as_str()) != Some(name.as_str())
+            || row.get("kind").and_then(|v| v.as_str()) != Some(kind.as_str())
+            || row.get("status").and_then(|v| v.as_str()) != Some("active")
+            || row.get("profile_uri").is_some_and(|v| !v.is_null())
+            || row.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "id" | "name" | "kind" | "status" | "profile_uri"
+                )
+            })
+        {
+            return Err(Self::reject()
+                .with_details(serde_json::json!({"stage":"json_snapshot","columns":row.len()})));
+        }
+        Ok(())
+    }
+    pub(crate) fn ensure_session(&self, branch: &str, account: &str) -> Result<(), LixError> {
+        if branch != crate::GLOBAL_BRANCH_ID || account != crate::SYSTEM_ACCOUNT_ID {
+            return Err(Self::reject());
+        }
+        Ok(())
     }
 }

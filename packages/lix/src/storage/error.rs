@@ -7,6 +7,8 @@ use crate::storage::{Key, KeyRange, StorageSpace, Support};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageError {
     Unsupported(Capability),
+    /// Another engine owns exclusive use of this physical storage.
+    InUse,
     InvalidKey,
     InvalidCursor,
     ReadExpired,
@@ -27,6 +29,7 @@ pub enum StorageError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Capability {
     StorageSessions,
+    PartialReplicaOwner,
     ChangeWatch,
     EnvelopeProjection,
     KeyOrderedPoints,
@@ -87,6 +90,7 @@ impl fmt::Display for StorageError {
             Self::Unsupported(capability) => {
                 write!(f, "unsupported capability: {capability:?}")
             }
+            Self::InUse => f.write_str("storage already has an active exclusive engine owner"),
             Self::InvalidKey => f.write_str("invalid key encoding"),
             Self::InvalidCursor => f.write_str("cursor is invalid for this read view"),
             Self::ReadExpired => f.write_str("read transaction is no longer valid"),

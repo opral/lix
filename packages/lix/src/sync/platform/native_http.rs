@@ -2,13 +2,13 @@
 
 use super::super::http::{
     HTTP_TIMEOUT, HttpSyncTransport, RawHttpClient, RawHttpRequest, RawHttpResponse,
-    SYNC_TRANSPORT_ERROR_CODE, response_too_large,
+    SYNC_TRANSPORT_ERROR_CODE, response_too_large_limit,
 };
 use crate::LixError;
 use crate::authority_client::{
     ProtocolByteStream, ProtocolHttp, ProtocolHttpRequest, ProtocolHttpResponse, ProtocolHttpStream,
 };
-use crate::sync::{MAX_SYNC_PULL_RESPONSE_BYTES, SyncTransportFuture};
+use crate::sync::SyncTransportFuture;
 use bytes::Bytes;
 use std::future::Future;
 use std::pin::Pin;
@@ -243,9 +243,12 @@ impl RawHttpClient for reqwest::Client {
                 .unwrap_or_default();
             if response
                 .content_length()
-                .is_some_and(|length| length > MAX_SYNC_PULL_RESPONSE_BYTES as u64)
+                .is_some_and(|length| length > request.response_limit as u64)
             {
-                return Err(response_too_large(request.operation));
+                return Err(response_too_large_limit(
+                    request.operation,
+                    request.response_limit,
+                ));
             }
             let mut body = Vec::new();
             while let Some(chunk) = response
@@ -253,8 +256,11 @@ impl RawHttpClient for reqwest::Client {
                 .await
                 .map_err(|error| transport_error(request.operation, error))?
             {
-                if body.len().saturating_add(chunk.len()) > MAX_SYNC_PULL_RESPONSE_BYTES {
-                    return Err(response_too_large(request.operation));
+                if body.len().saturating_add(chunk.len()) > request.response_limit {
+                    return Err(response_too_large_limit(
+                        request.operation,
+                        request.response_limit,
+                    ));
                 }
                 body.extend_from_slice(&chunk);
             }
@@ -269,4 +275,52 @@ impl RawHttpClient for reqwest::Client {
 
 fn transport_error(operation: &str, error: impl std::fmt::Display) -> LixError {
     LixError::new(SYNC_TRANSPORT_ERROR_CODE, format!("{operation}: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[tokio::test]
+    async fn native_receive_limit_rejects_chunked_body_without_content_length() {
+        for (limit, succeeds) in [(4, false), (6, true)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(HTTP_TIMEOUT)).unwrap();
+                let mut received = Vec::new();
+                let mut buffer = [0; 1024];
+                while !received.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let count = socket.read(&mut buffer).unwrap();
+                    assert!(count > 0, "client closed before request headers");
+                    received.extend_from_slice(&buffer[..count]);
+                }
+                socket.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n").unwrap();
+            });
+            let client = build_client(&[]).unwrap();
+            let result = RawHttpClient::send(
+                &client,
+                RawHttpRequest {
+                    method: http::Method::GET,
+                    url: format!("http://{address}/native-limit"),
+                    headers: Vec::new(),
+                    body: None,
+                    cache_immutable: false,
+                    response_limit: limit,
+                    operation: "native receive limit fixture",
+                },
+            )
+            .await;
+            server.join().unwrap();
+            if succeeds {
+                assert_eq!(result.unwrap().body, b"abcdef");
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+                assert!(error.message.contains("exceeds 4 bytes"));
+            }
+        }
+    }
 }

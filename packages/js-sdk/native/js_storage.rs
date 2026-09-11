@@ -26,6 +26,19 @@ extern "C" {
     #[wasm_bindgen(method, js_name = acquireSession)]
     fn acquire_storage_session(this: &JsStorageProvider) -> js_sys::Promise;
 
+    #[wasm_bindgen(method, catch, js_name = acquirePartialReplicaOwner)]
+    fn acquire_partial_owner(
+        this: &JsStorageProvider,
+        token: &str,
+    ) -> Result<JsPartialOwnerHandle, JsValue>;
+
+    #[derive(Clone)]
+    type JsPartialOwnerHandle;
+    #[wasm_bindgen(method, getter, catch)]
+    fn ready(this: &JsPartialOwnerHandle) -> Result<js_sys::Promise, JsValue>;
+    #[wasm_bindgen(method)]
+    fn close(this: &JsPartialOwnerHandle);
+
     #[wasm_bindgen(method, js_name = beginWrite)]
     fn begin_write(this: &JsStorageProvider, options: JsValue) -> js_sys::Promise;
 
@@ -106,6 +119,16 @@ struct SendScan(JsStorageScanHandle);
 struct SendWrite(JsStorageWriteHandle);
 
 struct SendChangeWatch(JsStorageChangeWatchHandle);
+// Like other provider handles this never crosses the dedicated browser worker.
+struct SendPartialOwner(JsPartialOwnerHandle);
+unsafe impl Send for SendPartialOwner {}
+unsafe impl Sync for SendPartialOwner {}
+impl lix::storage::StorageOwnerGuard for SendPartialOwner {}
+impl Drop for SendPartialOwner {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
 
 // Browser WASM and every imported provider run on one dedicated worker. The
 // engine traits retain Send/Sync so native adapters can use multithreaded
@@ -370,6 +393,31 @@ impl Storage for JsStorage {
                 "JS storage acquireSession returned an invalid session token".to_string(),
             )
         })
+    }
+
+    async fn acquire_partial_replica_owner(
+        &self,
+        token: StorageSessionToken,
+    ) -> Result<lix::storage::StorageOwnerLease, StorageError> {
+        let method = js_sys::Reflect::get(
+            self.provider.0.as_ref(),
+            &JsValue::from_str("acquirePartialReplicaOwner"),
+        )
+        .map_err(storage_error)?;
+        if !method.is_function() {
+            return Err(StorageError::Unsupported(Capability::PartialReplicaOwner));
+        }
+        // No await occurs until the cancellation-owned guard is constructed.
+        let guard = SendPartialOwner(
+            self.provider
+                .0
+                .acquire_partial_owner(&token.to_decimal_string())
+                .map_err(storage_error)?,
+        );
+        SendJsFuture(JsFuture::from(guard.0.ready().map_err(storage_error)?))
+            .await
+            .map_err(storage_error)?;
+        Ok(lix::storage::StorageOwnerLease::from_guard(guard))
     }
 
     async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
@@ -767,6 +815,7 @@ fn storage_error(error: JsValue) -> StorageError {
         Some("LIX_STORAGE_READ_EXPIRED") => StorageError::ReadExpired,
         Some("LIX_STORAGE_WRITE_CONFLICT") => StorageError::WriteConflict,
         Some("LIX_STORAGE_DURABILITY") => StorageError::Durability,
+        Some("LIX_STORAGE_IN_USE") => StorageError::InUse,
         Some("LIX_STORAGE_FENCED") => StorageError::Fenced,
         Some("LIX_STORAGE_CLOSED") => StorageError::Closed(message),
         Some("LIX_STORAGE_COMMIT_OUTCOME_UNKNOWN") => StorageError::CommitOutcomeUnknown(message),
@@ -818,6 +867,7 @@ fn capability_from_error(error: &JsValue) -> Option<Capability> {
         "idempotentCommit" => Some(Capability::IdempotentCommit),
         "predicatePushdown" => Some(Capability::PredicatePushdown),
         "parallelPartitions" => Some(Capability::ParallelPartitions),
+        "partialReplicaOwner" => Some(Capability::PartialReplicaOwner),
         "storageSessions" => Some(Capability::StorageSessions),
         _ => None,
     }

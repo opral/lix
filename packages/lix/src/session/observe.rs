@@ -327,9 +327,10 @@ where
             // operations — taking it while holding this observation's own
             // guard would self-deadlock.
             session.refresh_active_branch_base_if_stale().await?;
-            let operation_guard = session.begin_waitable_session_operation().await?;
+            // The SQL route owns its admission through result consumption.
+            // A second outer read lease would deadlock behind a queued
+            // publication writer when the inner route acquires its lease.
             let rows = Box::pin(session.execute_for_observe(sql, params)).await;
-            drop(operation_guard);
             match rows {
                 Err(error) => retry.hydrate_for_retry(sync_demand_tx, error).await?,
                 result => return result,

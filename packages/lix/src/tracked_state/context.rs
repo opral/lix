@@ -1107,7 +1107,7 @@ where
         if row_pks.is_empty() {
             return Ok(Vec::new());
         }
-        let manifest = storage::load_commit_state_manifest(&self.store, commit_id)
+        let manifest = storage::load_published_commit_state_topology(&self.store, commit_id)
             .await?
             .ok_or_else(|| {
                 LixError::new(
@@ -1115,10 +1115,9 @@ where
                     format!("commit '{commit_id}' has no commit-state manifest"),
                 )
             })?;
-        let Some(root) = manifest.row_pk_index_root_id.as_ref() else {
-            if manifest
-                .snapshot_root
-                .as_ref()
+        let Some(root) = manifest.row_pk_index_root_id() else {
+            if storage::load_manifest_snapshot_commit_root(&self.store, commit_id)
+                .await?
                 .is_some_and(|root| root.row_count_estimate == 0)
             {
                 return Ok(Vec::new());
@@ -1179,7 +1178,40 @@ where
             } else {
                 crate::storage_bench::record_tracked_scan_exact_keys();
             }
-            let mut entries = if bounded_tree_page
+            let mut entries = if let Some(root_id) = durable_root.as_ref()
+                && request.limit != Some(0)
+                && !tree_request.schema_keys.is_empty()
+                && !tree_request.row_pks.is_empty()
+                && !request_has_exact_keys(&tree_request)
+            {
+                // A finite primary-key predicate with an unspecified file scope
+                // must discover its correlated identities from the row-PK index.
+                // Scanning the schema's primary tree demands unrelated rows and
+                // breaks offline UPDATE after a successful point SELECT.
+                let mut keys = Vec::new();
+                let typed_commit_id = CommitId::parse_lix(commit_id, "row-PK scan commit_id")?;
+                for schema_key in &tree_request.schema_keys {
+                    keys.extend(
+                        self.enumerate_schema_row_pk_keys_at_commit(
+                            typed_commit_id,
+                            schema_key,
+                            &tree_request.row_pks,
+                        )
+                        .await?,
+                    );
+                }
+                keys.sort();
+                keys.dedup();
+                if let Some(after) = exclusive_after {
+                    keys.retain(|key| key > after);
+                }
+                let values = self.tree.get_many(&self.store, root_id, &keys).await?;
+                keys.into_iter()
+                    .zip(values)
+                    .filter_map(|(key, value)| value.map(|value| (key, value)))
+                    .filter(|(key, value)| tree_request.matches(key, value))
+                    .collect()
+            } else if bounded_tree_page
                 && !request_has_exact_keys(&tree_request)
                 && let Some(root_id) = durable_root.as_ref()
             {
@@ -2200,9 +2232,9 @@ where
             })
             .await?;
         let Some(_) = batch.into_iter().next().and_then(|(_, value)| value) else {
-            return Err(LixError::unknown(format!(
+            return Err(super::NativeMetadataRef::CommitGraphRecord(commit_id.to_owned()).annotate_missing(LixError::unknown(format!(
                 "changelog commit '{commit_id}' is missing while validating tracked-state commit-root rows"
-            )));
+            ))));
         };
         let topology =
             match storage::load_published_commit_state_topology(&self.store, commit_id_typed)
@@ -2327,9 +2359,9 @@ where
             })
             .await?;
         let Some(entry) = batch.into_iter().next().and_then(|(_, value)| value) else {
-            return Err(LixError::unknown(format!(
+            return Err(super::NativeMetadataRef::CommitGraphRecord(commit_id.to_owned()).annotate_missing(LixError::unknown(format!(
                 "changelog commit '{commit_id}' is missing while validating tracked-state commit-root metadata"
-            )));
+            ))));
         };
         let record = entry;
         let parent_id = record.parent_commit_ids.first().copied();
@@ -9138,6 +9170,12 @@ mod tests {
             error.message.contains("missing from owning commit"),
             "unexpected error: {error}"
         );
+        assert!(
+            crate::tracked_state::NativeMetadataRef::from_missing_error(&error)
+                .unwrap()
+                .is_none(),
+            "present but incomplete authority is corruption, not a native fetch demand"
+        );
         let details = error
             .details
             .as_ref()
@@ -10956,6 +10994,99 @@ mod tests {
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .expect("stale root overwrite should commit");
+    }
+
+    #[tokio::test]
+    async fn finite_row_pk_scan_preserves_file_identity_tombstones_and_pages() {
+        let storage = StorageAdapter::new(Memory::new());
+        let context = TrackedStateContext::new();
+        let mut rows = vec![
+            row("shared", "none", "initial"),
+            row("shared", "a", "initial"),
+            row("shared", "b", "initial"),
+            row("deleted", "deleted", "initial"),
+            row("unrelated", "other", "initial"),
+        ];
+        rows[1].file_id = Some("01920000-0000-7000-8000-000000000001".into());
+        rows[2].file_id = Some("01920000-0000-7000-8000-000000000002".into());
+        rows[3].deleted = true;
+        rows[3].snapshot_content = None;
+        write_root_for_test(&storage, &context, "initial", None, &rows)
+            .await
+            .unwrap();
+        let mut reader = context.reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .unwrap(),
+        );
+        let mut request = test_schema_scan_request();
+        request.filter.row_pks = vec![
+            RowPk::single("shared"),
+            RowPk::single("absent"),
+            RowPk::single("deleted"),
+        ];
+        let found = reader
+            .scan_batch_at_commit("initial", &request)
+            .await
+            .unwrap()
+            .into_rows();
+        assert_eq!(found.len(), 3);
+        assert!(
+            found
+                .iter()
+                .all(|row| row.row_pk == RowPk::single("shared") && !row.deleted)
+        );
+        assert_eq!(
+            found
+                .iter()
+                .map(|row| row.file_id.clone())
+                .collect::<BTreeSet<_>>(),
+            rows[..3].iter().map(|row| row.file_id.clone()).collect()
+        );
+        request.filter.include_tombstones = true;
+        let all = reader
+            .scan_batch_at_commit("initial", &request)
+            .await
+            .unwrap()
+            .into_rows();
+        assert_eq!(all.len(), 4);
+        assert_eq!(all.iter().filter(|row| row.deleted).count(), 1);
+        let identity = |row: &MaterializedTrackedStateRow| TrackedStateKey {
+            schema_key: row.schema_key.clone(),
+            file_id: row.file_id.clone(),
+            row_pk: row.row_pk.clone(),
+        };
+        let expected = all.iter().map(identity).collect::<Vec<_>>();
+        let mut sorted = expected.clone();
+        sorted.sort();
+        assert_eq!(expected, sorted);
+        request.limit = Some(0);
+        assert!(
+            reader
+                .scan_batch_at_commit_page("initial", &request, None)
+                .await
+                .unwrap()
+                .into_rows()
+                .is_empty()
+        );
+        request.limit = Some(1);
+        let mut after = None;
+        let mut paged = Vec::new();
+        loop {
+            let page = reader
+                .scan_batch_at_commit_page("initial", &request, after.as_ref())
+                .await
+                .unwrap()
+                .into_rows();
+            assert!(page.len() <= 1);
+            let Some(row) = page.first() else { break };
+            let key = identity(row);
+            assert!(after.as_ref().is_none_or(|after| after < &key));
+            after = Some(key.clone());
+            paged.push(key);
+        }
+        assert_eq!(paged, expected);
     }
 
     fn test_schema_scan_request() -> TrackedStateScanRequest {

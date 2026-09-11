@@ -662,9 +662,12 @@ async fn commit_state_descriptor<S: StorageAdapterRead + Clone>(
         .await
         .map_err(lix_error_to_datafusion_error)?
         .ok_or_else(|| {
-            lix_error_to_datafusion_error(crate::tracked_state::sync_history_required_for_commits(
-                &[commit_id],
-            ))
+            lix_error_to_datafusion_error(
+                crate::tracked_state::NativeMetadataRef::CommitStateHeader(commit_id.to_string())
+                    .annotate_missing(crate::tracked_state::sync_history_required_for_commits(&[
+                        commit_id,
+                    ])),
+            )
         })?;
     let node = crate::commit_graph::CommitGraphContext::new()
         .reader(store)
@@ -672,7 +675,13 @@ async fn commit_state_descriptor<S: StorageAdapterRead + Clone>(
         .await
         .map_err(lix_error_to_datafusion_error)?
         .ok_or_else(|| {
-            DataFusionError::Execution(format!("commit '{commit_id}' does not exist"))
+            lix_error_to_datafusion_error(
+                crate::tracked_state::NativeMetadataRef::CommitGraphRecord(commit_id.to_string())
+                    .annotate_missing(crate::LixError::new(
+                        crate::LixError::CODE_INTERNAL_ERROR,
+                        format!("commit '{commit_id}' does not exist"),
+                    )),
+            )
         })?;
     Ok(CommitStateDescriptor {
         base_commit_id: node.base_commit_id,

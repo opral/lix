@@ -36,6 +36,7 @@ import { FilesystemStorage } from "@lix-js/storage-filesystem";
 const lix = await openLix({
   storage: new FilesystemStorage({ path: "./project" }),
   server: {
+    mode: "partial_replica",
     url: "https://lixray.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
   },
 });

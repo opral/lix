@@ -12,10 +12,9 @@ use crate::storage_adapter::Storage;
 use crate::{Lix, LixError};
 
 use super::SyncPushRequest;
-use super::platform::{HttpSyncTransport, SyncTask, sleep, spawn_sync_task};
+use super::platform::{SyncTask, sleep};
 use super::{SyncRepositoryPullResponse, SyncTransport};
 
-const SYNC_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const SYNC_MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 const SYNC_RESPONSE_TOO_LARGE_CODE: &str = "LIX_ERROR_SYNC_RESPONSE_TOO_LARGE";
 const SYNC_REQUEST_TOO_LARGE_CODE: &str = "LIX_ERROR_REQUEST_BODY_TOO_LARGE";
@@ -30,22 +29,22 @@ const SYNC_DEMAND_FETCH_CONCURRENCY: usize = 6;
 
 #[derive(Debug)]
 pub(crate) struct SyncRuntime {
-    shutdown_tx: tokio::sync::watch::Sender<SyncShutdown>,
+    pub(super) shutdown_tx: tokio::sync::watch::Sender<SyncShutdown>,
     pub(crate) demand_tx: tokio::sync::mpsc::Sender<SyncDemand>,
-    completion_rx: Mutex<Option<tokio::sync::oneshot::Receiver<Result<(), LixError>>>>,
-    task: SyncTask,
+    pub(super) completion_rx: Mutex<Option<tokio::sync::oneshot::Receiver<Result<(), LixError>>>>,
+    pub(super) task: SyncTask,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SyncShutdown {
+pub(super) enum SyncShutdown {
     Running,
     Stop,
 }
 
 #[derive(Debug)]
 pub(crate) struct SyncDemand {
-    request: SyncDemandRequest,
-    response: tokio::sync::oneshot::Sender<Result<(), LixError>>,
+    pub(super) request: SyncDemandRequest,
+    pub(super) response: tokio::sync::oneshot::Sender<Result<(), LixError>>,
 }
 
 #[cfg(test)]
@@ -59,8 +58,12 @@ impl SyncDemand {
     }
 }
 
-#[derive(Debug)]
-enum SyncDemandRequest {
+#[derive(Clone, Debug)]
+pub(super) enum SyncDemandRequest {
+    BlobManifest(crate::binary_cas::BlobId, LixError),
+    NativeObject(crate::tracked_state::NativeObjectRef, LixError),
+    NativeObjects(Vec<crate::tracked_state::NativeObjectRef>, LixError),
+    NativeMetadata(crate::tracked_state::NativeMetadataRef, LixError),
     History(Vec<String>),
     Chunks(Vec<String>),
     #[cfg(test)]
@@ -291,7 +294,26 @@ impl SyncRuntime {
     }
 }
 
+fn demand_replay_is_forbidden(error: &LixError) -> bool {
+    error.code == LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
+        || error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("nonRetryableAfterCommit"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        || error
+            .details
+            .as_ref()
+            .and_then(|details| details.get("nonRetryableAfterExecution"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+}
+
 fn sync_demand_request_for_error(error: &LixError) -> Result<Option<SyncDemandRequest>, LixError> {
+    if demand_replay_is_forbidden(error) {
+        return Ok(None);
+    }
     let (field, context, constructor): (_, _, fn(Vec<String>) -> _) = match error.code.as_str() {
         "LIX_SYNC_HISTORY_REQUIRED" => ("commitIds", "history", SyncDemandRequest::History),
         "LIX_SYNC_CHUNKS_REQUIRED" => ("chunkIds", "chunk", SyncDemandRequest::Chunks),
@@ -343,6 +365,53 @@ fn sync_demand_request_for_error(error: &LixError) -> Result<Option<SyncDemandRe
     Ok(Some(constructor(ids)))
 }
 
+/// Preserve the original error so a full replica never treats an unexpected
+/// native hole as permission to heal corruption from the authority.
+pub(super) fn native_sync_demand_request_for_error(
+    error: &LixError,
+) -> Result<Option<SyncDemandRequest>, LixError> {
+    if demand_replay_is_forbidden(error) {
+        return Ok(None);
+    }
+    if let Some(crate::binary_cas::BlobManifestRequired(hash)) =
+        crate::binary_cas::BlobManifestRequired::from_error(error)?
+    {
+        return Ok(Some(SyncDemandRequest::BlobManifest(hash, error.clone())));
+    }
+    if let Some(addresses) = crate::tracked_state::NativeObjectRef::batch_from_missing_error(error)?
+    {
+        return Ok(Some(SyncDemandRequest::NativeObjects(
+            addresses,
+            error.clone(),
+        )));
+    }
+    if let Some(address) = crate::tracked_state::NativeObjectRef::from_missing_error(error)? {
+        return Ok(Some(SyncDemandRequest::NativeObject(
+            address,
+            error.clone(),
+        )));
+    }
+    if let Some(address) = crate::tracked_state::NativeMetadataRef::from_missing_error(error)? {
+        return Ok(Some(SyncDemandRequest::NativeMetadata(
+            address,
+            error.clone(),
+        )));
+    }
+    sync_demand_request_for_error(error)
+}
+
+fn full_replica_demand(request: SyncDemandRequest) -> Result<SyncDemandRequest, LixError> {
+    match request {
+        SyncDemandRequest::NativeObject(_, error)
+        | SyncDemandRequest::NativeObjects(_, error)
+        | SyncDemandRequest::NativeMetadata(_, error)
+        | SyncDemandRequest::BlobManifest(_, error) => {
+            sync_demand_request_for_error(&error)?.ok_or(error)
+        }
+        request => Ok(request),
+    }
+}
+
 async fn send_sync_demand(
     demand_tx: &tokio::sync::mpsc::Sender<SyncDemand>,
     request: SyncDemandRequest,
@@ -372,7 +441,10 @@ pub(crate) struct SyncDemandRetry {
 
 impl SyncDemandRetry {
     fn admit(&mut self, error: LixError) -> Result<SyncDemandRequest, LixError> {
-        let Some(request) = sync_demand_request_for_error(&error)? else {
+        if demand_replay_is_forbidden(&error) {
+            return Err(error);
+        }
+        let Some(request) = native_sync_demand_request_for_error(&error)? else {
             return Err(error);
         };
         let identity = format!(
@@ -406,258 +478,6 @@ impl Drop for SyncRuntime {
     fn drop(&mut self) {
         self.stop();
     }
-}
-
-pub(crate) async fn activate_sync_mode<StorageImpl>(
-    lix: &mut Lix<StorageImpl>,
-    server: &crate::ServerOptions,
-    initial_transport: Option<HttpSyncTransport>,
-) -> Result<Arc<SyncRuntime>, LixError>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    let remote_id = server.url.clone();
-    let headers = server.headers.clone();
-    if let Some(transport) = initial_transport.as_ref() {
-        validate_connected_authority(
-            lix,
-            &remote_id,
-            transport.lix_id(),
-            transport.active_account_id(),
-        )
-        .await?;
-    }
-    lix.set_sync_replica_remote_id(&remote_id)?;
-    lix.storage_adapter().admit_sync_replica_writer();
-    lix.set_sync_role(crate::sync::SyncRole::Replica)?;
-
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(SyncShutdown::Running);
-    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-    let (demand_tx, demand_rx) = tokio::sync::mpsc::channel(64);
-    let worker_lix = lix
-        .open_internal_session(lix.active_branch_id().await?, lix.active_account_id())
-        .await?;
-    let task = spawn_sync_task(async move {
-        let result = run_sync_worker(
-            worker_lix,
-            remote_id,
-            headers,
-            initial_transport,
-            shutdown_rx,
-            demand_rx,
-        )
-        .await;
-        let _ = completion_tx.send(result);
-    })?;
-
-    Ok(Arc::new(SyncRuntime {
-        shutdown_tx,
-        demand_tx,
-        completion_rx: Mutex::new(Some(completion_rx)),
-        task,
-    }))
-}
-
-/// Shared bootstrap, durable upload, certified pull, demand, and retry policy.
-///
-/// Platform adapters supply only task spawning, timers, HTTP, and cancellation.
-async fn run_sync_worker<StorageImpl>(
-    lix: Lix<StorageImpl>,
-    remote_id: String,
-    headers: Vec<(String, String)>,
-    mut transport: Option<HttpSyncTransport>,
-    mut shutdown_rx: tokio::sync::watch::Receiver<SyncShutdown>,
-    mut demand_rx: tokio::sync::mpsc::Receiver<SyncDemand>,
-) -> Result<(), LixError>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
-    let mut retry_backoff = SYNC_RETRY_INITIAL_BACKOFF;
-    let mut delta_pull_limit = super::MAX_SYNC_REQUEST_ITEMS;
-    let mut push_item_limit = super::MAX_SYNC_REQUEST_ITEMS;
-    let mut change_watcher = lix.sync_mode_state().change_watcher();
-    let mut internal_demand_retry = SyncDemandRetry::default();
-    let mut pending_demands = Vec::new();
-    let mut upload_plan = None;
-
-    let mut terminal_error = None;
-    while *shutdown_rx.borrow() == SyncShutdown::Running {
-        if transport.is_none() {
-            let connected = {
-                let connect = HttpSyncTransport::connect(&remote_id, &headers).fuse();
-                let shutdown = shutdown_rx.changed().fuse();
-                futures_util::pin_mut!(connect, shutdown);
-                select_biased! {
-                    _ = shutdown => break,
-                    connected = connect => connected,
-                }
-            };
-            match connected {
-                Ok(connected) => {
-                    let validation = {
-                        let validation = validate_connected_authority(
-                            &lix,
-                            &remote_id,
-                            connected.lix_id(),
-                            connected.active_account_id(),
-                        )
-                        .fuse();
-                        let shutdown = shutdown_rx.changed().fuse();
-                        futures_util::pin_mut!(validation, shutdown);
-                        select_biased! {
-                            _ = shutdown => break,
-                            result = validation => result,
-                        }
-                    };
-                    if let Err(error) = validation {
-                        // Validation reads the local receipt. Exhausting its
-                        // bounded coherent-read retry budget is not evidence
-                        // that the remote identity or account changed.
-                        {
-                            let close = connected.close_session().fuse();
-                            let shutdown = shutdown_rx.changed().fuse();
-                            futures_util::pin_mut!(close, shutdown);
-                            select_biased! {
-                                _ = shutdown => break,
-                                _ = close => {},
-                            }
-                        }
-                        if is_retryable_authority_validation_error(&error) {
-                            tracing::warn!(error = ?error, "sync authority validation read expired");
-                            if !wait_for_sync_retry(&mut retry_backoff, &mut shutdown_rx).await {
-                                break;
-                            }
-                            continue;
-                        }
-                        tracing::error!(error = ?error, "sync authority identity changed");
-                        lix.fail_observers_for_sync(error.clone());
-                        terminal_error = Some(error);
-                        break;
-                    }
-                    transport = Some(connected);
-                }
-                Err(error) => {
-                    if is_terminal_sync_error(&error) {
-                        tracing::error!(error = ?error, "sync repository cannot connect");
-                        lix.fail_observers_for_sync(error.clone());
-                        terminal_error = Some(error);
-                        break;
-                    }
-                    tracing::warn!(error = ?error, "sync reconnect failed");
-                    if !wait_for_sync_retry(&mut retry_backoff, &mut shutdown_rx).await {
-                        break;
-                    }
-                    continue;
-                }
-            }
-        }
-
-        let Some(current) = transport.as_ref() else {
-            continue;
-        };
-        // This outer race covers every phase, including connect and certified
-        // pull. Dropping an in-flight transport future invokes the
-        // adapter's cancellation mechanism.
-        let result = {
-            let iteration = sync_iteration(
-                &lix,
-                &remote_id,
-                current,
-                &mut push_item_limit,
-                &mut delta_pull_limit,
-                &mut change_watcher,
-                &mut demand_rx,
-                &mut pending_demands,
-                &mut upload_plan,
-            )
-            .fuse();
-            let shutdown = shutdown_rx.changed().fuse();
-            futures_util::pin_mut!(iteration, shutdown);
-            select_biased! {
-                _ = shutdown => break,
-                result = iteration => result,
-            }
-        };
-        match result {
-            Ok(()) => {
-                internal_demand_retry = SyncDemandRetry::default();
-                retry_backoff = SYNC_RETRY_INITIAL_BACKOFF;
-            }
-            Err(error) => {
-                let error = match internal_demand_retry.admit(error) {
-                    Ok(request) => {
-                        let result = {
-                            let hydration = async {
-                                match request {
-                                    SyncDemandRequest::History(ids) => {
-                                        hydrate_history_ids(
-                                            &lix,
-                                            current,
-                                            ids.into_iter().collect(),
-                                        )
-                                        .await
-                                    }
-                                    SyncDemandRequest::Chunks(ids) => {
-                                        hydrate_chunk_ids(&lix, current, ids.into_iter().collect())
-                                            .await
-                                    }
-                                    #[cfg(test)]
-                                    SyncDemandRequest::PublicationBarrier => Ok(()),
-                                }
-                            }
-                            .fuse();
-                            let shutdown = shutdown_rx.changed().fuse();
-                            futures_util::pin_mut!(hydration, shutdown);
-                            select_biased! {
-                                _ = shutdown => None,
-                                result = hydration => Some(result),
-                            }
-                        };
-                        let Some(result) = result else {
-                            break;
-                        };
-                        match result {
-                            Ok(()) => {
-                                retry_backoff = SYNC_RETRY_INITIAL_BACKOFF;
-                                continue;
-                            }
-                            Err(error) => error,
-                        }
-                    }
-                    Err(error) => error,
-                };
-                internal_demand_retry = SyncDemandRetry::default();
-                if is_terminal_sync_error(&error) {
-                    tracing::error!(error = ?error, "sync repository cannot make progress");
-                    lix.fail_observers_for_sync(error.clone());
-                    terminal_error = Some(error);
-                    break;
-                }
-                if retry_sync_iteration_without_reconnect(&error) {
-                    tracing::debug!(
-                        error = ?error,
-                        "sync publication raced another local storage client"
-                    );
-                    if !wait_for_sync_retry(&mut retry_backoff, &mut shutdown_rx).await {
-                        break;
-                    }
-                    continue;
-                }
-                tracing::warn!(error = ?error, "sync repository iteration failed");
-                transport = None;
-                if !wait_for_sync_retry(&mut retry_backoff, &mut shutdown_rx).await {
-                    break;
-                }
-            }
-        }
-    }
-    // Local commits and their refs are a durable outbox. Close cancels network
-    // work promptly; a warm reopen resumes any unacknowledged suffix.
-    let result = terminal_error.map_or(Ok(()), Err);
-    drop(pending_demands);
-    drop(demand_rx);
-    let close_result = lix.close().await;
-    result.and(close_result)
 }
 
 async fn validate_connected_authority<StorageImpl>(
@@ -1124,6 +944,19 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
     Transport: SyncTransport,
 {
+    let demands = demands
+        .into_iter()
+        .filter_map(|demand| match full_replica_demand(demand.request) {
+            Ok(request) => Some(SyncDemand {
+                request,
+                response: demand.response,
+            }),
+            Err(error) => {
+                let _ = demand.response.send(Err(error));
+                None
+            }
+        })
+        .collect::<Vec<_>>();
     let mut history_ids = BTreeSet::new();
     let mut chunk_ids = BTreeSet::new();
     #[cfg(test)]
@@ -1132,6 +965,10 @@ where
         .any(|demand| matches!(&demand.request, SyncDemandRequest::PublicationBarrier));
     for demand in &demands {
         match &demand.request {
+            SyncDemandRequest::NativeObject(_, _)
+            | SyncDemandRequest::NativeObjects(_, _)
+            | SyncDemandRequest::NativeMetadata(_, _)
+            | SyncDemandRequest::BlobManifest(_, _) => {}
             SyncDemandRequest::History(ids) => history_ids.extend(ids),
             SyncDemandRequest::Chunks(ids) => chunk_ids.extend(ids),
             #[cfg(test)]
@@ -1174,6 +1011,10 @@ fn resolve_sync_demand_results(
             continue;
         }
         let result = match &demand.request {
+            SyncDemandRequest::NativeObject(_, error)
+            | SyncDemandRequest::NativeObjects(_, error)
+            | SyncDemandRequest::NativeMetadata(_, error)
+            | SyncDemandRequest::BlobManifest(_, error) => Err(error.clone()),
             SyncDemandRequest::History(_) => history_result.clone(),
             SyncDemandRequest::Chunks(_) => chunk_result.clone(),
             #[cfg(test)]
@@ -1747,6 +1588,10 @@ where
     Transport: SyncTransport,
 {
     match sync_demand_request_for_error(&error)? {
+        Some(SyncDemandRequest::NativeObject(_, original))
+        | Some(SyncDemandRequest::NativeObjects(_, original))
+        | Some(SyncDemandRequest::NativeMetadata(_, original))
+        | Some(SyncDemandRequest::BlobManifest(_, original)) => Err(original),
         Some(SyncDemandRequest::History(ids)) => {
             hydrate_history_ids(lix, transport, ids.into_iter().collect()).await
         }
@@ -2015,27 +1860,6 @@ fn validate_delta_after(
     Ok(*cursor)
 }
 
-async fn wait_for_sync_retry(
-    retry_backoff: &mut Duration,
-    shutdown_rx: &mut tokio::sync::watch::Receiver<SyncShutdown>,
-) -> bool {
-    if *shutdown_rx.borrow() != SyncShutdown::Running {
-        return false;
-    }
-    let timer = sleep(*retry_backoff).fuse();
-    let changed = shutdown_rx.changed().fuse();
-    futures_util::pin_mut!(timer, changed);
-    let elapsed = select_biased! {
-        _ = changed => false,
-        _ = timer => true,
-    };
-    if !elapsed {
-        return false;
-    }
-    *retry_backoff = next_backoff(*retry_backoff);
-    true
-}
-
 fn next_backoff(current: Duration) -> Duration {
     current
         .checked_mul(2)
@@ -2043,13 +1867,41 @@ fn next_backoff(current: Duration) -> Duration {
         .min(SYNC_MAX_RETRY_BACKOFF)
 }
 
-fn stopped_error() -> LixError {
+pub(super) fn stopped_error() -> LixError {
     LixError::new(LixError::CODE_CLOSED, "sync worker is stopping")
 }
 
 #[cfg(test)]
 mod tests {
     mod reconnect_validation_tests;
+
+    #[test]
+    fn committed_or_uncertain_operations_never_become_native_or_legacy_demands() {
+        let id = "00000000-0000-7000-8000-000000003001";
+        for error in [
+            LixError::new("LIX_SYNC_HISTORY_REQUIRED", "after commit").with_details(
+                serde_json::json!({"commitIds":[id], "nonRetryableAfterCommit":true}),
+            ),
+            crate::tracked_state::NativeObjectRef::TrackedStateTreeChunk([9; 32]).annotate_missing(
+                LixError::new(
+                    LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN,
+                    "unknown outcome",
+                ),
+            ),
+        ] {
+            assert!(sync_demand_request_for_error(&error).unwrap().is_none());
+            assert!(
+                native_sync_demand_request_for_error(&error)
+                    .unwrap()
+                    .is_none()
+            );
+            let original_code = error.code.clone();
+            assert_eq!(
+                SyncDemandRetry::default().admit(error).unwrap_err().code,
+                original_code
+            );
+        }
+    }
 
     use super::*;
     use base64::Engine as _;
@@ -2405,6 +2257,75 @@ mod tests {
             inline_bytes_base64: inline
                 .then(|| base64::engine::general_purpose::STANDARD.encode(bytes)),
         }
+    }
+
+    #[test]
+    fn native_demand_preserves_full_history_and_rejects_unexpected_cache_holes() {
+        let address = crate::tracked_state::NativeMetadataRef::CommitStateHeader(
+            "00000000-0000-7000-8000-000000000399".into(),
+        );
+        let history = address.clone().annotate_missing(
+            LixError::new("LIX_SYNC_HISTORY_REQUIRED", "deferred")
+                .with_details(serde_json::json!({"commitIds":[address.id()]})),
+        );
+        let request = native_sync_demand_request_for_error(&history)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(request, SyncDemandRequest::NativeMetadata(_, _)));
+        assert!(matches!(
+            full_replica_demand(request).unwrap(),
+            SyncDemandRequest::History(_)
+        ));
+        let missing = address.annotate_missing(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "unexpected missing header",
+        ));
+        let request = native_sync_demand_request_for_error(&missing)
+            .unwrap()
+            .unwrap();
+        let error = full_replica_demand(request).unwrap_err();
+        assert_eq!(error.code, missing.code);
+        assert_eq!(error.message, missing.message);
+        assert_eq!(error.details, missing.details);
+    }
+
+    #[test]
+    fn completed_execution_journal_failure_cannot_trigger_demand_replay() {
+        let mut error = crate::tracked_state::NativeObjectRef::TrackedStateTreeChunk([29; 32])
+            .annotate_missing(LixError::unknown("completed execution journal failure"));
+        error.details.as_mut().unwrap()["nonRetryableAfterExecution"] = serde_json::json!(true);
+        assert!(
+            native_sync_demand_request_for_error(&error)
+                .unwrap()
+                .is_none()
+        );
+        assert!(sync_demand_request_for_error(&error).unwrap().is_none());
+        let rejected = match SyncDemandRetry::default().admit(error.clone()) {
+            Err(error) => error,
+            Ok(_) => panic!("completed execution must not be admitted for replay"),
+        };
+        assert_eq!(rejected.code, error.code);
+        assert_eq!(rejected.details, error.details);
+    }
+
+    #[test]
+    fn referenced_blob_demand_is_partial_only_and_postcommit_is_not_replayed() {
+        let hash = crate::binary_cas::BlobId::from_content(b"referenced content");
+        let error = crate::binary_cas::BlobManifestRequired(hash).into_error();
+        let request = native_sync_demand_request_for_error(&error)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(request, SyncDemandRequest::BlobManifest(id, _) if id == hash));
+        assert_eq!(full_replica_demand(request).unwrap_err().code, error.code);
+        assert!(sync_demand_request_for_error(&error).unwrap().is_none());
+        let mut committed = error;
+        committed.details.as_mut().unwrap()["nonRetryableAfterCommit"] = serde_json::json!(true);
+        assert!(
+            native_sync_demand_request_for_error(&committed)
+                .unwrap()
+                .is_none()
+        );
+        assert!(SyncDemandRetry::default().admit(committed).is_err());
     }
 
     #[tokio::test]
@@ -4440,5 +4361,67 @@ mod tests {
             .rollback()
             .await
             .expect("transaction rolls back");
+    }
+}
+
+/// Only explicit legacy recovery and its authenticated owner may request this
+/// bounded demand path. Unknown native cache holes retain their original error.
+pub(super) async fn hydrate_explicit_recovery_error<StorageImpl, Transport>(
+    lix: &Lix<StorageImpl>,
+    transport: &Transport,
+    error: LixError,
+    seen: &mut BTreeSet<String>,
+) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+    Transport: SyncTransport,
+{
+    let request = sync_demand_request_for_error(&error)?.ok_or_else(|| error.clone())?;
+    let key = format!("{request:?}");
+    if seen.len() >= 128 || !seen.insert(key) {
+        return Err(LixError::new(
+            SYNC_DEMAND_STALLED_CODE,
+            "explicit recovery exceeded its missing-input retry budget",
+        )
+        .with_details(serde_json::json!({"sourcePreserved":true})));
+    }
+    match request {
+        SyncDemandRequest::History(ids) if ids.len() <= 128 => {
+            hydrate_history_ids(lix, transport, ids.into_iter().collect()).await
+        }
+        SyncDemandRequest::Chunks(ids) if ids.len() <= 128 => {
+            hydrate_chunk_ids(lix, transport, ids.into_iter().collect()).await
+        }
+        _ => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod native_batch_demand_tests {
+    use super::*;
+    #[test]
+    fn partial_parser_keeps_exact_frontier_and_full_replica_keeps_error() {
+        let addresses = vec![
+            crate::tracked_state::NativeObjectRef::ScopedRangeNode([1; 32]),
+            crate::tracked_state::NativeObjectRef::ScopedRangeNode([2; 32]),
+        ];
+        let original = crate::tracked_state::NativeObjectRef::annotate_missing_batch(
+            addresses.clone(),
+            LixError::unknown("missing selected immutable nodes"),
+        );
+        let demand = native_sync_demand_request_for_error(&original)
+            .unwrap()
+            .unwrap();
+        match &demand {
+            SyncDemandRequest::NativeObjects(actual, error) => {
+                assert_eq!(actual, &addresses);
+                assert_eq!(error.message, original.message);
+            }
+            other => panic!("expected frontier, got {other:?}"),
+        }
+        assert_eq!(
+            full_replica_demand(demand).unwrap_err().message,
+            original.message
+        );
     }
 }

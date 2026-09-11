@@ -7,8 +7,7 @@ description: "Reference for opening local, remote, and synchronized Lix instance
 `@lix-js/sdk` exports `openLix()`, `createLix()`, `deleteLix()`, the generic JavaScript storage protocol,
 `Value` and `bundledPluginArchives`. `@lix-js/storage-opfs` and
 `@lix-js/storage-filesystem` provide concrete storage implementations.
-`openLix()` returns a local repository, a thin remote client, or a synchronized
-local replica.
+`openLix()` returns a local repository, a thin remote client, or a partial replica with on-demand sync.
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -38,8 +37,9 @@ empty one. Creation takes one consistent snapshot, including files, branches,
 history, and untracked rows. It does not attach or change the source handle.
 Subsequent source edits are not part of that copy. To attach the original
 durable storage afterward, pause writes during creation, close the local handle,
-and reopen the same storage with the returned server URL. Lix refuses to replace
-unrelated or locally diverged history.
+and follow the [explicit conversion guide](./partial-replica-migration.md) for
+supported existing replica storage. Opening with `server.mode: "partial_replica"`
+does not silently replace unrelated or locally diverged history.
 
 Supply `idempotencyKey` to recover a creation after a lost response. Retry with
 the same key and unchanged source snapshot; reusing a key for different content
@@ -66,8 +66,8 @@ Options:
 | Option      | Type                                             | Description                                                                                |
 | ----------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------ |
 | `storage`   | `LixStorage`                                     | Local storage selected by a provider package. Omit both `storage` and `server` for memory.                          |
-| `server`    | `LixServerOptions` | Connect directly to a server or synchronize a local replica.                               |
-| `telemetry` | `LixTelemetryOptions`                            | Optional `onSpan(span)` callback that receives telemetry spans. Local and sync modes only. |
+| `server`    | `LixServerOptions` | Defaults to `mode: "remote"`; use `mode: "partial_replica"` with storage for on-demand sync.                               |
+| `telemetry` | `LixTelemetryOptions`                            | Optional `onSpan(span)` callback that receives telemetry spans. Local and partial-replica modes only. |
 
 Connect to a remote server:
 
@@ -82,7 +82,8 @@ const lix = await openLix({
 
 Remote file content, SQL rows, and branches live on the server. Use `headers` for authentication and `fetch` when you need a custom fetch implementation.
 
-Open a synchronized local replica by combining `storage` with `server`:
+Open a **partial replica with on-demand sync** by supplying `storage` and
+explicitly selecting `server.mode: "partial_replica"`:
 
 ```ts
 import { OpfsStorage } from "@lix-js/storage-opfs";
@@ -90,14 +91,21 @@ import { OpfsStorage } from "@lix-js/storage-opfs";
 const lix = await openLix({
   storage: new OpfsStorage({ name: "atelier" }),
   server: {
+    mode: "partial_replica",
     url: "https://example.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
     headers: () => ({ Authorization: `Bearer ${token}` }),
   },
 });
 ```
 
-With storage and a server, mutations execute on the server while certified
-current-state reads can use the local replica. See
+Opening installs bounded metadata. SQL fetches missing native inputs on demand
+and retains them in local storage. Covered reads and writes with resident
+dependencies execute locally, including offline. Mutations commit locally and
+upload in the background; success does not wait for server acceptance.
+
+`server.mode` defaults to `"remote"`, which rejects storage. Partial-replica mode
+requires storage. `"sync"` is not an alias and full `"replica"` mode is not yet
+supported. See
 [Collaboration](./collaboration-and-sync.md) for the complete behavior.
 
 Use `OpfsStorage` to persist a local browser Lix across reloads:
@@ -154,6 +162,11 @@ Executes one PostgreSQL-dialect SQL statement against the active Lix session.
 Pass a single statement. To run several statements atomically, call
 `executeBatch()` with an array of `{ sql, params? }` objects. Do not concatenate
 statements into one SQL string or parse a script on the host.
+
+For a partial replica with on-demand sync, prefetch a view by executing its SELECT
+on hover, then execute the same SELECT when opening it. Resident inputs stay local.
+Use ordinary `execute()` for writes; a read does not promise that all later write
+validation or commit dependencies are resident.
 
 Parameters:
 

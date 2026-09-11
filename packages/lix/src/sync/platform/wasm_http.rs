@@ -379,6 +379,7 @@ impl ProtocolHttp for AuthorityHttp {
                 headers: request.headers,
                 body: request.body.map(|body| body.to_vec()),
                 cache_immutable: false,
+                response_limit: MAX_SYNC_PULL_RESPONSE_BYTES,
                 operation: "authority request",
             })
             .await?;
@@ -575,6 +576,7 @@ impl RawHttpClient for BrowserHttpClient {
                 &headers,
                 request.body,
                 request.cache_immutable,
+                request.response_limit,
                 self.fetch.as_ref(),
                 request.operation,
             )
@@ -634,6 +636,7 @@ async fn fetch(
     headers: &[(String, String)],
     body: Option<Vec<u8>>,
     cache_immutable: bool,
+    response_limit: usize,
     fetch_override: Option<&Function>,
     operation: &str,
 ) -> Result<RawHttpResponse, LixError> {
@@ -682,7 +685,7 @@ async fn fetch(
     Reflect::set(
         &init,
         &"lixResponseLimit".into(),
-        &JsValue::from_f64(MAX_SYNC_PULL_RESPONSE_BYTES as f64),
+        &JsValue::from_f64(response_limit as f64),
     )
     .map_err(js_transport_error)?;
     let header_pairs = Array::new();
@@ -724,27 +727,14 @@ async fn fetch(
         .map_err(js_transport_error)?
         .as_string()
         .unwrap_or_default();
-    let body = read_response_body(&response, operation, &controller).await?;
+    let body =
+        read_response_body_limited(&response, operation, &controller, response_limit).await?;
     abort_on_drop.disarm();
     Ok(RawHttpResponse {
         status,
         status_text,
         body,
     })
-}
-
-async fn read_response_body(
-    response: &JsValue,
-    operation: &str,
-    controller: &Object,
-) -> Result<Vec<u8>, LixError> {
-    read_response_body_limited(
-        response,
-        operation,
-        controller,
-        MAX_SYNC_PULL_RESPONSE_BYTES,
-    )
-    .await
 }
 
 async fn read_response_body_limited(

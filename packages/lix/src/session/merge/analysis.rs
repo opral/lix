@@ -50,6 +50,28 @@ pub(crate) async fn analyze<S>(
 where
     S: StorageAdapterRead,
 {
+    analyze_with_publication(reader, commits, false).await
+}
+/// Explicit migration authors a native two-parent commit even for a fast-forward
+/// so selected historical rows receive candidate constraint validation and an
+/// exact atomic outcome receipt. Ordinary branch merge retains its fast path.
+pub(crate) async fn analyze_native_migration<S>(
+    reader: &mut TrackedStateStoreReader<S>,
+    commits: MergeCommits,
+) -> Result<MergeAnalysis, LixError>
+where
+    S: StorageAdapterRead,
+{
+    analyze_with_publication(reader, commits, true).await
+}
+async fn analyze_with_publication<S>(
+    reader: &mut TrackedStateStoreReader<S>,
+    commits: MergeCommits,
+    force_merge: bool,
+) -> Result<MergeAnalysis, LixError>
+where
+    S: StorageAdapterRead,
+{
     // Commit-graph analysis has already authenticated both heads and selected
     // this base. When the source is the base, the merge cannot contribute any
     // tracked-state changes, so avoid opening the immutable state authorities
@@ -84,7 +106,7 @@ where
     exclude_checkpoint_rows(&mut source_diff);
     exclude_checkpoint_rows(&mut target_diff);
 
-    let outcome = if commits.base_commit_id == commits.target_commit_id {
+    let outcome = if !force_merge && commits.base_commit_id == commits.target_commit_id {
         MergeOutcome::FastForward
     } else {
         MergeOutcome::MergeCommitted
