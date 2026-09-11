@@ -9,7 +9,7 @@ use crate::storage_adapter::{
 };
 use crate::{LixError, LixNotice, ResultColumnType, Value};
 
-use super::execute::ExecuteResult;
+use super::execute::{CommitSpan, ExecuteResult};
 
 /// Opaque replay identity for one HTTP SQL mutation.
 ///
@@ -106,6 +106,15 @@ struct StoredExecuteResult {
     rows: Vec<Vec<StoredValue>>,
     rows_affected: u64,
     notices: Vec<LixNotice>,
+    /// Receipts written before spans existed replay without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    commit: Option<StoredCommitSpan>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct StoredCommitSpan {
+    before: String,
+    after: String,
 }
 
 /// Replay-storage form of a SQL value.
@@ -214,6 +223,16 @@ impl ExecuteIdempotencyReceipt {
             && self.request_fingerprint == BASE64.encode(idempotency.request_fingerprint())
     }
 
+    /// Points every stored span at `before`: the commit parent the write
+    /// actually published on, known only once its transaction commits.
+    pub(crate) fn set_commit_before(&mut self, before: &str) {
+        for result in &mut self.results {
+            if let Some(span) = &mut result.commit {
+                span.before = before.to_owned();
+            }
+        }
+    }
+
     pub(crate) fn into_single_result(self) -> Result<ExecuteResult, LixError> {
         let mut results = self.into_results()?;
         if results.len() != 1 {
@@ -251,6 +270,10 @@ impl StoredExecuteResult {
             rows,
             rows_affected: result.rows_affected(),
             notices: result.notices().to_vec(),
+            commit: result.commit().map(|span| StoredCommitSpan {
+                before: span.before().to_owned(),
+                after: span.after().to_owned(),
+            }),
         })
     }
 
@@ -270,6 +293,8 @@ impl StoredExecuteResult {
             rows,
             self.rows_affected,
             self.notices,
+            self.commit
+                .map(|span| CommitSpan::new(span.before, span.after)),
         ))
     }
 }

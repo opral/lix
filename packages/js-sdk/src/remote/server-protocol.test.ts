@@ -374,3 +374,17 @@ test("observe row deltas reject invalid bases ranges and row shapes", () => {
 		),
 	).toThrow("observe row delta insert row 0 has 0 values for 1 columns");
 });
+
+test("remote execute results carry a commit span when the server sends one", () => {
+	const base = { columns: [], rows: [], rowsAffected: 1, notices: [] };
+	expect(decodeExecuteResult(base).commit).toBeUndefined();
+	expect(
+		decodeExecuteResult({
+			...base,
+			commit: { before: "commit-a", after: "commit-b" },
+		}).commit,
+	).toEqual({ before: "commit-a", after: "commit-b" });
+	expect(() =>
+		decodeExecuteResult({ ...base, commit: { before: "commit-a" } }),
+	).toThrow("execute result commit requires before and after commit ids");
+});

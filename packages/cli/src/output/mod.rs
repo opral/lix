@@ -9,6 +9,9 @@ pub fn print_execute_result_table(result: &ExecuteResult) {
         if result.rows_affected() > 0 {
             println!("({} rows affected)", result.rows_affected());
         }
+        if let Some(span) = result.commit() {
+            println!("(commit {} -> {})", span.before(), span.after());
+        }
         return;
     }
 
@@ -34,6 +37,10 @@ pub fn print_execute_result_table(result: &ExecuteResult) {
 
     println!("{table}");
     println!("({} rows)", result.rows().len());
+    // A RETURNING write has rows and a span; show both.
+    if let Some(span) = result.commit() {
+        println!("(commit {} -> {})", span.before(), span.after());
+    }
 }
 
 pub fn print_execute_result_json(result: &ExecuteResult) {
@@ -45,12 +52,20 @@ pub fn print_execute_result_json(result: &ExecuteResult) {
 }
 
 fn execute_result_to_json(result: &ExecuteResult) -> JsonValue {
-    serde_json::json!({
+    let mut payload = serde_json::json!({
         "columns": result.columns(),
         "rows": result.rows().iter().map(|row| row_to_json(result.columns(), row)).collect::<Vec<_>>(),
         "rowsAffected": result.rows_affected(),
         "notices": result.notices(),
-    })
+    });
+    // Same shape as the server: present for writes, absent for reads.
+    if let Some(span) = result.commit() {
+        payload["commit"] = serde_json::json!({
+            "before": span.before(),
+            "after": span.after(),
+        });
+    }
+    payload
 }
 
 fn row_to_json(columns: &[String], row: &lix::Row) -> JsonValue {

@@ -32,6 +32,7 @@ export type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
 	RedoReceipt,
+	CommitSpan,
 	ExecuteOptions,
 	ExecuteResult,
 	ExecuteBatchResult,
