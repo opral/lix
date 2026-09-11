@@ -135,7 +135,7 @@ pub use platform::{
     unregister_browser_sync_transport,
 };
 pub(crate) use platform::{SyncTransportBounds, SyncTransportFuture};
-#[cfg(feature = "server-protocol")]
+#[cfg(any(test, feature = "server-protocol"))]
 pub(crate) use protocol::SyncRefUpdate;
 pub(crate) use protocol::{
     SyncBlobChunk, SyncBlobManifest, SyncBlobRegistration, SyncBranchHead,
