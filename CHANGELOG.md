@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.17.0 - 2026-09-11
+
+### Minor
+
+- Write results now report the commits they moved the active branch between.
+
+  `execute` and `executeBatch` results carry `commit: { before, after }` for every statement that committed a write: `before` is the active branch's head before the write and `after` the head it published. `lix_diff('lix_file', before, after)` is then exactly what the write changed, with no readback. Every statement of a written batch carries the batch's one span, and a write that published no commit on the active branch reports both ids equal. Read statements outside a written batch, read-only batches, and statements inside an explicit transaction carry no span. The server protocol, the remote client, and the CLI's JSON output pass it through, and results from servers that predate it simply omit it.
+- `information_schema.columns` and `information_schema.lix_surfaces` now carry a `description`.
+
+  A registered schema's `description` annotations for its table and columns are what tools have always been able to read from the schema document; now they are one column away in the catalog itself, next to the type and nullability. The composed views (`lix_file`, `lix_directory`, `lix_branch`, `lix_change`), the `lixcol_*` bookkeeping columns, and the built-in file, directory, and key-value schemas that shipped without descriptions describe themselves the same way. The column is NULL where nothing was written.
+- Removed the unused `BranchEquals` storage precondition (`branchEquals` in JavaScript).
+
+  Custom storage adapters only need space-aware preconditions. Use `KeyValueEquals` to condition a write on an exact stored value.
+- Removed the redundant `lixcol_schema_key` SQL column.
+
+  Schema tables, historical reads, diff/history results, and SQL metadata no longer expose this column. Queries that explicitly reference it now fail; use the relation name to identify the schema. The `schema_key` column on `lix_change` is unchanged.
+- Removed the JavaScript SDK's `@lix-js/sdk/server-protocol` helper export.
+
+  Use the SDK's remote connection API to access hosted repositories, or the documented HTTP protocol for custom clients. Remote SDK operations continue to use the shared Rust protocol implementation.
+
+### Patch
+
+- Large SQL uploads use less redundant decoding, copying and request fingerprinting work. The server protocol no longer imposes a default 64 MiB request-body limit; hosts can still configure an explicit byte budget.
+
+  SQL requests keep the same public API. Retry keys recorded with the previous fingerprint format return `409 LIX_IDEMPOTENCY_KEY_REUSED` after upgrading, without re-executing the mutation. Reconcile uncertain pre-upgrade requests before issuing new keys. Existing repository content and storage formats are unchanged.
+- Fixed plugin file renames after switching branches or opening a new session losing the previous filename when no plugin observation was cached.
+
+  Cold transitions now resolve the predecessor path from the transaction's repository state. Format-sensitive plugins can correctly handle changes such as CSV to TSV before subsequent semantic edits.
+- Fixed migrations failing when opening repositories connected to sync.
+
+  Existing server repositories and local replicas now retain their sync ownership while migrating, allowing previously failed opens to be retried without deleting repository data.
+- A file rename no longer fails when a concurrent commit expires its plugin discovery read.
+
+  `UPDATE lix_file SET path` and `lix_file` scans that need plugin rendering run Lix reads inside the query plan. An expired coherent read there was reported as a plain execution error, which hid its `LIX_STORAGE_READ_EXPIRED` code from the session's bounded retry, so a rename during sync churn surfaced "plugin discovery failed" to the caller instead of restarting. The Lix error now stays the cause, code included, and the statement restarts like any other expired read.
+- Fixed Undo and Redo of plugin-backed files failing with a duplicate `lix_binary_blob_ref` primary key, and restored support for applying file additions and deletions from history.
+
+  Applying historical file changes now replaces the historical blob reference with the plugin's newly rendered reference. References and deletion records for other files remain intact.
+
+  Complete file restoration replays its historical plugin state and bytes together, while preserving source-change validation and restrictions on direct writes to engine-managed plugin metadata.
+
+  Optimized SQL writes now enforce those same reserved-metadata restrictions.
+- Fixed filesystem imports failing with "plugin observation is unknown or evicted" after edits through another Lix session.
+
+  Read batches that combine file contents with directory or metadata queries now refresh the observations for the file bytes actually returned. Aggregate queries still do not authorize overwriting unseen file contents.
+- Server migration failures now return a safe diagnostic message and the originating migration error code when available, including failures returned to later callers. Copy destination precondition conflicts are identified explicitly; other failures direct operators to the full server logs without exposing storage credentials. HTTP status codes and retry behavior are unchanged.
+- Rebuild supported clean local replicas from the server during format upgrades, avoiding historical migrations over sparse downloaded data. The replacement is prepared and validated in a separate epoch before publication. Replicas with pending local work or an unproven recovery state are preserved and report `LIX_ERROR_REPLICA_UPGRADE_BLOCKED` instead of being reset.
+- Fixed rebuilding repositories after checkpoint garbage collection.
+
+  Rebuilding change tracking now validates deleted rows without requiring mutation bodies that garbage collection has already removed, while preserving checks against the repository's recorded state.
+- Synced replicas now retain their previous storage generation and rebuild from the authoritative server during format upgrades. Local pending work no longer prevents opening the current repository. Standalone and authoritative repositories continue to migrate their stored data.
+
+  New recovery APIs list retained sources, export available logical recovery data, and restore tracked rows onto separate branches without overwriting the active branch. Recovery reports unresolved content, preserves local-only data, and keeps original sources across subsequent upgrades. Permanent sync rejection preserves pending edits instead of silently resetting them.
+
+  OPFS SQLite initialization failures now report their original error instead of surfacing only as a storage startup timeout.
+- Merge preview and merge now explicitly reject plugin-owned content conflicts when the file descriptor or ancestor path differs between the merge inputs. This unsupported combination could render file contents with the target's old format while selecting the source's new path and format metadata.
+
+  The operation returns a merge conflict before modifying the target, with a hint to merge the rename separately. This includes disjoint row edits whose combined file contents require materialization. Ordinary renames without conflicting file contents remain supported.
+- Fixed concurrent browser writes interrupting synchronization during reconnect.
+
+  Transient local read conflicts now retry without terminating live queries. Repository identity and account mismatches continue to stop synchronization.
+
 ## 0.16.0 - 2026-09-09
 
 ### Minor
