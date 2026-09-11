@@ -1948,7 +1948,7 @@ test("default remote mode rejects SQL preparation without sending requests", asy
  try {
   const requestCount = fetch.mock.calls.length;
   await expect(lix.prepare("SELECT value FROM lix_key_value WHERE key=$1", ["key"]))
-   .rejects.toMatchObject({ code: "LIX_ERROR_LOCAL_STORAGE_REQUIRED" });
+   .rejects.toMatchObject({ code: "LIX_SQL_PREPARATION_UNSUPPORTED" });
   expect(fetch).toHaveBeenCalledTimes(requestCount);
  } finally { await lix.close(); }
  await expect(lix.prepare("SELECT 1")).rejects.toMatchObject({ code: "LIX_ERROR_CLOSED" });
