@@ -157,6 +157,11 @@ pub(crate) struct TransactionCommitOutcome {
     pub(crate) storage_stats: StorageWriteSetStats,
     pub(crate) commit_cohort_id: Option<String>,
     pub(crate) checkpoint_gc_sequence: Option<u64>,
+    /// The active branch's head before this commit and the head it
+    /// published, so a write can report exactly which commits it sits
+    /// between. Equal when the transaction published no commit on that
+    /// branch. `None` when the branch had no head to commit on.
+    pub(crate) active_branch_commit_span: Option<(CommitId, CommitId)>,
 }
 
 fn typed_transaction_validation_counters(rows: &RawWriteBatch) -> WasmTransitionCounters {
@@ -729,6 +734,13 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     trust_filesystem_planner: bool,
     origin_key: Option<SharedStr>,
     idempotency_receipt: Option<(crate::storage_adapter::StorageKey, Vec<u8>)>,
+    /// The receipt as staged, with the active head it was staged against, so
+    /// the commit can re-encode it if stale reconciliation moved the parent.
+    idempotency_receipt_source: Option<(
+        ExecuteIdempotency,
+        ExecuteIdempotencyReceipt,
+        Option<CommitId>,
+    )>,
     /// Storage-native metadata that must publish in the same backend commit as
     /// this transaction's file rows and history. Resumable media finalization
     /// uses this lane for its completed manifest and upload receipt.
@@ -1748,6 +1760,7 @@ where
             trust_filesystem_planner: false,
             origin_key: None,
             idempotency_receipt: None,
+            idempotency_receipt_source: None,
             atomic_metadata_writes: None,
             atomic_metadata_preconditions: Vec::new(),
             sync_role: crate::sync::SyncRole::Disabled,
@@ -1825,6 +1838,24 @@ where
         let _commit_guard = begin_commit_boundary(commit_boundary.as_ref());
         let result = async {
             let transaction = &mut self;
+            // The staged commit id is fixed at staging time; the prepared writes
+            // are consumed by materialization below, so read it now. The head it
+            // parents is read after commit, once stale reconciliation has settled
+            // on the real parent.
+            let published_active_branch_commit_id = prepared_writes
+                .commit_change_refs_by_branch
+                .get(&transaction.active_branch_id)
+                .filter(|refs| !refs.is_empty() || refs.allow_empty)
+                .map(|refs| refs.commit_id)
+                // A restore moves the head to an existing commit without
+                // authoring one; the restore intent is consumed below, so read
+                // it here.
+                .or_else(|| {
+                    transaction
+                        .pending_restore_targets
+                        .get(&transaction.active_branch_id)
+                        .map(|intent| intent.target_commit_id)
+                });
             let (
                 writes,
                 write_options,
@@ -2053,6 +2084,17 @@ where
                         ),
                     );
                 }
+                // Stale reconciliation may have moved this transaction onto a
+                // newer parent after the receipt was staged. The replayed span
+                // must match the response, so re-encode it against that parent.
+                if let Some((idempotency, mut receipt, staged_head)) =
+                    transaction.idempotency_receipt_source.take()
+                    && staged_head != transaction.opening_active_branch_head
+                    && let Some(before) = transaction.opening_active_branch_head
+                {
+                    receipt.set_commit_before(&before.to_string());
+                    transaction.idempotency_receipt = Some(encode_receipt(&idempotency, &receipt)?);
+                }
                 if let Some((key, value)) = transaction.idempotency_receipt.take() {
                     writes.put(EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, key.clone(), value);
                     // The mutation and this receipt share one atomic storage commit.
@@ -2203,6 +2245,9 @@ where
                 storage_stats,
                 commit_cohort_id: Some(commit_cohort_id),
                 checkpoint_gc_sequence: transaction.pending_checkpoint_gc_sequence,
+                active_branch_commit_span: transaction
+                    .opening_active_branch_head
+                    .map(|before| (before, published_active_branch_commit_id.unwrap_or(before))),
             })
         }
         .await;
@@ -2210,6 +2255,33 @@ where
             self.discard_pending_plugin_actor_publications().await;
         }
         result
+    }
+
+    /// The active-branch commit span this transaction is set to publish: the
+    /// head it opened on (or was reconciled onto) and the commit it has
+    /// staged, or that same head when nothing is staged for the branch.
+    ///
+    /// The staged id is the one the commit will carry, since stale
+    /// reconciliation rewrites rows onto it rather than minting another. The
+    /// parent can still move if the transaction is reconciled at commit, so
+    /// callers that need the exact published span read it from the commit
+    /// outcome instead.
+    pub(crate) fn staged_active_branch_commit_span(
+        &self,
+    ) -> Result<Option<(CommitId, CommitId)>, LixError> {
+        let Some(before) = self.opening_active_branch_head else {
+            return Ok(None);
+        };
+        let after = self
+            .staged_writes
+            .staged_commit_id(&self.active_branch_id)?
+            .or_else(|| {
+                self.pending_restore_targets
+                    .get(&self.active_branch_id)
+                    .map(|intent| intent.target_commit_id)
+            })
+            .unwrap_or(before);
+        Ok(Some((before, after)))
     }
 
     /// Large import documents are more valuable as transient parser state than
@@ -7506,6 +7578,11 @@ where
             ));
         }
         self.idempotency_receipt = Some(encode_receipt(idempotency, receipt)?);
+        self.idempotency_receipt_source = Some((
+            idempotency.clone(),
+            receipt.clone(),
+            self.opening_active_branch_head,
+        ));
         Ok(())
     }
 

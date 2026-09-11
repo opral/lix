@@ -4819,6 +4819,15 @@ struct ExecuteResponse {
     rows: Vec<Vec<WireValue>>,
     rows_affected: u64,
     notices: Vec<lix::LixNotice>,
+    /// The active-branch commits a write moved between; absent for reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit: Option<CommitSpanResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct CommitSpanResponse {
+    before: String,
+    after: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -4855,6 +4864,10 @@ impl TryFrom<ExecuteResult> for ExecuteResponse {
             rows,
             rows_affected: result.rows_affected(),
             notices: result.notices().to_vec(),
+            commit: result.commit().map(|span| CommitSpanResponse {
+                before: span.before().to_owned(),
+                after: span.after().to_owned(),
+            }),
         })
     }
 }
@@ -10735,6 +10748,58 @@ mod tests {
         assert_eq!(body.as_array().map(Vec::len), Some(2));
         assert_eq!(body[0]["rows"][0][0], json!({ "kind": "int", "value": 1 }));
         assert_eq!(body[1]["rows"][0][0], json!({ "kind": "int", "value": 2 }));
+    }
+
+    #[tokio::test]
+    async fn execute_responses_carry_the_commit_span_of_writes() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let head = |sql: &'static str| {
+            let router = app.router.clone();
+            let session_id = session_id.clone();
+            async move {
+                let response = request(
+                    &router,
+                    "POST",
+                    "/lix/v1/execute",
+                    Some(&session_id),
+                    Some(json!({ "sql": sql, "params": [] })),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                response_json(response).await
+            }
+        };
+        let read = head("SELECT lix_active_branch_commit_id() AS commit_id").await;
+        assert!(read.get("commit").is_none(), "reads carry no span: {read}");
+        let before = read["rows"][0][0]["value"].as_str().unwrap().to_owned();
+
+        let written =
+            head("INSERT INTO lix_key_value (key, value) VALUES ('span-http', 'one')").await;
+        assert_eq!(written["commit"]["before"], json!(before));
+        let after = written["commit"]["after"].as_str().unwrap().to_owned();
+        assert_ne!(after, before);
+
+        let now = head("SELECT lix_active_branch_commit_id() AS commit_id").await;
+        assert_eq!(now["rows"][0][0]["value"], json!(after));
+
+        let batch = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute-batch",
+            Some(&session_id),
+            Some(json!({
+                "statements": [
+                    { "sql": "INSERT INTO lix_key_value (key, value) VALUES ('span-http-b', 'one')", "params": [] },
+                    { "sql": "SELECT 1 AS value", "params": [] }
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(batch.status(), StatusCode::OK);
+        let batch = response_json(batch).await;
+        assert_eq!(batch[0]["commit"]["before"], json!(after));
+        assert_eq!(batch[1]["commit"], batch[0]["commit"], "one span per batch");
     }
 
     #[tokio::test]

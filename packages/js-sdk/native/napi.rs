@@ -3181,6 +3181,14 @@ pub struct ExecuteResult {
     pub rows: Vec<Vec<LixValue>>,
     pub rows_affected: u32,
     pub notices: Vec<LixNotice>,
+    /// The active-branch commits a write moved between; absent for reads.
+    pub commit: Option<CommitSpan>,
+}
+
+#[napi(object)]
+pub struct CommitSpan {
+    pub before: String,
+    pub after: String,
 }
 
 #[napi(object)]
@@ -3241,6 +3249,10 @@ impl TryFrom<RsExecuteResult> for ExecuteResult {
                     hint: notice.hint.clone(),
                 })
                 .collect(),
+            commit: result.commit().map(|span| CommitSpan {
+                before: span.before().to_owned(),
+                after: span.after().to_owned(),
+            }),
         })
     }
 }

@@ -16,6 +16,7 @@ use crate::branch::{
 };
 use crate::catalog::{CatalogContext, CatalogFingerprint, CatalogSnapshot, load_catalog_revision};
 use crate::changelog::CommitId;
+use crate::session::execute::CommitSpan;
 use crate::commit_graph::{CommitGraphContext, CommitGraphReader};
 use crate::domain::Domain;
 use crate::filesystem::FilesystemPathIndexReader;
@@ -471,9 +472,23 @@ where
     where
         F: for<'tx> AsyncFnOnce(&'tx mut Transaction<StorageImpl>) -> Result<T, LixError>,
     {
+        self.with_write_transaction_lending_spanned(f)
+            .await
+            .map(|(value, _)| value)
+    }
+
+    /// Like [`Self::with_write_transaction_lending`], also returning the
+    /// active-branch commit span the transaction published.
+    pub(crate) async fn with_write_transaction_lending_spanned<T, F>(
+        &self,
+        f: F,
+    ) -> Result<(T, Option<CommitSpan>), LixError>
+    where
+        F: for<'tx> AsyncFnOnce(&'tx mut Transaction<StorageImpl>) -> Result<T, LixError>,
+    {
         self.ensure_open()?;
         let write_access = self.begin_session_write_access().await?;
-        self.with_write_transaction_reserved_lending(write_access, f, |_| Ok(()))
+        self.with_write_transaction_reserved_lending_spanned(write_access, f, |_| Ok(()))
             .await
     }
 
@@ -483,6 +498,23 @@ where
         f: F,
         after_commit: A,
     ) -> Result<T, LixError>
+    where
+        F: for<'tx> AsyncFnOnce(&'tx mut Transaction<StorageImpl>) -> Result<T, LixError>,
+        A: FnOnce(&T) -> Result<(), LixError>,
+    {
+        self.with_write_transaction_reserved_lending_spanned(write_access, f, after_commit)
+            .await
+            .map(|(value, _)| value)
+    }
+
+    /// Runs `f` in a write transaction and commits it, returning its value
+    /// together with the commit span the active branch moved through.
+    pub(super) async fn with_write_transaction_reserved_lending_spanned<T, F, A>(
+        &self,
+        write_access: SessionWriteAccess,
+        f: F,
+        after_commit: A,
+    ) -> Result<(T, Option<CommitSpan>), LixError>
     where
         F: for<'tx> AsyncFnOnce(&'tx mut Transaction<StorageImpl>) -> Result<T, LixError>,
         A: FnOnce(&T) -> Result<(), LixError>,
@@ -555,7 +587,12 @@ where
                     );
                 }
                 after_commit_result?;
-                Ok(value)
+                Ok((
+                    value,
+                    outcome
+                        .active_branch_commit_span
+                        .map(CommitSpan::from_commit_ids),
+                ))
             }
             Err(error) => Err(error),
         }

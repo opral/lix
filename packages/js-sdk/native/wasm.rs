@@ -1433,6 +1433,15 @@ pub(super) struct ExecuteResultDto {
     rows: Vec<Vec<LixValueDto>>,
     rows_affected: f64,
     notices: Vec<LixNoticeDto>,
+    /// The active-branch commits a write moved between; absent for reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit: Option<CommitSpanDto>,
+}
+
+#[derive(Serialize)]
+struct CommitSpanDto {
+    before: String,
+    after: String,
 }
 
 #[derive(Serialize)]
@@ -1477,6 +1486,10 @@ impl TryFrom<RsExecuteResult> for ExecuteResultDto {
                     hint: notice.hint.clone(),
                 })
                 .collect(),
+            commit: result.commit().map(|span| CommitSpanDto {
+                before: span.before().to_owned(),
+                after: span.after().to_owned(),
+            }),
         })
     }
 }

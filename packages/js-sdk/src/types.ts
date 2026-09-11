@@ -243,6 +243,19 @@ export type ResultObjectRow = Record<string, unknown>;
 export type ResultArrayRow = unknown[];
 export type ResultRow = ResultObjectRow | ResultArrayRow;
 
+/**
+ * The active-branch commits a write moved between.
+ *
+ * `before` is the active branch's head before the write and `after` the head
+ * it published, so `lix_diff('lix_file', before, after)` is exactly what the
+ * write changed. A write that published no commit on the active branch
+ * reports both ids equal; a restore reports the commit it moved the head to.
+ */
+export type CommitSpan = {
+	before: string;
+	after: string;
+};
+
 export type ExecuteResult<TRow extends object = ResultObjectRow> = {
 	statementIndex?: number;
 	label?: string;
@@ -254,6 +267,15 @@ export type ExecuteResult<TRow extends object = ResultObjectRow> = {
 		message: string;
 		hint?: string;
 	}>;
+	/**
+	 * Present on every auto-committed write statement, including `RETURNING`
+	 * writes, and on every statement of a written batch (all carry the
+	 * batch's one span, read statements included). Absent for read
+	 * statements outside a written batch, read-only batches, statements
+	 * inside an explicit transaction (whose commit is the write), and the
+	 * first commit on a branch that had no head yet.
+	 */
+	commit?: CommitSpan;
 };
 
 export type ExecuteBatchResult<TRow extends object = ResultObjectRow> =

@@ -1761,8 +1761,12 @@ impl PreparedWriteSet {
 
 impl TransactionWriteBuffer {
     pub(crate) fn has_staged_live_branch_head(&self, branch_id: &str) -> bool {
-        self.branch_heads.lock().unwrap_or_else(|e| e.into_inner())
-            .targets.get(branch_id).is_some_and(|target| target.head_commit_id.is_some())
+        self.branch_heads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .targets
+            .get(branch_id)
+            .is_some_and(|target| target.head_commit_id.is_some())
     }
 
     pub(crate) fn stage_branch_heads(&self, heads: PreparedBranchHeads) {
@@ -1770,6 +1774,22 @@ impl TransactionWriteBuffer {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .append(heads)
+    }
+
+    /// The commit this buffer will publish on `branch_id`, once anything is
+    /// staged there. A branch with nothing staged publishes no commit unless
+    /// it was explicitly allowed to publish an empty one.
+    pub(crate) fn staged_commit_id(&self, branch_id: &str) -> Result<Option<CommitId>, LixError> {
+        let commit_change_refs = self.commit_change_refs_by_branch.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "failed to acquire transaction staged commit change refs",
+            )
+        })?;
+        Ok(commit_change_refs
+            .get(branch_id)
+            .filter(|refs| !refs.is_empty() || refs.allow_empty)
+            .map(|refs| refs.commit_id))
     }
 
     pub(crate) fn new(functions: FunctionProviderHandle) -> Self {

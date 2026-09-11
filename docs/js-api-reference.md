@@ -187,6 +187,7 @@ type ExecuteResult<TRow = Record<string, unknown>> = {
   rows: TRow[];
   rowsAffected: number;
   notices: { code: string; message: string; hint?: string }[];
+  commit?: { before: string; after: string };
 };
 ```
 
@@ -196,6 +197,7 @@ type ExecuteResult<TRow = Record<string, unknown>> = {
 | `rows`         | Enumerable plain objects by default. Property access, destructuring, spread, and JSON serialization work directly. |
 | `rowsAffected` | Number of rows affected by write statements.                                |
 | `notices`      | Non-fatal engine notices with `{ code, message, hint? }`.                   |
+| `commit`       | The active-branch commits a write moved between: `before` is the branch head before the write, `after` the head it published, so `lix_diff('lix_file', before, after)` is exactly what it changed. Present for every auto-committed write statement, including `RETURNING` writes and restores, and for every statement of a written batch (all share the batch's span, read statements included); a write that published no commit on the active branch reports both ids equal. Absent for read statements outside a written batch, read-only batches, statements inside an explicit transaction, and the first commit on a branch that had no head yet. |
 
 Example:
 
