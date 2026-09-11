@@ -395,11 +395,7 @@ impl LixFileSpec {
                         options.needs_plugin_ownership,
                     )
                     .await
-                    .map_err(|error| {
-                        DataFusionError::Execution(format!(
-                            "sql2 lix_file plugin discovery failed: {error}"
-                        ))
-                    })?
+                    .map_err(plugin_discovery_error)?
                     .map(|context| context.with_session_file_views(session_file_views.clone()))
                 } else {
                     None
@@ -1119,12 +1115,7 @@ impl TableSpec for LixFileSpec {
                             acknowledge_plugin_data,
                         )
                         .await
-                        .map_err(|error| {
-                            DataFusionError::Context(
-                                "sql2 lix_file plugin discovery failed".to_string(),
-                                Box::new(lix_error_to_datafusion_error(error)),
-                            )
-                        })?
+                        .map_err(plugin_discovery_error)?
                         .map(|context| context.with_session_file_views(session_file_views.clone()))
                     } else {
                         None
@@ -1811,11 +1802,7 @@ impl UpsertSupport for LixFileSpec {
                 false,
             )
             .await
-            .map_err(|error| {
-                DataFusionError::Execution(format!(
-                    "sql2 lix_file plugin discovery failed: {error}"
-                ))
-            })?
+            .map_err(plugin_discovery_error)?
         } else {
             None
         };
@@ -1907,11 +1894,7 @@ impl UpsertSupport for LixFileSpec {
             let branches =
                 load_plugin_render_branches(Arc::clone(&hot_state), &request, &plugin_host, None)
                     .await
-                    .map_err(|error| {
-                        DataFusionError::Execution(format!(
-                            "sql2 lix_file plugin discovery failed: {error}"
-                        ))
-                    })?;
+                    .map_err(plugin_discovery_error)?;
             let plugin_render = if branches.is_empty() {
                 None
             } else {
@@ -1923,11 +1906,7 @@ impl UpsertSupport for LixFileSpec {
                     true,
                 )
                 .await
-                .map_err(|error| {
-                    DataFusionError::Execution(format!(
-                        "sql2 lix_file plugin discovery failed: {error}"
-                    ))
-                })?
+                .map_err(plugin_discovery_error)?
             };
             path_update_plugin_rewrite_file_ids(
                 plugin_render.as_ref(),
@@ -5409,6 +5388,16 @@ async fn acknowledge_materialized_file(
         );
     }
     Ok(())
+}
+
+/// Plugin discovery runs Lix reads inside a DataFusion plan. The Lix error
+/// stays the cause, code included, so an expired coherent read still reaches
+/// the session's bounded retry instead of surfacing as an execution error.
+fn plugin_discovery_error(error: LixError) -> DataFusionError {
+    DataFusionError::Context(
+        "sql2 lix_file plugin discovery failed".to_string(),
+        Box::new(lix_error_to_datafusion_error(error)),
+    )
 }
 
 async fn plugin_render_context_for_lix_file_scan(

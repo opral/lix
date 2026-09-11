@@ -16,6 +16,7 @@ struct ExpiringReadStorage {
     read_calls_before_expiry: Arc<AtomicUsize>,
     expired_calls: Arc<AtomicUsize>,
     remaining_expired_hot_epoch_calls: Arc<AtomicUsize>,
+    read_calls: Arc<AtomicUsize>,
 }
 
 impl ExpiringReadStorage {
@@ -27,6 +28,7 @@ impl ExpiringReadStorage {
             read_calls_before_expiry: Arc::new(AtomicUsize::new(usize::MAX)),
             expired_calls: Arc::new(AtomicUsize::new(0)),
             remaining_expired_hot_epoch_calls: Arc::new(AtomicUsize::new(0)),
+            read_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -57,6 +59,11 @@ impl ExpiringReadStorage {
     fn expired_calls(&self) -> usize {
         self.expired_calls.load(Ordering::Acquire)
     }
+
+    /// Every get or scan call made so far, expired or not.
+    fn read_calls(&self) -> usize {
+        self.read_calls.load(Ordering::Acquire)
+    }
 }
 
 struct ExpiringRead {
@@ -66,10 +73,12 @@ struct ExpiringRead {
     read_calls_before_expiry: Arc<AtomicUsize>,
     expired_calls: Arc<AtomicUsize>,
     remaining_expired_hot_epoch_calls: Arc<AtomicUsize>,
+    read_calls: Arc<AtomicUsize>,
 }
 
 impl ExpiringRead {
     fn expire_if_armed(&self) -> Result<(), StorageError> {
+        self.read_calls.fetch_add(1, Ordering::AcqRel);
         let countdown_expired = self
             .read_calls_before_expiry
             .fetch_update(
@@ -132,6 +141,7 @@ impl Storage for ExpiringReadStorage {
             read_calls_before_expiry: Arc::clone(&self.read_calls_before_expiry),
             expired_calls: Arc::clone(&self.expired_calls),
             remaining_expired_hot_epoch_calls: Arc::clone(&self.remaining_expired_hot_epoch_calls),
+            read_calls: Arc::clone(&self.read_calls),
         })
     }
 
@@ -511,6 +521,69 @@ async fn auto_commit_mutation_restarts_after_its_planning_snapshot_expires() {
         serde_json::json!("committed")
     );
     assert_eq!(storage.expired_calls(), 1);
+}
+
+/// A file rename plans a plugin rewrite, whose discovery reads run inside the
+/// DataFusion plan. Expire each read of the statement in turn: every one of
+/// them, discovery included, must restart the statement rather than surface.
+#[tokio::test]
+async fn path_update_restarts_wherever_its_snapshot_expires() {
+    async fn open_with_file(
+        storage: &ExpiringReadStorage,
+    ) -> lix::Lix<ExpiringReadStorage> {
+        let lix = crate::open_lix()
+            .with_storage(storage.clone())
+            .await
+            .expect("open Lix");
+        lix.execute(
+            "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+            &[
+                Value::Text("/notes.md".into()),
+                Value::Blob(b"# Notes".to_vec().into()),
+            ],
+        )
+        .await
+        .expect("create the file");
+        lix
+    }
+    const RENAME: &str = "UPDATE lix_file SET path = $1 WHERE path = $2";
+    let rename_params = [
+        Value::Text("/renamed.md".into()),
+        Value::Text("/notes.md".into()),
+    ];
+
+    let measured = ExpiringReadStorage::new();
+    let lix = open_with_file(&measured).await;
+    let reads_before = measured.read_calls();
+    lix.execute(RENAME, &rename_params)
+        .await
+        .expect("rename without expiry");
+    let reads_per_rename = measured.read_calls() - reads_before;
+    assert!(reads_per_rename > 0, "a rename reads storage");
+
+    for ordinal in 0..reads_per_rename {
+        let storage = ExpiringReadStorage::new();
+        let lix = open_with_file(&storage).await;
+        storage.expire_read_call_after(ordinal);
+        lix.execute(RENAME, &rename_params)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("the rename must restart when read {ordinal} expires: {error:?}")
+            });
+        assert_eq!(
+            storage.expired_calls(),
+            1,
+            "read ordinal {ordinal} of {reads_per_rename} must be exercised"
+        );
+        let result = lix
+            .execute(
+                "SELECT path FROM lix_file WHERE path = $1",
+                &[Value::Text("/renamed.md".into())],
+            )
+            .await
+            .expect("read the renamed file");
+        assert_eq!(result.rows().len(), 1, "the rename committed once");
+    }
 }
 
 #[tokio::test]
