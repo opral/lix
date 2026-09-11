@@ -38,9 +38,7 @@ impl SqlWriteResult {
             .commit_id
             .as_ref()
             .zip(outcome.parent_commit_id.as_ref())
-            .map(|(commit_id, parent_commit_id)| {
-                (commit_id.clone(), parent_commit_id.clone())
-            });
+            .map(|(commit_id, parent_commit_id)| (commit_id.clone(), parent_commit_id.clone()));
         let rows = match outcome.commit_id {
             Some(commit_id) => vec![vec![crate::Value::Text(commit_id)]],
             None if outcome.rows_affected == 0 => Vec::new(),
@@ -124,9 +122,9 @@ pub(crate) use write::{
 pub(crate) use write::{
     WriteLogicalPlan as SqlWriteLogicalPlan, create_write_logical_plan_from_template,
     create_write_plan_template_from_parsed, diff_command_query,
-    execute_write_logical_plan_parameter_batch, execute_write_logical_plan_prepared_dml_batch,
-    execute_write_logical_plan_result_with_metadata, execute_write_logical_plan_value_batch,
-    parameter_record_batch, parameter_row, write_plan_requires_post_stage_returning_checkpoint,
+    execute_write_logical_plan_parameter_batch, execute_write_logical_plan_result_with_metadata,
+    execute_write_logical_plan_value_batch, parameter_record_batch, parameter_row,
+    write_plan_requires_post_stage_returning_checkpoint,
 };
 
 pub(crate) enum SqlLogicalPlan {
@@ -181,9 +179,9 @@ pub(crate) fn append_path_value_replacement_snapshot_text(
 
 #[cfg(test)]
 pub(crate) use bound_public_write::{
-    take_certified_row_insert_batch_executions,
-    take_certified_row_insert_parameter_batch_executions,
     take_certified_generation_identity_replacements,
     take_certified_replacement_parameter_batch_executions,
+    take_certified_row_insert_batch_executions,
+    take_certified_row_insert_parameter_batch_executions,
     take_certified_single_path_value_replacements, take_row_update_parameter_batch_executions,
 };

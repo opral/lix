@@ -5,41 +5,48 @@
 //! projection decoder remains the single value-conversion contract; this
 //! module only chooses physical row groups and delegates their encoding.
 
-use std::collections::{BTreeMap, HashMap};
-use std::ops::Deref;
+use crate::row_columnar::{EncodedRowGroups, RowGroupLocations};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{ArrayRef, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
+#[cfg(test)]
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
-use crate::columnar_row_group::{
-    EncodedRowGroupSet, ROW_GROUP_MAX_ROWS, RowGroupRowLocation,
-    encode_row_group_set_preserving_batches,
-};
+#[cfg(test)]
+use crate::columnar_row_group::RowGroupRowLocation;
+use crate::columnar_row_group::{ROW_GROUP_MAX_ROWS, encode_row_group_set_preserving_batches};
+#[cfg(test)]
 use crate::row_pk::RowPk;
-use crate::sql2::{
-    SchemaColumnType, RowProjectionDecoder, SchemaSurfaceSpec, row_visible_fields,
-};
+#[cfg(test)]
+use crate::sql2::RowProjectionDecoder;
+use crate::sql2::{SchemaColumnType, SchemaSurfaceSpec, row_visible_fields};
 
 pub(crate) const ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY: &str =
     "lix.row_columnar.layout_fingerprint.v1";
 pub(crate) const ROW_COLUMNAR_BASE_COORDINATES_METADATA_KEY: &str =
     "lix.row_columnar.base_coordinates.v1";
-pub(crate) use crate::hot_state::{
+pub(crate) use crate::row_columnar::{
     ROW_COLUMNAR_IDENTITY_FIELD, ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY,
 };
 pub(crate) const LOW_CARDINALITY_CLUSTER_MAX_VALUES: usize = 64;
+#[cfg(test)]
 const LOW_CARDINALITY_CLUSTER_MAX_BUCKETS: usize = 8;
+#[cfg(test)]
 const ROW_COLUMNAR_MAX_CLUSTER_PARTITIONS: usize = 64;
 
+#[cfg(test)]
 enum ClusterField<'a> {
     Boolean(&'a str),
     String(&'a str, BTreeMap<String, u8>),
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 pub(crate) struct RowColumnarRowRef<'a> {
     pub(crate) row_pk: &'a RowPk,
@@ -48,6 +55,7 @@ pub(crate) struct RowColumnarRowRef<'a> {
     pub(crate) typed_row: Option<&'a lix_schema::Row>,
 }
 
+#[cfg(test)]
 impl RowColumnarRowRef<'_> {
     fn boolean(&self, name: &str) -> Option<bool> {
         self.typed_row
@@ -68,72 +76,9 @@ impl RowColumnarRowRef<'_> {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct EncodedRowGroups {
-    encoded: EncodedRowGroupSet,
-    pub(crate) input_locations: RowGroupLocations,
-}
-
-/// Input-row to physical-row mapping for one sealed row generation.
-///
-/// Identity-preserving batches use arithmetic coordinates and retain no
-/// row-cardinal location column. Clustered layouts keep the explicit
-/// permutation required to map their reordered rows back to statement order.
-#[derive(Clone, Debug)]
-pub(crate) enum RowGroupLocations {
-    Dense { row_count: usize },
-    Explicit(Vec<RowGroupRowLocation>),
-}
-
-impl RowGroupLocations {
-    pub(crate) fn len(&self) -> usize {
-        match self {
-            Self::Dense { row_count } => *row_count,
-            Self::Explicit(locations) => locations.len(),
-        }
-    }
-
-    pub(crate) fn location(&self, input_index: usize) -> Option<RowGroupRowLocation> {
-        match self {
-            Self::Dense { row_count } if input_index < *row_count => Some(RowGroupRowLocation {
-                group_index: u32::try_from(input_index / ROW_GROUP_MAX_ROWS).ok()?,
-                row_index: u32::try_from(input_index % ROW_GROUP_MAX_ROWS).ok()?,
-            }),
-            Self::Dense { .. } => None,
-            Self::Explicit(locations) => locations.get(input_index).copied(),
-        }
-    }
-
-    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = RowGroupRowLocation> + '_ {
-        (0..self.len()).map(|input_index| {
-            self.location(input_index)
-                .expect("row-group location covers every input row")
-        })
-    }
-}
-
-impl PartialEq for RowGroupLocations {
-    fn eq(&self, other: &Self) -> bool {
-        self.len() == other.len() && self.iter().eq(other.iter())
-    }
-}
-
-impl Eq for RowGroupLocations {}
-
-impl Deref for EncodedRowGroups {
-    type Target = EncodedRowGroupSet;
-
-    fn deref(&self) -> &Self::Target {
-        &self.encoded
-    }
-}
-
-impl EncodedRowGroups {
-    pub(crate) fn into_parts(self) -> (EncodedRowGroupSet, RowGroupLocations) {
-        (self.encoded, self.input_locations)
-    }
-}
-
+// Independent fixture encoder for projection, corruption, and layout equivalence tests.
+// Runtime publication uses the certified unclustered encoder or canonical rows.
+#[cfg(test)]
 pub(crate) fn encode_registered_row_groups<'a, I>(
     spec: &SchemaSurfaceSpec,
     rows: I,
@@ -155,7 +100,7 @@ where
 /// Encodes frontend-owned Arrow columns without reconstructing them from
 /// canonical snapshot JSON. The fast contract is deliberately limited to
 /// layouts whose established encoder would not reorder rows for clustering;
-/// clustered layouts retain the general encoder and identical physical
+/// clustered layouts retain canonical row staging and identical physical
 /// behavior.
 pub(crate) fn encode_unclustered_registered_row_groups(
     spec: &SchemaSurfaceSpec,
@@ -232,6 +177,7 @@ pub(crate) fn encode_unclustered_registered_row_groups(
     }))
 }
 
+#[cfg(test)]
 fn encode_registered_row_groups_impl<'a, I>(
     spec: &SchemaSurfaceSpec,
     rows: I,
@@ -315,13 +261,11 @@ where
             let key = cluster_fields
                 .iter()
                 .map(|field| match field {
-                    ClusterField::Boolean(name) => {
-                        match row.boolean(name) {
-                            Some(false) => 0,
-                            Some(true) => 1,
-                            None => 2,
-                        }
-                    }
+                    ClusterField::Boolean(name) => match row.boolean(name) {
+                        Some(false) => 0,
+                        Some(true) => 1,
+                        None => 2,
+                    },
                     ClusterField::String(name, dictionary) => row
                         .string(name)
                         .and_then(|value| dictionary.get(value).copied())
@@ -370,13 +314,12 @@ where
             input_locations
                 .into_iter()
                 .collect::<Option<Vec<_>>>()
-                .ok_or_else(|| {
-                    row_columnar_error("row-group permutation omitted an input row")
-                })?,
+                .ok_or_else(|| row_columnar_error("row-group permutation omitted an input row"))?,
         ),
     })
 }
 
+#[cfg(test)]
 fn optional_derived_row_group_set(
     encoded: Result<EncodedRowGroups, LixError>,
 ) -> Option<EncodedRowGroups> {
@@ -422,6 +365,7 @@ mod tests {
 
     use super::*;
     use crate::columnar_row_group::RowGroupScalar;
+    #[cfg(test)]
     use crate::row_pk::RowPk;
     use crate::sql2::derive_schema_surface_spec_from_schema;
 

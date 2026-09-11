@@ -1,4 +1,3 @@
-mod authority_route;
 mod bind;
 mod branch_ref;
 mod branch_scope;
@@ -27,7 +26,6 @@ mod row_batch;
 mod row_columnar_layout;
 mod row_projection;
 mod runtime;
-mod script;
 mod session;
 #[cfg(test)]
 mod test_support;
@@ -38,7 +36,6 @@ mod write_normalization;
 #[cfg(feature = "storage-benches")]
 pub(crate) use error::datafusion_error_to_lix_error;
 
-pub(crate) use authority_route::{StatementAuthorityRoute, statement_authority_route};
 #[cfg(test)]
 pub(crate) use bind::bind_statement;
 pub(crate) use bind::{
@@ -70,11 +67,11 @@ pub(crate) use exec::{
     create_write_plan_template_from_parsed, diff_command_query,
     execute_read_statement_in_session_from_parsed, execute_read_statement_in_session_with_result,
     execute_transaction_read_statement_from_parsed, execute_write_logical_plan_parameter_batch,
-    execute_write_logical_plan_prepared_dml_batch, execute_write_logical_plan_result_with_metadata,
-    execute_write_logical_plan_value_batch, parameter_record_batch, parameter_row,
-    prepare_path_value_replacement_program, prepare_path_value_replacement_row,
-    prepare_read_session, prepare_read_session_at_head, query_result_from_batches,
-    query_values_from_batches, write_plan_requires_post_stage_returning_checkpoint,
+    execute_write_logical_plan_result_with_metadata, execute_write_logical_plan_value_batch,
+    parameter_record_batch, parameter_row, prepare_path_value_replacement_program,
+    prepare_path_value_replacement_row, prepare_read_session, prepare_read_session_at_head,
+    query_result_from_batches, query_values_from_batches,
+    write_plan_requires_post_stage_returning_checkpoint,
 };
 #[cfg(test)]
 pub(crate) use exec::{
@@ -107,11 +104,21 @@ pub(crate) use providers::{
 pub(crate) use result_metadata::result_column_type;
 pub(crate) use row_batch::{CurrentRowSnapshotReader, RowSnapshotReader};
 pub(crate) use row_columnar_layout::{
-    EncodedRowGroups, LOW_CARDINALITY_CLUSTER_MAX_VALUES,
-    ROW_COLUMNAR_BASE_COORDINATES_METADATA_KEY, ROW_COLUMNAR_IDENTITY_FIELD,
-    ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY, ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY,
-    RowColumnarRowRef, RowGroupLocations, encode_registered_row_groups,
-    encode_unclustered_registered_row_groups,
+    LOW_CARDINALITY_CLUSTER_MAX_VALUES, ROW_COLUMNAR_BASE_COORDINATES_METADATA_KEY,
+    ROW_COLUMNAR_IDENTITY_FIELD, ROW_COLUMNAR_LAYOUT_FINGERPRINT_METADATA_KEY,
+    ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY, encode_unclustered_registered_row_groups,
 };
+#[cfg(test)]
+pub(crate) use row_columnar_layout::{RowColumnarRowRef, encode_registered_row_groups};
 pub(crate) use row_projection::RowProjectionDecoder;
 mod aggregate_statistics;
+
+pub(crate) use plan::read::execute_native_read;
+#[cfg(test)]
+pub(crate) use plan::read::statement::ExactFilesystemRead;
+#[cfg(any(test, feature = "storage-benches"))]
+pub(crate) use plan::read::statement::exact_filesystem_read_route;
+pub(crate) use plan::read::statement::{
+    StatementReadPlan, is_acknowledgeable_file_content_read,
+    late_materialized_lix_file_content_read, plan_read_statement,
+};

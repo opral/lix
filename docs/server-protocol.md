@@ -36,7 +36,7 @@ contract in another language. See [Hosting](./hosting.md).
 | Transaction | `/lix/v1/{lix_id}/transaction/{begin,execute,commit,rollback}`                  |
 | Files       | `/lix/v1/{lix_id}/file`, `/lix/v1/{lix_id}/file/upsert{,-batch}`               |
 | Sync        | `/lix/v1/{lix_id}/sync/{push,pull,history,checkpoints,blob,chunk}`                          |
-| Versioning  | `/lix/v1/{lix_id}/branch/{create,switch}`, `/lix/v1/{lix_id}/{undo,redo}`       |
+| Versioning  | `/lix/v1/{lix_id}/branch/{create,switch,merge,merge-preview}`, `/lix/v1/{lix_id}/{undo,redo}`       |
 | Observation | `/lix/v1/{lix_id}/observe`, `/lix/v1/{lix_id}/observe/multiplex`                |
 | Snapshot    | `/lix/v1/{lix_id}/snapshot`                                                     |
 

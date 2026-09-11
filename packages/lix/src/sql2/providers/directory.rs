@@ -103,15 +103,8 @@ pub(crate) async fn execute_exact_lix_directory_root_listing(
     let index = filesystem_path_index
         .path_index(&FilesystemPathIndexRequest::new(branch_ids))
         .await?;
-    let matches = indexed_path_matches(
-        index,
-        &FilePathPredicate::All,
-        FilesystemPathKind::Directory,
-    );
-    let mut entries = matches
-        .entries()
-        .filter(|entry| entry.parent_id.is_none())
-        .collect::<Vec<_>>();
+    let matches = indexed_directory_root_matches(index);
+    let mut entries = matches.entries().collect::<Vec<_>>();
     entries.sort_unstable_by(|left, right| {
         left.name
             .cmp(&right.name)

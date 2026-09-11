@@ -274,314 +274,6 @@ impl PluginRowAuthorities {
             }
         }
     }
-
-    pub(crate) fn encode_checkpoint(&self) -> Result<Vec<u8>, LixError> {
-        let (ranges, terminal) = self.flatten_refs();
-        let inserted_count = terminal.values().filter(|present| **present).count();
-        let removed_count = terminal.len().saturating_sub(inserted_count);
-        let capacity = checkpoint_flat_encoded_size(&ranges, &terminal)?;
-        let mut output = Vec::with_capacity(capacity);
-        output.extend_from_slice(b"LIXAUT02");
-        push_authority_len(&mut output, ranges.len())?;
-        push_authority_len(&mut output, inserted_count)?;
-        push_authority_len(&mut output, removed_count)?;
-        for range in ranges {
-            push_authority_text(&mut output, &range.schema_key)?;
-            output.extend_from_slice(&range.schema_fingerprint);
-            output.extend_from_slice(&range.namespace);
-            output.extend_from_slice(&range.first_local_ref.to_le_bytes());
-            output.extend_from_slice(&range.last_local_ref.to_le_bytes());
-        }
-        for key in terminal
-            .iter()
-            .filter_map(|(key, present)| present.then_some(*key))
-            .chain(
-                terminal
-                    .iter()
-                    .filter_map(|(key, present)| (!present).then_some(*key)),
-            )
-        {
-            push_authority_text(&mut output, key.schema_key.as_str())?;
-            output.extend_from_slice(&key.schema_fingerprint);
-            push_authority_len(&mut output, key.row_pk.len())?;
-            for component in key.row_pk.iter() {
-                let encoded_len = crate::plugin::wire::typed::encoded_key_value_size(component)
-                    .map_err(|_| invalid_authority_checkpoint())?;
-                push_authority_len(&mut output, encoded_len)?;
-                crate::plugin::wire::typed::append_key_value_bytes(&mut output, component)
-                    .map_err(|_| invalid_authority_checkpoint())?;
-            }
-        }
-        Ok(output)
-    }
-
-    fn flatten_refs(&self) -> (Vec<&PluginRowAuthorityRange>, BTreeMap<&WasmRowKey, bool>) {
-        fn visit<'a>(
-            node: &'a PluginRowAuthorityNode,
-            ranges: &mut Vec<&'a PluginRowAuthorityRange>,
-            terminal: &mut BTreeMap<&'a WasmRowKey, bool>,
-        ) {
-            match node {
-                PluginRowAuthorityNode::Base {
-                    ranges: base_ranges,
-                    inserted,
-                    removed,
-                } => {
-                    ranges.extend(base_ranges);
-                    terminal.extend(inserted.iter().map(|key| (key, true)));
-                    terminal.extend(removed.iter().map(|key| (key, false)));
-                }
-                PluginRowAuthorityNode::Delta {
-                    parent,
-                    inserted,
-                    removed,
-                    ..
-                } => {
-                    visit(parent.node.as_ref(), ranges, terminal);
-                    terminal.extend(removed.iter().map(|key| (key, false)));
-                    terminal.extend(inserted.iter().map(|key| (key, true)));
-                }
-            }
-        }
-
-        let mut ranges = Vec::new();
-        let mut terminal = BTreeMap::new();
-        visit(self.node.as_ref(), &mut ranges, &mut terminal);
-        (ranges, terminal)
-    }
-
-    pub(crate) fn encode_checkpoint_bounded(&self, max_bytes: usize) -> Option<Vec<u8>> {
-        if self.checkpoint_encoded_upper_bound()? > max_bytes {
-            return None;
-        }
-        let encoded = self.encode_checkpoint().ok()?;
-        (encoded.len() <= max_bytes).then_some(encoded)
-    }
-
-    fn checkpoint_encoded_upper_bound(&self) -> Option<usize> {
-        fn add_text(len: usize, text: &str) -> Option<usize> {
-            len.checked_add(4)?.checked_add(text.len())
-        }
-
-        fn add_key(mut len: usize, key: &WasmRowKey) -> Option<usize> {
-            len = add_text(len, key.schema_key.as_str())?;
-            len = len.checked_add(32 + 4)?;
-            for component in key.row_pk.iter() {
-                let encoded_len =
-                    crate::plugin::wire::typed::encoded_key_value_size(component).ok()?;
-                len = len.checked_add(4)?.checked_add(encoded_len)?;
-            }
-            Some(len)
-        }
-
-        fn add_keys<'a>(
-            mut len: usize,
-            keys: impl Iterator<Item = &'a WasmRowKey>,
-        ) -> Option<usize> {
-            for key in keys {
-                len = add_key(len, key)?;
-            }
-            Some(len)
-        }
-
-        fn node_upper_bound(node: &PluginRowAuthorityNode) -> Option<usize> {
-            match node {
-                PluginRowAuthorityNode::Base {
-                    ranges,
-                    inserted,
-                    removed,
-                } => {
-                    let mut len = 20_usize;
-                    for range in ranges {
-                        len = add_text(len, &range.schema_key)?;
-                        len = len.checked_add(52)?;
-                    }
-                    add_keys(len, inserted.iter().chain(removed.iter()))
-                }
-                PluginRowAuthorityNode::Delta {
-                    parent,
-                    inserted,
-                    removed,
-                    ..
-                } => add_keys(
-                    node_upper_bound(parent.node.as_ref())?,
-                    inserted.iter().chain(removed.iter()),
-                ),
-            }
-        }
-
-        node_upper_bound(self.node.as_ref())
-    }
-
-    pub(crate) fn decode_checkpoint(bytes: &[u8]) -> Result<Self, LixError> {
-        let mut reader = AuthorityCheckpointReader::new(bytes);
-        if reader.take(8)? != b"LIXAUT02" {
-            return Err(invalid_authority_checkpoint());
-        }
-        let range_count = reader.len()?;
-        let inserted_count = reader.len()?;
-        let removed_count = reader.len()?;
-        let mut ranges = Vec::new();
-        for _ in 0..range_count {
-            let schema_key = reader.text()?;
-            let schema_fingerprint = reader
-                .take(32)?
-                .try_into()
-                .map_err(|_| invalid_authority_checkpoint())?;
-            let namespace: [u8; 12] = reader
-                .take(12)?
-                .try_into()
-                .map_err(|_| invalid_authority_checkpoint())?;
-            let first_local_ref = reader.u32()?;
-            let last_local_ref = reader.u32()?;
-            if first_local_ref > last_local_ref {
-                return Err(invalid_authority_checkpoint());
-            }
-            ranges.push(PluginRowAuthorityRange {
-                schema_key,
-                schema_fingerprint,
-                namespace,
-                first_local_ref,
-                last_local_ref,
-            });
-        }
-        let mut read_keys = |count: usize| -> Result<BTreeSet<WasmRowKey>, LixError> {
-            let mut keys = BTreeSet::new();
-            for _ in 0..count {
-                let schema_key = reader.text()?;
-                let schema_fingerprint = reader
-                    .take(32)?
-                    .try_into()
-                    .map_err(|_| invalid_authority_checkpoint())?;
-                let component_count = reader.len()?;
-                let mut row_pk = Vec::new();
-                for _ in 0..component_count {
-                    row_pk.push(
-                        crate::plugin::wire::typed::decode_key_value_bytes(reader.bytes()?)
-                            .map_err(|_| invalid_authority_checkpoint())?,
-                    );
-                }
-                let key = WasmRowKey::from_typed_parts(schema_key, schema_fingerprint, row_pk)
-                    .map_err(|_| invalid_authority_checkpoint())?;
-                if !keys.insert(key) {
-                    return Err(invalid_authority_checkpoint());
-                }
-            }
-            Ok(keys)
-        };
-        let inserted = read_keys(inserted_count)?;
-        let removed = read_keys(removed_count)?;
-        if !reader.is_empty() || inserted.iter().any(|key| removed.contains(key)) {
-            return Err(invalid_authority_checkpoint());
-        }
-        Ok(Self {
-            node: Arc::new(PluginRowAuthorityNode::Base {
-                ranges,
-                inserted,
-                removed,
-            }),
-        })
-    }
-}
-
-fn checkpoint_flat_encoded_size(
-    ranges: &[&PluginRowAuthorityRange],
-    terminal: &BTreeMap<&WasmRowKey, bool>,
-) -> Result<usize, LixError> {
-    let mut len = 20_usize;
-    for range in ranges {
-        len = len
-            .checked_add(4 + range.schema_key.len() + 52)
-            .ok_or_else(invalid_authority_checkpoint)?;
-    }
-    for key in terminal.keys() {
-        len = len
-            .checked_add(4 + key.schema_key.len() + 32 + 4)
-            .ok_or_else(invalid_authority_checkpoint)?;
-        for component in key.row_pk.iter() {
-            let encoded_len = crate::plugin::wire::typed::encoded_key_value_size(component)
-                .map_err(|_| invalid_authority_checkpoint())?;
-            len = len
-                .checked_add(4 + encoded_len)
-                .ok_or_else(invalid_authority_checkpoint)?;
-        }
-    }
-    Ok(len)
-}
-
-fn push_authority_len(output: &mut Vec<u8>, value: usize) -> Result<(), LixError> {
-    let value = u32::try_from(value).map_err(|_| invalid_authority_checkpoint())?;
-    output.extend_from_slice(&value.to_le_bytes());
-    Ok(())
-}
-
-fn push_authority_text(output: &mut Vec<u8>, value: &str) -> Result<(), LixError> {
-    push_authority_bytes(output, value.as_bytes())
-}
-
-fn push_authority_bytes(output: &mut Vec<u8>, value: &[u8]) -> Result<(), LixError> {
-    push_authority_len(output, value.len())?;
-    output.extend_from_slice(value);
-    Ok(())
-}
-
-fn invalid_authority_checkpoint() -> LixError {
-    LixError::new(
-        LixError::CODE_INVALID_PLUGIN,
-        "plugin row authority checkpoint is corrupt",
-    )
-}
-
-struct AuthorityCheckpointReader<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> AuthorityCheckpointReader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
-    }
-
-    fn take(&mut self, len: usize) -> Result<&'a [u8], LixError> {
-        let end = self
-            .offset
-            .checked_add(len)
-            .ok_or_else(invalid_authority_checkpoint)?;
-        let value = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or_else(invalid_authority_checkpoint)?;
-        self.offset = end;
-        Ok(value)
-    }
-
-    fn u32(&mut self) -> Result<u32, LixError> {
-        Ok(u32::from_le_bytes(
-            self.take(4)?
-                .try_into()
-                .map_err(|_| invalid_authority_checkpoint())?,
-        ))
-    }
-
-    fn len(&mut self) -> Result<usize, LixError> {
-        usize::try_from(self.u32()?).map_err(|_| invalid_authority_checkpoint())
-    }
-
-    fn text(&mut self) -> Result<String, LixError> {
-        let len = self.len()?;
-        std::str::from_utf8(self.take(len)?)
-            .map(str::to_owned)
-            .map_err(|_| invalid_authority_checkpoint())
-    }
-
-    fn bytes(&mut self) -> Result<&'a [u8], LixError> {
-        let len = self.len()?;
-        self.take(len)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.offset == self.bytes.len()
-    }
 }
 
 /// Complete authority identity for one mutable guest instance.
@@ -1398,7 +1090,7 @@ impl PluginActorCache {
     }
 
     #[cfg(test)]
-    fn live_store_count(&self) -> usize {
+    pub(crate) fn live_store_count(&self) -> usize {
         self.capacity
             .get()
             .saturating_sub(self.store_admission.available_permits())
@@ -2023,7 +1715,7 @@ fn stale_observation(message: impl Into<String>) -> LixError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use async_trait::async_trait;
 
     use super::*;
@@ -2219,6 +1911,109 @@ mod tests {
         )
     }
 
+    pub(crate) fn pending_publication_for_test(
+        cache: &PluginActorCache,
+    ) -> (
+        crate::plugin::runtime::PendingPluginActorPublication,
+        Arc<AtomicBool>,
+    ) {
+        let retired = Arc::new(AtomicBool::new(false));
+        let publication = crate::plugin::runtime::PendingPluginActorPublication::new(
+            key("main", "/pending.csv", "g1"),
+            cache.clone(),
+            PluginActorStore::new(
+                Box::new(TestActor {
+                    retirement_probe: Some(retired.clone()),
+                    ..Default::default()
+                }),
+                cache.admit_store().unwrap(),
+            ),
+            WasmDocumentHandle(1),
+            Some(WasmDocumentCheckpoint::new(42_u64, 8)),
+            b"new".as_slice().into(),
+            Arc::from("root-new"),
+            PluginRowAuthorities::empty(),
+            crate::plugin::runtime::PluginPublicationPolicy {
+                semantic_chainable: false,
+                retain_large_import_actor: false,
+            },
+        );
+        (publication, retired)
+    }
+
+    pub(crate) async fn failing_publication_for_test(
+        cache: &PluginActorCache,
+    ) -> crate::plugin::runtime::PendingPluginActorPublication {
+        let actor_key = key("main", "/pending.csv", "g1");
+        let observation = install(cache, actor_key.clone(), 1, b"old", "root-old");
+        let lease = cache.lease(&observation).await.unwrap();
+        // A missing successor injects a derived cache publication failure.
+        crate::plugin::runtime::PendingPluginActorPublication::existing(
+            actor_key,
+            lease,
+            crate::plugin::runtime::PluginPublicationPolicy {
+                semantic_chainable: true,
+                retain_large_import_actor: false,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn publication_uncaches_without_publishing_checkpoint_until_commit() {
+        let cache = PluginActorCache::new(1).unwrap();
+        let (publication, retired) = pending_publication_for_test(&cache);
+        let actor_key = publication.key().clone();
+        let publication = publication.into_uncached().await;
+        assert!(retired.load(Ordering::Acquire));
+        assert_eq!(cache.live_store_count(), 0);
+        assert!(cache.checkpoint(&actor_key, "root-new").is_none());
+        let receipt = publication.publish().await.unwrap();
+        assert_eq!(receipt.key, actor_key);
+        assert!(receipt.observation.is_none());
+        assert!(cache.checkpoint(&actor_key, "root-new").is_some());
+    }
+
+    #[tokio::test]
+    async fn aborting_publication_releases_store_and_discards_checkpoint() {
+        let cache = PluginActorCache::new(1).unwrap();
+        let (publication, retired) = pending_publication_for_test(&cache);
+        let actor_key = publication.key().clone();
+        publication.discard().await;
+        assert!(retired.load(Ordering::Acquire));
+        assert_eq!(cache.live_store_count(), 0);
+        assert!(cache.checkpoint(&actor_key, "root-new").is_none());
+        assert!(cache.observe(&actor_key, "root-new").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_existing_publication_retires_private_successor() {
+        let cache = PluginActorCache::new(1).unwrap();
+        let actor_key = key("main", "/pending.csv", "g1");
+        let observation = install(&cache, actor_key.clone(), 1, b"old", "root-old");
+        let mut lease = cache.lease(&observation).await.unwrap();
+        lease.begin_guest_call().unwrap();
+        lease
+            .complete_guest_call(
+                WasmDocumentHandle(2),
+                None,
+                b"new".as_slice().into(),
+                FileBytesSha256::compute(b"new"),
+                Arc::from("root-new"),
+            )
+            .unwrap();
+        let publication = crate::plugin::runtime::PendingPluginActorPublication::existing(
+            actor_key.clone(),
+            lease,
+            crate::plugin::runtime::PluginPublicationPolicy {
+                semantic_chainable: true,
+                retain_large_import_actor: false,
+            },
+        );
+        drop(publication);
+        assert!(cache.observe(&actor_key, "root-old").await.is_err());
+        assert!(cache.observe(&actor_key, "root-new").await.is_err());
+    }
+
     #[test]
     fn decoded_checkpoints_require_exact_actor_and_semantic_root() {
         let cache = PluginActorCache::new(2).unwrap();
@@ -2405,62 +2200,6 @@ mod tests {
             authorities.materialize_keys(),
             BTreeSet::from([key(10), key(11), inside, key(14), key(15), outside])
         );
-    }
-
-    #[test]
-    fn row_authority_checkpoint_roundtrips_ranges_and_sparse_overrides() {
-        let creates = WasmCreateContext {
-            high: 0x0123_4567_89ab_cdef,
-            low: 0xfedc_ba98,
-        };
-        let key = |local_ref| {
-            typed_uuid_key(
-                "row",
-                creates.component(local_ref).expect("local ref should fit"),
-            )
-        };
-        let retained = key(2);
-        let removed = key(3);
-        let inserted = key(9);
-        let authorities = PluginRowAuthorities::empty()
-            .with_ranges(vec![PluginRowAuthorityRange::new(
-                "row".to_owned(),
-                [0; 32],
-                creates,
-                1,
-                4,
-            )])
-            .with_delta(BTreeSet::new(), BTreeSet::from([removed.clone()]))
-            .with_delta(BTreeSet::from([inserted.clone()]), BTreeSet::new());
-
-        let decoded =
-            PluginRowAuthorities::decode_checkpoint(&authorities.encode_checkpoint().unwrap())
-                .unwrap();
-        assert!(decoded.contains(&retained));
-        assert!(!decoded.contains(&removed));
-        assert!(decoded.contains(&inserted));
-    }
-
-    #[test]
-    fn row_authority_checkpoint_respects_optional_byte_bound() {
-        let authorities = PluginRowAuthorities::empty();
-        let encoded = authorities.encode_checkpoint().unwrap();
-
-        assert!(
-            authorities
-                .encode_checkpoint_bounded(encoded.len() - 1)
-                .is_none()
-        );
-        assert_eq!(
-            authorities
-                .encode_checkpoint_bounded(encoded.len())
-                .unwrap(),
-            encoded
-        );
-
-        let mut old = encoded;
-        old[..8].copy_from_slice(b"LIXAUT01");
-        assert!(PluginRowAuthorities::decode_checkpoint(&old).is_err());
     }
 
     #[tokio::test]

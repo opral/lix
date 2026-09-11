@@ -2789,7 +2789,6 @@ async fn check_preconditions(
                         }
                         keys.is_empty()
                     }
-                    Precondition::BranchEquals { .. } => false,
                     Precondition::KeyAbsent { .. }
                     | Precondition::KeyPresent { .. }
                     | Precondition::KeyValueHashEquals { .. }
@@ -2854,7 +2853,7 @@ fn point_precondition_physical_key(
         | Precondition::KeyPresent { space, key }
         | Precondition::KeyValueHashEquals { space, key, .. }
         | Precondition::KeyValueEquals { space, key, .. } => physical_key(space.id, key).map(Some),
-        Precondition::RangeEmpty { .. } | Precondition::BranchEquals { .. } => Ok(None),
+        Precondition::RangeEmpty { .. } => Ok(None),
     }
 }
 
@@ -2868,7 +2867,7 @@ fn point_precondition_matches(precondition: &Precondition, value: Option<&Bytes>
         Precondition::KeyValueEquals { expected, .. } => {
             value.is_some_and(|value| value == expected)
         }
-        Precondition::RangeEmpty { .. } | Precondition::BranchEquals { .. } => {
+        Precondition::RangeEmpty { .. } => {
             unreachable!("only point preconditions have batched snapshot values")
         }
     }
@@ -7045,10 +7044,6 @@ mod tests {
                     space,
                     key: present.clone(),
                 },
-                Precondition::BranchEquals {
-                    ref_key: Key(Bytes::from_static(b"branch-ref")),
-                    expected: Bytes::from_static(b"ignored"),
-                },
                 Precondition::KeyValueHashEquals {
                     space,
                     key: present,
@@ -7069,7 +7064,6 @@ mod tests {
                 PreconditionFailure { index: 2 },
                 PreconditionFailure { index: 3 },
                 PreconditionFailure { index: 4 },
-                PreconditionFailure { index: 5 },
             ])
         );
     }

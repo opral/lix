@@ -32,7 +32,7 @@ use crate::hot_state::{
     HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter, HotStateProjection,
     HotStateReader, HotStateRowFilter, HotStateScanRequest,
 };
-use crate::plugin::runtime::WasmTypedRow;
+use crate::row_payload::TypedRow as WasmTypedRow;
 use crate::row_pk::RowPk;
 use crate::sql2::branch_scope::{BranchBinding, resolve_provider_branch_ids};
 use crate::sql2::catalog::{
@@ -40,6 +40,7 @@ use crate::sql2::catalog::{
     schema_surface_schema,
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
+use crate::sql2::plan::read::{self, IdentityConstraint, datafusion_identity_node};
 use crate::sql2::read_only::reject_read_only_schema_surface;
 use crate::sql2::row_projection::{RowProjectionDecoder, row_projection_error_to_datafusion_error};
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
@@ -1917,7 +1918,7 @@ pub(super) fn row_pks_from_primary_key_filters(
     filters: &[Expr],
 ) -> Result<Option<Vec<RowPk>>> {
     let analyzer = RowPrimaryKeyFilterAnalyzer::new(spec);
-    let mut constraint: Option<RowPkConstraint> = None;
+    let mut constraint: Option<IdentityConstraint> = None;
     for filter in filters {
         let Some(filter_constraint) = analyzer.analyze_conjunctive_constraint(filter)? else {
             continue;
@@ -1929,12 +1930,7 @@ pub(super) fn row_pks_from_primary_key_filters(
     }
 
     Ok(constraint
-        .and_then(|constraint| {
-            constraint.into_row_pks(
-                &analyzer.primary_key_columns,
-                &analyzer.primary_key_component_types,
-            )
-        })
+        .and_then(|constraint| analyzer.into_row_pks(constraint))
         .map(|ids| ids.into_iter().collect()))
 }
 
@@ -2429,131 +2425,40 @@ impl<'a> RowPrimaryKeyFilterAnalyzer<'a> {
     }
 
     fn analyze(&self, expr: &Expr) -> Result<Option<BTreeSet<RowPk>>> {
+        Ok(self
+            .analyze_constraint(expr, false)
+            .and_then(|constraint| self.into_row_pks(constraint)))
+    }
+
+    fn into_row_pks(&self, constraint: IdentityConstraint) -> Option<BTreeSet<RowPk>> {
+        constraint
+            .into_rows(&self.primary_key_columns, usize::MAX)?
+            .into_iter()
+            .map(|values| read::row_pk(&values, &self.primary_key_component_types))
+            .collect()
+    }
+
+    fn analyze_conjunctive_constraint(&self, expr: &Expr) -> Result<Option<IdentityConstraint>> {
+        Ok(self.analyze_constraint(expr, true))
+    }
+
+    fn analyze_constraint(&self, expr: &Expr, allow_residual: bool) -> Option<IdentityConstraint> {
         if self.primary_key_columns.is_empty() {
-            return Ok(None);
+            return None;
         }
-        let Some(constraint) = self.analyze_constraint(expr)? else {
-            return Ok(None);
-        };
-        Ok(constraint.into_row_pks(&self.primary_key_columns, &self.primary_key_component_types))
-    }
-
-    /// Extracts identity constraints that are guaranteed conjuncts while
-    /// refusing to partially route a disjunction. This lets DataFusion pass
-    /// separately planned composite-key terms without turning a payload
-    /// predicate into identity semantics.
-    fn analyze_conjunctive_constraint(&self, expr: &Expr) -> Result<Option<RowPkConstraint>> {
-        if self.primary_key_columns.is_empty() {
-            return Ok(None);
-        }
-        let Expr::BinaryExpr(binary_expr) = expr else {
-            return self.analyze_constraint(expr);
-        };
-        if binary_expr.op != Operator::And {
-            return self.analyze_constraint(expr);
-        }
-
-        let left = self.analyze_conjunctive_constraint(&binary_expr.left)?;
-        let right = self.analyze_conjunctive_constraint(&binary_expr.right)?;
-        Ok(match (left, right) {
-            (Some(left), Some(right)) => Some(left.intersect(right, &self.primary_key_columns)),
-            (Some(constraint), None) | (None, Some(constraint)) => Some(constraint),
-            (None, None) => None,
-        })
-    }
-
-    fn analyze_constraint(&self, expr: &Expr) -> Result<Option<RowPkConstraint>> {
-        match expr {
-            Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
-                let Some(left) = self.analyze_constraint(&binary_expr.left)? else {
-                    return Ok(None);
-                };
-                let Some(right) = self.analyze_constraint(&binary_expr.right)? else {
-                    return Ok(None);
-                };
-                Ok(Some(left.intersect(right, &self.primary_key_columns)))
-            }
-            Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Or => {
-                let Some(left) = self.analyze_constraint(&binary_expr.left)? else {
-                    return Ok(None);
-                };
-                let Some(right) = self.analyze_constraint(&binary_expr.right)? else {
-                    return Ok(None);
-                };
-                let Some(left_ids) =
-                    left.into_row_pks(&self.primary_key_columns, &self.primary_key_component_types)
-                else {
-                    return Ok(None);
-                };
-                let Some(mut right_ids) = right
-                    .into_row_pks(&self.primary_key_columns, &self.primary_key_component_types)
-                else {
-                    return Ok(None);
-                };
-                right_ids.extend(left_ids);
-                Ok(Some(RowPkConstraint::Full(right_ids)))
-            }
-            Expr::BinaryExpr(binary_expr) => Ok(row_pk_constraint_from_binary_filter(
-                binary_expr,
-                &self.primary_key_columns,
-                &self.primary_key_component_types,
-            )),
-            Expr::InList(in_list) => Ok(row_pk_constraint_from_in_list_filter(
-                in_list,
-                &self.primary_key_columns,
-                &self.primary_key_component_types,
-            )),
-            _ => Ok(None),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum RowPkConstraint {
-    Full(BTreeSet<RowPk>),
-    Parts(BTreeMap<String, BTreeSet<String>>),
-}
-
-impl RowPkConstraint {
-    fn intersect(self, other: Self, primary_key_columns: &[&str]) -> Self {
-        match (self, other) {
-            (Self::Full(left), Self::Full(right)) => {
-                Self::Full(left.intersection(&right).cloned().collect())
-            }
-            (Self::Full(ids), Self::Parts(parts)) | (Self::Parts(parts), Self::Full(ids)) => {
-                Self::Full(
-                    ids.into_iter()
-                        .filter(|identity| {
-                            identity_matches_parts(identity, primary_key_columns, &parts)
-                        })
-                        .collect(),
+        read::bind_identity(
+            expr,
+            &self.primary_key_columns,
+            allow_residual,
+            usize::MAX,
+            &|expr| {
+                read::normalize_node(
+                    datafusion_identity_node(expr),
+                    &self.primary_key_columns,
+                    &self.primary_key_component_types,
                 )
-            }
-            (Self::Parts(mut left), Self::Parts(right)) => {
-                for (column, right_values) in right {
-                    left.entry(column)
-                        .and_modify(|left_values| {
-                            *left_values =
-                                left_values.intersection(&right_values).cloned().collect();
-                        })
-                        .or_insert(right_values);
-                }
-                Self::Parts(left)
-            }
-        }
-    }
-
-    fn into_row_pks(
-        self,
-        primary_key_columns: &[&str],
-        component_types: &[crate::row_pk::RowPkComponentType],
-    ) -> Option<BTreeSet<RowPk>> {
-        match self {
-            Self::Full(ids) => Some(ids),
-            Self::Parts(parts) => {
-                row_pks_from_primary_key_parts(primary_key_columns, component_types, parts)
-            }
-        }
+            },
+        )
     }
 }
 
@@ -3298,175 +3203,6 @@ fn top_level_primary_key_columns(spec: &SchemaSurfaceSpec) -> Vec<&str> {
         })
         .collect::<Option<Vec<_>>>()
         .unwrap_or_default()
-}
-
-fn row_pk_constraint_from_binary_filter(
-    binary_expr: &BinaryExpr,
-    primary_key_columns: &[&str],
-    component_types: &[crate::row_pk::RowPkComponentType],
-) -> Option<RowPkConstraint> {
-    if binary_expr.op != Operator::Eq {
-        return None;
-    }
-    row_pk_constraint_from_column_literal_filter(
-        &binary_expr.left,
-        &binary_expr.right,
-        primary_key_columns,
-        component_types,
-    )
-    .or_else(|| {
-        row_pk_constraint_from_column_literal_filter(
-            &binary_expr.right,
-            &binary_expr.left,
-            primary_key_columns,
-            component_types,
-        )
-    })
-}
-
-fn row_pk_constraint_from_in_list_filter(
-    in_list: &InList,
-    primary_key_columns: &[&str],
-    component_types: &[crate::row_pk::RowPkComponentType],
-) -> Option<RowPkConstraint> {
-    if in_list.negated {
-        return None;
-    }
-    let Expr::Column(column) = in_list.expr.as_ref() else {
-        return None;
-    };
-    if in_list.list.is_empty() {
-        return None;
-    }
-    match column.name.as_str() {
-        column_name if primary_key_columns.contains(&column_name) => {
-            let component_type =
-                primary_key_component_type(column_name, primary_key_columns, component_types)?;
-            let values = in_list
-                .list
-                .iter()
-                .map(|expr| primary_key_expr_literal(expr, component_type))
-                .collect::<Option<BTreeSet<_>>>()?;
-            Some(RowPkConstraint::Parts(BTreeMap::from([(
-                column_name.to_string(),
-                values,
-            )])))
-        }
-        _ => None,
-    }
-}
-
-fn row_pk_constraint_from_column_literal_filter(
-    column_expr: &Expr,
-    literal_expr: &Expr,
-    primary_key_columns: &[&str],
-    component_types: &[crate::row_pk::RowPkComponentType],
-) -> Option<RowPkConstraint> {
-    let Expr::Column(column) = column_expr else {
-        return None;
-    };
-    match column.name.as_str() {
-        column_name if primary_key_columns.contains(&column_name) => {
-            let component_type =
-                primary_key_component_type(column_name, primary_key_columns, component_types)?;
-            let value = primary_key_expr_literal(literal_expr, component_type)?;
-            Some(RowPkConstraint::Parts(BTreeMap::from([(
-                column_name.to_string(),
-                BTreeSet::from([value]),
-            )])))
-        }
-        _ => None,
-    }
-}
-
-fn primary_key_component_type(
-    column_name: &str,
-    primary_key_columns: &[&str],
-    component_types: &[crate::row_pk::RowPkComponentType],
-) -> Option<crate::row_pk::RowPkComponentType> {
-    primary_key_columns
-        .iter()
-        .position(|candidate| *candidate == column_name)
-        .and_then(|index| component_types.get(index))
-        .copied()
-}
-
-fn primary_key_expr_literal(
-    expr: &Expr,
-    component_type: crate::row_pk::RowPkComponentType,
-) -> Option<String> {
-    use crate::row_pk::RowPkComponentType;
-
-    if !matches!(component_type, RowPkComponentType::Integer) {
-        return string_expr_literal(expr);
-    }
-    let Expr::Literal(literal, _) = expr else {
-        return None;
-    };
-    match literal {
-        ScalarValue::Int8(Some(value)) => Some(i64::from(*value).to_string()),
-        ScalarValue::Int16(Some(value)) => Some(i64::from(*value).to_string()),
-        ScalarValue::Int32(Some(value)) => Some(i64::from(*value).to_string()),
-        ScalarValue::Int64(Some(value)) => Some(value.to_string()),
-        ScalarValue::UInt8(Some(value)) => Some(i64::from(*value).to_string()),
-        ScalarValue::UInt16(Some(value)) => Some(i64::from(*value).to_string()),
-        ScalarValue::UInt32(Some(value)) => Some(i64::from(*value).to_string()),
-        ScalarValue::UInt64(Some(value)) => {
-            i64::try_from(*value).ok().map(|value| value.to_string())
-        }
-        _ => None,
-    }
-}
-
-fn row_pks_from_primary_key_parts(
-    primary_key_columns: &[&str],
-    component_types: &[crate::row_pk::RowPkComponentType],
-    parts: BTreeMap<String, BTreeSet<String>>,
-) -> Option<BTreeSet<RowPk>> {
-    if primary_key_columns
-        .iter()
-        .any(|column| !parts.contains_key(*column))
-    {
-        return None;
-    }
-
-    let mut identities = BTreeSet::from([Vec::<String>::new()]);
-    for column in primary_key_columns {
-        let values = parts.get(*column)?;
-        identities = identities
-            .into_iter()
-            .flat_map(|prefix| {
-                values.iter().map(move |value| {
-                    let mut parts = prefix.clone();
-                    parts.push(value.clone());
-                    parts
-                })
-            })
-            .collect();
-    }
-    identities
-        .into_iter()
-        .map(|parts| RowPk::from_external_parts(parts, component_types))
-        .collect::<std::result::Result<BTreeSet<_>, _>>()
-        .ok()
-}
-
-fn identity_matches_parts(
-    identity: &RowPk,
-    primary_key_columns: &[&str],
-    parts: &BTreeMap<String, BTreeSet<String>>,
-) -> bool {
-    if identity.components.len() != primary_key_columns.len() {
-        return false;
-    }
-    primary_key_columns
-        .iter()
-        .zip(identity.components.iter())
-        .all(|(column, component)| {
-            parts
-                .get(*column)
-                .is_none_or(|values| values.contains(&component.external_string()))
-        })
 }
 
 #[cfg(test)]
@@ -4939,7 +4675,7 @@ mod tests {
         batch.push_owned(row);
         batch.set_decoded_snapshot(
             0,
-            Some(Arc::new(crate::plugin::runtime::WasmTypedRow {
+            Some(Arc::new(crate::row_payload::TypedRow {
                 schema_fingerprint: spec.schema_fingerprint,
                 row_pk: vec![lix_schema::Value::Text("row-1".to_owned())].into(),
                 row: lix_schema::Row::from([
@@ -4996,7 +4732,7 @@ mod tests {
         batch.push_owned(row);
         batch.set_decoded_snapshot(
             0,
-            Some(Arc::new(crate::plugin::runtime::WasmTypedRow {
+            Some(Arc::new(crate::row_payload::TypedRow {
                 schema_fingerprint,
                 row_pk: vec![lix_schema::Value::Text("row-1".to_owned())].into(),
                 row: lix_schema::Row::from([
@@ -6190,6 +5926,47 @@ mod tests {
             ]
         );
         assert!(contradiction_ids.is_empty());
+    }
+
+    #[test]
+    fn shared_identity_plan_validates_uuid_and_keeps_residuals() {
+        let mut spec = (*row_insert_spec_with_primary_key()).clone();
+        spec.primary_key_component_types = vec![crate::row_pk::RowPkComponentType::Uuid];
+        let analyzer = super::RowPrimaryKeyFilterAnalyzer::new(&spec);
+        let lower = "550e8400-e29b-41d4-a716-446655440000";
+        assert!(
+            analyzer
+                .analyze(&eq_filter("id", &lower.to_ascii_uppercase()))
+                .unwrap()
+                .is_none(),
+            "noncanonical UUID predicate retains SQL evaluation"
+        );
+        let expression = eq_filter("id", lower)
+            .or(eq_filter("id", "550e8400-e29b-41d4-a716-446655440001"))
+            .and(eq_filter("id", lower));
+        let expected = crate::row_pk::RowPk::from_external_parts(
+            vec![lower.to_owned()],
+            &spec.primary_key_component_types,
+        )
+        .unwrap();
+        assert_eq!(
+            analyzer.analyze(&expression).unwrap(),
+            Some(std::collections::BTreeSet::from([expected.clone()]))
+        );
+        let residual = expression.clone().and(eq_filter("body", "wanted"));
+        assert!(!analyzer.supports(&residual));
+        assert_eq!(
+            super::row_pks_from_primary_key_filters(&spec, &[residual]).unwrap(),
+            Some(vec![expected])
+        );
+        assert!(
+            super::row_pks_from_primary_key_filters(
+                &spec,
+                &[expression.or(eq_filter("body", "wanted"))]
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]

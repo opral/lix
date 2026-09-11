@@ -4,7 +4,6 @@ mod reader;
 mod row_columnar_cache;
 mod row_decoded_column_cache;
 mod tracked_head;
-pub(crate) mod typed_slots;
 #[cfg(test)]
 pub(crate) use tracked_head::{head_decode_row_pk_probe, hot_decode_row_pk_probe};
 mod types;
@@ -14,10 +13,7 @@ pub(crate) mod visibility;
 /// The definitions live in the top-level `row_columnar` module, which sits
 /// below both state planes; this facade only exists so the move did not have to
 /// touch every call site at once and can be dropped as those are migrated.
-pub(crate) use crate::row_columnar::{
-    ROW_COLUMNAR_IDENTITY_FIELD, ROW_COLUMNAR_LOSSLESS_SNAPSHOT_METADATA_KEY, RowColumnarWriteSets,
-    row_group_set_id,
-};
+pub(crate) use crate::row_columnar::{RowColumnarWriteSets, row_group_set_id};
 #[allow(unused_imports)]
 pub(crate) use context::{
     BranchHeadControlCache, GlobalKeyValueRowCache, HotStateContext, HotStateContextReader,
@@ -68,8 +64,8 @@ pub(crate) use tracked_head::{
     PACKED_CURRENT_BASE_SPACE, PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
     PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE, ROW_SPACE, RowColumnarOverlayRow,
     TRACKED_WORKING_DIFF_MARKER_SPACE, TrackedHeadContext, TrackedWorkingDiff,
-    TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
-    stage_certified_row_batches, stage_hot_index_entries, stage_tracked_working_diff_epoch,
+    TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage, stage_certified_row_batches,
+    stage_hot_index_entries, stage_tracked_working_diff_epoch,
 };
 #[allow(unused_imports)]
 pub(crate) use types::{
@@ -87,3 +83,5 @@ pub(crate) use visibility::{
 };
 #[cfg(test)]
 pub(crate) use visibility::{blob_ref_probe_stats, reset_blob_ref_probe_stats};
+
+pub(crate) use types::materialized_hot_state_row_with_snapshot_projection;

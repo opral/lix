@@ -7,6 +7,7 @@
 
 mod core;
 mod model;
+#[path = "../../../packages/plugin-utils/order_key.rs"]
 mod order_key;
 
 use core::{Document, FileEdit, LineIdentity};

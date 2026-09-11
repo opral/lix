@@ -295,3 +295,223 @@ async fn mixed_read_batches_only_acknowledge_returned_file_bytes() {
         }
     }
 }
+
+#[tokio::test]
+async fn fresh_import_and_plugin_reselection_preserve_rows_across_rollback() {
+    let lix = open_lix().with_storage(Memory::new()).await.unwrap();
+    install_markdown(&lix).await;
+    let wasm = std::fs::read(env!("CARGO_CDYLIB_FILE_PLUGIN_JSON_plugin_json")).unwrap();
+    let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (path, content) in [
+        (
+            "manifest.json",
+            include_str!("../../../plugins/json/manifest.json").as_bytes(),
+        ),
+        (
+            "schema/json_root.json",
+            include_str!("../../../plugins/json/schema/json_root.json").as_bytes(),
+        ),
+        (
+            "schema/json_object_member.json",
+            include_str!("../../../plugins/json/schema/json_object_member.json").as_bytes(),
+        ),
+        (
+            "schema/json_array_item.json",
+            include_str!("../../../plugins/json/schema/json_array_item.json").as_bytes(),
+        ),
+        ("plugin.wasm", wasm.as_slice()),
+    ] {
+        archive.start_file(path, options).unwrap();
+        archive.write_all(content).unwrap();
+    }
+    lix.execute(
+        "INSERT INTO lix_file(path,content) VALUES('/.lix/plugins/plugin_json.lixplugin',$1)",
+        &[Value::Blob(archive.finish().unwrap().into_inner().into())],
+    )
+    .await
+    .unwrap();
+
+    // Both ownerless files enter the fresh-import worker batch in one statement.
+    lix.execute(
+        "INSERT INTO lix_file(path,content) VALUES('/switch.md',$1),('/keep.md',$2)",
+        &[
+            Value::Blob(b"switch original\n".to_vec().into()),
+            Value::Blob(b"keep original\n".to_vec().into()),
+        ],
+    )
+    .await
+    .unwrap();
+    let file_id: String = lix
+        .execute("SELECT id FROM lix_file WHERE path='/switch.md'", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get("id")
+        .unwrap();
+    let original_rows = lix
+        .execute(
+            "SELECT id FROM markdown_node WHERE lixcol_file_id=$1 ORDER BY id",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .unwrap()
+        .rows()
+        .iter()
+        .map(|row| row.get::<String>("id").unwrap())
+        .collect::<Vec<_>>();
+    assert!(!original_rows.is_empty());
+
+    let json_bytes = br#"{"replacement":"accepted"}"#.to_vec();
+    let params = [
+        Value::Blob(json_bytes.clone().into()),
+        Value::Text(file_id.clone()),
+    ];
+    let mut transaction = lix.begin_transaction().await.unwrap();
+    transaction
+        .execute(
+            "UPDATE lix_file SET path='/switch.json',content=$1 WHERE id=$2",
+            &params,
+        )
+        .await
+        .expect("a different selected plugin must open a fresh actor");
+    assert!(
+        transaction
+            .execute(
+                "SELECT id FROM markdown_node WHERE lixcol_file_id=$1",
+                &[Value::Text(file_id.clone())],
+            )
+            .await
+            .unwrap()
+            .rows()
+            .is_empty()
+    );
+    assert_eq!(
+        transaction
+            .execute(
+                "SELECT key FROM json_object_member WHERE lixcol_file_id=$1",
+                &[Value::Text(file_id.clone())],
+            )
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("key")
+            .unwrap(),
+        "replacement"
+    );
+    transaction.rollback().await.unwrap();
+
+    let after_rollback = lix
+        .execute(
+            "SELECT id FROM markdown_node WHERE lixcol_file_id=$1 ORDER BY id",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .unwrap()
+        .rows()
+        .iter()
+        .map(|row| row.get::<String>("id").unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        after_rollback, original_rows,
+        "rollback restores the original semantic identities"
+    );
+    assert!(
+        lix.execute(
+            "SELECT key FROM json_object_member WHERE lixcol_file_id=$1",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .unwrap()
+        .rows()
+        .is_empty()
+    );
+    let original = lix
+        .execute(
+            "SELECT path,content FROM lix_file WHERE id=$1",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        original.rows()[0].get::<String>("path").unwrap(),
+        "/switch.md"
+    );
+    assert_eq!(
+        original.rows()[0].get::<Vec<u8>>("content").unwrap(),
+        b"switch original\n"
+    );
+
+    lix.execute(
+        "UPDATE lix_file SET path='/switch.json',content=$1 WHERE id=$2",
+        &params,
+    )
+    .await
+    .expect("retry after rollback must publish the new plugin's actor");
+    assert!(
+        lix.execute(
+            "SELECT id FROM markdown_node WHERE lixcol_file_id=$1",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .unwrap()
+        .rows()
+        .is_empty()
+    );
+    let members = lix
+        .execute(
+            "SELECT key FROM json_object_member WHERE lixcol_file_id=$1",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(members.rows().len(), 1);
+    assert_eq!(
+        members.rows()[0].get::<String>("key").unwrap(),
+        "replacement"
+    );
+    let owner = lix
+        .execute(
+            "SELECT value FROM lix_key_value WHERE lixcol_file_id=$1 AND key='lix_plugin_owner_v2'",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(owner.rows().len(), 1);
+    let Value::Jsonb(owner) = owner.rows()[0].get::<Value>("value").unwrap() else {
+        panic!("owner must be JSON");
+    };
+    assert_eq!(owner.to_value()["plugin_key"], "plugin_json");
+    let files = lix.execute("SELECT path,content FROM lix_file WHERE path IN ('/switch.json','/keep.md') ORDER BY path", &[]).await.unwrap();
+    assert_eq!(files.rows().len(), 2);
+    assert_eq!(
+        files.rows()[0].get::<Vec<u8>>("content").unwrap(),
+        b"keep original\n"
+    );
+    assert_eq!(
+        files.rows()[1].get::<Vec<u8>>("content").unwrap(),
+        json_bytes
+    );
+
+    // A subsequent ordinary edit exercises the newly published actor's authority.
+    lix.execute(
+        "UPDATE lix_file SET content=$1 WHERE id=$2",
+        &[
+            Value::Blob(br#"{"followup":"warm"}"#.to_vec().into()),
+            Value::Text(file_id.clone()),
+        ],
+    )
+    .await
+    .unwrap();
+    let members = lix
+        .execute(
+            "SELECT key FROM json_object_member WHERE lixcol_file_id=$1",
+            &[Value::Text(file_id)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(members.rows().len(), 1);
+    assert_eq!(members.rows()[0].get::<String>("key").unwrap(), "followup");
+    lix.close().await.unwrap();
+}

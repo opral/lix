@@ -629,11 +629,8 @@ pub(crate) async fn execute_exact_lix_file_root_listing(
     let index = filesystem_path_index
         .path_index(&FilesystemPathIndexRequest::new(branch_ids))
         .await?;
-    let matches = indexed_file_matches(index, &FilePathPredicate::All);
-    let mut entries = matches
-        .entries()
-        .filter(|entry| entry.parent_id.is_none())
-        .collect::<Vec<_>>();
+    let matches = indexed_file_root_matches(index, &FileIdConstraint::All, &FilePathPredicate::All);
+    let mut entries = matches.entries().collect::<Vec<_>>();
     entries.sort_unstable_by(|left, right| {
         left.name
             .cmp(&right.name)
@@ -6006,17 +6003,6 @@ impl FileIdConstraint {
         }
     }
 
-    fn union(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::All, _) | (_, Self::All) => Self::All,
-            (Self::None, constraint) | (constraint, Self::None) => constraint,
-            (Self::Ids(mut left), Self::Ids(right)) => {
-                left.extend(right);
-                Self::Ids(left)
-            }
-        }
-    }
-
     fn allows(&self, file_id: &str) -> bool {
         match self {
             Self::All => true,
@@ -6447,75 +6433,34 @@ impl ExactStringColumnFilterAnalyzer {
     }
 
     fn analyze(&self, expr: &Expr) -> Result<Option<FileIdConstraint>> {
-        match expr {
-            Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::And => {
-                let Some(left) = self.analyze(&binary_expr.left)? else {
-                    return Ok(None);
-                };
-                let Some(right) = self.analyze(&binary_expr.right)? else {
-                    return Ok(None);
-                };
-                Ok(Some(left.intersect(right)))
+        use crate::sql2::plan::read::{self, IdentityValue};
+        let columns = [self.column_name];
+        let types = [crate::row_pk::RowPkComponentType::String];
+        let constraint = read::bind_identity(expr, &columns, false, usize::MAX, &|expr| {
+            // DataFusion can represent an empty IN list even though SQL cannot.
+            if let Expr::InList(list) = expr {
+                if !list.negated && list.list.is_empty() {
+                    if let Expr::Column(column) = list.expr.as_ref() {
+                        return read::IdentityNode::Values(column.name.clone(), BTreeSet::new());
+                    }
+                }
             }
-            Expr::BinaryExpr(binary_expr) if binary_expr.op == Operator::Or => {
-                let Some(left) = self.analyze(&binary_expr.left)? else {
-                    return Ok(None);
-                };
-                let Some(right) = self.analyze(&binary_expr.right)? else {
-                    return Ok(None);
-                };
-                Ok(Some(left.union(right)))
-            }
-            Expr::BinaryExpr(binary_expr) => Ok(self
-                .value_from_binary_filter(binary_expr)
-                .map(|value| FileIdConstraint::Ids(BTreeSet::from([value])))),
-            Expr::InList(in_list) => Ok(self
-                .values_from_in_list_filter(in_list)
-                .map(FileIdConstraint::from_ids)),
-            _ => Ok(None),
-        }
-    }
-
-    fn value_from_binary_filter(&self, binary_expr: &BinaryExpr) -> Option<String> {
-        if binary_expr.op != Operator::Eq {
-            return None;
-        }
-        self.value_from_column_literal_filter(&binary_expr.left, &binary_expr.right)
-            .or_else(|| {
-                self.value_from_column_literal_filter(&binary_expr.right, &binary_expr.left)
-            })
-    }
-
-    fn values_from_in_list_filter(&self, in_list: &InList) -> Option<Vec<String>> {
-        if in_list.negated {
-            return None;
-        }
-        let Expr::Column(column) = in_list.expr.as_ref() else {
-            return None;
-        };
-        if column.name != self.column_name {
-            return None;
-        }
-        let values = in_list
-            .list
-            .iter()
-            .map(string_expr_literal)
-            .collect::<Option<Vec<_>>>()?;
-        Some(values)
-    }
-
-    fn value_from_column_literal_filter(
-        &self,
-        column_expr: &Expr,
-        literal_expr: &Expr,
-    ) -> Option<String> {
-        let Expr::Column(column) = column_expr else {
-            return None;
-        };
-        if column.name != self.column_name {
-            return None;
-        }
-        string_expr_literal(literal_expr)
+            read::normalize_node(read::datafusion_identity_node(expr), &columns, &types)
+        });
+        Ok(constraint
+            .and_then(|constraint| constraint.into_single_values(self.column_name))
+            .map(|rows| {
+                FileIdConstraint::from_ids(
+                    rows.into_iter()
+                        .map(|value| {
+                            let IdentityValue::Text(value) = value else {
+                                unreachable!("text identity binding")
+                            };
+                            value
+                        })
+                        .collect(),
+                )
+            }))
     }
 }
 
@@ -8699,7 +8644,7 @@ mod tests {
                         serde_json::from_str(snapshot).map_err(|error| {
                             LixError::unknown(format!("invalid test live-row JSON: {error}"))
                         })?;
-                    crate::plugin::runtime::WasmTypedRow::from_builtin_json(
+                    crate::row_payload::TypedRow::from_builtin_json(
                         &row.schema_key,
                         &row.row_pk,
                         &value,

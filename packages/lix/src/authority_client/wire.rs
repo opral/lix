@@ -672,4 +672,16 @@ mod commit_span_tests {
         let span = with.commit().expect("span is kept");
         assert_eq!((span.before(), span.after()), ("commit-a", "commit-b"));
     }
+
+    #[test]
+    fn execute_responses_reject_malformed_present_commit_spans() {
+        for commit in [
+            serde_json::json!({ "before": "commit-a" }),
+            serde_json::json!({ "after": "commit-b" }),
+            serde_json::json!({ "before": 1, "after": "commit-b" }),
+            serde_json::json!({ "before": "commit-a", "after": false }),
+        ] {
+            assert!(serde_json::from_value::<ExecuteResponseBody>(body(commit)).is_err());
+        }
+    }
 }

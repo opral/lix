@@ -165,7 +165,7 @@ impl EpochRouting {
             .preconditions
             .into_iter()
             .map(|precondition| self.map_precondition(precondition))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect();
         let fence_precondition_index = self
             .expected_pointer
             .as_ref()
@@ -180,8 +180,8 @@ impl EpochRouting {
         Ok((options, fence_precondition_index))
     }
 
-    fn map_precondition(&self, precondition: Precondition) -> Result<Precondition, StorageError> {
-        Ok(match precondition {
+    fn map_precondition(&self, precondition: Precondition) -> Precondition {
+        match precondition {
             Precondition::KeyAbsent { space, key } => Precondition::KeyAbsent {
                 space: self.map_space(space),
                 key,
@@ -210,16 +210,7 @@ impl EpochRouting {
                 space: self.map_space(space),
                 range,
             },
-            // This backend-specialized precondition contains an already
-            // physical key but no StorageSpace, so routing it would silently
-            // target the legacy mutable range. No engine path uses it.
-            Precondition::BranchEquals { .. } if self.bank != EpochBank::Legacy => {
-                return Err(StorageError::Corruption(
-                    "BranchEquals cannot be used through epoch-routed storage".to_string(),
-                ));
-            }
-            precondition @ Precondition::BranchEquals { .. } => precondition,
-        })
+        }
     }
 
     pub(super) fn mix_snapshot_cache_key(&self, key: Option<u128>) -> Option<u128> {
@@ -397,7 +388,7 @@ mod tests {
         let (options, fence_precondition_index) =
             EpochRouting::fenced(EpochBank::A, expected.clone())
                 .route_write_options(WriteOptions::default())
-                .unwrap();
+                .expect("writable epoch");
         assert_eq!(fence_precondition_index, Some(0));
         assert_eq!(
             options.preconditions,

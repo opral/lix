@@ -487,6 +487,42 @@ paths:
       responses:
         "200": { description: Session switched. }
         default: { $ref: "#/components/responses/Error" }
+  /lix/v1/{lix_id}/branch/merge:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
+    post:
+      operationId: mergeBranch
+      parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sourceBranchId]
+              properties: { sourceBranchId: { type: string } }
+      responses:
+        "200": { description: Merge result for the active branch. }
+        default: { $ref: "#/components/responses/Error" }
+  /lix/v1/{lix_id}/branch/merge-preview:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ServerProtocolVersion"
+    post:
+      operationId: mergeBranchPreview
+      parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sourceBranchId]
+              properties: { sourceBranchId: { type: string } }
+      responses:
+        "200": { description: Merge preview for the active branch. }
+        default: { $ref: "#/components/responses/Error" }
   /lix/v1/{lix_id}/observe:
     parameters:
       - $ref: "#/components/parameters/LixId"

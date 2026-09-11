@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::ops::ControlFlow;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -11,7 +10,12 @@ use crate::common::{ExecuteStatementMetadata, ExpiredReadRetryState};
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::sql_telemetry::{SqlStatementTelemetry, finish_operation, start_batch};
 use crate::sql2;
+#[cfg(test)]
+use crate::sql2::ExactFilesystemRead;
 use crate::sql2::SqlWriteExecutionContext;
+#[cfg(any(test, feature = "storage-benches"))]
+use crate::sql2::exact_filesystem_read_route;
+use crate::sql2::{is_acknowledgeable_file_content_read, late_materialized_lix_file_content_read};
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
@@ -24,11 +28,6 @@ use datafusion::arrow::array::{ArrayRef, LargeStringBuilder, StringBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::sql::parser::Statement as DataFusionStatement;
-use datafusion::sql::sqlparser::ast::{
-    BinaryOperator, Expr, GroupByExpr, Ident, LimitClause, OrderByKind, Query, Select,
-    SelectFlavor, SelectItem, SetExpr, Statement as SqlStatement, TableAlias, TableFactor,
-    Value as SqlValue, Visit, Visitor,
-};
 #[cfg(feature = "storage-benches")]
 use futures_util::TryStreamExt;
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -38,7 +37,6 @@ use super::ExecuteIdempotency;
 use super::context::{SessionContext, SessionSqlExecutionContext};
 use super::idempotency::{ExecuteIdempotencyReceipt, load_receipt};
 use super::transaction::{SessionTransaction, transaction_state_error};
-use crate::PreparedDmlParameterBatch;
 
 const MAX_INITIAL_LITERAL_COLUMN_BYTES: usize = 64 * 1024 * 1024;
 const MAX_AUTO_COMMIT_RETRIES: usize = 16;
@@ -961,6 +959,40 @@ impl TransactionBatchStatements {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadBatchKind {
+    Ordinary,
+    Coherent,
+}
+
+impl ReadBatchKind {
+    fn telemetry_name(self) -> &'static str {
+        match self {
+            Self::Ordinary => "batch",
+            Self::Coherent => "coherent_read_batch",
+        }
+    }
+
+    fn normalize_error(self, error: LixError, sql: &str, index: usize) -> LixError {
+        let error = normalize_sql_surface_error(error, sql);
+        match self {
+            Self::Ordinary => with_batch_statement_index(error, index),
+            Self::Coherent => error,
+        }
+    }
+}
+
+struct ReadBatchSnapshot {
+    active_branch_id: String,
+    active_branch_commit_id: String,
+    storage_mutation_revision: Option<Vec<u8>>,
+}
+
+struct ReadBatchResult {
+    results: Vec<ExecuteResult>,
+    snapshot: Option<ReadBatchSnapshot>,
+}
+
 enum IdempotencyReceiptResolution {
     Absent,
     Replay(ExecuteIdempotencyReceipt),
@@ -1025,39 +1057,6 @@ where
     ) -> Result<ExecutionDisposition, LixError> {
         let statement = self.sql_planning_cache.parse_statement(sql)?;
         execution_disposition(&statement)
-    }
-
-    pub(crate) fn statement_authority_route(
-        &self,
-        sql: &str,
-    ) -> Result<sql2::StatementAuthorityRoute, LixError> {
-        let statement = self.sql_planning_cache.parse_statement(sql)?;
-        sql2::statement_authority_route(&statement)
-    }
-
-    pub(crate) fn batch_authority_route(
-        &self,
-        statements: &[ExecuteBatchStatement],
-    ) -> Result<sql2::StatementAuthorityRoute, LixError> {
-        let mut route = sql2::StatementAuthorityRoute::HotRead;
-        for (statement_index, statement) in statements.iter().enumerate() {
-            let parsed = self
-                .sql_planning_cache
-                .parse_statement(&statement.sql)
-                .map_err(|error| with_batch_statement_index(error, statement_index))?;
-            match sql2::statement_authority_route(&parsed)
-                .map_err(|error| with_batch_statement_index(error, statement_index))?
-            {
-                sql2::StatementAuthorityRoute::AuthorityWrite => {
-                    return Ok(sql2::StatementAuthorityRoute::AuthorityWrite);
-                }
-                sql2::StatementAuthorityRoute::AuthorityRead => {
-                    route = sql2::StatementAuthorityRoute::AuthorityRead;
-                }
-                sql2::StatementAuthorityRoute::HotRead => {}
-            }
-        }
-        Ok(route)
     }
 
     /// Classifies an atomic SQL batch for a caller that owns its transport
@@ -1757,26 +1756,8 @@ where
             self.refresh_active_branch_base_if_stale().await?;
         }
 
-        let exact_filesystem_read = exact_filesystem_read_route(&statement, params);
-        let exact_schema_point_read = exact_filesystem_read
-            .is_none()
-            .then(|| exact_schema_point_read_route(&statement, params))
-            .flatten();
-        let exact_schema_batch_read = (exact_filesystem_read.is_none()
-            && exact_schema_point_read.is_none())
-        .then(|| exact_schema_batch_read_route(&statement, params))
-        .flatten();
-        let late_file_content_read = (exact_filesystem_read.is_none()
-            && exact_schema_point_read.is_none()
-            && exact_schema_batch_read.is_none())
-        .then(|| late_materialized_lix_file_content_read(&statement))
-        .flatten();
-        let acknowledge_file_views = is_acknowledgeable_file_content_read(&statement, params)
-            || matches!(
-                &exact_filesystem_read,
-                Some(ExactFilesystemRead::PathContentBatch(_))
-            )
-            || late_file_content_read.is_some();
+        let read_plan = sql2::plan_read_statement(&statement, params);
+        let acknowledge_file_views = read_plan.acknowledge_file_views;
         let has_durable_runtime_function = sql2::statement_has_durable_runtime_function(&statement);
         let runtime_write_access = if has_durable_runtime_function {
             let write_access = self.begin_session_write_access().await?;
@@ -1824,10 +1805,7 @@ where
                 read_scope,
                 |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| {
                     let statement = statement.clone();
-                    let exact_filesystem_read = exact_filesystem_read.clone();
-                    let exact_schema_point_read = exact_schema_point_read.clone();
-                    let exact_schema_batch_read = exact_schema_batch_read.clone();
-                    let late_file_content_read = late_file_content_read.clone();
+                    let read_plan = read_plan.clone();
                     async move {
                         self.execute_read_statement_with_store(
                             read_store,
@@ -1835,10 +1813,7 @@ where
                             statement,
                             params,
                             acknowledge_file_views,
-                            exact_filesystem_read,
-                            exact_schema_point_read,
-                            exact_schema_batch_read,
-                            late_file_content_read,
+                            read_plan,
                             has_durable_runtime_function,
                         )
                         .await
@@ -2029,32 +2004,21 @@ where
         metadata: ExecuteStatementMetadata,
         idempotency: ExecuteIdempotency,
     ) -> Result<ExecuteResult, LixError> {
-        let mut expired_read_retries = ExpiredReadRetryState::default();
-        if let IdempotencyReceiptResolution::Replay(receipt) = self
-            .resolve_idempotency_receipt_with_expired_read_retry(
-                &idempotency,
-                &mut expired_read_retries,
-            )
-            .await?
-        {
-            return receipt.into_single_result();
-        }
-
-        let sql_for_error = sql.to_string();
-        let params = params.to_vec();
-        loop {
-            let write_access = self.begin_session_write_access().await?;
-            let sql_for_planning = sql_for_error.clone();
-            let statement = statement.clone();
-            let params = params.clone();
-            let options = options.clone();
-            let metadata = metadata.clone();
-            // Every retry retains the original identity. A transaction closure
-            // owns its copy because its future may outlive this call's immediate
-            // stack frame while the write lease is held.
-            let idempotency_for_commit = idempotency.clone();
-            let result = self
-                .with_write_transaction_reserved_lending_spanned(
+        self.execute_with_idempotency_recovery(
+            &idempotency,
+            ExecuteIdempotencyReceipt::into_single_result,
+            || async {
+                let write_access = self.begin_session_write_access().await?;
+                let sql_for_planning = sql.to_owned();
+                let statement = statement.clone();
+                let params = params.to_vec();
+                let options = options.clone();
+                let metadata = metadata.clone();
+                // Every retry retains the original identity. A transaction closure
+                // owns its copy because its future may outlive this call's immediate
+                // stack frame while the write lease is held.
+                let idempotency_for_commit = idempotency.clone();
+                self.with_write_transaction_reserved_lending_spanned(
                     write_access,
                     async move |transaction| {
                         let previous_origin_key =
@@ -2091,10 +2055,39 @@ where
                     |_| Ok(()),
                 )
                 .await
-                .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
+                .map(|(result, commit)| result.with_commit(commit))
+                .map_err(|error| normalize_sql_surface_error(error, sql))
+            },
+        )
+        .await
+    }
 
+    /// One retry budget covers receipt preflight, expired transaction reads,
+    /// and durable proof after an ambiguous commit for both SQL APIs.
+    async fn execute_with_idempotency_recovery<T, F, Fut>(
+        &self,
+        idempotency: &ExecuteIdempotency,
+        replay: fn(ExecuteIdempotencyReceipt) -> Result<T, LixError>,
+        mut execute: F,
+    ) -> Result<T, LixError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, LixError>>,
+    {
+        let mut expired_read_retries = ExpiredReadRetryState::default();
+        if let IdempotencyReceiptResolution::Replay(receipt) = self
+            .resolve_idempotency_receipt_with_expired_read_retry(
+                idempotency,
+                &mut expired_read_retries,
+            )
+            .await?
+        {
+            return replay(receipt);
+        }
+        loop {
+            let result = execute().await;
             match result {
-                Ok((result, commit)) => return Ok(result.with_commit(commit)),
+                Ok(result) => return Ok(result),
                 Err(error)
                     if error.code == LixError::CODE_STORAGE_READ_EXPIRED
                         && retry_expired_auto_commit(&mut expired_read_retries, &error).await =>
@@ -2110,14 +2103,14 @@ where
                 {
                     return match self
                         .resolve_idempotency_receipt_with_expired_read_retry(
-                            &idempotency,
+                            idempotency,
                             &mut expired_read_retries,
                         )
                         .await
                     {
                         Ok(IdempotencyReceiptResolution::Replay(receipt)) => {
                             // `Transaction::commit` did not return normally, so
-                            // its usual invalidation path was skipped. A remote
+                            // its usual invalidation path was skipped. A durable
                             // receipt proves that this transaction did publish;
                             // wake local observers before acknowledging recovery.
                             self.observe_invalidation.bump();
@@ -2126,7 +2119,7 @@ where
                             // rather than let a stale acknowledgement poison the
                             // next plugin-backed edit.
                             self.file_views.clear();
-                            receipt.into_single_result()
+                            replay(receipt)
                         }
                         Ok(IdempotencyReceiptResolution::Absent) => Err(error),
                         Err(recovery_error) => Err(recovery_error),
@@ -2234,77 +2227,6 @@ where
         statements: &[ExecuteBatchStatement],
     ) -> Result<Vec<ExecuteResult>, LixError> {
         Box::pin(self.execute_batch_with_options(statements, ExecuteOptions::default())).await
-    }
-
-    /// Executes one prepared DML shape over a shared parameter page.
-    ///
-    /// Unlike [`Self::execute_batch`], this API does not duplicate the SQL
-    /// text and owned parameter strings into one statement object per row.
-    /// The SQL plan is prepared once and the whole page is committed
-    /// atomically. The bound write must accept either the borrowed-value
-    /// certificate or the physical parameter-batch route; shapes that require
-    /// sequential statement semantics are rejected instead of silently
-    /// degrading to per-row execution.
-    pub(crate) async fn execute_prepared_dml_batch(
-        &self,
-        sql: Arc<str>,
-        parameter_batch: PreparedDmlParameterBatch,
-    ) -> Result<Vec<ExecuteResult>, LixError> {
-        Box::pin(self.execute_prepared_dml_batch_inner(sql, parameter_batch)).await
-    }
-
-    async fn execute_prepared_dml_batch_inner(
-        &self,
-        sql: Arc<str>,
-        parameter_batch: PreparedDmlParameterBatch,
-    ) -> Result<Vec<ExecuteResult>, LixError> {
-        self.ensure_open()?;
-        if parameter_batch.is_empty() {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "execute_prepared_dml_batch requires at least one parameter row",
-            ));
-        }
-        let statement = self.sql_planning_cache.parse_statement(&sql)?;
-        if sql2::bind_statement_route(&statement)? != sql2::BoundStatementRoute::Write {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "execute_prepared_dml_batch requires a write statement",
-            ));
-        }
-
-        let sql_for_error = Arc::clone(&sql);
-        let result = self
-            .with_write_transaction_lending_spanned(async move |transaction| {
-                let plan = transaction.prepare_sql_write_logical_plan(&sql, &statement)?;
-                let results = sql2::execute_write_logical_plan_prepared_dml_batch(
-                    transaction,
-                    &plan,
-                    &parameter_batch,
-                )
-                .await?;
-                results
-                    .ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_INVALID_PARAM,
-                            "write shape requires sequential execute_batch semantics",
-                        )
-                    })
-                    .map(|results| {
-                        results
-                            .into_iter()
-                            .map(ExecuteResult::from_sql_write_result)
-                            .collect::<Vec<_>>()
-                    })
-            })
-            .await
-            .map(|(results, commit)| {
-                results
-                    .into_iter()
-                    .map(|result| result.with_commit(commit.clone()))
-                    .collect()
-            });
-        result.map_err(|error| normalize_sql_surface_error(error, &sql_for_error))
     }
 
     pub(crate) async fn execute_batch_with_options(
@@ -2469,65 +2391,20 @@ where
                         )
                         .await;
                 };
-                let mut expired_read_retries = ExpiredReadRetryState::default();
-                if let IdempotencyReceiptResolution::Replay(receipt) = self
-                    .resolve_idempotency_receipt_with_expired_read_retry(
-                        &idempotency,
-                        &mut expired_read_retries,
-                    )
-                    .await?
-                {
-                    return receipt.into_results();
-                }
-                loop {
-                    let result = self
-                        .execute_transaction_batch(
+                self.execute_with_idempotency_recovery(
+                    &idempotency,
+                    ExecuteIdempotencyReceipt::into_results,
+                    || {
+                        self.execute_transaction_batch(
                             statements,
                             parsed.clone(),
                             options.clone(),
                             statement_metadata.clone(),
                             Some(idempotency.clone()),
                         )
-                        .await;
-                    match result {
-                        Ok(results) => return Ok(results),
-                        Err(error)
-                            if error.code == LixError::CODE_STORAGE_READ_EXPIRED
-                                && retry_expired_auto_commit(&mut expired_read_retries, &error)
-                                    .await =>
-                        {
-                            continue;
-                        }
-                        Err(error)
-                            if matches!(
-                                error.code.as_str(),
-                                LixError::CODE_TRANSACTION_CONFLICT
-                                    | LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
-                            ) =>
-                        {
-                            return match self
-                                .resolve_idempotency_receipt_with_expired_read_retry(
-                                    &idempotency,
-                                    &mut expired_read_retries,
-                                )
-                                .await
-                            {
-                                Ok(IdempotencyReceiptResolution::Replay(receipt)) => {
-                                    // See the single-statement recovery path:
-                                    // positive receipt proof means a commit
-                                    // happened after its normal invalidation
-                                    // callback was bypassed by an ambiguous error.
-                                    self.observe_invalidation.bump();
-                                    self.file_views.clear();
-                                    receipt.into_results()
-                                }
-                                Ok(IdempotencyReceiptResolution::Absent) => Err(error),
-                                Err(recovery_error) => Err(recovery_error),
-                            };
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
+                    },
+                )
+                .await
             }
         }
     }
@@ -2734,8 +2611,24 @@ where
         statements: &[ExecuteBatchStatement],
         parsed: Vec<datafusion::sql::parser::Statement>,
     ) -> Result<Vec<ExecuteResult>, LixError> {
-        let acknowledge_file_views = parsed.iter().zip(statements).any(|(parsed, statement)| {
-            is_acknowledgeable_file_content_read(parsed, &statement.params)
+        let statements = statements
+            .iter()
+            .map(|statement| (statement.sql.as_str(), statement.params.as_slice()))
+            .collect::<Vec<_>>();
+        Ok(self
+            .execute_read_batch(&statements, parsed, ReadBatchKind::Ordinary)
+            .await?
+            .results)
+    }
+
+    async fn execute_read_batch(
+        &self,
+        statements: &[(&str, &[Value])],
+        parsed: Vec<datafusion::sql::parser::Statement>,
+        kind: ReadBatchKind,
+    ) -> Result<ReadBatchResult, LixError> {
+        let acknowledge_file_views = parsed.iter().zip(statements).any(|(parsed, (_, params))| {
+            is_acknowledgeable_file_content_read(parsed, params)
                 || late_materialized_lix_file_content_read(parsed).is_some()
         });
         let _operation_guard = self.begin_waitable_session_operation().await?;
@@ -2769,6 +2662,42 @@ where
                             acknowledge_file_views.then(|| self.file_views.fork_for_read());
                         let active_branch_id =
                             self.active_branch_id_from_reader(&read_store).await?;
+                        let (snapshot, active_branch_head) = if kind == ReadBatchKind::Coherent {
+                            let head = self
+                                .branch_ctx
+                                .ref_reader(read_store.clone())
+                                .load_head(&active_branch_id)
+                                .await?
+                                .ok_or_else(|| {
+                                    LixError::branch_not_found(
+                                        active_branch_id.clone(),
+                                        "execute coherent read batch",
+                                        "active branch",
+                                    )
+                                })?;
+                            let snapshot = ReadBatchSnapshot {
+                                active_branch_id: active_branch_id.clone(),
+                                active_branch_commit_id: head.commit_id.to_string(),
+                                storage_mutation_revision:
+                                    StorageAdapter::<StorageImpl>::load_mutation_revision_from_read(
+                                        &read_store,
+                                    )
+                                    .await?
+                                    .map(|revision| revision.to_vec()),
+                            };
+                            (Some(snapshot), Some(head))
+                        } else {
+                            (None, None)
+                        };
+                        if parsed.is_empty() {
+                            return Ok((
+                                ReadBatchResult {
+                                    results: Vec::new(),
+                                    snapshot,
+                                },
+                                Vec::new(),
+                            ));
+                        }
                         let ctx = SessionSqlExecutionContext {
                             active_branch_id: &active_branch_id,
                             active_account_id: self.active_account_id(),
@@ -2782,14 +2711,19 @@ where
                             plugin_host: self.plugin_host.clone(),
                             file_views: file_view_collector.clone(),
                         };
-                        let read_session = sql2::prepare_read_session(&ctx, &parsed).await?;
+                        let read_session = match active_branch_head {
+                            Some(head) => {
+                                sql2::prepare_read_session_at_head(&ctx, head, &parsed).await?
+                            }
+                            None => sql2::prepare_read_session(&ctx, &parsed).await?,
+                        };
                         let mut results = Vec::with_capacity(statements.len());
                         let mut file_view_mutations = Vec::new();
-                        for (statement_index, (statement, parsed)) in
+                        for (statement_index, ((sql, params), parsed)) in
                             statements.iter().zip(parsed).enumerate()
                         {
                             let acknowledge_statement =
-                                is_acknowledgeable_file_content_read(&parsed, &statement.params)
+                                is_acknowledgeable_file_content_read(&parsed, params)
                                     || late_materialized_lix_file_content_read(&parsed).is_some();
                             // A mixed batch may return file bytes alongside metadata or
                             // aggregates. Only the exact byte-returning statement may
@@ -2799,52 +2733,46 @@ where
                             }
                             let telemetry = SqlStatementTelemetry::start(
                                 self.telemetry.as_ref(),
-                                &statement.sql,
-                                "batch",
+                                sql,
+                                kind.telemetry_name(),
                                 Some(statement_index),
                             );
                             let operation = async {
-                                if let Some(plan) = late_materialized_lix_file_content_read(&parsed) {
+                                if let Some(plan) = late_materialized_lix_file_content_read(&parsed)
+                                {
                                     // Resolve filters and LIMIT on file metadata first. A
                                     // provider scan may render files absent from the result;
                                     // only hydrate (and acknowledge) returned paths.
                                     let (result, mutations, _) = self
                                         .execute_read_statement_with_store(
                                             read_store.clone(),
-                                            &statement.sql,
+                                            sql,
                                             parsed,
-                                            &statement.params,
+                                            params,
                                             true,
-                                            None,
-                                            None,
-                                            None,
-                                            Some(plan),
+                                            sql2::StatementReadPlan {
+                                                native: None,
+                                                late_content: Some(plan),
+                                                acknowledge_file_views: true,
+                                            },
                                             false,
                                         )
                                         .await
                                         .map_err(|error| {
-                                            with_batch_statement_index(
-                                                normalize_sql_surface_error(error, &statement.sql),
-                                                statement_index,
-                                            )
+                                            kind.normalize_error(error, sql, statement_index)
                                         })?;
                                     file_view_mutations.extend(mutations);
                                     return Ok(ExecuteResult::from_session_read_result(result));
                                 }
                                 sql2::execute_read_statement_in_session_from_parsed(
                                     &read_session,
-                                    &statement.sql,
+                                    sql,
                                     parsed,
-                                    &statement.params,
+                                    params,
                                 )
                                 .await
                                 .map(ExecuteResult::from_sql_query_result)
-                                .map_err(|error| {
-                                    with_batch_statement_index(
-                                        normalize_sql_surface_error(error, &statement.sql),
-                                        statement_index,
-                                    )
-                                })
+                                .map_err(|error| kind.normalize_error(error, sql, statement_index))
                             };
                             let result = match telemetry.as_ref() {
                                 Some(telemetry) => telemetry.instrument(operation).await,
@@ -2862,7 +2790,7 @@ where
                         }
                         drop(read_session);
                         drop(ctx);
-                        Ok((results, file_view_mutations))
+                        Ok((ReadBatchResult { results, snapshot }, file_view_mutations))
                     }
                 },
             )
@@ -2954,193 +2882,17 @@ where
                 }
             })
             .collect::<Result<Vec<_>, LixError>>()?;
-        let acknowledge_file_views = parsed.iter().zip(statements).any(|(parsed, (_, params))| {
-            is_acknowledgeable_file_content_read(parsed, params)
-                || late_materialized_lix_file_content_read(parsed).is_some()
-        });
-
         self.refresh_active_branch_base_if_stale().await?;
-
-        let _operation_guard = self.begin_waitable_session_operation().await?;
-        let mut expired_read_retries = ExpiredReadRetryState::default();
-        let mut read_quiescence_guard = None;
-        loop {
-            let read_scope = match self.storage.begin_read(StorageReadOptions::default()).await {
-                Ok(read_scope) => read_scope,
-                Err(error) => {
-                    let error: LixError = error.into();
-                    if retry_expired_read_with_write_quiescence(
-                        &mut expired_read_retries,
-                        &error,
-                        &self.collaboration_write_gate,
-                        &mut read_quiescence_guard,
-                        false,
-                    )
-                    .await
-                    {
-                        continue;
-                    }
-                    return Err(error);
-                }
-            };
-            let attempt = with_static_session_sql_read::<StorageImpl, _, _, _>(
-                read_scope,
-                |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| {
-                    let parsed = parsed.clone();
-                    async move {
-                        let file_view_collector =
-                            acknowledge_file_views.then(|| self.file_views.fork_for_read());
-                        let active_branch_id =
-                            self.active_branch_id_from_reader(&read_store).await?;
-                        let active_branch_head = self
-                            .branch_ctx
-                            .ref_reader(read_store.clone())
-                            .load_head(&active_branch_id)
-                            .await?
-                            .ok_or_else(|| {
-                                LixError::branch_not_found(
-                                    active_branch_id.clone(),
-                                    "execute coherent read batch",
-                                    "active branch",
-                                )
-                            })?;
-                        let active_branch_commit_id = active_branch_head.commit_id.to_string();
-                        let storage_mutation_revision =
-                            StorageAdapter::<StorageImpl>::load_mutation_revision_from_read(
-                                &read_store,
-                            )
-                            .await?
-                            .map(|revision| revision.to_vec());
-                        if parsed.is_empty() {
-                            return Ok((
-                                CoherentReadBatch {
-                                    active_branch_id,
-                                    active_branch_commit_id,
-                                    storage_mutation_revision,
-                                    results: Vec::new(),
-                                },
-                                Vec::new(),
-                            ));
-                        }
-                        let ctx = SessionSqlExecutionContext {
-                            active_branch_id: &active_branch_id,
-                            active_account_id: self.active_account_id(),
-                            read_store: read_store.clone(),
-                            hot_state: Arc::clone(&self.hot_state),
-                            binary_cas: Arc::clone(&self.binary_cas),
-                            branch_ctx: Arc::clone(&self.branch_ctx),
-                            catalog_context: Arc::clone(&self.catalog_context),
-                            sql_planning_cache: Arc::clone(&self.sql_planning_cache),
-                            functions: FunctionProviderHandle::system(),
-                            plugin_host: self.plugin_host.clone(),
-                            file_views: file_view_collector.clone(),
-                        };
-                        let read_session =
-                            sql2::prepare_read_session_at_head(&ctx, active_branch_head, &parsed)
-                                .await?;
-                        let mut results = Vec::with_capacity(statements.len());
-                        let mut file_view_mutations = Vec::new();
-                        for (statement_index, ((sql, params), statement)) in
-                            statements.iter().zip(parsed).enumerate()
-                        {
-                            let acknowledge_statement =
-                                is_acknowledgeable_file_content_read(&statement, params)
-                                    || late_materialized_lix_file_content_read(&statement).is_some();
-                            // A mixed batch may return file bytes alongside metadata or
-                            // aggregates. Only the exact byte-returning statement may
-                            // update the session's private plugin observation.
-                            if let Some(collector) = &file_view_collector {
-                                collector.clear();
-                            }
-                            let telemetry = SqlStatementTelemetry::start(
-                                self.telemetry.as_ref(),
-                                sql,
-                                "coherent_read_batch",
-                                Some(statement_index),
-                            );
-                            let operation = async {
-                                if let Some(plan) = late_materialized_lix_file_content_read(&statement) {
-                                    // Resolve filters and LIMIT on file metadata first. A
-                                    // provider scan may render files absent from the result;
-                                    // only hydrate (and acknowledge) returned paths.
-                                    let (result, mutations, _) = self
-                                        .execute_read_statement_with_store(
-                                            read_store.clone(),
-                                            sql,
-                                            statement,
-                                            params,
-                                            true,
-                                            None,
-                                            None,
-                                            None,
-                                            Some(plan),
-                                            false,
-                                        )
-                                        .await
-                                        .map_err(|error| normalize_sql_surface_error(error, sql))?;
-                                    file_view_mutations.extend(mutations);
-                                    return Ok(ExecuteResult::from_session_read_result(result));
-                                }
-                                sql2::execute_read_statement_in_session_from_parsed(
-                                    &read_session,
-                                    sql,
-                                    statement,
-                                    params,
-                                )
-                                .await
-                                .map(ExecuteResult::from_sql_query_result)
-                                .map_err(|error| normalize_sql_surface_error(error, sql))
-                            };
-                            let result = match telemetry.as_ref() {
-                                Some(telemetry) => telemetry.instrument(operation).await,
-                                None => operation.await,
-                            };
-                            if let Some(telemetry) = telemetry {
-                                telemetry.finish(&result);
-                            }
-                            results.push(result?);
-                            if acknowledge_statement {
-                                if let Some(collector) = &file_view_collector {
-                                    file_view_mutations.extend(collector.plugin_file_mutations());
-                                }
-                            }
-                        }
-                        drop(read_session);
-                        drop(ctx);
-                        Ok((
-                            CoherentReadBatch {
-                                active_branch_id,
-                                active_branch_commit_id,
-                                storage_mutation_revision,
-                                results,
-                            },
-                            file_view_mutations,
-                        ))
-                    }
-                },
-            )
-            .await;
-            match attempt {
-                Ok((batch, file_view_mutations)) => {
-                    self.file_views.apply_mutations(file_view_mutations);
-                    return Ok(batch);
-                }
-                Err(error) => {
-                    if retry_expired_read_with_write_quiescence(
-                        &mut expired_read_retries,
-                        &error,
-                        &self.collaboration_write_gate,
-                        &mut read_quiescence_guard,
-                        false,
-                    )
-                    .await
-                    {
-                        continue;
-                    }
-                    return Err(error);
-                }
-            }
-        }
+        let ReadBatchResult { results, snapshot } = self
+            .execute_read_batch(statements, parsed, ReadBatchKind::Coherent)
+            .await?;
+        let snapshot = snapshot.expect("coherent read batch captures snapshot metadata");
+        Ok(CoherentReadBatch {
+            active_branch_id: snapshot.active_branch_id,
+            active_branch_commit_id: snapshot.active_branch_commit_id,
+            storage_mutation_revision: snapshot.storage_mutation_revision,
+            results,
+        })
     }
 
     #[cfg(test)]
@@ -3232,10 +2984,7 @@ where
         statement: datafusion::sql::parser::Statement,
         params: &[Value],
         acknowledge_file_views: bool,
-        exact_filesystem_read: Option<ExactFilesystemRead>,
-        exact_schema_point_read: Option<ExactSchemaPointRead>,
-        exact_schema_batch_read: Option<ExactSchemaBatchRead>,
-        late_file_content_read: Option<LateMaterializedLixFileContentRead>,
+        read_plan: sql2::StatementReadPlan,
         has_durable_runtime_function: bool,
     ) -> Result<
         (
@@ -3253,95 +3002,21 @@ where
                 "lix.perf.public_read.active_branch"
             ))
             .await?;
-        if let Some(exact_filesystem_read) = exact_filesystem_read {
-            let query = match exact_filesystem_read {
-                ExactFilesystemRead::RootFileListing => {
-                    let filesystem_path_index: Arc<
-                        dyn crate::filesystem::FilesystemPathIndexReader,
-                    > = Arc::new(self.hot_state.reader(read_store.clone()));
-                    let branch_ref: Arc<dyn BranchRefReader> =
-                        Arc::new(self.branch_ctx.ref_reader(read_store));
-                    sql2::execute_exact_lix_file_root_listing(
-                        &active_branch_id,
-                        filesystem_path_index,
-                        branch_ref,
-                    )
-                    .await?
-                }
-                ExactFilesystemRead::RootDirectoryListing => {
-                    let filesystem_path_index: Arc<
-                        dyn crate::filesystem::FilesystemPathIndexReader,
-                    > = Arc::new(self.hot_state.reader(read_store.clone()));
-                    let branch_ref: Arc<dyn BranchRefReader> =
-                        Arc::new(self.branch_ctx.ref_reader(read_store));
-                    sql2::execute_exact_lix_directory_root_listing(
-                        &active_branch_id,
-                        filesystem_path_index,
-                        branch_ref,
-                    )
-                    .await?
-                }
-                exact_filesystem_read => {
-                    let hot_state: Arc<dyn crate::hot_state::HotStateReader> =
-                        Arc::new(self.hot_state.reader(read_store.clone()));
-                    let filesystem_path_index: Arc<
-                        dyn crate::filesystem::FilesystemPathIndexReader,
-                    > = Arc::new(self.hot_state.reader(read_store.clone()));
-                    let branch_ref: Arc<dyn BranchRefReader> =
-                        Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
-                    let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
-                        Arc::new(self.binary_cas.reader(read_store));
-                    match exact_filesystem_read {
-                        ExactFilesystemRead::Point(selector, column) => {
-                            sql2::execute_exact_lix_file_read(
-                                &active_branch_id,
-                                hot_state,
-                                filesystem_path_index,
-                                branch_ref,
-                                blob_reader,
-                                self.plugin_host.clone(),
-                                file_view_collector.clone(),
-                                &selector,
-                                column,
-                            )
-                            .await?
-                        }
-                        ExactFilesystemRead::PathContentBatch(paths) => {
-                            sql2::execute_exact_lix_file_batch_read(
-                                &active_branch_id,
-                                hot_state,
-                                filesystem_path_index,
-                                branch_ref,
-                                blob_reader,
-                                self.plugin_host.clone(),
-                                file_view_collector.clone(),
-                                None,
-                                &paths,
-                                None,
-                            )
-                            .await?
-                        }
-                        ExactFilesystemRead::IdManifestBatch(file_ids) => {
-                            sql2::execute_exact_lix_file_id_manifest_batch_read(
-                                &active_branch_id,
-                                hot_state,
-                                filesystem_path_index,
-                                branch_ref,
-                                blob_reader,
-                                self.plugin_host.clone(),
-                                file_view_collector.clone(),
-                                &file_ids,
-                            )
-                            .await?
-                        }
-                        ExactFilesystemRead::RootFileListing
-                        | ExactFilesystemRead::RootDirectoryListing => unreachable!(
-                            "root filesystem listings handled before file content readers"
-                        ),
-                    }
-                }
-            };
-            let file_view_mutations = file_view_collector
+        let native_ctx = SessionSqlExecutionContext {
+            active_branch_id: &active_branch_id,
+            active_account_id: self.active_account_id(),
+            read_store: read_store.clone(),
+            hot_state: Arc::clone(&self.hot_state),
+            binary_cas: Arc::clone(&self.binary_cas),
+            branch_ctx: Arc::clone(&self.branch_ctx),
+            catalog_context: Arc::clone(&self.catalog_context),
+            sql_planning_cache: Arc::clone(&self.sql_planning_cache),
+            functions: FunctionProviderHandle::system(),
+            plugin_host: self.plugin_host.clone(),
+            file_views: file_view_collector.clone(),
+        };
+        if let Some((query, examined)) = sql2::execute_native_read(&native_ctx, &read_plan).await? {
+            let mutations = file_view_collector
                 .map(|collector| collector.plugin_file_mutations())
                 .unwrap_or_default();
             return Ok((
@@ -3349,90 +3024,11 @@ where
                     runtime_functions: None,
                     query: sql2::SessionReadResult::Rows(query),
                 },
-                file_view_mutations,
-                0,
+                mutations,
+                examined,
             ));
         }
-        if let Some(exact) = exact_schema_point_read {
-            let ctx = SessionSqlExecutionContext {
-                active_branch_id: &active_branch_id,
-                active_account_id: self.active_account_id(),
-                read_store: read_store.clone(),
-                hot_state: Arc::clone(&self.hot_state),
-                binary_cas: Arc::clone(&self.binary_cas),
-                branch_ctx: Arc::clone(&self.branch_ctx),
-                catalog_context: Arc::clone(&self.catalog_context),
-                sql_planning_cache: Arc::clone(&self.sql_planning_cache),
-                functions: FunctionProviderHandle::system(),
-                plugin_host: self.plugin_host.clone(),
-                file_views: None,
-            };
-            let catalog = sql2::SqlExecutionContext::public_catalog(&ctx).await?;
-            if let Some((spec, row_pk)) = resolve_exact_schema_point_read(catalog.as_ref(), &exact)?
-            {
-                let reader: Arc<dyn crate::hot_state::HotStateReader> =
-                    Arc::new(self.hot_state.reader(read_store.clone()));
-                let query = sql2::execute_exact_schema_point_read(
-                    &spec,
-                    &active_branch_id,
-                    reader,
-                    row_pk,
-                    &exact.projected_columns,
-                    exact.output_columns,
-                )
-                .await?;
-                if let Some(query) = query {
-                    return Ok((
-                        sql2::SessionReadSqlResult {
-                            runtime_functions: None,
-                            query: sql2::SessionReadResult::Rows(query),
-                        },
-                        Vec::new(),
-                        1,
-                    ));
-                }
-            }
-        }
-        if let Some(exact) = exact_schema_batch_read {
-            let ctx = SessionSqlExecutionContext {
-                active_branch_id: &active_branch_id,
-                active_account_id: self.active_account_id(),
-                read_store: read_store.clone(),
-                hot_state: Arc::clone(&self.hot_state),
-                binary_cas: Arc::clone(&self.binary_cas),
-                branch_ctx: Arc::clone(&self.branch_ctx),
-                catalog_context: Arc::clone(&self.catalog_context),
-                sql_planning_cache: Arc::clone(&self.sql_planning_cache),
-                functions: FunctionProviderHandle::system(),
-                plugin_host: self.plugin_host.clone(),
-                file_views: None,
-            };
-            let catalog = sql2::SqlExecutionContext::public_catalog(&ctx).await?;
-            if let Some((spec, identities)) =
-                resolve_exact_schema_batch_read(catalog.as_ref(), &exact)?
-            {
-                let provider_rows_examined = identities.iter().collect::<BTreeSet<_>>().len();
-                let hot_state: Arc<dyn crate::hot_state::HotStateReader> =
-                    Arc::new(self.hot_state.reader(read_store.clone()));
-                let query = sql2::execute_exact_schema_batch_read(
-                    &spec,
-                    &active_branch_id,
-                    hot_state,
-                    identities,
-                    &exact.projected_columns,
-                    exact.output_columns,
-                )
-                .await?;
-                return Ok((
-                    sql2::SessionReadSqlResult {
-                        runtime_functions: None,
-                        query: sql2::SessionReadResult::Rows(query),
-                    },
-                    Vec::new(),
-                    provider_rows_examined,
-                ));
-            }
-        }
+        drop(native_ctx);
         let hot_state: Arc<dyn crate::hot_state::HotStateReader> =
             Arc::new(self.hot_state.reader(read_store.clone()));
         let runtime_functions = if has_durable_runtime_function {
@@ -3446,7 +3042,7 @@ where
         let functions = runtime_functions
             .as_ref()
             .map_or_else(FunctionProviderHandle::system, FunctionContext::provider);
-        let (statement, late_file_content_column, rewritten_sql) = match late_file_content_read {
+        let (statement, late_file_content_column, rewritten_sql) = match read_plan.late_content {
             Some(plan) => {
                 let statement = *plan.statement;
                 let rewritten_sql = statement.to_string();
@@ -3950,63 +3546,6 @@ where
         Box::pin(self.execute_with_options_inner(sql, params, ExecuteOptions::default())).await
     }
 
-    /// Executes one public prepared-DML parameter page inside this explicit
-    /// transaction. The page is atomic with surrounding statements; callers
-    /// use ordinary `execute` for shape changes or dependency barriers.
-    pub(crate) async fn execute_prepared_dml_batch(
-        &mut self,
-        sql: Arc<str>,
-        parameter_batch: PreparedDmlParameterBatch,
-    ) -> Result<Vec<ExecuteResult>, LixError> {
-        self.ensure_session_open()?;
-        if parameter_batch.is_empty() {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "execute_prepared_dml_batch requires at least one parameter row",
-            ));
-        }
-        let statement = self.sql_planning_cache.parse_statement(&sql)?;
-        if sql2::bind_statement_route(&statement)? != sql2::BoundStatementRoute::Write {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "execute_prepared_dml_batch requires a write statement",
-            ));
-        }
-        self.has_started_statement = true;
-        let transaction = self.transaction_mut()?;
-        transaction.ensure_statement_allowed_after_restore()?;
-        transaction.flush_prepared_mutations().await?;
-        let plan = transaction.prepare_sql_write_logical_plan(&sql, &statement)?;
-        let checkpoint = transaction.begin_sql_statement_checkpoint()?;
-        let result = sql2::execute_write_logical_plan_prepared_dml_batch(
-            transaction,
-            &plan,
-            &parameter_batch,
-        )
-        .await;
-        let result = match result {
-            Ok(Some(results)) => Ok(results),
-            Ok(None) => Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "write shape is not supported by prepared DML batch",
-            )),
-            Err(error) => Err(normalize_sql_surface_error(error, &sql)),
-        };
-        let results = match result {
-            Ok(results) => results,
-            Err(error) => {
-                transaction
-                    .rollback_sql_statement_checkpoint(checkpoint)
-                    .await?;
-                return Err(error);
-            }
-        };
-        Ok(results
-            .into_iter()
-            .map(ExecuteResult::from_sql_write_result)
-            .collect())
-    }
-
     async fn execute_with_options_inner(
         &mut self,
         sql: &str,
@@ -4498,1152 +4037,6 @@ where
         return sql2::SqlWriteResult::diff_command(outcome, returning.as_ref());
     }
     sql2::execute_write_logical_plan_result_with_metadata(transaction, plan, params, metadata).await
-}
-
-/// Returns true only when SQL directly delivers one file's bytes to the
-/// caller. Materializing `data` inside an aggregate, join, filter, or derived
-/// expression is not acknowledgement: the caller did not receive those bytes
-/// and must not gain the ability to delete rows that only existed there.
-///
-/// This intentionally recognizes a narrow, predictable MVP surface. False
-/// negatives merely preserve an omitted row; false positives can lose one.
-fn is_acknowledgeable_file_content_read(statement: &DataFusionStatement, params: &[Value]) -> bool {
-    let Some(point_read) = simple_point_read(statement) else {
-        return false;
-    };
-
-    if !point_read.select.projection.iter().any(|item| {
-        matches!(
-            item,
-            SelectItem::UnnamedExpr(expression)
-                | SelectItem::ExprWithAlias {
-                    expr: expression,
-                    ..
-                } if direct_column_name(expression).as_deref() == Some("content")
-        )
-    }) {
-        return false;
-    }
-
-    let selection = point_read
-        .select
-        .selection
-        .as_ref()
-        .expect("simple point read requires a predicate");
-    let mut equality_columns = BTreeSet::new();
-    if !collect_literal_equalities(selection, &mut equality_columns, params) {
-        return false;
-    }
-    match point_read.table_name.as_str() {
-        "lix_file" => {
-            equality_columns.len() == 1
-                && (equality_columns.contains("id") || equality_columns.contains("path"))
-        }
-        _ => false,
-    }
-}
-
-struct SimplePointRead<'a> {
-    select: &'a Select,
-    table_name: String,
-    exact_table_shape: bool,
-}
-
-struct SimpleSingleTableSelect<'a> {
-    query: &'a Query,
-    select: &'a Select,
-    table_identifier: &'a Ident,
-    table_name: String,
-    unqualified_unquoted_table: bool,
-    alias: Option<&'a TableAlias>,
-}
-
-fn simple_single_table_select(
-    statement: &DataFusionStatement,
-) -> Option<SimpleSingleTableSelect<'_>> {
-    let DataFusionStatement::Statement(statement) = statement else {
-        return None;
-    };
-    let SqlStatement::Query(query) = statement.as_ref() else {
-        return None;
-    };
-    if query.with.is_some()
-        || !query.locks.is_empty()
-        || query.for_clause.is_some()
-        || query.settings.is_some()
-        || query.format_clause.is_some()
-        || !query.pipe_operators.is_empty()
-    {
-        return None;
-    }
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return None;
-    };
-    if select.flavor != SelectFlavor::Standard
-        || select.optimizer_hint.is_some()
-        || select.distinct.is_some()
-        || select.select_modifiers.is_some()
-        || select.top.is_some()
-        || select.exclude.is_some()
-        || select.into.is_some()
-        || !select.lateral_views.is_empty()
-        || select.prewhere.is_some()
-        || !select.connect_by.is_empty()
-        || !group_by_is_empty(&select.group_by)
-        || !select.cluster_by.is_empty()
-        || !select.distribute_by.is_empty()
-        || !select.sort_by.is_empty()
-        || select.having.is_some()
-        || !select.named_window.is_empty()
-        || select.qualify.is_some()
-        || select.value_table_mode.is_some()
-    {
-        return None;
-    }
-
-    let [from] = select.from.as_slice() else {
-        return None;
-    };
-    if !from.joins.is_empty() {
-        return None;
-    }
-    let TableFactor::Table {
-        name,
-        alias,
-        args,
-        with_hints,
-        version,
-        with_ordinality,
-        partitions,
-        json_path,
-        sample,
-        index_hints,
-        ..
-    } = &from.relation
-    else {
-        return None;
-    };
-    if args.is_some()
-        || !with_hints.is_empty()
-        || version.is_some()
-        || *with_ordinality
-        || !partitions.is_empty()
-        || json_path.is_some()
-        || sample.is_some()
-        || !index_hints.is_empty()
-    {
-        return None;
-    }
-    let table_identifier = name.0.last().and_then(|part| part.as_ident())?;
-    let table_name = table_identifier.value.to_ascii_lowercase();
-
-    Some(SimpleSingleTableSelect {
-        query,
-        select,
-        table_identifier,
-        table_name,
-        unqualified_unquoted_table: name.0.len() == 1 && table_identifier.quote_style.is_none(),
-        alias: alias.as_ref(),
-    })
-}
-
-fn simple_point_read(statement: &DataFusionStatement) -> Option<SimplePointRead<'_>> {
-    let simple = simple_single_table_select(statement)?;
-    if simple.query.order_by.is_some()
-        || !point_read_limit_is_safe(simple.query.limit_clause.as_ref())
-        || simple.query.fetch.is_some()
-    {
-        return None;
-    }
-
-    simple.select.selection.as_ref()?;
-    Some(SimplePointRead {
-        select: simple.select,
-        table_name: simple.table_name,
-        exact_table_shape: simple.unqualified_unquoted_table
-            && simple.alias.is_none()
-            && simple.query.limit_clause.is_none(),
-    })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LateMaterializedLixFileContentRead {
-    statement: Box<DataFusionStatement>,
-    data_column_index: usize,
-}
-
-/// Defers an unchanged `lix_file.content` projection until DataFusion has applied
-/// metadata predicates, ordering, and limits. This keeps SQL semantics in
-/// DataFusion while preventing large file bytes from entering Arrow at all.
-fn late_materialized_lix_file_content_read(
-    statement: &DataFusionStatement,
-) -> Option<LateMaterializedLixFileContentRead> {
-    let simple = simple_single_table_select(statement)?;
-    if simple.table_name != "lix_file"
-        || !simple.unqualified_unquoted_table
-        || simple.alias.is_some_and(|alias| !alias.columns.is_empty())
-    {
-        return None;
-    }
-    let qualifier = simple
-        .alias
-        .map_or(simple.table_identifier, |alias| &alias.name)
-        .clone();
-
-    let mut statement = statement.clone();
-    let DataFusionStatement::Statement(sql_statement) = &mut statement else {
-        return None;
-    };
-    let SqlStatement::Query(query) = sql_statement.as_mut() else {
-        return None;
-    };
-    let SetExpr::Select(select) = query.body.as_mut() else {
-        return None;
-    };
-
-    let mut data_column_index = None;
-    let mut data_output_name = None;
-    for (index, item) in select.projection.iter_mut().enumerate() {
-        let expression = match item {
-            SelectItem::UnnamedExpr(expression)
-            | SelectItem::ExprWithAlias {
-                expr: expression, ..
-            } => expression,
-            SelectItem::QualifiedWildcard(..) | SelectItem::Wildcard(..) => return None,
-        };
-        let projected_column = direct_projection_identifier(expression)?;
-        if identifier_matches(projected_column, "content") {
-            if data_column_index.is_some() {
-                return None;
-            }
-            let (path_expression, output_name) =
-                replaceable_lix_file_content_projection(item, &qualifier)?;
-            *item = SelectItem::ExprWithAlias {
-                expr: path_expression,
-                alias: output_name.clone(),
-            };
-            data_column_index = Some(index);
-            data_output_name = Some(output_name.value.to_ascii_lowercase());
-        }
-    }
-    let data_column_index = data_column_index?;
-    let data_output_name = data_output_name?;
-
-    if select
-        .selection
-        .as_ref()
-        .is_some_and(|selection| expression_mentions_column(selection, "content"))
-    {
-        return None;
-    }
-    if let Some(order_by) = &query.order_by {
-        if order_by.interpolate.is_some() {
-            return None;
-        }
-        let OrderByKind::Expressions(expressions) = &order_by.kind else {
-            return None;
-        };
-        if expressions.iter().any(|order| {
-            order.with_fill.is_some()
-                || direct_column_name(&order.expr)
-                    .is_none_or(|column| column == "content" || column == data_output_name)
-        }) {
-            return None;
-        }
-    }
-
-    Some(LateMaterializedLixFileContentRead {
-        statement: Box::new(statement),
-        data_column_index,
-    })
-}
-
-fn replaceable_lix_file_content_projection(
-    item: &SelectItem,
-    qualifier: &Ident,
-) -> Option<(Expr, Ident)> {
-    let (expression, output_name) = match item {
-        SelectItem::UnnamedExpr(expression) => {
-            let output_name = direct_projection_identifier(expression)?.clone();
-            (expression, output_name)
-        }
-        SelectItem::ExprWithAlias { expr, alias } => (expr, alias.clone()),
-        SelectItem::QualifiedWildcard(..) | SelectItem::Wildcard(..) => return None,
-    };
-    let path_expression = direct_file_content_path_expression(expression, qualifier)?;
-    Some((path_expression, output_name))
-}
-
-fn direct_file_content_path_expression(expression: &Expr, qualifier: &Ident) -> Option<Expr> {
-    match expression {
-        Expr::Identifier(identifier) if identifier_matches(identifier, "content") => {
-            let mut path = identifier.clone();
-            path.value = "path".to_string();
-            Some(Expr::Identifier(path))
-        }
-        Expr::CompoundIdentifier(identifiers) => {
-            let [expression_qualifier, identifier] = identifiers.as_slice() else {
-                return None;
-            };
-            if !identifiers_match(expression_qualifier, qualifier)
-                || !identifier_matches(identifier, "content")
-            {
-                return None;
-            }
-            let mut identifiers = identifiers.clone();
-            identifiers.last_mut()?.value = "path".to_string();
-            Some(Expr::CompoundIdentifier(identifiers))
-        }
-        _ => None,
-    }
-}
-
-fn direct_projection_identifier(expression: &Expr) -> Option<&Ident> {
-    match expression {
-        Expr::Identifier(identifier) => Some(identifier),
-        Expr::CompoundIdentifier(identifiers) => identifiers.last(),
-        _ => None,
-    }
-}
-
-fn identifier_matches(identifier: &Ident, expected: &str) -> bool {
-    if identifier.quote_style.is_some() {
-        identifier.value == expected
-    } else {
-        identifier.value.eq_ignore_ascii_case(expected)
-    }
-}
-
-fn identifiers_match(left: &Ident, right: &Ident) -> bool {
-    if left.quote_style.is_some() || right.quote_style.is_some() {
-        left.quote_style == right.quote_style && left.value == right.value
-    } else {
-        left.value.eq_ignore_ascii_case(&right.value)
-    }
-}
-
-fn expression_mentions_column(expression: &Expr, column: &str) -> bool {
-    let mut visitor = ColumnReferenceVisitor {
-        column,
-        found: false,
-    };
-    let _ = expression.visit(&mut visitor);
-    visitor.found
-}
-
-struct ColumnReferenceVisitor<'a> {
-    column: &'a str,
-    found: bool,
-}
-
-impl Visitor for ColumnReferenceVisitor<'_> {
-    type Break = ();
-
-    fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
-        if direct_column_name(expression).as_deref() == Some(self.column) {
-            self.found = true;
-            return ControlFlow::Break(());
-        }
-        ControlFlow::Continue(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ExactFilesystemRead {
-    RootFileListing,
-    RootDirectoryListing,
-    Point(sql2::ExactLixFileReadSelector, sql2::ExactLixFileReadColumn),
-    PathContentBatch(BTreeSet<String>),
-    IdManifestBatch(BTreeSet<String>),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct ExactSchemaPointRead {
-    table_name: String,
-    projected_columns: Vec<String>,
-    output_columns: Vec<String>,
-    equalities: BTreeMap<String, Value>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct ExactSchemaBatchRead {
-    table_name: String,
-    projected_columns: Vec<String>,
-    output_columns: Vec<String>,
-    identities: Vec<BTreeMap<String, Value>>,
-    order_by_columns: Vec<String>,
-}
-
-fn exact_schema_point_read_route(
-    statement: &DataFusionStatement,
-    params: &[Value],
-) -> Option<ExactSchemaPointRead> {
-    let simple = simple_single_table_select(statement)?;
-    if !simple.unqualified_unquoted_table
-        || simple.alias.is_some()
-        || simple.query.order_by.is_some()
-        || simple.query.fetch.is_some()
-        || !point_read_limit_is_safe(simple.query.limit_clause.as_ref())
-    {
-        return None;
-    }
-    let mut projected_columns = Vec::with_capacity(simple.select.projection.len());
-    let mut output_columns = Vec::with_capacity(simple.select.projection.len());
-    for item in &simple.select.projection {
-        let (expression, alias) = match item {
-            SelectItem::UnnamedExpr(expression) => (expression, None),
-            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias)),
-            _ => return None,
-        };
-        let column = exact_point_column(expression)?;
-        projected_columns.push(column.clone());
-        output_columns.push(alias.map_or(column, |alias| alias.value.clone()));
-    }
-    if projected_columns.is_empty() {
-        return None;
-    }
-    let mut equalities = BTreeMap::new();
-    collect_exact_schema_equalities(simple.select.selection.as_ref()?, params, &mut equalities)?;
-    Some(ExactSchemaPointRead {
-        table_name: simple.table_name,
-        projected_columns,
-        output_columns,
-        equalities,
-    })
-}
-
-fn exact_schema_batch_read_route(
-    statement: &DataFusionStatement,
-    params: &[Value],
-) -> Option<ExactSchemaBatchRead> {
-    let simple = simple_single_table_select(statement)?;
-    if !simple.unqualified_unquoted_table
-        || simple.alias.is_some()
-        || simple.query.fetch.is_some()
-        || simple.query.limit_clause.is_some()
-    {
-        return None;
-    }
-    let mut projected_columns = Vec::with_capacity(simple.select.projection.len());
-    let mut output_columns = Vec::with_capacity(simple.select.projection.len());
-    for item in &simple.select.projection {
-        let (expression, alias) = match item {
-            SelectItem::UnnamedExpr(expression) => (expression, None),
-            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias)),
-            _ => return None,
-        };
-        let column = exact_point_column(expression)?;
-        projected_columns.push(column.clone());
-        output_columns.push(alias.map_or(column, |alias| alias.value.clone()));
-    }
-    if projected_columns.is_empty() {
-        return None;
-    }
-    let order_by_columns = match &simple.query.order_by {
-        None => Vec::new(),
-        Some(order_by) if order_by.interpolate.is_none() => {
-            let OrderByKind::Expressions(expressions) = &order_by.kind else {
-                return None;
-            };
-            expressions
-                .iter()
-                .map(|order| {
-                    (order.with_fill.is_none()
-                        && order.options.asc != Some(false)
-                        && order.options.nulls_first.is_none())
-                    .then(|| exact_point_column(&order.expr))
-                    .flatten()
-                })
-                .collect::<Option<Vec<_>>>()?
-        }
-        Some(_) => return None,
-    };
-    let identities = collect_exact_schema_identity_rows(simple.select.selection.as_ref()?, params)?;
-    (identities.len() > 1).then_some(ExactSchemaBatchRead {
-        table_name: simple.table_name,
-        projected_columns,
-        output_columns,
-        identities,
-        order_by_columns,
-    })
-}
-
-fn collect_exact_schema_identity_rows(
-    expression: &Expr,
-    params: &[Value],
-) -> Option<Vec<BTreeMap<String, Value>>> {
-    match expression {
-        Expr::Nested(expression) => collect_exact_schema_identity_rows(expression, params),
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Or,
-            right,
-        } => {
-            let mut rows = collect_exact_schema_identity_rows(left, params)?;
-            rows.extend(collect_exact_schema_identity_rows(right, params)?);
-            Some(rows)
-        }
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => {
-            let left = collect_exact_schema_identity_rows(left, params)?;
-            let right = collect_exact_schema_identity_rows(right, params)?;
-            (left.len().checked_mul(right.len())? <= 4096).then_some(())?;
-            let mut rows = Vec::with_capacity(left.len() * right.len());
-            for left in left {
-                for right in &right {
-                    let mut combined = left.clone();
-                    let mut compatible = true;
-                    for (column, value) in right {
-                        if combined
-                            .insert(column.clone(), value.clone())
-                            .is_some_and(|existing| existing != *value)
-                        {
-                            compatible = false;
-                            break;
-                        }
-                    }
-                    if compatible {
-                        rows.push(combined);
-                    }
-                }
-            }
-            Some(rows)
-        }
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        } => {
-            let (column, value) = match (exact_point_column(left), exact_point_column(right)) {
-                (Some(column), None) => (column, exact_schema_literal(right, params)?),
-                (None, Some(column)) => (column, exact_schema_literal(left, params)?),
-                _ => return None,
-            };
-            Some(vec![BTreeMap::from([(column, value)])])
-        }
-        Expr::InList {
-            expr,
-            list,
-            negated: false,
-        } if !list.is_empty() => {
-            let column = exact_point_column(expr)?;
-            list.iter()
-                .map(|value| {
-                    Some(BTreeMap::from([(
-                        column.clone(),
-                        exact_schema_literal(value, params)?,
-                    )]))
-                })
-                .collect()
-        }
-        Expr::IsNull(expression) => {
-            let column = exact_point_column(expression)?;
-            Some(vec![BTreeMap::from([(column, Value::Null)])])
-        }
-        _ => None,
-    }
-}
-
-fn collect_exact_schema_equalities(
-    expression: &Expr,
-    params: &[Value],
-    equalities: &mut BTreeMap<String, Value>,
-) -> Option<()> {
-    match expression {
-        Expr::Nested(expression) => collect_exact_schema_equalities(expression, params, equalities),
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => {
-            collect_exact_schema_equalities(left, params, equalities)?;
-            collect_exact_schema_equalities(right, params, equalities)
-        }
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        } => {
-            let (column, value) = match (exact_point_column(left), exact_point_column(right)) {
-                (Some(column), None) => (column, exact_schema_literal(right, params)?),
-                (None, Some(column)) => (column, exact_schema_literal(left, params)?),
-                _ => return None,
-            };
-            equalities.insert(column, value).is_none().then_some(())
-        }
-        _ => None,
-    }
-}
-
-fn exact_schema_literal(expression: &Expr, params: &[Value]) -> Option<Value> {
-    let Expr::Value(value) = expression else {
-        return None;
-    };
-    match &value.value {
-        SqlValue::Placeholder(placeholder) => placeholder
-            .strip_prefix('$')
-            .and_then(|index| index.parse::<usize>().ok())
-            .and_then(|index| index.checked_sub(1))
-            .and_then(|index| params.get(index))
-            .cloned(),
-        SqlValue::SingleQuotedString(value) => Some(Value::Text(value.clone())),
-        SqlValue::Number(value, _) => value.parse::<i64>().ok().map(Value::Integer),
-        _ => None,
-    }
-}
-
-fn resolve_exact_schema_point_read(
-    catalog: &sql2::PublicCatalog,
-    exact: &ExactSchemaPointRead,
-) -> Result<Option<(sql2::SchemaSurfaceSpec, crate::row_pk::RowPk)>, LixError> {
-    let Some(surface) = catalog.surface(&exact.table_name) else {
-        return Ok(None);
-    };
-    let sql2::PublicSurfaceKind::SchemaBase { schema_key } = &surface.kind else {
-        return Ok(None);
-    };
-    let spec = catalog.schema_spec(schema_key).cloned().ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "exact schema point route is missing schema metadata",
-        )
-    })?;
-    if exact
-        .projected_columns
-        .iter()
-        .any(|column| spec.visible_column(column).is_none())
-    {
-        return Ok(None);
-    }
-    let primary_key_columns = spec
-        .primary_key_paths
-        .iter()
-        .map(|path| match path.as_slice() {
-            [column] => Some(column.as_str()),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "exact schema point route requires top-level primary-key columns",
-            )
-        })?;
-    if exact.equalities.len() != primary_key_columns.len()
-        || exact
-            .equalities
-            .keys()
-            .any(|column| !primary_key_columns.contains(&column.as_str()))
-    {
-        return Ok(None);
-    }
-    let parts = primary_key_columns
-        .iter()
-        .zip(&spec.primary_key_component_types)
-        .map(|(column, component_type)| {
-            let value = exact.equalities.get(*column)?;
-            match (component_type, value) {
-                (
-                    crate::row_pk::RowPkComponentType::Uuid
-                    | crate::row_pk::RowPkComponentType::String
-                    | crate::row_pk::RowPkComponentType::Bytes,
-                    Value::Text(value),
-                ) => Some(value.clone()),
-                (crate::row_pk::RowPkComponentType::Integer, Value::Integer(value)) => {
-                    Some(value.to_string())
-                }
-                _ => None,
-            }
-        })
-        .collect::<Option<Vec<_>>>();
-    let Some(parts) = parts else {
-        return Ok(None);
-    };
-    let Ok(row_pk) =
-        crate::row_pk::RowPk::from_external_parts(parts, &spec.primary_key_component_types)
-    else {
-        return Ok(None);
-    };
-    Ok(Some((spec, row_pk)))
-}
-
-fn resolve_exact_schema_batch_read(
-    catalog: &sql2::PublicCatalog,
-    exact: &ExactSchemaBatchRead,
-) -> Result<
-    Option<(
-        sql2::SchemaSurfaceSpec,
-        Vec<(crate::row_pk::RowPk, Option<String>)>,
-    )>,
-    LixError,
-> {
-    let Some(surface) = catalog.surface(&exact.table_name) else {
-        return Ok(None);
-    };
-    let sql2::PublicSurfaceKind::SchemaBase { schema_key } = &surface.kind else {
-        return Ok(None);
-    };
-    let spec = catalog.schema_spec(schema_key).cloned().ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "exact schema batch route is missing schema metadata",
-        )
-    })?;
-    if exact
-        .projected_columns
-        .iter()
-        .any(|column| spec.visible_column(column).is_none())
-    {
-        return Ok(None);
-    }
-    let primary_key_columns = spec
-        .primary_key_paths
-        .iter()
-        .map(|path| match path.as_slice() {
-            [column] => Some(column.as_str()),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "exact schema batch route requires top-level primary-key columns",
-            )
-        })?;
-    if !exact.order_by_columns.is_empty()
-        && exact.order_by_columns
-            != primary_key_columns
-                .iter()
-                .map(|column| (*column).to_owned())
-                .collect::<Vec<_>>()
-    {
-        return Ok(None);
-    }
-    let mut seen = BTreeSet::new();
-    let mut identities = Vec::with_capacity(exact.identities.len());
-    for identity in &exact.identities {
-        if identity.len() != primary_key_columns.len() + 1
-            || identity.keys().any(|column| {
-                column != "lixcol_file_id" && !primary_key_columns.contains(&column.as_str())
-            })
-        {
-            return Ok(None);
-        }
-        let file_id = match identity.get("lixcol_file_id") {
-            Some(Value::Null) => None,
-            Some(Value::Text(file_id)) => Some(file_id.clone()),
-            _ => return Ok(None),
-        };
-        let parts = primary_key_columns
-            .iter()
-            .zip(&spec.primary_key_component_types)
-            .map(|(column, component_type)| {
-                let value = identity.get(*column)?;
-                match (component_type, value) {
-                    (
-                        crate::row_pk::RowPkComponentType::Uuid
-                        | crate::row_pk::RowPkComponentType::String
-                        | crate::row_pk::RowPkComponentType::Bytes,
-                        Value::Text(value),
-                    ) => Some(value.clone()),
-                    (crate::row_pk::RowPkComponentType::Integer, Value::Integer(value)) => {
-                        Some(value.to_string())
-                    }
-                    _ => None,
-                }
-            })
-            .collect::<Option<Vec<_>>>();
-        let Some(parts) = parts else {
-            return Ok(None);
-        };
-        let Ok(row_pk) =
-            crate::row_pk::RowPk::from_external_parts(parts, &spec.primary_key_component_types)
-        else {
-            return Ok(None);
-        };
-        if seen.insert((row_pk.clone(), file_id.clone())) {
-            identities.push((row_pk, file_id));
-        }
-    }
-    if !exact.order_by_columns.is_empty() {
-        identities.sort_unstable();
-    }
-    Ok(Some((spec, identities)))
-}
-
-fn exact_filesystem_read_route(
-    statement: &DataFusionStatement,
-    params: &[Value],
-) -> Option<ExactFilesystemRead> {
-    if exact_lix_file_root_listing(statement, params) {
-        return Some(ExactFilesystemRead::RootFileListing);
-    }
-    if exact_lix_directory_root_listing(statement, params) {
-        return Some(ExactFilesystemRead::RootDirectoryListing);
-    }
-    if let Some((selector, column)) = exact_lix_file_point_read(statement, params) {
-        return Some(ExactFilesystemRead::Point(selector, column));
-    }
-
-    let point_read = simple_point_read(statement)?;
-    if point_read.table_name != "lix_file" || !point_read.exact_table_shape {
-        return None;
-    }
-    exact_path_content_batch(point_read.select, params)
-        .map(ExactFilesystemRead::PathContentBatch)
-        .or_else(|| {
-            exact_id_manifest_batch(point_read.select, params)
-                .map(ExactFilesystemRead::IdManifestBatch)
-        })
-}
-
-fn exact_lix_file_root_listing(statement: &DataFusionStatement, params: &[Value]) -> bool {
-    exact_root_listing(
-        statement,
-        params,
-        "lix_file",
-        &["id", "path", "name", "lixcol_metadata", "lixcol_updated_at"],
-        "directory_id",
-    )
-}
-
-fn exact_lix_directory_root_listing(statement: &DataFusionStatement, params: &[Value]) -> bool {
-    exact_root_listing(
-        statement,
-        params,
-        "lix_directory",
-        &["id", "path", "name", "lixcol_updated_at"],
-        "parent_id",
-    )
-}
-
-fn exact_root_listing(
-    statement: &DataFusionStatement,
-    params: &[Value],
-    table_name: &str,
-    projection: &[&str],
-    parent_column: &str,
-) -> bool {
-    if !params.is_empty() {
-        return false;
-    }
-    let Some(simple) = simple_single_table_select(statement) else {
-        return false;
-    };
-    if simple.table_name != table_name
-        || !simple.unqualified_unquoted_table
-        || simple.alias.is_some()
-        || simple.query.limit_clause.is_some()
-        || simple.query.fetch.is_some()
-    {
-        return false;
-    }
-    if simple.select.projection.len() != projection.len()
-        || !simple
-            .select
-            .projection
-            .iter()
-            .zip(projection)
-            .all(|(item, expected)| {
-                let SelectItem::UnnamedExpr(expression) = item else {
-                    return false;
-                };
-                exact_point_column(expression).as_deref() == Some(*expected)
-            })
-    {
-        return false;
-    }
-    let Some(Expr::IsNull(parent)) = simple.select.selection.as_ref() else {
-        return false;
-    };
-    if exact_point_column(parent).as_deref() != Some(parent_column) {
-        return false;
-    }
-    let Some(order_by) = &simple.query.order_by else {
-        return false;
-    };
-    if order_by.interpolate.is_some() {
-        return false;
-    }
-    let OrderByKind::Expressions(expressions) = &order_by.kind else {
-        return false;
-    };
-    let [order] = expressions.as_slice() else {
-        return false;
-    };
-    order.with_fill.is_none()
-        && order.options.asc != Some(false)
-        && order.options.nulls_first.is_none()
-        && exact_point_column(&order.expr).as_deref() == Some("name")
-}
-
-fn exact_lix_file_point_read(
-    statement: &DataFusionStatement,
-    params: &[Value],
-) -> Option<(sql2::ExactLixFileReadSelector, sql2::ExactLixFileReadColumn)> {
-    let point_read = simple_point_read(statement)?;
-    if point_read.table_name != "lix_file" || !point_read.exact_table_shape {
-        return None;
-    }
-    let [SelectItem::UnnamedExpr(projection)] = point_read.select.projection.as_slice() else {
-        return None;
-    };
-    let Expr::Identifier(projection) = projection else {
-        return None;
-    };
-    if projection.quote_style.is_some() {
-        return None;
-    }
-    let column = match projection.value.to_ascii_lowercase().as_str() {
-        "content" => sql2::ExactLixFileReadColumn::Content,
-        "lixcol_change_id" => sql2::ExactLixFileReadColumn::ChangeId,
-        _ => return None,
-    };
-    let selection = point_read.select.selection.as_ref()?;
-    let (identity_column, identity_value) = exact_point_identity(selection, params)?;
-    let selector = match identity_column.as_str() {
-        "id" => sql2::ExactLixFileReadSelector::Id(identity_value),
-        "path" => sql2::ExactLixFileReadSelector::Path(identity_value),
-        _ => return None,
-    };
-    Some((selector, column))
-}
-
-/// Recognizes the exact batch download shape used by Lixray. Keeping the
-/// projection and numbered placeholders strict makes the direct result path
-/// equivalent to the DataFusion query without reimplementing general SQL.
-fn exact_path_content_batch(select: &Select, params: &[Value]) -> Option<BTreeSet<String>> {
-    let [
-        SelectItem::UnnamedExpr(path_projection),
-        SelectItem::UnnamedExpr(content_projection),
-    ] = select.projection.as_slice()
-    else {
-        return None;
-    };
-    if exact_point_column(path_projection).as_deref() != Some("path")
-        || exact_point_column(content_projection).as_deref() != Some("content")
-    {
-        return None;
-    }
-    let Expr::InList {
-        expr,
-        list,
-        negated: false,
-    } = select.selection.as_ref()?
-    else {
-        return None;
-    };
-    if exact_point_column(expr).as_deref() != Some("path")
-        || list.is_empty()
-        || list.len() != params.len()
-    {
-        return None;
-    }
-
-    let mut paths = BTreeSet::new();
-    for (index, (expression, param)) in list.iter().zip(params).enumerate() {
-        let Expr::Value(value) = expression else {
-            return None;
-        };
-        let SqlValue::Placeholder(placeholder) = &value.value else {
-            return None;
-        };
-        if placeholder != &format!("${}", index + 1) {
-            return None;
-        }
-        let Value::Text(path) = param else {
-            return None;
-        };
-        paths.insert(path.clone());
-    }
-    Some(paths)
-}
-
-/// Recognizes the exact changed-file manifest verification shape. Keeping the
-/// projection and parameter-only id list strict avoids changing general SQL
-/// semantics while bypassing repeated DataFusion setup for bounded exact
-/// batches.
-fn exact_id_manifest_batch(select: &Select, params: &[Value]) -> Option<BTreeSet<String>> {
-    let [
-        SelectItem::UnnamedExpr(id_projection),
-        SelectItem::UnnamedExpr(path_projection),
-        SelectItem::UnnamedExpr(content_projection),
-        SelectItem::UnnamedExpr(metadata_projection),
-    ] = select.projection.as_slice()
-    else {
-        return None;
-    };
-    if exact_point_column(id_projection).as_deref() != Some("id")
-        || exact_point_column(path_projection).as_deref() != Some("path")
-        || exact_point_column(content_projection).as_deref() != Some("content")
-        || exact_point_column(metadata_projection).as_deref() != Some("lixcol_metadata")
-    {
-        return None;
-    }
-    let Expr::InList {
-        expr,
-        list,
-        negated: false,
-    } = select.selection.as_ref()?
-    else {
-        return None;
-    };
-    if exact_point_column(expr).as_deref() != Some("id")
-        || list.is_empty()
-        || list.len() != params.len()
-    {
-        return None;
-    }
-    let mut ids = BTreeSet::new();
-    for (index, (expression, param)) in list.iter().zip(params).enumerate() {
-        let Expr::Value(value) = expression else {
-            return None;
-        };
-        let SqlValue::Placeholder(placeholder) = &value.value else {
-            return None;
-        };
-        if placeholder != &format!("${}", index + 1) {
-            return None;
-        }
-        let Value::Text(id) = param else {
-            return None;
-        };
-        ids.insert(id.clone());
-    }
-    (ids.len() == list.len()).then_some(ids)
-}
-
-fn exact_point_identity(expression: &Expr, params: &[Value]) -> Option<(String, String)> {
-    let Expr::BinaryOp {
-        left,
-        op: BinaryOperator::Eq,
-        right,
-    } = expression
-    else {
-        return None;
-    };
-    match (exact_point_column(left), exact_point_column(right)) {
-        (Some(column), None) => Some((column, exact_point_text_param(right, params)?)),
-        (None, Some(column)) => Some((column, exact_point_text_param(left, params)?)),
-        _ => None,
-    }
-}
-
-fn exact_point_column(expression: &Expr) -> Option<String> {
-    let Expr::Identifier(identifier) = expression else {
-        return None;
-    };
-    if identifier.quote_style.is_some() {
-        return None;
-    }
-    Some(identifier.value.to_ascii_lowercase())
-}
-
-fn exact_point_text_param(expression: &Expr, params: &[Value]) -> Option<String> {
-    let Expr::Value(value) = expression else {
-        return None;
-    };
-    match &value.value {
-        SqlValue::Placeholder(placeholder) if params.len() == 1 && placeholder == "$1" => {
-            let Value::Text(value) = &params[0] else {
-                return None;
-            };
-            Some(value.clone())
-        }
-        _ => None,
-    }
-}
-
-/// A unique id/path predicate can return at most one row. `LIMIT 1` therefore
-/// leaves that delivered row unchanged, while offsets and dynamic limits can
-/// hide a materialized row and must remain non-acknowledging.
-fn point_read_limit_is_safe(limit_clause: Option<&LimitClause>) -> bool {
-    let Some(limit_clause) = limit_clause else {
-        return true;
-    };
-    let LimitClause::LimitOffset {
-        limit,
-        offset,
-        limit_by,
-    } = limit_clause
-    else {
-        return false;
-    };
-    if offset.is_some() || !limit_by.is_empty() {
-        return false;
-    }
-    let Some(Expr::Value(value)) = limit else {
-        // `LIMIT ALL` does not remove the unique point row.
-        return limit.is_none();
-    };
-    matches!(&value.value, SqlValue::Number(number, _) if number.parse::<u64>().is_ok_and(|number| number > 0))
-}
-
-fn group_by_is_empty(group_by: &GroupByExpr) -> bool {
-    matches!(group_by, GroupByExpr::Expressions(expressions, modifiers)
-        if expressions.is_empty() && modifiers.is_empty())
-}
-
-fn direct_column_name(expression: &Expr) -> Option<String> {
-    let identifier = match expression {
-        Expr::Identifier(identifier) => identifier,
-        Expr::CompoundIdentifier(identifiers) => identifiers.last()?,
-        Expr::Nested(expression) => return direct_column_name(expression),
-        _ => return None,
-    };
-    Some(identifier.value.to_ascii_lowercase())
-}
-
-fn collect_literal_equalities(
-    expression: &Expr,
-    columns: &mut BTreeSet<String>,
-    params: &[Value],
-) -> bool {
-    match expression {
-        Expr::Nested(expression) => collect_literal_equalities(expression, columns, params),
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::And,
-            right,
-        } => {
-            collect_literal_equalities(left, columns, params)
-                && collect_literal_equalities(right, columns, params)
-        }
-        Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        } => {
-            let column = match (direct_column_name(left), direct_column_name(right)) {
-                (Some(column), None) if point_identity_value_is_text(right, params) => column,
-                (None, Some(column)) if point_identity_value_is_text(left, params) => column,
-                _ => return false,
-            };
-            columns.insert(column)
-        }
-        _ => false,
-    }
-}
-
-fn point_identity_value_is_text(expression: &Expr, params: &[Value]) -> bool {
-    let Expr::Value(value) = expression else {
-        return false;
-    };
-    match &value.value {
-        SqlValue::Placeholder(placeholder) => {
-            let index = placeholder
-                .strip_prefix('$')
-                .and_then(|index| index.parse::<usize>().ok())
-                .and_then(|index| index.checked_sub(1));
-            index
-                .and_then(|index| params.get(index))
-                .is_some_and(|value| matches!(value, Value::Text(_)))
-        }
-        value => value.clone().into_string().is_some(),
-    }
 }
 
 fn execution_disposition(
@@ -6964,36 +5357,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn exact_schema_batch_route_preserves_composite_identity_expansion() {
-        let statement = sql2::parse_statement(
-            "SELECT tenant, revision, payload FROM batch_route_row \
-             WHERE tenant = $1 AND revision IN ($2, $3, $2) \
-               AND lixcol_file_id IS NULL \
-             ORDER BY tenant, revision",
-        )
-        .expect("batch route SQL should parse");
-        let route = exact_schema_batch_read_route(
-            &statement,
-            &[
-                Value::Text("docs".to_owned()),
-                Value::Integer(7),
-                Value::Integer(9),
-            ],
-        )
-        .expect("complete composite identities should route");
-        assert_eq!(route.identities.len(), 3, "request slots stay aligned");
-        assert_eq!(route.order_by_columns, ["tenant", "revision"]);
-        assert_eq!(
-            route.identities[0]["tenant"],
-            Value::Text("docs".to_owned())
-        );
-        assert_eq!(route.identities[0]["revision"], Value::Integer(7));
-        assert_eq!(route.identities[0]["lixcol_file_id"], Value::Null);
-        assert_eq!(route.identities[1]["revision"], Value::Integer(9));
-        assert_eq!(route.identities[2]["revision"], Value::Integer(7));
-    }
-
     #[tokio::test]
     async fn exact_schema_batch_matches_relational_duplicate_missing_null_and_jsonb_semantics() {
         let session = open_session().await;
@@ -7365,6 +5728,54 @@ mod tests {
                 .unwrap(),
             ExecutionDisposition::Durable
         );
+    }
+
+    #[tokio::test]
+    async fn current_and_historical_reads_share_replica_retry_disposition() {
+        let session = open_session().await;
+        let reads = [
+            "SELECT * FROM lix_file",
+            "SELECT * FROM lix_diff('lix_file')",
+            "SELECT * FROM lix_change",
+            "SELECT * FROM lix_log()",
+            "SELECT * FROM lix_commit",
+            "SELECT * FROM lix_history('lix_file')",
+            "SELECT * FROM lix_as_of('lix_file', $1)",
+            "SELECT * FROM lix_diff('lix_file', $1, $2)",
+            "SELECT * FROM lix_commit_ancestry($1)",
+            "EXPLAIN SELECT * FROM lix_history('lix_file')",
+        ];
+        for sql in reads {
+            assert_eq!(
+                session.execution_disposition(sql).unwrap(),
+                ExecutionDisposition::CancellableRead,
+                "{sql}"
+            );
+        }
+        let mut batch = reads.into_iter().map(batch_statement).collect::<Vec<_>>();
+        assert_eq!(
+            session.execute_batch_disposition(&batch).unwrap(),
+            ExecutionDisposition::CancellableRead
+        );
+        for sql in [
+            "SELECT uuidv7()",
+            "SELECT CURRENT_TIMESTAMP",
+            "UPDATE lix_file SET path = '/b' WHERE path = '/a'",
+            "EXPLAIN SELECT uuidv7()",
+        ] {
+            batch.push(batch_statement(sql));
+            assert_eq!(
+                session.execution_disposition(sql).unwrap(),
+                ExecutionDisposition::Durable,
+                "{sql}"
+            );
+            assert_eq!(
+                session.execute_batch_disposition(&batch).unwrap(),
+                ExecutionDisposition::Durable,
+                "{sql}"
+            );
+            batch.pop();
+        }
     }
 
     #[test]
@@ -9497,6 +7908,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_insert_batches_match_individual_inserts_without_json_roundtrips() {
+        let cases = [
+            (
+                serde_json::json!({
+                    "$schema": "https://lix.dev/schema-v1.json", "key": "native_batch_probe",
+                    "columns": [
+                        {"name": "id", "type": "text", "nullable": false},
+                        {"name": "text", "type": "text", "nullable": true},
+                        {"name": "enabled", "type": "boolean", "nullable": false},
+                        {"name": "uuid", "type": "uuid", "nullable": false},
+                        {"name": "omitted", "type": "int8", "nullable": true}
+                    ], "primary_key": ["id"]
+                }),
+                "INSERT INTO native_batch_probe (uuid, text, enabled, id) VALUES ($1, $2, $3, $4)",
+                vec![
+                    vec![Value::Text("550E8400-E29B-41D4-A716-446655440000".into()), Value::Text("quote\" slash\\ newline\n emoji 🦀".into()), Value::Boolean(true), Value::Text("a".into())],
+                    vec![Value::Text("550e8400-e29b-41d4-a716-446655440001".into()), Value::Null, Value::Boolean(false), Value::Text("b".into())],
+                ],
+                "SELECT id, text, enabled, uuid, omitted FROM native_batch_probe ORDER BY id",
+            ),
+            (
+                serde_json::json!({
+                    "$schema": "https://lix.dev/schema-v1.json", "key": "native_batch_probe",
+                    "columns": [
+                        {"name": "id", "type": "text", "nullable": false},
+                        {"name": "text", "type": "text", "nullable": false},
+                        {"name": "at", "type": "timestamptz", "nullable": false},
+                        {"name": "omitted", "type": "boolean", "nullable": true}
+                    ], "primary_key": ["id"]
+                }),
+                "INSERT INTO native_batch_probe (id, text, at) VALUES ($1, $2, $3)",
+                vec![
+                    vec![Value::Text("a".into()), Value::Text("\t🦀".into()), Value::Text("2026-01-02T03:04:05.123456+02:00".into())],
+                    vec![Value::Text("b".into()), Value::Text("\"\\".into()), Value::Text("2026-01-02T01:04:05.123456Z".into())],
+                ],
+                "SELECT id, text, at, omitted FROM native_batch_probe ORDER BY id",
+            ),
+            (
+                serde_json::json!({
+                    "$schema": "https://lix.dev/schema-v1.json", "key": "native_batch_probe",
+                    "columns": [
+                        {"name": "path", "type": "text", "nullable": false},
+                        {"name": "value", "type": "jsonb", "nullable": false}
+                    ], "primary_key": ["path"]
+                }),
+                "INSERT INTO native_batch_probe (path, value) VALUES ($1, CAST($2 AS JSONB))",
+                vec![
+                    vec![Value::Text("/a\"\\🦀".into()), Value::Text(serde_json::json!({"nested": [null, true, {"text": "x".repeat(8192)}], "number": 9223372036854775807_i64}).to_string())],
+                    vec![Value::Text("/b".into()), Value::Text("null".into())],
+                ],
+                "SELECT path, value FROM native_batch_probe ORDER BY path",
+            ),
+        ];
+        for (case_index, (schema, sql, params, probe)) in cases.into_iter().enumerate() {
+            let batch = open_session().await;
+            let individual = open_session().await;
+            for session in [&batch, &individual] {
+                session.execute(
+                    "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
+                    &[Value::Text(schema.to_string())],
+                ).await.unwrap();
+            }
+            let statements = params
+                .iter()
+                .map(|params| ExecuteBatchStatement {
+                    label: None,
+                    sql: sql.into(),
+                    params: params.clone(),
+                })
+                .collect::<Vec<_>>();
+            sql2::take_certified_row_insert_parameter_batch_executions();
+            let results = batch.execute_batch(&statements).await.unwrap();
+            let executions = sql2::take_certified_row_insert_parameter_batch_executions();
+            if case_index == 0 {
+                assert_eq!(
+                    executions, 1,
+                    "direct typed INSERT batch must retain its dense lane: {sql}"
+                );
+            }
+            assert!(results.iter().all(|result| result.rows_affected() == 1));
+            for params in &params {
+                individual.execute(sql, params).await.unwrap();
+            }
+            let actual = batch.execute(probe, &[]).await.unwrap();
+            let expected = individual.execute(probe, &[]).await.unwrap();
+            assert_eq!(actual.len(), expected.len(), "{sql}");
+            for (actual, expected) in actual.rows().iter().zip(expected.rows()) {
+                assert_eq!(actual.values(), expected.values(), "{sql}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_insert_batch_rejects_invalid_uuid_with_statement_index_and_no_prefix() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json", "key": "native_invalid_batch_probe",
+            "columns": [
+                {"name": "id", "type": "text", "nullable": false},
+                {"name": "uuid", "type": "uuid", "nullable": false}
+            ], "primary_key": ["id"]
+        });
+        session.execute(
+            "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
+            &[Value::Text(schema.to_string())],
+        ).await.unwrap();
+        let sql = "INSERT INTO native_invalid_batch_probe (id, uuid) VALUES ($1, $2)";
+        for invalid in [Value::Text("not-a-uuid".into()), Value::Null] {
+            let invalid_params = vec![Value::Text("b".into()), invalid];
+            let ordinary = session.execute(sql, &invalid_params).await.unwrap_err();
+            let batch = session
+                .execute_batch(&[
+                    ExecuteBatchStatement {
+                        label: None,
+                        sql: sql.into(),
+                        params: vec![
+                            Value::Text("a".into()),
+                            Value::Text("550e8400-e29b-41d4-a716-446655440000".into()),
+                        ],
+                    },
+                    ExecuteBatchStatement {
+                        label: None,
+                        sql: sql.into(),
+                        params: invalid_params,
+                    },
+                ])
+                .await
+                .unwrap_err();
+            assert_eq!(batch.code, ordinary.code);
+            assert_eq!(batch.details.as_ref().unwrap()["statementIndex"], 1);
+            assert!(
+                session
+                    .execute("SELECT id FROM native_invalid_batch_probe", &[])
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn execute_batch_declines_uncertified_row_insert_rows() {
         let session = open_session().await;
         let schema = serde_json::json!({
@@ -9853,120 +8405,6 @@ mod tests {
             .unwrap();
         assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "new-a");
         assert_eq!(rows.rows()[1].get::<String>("value").unwrap(), "new-b");
-    }
-
-    #[tokio::test]
-    async fn execute_prepared_dml_batch_preserves_order_absence_and_atomic_errors() {
-        let session = open_session().await;
-        let schema = serde_json::json!({
-            "$schema": "https://lix.dev/schema-v1.json",
-            "key": "prepared_dml_contract_probe",
-            "columns": [
-                { "name": "id", "type": "text", "nullable": false },
-                { "name": "value", "type": "text", "nullable": false },
-            ],
-            "primary_key": ["id"],
-        });
-        session
-            .execute(
-                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
-                &[Value::Text(schema.to_string())],
-            )
-            .await
-            .unwrap();
-        session
-            .execute(
-                "INSERT INTO prepared_dml_contract_probe (id, value) VALUES \
-                 ('a', 'old-a'), ('b', 'old-b')",
-                &[],
-            )
-            .await
-            .unwrap();
-
-        let sql =
-            Arc::<str>::from("UPDATE prepared_dml_contract_probe SET value = $1 WHERE id = $2");
-        let rows = PreparedDmlParameterBatch::from_rows([
-            vec![Value::Text("new-b".into()), Value::Text("b".into())],
-            vec![Value::Text("new-a".into()), Value::Text("a".into())],
-            vec![Value::Text("missing".into()), Value::Text("missing".into())],
-        ])
-        .unwrap();
-        let results = session
-            .execute_prepared_dml_batch(Arc::clone(&sql), rows)
-            .await
-            .unwrap();
-        assert_eq!(
-            results
-                .iter()
-                .map(ExecuteResult::rows_affected)
-                .collect::<Vec<_>>(),
-            vec![1, 1, 0]
-        );
-
-        let error = session
-            .execute_prepared_dml_batch(
-                Arc::<str>::from(
-                    "UPDATE prepared_dml_contract_probe SET value = CAST($1 AS JSONB) WHERE id = $2",
-                ),
-                PreparedDmlParameterBatch::from_rows([
-                    vec![Value::Text("{invalid".into()), Value::Text("a".into())],
-                    vec![Value::Text("{\"ok\":true}".into()), Value::Text("b".into())],
-                ])
-                .unwrap(),
-            )
-            .await
-            .expect_err("invalid RETURN expression must abort the atomic prepared batch");
-        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
-
-        let rows = session
-            .execute(
-                "SELECT id, value FROM prepared_dml_contract_probe ORDER BY id",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "new-a");
-        assert_eq!(rows.rows()[1].get::<String>("value").unwrap(), "new-b");
-
-        let mut transaction = session.begin_transaction().await.unwrap();
-        transaction
-            .execute(
-                "UPDATE prepared_dml_contract_probe SET value = 'before' WHERE id = 'a'",
-                &[],
-            )
-            .await
-            .unwrap();
-        let error = transaction
-            .execute_prepared_dml_batch(
-                Arc::<str>::from(
-                    "UPDATE prepared_dml_contract_probe SET value = CAST($1 AS JSONB) WHERE id = $2",
-                ),
-                PreparedDmlParameterBatch::from_rows([
-                    vec![Value::Text("{\"ok\":true}".into()), Value::Text("b".into())],
-                    vec![Value::Text("{invalid".into()), Value::Text("a".into())],
-                ])
-                .unwrap(),
-            )
-            .await
-            .expect_err("failed prepared statement must roll back its own staging");
-        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
-        transaction
-            .execute(
-                "UPDATE prepared_dml_contract_probe SET value = 'after' WHERE id = 'b'",
-                &[],
-            )
-            .await
-            .unwrap();
-        transaction.commit().await.unwrap();
-        let rows = session
-            .execute(
-                "SELECT id, value FROM prepared_dml_contract_probe ORDER BY id",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "before");
-        assert_eq!(rows.rows()[1].get::<String>("value").unwrap(), "after");
     }
 
     #[tokio::test]
@@ -11716,6 +10154,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_in_limit_fallback_delivers_content_with_acknowledgement_plan() {
+        let session = open_session().await;
+        let bytes = b"content must survive a declined native schema candidate";
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+                &[
+                    Value::Text("/fallback.txt".into()),
+                    Value::Blob(bytes.to_vec().into()),
+                ],
+            )
+            .await
+            .unwrap();
+        // Seed a valid durable owner/registry over already-materialized bytes.
+        // A read acknowledgement only observes the actor cache; no component
+        // execution or external plugin artifact is needed for this fixture.
+        use crate::plugin::runtime::{
+            PluginCapabilities, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
+            PluginRegistryEntryInput, PluginRuntime, plugin_storage_archive_file_id,
+            plugin_storage_archive_path,
+        };
+        let plugin_key = "plugin_ack_probe";
+        let entry = PluginRegistryEntry::new(PluginRegistryEntryInput {
+            key: plugin_key.into(), runtime: PluginRuntime::WasmComponent,
+            api_version: "2.0.0".into(),
+            capabilities: PluginCapabilities { column_merger: false, file_projection: true },
+            path_glob: Some("*.txt".into()), content: None, entry: Some("plugin.wasm".into()),
+            schema_keys: vec!["ack_row".into()], create_schema_keys: Vec::new(),
+            manifest_json: serde_json::json!({"key": plugin_key, "entry": "plugin.wasm", "file_match": {"path_glob": "*.txt"}, "schemas": ["schema/ack_row.json"]}).to_string(),
+            archive_file_id: plugin_storage_archive_file_id(plugin_key),
+            archive_path: plugin_storage_archive_path(plugin_key),
+            archive_blob_hash: "a".repeat(64), wasm_blob_hash: Some("b".repeat(64)),
+        }).unwrap();
+        let file_id = session
+            .execute(
+                "SELECT id FROM lix_file WHERE path = $1",
+                &[Value::Text("/fallback.txt".into())],
+            )
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("id")
+            .unwrap();
+        let branch_id = session.active_branch_id().await.unwrap();
+        let registry = PluginRegistry::new(vec![entry]).unwrap();
+        let owner = PluginFileOwner::new(&file_id, plugin_key, vec!["ack_row".into()]).unwrap();
+        let mut seed = session.begin_transaction().await.unwrap();
+        seed.transaction_mut()
+            .unwrap()
+            .stage_engine_test_rows(RawWriteBatch::from_test_rows(vec![
+                registry.write_row(&branch_id).unwrap(),
+                owner.write_row(&branch_id, false).unwrap(),
+            ]))
+            .await
+            .unwrap();
+        seed.commit().await.unwrap();
+        session.file_views.clear();
+        let view_key = sql2::SessionFileViewKey::new(&branch_id, &file_id);
+        assert!(
+            session
+                .file_views
+                .unfiltered_plugin_file_view(&view_key)
+                .is_none()
+        );
+        let sql = "SELECT content FROM lix_file WHERE path IN ($1) LIMIT 1";
+        let params = [Value::Text("/fallback.txt".into())];
+        let plan = sql2::plan_read_statement(&sql2::parse_statement(sql).unwrap(), &params);
+        assert!(plan.native.is_none());
+        assert!(plan.late_content.is_some());
+        assert!(
+            plan.acknowledge_file_views,
+            "delivered bytes must authorize the read collector"
+        );
+        let result = session.execute(sql, &params).await.unwrap();
+        let view = session
+            .file_views
+            .unfiltered_plugin_file_view(&view_key)
+            .expect("delivering plugin-owned content must publish the acknowledgement");
+        assert_eq!(view.path, "/fallback.txt");
+        assert_eq!(view.plugin_key, plugin_key);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result.rows()[0].value("content").unwrap(),
+            &Value::Blob(bytes.to_vec().into())
+        );
+    }
+
+    #[tokio::test]
     async fn late_file_content_read_preserves_metadata_filters_order_and_limit() {
         let session = open_session().await;
         session
@@ -11964,6 +10490,52 @@ mod tests {
                 .expect("value should remain JSON"),
             serde_json::json!("original"),
             "the rejected INSERT must not overwrite committed state"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_coherent_batch_keeps_snapshot_metadata() {
+        let session = open_session().await;
+        let empty = session.execute_coherent_read_batch(&[]).await.unwrap();
+        let nonempty = session
+            .execute_coherent_read_batch(&[("SELECT 1", &[])])
+            .await
+            .unwrap();
+        assert!(empty.results.is_empty());
+        assert_eq!(empty.active_branch_id, nonempty.active_branch_id);
+        assert_eq!(
+            empty.active_branch_commit_id,
+            nonempty.active_branch_commit_id
+        );
+        assert_eq!(
+            empty.storage_mutation_revision,
+            nonempty.storage_mutation_revision
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_read_batch_preserves_each_apis_error_details() {
+        let session = open_session().await;
+        let sql = "SELECT nonexistent_column FROM lix_file";
+        let ordinary = session
+            .execute_batch_with_options(
+                &[batch_statement("SELECT 1"), batch_statement(sql)],
+                ExecuteOptions::default(),
+            )
+            .await
+            .unwrap_err();
+        let coherent = session
+            .execute_coherent_read_batch(&[("SELECT 1", &[]), (sql, &[])])
+            .await
+            .unwrap_err();
+        assert_eq!(ordinary.code, coherent.code);
+        assert_eq!(ordinary.details.as_ref().unwrap()["statementIndex"], 1);
+        assert!(
+            coherent
+                .details
+                .as_ref()
+                .and_then(|details| details.get("statementIndex"))
+                .is_none()
         );
     }
 

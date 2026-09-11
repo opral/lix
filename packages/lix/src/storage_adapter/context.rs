@@ -268,10 +268,7 @@ where
         opts.batch_capacity_hint_bytes = opts
             .batch_capacity_hint_bytes
             .max(write_set.backend_batch_capacity_hint_bytes());
-        let (opts, fence_precondition_index) = self
-            .routing
-            .route_write_options(opts)
-            .map_err(StorageWriteSetError::Storage)?;
+        let (opts, fence_precondition_index) = self.routing.route_write_options(opts)?;
         let write = self
             .storage
             .begin_write(opts)

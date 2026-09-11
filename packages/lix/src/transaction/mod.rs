@@ -1,5 +1,6 @@
 #[cfg(feature = "storage-benches")]
 mod bench_support;
+mod branch_heads;
 mod commit;
 mod commit_coordinator;
 mod context;
@@ -9,7 +10,6 @@ mod staged_commit_changes;
 mod staging;
 mod stale_commit;
 mod validation;
-pub(crate) use validation::MAX_DIRECTORY_PARENT_DEPTH;
 
 #[cfg(feature = "storage-benches")]
 pub mod bench {
@@ -48,4 +48,3 @@ pub(crate) use context::open_transaction_with_runtime_boundary;
 pub(crate) use context::transaction_is_file_cohort_eligible;
 pub(crate) use context::transactions_can_share_cohort;
 pub(crate) use staged_commit_changes::StagedCommitChangeBatchBuilder;
-pub(crate) use staging::duplicate_insert_identity_message;

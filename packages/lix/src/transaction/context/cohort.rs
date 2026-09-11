@@ -130,7 +130,8 @@ where
     let branch_id = leader.transaction.active_branch_id.as_str();
     for member in members {
         let writes = &member.prepared_writes;
-        if writes.commit_change_refs_by_branch.len() != 1
+        if !writes.branch_heads.is_empty()
+            || writes.commit_change_refs_by_branch.len() != 1
             || !writes.commit_change_refs_by_branch.contains_key(branch_id)
             || !writes.first_commit_parent_override_by_branch.is_empty()
             || !writes.checkpoint_publications.is_empty()
