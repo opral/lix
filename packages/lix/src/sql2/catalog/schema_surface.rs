@@ -46,11 +46,13 @@ pub(crate) struct SchemaSurfaceColumn {
     pub(crate) read_nullable: bool,
     pub(crate) insert_required: bool,
     pub(crate) default_expression: Option<String>,
+    pub(crate) description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SchemaSurfaceSpec {
     pub(crate) schema_key: String,
+    pub(crate) description: Option<String>,
     /// Fingerprint used by the typed plugin wire and durable row payloads.
     /// SQL readers bind durable rows to this resolved schema before exposing
     /// any typed value.
@@ -210,6 +212,20 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
             }
         })
         .collect();
+    // A repository keeps the seed schema document it was created with, so a
+    // built-in schema whose stored document predates its descriptions still
+    // reads the engine's current words. Descriptions are documentation, not
+    // contract, so no amendment commit is needed for them.
+    let seed = crate::schema::seed_schema_definition(&schema_key)
+        .and_then(|definition| lix_schema::from_value(definition.clone()).ok());
+    let seed_column_description = |name: &str| -> Option<String> {
+        seed.as_ref()?
+            .columns
+            .iter()
+            .find(|column| column.name == name)?
+            .description
+            .clone()
+    };
     let columns = parsed
         .columns
         .iter()
@@ -232,6 +248,10 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
                 .default_expression
                 .clone()
                 .or_else(|| column.default_value.as_ref().map(postgres_literal)),
+            description: column
+                .description
+                .clone()
+                .or_else(|| seed_column_description(&column.name)),
         })
         .collect::<Vec<_>>();
     let certifies_path_value_replacement = parsed.primary_key == ["path"]
@@ -261,6 +281,10 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
     });
     Ok(SchemaSurfaceSpec {
         schema_key,
+        description: parsed
+            .description
+            .clone()
+            .or_else(|| seed.as_ref().and_then(|seed| seed.description.clone())),
         schema_fingerprint,
         primary_key_paths,
         primary_key_component_types,
@@ -460,6 +484,44 @@ mod tests {
             ],
             "primary_key": ["path"]
         })
+    }
+
+    #[test]
+    fn seed_schemas_read_descriptions_from_the_engine_when_stored_without_them() {
+        // A repository created before lix_key_value carried descriptions
+        // still stores the old document; the surface reads today's words.
+        let stored = json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "lix_key_value",
+            "columns": [
+                { "name": "key", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": true, "description": "Kept as stored." },
+            ],
+            "primary_key": ["key"],
+        });
+        let spec = derive_schema_surface_spec_from_schema(&stored).expect("seed schema derives");
+        assert_eq!(
+            spec.description.as_deref(),
+            Some("A repository setting or application value stored under a key.")
+        );
+        assert_eq!(
+            spec.visible_column("key").unwrap().description.as_deref(),
+            Some("Unique key naming the value.")
+        );
+        assert_eq!(
+            spec.visible_column("value").unwrap().description.as_deref(),
+            Some("Kept as stored.")
+        );
+
+        let user = json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "user_note",
+            "columns": [{ "name": "id", "type": "text", "nullable": false }],
+            "primary_key": ["id"],
+        });
+        let spec = derive_schema_surface_spec_from_schema(&user).expect("user schema derives");
+        assert_eq!(spec.description, None);
+        assert_eq!(spec.visible_column("id").unwrap().description, None);
     }
 
     #[test]

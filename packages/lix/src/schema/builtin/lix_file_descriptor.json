@@ -1,22 +1,26 @@
 {
   "$schema": "https://lix.dev/schema-v1.json",
   "key": "lix_file_descriptor",
+  "description": "The identity of a file: its name and the directory holding it. The composed `lix_file` view joins this descriptor with the file's path and content.",
   "columns": [
     {
       "name": "directory_id",
       "type": "uuid",
-      "nullable": true
+      "nullable": true,
+      "description": "Directory holding the file (references `lix_directory_descriptor.id`); null at the repository root."
     },
     {
       "name": "id",
       "type": "uuid",
       "nullable": false,
-      "default_expression": "uuidv7()"
+      "default_expression": "uuidv7()",
+      "description": "Stable file identifier (UUIDv7); it survives renames and moves."
     },
     {
       "name": "name",
       "type": "text",
-      "nullable": false
+      "nullable": false,
+      "description": "File name: the last path segment, extension included."
     }
   ],
   "primary_key": [

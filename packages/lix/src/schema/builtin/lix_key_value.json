@@ -1,11 +1,13 @@
 {
   "$schema": "https://lix.dev/schema-v1.json",
   "key": "lix_key_value",
+  "description": "A repository setting or application value stored under a key.",
   "columns": [
     {
       "name": "key",
       "type": "text",
-      "nullable": false
+      "nullable": false,
+      "description": "Unique key naming the value."
     },
     {
       "name": "value",

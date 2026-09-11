@@ -333,6 +333,7 @@ impl LixInformationSchemaProvider {
         let mut can_update = Vec::new();
         let mut can_delete = Vec::new();
         let mut is_side_effecting = Vec::new();
+        let mut description = Vec::new();
 
         for surface in self.public_catalog.surfaces() {
             surface_catalog.push(self.public_catalog_name.clone());
@@ -352,6 +353,7 @@ impl LixInformationSchemaProvider {
                 matches!(surface.class, PublicSurfaceClass::CommandSink)
                     || surface.kind == PublicSurfaceKind::CheckpointFunction,
             );
+            description.push(surface.description.clone());
         }
         for function in self.public_catalog.scalar_functions() {
             surface_catalog.push(self.public_catalog_name.clone());
@@ -364,6 +366,7 @@ impl LixInformationSchemaProvider {
             can_update.push(false);
             can_delete.push(false);
             is_side_effecting.push(false);
+            description.push(None);
         }
 
         let batch = RecordBatch::try_new(
@@ -379,6 +382,7 @@ impl LixInformationSchemaProvider {
                 Arc::new(BooleanArray::from(can_update)),
                 Arc::new(BooleanArray::from(can_delete)),
                 Arc::new(BooleanArray::from(is_side_effecting)),
+                Arc::new(StringArray::from(description)),
             ],
         )?;
         Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
@@ -453,6 +457,7 @@ fn lix_surfaces_schema() -> SchemaRef {
         Field::new("can_update", DataType::Boolean, false),
         Field::new("can_delete", DataType::Boolean, false),
         Field::new("is_side_effecting", DataType::Boolean, false),
+        Field::new("description", DataType::Utf8, true),
     ]))
 }
 
@@ -475,6 +480,7 @@ fn columns_schema() -> SchemaRef {
         Field::new("interval_type", DataType::Utf8, true),
         Field::new("lix_value_kind", DataType::Utf8, true),
         Field::new("lix_insert_policy", DataType::Utf8, false),
+        Field::new("description", DataType::Utf8, true),
     ]))
 }
 
@@ -497,6 +503,7 @@ struct ColumnsRows {
     interval_type: Vec<Option<String>>,
     lix_value_kind: Vec<Option<String>>,
     lix_insert_policy: Vec<String>,
+    description: Vec<Option<String>>,
 }
 
 impl ColumnsRows {
@@ -560,6 +567,11 @@ impl ColumnsRows {
             self.lix_value_kind.push(field_value_kind(field));
             self.lix_insert_policy
                 .push(insert_policy.as_str().to_string());
+            self.description.push(
+                column_contract
+                    .as_ref()
+                    .and_then(|(_, column)| column.description.clone()),
+            );
         }
     }
 
@@ -582,6 +594,7 @@ impl ColumnsRows {
             Arc::new(StringArray::from(self.interval_type)),
             Arc::new(StringArray::from(self.lix_value_kind)),
             Arc::new(StringArray::from(self.lix_insert_policy)),
+            Arc::new(StringArray::from(self.description)),
         ];
         Ok(RecordBatch::try_new(schema, arrays)?)
     }

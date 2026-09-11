@@ -7,6 +7,8 @@ pub(crate) struct PublicSurfaceContract {
     pub(crate) kind: PublicSurfaceKind,
     pub(crate) columns: Vec<PublicColumn>,
     pub(crate) capabilities: SurfaceCapabilities,
+    /// What the surface means, for catalogs and tools; None when undocumented.
+    pub(crate) description: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +58,11 @@ pub(crate) struct PublicHistoryContract {
 }
 
 impl PublicSurfaceContract {
+    pub(crate) fn with_description(mut self, description: Option<String>) -> Self {
+        self.description = description;
+        self
+    }
+
     pub(crate) fn public_column(&self, column_name: &str) -> Option<&PublicColumn> {
         self.columns
             .iter()

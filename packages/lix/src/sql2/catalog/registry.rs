@@ -228,52 +228,70 @@ impl PublicCatalog {
     }
 
     fn insert_system_surfaces(&mut self) -> Result<(), LixError> {
-        self.insert(surface(
-            "lix_file",
-            PublicSurfaceClass::Relation(PublicRelationKind::View),
-            PublicSurfaceKind::File,
-            filesystem_columns(),
-            SurfaceCapabilities::read_write(),
-        ))?;
-        self.insert(surface(
-            "lix_directory",
-            PublicSurfaceClass::Relation(PublicRelationKind::View),
-            PublicSurfaceKind::Directory,
-            directory_columns(),
-            SurfaceCapabilities::read_write(),
-        ))?;
-        self.insert(surface(
-            "lix_branch",
-            PublicSurfaceClass::Relation(PublicRelationKind::View),
-            PublicSurfaceKind::Branch,
-            vec![
-                PublicColumn::public_insert_only("id", false),
-                PublicColumn::public("name", false),
-                PublicColumn::public("hidden", false).with_default("FALSE"),
-                PublicColumn::public("commit_id", false)
-                    .with_default("lix_active_branch_commit_id()"),
-                PublicColumn::public_read_only("working_base_commit_id", true),
-                PublicColumn::public("lixcol_metadata", true).optional_on_insert(),
-            ],
-            SurfaceCapabilities::read_write(),
-        ))?;
-        self.insert(surface(
-            "lix_change",
-            PublicSurfaceClass::Relation(PublicRelationKind::View),
-            PublicSurfaceKind::Change,
-            public_columns([
-                ("id", false),
-                ("account_id", false),
-                ("row_pk", false),
-                ("schema_key", false),
-                ("file_id", true),
-                ("metadata", true),
-                ("created_at", false),
-                ("origin_key", true),
-                ("snapshot_content", true),
-            ]),
-            SurfaceCapabilities::read_only(),
-        ))?;
+        self.insert(
+            surface(
+                "lix_file",
+                PublicSurfaceClass::Relation(PublicRelationKind::View),
+                PublicSurfaceKind::File,
+                describe_columns(filesystem_columns(), file_column_description),
+                SurfaceCapabilities::read_write(),
+            )
+            .with_description(Some(LIX_FILE_DESCRIPTION.to_string())),
+        )?;
+        self.insert(
+            surface(
+                "lix_directory",
+                PublicSurfaceClass::Relation(PublicRelationKind::View),
+                PublicSurfaceKind::Directory,
+                describe_columns(directory_columns(), directory_column_description),
+                SurfaceCapabilities::read_write(),
+            )
+            .with_description(Some(LIX_DIRECTORY_DESCRIPTION.to_string())),
+        )?;
+        self.insert(
+            surface(
+                "lix_branch",
+                PublicSurfaceClass::Relation(PublicRelationKind::View),
+                PublicSurfaceKind::Branch,
+                describe_columns(
+                    vec![
+                        PublicColumn::public_insert_only("id", false),
+                        PublicColumn::public("name", false),
+                        PublicColumn::public("hidden", false).with_default("FALSE"),
+                        PublicColumn::public("commit_id", false)
+                            .with_default("lix_active_branch_commit_id()"),
+                        PublicColumn::public_read_only("working_base_commit_id", true),
+                        PublicColumn::public("lixcol_metadata", true).optional_on_insert(),
+                    ],
+                    branch_column_description,
+                ),
+                SurfaceCapabilities::read_write(),
+            )
+            .with_description(Some(LIX_BRANCH_DESCRIPTION.to_string())),
+        )?;
+        self.insert(
+            surface(
+                "lix_change",
+                PublicSurfaceClass::Relation(PublicRelationKind::View),
+                PublicSurfaceKind::Change,
+                describe_columns(
+                    public_columns([
+                        ("id", false),
+                        ("account_id", false),
+                        ("row_pk", false),
+                        ("schema_key", false),
+                        ("file_id", true),
+                        ("metadata", true),
+                        ("created_at", false),
+                        ("origin_key", true),
+                        ("snapshot_content", true),
+                    ]),
+                    change_column_description,
+                ),
+                SurfaceCapabilities::read_only(),
+            )
+            .with_description(Some(LIX_CHANGE_DESCRIPTION.to_string())),
+        )?;
         self.insert(surface(
             "lix_log",
             PublicSurfaceClass::TableFunction,
@@ -400,15 +418,18 @@ impl PublicCatalog {
             SurfaceCapabilities::read_write()
         };
 
-        self.insert(surface(
-            &spec.schema_key,
-            PublicSurfaceClass::Relation(PublicRelationKind::Base),
-            PublicSurfaceKind::SchemaBase {
-                schema_key: spec.schema_key.clone(),
-            },
-            columns,
-            capabilities.clone(),
-        ))?;
+        self.insert(
+            surface(
+                &spec.schema_key,
+                PublicSurfaceClass::Relation(PublicRelationKind::Base),
+                PublicSurfaceKind::SchemaBase {
+                    schema_key: spec.schema_key.clone(),
+                },
+                columns,
+                capabilities.clone(),
+            )
+            .with_description(spec.description.clone()),
+        )?;
 
         self.schema_specs
             .insert(spec.schema_key.clone(), spec.clone());
@@ -471,7 +492,112 @@ fn surface(
         kind,
         columns,
         capabilities,
+        description: None,
     }
+}
+
+/// Attaches each column's meaning; columns the describer does not know keep none.
+fn describe_columns(
+    columns: Vec<PublicColumn>,
+    describe: fn(&str) -> Option<&'static str>,
+) -> Vec<PublicColumn> {
+    columns
+        .into_iter()
+        .map(|column| {
+            let description = describe(&column.name).map(str::to_string);
+            column.with_description(description)
+        })
+        .collect()
+}
+
+/// The engine-owned bookkeeping columns every relation carries.
+fn system_column_description(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "lixcol_schema_key" => "Key of the registered schema the row belongs to.",
+        "lixcol_file_id" => {
+            "File the row belongs to (references lix_file.id); null for rows not scoped to a file."
+        }
+        "lixcol_global" => {
+            "When true the row is global, shared by every branch, rather than versioned per branch."
+        }
+        "lixcol_change_id" => {
+            "Identifier of the change that wrote the row's current state (references lix_change.id)."
+        }
+        "lixcol_created_at" => "When the row was first written.",
+        "lixcol_updated_at" => "When the row's current state was written.",
+        "lixcol_commit_id" => {
+            "Commit that wrote the row's current state (references lix_commit.id); null for untracked rows."
+        }
+        "lixcol_untracked" => {
+            "When true the row is untracked: written without history, so it is absent from every diff and checkpoint."
+        }
+        "lixcol_metadata" => "Optional JSON metadata the application attaches to the row.",
+        _ => return None,
+    })
+}
+
+const LIX_FILE_DESCRIPTION: &str = "A file in the repository: its path, name, and bytes. Composed from the file descriptor, the directory chain, and the file's content.";
+
+fn file_column_description(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "id" => "Stable identifier of the file (UUIDv7); it survives renames and moves.",
+        "path" => "Absolute path from the repository root, ending in the file's name.",
+        "directory_id" => "Directory holding the file (references lix_directory.id); null at the root.",
+        "name" => "File name: the last segment of the path, extension included.",
+        "content" => "The file's bytes.",
+        other => return system_column_description(other),
+    })
+}
+
+const LIX_DIRECTORY_DESCRIPTION: &str =
+    "A directory in the repository. Composed from the directory descriptor and its chain of parents.";
+
+fn directory_column_description(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "id" => "Stable identifier of the directory (UUIDv7).",
+        "path" => "Absolute path from the repository root.",
+        "parent_id" => "Parent directory (references lix_directory.id); null for a top-level directory.",
+        "name" => "Directory name: the last segment of the path.",
+        other => return system_column_description(other),
+    })
+}
+
+const LIX_BRANCH_DESCRIPTION: &str =
+    "A branch: a named, movable pointer to a commit. Joins the branch descriptor with its head ref.";
+
+fn branch_column_description(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "id" => "Stable identifier of the branch (UUIDv7).",
+        "name" => "Human-readable branch name, such as main.",
+        "hidden" => {
+            "When true, the branch is filtered from default listings; operations by explicit id still succeed."
+        }
+        "commit_id" => "The commit the branch currently resolves to (references lix_commit.id).",
+        "working_base_commit_id" => {
+            "Baseline of the branch's working changes, which lix_diff(relation) measures against: the latest checkpoint, or an ordinary commit after a fork or restore. Null when there is none."
+        }
+        other => return system_column_description(other),
+    })
+}
+
+const LIX_CHANGE_DESCRIPTION: &str =
+    "A change records one edit to a Lix row: what changed, when it changed, and which row was affected.";
+
+fn change_column_description(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "id" => "Stable identifier of this change.",
+        "account_id" => "Account whose active session authored this change.",
+        "row_pk" => {
+            "Primary-key tuple of the changed row, in schema primary-key order, scoped by schema_key and file_id."
+        }
+        "schema_key" => "Schema key of the changed row, such as lix_file_descriptor, lix_commit, or a registered key.",
+        "file_id" => "File the change belongs to; null for engine-internal rows such as commits, branches, and settings.",
+        "metadata" => "Optional JSON metadata the writer attached to the change; null when nothing was supplied.",
+        "created_at" => "When the change was recorded.",
+        "origin_key" => "Optional origin key the writer supplied for the write that produced this change; null when none was given.",
+        "snapshot_content" => "The row's JSON body at this change; null marks a deletion.",
+        _ => return None,
+    })
 }
 
 fn public_columns<const N: usize>(columns: [(&str, bool); N]) -> Vec<PublicColumn> {
@@ -501,6 +627,7 @@ fn row_columns(spec: &SchemaSurfaceSpec) -> Vec<PublicColumn> {
                 } else {
                     PublicColumn::public(column.name.as_str(), column.read_nullable)
                 };
+            let public_column = public_column.with_description(column.description.clone());
             if let Some(default) = column.default_expression.as_deref() {
                 public_column.with_default(default)
             } else if !column.insert_required {
@@ -556,16 +683,19 @@ fn row_system_columns(
     _spec: &SchemaSurfaceSpec,
     _variant: SchemaSurfaceShape,
 ) -> Vec<PublicColumn> {
-    vec![
-        PublicColumn::public_insert_only("lixcol_file_id", true).optional_on_insert(),
-        PublicColumn::public("lixcol_metadata", true).optional_on_insert(),
-        PublicColumn::public_read_only("lixcol_created_at", false),
-        PublicColumn::public_read_only("lixcol_updated_at", false),
-        PublicColumn::public_insert_only("lixcol_global", false).with_default("FALSE"),
-        PublicColumn::public_read_only("lixcol_change_id", true),
-        PublicColumn::public_read_only("lixcol_commit_id", true),
-        PublicColumn::public_insert_only("lixcol_untracked", false).with_default("FALSE"),
-    ]
+    describe_columns(
+        vec![
+            PublicColumn::public_insert_only("lixcol_file_id", true).optional_on_insert(),
+            PublicColumn::public("lixcol_metadata", true).optional_on_insert(),
+            PublicColumn::public_read_only("lixcol_created_at", false),
+            PublicColumn::public_read_only("lixcol_updated_at", false),
+            PublicColumn::public_insert_only("lixcol_global", false).with_default("FALSE"),
+            PublicColumn::public_read_only("lixcol_change_id", true),
+            PublicColumn::public_read_only("lixcol_commit_id", true),
+            PublicColumn::public_insert_only("lixcol_untracked", false).with_default("FALSE"),
+        ],
+        system_column_description,
+    )
 }
 
 #[cfg(test)]
