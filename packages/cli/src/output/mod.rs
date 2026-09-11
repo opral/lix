@@ -37,6 +37,10 @@ pub fn print_execute_result_table(result: &ExecuteResult) {
 
     println!("{table}");
     println!("({} rows)", result.rows().len());
+    // A RETURNING write has rows and a span; show both.
+    if let Some(span) = result.commit() {
+        println!("(commit {} -> {})", span.before(), span.after());
+    }
 }
 
 pub fn print_execute_result_json(result: &ExecuteResult) {

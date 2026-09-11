@@ -149,12 +149,15 @@ struct ColumnarResult {
     batches: Arc<[RecordBatch]>,
 }
 
+/// Equality compares what a statement returned: its position, label, rows,
+/// affected count, and notices. Where it ran (`commit`, telemetry) is
+/// execution context and stays out, so a result can be compared with one
+/// built from its parts.
 impl PartialEq for ExecuteResult {
     fn eq(&self, other: &Self) -> bool {
         self.statement_index == other.statement_index
             && self.statement_label == other.statement_label
             && self.rows_affected == other.rows_affected
-            && self.commit == other.commit
             && (matches!(
                 (&self.backing, &other.backing),
                 (Some(left), Some(right)) if Arc::ptr_eq(left, right)
