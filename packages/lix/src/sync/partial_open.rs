@@ -186,7 +186,7 @@ impl FinalizedPartialConversion {
         self.deadline.check(&self.state.baseline_lease().lease_id)
     }
     #[cfg(test)]
-    pub(crate) fn for_test(state: PartialReplicaState, duration: std::time::Duration) -> Self {
+    pub(crate) fn for_test(state: PartialReplicaState, duration: Duration) -> Self {
         let deadline = super::http::CandidateBaselineDeadline::for_test(
             &state.baseline_lease().lease_id,
             duration,

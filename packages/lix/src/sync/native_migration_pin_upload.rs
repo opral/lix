@@ -140,7 +140,7 @@ where
         let manifest = super::blob::encode_manifest(id, &chunks)?;
         drop(read);
         let registration = transport.register_blob(&manifest).await?;
-        let mut missing = std::collections::BTreeSet::new();
+        let mut missing = BTreeSet::new();
         for id in &registration.missing_chunk_ids {
             if !missing.insert(id.as_str())
                 || !manifest.chunks.iter().any(|chunk| &chunk.chunk_id == id)

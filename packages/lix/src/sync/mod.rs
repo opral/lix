@@ -76,7 +76,6 @@ mod partial_upload;
 mod partial_upload_cycle;
 #[cfg(test)]
 mod partial_working_diff_tests;
-pub(crate) use partial_runtime::{start_partial_runtime, start_partial_runtime_lazy};
 #[cfg(test)]
 mod partial_sql_tests;
 pub(crate) use partial_push_state::PARTIAL_BRANCH_PUSH_SPACE;
@@ -115,8 +114,7 @@ use parking_lot::RwLock;
 #[cfg(feature = "server-protocol")]
 pub(crate) use blob::validate_sync_blob_manifest;
 pub(crate) use bootstrap::{
-    SyncBootstrapAdmission, inspect_sync_bootstrap_with_adapter, install_sync_bootstrap,
-    prepare_sync_bootstrap, rebuild_replica_candidate,
+    install_sync_bootstrap, prepare_sync_bootstrap, rebuild_replica_candidate,
 };
 pub(crate) use commit::{
     SYNC_CHECKPOINT_SOURCE_SPACE, SYNC_MATERIALIZED_STATE_ALIAS_SPACE,
@@ -158,7 +156,7 @@ pub(crate) use repository::{
 pub(crate) use repository::{
     ReplicaRebuildSource, inspect_replica_rebuild_source, replica_replacement_unavailable,
 };
-pub(crate) use runtime::{SyncDemand, SyncDemandRetry, SyncRuntime, activate_sync_mode};
+pub(crate) use runtime::{SyncDemand, SyncDemandRetry, SyncRuntime};
 pub(crate) use upload_plan::{
     SYNC_UPLOAD_GENERATION_SPACE, stage_invalidate as stage_upload_plan_invalidation,
 };

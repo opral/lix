@@ -19,49 +19,6 @@ use super::partial_state::{PartialReplicaState, load_partial_replica_state};
 use super::platform::{sleep, spawn_sync_task};
 use super::runtime::{SyncDemand, SyncDemandRequest, SyncRuntime, SyncShutdown, stopped_error};
 
-/// Starts only demand handling after the caller has admitted the durable
-/// receipt. The existing session authenticates every fetch. The worker does
-/// not advance the descriptor, mint a retention lease, or publish local edits.
-pub(crate) async fn start_partial_runtime<S>(
-    storage: StorageAdapter<S>,
-    state: Arc<PartialReplicaState>,
-    transport: super::platform::HttpSyncTransport,
-) -> Result<Arc<SyncRuntime>, LixError>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    validate_admission(&storage, &state, &transport).await?;
-    start_partial_runtime_lazy(storage, state, None, Some(transport)).await
-}
-
-/// Reopen a durable partial working set without a foreground handshake.
-/// Connection and authority validation occur only when a missing input is
-/// demanded. Background synchronization is attached separately.
-pub(crate) async fn start_partial_runtime_lazy<S>(
-    storage: StorageAdapter<S>,
-    state: Arc<PartialReplicaState>,
-    server: Option<crate::ServerOptions>,
-    transport: Option<super::platform::HttpSyncTransport>,
-) -> Result<Arc<SyncRuntime>, LixError>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    start_partial_runtime_with_changes(storage, state, server, transport, None).await
-}
-
-pub(crate) async fn start_partial_runtime_with_changes<S>(
-    storage: StorageAdapter<S>,
-    state: Arc<PartialReplicaState>,
-    server: Option<crate::ServerOptions>,
-    transport: Option<super::platform::HttpSyncTransport>,
-    changes: Option<tokio::sync::watch::Receiver<u64>>,
-) -> Result<Arc<SyncRuntime>, LixError>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    start_partial_runtime_with_engine(storage, state, server, transport, changes, None).await
-}
-
 pub(crate) async fn start_partial_runtime_with_engine<S>(
     storage: StorageAdapter<S>,
     state: Arc<PartialReplicaState>,
@@ -148,7 +105,7 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     Box::pin(async move {
-        let connect = move || {
+        let connect = move || -> super::SyncTransportFuture<'static, super::platform::HttpSyncTransport> {
             let server = server.clone();
             Box::pin(async move {
                 let server = server.ok_or_else(|| {
@@ -159,7 +116,6 @@ where
                 })?;
                 super::platform::HttpSyncTransport::connect(&server.url, &server.headers).await
             })
-                as super::SyncTransportFuture<'static, super::platform::HttpSyncTransport>
         };
         run_partial_worker_with_engine(
             storage,
@@ -459,7 +415,7 @@ where
             .await?
             .ok_or_else(|| LixError::unknown("partial upload branch disappeared"))?;
         let clean = push.prepared.is_none()
-            && control.head_commit_id.to_string() == push.confirmed.head
+            && control.head_commit_id == push.confirmed.head
             && control
                 .working_diff_checkpoint_commit_id
                 .map(|id| id.to_string())
@@ -532,11 +488,11 @@ fn lease_renewal_delay(expires_at_ms: u64) -> Duration {
 pub(super) async fn run_partial_worker_with_changes<S, C, Connect>(
     storage: StorageAdapter<S>,
     state: Arc<PartialReplicaState>,
-    mut transport: Option<HttpSyncTransport<C>>,
-    mut connect: Connect,
-    mut shutdown_rx: tokio::sync::watch::Receiver<SyncShutdown>,
-    mut demand_rx: tokio::sync::mpsc::Receiver<SyncDemand>,
-    mut changes: Option<tokio::sync::watch::Receiver<u64>>,
+    transport: Option<HttpSyncTransport<C>>,
+    connect: Connect,
+    shutdown_rx: tokio::sync::watch::Receiver<SyncShutdown>,
+    demand_rx: tokio::sync::mpsc::Receiver<SyncDemand>,
+    changes: Option<tokio::sync::watch::Receiver<u64>>,
 ) -> Result<(), LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -999,10 +955,9 @@ mod tests {
         let connects = Arc::new(AtomicUsize::new(0));
         let connect = {
             let connects = connects.clone();
-            move || {
+            move || -> SyncTransportFuture<'static, HttpSyncTransport<Client>> {
                 connects.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async { Err(LixError::unknown("offline")) })
-                    as super::super::SyncTransportFuture<'static, HttpSyncTransport<Client>>
             }
         };
         let (response, done) = tokio::sync::oneshot::channel();
@@ -1040,7 +995,7 @@ mod tests {
             let connects = connects.clone();
             let entered = entered.clone();
             let cancelled = client.cancelled.clone();
-            move || {
+            move || -> SyncTransportFuture<'static, HttpSyncTransport<Client>> {
                 connects.fetch_add(1, Ordering::SeqCst);
                 let entered = entered.clone();
                 let cancelled = cancelled.clone();
@@ -1050,7 +1005,6 @@ mod tests {
                     futures_util::future::pending::<Result<HttpSyncTransport<Client>, LixError>>()
                         .await
                 })
-                    as super::super::SyncTransportFuture<'static, HttpSyncTransport<Client>>
             }
         };
         let caller = async {

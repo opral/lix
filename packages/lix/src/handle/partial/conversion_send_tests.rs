@@ -9,7 +9,7 @@ fn assert_sync<T: Sync + ?Sized>() {}
 #[test]
 fn complete_unwrapped_memory_conversion_future_is_send() {
     let raw = convert_full_replica_owned(
-        crate::Memory::new(),
+        Memory::new(),
         ServerOptions::new("https://example.invalid/lix/test"),
         Some(uuid::Uuid::nil().to_string()),
     );
@@ -45,7 +45,7 @@ fn owned_and_borrowed_capture_types_meet_send_contract() {
     assert_sync::<ServerOptions>();
     assert_send::<crate::storage::StorageOwnerLease>();
     assert_sync::<bytes::Bytes>();
-    assert_sync::<Arc<dyn crate::OpenProgressSink>>();
+    assert_sync::<Arc<dyn OpenProgressSink>>();
     assert_sync::<crate::sync::InspectedFullConversion>();
     assert_sync::<crate::sync::AuthenticatedPartialConversion>();
     assert_sync::<crate::sync::PartialReplicaState>();

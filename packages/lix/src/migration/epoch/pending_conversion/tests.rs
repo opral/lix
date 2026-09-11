@@ -468,7 +468,7 @@ async fn run_pending_native_conversion(
     let owned = crate::storage_adapter::StorageSession::acquire(local_storage.clone())
         .await
         .unwrap();
-    let admitted = partial::admit_partial_epoch(&owned).await.unwrap();
+    let admitted = admit_partial_epoch(&owned).await.unwrap();
     assert_eq!(
         admitted.state.descriptor().selected_branch.branch_id,
         requested_branch
@@ -594,7 +594,7 @@ async fn run_pending_native_conversion(
             pointer_before
         );
         assert_eq!(
-            partial::admit_partial_epoch(&owned).await.unwrap().state,
+            admit_partial_epoch(&owned).await.unwrap().state,
             before
         );
         let (journal, _) = load_pending_conversion_journal(

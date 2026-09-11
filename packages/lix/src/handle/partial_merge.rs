@@ -2,7 +2,7 @@
 use super::*;
 impl<S> Lix<S>
 where
-    S: crate::storage_adapter::Storage + Clone + Send + Sync + 'static,
+    S: Storage + Clone + Send + Sync + 'static,
 {
     pub(crate) async fn restart_native_global_migration_for_account(
         &self,
@@ -421,7 +421,7 @@ mod tests {
     #[tokio::test]
     async fn retained_body_gc_authority_merge_and_newer_local_suffix_preserve_both_sides() {
         let memory = Memory::new();
-        let authority = crate::open_lix()
+        let authority = open_lix()
             .with_storage(memory.clone())
             .await
             .unwrap();
@@ -436,7 +436,7 @@ mod tests {
             .selected_branch
             .head
             .commit_id;
-        let local = crate::open_lix()
+        let local = open_lix()
             .with_storage(memory.fork().unwrap())
             .await
             .unwrap();
@@ -500,8 +500,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(values.rows().len(), 2);
-        let value = values.rows()[0].get::<crate::Value>("value").unwrap();
-        let crate::Value::Jsonb(value) = value else {
+        let value = values.rows()[0].get::<Value>("value").unwrap();
+        let Value::Jsonb(value) = value else {
             panic!("key/value must retain JSONB value")
         };
         assert_eq!(value.as_json_string().unwrap(), "local");
@@ -565,7 +565,7 @@ mod tests {
     #[tokio::test]
     async fn authority_merge_conflict_keeps_both_native_heads_and_live_attempt() {
         let memory = Memory::new();
-        let authority = crate::open_lix()
+        let authority = open_lix()
             .with_storage(memory.clone())
             .await
             .unwrap();
@@ -586,7 +586,7 @@ mod tests {
             .selected_branch
             .head
             .commit_id;
-        let local = crate::open_lix()
+        let local = open_lix()
             .with_storage(memory.fork().unwrap())
             .await
             .unwrap();

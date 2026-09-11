@@ -8934,7 +8934,7 @@ mod tests {
             lease,
             Some(branch.clone()),
             Some(descriptor.cursor),
-            tokio::time::Instant::now() + std::time::Duration::from_millis(10),
+            tokio::time::Instant::now() + Duration::from_millis(10),
         )
         .await
         .unwrap();
@@ -8946,7 +8946,7 @@ mod tests {
         let lease = app.server.lease(&session_id, None).await.unwrap();
         assert!(
             tokio::time::timeout(
-                std::time::Duration::from_millis(10),
+                Duration::from_millis(10),
                 sync_descriptor(
                     lease,
                     SyncDescriptorQuery {
@@ -8980,13 +8980,13 @@ mod tests {
             },
         );
         let write = async {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
             let response = request(&app.router, "POST", "/lix/v1/execute", Some(&session_id), Some(json!({
                 "sql": "INSERT INTO lix_key_value (key, value) VALUES ('descriptor-wake', 'true')"
             }))).await;
             assert_eq!(response.status(), StatusCode::OK);
         };
-        let (response, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let (response, ()) = tokio::time::timeout(Duration::from_secs(2), async {
             tokio::join!(wait, write)
         })
         .await
@@ -8999,7 +8999,7 @@ mod tests {
             lease,
             Some(descriptor.selected_branch.branch_id),
             Some(next["cursor"].as_u64().unwrap()),
-            tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+            tokio::time::Instant::now() + Duration::from_millis(20),
         );
         let noise = async {
             loop {
@@ -9008,14 +9008,14 @@ mod tests {
                     .lix
                     .sync_mode_state()
                     .notify_sync_change();
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         };
         tokio::pin!(noise);
         tokio::select! {
             response = wait => assert_eq!(response.unwrap().status(), StatusCode::OK),
             _ = &mut noise => unreachable!(),
-            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => panic!("neutral wakes extended descriptor deadline"),
+            _ = tokio::time::sleep(Duration::from_millis(200)) => panic!("neutral wakes extended descriptor deadline"),
         }
     }
 

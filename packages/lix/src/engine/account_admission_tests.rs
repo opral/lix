@@ -51,8 +51,8 @@ impl<S: Storage> Storage for CountedStorage<S> {
     }
     async fn acquire_partial_replica_owner(
         &self,
-        token: crate::storage::StorageSessionToken,
-    ) -> Result<crate::storage::StorageOwnerLease, StorageError> {
+        token: StorageSessionToken,
+    ) -> Result<StorageOwnerLease, StorageError> {
         self.inner.acquire_partial_replica_owner(token).await
     }
     async fn begin_read(&self, opts: StorageReadOptions) -> Result<Self::Read<'_>, StorageError> {
@@ -130,7 +130,7 @@ impl StorageScanSource for CountedScan<'_> {
         &mut self,
         limit: usize,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<StorageScanChunk, StorageError>> + Send + '_>,
+        Box<dyn Future<Output = Result<StorageScanChunk, StorageError>> + Send + '_>,
     > {
         Box::pin(async move {
             let (entries, more) = self.inner.next_page(limit).await?.into_parts();
@@ -156,7 +156,7 @@ impl StorageScanSource for CountedScan<'_> {
 
 #[tokio::test]
 async fn existing_account_admission_is_read_only_and_disabled_accounts_fail() {
-    let store = CountedStorage::new(crate::Memory::new());
+    let store = CountedStorage::new(Memory::new());
     let lix = crate::open_lix().with_storage(store.clone()).await.unwrap();
     let id = uuid::Uuid::now_v7().to_string();
     lix.ensure_account(&id, "Original name", "human")
@@ -225,7 +225,7 @@ async fn authenticated_account_admission_profile() {
         };
         for &width in widths {
             let store =
-                CountedStorage::new(crate::sync::durable_memory_for_test(crate::Memory::new()));
+                CountedStorage::new(crate::sync::durable_memory_for_test(Memory::new()));
             let lix = crate::open_lix().with_storage(store.clone()).await.unwrap();
             // Branch creation is fixture work, outside both timers/I/O samples.
             if dimension == "branches" {
@@ -282,7 +282,7 @@ async fn authenticated_account_admission_profile() {
             // Match the authority role that authenticated server handshakes use.
             let adapter = lix.storage_adapter();
             let read = adapter.begin_read(Default::default()).await.unwrap();
-            let revision = crate::storage_adapter::load_repository_mutation_revision(&read)
+            let revision = load_repository_mutation_revision(&read)
                 .await
                 .unwrap();
             drop(read);
@@ -317,7 +317,7 @@ async fn authenticated_account_admission_profile() {
 
 #[tokio::test]
 async fn first_account_creation_does_not_enumerate_custom_global_schemas() {
-    let store = CountedStorage::new(crate::Memory::new());
+    let store = CountedStorage::new(Memory::new());
     let lix = crate::open_lix().with_storage(store.clone()).await.unwrap();
     let schemas = (0..32).map(|index| {
         let schema = serde_json::json!({"$schema":"https://lix.dev/schema-v1.json", "key":format!("account_scope_{index}"),
@@ -424,7 +424,7 @@ async fn first_account_creation_does_not_enumerate_custom_global_schemas() {
 async fn sealed_account_insertion_rejects_arbitrary_sql_and_native_writes() {
     // Canonical initialization and a directly owned engine session exercise
     // the private scope without exporting it through the public API.
-    let adapter = StorageAdapter::new(crate::Memory::new());
+    let adapter = StorageAdapter::new(Memory::new());
     crate::engine::Engine::initialize_with_adapter(adapter.clone(), None)
         .await
         .unwrap();
@@ -508,7 +508,7 @@ async fn sealed_account_insertion_rejects_arbitrary_sql_and_native_writes() {
 
 #[tokio::test]
 async fn account_do_nothing_keeps_insert_validation_under_concurrent_creation() {
-    let adapter = StorageAdapter::new(crate::Memory::new());
+    let adapter = StorageAdapter::new(Memory::new());
     crate::engine::Engine::initialize_with_adapter(adapter.clone(), None)
         .await
         .unwrap();
@@ -557,7 +557,7 @@ async fn account_do_nothing_keeps_insert_validation_under_concurrent_creation() 
 async fn authenticated_account_creation_has_bounded_work_across_branch_inventory() {
     let mut samples = Vec::new();
     for width in [1, 32] {
-        let store = CountedStorage::new(crate::Memory::new());
+        let store = CountedStorage::new(Memory::new());
         let lix = crate::open_lix().with_storage(store.clone()).await.unwrap();
         for branch in 0..width {
             lix.create_branch(crate::CreateBranchOptions {

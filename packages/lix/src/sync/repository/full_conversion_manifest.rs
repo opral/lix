@@ -332,7 +332,7 @@ pub(crate) fn pending_conversion_request_after_global(
             "global publication proof belongs to another frozen source",
         ));
     }
-    let plan = super::native_global_conversion_manifest::classify_descriptor_global_conversion(
+    let plan = classify_descriptor_global_conversion(
         source,
         &descriptor.selected_branch.branch_id,
     )?;

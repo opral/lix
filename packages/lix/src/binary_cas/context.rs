@@ -98,7 +98,6 @@ impl BinaryCasContext {
     ///
     /// The reader can be a read transaction or the active write transaction
     /// when reads must participate in transaction-local visibility.
-    #[expect(clippy::unused_self)]
     pub(crate) fn reader<S>(&self, store: S) -> BinaryCasStoreReader<S>
     where
         S: StorageAdapterRead,

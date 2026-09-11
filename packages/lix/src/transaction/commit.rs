@@ -5737,14 +5737,14 @@ async fn stage_branch_head_control_publications(
                             .iter()
                             .any(|branch| {
                                 branch.branch_id == *branch_id
-                                    && branch.ref_change_id == old_control.ref_change_id.to_string()
+                                    && branch.ref_change_id == old_control.ref_change_id
                                     && branch.head.commit_id
-                                        == old_control.head_commit_id.to_string()
+                                        == old_control.head_commit_id
                                     && state.serving_generation(branch_id).ok()
                                         == Some(old_control.tracked_generation)
                                     && old_control.working_diff_checkpoint_commit_id.is_some_and(
                                         |checkpoint| {
-                                            checkpoint.to_string() == branch.checkpoint.commit_id
+                                            checkpoint == branch.checkpoint.commit_id
                                         },
                                     )
                             })
@@ -7520,7 +7520,7 @@ mod tests {
     async fn warm_account_proof_uses_one_point_read_and_rotation_invalidates_it() {
         struct RevisionOnlyRead<R> {
             inner: R,
-            keys: std::sync::atomic::AtomicUsize,
+            keys: AtomicUsize,
         }
         impl<R: StorageAdapterRead> StorageAdapterRead for RevisionOnlyRead<R> {
             async fn get_many(
@@ -7534,7 +7534,7 @@ mod tests {
                         "warm account validation unexpectedly loads native inputs"
                     );
                     self.keys
-                        .fetch_add(request.keys.len(), std::sync::atomic::Ordering::Relaxed);
+                        .fetch_add(request.keys.len(), Ordering::Relaxed);
                 }
                 self.inner.get_many(requests).await
             }
@@ -7583,7 +7583,7 @@ mod tests {
         validate_active_account_and_account_rows(&mut read, &prepared, &account)
             .await
             .unwrap();
-        assert_eq!(read.keys.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(read.keys.load(Ordering::Relaxed), 1);
         drop(read);
         let mut writes = storage.new_write_set();
         crate::account::stage_account_revision(&mut writes);

@@ -807,13 +807,12 @@ where
         self.active_account_id
     }
 
-    #[expect(trivial_casts)]
     fn read_interest_registry(&self) -> Option<Arc<crate::hot_state::ReadInterestRegistry>> {
         self.hot_state.read_interest_registry()
     }
 
     fn hot_state(&self) -> Arc<dyn HotStateReader> {
-        Arc::new(self.hot_state.reader(self.read_store.clone())) as Arc<dyn HotStateReader>
+        Arc::new(self.hot_state.reader(self.read_store.clone()))
     }
 
     fn row_snapshot_reader(&self) -> Option<Arc<dyn crate::sql2::RowSnapshotReader>> {

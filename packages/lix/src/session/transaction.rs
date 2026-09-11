@@ -802,7 +802,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> SessionContext<S> {
         &'a self,
         sql: &'a str,
         params: &'a [crate::Value],
-    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<(), LixError>> + 'a>> {
+    ) -> std::pin::Pin<Box<impl Future<Output = Result<(), LixError>> + 'a>> {
         Box::pin(async move {
             let update = crate::sql2::validate_sql_preparation(sql)?;
             // Even SELECT stays inside a discarded transaction: the ordinary

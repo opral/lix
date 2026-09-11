@@ -152,10 +152,10 @@ mod tests {
                 "normal admission must not silently upgrade an old authority"
             );
         }
-        crate::upgrade_authority_for_partial_sync(storage.clone())
+        upgrade_authority_for_partial_sync(storage.clone())
             .await
             .unwrap();
-        crate::upgrade_authority_for_partial_sync(storage.clone())
+        upgrade_authority_for_partial_sync(storage.clone())
             .await
             .unwrap();
         let storage = crate::storage_adapter::StorageSession::acquire(storage)

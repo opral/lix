@@ -225,7 +225,7 @@ where
     pub(crate) fn cleanup_native_migration<'a>(
         &'a self,
         value: &'a super::NativeMigrationCleanupRequest,
-    ) -> SyncTransportFuture<'a, super::SyncPushResponse> {
+    ) -> SyncTransportFuture<'a, SyncPushResponse> {
         Box::pin(async move {
             value.validate()?;
             let mut request = self.request(
@@ -243,7 +243,7 @@ where
                     4096,
                 ));
             }
-            let result: super::SyncPushResponse =
+            let result: SyncPushResponse =
                 decode_response(response, "merge partial replica commits")?;
             Ok(result)
         })
@@ -329,7 +329,7 @@ where
     pub(crate) fn push_native_global_migration_wave<'a>(
         &'a self,
         value: &'a super::NativeGlobalBodyWaveRequest,
-    ) -> SyncTransportFuture<'a, super::SyncPushResponse> {
+    ) -> SyncTransportFuture<'a, SyncPushResponse> {
         Box::pin(async move {
             value.validate()?;
             let mut request = self.request(
@@ -1347,7 +1347,7 @@ mod tests {
             lix_id: descriptor.lix_id.clone(),
             session_id: "session".into(),
             active_account_id: crate::SYSTEM_ACCOUNT_ID.into(),
-            baseline_lease: std::sync::Arc::new(parking_lot::Mutex::new(Some(
+            baseline_lease: Arc::new(parking_lot::Mutex::new(Some(
                 crate::sync::LeasedPartialReplicaDescriptor::for_test(
                     descriptor.clone(),
                     crate::SYSTEM_ACCOUNT_ID,
@@ -1628,14 +1628,15 @@ mod tests {
         transport.client.body = serde_json::to_vec(&response).unwrap();
         let fetched = transport.native_objects(&[address]).await.unwrap();
         assert_eq!(fetched.objects[0].bytes, bytes);
-        let requests = transport.client.requests.lock().unwrap();
-        assert!(requests[0].url.ends_with("/sync/native-objects"));
-        assert_eq!(requests[0].method, http::Method::POST);
-        assert_eq!(
-            requests[0].response_limit,
-            crate::sync::native_object::MAX_NATIVE_OBJECT_RESPONSE_BYTES
-        );
-        drop(requests);
+        {
+            let requests = transport.client.requests.lock().unwrap();
+            assert!(requests[0].url.ends_with("/sync/native-objects"));
+            assert_eq!(requests[0].method, http::Method::POST);
+            assert_eq!(
+                requests[0].response_limit,
+                crate::sync::native_object::MAX_NATIVE_OBJECT_RESPONSE_BYTES
+            );
+        }
         let mut corrupt = response;
         corrupt.objects[0].bytes.push(0);
         transport.client.body = serde_json::to_vec(&corrupt).unwrap();
@@ -1668,14 +1669,15 @@ mod tests {
             transport.native_object_range(&range).await.unwrap().bytes,
             b"cde"
         );
-        let requests = transport.client.requests.lock().unwrap();
-        assert!(requests[0].url.ends_with("/sync/native-object-range"));
-        assert_eq!(requests[0].method, http::Method::POST);
-        assert_eq!(
-            requests[0].response_limit,
-            crate::sync::native_object::MAX_NATIVE_OBJECT_RESPONSE_BYTES
-        );
-        drop(requests);
+        {
+            let requests = transport.client.requests.lock().unwrap();
+            assert!(requests[0].url.ends_with("/sync/native-object-range"));
+            assert_eq!(requests[0].method, http::Method::POST);
+            assert_eq!(
+                requests[0].response_limit,
+                crate::sync::native_object::MAX_NATIVE_OBJECT_RESPONSE_BYTES
+            );
+        }
         for mutation in 0..6 {
             let mut wrong = response.clone();
             match mutation {
@@ -1943,17 +1945,18 @@ mod tests {
             transport.merge_partial_replica(&request).await.unwrap(),
             receipt
         );
-        let requests = transport.client.requests.lock().unwrap();
-        let sent = requests.last().unwrap();
-        assert!(sent.url.ends_with("/sync/merge"));
-        assert_eq!(sent.response_limit, 4096);
-        assert!(
-            sent.headers
-                .iter()
-                .any(|(key, value)| key == "lix-sync-protocol-version"
-                    && value == &super::super::SYNC_PROTOCOL_VERSION.to_string())
-        );
-        drop(requests);
+        {
+            let requests = transport.client.requests.lock().unwrap();
+            let sent = requests.last().unwrap();
+            assert!(sent.url.ends_with("/sync/merge"));
+            assert_eq!(sent.response_limit, 4096);
+            assert!(
+                sent.headers
+                    .iter()
+                    .any(|(key, value)| key == "lix-sync-protocol-version"
+                        && value == &super::super::SYNC_PROTOCOL_VERSION.to_string())
+            );
+        }
         let mut changed = receipt;
         changed.request.captured_local_head_commit_id = uuid::Uuid::now_v7().to_string();
         transport.client.body = serde_json::to_vec(&changed).unwrap();

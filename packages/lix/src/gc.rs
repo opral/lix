@@ -20,7 +20,7 @@ pub(crate) use native_baseline_lease::{
 pub(crate) use native_upload_attempt::{
     NATIVE_UPLOAD_ATTEMPT_SPACE, NativeUploadAttempt, NativeUploadAttemptIdentity,
     load_native_upload_attempt, require_native_upload_attempt, stage_accepted_native_upload_wave,
-    stage_finalize_native_upload_attempt, stage_renew_native_upload_attempt,
+    stage_finalize_native_upload_attempt,
     stage_revoke_expired_upload_attempt,
 };
 
@@ -907,9 +907,9 @@ where
 /// never additional roots.
 #[derive(Debug)]
 struct AuthenticatedServingDependencyClosure {
-    expired_upload_attempts: Vec<crate::storage_adapter::StorageKey>,
+    expired_upload_attempts: Vec<StorageKey>,
     more_expired_upload_attempts: bool,
-    expired_baseline_leases: Vec<crate::storage_adapter::StorageKey>,
+    expired_baseline_leases: Vec<StorageKey>,
     more_expired_baseline_leases: bool,
     chronology_roots: BTreeSet<CommitId>,
     physical_authorities: BTreeSet<CommitId>,
@@ -1605,10 +1605,10 @@ where
         // Expired pins were discovered during the existing root scan. Deletes
         // share the GC revision fence, so a concurrent renewal cannot be erased.
         for key in expired_upload_attempts {
-            auxiliary_writes.delete(native_upload_attempt::NATIVE_UPLOAD_ATTEMPT_SPACE, key);
+            auxiliary_writes.delete(NATIVE_UPLOAD_ATTEMPT_SPACE, key);
         }
         for key in expired_baseline_leases {
-            auxiliary_writes.delete(native_baseline_lease::NATIVE_BASELINE_LEASE_SPACE, key);
+            auxiliary_writes.delete(NATIVE_BASELINE_LEASE_SPACE, key);
         }
 
         let mut auxiliary_preconditions = Vec::new();
@@ -2394,22 +2394,22 @@ mod tests {
             authority.partial_replica_descriptor(None).await.unwrap(),
         )
         .unwrap();
-        let adapter = crate::storage_adapter::StorageAdapter::new(crate::Memory::new());
+        let adapter = StorageAdapter::new(Memory::new());
         let mut seed = adapter.new_write_set();
         seed.put(
             crate::sync::PARTIAL_REPLICA_STATE_SPACE,
             crate::sync::partial_replica_state_key(),
-            crate::storage_adapter::StorageValue {
+            StorageValue {
                 bytes: serde_json::to_vec(&state).unwrap().into(),
             },
         );
         adapter
-            .commit_write_set(seed, crate::storage_adapter::StorageWriteOptions::default())
+            .commit_write_set(seed, StorageWriteOptions::default())
             .await
             .unwrap();
-        let read = crate::storage_adapter::SharedStorageAdapterRead::new(
+        let read = SharedStorageAdapterRead::new(
             adapter
-                .begin_read(crate::storage_adapter::StorageReadOptions::default())
+                .begin_read(StorageReadOptions::default())
                 .await
                 .unwrap(),
         );

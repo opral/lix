@@ -221,7 +221,7 @@ async fn descriptor_only_file_content_reads_and_prepared_writes_remain_local() {
             assert_eq!(content(session.execute(sql, &[]).await.unwrap()), prepared);
         }
         let authority = std::sync::Arc::new(authority);
-        let client = super::worker::AuthorityClient::new(authority.clone(), false);
+        let client = worker::AuthorityClient::new(authority.clone(), false);
         let transport =
             crate::sync::http::HttpSyncTransport::connect_with(client.clone(), state.remote_id())
                 .await

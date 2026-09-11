@@ -140,9 +140,6 @@ impl AuthorityKvMergePlan {
             .iter()
             .any(|group| !group.conflicts.is_empty())
     }
-    pub(crate) fn already_in_authority(&self) -> bool {
-        self.native.already_in_authority
-    }
     pub(crate) fn into_receipt(
         self,
         merge: CommitId,

@@ -301,7 +301,7 @@ pub(super) async fn stage_remote_partial_confirmation(
 mod tests {
     use super::*;
     use crate::storage_adapter::{StorageAdapter, StorageWriteOptions};
-    use crate::{Memory, open_lix};
+    use crate::open_lix;
 
     async fn commit<S: crate::storage_adapter::Storage + Clone + Send + Sync + 'static>(
         adapter: &StorageAdapter<S>,
@@ -429,10 +429,11 @@ mod tests {
             .unwrap_err();
             assert_eq!(error.code, "TEST_LOST_REPLY");
         }
-        let sent = sent.lock().unwrap();
-        assert_eq!(sent.len(), 3);
-        assert!(sent.windows(2).all(|pair| pair[0] == pair[1]));
-        drop(sent);
+        {
+            let sent = sent.lock().unwrap();
+            assert_eq!(sent.len(), 3);
+            assert!(sent.windows(2).all(|pair| pair[0] == pair[1]));
+        }
         let read = adapter.begin_read(Default::default()).await.unwrap();
         assert_eq!(
             crate::storage_adapter::load_repository_mutation_revision(&read)

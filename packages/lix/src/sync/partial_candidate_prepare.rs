@@ -25,8 +25,8 @@ pub(crate) struct PreparedCandidateState {
 // support is needed or permitted for the unpublished fresh-generation copy.
 struct CandidateScanSource<'a> {
     base: ScanCursor<'a>,
-    staged: std::collections::VecDeque<crate::storage_adapter::StorageReadEntry>,
-    base_rows: std::collections::VecDeque<crate::storage_adapter::StorageReadEntry>,
+    staged: std::collections::VecDeque<StorageReadEntry>,
+    base_rows: std::collections::VecDeque<StorageReadEntry>,
     base_done: bool,
     descending: bool,
 }
@@ -36,7 +36,7 @@ impl crate::storage_adapter::StorageScanSource for CandidateScanSource<'_> {
         limit_rows: usize,
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<
+            dyn Future<
                     Output = Result<crate::storage_adapter::StorageScanChunk, StorageError>,
                 > + Send
                 + '_,

@@ -146,7 +146,7 @@ where
             .control
             .ok_or_else(|| conflict("partial branch disappeared"))?;
         if push.prepared.is_some()
-            || control.head_commit_id.to_string() != push.confirmed.head
+            || control.head_commit_id != push.confirmed.head
             || control
                 .working_diff_checkpoint_commit_id
                 .map(|id| id.to_string())
@@ -326,7 +326,7 @@ where
                     // A backend may report an ambiguous commit. Fail observers
                     // closed; the exact durable receipt fences further writes.
                     let error: LixError = error.into();
-                    if error.code == crate::LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN {
+                    if error.code == LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN {
                         mode.fail_partial_admission(error.clone());
                         engine.fail_observers(error.clone());
                     }
@@ -406,7 +406,7 @@ where
             .control
             .ok_or_else(|| conflict("lease recovery control absent"))?;
         if push.prepared.is_some()
-            || control.head_commit_id.to_string() != push.confirmed.head
+            || control.head_commit_id != push.confirmed.head
             || control
                 .working_diff_checkpoint_commit_id
                 .map(|id| id.to_string())

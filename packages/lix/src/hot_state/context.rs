@@ -421,8 +421,8 @@ impl HotStateContext {
     /// Every mutable serving cache and read-interest registry stays private.
     pub(crate) fn fork_for_native_candidate(&self) -> Self {
         let mut candidate = Self::new(
-            crate::tracked_state::TrackedStateContext::new(),
-            crate::commit_graph::CommitGraphContext::new(),
+            TrackedStateContext::new(),
+            CommitGraphContext::new(),
         );
         candidate.root_base_cache = std::sync::Arc::clone(&self.root_base_cache);
         candidate
@@ -1991,9 +1991,9 @@ mod tests {
         let lix = crate::open_lix().await.unwrap();
         let adapter = lix.storage_adapter();
         let read = adapter.begin_read(Default::default()).await.unwrap();
-        let control = crate::branch::BranchHeadControlContext::new()
+        let control = BranchHeadControlContext::new()
             .reader(&read)
-            .load(crate::GLOBAL_BRANCH_ID)
+            .load(GLOBAL_BRANCH_ID)
             .await
             .unwrap()
             .unwrap();
@@ -2001,7 +2001,7 @@ mod tests {
             .with_read_interest_registry(crate::hot_state::ReadInterestRegistry::new_durable(
                 16, 4096,
             ))
-            .with_partial_scope_policy(crate::GLOBAL_BRANCH_ID, crate::GLOBAL_BRANCH_ID);
+            .with_partial_scope_policy(GLOBAL_BRANCH_ID, GLOBAL_BRANCH_ID);
         original
             .global_key_value_rows
             .insert(control.clone(), "candidate-negative", None);

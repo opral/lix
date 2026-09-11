@@ -13,11 +13,11 @@ fn unsupported(message: &str) -> LixError {
 }
 
 pub(crate) struct DescriptorOnlyGlobalProof {
-    base: CommitId,
-    remote: CommitId,
-    local: CommitId,
-    local_descriptors: TrackedStateDiff,
-    local_branch_ids: BTreeSet<String>,
+    _base: CommitId,
+    _remote: CommitId,
+    _local: CommitId,
+    _local_descriptors: TrackedStateDiff,
+    _local_branch_ids: BTreeSet<String>,
 }
 fn added_branch_ids(diff: &TrackedStateDiff) -> Result<BTreeSet<String>, LixError> {
     let mut ids = BTreeSet::new();
@@ -114,11 +114,11 @@ pub(crate) async fn prove_descriptor_only_global_merge(
         ));
     }
     Ok(DescriptorOnlyGlobalProof {
-        base,
-        remote,
-        local,
-        local_descriptors: local_diff,
-        local_branch_ids: local_ids,
+        _base: base,
+        _remote: remote,
+        _local: local,
+        _local_descriptors: local_diff,
+        _local_branch_ids: local_ids,
     })
 }
 
@@ -163,13 +163,13 @@ pub(crate) async fn prove_compatible_global_basis(
 /// Validate only immutable local B→L coordinates before the explicit migration
 /// performs network I/O. R=B here is a local validation baseline, never a ref.
 pub(crate) async fn prove_local_descriptor_global_source(
-    read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+    read: &(impl StorageAdapterRead + ?Sized),
     request: &super::NativeGlobalMigrationRequest,
     account: &str,
-) -> Result<(), crate::LixError> {
+) -> Result<(), LixError> {
     request.validate()?;
-    let b = crate::changelog::CommitId::parse_lix(&request.base_commit_id, "global source base")?;
-    let l = crate::changelog::CommitId::parse_lix(
+    let b = CommitId::parse_lix(&request.base_commit_id, "global source base")?;
+    let l = CommitId::parse_lix(
         &request.captured_local_head_commit_id,
         "global source head",
     )?;

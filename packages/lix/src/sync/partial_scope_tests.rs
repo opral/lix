@@ -56,7 +56,7 @@ async fn candidate_root_prepares_new_match_without_changing_published_current_st
     use crate::changelog::CommitId;
     use crate::commit_graph::CommitGraphContext;
     use crate::hot_state::{
-        HotStateContext, HotStateFilter, HotStateReader, HotStateScanRequest, TrackedHeadContext,
+        HotStateContext, HotStateFilter, HotStateScanRequest, TrackedHeadContext,
     };
     use crate::storage_adapter::StorageWriteOptions;
     use crate::tracked_state::TrackedStateContext;

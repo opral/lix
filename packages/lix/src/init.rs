@@ -1536,7 +1536,7 @@ mod tests {
             parse_repository_protocol(PARTIAL_REPOSITORY_PROTOCOL_VALUE),
             RepositoryProtocolStatus::Malformed
         );
-        let storage = StorageAdapter::new(crate::Memory::new());
+        let storage = StorageAdapter::new(Memory::new());
         let mut writes = storage.new_write_set();
         stage_partial_repository_protocol(&mut writes);
         storage

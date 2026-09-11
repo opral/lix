@@ -83,7 +83,7 @@ where
     }
 }
 pub(super) async fn capture<T>(
-    future: impl std::future::Future<Output = T>,
+    future: impl Future<Output = T>,
 ) -> (T, BTreeMap<&'static str, Metric>) {
     let collector = Collector::default();
     let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector.clone()));

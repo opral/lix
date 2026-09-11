@@ -104,7 +104,7 @@ impl VerifiedRetainedBodyWave {
             .enumerate()
             {
                 let control = observed[index].control.as_ref().ok_or_else(invalid)?;
-                if control.head_commit_id.to_string() != *head
+                if control.head_commit_id != head.as_str()
                     || control
                         .working_diff_checkpoint_commit_id
                         .map(|id| id.to_string())

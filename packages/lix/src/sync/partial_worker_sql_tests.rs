@@ -135,7 +135,7 @@ async fn partial_upload_worker_yields_to_demands_and_retries_ambiguous_acceptanc
                 .await
                 .unwrap();
         engine.sync_mode().admit_partial_replica(
-            std::sync::Arc::new(state.clone()),
+            Arc::new(state.clone()),
             crate::sync::partial_replica_write_capability(),
         );
         storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
@@ -223,7 +223,7 @@ async fn partial_upload_worker_yields_to_demands_and_retries_ambiguous_acceptanc
                     .unwrap()
                     .unwrap();
                 if push.prepared.is_none()
-                    && push.confirmed.head == control.head_commit_id.to_string()
+                    && push.confirmed.head == control.head_commit_id
                 {
                     break;
                 }
@@ -282,7 +282,6 @@ async fn production_frontier_preparation_supports_thirty_local_appends() {
         authority.partial_replica_descriptor(None).await.unwrap(),
     )
     .unwrap();
-    let branch = state.descriptor().selected_branch.branch_id.clone();
     let memory = Memory::new();
     let storage = StorageAdapter::new(memory.clone());
     let read = storage.begin_read(Default::default()).await.unwrap();
@@ -306,7 +305,7 @@ async fn production_frontier_preparation_supports_thirty_local_appends() {
             .await
             .unwrap();
     engine.sync_mode().admit_partial_replica(
-        std::sync::Arc::new(state.clone()),
+        Arc::new(state.clone()),
         crate::sync::partial_replica_write_capability(),
     );
     storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
@@ -444,7 +443,7 @@ impl RawHttpClient for WatchingAuthorityClient {
                     #[derive(serde::Deserialize)]
                     #[serde(deny_unknown_fields)]
                     struct Request {
-                        objects: Vec<crate::tracked_state::NativeObjectRef>,
+                        objects: Vec<NativeObjectRef>,
                     }
                     let body: Request =
                         serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();

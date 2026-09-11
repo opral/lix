@@ -8,8 +8,8 @@ async fn global_migration_restarts_after_authority_moves_with_original_bodies_re
     run_global_migration(true).await;
 }
 async fn run_global_migration(restart: bool) {
-    let memory = crate::Memory::new();
-    let authority = crate::open_lix()
+    let memory = Memory::new();
+    let authority = open_lix()
         .with_storage(memory.clone())
         .await
         .unwrap();
@@ -21,7 +21,7 @@ async fn run_global_migration(restart: bool) {
         .await
         .unwrap();
     let base = authority.partial_replica_descriptor(None).await.unwrap();
-    let local = crate::open_lix()
+    let local = open_lix()
         .with_storage(memory.fork().unwrap())
         .await
         .unwrap();
@@ -29,7 +29,7 @@ async fn run_global_migration(restart: bool) {
         .set_sync_role(crate::sync::SyncRole::Authority)
         .unwrap();
     let created = local
-        .create_branch(crate::CreateBranchOptions {
+        .create_branch(CreateBranchOptions {
             id: None,
             name: "migrated-local".into(),
             from_commit_id: None,
@@ -53,7 +53,7 @@ async fn run_global_migration(restart: bool) {
         .await
         .unwrap();
     let remote_branch = authority
-        .create_branch(crate::CreateBranchOptions {
+        .create_branch(CreateBranchOptions {
             id: None,
             name: "remote-added".into(),
             from_commit_id: None,
@@ -149,7 +149,7 @@ async fn run_global_migration(restart: bool) {
         .unwrap();
         drop(held);
         authority
-            .create_branch(crate::CreateBranchOptions {
+            .create_branch(CreateBranchOptions {
                 id: None,
                 name: "racing-remote".into(),
                 from_commit_id: None,
@@ -252,7 +252,7 @@ async fn run_global_migration(restart: bool) {
         .execute("SELECT value FROM lix_key_value WHERE key='base'", &[])
         .await
         .unwrap();
-    let crate::Value::Jsonb(value) = rows.rows()[0].get::<crate::Value>("value").unwrap() else {
+    let Value::Jsonb(value) = rows.rows()[0].get::<Value>("value").unwrap() else {
         panic!("expected JSONB value")
     };
     assert_eq!(value.as_json_string().as_deref(), Some("local-pending"));
@@ -318,13 +318,13 @@ async fn run_global_migration(restart: bool) {
 }
 #[tokio::test]
 async fn global_migration_rejects_existing_target_even_when_its_head_matches() {
-    let memory = crate::Memory::new();
-    let authority = crate::open_lix()
+    let memory = Memory::new();
+    let authority = open_lix()
         .with_storage(memory.clone())
         .await
         .unwrap();
     let base = authority.partial_replica_descriptor(None).await.unwrap();
-    let local = crate::open_lix()
+    let local = open_lix()
         .with_storage(memory.fork().unwrap())
         .await
         .unwrap();
@@ -332,7 +332,7 @@ async fn global_migration_rejects_existing_target_even_when_its_head_matches() {
         .set_sync_role(crate::sync::SyncRole::Authority)
         .unwrap();
     let branch = local
-        .create_branch(crate::CreateBranchOptions {
+        .create_branch(CreateBranchOptions {
             id: None,
             name: "local-name".into(),
             from_commit_id: None,
@@ -340,7 +340,7 @@ async fn global_migration_rejects_existing_target_even_when_its_head_matches() {
         .await
         .unwrap();
     authority
-        .create_branch(crate::CreateBranchOptions {
+        .create_branch(CreateBranchOptions {
             id: Some(branch.id.clone()),
             name: "concurrent-name".into(),
             from_commit_id: None,

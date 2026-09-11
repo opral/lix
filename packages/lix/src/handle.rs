@@ -1111,15 +1111,6 @@ struct SyncSessionLease {
 }
 
 impl SyncSessionLease {
-    fn root(runtime: Arc<crate::sync::SyncRuntime>) -> Arc<Self> {
-        Arc::new(Self {
-            runtime,
-            active_sessions: Arc::new(AtomicUsize::new(1)),
-            partial_owner: None,
-            released: AtomicBool::new(false),
-        })
-    }
-
     fn root_with_owner(
         runtime: Arc<crate::sync::SyncRuntime>,
         owner: crate::engine::PartialOwnerLifetime,
@@ -1230,7 +1221,7 @@ where
         retained_progress.retain_initialized(true);
     }
     let session = engine.open_session().await?;
-    let mut lix = Lix {
+    let lix = Lix {
         engine: Arc::new(engine),
         session: Arc::new(session),
         transaction_lifecycle: Arc::default(),
@@ -1439,10 +1430,6 @@ where
 
     pub(crate) fn notify_observers_for_sync(&self) {
         self.engine.notify_observers();
-    }
-
-    pub(crate) fn fail_observers_for_sync(&self, error: LixError) {
-        self.engine.fail_observers(error);
     }
 
     pub(crate) async fn repository_default_branch_id_for_sync(

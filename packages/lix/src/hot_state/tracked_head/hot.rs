@@ -1566,7 +1566,7 @@ pub(crate) async fn stage_deterministic_identity_witness_migration(
         generation,
         scope,
     )));
-    let values = PointReadPlan::new(COLLECTION_CONTROL_SPACE, &[key.clone()])
+    let values = PointReadPlan::new(COLLECTION_CONTROL_SPACE, std::slice::from_ref(&key))
         .materialize(read, StorageGetOptions::default())
         .await?
         .value;
@@ -1690,7 +1690,7 @@ pub(crate) async fn stage_deterministic_identity_witness_migration(
             "witness migration collection identity closure mismatch",
         ));
     }
-    let prior = PointReadPlan::new(DETERMINISTIC_IDENTITY_WITNESS_SPACE, &[key.clone()])
+    let prior = PointReadPlan::new(DETERMINISTIC_IDENTITY_WITNESS_SPACE, std::slice::from_ref(&key))
         .materialize(read, StorageGetOptions::default())
         .await?
         .value;

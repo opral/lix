@@ -229,7 +229,7 @@ where
         }
     }
     Err(LixError::new(
-        crate::LixError::CODE_TRANSACTION_CONFLICT,
+        LixError::CODE_TRANSACTION_CONFLICT,
         "interest journal changed throughout bounded flush retries",
     ))
 }

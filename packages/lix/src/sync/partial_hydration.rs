@@ -138,7 +138,7 @@ where
         return Err(stale_admission());
     }
     let key = StorageKey(Bytes::from(address.storage_key()));
-    let existing = PointReadPlan::new(address.space(), &[key.clone()])
+    let existing = PointReadPlan::new(address.space(), std::slice::from_ref(&key))
         .materialize(&read, Default::default())
         .await?
         .value

@@ -202,7 +202,7 @@ pub(super) async fn load_partial_merge_state(
         return Err(conflict("merge state admission changed"));
     }
     let key = key(branch)?;
-    let values = PointReadPlan::new(PARTIAL_BRANCH_MERGE_SPACE, &[key.clone()])
+    let values = PointReadPlan::new(PARTIAL_BRANCH_MERGE_SPACE, std::slice::from_ref(&key))
         .materialize(read, Default::default())
         .await?;
     let raw = match values.value.into_iter().next().flatten() {
@@ -301,7 +301,7 @@ pub(super) async fn stage_capture_partial_merge(
                 &request.global_checkpoint_commit_id,
             )
         };
-        if control.head_commit_id.to_string() != *head
+        if control.head_commit_id != head.as_str()
             || control
                 .working_diff_checkpoint_commit_id
                 .map(|id| id.to_string())

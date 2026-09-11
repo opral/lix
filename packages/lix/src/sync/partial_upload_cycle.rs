@@ -23,7 +23,7 @@ pub(super) async fn upload_partial_once<S, Sender, Sent>(
 where
     S: Storage + Clone + Send + Sync + 'static,
     Sender: FnOnce(SyncPushRequest) -> Sent,
-    Sent: std::future::Future<Output = Result<SyncPushResponse, LixError>>,
+    Sent: Future<Output = Result<SyncPushResponse, LixError>>,
 {
     let read = storage.begin_read(Default::default()).await?;
     let (push, _, _) =

@@ -128,7 +128,7 @@ pub(super) async fn convert_pending_replica<S: Storage + Clone + Send + Sync + '
     storage: &S,
     authenticated: &crate::sync::AuthenticatedPartialConversion,
     adapter: StorageAdapter<S>,
-) -> Result<partial::PartialEpochAdmission<S>, LixError> {
+) -> Result<PartialEpochAdmission<S>, LixError> {
     let state = authenticated.state();
     let read = adapter.begin_read(ReadOptions::default()).await?;
     let inspected = crate::sync::inspect_full_conversion_manifest(&read).await?;
@@ -248,7 +248,7 @@ pub(super) async fn convert_pending_replica<S: Storage + Clone + Send + Sync + '
         retain_replica_source(storage, &claim, &source, format, &retention).await?;
         let global_proof = match &global_plan {
             Some(plan) => Some(
-                super::native_global_epoch_owner::reconcile_global_source(
+                native_global_epoch_owner::reconcile_global_source(
                     storage,
                     &claim,
                     &source,
@@ -455,7 +455,7 @@ pub(super) async fn convert_pending_replica<S: Storage + Clone + Send + Sync + '
             )
         })?;
         Ok((
-            partial::PartialEpochAdmission {
+            PartialEpochAdmission {
                 adapter: StorageAdapter::for_epoch(storage.clone(), target_bank, active),
                 state: state.clone(),
             },
@@ -508,7 +508,7 @@ pub(super) async fn convert_pending_replica<S: Storage + Clone + Send + Sync + '
             .await?;
         }
         if global_plan.is_some() {
-            super::native_global_epoch_owner::cleanup_global_source(
+            native_global_epoch_owner::cleanup_global_source(
                 storage,
                 &active,
                 source_bank,

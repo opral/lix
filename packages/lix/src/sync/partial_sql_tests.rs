@@ -98,7 +98,7 @@ async fn prepare_baseline_jump_spines(
         &state.descriptor().global_branch,
     ] {
         let mut cursor = crate::changelog::CommitId::parse(&branch.head.commit_id)
-            .map_err(|error| crate::LixError::unknown(error.to_string()))?;
+            .map_err(|error| LixError::unknown(error.to_string()))?;
         let mut previous: Option<crate::changelog::CommitRecord> = None;
         loop {
             let read = storage.begin_read(Default::default()).await?;

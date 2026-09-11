@@ -37,7 +37,7 @@ impl VerifiedGlobalMigrationBody {
             .next()
             .ok_or_else(invalid)?;
         let current = control.control.as_ref().ok_or_else(invalid)?;
-        if current.head_commit_id.to_string() != wave.request.expected_authority_head_commit_id
+        if current.head_commit_id != wave.request.expected_authority_head_commit_id
             || current
                 .working_diff_checkpoint_commit_id
                 .map(|c| c.to_string())

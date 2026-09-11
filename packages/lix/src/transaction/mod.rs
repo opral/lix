@@ -43,6 +43,7 @@ pub(crate) use context::TransactionCommitOutcome;
 pub(crate) use context::begin_commit_boundary;
 pub(crate) use context::commit_at_boundary;
 pub(crate) use context::commit_transaction_cohort;
+#[cfg(feature = "storage-benches")]
 pub(crate) use context::open_transaction;
 pub(crate) use context::open_transaction_with_account_scope;
 pub(crate) use context::open_transaction_with_runtime_boundary;

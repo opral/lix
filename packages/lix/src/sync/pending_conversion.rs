@@ -67,7 +67,7 @@ pub(crate) struct ReconciledPendingConversion {
     source_branch: String,
     source_head: String,
     state: PartialReplicaState,
-    deadline: super::http::CandidateBaselineDeadline,
+    deadline: http::CandidateBaselineDeadline,
 }
 impl ReconciledPendingConversion {
     pub(crate) fn source_coordinate(&self) -> (&str, &str) {
@@ -90,12 +90,12 @@ fn unresolved(message: &str) -> LixError {
 fn id(value: &str) -> Result<crate::changelog::CommitId, LixError> {
     crate::changelog::CommitId::parse_lix(value, "conversion native coordinate")
 }
-pub(super) async fn graph<C: super::http::RawHttpClient + Clone + 'static>(
-    transport: &super::http::HttpSyncTransport<C>,
+pub(super) async fn graph<C: http::RawHttpClient + Clone + 'static>(
+    transport: &http::HttpSyncTransport<C>,
     commit: &str,
 ) -> Result<crate::changelog::CommitRecord, LixError> {
     let response = transport
-        .native_metadata(&super::native_metadata::NativeMetadataRequest {
+        .native_metadata(&NativeMetadataRequest {
             epoch_id: uuid::Uuid::now_v7().to_string(),
             objects: vec![crate::tracked_state::NativeMetadataRef::CommitGraphRecord(
                 commit.into(),
@@ -109,8 +109,8 @@ pub(super) async fn graph<C: super::http::RawHttpClient + Clone + 'static>(
     crate::commit_graph::validate_native_commit_graph_record(id(commit)?, &object.bytes)?;
     crate::storage_codec::decode("conversion native graph", &object.bytes)
 }
-pub(super) async fn includes<C: super::http::RawHttpClient + Clone + 'static>(
-    transport: &super::http::HttpSyncTransport<C>,
+pub(super) async fn includes<C: http::RawHttpClient + Clone + 'static>(
+    transport: &http::HttpSyncTransport<C>,
     ancestor: &str,
     head: &str,
 ) -> Result<bool, LixError> {
@@ -176,9 +176,9 @@ fn validate_descriptor(
     }
     Ok(())
 }
-async fn restart<C: super::http::RawHttpClient + Clone + 'static>(
+async fn restart<C: http::RawHttpClient + Clone + 'static>(
     journal: &mut impl ConversionJournalOwner,
-    transport: &super::http::HttpSyncTransport<C>,
+    transport: &http::HttpSyncTransport<C>,
 ) -> Result<(), LixError> {
     let current = journal.current().clone();
     let intent = current
@@ -284,13 +284,13 @@ async fn restart<C: super::http::RawHttpClient + Clone + 'static>(
 pub(crate) async fn reconcile_pending_conversion<S, C>(
     source: &StorageAdapter<S>,
     journal: &mut impl ConversionJournalOwner,
-    transport: &super::http::HttpSyncTransport<C>,
+    transport: &http::HttpSyncTransport<C>,
     remote: &str,
     epoch: &str,
 ) -> Result<ReconciledPendingConversion, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
-    C: super::http::RawHttpClient + Clone + 'static,
+    C: http::RawHttpClient + Clone + 'static,
 {
     loop {
         let current = journal.current().clone();
@@ -309,7 +309,7 @@ where
         if current.accepted_tip == current.request.captured_local_head_commit_id {
             let result = if let Some(pin) = &current.native_source_pin {
                 transport
-                    .merge_native_migration(&super::NativeMigrationMergeRequest {
+                    .merge_native_migration(&NativeMigrationMergeRequest {
                         request: current.request.clone(),
                         source_branch_id: pin.clone(),
                     })
@@ -340,7 +340,7 @@ where
         }
         if let Some(pin) = &current.native_source_pin {
             let read = source.begin_read(Default::default()).await?;
-            let wave = super::native_migration_pin_upload::native_migration_pin_wave(
+            let wave = native_migration_pin_upload::native_migration_pin_wave(
                 &read,
                 &current.request,
                 pin,
@@ -357,7 +357,7 @@ where
             let mut next = current.clone();
             next.prepared_tip = Some(target.clone());
             journal.publish(next).await?;
-            super::native_migration_pin_upload::push_native_migration_with_blobs(
+            native_migration_pin_upload::push_native_migration_with_blobs(
                 source,
                 transport.active_account_id(),
                 transport,
@@ -371,13 +371,13 @@ where
             continue;
         }
         let prepared = current.prepared_tip.as_ref().map(|target| {
-            super::partial_merge_state::PreparedMergeBodyWave {
+            partial_merge_state::PreparedMergeBodyWave {
                 previous: current.accepted_tip.clone(),
                 target: target.clone(),
             }
         });
         let read = source.begin_read(Default::default()).await?;
-        let wave = super::partial_merge_runtime::captured_wave(
+        let wave = partial_merge_runtime::captured_wave(
             &read,
             &current.request,
             &current.accepted_tip,
@@ -513,7 +513,7 @@ pub(crate) async fn reconcile_pending_conversion_authenticated<
 ) -> Result<ReconciledPendingConversion, LixError> {
     use futures_util::FutureExt as _;
     let server = authenticated.server();
-    let transport = super::http::HttpSyncTransport::connect(&server.url, &server.headers).await?;
+    let transport = http::HttpSyncTransport::connect(&server.url, &server.headers).await?;
     let result = async {
         if transport.lix_id() != authenticated.state().repository_id()
             || transport.active_account_id() != authenticated.state().active_account_id()
@@ -533,7 +533,7 @@ pub(crate) async fn reconcile_pending_conversion_authenticated<
     }
     .await;
     let close = transport.close_session().fuse();
-    let timeout = super::platform::sleep(std::time::Duration::from_secs(1)).fuse();
+    let timeout = sleep(Duration::from_secs(1)).fuse();
     futures_util::pin_mut!(close, timeout);
     futures_util::select_biased! {_=close=>{},_=timeout=>{}};
     result
@@ -543,7 +543,7 @@ pub(crate) async fn reconcile_pending_conversion_authenticated<
 /// the original journal coordinates available for an exact retry.
 pub(crate) async fn cleanup_pending_conversion_authenticated(
     authenticated: &AuthenticatedPartialConversion,
-    journal: &crate::migration::PendingConversionJournal,
+    journal: &PendingConversionJournal,
 ) -> Result<(), LixError> {
     let pin = journal
         .native_source_pin
@@ -553,7 +553,7 @@ pub(crate) async fn cleanup_pending_conversion_authenticated(
         return Err(unresolved("cleanup lacks a durable native merge outcome"));
     }
     let server = authenticated.server();
-    let transport = super::http::HttpSyncTransport::connect(&server.url, &server.headers).await?;
+    let transport = http::HttpSyncTransport::connect(&server.url, &server.headers).await?;
     let result = async {
         if transport.lix_id() != authenticated.state().repository_id()
             || transport.active_account_id() != authenticated.state().active_account_id()
@@ -561,8 +561,8 @@ pub(crate) async fn cleanup_pending_conversion_authenticated(
             return Err(unresolved("cleanup authority identity changed"));
         }
         transport
-            .cleanup_native_migration(&super::NativeMigrationCleanupRequest {
-                migration: super::NativeMigrationMergeRequest {
+            .cleanup_native_migration(&NativeMigrationCleanupRequest {
+                migration: NativeMigrationMergeRequest {
                     request: journal.request.clone(),
                     source_branch_id: pin.clone(),
                 },
@@ -575,13 +575,13 @@ pub(crate) async fn cleanup_pending_conversion_authenticated(
     result
 }
 pub(crate) async fn finish_conversion_cleanup_bounded<
-    F: std::future::Future<Output = Result<(), LixError>>,
+    F: Future<Output = Result<(), LixError>>,
 >(
     cleanup: F,
 ) {
     use futures_util::FutureExt as _;
     let cleanup = cleanup.fuse();
-    let timeout = super::platform::sleep(std::time::Duration::from_secs(1)).fuse();
+    let timeout = sleep(Duration::from_secs(1)).fuse();
     futures_util::pin_mut!(cleanup, timeout);
     futures_util::select_biased! {_=cleanup=>{},_=timeout=>{}};
 }

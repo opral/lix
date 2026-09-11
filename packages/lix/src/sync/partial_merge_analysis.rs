@@ -164,7 +164,7 @@ pub(super) async fn prepare_partial_merge_analysis(
         .ok_or_else(|| blocked("global control disappeared"))?;
     if candidate.descriptor().global_branch.head.commit_id != global.confirmed.head
         || candidate.descriptor().global_branch.checkpoint.commit_id != global.confirmed.checkpoint
-        || global_control.head_commit_id.to_string() != global.confirmed.head
+        || global_control.head_commit_id != global.confirmed.head
         || global_control
             .working_diff_checkpoint_commit_id
             .map(|key| key.to_string())
@@ -272,7 +272,7 @@ pub(super) async fn analyze_native_kv_divergence(
             || node.account_id != account
             || node
                 .base_commit_id
-                .is_some_and(|key| key.to_string() != global_head.to_string())
+                .is_some_and(|key| key != global_head)
         {
             return Err(blocked(
                 "local suffix is not ordinary selected state at the confirmed catalog",

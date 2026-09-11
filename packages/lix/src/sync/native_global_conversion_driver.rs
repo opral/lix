@@ -43,7 +43,7 @@ pub(crate) async fn global_new_branch_upload_boundaries(
                     "new branch has no ordinary published authority boundary within migration limit",
                 ));
             }
-            let node = super::partial_merge_analysis::record(read, cursor, true).await?;
+            let node = partial_merge_analysis::record(read, cursor, true).await?;
             if node.is_checkpoint
                 || node.parent_commit_ids.len() != 1
                 || node.account_id != manifest.account_id
@@ -82,7 +82,7 @@ async fn prepare_wave(
     let target = match &frontier.prepared {
         Some(target) => id(target)?,
         None => {
-            super::partial_upload::wave_target(read, id(final_head)?, id(&frontier.accepted)?, 32)
+            partial_upload::wave_target(read, id(final_head)?, id(&frontier.accepted)?, 32)
                 .await?
         }
     };
@@ -93,7 +93,7 @@ async fn prepare_wave(
         if reverse.len() == 32 || !seen.insert(cursor) {
             return Err(unresolved("global prepared wave exceeded exact bound"));
         }
-        let commit = super::commit::load_sync_commit(read, cursor)
+        let commit = commit::load_sync_commit(read, cursor)
             .await?
             .ok_or_else(|| unresolved("frozen migration body is absent"))?;
         if commit.parent_commit_ids.len() != 1 {
@@ -118,12 +118,12 @@ async fn prepare_wave(
 }
 async fn reconcile_native_global_attempt<S, C>(
     storage: &StorageAdapter<S>,
-    transport: &super::http::HttpSyncTransport<C>,
+    transport: &http::HttpSyncTransport<C>,
     journal: &mut impl GlobalConversionJournalOwner,
 ) -> Result<NativeGlobalMigrationReceipt, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
-    C: super::http::RawHttpClient + Clone + 'static,
+    C: http::RawHttpClient + Clone + 'static,
 {
     journal.current().validate()?;
     // Global bodies establish original global bases before selected bodies use them.
@@ -173,7 +173,7 @@ where
                 journal
                     .publish(current.prepare_wave(&branch, &wave.previous_commit_id, &target)?)
                     .await?;
-                super::native_migration_pin_upload::prepare_native_migration_blobs(
+                native_migration_pin_upload::prepare_native_migration_blobs(
                     storage,
                     transport.active_account_id(),
                     transport,
@@ -206,7 +206,7 @@ where
         .await?;
     baseline.deadline.check(&baseline.wire.lease.lease_id)?;
     let leased = transport.fork_native_baseline_lease(&baseline.wire.lease)?;
-    let node = super::pending_conversion::graph(&leased, &receipt.merge_commit_id).await?;
+    let node = pending_conversion::graph(&leased, &receipt.merge_commit_id).await?;
     baseline.deadline.check(&baseline.wire.lease.lease_id)?;
     if node.base_commit_id.is_some()
         || node.account_id != transport.active_account_id()
@@ -224,13 +224,13 @@ where
 }
 async fn recover_global_restart<S, C>(
     storage: &StorageAdapter<S>,
-    transport: &super::http::HttpSyncTransport<C>,
+    transport: &http::HttpSyncTransport<C>,
     manifest: &FullConversionManifest,
     journal: &mut impl GlobalConversionJournalOwner,
 ) -> Result<(), LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
-    C: super::http::RawHttpClient + Clone + 'static,
+    C: http::RawHttpClient + Clone + 'static,
 {
     if journal.current().restart_intent.is_none() {
         journal
@@ -283,13 +283,13 @@ where
 /// authorize changing R or resetting acknowledged native body frontiers.
 pub(crate) async fn reconcile_native_global_conversion<S, C>(
     storage: &StorageAdapter<S>,
-    transport: &super::http::HttpSyncTransport<C>,
+    transport: &http::HttpSyncTransport<C>,
     manifest: &FullConversionManifest,
     journal: &mut impl GlobalConversionJournalOwner,
 ) -> Result<NativeGlobalMigrationReceipt, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
-    C: super::http::RawHttpClient + Clone + 'static,
+    C: http::RawHttpClient + Clone + 'static,
 {
     for _ in 0..8 {
         if journal.current().restart_intent.is_some() {
@@ -381,7 +381,7 @@ pub(crate) async fn reconcile_global_conversion_authenticated<
 ) -> Result<ReconciledGlobalConversion, LixError> {
     use futures_util::FutureExt as _;
     let server = authenticated.server();
-    let transport = super::http::HttpSyncTransport::connect(&server.url, &server.headers).await?;
+    let transport = http::HttpSyncTransport::connect(&server.url, &server.headers).await?;
     let result = async {
         if transport.lix_id() != authenticated.state().repository_id()
             || transport.active_account_id() != authenticated.state().active_account_id()
@@ -399,7 +399,7 @@ pub(crate) async fn reconcile_global_conversion_authenticated<
     }
     .await;
     let close = transport.close_session().fuse();
-    let timeout = super::platform::sleep(std::time::Duration::from_secs(1)).fuse();
+    let timeout = sleep(Duration::from_secs(1)).fuse();
     futures_util::pin_mut!(close, timeout);
     futures_util::select_biased! {_=close=>{},_=timeout=>{}};
     result
@@ -424,7 +424,7 @@ pub(crate) async fn verify_global_conversion_baseline_authenticated(
         ));
     }
     let server = authenticated.server();
-    let transport = super::http::HttpSyncTransport::connect(&server.url, &server.headers).await?;
+    let transport = http::HttpSyncTransport::connect(&server.url, &server.headers).await?;
     let result = async {
         if transport.lix_id() != proof.repository()
             || transport.active_account_id() != proof.account()
@@ -436,7 +436,7 @@ pub(crate) async fn verify_global_conversion_baseline_authenticated(
             .await?;
         baseline.deadline.check(&baseline.wire.lease.lease_id)?;
         let leased = transport.fork_native_baseline_lease(&baseline.wire.lease)?;
-        if !super::pending_conversion::includes(
+        if !pending_conversion::includes(
             &leased,
             &proof.receipt().merge_commit_id,
             &state.descriptor().global_branch.head.commit_id,
@@ -452,7 +452,7 @@ pub(crate) async fn verify_global_conversion_baseline_authenticated(
     }
     .await;
     let close = transport.close_session().fuse();
-    let timeout = super::platform::sleep(std::time::Duration::from_secs(1)).fuse();
+    let timeout = sleep(Duration::from_secs(1)).fuse();
     futures_util::pin_mut!(close, timeout);
     futures_util::select_biased! {_=close=>{},_=timeout=>{}};
     result
@@ -463,7 +463,7 @@ pub(crate) async fn cleanup_global_conversion_authenticated(
 ) -> Result<(), LixError> {
     use futures_util::FutureExt as _;
     let server = authenticated.server();
-    let transport = super::http::HttpSyncTransport::connect(&server.url, &server.headers).await?;
+    let transport = http::HttpSyncTransport::connect(&server.url, &server.headers).await?;
     let result = async {
         if transport.lix_id() != authenticated.state().repository_id()
             || transport.active_account_id() != authenticated.state().active_account_id()
@@ -475,7 +475,7 @@ pub(crate) async fn cleanup_global_conversion_authenticated(
     }
     .await;
     let close = transport.close_session().fuse();
-    let timeout = super::platform::sleep(std::time::Duration::from_secs(1)).fuse();
+    let timeout = sleep(Duration::from_secs(1)).fuse();
     futures_util::pin_mut!(close, timeout);
     futures_util::select_biased! {_=close=>{},_=timeout=>{}};
     result
@@ -493,7 +493,7 @@ pub(crate) async fn verify_resumed_global_basis_authenticated(
         return Err(unresolved("resumed branch global checkpoint changed"));
     }
     let server = authenticated.server();
-    let transport = super::http::HttpSyncTransport::connect(&server.url, &server.headers).await?;
+    let transport = http::HttpSyncTransport::connect(&server.url, &server.headers).await?;
     let result = async {
         if transport.lix_id() != proof.repository()
             || transport.active_account_id() != proof.account()
@@ -505,7 +505,7 @@ pub(crate) async fn verify_resumed_global_basis_authenticated(
             .await?;
         baseline.deadline.check(&baseline.wire.lease.lease_id)?;
         let leased = transport.fork_native_baseline_lease(&baseline.wire.lease)?;
-        if !super::pending_conversion::includes(
+        if !pending_conversion::includes(
             &leased,
             &proof.receipt().merge_commit_id,
             &request.global_head_commit_id,
@@ -521,7 +521,7 @@ pub(crate) async fn verify_resumed_global_basis_authenticated(
     }
     .await;
     let close = transport.close_session().fuse();
-    let timeout = super::platform::sleep(std::time::Duration::from_secs(1)).fuse();
+    let timeout = sleep(Duration::from_secs(1)).fuse();
     futures_util::pin_mut!(close, timeout);
     futures_util::select_biased! {_=close=>{},_=timeout=>{}};
     result

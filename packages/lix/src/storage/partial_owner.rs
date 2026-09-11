@@ -8,7 +8,10 @@ use std::sync::{Arc, Mutex, Weak};
 pub trait StorageOwnerGuard: Send + Sync + 'static {}
 
 #[derive(Clone)]
-pub struct StorageOwnerLease(Arc<dyn StorageOwnerGuard>);
+pub struct StorageOwnerLease {
+    // Retains the physical-store exclusion until the last lease is dropped.
+    _guard: Arc<dyn StorageOwnerGuard>,
+}
 impl std::fmt::Debug for StorageOwnerLease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StorageOwnerLease").finish_non_exhaustive()
@@ -16,7 +19,7 @@ impl std::fmt::Debug for StorageOwnerLease {
 }
 impl StorageOwnerLease {
     pub fn from_guard(guard: impl StorageOwnerGuard) -> Self {
-        Self(Arc::new(guard))
+        Self { _guard: Arc::new(guard) }
     }
 }
 
@@ -40,7 +43,7 @@ impl StorageOwnerGate {
         }
         let guard = Arc::new(GateGuard);
         *current = Arc::downgrade(&guard);
-        Ok(StorageOwnerLease(guard))
+        Ok(StorageOwnerLease { _guard: guard })
     }
 }
 

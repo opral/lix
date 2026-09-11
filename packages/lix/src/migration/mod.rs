@@ -18,7 +18,7 @@ pub(crate) use api::{
     migrate_lix_with_adapter,
 };
 pub(crate) use epoch::{
-    FreshEpochImport, PartialEpochAdmission, RetainedReplicaSource, admit_existing_repository,
+    FreshEpochImport, RetainedReplicaSource, admit_existing_repository,
     admit_partial_epoch, admit_repository_with_server, begin_fresh_epoch_import,
     convert_clean_replica_to_partial, has_partial_replica_marker, install_fresh_partial_epoch,
     list_retained_replica_sources, open_retained_replica_source, partial_epoch_has_no_markers,

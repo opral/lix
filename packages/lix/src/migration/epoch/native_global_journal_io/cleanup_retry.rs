@@ -8,7 +8,7 @@ pub(crate) async fn retry_published_global_conversion_cleanup<
     storage: &S,
     authenticated: &crate::sync::AuthenticatedPartialConversion,
 ) -> Result<usize, LixError> {
-    let admitted = super::super::partial::admit_partial_epoch(storage).await?;
+    let admitted = admit_partial_epoch(storage).await?;
     let expected = &admitted.state;
     if authenticated.state().repository_id() != expected.repository_id()
         || authenticated.state().active_account_id() != expected.active_account_id()

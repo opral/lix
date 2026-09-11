@@ -171,7 +171,7 @@ pub(crate) async fn require_unrestarted_identity(
         );
     }
     let address = StorageKey(Bytes::from(bytes));
-    let value = PointReadPlan::new(PARTIAL_ATTEMPT_RESTART_SPACE, &[address.clone()])
+    let value = PointReadPlan::new(PARTIAL_ATTEMPT_RESTART_SPACE, std::slice::from_ref(&address))
         .materialize(read, Default::default())
         .await?
         .value

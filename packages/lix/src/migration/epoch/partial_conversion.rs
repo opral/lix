@@ -13,7 +13,7 @@ pub(crate) async fn convert_clean_replica_to_partial<S>(
     storage: &S,
     authenticated: &crate::sync::AuthenticatedPartialConversion,
     progress: Option<&Arc<dyn OpenProgressSink>>,
-) -> Result<partial::PartialEpochAdmission<S>, LixError>
+) -> Result<PartialEpochAdmission<S>, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -27,7 +27,7 @@ where
             .is_some_and(|proof| proof.recovery_required);
     drop(read);
     if pending {
-        return super::pending_conversion::convert_pending_replica(
+        return pending_conversion::convert_pending_replica(
             storage,
             authenticated,
             admitted.adapter,
@@ -73,10 +73,10 @@ async fn convert_clean_replica_to_partial_inner<S, F>(
     server: &crate::ServerOptions,
     progress: Option<&Arc<dyn OpenProgressSink>>,
     finalized: F,
-) -> Result<partial::PartialEpochAdmission<S>, LixError>
+) -> Result<PartialEpochAdmission<S>, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
-    F: std::future::Future<Output = Result<crate::sync::FinalizedPartialConversion, LixError>>,
+    F: Future<Output = Result<crate::sync::FinalizedPartialConversion, LixError>>,
 {
     if load_pointer(storage).await?.is_none()
         && matches!(
@@ -160,7 +160,7 @@ where
             let control = crate::branch::BranchHeadControlContext::new().reader(&read)
                 .load(&branch.branch_id).await?
                 .ok_or_else(|| conversion_required("selected authority branch is absent locally; reconcile full sync before conversion"))?;
-            if control.head_commit_id.to_string() != branch.head.commit_id
+            if control.head_commit_id != branch.head.commit_id
                 || control.working_diff_checkpoint_commit_id.map(|id| id.to_string()).as_deref() != Some(branch.checkpoint.commit_id.as_str()) {
                 return Err(conversion_required("authority descriptor changed relative to acknowledged local refs; reconcile full sync before conversion"));
             }
@@ -192,7 +192,7 @@ where
             "LIX_PARTIAL_CONVERSION_EXPIRED_AFTER_PUBLICATION",
             "conversion became durable after baseline expiry; retained full source is preserved and fresh admission is required",
         ))?;
-        Ok(partial::PartialEpochAdmission {
+        Ok(PartialEpochAdmission {
             adapter: StorageAdapter::for_epoch(storage.clone(), target_bank, active), state: state.clone(),
         })
     }.await;
@@ -309,9 +309,9 @@ mod tests {
                     Ok(crate::sync::FinalizedPartialConversion::for_test(
                         state.clone(),
                         if monotonic_expired {
-                            std::time::Duration::ZERO
+                            Duration::ZERO
                         } else {
-                            std::time::Duration::from_secs(300)
+                            Duration::from_secs(300)
                         },
                     ))
                 }),
@@ -342,7 +342,7 @@ mod tests {
             } else {
                 let converted = converted.unwrap();
                 assert_eq!(
-                    partial::admit_partial_epoch(&storage).await.unwrap().state,
+                    admit_partial_epoch(&storage).await.unwrap().state,
                     state
                 );
                 assert_ne!(load_pointer(&storage).await.unwrap().unwrap().1, before);

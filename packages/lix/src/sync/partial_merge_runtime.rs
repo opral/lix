@@ -275,7 +275,7 @@ where
                     .await?
                     .ok_or_else(|| invalid("merge selected control disappeared"))?;
                 if outbox.is_none()
-                    && (control.head_commit_id.to_string() == push.confirmed.head
+                    && (control.head_commit_id == push.confirmed.head
                         || wrapper.wire.descriptor.selected_branch.head.commit_id
                             == push.confirmed.head)
                 {
@@ -283,13 +283,13 @@ where
                 }
                 if let Some(outbox) = &outbox {
                     if outbox.authority_receipt.is_none()
-                        || control.head_commit_id.to_string()
+                        || control.head_commit_id
                             == outbox.request.captured_local_head_commit_id
                     {
                         return Ok(true);
                     }
                 }
-                if wrapper.wire.descriptor.selected_branch.head.commit_id==control.head_commit_id.to_string() {
+                if wrapper.wire.descriptor.selected_branch.head.commit_id==control.head_commit_id {
                     return Err(LixError::new("LIX_PARTIAL_REPLICA_MERGE_RECOVERY_PENDING",
                         "authority already has the local head without a matching ordinary receipt; preserve local state for native inclusion settlement"));
                 }

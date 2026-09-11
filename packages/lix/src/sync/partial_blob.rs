@@ -263,7 +263,7 @@ where
         return Ok(());
     }
     let key = StorageKey(Bytes::copy_from_slice(requested.as_bytes()));
-    let marker = PointReadPlan::new(BINARY_CAS_CHUNK_DEMAND_SPACE, &[key.clone()])
+    let marker = PointReadPlan::new(BINARY_CAS_CHUNK_DEMAND_SPACE, std::slice::from_ref(&key))
         .materialize(&read, Default::default())
         .await?
         .value

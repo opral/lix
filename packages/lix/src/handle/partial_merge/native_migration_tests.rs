@@ -4,7 +4,7 @@ use super::*;
 // this cross-row UNIQUE collision. Failed merge must preserve both histories.
 #[tokio::test]
 async fn migration_native_merge_validates_disjoint_custom_unique_rows() {
-    let authority = crate::open_lix().await.unwrap();
+    let authority = open_lix().await.unwrap();
     authority
         .set_sync_role(crate::sync::SyncRole::Authority)
         .unwrap();
@@ -12,12 +12,12 @@ async fn migration_native_merge_validates_disjoint_custom_unique_rows() {
     authority
         .execute(
             "INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))",
-            &[crate::Value::Text(schema.to_string())],
+            &[Value::Text(schema.to_string())],
         )
         .await
         .unwrap();
     let branch = authority
-        .create_branch(crate::CreateBranchOptions {
+        .create_branch(CreateBranchOptions {
             id: None,
             name: "migration-source".into(),
             from_commit_id: None,
@@ -73,7 +73,7 @@ async fn migration_native_merge_validates_disjoint_custom_unique_rows() {
         .merge_native_migration_for_account(&request, authority.active_account_id(), &branch.id)
         .await
         .unwrap_err();
-    assert_eq!(error.code, crate::LixError::CODE_UNIQUE);
+    assert_eq!(error.code, LixError::CODE_UNIQUE);
     assert_eq!(
         authority
             .partial_replica_descriptor(None)
@@ -98,7 +98,7 @@ async fn migration_native_merge_validates_disjoint_custom_unique_rows() {
 
 #[tokio::test]
 async fn migration_native_merge_preserves_custom_indexes_and_exact_outcome() {
-    let authority = crate::open_lix().await.unwrap();
+    let authority = open_lix().await.unwrap();
     authority
         .set_sync_role(crate::sync::SyncRole::Authority)
         .unwrap();
@@ -106,12 +106,12 @@ async fn migration_native_merge_preserves_custom_indexes_and_exact_outcome() {
     authority
         .execute(
             "INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))",
-            &[crate::Value::Text(schema.to_string())],
+            &[Value::Text(schema.to_string())],
         )
         .await
         .unwrap();
     let branch = authority
-        .create_branch(crate::CreateBranchOptions {
+        .create_branch(CreateBranchOptions {
             id: None,
             name: "migration-source".into(),
             from_commit_id: None,
@@ -206,7 +206,7 @@ async fn migration_native_merge_preserves_custom_indexes_and_exact_outcome() {
 
 #[tokio::test]
 async fn migration_native_merge_preserves_ordinary_file_content() {
-    let authority = crate::open_lix().await.unwrap();
+    let authority = open_lix().await.unwrap();
     authority
         .set_sync_role(crate::sync::SyncRole::Authority)
         .unwrap();
@@ -219,7 +219,7 @@ async fn migration_native_merge_preserves_ordinary_file_content() {
         .await
         .unwrap();
     let branch = authority
-        .create_branch(crate::CreateBranchOptions {
+        .create_branch(CreateBranchOptions {
             id: None,
             name: "migration-source".into(),
             from_commit_id: None,
@@ -312,7 +312,7 @@ async fn migration_native_merge_preserves_ordinary_file_content() {
 
 #[tokio::test]
 async fn migration_native_merge_validates_reverse_foreign_key_deletion() {
-    let authority = crate::open_lix().await.unwrap();
+    let authority = open_lix().await.unwrap();
     authority
         .set_sync_role(crate::sync::SyncRole::Authority)
         .unwrap();
@@ -322,7 +322,7 @@ async fn migration_native_merge_validates_reverse_foreign_key_deletion() {
         authority
             .execute(
                 "INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))",
-                &[crate::Value::Text(schema.to_string())],
+                &[Value::Text(schema.to_string())],
             )
             .await
             .unwrap();
@@ -332,7 +332,7 @@ async fn migration_native_merge_validates_reverse_foreign_key_deletion() {
         .await
         .unwrap();
     let branch = authority
-        .create_branch(crate::CreateBranchOptions {
+        .create_branch(CreateBranchOptions {
             id: None,
             name: "migration-source".into(),
             from_commit_id: None,
@@ -385,7 +385,7 @@ async fn migration_native_merge_validates_reverse_foreign_key_deletion() {
         .merge_native_migration_for_account(&request, authority.active_account_id(), &branch.id)
         .await
         .unwrap_err();
-    assert_eq!(error.code, crate::LixError::CODE_FOREIGN_KEY);
+    assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
     assert_eq!(
         authority
             .partial_replica_descriptor(None)
@@ -410,7 +410,7 @@ async fn migration_native_merge_validates_reverse_foreign_key_deletion() {
 
 #[tokio::test]
 async fn migration_native_merge_validates_file_changes_without_remote_edits() {
-    let authority = crate::open_lix().await.unwrap();
+    let authority = open_lix().await.unwrap();
     authority
         .set_sync_role(crate::sync::SyncRole::Authority)
         .unwrap();
@@ -423,7 +423,7 @@ async fn migration_native_merge_validates_file_changes_without_remote_edits() {
         .await
         .unwrap();
     let branch = authority
-        .create_branch(crate::CreateBranchOptions {
+        .create_branch(CreateBranchOptions {
             id: None,
             name: "migration-source".into(),
             from_commit_id: None,
@@ -516,7 +516,7 @@ async fn migration_native_merge_validates_file_changes_without_remote_edits() {
 
 #[tokio::test]
 async fn migration_cleanup_fences_changed_surviving_head_and_retries_exactly() {
-    let authority = crate::open_lix().await.unwrap();
+    let authority = open_lix().await.unwrap();
     authority
         .set_sync_role(crate::sync::SyncRole::Authority)
         .unwrap();
@@ -524,12 +524,12 @@ async fn migration_cleanup_fences_changed_surviving_head_and_retries_exactly() {
     authority
         .execute(
             "INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))",
-            &[crate::Value::Text(schema.to_string())],
+            &[Value::Text(schema.to_string())],
         )
         .await
         .unwrap();
     let branch = authority
-        .create_branch(crate::CreateBranchOptions {
+        .create_branch(CreateBranchOptions {
             id: None,
             name: "migration-source".into(),
             from_commit_id: None,

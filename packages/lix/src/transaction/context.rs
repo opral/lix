@@ -970,9 +970,9 @@ type NativePreparationResult = Result<
     (
         StorageWriteSet,
         StorageWriteOptions,
-        Vec<crate::hot_state::MaterializedHotStateRow>,
+        Vec<MaterializedHotStateRow>,
         Option<Vec<u8>>,
-        Option<crate::catalog::CatalogRevision>,
+        Option<CatalogRevision>,
     ),
     LixError,
 >;
@@ -1169,7 +1169,7 @@ where
                 "migration requires a validated native merge outcome",
             )
         })?;
-        let merge = crate::changelog::CommitId::parse_lix(merge, "native migration outcome")?;
+        let merge = CommitId::parse_lix(merge, "native migration outcome")?;
         self.stage_partial_authority_merge_receipt(admission.into_receipt(merge)?)
     }
 
@@ -1252,7 +1252,7 @@ where
                     .load_projected_batch_at_commit_refs(
                         &selected.source_commit_id.to_string(),
                         &[key],
-                        &crate::changelog::ChangeRecordProjection::full(),
+                        &ChangeRecordProjection::full(),
                     )
                     .await?;
                 let row = rows.row(0).ok_or_else(|| {
@@ -1396,7 +1396,7 @@ where
             ));
         }
         let mut selected =
-        crate::transaction::staged_commit_changes::StagedCommitChangeBatchBuilder::with_capacity(
+        StagedCommitChangeBatchBuilder::with_capacity(
             plan.groups().iter().map(|group| group.picks.len()).sum(),
         );
         for group in plan.groups() {
@@ -2557,7 +2557,7 @@ where
                     if &current != bound.as_ref() {
                         return Err(mismatch());
                     }
-                    Some(crate::storage_adapter::StoragePrecondition::KeyValueEquals {
+                    Some(StoragePrecondition::KeyValueEquals {
                         space: crate::sync::PARTIAL_REPLICA_STATE_SPACE,
                         key: crate::sync::partial_replica_state_key(), expected: raw,
                     })

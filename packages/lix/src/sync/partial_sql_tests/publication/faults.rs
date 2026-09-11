@@ -39,7 +39,7 @@ impl Storage for AcceptanceStorage {
     }
     async fn acquire_partial_replica_owner(
         &self,
-        token: crate::storage::StorageSessionToken,
+        token: StorageSessionToken,
     ) -> Result<crate::storage::StorageOwnerLease, StorageError> {
         self.memory.acquire_partial_replica_owner(token).await
     }

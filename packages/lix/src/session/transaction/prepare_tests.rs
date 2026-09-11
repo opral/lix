@@ -1,5 +1,4 @@
 
-use super::*;
 use crate::Value;
 use crate::sql2::validate_sql_preparation as admitted_update;
 #[test]

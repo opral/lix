@@ -99,16 +99,16 @@ fn admission_bytes(
     keys: &[TrackedStateKeyRef<'_>],
     batch: &MaterializedTrackedStateExactBatch,
 ) -> Option<usize> {
-    let mut bytes = std::mem::size_of::<Entry>();
+    let mut bytes = size_of::<Entry>();
     for key in keys {
         bytes = bytes
-            .checked_add(std::mem::size_of::<TrackedStateKey>())?
+            .checked_add(size_of::<TrackedStateKey>())?
             .checked_add(key.schema_key.len())?
             .checked_add(key.file_id.map_or(0, str::len))?
             .checked_add(key.row_pk.estimated_heap_bytes())?;
     }
     for index in 0..batch.len() {
-        bytes = bytes.checked_add(std::mem::size_of::<Option<u32>>())?;
+        bytes = bytes.checked_add(size_of::<Option<u32>>())?;
         if let Some(row) = batch.row(index) {
             bytes = bytes
                 .checked_add(256)?
@@ -288,7 +288,7 @@ mod tests {
         writes.put(
             COLLECTION_CONTROL_SPACE,
             hot_collection_control_key(&branch, generation, scope),
-            crate::storage_codec::encode(
+            storage_codec::encode(
                 "hot collection control",
                 &HotCollectionControl {
                     active_generation: CommitId::for_test_label("replacement-generation"),

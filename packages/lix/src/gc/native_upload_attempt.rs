@@ -234,7 +234,7 @@ pub(crate) async fn stage_accepted_native_upload_wave(
             None,
         )
     };
-    if state.accepted_tip != proof.tip().to_string() {
+    if state.accepted_tip != proof.tip() {
         state.accepted_commits = state
             .accepted_commits
             .checked_add(proof.commit_count())

@@ -89,8 +89,8 @@ pub(crate) async fn load_native_global_migration_receipt(
 /// Capability constructed only after an authority-owned plan has staged its
 /// native merge commit. This type does not itself certify a plan or lease.
 pub(crate) struct PreparedNativeGlobalMigrationReceipt {
-    repository_id: String,
-    account_id: String,
+    _repository_id: String,
+    _account_id: String,
     receipt: NativeGlobalMigrationReceipt,
     writes: StorageWriteSet,
     guards: Vec<StoragePrecondition>,
@@ -142,24 +142,12 @@ impl PreparedNativeGlobalMigrationReceipt {
             key: address,
         });
         Ok(Self {
-            repository_id: repository.into(),
-            account_id: account.into(),
+            _repository_id: repository.into(),
+            _account_id: account.into(),
             receipt,
             writes,
             guards,
         })
-    }
-    pub(crate) fn repository_id(&self) -> &str {
-        &self.repository_id
-    }
-    pub(crate) fn receipt(&self) -> &NativeGlobalMigrationReceipt {
-        &self.receipt
-    }
-    pub(crate) fn account_id(&self) -> &str {
-        &self.account_id
-    }
-    pub(crate) fn merge_commit_id(&self) -> Result<CommitId, LixError> {
-        CommitId::parse_lix(&self.receipt.merge_commit_id, "prepared authority merge")
     }
     pub(crate) fn into_parts(
         self,
