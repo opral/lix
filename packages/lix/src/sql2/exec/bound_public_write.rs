@@ -42,7 +42,6 @@ use crate::transaction_types::{
     TypedMutationJournalBatch,
 };
 use crate::{LixError, NullableKeyFilter, Value, parse_row_metadata_value};
-use crate::{PreparedDmlParameterBatch, PreparedDmlValueRef};
 
 use super::SqlWriteResult;
 
@@ -114,7 +113,6 @@ pub(crate) enum BoundPublicWriteExecution {
 enum RowInsertParameterBatch<'a> {
     Arrow(&'a RecordBatch),
     Values(&'a [&'a [Value]]),
-    Prepared(&'a PreparedDmlParameterBatch),
 }
 
 enum CertifiedRowInsertParameterBatch {
@@ -153,7 +151,6 @@ impl<'a> RowInsertParameterBatch<'a> {
         match self {
             Self::Arrow(batch) => batch.num_rows(),
             Self::Values(rows) => rows.len(),
-            Self::Prepared(batch) => batch.row_count(),
         }
     }
 
@@ -161,7 +158,6 @@ impl<'a> RowInsertParameterBatch<'a> {
         match self {
             Self::Arrow(batch) => batch.num_columns(),
             Self::Values(rows) => rows.first().map_or(0, |row| row.len()),
-            Self::Prepared(batch) => batch.column_count(),
         }
     }
 
@@ -195,18 +191,6 @@ impl<'a> RowInsertParameterBatch<'a> {
                         )
                 )
             }),
-            Self::Prepared(batch) => (0..batch.row_count()).all(|row| {
-                matches!(
-                    (column_type, batch.value(row, parameter_index)),
-                    (
-                        SchemaColumnType::String,
-                        PreparedDmlValueRef::Text(_) | PreparedDmlValueRef::Null
-                    ) | (
-                        SchemaColumnType::Boolean,
-                        PreparedDmlValueRef::Boolean(_) | PreparedDmlValueRef::Null
-                    )
-                )
-            }),
         }
     }
 
@@ -233,12 +217,6 @@ impl<'a> RowInsertParameterBatch<'a> {
                 Value::Boolean(value) => DirectParameterValue::Boolean(*value),
                 _ => unreachable!("direct parameter value type was certified"),
             },
-            Self::Prepared(batch) => match batch.value(row_index, parameter_index) {
-                PreparedDmlValueRef::Null => DirectParameterValue::Null,
-                PreparedDmlValueRef::Text(value) => DirectParameterValue::String(value),
-                PreparedDmlValueRef::Boolean(value) => DirectParameterValue::Boolean(value),
-                _ => unreachable!("direct parameter value type was certified"),
-            },
         }
     }
 }
@@ -259,84 +237,6 @@ pub(crate) async fn try_execute_row_insert_parameter_batch(
         true,
     )
     .await
-}
-
-pub(crate) async fn try_execute_row_insert_prepared_batch(
-    ctx: &mut dyn SqlWriteExecutionContext,
-    plan: &LogicalWritePlan,
-    parameter_batch: &PreparedDmlParameterBatch,
-) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
-    try_execute_row_insert_batch(
-        ctx,
-        plan,
-        RowInsertParameterBatch::Prepared(parameter_batch),
-        true,
-    )
-    .await
-}
-
-/// Executes the prepared single-row lix_file path shape in one provider batch.
-/// This keeps Git replay on the same production parameter-page contract while
-/// preserving its explicit marker barrier in the surrounding transaction.
-pub(crate) async fn try_execute_file_prepared_batch(
-    ctx: &mut dyn SqlWriteExecutionContext,
-    plan: &LogicalWritePlan,
-    parameter_batch: &PreparedDmlParameterBatch,
-) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
-    let BoundWriteTarget::File(surface) = &plan.bound.target else {
-        return Ok(None);
-    };
-    let Some(shape) = fast_file_path_write_shape(plan, surface) else {
-        return Ok(None);
-    };
-    let BoundWriteInput::Values(values) = &plan.bound.input else {
-        return Ok(None);
-    };
-    if values.rows.len() != 1 || parameter_batch.column_count() != values.columns.len() {
-        return Ok(None);
-    }
-    let metadata = ExecuteStatementMetadata::default();
-    let mut writes = Vec::with_capacity(parameter_batch.row_count());
-    for row_index in 0..parameter_batch.row_count() {
-        let params = parameter_batch.row_values(row_index)?;
-        let row = &values.rows[0];
-        writes.push((
-            shape
-                .id_index
-                .map(|index| eval_fast_file_text(&row[index], &params, "id"))
-                .transpose()?,
-            eval_fast_file_text(&row[shape.path_index], &params, "path")?,
-            eval_fast_file_blob(&row[shape.data_index], &params, "content")?,
-            shape
-                .metadata_index
-                .map(|index| eval_fast_file_metadata(&row[index], &params))
-                .transpose()?
-                .flatten(),
-            fast_file_blob_expr_splice_provenance(&row[shape.data_index], &metadata),
-        ));
-    }
-    let affected = crate::sql2::providers::execute_fast_lix_file_id_path_writes(
-        ctx,
-        writes,
-        shape.conflict,
-        metadata.mutation_identity(),
-    )
-    .await?;
-    if affected != Some(parameter_batch.row_count() as u64) {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "prepared lix_file batch affected {:?} rows, expected {}",
-                affected,
-                parameter_batch.row_count()
-            ),
-        ));
-    }
-    Ok(Some(
-        (0..parameter_batch.row_count())
-            .map(|_| SqlWriteResult::affected(1))
-            .collect(),
-    ))
 }
 
 pub(crate) async fn try_execute_row_insert_value_batch<'a>(
@@ -626,7 +526,7 @@ async fn try_execute_row_update_batch(
                 )
             })
         }
-        RowInsertParameterBatch::Values(_) | RowInsertParameterBatch::Prepared(_) => None,
+        RowInsertParameterBatch::Values(_) => None,
     };
     let mut parameter_rows = Vec::with_capacity(parameter_batch.num_rows());
     let mut row_pks = Vec::<RowPk>::with_capacity(parameter_batch.num_rows());
@@ -850,26 +750,13 @@ async fn try_execute_row_update_batch(
     ))
 }
 
-pub(crate) async fn try_execute_row_update_prepared_batch(
-    ctx: &mut dyn SqlWriteExecutionContext,
-    plan: &LogicalWritePlan,
-    parameter_batch: &PreparedDmlParameterBatch,
-) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
-    try_execute_row_update_batch(
-        ctx,
-        plan,
-        RowInsertParameterBatch::Prepared(parameter_batch),
-    )
-    .await
-}
-
 fn parameter_batch_row_values(
     parameter_batch: RowInsertParameterBatch<'_>,
     row_index: usize,
 ) -> Result<Vec<Value>, LixError> {
     match parameter_batch {
         RowInsertParameterBatch::Arrow(batch) => super::write::parameter_row(batch, row_index),
-        RowInsertParameterBatch::Prepared(batch) => batch.row_values(row_index),
+
         RowInsertParameterBatch::Values(rows) => {
             rows.get(row_index).map(|row| row.to_vec()).ok_or_else(|| {
                 LixError::new(
@@ -3572,7 +3459,7 @@ fn returning_expr_column_type(
         {
             "lixcol_metadata" => Some(crate::ResultColumnType::Jsonb),
             "lixcol_global" | "lixcol_untracked" => Some(crate::ResultColumnType::Boolean),
-            "lixcol_schema_key" | "lixcol_file_id" | "lixcol_created_at" | "lixcol_updated_at"
+            "lixcol_file_id" | "lixcol_created_at" | "lixcol_updated_at"
             | "lixcol_change_id" | "lixcol_commit_id" => Some(crate::ResultColumnType::Text),
             _ => None,
         },
@@ -4466,7 +4353,7 @@ fn certified_row_insert_parameter_batch(
                 RowInsertParameterBatch::Arrow(batch) => {
                     super::write::parameter_row(batch, statement_index)
                 }
-                RowInsertParameterBatch::Prepared(batch) => batch.row_values(statement_index),
+
                 RowInsertParameterBatch::Values(rows) => rows
                     .get(statement_index)
                     .map(|row| row.to_vec())
@@ -5649,13 +5536,6 @@ enum RowEvalRowRef<'a> {
 }
 
 impl<'a> RowEvalRowRef<'a> {
-    fn schema_key(self) -> &'a str {
-        match self {
-            Self::Live(row) => row.schema_key(),
-            Self::Staged(row) => row.schema_key.as_str(),
-        }
-    }
-
     fn file_id(self) -> Option<&'a str> {
         match self {
             Self::Live(row) => row.file_id(),
@@ -7218,9 +7098,6 @@ fn column_eval_value(
         return Ok(RowEvalValue::SqlNull);
     };
     match column_name {
-        "lixcol_schema_key" => Ok(RowEvalValue::Json(JsonValue::String(
-            row.schema_key().to_string(),
-        ))),
         "lixcol_file_id" => Ok(row
             .file_id()
             .map(|value| RowEvalValue::Json(JsonValue::String(value.to_string())))
@@ -7292,9 +7169,6 @@ fn excluded_column_eval_value(
         return Ok(RowEvalValue::SqlNull);
     };
     match column_name {
-        "lixcol_schema_key" => Ok(RowEvalValue::Json(JsonValue::String(
-            row.schema_key.to_string(),
-        ))),
         "lixcol_file_id" => Ok(row
             .file_id
             .map(|value| RowEvalValue::Json(JsonValue::String(value.to_string())))

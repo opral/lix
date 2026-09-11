@@ -3,6 +3,7 @@
 #![cfg_attr(test, allow(clippy::large_futures))]
 
 use super::PROTOCOL_VERSION;
+use super::request_value::RequestWireValue;
 use crate::engine::Engine;
 use crate::session::ExecuteOptions;
 #[cfg(test)]
@@ -105,6 +106,14 @@ impl ServerProtocolBody {
     }
 
     pub(super) async fn into_bytes(mut self, limit: usize) -> Result<Bytes, ApiError> {
+        if let ServerProtocolBodyInner::Full(bytes) = &mut self.inner {
+            let bytes = bytes.take().unwrap_or_default();
+            return if bytes.len() > limit {
+                Err(ApiError::payload_too_large(limit))
+            } else {
+                Ok(bytes)
+            };
+        }
         let mut collected = Vec::new();
         while let Some(frame) =
             std::future::poll_fn(|context| Pin::new(&mut self).poll_frame(context)).await
@@ -367,10 +376,9 @@ pub const FILE_UPLOAD_ID_HEADER: &str = "lix-upload-id";
 pub const DEFAULT_MAX_SESSIONS: usize = 64;
 /// Default idle lifetime for a remote session.
 pub const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_mins(30);
-/// Default JSON request ceiling. Base64 expands blobs by roughly one third,
-/// so 64 MiB carries the engine's 32 MiB maximum plugin archive with room for
-/// the SQL envelope and also covers ordinary larger document blobs.
-pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// No application-level request-body ceiling by default. Hosts that require a
+/// byte budget can set [`ServerProtocolOptions::max_request_body_bytes`].
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = usize::MAX;
 /// Largest number of file entries accepted by one native batch request.
 ///
 /// Keeping this bounded makes the fast path predictable for the normal bulk
@@ -1952,15 +1960,19 @@ where
         };
 
         macro_rules! json_request {
-            ($ty:ty) => {
-                match serde_json::from_slice::<$ty>(&body) {
+            ($ty:ty) => {{
+                let parsed = serde_json::from_slice::<$ty>(&body);
+                // Request types own their decoded fields. Release the raw
+                // body before hashing or executing a large SQL upload.
+                drop(body);
+                match parsed {
                     Ok(value) => Json(value),
                     Err(error) => {
                         return ApiError::bad_request(format!("invalid JSON request: {error}"))
                             .into_response();
                     }
                 }
-            };
+            }};
         }
 
         match route {
@@ -5073,20 +5085,6 @@ struct ExecuteBatchStatementRequest {
     label: Option<String>,
 }
 
-#[derive(Serialize)]
-struct ExecuteFingerprint<'a> {
-    sql: &'a str,
-    params: &'a [Value],
-    origin_key: Option<&'a str>,
-    label: Option<&'a str>,
-}
-
-#[derive(Serialize)]
-struct ExecuteBatchFingerprint<'a> {
-    statements: Vec<ExecuteFingerprint<'a>>,
-    origin_key: Option<&'a str>,
-}
-
 fn execute_idempotency(
     headers: &HeaderMap,
     scope: Option<String>,
@@ -5097,15 +5095,7 @@ fn execute_idempotency(
     let Some(key) = optional_idempotency_key(headers)? else {
         return Ok(None);
     };
-    let fingerprint = idempotency_fingerprint(
-        "execute",
-        &ExecuteFingerprint {
-            sql,
-            params,
-            origin_key,
-            label: None,
-        },
-    )?;
+    let fingerprint = super::fingerprint::execute(sql, params, origin_key);
     Ok(Some(ExecuteIdempotency::new(scope, key, fingerprint)))
 }
 
@@ -5118,21 +5108,7 @@ fn execute_batch_idempotency(
     let Some(key) = optional_idempotency_key(headers)? else {
         return Ok(None);
     };
-    let fingerprint = idempotency_fingerprint(
-        "execute-batch",
-        &ExecuteBatchFingerprint {
-            statements: statements
-                .iter()
-                .map(|statement| ExecuteFingerprint {
-                    sql: &statement.sql,
-                    params: &statement.params,
-                    origin_key: None,
-                    label: statement.label.as_deref(),
-                })
-                .collect(),
-            origin_key,
-        },
-    )?;
+    let fingerprint = super::fingerprint::batch(statements, origin_key);
     Ok(Some(ExecuteIdempotency::new(scope, key, fingerprint)))
 }
 
@@ -5198,56 +5174,6 @@ fn require_octet_stream_content_type(headers: &HeaderMap) -> Result<(), ApiError
     }
 }
 
-fn idempotency_fingerprint(
-    operation: &'static str,
-    payload: &impl Serialize,
-) -> Result<[u8; 32], ApiError> {
-    #[derive(Serialize)]
-    struct Envelope<'a, T: ?Sized> {
-        version: u8,
-        operation: &'static str,
-        payload: &'a T,
-    }
-
-    let bytes = serde_json::to_vec(&Envelope {
-        version: 1,
-        operation,
-        payload,
-    })
-    .map_err(|error| {
-        ApiError::from(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("serialize idempotency request fingerprint: {error}"),
-        ))
-    })?;
-    Ok(Sha256::digest(bytes).into())
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum RequestWireValue {
-    BlobSplice(RequestBlobSplice),
-    Value(WireValue),
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RequestBlobSplice {
-    #[serde(rename = "kind")]
-    _kind: RequestBlobSpliceKind,
-    base_sha256: String,
-    result_sha256: String,
-    prefix_bytes: u64,
-    suffix_bytes: u64,
-    insert_base64: String,
-}
-
-#[derive(Debug, Deserialize)]
-enum RequestBlobSpliceKind {
-    #[serde(rename = "blob-splice")]
-    BlobSplice,
-}
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExecuteResponse {
@@ -5259,6 +5185,15 @@ struct ExecuteResponse {
     rows: Vec<Vec<WireValue>>,
     rows_affected: u64,
     notices: Vec<lix::LixNotice>,
+    /// The active-branch commits a write moved between; absent for reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commit: Option<CommitSpanResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct CommitSpanResponse {
+    before: String,
+    after: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -5295,6 +5230,10 @@ impl TryFrom<ExecuteResult> for ExecuteResponse {
             rows,
             rows_affected: result.rows_affected(),
             notices: result.notices().to_vec(),
+            commit: result.commit().map(|span| CommitSpanResponse {
+                before: span.before().to_owned(),
+                after: span.after().to_owned(),
+            }),
         })
     }
 }
@@ -11734,6 +11673,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_responses_carry_the_commit_span_of_writes() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let head = |sql: &'static str| {
+            let router = app.router.clone();
+            let session_id = session_id.clone();
+            async move {
+                let response = request(
+                    &router,
+                    "POST",
+                    "/lix/v1/execute",
+                    Some(&session_id),
+                    Some(json!({ "sql": sql, "params": [] })),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                response_json(response).await
+            }
+        };
+        let read = head("SELECT lix_active_branch_commit_id() AS commit_id").await;
+        assert!(read.get("commit").is_none(), "reads carry no span: {read}");
+        let before = read["rows"][0][0]["value"].as_str().unwrap().to_owned();
+
+        let written =
+            head("INSERT INTO lix_key_value (key, value) VALUES ('span-http', 'one')").await;
+        assert_eq!(written["commit"]["before"], json!(before));
+        let after = written["commit"]["after"].as_str().unwrap().to_owned();
+        assert_ne!(after, before);
+
+        let now = head("SELECT lix_active_branch_commit_id() AS commit_id").await;
+        assert_eq!(now["rows"][0][0]["value"], json!(after));
+
+        let batch = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute-batch",
+            Some(&session_id),
+            Some(json!({
+                "statements": [
+                    { "sql": "INSERT INTO lix_key_value (key, value) VALUES ('span-http-b', 'one')", "params": [] },
+                    { "sql": "SELECT 1 AS value", "params": [] }
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(batch.status(), StatusCode::OK);
+        let batch = response_json(batch).await;
+        assert_eq!(batch[0]["commit"]["before"], json!(after));
+        assert_eq!(batch[1]["commit"], batch[0]["commit"], "one span per batch");
+    }
+
+    #[tokio::test]
     async fn execute_batch_metadata_and_returning_work_in_memory() {
         assert_execute_batch_metadata(Memory::default()).await;
     }
@@ -12737,6 +12728,35 @@ mod tests {
         )
         .await;
         assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn full_body_limit_preserves_shared_bytes_without_copying() {
+        let bytes = Bytes::from(vec![b'x'; 1024 * 1024]);
+        let body = ServerProtocolBody::full(bytes.clone())
+            .into_bytes(bytes.len())
+            .await
+            .expect("body at the exact limit");
+        assert_eq!(body.as_ptr(), bytes.as_ptr());
+        assert_eq!(body, bytes);
+        assert!(
+            ServerProtocolBody::full(bytes.clone())
+                .into_bytes(bytes.len() - 1)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn default_body_limit_accepts_stream_larger_than_64_mib() {
+        let chunk = Bytes::from(vec![b'x'; 1024 * 1024]);
+        let stream =
+            futures_util::stream::iter((0..65).map(move |_| Ok::<_, io::Error>(chunk.clone())));
+        let body = ServerProtocolBody::stream(stream)
+            .into_bytes(ServerProtocolOptions::default().max_request_body_bytes)
+            .await
+            .expect("default protocol budget must accept bulk imports over 64 MiB");
+        assert_eq!(body.len(), 65 * 1024 * 1024);
     }
 
     #[tokio::test]

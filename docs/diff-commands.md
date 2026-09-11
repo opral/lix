@@ -6,7 +6,9 @@ description: Compare typed Lix relations across commits and select rows atomical
 
 `lix_diff(relation, from_commit_id, to_commit_id)` compares one relation across
 two explicitly selected commits. With only the relation argument it defaults
-to latest checkpoint → active head. A file is one row of `lix_file`; a
+to latest checkpoint → active head. A write's own span is on its result:
+`execute` returns `commit: { before, after }`, and `lix_diff('lix_file',
+before, after)` is exactly what that write changed. A file is one row of `lix_file`; a
 registered schema row is one row of its schema relation. Commands consume the
 diff's `row_ref` identity, so selecting a file also selects its underlying
 tracked content.

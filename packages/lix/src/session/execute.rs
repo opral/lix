@@ -37,7 +37,6 @@ use super::ExecuteIdempotency;
 use super::context::{SessionContext, SessionSqlExecutionContext};
 use super::idempotency::{ExecuteIdempotencyReceipt, load_receipt};
 use super::transaction::{SessionTransaction, transaction_state_error};
-use crate::PreparedDmlParameterBatch;
 
 const MAX_INITIAL_LITERAL_COLUMN_BYTES: usize = 64 * 1024 * 1024;
 const MAX_AUTO_COMMIT_RETRIES: usize = 16;
@@ -74,6 +73,40 @@ impl LiteralParameterBuilder {
     }
 }
 
+/// The active-branch commits a write moved between.
+///
+/// `before` is the active branch's head before the write and `after` the head
+/// it published, so `lix_diff('lix_file', before, after)` is exactly what the
+/// write changed. A write that published no commit on the active branch
+/// reports both ids equal; a restore reports the commit it moved the head to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitSpan {
+    before: String,
+    after: String,
+}
+
+impl CommitSpan {
+    pub(crate) fn new(before: String, after: String) -> Self {
+        Self { before, after }
+    }
+
+    pub(crate) fn from_commit_ids(
+        (before, after): (crate::changelog::CommitId, crate::changelog::CommitId),
+    ) -> Self {
+        Self::new(before.to_string(), after.to_string())
+    }
+
+    /// The head the write committed on top of.
+    pub fn before(&self) -> &str {
+        &self.before
+    }
+
+    /// The head the write published.
+    pub fn after(&self) -> &str {
+        &self.after
+    }
+}
+
 /// Result of executing one SQL statement through engine.
 ///
 /// Column names live once at the result-set level. Individual rows only own
@@ -88,6 +121,8 @@ pub struct ExecuteResult {
     /// empty case inline avoids one Arc clone/drop pair for every scalar write.
     backing: Option<Arc<ExecuteResultBacking>>,
     rows_affected: u64,
+    /// Present on results of statements that committed a write.
+    commit: Option<CommitSpan>,
     checkpoint_telemetry: Option<(String, String)>,
     #[cfg(feature = "storage-benches")]
     profile_provider_rows_examined: u64,
@@ -112,6 +147,10 @@ struct ColumnarResult {
     batches: Arc<[RecordBatch]>,
 }
 
+/// Equality compares what a statement returned: its position, label, rows,
+/// affected count, and notices. Where it ran (`commit`, telemetry) is
+/// execution context and stays out, so a result can be compared with one
+/// built from its parts.
 impl PartialEq for ExecuteResult {
     fn eq(&self, other: &Self) -> bool {
         self.statement_index == other.statement_index
@@ -180,6 +219,29 @@ impl ExecuteResult {
         self.statement_label.as_deref()
     }
 
+    /// The commits a write moved the active branch between.
+    ///
+    /// `Some` for every auto-committed write statement, including `RETURNING`
+    /// writes, and for every statement of a written batch (all carry the
+    /// batch's one span, read statements included). A write that published
+    /// no commit on the active branch reports both ids equal. `None` for read
+    /// statements outside a written batch, read-only batches, statements
+    /// inside an explicit transaction (whose commit is the write), and the
+    /// first commit on a branch that had no head yet.
+    pub fn commit(&self) -> Option<&CommitSpan> {
+        self.commit.as_ref()
+    }
+
+    /// Sets the span when one is known. `None` leaves an earlier span in
+    /// place, so the post-commit stamp never erases the staging-time span a
+    /// receipt already carries.
+    pub(crate) fn with_commit(mut self, commit: Option<CommitSpan>) -> Self {
+        if commit.is_some() {
+            self.commit = commit;
+        }
+        self
+    }
+
     fn with_batch_metadata(mut self, statement_index: usize, label: Option<String>) -> Self {
         self.statement_index = Some(statement_index);
         self.statement_label = label;
@@ -243,6 +305,7 @@ impl ExecuteResult {
             statement_label: None,
             backing: None,
             rows_affected,
+            commit: None,
             checkpoint_telemetry: None,
             #[cfg(feature = "storage-benches")]
             profile_provider_rows_examined: 0,
@@ -259,8 +322,10 @@ impl ExecuteResult {
         rows: Vec<Vec<Value>>,
         rows_affected: u64,
         notices: Vec<LixNotice>,
+        commit: Option<CommitSpan>,
     ) -> Self {
         Self::from_query_parts(columns, column_types, rows, rows_affected, notices)
+            .with_commit(commit)
     }
 
     pub(crate) fn from_protocol_response(
@@ -271,12 +336,13 @@ impl ExecuteResult {
         rows: Vec<Vec<Value>>,
         rows_affected: u64,
         notices: Vec<LixNotice>,
+        commit: Option<CommitSpan>,
     ) -> Self {
         let mut result =
             Self::from_query_parts(columns, column_types, rows, rows_affected, notices);
         result.statement_index = statement_index;
         result.statement_label = label;
-        result
+        result.with_commit(commit)
     }
 
     fn from_query_parts(
@@ -304,6 +370,7 @@ impl ExecuteResult {
                 file_view_mutations: Vec::new(),
             })),
             rows_affected,
+            commit: None,
             checkpoint_telemetry: None,
             #[cfg(feature = "storage-benches")]
             profile_provider_rows_examined: 0,
@@ -338,6 +405,7 @@ impl ExecuteResult {
                 file_view_mutations: Vec::new(),
             })),
             rows_affected: 0,
+            commit: None,
             checkpoint_telemetry: None,
             #[cfg(feature = "storage-benches")]
             profile_provider_rows_examined: 0,
@@ -778,6 +846,33 @@ pub struct ExecuteBatchStatement {
     /// Opaque caller metadata echoed by the corresponding batch result.
     /// Labels need not be unique; `statement_index` is the unique identity.
     pub label: Option<String>,
+}
+
+/// The span a transaction knows before it commits; see
+/// `Transaction::staged_active_branch_commit_span`.
+fn staged_commit_span<StorageImpl>(
+    transaction: &crate::transaction::Transaction<StorageImpl>,
+) -> Result<Option<CommitSpan>, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    Ok(transaction
+        .staged_active_branch_commit_span()?
+        .map(CommitSpan::from_commit_ids))
+}
+
+fn with_staged_commit_span<StorageImpl>(
+    transaction: &crate::transaction::Transaction<StorageImpl>,
+    results: Vec<ExecuteResult>,
+) -> Result<Vec<ExecuteResult>, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let commit = staged_commit_span(transaction)?;
+    Ok(results
+        .into_iter()
+        .map(|result| result.with_commit(commit.clone()))
+        .collect())
 }
 
 fn annotate_batch_results(
@@ -1613,7 +1708,7 @@ where
                 let options = options.clone();
                 let metadata = metadata.clone();
                 let result = self
-                    .with_write_transaction_reserved_lending(
+                    .with_write_transaction_reserved_lending_spanned(
                         write_access,
                         async move |transaction| {
                             let previous_origin_key =
@@ -1641,7 +1736,7 @@ where
                     .await
                     .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
                 match result {
-                    Ok(result) => return Ok(result),
+                    Ok((result, commit)) => return Ok(result.with_commit(commit)),
                     Err(error) => {
                         if retry_auto_commit(
                             &mut transaction_conflict_retries,
@@ -1939,7 +2034,7 @@ where
                 // owns its copy because its future may outlive this call's immediate
                 // stack frame while the write lease is held.
                 let idempotency_for_commit = idempotency.clone();
-                self.with_write_transaction_reserved_lending(
+                self.with_write_transaction_reserved_lending_spanned(
                     write_access,
                     async move |transaction| {
                         let previous_origin_key =
@@ -1954,7 +2049,11 @@ where
                                 &metadata,
                             )
                             .await?;
-                            let result = ExecuteResult::from_sql_write_result(result);
+                            // The receipt is part of this write set, so it can
+                            // only carry the span known at staging time; a
+                            // replay reports that span.
+                            let result = ExecuteResult::from_sql_write_result(result)
+                                .with_commit(staged_commit_span(transaction)?);
                             let receipt = ExecuteIdempotencyReceipt::single(
                                 &idempotency_for_commit,
                                 &result,
@@ -1972,6 +2071,7 @@ where
                     |_| Ok(()),
                 )
                 .await
+                .map(|(result, commit)| result.with_commit(commit))
                 .map_err(|error| normalize_sql_surface_error(error, sql))
             },
         )
@@ -2143,71 +2243,6 @@ where
         statements: &[ExecuteBatchStatement],
     ) -> Result<Vec<ExecuteResult>, LixError> {
         Box::pin(self.execute_batch_with_options(statements, ExecuteOptions::default())).await
-    }
-
-    /// Executes one prepared DML shape over a shared parameter page.
-    ///
-    /// Unlike [`Self::execute_batch`], this API does not duplicate the SQL
-    /// text and owned parameter strings into one statement object per row.
-    /// The SQL plan is prepared once and the whole page is committed
-    /// atomically. The bound write must accept either the borrowed-value
-    /// certificate or the physical parameter-batch route; shapes that require
-    /// sequential statement semantics are rejected instead of silently
-    /// degrading to per-row execution.
-    pub(crate) async fn execute_prepared_dml_batch(
-        &self,
-        sql: Arc<str>,
-        parameter_batch: PreparedDmlParameterBatch,
-    ) -> Result<Vec<ExecuteResult>, LixError> {
-        Box::pin(self.execute_prepared_dml_batch_inner(sql, parameter_batch)).await
-    }
-
-    async fn execute_prepared_dml_batch_inner(
-        &self,
-        sql: Arc<str>,
-        parameter_batch: PreparedDmlParameterBatch,
-    ) -> Result<Vec<ExecuteResult>, LixError> {
-        self.ensure_open()?;
-        if parameter_batch.is_empty() {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "execute_prepared_dml_batch requires at least one parameter row",
-            ));
-        }
-        let statement = self.sql_planning_cache.parse_statement(&sql)?;
-        if sql2::bind_statement_route(&statement)? != sql2::BoundStatementRoute::Write {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "execute_prepared_dml_batch requires a write statement",
-            ));
-        }
-
-        let sql_for_error = Arc::clone(&sql);
-        let result = self
-            .with_write_transaction_lending(async move |transaction| {
-                let plan = transaction.prepare_sql_write_logical_plan(&sql, &statement)?;
-                let results = sql2::execute_write_logical_plan_prepared_dml_batch(
-                    transaction,
-                    &plan,
-                    &parameter_batch,
-                )
-                .await?;
-                results
-                    .ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_INVALID_PARAM,
-                            "write shape requires sequential execute_batch semantics",
-                        )
-                    })
-                    .map(|results| {
-                        results
-                            .into_iter()
-                            .map(ExecuteResult::from_sql_write_result)
-                            .collect()
-                    })
-            })
-            .await;
-        result.map_err(|error| normalize_sql_surface_error(error, &sql_for_error))
     }
 
     pub(crate) async fn execute_batch_with_options(
@@ -2439,8 +2474,12 @@ where
         let parameter_route = Arc::new(AtomicBool::new(false));
         let transaction_parameter_route = Arc::clone(&parameter_route);
         let transaction_telemetry_sink = telemetry_sink.clone();
+        // Only a batch that writes reports a span. Read-only batches also run
+        // on this lane when a statement is nondeterministic; they commit
+        // nothing worth naming.
+        let carries_span = parsed.contains_write()?;
         let result = self
-            .with_write_transaction_lending(async move |transaction| {
+            .with_write_transaction_lending_spanned(async move |transaction| {
                 if let Some(results) = try_execute_transaction_parameter_batch(
                     transaction,
                     statements,
@@ -2451,6 +2490,11 @@ where
                 )
                 .await?
                 {
+                    let results = if carries_span {
+                        with_staged_commit_span(transaction, results)?
+                    } else {
+                        results
+                    };
                     if let Some(idempotency) = &idempotency {
                         let receipt = ExecuteIdempotencyReceipt::batch(idempotency, &results)?;
                         transaction.stage_execute_idempotency_receipt(idempotency, &receipt)?;
@@ -2545,13 +2589,29 @@ where
                         }
                     }
                 }
+                let results = if carries_span {
+                    with_staged_commit_span(transaction, results)?
+                } else {
+                    results
+                };
                 if let Some(idempotency) = &idempotency {
                     let receipt = ExecuteIdempotencyReceipt::batch(idempotency, &results)?;
                     transaction.stage_execute_idempotency_receipt(idempotency, &receipt)?;
                 }
                 Ok(results)
             })
-            .await;
+            .await
+            .map(|(results, commit)| {
+                if !carries_span {
+                    return results;
+                }
+                // Every statement of the batch sits between the same two
+                // commits: the span the batch published.
+                results
+                    .into_iter()
+                    .map(|result| result.with_commit(commit.clone()))
+                    .collect::<Vec<_>>()
+            });
         if parameter_route.load(Ordering::Relaxed) {
             finish_parameter_batch_statement_telemetry(
                 telemetry_sink.as_ref(),
@@ -3512,63 +3572,6 @@ where
         Box::pin(self.execute_with_options_inner(sql, params, ExecuteOptions::default())).await
     }
 
-    /// Executes one public prepared-DML parameter page inside this explicit
-    /// transaction. The page is atomic with surrounding statements; callers
-    /// use ordinary `execute` for shape changes or dependency barriers.
-    pub(crate) async fn execute_prepared_dml_batch(
-        &mut self,
-        sql: Arc<str>,
-        parameter_batch: PreparedDmlParameterBatch,
-    ) -> Result<Vec<ExecuteResult>, LixError> {
-        self.ensure_session_open()?;
-        if parameter_batch.is_empty() {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "execute_prepared_dml_batch requires at least one parameter row",
-            ));
-        }
-        let statement = self.sql_planning_cache.parse_statement(&sql)?;
-        if sql2::bind_statement_route(&statement)? != sql2::BoundStatementRoute::Write {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "execute_prepared_dml_batch requires a write statement",
-            ));
-        }
-        self.has_started_statement = true;
-        let transaction = self.transaction_mut()?;
-        transaction.ensure_statement_allowed_after_restore()?;
-        transaction.flush_prepared_mutations().await?;
-        let plan = transaction.prepare_sql_write_logical_plan(&sql, &statement)?;
-        let checkpoint = transaction.begin_sql_statement_checkpoint()?;
-        let result = sql2::execute_write_logical_plan_prepared_dml_batch(
-            transaction,
-            &plan,
-            &parameter_batch,
-        )
-        .await;
-        let result = match result {
-            Ok(Some(results)) => Ok(results),
-            Ok(None) => Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "write shape is not supported by prepared DML batch",
-            )),
-            Err(error) => Err(normalize_sql_surface_error(error, &sql)),
-        };
-        let results = match result {
-            Ok(results) => results,
-            Err(error) => {
-                transaction
-                    .rollback_sql_statement_checkpoint(checkpoint)
-                    .await?;
-                return Err(error);
-            }
-        };
-        Ok(results
-            .into_iter()
-            .map(ExecuteResult::from_sql_write_result)
-            .collect())
-    }
-
     async fn execute_with_options_inner(
         &mut self,
         sql: &str,
@@ -4433,6 +4436,162 @@ mod tests {
             .await
             .expect("initialized storage should create engine");
         engine.open_session().await.expect("session should open")
+    }
+
+    async fn active_head(session: &SessionContext<Memory>) -> String {
+        session
+            .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+            .await
+            .expect("head should read")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("head should be text")
+    }
+
+    #[tokio::test]
+    async fn write_results_carry_the_commit_span_they_published() {
+        let session = open_session().await;
+        let read = session
+            .execute("SELECT 1 AS value", &[])
+            .await
+            .expect("read should run");
+        assert_eq!(read.commit(), None, "reads commit nothing");
+
+        let head_before_first = active_head(&session).await;
+        let first = session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('span-a', 'one')",
+                &[],
+            )
+            .await
+            .expect("write should commit");
+        let first_span = first.commit().expect("a write carries its span");
+        assert_eq!(first_span.before(), head_before_first);
+        assert_eq!(first_span.after(), active_head(&session).await);
+        assert_ne!(first_span.before(), first_span.after());
+
+        // The next write parents the head the previous one published.
+        let second = session
+            .execute(
+                "UPDATE lix_key_value SET value = 'two' WHERE key = 'span-a' RETURNING key",
+                &[],
+            )
+            .await
+            .expect("returning write should commit");
+        assert_eq!(second.rows().len(), 1, "RETURNING rows still come back");
+        let second_span = second.commit().expect("a RETURNING write carries its span");
+        assert_eq!(second_span.before(), first_span.after());
+        assert_eq!(second_span.after(), active_head(&session).await);
+
+        // Every statement of a batch sits between the same two commits.
+        let head_before_batch = active_head(&session).await;
+        let batch = session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    label: None,
+                    sql: "INSERT INTO lix_key_value (key, value) VALUES ('span-b', 'one')"
+                        .to_string(),
+                    params: Vec::new(),
+                },
+                ExecuteBatchStatement {
+                    label: None,
+                    sql: "INSERT INTO lix_key_value (key, value) VALUES ('span-c', 'one')"
+                        .to_string(),
+                    params: Vec::new(),
+                },
+            ])
+            .await
+            .expect("batch should commit");
+        let spans = batch
+            .iter()
+            .map(|result| result.commit().expect("batch statements carry the span"))
+            .collect::<Vec<_>>();
+        assert_eq!(spans[0], spans[1]);
+        assert_eq!(spans[0].before(), head_before_batch);
+        assert_eq!(spans[0].after(), active_head(&session).await);
+        assert_ne!(spans[0].before(), spans[0].after());
+    }
+
+    #[tokio::test]
+    async fn spans_are_absent_where_nothing_auto_committed() {
+        let session = open_session().await;
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('span-d', 'one')",
+                &[],
+            )
+            .await
+            .expect("seed should commit");
+        let head = active_head(&session).await;
+
+        // A write that matched nothing still reports where it stands.
+        let noop = session
+            .execute(
+                "UPDATE lix_key_value SET value = 'x' WHERE key = 'span-missing'",
+                &[],
+            )
+            .await
+            .expect("no-op write should run");
+        assert_eq!(noop.rows_affected(), 0);
+        let span = noop.commit().expect("a no-op write still carries its span");
+        assert_eq!(span.before(), head);
+        assert_eq!(span.after(), active_head(&session).await);
+
+        // A restore moves the head to a commit it did not author.
+        let target = span.before().to_owned();
+        let restored = session
+            .execute(
+                "INSERT INTO lix_restore (commit_id) VALUES ($1) RETURNING commit_id",
+                &[Value::Text(target.clone())],
+            )
+            .await
+            .expect("restore should run");
+        let restore_span = restored.commit().expect("a restore carries its span");
+        assert_eq!(restore_span.before(), head);
+        assert_eq!(restore_span.after(), target);
+        assert_eq!(active_head(&session).await, target);
+
+        // Read-only batches commit nothing, even on the transaction lane
+        // that nondeterministic reads take.
+        let nondeterministic = session
+            .execute_batch(&[ExecuteBatchStatement {
+                label: None,
+                sql: "SELECT uuidv7() AS id".to_string(),
+                params: Vec::new(),
+            }])
+            .await
+            .expect("nondeterministic read batch should run");
+        assert!(nondeterministic.iter().all(|result| result.commit().is_none()));
+        let reads = session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    label: None,
+                    sql: "SELECT 1 AS value".to_string(),
+                    params: Vec::new(),
+                },
+                ExecuteBatchStatement {
+                    label: None,
+                    sql: "SELECT 2 AS value".to_string(),
+                    params: Vec::new(),
+                },
+            ])
+            .await
+            .expect("read batch should run");
+        assert!(reads.iter().all(|result| result.commit().is_none()));
+
+        // Inside an explicit transaction the commit is the write, so its
+        // statements report no span of their own.
+        let mut transaction = session.begin_transaction().await.unwrap();
+        let staged = transaction
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('span-e', 'one')",
+                &[],
+            )
+            .await
+            .expect("statement should stage");
+        assert_eq!(staged.rows_affected(), 1);
+        assert_eq!(staged.commit(), None);
+        transaction.commit().await.expect("transaction should commit");
     }
 
     #[derive(Clone)]
@@ -8272,120 +8431,6 @@ mod tests {
             .unwrap();
         assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "new-a");
         assert_eq!(rows.rows()[1].get::<String>("value").unwrap(), "new-b");
-    }
-
-    #[tokio::test]
-    async fn execute_prepared_dml_batch_preserves_order_absence_and_atomic_errors() {
-        let session = open_session().await;
-        let schema = serde_json::json!({
-            "$schema": "https://lix.dev/schema-v1.json",
-            "key": "prepared_dml_contract_probe",
-            "columns": [
-                { "name": "id", "type": "text", "nullable": false },
-                { "name": "value", "type": "text", "nullable": false },
-            ],
-            "primary_key": ["id"],
-        });
-        session
-            .execute(
-                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
-                &[Value::Text(schema.to_string())],
-            )
-            .await
-            .unwrap();
-        session
-            .execute(
-                "INSERT INTO prepared_dml_contract_probe (id, value) VALUES \
-                 ('a', 'old-a'), ('b', 'old-b')",
-                &[],
-            )
-            .await
-            .unwrap();
-
-        let sql =
-            Arc::<str>::from("UPDATE prepared_dml_contract_probe SET value = $1 WHERE id = $2");
-        let rows = PreparedDmlParameterBatch::from_rows([
-            vec![Value::Text("new-b".into()), Value::Text("b".into())],
-            vec![Value::Text("new-a".into()), Value::Text("a".into())],
-            vec![Value::Text("missing".into()), Value::Text("missing".into())],
-        ])
-        .unwrap();
-        let results = session
-            .execute_prepared_dml_batch(Arc::clone(&sql), rows)
-            .await
-            .unwrap();
-        assert_eq!(
-            results
-                .iter()
-                .map(ExecuteResult::rows_affected)
-                .collect::<Vec<_>>(),
-            vec![1, 1, 0]
-        );
-
-        let error = session
-            .execute_prepared_dml_batch(
-                Arc::<str>::from(
-                    "UPDATE prepared_dml_contract_probe SET value = CAST($1 AS JSONB) WHERE id = $2",
-                ),
-                PreparedDmlParameterBatch::from_rows([
-                    vec![Value::Text("{invalid".into()), Value::Text("a".into())],
-                    vec![Value::Text("{\"ok\":true}".into()), Value::Text("b".into())],
-                ])
-                .unwrap(),
-            )
-            .await
-            .expect_err("invalid RETURN expression must abort the atomic prepared batch");
-        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
-
-        let rows = session
-            .execute(
-                "SELECT id, value FROM prepared_dml_contract_probe ORDER BY id",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "new-a");
-        assert_eq!(rows.rows()[1].get::<String>("value").unwrap(), "new-b");
-
-        let mut transaction = session.begin_transaction().await.unwrap();
-        transaction
-            .execute(
-                "UPDATE prepared_dml_contract_probe SET value = 'before' WHERE id = 'a'",
-                &[],
-            )
-            .await
-            .unwrap();
-        let error = transaction
-            .execute_prepared_dml_batch(
-                Arc::<str>::from(
-                    "UPDATE prepared_dml_contract_probe SET value = CAST($1 AS JSONB) WHERE id = $2",
-                ),
-                PreparedDmlParameterBatch::from_rows([
-                    vec![Value::Text("{\"ok\":true}".into()), Value::Text("b".into())],
-                    vec![Value::Text("{invalid".into()), Value::Text("a".into())],
-                ])
-                .unwrap(),
-            )
-            .await
-            .expect_err("failed prepared statement must roll back its own staging");
-        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
-        transaction
-            .execute(
-                "UPDATE prepared_dml_contract_probe SET value = 'after' WHERE id = 'b'",
-                &[],
-            )
-            .await
-            .unwrap();
-        transaction.commit().await.unwrap();
-        let rows = session
-            .execute(
-                "SELECT id, value FROM prepared_dml_contract_probe ORDER BY id",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "before");
-        assert_eq!(rows.rows()[1].get::<String>("value").unwrap(), "after");
     }
 
     #[tokio::test]

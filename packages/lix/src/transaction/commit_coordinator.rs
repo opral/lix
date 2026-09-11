@@ -399,6 +399,9 @@ where
                 outcomes.iter_mut().zip(checkpoint_gc_sequences)
             {
                 if let Ok(outcome) = outcome {
+                    // Cohort commits serve explicit transactions, whose
+                    // statements carry no commit span by design; the span
+                    // is deliberately left unset here.
                     *outcome = TransactionCommitOutcome {
                         checkpoint_gc_sequence,
                         ..TransactionCommitOutcome::default()

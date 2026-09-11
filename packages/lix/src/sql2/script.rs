@@ -15,10 +15,10 @@ pub struct SqlScriptStatement {
     pub params: Range<usize>,
 }
 
-/// Atomic execution plan produced by [`parse_sql_script`].
+/// Parsed statement and parameter boundaries produced by [`parse_sql_script`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqlScriptPlan {
-    /// One or more statements that must execute atomically.
+    /// Statements for host inspection; this type does not execute a transaction.
     pub statements: Vec<SqlScriptStatement>,
 }
 
@@ -41,7 +41,12 @@ struct ParsedStatement {
     tokens: Vec<Token>,
 }
 
-/// Parses one or more SQL statements into an atomic execution plan.
+/// Parses SQL script boundaries for host inspection using the engine dialect.
+///
+/// This does not execute SQL or change the single-statement execution API.
+/// Hosts that accept scripts must explicitly execute the returned statements
+/// through a transaction. Anonymous parameters are rejected by this script
+/// inspection surface; numbered parameters retain their script-wide positions.
 ///
 /// Multi-statement scripts may be unwrapped, or wrapped by `BEGIN` (optionally
 /// followed by `TRANSACTION`) and a final `COMMIT`. Transaction aliases,

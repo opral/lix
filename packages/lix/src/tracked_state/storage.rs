@@ -17,8 +17,8 @@ use crate::changelog::{
 };
 use crate::common::SharedStr;
 use crate::plugin::wire::typed::{
-    BorrowedNativeValue, CertifiedNativeProjectionSegment, ValidatedNativePayload,
-    certify_native_projection_segment,
+    BorrowedNativeValue, CertifiedNativeProjectionSegment, NativeProjectionCertification,
+    ValidatedNativePayload, certify_native_projection_segment, visit_validated_native_row_payload,
 };
 use crate::row_pk::RowPk;
 use crate::storage_adapter::{
@@ -2099,49 +2099,115 @@ fn validate_native_commit_delta_payloads(
             all_native = false;
             continue;
         }
-        native_ranges.push(
+        native_ranges.push((
+            ordinal,
             u32::try_from(range.start)
                 .map_err(|_| replacement_payload_error("native payload offset exceeds u32"))?
                 ..u32::try_from(range.end).map_err(|_| {
                     replacement_payload_error("native payload end offset exceeds u32")
                 })?,
-        );
+        ));
     }
     if native_ranges.is_empty() {
         return Ok((None, None));
     }
     let owner = payloads.sidecar.clone();
     if all_native {
-        let projection =
-            certify_native_projection_segment(owner.clone(), native_ranges.into_boxed_slice())
-                .map_err(|error| {
-                    replacement_payload_error(&format!(
-                        "native commit-delta projection certification failed: {error:?}"
-                    ))
-                })?;
-        let certified_native_projection =
-            bind_native_projection_to_leaf(leaf, projection)?.map(Arc::new);
-        return Ok((None, certified_native_projection));
+        let certification = certify_native_projection_segment(
+            owner.clone(),
+            native_ranges.into_iter().map(|(_, range)| range).collect(),
+        )
+        .map_err(|error| {
+            replacement_payload_error(&format!(
+                "native commit-delta payload failed canonical wire validation: {error:?}"
+            ))
+        })?;
+        let validated = match certification {
+            NativeProjectionCertification::Uniform(projection) => {
+                if let Some((scope, outer_row_keys)) =
+                    bind_native_projection_to_leaf(leaf, &projection)?
+                {
+                    return Ok((
+                        None,
+                        Some(Arc::new(EnvelopeCertifiedNativeProjectionSegment {
+                            projection,
+                            scope,
+                            outer_row_keys,
+                            arrow_columns: OnceLock::new(),
+                        })),
+                    ));
+                }
+                projection.into_validated_payloads()
+            }
+            NativeProjectionCertification::Heterogeneous(validated) => validated,
+        };
+        for (ordinal, payload) in validated.iter().enumerate() {
+            validate_native_payload_identity(leaf, ordinal, payload)?;
+        }
+        return Ok((Some(Arc::from(validated)), None));
     }
-    let validated = native_ranges
-        .into_iter()
-        .map(|range| {
-            let range = usize::try_from(range.start).expect("u32 payload offset fits usize")
-                ..usize::try_from(range.end).expect("u32 payload offset fits usize");
+    native_ranges.into_iter().try_for_each(|(ordinal, range)| {
+        let range = usize::try_from(range.start).expect("u32 payload offset fits usize")
+            ..usize::try_from(range.end).expect("u32 payload offset fits usize");
+        let payload =
             ValidatedNativePayload::try_new_range(owner.clone(), range).map_err(|error| {
                 replacement_payload_error(&format!(
                     "native commit-delta payload failed canonical wire validation: {error:?}"
                 ))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((Some(Arc::from(validated)).filter(|_| all_native), None))
+            })?;
+        validate_native_payload_identity(leaf, ordinal, &payload)
+    })?;
+    Ok((None, None))
+}
+
+/// Embedded native keys must agree with their durable identity regardless of
+/// whether neighboring rows can share a projection. Storage payloads omit keys.
+fn validate_native_payload_identity(
+    leaf: &DecodedLeafNodeRef,
+    ordinal: usize,
+    payload: &ValidatedNativePayload,
+) -> Result<(), LixError> {
+    if payload.as_bytes().first() == Some(&crate::plugin::wire::typed::STORAGE_ROW_PAYLOAD_VERSION)
+    {
+        return Ok(());
+    }
+    let encoded_key = leaf
+        .key_owned(ordinal)
+        .ok_or_else(|| replacement_payload_error("native payload leaf omitted an identity"))?;
+    let decoded = decode_key_shared(encoded_key).map_err(|error| {
+        replacement_payload_error(&format!("native payload leaf identity is invalid: {error}"))
+    })?;
+    let mut key_count = 0;
+    let mut matches = true;
+    visit_validated_native_row_payload(
+        payload,
+        |index, value| {
+            key_count += 1;
+            matches &= decoded
+                .row_pk
+                .components
+                .get(index)
+                .is_some_and(|component| native_key_matches_row_pk(value, component));
+        },
+        |_, _| {},
+    )
+    .map_err(|error| {
+        replacement_payload_error(&format!(
+            "native payload identity cannot be read: {error:?}"
+        ))
+    })?;
+    if !matches || key_count != decoded.row_pk.components.len() {
+        return Err(replacement_payload_error(
+            "native payload key disagrees with its immutable leaf identity",
+        ));
+    }
+    Ok(())
 }
 
 fn bind_native_projection_to_leaf(
     leaf: &DecodedLeafNodeRef,
-    projection: CertifiedNativeProjectionSegment,
-) -> Result<Option<EnvelopeCertifiedNativeProjectionSegment>, LixError> {
+    projection: &CertifiedNativeProjectionSegment,
+) -> Result<Option<(CommitDeltaReplacementScope, Option<EncodedOuterRowKeys>)>, LixError> {
     if leaf.len() != projection.row_count() {
         return Err(replacement_payload_error(
             "native projection row count disagrees with its immutable leaf",
@@ -2194,12 +2260,7 @@ fn bind_native_projection_to_leaf(
                 ));
             }
         }
-        return Ok(Some(EnvelopeCertifiedNativeProjectionSegment {
-            projection,
-            scope,
-            outer_row_keys: Some(EncodedOuterRowKeys { owner, ranges }),
-            arrow_columns: OnceLock::new(),
-        }));
+        return Ok(Some((scope, Some(EncodedOuterRowKeys { owner, ranges }))));
     }
     let mut scope = None::<CommitDeltaReplacementScope>;
     let mut identity_prefix = None::<Vec<u8>>;
@@ -2254,12 +2315,7 @@ fn bind_native_projection_to_leaf(
             ));
         }
     }
-    Ok(scope.map(|scope| EnvelopeCertifiedNativeProjectionSegment {
-        projection,
-        scope,
-        outer_row_keys: None,
-        arrow_columns: OnceLock::new(),
-    }))
+    Ok(scope.map(|scope| (scope, None)))
 }
 
 fn native_key_matches_row_pk(
@@ -18409,7 +18465,10 @@ mod tests {
         )
         .expect("wire-valid payload certifies");
 
-        let error = super::bind_native_projection_to_leaf(&leaf, projection)
+        let super::NativeProjectionCertification::Uniform(projection) = projection else {
+            panic!("single native row must have a uniform projection");
+        };
+        let error = super::bind_native_projection_to_leaf(&leaf, &projection)
             .expect_err("mismatched envelope identity must reject");
         assert!(error.message.contains("disagrees"));
     }
@@ -18629,6 +18688,204 @@ mod tests {
             super::admit_new_authored_typed_commit_delta_segment(encode(&invalid), &mut bounds)
                 .is_err(),
             "self-consistent physical storage cannot cache an invalid native payload"
+        );
+    }
+
+    fn check_native_segment_validation(
+        rows: &[(&str, Option<&str>, &str, &[u8])],
+        check: impl Fn(Result<std::sync::Arc<DecodedCommitDeltaSegment>, LixError>),
+    ) {
+        let commit_id = CommitId::for_test_label("native-segment-validation");
+        let entries = rows
+            .iter()
+            .enumerate()
+            .map(
+                |(ordinal, (schema_key, file_id, row_key, _))| EncodedLeafEntry {
+                    key: encode_key_ref(TrackedStateKeyRef {
+                        schema_key,
+                        file_id: *file_id,
+                        row_pk: &RowPk::single(*row_key),
+                    })
+                    .into(),
+                    value: encode_value_ref(TrackedStateIndexValueRef {
+                        change_id: super::change_id_from_packed_address(
+                            commit_id,
+                            ordinal as u32 + 1,
+                        ),
+                        commit_id,
+                        deleted: false,
+                        created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+                        updated_at: LixTimestamp::from_unix_millis_utc_lossy(2),
+                    })
+                    .into(),
+                },
+            )
+            .collect::<Vec<_>>();
+        let payloads = rows
+            .iter()
+            .map(|(_, _, _, snapshot)| CommitDeltaPayloadRef {
+                metadata: None,
+                snapshot: Some(snapshot),
+                origin_key: None,
+                base_coordinate: None,
+                authored: true,
+            })
+            .collect::<Vec<_>>();
+        let encoded = try_encode_commit_delta_segment_with_payloads(&entries, &payloads, &mut None)
+            .map_err(CommitDeltaSegmentEncodeError::into_lix_error)
+            .expect("native validation fixture physically encodes");
+        let bounds = CommitDeltaSegmentBounds {
+            first_key: entries.first().unwrap().key.to_vec(),
+            last_key: entries.last().unwrap().key.to_vec(),
+            replacement_part: None,
+            content_digest: [0; 32],
+        };
+        // Eager write-through admission and cold durable reads must agree.
+        check(super::decode_owned_commit_delta_segment(
+            &encoded.encoded,
+            Some(&bounds),
+        ));
+        check(
+            prepare_new_authored_typed_commit_delta_segment(encoded, &bounds)
+                .map(|(_, decoded)| decoded.expect("authored native segment is eagerly prepared")),
+        );
+    }
+
+    #[test]
+    fn native_segment_retains_heterogeneous_wire_proofs() {
+        let first = crate::plugin::wire::typed::encode_native_row_payload_with_identity(
+            &[1; 32],
+            &[lix_schema::Value::Text("a".into())],
+            &lix_schema::Row::from([("id", lix_schema::Value::Text("a".into()))]),
+        )
+        .unwrap();
+        let second = crate::plugin::wire::typed::encode_native_row_payload_with_identity(
+            &[2; 32],
+            &[lix_schema::Value::Text("b".into())],
+            &lix_schema::Row::from([
+                ("id", lix_schema::Value::Text("b".into())),
+                ("value", lix_schema::Value::Boolean(true)),
+            ]),
+        )
+        .unwrap();
+        check_native_segment_validation(
+            &[("alpha", None, "a", &first), ("beta", None, "b", &second)],
+            |result| {
+                let decoded = result.expect("heterogeneous native rows are valid");
+                assert!(decoded.certified_native_projection.is_none());
+                assert_eq!(decoded.validated_native_payloads.as_ref().unwrap().len(), 2);
+                assert_eq!(
+                    decoded
+                        .validated_native_payload_owned(0)
+                        .unwrap()
+                        .as_bytes(),
+                    first
+                );
+                assert_eq!(
+                    decoded
+                        .validated_native_payload_owned(1)
+                        .unwrap()
+                        .as_bytes(),
+                    second
+                );
+            },
+        );
+        check_native_segment_validation(
+            &[
+                ("alpha", None, "a", &first),
+                ("beta", None, "b", &second),
+                (
+                    "gamma",
+                    None,
+                    "c",
+                    &[crate::plugin::wire::typed::STORAGE_ROW_PAYLOAD_VERSION],
+                ),
+            ],
+            |result| {
+                assert!(
+                    result
+                        .expect_err("heterogeneity cannot hide corrupt tail wire")
+                        .message
+                        .contains("canonical wire validation")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn native_segment_retains_uniform_payload_proofs_across_file_scopes() {
+        let payload = crate::plugin::wire::typed::encode_native_row_payload_with_identity(
+            &[1; 32],
+            &[lix_schema::Value::Text("a".into())],
+            &lix_schema::Row::from([("id", lix_schema::Value::Text("a".into()))]),
+        )
+        .unwrap();
+        check_native_segment_validation(
+            &[
+                ("schema", Some("file-a"), "a", &payload),
+                ("schema", Some("file-b"), "a", &payload),
+            ],
+            |result| {
+                let decoded = result.expect("uniform rows in different scopes are valid");
+                assert!(decoded.certified_native_projection.is_none());
+                assert_eq!(decoded.validated_native_payloads.as_ref().unwrap().len(), 2);
+                for ordinal in 0..2 {
+                    assert_eq!(
+                        decoded
+                            .validated_native_payload_owned(ordinal)
+                            .unwrap()
+                            .as_bytes(),
+                        payload
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn native_segment_checks_identity_independently_of_projection_eligibility() {
+        let native = crate::plugin::wire::typed::encode_native_row_payload_with_identity(
+            &[1; 32],
+            &[lix_schema::Value::Text("payload".into())],
+            &lix_schema::Row::from([("id", lix_schema::Value::Text("payload".into()))]),
+        )
+        .unwrap();
+        let storage = crate::plugin::wire::typed::encode_native_row_payload(
+            &[2; 32],
+            &[lix_schema::Value::Text("a".into())],
+            &lix_schema::Row::from([("id", lix_schema::Value::Text("a".into()))]),
+        )
+        .unwrap();
+        for neighbor in [storage.as_slice(), b"generic".as_slice()] {
+            check_native_segment_validation(
+                &[
+                    ("schema", None, "a", neighbor),
+                    ("schema", None, "b", &native),
+                ],
+                |result| {
+                    assert!(
+                        result
+                            .expect_err("native key mismatch must reject every layout")
+                            .message
+                            .contains("disagrees")
+                    );
+                },
+            );
+        }
+        // A uniform layout with different scopes also takes the row-proof path.
+        check_native_segment_validation(
+            &[
+                ("schema", Some("file-a"), "payload", &native),
+                ("schema", Some("file-b"), "wrong", &native),
+            ],
+            |result| {
+                assert!(
+                    result
+                        .expect_err("scope differences cannot hide identity mismatches")
+                        .message
+                        .contains("disagrees")
+                );
+            },
         );
     }
 

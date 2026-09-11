@@ -491,6 +491,122 @@ simulation_test!(
 );
 
 simulation_test!(
+    information_schema_describes_columns_and_surfaces,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        // A registered schema's own words, column and table alike.
+        let commit_columns = session
+            .execute(
+                "SELECT column_name, description FROM information_schema.columns \
+                 WHERE table_name = 'lix_commit' ORDER BY ordinal_position",
+                &[],
+            )
+            .await
+            .expect("lix_commit columns should be readable");
+        let described = |name: &str| -> Value {
+            commit_columns
+                .rows()
+                .iter()
+                .find(|row| row.value("column_name") == Ok(&Value::Text(name.to_string())))
+                .unwrap_or_else(|| panic!("{name} should be listed"))
+                .value("description")
+                .expect("description should be present")
+                .clone()
+        };
+        assert_eq!(
+            described("base_commit_id"),
+            Value::Text(
+                "Exact global commit composed underneath this commit. Null marks a base-native commit. This is state dependency, not ancestry."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            described("lixcol_untracked"),
+            Value::Text(
+                "When true the row is untracked: written without history, so it is absent from every diff and checkpoint."
+                    .to_string()
+            )
+        );
+
+        // Composed views describe themselves.
+        let file_path = session
+            .execute(
+                "SELECT description FROM information_schema.columns \
+                 WHERE table_name = 'lix_file' AND column_name = 'path'",
+                &[],
+            )
+            .await
+            .expect("lix_file.path should be readable");
+        assert_eq!(
+            file_path.rows()[0].value("description").unwrap(),
+            &Value::Text(
+                "Absolute path from the repository root, ending in the file's name.".to_string()
+            )
+        );
+
+        let surfaces = session
+            .execute(
+                "SELECT surface_name, description FROM information_schema.lix_surfaces \
+                 WHERE surface_name IN ('lix_commit', 'lix_file', 'lix_log') ORDER BY surface_name",
+                &[],
+            )
+            .await
+            .expect("surface descriptions should be readable");
+        assert_rows_eq(
+            surfaces,
+            vec![
+                vec![
+                    Value::Text("lix_commit".to_string()),
+                    Value::Text(
+                        "A commit is a stable point in project history. Branches point to commits. Parent commit IDs are ordered, with the first parent representing the mainline."
+                            .to_string(),
+                    ),
+                ],
+                vec![
+                    Value::Text("lix_file".to_string()),
+                    Value::Text(
+                        "A file in the repository: its path, name, and bytes. Composed from the file descriptor, the directory chain, and the file's content."
+                            .to_string(),
+                    ),
+                ],
+                vec![Value::Text("lix_log".to_string()), Value::Null],
+            ],
+        );
+
+        // A schema registered without descriptions reports none.
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                   CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"undescribed\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
+                   false,\
+                   false\
+                 )",
+                &[],
+            )
+            .await
+            .expect("registered schema insert should succeed");
+        let undescribed = session
+            .execute(
+                "SELECT description FROM information_schema.columns \
+                 WHERE table_name = 'undescribed' AND column_name = 'id'",
+                &[],
+            )
+            .await
+            .expect("undescribed.id should be readable");
+        assert_eq!(undescribed.rows()[0].value("description").unwrap(), &Value::Null);
+    }
+);
+
+simulation_test!(
     information_schema_exposes_executable_lix_column_contract,
     |sim| async move {
         let engine = sim.boot_engine().await;
@@ -709,7 +825,7 @@ simulation_test!(
                    table_name = 'engine_column_contract' \
                    AND column_name IN (\
                      'lixcol_change_id', 'lixcol_commit_id', 'lixcol_created_at', \
-                     'lixcol_global', 'lixcol_schema_key', \
+                     'lixcol_global', \
                      'lixcol_untracked', 'lixcol_updated_at'\
                    )\
                  ) \
@@ -748,13 +864,6 @@ simulation_test!(
                     Value::Text("NO".to_string()),
                     Value::Text("FALSE".to_string()),
                     Value::Text("DEFAULT".to_string()),
-                ],
-                vec![
-                    Value::Text("engine_column_contract".to_string()),
-                    Value::Text("lixcol_schema_key".to_string()),
-                    Value::Text("NO".to_string()),
-                    Value::Null,
-                    Value::Text("READ_ONLY".to_string()),
                 ],
                 vec![
                     Value::Text("engine_column_contract".to_string()),
@@ -2135,5 +2244,99 @@ simulation_test!(
                 ],
             ],
         );
+    }
+);
+
+simulation_test!(
+    schema_key_system_column_is_removed_from_public_sql,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
+            &engine,
+        );
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('example', 'value')",
+                &[],
+            )
+            .await
+            .expect("tracked row should insert");
+        let commit = session
+            .execute("SELECT lix_active_branch_commit_id()", &[])
+            .await
+            .expect("commit should load");
+        let [Value::Text(commit_id)] = commit.rows()[0].values() else {
+            panic!("expected commit id");
+        };
+
+        for relation in ["lix_key_value", "lix_file", "lix_directory"] {
+            for surface in [
+                relation.to_string(),
+                format!("lix_as_of('{relation}', '{commit_id}')"),
+                format!("lix_diff('{relation}', lix_root_commit_id(), '{commit_id}')"),
+                format!("lix_history('{relation}')"),
+            ] {
+                let is_diff = surface.starts_with("lix_diff(")
+                    || surface.starts_with("lix_history(");
+                // File diffs expose content names but intentionally reject byte projection.
+                let projection = if relation == "lix_file" && is_diff {
+                    "id, from_path, to_path"
+                } else {
+                    "*"
+                };
+                let result = session
+                    .execute(&format!("SELECT {projection} FROM {surface}"), &[])
+                    .await
+                    .expect("public relation query should succeed");
+                assert!(
+                    result
+                        .columns()
+                        .iter()
+                        .all(|column| !column.contains("lixcol_schema_key")),
+                    "removed column leaked through {surface}: {:?}",
+                    result.columns(),
+                );
+                let columns = if is_diff {
+                    &["from_lixcol_schema_key", "to_lixcol_schema_key"][..]
+                } else {
+                    &["lixcol_schema_key"][..]
+                };
+                for column in columns {
+                    session
+                        .execute(&format!("SELECT {column} FROM {surface}"), &[])
+                        .await
+                        .expect_err("removed column must not resolve");
+                }
+            }
+        }
+
+        for sql in [
+            "SELECT column_name FROM information_schema.columns WHERE column_name LIKE '%lixcol_schema_key%'",
+            "SELECT result_column FROM information_schema.table_functions WHERE result_column LIKE '%lixcol_schema_key%'",
+        ] {
+            assert_rows_eq(
+                session.execute(sql, &[]).await.expect("catalog should load"),
+                vec![],
+            );
+        }
+
+        for sql in [
+            "INSERT INTO lix_key_value (key, value, lixcol_schema_key) VALUES ('removed', 'value', 'lix_key_value')",
+            "UPDATE lix_key_value SET lixcol_schema_key = 'lix_key_value' WHERE key = 'example'",
+            "DELETE FROM lix_key_value WHERE lixcol_schema_key = 'lix_key_value'",
+            "UPDATE lix_key_value SET value = 'updated' WHERE key = 'example' RETURNING lixcol_schema_key",
+        ] {
+            let error = session
+                .execute(sql, &[])
+                .await
+                .expect_err("removed column must not bind in writes");
+            assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND, "{sql}: {error}");
+        }
+        let result = session
+            .execute("SELECT value FROM lix_key_value WHERE key = 'example'", &[])
+            .await
+            .expect("row should remain unchanged");
+        assert_rows_eq(result, vec![vec![Value::Jsonb(serde_json::json!("value").into())]]);
     }
 );

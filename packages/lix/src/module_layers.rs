@@ -133,7 +133,6 @@ const UNLAYERED_MODULES: &[(&str, &str)] = &[
     ("migration", "offline repository format migration"),
     ("observe_coordinator", "not yet analysed"),
     ("observe_invalidation", "not yet analysed"),
-    ("prepared_dml", "leaf utility, no layer semantics"),
     (
         "row_ref",
         "public identity encoding depends on the compiled SQL relation catalog",

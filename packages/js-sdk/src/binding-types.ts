@@ -1,4 +1,5 @@
 import type {
+	CommitSpan,
 	CreateBranchOptions,
 	CreateBranchReceipt,
 	UndoReceipt,
@@ -41,6 +42,7 @@ export type BindingExecuteResult = {
 		message: string;
 		hint?: string;
 	}>;
+	commit?: CommitSpan;
 };
 
 export type BindingObserveEvent = {

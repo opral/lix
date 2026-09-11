@@ -3918,9 +3918,6 @@ fn row_system_column_array(
 ) -> Result<ArrayRef> {
     #[expect(trivial_casts)]
     let array = match column_name {
-        "schema_key" => Arc::new(StringArray::from_iter(
-            rows.iter().map(|row| Some(row.schema_key())),
-        )) as ArrayRef,
         "file_id" => {
             Arc::new(StringArray::from_iter(rows.iter().map(|row| row.file_id()))) as ArrayRef
         }
@@ -5119,7 +5116,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "body",
-                "lixcol_schema_key",
                 "lixcol_file_id",
                 "lixcol_metadata",
                 "lixcol_created_at",

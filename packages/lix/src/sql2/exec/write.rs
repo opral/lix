@@ -10,7 +10,6 @@ use datafusion::common::ScalarValue;
 use datafusion::sql::parser::Statement as DataFusionStatement;
 
 use super::{SqlLogicalPlan, SqlWriteResult};
-use crate::PreparedDmlParameterBatch;
 use crate::common::ExecuteStatementMetadata;
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::write::BoundWriteTarget;
@@ -303,10 +302,9 @@ impl ParameterKind {
             (Self::Integer, Value::Null) => Ok(ScalarValue::Int64(None)),
             (Self::Real, Value::Null) => Ok(ScalarValue::Float64(None)),
             (Self::Text | Self::Jsonb | Self::RowRef, Value::Null) => Ok(ScalarValue::Utf8(None)),
-            (Self::Timestamptz, Value::Null) => Ok(ScalarValue::TimestampMicrosecond(
-                None,
-                Some("UTC".into()),
-            )),
+            (Self::Timestamptz, Value::Null) => {
+                Ok(ScalarValue::TimestampMicrosecond(None, Some("UTC".into())))
+            }
             (Self::Blob, Value::Null) => Ok(ScalarValue::LargeBinary(None)),
             _ => Err(LixError::unknown(
                 "heterogeneous SQL parameter column reached Arrow lowering",
@@ -381,45 +379,6 @@ pub(crate) async fn execute_write_logical_plan_parameter_batch(
     )
     .await
     .map_err(normalize_bound_public_write_error)
-}
-
-pub(crate) async fn execute_write_logical_plan_prepared_dml_batch(
-    ctx: &mut dyn SqlWriteExecutionContext,
-    plan: &SqlLogicalPlan,
-    parameter_batch: &PreparedDmlParameterBatch,
-) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
-    let SqlLogicalPlan::Write(write_plan) = plan else {
-        return Ok(None);
-    };
-    validate_write_parameter_count(&write_plan.plan, parameter_batch.column_count())?;
-    if let Some(results) = super::bound_public_write::try_execute_file_prepared_batch(
-        ctx,
-        &write_plan.plan,
-        parameter_batch,
-    )
-    .await
-    .map_err(normalize_bound_public_write_error)?
-    {
-        return Ok(Some(results));
-    }
-    if let Some(results) = super::bound_public_write::try_execute_row_insert_prepared_batch(
-        ctx,
-        &write_plan.plan,
-        parameter_batch,
-    )
-    .await
-    .map_err(normalize_bound_public_write_error)?
-    {
-        return Ok(Some(results));
-    }
-    let results = super::bound_public_write::try_execute_row_update_prepared_batch(
-        ctx,
-        &write_plan.plan,
-        parameter_batch,
-    )
-    .await
-    .map_err(normalize_bound_public_write_error)?;
-    Ok(results)
 }
 
 pub(crate) async fn execute_write_logical_plan_value_batch<'a>(

@@ -12,6 +12,8 @@ pub(crate) struct PublicColumn {
     pub(crate) write: PublicColumnWrite,
     pub(crate) insert_policy: PublicColumnInsertPolicy,
     pub(crate) column_default: Option<String>,
+    /// What the column means, for catalogs and tools; None when undocumented.
+    pub(crate) description: Option<String>,
 }
 
 impl PublicColumn {
@@ -24,6 +26,7 @@ impl PublicColumn {
             write: PublicColumnWrite::READ_WRITE,
             insert_policy: PublicColumnInsertPolicy::Required,
             column_default: None,
+            description: None,
         }
     }
 
@@ -39,6 +42,7 @@ impl PublicColumn {
             },
             insert_policy: PublicColumnInsertPolicy::Required,
             column_default: None,
+            description: None,
         }
     }
 
@@ -51,6 +55,7 @@ impl PublicColumn {
             write: PublicColumnWrite::READ_ONLY,
             insert_policy: PublicColumnInsertPolicy::ReadOnly,
             column_default: None,
+            description: None,
         }
     }
 
@@ -63,6 +68,7 @@ impl PublicColumn {
             write: PublicColumnWrite::READ_ONLY,
             insert_policy: PublicColumnInsertPolicy::ReadOnly,
             column_default: None,
+            description: None,
         }
     }
 
@@ -79,6 +85,11 @@ impl PublicColumn {
     pub(crate) fn with_default(mut self, default: impl Into<String>) -> Self {
         self.insert_policy = PublicColumnInsertPolicy::Default;
         self.column_default = Some(default.into());
+        self
+    }
+
+    pub(crate) fn with_description(mut self, description: Option<String>) -> Self {
+        self.description = description;
         self
     }
 

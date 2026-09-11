@@ -164,3 +164,65 @@ test("prepare normalizes parameters and close drains preparation before binding 
     await closing;
     expect(close).toHaveBeenCalledOnce();
 });
+test.each(["commit", "rollback"] as const)(
+	"a pending %s exclusively owns the transaction until it settles",
+	async (kind) => {
+		const completion = deferred<void>();
+		const transactionBinding = {
+			execute: vi.fn(),
+			commit: vi.fn(async () => completion.promise),
+			rollback: vi.fn(async () => completion.promise),
+		};
+		const binding = {
+			beginTransaction: vi.fn(async () => transactionBinding),
+			close: vi.fn(async () => undefined),
+		} as unknown as LixBinding;
+		const lix = new Lix(binding);
+		const transaction = await lix.beginTransaction();
+		const finishing = transaction[kind]();
+		const closed = { code: "LIX_INVALID_TRANSACTION_STATE" };
+
+		await expect(transaction.commit()).rejects.toMatchObject(closed);
+		await expect(transaction.rollback()).rejects.toMatchObject(closed);
+		await expect(transaction.execute("SELECT 1")).rejects.toMatchObject(closed);
+		expect(transactionBinding.execute).not.toHaveBeenCalled();
+		expect(transactionBinding[kind]).toHaveBeenCalledOnce();
+		expect(
+			transactionBinding[kind === "commit" ? "rollback" : "commit"],
+		).not.toHaveBeenCalled();
+		await expect(lix.close()).rejects.toMatchObject(closed);
+
+		completion.resolve();
+		await finishing;
+		await lix.close();
+		expect(binding.close).toHaveBeenCalledOnce();
+	},
+);
+
+test.each(["commit", "rollback"] as const)(
+	"a failed %s preserves its error and consumes the transaction",
+	async (kind) => {
+		const failure = new Error(`${kind} failed`);
+		const transactionBinding = {
+			execute: vi.fn(),
+			commit: vi.fn(async () => {
+				throw failure;
+			}),
+			rollback: vi.fn(async () => {
+				throw failure;
+			}),
+		};
+		const binding = {
+			beginTransaction: vi.fn(async () => transactionBinding),
+			close: vi.fn(async () => undefined),
+		} as unknown as LixBinding;
+		const lix = new Lix(binding);
+		const transaction = await lix.beginTransaction();
+		await expect(transaction[kind]()).rejects.toBe(failure);
+		await expect(transaction.execute("SELECT 1")).rejects.toMatchObject({
+			code: "LIX_INVALID_TRANSACTION_STATE",
+		});
+		expect(transactionBinding.execute).not.toHaveBeenCalled();
+		await lix.close();
+	},
+);

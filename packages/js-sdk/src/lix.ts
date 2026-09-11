@@ -543,7 +543,6 @@ export class ObserveEvents {
 }
 
 export class LixTransaction {
-	private finishPromise: Promise<void> | undefined;
 	private finished = false;
 
 	constructor(
@@ -577,6 +576,7 @@ export class LixTransaction {
 		params: SqlParam[] = [],
 		options?: ExecuteOptions,
 	): Promise<ExecuteResult<ResultRow>> {
+		if (this.finished) throw transactionClosedError();
 		assertExecuteArgs("lixTransaction", sql, params, options);
 		const { rowMode = "object", ...bindingOptions } = options ?? {};
 		return wrapExecuteResult(
@@ -603,21 +603,18 @@ export class LixTransaction {
 		kind: "transaction.commit" | "transaction.rollback",
 	): Promise<void> {
 		if (this.finished) throw transactionClosedError();
-		if (!this.finishPromise) {
-			this.finishPromise = (async () => {
-				try {
-					if (kind === "transaction.commit") await this.binding.commit();
-					else await this.binding.rollback();
-				} finally {
-					// A terminal binding call consumes the underlying transaction even
-					// when its durable commit or rollback reports an error.
-					this.finished = true;
-					transactionFinalizer.unregister(this);
-					this.onFinish();
-				}
-			})();
+		// The first terminal call owns the handle immediately. In particular,
+		// a concurrent rollback must never report a pending commit's success.
+		this.finished = true;
+		try {
+			if (kind === "transaction.commit") await this.binding.commit();
+			else await this.binding.rollback();
+		} finally {
+			// Keep the parent transaction lease until the binding settles. A
+			// terminal call consumes the handle even when it reports an error.
+			transactionFinalizer.unregister(this);
+			this.onFinish();
 		}
-		await this.finishPromise;
 	}
 }
 

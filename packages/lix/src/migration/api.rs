@@ -1654,6 +1654,12 @@ fn validate_v74_registered_schema(
 }
 
 fn storage_error(error: StorageError) -> LixError {
+    // Repository open restarts a coherent read only when this typed storage
+    // classification survives migration context. Concurrent initialization
+    // may invalidate even the first format-marker inspection.
+    if matches!(error, StorageError::ReadExpired) {
+        return LixError::from(error);
+    }
     LixError::new(
         LixError::CODE_INTERNAL_ERROR,
         format!("repository migration storage error: {error}"),

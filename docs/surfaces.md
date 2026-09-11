@@ -70,11 +70,18 @@ get a `Did you mean ...` suggestion, while other misses include the complete
 
 ```sql
 SELECT column_name, data_type, is_nullable, column_default,
-       lix_value_kind, lix_insert_policy
+       lix_value_kind, lix_insert_policy, description
 FROM information_schema.columns
 WHERE table_name = 'lix_file'
 ORDER BY ordinal_position;
 ```
+
+`description` is what the column means, in prose: a registered schema's own
+`description` annotations for its table and columns, and the engine's words
+for the composed views and the `lixcol_*` bookkeeping columns. It is NULL
+where nothing was written. `information_schema.lix_surfaces` carries the
+same for each relation, so a tool can present a table and its columns the way
+the schema author explained them.
 
 Lix reports the canonical SQL types `TEXT`, `BYTEA`, `BIGINT`,
 `DOUBLE PRECISION`, and `BOOLEAN`. The reported scalar type name is executable

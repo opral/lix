@@ -398,11 +398,7 @@ impl LixFileSpec {
                         options.needs_plugin_ownership,
                     )
                     .await
-                    .map_err(|error| {
-                        DataFusionError::Execution(format!(
-                            "sql2 lix_file plugin discovery failed: {error}"
-                        ))
-                    })?
+                    .map_err(plugin_discovery_error)?
                     .map(|context| context.with_session_file_views(session_file_views.clone()))
                 } else {
                     None
@@ -1190,12 +1186,7 @@ impl TableSpec for LixFileSpec {
                             acknowledge_plugin_data,
                         )
                         .await
-                        .map_err(|error| {
-                            DataFusionError::Context(
-                                "sql2 lix_file plugin discovery failed".to_string(),
-                                Box::new(lix_error_to_datafusion_error(error)),
-                            )
-                        })?
+                        .map_err(plugin_discovery_error)?
                         .map(|context| context.with_session_file_views(session_file_views.clone()))
                     } else {
                         None
@@ -1908,11 +1899,7 @@ impl UpsertSupport for LixFileSpec {
                 false,
             )
             .await
-            .map_err(|error| {
-                DataFusionError::Execution(format!(
-                    "sql2 lix_file plugin discovery failed: {error}"
-                ))
-            })?
+            .map_err(plugin_discovery_error)?
         } else {
             None
         };
@@ -2004,11 +1991,7 @@ impl UpsertSupport for LixFileSpec {
             let branches =
                 load_plugin_render_branches(Arc::clone(&hot_state), &request, &plugin_host, None)
                     .await
-                    .map_err(|error| {
-                        DataFusionError::Execution(format!(
-                            "sql2 lix_file plugin discovery failed: {error}"
-                        ))
-                    })?;
+                    .map_err(plugin_discovery_error)?;
             let plugin_render = if branches.is_empty() {
                 None
             } else {
@@ -2020,11 +2003,7 @@ impl UpsertSupport for LixFileSpec {
                     true,
                 )
                 .await
-                .map_err(|error| {
-                    DataFusionError::Execution(format!(
-                        "sql2 lix_file plugin discovery failed: {error}"
-                    ))
-                })?
+                .map_err(plugin_discovery_error)?
             };
             path_update_plugin_rewrite_file_ids(
                 plugin_render.as_ref(),
@@ -4122,7 +4101,6 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
 
     for row_index in 0..batch.num_rows() {
         if reject_read_only_fields {
-            reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_schema_key")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_change_id")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_created_at")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_updated_at")?;
@@ -4800,12 +4778,6 @@ fn lix_file_record_batch_from_path_selection(
             "content" => Arc::new(LargeBinaryArray::from(
                 entries.iter().map(|_| Some(&[][..])).collect::<Vec<_>>(),
             )),
-            "lixcol_schema_key" => {
-                Arc::new(StringArray::from(vec![
-                    Some(FILE_DESCRIPTOR_SCHEMA_KEY);
-                    row_count
-                ]))
-            }
             "lixcol_file_id" => Arc::new(StringArray::from(
                 entries
                     .iter()
@@ -4895,7 +4867,6 @@ struct LixFileRecordBatchColumns {
     directory_ids: Vec<Option<String>>,
     names: Vec<Option<String>>,
     data_values: Vec<Option<Vec<u8>>>,
-    schema_keys: Vec<Option<String>>,
     file_ids: Vec<Option<String>>,
     globals: Vec<Option<bool>>,
     change_ids: Vec<Option<String>>,
@@ -4913,8 +4884,6 @@ impl LixFileRecordBatchColumns {
         self.directory_ids.push(row.directory_id);
         self.names.push(Some(row.name));
         self.data_values.push(row.data);
-        self.schema_keys
-            .push(Some(FILE_DESCRIPTOR_SCHEMA_KEY.to_string()));
         self.file_ids.push(row.file_id);
         self.globals.push(Some(row.global));
         self.change_ids.push(row.change_id);
@@ -4933,7 +4902,6 @@ impl LixFileRecordBatchColumns {
             directory_ids,
             names,
             data_values,
-            schema_keys,
             file_ids,
             globals,
             change_ids,
@@ -4953,7 +4921,6 @@ impl LixFileRecordBatchColumns {
                 .map(|value| value.as_deref())
                 .collect::<Vec<_>>(),
         ));
-        let schema_keys: ArrayRef = Arc::new(StringArray::from(schema_keys));
         let file_ids: ArrayRef = Arc::new(StringArray::from(file_ids));
         let globals: ArrayRef = Arc::new(BooleanArray::from(globals));
         let change_ids: ArrayRef = Arc::new(StringArray::from(change_ids));
@@ -4971,7 +4938,6 @@ impl LixFileRecordBatchColumns {
                 "directory_id" => Arc::clone(&directory_ids),
                 "name" => Arc::clone(&names),
                 "content" => Arc::clone(&data_values),
-                "lixcol_schema_key" => Arc::clone(&schema_keys),
                 "lixcol_file_id" => Arc::clone(&file_ids),
                 "lixcol_global" => Arc::clone(&globals),
                 "lixcol_change_id" => Arc::clone(&change_ids),
@@ -5512,6 +5478,16 @@ async fn acknowledge_materialized_file(
         );
     }
     Ok(())
+}
+
+/// Plugin discovery runs Lix reads inside a DataFusion plan. The Lix error
+/// stays the cause, code included, so an expired coherent read still reaches
+/// the session's bounded retry instead of surfacing as an execution error.
+fn plugin_discovery_error(error: LixError) -> DataFusionError {
+    DataFusionError::Context(
+        "sql2 lix_file plugin discovery failed".to_string(),
+        Box::new(lix_error_to_datafusion_error(error)),
+    )
 }
 
 async fn plugin_render_context_for_lix_file_scan(
@@ -6910,7 +6886,6 @@ pub(super) fn lix_file_schema() -> SchemaRef {
         Field::new("directory_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, false),
         Field::new("content", DataType::LargeBinary, false),
-        Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
         Field::new("lixcol_global", DataType::Boolean, true),
         Field::new("lixcol_change_id", DataType::Utf8, true),
@@ -7569,7 +7544,6 @@ mod tests {
             "path",
             "directory_id",
             "name",
-            "lixcol_schema_key",
             "lixcol_commit_id",
             "lixcol_metadata",
         ]
@@ -7607,10 +7581,6 @@ mod tests {
             "01920000-0000-7000-8000-0000000000d3"
         );
         assert_eq!(string_value("name"), "readme.md");
-        assert_eq!(
-            string_value("lixcol_schema_key"),
-            super::FILE_DESCRIPTOR_SCHEMA_KEY
-        );
         assert_eq!(
             string_value("lixcol_commit_id"),
             CommitId::for_test_label("commit-01920000-0000-7000-8000-0000000000d2").to_string()

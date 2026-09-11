@@ -14,7 +14,6 @@ mod row_decoded_column_cache;
 mod tracked_head;
 #[cfg(test)]
 pub(crate) use tracked_head::root_exact_profile;
-pub(crate) mod typed_slots;
 #[cfg(test)]
 pub(crate) use tracked_head::{head_decode_row_pk_probe, hot_decode_row_pk_probe};
 mod types;

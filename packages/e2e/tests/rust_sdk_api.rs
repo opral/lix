@@ -1705,3 +1705,27 @@ async fn task_done(lix: &Lix, task_id: &str) -> bool {
 fn assert_closed(error: LixError) {
     assert_eq!(error.code, LixError::CODE_CLOSED);
 }
+
+#[tokio::test]
+async fn rs_sdk_writes_return_the_commit_span_they_published() {
+    let lix = open_lix().await.unwrap();
+    let before = active_head_commit_id(&lix).await;
+    let written = lix
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('span-rs', 'one')",
+            &[],
+        )
+        .await
+        .unwrap();
+    let span = written.commit().expect("a write carries its commit span");
+    assert_eq!(span.before(), before);
+    assert_eq!(span.after(), active_head_commit_id(&lix).await);
+    assert_ne!(span.before(), span.after());
+
+    let read = lix
+        .execute("SELECT value FROM lix_key_value WHERE key = 'span-rs'", &[])
+        .await
+        .unwrap();
+    assert_eq!(read.commit(), None);
+    lix.close().await.unwrap();
+}

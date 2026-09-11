@@ -1208,7 +1208,6 @@ fn lix_directory_surface_name(branch_binding: &BranchBinding) -> &'static str {
 }
 
 trait DirectoryLiveRow {
-    fn schema_key(&self) -> &str;
     fn file_id(&self) -> Option<&str>;
     fn global(&self) -> bool;
     fn change_id(&self) -> Option<String>;
@@ -1220,10 +1219,6 @@ trait DirectoryLiveRow {
 }
 
 impl DirectoryLiveRow for MaterializedHotStateRow {
-    fn schema_key(&self) -> &str {
-        &self.schema_key
-    }
-
     fn file_id(&self) -> Option<&str> {
         self.file_id.as_deref()
     }
@@ -1258,10 +1253,6 @@ impl DirectoryLiveRow for MaterializedHotStateRow {
 }
 
 impl DirectoryLiveRow for MaterializedHotStateRowRef<'_> {
-    fn schema_key(&self) -> &str {
-        (*self).schema_key()
-    }
-
     fn file_id(&self) -> Option<&str> {
         (*self).file_id()
     }
@@ -1591,7 +1582,6 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
     let mut rows = RawWriteBatch::with_capacity(batch.num_rows().saturating_mul(3));
     for row_index in 0..batch.num_rows() {
         if reject_read_only_fields {
-            reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_schema_key")?;
             reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_change_id")?;
             reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_created_at")?;
             reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_updated_at")?;
@@ -1932,7 +1922,6 @@ where
     let mut paths = Vec::new();
     let mut parent_ids = Vec::new();
     let mut names = Vec::new();
-    let mut schema_keys = Vec::new();
     let mut file_ids = Vec::new();
     let mut globals = Vec::new();
     let mut change_ids = Vec::new();
@@ -1947,7 +1936,6 @@ where
         paths.push(path);
         parent_ids.push(directory.parent_id);
         names.push(Some(directory.name));
-        schema_keys.push(Some(directory.live.schema_key().to_owned()));
         file_ids.push(directory.live.file_id().map(str::to_owned));
         globals.push(Some(directory.live.global()));
         change_ids.push(directory.live.change_id());
@@ -1965,7 +1953,6 @@ where
             "path" => Arc::new(StringArray::from(paths.clone())),
             "parent_id" => Arc::new(StringArray::from(parent_ids.clone())),
             "name" => Arc::new(StringArray::from(names.clone())),
-            "lixcol_schema_key" => Arc::new(StringArray::from(schema_keys.clone())),
             "lixcol_file_id" => Arc::new(StringArray::from(file_ids.clone())),
             "lixcol_global" => Arc::new(BooleanArray::from(globals.clone())),
             "lixcol_change_id" => Arc::new(StringArray::from(change_ids.clone())),
@@ -2198,7 +2185,6 @@ pub(super) fn lix_directory_schema() -> SchemaRef {
         Field::new("path", DataType::Utf8, true),
         Field::new("parent_id", DataType::Utf8, true),
         Field::new("name", DataType::Utf8, false),
-        Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
         Field::new("lixcol_global", DataType::Boolean, true),
         Field::new("lixcol_change_id", DataType::Utf8, true),

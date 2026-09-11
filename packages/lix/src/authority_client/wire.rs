@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{ExecuteResult, LixError, LixNotice, ResultColumnType, Value, WireValue};
+use crate::{CommitSpan, ExecuteResult, LixError, LixNotice, ResultColumnType, Value, WireValue};
 use crate::{
     MergeBranchOptions, MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions,
     MergeBranchReceipt, MergeChangeStats, MergeConflict, MergeConflictChangeKind,
@@ -95,6 +95,15 @@ pub struct ExecuteResponseBody {
     pub rows_affected: u64,
     #[serde(default)]
     pub notices: Vec<LixNotice>,
+    /// Absent from servers that predate commit spans.
+    #[serde(default)]
+    pub commit: Option<CommitSpanBody>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommitSpanBody {
+    pub before: String,
+    pub after: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -149,6 +158,8 @@ impl ExecuteResponseBody {
             rows,
             self.rows_affected,
             self.notices,
+            self.commit
+                .map(|span| CommitSpan::new(span.before, span.after)),
         ))
     }
 }
@@ -625,4 +636,52 @@ pub fn unsupported_remote_operation(operation: &str) -> LixError {
         format!("{operation} is not supported in remote mode"),
     )
     .with_details(serde_json::json!({ "operation": operation }))
+}
+
+#[cfg(test)]
+mod commit_span_tests {
+    use super::*;
+
+    fn body(commit: serde_json::Value) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "columns": [],
+            "rows": [],
+            "rowsAffected": 1,
+            "notices": []
+        });
+        if !commit.is_null() {
+            body["commit"] = commit;
+        }
+        body
+    }
+
+    #[test]
+    fn execute_responses_decode_with_and_without_a_commit_span() {
+        let without = serde_json::from_value::<ExecuteResponseBody>(body(serde_json::Value::Null))
+            .expect("older servers omit the span")
+            .into_execute_result()
+            .expect("result should decode");
+        assert_eq!(without.commit(), None);
+
+        let with = serde_json::from_value::<ExecuteResponseBody>(body(
+            serde_json::json!({ "before": "commit-a", "after": "commit-b" }),
+        ))
+        .expect("span should decode")
+        .into_execute_result()
+        .expect("result should decode");
+        let span = with.commit().expect("span is kept");
+        assert_eq!((span.before(), span.after()), ("commit-a", "commit-b"));
+    }
+
+    #[test]
+    fn execute_responses_reject_malformed_present_commit_spans() {
+        for commit in [
+            serde_json::json!({ "before": "commit-a" }),
+            serde_json::json!({ "after": "commit-b" }),
+            serde_json::json!({ "before": 1, "after": "commit-b" }),
+            serde_json::json!({ "before": "commit-a", "after": false }),
+        ] {
+            assert!(serde_json::from_value::<ExecuteResponseBody>(body(commit)).is_err());
+        }
+    }
 }
