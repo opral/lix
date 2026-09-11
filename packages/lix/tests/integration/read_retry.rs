@@ -224,6 +224,35 @@ async fn repository_open_restarts_after_its_snapshot_expires() {
 }
 
 #[tokio::test]
+async fn fresh_repository_open_restarts_each_early_coherent_read() {
+    // Two OPFS clients can race while admitting an empty repository: a commit
+    // from one expires the other's format-marker inspection. Exercise every
+    // early read, including inspection before an epoch has been published.
+    for calls_before_expiry in 0..12 {
+        let storage = ExpiringReadStorage::new();
+        storage.expire_read_call_after(calls_before_expiry);
+        let lix = crate::open_lix()
+            .with_storage(storage.clone())
+            .await
+            .unwrap_or_else(|error| {
+                panic!("fresh admission must restart after read {calls_before_expiry}: {error:?}")
+            });
+        assert_eq!(
+            storage.expired_calls(),
+            1,
+            "read {calls_before_expiry} must expire"
+        );
+        lix.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('admission-retry', 'ready')",
+            &[],
+        )
+        .await
+        .expect("restarted admission leaves a writable repository");
+        lix.close().await.expect("close initialized repository");
+    }
+}
+
+#[tokio::test]
 async fn initialized_repository_reopen_restarts_each_early_coherent_read() {
     let storage = ExpiringReadStorage::new();
     crate::open_lix()
