@@ -11,9 +11,12 @@ const lix = await openLix({
 });
 ```
 
-Combine OPFS with `server: { url: repositoryUrl }` to keep a durable local
-replica of an existing hosted repository. Reads use the local replica; writes
-execute on the server and synchronize back to the replica. See
+Combine OPFS with `server: { url: repositoryUrl, mode: "partial_replica" }`
+to keep a durable **partial replica with on-demand sync** of an existing hosted
+repository. Opening loads bounded metadata; SQL fetches missing native inputs
+and retains them locally. Covered reads and prepared writes run locally, including
+offline, and local commits upload in the background. The default `"remote"` mode
+rejects local storage. See
 [Collaboration and Sync](https://lix.dev/docs/collaboration-and-sync).
 
 `OpfsStorage` starts one package-owned dedicated worker in the page. The Lix

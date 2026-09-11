@@ -56,7 +56,7 @@ Or against a server:
 ```ts
 const lix = await openLix({
   server: {
-    url: "https://example.com/repositories/acme",
+    url: "https://example.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
   },
 });
 ```
@@ -81,7 +81,7 @@ Lix handles any file format, collaborates in real time, and embeds in your produ
 // One hosted repository per customer.
 const lix = await openLix({
   server: {
-    url: `https://example.com/repositories/${customer.id}`,
+    url: `https://example.com/lix/${customer.repositoryId}`,
   },
 });
 
@@ -108,10 +108,14 @@ import { FilesystemStorage } from "@lix-js/storage-filesystem";
 const lix = await openLix({
   storage: new FilesystemStorage({ path: "./project" }),
   server: {
-    url: "https://lixray.com/@acme/project",
+    mode: "partial_replica",
+    url: "https://lixray.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
   },
 });
 ```
+
+This creates a **partial replica with on-demand sync**. SQL loads missing inputs;
+covered reads and prepared writes run locally, with commits uploaded in the background.
 
 Use [LixRay](https://lixray.com) or [run your own server](./docs/hosting.md).
 

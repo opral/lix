@@ -34,12 +34,7 @@ where
     let source = super::epoch::inspect_existing_epoch_adapter(storage).await?;
     let source_read = source.begin_read(Default::default()).await?;
     let original_marker = supported_authority_marker(&source_read).await?;
-    if crate::sync::has_any_sync_replica_state(&source_read).await? {
-        return Err(LixError::new(
-            "LIX_AUTHORITY_UPGRADE_REQUIRED",
-            "replica storage cannot be upgraded as an authority",
-        ));
-    }
+    ensure_authority_only_sync_state(&source_read, &original_marker).await?;
     drop(source_read);
     drop(source);
     // Reuse the ordinary registered, resumable epoch migration rather than
@@ -47,12 +42,13 @@ where
     let adapter = super::admit_existing_repository(storage).await?;
     let read = adapter.begin_read(Default::default()).await?;
     let marker = supported_authority_marker(&read).await?;
-    if marker != original_marker || crate::sync::has_any_sync_replica_state(&read).await? {
+    if marker != original_marker {
         return Err(LixError::new(
             "LIX_AUTHORITY_UPGRADE_REQUIRED",
             "authority identity changed during format migration",
         ));
     }
+    ensure_authority_only_sync_state(&read, &marker).await?;
     if marker.as_ref() == crate::sync::AUTHORITY_STATE_VALUE {
         return Ok(());
     }
@@ -98,6 +94,54 @@ where
     Ok(())
 }
 
+// Authority and full-replica records share a physical space. The ordinary
+// runtime helper treats a pre-lease v4 authority marker as incompatible state;
+// this explicit upgrader admits only its exact prevalidated marker instead.
+async fn ensure_authority_only_sync_state(
+    read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+    marker: &Bytes,
+) -> Result<(), LixError> {
+    let rejected = || {
+        LixError::new(
+            "LIX_AUTHORITY_UPGRADE_REQUIRED",
+            "replica storage cannot be upgraded as an authority",
+        )
+    };
+    let partial = PointReadPlan::new(
+        crate::sync::PARTIAL_REPLICA_STATE_SPACE,
+        &[crate::sync::partial_replica_state_key()],
+    )
+    .materialize(read, Default::default())
+    .await?
+    .value;
+    if partial.into_iter().any(|value| value.is_some()) {
+        return Err(rejected());
+    }
+    let mut cursor = read
+        .begin_scan(
+            crate::sync::SYNC_REPLICA_STATE_SPACE,
+            crate::storage_adapter::StoragePrefix {
+                bytes: Bytes::new(),
+            }
+            .to_range()?,
+            crate::storage_adapter::StorageBeginScanOptions {
+                projection: crate::storage_adapter::StorageCoreProjection::FullValue,
+                ..Default::default()
+            },
+        )
+        .await?;
+    while let Some(entries) = cursor.next_chunk().await? {
+        for entry in entries {
+            if entry.key != crate::sync::authority_state_key()
+                || !matches!(entry.value, StorageProjectedValue::FullValue(value) if value == *marker)
+            {
+                return Err(rejected());
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn supported_authority_marker(
     read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
 ) -> Result<Bytes, LixError> {
@@ -128,6 +172,54 @@ async fn supported_authority_marker(
 #[cfg(all(test, feature = "server-protocol"))]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn partial_receipt_presence_rejects_authority_upgrade_before_migration() {
+        let storage = crate::Memory::new();
+        let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
+        let mut writes = adapter.new_write_set();
+        writes.put(
+            crate::init::REPOSITORY_PROTOCOL_SPACE,
+            crate::init::REPOSITORY_PROTOCOL_KEY,
+            crate::init::REPOSITORY_PROTOCOL_V75,
+        );
+        writes.put(
+            crate::sync::SYNC_AUTHORITY_STATE_SPACE,
+            crate::sync::authority_state_key(),
+            PRE_LEASE_AUTHORITY_MARKER,
+        );
+        // Even an unrecognized/corrupt partial receipt is not permission to
+        // migrate this store as an authority.
+        writes.put(
+            crate::sync::PARTIAL_REPLICA_STATE_SPACE,
+            crate::sync::partial_replica_state_key(),
+            b"unknown-partial-state".as_slice(),
+        );
+        adapter
+            .commit_write_set(writes, Default::default())
+            .await
+            .unwrap();
+        drop(adapter);
+        let error = upgrade_authority_for_partial_sync(storage.clone())
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("replica storage"));
+        let session = crate::storage_adapter::StorageSession::acquire(storage)
+            .await
+            .unwrap();
+        let source = super::super::epoch::inspect_existing_epoch_adapter(&session)
+            .await
+            .unwrap();
+        assert!(matches!(
+            super::super::inspect_lix_with_adapter(&source)
+                .await
+                .unwrap(),
+            super::super::MigrationStatus::Required {
+                from_version: 75,
+                ..
+            }
+        ));
+    }
+
     #[tokio::test]
     async fn released_v75_authority_upgrades_preserving_rows_and_blob() {
         let storage = crate::Memory::new();
@@ -246,6 +338,61 @@ mod tests {
                 .await
                 .is_err()
         );
+        let session = crate::storage_adapter::StorageSession::acquire(storage.clone())
+            .await
+            .unwrap();
+        let source = super::super::epoch::inspect_existing_epoch_adapter(&session)
+            .await
+            .unwrap();
+        assert!(matches!(
+            super::super::inspect_lix_with_adapter(&source)
+                .await
+                .unwrap(),
+            super::super::MigrationStatus::Required {
+                from_version: 75,
+                ..
+            }
+        ));
+        // A supported authority marker cannot hide another replica entry in
+        // the shared sync-state space. Reject before advancing the v75 epoch.
+        let mut write = source
+            .begin_migration_write(StorageWriteOptions {
+                await_durable: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        write
+            .put_many(
+                crate::sync::SYNC_AUTHORITY_STATE_SPACE,
+                PutBatch {
+                    entries: vec![
+                        PutEntry {
+                            key: crate::sync::authority_state_key(),
+                            value: StorageValue {
+                                bytes: Bytes::from_static(PRE_LEASE_AUTHORITY_MARKER),
+                            },
+                        },
+                        PutEntry {
+                            key: crate::storage_adapter::StorageKey(Bytes::from_static(
+                                b"old-replica",
+                            )),
+                            value: StorageValue {
+                                bytes: Bytes::from_static(b"retained-replica-state"),
+                            },
+                        },
+                    ],
+                },
+            )
+            .await
+            .unwrap();
+        write.commit().await.unwrap();
+        drop(source);
+        drop(session);
+        let error = upgrade_authority_for_partial_sync(storage.clone())
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("replica storage"));
         let session = crate::storage_adapter::StorageSession::acquire(storage)
             .await
             .unwrap();
