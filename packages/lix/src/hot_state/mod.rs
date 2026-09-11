@@ -4,7 +4,6 @@ mod reader;
 mod row_columnar_cache;
 mod row_decoded_column_cache;
 mod tracked_head;
-pub(crate) mod typed_slots;
 #[cfg(test)]
 pub(crate) use tracked_head::{head_decode_row_pk_probe, hot_decode_row_pk_probe};
 mod types;

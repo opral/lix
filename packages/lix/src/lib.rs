@@ -97,7 +97,6 @@ mod module_layers;
 pub(crate) mod observe_coordinator;
 pub(crate) mod observe_invalidation;
 pub(crate) mod order_preserving_key;
-mod prepared_dml;
 // A `pub` view of `storage_spaces`, which is itself unconditional. This module
 // stays gated on its own merits rather than mirroring the registry's: a build
 // with neither `cfg(test)` nor `storage-benches` has no consumer for the
@@ -186,7 +185,6 @@ pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, FileId};
 pub use common::{LixPath, validate_lix_path_segment};
 pub use common::{WireQueryResult, WireValue};
 pub(crate) use common::{parse_row_metadata_value, serialize_row_metadata};
-pub(crate) use prepared_dml::{PreparedDmlParameterBatch, PreparedDmlValueRef};
 pub use session::{
     CreateBranchOptions, CreateBranchReceipt, MergeBranchOptions,
     MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
