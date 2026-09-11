@@ -13,9 +13,9 @@ const PRE_LEASE_AUTHORITY_MARKER: &[u8] = b"certified-authority-v4";
 
 /// Explicitly upgrades an existing authority to support partial-replica baseline leases.
 ///
-/// First complete the ordinary repository-format migration using the existing
-/// opening workflow. Close all handles before passing storage here. This operation
-/// preserves repository rows and atomically fences authorities predating leases;
+/// Close all handles before passing storage here. After checking authority
+/// eligibility, this explicitly runs registered full-format migrations (v72 onward)
+/// and atomically fences authorities predating leases. It preserves repository rows;
 /// it is never performed implicitly by partial-replica opening.
 pub async fn upgrade_authority_for_partial_sync<S>(storage: S) -> Result<(), LixError>
 where
@@ -29,38 +29,32 @@ pub(crate) async fn upgrade_authority_native_baseline_fence<S>(storage: &S) -> R
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    // Admission can migrate an old epoch. Validate the source first so this
+    // explicit authority operation never upgrades a replica or ordinary store.
+    let source = super::epoch::inspect_existing_epoch_adapter(storage).await?;
+    let source_read = source.begin_read(Default::default()).await?;
+    let original_marker = supported_authority_marker(&source_read).await?;
+    if crate::sync::has_any_sync_replica_state(&source_read).await? {
+        return Err(LixError::new(
+            "LIX_AUTHORITY_UPGRADE_REQUIRED",
+            "replica storage cannot be upgraded as an authority",
+        ));
+    }
+    drop(source_read);
+    drop(source);
+    // Reuse the ordinary registered, resumable epoch migration rather than
+    // rewriting the old source in place or constructing an engine.
     let adapter = super::admit_existing_repository(storage).await?;
     let read = adapter.begin_read(Default::default()).await?;
-    if !matches!(
-        super::inspect_lix_with_adapter(&adapter).await?,
-        super::MigrationStatus::Current { .. }
-    ) {
+    let marker = supported_authority_marker(&read).await?;
+    if marker != original_marker || crate::sync::has_any_sync_replica_state(&read).await? {
         return Err(LixError::new(
             "LIX_AUTHORITY_UPGRADE_REQUIRED",
-            "authority fence upgrade requires current native full format",
+            "authority identity changed during format migration",
         ));
     }
-    let values = PointReadPlan::new(
-        crate::sync::SYNC_AUTHORITY_STATE_SPACE,
-        &[crate::sync::authority_state_key()],
-    )
-    .materialize(&read, Default::default())
-    .await?
-    .value;
-    let Some(StorageProjectedValue::FullValue(marker)) = values.into_iter().next().flatten() else {
-        return Err(LixError::new(
-            "LIX_AUTHORITY_UPGRADE_REQUIRED",
-            "existing authority marker is missing",
-        ));
-    };
     if marker.as_ref() == crate::sync::AUTHORITY_STATE_VALUE {
         return Ok(());
-    }
-    if marker.as_ref() != PRE_LEASE_AUTHORITY_MARKER {
-        return Err(LixError::new(
-            "LIX_AUTHORITY_UPGRADE_REQUIRED",
-            "authority marker is not a supported upgrade source",
-        ));
     }
     let revision = crate::storage_adapter::load_repository_mutation_revision(&read).await?;
     drop(read);
@@ -104,9 +98,171 @@ where
     Ok(())
 }
 
+async fn supported_authority_marker(
+    read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+) -> Result<Bytes, LixError> {
+    let values = PointReadPlan::new(
+        crate::sync::SYNC_AUTHORITY_STATE_SPACE,
+        &[crate::sync::authority_state_key()],
+    )
+    .materialize(read, Default::default())
+    .await?
+    .value;
+    let Some(StorageProjectedValue::FullValue(marker)) = values.into_iter().next().flatten() else {
+        return Err(LixError::new(
+            "LIX_AUTHORITY_UPGRADE_REQUIRED",
+            "existing authority marker is missing",
+        ));
+    };
+    if marker.as_ref() != PRE_LEASE_AUTHORITY_MARKER
+        && marker.as_ref() != crate::sync::AUTHORITY_STATE_VALUE
+    {
+        return Err(LixError::new(
+            "LIX_AUTHORITY_UPGRADE_REQUIRED",
+            "authority marker is not a supported upgrade source",
+        ));
+    }
+    Ok(marker)
+}
+
 #[cfg(all(test, feature = "server-protocol"))]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn released_v75_authority_upgrades_preserving_rows_and_blob() {
+        let storage = crate::Memory::new();
+        let session = crate::storage_adapter::StorageSession::acquire(storage.clone())
+            .await
+            .unwrap();
+        let session = crate::snapshot::restore_snapshot(
+            session,
+            futures_lite::io::Cursor::new(
+                include_bytes!("../../tests/fixtures/v75_released_repository.lixsnap").as_slice(),
+            ),
+        )
+        .await
+        .unwrap();
+        let source = super::super::epoch::inspect_existing_epoch_adapter(&session)
+            .await
+            .unwrap();
+        assert!(matches!(
+            super::super::inspect_lix_with_adapter(&source)
+                .await
+                .unwrap(),
+            super::super::MigrationStatus::Required {
+                from_version: 75,
+                ..
+            }
+        ));
+        let mut write = source
+            .begin_migration_write(StorageWriteOptions {
+                await_durable: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        write
+            .put_many(
+                crate::sync::SYNC_AUTHORITY_STATE_SPACE,
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: crate::sync::authority_state_key(),
+                        value: StorageValue {
+                            bytes: Bytes::from_static(PRE_LEASE_AUTHORITY_MARKER),
+                        },
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        write.commit().await.unwrap();
+        drop(source);
+        drop(session);
+        upgrade_authority_for_partial_sync(storage.clone())
+            .await
+            .unwrap();
+        upgrade_authority_for_partial_sync(storage.clone())
+            .await
+            .unwrap();
+        let session = crate::storage_adapter::StorageSession::acquire(storage)
+            .await
+            .unwrap();
+        let adapter = super::super::admit_existing_repository(&session)
+            .await
+            .unwrap();
+        crate::sync::admit_sync_authority_storage(&adapter, None)
+            .await
+            .unwrap();
+        let engine =
+            crate::engine::Engine::new_with_adapter(adapter, crate::engine::EngineOptions::new())
+                .await
+                .unwrap();
+        let reader = engine.open_session().await.unwrap();
+        let value = reader
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key='fixture-shared'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            value.rows()[0].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!({ "generation": 75, "lane": "main" })
+        );
+        let blob = reader
+            .execute(
+                "SELECT content FROM lix_file WHERE path='/docs/released-v75.bin'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let expected: Vec<u8> = (0..65_537)
+            .map(|index| ((index * 31 + index / 251) % 256) as u8)
+            .collect();
+        assert_eq!(
+            blob.rows()[0].values(),
+            &[crate::Value::Blob(expected.into())]
+        );
+        reader.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_authority_v75_is_rejected_before_format_migration() {
+        let storage = crate::Memory::new();
+        let session = crate::storage_adapter::StorageSession::acquire(storage.clone())
+            .await
+            .unwrap();
+        let session = crate::snapshot::restore_snapshot(
+            session,
+            futures_lite::io::Cursor::new(
+                include_bytes!("../../tests/fixtures/v75_released_repository.lixsnap").as_slice(),
+            ),
+        )
+        .await
+        .unwrap();
+        drop(session);
+        assert!(
+            upgrade_authority_for_partial_sync(storage.clone())
+                .await
+                .is_err()
+        );
+        let session = crate::storage_adapter::StorageSession::acquire(storage)
+            .await
+            .unwrap();
+        let source = super::super::epoch::inspect_existing_epoch_adapter(&session)
+            .await
+            .unwrap();
+        assert!(matches!(
+            super::super::inspect_lix_with_adapter(&source)
+                .await
+                .unwrap(),
+            super::super::MigrationStatus::Required {
+                from_version: 75,
+                ..
+            }
+        ));
+    }
+
     #[tokio::test]
     async fn explicit_authority_upgrade_fences_older_writer_and_preserves_rows() {
         let storage = crate::sync::durable_memory_for_test(crate::Memory::new());

@@ -26,8 +26,9 @@ Both speak the same protocol. Only the URL changes in client code.
 
 Use `createLix({ server: { url: hostOrigin, headers } })` to create a hosted
 repository programmatically. It returns `{ id, url }`; pass `url` to
-`openLix({ server: { url, headers } })`. Add `storage` to that open request to
-keep a synchronized local replica.
+`openLix({ server: { url, headers } })`. Add `storage` and explicitly set `server.mode: "partial_replica"` to keep a
+partial replica with on-demand sync. Omitting the mode defaults to remote SQL
+and does not accept client storage.
 
 `createLix({ server, from: localLix })` creates a point-in-time copy including
 history and untracked rows. It does not connect the source handle. Use

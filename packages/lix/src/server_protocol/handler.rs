@@ -2029,10 +2029,10 @@ where
                     .into_response();
                 }
                 result_response(
-                    Box::pin(partial_merge::native_migration_cleanup(
+                    partial_merge::native_migration_cleanup(
                         lease,
                         json_request!(crate::sync::NativeMigrationCleanupRequest),
-                    ))
+                    )
                     .await,
                 )
             }
@@ -2104,10 +2104,10 @@ where
                     .into_response();
                 }
                 result_response(
-                    Box::pin(partial_merge::native_migration_merge(
+                    partial_merge::native_migration_merge(
                         lease,
                         json_request!(crate::sync::NativeMigrationMergeRequest),
-                    ))
+                    )
                     .await,
                 )
             }
@@ -3471,51 +3471,55 @@ where
     }))
 }
 
-async fn transaction_execute<S>(
+fn transaction_execute<S>(
     lease: SessionLease<S>,
     headers: HeaderMap,
     Json(request): Json<ExecuteRequest>,
-) -> Result<Json<ExecuteResponse>, ApiError>
+) -> SqlHandlerFuture<Json<ExecuteResponse>>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let sql = required_non_empty(request.sql, "sql")?;
-    let reconstructed_bytes_limit = lease.record.max_reconstructed_request_blob_bytes;
-    let mut reconstructed_bytes_remaining = reconstructed_bytes_limit;
-    let mut cache_candidate_bytes_remaining = 0;
-    let mut cache_candidates = Vec::new();
-    let decoded = decode_request_params(
-        request.params,
-        None,
-        false,
-        reconstructed_bytes_limit,
-        &mut reconstructed_bytes_remaining,
-        &mut cache_candidate_bytes_remaining,
-        &mut cache_candidates,
-        |sha256| lease.record.request_blob(sha256),
-    )?;
-    let result = lease
-        .transaction_execute(
-            required_transaction_id(&headers)?,
-            sql,
-            decoded.values,
-            request.options.into(),
-        )
-        .await?;
-    Ok(Json(ExecuteResponse::try_from(result)?))
+    Box::pin(async move {
+        let sql = required_non_empty(request.sql, "sql")?;
+        let reconstructed_bytes_limit = lease.record.max_reconstructed_request_blob_bytes;
+        let mut reconstructed_bytes_remaining = reconstructed_bytes_limit;
+        let mut cache_candidate_bytes_remaining = 0;
+        let mut cache_candidates = Vec::new();
+        let decoded = decode_request_params(
+            request.params,
+            None,
+            false,
+            reconstructed_bytes_limit,
+            &mut reconstructed_bytes_remaining,
+            &mut cache_candidate_bytes_remaining,
+            &mut cache_candidates,
+            |sha256| lease.record.request_blob(sha256),
+        )?;
+        let result = lease
+            .transaction_execute(
+                required_transaction_id(&headers)?,
+                sql,
+                decoded.values,
+                request.options.into(),
+            )
+            .await?;
+        Ok(Json(ExecuteResponse::try_from(result)?))
+    })
 }
 
-async fn commit_transaction<S>(
+fn commit_transaction<S>(
     lease: SessionLease<S>,
     headers: HeaderMap,
-) -> Result<StatusCode, ApiError>
+) -> SqlHandlerFuture<StatusCode>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    lease
-        .commit_transaction(required_transaction_id(&headers)?)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
+    Box::pin(async move {
+        lease
+            .commit_transaction(required_transaction_id(&headers)?)
+            .await?;
+        Ok(StatusCode::NO_CONTENT)
+    })
 }
 
 async fn rollback_transaction<S>(
@@ -3536,58 +3540,60 @@ where
 /// This intentionally covers only the dominant file-transfer shape. It keeps
 /// the normal execute response envelope, but avoids JSON base64 expansion and
 /// decoding for the file payload itself.
-async fn upsert_file_content<S>(
+fn upsert_file_content<S>(
     lease: SessionLease<S>,
     request: BinaryFileUpdateRequest,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Response, ApiError>
+) -> SqlHandlerFuture<Response>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let path = required_non_empty(request.path, "path")?;
-    if let Some(content_range) = parse_file_upload_content_range(&headers, body.len())? {
-        let upload_id = headers
-            .get(FILE_UPLOAD_ID_HEADER)
-            .ok_or_else(|| ApiError::bad_request("Content-Range requires Lix-Upload-Id"))?
-            .to_str()
-            .map_err(|_| ApiError::bad_request("Lix-Upload-Id must be ASCII"))?
-            .to_owned();
-        let progress = lease
-            .run_durable(move |lix| async move {
-                lix.upsert_file_content_part(
-                    upload_id,
-                    path,
-                    content_range.start,
-                    content_range.total,
-                    body,
-                )
-                .await
-            })
-            .await?;
-        let mut response = Json(ExecuteResponse::try_from(
-            ExecuteResult::from_rows_affected(u64::from(progress.finalized)),
-        )?)
-        .into_response();
-        if !progress.finalized {
-            *response.status_mut() = StatusCode::PERMANENT_REDIRECT;
-            if progress.next_offset > 0 {
-                response.headers_mut().insert(
-                    RANGE,
-                    http::HeaderValue::from_str(&format!("bytes=0-{}", progress.next_offset - 1))
-                        .expect("decimal upload offset is a valid HTTP header"),
-                );
+    Box::pin(async move {
+        let path = required_non_empty(request.path, "path")?;
+        if let Some(content_range) = parse_file_upload_content_range(&headers, body.len())? {
+            let upload_id = headers
+                .get(FILE_UPLOAD_ID_HEADER)
+                .ok_or_else(|| ApiError::bad_request("Content-Range requires Lix-Upload-Id"))?
+                .to_str()
+                .map_err(|_| ApiError::bad_request("Lix-Upload-Id must be ASCII"))?
+                .to_owned();
+            let progress = lease
+                .run_durable(move |lix| async move {
+                    lix.upsert_file_content_part(
+                        upload_id,
+                        path,
+                        content_range.start,
+                        content_range.total,
+                        body,
+                    )
+                    .await
+                })
+                .await?;
+            let mut response = Json(ExecuteResponse::try_from(
+                ExecuteResult::from_rows_affected(u64::from(progress.finalized)),
+            )?)
+            .into_response();
+            if !progress.finalized {
+                *response.status_mut() = StatusCode::PERMANENT_REDIRECT;
+                if progress.next_offset > 0 {
+                    response.headers_mut().insert(
+                        RANGE,
+                        http::HeaderValue::from_str(&format!("bytes=0-{}", progress.next_offset - 1))
+                            .expect("decimal upload offset is a valid HTTP header"),
+                    );
+                }
             }
+            return Ok(response);
         }
-        return Ok(response);
-    }
-    let result = lease
-        .run_durable(move |lix| async move { lix.upsert_file_content(path, body).await })
-        .await?;
-    Ok(Json(ExecuteResponse::try_from(
-        ExecuteResult::from_rows_affected(result),
-    )?)
-    .into_response())
+        let result = lease
+            .run_durable(move |lix| async move { lix.upsert_file_content(path, body).await })
+            .await?;
+        Ok(Json(ExecuteResponse::try_from(
+            ExecuteResult::from_rows_affected(result),
+        )?)
+        .into_response())
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3642,20 +3648,22 @@ fn parse_file_upload_content_range(
 /// `u32be content_length`, UTF-8 path, and raw content sequence per entry. Content
 /// payloads remain `Bytes` slices through the SDK boundary; only paths need a
 /// `String` allocation.
-async fn upsert_file_content_batch<S>(
+fn upsert_file_content_batch<S>(
     lease: SessionLease<S>,
     body: Bytes,
-) -> Result<Json<ExecuteResponse>, ApiError>
+) -> SqlHandlerFuture<Json<ExecuteResponse>>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let writes = parse_binary_file_upsert_batch(body)?;
-    let result = lease
-        .run_durable(move |lix| async move { lix.upsert_file_content_batch(writes).await })
-        .await?;
-    Ok(Json(ExecuteResponse::try_from(
-        ExecuteResult::from_rows_affected(result),
-    )?))
+    Box::pin(async move {
+        let writes = parse_binary_file_upsert_batch(body)?;
+        let result = lease
+            .run_durable(move |lix| async move { lix.upsert_file_content_batch(writes).await })
+            .await?;
+        Ok(Json(ExecuteResponse::try_from(
+            ExecuteResult::from_rows_affected(result),
+        )?))
+    })
 }
 
 fn parse_binary_file_upsert_batch(body: Bytes) -> Result<Vec<(String, Blob)>, ApiError> {
@@ -3963,99 +3971,111 @@ fn parse_single_file_range(headers: &HeaderMap) -> Result<Option<std::ops::Range
     Ok(Some(start..end_exclusive))
 }
 
-async fn create_branch<S>(
+fn create_branch<S>(
     lease: SessionLease<S>,
     Json(request): Json<CreateBranchRequest>,
-) -> Result<Json<CreateBranchResponse>, ApiError>
+) -> SqlHandlerFuture<Json<CreateBranchResponse>>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let options = CreateBranchOptions {
-        id: request.id,
-        name: required_non_empty(request.name, "name")?,
-        from_commit_id: request.from_commit_id,
-    };
-    let receipt = lease
-        .run_durable(move |lix| async move { lix.create_branch(options).await })
-        .await?;
-    Ok(Json(CreateBranchResponse {
-        id: receipt.id,
-        name: receipt.name,
-        hidden: receipt.hidden,
-        commit_id: receipt.commit_id,
-    }))
+    Box::pin(async move {
+        let options = CreateBranchOptions {
+            id: request.id,
+            name: required_non_empty(request.name, "name")?,
+            from_commit_id: request.from_commit_id,
+        };
+        let receipt = lease
+            .run_durable(move |lix| async move { lix.create_branch(options).await })
+            .await?;
+        Ok(Json(CreateBranchResponse {
+            id: receipt.id,
+            name: receipt.name,
+            hidden: receipt.hidden,
+            commit_id: receipt.commit_id,
+        }))
+    })
 }
 
-async fn undo<S>(lease: SessionLease<S>) -> Result<Json<UndoResponse>, ApiError>
+fn undo<S>(lease: SessionLease<S>) -> SqlHandlerFuture<Json<UndoResponse>>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let receipt = lease
-        .run_durable(move |lix| async move { lix.undo().await })
-        .await?;
-    Ok(Json(UndoResponse {
-        branch_id: receipt.branch_id,
-        target_commit_id: receipt.target_commit_id,
-        inverse_commit_id: receipt.inverse_commit_id,
-    }))
+    Box::pin(async move {
+        let receipt = lease
+            .run_durable(move |lix| async move { lix.undo().await })
+            .await?;
+        Ok(Json(UndoResponse {
+            branch_id: receipt.branch_id,
+            target_commit_id: receipt.target_commit_id,
+            inverse_commit_id: receipt.inverse_commit_id,
+        }))
+    })
 }
 
-async fn redo<S>(lease: SessionLease<S>) -> Result<Json<RedoResponse>, ApiError>
+fn redo<S>(lease: SessionLease<S>) -> SqlHandlerFuture<Json<RedoResponse>>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let receipt = lease
-        .run_durable(move |lix| async move { lix.redo().await })
-        .await?;
-    Ok(Json(RedoResponse {
-        branch_id: receipt.branch_id,
-        target_commit_id: receipt.target_commit_id,
-        replay_commit_id: receipt.replay_commit_id,
-    }))
+    Box::pin(async move {
+        let receipt = lease
+            .run_durable(move |lix| async move { lix.redo().await })
+            .await?;
+        Ok(Json(RedoResponse {
+            branch_id: receipt.branch_id,
+            target_commit_id: receipt.target_commit_id,
+            replay_commit_id: receipt.replay_commit_id,
+        }))
+    })
 }
 
-async fn switch_branch<S>(
+fn switch_branch<S>(
     lease: SessionLease<S>,
     Json(request): Json<SwitchBranchRequest>,
-) -> Result<Json<SwitchBranchResponse>, ApiError>
+) -> SqlHandlerFuture<Json<SwitchBranchResponse>>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let options = SwitchBranchOptions {
-        branch_id: required_non_empty(request.branch_id, "branchId")?,
-    };
-    let receipt = lease.switch_branch(options).await?;
-    Ok(Json(SwitchBranchResponse {
-        branch_id: receipt.branch_id,
-    }))
+    Box::pin(async move {
+        let options = SwitchBranchOptions {
+            branch_id: required_non_empty(request.branch_id, "branchId")?,
+        };
+        let receipt = lease.switch_branch(options).await?;
+        Ok(Json(SwitchBranchResponse {
+            branch_id: receipt.branch_id,
+        }))
+    })
 }
 
-async fn merge_branch<S>(
+fn merge_branch<S>(
     lease: SessionLease<S>,
     Json(options): Json<MergeBranchRequestBody>,
-) -> Result<Json<MergeBranchResponseBody>, ApiError>
+) -> SqlHandlerFuture<Json<MergeBranchResponseBody>>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let receipt = lease
-        .run_durable(move |lix| async move { lix.merge_branch(options.into()).await })
-        .await?;
-    Ok(Json(receipt.into()))
+    Box::pin(async move {
+        let receipt = lease
+            .run_durable(move |lix| async move { lix.merge_branch(options.into()).await })
+            .await?;
+        Ok(Json(receipt.into()))
+    })
 }
 
-async fn merge_branch_preview<S>(
+fn merge_branch_preview<S>(
     lease: SessionLease<S>,
     Json(options): Json<MergeBranchPreviewRequestBody>,
-) -> Result<Json<MergeBranchPreviewResponseBody>, ApiError>
+) -> SqlHandlerFuture<Json<MergeBranchPreviewResponseBody>>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let preview = lease
-        .run_cancellable_read(
-            move |lix| async move { lix.merge_branch_preview(options.into()).await },
-        )
-        .await?;
-    Ok(Json(preview.into()))
+    Box::pin(async move {
+        let preview = lease
+            .run_cancellable_read(
+                move |lix| async move { lix.merge_branch_preview(options.into()).await },
+            )
+            .await?;
+        Ok(Json(preview.into()))
+    })
 }
 
 async fn observe<S>(

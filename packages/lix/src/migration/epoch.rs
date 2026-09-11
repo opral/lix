@@ -354,6 +354,25 @@ enum PointerState {
     },
 }
 
+/// Inspect the existing source without admitting or migrating it. Operator
+/// upgrades use this to reject an ineligible authority before changing storage.
+pub(super) async fn inspect_existing_epoch_adapter<S>(storage: &S) -> Result<StorageAdapter<S>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    match load_pointer(storage).await? {
+        None => Ok(StorageAdapter::new(storage.clone())),
+        Some((PointerState::Active { bank, .. }, bytes)) => {
+            Ok(StorageAdapter::for_epoch(storage.clone(), bank, bytes))
+        }
+        Some((PointerState::Migrating { source, .. }, bytes)) => {
+            // Inspect only the retained source. Ordinary admission owns claim
+            // recovery; this probe neither renews nor publishes that claim.
+            Ok(StorageAdapter::for_epoch_migration(storage.clone(), source, bytes))
+        }
+    }
+}
+
 /// Adoption may migrate existing banks but must never claim a fresh bank.
 pub(crate) async fn admit_existing_repository<S>(storage: &S) -> Result<StorageAdapter<S>, LixError>
 where

@@ -26,102 +26,112 @@ fn merge_error(error: LixError) -> ApiError {
         body: ErrorEnvelope::from_lix_error(&error),
     }
 }
-pub(super) async fn retained_bodies<S>(
+pub(super) fn retained_bodies<S>(
     lease: SessionLease<S>,
     Json(request): Json<crate::sync::RetainedBodyWaveRequest>,
-) -> Result<Response, ApiError>
+) -> SqlHandlerFuture<Response>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    request.validate().map_err(merge_error)?;
-    ensure_sync_push_event_fits(&request.bodies, MAX_SYNC_PULL_RESPONSE_BYTES)?;
-    let account = lease.record.principal.account_id().to_owned();
-    let response = lease
-        .run_durable(move |lix| async move {
-            lix.push_retained_body_wave_for_account(&request, &account)
-                .await
-        })
-        .await
-        .map_err(merge_error)?;
-    bounded_sync_json_response(response, "retained body acknowledgment", 2048)
+    Box::pin(async move {
+        request.validate().map_err(merge_error)?;
+        ensure_sync_push_event_fits(&request.bodies, MAX_SYNC_PULL_RESPONSE_BYTES)?;
+        let account = lease.record.principal.account_id().to_owned();
+        let response = lease
+            .run_durable(move |lix| async move {
+                lix.push_retained_body_wave_for_account(&request, &account)
+                    .await
+            })
+            .await
+            .map_err(merge_error)?;
+        bounded_sync_json_response(response, "retained body acknowledgment", 2048)
+    })
 }
-pub(super) async fn merge<S>(
+pub(super) fn merge<S>(
     lease: SessionLease<S>,
     Json(request): Json<crate::sync::PartialMergeRequest>,
-) -> Result<Response, ApiError>
+) -> SqlHandlerFuture<Response>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    request.validate().map_err(merge_error)?;
-    let account = lease.record.principal.account_id().to_owned();
-    let response = lease
-        .run_durable(move |lix| async move {
-            lix.merge_partial_replica_for_account(&request, &account)
-                .await
-        })
-        .await
-        .map_err(merge_error)?;
-    bounded_sync_json_response(response, "authority merge receipt", 4096)
+    Box::pin(async move {
+        request.validate().map_err(merge_error)?;
+        let account = lease.record.principal.account_id().to_owned();
+        let response = lease
+            .run_durable(move |lix| async move {
+                lix.merge_partial_replica_for_account(&request, &account)
+                    .await
+            })
+            .await
+            .map_err(merge_error)?;
+        bounded_sync_json_response(response, "authority merge receipt", 4096)
+    })
 }
 
-pub(super) async fn restart<S>(
+pub(super) fn restart<S>(
     lease: SessionLease<S>,
     Json(request): Json<crate::sync::PartialAttemptRestartRequest>,
-) -> Result<Response, ApiError>
+) -> SqlHandlerFuture<Response>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    request.validate().map_err(merge_error)?;
-    let account = lease.record.principal.account_id().to_owned();
-    let response = lease
-        .run_durable(move |lix| async move {
-            lix.restart_partial_attempt_for_account(&request, &account)
-                .await
-        })
-        .await
-        .map_err(merge_error)?;
-    bounded_sync_json_response(response, "partial merge restart outcome", 4096)
+    Box::pin(async move {
+        request.validate().map_err(merge_error)?;
+        let account = lease.record.principal.account_id().to_owned();
+        let response = lease
+            .run_durable(move |lix| async move {
+                lix.restart_partial_attempt_for_account(&request, &account)
+                    .await
+            })
+            .await
+            .map_err(merge_error)?;
+        bounded_sync_json_response(response, "partial merge restart outcome", 4096)
+    })
 }
 
-pub(super) async fn native_migration_merge<S>(
+pub(super) fn native_migration_merge<S>(
     lease: SessionLease<S>,
     Json(request): Json<crate::sync::NativeMigrationMergeRequest>,
-) -> Result<Response, ApiError>
+) -> SqlHandlerFuture<Response>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    request.validate().map_err(merge_error)?;
-    let account = lease.record.principal.account_id().to_owned();
-    let response = lease
-        .run_durable(move |lix| async move {
-            Box::pin(lix.merge_native_migration_for_account(
-                &request.request,
-                &account,
-                &request.source_branch_id,
-            ))
+    Box::pin(async move {
+        request.validate().map_err(merge_error)?;
+        let account = lease.record.principal.account_id().to_owned();
+        let response = lease
+            .run_durable(move |lix| async move {
+                Box::pin(lix.merge_native_migration_for_account(
+                    &request.request,
+                    &account,
+                    &request.source_branch_id,
+                ))
+                .await
+            })
             .await
-        })
-        .await
-        .map_err(merge_error)?;
-    bounded_sync_json_response(response, "authority merge receipt", 4096)
+            .map_err(merge_error)?;
+        bounded_sync_json_response(response, "authority merge receipt", 4096)
+    })
 }
 
-pub(super) async fn native_migration_cleanup<S>(
+pub(super) fn native_migration_cleanup<S>(
     lease: SessionLease<S>,
     Json(request): Json<crate::sync::NativeMigrationCleanupRequest>,
-) -> Result<Response, ApiError>
+) -> SqlHandlerFuture<Response>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    request.validate().map_err(merge_error)?;
-    let account = lease.record.principal.account_id().to_owned();
-    let response = lease
-        .run_durable(move |lix| async move {
-            Box::pin(lix.cleanup_native_migration_for_account(&request, &account)).await
-        })
-        .await
-        .map_err(merge_error)?;
-    bounded_sync_json_response(response, "authority merge receipt", 4096)
+    Box::pin(async move {
+        request.validate().map_err(merge_error)?;
+        let account = lease.record.principal.account_id().to_owned();
+        let response = lease
+            .run_durable(move |lix| async move {
+                Box::pin(lix.cleanup_native_migration_for_account(&request, &account)).await
+            })
+            .await
+            .map_err(merge_error)?;
+        bounded_sync_json_response(response, "authority merge receipt", 4096)
+    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
