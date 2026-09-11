@@ -900,7 +900,12 @@ fn validate_first_parent_jump(
 }
 
 pub(crate) fn missing_commit_graph_error(commit_id: &CommitId) -> LixError {
-    LixError::commit_not_found(commit_id.to_string(), "walk_commit_graph", "graph_node")
+    crate::tracked_state::NativeMetadataRef::CommitGraphRecord(commit_id.to_string())
+        .annotate_missing(LixError::commit_not_found(
+            commit_id.to_string(),
+            "walk_commit_graph",
+            "graph_node",
+        ))
 }
 
 fn full_value_bytes(value: Option<StorageProjectedValue>) -> Option<Bytes> {
@@ -1261,6 +1266,18 @@ mod tests {
             .expect("commit load should succeed");
 
         assert_eq!(commit, None);
+    }
+
+    #[test]
+    fn missing_graph_node_retains_native_address_for_partial_history() {
+        let id = commit_id("missing-history-parent");
+        let error = super::missing_commit_graph_error(&id);
+        assert_eq!(error.code, crate::LixError::CODE_COMMIT_NOT_FOUND);
+        assert_eq!(
+            crate::tracked_state::NativeMetadataRef::from_missing_error(&error).unwrap(),
+            Some(crate::tracked_state::NativeMetadataRef::CommitGraphRecord(id.to_string()))
+        );
+        assert_eq!(error.details.as_ref().unwrap()["operation"], "walk_commit_graph");
     }
 
     #[tokio::test]

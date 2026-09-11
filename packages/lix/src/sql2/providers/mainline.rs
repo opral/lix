@@ -384,7 +384,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                     if limit.is_some_and(|n| emitted >= n) || remaining_ids.as_ref().is_some_and(|ids| ids.is_empty()) { break; }
                     record_work(false);
                     let node = graph.load_node(&id).await.map_err(lix_error_to_datafusion_error)?
-                        .ok_or_else(|| lix_error_to_datafusion_error(crate::LixError::commit_not_found(id.to_string(), "walk_commit_graph", "graph_node")))?;
+                        .ok_or_else(|| lix_error_to_datafusion_error(crate::commit_graph::missing_commit_graph_error(&id)))?;
                     next = node.parent_commit_ids.first().copied();
                     if let Some(ids) = remaining_ids.as_mut() { ids.remove(&id.to_string()); }
                     let current_position = position;

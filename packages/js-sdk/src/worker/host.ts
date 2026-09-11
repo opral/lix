@@ -31,7 +31,8 @@ import {
 export function startWorkerHost(
 	endpoint: WorkerHostEndpoint,
 	openBinding: typeof openLixBinding = openLixBinding,
-): void {
+): { close(): Promise<void> } {
+	let closed = false;
 	const sessions = new Map<number, LixBinding>();
 	let nextSessionId = 1;
 	let nextTransactionId = 1;
@@ -69,8 +70,10 @@ export function startWorkerHost(
 	>();
 	const syncStreamCleanup = new Map<number, () => void>();
 	let finiteQueue = Promise.resolve();
+	const registrations = new Set<Promise<void>>();
 
 	endpoint.onMessage((message: WorkerInput) => {
+		if (closed && "id" in message) return;
 		if (!("id" in message)) {
 			handleNotification(message);
 			return;
@@ -114,18 +117,21 @@ export function startWorkerHost(
 			// finite-operation queue lets a long-running operation block a newly
 			// mounted query, including one that needs lazy history hydration.
 			// The live `next()` lane is already independent for the same reason.
-			void respond(message, () =>
+			const registration = respond(message, () =>
 				handleObserveRegistration(
 					message.sessionId,
 					operation.sql,
 					operation.params,
 				),
 			);
+            registrations.add(registration);
+            void registration.finally(() => registrations.delete(registration));
 			return;
 		}
 		finiteQueue = finiteQueue.then(async () => {
 			try {
 				await respond(message, async () => {
+                    if (closed) throw workerStateError("Worker client disconnected");
 					if (
 						message.operation.kind !== "open" &&
 						message.operation.kind !== "hosted.create" &&
@@ -449,6 +455,34 @@ export function startWorkerHost(
 		await input.writer.close();
 	}
 
+    return { async close() {
+        if (closed) return;
+        closed = true;
+        const failure = workerStateError("Worker client disconnected");
+        for (const pending of pendingSyncHeaders.values()) pending.reject(failure);
+        pendingSyncHeaders.clear();
+        for (const pending of pendingSyncFetch.values()) pending.reject(failure);
+        pendingSyncFetch.clear();
+        for (const cleanup of syncStreamCleanup.values()) cleanup();
+        syncStreamCleanup.clear();
+        for (const pending of pendingSyncStreamPulls.values()) { pending.controller.error(failure); pending.reject(failure); }
+        pendingSyncStreamPulls.clear();
+        for (const observation of observations.values()) observation.close();
+        observations.clear();
+        for (const snapshot of snapshotExports.values()) await Promise.resolve(snapshot.cancel()).catch(() => undefined);
+        snapshotExports.clear();
+        await finiteQueue.catch(() => undefined);
+        await Promise.allSettled(registrations);
+        // The active finite operation has finished; never roll back a handle
+        // concurrently with its execute/commit operation.
+        for (const transaction of transactions.values()) await transaction.rollback().catch(() => undefined);
+        transactions.clear();
+        for (const snapshot of snapshotExports.values()) await Promise.resolve(snapshot.cancel()).catch(() => undefined);
+        snapshotExports.clear();
+        for (const session of sessions.values()) await session.close();
+        sessions.clear();
+    } };
+
 	function createSyncServerBridge(server: WorkerSyncServerOptions | undefined, transportScope?: number):
 		| {
 				url: string;
@@ -463,7 +497,8 @@ export function startWorkerHost(
 			headers: server.headers ?? [],
 			headerProvider: server.dynamicHeaders
 				? () => {
-						const requestId = nextSyncRequestId++;
+						if (closed) throw workerStateError("Worker client disconnected");
+                    const requestId = nextSyncRequestId++;
 						return new Promise((resolve, reject) => {
 							pendingSyncHeaders.set(requestId, { resolve, reject });
 							endpoint.postMessage({ kind: "sync.headers", requestId, transportScope });
@@ -495,7 +530,8 @@ export function startWorkerHost(
 		) {
 			throw new TypeError("Browser sync fetch has no valid response limit");
 		}
-		const requestId = nextSyncRequestId++;
+		if (closed) throw workerStateError("Worker client disconnected");
+                    const requestId = nextSyncRequestId++;
 		const requestBase = {
 			url:
 				typeof input === "string"
@@ -623,6 +659,7 @@ export function startWorkerHost(
 		// serialized finite lane. Each `observe.next` supplies telemetry directly
 		// to its observation binding.
 		const events = await requiredLix(sessionId).observe(sql, params);
+        if (closed) { events.close(); throw workerStateError("Worker client disconnected"); }
 		const observeId = nextObserveId++;
 		observations.set(observeId, events);
 		return observeId;

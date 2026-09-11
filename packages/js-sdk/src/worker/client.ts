@@ -1,4 +1,4 @@
-import { createWorkerConnection, openDirectLixBinding } from "#worker-factory";
+import { createWorkerConnection, createSharedWorkerConnection, openDirectLixBinding } from "#worker-factory";
 import type {
 	LixBinding,
 	LixStorageConfig,
@@ -46,7 +46,12 @@ export async function openLixWorker(
 	onProgress?: (progress: LixOpenProgress) => void,
 	snapshot?: ReadableStream<Uint8Array>,
 ): Promise<LixWorkerClient> {
-	let client = idleWorkers.pop();
+	const providerOptions = storage.kind === "jsStorage" ? storage.options : undefined;
+	const sharedKey = !snapshot && server && providerOptions && typeof providerOptions === "object"
+		&& "sharedEngineKey" in providerOptions && typeof providerOptions.sharedEngineKey === "string"
+		&& providerOptions.sharedEngineKey.startsWith("lix:opfs:") ? providerOptions.sharedEngineKey : undefined;
+	const sharedConnection = sharedKey ? createSharedWorkerConnection(sharedKey) : undefined;
+	let client = sharedConnection ? new LixWorkerClient(sharedConnection, false) : idleWorkers.pop();
 	while (client?.isDisposed) client = idleWorkers.pop();
 	client ??= new LixWorkerClient();
 	client.beginLease(onDisposed, telemetry, server, onProgress);
@@ -471,7 +476,7 @@ function workerObserveBinding(
 
 async function releaseWorker(client: LixWorkerClient): Promise<void> {
 	client.endLease();
-	if (!client.isDisposed && idleWorkers.length < MAX_IDLE_WORKERS) {
+	if (client.reusable && !client.isDisposed && idleWorkers.length < MAX_IDLE_WORKERS) {
 		idleWorkers.push(client);
 		return;
 	}
@@ -506,6 +511,7 @@ export class LixWorkerClient {
 
 	constructor(
 		private readonly connection: WorkerConnection = createWorkerConnection(),
+        readonly reusable = true,
 	) {
 		connection.onMessage((message) => this.handleMessage(message));
 		connection.onFatal((error) => this.handleFatal(error));

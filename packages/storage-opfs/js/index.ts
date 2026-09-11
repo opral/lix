@@ -3,6 +3,7 @@ import type {
 	LixStorageProviderRegistration,
 } from "@lix-js/sdk";
 import { OPFS_RPC_CHANNEL } from "./rpc.js";
+import { physicalName } from "./physical-name.js";
 
 export type OpfsStorageOptions = {
 	/** Identifies one persistent Lix database within the current origin. */
@@ -38,6 +39,9 @@ export class OpfsStorage implements LixStorage {
 				name: this.name,
 				mode: shared ? "shared" : "direct",
 				channelName: shared ? OPFS_RPC_CHANNEL : undefined,
+				// Internal SDK coordination; all engines for this physical file
+				// attach to one broker while the native owner fence stays intact.
+				sharedEngineKey: shared ? `lix:opfs:${physicalName(this.name)}` : undefined,
 			},
 		};
 	}
