@@ -56,3 +56,5 @@ No CI/CD runs requested; implementation commit carries `[skip ci]`.
 ## Final review — 2026-09-11
 
 Independent review found no remaining production callers of the retired APIs and no weakened surviving public-path regression. The refreshed integration tree passed 3,711 engine tests with all-simulations and server-protocol enabled (69 existing skips), plus 10 doctests. An initial release-profile run hit an unchanged test that expects debug-only content-address verification; the normal test-profile rerun passed in full. Full PR CI is required before merging into #1729.
+
+CI exposed one transitive orphan: `append_key_value_bytes` lost its last caller when typed slots were removed. Deleted the five-line private helper; adjacent active key encoders/decoders remain. Final all-features validation passed 3,740 engine tests (72 existing skips), 10 doctests, and strict Clippy across all lix targets. The first CI E2E run exceeded the unchanged 100 ms concurrent-commit p95 gate in its first wave; isolated repeats and a fresh full CI run validate that separately.

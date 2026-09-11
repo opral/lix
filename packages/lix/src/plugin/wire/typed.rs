@@ -1495,11 +1495,6 @@ pub(crate) fn encoded_key_value_size(value: &Value) -> Result<usize, Error> {
     encoded_inline_value_size(value)
 }
 
-pub(crate) fn append_key_value_bytes(output: &mut Vec<u8>, value: &Value) -> Result<(), Error> {
-    validate_key_value(value)?;
-    encode_value_inline(output, value)
-}
-
 pub fn decode_key_value_bytes(bytes: &[u8]) -> Result<Value, Error> {
     let mut reader = Reader::new(bytes);
     let value = reader.value(&mut [])?;
