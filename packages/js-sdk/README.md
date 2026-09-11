@@ -31,7 +31,7 @@ await lix.close();
 | Neither | Fresh in-memory repository |
 | `storage` | Local repository, initialized if empty |
 | `server`, mode omitted or `"remote"` | Execute SQL remotely against an existing hosted repository; no local storage |
-| `storage` and `server.mode: "partial_replica"` | Partial replica with on-demand sync; covered reads and prepared writes execute locally |
+| `storage` and `server.mode: "partial_replica"` | Partial replica with on-demand sync; reads and writes whose dependencies are resident execute locally |
 
 `server.mode` defaults to `"remote"`. Supplying storage requires explicitly opting
 into `"partial_replica"`; remote mode rejects storage. Partial-replica mode requires
@@ -97,24 +97,18 @@ A statement requiring missing inputs needs a connection; missing data is never
 silently treated as an empty result. Current data means the coherently applied
 server state plus pending local writes.
 
-Use SQL preparation to load dependencies before an interaction without applying
-its mutation:
+Prefetch a view on hover using the same ordinary SELECT it will display:
 
 ```ts
-const sql = "UPDATE lix_file SET content=$1 WHERE path=$2";
-const params = [new TextEncoder().encode("next content"), "/notes.txt"];
-await lix.prepare(sql, params); // May fetch missing inputs; content is unchanged.
-await lix.execute(sql, params); // Commits locally when dependencies remain ready.
+const sql = "SELECT content FROM lix_file WHERE path=$1";
+const params = ["/notes.txt"];
+await lix.execute(sql, params); // On hover: fetch missing read inputs.
+const result = await lix.execute(sql, params); // On open: resident reads stay local.
 ```
 
-Initial preparation supports function-free `SELECT` and deterministic filtered
-`UPDATE` of `lix_key_value.value` or ordinary `lix_file.content`. Plugin-matched
-files and other mutation shapes return `LIX_SQL_PREPARATION_UNSUPPORTED`; ordinary
-execution remains the way to run them. Preparation is scoped to the SQL,
-parameters and synchronized context: different inputs or subsequent changes can
-introduce new dependencies. It does not promise that every future write is warm
-or that validation will succeed. A server-only SQL session has no local replica
-and cannot prepare local dependencies.
+Use ordinary `execute()` for mutations. Reading a file does not promise that every
+later write's validation or commit dependencies are resident; cold operations can
+fetch additional inputs while connected.
 
 See [Collaboration and Sync](https://lix.dev/docs/collaboration-and-sync).
 

@@ -4,5 +4,3 @@ pub(crate) mod read;
 pub(crate) mod write;
 
 pub(crate) use write::{LogicalWritePlan, plan_write};
-
-pub(crate) mod prepare;

@@ -87,7 +87,6 @@ export type WorkerOperation =
 			statements: BindingBatchStatement[];
 			options?: LixBatchOptions;
 	  }
-	| { kind: "prepare"; sql: string; params: BindingParam[] }
 	| { kind: "beginTransaction" }
 	| {
 			kind: "transaction.execute";

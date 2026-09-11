@@ -127,23 +127,3 @@ test("observation setup bypasses a blocked finite operation", async () => {
 	firstExecute.resolve();
 	await vi.waitFor(() => expect(executeCalls).toBe(2));
 });
-
-
-test("prepare routes to its session and returns no execute result", async () => {
-    const responses: WorkerResponse[] = [];
-    let receive: (message: WorkerInput) => void = () => undefined;
-    const prepare = vi.fn(async () => undefined);
-    const execute = vi.fn();
-    const endpoint: WorkerHostEndpoint = {
-        postMessage(message) { responses.push(message); },
-        onMessage(listener) { receive = listener; },
-    };
-    startWorkerHost(endpoint, async () => ({ prepare, execute, setTelemetryParent() {} } as unknown as LixBinding));
-    receive({id:1,sessionId:0,operation:{kind:"open",storage:{kind:"memory"},telemetryEnabled:false,progressEnabled:false}});
-    await vi.waitFor(() => expect(responses).toContainEqual({id:1,ok:true}));
-    receive({id:2,sessionId:0,operation:{kind:"prepare",sql:"UPDATE lix_key_value SET value=$1 WHERE key='x'",params:[{kind:"text",value:"prepared"}]}});
-    await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce());
-    expect(prepare).toHaveBeenCalledWith("UPDATE lix_key_value SET value=$1 WHERE key='x'",[{kind:"text",value:"prepared"}]);
-    await vi.waitFor(() => expect(responses).toContainEqual({id:2,ok:true}));
-    expect(execute).not.toHaveBeenCalled();
-});

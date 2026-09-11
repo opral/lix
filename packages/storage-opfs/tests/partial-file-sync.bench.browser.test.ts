@@ -158,8 +158,7 @@ test("profiles public file tree, negative scope and editable content in OPFS", a
     throw new Error("Retained empty file scope did not receive remote insertion");
    });
    expect(Number((await lix.execute(countSql,[pattern])).rows[0]?.n)).toBe(fixture.directoryFiles+1);
-   const prospective = new Uint8Array(bytes); prospective[0] ^= 1;
-   await measured("fileWritePreparation", () => lix.prepare("UPDATE lix_file SET content=$1 WHERE path=$2",[prospective,fixture.target]));
+   await measured("fileHoverPrefetch", () => lix.execute(contentSql,[fixture.target]));
    expect((await lix.execute(contentSql,[fixture.target])).rows[0]?.content).toEqual(bytes);
    offline=true; for(const controller of inFlight) controller.abort();
    const offlineStart=transfers.length;

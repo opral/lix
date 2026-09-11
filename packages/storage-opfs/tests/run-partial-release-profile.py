@@ -93,7 +93,7 @@ def run(label,fixture,config,large=False,dimension=None):
      ordered=sorted(values);summary[key]={'samples':len(values),'median':statistics.median(values),'p95':ordered[math.ceil(len(values)*.95)-1]}
    if 'timings' in row:
     summary['timings']=row['timings']
-    summary['fileWritePreparationSemantics']='Public Lix.prepare; prospective bytes remain unpublished. Earlier release fixtures performed a real dummy write, so this phase is not directly comparable.'
+    summary['fileHoverPrefetchSemantics']='Ordinary SELECT execution loads file content without publishing a write. Historical preparation phases used different APIs and are not directly comparable.'
    summaries.append(summary)
   (folder/'summary.json').write_text(json.dumps(summaries,indent=2)+'\n')
   enriched=folder/'result-with-opening-phases.json';enriched.write_text(json.dumps(payload,indent=2)+'\n')

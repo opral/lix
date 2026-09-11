@@ -1937,19 +1937,3 @@ test("remote-only handles reject local replica recovery without sending requests
 		await binding.close();
 	}
 });
-
-
-test("default remote mode rejects SQL preparation without sending requests", async () => {
- const fetch = vi.fn(async () => handshakeResponse());
- const lix = await openLix({ server: {
-  url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
-  fetch,
- } });
- try {
-  const requestCount = fetch.mock.calls.length;
-  await expect(lix.prepare("SELECT value FROM lix_key_value WHERE key=$1", ["key"]))
-   .rejects.toMatchObject({ code: "LIX_SQL_PREPARATION_UNSUPPORTED" });
-  expect(fetch).toHaveBeenCalledTimes(requestCount);
- } finally { await lix.close(); }
- await expect(lix.prepare("SELECT 1")).rejects.toMatchObject({ code: "LIX_ERROR_CLOSED" });
-});

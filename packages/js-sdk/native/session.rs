@@ -33,7 +33,6 @@ pub(crate) trait SessionOperations: Sized {
     async fn observe(&self, sql: &str, params: &[Value]) -> Result<Self::Observation, LixError>;
     async fn export_snapshot(&self) -> Result<Self::Snapshot, LixError>;
     async fn close(&self) -> Result<(), LixError>;
-    async fn prepare(&self, sql: &str, params: &[Value]) -> Result<(), LixError>;
     async fn execute(
         &self,
         sql: &str,
@@ -101,10 +100,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> SessionOperations for Lix<S> {
 
     async fn close(&self) -> Result<(), LixError> {
         Lix::close(self).await
-    }
-
-    async fn prepare(&self, sql: &str, params: &[Value]) -> Result<(), LixError> {
-        Lix::prepare(self, sql, params).await
     }
 
     async fn execute(
@@ -308,13 +303,6 @@ mod remote {
 
         async fn close(&self) -> Result<(), LixError> {
             ProtocolClient::close(self).await
-        }
-
-        async fn prepare(&self, _sql: &str, _params: &[Value]) -> Result<(), LixError> {
-            Err(LixError::new(
-                "LIX_SQL_PREPARATION_UNSUPPORTED",
-                "SQL preparation requires local storage",
-            ))
         }
 
         async fn execute(

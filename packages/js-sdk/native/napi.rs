@@ -277,11 +277,7 @@ enum LixCommand {
         telemetry_parent: Option<PendingTelemetryParent>,
         deferred: NativeLixDeferred,
     },
-    Prepare {
-        sql: String,
-        params: Vec<Value>,
-        deferred: NativeUnitDeferred,
-    },
+
     Execute {
         sql: String,
         params: Vec<Value>,
@@ -923,7 +919,6 @@ fn reject_pending_lix_commands(receiver: mpsc::Receiver<QueuedLixCommand>, error
     while let Ok(queued) = receiver.recv() {
         match queued.command {
             LixCommand::CreateHosted { deferred, .. } => deferred.reject(to_napi_error(&error)),
-            LixCommand::Prepare { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::Execute { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::OpenAnotherSession { deferred, .. } => {
                 deferred.reject(to_napi_error(&error))
@@ -989,14 +984,6 @@ fn handle_lix_command(
             let result = block_on!(state.lix.open_another_session(options))
                 .and_then(|lix| NativeLix::new(lix, telemetry_parent));
             settle_deferred(deferred, result);
-            None
-        }
-        LixCommand::Prepare {
-            sql,
-            params,
-            deferred,
-        } => {
-            settle_deferred(deferred, block_on!(state.lix.prepare(&sql, &params)));
             None
         }
         LixCommand::Execute {
@@ -1305,7 +1292,6 @@ fn settle_command_after_close(command: LixCommand) {
             settle_deferred(deferred, Err(lix_closed_error()))
         }
         LixCommand::Close(deferred) => settle_deferred(deferred, Ok(())),
-        LixCommand::Prepare { deferred, .. } => settle_deferred(deferred, Err(lix_closed_error())),
         LixCommand::OpenAnotherSession { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
@@ -1451,15 +1437,6 @@ impl NativeLixInner {
                 crate::session::SessionOperations::export_snapshot(lix).await?,
             ),
         })
-    }
-
-    async fn prepare(&self, sql: &str, params: &[Value]) -> std::result::Result<(), LixError> {
-        match self {
-            Self::Memory(lix) => crate::session::SessionOperations::prepare(lix, sql, params).await,
-            Self::FilesystemStorage(lix, _, _) => {
-                crate::session::SessionOperations::prepare(lix, sql, params).await
-            }
-        }
     }
 
     async fn execute(
@@ -2148,29 +2125,6 @@ impl NativeLix {
                     account_id: None,
                 }),
                 telemetry_parent: self.telemetry_parent.clone(),
-                deferred,
-            });
-        Ok(promise)
-    }
-
-    #[napi]
-    pub fn prepare<'env>(
-        &self,
-        env: &'env Env,
-        sql: String,
-        params: Option<Vec<LixValue>>,
-    ) -> Result<Object<'env>> {
-        let params = params
-            .unwrap_or_default()
-            .into_iter()
-            .map(Value::try_from)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| throw_lix_error(env, error))?;
-        let (deferred, promise): (NativeUnitDeferred, Object<'env>) = env.create_deferred()?;
-        self.actor
-            .send_with_deferred(deferred, |deferred| LixCommand::Prepare {
-                sql,
-                params,
                 deferred,
             });
         Ok(promise)

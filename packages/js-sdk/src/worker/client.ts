@@ -364,7 +364,6 @@ export function workerBinding(
 			lease.retain();
 			return workerBinding(client, lease, openedSessionId);
 		},
-		prepare: (sql, params) => request({ kind: "prepare", sql, params }),
 		execute: (sql, params, options) =>
 			request({ kind: "execute", sql, params, options }),
 		executeBatch: (statements, options) =>

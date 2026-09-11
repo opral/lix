@@ -99,7 +99,7 @@ const lix = await openLix({
 ```
 
 Opening installs bounded metadata. SQL fetches missing native inputs on demand
-and retains them in local storage. Covered reads and writes with prepared
+and retains them in local storage. Covered reads and writes with resident
 dependencies execute locally, including offline. Mutations commit locally and
 upload in the background; success does not wait for server acceptance.
 
@@ -162,6 +162,11 @@ Executes one PostgreSQL-dialect SQL statement against the active Lix session.
 Pass a single statement. To run several statements atomically, call
 `executeBatch()` with an array of `{ sql, params? }` objects. Do not concatenate
 statements into one SQL string or parse a script on the host.
+
+For a partial replica with on-demand sync, prefetch a view by executing its SELECT
+on hover, then execute the same SELECT when opening it. Resident inputs stay local.
+Use ordinary `execute()` for writes; a read does not promise that all later write
+validation or commit dependencies are resident.
 
 Parameters:
 

@@ -120,15 +120,6 @@ export class Lix {
 		);
 	}
 
-	/** Hydrates supported SQL dependencies without publishing prospective writes.
-	 * Inputs changed after preparation may require further hydration. */
-	async prepare(sql: string, params: SqlParam[] = []): Promise<void> {
-		assertExecuteArgs("lix", sql, params, undefined);
-		return this.#runOperation(() => this.binding.prepare(sql,
-			params.map((param, index) => toNativeValue(normalizeParam(param, index))),
-		));
-	}
-
 	execute(
 		sql: string,
 		params: SqlParam[] | undefined,

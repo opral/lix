@@ -225,22 +225,6 @@ where
         Ok(())
     }
 
-    pub(crate) async fn prepare_for_discard(mut self) -> Result<(), LixError> {
-        let transaction = self
-            .transaction
-            .take()
-            .ok_or_else(|| transaction_state_error("Lix transaction is closed"))?;
-        // No coordinator commit, notification or change cursor advancement.
-        // Runtime functions are execution-scoped; their durable sequence rows
-        // remain in the discarded prospective write set.
-        let result = transaction
-            .prepare_for_discard(&self.runtime_functions)
-            .await;
-        drop(self.write_access.take());
-        result?;
-        self.session.flush_partial_read_interests().await
-    }
-
     pub async fn rollback(mut self) -> Result<(), LixError> {
         let transaction = self
             .transaction
@@ -794,37 +778,3 @@ impl Drop for SessionOperationGuard {
         self.manager.finish_operation();
     }
 }
-
-impl<S: Storage + Clone + Send + Sync + 'static> SessionContext<S> {
-    // Box each preparation attempt at its session boundary so caller layouts
-    // do not embed the entire SQL/commit future recursively.
-    pub(crate) fn prepare_sql_once<'a>(
-        &'a self,
-        sql: &'a str,
-        params: &'a [crate::Value],
-    ) -> std::pin::Pin<Box<impl Future<Output = Result<(), LixError>> + 'a>> {
-        Box::pin(async move {
-            let update = crate::sql2::validate_sql_preparation(sql)?;
-            // Even SELECT stays inside a discarded transaction: the ordinary
-            // standalone read path may publish an automatic full-mode base refresh.
-            let mut transaction = self.begin_transaction().await?;
-            transaction
-                .transaction
-                .as_mut()
-                .expect("new preparation transaction")
-                .enable_sql_preparation();
-            if let Err(error) = transaction.execute(sql, params).await {
-                let _ = transaction.rollback().await;
-                return Err(error);
-            }
-            if update {
-                transaction.prepare_for_discard().await
-            } else {
-                transaction.rollback().await
-            }
-        })
-    }
-}
-
-#[cfg(test)]
-mod prepare_tests;

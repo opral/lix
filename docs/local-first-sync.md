@@ -9,8 +9,9 @@ them locally; unknown data is never treated as an empty result.
 
 Covered reads execute locally. Writes whose read, validation and publication
 dependencies are resident commit after local durability, without waiting for the
-server. `Lix.prepare(sql, params)` can load the supported operation's dependencies
-ahead of interaction. Cold operations may fetch more inputs or fail offline.
+server. Call `lix.execute()` with the intended SELECT on hover to fetch its
+inputs ahead of interaction. Writes use ordinary `execute()`; a cold write may
+fetch additional validation or commit inputs and can fail offline.
 One successful query does not prepare every possible subsequent statement.
 
 Current data means the coherently synchronized local state plus pending local
@@ -38,5 +39,5 @@ native inputs; unsupported inventories fail explicitly. Aggregate result caches
 are not a substitute for native coverage or editable rows.
 
 See [configuration](./collaboration-and-sync.md),
-[preparation and limits](./partial-replica-on-demand-sync.md), and
+[on-demand hydration and limits](./partial-replica-on-demand-sync.md), and
 [performance evidence](./partial-replica-performance.md).

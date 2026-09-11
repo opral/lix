@@ -116,7 +116,7 @@ by the server. For ordinary files on disk, use [filesystem sync](#filesystem-syn
 to create a **partial replica with on-demand sync**.
 
 Opening loads bounded metadata. SQL fetches missing native inputs and retains
-them locally. Covered reads and prepared writes run locally, including offline;
+them locally. Reads and writes whose dependencies are resident run locally, including offline;
 local commits upload in the background. Background synchronization advances the
 local state without making warm foreground operations wait for the server.
 
@@ -143,7 +143,7 @@ same name through the package's storage worker and cross-tab Web Lock.
 
 These configurations create a **partial replica with on-demand sync**. Opening
 loads bounded metadata; SQL fetches missing native inputs and caches them locally.
-Covered reads and prepared writes execute locally, including offline. Local
+Reads and writes whose dependencies are resident execute locally, including offline. Local
 commits upload in the background. `server.mode` defaults to `"remote"`, which
 rejects storage; the partial-replica opt-in is required. See
 [opening and reconnecting](./collaboration-and-sync.md#opening-and-reconnecting).

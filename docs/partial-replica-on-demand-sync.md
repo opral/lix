@@ -43,7 +43,7 @@ Protocol and storage changes may break compatibility. Migrate existing repositor
 
 Opening independence means bounded request count, descriptor bytes and application work as repository rows, content, history, branches and schemas grow. It does not promise constant network latency or eliminate ordinary indexed-lookup cost. The authority’s descriptor path must avoid repository-wide scans too; moving a bootstrap scan to the server does not satisfy the objective.
 
-**The local guarantee applies to prepared dependencies, not arbitrary future SQL.** Reading one file cannot make a later repository-wide update or a rename into an unseen directory warm. A cold read also does not automatically prepare every possible write on the returned rows. The prefetch/preparation API makes intended editing operations warm before the user invokes them.
+**The local guarantee applies to prepared dependencies, not arbitrary future SQL.** Reading one file cannot make a later repository-wide update or a rename into an unseen directory warm. A cold read also does not automatically prepare every possible write on the returned rows. Applications can call `execute()` with a SELECT on hover to prefetch the intended read. Writes hydrate additional dependencies through ordinary execution.
 
 ## 1. Replace the opening boundary
 
@@ -112,7 +112,7 @@ Keep default `execute` behavior automatic: cold statements hydrate and retry, wa
 
 Preparation readiness belongs to a dependency set and context. A new parameter that introduces an unseen uniqueness target, foreign key, plugin dependency or directory is a new cold demand. Do not advertise a generic “editable file” as covering every possible future mutation.
 
-Explicit transactions require preparation before opening their fixed snapshot. A missing dependency inside such a transaction returns a typed preparation error; callers can prepare and retry the whole transaction. Never replay arbitrary external side effects or partially publish a mutation while hydrating.
+Explicit transactions require preparation before opening their fixed snapshot. A missing dependency inside such a transaction returns a typed preparation error; callers can load the missing inputs with ordinary SQL and retry the whole transaction. Never replay arbitrary external side effects or partially publish a mutation while hydrating.
 
 ## 4. Prove partial native writes before broad implementation
 

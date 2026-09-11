@@ -115,7 +115,7 @@ const lix = await openLix({
 ```
 
 This creates a **partial replica with on-demand sync**. SQL loads missing inputs;
-covered reads and prepared writes run locally, with commits uploaded in the background.
+reads and writes whose dependencies are resident run locally, with commits uploaded in the background.
 
 Use [LixRay](https://lixray.com) or [run your own server](./docs/hosting.md).
 

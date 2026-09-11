@@ -299,8 +299,6 @@ export function startWorkerHost(
 				sessions.set(openedSessionId, opened);
 				return openedSessionId;
 			}
-			case "prepare":
-				return requiredLix(sessionId).prepare(operation.sql, operation.params);
 			case "execute":
 				return requiredLix(sessionId).execute(
 					operation.sql,

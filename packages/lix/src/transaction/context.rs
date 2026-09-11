@@ -738,7 +738,6 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// SQL UPDATE/DELETE predicates and computed values are decisions against
     /// the opening snapshot, not edits that may be silently reconciled later.
     protect_sql_write_snapshot: bool,
-    sql_preparation_only: bool,
     commit_boundary: Option<TransactionCommitBoundary>,
     trust_filesystem_planner: bool,
     origin_key: Option<SharedStr>,
@@ -2231,7 +2230,6 @@ where
             opening_active_branch_head,
             opening_global_branch_head,
             protect_sql_write_snapshot: false,
-            sql_preparation_only: false,
             commit_boundary: None,
             trust_filesystem_planner: false,
             origin_key: None,
@@ -2483,11 +2481,7 @@ where
         result
     }
 
-    pub(crate) fn enable_sql_preparation(&mut self) {
-        self.sql_preparation_only = true;
-    }
-
-    /// Shared native preparation boundary. Returns prospective storage
+    /// Native commit materialization boundary. Returns prospective storage
     /// mutations only; durable publication remains exclusively in commit_prepared.
     fn prepare_storage_commit<'a>(
         &'a mut self,
@@ -2784,37 +2778,6 @@ where
 
         }).await
         })
-    }
-
-    /// Consume an isolated preparation transaction without publishing it.
-    /// The caller admits only deterministic UPDATE statements before execution.
-    pub(crate) async fn prepare_for_discard(
-        mut self,
-        runtime_functions: &FunctionContext,
-    ) -> Result<(), LixError> {
-        let result = async {
-            self.flush_prepared_mutations().await?;
-            let prepared = self.staged_writes.drain()?;
-            self.ensure_account_insertion_prepared(&prepared)?;
-            let (writes, _options, _, _, _) = self
-                .prepare_storage_commit(runtime_functions, prepared, None)
-                .await?;
-            if !self.pending_plugin_actor_publications.is_empty() {
-                return Err(LixError::new(
-                    "LIX_SQL_PREPARATION_UNSUPPORTED",
-                    "plugin-authored UPDATE preparation is not yet supported",
-                ));
-            }
-            // Every native dependency was read by the same materializer used
-            // for commit. Adapter lowering only emits mutations; opening its
-            // writer here would add no dependency coverage and would create an
-            // unnecessary cancellation/async-rollback obligation.
-            drop(writes);
-            Ok(())
-        }
-        .await;
-        self.discard_pending_plugin_actor_publications().await;
-        result
     }
 
     /// The active-branch commit span this transaction is set to publish: the
@@ -5234,43 +5197,7 @@ where
             };
             registries.insert(branch_id.clone(), registry);
         }
-        if self.sql_preparation_only {
-            // Read-only native registry/path classification precedes generation
-            // upgrades, actor leases, actor creation and prospective documents.
-            for row in rows.iter() {
-                if registries
-                    .get(row.branch_id.as_str())
-                    .is_some_and(|registry| registry.owns_schema(row.schema_key.as_str()))
-                {
-                    return Err(LixError::new(
-                        "LIX_SQL_PREPARATION_UNSUPPORTED",
-                        "plugin-authored SQL preparation is not yet supported",
-                    ));
-                }
-            }
-            for write in file_content.iter() {
-                let Some(registry) = registries.get(&write.branch_id) else {
-                    continue;
-                };
-                let Some(path) = write.path.as_deref() else {
-                    return Err(LixError::new(
-                        "LIX_SQL_PREPARATION_UNSUPPORTED",
-                        "file preparation requires a resolved path",
-                    ));
-                };
-                let catalog = self.plugin_host.compiled_plugin_catalog(registry)?;
-                if registry
-                    .plugins()
-                    .iter()
-                    .any(|plugin| catalog.matches_plugin(plugin.key(), path))
-                {
-                    return Err(LixError::new(
-                        "LIX_SQL_PREPARATION_UNSUPPORTED",
-                        "plugin-matched file preparation is not yet supported",
-                    ));
-                }
-            }
-        }
+
         for (key, mutation) in lifecycle {
             let registry = registries
                 .get_mut(&key.branch_id)
@@ -5493,12 +5420,7 @@ where
             }
         }
 
-        if self.sql_preparation_only && !owners.is_empty() {
-            return Err(LixError::new(
-                "LIX_SQL_PREPARATION_UNSUPPORTED",
-                "plugin-owned file preparation is not yet supported",
-            ));
-        }
+
         let mut catalogs = BTreeMap::<String, Arc<CompiledPluginCatalog>>::new();
         for branch_id in &active_branch_ids {
             let registry = registries

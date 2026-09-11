@@ -52,12 +52,14 @@ insertion publication**. The earlier instrumented release 2 publication took
 speedup. Bounded sibling batching and reuse of complete immutable projections
 remove repeated candidate work without weakening native validation.
 
-After public SQL preparation, 30 disconnected 96 KiB content edits, reads and
+In this historical run, the now-removed SQL preparation API preceded 30 disconnected 96 KiB content edits, reads and
 counts pass with zero native input-fetch attempts. Warm content read/write
 medians are **4.7/19.75 ms**; offline OPFS reopen is 49.2 ms. Preparation itself
 takes 56.5 ms and leaves content unpublished. Changed dependencies can make a
 later operation cold; these figures do not promise that any SQL after one query
 is warm.
+Current applications prefetch SELECT inputs through `execute()`; these historical
+write-preparation timings do not describe a currently available API.
 
 | Verification | Result |
 |---|---|
@@ -131,14 +133,14 @@ and 30 samples per case, with reversed mode order at the second size:
 | 16 | 0.9 ms | 1.0 ms | 7.0 ms | 8.4 ms |
 | 16,000 | 0.7 ms | 0.9 ms | 8.85 ms | 10.65 ms |
 
-The real-file workflow passes SQL preparation without publication, 30 offline
+This historical real-file workflow used the now-removed preparation API without publication, followed by 30 offline
 96 KiB content edits/reads/counts, and reopen. At 1,600 files, warm content reads
 have a 4.55 ms median and writes 19.55 ms. This release exposed a background
 publication bottleneck: a remote insertion into retained negative/directory scopes
 took 17.81 seconds and issued 137 native range requests. The batch endpoint
 was never used by that phase. The release 4 follow-up below addresses this
 bottleneck. Cold directory
-loading is 1.30 seconds. Preparation uses the public `Lix.prepare` API and is not
+loading is 1.30 seconds. This historical run used the now-removed `Lix.prepare` API and is not
 directly comparable to earlier fixtures that performed an actual dummy write.
 
 Native verification: 3,496 tests passed, 78 ignored, normal stack, no exclusions.
@@ -178,7 +180,7 @@ population latency guarantee. Request timestamps in the baseline measured only
 work, rather than transport bandwidth, addresses that measured bottleneck.
 
 The final diagnostic retains two opening requests (2,329 bytes at 1,600 files),
-zero offline native input-fetch attempts, SQL preparation without publication,
+zero offline native input-fetch attempts, preparation through the now-removed API,
 30 content edits/reads/counts and offline reopen. Warm 96 KiB content read/write
 medians are 4.8/19.25 ms. Raw artifacts are in
 `research/lazy-browser-sync/file-demand-diagnostic-release4` in the parent

@@ -78,7 +78,6 @@ export type LixBinding = {
 	openReport?(): LixOpenReport | undefined;
 	setTelemetryParent(parent?: TelemetryParentContext): void;
 	openAnotherSession(options: OpenAnotherSessionOptions): Promise<LixBinding>;
-	prepare(sql: string, params: BindingParam[]): Promise<void>;
 	execute(
 		sql: string,
 		params: BindingParam[],

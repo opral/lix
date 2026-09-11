@@ -126,5 +126,3 @@ pub(crate) use plan::read::statement::{
 };
 
 pub(crate) use providers::{prepare_native_diff_interest, prepare_native_file_content_interest};
-
-pub(crate) use plan::prepare::validate_sql_preparation;

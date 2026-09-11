@@ -71,7 +71,7 @@ persistence, use `lix-storage-rocksdb` or `lix-storage-filesystem`. See
 
 Rust defines the lifecycle; JavaScript exposes bindings to it. Supply only a
 server for remote execution, or explicit storage and a server for a
-partial replica with on-demand sync. Covered reads and prepared writes execute
+partial replica with on-demand sync. Reads and writes whose dependencies are resident execute
 locally; pending commits upload in the background:
 
 ```rust
