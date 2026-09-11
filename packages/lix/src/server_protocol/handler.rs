@@ -3,6 +3,7 @@
 #![cfg_attr(test, allow(clippy::large_futures))]
 
 use super::PROTOCOL_VERSION;
+use super::request_value::RequestWireValue;
 use crate::engine::Engine;
 use crate::session::ExecuteOptions;
 #[cfg(test)]
@@ -105,6 +106,14 @@ impl ServerProtocolBody {
     }
 
     pub(super) async fn into_bytes(mut self, limit: usize) -> Result<Bytes, ApiError> {
+        if let ServerProtocolBodyInner::Full(bytes) = &mut self.inner {
+            let bytes = bytes.take().unwrap_or_default();
+            return if bytes.len() > limit {
+                Err(ApiError::payload_too_large(limit))
+            } else {
+                Ok(bytes)
+            };
+        }
         let mut collected = Vec::new();
         while let Some(frame) =
             std::future::poll_fn(|context| Pin::new(&mut self).poll_frame(context)).await
@@ -321,10 +330,9 @@ pub const FILE_UPLOAD_ID_HEADER: &str = "lix-upload-id";
 pub const DEFAULT_MAX_SESSIONS: usize = 64;
 /// Default idle lifetime for a remote session.
 pub const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_mins(30);
-/// Default JSON request ceiling. Base64 expands blobs by roughly one third,
-/// so 64 MiB carries the engine's 32 MiB maximum plugin archive with room for
-/// the SQL envelope and also covers ordinary larger document blobs.
-pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// No application-level request-body ceiling by default. Hosts that require a
+/// byte budget can set [`ServerProtocolOptions::max_request_body_bytes`].
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = usize::MAX;
 /// Largest number of file entries accepted by one native batch request.
 ///
 /// Keeping this bounded makes the fast path predictable for the normal bulk
@@ -1915,15 +1923,19 @@ where
         };
 
         macro_rules! json_request {
-            ($ty:ty) => {
-                match serde_json::from_slice::<$ty>(&body) {
+            ($ty:ty) => {{
+                let parsed = serde_json::from_slice::<$ty>(&body);
+                // Request types own their decoded fields. Release the raw
+                // body before hashing or executing a large SQL upload.
+                drop(body);
+                match parsed {
                     Ok(value) => Json(value),
                     Err(error) => {
                         return ApiError::bad_request(format!("invalid JSON request: {error}"))
                             .into_response();
                     }
                 }
-            };
+            }};
         }
 
         match (&method, path.as_str()) {
@@ -4683,20 +4695,6 @@ struct ExecuteBatchStatementRequest {
     label: Option<String>,
 }
 
-#[derive(Serialize)]
-struct ExecuteFingerprint<'a> {
-    sql: &'a str,
-    params: &'a [Value],
-    origin_key: Option<&'a str>,
-    label: Option<&'a str>,
-}
-
-#[derive(Serialize)]
-struct ExecuteBatchFingerprint<'a> {
-    statements: Vec<ExecuteFingerprint<'a>>,
-    origin_key: Option<&'a str>,
-}
-
 fn execute_idempotency(
     headers: &HeaderMap,
     scope: Option<String>,
@@ -4707,15 +4705,7 @@ fn execute_idempotency(
     let Some(key) = optional_idempotency_key(headers)? else {
         return Ok(None);
     };
-    let fingerprint = idempotency_fingerprint(
-        "execute",
-        &ExecuteFingerprint {
-            sql,
-            params,
-            origin_key,
-            label: None,
-        },
-    )?;
+    let fingerprint = super::fingerprint::execute(sql, params, origin_key);
     Ok(Some(ExecuteIdempotency::new(scope, key, fingerprint)))
 }
 
@@ -4728,21 +4718,7 @@ fn execute_batch_idempotency(
     let Some(key) = optional_idempotency_key(headers)? else {
         return Ok(None);
     };
-    let fingerprint = idempotency_fingerprint(
-        "execute-batch",
-        &ExecuteBatchFingerprint {
-            statements: statements
-                .iter()
-                .map(|statement| ExecuteFingerprint {
-                    sql: &statement.sql,
-                    params: &statement.params,
-                    origin_key: None,
-                    label: statement.label.as_deref(),
-                })
-                .collect(),
-            origin_key,
-        },
-    )?;
+    let fingerprint = super::fingerprint::batch(statements, origin_key);
     Ok(Some(ExecuteIdempotency::new(scope, key, fingerprint)))
 }
 
@@ -4806,56 +4782,6 @@ fn require_octet_stream_content_type(headers: &HeaderMap) -> Result<(), ApiError
             "raw sync chunk requests require Content-Type application/octet-stream",
         ))
     }
-}
-
-fn idempotency_fingerprint(
-    operation: &'static str,
-    payload: &impl Serialize,
-) -> Result<[u8; 32], ApiError> {
-    #[derive(Serialize)]
-    struct Envelope<'a, T: ?Sized> {
-        version: u8,
-        operation: &'static str,
-        payload: &'a T,
-    }
-
-    let bytes = serde_json::to_vec(&Envelope {
-        version: 1,
-        operation,
-        payload,
-    })
-    .map_err(|error| {
-        ApiError::from(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("serialize idempotency request fingerprint: {error}"),
-        ))
-    })?;
-    Ok(Sha256::digest(bytes).into())
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum RequestWireValue {
-    BlobSplice(RequestBlobSplice),
-    Value(WireValue),
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RequestBlobSplice {
-    #[serde(rename = "kind")]
-    _kind: RequestBlobSpliceKind,
-    base_sha256: String,
-    result_sha256: String,
-    prefix_bytes: u64,
-    suffix_bytes: u64,
-    insert_base64: String,
-}
-
-#[derive(Debug, Deserialize)]
-enum RequestBlobSpliceKind {
-    #[serde(rename = "blob-splice")]
-    BlobSplice,
 }
 
 #[derive(Debug, Serialize)]
@@ -11679,6 +11605,35 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn full_body_limit_preserves_shared_bytes_without_copying() {
+        let bytes = Bytes::from(vec![b'x'; 1024 * 1024]);
+        let body = ServerProtocolBody::full(bytes.clone())
+            .into_bytes(bytes.len())
+            .await
+            .expect("body at the exact limit");
+        assert_eq!(body.as_ptr(), bytes.as_ptr());
+        assert_eq!(body, bytes);
+        assert!(
+            ServerProtocolBody::full(bytes.clone())
+                .into_bytes(bytes.len() - 1)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn default_body_limit_accepts_stream_larger_than_64_mib() {
+        let chunk = Bytes::from(vec![b'x'; 1024 * 1024]);
+        let stream =
+            futures_util::stream::iter((0..65).map(move |_| Ok::<_, io::Error>(chunk.clone())));
+        let body = ServerProtocolBody::stream(stream)
+            .into_bytes(ServerProtocolOptions::default().max_request_body_bytes)
+            .await
+            .expect("default protocol budget must accept bulk imports over 64 MiB");
+        assert_eq!(body.len(), 65 * 1024 * 1024);
     }
 
     #[tokio::test]

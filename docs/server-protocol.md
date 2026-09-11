@@ -85,6 +85,17 @@ SQL and file mutations accept an optional `Idempotency-Key` header. Replaying a
 key after a lost response applies the mutation once. Sync pushes are instead
 idempotent by immutable commit identity and compare-and-swap branch updates.
 
+SQL request fingerprints now hash typed parameters directly. Receipts created
+with the previous JSON-based fingerprint remain stored, but replaying those
+keys after upgrading returns `409 LIX_IDEMPOTENCY_KEY_REUSED` without executing
+the request again. Reconcile an uncertain pre-upgrade request before submitting
+it with a new key. Repository content and storage formats are unchanged.
+
+The protocol has no default request-body byte ceiling. Hosts can set
+`ServerProtocolOptions::max_request_body_bytes` to enforce a byte budget;
+explicit budgets still return `413` for oversized bodies. Proxy limits and the
+separate sync-chunk limits still apply.
+
 ## Sync
 
 Sync is Lix-scoped: the immutable ID in the path selects the Lix. Connected
