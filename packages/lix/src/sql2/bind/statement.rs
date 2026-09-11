@@ -1503,7 +1503,7 @@ mod tests {
     #[test]
     fn bind_statement_rejects_hidden_insert_columns() {
         let statement = parse_statement(
-            "INSERT INTO lix_file (id, path, directory_id, name, content, lixcol_schema_key) VALUES ('file1', '/a', null, 'a', null, 'schema')",
+            "INSERT INTO lix_file (id, path, directory_id, name, content, lixcol_file_id) VALUES ('file1', '/a', null, 'a', null, 'schema')",
         );
         let error = bind_statement(&statement, &[], "branch1")
             .expect_err("hidden columns should not bind through statement binder");
@@ -1677,7 +1677,7 @@ mod tests {
 
     #[test]
     fn bind_statement_rejects_hidden_predicate_columns() {
-        let statement = parse_statement("DELETE FROM lix_file WHERE lixcol_schema_key = 'schema'");
+        let statement = parse_statement("DELETE FROM lix_file WHERE lixcol_file_id = 'schema'");
         let error = bind_statement(&statement, &[], "branch1")
             .expect_err("hidden predicate columns should not bind");
 

@@ -3438,7 +3438,7 @@ fn returning_expr_column_type(
         {
             "lixcol_metadata" => Some(crate::ResultColumnType::Jsonb),
             "lixcol_global" | "lixcol_untracked" => Some(crate::ResultColumnType::Boolean),
-            "lixcol_schema_key" | "lixcol_file_id" | "lixcol_created_at" | "lixcol_updated_at"
+            "lixcol_file_id" | "lixcol_created_at" | "lixcol_updated_at"
             | "lixcol_change_id" | "lixcol_commit_id" => Some(crate::ResultColumnType::Text),
             _ => None,
         },
@@ -5515,13 +5515,6 @@ enum RowEvalRowRef<'a> {
 }
 
 impl<'a> RowEvalRowRef<'a> {
-    fn schema_key(self) -> &'a str {
-        match self {
-            Self::Live(row) => row.schema_key(),
-            Self::Staged(row) => row.schema_key.as_str(),
-        }
-    }
-
     fn file_id(self) -> Option<&'a str> {
         match self {
             Self::Live(row) => row.file_id(),
@@ -7084,9 +7077,6 @@ fn column_eval_value(
         return Ok(RowEvalValue::SqlNull);
     };
     match column_name {
-        "lixcol_schema_key" => Ok(RowEvalValue::Json(JsonValue::String(
-            row.schema_key().to_string(),
-        ))),
         "lixcol_file_id" => Ok(row
             .file_id()
             .map(|value| RowEvalValue::Json(JsonValue::String(value.to_string())))
@@ -7158,9 +7148,6 @@ fn excluded_column_eval_value(
         return Ok(RowEvalValue::SqlNull);
     };
     match column_name {
-        "lixcol_schema_key" => Ok(RowEvalValue::Json(JsonValue::String(
-            row.schema_key.to_string(),
-        ))),
         "lixcol_file_id" => Ok(row
             .file_id
             .map(|value| RowEvalValue::Json(JsonValue::String(value.to_string())))

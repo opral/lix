@@ -17,8 +17,7 @@ pub(crate) enum SchemaSurfaceShape {
 /// Relation payload must never use these names or introduce another
 /// `lixcol_` segment. Derived surfaces may preserve these names directly or
 /// through a structural side prefix such as `from_lixcol_created_at`.
-pub(crate) const TRACKED_ROW_SYSTEM_COLUMN_NAMES: [&str; 9] = [
-    "lixcol_schema_key",
+pub(crate) const TRACKED_ROW_SYSTEM_COLUMN_NAMES: [&str; 8] = [
     "lixcol_file_id",
     "lixcol_metadata",
     "lixcol_created_at",
@@ -422,7 +421,6 @@ pub(crate) fn row_visible_fields(spec: &SchemaSurfaceSpec) -> Vec<Field> {
 
 pub(crate) fn row_system_fields(_shape: SchemaSurfaceShape) -> Vec<Field> {
     vec![
-        Field::new("lixcol_schema_key", DataType::Utf8, false),
         Field::new("lixcol_file_id", DataType::Utf8, true),
         json_field("lixcol_metadata", true),
         Field::new("lixcol_created_at", DataType::Utf8, true),

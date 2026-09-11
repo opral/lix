@@ -1130,7 +1130,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT id, path, content, lixcol_schema_key \
+                "SELECT id, path, content \
              FROM lix_file \
              WHERE id = '66696c65-2d72-8561-846d-650000000000'",
                 &[],
@@ -1145,7 +1145,6 @@ simulation_test!(
                 Value::Text("66696c65-2d72-8561-846d-650000000000".to_string()),
                 Value::Text("/docs/guides/readme.md".to_string()),
                 Value::Blob(b"hello".to_vec().into()),
-                Value::Text("lix_file_descriptor".to_string()),
             ]
         );
 
