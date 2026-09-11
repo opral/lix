@@ -1,6 +1,6 @@
 # Lix simplification integration
 
-This draft integration branch collects independently reviewed changes before final review against main. Physical-layout migrations remain supported; public API compatibility is not required.
+This integration branch collects independently reviewed changes before final review against main. Physical-layout migrations remain supported; public API compatibility is not required.
 
 - [x] Retire unused JSON runtime storage, fences and hashing; retain required migration decoding.
 - [x] Finish typed INSERT lowering and remove custom JSON recertification.
@@ -11,7 +11,7 @@ This draft integration branch collects independently reviewed changes before fin
 - [x] Fix shared row/mutation contract ownership.
 - [x] Centralize transactional plugin publication and cleanup.
 
-Each implementation PR targets this integration branch and starts in draft. Validate and merge each child PR into this branch. The integration PR remains draft until final user review; do not merge it into main automatically.
+Each implementation PR targets this integration branch and starts in draft. Validate and merge each child PR into this branch. Final review and green CI are required before merging the integration PR into main.
 
 Required validation includes engine all-simulations and doctests, adapter conformance for storage-contract changes, and targeted SDK, migration, SQL, branch and plugin tests. Preserve native read and batch INSERT fast-path performance.
 
@@ -33,3 +33,9 @@ Completed #1743: [explicit internal sync import variants](lix-sync-import-modes.
 Completed #1744: [shared plugin cold-file transition pipeline](lix-plugin-transition-pipeline.md), reviewed independently for correctness and performance and merged while draft. Fresh imports and ownership reselection share guest validation, host create-row/accounting and checkpoint/publication; bounded parallel scheduling, sparse transitions and publication ordering remain intact. Validation passed 3,728 engine tests (69 skipped), 10 doctests and nine real-plugin regressions. Three alternating baseline/candidate benchmark pairs across 12 workloads passed existing gates; measured median elapsed ratios were 0.955–1.022, maximum allocated bytes 1.055 and peak live bytes 1.050. CI/CD remains skipped and integration remains draft.
 
 Completed #1745: [shared tracked-head proof and publication](lix-tracked-head-publication.md), merged while draft. Prepared rows and ordered journals share ancestry certification while preserving optional versus mandatory proof and parent-bound seeds; three packed materialization routes share epoch/control publication while retaining optimized writers. Validation passed 3,729 engine tests (69 skipped), 10 doctests and four durable/columnar regressions. Seven alternating process pairs on four optimized-path tests measured median wall-time ratios 0.989–1.007 and peak RSS 0.995–0.998. CI/CD remains skipped; integration remains draft.
+
+## Final review — 2026-09-11
+
+The user requested review, necessary updates, and merging #1746, #1747 and #1729 after green CI. This supersedes the earlier draft-only instructions above. Independent reviews found no correctness blockers in SQL planning/typed validation, transaction and branch publication, migration/storage identity, sync import modes, plugin transitions, private API removal, or shared plugin source inclusion.
+
+Integration with current main preserves the SQL upload improvements and both sets of protocol regression tests. Final review added the missing merge routes to the protocol documentation table and removed two redundant codec qualifications in a frozen-layout test. Child PRs will merge into this integration branch before final main validation.

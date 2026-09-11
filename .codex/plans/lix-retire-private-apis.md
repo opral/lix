@@ -52,3 +52,7 @@ must use their own baseline/candidate workloads.
 
 Logs: `/root/repos/lix-cut-a-tests.log`, `/root/repos/lix-cut-a-docs.log`.
 No CI/CD runs requested; implementation commit carries `[skip ci]`.
+
+## Final review — 2026-09-11
+
+Independent review found no remaining production callers of the retired APIs and no weakened surviving public-path regression. The refreshed integration tree passed 3,711 engine tests with all-simulations and server-protocol enabled (69 existing skips), plus 10 doctests. An initial release-profile run hit an unchanged test that expects debug-only content-address verification; the normal test-profile rerun passed in full. Full PR CI is required before merging into #1729.
