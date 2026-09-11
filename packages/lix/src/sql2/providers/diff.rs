@@ -699,7 +699,7 @@ impl DiffRoute {
                 .any(|(_, column)| {
                     !matches!(
                         column,
-                        "id" | "lixcol_schema_key"
+                        "id"
                             | "lixcol_file_id"
                             | "lixcol_created_at"
                             | "lixcol_updated_at"
@@ -773,7 +773,6 @@ struct DiffSqlRow {
 #[derive(Clone)]
 struct DiffSide {
     id: Option<String>,
-    schema_key: String,
     global: bool,
     file_id: Option<String>,
     created_at: String,
@@ -1174,7 +1173,6 @@ fn diff_side(
         payload.and_then(|payload| payload.metadata.map(|value| value.as_value().clone()));
     Ok(Some(DiffSide {
         id: single_row_pk_string(entry.identity.row_pk()),
-        schema_key: entry.identity.schema_key().to_string(),
         global: global_rows.contains(&TrackedStateKey {
             schema_key: entry.identity.schema_key().to_owned(),
             file_id: entry.identity.file_id().map(str::to_owned),
@@ -1434,7 +1432,7 @@ where
         .any(|(_, column)| {
             !matches!(
                 column,
-                "id" | "lixcol_schema_key"
+                "id"
                     | "lixcol_file_id"
                     | "lixcol_created_at"
                     | "lixcol_updated_at"
@@ -1705,7 +1703,6 @@ fn materialized_side(row: Option<MaterializedTrackedStateRowRef<'_>>) -> Result<
         .transpose()?;
     Ok(Some(DiffSide {
         id: single_row_pk_string(row.row_pk()),
-        schema_key: row.schema_key().to_string(),
         global: false, // Filled from effective endpoint overlay provenance by the caller.
         file_id: row.file_id().map(str::to_string),
         created_at: row.created_at().to_string(),
@@ -1979,7 +1976,6 @@ fn side_value(side: Option<&DiffSide>, column: &str) -> Result<Option<lix_schema
     Ok(match column {
         "id" => side.id.clone().map(lix_schema::Value::Text),
         "path" => side.path.clone().map(lix_schema::Value::Text),
-        "lixcol_schema_key" => Some(lix_schema::Value::Text(side.schema_key.clone())),
         "lixcol_file_id" => side.file_id.clone().map(lix_schema::Value::Text),
         "lixcol_created_at" => Some(lix_schema::Value::Text(side.created_at.clone())),
         "lixcol_updated_at" => Some(lix_schema::Value::Text(side.updated_at.clone())),

@@ -279,7 +279,7 @@ simulation_test!(
             .await
             .expect("unrelated row should insert");
 
-        let columns = "key, value, lixcol_schema_key, lixcol_file_id, lixcol_metadata, \
+        let columns = "key, value, lixcol_file_id, lixcol_metadata, \
                    lixcol_created_at, lixcol_updated_at, lixcol_global, lixcol_change_id, \
                    lixcol_commit_id, lixcol_untracked";
         let live = session

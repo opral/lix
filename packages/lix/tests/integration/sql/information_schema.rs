@@ -709,7 +709,7 @@ simulation_test!(
                    table_name = 'engine_column_contract' \
                    AND column_name IN (\
                      'lixcol_change_id', 'lixcol_commit_id', 'lixcol_created_at', \
-                     'lixcol_global', 'lixcol_schema_key', \
+                     'lixcol_global', \
                      'lixcol_untracked', 'lixcol_updated_at'\
                    )\
                  ) \
@@ -748,13 +748,6 @@ simulation_test!(
                     Value::Text("NO".to_string()),
                     Value::Text("FALSE".to_string()),
                     Value::Text("DEFAULT".to_string()),
-                ],
-                vec![
-                    Value::Text("engine_column_contract".to_string()),
-                    Value::Text("lixcol_schema_key".to_string()),
-                    Value::Text("NO".to_string()),
-                    Value::Null,
-                    Value::Text("READ_ONLY".to_string()),
                 ],
                 vec![
                     Value::Text("engine_column_contract".to_string()),
@@ -2135,5 +2128,99 @@ simulation_test!(
                 ],
             ],
         );
+    }
+);
+
+simulation_test!(
+    schema_key_system_column_is_removed_from_public_sql,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
+            &engine,
+        );
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('example', 'value')",
+                &[],
+            )
+            .await
+            .expect("tracked row should insert");
+        let commit = session
+            .execute("SELECT lix_active_branch_commit_id()", &[])
+            .await
+            .expect("commit should load");
+        let [Value::Text(commit_id)] = commit.rows()[0].values() else {
+            panic!("expected commit id");
+        };
+
+        for relation in ["lix_key_value", "lix_file", "lix_directory"] {
+            for surface in [
+                relation.to_string(),
+                format!("lix_as_of('{relation}', '{commit_id}')"),
+                format!("lix_diff('{relation}', lix_root_commit_id(), '{commit_id}')"),
+                format!("lix_history('{relation}')"),
+            ] {
+                let is_diff = surface.starts_with("lix_diff(")
+                    || surface.starts_with("lix_history(");
+                // File diffs expose content names but intentionally reject byte projection.
+                let projection = if relation == "lix_file" && is_diff {
+                    "id, from_path, to_path"
+                } else {
+                    "*"
+                };
+                let result = session
+                    .execute(&format!("SELECT {projection} FROM {surface}"), &[])
+                    .await
+                    .expect("public relation query should succeed");
+                assert!(
+                    result
+                        .columns()
+                        .iter()
+                        .all(|column| !column.contains("lixcol_schema_key")),
+                    "removed column leaked through {surface}: {:?}",
+                    result.columns(),
+                );
+                let columns = if is_diff {
+                    &["from_lixcol_schema_key", "to_lixcol_schema_key"][..]
+                } else {
+                    &["lixcol_schema_key"][..]
+                };
+                for column in columns {
+                    session
+                        .execute(&format!("SELECT {column} FROM {surface}"), &[])
+                        .await
+                        .expect_err("removed column must not resolve");
+                }
+            }
+        }
+
+        for sql in [
+            "SELECT column_name FROM information_schema.columns WHERE column_name LIKE '%lixcol_schema_key%'",
+            "SELECT result_column FROM information_schema.table_functions WHERE result_column LIKE '%lixcol_schema_key%'",
+        ] {
+            assert_rows_eq(
+                session.execute(sql, &[]).await.expect("catalog should load"),
+                vec![],
+            );
+        }
+
+        for sql in [
+            "INSERT INTO lix_key_value (key, value, lixcol_schema_key) VALUES ('removed', 'value', 'lix_key_value')",
+            "UPDATE lix_key_value SET lixcol_schema_key = 'lix_key_value' WHERE key = 'example'",
+            "DELETE FROM lix_key_value WHERE lixcol_schema_key = 'lix_key_value'",
+            "UPDATE lix_key_value SET value = 'updated' WHERE key = 'example' RETURNING lixcol_schema_key",
+        ] {
+            let error = session
+                .execute(sql, &[])
+                .await
+                .expect_err("removed column must not bind in writes");
+            assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND, "{sql}: {error}");
+        }
+        let result = session
+            .execute("SELECT value FROM lix_key_value WHERE key = 'example'", &[])
+            .await
+            .expect("row should remain unchanged");
+        assert_rows_eq(result, vec![vec![Value::Jsonb(serde_json::json!("value").into())]]);
     }
 );
