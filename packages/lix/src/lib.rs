@@ -35,6 +35,7 @@
 pub(crate) const SERVER_PROTOCOL_VERSION: u32 = 8;
 
 // Hosts can parse SQL with the same dialect and parameter rules as execution.
+#[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
 pub use sql2::script::{SqlScriptPlan, SqlScriptStatement, parse_sql_script};
 
 // Let implementation modules use the same `lix::...` paths as external
