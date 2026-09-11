@@ -171,6 +171,18 @@ pub(crate) async fn stage_row_pk_index_from_deltas<'a>(
     deltas: impl IntoIterator<Item = crate::tracked_state::TrackedStateDeltaRef<'a>>,
     commit_id: crate::changelog::CommitId,
 ) -> Result<Option<TrackedStateRootId>, LixError> {
+    stage_row_pk_index_from_deltas_with_base(store, writes, overlay, None, deltas, commit_id).await
+}
+
+/// Adds prepared native identities to the inherited immutable catalog.
+pub(crate) async fn stage_row_pk_index_from_deltas_with_base<'a>(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    overlay: &mut super::storage::TrackedStateChunkOverlay,
+    base_root: Option<&TrackedStateRootId>,
+    deltas: impl IntoIterator<Item = crate::tracked_state::TrackedStateDeltaRef<'a>>,
+    commit_id: crate::changelog::CommitId,
+) -> Result<Option<TrackedStateRootId>, LixError> {
     let deltas = deltas.into_iter().collect::<Vec<_>>();
     let mut primary =
         crate::tracked_state::codec::TrackedStateMutationBatchBuilder::with_row_capacity(
@@ -198,7 +210,7 @@ pub(crate) async fn stage_row_pk_index_from_deltas<'a>(
             store,
             writes,
             overlay,
-            None,
+            base_root,
             secondary,
             Some(&commit_id.to_string()),
         )
@@ -206,7 +218,7 @@ pub(crate) async fn stage_row_pk_index_from_deltas<'a>(
     Ok(Some(result.root_id))
 }
 
-/// Offline v73 backfill for one immutable commit authority.
+/// Rebuilds one immutable commit catalog from authoritative state, including explicit tombstones.
 pub(crate) async fn backfill_row_pk_index_for_commit(
     store: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
@@ -220,6 +232,10 @@ pub(crate) async fn backfill_row_pk_index_for_commit(
             .scan_batch_at_commit(
                 &manifest.commit_id.to_string(),
                 &crate::tracked_state::TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        include_tombstones: true,
+                        ..Default::default()
+                    },
                     limit: Some(max_rows.saturating_add(1)),
                     ..Default::default()
                 },
@@ -231,6 +247,10 @@ pub(crate) async fn backfill_row_pk_index_for_commit(
         loop {
             let remaining = max_rows.saturating_sub(rows.len());
             let request = crate::tracked_state::TrackedStateScanRequest {
+                filter: crate::tracked_state::TrackedStateFilter {
+                    include_tombstones: true,
+                    ..Default::default()
+                },
                 limit: Some(remaining.saturating_add(1).min(4096)),
                 ..Default::default()
             };
@@ -261,7 +281,7 @@ pub(crate) async fn backfill_row_pk_index_for_commit(
         return Err(LixError::new(
             "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
             format!(
-                "v73 row-PK-index migration exceeds configured row bound while scanning commit '{}'",
+                "row-PK-index migration exceeds configured row bound while scanning commit '{}'",
                 manifest.commit_id
             ),
         ));

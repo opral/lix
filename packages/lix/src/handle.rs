@@ -2039,10 +2039,34 @@ where
         unsafe {
             crate::session::AssumeSendFuture::new(async move {
                 let _primary_switch_guard = match &self.primary_switch_gate {
-                    Some(gate) => Some(gate.lock().await),
+                    Some(gate) => Some(gate.clone().lock_owned().await),
                     None => None,
                 };
 
+                if let Some(state) = self.engine.sync_mode().partial_admission() {
+                    if options.branch_id != state.descriptor().selected_branch.branch_id
+                        && options.branch_id != state.descriptor().global_branch.branch_id
+                    {
+                        let server = self.server.clone().ok_or_else(|| {
+                            LixError::new(
+                                "LIX_PARTIAL_REPLICA_OFFLINE",
+                                "admitting another branch requires its authority",
+                            )
+                        })?;
+                        let target = options.branch_id.clone();
+                        let completion = self
+                            .session
+                            .partial_switch_completion(target.clone(), _primary_switch_guard)
+                            .await?;
+                        crate::sync::switch_existing_branch(
+                            self.engine.clone(),
+                            server,
+                            completion,
+                        )
+                        .await?;
+                        return Ok(SwitchBranchReceipt { branch_id: target });
+                    }
+                }
                 self.retry_sync_demands(|| self.session.switch_branch(options.clone()))
                     .await
             })

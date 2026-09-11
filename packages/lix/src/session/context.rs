@@ -443,6 +443,22 @@ where
     }
 
     /// In-memory branch this session was bound with. Does not read storage.
+    pub(crate) async fn partial_switch_completion(
+        &self,
+        target: String,
+        primary_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Result<crate::sync::PartialBranchSwitchCompletion, LixError> {
+        self.ensure_open()?;
+        let session_guard = self.branch.begin_switch().await;
+        self.ensure_open()?;
+        Ok(crate::sync::PartialBranchSwitchCompletion {
+            branch: self.branch.clone(),
+            target,
+            _primary_guard: primary_guard,
+            _session_guard: session_guard,
+        })
+    }
+
     pub(crate) fn bound_branch_id(&self) -> Result<String, LixError> {
         self.branch.get()
     }

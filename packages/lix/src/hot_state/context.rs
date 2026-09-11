@@ -325,6 +325,7 @@ fn estimated_row_columnar_layout_bytes(
 pub(crate) struct HotStateContext {
     read_interest_registry: Option<std::sync::Arc<super::ReadInterestRegistry>>,
     partial_scope_policy: Option<super::PartialReadScopePolicy>,
+    partial_scope_source: Option<std::sync::Arc<super::PartialReadScopeSource>>,
     tracked_head: TrackedHeadContext,
     commit_graph: CommitGraphContext,
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
@@ -342,6 +343,13 @@ impl HotStateContext {
     pub(crate) fn with_partial_scope_policy(&self, selected: &str, global: &str) -> Self {
         let mut scoped = self.clone();
         scoped.partial_scope_policy = Some(super::PartialReadScopePolicy::new(selected, global));
+        scoped.partial_scope_source = None;
+        scoped
+    }
+    pub(crate) fn with_partial_scope_source(&self, source: super::PartialReadScopeSource) -> Self {
+        let mut scoped = self.clone();
+        scoped.partial_scope_source = Some(std::sync::Arc::new(source));
+        scoped.partial_scope_policy = None;
         scoped
     }
     pub(crate) fn with_partial_read_preparation_epoch(mut self, epoch: &str) -> Self {
@@ -355,7 +363,7 @@ impl HotStateContext {
         &self,
     ) -> Option<(Self, std::sync::Arc<super::ReadInterestRegistry>)> {
         let parent = self.read_interest_registry.as_ref()?;
-        if self.partial_scope_policy.is_none() {
+        if self.partial_scope_policy.is_none() && self.partial_scope_source.is_none() {
             return None;
         }
         let capture = super::ReadInterestRegistry::capture(std::sync::Arc::clone(parent));
@@ -377,7 +385,7 @@ impl HotStateContext {
     }
 
     pub(crate) fn is_partial_replica(&self) -> bool {
-        self.partial_scope_policy.is_some()
+        self.partial_scope_policy.is_some() || self.partial_scope_source.is_some()
     }
 
     /// Cached readers retain this stable registry, never an operation lease.
@@ -421,6 +429,7 @@ impl HotStateContext {
         Self {
             read_interest_registry: None,
             partial_scope_policy: None,
+            partial_scope_source: None,
             tracked_head: TrackedHeadContext::new(),
             commit_graph,
             filesystem_path_index_cache: std::sync::Arc::new(FilesystemPathIndexCache::default()),
@@ -466,6 +475,8 @@ impl HotStateContext {
         HotStateContextReader {
             read_interest_registry: self.read_interest_registry.clone(),
             partial_scope_policy: self.partial_scope_policy.clone(),
+            partial_scope_source: self.partial_scope_source.clone(),
+            resolved_partial_scope: std::sync::Arc::new(tokio::sync::OnceCell::new()),
             store,
             tracked_head: self.tracked_head,
             commit_graph: self.commit_graph.clone(),
@@ -493,6 +504,8 @@ impl HotStateContext {
         HotStateContextReader {
             read_interest_registry: self.read_interest_registry.clone(),
             partial_scope_policy: self.partial_scope_policy.clone(),
+            partial_scope_source: self.partial_scope_source.clone(),
+            resolved_partial_scope: std::sync::Arc::new(tokio::sync::OnceCell::new()),
             store,
             tracked_head: self.tracked_head,
             commit_graph: self.commit_graph.clone(),
@@ -530,6 +543,8 @@ impl HotStateContext {
         HotStateContextReader {
             read_interest_registry: self.read_interest_registry.clone(),
             partial_scope_policy: self.partial_scope_policy.clone(),
+            partial_scope_source: self.partial_scope_source.clone(),
+            resolved_partial_scope: std::sync::Arc::new(tokio::sync::OnceCell::new()),
             store,
             tracked_head: self.tracked_head,
             commit_graph: self.commit_graph.clone(),
@@ -559,6 +574,7 @@ impl HotStateContext {
 pub(crate) struct HotStateContextReader<S> {
     read_interest_registry: Option<std::sync::Arc<super::ReadInterestRegistry>>,
     partial_scope_policy: Option<super::PartialReadScopePolicy>,
+    partial_scope_source: Option<std::sync::Arc<super::PartialReadScopeSource>>,
     store: S,
     tracked_head: TrackedHeadContext,
     commit_graph: CommitGraphContext,
@@ -568,12 +584,26 @@ pub(crate) struct HotStateContextReader<S> {
     branch_head_control_cache: Option<std::sync::Arc<BranchHeadControlCache>>,
     root_base_cache: std::sync::Arc<crate::hot_state::tracked_head::RootBaseBatchCache>,
     prepared_read_rows: std::sync::Arc<std::sync::Mutex<PreparedReadRows>>,
+    resolved_partial_scope: std::sync::Arc<tokio::sync::OnceCell<super::PartialReadScopePolicy>>,
 }
 
 impl<S> HotStateContextReader<S>
 where
     S: StorageAdapterRead,
 {
+    async fn effective_partial_scope_policy(
+        &self,
+    ) -> Result<Option<&super::PartialReadScopePolicy>, LixError> {
+        if let Some(source) = &self.partial_scope_source {
+            return self
+                .resolved_partial_scope
+                .get_or_try_init(|| source.load(&self.store))
+                .await
+                .map(Some);
+        }
+        Ok(self.partial_scope_policy.as_ref())
+    }
+
     pub(crate) async fn prepare_packed_identity_membership(
         &self,
         branch_id: &str,
@@ -777,7 +807,7 @@ where
         let [schema_key] = request.filter.schema_keys.as_slice() else {
             return Ok(None);
         };
-        if let Some(policy) = &self.partial_scope_policy {
+        if let Some(policy) = self.effective_partial_scope_policy().await? {
             policy.validate(&request.filter.branch_ids)?;
         }
         let scope = scan_scope(
@@ -840,7 +870,7 @@ where
         }
         let store = &self.store;
         let reads_tracked = !is_derived_only_request(request);
-        if let Some(policy) = &self.partial_scope_policy {
+        if let Some(policy) = self.effective_partial_scope_policy().await? {
             policy.validate(&request.filter.branch_ids)?;
         }
         let scope = scan_scope(
@@ -1159,12 +1189,12 @@ where
         active_account_id: &'a str,
     ) -> ReturnedChangePreparationFuture<'a> {
         Box::pin(async move {
-            if self.partial_scope_policy.is_none() {
+            if self.partial_scope_policy.is_none() && self.partial_scope_source.is_none() {
                 return Ok(());
             }
             let mut account_prepared = false;
             for interest in &captured.interests {
-                let rows = match interest.as_ref() {
+                let rows: Vec<CurrentReadIdentity> = match interest.as_ref() {
                     super::LogicalReadInterest::Scan { request, domain } => {
                         let batch = match domain {
                             super::InterestDomain::Tracked => {
@@ -1206,32 +1236,10 @@ where
                             .filter_map(CurrentReadIdentity::from_row)
                             .collect()
                     }
-                    super::LogicalReadInterest::FilesystemPaths {
-                        branch_ids,
-                        include_blob_refs,
-                        ..
-                    } => {
-                        let index = self
-                            .path_index(
-                                &FilesystemPathIndexRequest::new(branch_ids.clone())
-                                    .with_blob_refs(*include_blob_refs)
-                                    .with_cached_blob_data(false),
-                            )
-                            .await?;
-                        let mut rows = Vec::new();
-                        for entry in index.entries() {
-                            if let Some(row) = CurrentReadIdentity::from_owned(&entry.live_row()) {
-                                rows.push(row);
-                            }
-                            if *include_blob_refs
-                                && let Some(blob) = entry.blob_ref_live_row()
-                                && let Some(row) = CurrentReadIdentity::from_owned(blob)
-                            {
-                                rows.push(row);
-                            }
-                        }
-                        rows
-                    }
+                    // Path-index availability is not a returned-row scope.
+                    // File/directory providers retain exact selected identities
+                    // after predicates and limits, including cached index reads.
+                    super::LogicalReadInterest::FilesystemPaths { .. } => continue,
                     super::LogicalReadInterest::Diff {
                         branch_id: Some(branch),
                         from: super::DiffInterestEndpoint::WorkingCheckpoint,
@@ -1288,11 +1296,12 @@ where
                     }
                     // These recipes retain metadata, historical endpoints or
                     // content projections. Any current row reads they perform
-                    // independently register Exact/Scan/FilesystemPaths above.
+                    // independently register Exact/Scan above.
                     super::LogicalReadInterest::CollectionGeneration { .. }
                     | super::LogicalReadInterest::PackedIdentityMembership { .. }
                     | super::LogicalReadInterest::Diff { .. }
-                    | super::LogicalReadInterest::FileContent { .. } => continue,
+                    | super::LogicalReadInterest::FileContent { .. }
+                    | super::LogicalReadInterest::FilesystemMetadata { .. } => continue,
                 };
                 if !rows.is_empty() && !account_prepared {
                     // Every local write validates this session's active actor.
@@ -1336,8 +1345,8 @@ where
                 return Ok(());
             }
             let epoch = self
-                .partial_scope_policy
-                .as_ref()
+                .effective_partial_scope_policy()
+                .await?
                 .and_then(|policy| policy.preparation_epoch());
             let branches = rows
                 .iter()
@@ -1483,7 +1492,7 @@ where
         // controls that select the active generation; treating that request
         // as "not tracked" used to skip the controls entirely and made the
         // global untracked rows invisible after hot-index initialization.
-        if let Some(policy) = &self.partial_scope_policy {
+        if let Some(policy) = self.effective_partial_scope_policy().await? {
             policy.validate(&scope_request.filter.branch_ids)?;
         }
         let scope = scan_scope(
@@ -1738,7 +1747,7 @@ where
         }
         let store = &self.store;
         let reads_tracked = !is_derived_only_request(request);
-        if let Some(policy) = &self.partial_scope_policy {
+        if let Some(policy) = self.effective_partial_scope_policy().await? {
             policy.validate(&request.filter.branch_ids)?;
         }
         let scope = scan_scope(
@@ -1875,7 +1884,7 @@ where
     S: StorageAdapterRead,
 {
     fn is_partial_replica(&self) -> bool {
-        self.partial_scope_policy.is_some()
+        self.partial_scope_policy.is_some() || self.partial_scope_source.is_some()
     }
     fn read_interest_registry(&self) -> Option<std::sync::Arc<super::ReadInterestRegistry>> {
         self.read_interest_registry.clone()
@@ -1956,6 +1965,9 @@ where
         &self,
         request: &FilesystemPathIndexRequest,
     ) -> Result<std::sync::Arc<FilesystemPathIndex>, LixError> {
+        if let Some(policy) = self.effective_partial_scope_policy().await? {
+            policy.validate(&request.branch_ids)?;
+        }
         if let Some(registry) = &self.read_interest_registry {
             registry.register(super::LogicalReadInterest::FilesystemPaths {
                 branch_ids: request.branch_ids.clone(),
@@ -1970,7 +1982,24 @@ where
         {
             return Ok(index);
         }
-        let mut index = build_path_index(self, request).await?;
+        // FilesystemPaths already retains the complete index dependency. Its
+        // implementation scan is not a request to prepare every file for edits.
+        let index_reader = HotStateContextReader {
+            read_interest_registry: None,
+            partial_scope_policy: self.partial_scope_policy.clone(),
+            partial_scope_source: self.partial_scope_source.clone(),
+            resolved_partial_scope: self.resolved_partial_scope.clone(),
+            store: &self.store,
+            tracked_head: self.tracked_head.clone(),
+            commit_graph: self.commit_graph.clone(),
+            filesystem_path_index_cache: self.filesystem_path_index_cache.clone(),
+            row_columnar_layout_cache: self.row_columnar_layout_cache.clone(),
+            exclusive_certified_batch_cache: self.exclusive_certified_batch_cache.clone(),
+            branch_head_control_cache: self.branch_head_control_cache.clone(),
+            root_base_cache: self.root_base_cache.clone(),
+            prepared_read_rows: self.prepared_read_rows.clone(),
+        };
+        let mut index = build_path_index(&index_reader, request).await?;
         if request.cache_small_blob_data {
             index = std::sync::Arc::new(
                 (*index)
@@ -2807,6 +2836,24 @@ mod tests {
             ordered_unique_branch_row_index(&[unordered_candidate], &requested_branch_ids),
             None,
             "an unordered candidate does not make the table ordering promise"
+        );
+    }
+
+    #[test]
+    fn mutation_preparation_excludes_derived_rows_without_filtering_explicit_ids() {
+        let mut commit = commit_hot_state_row("synthetic-commit");
+        let synthetic_id = commit.commit_id.unwrap().commit_change_id();
+        commit.change_id = Some(synthetic_id);
+        let mut ordinary = tracked_row_at_with_commit("branch", "value", None, "ordinary");
+        // The schema owner, not the UUID bit pattern, determines eligibility.
+        ordinary.change_id = Some(synthetic_id);
+        let batch = MaterializedHotStateBatch::from_rows(vec![commit, ordinary]);
+        assert!(CurrentReadIdentity::from_row(batch.get(0).unwrap()).is_none());
+        assert_eq!(
+            CurrentReadIdentity::from_row(batch.get(1).unwrap())
+                .unwrap()
+                .change_id,
+            synthetic_id
         );
     }
 
@@ -5338,26 +5385,13 @@ struct CurrentReadIdentity {
     change_id: crate::changelog::ChangeId,
 }
 impl CurrentReadIdentity {
-    fn from_owned(row: &MaterializedHotStateRow) -> Option<Self> {
-        if row.untracked {
+    fn from_row(row: MaterializedHotStateRowRef<'_>) -> Option<Self> {
+        // Derived relations are served by their authoritative metadata owners.
+        // Their identities (including ordinal-zero commit changes) are not
+        // selected mutations and have no native row mutation path to prepare.
+        if is_derived_schema(row.schema_key()) {
             return None;
         }
-        Some(Self {
-            branch_id: if row.global {
-                GLOBAL_BRANCH_ID
-            } else {
-                &row.branch_id
-            }
-            .to_owned(),
-            key: crate::tracked_state::TrackedStateKey {
-                schema_key: row.schema_key.clone(),
-                file_id: row.file_id.clone(),
-                row_pk: row.row_pk.clone(),
-            },
-            change_id: row.change_id?,
-        })
-    }
-    fn from_row(row: MaterializedHotStateRowRef<'_>) -> Option<Self> {
         Some(Self {
             branch_id: if row.global() {
                 GLOBAL_BRANCH_ID
@@ -5382,4 +5416,99 @@ type PreparedReadKey = (String, CommitId, crate::changelog::ChangeId);
 struct PreparedReadRows {
     epoch: Option<String>,
     keys: std::collections::BTreeSet<PreparedReadKey>,
+}
+
+#[cfg(test)]
+mod snapshot_scope_tests {
+    use super::*;
+    use crate::storage_adapter::{StorageAdapter, StorageKey, StorageWriteOptions};
+
+    #[tokio::test]
+    async fn scope_resolution_stays_with_its_read_and_never_falls_back_on_invalid_receipt() {
+        let storage = StorageAdapter::new(crate::Memory::new());
+        let key = StorageKey(Bytes::from_static(b"scope-test"));
+        let space = crate::hot_state::TRACKED_WORKING_DIFF_MARKER_SPACE;
+        let publish = |value: &'static [u8]| {
+            let mut writes = storage.new_write_set();
+            writes.put(space, key.clone(), value);
+            writes
+        };
+        storage
+            .commit_write_set(publish(b"first"), StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let source = super::super::PartialReadScopeSource::new(space, key.clone(), 16, |bytes| {
+            let selected = match bytes {
+                b"first" => "first",
+                b"second" => "second",
+                _ => {
+                    return Err(LixError::new(
+                        "INVALID_TEST_RECEIPT",
+                        "invalid scope receipt",
+                    ));
+                }
+            };
+            let mut policy = super::super::PartialReadScopePolicy::new(selected, GLOBAL_BRANCH_ID);
+            policy.set_preparation_epoch("fixed-physical-epoch");
+            Ok(policy)
+        });
+        let hot = HotStateContext::new(TrackedStateContext::new(), CommitGraphContext::new())
+            .with_partial_scope_source(source);
+        let old = hot.reader(storage.begin_read(Default::default()).await.unwrap());
+        old.effective_partial_scope_policy()
+            .await
+            .unwrap()
+            .unwrap()
+            .validate(&["first".into()])
+            .unwrap();
+        storage
+            .commit_write_set(publish(b"second"), StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let new = hot.reader(storage.begin_read(Default::default()).await.unwrap());
+        new.effective_partial_scope_policy()
+            .await
+            .unwrap()
+            .unwrap()
+            .validate(&["second".into()])
+            .unwrap();
+        assert!(
+            old.effective_partial_scope_policy()
+                .await
+                .unwrap()
+                .unwrap()
+                .validate(&["second".into()])
+                .is_err()
+        );
+        assert!(
+            new.effective_partial_scope_policy()
+                .await
+                .unwrap()
+                .unwrap()
+                .validate(&["first".into()])
+                .is_err()
+        );
+        storage
+            .commit_write_set(publish(b"invalid"), StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let invalid = hot.reader(storage.begin_read(Default::default()).await.unwrap());
+        assert_eq!(
+            invalid
+                .effective_partial_scope_policy()
+                .await
+                .unwrap_err()
+                .code,
+            "INVALID_TEST_RECEIPT"
+        );
+        let candidate = hot.with_partial_scope_policy("candidate", GLOBAL_BRANCH_ID);
+        let candidate = candidate.reader(storage.begin_read(Default::default()).await.unwrap());
+        let policy = candidate
+            .effective_partial_scope_policy()
+            .await
+            .unwrap()
+            .unwrap();
+        policy.validate(&["candidate".into()]).unwrap();
+        assert!(policy.preparation_epoch().is_none());
+    }
 }

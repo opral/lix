@@ -11,7 +11,10 @@
 )]
 
 mod interest;
-pub(crate) use interest::prepare_native_file_content_interest;
+pub(crate) use interest::{
+    prepare_native_file_content_interest, prepare_native_file_metadata_interest,
+};
+pub(super) use interest::{retain_metadata, retain_selected_batch, retain_selected_entries};
 
 use super::values::{optional_metadata_value, update_optional_metadata_value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -587,6 +590,27 @@ pub(crate) async fn execute_exact_lix_file_read(
             None,
         )?;
     }
+    if column != ExactLixFileReadColumn::Content {
+        let (ids, path) = match selector {
+            ExactLixFileReadSelector::Id(id) => (
+                FileIdConstraint::Ids(BTreeSet::from([id.clone()])),
+                FilePathPredicate::All,
+            ),
+            ExactLixFileReadSelector::Path(path) => (
+                FileIdConstraint::All,
+                FilePathPredicate::In(BTreeSet::from([path.clone()])),
+            ),
+        };
+        retain_metadata(
+            hot_state.as_ref(),
+            false,
+            &request.filter.branch_ids,
+            &ids,
+            &FileIdConstraint::All,
+            false,
+            &path,
+        )?;
+    }
     let index = filesystem_path_index
         .path_index(
             &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
@@ -608,6 +632,11 @@ pub(crate) async fn execute_exact_lix_file_read(
             },
         ),
     };
+    retain_selected_entries(
+        hot_state.as_ref(),
+        matches.entries(),
+        column == ExactLixFileReadColumn::Content,
+    )?;
     let rows = scan_indexed_file_batch(&matches, true)?;
     let prepared = prepare_indexed_lix_file_rows(&matches, rows)?;
     let load_data = column == ExactLixFileReadColumn::Content;
@@ -650,6 +679,7 @@ pub(crate) async fn execute_exact_lix_file_read(
 /// semantics.
 pub(crate) async fn execute_exact_lix_file_root_listing(
     active_branch_id: &str,
+    hot_state: Arc<dyn HotStateReader>,
     filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
     branch_ref: Arc<dyn BranchRefReader>,
 ) -> Result<SqlQueryResult, LixError> {
@@ -660,10 +690,20 @@ pub(crate) async fn execute_exact_lix_file_root_listing(
         vec![active_branch_id.to_string()],
     )
     .await?;
+    retain_metadata(
+        hot_state.as_ref(),
+        false,
+        &branch_ids,
+        &FileIdConstraint::All,
+        &FileIdConstraint::All,
+        true,
+        &FilePathPredicate::All,
+    )?;
     let index = filesystem_path_index
         .path_index(&FilesystemPathIndexRequest::new(branch_ids))
         .await?;
     let matches = indexed_file_root_matches(index, &FileIdConstraint::All, &FilePathPredicate::All);
+    retain_selected_entries(hot_state.as_ref(), matches.entries(), false)?;
     let mut entries = matches.entries().collect::<Vec<_>>();
     entries.sort_unstable_by(|left, right| {
         left.name
@@ -761,6 +801,7 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
         )
         .await?;
     let matches = indexed_file_matches(index, &FilePathPredicate::In(paths.clone()));
+    retain_selected_entries(hot_state.as_ref(), matches.entries(), true)?;
     let rows = scan_indexed_file_batch(&matches, true)?;
     let prepared = prepare_indexed_lix_file_rows(&matches, rows)?;
     let acknowledge_plugin_data = session_file_views.is_some();
@@ -874,6 +915,7 @@ pub(crate) async fn execute_exact_lix_file_id_manifest_batch_read(
         )
         .await?;
     let matches = indexed_file_id_matches(index, file_ids, &FilePathPredicate::All);
+    retain_selected_entries(hot_state.as_ref(), matches.entries(), true)?;
     let rows = scan_indexed_file_batch(&matches, true)?;
     let prepared = prepare_indexed_lix_file_rows(&matches, rows)?;
     let acknowledge_plugin_data = session_file_views.is_some();
@@ -1062,6 +1104,18 @@ impl TableSpec for LixFileSpec {
             )
             .map_err(lix_error_to_datafusion_error)?;
         }
+        if !needs_data && !projected_schema.fields().is_empty() {
+            retain_metadata(
+                self.hot_state.as_ref(),
+                false,
+                &request.filter.branch_ids,
+                &target_file_ids,
+                &target_directory_ids,
+                root_directory_filter,
+                &indexed_path_predicate,
+            )
+            .map_err(lix_error_to_datafusion_error)?;
+        }
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
         validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_filters = filters
@@ -1134,15 +1188,31 @@ impl TableSpec for LixFileSpec {
                                 "sql2 indexed lix_file batch build failed: {error}"
                             ))
                         })?;
+                        if filters.is_empty() {
+                            if !projected_schema.fields().is_empty() {
+                                retain_selected_entries(
+                                    hot_state.as_ref(),
+                                    indexed_matches.entries().take(limit.unwrap_or(usize::MAX)),
+                                    false,
+                                )
+                                .map_err(lix_error_to_datafusion_error)?;
+                            }
+                            return Ok(batch);
+                        }
+                        let selected = finish_scan_batch(batch, &filters, None, limit, "lix_file")?;
+                        if !projected_schema.fields().is_empty() {
+                            retain_selected_batch(
+                                hot_state.as_ref(),
+                                indexed_matches,
+                                &selected,
+                                false,
+                            )?;
+                        }
                         return finish_scan_batch(
-                            batch,
-                            &filters,
-                            if filters.is_empty() {
-                                None
-                            } else {
-                                projection.as_deref()
-                            },
-                            if filters.is_empty() { None } else { limit },
+                            selected,
+                            &[],
+                            projection.as_deref(),
+                            None,
                             "lix_file",
                         );
                     }
@@ -1205,7 +1275,13 @@ impl TableSpec for LixFileSpec {
                             Box::new(lix_error_to_datafusion_error(error)),
                         )
                     })?;
-                    finish_scan_batch(batch, &filters, projection.as_deref(), limit, "lix_file")
+                    let selected = finish_scan_batch(batch, &filters, None, limit, "lix_file")?;
+                    if !projected_schema.fields().is_empty()
+                        && let Some(matches) = indexed_matches.as_ref()
+                    {
+                        retain_selected_batch(hot_state.as_ref(), matches, &selected, needs_data)?;
+                    }
+                    finish_scan_batch(selected, &[], projection.as_deref(), None, "lix_file")
                 },
             ),
         })
@@ -8698,6 +8774,117 @@ mod tests {
 
     struct RejectingHotStateReader {
         scan_count: Arc<AtomicUsize>,
+    }
+
+    struct CapturingIndexedHotReader {
+        registry: Arc<crate::hot_state::ReadInterestRegistry>,
+    }
+    #[async_trait]
+    impl HotStateReader for CapturingIndexedHotReader {
+        fn read_interest_registry(&self) -> Option<Arc<crate::hot_state::ReadInterestRegistry>> {
+            Some(self.registry.clone())
+        }
+        async fn scan_batch(
+            &self,
+            _: &HotStateScanRequest,
+        ) -> Result<MaterializedHotStateBatch, LixError> {
+            panic!("indexed selected-entry read must not scan unrelated HOT rows")
+        }
+        async fn load_exact_batch(
+            &self,
+            _: &HotStateExactBatchRequest,
+        ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+            panic!("indexed selected-entry read must use resident native entries")
+        }
+    }
+
+    #[tokio::test]
+    async fn indexed_file_content_capture_selects_only_matching_native_rows_on_repeat() {
+        let branch = "01920000-0000-7000-8000-0000000000b1";
+        let target = "01920000-0000-7000-8000-0000000000d2";
+        let other = "01920000-0000-7000-8000-0000000000d3";
+        let data = b"selected bytes".to_vec();
+        let index = Arc::new(
+            path_index_from_rows(vec![
+                live_file_row(
+                    target,
+                    branch,
+                    &format!(r#"{{"id":"{target}","directory_id":null,"name":"selected.txt"}}"#),
+                ),
+                live_blob_ref_row(
+                    target,
+                    branch,
+                    target,
+                    &BlobId::from_content(&data).to_hex(),
+                    data.len(),
+                ),
+                live_file_row(
+                    other,
+                    branch,
+                    &format!(r#"{{"id":"{other}","directory_id":null,"name":"other.txt"}}"#),
+                ),
+                live_blob_ref_row(
+                    other,
+                    branch,
+                    other,
+                    &BlobId::from_content(&data).to_hex(),
+                    data.len(),
+                ),
+            ])
+            .unwrap(),
+        );
+        let parent = crate::hot_state::ReadInterestRegistry::new(64, 64 * 1024);
+        for _ in 0..2 {
+            let capture = crate::hot_state::ReadInterestRegistry::capture(parent.clone());
+            let spec = LixFileSpec::active_branch(
+                branch,
+                Arc::new(CapturingIndexedHotReader {
+                    registry: capture.clone(),
+                }),
+                Arc::new(StaticFilesystemPathIndexReader {
+                    index: index.clone(),
+                    request_count: Arc::new(AtomicUsize::new(0)),
+                }),
+                Arc::new(TestBranchRefReader),
+                Arc::new(StaticBlobReader::from_blobs(vec![data.clone()])),
+                PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
+                test_functions(),
+            );
+            let projection = vec![spec.schema().index_of("content").unwrap()];
+            let planned = spec
+                .plan_scan(
+                    Some(&projection),
+                    &[eq_filter("id", target)],
+                    None,
+                    &ExecutionProps::new(),
+                )
+                .await
+                .unwrap();
+            let batch = planned.source.load_single_batch().await.unwrap();
+            assert_eq!(batch.num_rows(), 1);
+            let captured = capture.snapshot().unwrap();
+            let rows = captured
+                .interests
+                .iter()
+                .filter_map(|interest| match interest.as_ref() {
+                    crate::hot_state::LogicalReadInterest::Exact { rows, .. } => Some(rows),
+                    _ => None,
+                })
+                .flatten()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rows.len(),
+                2,
+                "descriptor and selected BlobRef only, on cold and repeated capture"
+            );
+            assert!(rows.iter().all(|row| row.row_pk
+                == crate::row_pk::RowPk::uuid_from_canonical(target).unwrap()
+                || row.file_id.as_deref() == Some(target)));
+            assert!(!captured.interests.iter().any(|interest| matches!(
+                interest.as_ref(),
+                crate::hot_state::LogicalReadInterest::Scan { .. }
+            )));
+        }
     }
 
     struct RecordingHotStateReader {

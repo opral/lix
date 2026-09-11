@@ -62,7 +62,7 @@ fn key(branch: &str) -> Result<StorageKey, LixError> {
 impl PartialBranchMergeState {
     fn validate(&self, state: &PartialReplicaState, branch: &str) -> Result<(), LixError> {
         self.request.validate()?;
-        if self.version != 3
+        if self.version != 4
             || self.epoch_id != state.epoch_id()
             || self.request.branch_id != branch
             || branch != state.descriptor().selected_branch.branch_id
@@ -326,7 +326,7 @@ pub(super) async fn stage_capture_partial_merge(
         expected: global_raw,
     });
     let record = PartialBranchMergeState {
-        version: 3,
+        version: 4,
         epoch_id: state.epoch_id().into(),
         request: request.clone(),
         original_confirmed: push.confirmed,
@@ -665,5 +665,113 @@ pub(super) async fn stage_rollover_partial_merge(
     record.prepared_body_wave = None;
     record.validate(state, &request.branch_id)?;
     guards.push(stage_record(writes, &record, raw)?);
+    Ok(guards)
+}
+
+// Append within partial_merge_state; admission cannot erase an archived attempt.
+pub(super) async fn require_no_branch_merge(
+    read: &(impl StorageAdapterRead + ?Sized),
+    branch: &str,
+) -> Result<Vec<StoragePrecondition>, LixError> {
+    let key = key(branch)?;
+    let value = PointReadPlan::new(PARTIAL_BRANCH_MERGE_SPACE, std::slice::from_ref(&key))
+        .materialize(read, Default::default())
+        .await?
+        .value
+        .pop()
+        .flatten();
+    if value.is_some() {
+        return Err(LixError::new(
+            "LIX_PARTIAL_BRANCH_SWITCH_PENDING",
+            "branch has a retained merge attempt",
+        ));
+    }
+    Ok(vec![StoragePrecondition::KeyAbsent {
+        space: PARTIAL_BRANCH_MERGE_SPACE,
+        key,
+    }])
+}
+
+/// Bounded one-way migration of the embedded original upload. No normal-read
+/// defaults: v3 could only have sent the single branch ref, so its frozen
+/// original request migrates with an explicitly empty created-ref list.
+pub(crate) async fn prepare_owned_partial_merge_upload_upgrade(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    state: &PartialReplicaState,
+) -> Result<Vec<StoragePrecondition>, LixError> {
+    let mut branches = state
+        .archived_branch_ids()
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    branches.insert(state.descriptor().selected_branch.branch_id.clone());
+    let mut guards = Vec::new();
+    for branch in branches {
+        if branch == crate::GLOBAL_BRANCH_ID {
+            continue;
+        }
+        let values = PointReadPlan::new(PARTIAL_BRANCH_MERGE_SPACE, &[key(&branch)?])
+            .materialize(read, Default::default())
+            .await?
+            .value;
+        let bytes = match values.into_iter().next().flatten() {
+            None => continue,
+            Some(StorageProjectedValue::FullValue(bytes)) => bytes,
+            Some(_) => return Err(invalid("merge migration point read omitted value")),
+        };
+        if bytes.len() > MAX_RECORD_BYTES {
+            return Err(invalid("merge migration exceeds metadata bound"));
+        }
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|_| invalid("old merge record malformed"))?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| invalid("old merge record must be object"))?;
+        match object.get("version").and_then(serde_json::Value::as_u64) {
+            Some(4) => {
+                let record: PartialBranchMergeState =
+                    serde_json::from_value(value).map_err(|_| invalid("merge v4 malformed"))?;
+                record.validate(state, &branch)?;
+                continue;
+            }
+            Some(3) => {}
+            _ => return Err(invalid("unsupported merge migration version")),
+        }
+        if let Some(upload) = object.get_mut("originalUpload").filter(|v| !v.is_null()) {
+            let upload = upload
+                .as_object_mut()
+                .ok_or_else(|| invalid("old original upload must be object"))?;
+            if upload.len() != 3
+                || !["attemptId", "expected", "target"]
+                    .iter()
+                    .all(|key| upload.contains_key(*key))
+            {
+                return Err(invalid("old original upload fields do not match v3 schema"));
+            }
+            upload.insert("createdRefs".into(), serde_json::json!([]));
+        }
+        object.insert("version".into(), serde_json::json!(4));
+        let record: PartialBranchMergeState = serde_json::from_value(value)
+            .map_err(|_| invalid("upgraded merge fields malformed"))?;
+        record.validate(state, &branch)?;
+        let encoded =
+            serde_json::to_vec(&record).map_err(|_| invalid("merge migration encoding failed"))?;
+        if encoded.len() > MAX_RECORD_BYTES {
+            return Err(invalid("upgraded merge exceeds bound"));
+        }
+        writes.put(
+            PARTIAL_BRANCH_MERGE_SPACE,
+            key(&branch)?,
+            crate::storage_adapter::StorageValue {
+                bytes: encoded.into(),
+            },
+        );
+        guards.push(StoragePrecondition::KeyValueEquals {
+            space: PARTIAL_BRANCH_MERGE_SPACE,
+            key: key(&branch)?,
+            expected: bytes,
+        });
+    }
     Ok(guards)
 }

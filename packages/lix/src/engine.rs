@@ -216,6 +216,24 @@ where
             interests,
             self.plugin_host.clone(),
             self.hot_state.fork_for_native_candidate(),
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_partial_branch_candidate(
+        &self,
+        read: crate::storage_adapter::StorageAdapterReadScope<StorageImpl::Read<'_>>,
+        target: &crate::sync::PartialReplicaState,
+        interests: &crate::hot_state::ReadInterestSnapshot,
+    ) -> Result<crate::sync::PreparedCandidateState, LixError> {
+        crate::session::prepare_partial_candidate_read_scope::<StorageImpl>(
+            read,
+            target,
+            interests,
+            self.plugin_host.clone(),
+            self.hot_state.fork_for_native_candidate(),
+            true,
         )
         .await
     }
@@ -258,7 +276,8 @@ where
                             &expected.descriptor().selected_branch.branch_id,
                             &expected.descriptor().global_branch.branch_id,
                         )
-                        .with_partial_read_preparation_epoch(expected.epoch_id()),
+                        .with_partial_read_preparation_epoch(expected.epoch_id())
+                        .with_partial_scope_source(expected.read_scope_source()),
                 )
             } else {
                 hot_state

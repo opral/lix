@@ -377,3 +377,49 @@ async fn candidate_expiring_after_storage_acceptance_poison_blocks_live_sql() {
         "known accepted state remains the recovery source; it must not be rolled back"
     );
 }
+
+#[tokio::test]
+async fn cancelled_publication_finishes_owned_branch_selector_after_ack() {
+    let (engine, _session, old, next, prepared, fault) = prepared_fault_fixture().await;
+    let selector = crate::session::SessionBranch::new(crate::GLOBAL_BRANCH_ID.into());
+    let primary = Arc::new(tokio::sync::Mutex::new(()));
+    let completion = crate::sync::PartialBranchSwitchCompletion {
+        branch: selector.clone(),
+        target: next.descriptor().selected_branch.branch_id.clone(),
+        _primary_guard: Some(primary.clone().lock_owned().await),
+        _session_guard: selector.begin_switch().await,
+    };
+    fault.mode.store(1, Ordering::SeqCst);
+    let mut caller = Box::pin(publish_prepared_partial(
+        engine.clone(),
+        prepared.with_branch_switch_completion(completion),
+    ));
+    tokio::select! {
+        _ = fault.entered.notified() => {},
+        result = &mut caller => panic!("publication acknowledged before acceptance fault: {result:?}"),
+    }
+    drop(caller);
+    engine.partial_owner().close();
+    assert_eq!(selector.get().unwrap(), crate::GLOBAL_BRANCH_ID);
+    assert_eq!(
+        engine.sync_mode().partial_admission().as_deref(),
+        Some(old.as_ref())
+    );
+    assert!(primary.try_lock().is_err());
+    assert!(matches!(
+        fault.owner_gate.try_acquire(),
+        Err(StorageError::InUse)
+    ));
+    fault.release.notify_one();
+    let _finished = tokio::time::timeout(Duration::from_secs(10), primary.lock())
+        .await
+        .unwrap();
+    assert_eq!(
+        selector.get().unwrap(),
+        next.descriptor().selected_branch.branch_id
+    );
+    assert_eq!(
+        engine.sync_mode().partial_admission().as_deref(),
+        Some(next.as_ref())
+    );
+}

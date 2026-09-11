@@ -1,4 +1,4 @@
-//! Closed-storage migration only: exact global merge and newly created refs.
+//! Exact descriptor-only GLOBAL reconciliation and newly created native refs.
 use crate::{GLOBAL_BRANCH_ID, LixError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;

@@ -229,6 +229,7 @@ async fn merge_capture_invalidates_staged_ack_and_fences_both_ordinary_lanes() {
         .await
         .unwrap();
     let upload = PreparedPartialUpload {
+        created_refs: Vec::new(),
         attempt_id: uuid::Uuid::now_v7().to_string(),
         expected: selected.confirmed.clone(),
         target: PartialPushCoordinate {
@@ -317,6 +318,7 @@ async fn merge_capture_invalidates_staged_ack_and_fences_both_ordinary_lanes() {
             upload.clone()
         } else {
             PreparedPartialUpload {
+                created_refs: Vec::new(),
                 attempt_id: uuid::Uuid::now_v7().to_string(),
                 expected: push.confirmed.clone(),
                 target: push.confirmed,

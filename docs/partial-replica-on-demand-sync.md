@@ -2,7 +2,7 @@
 
 **Decision: implement a partial replica with on-demand sync. Opening installs a bounded session descriptor; SQL loads missing native inputs on demand; covered reads and prepared writes execute locally; background synchronization maintains that coverage.** Server SQL fallback is an optional optimization for cold reads, with strict consistency checks. A result-cache wrapper alone does not meet the local-write requirement.
 
-This document records the reviewed design and target contract. The core implementation is complete in the development worktree: bounded opening, native SQL hydration, local commits, scoped publication and explicit migration pass native, adapter and browser verification. This is not a production deployment. Optional server SQL result fallback, broader preparation forms and cache-eviction policy below remain follow-up capabilities; current cold reads hydrate native inputs, and unsupported inventories fail explicitly. See [measured performance](partial-replica-performance.md) and [migration support and remaining boundaries](partial-replica-migration.md) for current evidence; planned capabilities below must not be read as already delivered. Three independent sub-agents reviewed correctness, engine integration and performance; their required changes are incorporated below.
+This document records the reviewed design and target contract. The development worktree implements bounded opening, native SQL hydration, local commits, scoped publication and explicit migration. Validation status and current build measurements are recorded in [PR #1755](https://github.com/opral/lix/pull/1755); this document is not a production deployment record. Optional server SQL result fallback, broader preparation forms and cache-eviction policy below remain follow-up capabilities; current cold reads hydrate native inputs, and unsupported inventories fail explicitly. See [measured performance](partial-replica-performance.md) and [migration support and remaining boundaries](partial-replica-migration.md) for current evidence; planned capabilities below must not be read as already delivered. Three independent sub-agents reviewed correctness, engine integration and performance; their required changes are incorporated below.
 
 ## JavaScript opening configuration
 
@@ -24,6 +24,21 @@ former `"sync"` spelling is rejected. Existing JavaScript callers that combined
 server and storage must add the explicit opt-in. This selector describes the
 JavaScript API; Rust continues to select the topology through its typed builders.
 
+The existing `switchBranch()` operation admits an existing authority branch on
+demand. Switching to another branch requires an online connection and confirmed
+work on the current selected and global branches. If it reports
+`LIX_PARTIAL_BRANCH_SWITCH_PENDING`, keep the handle open so background sync can
+finish, then retry the switch. The operation does not discard pending edits.
+Creating a branch remains a separate operation: retry its switch rather than
+creating the branch again. Previously visited scopes are retained, but archived
+branch subscriptions are suspended until that branch is admitted again.
+
+Background upload publishes supported new branch references together with their
+global descriptors. Concurrent disjoint branch creations use native GLOBAL
+reconciliation; unsupported semantic GLOBAL conflicts preserve local work and
+wait for a relevant state change. This does not implement automatic reconciliation
+for arbitrary account, schema, plugin or default-branch conflicts.
+
 ## Contract
 
 Protocol and storage changes may break compatibility. Migrate existing repositories to the new native format explicitly; do not maintain compatibility shims or run the old full-bootstrap path behind an on-demand request. Measure migration separately from ordinary opening. Migration must preserve repository identity, history, branch/checkpoint references, content and pending local edits, and support resumption after interruption.
@@ -44,6 +59,11 @@ Protocol and storage changes may break compatibility. Migrate existing repositor
 Opening independence means bounded request count, descriptor bytes and application work as repository rows, content, history, branches and schemas grow. It does not promise constant network latency or eliminate ordinary indexed-lookup cost. The authority’s descriptor path must avoid repository-wide scans too; moving a bootstrap scan to the server does not satisfy the objective.
 
 **The local guarantee applies to prepared dependencies, not arbitrary future SQL.** Reading one file cannot make a later repository-wide update or a rename into an unseen directory warm. A cold read also does not automatically prepare every possible write on the returned rows. Applications can call `execute()` with a SELECT on hover to prefetch the intended read. Writes hydrate additional dependencies through ordinary execution.
+
+SELECT-only offline edit tests use `UPDATE` against fetched rows. An
+`INSERT ... ON CONFLICT` can require insertion/conflict-path metadata that the
+SELECT did not load, even if it ultimately updates an existing row. Treat that
+first UPSERT as potentially cold; there is no separate preparation API.
 
 ## 1. Replace the opening boundary
 

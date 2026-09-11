@@ -81,7 +81,7 @@ pub(super) async fn prepare_partial_checkpoint_upload(
         return Ok(None);
     }
     let (global, _, _) = load_partial_push_state(read, state, crate::GLOBAL_BRANCH_ID).await?;
-    let known = BTreeSet::from([
+    let mut known = BTreeSet::from([
         id(&branch.confirmed.head)?,
         id(&branch.confirmed.checkpoint)?,
         id(&global.confirmed.head)?,
@@ -89,6 +89,12 @@ pub(super) async fn prepare_partial_checkpoint_upload(
         id(&state.descriptor().global_branch.head.commit_id)?,
         id(&state.descriptor().global_branch.checkpoint.commit_id)?,
     ]);
+    if branch_id != crate::GLOBAL_BRANCH_ID {
+        known.extend(
+            super::partial_global_merge_state::confirmed_global_merge_bases(read, state).await?,
+        );
+    }
+
     let mut stack = vec![(id(&target.checkpoint)?, false), (id(&target.head)?, false)];
     let mut visiting = BTreeSet::new();
     let mut done = known.clone();
@@ -181,12 +187,24 @@ pub(super) async fn prepare_partial_checkpoint_upload(
         }
     }
     let resumed = branch.prepared.is_some();
-    let upload = branch.prepared.unwrap_or(PreparedPartialUpload {
+    let mut upload = branch.prepared.unwrap_or(PreparedPartialUpload {
         attempt_id,
+        created_refs: Vec::new(),
         expected: branch.confirmed,
         target,
     });
-    let request = SyncPushRequest {
+    if !resumed {
+        upload.created_refs = super::partial_created_refs::capture_created_refs(
+            read,
+            state,
+            branch_id,
+            &upload.expected,
+            &upload.target,
+            &commits,
+        )
+        .await?;
+    }
+    let mut request = SyncPushRequest {
         commits,
         ref_updates: vec![SyncRefUpdate {
             branch_id: branch_id.into(),
@@ -197,6 +215,7 @@ pub(super) async fn prepare_partial_checkpoint_upload(
         }],
         inline_blobs: Vec::new(),
     };
+    upload.append_created_ref_updates(&mut request);
     let mut budget = WireBudget {
         remaining: max_wire_bytes,
         written: 0,

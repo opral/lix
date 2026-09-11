@@ -2,8 +2,10 @@
 
 The measurements below are historical, from before removal of the public
 preparation API and the current SQL-driven dependency changes. They establish
-earlier baselines; they do not validate the current revision. Updated benchmarks
-disconnect immediately after the first SELECT and require fresh measurements.
+earlier baselines; they do not validate the current revision. Current SQL-driven
+validation and profiling are recorded in [PR #1755](https://github.com/opral/lix/pull/1755).
+The updated benchmarks disconnect immediately after the first SELECT; compare
+results only when their source and installed artifact hashes match.
 
 The public opener with storage and `server.mode: "partial_replica"` creates a **partial replica with
 on-demand sync**. Optimized Chromium/WASM/OPFS measurements below show bounded

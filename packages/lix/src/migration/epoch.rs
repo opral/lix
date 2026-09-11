@@ -356,7 +356,9 @@ enum PointerState {
 
 /// Inspect the existing source without admitting or migrating it. Operator
 /// upgrades use this to reject an ineligible authority before changing storage.
-pub(super) async fn inspect_existing_epoch_adapter<S>(storage: &S) -> Result<StorageAdapter<S>, LixError>
+pub(super) async fn inspect_existing_epoch_adapter<S>(
+    storage: &S,
+) -> Result<StorageAdapter<S>, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -368,7 +370,11 @@ where
         Some((PointerState::Migrating { source, .. }, bytes)) => {
             // Inspect only the retained source. Ordinary admission owns claim
             // recovery; this probe neither renews nor publishes that claim.
-            Ok(StorageAdapter::for_epoch_migration(storage.clone(), source, bytes))
+            Ok(StorageAdapter::for_epoch_migration(
+                storage.clone(),
+                source,
+                bytes,
+            ))
         }
     }
 }
@@ -919,11 +925,14 @@ where
                 )
                 .await
                 .map_err(|error| epoch_error(format!("candidate marker write failed: {error}")))?;
-                super::migrate_lix_with_adapter(
+                // Keep the multi-version migration state machine off this
+                // candidate frame. Its inactive repair phases otherwise inflate
+                // the stack while an older migration runs ordinary SQL.
+                Box::pin(super::migrate_lix_with_adapter(
                     storage.clone(),
                     target.clone(),
                     super::MigrationOptions::automatic(),
-                )
+                ))
                 .await?;
             }
             emit_validating(progress, from_format);
@@ -1103,11 +1112,14 @@ where
                 .await?;
             } else {
                 let _ = copy_repository(&migration_source, &target).await?;
-                super::migrate_lix_with_adapter(
+                // Keep the multi-version migration state machine off this
+                // candidate frame. Its inactive repair phases otherwise inflate
+                // the stack while an older migration runs ordinary SQL.
+                Box::pin(super::migrate_lix_with_adapter(
                     storage.clone(),
                     target.clone(),
                     super::MigrationOptions::automatic(),
-                )
+                ))
                 .await?;
             }
             emit_validating(progress, from_format);

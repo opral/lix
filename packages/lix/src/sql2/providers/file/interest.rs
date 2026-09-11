@@ -66,6 +66,84 @@ fn retained_ids(ids: &FileIdConstraint) -> Option<Vec<String>> {
         FileIdConstraint::Ids(ids) => Some(ids.iter().cloned().collect()),
     }
 }
+pub(in crate::sql2::providers) fn retain_metadata(
+    hot: &dyn HotStateReader,
+    directory: bool,
+    branch_ids: &[String],
+    file_ids: &FileIdConstraint,
+    directory_ids: &FileIdConstraint,
+    root_directory: bool,
+    path: &FilePathPredicate,
+) -> Result<(), LixError> {
+    if let Some(registry) = hot.read_interest_registry() {
+        registry.register(LogicalReadInterest::FilesystemMetadata {
+            directory,
+            branch_ids: branch_ids.to_vec(),
+            file_ids: retained_ids(file_ids),
+            directory_ids: retained_ids(directory_ids),
+            root_directory,
+            path_predicate: retained_path(path),
+        })?;
+    }
+    Ok(())
+}
+
+/// Replay only descriptor selection; metadata queries never fetch file bytes.
+pub(crate) async fn prepare_native_file_metadata_interest(
+    hot: Arc<dyn HotStateReader>,
+    paths: Arc<dyn FilesystemPathIndexReader>,
+    directory: bool,
+    branch_ids: &[String],
+    file_ids: Option<&[String]>,
+    directory_ids: Option<&[String]>,
+    root_directory: bool,
+    path: &FilePathInterest,
+) -> Result<(), LixError> {
+    if file_ids.is_some_and(<[String]>::is_empty) || directory_ids.is_some_and(<[String]>::is_empty)
+    {
+        return Ok(());
+    }
+    let index = paths
+        .path_index(&FilesystemPathIndexRequest::new(branch_ids.to_vec()))
+        .await?;
+    let ids = file_ids.map(|ids| ids.iter().cloned().collect::<BTreeSet<_>>());
+    let dirs = directory_ids.map(|ids| ids.iter().cloned().collect::<BTreeSet<_>>());
+    let path = native_path(path);
+    if directory {
+        let matches = indexed_path_matches(index, &path, FilesystemPathKind::Directory);
+        return retain_selected_entries(
+            hot.as_ref(),
+            matches.entries().filter(|entry| {
+                ids.as_ref().is_none_or(|ids| ids.contains(entry.id()))
+                    && (!root_directory || entry.parent_id.is_none())
+                    && dirs.as_ref().is_none_or(|dirs| {
+                        entry
+                            .parent_id
+                            .as_ref()
+                            .is_some_and(|parent| dirs.contains(parent))
+                    })
+            }),
+            false,
+        );
+    }
+    let matches = if root_directory {
+        indexed_file_root_matches(
+            index,
+            &ids.as_ref().map_or(FileIdConstraint::All, |ids| {
+                FileIdConstraint::Ids(ids.clone())
+            }),
+            &path,
+        )
+    } else if let Some(dirs) = &dirs {
+        indexed_file_directory_matches(index, dirs, ids.as_ref(), &path)
+    } else if let Some(ids) = &ids {
+        indexed_file_id_matches(index, ids, &path)
+    } else {
+        indexed_file_matches(index, &path)
+    };
+    retain_selected_entries(hot.as_ref(), matches.entries(), false)
+}
+
 pub(super) fn retain_content(
     hot: &dyn HotStateReader,
     request: &HotStateScanRequest,
@@ -146,6 +224,7 @@ pub(crate) async fn prepare_native_file_content_interest(
         // Native file projection currently loads its candidate content batch before
         // SQL residual filters/output LIMIT. Retain request.limit as a recipe fact,
         // never reinterpret it as complete coverage or truncate a file's state rows.
+        retain_selected_entries(hot_state.as_ref(), matches.entries(), true)?;
         let rows = scan_indexed_file_batch(&matches, true)?;
         prepare_indexed_lix_file_rows(&matches, rows)?
     } else {
@@ -170,4 +249,75 @@ pub(crate) async fn prepare_native_file_content_interest(
     };
     exact_path_data_rows_from_prepared(&blob_reader, render, prepared, range.as_ref()).await?;
     Ok(())
+}
+
+/// Retain exact native identities selected by the provider, including index
+/// cache hits. Availability of the path index is a separate, broader interest.
+pub(in crate::sql2::providers) fn retain_selected_entries<'a>(
+    hot: &dyn HotStateReader,
+    entries: impl Iterator<Item = &'a FilesystemPathEntry>,
+    include_blob_refs: bool,
+) -> Result<(), LixError> {
+    let Some(registry) = hot.read_interest_registry() else {
+        return Ok(());
+    };
+    let mut rows = Vec::new();
+    for entry in entries {
+        let mut selected = vec![entry.live_row()];
+        if include_blob_refs && let Some(blob) = entry.blob_ref_live_row() {
+            selected.push(blob.clone());
+        }
+        for row in selected {
+            rows.push(crate::hot_state::ExactReadIdentity {
+                schema_key: row.schema_key,
+                branch_id: if row.global {
+                    GLOBAL_BRANCH_ID.to_owned()
+                } else {
+                    row.branch_id.to_string()
+                },
+                file_id: row.file_id,
+                row_pk: row.row_pk,
+            });
+        }
+    }
+    if !rows.is_empty() {
+        registry.register(LogicalReadInterest::Exact {
+            rows,
+            projection: HotStateProjection {
+                columns: vec!["snapshot_content".to_owned()],
+            },
+            untracked: None,
+            include_tombstones: false,
+        })?;
+    }
+    Ok(())
+}
+
+pub(in crate::sql2::providers) fn retain_selected_batch(
+    hot: &dyn HotStateReader,
+    selection: &FilesystemPathSelection,
+    batch: &RecordBatch,
+    include_blob_refs: bool,
+) -> Result<()> {
+    if hot.read_interest_registry().is_none() {
+        return Ok(());
+    }
+    let keys = (0..batch.num_rows())
+        .map(|row| {
+            Ok((
+                required_string_value(batch, row, "id")?,
+                optional_string_value(batch, row, "lixcol_branch_id")?,
+            ))
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    retain_selected_entries(
+        hot,
+        selection.entries().filter(|entry| {
+            let live = entry.live_row();
+            keys.contains(&(entry.id().to_owned(), None))
+                || keys.contains(&(entry.id().to_owned(), Some(live.branch_id.to_string())))
+        }),
+        include_blob_refs,
+    )
+    .map_err(lix_error_to_datafusion_error)
 }

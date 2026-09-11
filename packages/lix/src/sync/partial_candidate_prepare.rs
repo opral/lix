@@ -197,6 +197,74 @@ fn endpoint(
         .clone(),
     })
 }
+/// Archived recipes retain their original concrete branch bindings. Skip a
+/// whole recipe only if every out-of-scope branch has a durable switch receipt
+/// represented in the state owner's archive. Unknown scopes still reach the
+/// ordinary candidate validator and fail closed.
+fn interest_belongs_to_candidate(
+    interest: &LogicalReadInterest,
+    selected: &str,
+    global: &str,
+    archived: &[String],
+) -> Result<bool, LixError> {
+    let admitted = |branch: &str| branch == selected || branch == global;
+    let keep = |branches: Vec<&str>| {
+        let outside = branches
+            .into_iter()
+            .filter(|branch| !admitted(branch))
+            .collect::<Vec<_>>();
+        outside.is_empty()
+            || outside
+                .iter()
+                .any(|branch| !archived.iter().any(|saved| saved.as_str() == *branch))
+    };
+    Ok(match interest {
+        LogicalReadInterest::Scan { request, .. }
+        | LogicalReadInterest::FileContent { request, .. } => keep(
+            request
+                .filter
+                .branch_ids
+                .iter()
+                .map(String::as_str)
+                .collect(),
+        ),
+        LogicalReadInterest::FilesystemPaths { branch_ids, .. }
+        | LogicalReadInterest::FilesystemMetadata { branch_ids, .. } => {
+            keep(branch_ids.iter().map(String::as_str).collect())
+        }
+        LogicalReadInterest::Exact { rows, .. } => {
+            keep(rows.iter().map(|row| row.branch_id.as_str()).collect())
+        }
+        LogicalReadInterest::CollectionGeneration { branch_id, .. }
+        | LogicalReadInterest::PackedIdentityMembership { branch_id, .. }
+        | LogicalReadInterest::Diff {
+            branch_id: Some(branch_id),
+            ..
+        } => keep(vec![branch_id]),
+        LogicalReadInterest::Diff {
+            branch_id: None,
+            from,
+            to,
+            ..
+        } => {
+            if !archived.is_empty()
+                && !matches!(
+                    (from, to),
+                    (
+                        crate::hot_state::DiffInterestEndpoint::Fixed(_),
+                        crate::hot_state::DiffInterestEndpoint::Fixed(_)
+                    )
+                )
+            {
+                return Err(unsupported(
+                    "unbound dynamic diff cannot be remapped across a branch transition",
+                ));
+            }
+            true
+        }
+    })
+}
+
 /// Concrete trusted caller must scope `read` through the session-owned bridge;
 /// no Arc reader or callback escapes this unit-returning native operation.
 pub(crate) async fn prepare_candidate_native_interests<R>(
@@ -205,11 +273,27 @@ pub(crate) async fn prepare_candidate_native_interests<R>(
     interests: &ReadInterestSnapshot,
     plugin_host: crate::plugin::runtime::PluginRuntimeHost,
     hot: HotStateContext,
+    allow_missing_selected_control: bool,
 ) -> Result<PreparedCandidateState, LixError>
 where
     R: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     let descriptor = state.descriptor();
+    let mut active_interests = interests.clone();
+    active_interests.interests.clear();
+    for interest in &interests.interests {
+        if interest_belongs_to_candidate(
+            interest,
+            &descriptor.selected_branch.branch_id,
+            &descriptor.global_branch.branch_id,
+            state.archived_branch_ids(),
+        )? {
+            active_interests.interests.push(interest.clone());
+        }
+    }
+    // Keep the original revision and byte bound for the publisher's journal
+    // fence; filtering is a private evaluation view, never journal mutation.
+    let interests = &active_interests;
     descriptor.validate(
         &descriptor.lix_id,
         Some(&descriptor.selected_branch.branch_id),
@@ -255,28 +339,38 @@ where
             continue;
         }
         let head = crate::changelog::CommitId::parse_lix(&branch.head.commit_id, "candidate head")?;
-        let observation = crate::branch::BranchHeadControlContext::new()
-            .reader(&read)
-            .load_observed(std::slice::from_ref(&branch.branch_id))
-            .await?
-            .pop()
-            .expect("one source branch observation");
-        let source = observation
-            .control
-            .ok_or_else(|| unsupported("candidate source branch is absent"))?;
+        let observation = if allow_missing_selected_control
+            && branch.branch_id == descriptor.selected_branch.branch_id
+        {
+            crate::branch::observe_branch_control_coordinate(&read, &branch.branch_id).await?
+        } else {
+            crate::branch::BranchHeadControlContext::new()
+                .reader(&read)
+                .load_observed(std::slice::from_ref(&branch.branch_id))
+                .await?
+                .pop()
+                .expect("one candidate control")
+        };
         source_control_guards.push(crate::branch::branch_head_control_precondition(
             &branch.branch_id,
             observation.raw_token,
         )?);
-        crate::hot_state::TrackedHeadContext::new()
-            .writer(&read, &mut staged)
-            .stage_untracked_for_root_generation(
-                &branch.branch_id,
-                source.tracked_generation,
-                state.serving_generation(&branch.branch_id)?,
-                head,
-            )
-            .await?;
+        if let Some(source) = observation.control {
+            crate::hot_state::TrackedHeadContext::new()
+                .writer(&read, &mut staged)
+                .stage_untracked_for_root_generation(
+                    &branch.branch_id,
+                    source.tracked_generation,
+                    state.serving_generation(&branch.branch_id)?,
+                    head,
+                )
+                .await?;
+        } else if !(allow_missing_selected_control
+            && branch.branch_id == descriptor.selected_branch.branch_id
+            && branch.branch_id != crate::GLOBAL_BRANCH_ID)
+        {
+            return Err(unsupported("candidate source branch is absent"));
+        }
         let control = super::partial_bootstrap::partial_branch_control(state, branch)?;
         source_control_guards.extend(crate::hot_state::root_generation_absence_preconditions(
             &branch.branch_id,
@@ -327,32 +421,14 @@ where
                 for branch in &request.filter.branch_ids {
                     selected_branch(descriptor, branch)?;
                 }
-                let reader = hot.reader(read.clone());
-                let batch = match domain {
-                    crate::hot_state::InterestDomain::Tracked => {
-                        reader.scan_tracked_batch(request).await?
-                    }
-                    crate::hot_state::InterestDomain::Combined
-                    | crate::hot_state::InterestDomain::Untracked => {
-                        reader.scan_batch(request).await?
-                    }
-                };
-                for row in batch.iter().filter(|row| !row.untracked()) {
-                    mutation_identities
-                        .entry(row.branch_id().to_owned())
-                        .or_default()
-                        .insert(crate::tracked_state::TrackedStateKey {
-                            schema_key: row.schema_key().to_owned(),
-                            file_id: row.file_id().map(str::to_owned),
-                            row_pk: row.row_pk().clone(),
-                        });
+                // The shared foreground preparation below performs this scan
+                // once and prepares the rows it actually resolves.
+                if matches!(domain, crate::hot_state::InterestDomain::Untracked) {
+                    hot.reader(read.clone()).scan_batch(request).await?;
                 }
             }
             LogicalReadInterest::Exact {
-                rows,
-                projection,
-                untracked,
-                include_tombstones,
+                rows, untracked, ..
             } => {
                 for row in rows {
                     selected_branch(descriptor, &row.branch_id)?;
@@ -367,24 +443,8 @@ where
                             });
                     }
                 }
-                let replayed = hot
-                    .reader(read.clone())
-                    .load_exact_batch(&crate::hot_state::HotStateExactBatchRequest {
-                        rows: rows
-                            .iter()
-                            .map(|row| crate::hot_state::HotStateExactRowRequest {
-                                schema_key: row.schema_key.clone(),
-                                branch_id: row.branch_id.clone(),
-                                file_id: row.file_id.clone(),
-                                row_pk: row.row_pk.clone(),
-                            })
-                            .collect(),
-                        projection: projection.clone(),
-                        untracked: *untracked,
-                        include_tombstones: *include_tombstones,
-                    })
-                    .await?;
-                drop(replayed);
+                // Exact absence and payloads are validated by the shared
+                // preparation below; retain explicit keys for insertion paths.
             }
             LogicalReadInterest::CollectionGeneration {
                 branch_id,
@@ -455,6 +515,37 @@ where
                 )
                 .await?;
             }
+            LogicalReadInterest::FilesystemMetadata {
+                directory,
+                branch_ids,
+                file_ids,
+                directory_ids,
+                root_directory,
+                path_predicate,
+            } => {
+                for branch in branch_ids {
+                    selected_branch(descriptor, branch)?;
+                }
+                let capture = crate::hot_state::ReadInterestRegistry::new(4096, 4 * 1024 * 1024);
+                let replay_hot = hot.with_read_interest_registry(capture.clone());
+                crate::sql2::prepare_native_file_metadata_interest(
+                    Arc::new(replay_hot.reader(read.clone())),
+                    Arc::new(replay_hot.reader(read.clone())),
+                    *directory,
+                    branch_ids,
+                    file_ids.as_deref(),
+                    directory_ids.as_deref(),
+                    *root_directory,
+                    path_predicate,
+                )
+                .await?;
+                hot.reader(read.clone())
+                    .prepare_captured_read_interests(
+                        &capture.snapshot()?,
+                        state.active_account_id(),
+                    )
+                    .await?;
+            }
             LogicalReadInterest::FileContent {
                 request,
                 file_ids,
@@ -467,9 +558,13 @@ where
                 for branch in &request.filter.branch_ids {
                     selected_branch(descriptor, branch)?;
                 }
+                // Capture newly matching native identities at this candidate,
+                // independently of the live registry and its persisted epoch.
+                let capture = crate::hot_state::ReadInterestRegistry::new(4096, 4 * 1024 * 1024);
+                let replay_hot = hot.with_read_interest_registry(capture.clone());
                 crate::sql2::prepare_native_file_content_interest(
-                    Arc::new(hot.reader(read.clone())),
-                    Arc::new(hot.reader(read.clone())),
+                    Arc::new(replay_hot.reader(read.clone())),
+                    Arc::new(replay_hot.reader(read.clone())),
                     Arc::new(blob.reader(read.clone())),
                     plugin_host.clone(),
                     request,
@@ -481,6 +576,12 @@ where
                     *byte_range,
                 )
                 .await?;
+                hot.reader(read.clone())
+                    .prepare_captured_read_interests(
+                        &capture.snapshot()?,
+                        state.active_account_id(),
+                    )
+                    .await?;
             }
         }
     }
@@ -517,6 +618,39 @@ mod tests {
     use super::*;
     use crate::storage_adapter::{StorageAdapter, StorageWriteOptions};
     use std::ops::Bound;
+    #[test]
+    fn only_explicit_archives_suspend_whole_recipes() {
+        let recipe = |branches: &[&str]| LogicalReadInterest::FilesystemPaths {
+            branch_ids: branches.iter().map(|branch| (*branch).to_owned()).collect(),
+            include_blob_refs: false,
+            cache_small_blob_data: false,
+        };
+        let archived = vec!["old".to_owned()];
+        assert!(
+            !interest_belongs_to_candidate(&recipe(&["old", "global"]), "new", "global", &archived)
+                .unwrap()
+        );
+        assert!(
+            interest_belongs_to_candidate(&recipe(&["old", "unknown"]), "new", "global", &archived)
+                .unwrap(),
+            "unknown branches must reach the ordinary rejecting validator"
+        );
+        assert!(
+            interest_belongs_to_candidate(&recipe(&["old"]), "new", "global", &[]).unwrap(),
+            "ordinary refresh cannot silently archive scopes"
+        );
+        assert!(
+            interest_belongs_to_candidate(
+                &recipe(&["old", "global"]),
+                "old",
+                "global",
+                &["new".to_owned()]
+            )
+            .unwrap(),
+            "switching back resumes the original recipe without remapping"
+        );
+    }
+
     #[tokio::test]
     async fn candidate_put_merge_preserves_bounds_pages_order_and_source() {
         let adapter = StorageAdapter::new(crate::Memory::new());

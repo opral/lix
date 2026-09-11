@@ -24,8 +24,8 @@ use crate::filesystem::stage_path_index_revision;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::hot_state::{
     CompleteWorkingDiffMode, HotStateContext, HotStateExactBatchRequest, HotStateProjection,
-    HotTrackedSnapshot, MaterializedHotStateRow, TrackedHeadContext,
-    TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage, stage_tracked_working_diff_epoch,
+    HotTrackedSnapshot, MaterializedHotStateRow, TrackedHeadContext, TrackedWorkingDiffEpoch,
+    WorkingDiffIndexCoverage, stage_tracked_working_diff_epoch,
 };
 use crate::row_pk::RowPk;
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
@@ -624,6 +624,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &staged_commits,
         &staged_snapshot_roots,
         &external_parent_manifests,
+        &state_rows,
+        &row_index.tracked_row_indices_by_commit,
     )
     .await?;
     // HOT publication has adapter-specific checkpoint, packed-base, and
@@ -6377,6 +6379,8 @@ fn stage_commit_state_manifests<'a, S>(
         CommitId,
         crate::tracked_state::PublishedCommitStateTopology,
     >,
+    state_rows: &'a PreparedStateBatch,
+    row_indices: &'a BTreeMap<CommitId, Vec<RowIndex>>,
 ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
 where
     S: StorageAdapterRead + ?Sized + 'a,
@@ -6647,7 +6651,14 @@ where
                     .and_then(|root| root.parent_roots.first())
                     .map(|source| source.commit_id)
             } else {
-                mutations.selected_source_commit_id().or(first_parent)
+                // The visible state inherits the first parent. Selected-source
+                // provenance identifies imported members, not the inherited
+                // identity catalog: those member keys are added below. Using
+                // the selected source here loses untouched first-parent rows.
+                // `first_parent` above intentionally means a single-parent
+                // replay interval; native merge/branch bases still inherit
+                // parent zero even when their topology has multiple parents.
+                record.parent_commit_ids.first().copied()
             };
             let loaded_row_pk_base = if let Some(base_id) = row_pk_base_commit_id
                 && !published_manifests.contains_key(&base_id)
@@ -6697,28 +6708,58 @@ where
                 )
                 .await?;
             }
-            let staged_segments = crate::tracked_state::staged_commit_delta_segment_bytes(
-                writes,
-                record.commit_id,
-                &mutations,
-            )?;
-            let row_pk_members = crate::tracked_state::staged_commit_delta_members(
-                read,
-                record.commit_id,
-                &record.account_id,
-                &mutations,
-                staged_segments,
-            )
-            .await?;
-            let row_pk_index_root_id = crate::tracked_state::stage_row_pk_index_from_members(
-                read,
-                writes,
-                &mut row_pk_index_overlay,
-                row_pk_base_root.as_ref(),
-                &row_pk_members,
-                record.commit_id,
-            )
-            .await?;
+            let row_pk_index_root_id = if let Some(columnar) = mutations.columnar_parts.as_ref() {
+                // Columnar mutation authority has no ordinary delta segments.
+                // Use the same validated prepared identities that produced it;
+                // interpreting an empty segment list as an empty catalog loses
+                // the rows when a later branch leaves the packed HOT path.
+                let indices = row_indices
+                    .get(&record.commit_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                if indices.len() != columnar.row_count as usize {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "columnar publication is missing its prepared identity closure",
+                    ));
+                }
+                let deltas = indices
+                    .iter()
+                    .map(|&index| tracked_delta_from_state_row(state_rows.row(index)))
+                    .collect::<Result<Vec<_>, _>>()?;
+                crate::tracked_state::stage_row_pk_index_from_deltas_with_base(
+                    read,
+                    writes,
+                    &mut row_pk_index_overlay,
+                    row_pk_base_root.as_ref(),
+                    deltas,
+                    record.commit_id,
+                )
+                .await?
+            } else {
+                let staged_segments = crate::tracked_state::staged_commit_delta_segment_bytes(
+                    writes,
+                    record.commit_id,
+                    &mutations,
+                )?;
+                let row_pk_members = crate::tracked_state::staged_commit_delta_members(
+                    read,
+                    record.commit_id,
+                    &record.account_id,
+                    &mutations,
+                    staged_segments,
+                )
+                .await?;
+                crate::tracked_state::stage_row_pk_index_from_members(
+                    read,
+                    writes,
+                    &mut row_pk_index_overlay,
+                    row_pk_base_root.as_ref(),
+                    &row_pk_members,
+                    record.commit_id,
+                )
+                .await?
+            };
             if mutations.replacement_generation.is_some() {
                 mutations.parts.clear();
             }
@@ -10326,6 +10367,8 @@ mod tests {
             &staged,
             &BTreeMap::new(),
             &external_parent_manifests,
+            &PreparedStateBatch::default(),
+            &BTreeMap::new(),
         )
         .await
         .expect("child-before-parent manifests should publish parent authority first");

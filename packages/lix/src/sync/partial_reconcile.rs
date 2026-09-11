@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 pub(super) enum PreparedDescriptor {
     NoChange,
+    /// Durable bookkeeping advanced while native serving controls stayed local.
+    LocalProgress,
     Ready(super::partial_publication::PreparedPartialPublication),
 }
 

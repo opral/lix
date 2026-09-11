@@ -82,6 +82,14 @@ pub(crate) enum FilePathInterestComparison {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum LogicalReadInterest {
+    FilesystemMetadata {
+        directory: bool,
+        branch_ids: Vec<String>,
+        file_ids: Option<Vec<String>>,
+        directory_ids: Option<Vec<String>>,
+        root_directory: bool,
+        path_predicate: FilePathInterest,
+    },
     FileContent {
         #[serde(with = "super::read_interests_codec::NativeScan")]
         request: HotStateScanRequest,

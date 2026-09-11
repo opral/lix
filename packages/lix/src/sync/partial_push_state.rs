@@ -19,7 +19,7 @@ pub(crate) const PARTIAL_BRANCH_PUSH_SPACE: StorageSpace = StorageSpace::declare
     "sync.partial_branch_push.v1",
     ValueSemantics::Mutable,
 );
-const MAX_RECORD_BYTES: usize = 2048;
+const MAX_RECORD_BYTES: usize = 16384;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -31,6 +31,7 @@ pub(super) struct PartialPushCoordinate {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct PreparedPartialUpload {
     pub(super) attempt_id: String,
+    pub(super) created_refs: Vec<CreatedPartialRef>,
     pub(super) expected: PartialPushCoordinate,
     pub(super) target: PartialPushCoordinate,
 }
@@ -63,6 +64,22 @@ impl PartialPushCoordinate {
 }
 impl PreparedPartialUpload {
     fn validate(&self) -> Result<(), LixError> {
+        if self.created_refs.len() > 32
+            || self
+                .created_refs
+                .windows(2)
+                .any(|v| v[0].branch_id >= v[1].branch_id)
+        {
+            return Err(invalid("created refs are not a bounded sorted set"));
+        }
+        for child in &self.created_refs {
+            uuid(&child.branch_id)?;
+            uuid(&child.head_commit_id)?;
+            uuid(&child.checkpoint_commit_id)?;
+            if child.branch_id == crate::GLOBAL_BRANCH_ID {
+                return Err(invalid("created ref cannot target GLOBAL"));
+            }
+        }
         uuid(&self.attempt_id)?;
         self.expected.validate()?;
         self.target.validate()
@@ -70,7 +87,7 @@ impl PreparedPartialUpload {
 }
 impl PartialBranchPushState {
     fn validate(&self) -> Result<(), LixError> {
-        if self.version != 1 {
+        if self.version != 2 {
             return Err(invalid("unsupported partial upload state version"));
         }
         uuid(&self.epoch_id)?;
@@ -78,6 +95,9 @@ impl PartialBranchPushState {
         self.confirmed.validate()?;
         if let Some(prepared) = &self.prepared {
             prepared.validate()?;
+            if self.branch_id != crate::GLOBAL_BRANCH_ID && !prepared.created_refs.is_empty() {
+                return Err(invalid("non-GLOBAL push record contains created refs"));
+            }
             if prepared.expected != self.confirmed {
                 return Err(invalid(
                     "prepared upload does not continue confirmed coordinate",
@@ -141,7 +161,7 @@ pub(super) fn stage_initial_partial_push_states(
         guards.push(stage_record(
             writes,
             &PartialBranchPushState {
-                version: 1,
+                version: 2,
                 epoch_id: state.epoch_id().into(),
                 branch_id: branch.branch_id.clone(),
                 confirmed: PartialPushCoordinate {
@@ -212,7 +232,9 @@ pub(super) async fn stage_prepare_partial_upload(
     upload: &PreparedPartialUpload,
 ) -> Result<Vec<StoragePrecondition>, LixError> {
     upload.validate()?;
+    let global_outbox_guards = ordinary_global_outbox_guards(read, state, branch_id).await?;
     let mut guards = super::partial_merge_state::ordinary_upload_merge_guards(read, state).await?;
+    guards.extend(global_outbox_guards);
     let (mut record, previous, epoch_guard) =
         load_partial_push_state(read, state, branch_id).await?;
     if upload.expected != record.confirmed {
@@ -236,6 +258,10 @@ pub(super) async fn stage_prepare_partial_upload(
         });
         return Ok(guards);
     }
+    if branch_id != crate::GLOBAL_BRANCH_ID && !upload.created_refs.is_empty() {
+        return Err(invalid("created refs require GLOBAL upload"));
+    }
+    guards.extend(guard_created_ref_capture(read, upload).await?);
     record.prepared = Some(upload.clone());
     record.bodies_acknowledged = false;
     guards.push(stage_record(writes, &record, Some(previous))?);
@@ -254,13 +280,16 @@ pub(super) async fn stage_acknowledge_partial_upload(
     ref_accepted: bool,
 ) -> Result<Vec<StoragePrecondition>, LixError> {
     accepted.validate()?;
+    let global_outbox_guards = ordinary_global_outbox_guards(read, state, branch_id).await?;
     let mut guards = super::partial_merge_state::ordinary_upload_merge_guards(read, state).await?;
+    guards.extend(global_outbox_guards);
     let (mut record, previous, epoch_guard) =
         load_partial_push_state(read, state, branch_id).await?;
     if record.prepared.as_ref() != Some(accepted) {
         return Err(invalid("acknowledgment does not match prepared upload"));
     }
     if ref_accepted {
+        guards.extend(stage_created_ref_ack(read, writes, state, accepted).await?);
         record.confirmed = accepted.target.clone();
         record.prepared = None;
         record.bodies_acknowledged = false;
@@ -300,8 +329,8 @@ pub(super) async fn stage_remote_partial_confirmation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_adapter::{StorageAdapter, StorageWriteOptions};
     use crate::open_lix;
+    use crate::storage_adapter::{StorageAdapter, StorageWriteOptions};
 
     async fn commit<S: crate::storage_adapter::Storage + Clone + Send + Sync + 'static>(
         adapter: &StorageAdapter<S>,
@@ -381,6 +410,7 @@ mod tests {
             .unwrap()
             .0;
         let accepted = PreparedPartialUpload {
+            created_refs: Vec::new(),
             attempt_id: "00000000-0000-7000-8000-000000000699".into(),
             expected: initial.confirmed.clone(),
             target: PartialPushCoordinate {
@@ -580,5 +610,436 @@ pub(super) async fn stage_settle_partial_merge_confirmation(
     let mut guards = verified.into_guards();
     guards.push(epoch_guard);
     guards.push(push_guard);
+    Ok(guards)
+}
+
+// Append within partial_push_state owner. Caller carries exact source receipt
+// CAS and proves the requested target using its authenticated descriptor.
+pub(super) async fn stage_admitted_branch_coordinate(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    previous: &PartialReplicaState,
+    branch: &super::partial_replica::PartialReplicaBranch,
+    observation: &crate::branch::BranchHeadControlObservation,
+) -> Result<Vec<StoragePrecondition>, LixError> {
+    let branch_key = key(&branch.branch_id)?;
+    let raw = PointReadPlan::new(PARTIAL_BRANCH_PUSH_SPACE, std::slice::from_ref(&branch_key))
+        .materialize(read, Default::default())
+        .await?
+        .value
+        .pop()
+        .flatten();
+    let raw = match raw {
+        None => None,
+        Some(StorageProjectedValue::FullValue(bytes)) => Some(bytes),
+        Some(_) => return Err(invalid("branch admission push coordinate omitted value")),
+    };
+    if let Some(bytes) = &raw {
+        if bytes.len() > MAX_RECORD_BYTES {
+            return Err(invalid("branch admission push record exceeds bound"));
+        }
+        let record: PartialBranchPushState = serde_json::from_slice(bytes)
+            .map_err(|_| invalid("branch admission push record is malformed"))?;
+        record.validate()?;
+        if record.epoch_id != previous.epoch_id() || record.branch_id != branch.branch_id {
+            return Err(invalid(
+                "branch admission push record belongs to another owner",
+            ));
+        }
+        let control = observation
+            .control
+            .as_ref()
+            .ok_or_else(|| invalid("archived branch lost its local control"))?;
+        if record.prepared.is_some()
+            || control.head_commit_id != record.confirmed.head
+            || control
+                .working_diff_checkpoint_commit_id
+                .map(|id| id.to_string())
+                .as_ref()
+                != Some(&record.confirmed.checkpoint)
+        {
+            return Err(LixError::new(
+                "LIX_PARTIAL_BRANCH_SWITCH_PENDING",
+                "target branch has unconfirmed local work",
+            ));
+        }
+    } else if observation.control.is_some() {
+        // A locally created branch without a confirmed authority lane is not
+        // an empty cache; it may own unpublished descriptor/ref/native data.
+        return Err(LixError::new(
+            "LIX_PARTIAL_BRANCH_SWITCH_PENDING",
+            "target branch has no confirmed authority coordinate",
+        ));
+    }
+    let mut guards =
+        super::partial_merge_state::require_no_branch_merge(read, &branch.branch_id).await?;
+    guards.push(stage_record(
+        writes,
+        &PartialBranchPushState {
+            version: 2,
+            epoch_id: previous.epoch_id().into(),
+            branch_id: branch.branch_id.clone(),
+            confirmed: PartialPushCoordinate {
+                head: branch.head.commit_id.clone(),
+                checkpoint: branch.checkpoint.commit_id.clone(),
+            },
+            prepared: None,
+            bodies_acknowledged: false,
+        },
+        raw,
+    )?);
+    Ok(guards)
+}
+
+pub(super) async fn clean_branch_source_guards(
+    read: &(impl StorageAdapterRead + ?Sized),
+    state: &PartialReplicaState,
+) -> Result<Vec<StoragePrecondition>, LixError> {
+    let mut guards = super::partial_merge_state::ordinary_upload_merge_guards(read, state).await?;
+    let mut branches = std::collections::BTreeSet::new();
+    for branch in [
+        &state.descriptor().selected_branch,
+        &state.descriptor().global_branch,
+    ] {
+        if !branches.insert(branch.branch_id.clone()) {
+            continue;
+        }
+        let (push, raw, receipt_guard) =
+            load_partial_push_state(read, state, &branch.branch_id).await?;
+        let observation =
+            crate::branch::observe_branch_control_coordinate(read, &branch.branch_id).await?;
+        let control = observation
+            .control
+            .as_ref()
+            .ok_or_else(|| invalid("admitted branch control disappeared"))?;
+        if push.prepared.is_some()
+            || control.head_commit_id != push.confirmed.head
+            || control
+                .working_diff_checkpoint_commit_id
+                .map(|id| id.to_string())
+                .as_ref()
+                != Some(&push.confirmed.checkpoint)
+        {
+            return Err(LixError::new(
+                "LIX_PARTIAL_BRANCH_SWITCH_PENDING",
+                "branch switch requires confirmed selected and global work; retry after sync",
+            ));
+        }
+        guards.push(receipt_guard);
+        guards.push(StoragePrecondition::KeyValueEquals {
+            space: PARTIAL_BRANCH_PUSH_SPACE,
+            key: key(&branch.branch_id)?,
+            expected: raw,
+        });
+        guards.push(crate::branch::branch_head_control_precondition(
+            &branch.branch_id,
+            observation.raw_token,
+        )?);
+    }
+    Ok(guards)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct CreatedPartialRef {
+    pub(super) branch_id: String,
+    pub(super) head_commit_id: String,
+    pub(super) checkpoint_commit_id: String,
+}
+impl PreparedPartialUpload {
+    pub(super) fn append_created_ref_updates(&self, request: &mut super::SyncPushRequest) {
+        request
+            .ref_updates
+            .extend(
+                self.created_refs
+                    .iter()
+                    .map(|child| super::protocol::SyncRefUpdate {
+                        branch_id: child.branch_id.clone(),
+                        expected_head_commit_id: None,
+                        expected_checkpoint_commit_id: None,
+                        head_commit_id: Some(child.head_commit_id.clone()),
+                        checkpoint_commit_id: Some(child.checkpoint_commit_id.clone()),
+                    }),
+            );
+    }
+}
+async fn guard_created_ref_capture(
+    read: &(impl StorageAdapterRead + ?Sized),
+    upload: &PreparedPartialUpload,
+) -> Result<Vec<StoragePrecondition>, LixError> {
+    let mut guards = Vec::new();
+    for child in &upload.created_refs {
+        let observed =
+            crate::branch::observe_branch_control_coordinate(read, &child.branch_id).await?;
+        let control = observed
+            .control
+            .ok_or_else(|| invalid("created branch disappeared during capture"))?;
+        if control.head_commit_id != child.head_commit_id
+            || control
+                .working_diff_checkpoint_commit_id
+                .map(|id| id.to_string())
+                .as_deref()
+                != Some(&child.checkpoint_commit_id)
+        {
+            return Err(invalid("created branch changed during capture"));
+        }
+        guards.push(crate::branch::branch_head_control_precondition(
+            &child.branch_id,
+            observed.raw_token,
+        )?);
+    }
+    Ok(guards)
+}
+pub(super) async fn stage_created_ref_ack(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    state: &PartialReplicaState,
+    accepted: &PreparedPartialUpload,
+) -> Result<Vec<StoragePrecondition>, LixError> {
+    let mut guards = Vec::new();
+    for child in &accepted.created_refs {
+        let values = PointReadPlan::new(PARTIAL_BRANCH_PUSH_SPACE, &[key(&child.branch_id)?])
+            .materialize(read, Default::default())
+            .await?
+            .value;
+        let coordinate = PartialPushCoordinate {
+            head: child.head_commit_id.clone(),
+            checkpoint: child.checkpoint_commit_id.clone(),
+        };
+        match values.into_iter().next().flatten() {
+            None => guards.push(stage_record(
+                writes,
+                &PartialBranchPushState {
+                    version: 2,
+                    epoch_id: state.epoch_id().into(),
+                    branch_id: child.branch_id.clone(),
+                    confirmed: coordinate,
+                    prepared: None,
+                    bodies_acknowledged: false,
+                },
+                None,
+            )?),
+            Some(StorageProjectedValue::FullValue(bytes)) => {
+                if bytes.len() > MAX_RECORD_BYTES {
+                    return Err(invalid("created child push record exceeds bound"));
+                }
+                let record: PartialBranchPushState = serde_json::from_slice(&bytes)
+                    .map_err(|_| invalid("created child push state malformed"))?;
+                record.validate()?;
+                if record.epoch_id != state.epoch_id()
+                    || record.branch_id != child.branch_id
+                    || record.confirmed != coordinate
+                {
+                    return Err(invalid(
+                        "created child ACK disagrees with confirmed coordinate",
+                    ));
+                }
+                // Never overwrite a later prepared child upload or local control.
+                guards.push(StoragePrecondition::KeyValueEquals {
+                    space: PARTIAL_BRANCH_PUSH_SPACE,
+                    key: key(&child.branch_id)?,
+                    expected: bytes,
+                });
+            }
+            _ => return Err(invalid("created child push point read incomplete")),
+        }
+    }
+    Ok(guards)
+}
+
+#[cfg(test)]
+mod created_ref_codec_tests {
+    use super::*;
+    #[test]
+    fn durable_selected_push_cannot_smuggle_created_refs() {
+        let id = |suffix: u8| format!("00000000-0000-4000-8000-{suffix:012x}");
+        let wire = serde_json::json!({
+            "version": 2, "epochId": id(1), "branchId": id(2),
+            "confirmed": {"head": id(3), "checkpoint": id(4)},
+            "prepared": {"attemptId": id(5), "expected": {"head": id(3), "checkpoint": id(4)},
+                "target": {"head": id(6), "checkpoint": id(4)},
+                "createdRefs": [{"branchId": id(7), "headCommitId": id(3), "checkpointCommitId": id(3)}]},
+            "bodiesAcknowledged": false
+        });
+        let mut record: PartialBranchPushState = serde_json::from_value(wire).unwrap();
+        assert!(record.validate().is_err());
+        record.branch_id = crate::GLOBAL_BRANCH_ID.into();
+        record.validate().unwrap();
+        let mut request = crate::sync::SyncPushRequest {
+            commits: Vec::new(),
+            ref_updates: Vec::new(),
+            inline_blobs: Vec::new(),
+        };
+        record
+            .prepared
+            .as_ref()
+            .unwrap()
+            .append_created_ref_updates(&mut request);
+        assert_eq!(request.ref_updates.len(), 1);
+        assert_eq!(request.ref_updates[0].branch_id, id(7));
+        assert!(request.ref_updates[0].expected_head_commit_id.is_none());
+        assert!(
+            request.ref_updates[0]
+                .expected_checkpoint_commit_id
+                .is_none()
+        );
+    }
+}
+
+/// One-way owner-only upgrade. Old prepared attempts retain exactly their old
+/// wire refs (none); never infer children after an ambiguous previous send.
+pub(crate) async fn prepare_owned_partial_push_upgrade(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    state: &PartialReplicaState,
+) -> Result<Vec<StoragePrecondition>, LixError> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct OldUpload {
+        attempt_id: String,
+        expected: PartialPushCoordinate,
+        target: PartialPushCoordinate,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct OldRecord {
+        version: u32,
+        epoch_id: String,
+        branch_id: String,
+        confirmed: PartialPushCoordinate,
+        prepared: Option<OldUpload>,
+        bodies_acknowledged: bool,
+    }
+    #[derive(Deserialize)]
+    struct Version {
+        version: u32,
+    }
+    let mut branches = state
+        .archived_branch_ids()
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    branches.insert(state.descriptor().selected_branch.branch_id.clone());
+    branches.insert(state.descriptor().global_branch.branch_id.clone());
+    let mut guards = Vec::new();
+    for branch in branches {
+        let values = PointReadPlan::new(PARTIAL_BRANCH_PUSH_SPACE, &[key(&branch)?])
+            .materialize(read, Default::default())
+            .await?
+            .value;
+        let Some(StorageProjectedValue::FullValue(bytes)) = values.into_iter().next().flatten()
+        else {
+            return Err(invalid(
+                "owned push upgrade lacks a named admitted coordinate",
+            ));
+        };
+        if bytes.len() > MAX_RECORD_BYTES {
+            return Err(invalid("owned push upgrade exceeds bound"));
+        }
+        let version: Version = serde_json::from_slice(&bytes)
+            .map_err(|_| invalid("push upgrade version malformed"))?;
+        if version.version == 2 {
+            let record: PartialBranchPushState = serde_json::from_slice(&bytes)
+                .map_err(|_| invalid("push upgrade record malformed"))?;
+            record.validate()?;
+            if record.epoch_id != state.epoch_id() || record.branch_id != branch {
+                return Err(invalid("push upgrade owner mismatch"));
+            }
+            continue;
+        }
+        let old: OldRecord = serde_json::from_slice(&bytes)
+            .map_err(|_| invalid("old push upgrade record malformed"))?;
+        if old.version != 1 || old.epoch_id != state.epoch_id() || old.branch_id != branch {
+            return Err(invalid("old push upgrade owner/version mismatch"));
+        }
+        let record = PartialBranchPushState {
+            version: 2,
+            epoch_id: old.epoch_id,
+            branch_id: old.branch_id,
+            confirmed: old.confirmed,
+            prepared: old.prepared.map(|old| PreparedPartialUpload {
+                attempt_id: old.attempt_id,
+                expected: old.expected,
+                target: old.target,
+                created_refs: Vec::new(),
+            }),
+            bodies_acknowledged: old.bodies_acknowledged,
+        };
+        guards.push(stage_record(writes, &record, Some(bytes))?);
+    }
+    Ok(guards)
+}
+
+/// Ordinary uploads carry the exact GLOBAL outbox observation through capture
+/// and ACK. A received HTTP response alone never opens the selected lane.
+#[must_use = "commit every outbox guard with upload bookkeeping"]
+pub(super) async fn ordinary_global_outbox_guards(
+    read: &(impl StorageAdapterRead + ?Sized),
+    state: &PartialReplicaState,
+    branch_id: &str,
+) -> Result<Vec<StoragePrecondition>, LixError> {
+    if branch_id != crate::GLOBAL_BRANCH_ID
+        && branch_id != state.descriptor().selected_branch.branch_id
+    {
+        return Err(invalid("ordinary upload lane is outside admitted branches"));
+    }
+    let (outbox, _, guards) =
+        super::partial_global_merge_state::load_partial_global_merge_state(read, state).await?;
+    if let Some(outbox) = outbox {
+        let may_upload = if branch_id == crate::GLOBAL_BRANCH_ID {
+            outbox.upload_settled
+        } else {
+            // load validated the immutable receipt against its exact request.
+            outbox.receipt.is_some()
+        };
+        if !may_upload {
+            return Err(LixError::new(
+                "LIX_PARTIAL_REPLICA_MERGE_PENDING",
+                "ordinary upload awaits durable GLOBAL merge settlement",
+            ));
+        }
+    }
+    Ok(guards)
+}
+
+/// Called only with the native inclusion proof. This stages bookkeeping beside
+/// candidate controls/root generations; it never publishes those pieces alone.
+#[must_use = "publish all returned guards with the full candidate write set"]
+pub(super) async fn stage_settle_partial_global_merge_confirmation(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    state: &PartialReplicaState,
+    verified: super::partial_global_merge_settlement::VerifiedPartialGlobalMergeSettlement,
+) -> Result<Vec<StoragePrecondition>, LixError> {
+    let (current, outbox_raw, mut guards) =
+        super::partial_global_merge_state::load_partial_global_merge_state(read, state).await?;
+    let mut outbox = current.ok_or_else(|| invalid("GLOBAL settlement outbox disappeared"))?;
+    if &outbox != verified.record() || outbox.upload_settled || outbox.receipt.is_none() {
+        return Err(invalid(
+            "GLOBAL settlement differs from proved unadopted receipt",
+        ));
+    }
+    let (mut push, push_raw, epoch_guard) =
+        load_partial_push_state(read, state, crate::GLOBAL_BRANCH_ID).await?;
+    if push.confirmed != outbox.original_upload.expected
+        || push.prepared.as_ref() != Some(&outbox.original_upload)
+    {
+        return Err(invalid(
+            "GLOBAL settlement raced the frozen ordinary upload",
+        ));
+    }
+    // Child ACKs confirm only the frozen refs, preserving any newer child head.
+    guards.extend(stage_created_ref_ack(read, writes, state, &outbox.original_upload).await?);
+    push.confirmed = verified.target().clone();
+    push.prepared = None;
+    push.bodies_acknowledged = false;
+    guards.push(stage_record(writes, &push, Some(push_raw))?);
+    outbox.upload_settled = true;
+    guards.push(super::partial_global_merge_state::stage_global_record(
+        writes, &outbox, outbox_raw,
+    )?);
+    // Keep the outbox and authority pin alive until exact cleanup completes.
+    guards.extend(verified.into_guards());
+    guards.push(epoch_guard);
     Ok(guards)
 }

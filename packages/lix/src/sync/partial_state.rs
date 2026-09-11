@@ -23,7 +23,7 @@ pub(crate) const PARTIAL_REPLICA_STATE_SPACE: StorageSpace = StorageSpace::decla
     ValueSemantics::Mutable,
 );
 const STATE_KEY: &[u8] = b"current";
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 const MAX_STATE_BYTES: usize = 16 * 1024;
 
 pub(crate) fn partial_replica_state_key() -> StorageKey {
@@ -34,6 +34,7 @@ pub(crate) fn partial_replica_state_key() -> StorageKey {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PartialReplicaState {
     version: u32,
+    archived_branch_ids: Vec<String>,
     remote_id: String,
     active_account_id: String,
     epoch_id: String,
@@ -44,6 +45,79 @@ pub(crate) struct PartialReplicaState {
 }
 
 impl PartialReplicaState {
+    // Method in PartialReplicaState; only the private switch owner calls this.
+    pub(super) fn with_selected_branch(
+        &self,
+        leased: super::LeasedPartialReplicaDescriptor,
+        target: &str,
+    ) -> Result<Self, LixError> {
+        leased.validate(self.repository_id(), self.active_account_id(), Some(target))?;
+        if leased.descriptor.cursor < self.descriptor.cursor {
+            return Err(invalid("branch admission cursor regressed"));
+        }
+        let mut next = Self::from_leased(
+            self.remote_id.clone(),
+            self.active_account_id.clone(),
+            self.epoch_id.clone(),
+            leased,
+        )?;
+        let mut archived = self
+            .archived_branch_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        if self.descriptor.selected_branch.branch_id != crate::GLOBAL_BRANCH_ID {
+            archived.insert(self.descriptor.selected_branch.branch_id.clone());
+        }
+        archived.remove(target);
+        next.archived_branch_ids = archived.into_iter().collect();
+        next.selected_serving_generation = uuid::Uuid::now_v7().to_string();
+        next.global_serving_generation = if target == crate::GLOBAL_BRANCH_ID {
+            next.selected_serving_generation.clone()
+        } else {
+            uuid::Uuid::now_v7().to_string()
+        };
+        next.validate()?;
+        Ok(next)
+    }
+
+    // Method to insert in PartialReplicaState's owner implementation.
+    pub(crate) fn read_scope_source(&self) -> crate::hot_state::PartialReadScopeSource {
+        let expected_repository = self.repository_id().to_owned();
+        let expected_remote = self.remote_id().to_owned();
+        let expected_account = self.active_account_id().to_owned();
+        let expected_epoch = self.epoch_id().to_owned();
+        crate::hot_state::PartialReadScopeSource::new(
+            PARTIAL_REPLICA_STATE_SPACE,
+            partial_replica_state_key(),
+            MAX_STATE_BYTES,
+            move |bytes| {
+                let state: PartialReplicaState = serde_json::from_slice(bytes)
+                    .map_err(|_| invalid("partial read admission is malformed"))?;
+                state.validate()?;
+                if state.repository_id() != expected_repository
+                    || state.remote_id() != expected_remote
+                    || state.active_account_id() != expected_account
+                    || state.epoch_id() != expected_epoch
+                {
+                    return Err(invalid(
+                        "partial read admission belongs to another storage owner",
+                    ));
+                }
+                let mut policy = crate::hot_state::PartialReadScopePolicy::new(
+                    &state.descriptor().selected_branch.branch_id,
+                    &state.descriptor().global_branch.branch_id,
+                );
+                policy.set_preparation_epoch(state.epoch_id());
+                Ok(policy)
+            },
+        )
+    }
+
+    pub(crate) fn archived_branch_ids(&self) -> &[String] {
+        &self.archived_branch_ids
+    }
+
     #[cfg(test)]
     pub(crate) fn new(
         remote_id: String,
@@ -78,6 +152,7 @@ impl PartialReplicaState {
         let state = Self {
             baseline_lease: leased.lease,
             version: STATE_VERSION,
+            archived_branch_ids: Vec::new(),
             remote_id,
             active_account_id,
             epoch_id,
@@ -90,6 +165,21 @@ impl PartialReplicaState {
     }
 
     fn validate(&self) -> Result<(), LixError> {
+        if self.archived_branch_ids.len() > 128
+            || self
+                .archived_branch_ids
+                .windows(2)
+                .any(|ids| ids[0] >= ids[1])
+            || self.archived_branch_ids.iter().any(|id| {
+                crate::storage_codec::id_string::uuid_bytes_from_canonical(id).is_none()
+                    || id == &self.descriptor.selected_branch.branch_id
+                    || id == &self.descriptor.global_branch.branch_id
+            })
+        {
+            return Err(invalid(
+                "partial branch archive is malformed or exceeds bound",
+            ));
+        }
         if self.version != STATE_VERSION {
             return Err(invalid("unsupported partial replica state version"));
         }
@@ -400,4 +490,185 @@ mod tests {
             "LIX_PARTIAL_REPLICA_STATE_INVALID"
         );
     }
+}
+
+// Private to the one-way owned-open migration. Ordinary readers and HOT policy
+// decoders accept only the current receipt version.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PartialReplicaStateV1 {
+    version: u32,
+    remote_id: String,
+    active_account_id: String,
+    epoch_id: String,
+    descriptor: PartialReplicaDescriptor,
+    baseline_lease: crate::gc::NativeBaselineLease,
+    selected_serving_generation: String,
+    global_serving_generation: String,
+}
+
+/// Owned epoch opening upgrades only bounded admission/upload metadata.
+/// Local controls and native data remain intact; pending attempts preserve
+/// their exact previously prepared wire requests without authority access.
+pub(crate) async fn upgrade_owned_partial_receipt<S>(
+    adapter: &crate::storage_adapter::StorageAdapter<S>,
+) -> Result<Option<PartialReplicaState>, LixError>
+where
+    S: crate::storage_adapter::Storage + Clone + Send + Sync + 'static,
+{
+    let read = adapter
+        .begin_read(crate::storage_adapter::StorageReadOptions {
+            durability: crate::storage_adapter::StorageReadDurability::Durable,
+            ..Default::default()
+        })
+        .await?;
+    let mut writes = adapter.new_write_set();
+    let Some((state, _upgraded, mut preconditions)) =
+        prepare_owned_partial_receipt_upgrade(&read, &mut writes).await?
+    else {
+        return Ok(None);
+    };
+    preconditions.extend(
+        super::partial_push_state::prepare_owned_partial_push_upgrade(&read, &mut writes, &state)
+            .await?,
+    );
+    preconditions.extend(
+        super::partial_merge_state::prepare_owned_partial_merge_upload_upgrade(
+            &read,
+            &mut writes,
+            &state,
+        )
+        .await?,
+    );
+    drop(read);
+    if !writes.is_empty() {
+        adapter
+            .commit_partial_replica_write_set(
+                super::partial_replica_write_capability(),
+                writes,
+                crate::storage_adapter::StorageWriteOptions {
+                    await_durable: true,
+                    preconditions,
+                    ..Default::default()
+                },
+            )
+            .await?;
+    }
+    Ok(Some(state))
+}
+
+pub(crate) async fn prepare_owned_partial_receipt_upgrade(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+) -> Result<Option<(PartialReplicaState, bool, Vec<StoragePrecondition>)>, LixError> {
+    let value = PointReadPlan::new(PARTIAL_REPLICA_STATE_SPACE, &[partial_replica_state_key()])
+        .materialize(read, Default::default())
+        .await?
+        .value
+        .pop()
+        .flatten();
+    let bytes = match value {
+        None => return Ok(None),
+        Some(StorageProjectedValue::FullValue(bytes)) => bytes,
+        Some(_) => return Err(invalid("partial receipt migration omitted its value")),
+    };
+    if bytes.len() > MAX_STATE_BYTES {
+        return Err(invalid("partial receipt migration exceeds metadata bound"));
+    }
+    #[derive(Deserialize)]
+    struct Version {
+        version: u32,
+    }
+    let version: Version = serde_json::from_slice(&bytes)
+        .map_err(|_| invalid("partial receipt version is malformed"))?;
+    if version.version == STATE_VERSION {
+        let state: PartialReplicaState =
+            serde_json::from_slice(&bytes).map_err(|_| invalid("partial receipt is malformed"))?;
+        state.validate()?;
+        return Ok(Some((
+            state,
+            false,
+            vec![StoragePrecondition::KeyValueEquals {
+                space: PARTIAL_REPLICA_STATE_SPACE,
+                key: partial_replica_state_key(),
+                expected: bytes,
+            }],
+        )));
+    }
+    if version.version != 1 {
+        return Err(invalid("unsupported partial receipt migration source"));
+    }
+    let old: PartialReplicaStateV1 =
+        serde_json::from_slice(&bytes).map_err(|_| invalid("partial v1 receipt is malformed"))?;
+    if old.version != 1 {
+        return Err(invalid("partial v1 receipt version changed"));
+    }
+    let state = PartialReplicaState {
+        version: STATE_VERSION,
+        archived_branch_ids: Vec::new(),
+        remote_id: old.remote_id,
+        active_account_id: old.active_account_id,
+        epoch_id: old.epoch_id,
+        descriptor: old.descriptor,
+        baseline_lease: old.baseline_lease,
+        selected_serving_generation: old.selected_serving_generation,
+        global_serving_generation: old.global_serving_generation,
+    };
+    state.validate()?;
+    let mut guards = Vec::new();
+    let mut visited = std::collections::BTreeSet::new();
+    for branch in [
+        &state.descriptor.selected_branch,
+        &state.descriptor.global_branch,
+    ] {
+        if !visited.insert(branch.branch_id.clone()) {
+            continue;
+        }
+        let observation =
+            crate::branch::observe_branch_control_coordinate(read, &branch.branch_id).await?;
+        let control = observation
+            .control
+            .ok_or_else(|| invalid("legacy partial admission lost its local control"))?;
+        if control.tracked_generation != state.serving_generation(&branch.branch_id)? {
+            return Err(invalid(
+                "legacy partial serving generation disagrees with its owner",
+            ));
+        }
+        let marker_key = StorageKey(Bytes::from(crate::hot_state::hot_generation_scope_prefix(
+            &branch.branch_id,
+            control.tracked_generation,
+        )));
+        let marker = PointReadPlan::new(
+            crate::hot_state::ROOT_CURRENT_BASE_SPACE,
+            std::slice::from_ref(&marker_key),
+        )
+        .materialize(read, Default::default())
+        .await?
+        .value
+        .pop()
+        .flatten();
+        let Some(StorageProjectedValue::FullValue(marker)) = marker else {
+            return Err(invalid(
+                "legacy partial admission lost its native root marker",
+            ));
+        };
+        let base =
+            crate::changelog::CommitId::parse_lix(&branch.head.commit_id, "legacy partial base")?;
+        if marker.as_ref() != base.as_uuid().as_bytes() {
+            return Err(invalid(
+                "legacy partial native root disagrees with its owner",
+            ));
+        }
+        guards.push(crate::branch::branch_head_control_precondition(
+            &branch.branch_id,
+            observation.raw_token,
+        )?);
+        guards.push(StoragePrecondition::KeyValueEquals {
+            space: crate::hot_state::ROOT_CURRENT_BASE_SPACE,
+            key: marker_key,
+            expected: marker,
+        });
+    }
+    guards.push(stage_partial_replica_state(writes, &state, Some(bytes))?);
+    Ok(Some((state, true, guards)))
 }

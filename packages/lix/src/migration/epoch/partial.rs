@@ -98,7 +98,7 @@ where
 }
 
 /// Resolve only a durable current-format active epoch and its partial receipt.
-/// Two coherent reads contain a fixed number of point reads. A concurrent
+/// Three coherent reads contain a fixed number of point reads. A concurrent
 /// pointer replacement is rejected by the returned adapter's exact-byte fence.
 /// The caller separately binds the receipt's remote/account to its transport.
 pub(crate) async fn admit_partial_epoch<S>(
@@ -131,12 +131,12 @@ where
             "partial replica repository protocol requires explicit migration",
         ));
     }
-    let Some((state, _)) = crate::sync::load_partial_replica_state(&read).await? else {
+    drop(read);
+    let Some(state) = crate::sync::upgrade_owned_partial_receipt(&adapter).await? else {
         return Err(migration_required(
             "existing full repositories require explicit conversion to a partial replica",
         ));
     };
-    drop(read);
     Ok(PartialEpochAdmission { adapter, state })
 }
 

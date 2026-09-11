@@ -14,12 +14,27 @@ test("compares complete and partial OPFS warm SQL in the same WASM artifact",asy
   // Reverse order at the second scale to expose order/system warm-up effects.
   for(const mode of (fixture.size===16?["complete","partial"]:["partial","complete"])) {
    const storage=new OpfsStorage({name:`paired-${mode}-${crypto.randomUUID()}`});
+   let phase="open",iteration=-1;
    let offline=false; const controllers=new Set<AbortController>();
    const attempts:{method:string;path:string}[]=[];
    const transport:typeof fetch=async(input,init)=>{
     const url=new URL(input instanceof Request?input.url:String(input));
     const method=(init?.method??(input instanceof Request?input.method:"GET")).toUpperCase();
-    if(offline){attempts.push({method,path:url.pathname});throw new TypeError("paired profile offline");}
+    if(offline){
+     attempts.push({method,path:url.pathname});
+     let nativeRequest:unknown;
+     if(/\/sync\/native-(objects|metadata|object-range)$/.test(url.pathname)) {
+      const body=init?.body;
+      let encoded:string|undefined;
+      if(typeof body==="string")encoded=body;
+      else if(body instanceof ArrayBuffer)encoded=new TextDecoder().decode(body);
+      else if(ArrayBuffer.isView(body))encoded=new TextDecoder().decode(body);
+      else if(input instanceof Request)encoded=await input.clone().text();
+      if(encoded!==undefined && encoded.length<=16384){try{nativeRequest=JSON.parse(encoded);}catch{nativeRequest="unparsed";}}
+     }
+     if(nativeRequest!==undefined)console.error(JSON.stringify({diagnostic:"paired-offline-request",mode,rows:fixture.size,phase,iteration,method,path:url.pathname+url.search,nativeRequest}));
+     throw new TypeError("paired profile offline");
+    }
     const controller=new AbortController();controllers.add(controller);
     const signal=init?.signal?AbortSignal.any([init.signal,controller.signal]):controller.signal;
     const response=await fetch(input,{...init,signal});
@@ -38,6 +53,7 @@ test("compares complete and partial OPFS warm SQL in the same WASM artifact",asy
       await lix.execute(`INSERT INTO lix_key_value(key,value) VALUES ${values}`);
      }
     }
+    phase="hoverPrefetch";
     const hoverStart=performance.now();
     const prefetched=await lix.execute(readSql,[fixture.key]);
     const hoverPrefetchMs=performance.now()-hoverStart;
@@ -45,17 +61,18 @@ test("compares complete and partial OPFS warm SQL in the same WASM artifact",asy
     expect(prefetched.rows[0]?.value).toEqual(fixture.expected);
     const selectMs:number[]=[],updateMs:number[]=[];
     for(let i=0;i<35;i++) {
+     iteration=i;phase="offlineRead";
      let begin=performance.now();
      const row=await lix.execute(readSql,[fixture.key]);
      const elapsed=performance.now()-begin;
      expect(row.rows[0]?.value).toBe(i===0?fixture.expected:`paired edit ${i-1}`);
      if(i>=5)selectMs.push(elapsed);
-     begin=performance.now();await lix.execute(writeSql,[`paired edit ${i}`,fixture.key]);
+     phase="offlineWrite";begin=performance.now();await lix.execute(writeSql,[`paired edit ${i}`,fixture.key]);
      if(i>=5)updateMs.push(performance.now()-begin);
     }
     expect(attempts.filter(a=>/\/sync\/native-(objects|object-range|metadata)$/.test(a.path)||(a.method==="GET"&&/\/sync\/(blob|chunk)$/.test(a.path)))).toHaveLength(0);
     results.push({mode,rows:fixture.size,hoverPrefetchMs,selectMs,updateMs,offlineNetworkAttempts:attempts,excludedWarmups:5});
-   }finally{await lix.close();}
+   }catch(error){console.error(JSON.stringify({diagnostic:"paired-failure",mode,rows:fixture.size,phase,iteration,error:String(error),attempts}));throw error;}finally{await lix.close();}
   }
  }
  const artifact={benchmark:"same-artifact-complete-vs-partial-opfs",userAgent:navigator.userAgent,generatedAt:new Date().toISOString(),results,

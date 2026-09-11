@@ -5,9 +5,9 @@ mod read_interests_codec;
 mod reader;
 #[allow(unused_imports)]
 pub(crate) use read_interests::{
-    DiffInterestEndpoint, FilePathInterest, FilePathInterestComparison, InterestDomain,
-    LogicalReadInterest, ReadInterestOperation, ReadInterestPublication, ReadInterestRegistry,
-    ReadInterestSnapshot,
+    DiffInterestEndpoint, ExactReadIdentity, FilePathInterest, FilePathInterestComparison,
+    InterestDomain, LogicalReadInterest, ReadInterestOperation, ReadInterestPublication,
+    ReadInterestRegistry, ReadInterestSnapshot,
 };
 mod row_columnar_cache;
 mod row_decoded_column_cache;
@@ -97,7 +97,7 @@ pub(crate) use visibility::{blob_ref_probe_stats, reset_blob_ref_probe_stats};
 pub(crate) use types::materialized_hot_state_row_with_snapshot_projection;
 
 mod partial_scope_policy;
-use partial_scope_policy::PartialReadScopePolicy;
+pub(crate) use partial_scope_policy::{PartialReadScopePolicy, PartialReadScopeSource};
 
 pub(crate) use tracked_head::root_generation_absence_preconditions;
 

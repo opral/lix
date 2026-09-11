@@ -105,18 +105,19 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     Box::pin(async move {
-        let connect = move || -> super::SyncTransportFuture<'static, super::platform::HttpSyncTransport> {
-            let server = server.clone();
-            Box::pin(async move {
-                let server = server.ok_or_else(|| {
-                    LixError::new(
-                        "LIX_PARTIAL_REPLICA_OFFLINE",
-                        "missing input requires a configured authority",
-                    )
-                })?;
-                super::platform::HttpSyncTransport::connect(&server.url, &server.headers).await
-            })
-        };
+        let connect =
+            move || -> super::SyncTransportFuture<'static, super::platform::HttpSyncTransport> {
+                let server = server.clone();
+                Box::pin(async move {
+                    let server = server.ok_or_else(|| {
+                        LixError::new(
+                            "LIX_PARTIAL_REPLICA_OFFLINE",
+                            "missing input requires a configured authority",
+                        )
+                    })?;
+                    super::platform::HttpSyncTransport::connect(&server.url, &server.headers).await
+                })
+            };
         run_partial_worker_with_engine(
             storage,
             state,
@@ -283,7 +284,8 @@ pub(super) fn hydrate_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: 
                         "blob manifest response must contain exactly the requested blob",
                     ));
                 }
-                super::partial_blob::install_manifest(storage, state, address, &manifests[0]).await?;
+                super::partial_blob::install_manifest(storage, state, address, &manifests[0])
+                    .await?;
                 Ok(())
             }
             SyncDemandRequest::Chunks(ids) => {
@@ -395,6 +397,26 @@ where
     Connect: FnMut() -> super::SyncTransportFuture<'static, HttpSyncTransport<C>>,
 {
     let mut progress = false;
+    let read = storage.begin_read(Default::default()).await?;
+    let cleanup_pending =
+        super::partial_global_merge_state::load_partial_global_merge_state(&read, state)
+            .await?
+            .0
+            .is_some_and(|record| record.upload_settled);
+    drop(read);
+    if cleanup_pending {
+        if transport.is_none() {
+            let connected = connect().await?;
+            validate_admission(storage, state, &connected).await?;
+            *transport = Some(connected);
+        }
+        progress |= super::partial_global_merge_runtime::cleanup_adopted_global_attempt(
+            storage,
+            state,
+            transport.as_ref().expect("connected"),
+        )
+        .await?;
+    }
     for (index, branch) in [
         &state.descriptor().global_branch,
         &state.descriptor().selected_branch,
@@ -431,7 +453,7 @@ where
             *transport = Some(connected);
         }
         let connected = transport.as_ref().expect("connected above");
-        progress |= super::partial_upload_cycle::upload_partial_once(
+        let upload = super::partial_upload_cycle::upload_partial_once(
             storage,
             state,
             &branch.branch_id,
@@ -445,7 +467,12 @@ where
                 .await
             },
         )
-        .await?;
+        .await;
+        match upload {
+            Ok(changed) => progress |= changed,
+            Err(error) if error.code == "LIX_PARTIAL_CREATED_REF_SOURCE_PENDING" => {}
+            Err(error) => return Err(error),
+        }
     }
     Ok(progress)
 }
@@ -529,6 +556,8 @@ where
 {
     let mut publication: Option<super::SyncTransportFuture<'static, ()>> = None;
     let mut watch_cursor = state.descriptor().cursor;
+    let mut blocked_global_cursor: Option<u64> = None;
+    let mut force_descriptor_refresh = false;
     let mut watch_after = web_time::Instant::now();
     let mut upload_due = changes.is_some();
     let mut retry_upload = false;
@@ -678,12 +707,13 @@ where
                     upload_due = true;
                 },
                 result = upload => match result {
-                    Ok(progress) => { upload_due = progress; retry_upload = false; retry_delay = Duration::from_millis(100); },
+                    Ok(progress) => { if progress {force_descriptor_refresh=true;} upload_due = progress; retry_upload = false; retry_delay = Duration::from_millis(100); },
                     Err(error) => {
                         if is_terminal_partial_transport_error(&error) {
                             terminal_error = Some(error);
                             break 'worker;
                         }
+                        force_descriptor_refresh=true;
                         tracing::warn!(code = %error.code, message = %error.message, "partial replica upload retained for retry");
                         retry_upload = true;
                         retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
@@ -702,6 +732,8 @@ where
         {
             let engine = engine.as_ref().expect("checked").clone();
             let after_cursor = watch_cursor;
+            let blocked_cursor = blocked_global_cursor;
+            let request_fresh = force_descriptor_refresh;
             let recovery = if baseline_expired.is_some() {
                 super::partial_publication::PartialRecoveryPolicy::ExpiredBaseline
             } else {
@@ -714,21 +746,41 @@ where
                     transport = Some(connected);
                 }
                 let connected = transport.as_ref().expect("connected");
-                let wrapper = connected
-                    .wait_partial_replica_descriptor(
-                        &state.descriptor().selected_branch.branch_id,
-                        after_cursor,
-                    )
-                    .await?;
+                let wrapper = if request_fresh {
+                    connected
+                        .partial_replica_descriptor(Some(
+                            &state.descriptor().selected_branch.branch_id,
+                        ))
+                        .await?
+                } else {
+                    connected
+                        .wait_partial_replica_descriptor(
+                            &state.descriptor().selected_branch.branch_id,
+                            after_cursor,
+                        )
+                        .await?
+                };
                 let cursor = wrapper.wire.descriptor.cursor;
-                let prepared = super::partial_merge_runtime::prepare_descriptor_with_merge(
-                    engine.clone(),
-                    state.clone(),
-                    connected,
-                    wrapper,
-                    recovery,
-                )
-                .await?;
+                if !request_fresh && blocked_cursor.is_some_and(|blocked| cursor <= blocked) {
+                    return Ok((
+                        cursor,
+                        super::partial_reconcile::PreparedDescriptor::NoChange,
+                    ));
+                }
+
+                let prepared =
+                    super::partial_global_merge_runtime::prepare_descriptor_with_global_merge(
+                        engine.clone(),
+                        state.clone(),
+                        connected,
+                        wrapper,
+                        recovery,
+                    )
+                    .await.map_err(|error| {
+                        if super::partial_global_merge_runtime::waits_for_state_change(&error) {
+                            error.with_details(serde_json::json!({"authorityCursor":cursor,"pendingPreserved":true,"waitForChange":true}))
+                        } else {error}
+                    })?;
                 Ok::<_, LixError>((cursor, prepared))
             }
             .fuse();
@@ -751,9 +803,11 @@ where
                 }
             }
             .fuse();
-            let retry = async {
-                if retry_upload {
-                    sleep(retry_deadline.saturating_duration_since(web_time::Instant::now())).await;
+            let retry_enabled = retry_upload;
+            let retry_at = retry_deadline;
+            let retry = async move {
+                if retry_enabled {
+                    sleep(retry_at.saturating_duration_since(web_time::Instant::now())).await;
                 } else {
                     futures_util::future::pending::<()>().await;
                 }
@@ -763,21 +817,37 @@ where
             select_biased! {
                 _ = shutdown => break,
                 next = demand => { let Some(next) = next else { break }; queued_demand = Some(next); },
-                live = changed => { if !live { break; } upload_due = true; },
+                live = changed => { if !live { break; } upload_due = true; blocked_global_cursor=None; force_descriptor_refresh=true; },
                 _ = renewal => {},
                 _ = retry => { upload_due = true; },
                 result = watch => match result {
+                    Ok((cursor, super::partial_reconcile::PreparedDescriptor::LocalProgress)) => {
+                        watch_cursor=watch_cursor.max(cursor);blocked_global_cursor=None;
+                        force_descriptor_refresh=true;upload_due=true;retry_upload=false;
+                        watch_after=web_time::Instant::now();
+                    },
                     Ok((cursor, super::partial_reconcile::PreparedDescriptor::NoChange)) => {
+                        force_descriptor_refresh=false;
+                        if blocked_global_cursor.is_some_and(|blocked|cursor>blocked){blocked_global_cursor=None;}
                         watch_cursor = watch_cursor.max(cursor);
                         watch_after = web_time::Instant::now() + Duration::from_millis(100);
                     },
                     Ok((_, super::partial_reconcile::PreparedDescriptor::Ready(prepared))) => {
+                        force_descriptor_refresh=false; blocked_global_cursor=None;
                         publication = Some(Box::pin(super::partial_publication::publish_prepared_partial(engine.clone(), prepared)));
                     },
                     Err(error) => {
                         if is_terminal_partial_transport_error(&error) {
                             terminal_error = Some(error);
                             break 'worker;
+                        }
+                        if super::partial_global_merge_runtime::waits_for_state_change(&error) {
+                            let cursor=error.details.as_ref().and_then(|v|v.get("authorityCursor")).and_then(serde_json::Value::as_u64).unwrap_or(watch_cursor);
+                            blocked_global_cursor=Some(cursor);watch_cursor=watch_cursor.max(cursor);
+                            force_descriptor_refresh=false;retry_upload=false;upload_due=false;
+                            tracing::warn!(code=%error.code,message=%error.message,"partial GLOBAL reconciliation awaits local or authority change; pending edits retained");
+                            watch_after=web_time::Instant::now();
+                            continue 'worker;
                         }
                         if error.code == "LIX_PARTIAL_REPLICA_REBASE_REQUIRED" && !retry_upload { upload_due = true; }
                         tracing::warn!(code=%error.code, "partial reconciliation retained existing working set");
@@ -800,9 +870,11 @@ where
                 }
             }
             .fuse();
-            let retry = async {
-                if retry_upload {
-                    sleep(retry_deadline.saturating_duration_since(web_time::Instant::now())).await;
+            let retry_enabled = retry_upload;
+            let retry_at = retry_deadline;
+            let retry = async move {
+                if retry_enabled {
+                    sleep(retry_at.saturating_duration_since(web_time::Instant::now())).await;
                 } else {
                     futures_util::future::pending::<()>().await;
                 }
@@ -830,7 +902,7 @@ where
             select_biased! {
                 _ = shutdown => break,
                 demand = next => demand,
-                live = changed => { if live { upload_due = true; } else { break; } continue; },
+                live = changed => { if live { upload_due = true; blocked_global_cursor=None; force_descriptor_refresh=true; } else { break; } continue; },
                 _ = retry => { upload_due = true; continue; },
                 _ = renewal => { continue; },
                 _ = watch_ready => { continue; },

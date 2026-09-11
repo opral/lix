@@ -266,6 +266,7 @@ async fn pending_suffix_blocks_recovery_without_losing_local_edit() {
             .await
             .unwrap();
     let upload = crate::sync::partial_push_state::PreparedPartialUpload {
+        created_refs: Vec::new(),
         attempt_id: uuid::Uuid::now_v7().to_string(),
         expected: push.confirmed,
         target: crate::sync::partial_push_state::PartialPushCoordinate {

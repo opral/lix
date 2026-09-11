@@ -20,6 +20,7 @@ pub(super) struct PreparedPartialPublication {
     // Exact owning engine, not a serializable receipt that another backing
     // store could copy. Preparation and publication use this same write gate.
     origin_write_gate: Arc<tokio::sync::Mutex<()>>,
+    branch_switch_completion: Option<super::partial_branch_switch::PartialBranchSwitchCompletion>,
     previous: Arc<PartialReplicaState>,
     next: Arc<PartialReplicaState>,
     interests_revision: u64,
@@ -50,6 +51,7 @@ pub(super) enum PartialRecoveryPolicy {
     Normal,
     ExpiredBaseline,
     NativeMerge,
+    NativeGlobalMerge,
 }
 
 pub(super) async fn prepare_partial_publication<S>(
@@ -116,6 +118,26 @@ where
     .enumerate()
     {
         if index == 1 && branch.branch_id == next.descriptor().selected_branch.branch_id {
+            continue;
+        }
+        if branch.branch_id == crate::GLOBAL_BRANCH_ID
+            && policy == PartialRecoveryPolicy::NativeGlobalMerge
+        {
+            let verified =
+                super::partial_global_merge_settlement::verify_partial_global_merge_settlement(
+                    &read, &previous, &next,
+                )
+                .await?;
+            preconditions.extend(
+                super::partial_push_state::stage_settle_partial_global_merge_confirmation(
+                    &read,
+                    &mut writes,
+                    &previous,
+                    verified,
+                )
+                .await?,
+            );
+            changed = true;
             continue;
         }
         if index == 0 && policy == PartialRecoveryPolicy::NativeMerge {
@@ -229,6 +251,7 @@ where
     writes.extend(candidate_writes);
     Ok(Some(PreparedPartialPublication {
         origin_write_gate: engine.collaboration_write_gate(),
+        branch_switch_completion: None,
         previous,
         next,
         interests_revision: interests.revision,
@@ -307,6 +330,14 @@ where
                 .await;
             match result {
                 Ok(_) => {
+                    if let Some(completion) = &prepared.branch_switch_completion {
+                        if let Err(error) = completion.complete() {
+                            mode.fail_partial_admission(error.clone());
+                            engine.fail_observers(error.clone());
+                            return Err(error);
+                        }
+                        mode.admit_partial_replica(prepared.next.clone(), super::partial_replica_write_capability());
+                    }
                     // Durability may have stalled past the server pin. The
                     // committed receipt cannot be rolled back, but it must not
                     // become an active admission without renewed retention.
@@ -445,6 +476,7 @@ where
     let interests_revision = registry.snapshot()?.revision;
     Ok(PreparedPartialPublication {
         origin_write_gate: engine.collaboration_write_gate(),
+        branch_switch_completion: None,
         previous,
         next,
         interests_revision,
@@ -465,4 +497,133 @@ pub(super) fn same_serving_basis(
         && left.selected_branch.checkpoint == right.selected_branch.checkpoint
         && left.global_branch.head == right.global_branch.head
         && left.global_branch.checkpoint == right.global_branch.checkpoint
+}
+
+// Append within partial_publication. Existing same-branch publisher checks
+// remain unchanged; this distinct proof owns explicit selected-scope admission.
+pub(super) async fn require_clean_switch_source<S>(
+    engine: &Engine<S>,
+    previous: &PartialReplicaState,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let storage = engine.storage();
+    let read = storage.begin_read(Default::default()).await?;
+    super::partial_push_state::clean_branch_source_guards(&read, previous).await?;
+    Ok(())
+}
+
+pub(super) async fn prepare_branch_switch_publication<S>(
+    engine: &Engine<S>,
+    next: Arc<PartialReplicaState>,
+    deadline: CandidateBaselineDeadline,
+) -> Result<PreparedPartialPublication, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    deadline.check(&next.baseline_lease().lease_id)?;
+    let mode = engine.sync_mode();
+    mode.ensure_partial_admission_healthy()?;
+    let previous = mode
+        .partial_admission()
+        .ok_or_else(|| conflict("branch switch has no current admission"))?;
+    if next.repository_id() != previous.repository_id()
+        || next.remote_id() != previous.remote_id()
+        || next.active_account_id() != previous.active_account_id()
+        || next.epoch_id() != previous.epoch_id()
+        || next.descriptor().global_branch.branch_id
+            != previous.descriptor().global_branch.branch_id
+        || next.descriptor().cursor < previous.descriptor().cursor
+    {
+        return Err(conflict(
+            "branch switch candidate identity or cursor differs",
+        ));
+    }
+    let registry = mode
+        .read_interests()
+        .ok_or_else(|| conflict("branch switch has no interest registry"))?;
+    let storage = engine.storage();
+    let read = storage.begin_read(Default::default()).await?;
+    let (actual, receipt) = load_partial_replica_state(&read)
+        .await?
+        .ok_or_else(|| conflict("branch switch receipt disappeared"))?;
+    if &actual != previous.as_ref() {
+        return Err(conflict("branch switch admission changed"));
+    }
+    let mut preconditions =
+        super::partial_push_state::clean_branch_source_guards(&read, &previous).await?;
+    preconditions.extend(
+        super::partial_interest_journal::restore_candidate_read_interests(
+            &read, &previous, &registry,
+        )
+        .await?,
+    );
+    let mut writes = storage.new_write_set();
+    let mut visited = std::collections::BTreeSet::new();
+    for branch in [
+        &next.descriptor().selected_branch,
+        &next.descriptor().global_branch,
+    ] {
+        if !visited.insert(branch.branch_id.clone()) {
+            continue;
+        }
+        let observation =
+            crate::branch::observe_branch_control_coordinate(&read, &branch.branch_id).await?;
+        preconditions.extend(
+            super::partial_push_state::stage_admitted_branch_coordinate(
+                &read,
+                &mut writes,
+                &previous,
+                branch,
+                &observation,
+            )
+            .await?,
+        );
+        preconditions.push(crate::branch::branch_head_control_precondition(
+            &branch.branch_id,
+            observation.raw_token,
+        )?);
+    }
+    let interests = registry.snapshot()?;
+    preconditions.push(stage_partial_replica_state(
+        &mut writes,
+        &next,
+        Some(receipt),
+    )?);
+    crate::catalog::stage_catalog_revision(&mut writes);
+    crate::filesystem::stage_path_index_revision(&mut writes);
+    if next.descriptor().global_branch != previous.descriptor().global_branch {
+        crate::account::stage_account_revision(&mut writes);
+    }
+    // Only this owner allows an authenticated target with no physical control.
+    // Existing target local work was checked against its archived confirmation.
+    let prepared = engine
+        .prepare_partial_branch_candidate(read, &next, &interests)
+        .await?;
+    preconditions.extend(prepared.source_control_guards);
+    writes.extend(
+        Arc::try_unwrap(prepared.writes)
+            .map_err(|_| conflict("branch candidate retained its staged write capability"))?,
+    );
+    Ok(PreparedPartialPublication {
+        origin_write_gate: engine.collaboration_write_gate(),
+        previous,
+        next,
+        interests_revision: interests.revision,
+        deadline,
+        writes,
+        preconditions,
+        branch_switch_completion: None,
+    })
+}
+
+impl PreparedPartialPublication {
+    pub(super) fn with_branch_switch_completion(
+        mut self,
+        completion: super::partial_branch_switch::PartialBranchSwitchCompletion,
+    ) -> Self {
+        self.branch_switch_completion = Some(completion);
+        self
+    }
 }

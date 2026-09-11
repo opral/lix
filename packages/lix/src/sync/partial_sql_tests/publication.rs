@@ -574,7 +574,8 @@ async fn remote_file_publication_rotates_live_path_index_and_count_cache() {
     let storage = engine.storage();
     let sql = "SELECT path FROM lix_file WHERE path='/appeared.bin'";
     let count = "SELECT COUNT(*) AS n FROM lix_file";
-    for query in [sql, count] {
+    let directory_sql = "SELECT path FROM lix_directory WHERE path='/appeared-dir'";
+    for query in [sql, count, directory_sql] {
         execute_hydrating(
             &session,
             &storage,
@@ -587,12 +588,51 @@ async fn remote_file_publication_rotates_live_path_index_and_count_cache() {
         .await
         .unwrap();
     }
+    let interests = engine
+        .sync_mode()
+        .read_interests()
+        .unwrap()
+        .snapshot()
+        .unwrap();
+    let metadata = interests
+        .interests
+        .iter()
+        .filter(|interest| {
+            matches!(
+                interest.as_ref(),
+                crate::hot_state::LogicalReadInterest::FilesystemMetadata {
+                    directory: false,
+                    ..
+                }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        metadata.len(),
+        1,
+        "COUNT retains no returned descriptor scope"
+    );
+    assert!(
+        matches!(metadata[0].as_ref(), crate::hot_state::LogicalReadInterest::FilesystemMetadata {
+        path_predicate: crate::hot_state::FilePathInterest::Comparison {
+            operation: crate::hot_state::FilePathInterestComparison::Equal,
+            value,
+        }, ..
+    } if value == "/appeared.bin")
+    );
     assert!(session.execute(sql, &[]).await.unwrap().rows().is_empty());
     let before_count = session.execute(count, &[]).await.unwrap().rows()[0]
         .get::<i64>("n")
         .unwrap();
     authority
         .upsert_file_content("/appeared.bin", vec![1, 2, 3])
+        .await
+        .unwrap();
+    authority
+        .execute(
+            "INSERT INTO lix_directory (path) VALUES ('/appeared-dir')",
+            &[],
+        )
         .await
         .unwrap();
     let next = Arc::new(
@@ -609,6 +649,15 @@ async fn remote_file_publication_rotates_live_path_index_and_count_cache() {
         .unwrap();
     assert_eq!(session.execute(sql, &[]).await.unwrap().rows().len(), 1);
     assert_eq!(
+        session
+            .execute(directory_sql, &[])
+            .await
+            .expect("newly matching directory is prepared before publication")
+            .rows()
+            .len(),
+        1
+    );
+    assert_eq!(
         session.execute(count, &[]).await.unwrap().rows()[0]
             .get::<i64>("n")
             .unwrap(),
@@ -618,6 +667,15 @@ async fn remote_file_publication_rotates_live_path_index_and_count_cache() {
         .await
         .unwrap();
     assert_eq!(reopened.execute(sql, &[]).await.unwrap().rows().len(), 1);
+    assert_eq!(
+        reopened
+            .execute(directory_sql, &[])
+            .await
+            .unwrap()
+            .rows()
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -957,4 +1015,547 @@ async fn remote_global_publication_keeps_global_session_sql_and_catalog_warm() {
     drop(read);
     reopened.close().await.unwrap();
     global.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn existing_branch_admission_publishes_matching_native_controls_and_retains_source() {
+    let (authority, engine, _session, old) = fixture().await;
+    let target = authority
+        .create_branch(crate::CreateBranchOptions {
+            id: None,
+            name: "native-admission-target".into(),
+            from_commit_id: None,
+        })
+        .await
+        .unwrap();
+    let descriptor = authority
+        .partial_replica_descriptor(Some(&target.id))
+        .await
+        .unwrap();
+    let lease = crate::gc::NativeBaselineLease::for_test(
+        old.active_account_id(),
+        &crate::sync::leased_descriptor::descriptor_roots(&descriptor).unwrap(),
+    );
+    let next = Arc::new(
+        old.with_selected_branch(
+            crate::sync::LeasedPartialReplicaDescriptor { descriptor, lease },
+            &target.id,
+        )
+        .unwrap(),
+    );
+    let deadline = crate::sync::http::CandidateBaselineDeadline::for_test(
+        &next.baseline_lease().lease_id,
+        std::time::Duration::from_secs(300),
+    );
+    let storage = engine.storage();
+    let old_control = {
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        crate::branch::observe_branch_control_coordinate(
+            &read,
+            &old.descriptor().selected_branch.branch_id,
+        )
+        .await
+        .unwrap()
+    };
+    let mut prepared = None;
+    for _ in 0..256 {
+        let error = match crate::sync::partial_publication::prepare_branch_switch_publication(
+            &engine,
+            next.clone(),
+            deadline.clone(),
+        )
+        .await
+        {
+            Ok(value) => {
+                prepared = Some(value);
+                break;
+            }
+            Err(error) => error,
+        };
+        if let Some(addresses) = NativeObjectRef::batch_from_missing_error(&error).unwrap() {
+            for address in addresses {
+                hydrate_native_object(&storage, &old, address, 32 * 1024 * 1024, |request| {
+                    let authority = &authority;
+                    async move { authority.read_sync_native_object_range(&request).await }
+                })
+                .await
+                .unwrap();
+            }
+        } else if let Some(address) = NativeObjectRef::from_missing_error(&error).unwrap() {
+            hydrate_native_object(&storage, &old, address, 32 * 1024 * 1024, |request| {
+                let authority = &authority;
+                async move { authority.read_sync_native_object_range(&request).await }
+            })
+            .await
+            .unwrap();
+        } else if let Some(address) = NativeMetadataRef::from_missing_error(&error).unwrap() {
+            hydrate_metadata(&storage, &old, &authority, address, &mut Fetches::default())
+                .await
+                .unwrap();
+        } else {
+            panic!("branch admission preparation failed: {error:?}");
+        }
+    }
+    publish_prepared_partial(
+        engine.clone(),
+        prepared.expect("bounded candidate preparation"),
+    )
+    .await
+    .unwrap();
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let (durable, _) = crate::sync::load_partial_replica_state(&read)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&durable, next.as_ref());
+    assert!(
+        durable
+            .archived_branch_ids()
+            .contains(&old.descriptor().selected_branch.branch_id)
+    );
+    let source = crate::branch::observe_branch_control_coordinate(
+        &read,
+        &old.descriptor().selected_branch.branch_id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        source.raw_token, old_control.raw_token,
+        "source branch control is archived intact"
+    );
+    for branch in [
+        &next.descriptor().selected_branch,
+        &next.descriptor().global_branch,
+    ] {
+        let control = crate::branch::BranchHeadControlContext::new()
+            .reader(&read)
+            .load(&branch.branch_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(control.head_commit_id.to_string(), branch.head.commit_id);
+        assert_eq!(
+            control
+                .working_diff_checkpoint_commit_id
+                .unwrap()
+                .to_string(),
+            branch.checkpoint.commit_id
+        );
+        assert_eq!(
+            control.tracked_generation,
+            next.serving_generation(&branch.branch_id).unwrap()
+        );
+        let root = crate::hot_state::TrackedHeadContext::new()
+            .reader(&read)
+            .root_current_base_commit(&branch.branch_id, control.tracked_generation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root.to_string(), branch.head.commit_id);
+        let (push, _, _) = crate::sync::partial_push_state::load_partial_push_state(
+            &read,
+            &next,
+            &branch.branch_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(push.confirmed.head, branch.head.commit_id);
+        assert_eq!(push.confirmed.checkpoint, branch.checkpoint.commit_id);
+        assert!(push.prepared.is_none());
+    }
+    drop(read);
+    let (_, reopened) = Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &next)
+        .await
+        .unwrap();
+    assert_eq!(reopened.active_branch_id().await.unwrap(), target.id);
+    // An archived target is not assumed clean from cache residency. Inject an
+    // unconfirmed control transition and verify admission never overwrites it.
+    let mut dirty = old_control.control.unwrap();
+    dirty.head_commit_id = crate::changelog::CommitId::parse_lix(
+        &next.descriptor().global_branch.head.commit_id,
+        "test unconfirmed head",
+    )
+    .unwrap();
+    assert_ne!(
+        dirty.head_commit_id.to_string(),
+        old.descriptor().selected_branch.head.commit_id
+    );
+    let mut writes = storage.new_write_set();
+    crate::branch::stage_branch_head_control(
+        &mut writes,
+        &old.descriptor().selected_branch.branch_id,
+        dirty,
+    )
+    .unwrap();
+    storage
+        .commit_partial_replica_write_set(
+            crate::sync::partial_replica_write_capability(),
+            writes,
+            StorageWriteOptions {
+                await_durable: true,
+                preconditions: vec![
+                    crate::branch::branch_head_control_precondition(
+                        &old.descriptor().selected_branch.branch_id,
+                        old_control.raw_token,
+                    )
+                    .unwrap(),
+                ],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let descriptor = authority
+        .partial_replica_descriptor(Some(&old.descriptor().selected_branch.branch_id))
+        .await
+        .unwrap();
+    let lease = crate::gc::NativeBaselineLease::for_test(
+        old.active_account_id(),
+        &crate::sync::leased_descriptor::descriptor_roots(&descriptor).unwrap(),
+    );
+    let returning = Arc::new(
+        next.with_selected_branch(
+            crate::sync::LeasedPartialReplicaDescriptor { descriptor, lease },
+            &old.descriptor().selected_branch.branch_id,
+        )
+        .unwrap(),
+    );
+    let deadline = crate::sync::http::CandidateBaselineDeadline::for_test(
+        &returning.baseline_lease().lease_id,
+        std::time::Duration::from_secs(300),
+    );
+    let error = match crate::sync::partial_publication::prepare_branch_switch_publication(
+        &engine, returning, deadline,
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("unconfirmed archived target was admitted"),
+    };
+    assert_eq!(error.code, "LIX_PARTIAL_BRANCH_SWITCH_PENDING");
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    assert_eq!(
+        crate::sync::load_partial_replica_state(&read)
+            .await
+            .unwrap()
+            .unwrap()
+            .0,
+        *next
+    );
+    assert_eq!(
+        crate::branch::observe_branch_control_coordinate(
+            &read,
+            &old.descriptor().selected_branch.branch_id
+        )
+        .await
+        .unwrap()
+        .control
+        .unwrap()
+        .head_commit_id,
+        dirty.head_commit_id
+    );
+}
+
+#[tokio::test]
+async fn owned_offline_open_upgrades_v1_receipt_without_changing_pending_data() {
+    let authority = open_lix().await.unwrap();
+    authority
+        .execute(
+            "INSERT INTO lix_key_value (key,value) VALUES ('receipt-pending','before')",
+            &[],
+        )
+        .await
+        .unwrap();
+    let state = PartialReplicaState::new(
+        format!("https://example.test/lix/{}", authority.lix_id()),
+        authority.active_account_id().into(),
+        uuid::Uuid::now_v7().to_string(),
+        authority.partial_replica_descriptor(None).await.unwrap(),
+    )
+    .unwrap();
+    let backing = crate::sync::durable_memory_for_test(Memory::new());
+    let admitted = crate::migration::install_fresh_partial_epoch(backing.clone(), &state)
+        .await
+        .unwrap();
+    let storage = admitted.adapter;
+    let (engine, session) =
+        Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &state)
+            .await
+            .unwrap();
+    engine.sync_mode().admit_partial_replica(
+        Arc::new(state.clone()),
+        crate::sync::partial_replica_write_capability(),
+    );
+    storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
+    let mut fetches = Fetches::default();
+    let file_bytes = vec![43u8; 96 * 1024];
+    execute_hydrating(
+        &session,
+        &storage,
+        &state,
+        &authority,
+        "INSERT INTO lix_file (path,content) VALUES ('/receipt-pending.bin',$1)",
+        &[Value::Blob(vec![17u8; 96 * 1024].into())],
+        &mut fetches,
+    )
+    .await
+    .unwrap();
+    execute_hydrating(
+        &session,
+        &storage,
+        &state,
+        &authority,
+        "UPDATE lix_key_value SET value='pending-offline' WHERE key='receipt-pending'",
+        &[],
+        &mut fetches,
+    )
+    .await
+    .unwrap();
+    execute_hydrating(
+        &session,
+        &storage,
+        &state,
+        &authority,
+        "SELECT value FROM lix_key_value WHERE key='receipt-pending'",
+        &[],
+        &mut fetches,
+    )
+    .await
+    .unwrap();
+    execute_hydrating(
+        &session,
+        &storage,
+        &state,
+        &authority,
+        "UPDATE lix_file SET content=$1 WHERE path='/receipt-pending.bin'",
+        &[Value::Blob(file_bytes.clone().into())],
+        &mut fetches,
+    )
+    .await
+    .unwrap();
+    let checkpoint = execute_hydrating(&session, &storage, &state, &authority,
+        "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_key_value','receipt-pending')])",
+        &[], &mut fetches,
+    ).await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let (state, _) = crate::sync::load_partial_replica_state(&read)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(read);
+    // Establish the ordinary admission contract accepts this checkpoint/file
+    // cohort before asking the receipt-only migration to preserve it.
+    let (proof_engine, proof_session) =
+        Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &state)
+            .await
+            .unwrap();
+    drop(proof_session);
+    drop(proof_engine);
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let branch = &state.descriptor().selected_branch.branch_id;
+    let observation = crate::branch::observe_branch_control_coordinate(&read, branch)
+        .await
+        .unwrap();
+    let control = observation.control.unwrap();
+    let (push, _, _) =
+        crate::sync::partial_push_state::load_partial_push_state(&read, &state, branch)
+            .await
+            .unwrap();
+    let pending_upload = crate::sync::partial_push_state::PreparedPartialUpload {
+        created_refs: Vec::new(),
+        attempt_id: uuid::Uuid::now_v7().to_string(),
+        expected: push.confirmed,
+        target: crate::sync::partial_push_state::PartialPushCoordinate {
+            head: control.head_commit_id.to_string(),
+            checkpoint: control
+                .working_diff_checkpoint_commit_id
+                .unwrap()
+                .to_string(),
+        },
+    };
+    let mut writes = storage.new_write_set();
+    let mut guards = crate::sync::partial_push_state::stage_prepare_partial_upload(
+        &read,
+        &mut writes,
+        &state,
+        branch,
+        &pending_upload,
+    )
+    .await
+    .unwrap();
+    guards.push(
+        crate::branch::branch_head_control_precondition(branch, observation.raw_token).unwrap(),
+    );
+    drop(read);
+    storage
+        .commit_partial_replica_write_set(
+            crate::sync::partial_replica_write_capability(),
+            writes,
+            StorageWriteOptions {
+                await_durable: true,
+                preconditions: guards,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let before_controls = admitted_controls(&storage, &state).await.unwrap();
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let (_, before_push, _) = crate::sync::partial_push_state::load_partial_push_state(
+        &read,
+        &state,
+        &state.descriptor().selected_branch.branch_id,
+    )
+    .await
+    .unwrap();
+    let (_, receipt) = crate::sync::load_partial_replica_state(&read)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(read);
+    let mut legacy = serde_json::to_value(&state).unwrap();
+    legacy.as_object_mut().unwrap().remove("archivedBranchIds");
+    legacy["version"] = serde_json::json!(1);
+    let mut writes = storage.new_write_set();
+    writes.put(
+        crate::sync::PARTIAL_REPLICA_STATE_SPACE,
+        crate::sync::partial_replica_state_key(),
+        crate::storage_adapter::StorageValue {
+            bytes: serde_json::to_vec(&legacy).unwrap().into(),
+        },
+    );
+    let push_key = crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(
+        &crate::storage_codec::id_string::uuid_bytes_from_canonical(branch).unwrap(),
+    ));
+    let mut old_push: serde_json::Value = serde_json::from_slice(&before_push).unwrap();
+    old_push["version"] = serde_json::json!(1);
+    old_push["prepared"]
+        .as_object_mut()
+        .unwrap()
+        .remove("createdRefs");
+    writes.put(
+        crate::sync::partial_push_state::PARTIAL_BRANCH_PUSH_SPACE,
+        push_key.clone(),
+        crate::storage_adapter::StorageValue {
+            bytes: serde_json::to_vec(&old_push).unwrap().into(),
+        },
+    );
+    storage
+        .commit_partial_replica_write_set(
+            crate::sync::partial_replica_write_capability(),
+            writes,
+            StorageWriteOptions {
+                await_durable: true,
+                preconditions: vec![
+                    crate::storage_adapter::StoragePrecondition::KeyValueEquals {
+                        space: crate::sync::partial_push_state::PARTIAL_BRANCH_PUSH_SPACE,
+                        key: push_key,
+                        expected: before_push.clone(),
+                    },
+                    crate::storage_adapter::StoragePrecondition::KeyValueEquals {
+                        space: crate::sync::PARTIAL_REPLICA_STATE_SPACE,
+                        key: crate::sync::partial_replica_state_key(),
+                        expected: receipt,
+                    },
+                ],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    assert!(
+        crate::sync::load_partial_replica_state(&read)
+            .await
+            .is_err(),
+        "ordinary readers must not accept legacy receipts"
+    );
+    drop(read);
+    drop(session);
+    drop(engine);
+    drop(storage);
+    authority.close().await.unwrap();
+    // No transport exists in this route. Normal runtime readers must not decode
+    // v1; only owned epoch admission performs the one-way bounded rewrite.
+    let admitted = crate::migration::admit_partial_epoch(&backing)
+        .await
+        .unwrap();
+    assert!(admitted.state.archived_branch_ids().is_empty());
+    assert_eq!(admitted.state, state);
+    assert_eq!(
+        admitted_controls(&admitted.adapter, &state).await.unwrap(),
+        before_controls
+    );
+    let read = admitted
+        .adapter
+        .begin_read(Default::default())
+        .await
+        .unwrap();
+    let (after_record, after_push, _) = crate::sync::partial_push_state::load_partial_push_state(
+        &read,
+        &state,
+        &state.descriptor().selected_branch.branch_id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(after_push, before_push);
+    assert_eq!(after_record.prepared.as_ref(), Some(&pending_upload));
+    drop(read);
+    let (engine, session) =
+        Engine::new_partial_replica(admitted.adapter, EngineOptions::new(), &state)
+            .await
+            .unwrap();
+    engine.sync_mode().admit_partial_replica(
+        Arc::new(state.clone()),
+        crate::sync::partial_replica_write_capability(),
+    );
+    assert_eq!(
+        value(
+            session
+                .execute(
+                    "SELECT value FROM lix_key_value WHERE key='receipt-pending'",
+                    &[]
+                )
+                .await
+                .unwrap()
+        ),
+        "pending-offline"
+    );
+    let file = session
+        .execute(
+            "SELECT content FROM lix_file WHERE path='/receipt-pending.bin'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let Value::Blob(content) = file.rows()[0].get::<Value>("content").unwrap() else {
+        panic!("file content was not bytes")
+    };
+    assert_eq!(content.as_ref(), file_bytes.as_slice());
+    let storage = engine.storage();
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let control = crate::branch::BranchHeadControlContext::new()
+        .reader(&read)
+        .load(&state.descriptor().selected_branch.branch_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        control
+            .working_diff_checkpoint_commit_id
+            .unwrap()
+            .to_string(),
+        checkpoint
+    );
+    drop(read);
+    drop(storage);
+    drop(session);
+    drop(engine);
+    assert_eq!(
+        crate::migration::admit_partial_epoch(&backing)
+            .await
+            .unwrap()
+            .state,
+        state
+    );
 }

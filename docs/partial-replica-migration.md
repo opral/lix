@@ -16,6 +16,12 @@ existing format-68 hard cut, still fail explicitly; this does not introduce a
 compatibility shim for them. Released format-72 and format-75 fixtures retain
 their tested schema, file/checkpoint and cold-reopen semantics after migration.
 
+The upgrade rebuilds native primary-key lookup catalogs from authoritative state,
+including explicit tombstones. This repairs incomplete catalogs left by earlier
+merge and columnar-storage paths while preserving current rows, history and
+pending branch controls. The repair runs in the migration epoch, before format
+79 is published; ordinary partial-replica opening does not scan repository rows.
+
 For a closed existing replica, JavaScript exposes
 `convertReplicaToPartial({ storage, server, branchId? })`; Rust exposes
 `convert_replica_to_partial(storage, server, branch_id)`. Conversion owns storage

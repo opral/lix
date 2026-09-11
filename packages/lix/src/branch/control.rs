@@ -751,3 +751,32 @@ mod tests {
         assert!(error.to_string().contains("authentication digest mismatch"));
     }
 }
+
+// Storage-owner observation only. This does not prove logical branch absence.
+// Use only when a separately authenticated native admission supplies the target.
+pub(crate) async fn observe_branch_control_coordinate(
+    read: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+) -> Result<BranchHeadControlObservation, LixError> {
+    let key = StorageKey(Bytes::from(encode_key(branch_id)?));
+    let value = PointReadPlan::new(BRANCH_HEAD_CONTROL_SPACE, &[key])
+        .materialize(read, StorageGetOptions::default())
+        .await?
+        .value
+        .pop()
+        .flatten();
+    match value {
+        None => Ok(BranchHeadControlObservation {
+            control: None,
+            raw_token: None,
+        }),
+        Some(StorageProjectedValue::FullValue(bytes)) => Ok(BranchHeadControlObservation {
+            control: Some(decode_control(branch_id, &bytes)?),
+            raw_token: Some(bytes),
+        }),
+        Some(StorageProjectedValue::KeyOnly) => Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "branch control observation omitted its value",
+        )),
+    }
+}

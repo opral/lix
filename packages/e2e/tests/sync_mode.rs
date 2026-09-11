@@ -574,22 +574,22 @@ async fn connected_api_routes_local_work_and_hot_reads_need_no_round_trip() {
         })
         .await
         .expect("create connected race branch");
+    switch_to_uploaded_branch(&replica, &race_branch.id).await;
+    assert_eq!(
+        read_value(&replica, "branch-race").await.as_deref(),
+        Some("main")
+    );
     replica
-        .switch_branch(SwitchBranchOptions {
-            branch_id: race_branch.id.clone(),
-        })
+        .execute(
+            "UPDATE lix_key_value SET value = 'child' WHERE key = 'branch-race'",
+            &[],
+        )
         .await
-        .expect("switch to race branch");
-    for sql in [
-        "SELECT value FROM lix_key_value WHERE key = 'branch-race'",
-        "UPDATE lix_key_value SET value = 'child' WHERE key = 'branch-race'",
-    ] {
-        let error = replica
-            .execute(sql, &[])
-            .await
-            .expect_err("created branch is outside the replica's admitted data scope");
-        assert_eq!(error.code, "LIX_PARTIAL_SCOPE_PREPARATION_REQUIRED");
-    }
+        .expect("write admitted created branch");
+    assert_eq!(
+        read_value(&replica, "branch-race").await.as_deref(),
+        Some("child")
+    );
     replica
         .switch_branch(SwitchBranchOptions {
             branch_id: lix::GLOBAL_BRANCH_ID.to_owned(),
@@ -603,12 +603,7 @@ async fn connected_api_routes_local_work_and_hot_reads_need_no_round_trip() {
         )
         .await
         .expect("seed global-plane race marker");
-    replica
-        .switch_branch(SwitchBranchOptions {
-            branch_id: main_branch_id.clone(),
-        })
-        .await
-        .expect("return to connected main branch");
+    switch_to_uploaded_branch(&replica, &main_branch_id).await;
 
     tokio::time::timeout(WAIT_TIMEOUT, async {
         tokio::try_join!(
@@ -1385,23 +1380,15 @@ async fn remote_branch_content_is_hydrated_only_after_explicit_selection() {
         chunks_before_catch_up,
         "an unrelated branch must not hydrate its head or checkpoint content",
     );
-    let error = replica
-        .switch_branch(SwitchBranchOptions {
-            branch_id: inherited_branch_id.to_owned(),
-        })
-        .await
-        .expect_err("an unprepared branch cannot be served from partial controls");
+    switch_to_uploaded_branch(&replica, inherited_branch_id).await;
     assert_eq!(
-        error.code, "LIX_SYNC_BRANCH_CONTROLS_REQUIRED",
-        "unexpected branch-selection error: {error:?}"
+        replica.active_branch_id().await.unwrap(),
+        inherited_branch_id
     );
     assert_eq!(
-        replica
-            .active_branch_id()
-            .await
-            .expect("selector after rejected branch switch"),
-        default_branch_id,
-        "typed demand retry must not select an unprepared authority branch"
+        probe.chunk_gets.load(Ordering::Acquire),
+        chunks_before_catch_up,
+        "branch admission alone must not fetch unrelated content bytes"
     );
     replica
         .close()
@@ -1515,6 +1502,86 @@ async fn cold_update_supports_offline_current_reads_and_repeated_edits() {
         .close()
         .await
         .expect("close durable offline reopen");
+    stop_server(server_task).await;
+}
+
+/// Match the browser's tall native tree: SELECT alone must prepare the first
+/// existing-key write, not just repeat a write whose online trial filled gaps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn first_select_at_16000_rows_supports_offline_updates_and_reopen() {
+    let (storage, authority) = open_authority().await;
+    for start in (0..16000).step_by(256) {
+        let values = (start..(start + 256).min(16000))
+            .map(|row| {
+                format!(
+                    "('partial-open-{row:06}', 'payload-{row:06}-{}')",
+                    "x".repeat(128)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        authority
+            .execute(
+                &format!("INSERT INTO lix_key_value(key,value) VALUES {values}"),
+                &[],
+            )
+            .await
+            .expect("seed browser-equivalent row batch");
+    }
+    authority.close().await.unwrap();
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server_task, _remote) =
+        serve_with_authority_session(storage, Arc::clone(&probe)).await;
+    let directory = TempDir::new().unwrap();
+    let replica = open_replica(directory.path(), &url).await;
+    let first = replica
+        .execute(
+            "SELECT value FROM lix_key_value WHERE key=$1",
+            &[Value::Text("partial-open-000000".into())],
+        )
+        .await
+        .expect("first SELECT hydrates existing-key dependencies");
+    probe.set_offline(true);
+    let first_value = match first.rows()[0].get::<Value>("value").unwrap() {
+        Value::Jsonb(value) => value.as_json_string(),
+        Value::Text(value) => Some(value),
+        _ => None,
+    };
+    assert_eq!(
+        first_value,
+        Some(format!("payload-000000-{}", "x".repeat(128)))
+    );
+    for iteration in 0..31 {
+        let value = format!("offline-{iteration}");
+        let result = replica
+            .execute(
+                "UPDATE lix_key_value SET value=$1 WHERE key=$2",
+                &[
+                    Value::Text(value.clone()),
+                    Value::Text("partial-open-000000".into()),
+                ],
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "offline UPDATE iteration {iteration}: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            read_value(&replica, "partial-open-000000").await,
+            Some(value)
+        );
+    }
+    replica.close().await.unwrap();
+    drop(replica);
+    let reopened = open_replica(directory.path(), &url).await;
+    assert_eq!(
+        read_value(&reopened, "partial-open-000000")
+            .await
+            .as_deref(),
+        Some("offline-30")
+    );
+    reopened.close().await.unwrap();
     stop_server(server_task).await;
 }
 
@@ -2643,20 +2710,6 @@ where
     let (parts, body) = request.into_parts();
     probe.attempted_requests.fetch_add(1, Ordering::Relaxed);
     if probe.reject_requests.load(Ordering::Acquire) {
-        if std::env::var_os("LIX_TRACE_OFFLINE_REQUEST").is_some() {
-            eprintln!("offline request: {} {}", parts.method, parts.uri);
-            if parts.uri.path().contains("/sync/native-") {
-                let payload = body
-                    .collect()
-                    .await
-                    .expect("trace offline native request")
-                    .to_bytes();
-                eprintln!(
-                    "offline native request: {}",
-                    String::from_utf8_lossy(&payload)
-                );
-            }
-        }
         return Ok(Response::builder()
             .status(503)
             .header(CONTENT_TYPE, "application/json")
@@ -3139,4 +3192,228 @@ async fn migrated_partial_checkpoint_repository_reads_state_on_a_sparse_replica(
 
     replica.close().await.expect("close replica");
     stop_server(server_task).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn existing_branch_admission_preserves_pending_work_and_restores_archived_reads() {
+    let (storage, authority) = open_authority().await;
+    let main = authority.active_branch_id().await.unwrap();
+    put_value(&authority, "branch-marker", "main").await;
+    let ancestor = active_head(&authority).await;
+    authority.close().await.unwrap();
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server, remote) = serve_with_authority_session(storage, probe.clone()).await;
+    let target = "01920000-0000-7000-8000-000000009061";
+    remote
+        .create_branch(target, "admission-target", &ancestor)
+        .await;
+    remote.switch_branch(target).await;
+    remote.put_value("branch-marker", "target").await;
+
+    remote.switch_branch(&main).await;
+    let directory = TempDir::new().unwrap();
+    let replica = open_replica(directory.path(), &url).await;
+    assert_eq!(
+        read_value(&replica, "branch-marker").await.as_deref(),
+        Some("main")
+    );
+    let independent = replica.open_another_session().await.unwrap();
+    replica
+        .switch_branch(SwitchBranchOptions {
+            branch_id: target.into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(independent.active_branch_id().await.unwrap(), main);
+    let unavailable = independent
+        .execute(
+            "SELECT value FROM lix_key_value WHERE key='branch-marker'",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(unavailable.code, "LIX_PARTIAL_SCOPE_PREPARATION_REQUIRED");
+    independent
+        .switch_branch(SwitchBranchOptions {
+            branch_id: target.into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        read_value(&independent, "branch-marker").await.as_deref(),
+        Some("target")
+    );
+    independent.close().await.unwrap();
+    assert_eq!(replica.active_branch_id().await.unwrap(), target);
+    assert_eq!(
+        read_value(&replica, "branch-marker").await.as_deref(),
+        Some("target")
+    );
+    probe.set_offline(true);
+    replica
+        .execute(
+            "UPDATE lix_key_value SET value='pending-target' WHERE key='branch-marker'",
+            &[],
+        )
+        .await
+        .expect("update fetched row offline after branch admission");
+
+    let error = replica
+        .switch_branch(SwitchBranchOptions {
+            branch_id: main.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "LIX_PARTIAL_BRANCH_SWITCH_PENDING", "{error:?}");
+    assert_eq!(replica.active_branch_id().await.unwrap(), target);
+    assert_eq!(
+        read_value(&replica, "branch-marker").await.as_deref(),
+        Some("pending-target")
+    );
+    replica.close().await.unwrap();
+    let replica = open_replica(directory.path(), &url).await;
+    assert_eq!(replica.active_branch_id().await.unwrap(), target);
+    assert_eq!(
+        read_value(&replica, "branch-marker").await.as_deref(),
+        Some("pending-target")
+    );
+    remote.switch_branch(target).await;
+    probe.set_offline(false);
+    remote
+        .wait_for_value("branch-marker", "pending-target")
+        .await;
+    tokio::time::timeout(WAIT_TIMEOUT, async {
+        loop {
+            match replica
+                .switch_branch(SwitchBranchOptions {
+                    branch_id: main.clone(),
+                })
+                .await
+            {
+                Ok(_) => break,
+                Err(error)
+                    if error.code == "LIX_PARTIAL_BRANCH_SWITCH_PENDING"
+                        || error.code == LixError::CODE_TRANSACTION_CONFLICT
+                        || error.code == "LIX_PARTIAL_READ_INTEREST_CHANGED" =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("branch switch after exact upload acknowledgement: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("branch switch after selected upload");
+    // The old exact recipe survived in the bounded archive and was prepared
+    // before publication; this first returning read must already be local.
+    probe.set_offline(true);
+    assert_eq!(
+        read_value(&replica, "branch-marker").await.as_deref(),
+        Some("main")
+    );
+    replica.close().await.unwrap();
+    let replica = open_replica(directory.path(), &url).await;
+    assert_eq!(replica.active_branch_id().await.unwrap(), main);
+    assert_eq!(
+        read_value(&replica, "branch-marker").await.as_deref(),
+        Some("main")
+    );
+    replica.close().await.unwrap();
+    stop_server(server).await;
+}
+
+async fn switch_to_uploaded_branch(replica: &Lix<FilesystemStorage>, target: &str) {
+    tokio::time::timeout(WAIT_TIMEOUT, async {
+        loop {
+            match replica
+                .switch_branch(SwitchBranchOptions {
+                    branch_id: target.into(),
+                })
+                .await
+            {
+                Ok(_) => break,
+                Err(error)
+                    if error.code == "LIX_PARTIAL_BRANCH_SWITCH_PENDING"
+                        || error.code == LixError::CODE_TRANSACTION_CONFLICT
+                        || error.code == "LIX_PARTIAL_REPLICA_INTEREST_CHANGED" =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("branch admission failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("pending upload must unblock branch admission");
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_created_branch_publishes_refs_then_admits_without_losing_main() {
+    let (storage, authority) = open_authority().await;
+    put_value(&authority, "creation-value", "source").await;
+    let main = authority.active_branch_id().await.unwrap();
+    authority.close().await.unwrap();
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server, remote) = serve_with_authority_session(storage, probe.clone()).await;
+    let directory = TempDir::new().unwrap();
+    let replica = open_replica(directory.path(), &url).await;
+    assert_eq!(
+        read_value(&replica, "creation-value").await.as_deref(),
+        Some("source")
+    );
+    let created = replica
+        .create_branch(CreateBranchOptions {
+            id: None,
+            name: "partial-created".into(),
+            from_commit_id: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT_TIMEOUT, async {
+        loop {
+            match replica
+                .switch_branch(SwitchBranchOptions {
+                    branch_id: created.id.clone(),
+                })
+                .await
+            {
+                Ok(_) => break,
+                Err(error)
+                    if error.code == "LIX_PARTIAL_BRANCH_SWITCH_PENDING"
+                        || error.code == "LIX_TRANSACTION_CONFLICT"
+                        || error.code == "LIX_PARTIAL_REPLICA_INTEREST_CHANGED" =>
+                {
+                    assert_eq!(replica.active_branch_id().await.unwrap(), main);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("create-to-switch admission failed: {error:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        read_value(&replica, "creation-value").await.as_deref(),
+        Some("source")
+    );
+    remote.switch_branch(&created.id).await;
+    probe.set_offline(true);
+    put_value(&replica, "creation-value", "child-offline").await;
+    assert_eq!(
+        read_value(&replica, "creation-value").await.as_deref(),
+        Some("child-offline")
+    );
+    replica.close().await.unwrap();
+    let replica = open_replica(directory.path(), &url).await;
+    assert_eq!(replica.active_branch_id().await.unwrap(), created.id);
+    assert_eq!(
+        read_value(&replica, "creation-value").await.as_deref(),
+        Some("child-offline")
+    );
+    probe.set_offline(false);
+    remote
+        .wait_for_value("creation-value", "child-offline")
+        .await;
+    remote.switch_branch(&main).await;
+    remote.wait_for_value("creation-value", "source").await;
+    replica.close().await.unwrap();
+    stop_server(server).await;
 }

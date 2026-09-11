@@ -178,6 +178,12 @@ pub(super) async fn prepare_partial_ordinary_upload(
         id(&state.descriptor().global_branch.head.commit_id)?,
         id(&state.descriptor().global_branch.checkpoint.commit_id)?,
     ]);
+    if branch_id != crate::GLOBAL_BRANCH_ID {
+        known.extend(
+            super::partial_global_merge_state::confirmed_global_merge_bases(read, state).await?,
+        );
+    }
+
     let mut records = Vec::new();
     let mut seen = BTreeSet::new();
     let mut current = id(&target.head)?;
@@ -205,20 +211,44 @@ pub(super) async fn prepare_partial_ordinary_upload(
         records.push(record);
     }
     records.reverse();
-    let mut commits = Vec::with_capacity(records.len());
+    let mut commits: Vec<super::commit::SyncCommit> = Vec::with_capacity(records.len());
     let mut budget = ByteBudget {
         remaining: max_wire_bytes,
         written: 0,
     };
+    let mut global_ancestry = std::collections::BTreeMap::new();
     for record in records {
         // Preparation proved this immutable suffix's dependencies before the
         // tuple was persisted. A later global ACK can retire that coordinate
         // from the tiny confirmed frontier; it does not undo the proof.
         if resumed.is_none()
+            && branch_id != crate::GLOBAL_BRANCH_ID
+            && let Some(base) = record.base_commit_id.filter(|base| !known.contains(base))
+            && is_confirmed_global_base(
+                read,
+                base,
+                id(&global.confirmed.head)?,
+                &mut global_ancestry,
+            )
+            .await?
+        {
+            known.insert(base);
+        }
+        if resumed.is_none()
             && record
                 .base_commit_id
                 .is_some_and(|base| !known.contains(&base))
         {
+            if branch_id != crate::GLOBAL_BRANCH_ID && !commits.is_empty() {
+                // S may supply a child in GLOBAL L2, while a later S2 already
+                // depends on L2. Freeze the eligible selected prefix first.
+                target.head = commits
+                    .last()
+                    .expect("nonempty selected prefix")
+                    .commit_id
+                    .clone();
+                break;
+            }
             return Err(blocked(
                 "local commit requires unconfirmed global base preparation",
             ));
@@ -240,12 +270,44 @@ pub(super) async fn prepare_partial_ordinary_upload(
         commits.push(commit);
     }
     let is_resume = resumed.is_some();
-    let upload = resumed.unwrap_or_else(|| PreparedPartialUpload {
+    let mut upload = resumed.unwrap_or_else(|| PreparedPartialUpload {
         attempt_id,
+        created_refs: Vec::new(),
         expected: branch_state.confirmed,
         target,
     });
-    let request = SyncPushRequest {
+    if !is_resume {
+        loop {
+            match super::partial_created_refs::capture_created_refs(
+                read,
+                state,
+                branch_id,
+                &upload.expected,
+                &upload.target,
+                &commits,
+            )
+            .await
+            {
+                Ok(created) => {
+                    upload.created_refs = created;
+                    break;
+                }
+                Err(error)
+                    if branch_id == crate::GLOBAL_BRANCH_ID
+                        && error.code == "LIX_PARTIAL_CREATED_REF_SOURCE_PENDING"
+                        && commits.len() > 1 =>
+                {
+                    // Freeze a nonempty eligible prefix. Publishing it can make
+                    // a selected commit's GLOBAL basis available before that
+                    // selected commit supplies a later child's source head.
+                    commits.pop();
+                    upload.target.head = commits.last().expect("nonempty prefix").commit_id.clone();
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    let mut request = SyncPushRequest {
         commits,
         ref_updates: vec![SyncRefUpdate {
             branch_id: branch_id.into(),
@@ -256,6 +318,7 @@ pub(super) async fn prepare_partial_ordinary_upload(
         }],
         inline_blobs: Vec::new(),
     };
+    upload.append_created_ref_updates(&mut request);
     // Include commas, field names and refs in the actual request budget.
     let mut budget = ByteBudget {
         remaining: max_wire_bytes,
@@ -465,6 +528,7 @@ mod paging_and_resume_tests {
             .0
             .confirmed;
         let upload = PreparedPartialUpload {
+            created_refs: Vec::new(),
             attempt_id: attempt_id.into(),
             expected,
             target: coordinate,
@@ -667,5 +731,503 @@ mod paging_and_resume_tests {
             serde_json::to_vec(&first.request).unwrap()
         );
         assert!(resumed.control_guard.is_none());
+    }
+}
+
+#[cfg(test)]
+mod created_ref_prefix_tests {
+    use super::*;
+    #[tokio::test]
+    async fn global_prefix_unblocks_selected_source_before_later_child_creation() {
+        let lix = crate::open_lix().await.unwrap();
+        let descriptor = lix.partial_replica_descriptor(None).await.unwrap();
+        let selected = descriptor.selected_branch.branch_id.clone();
+        let state = PartialReplicaState::new(
+            format!("https://example.test/lix/{}", lix.lix_id()),
+            lix.active_account_id().into(),
+            uuid::Uuid::now_v7().to_string(),
+            descriptor,
+        )
+        .unwrap();
+        let first = lix
+            .create_branch(crate::CreateBranchOptions {
+                id: None,
+                name: "prefix-first".into(),
+                from_commit_id: None,
+            })
+            .await
+            .unwrap();
+        lix.execute(
+            "INSERT INTO lix_key_value (key,value) VALUES ('prefix-source','pending')",
+            &[],
+        )
+        .await
+        .unwrap();
+        let second = lix
+            .create_branch(crate::CreateBranchOptions {
+                id: None,
+                name: "prefix-second".into(),
+                from_commit_id: None,
+            })
+            .await
+            .unwrap();
+        // A later selected edit must not strand the already captured child S.
+        lix.execute(
+            "UPDATE lix_key_value SET value='later' WHERE key='prefix-source'",
+            &[],
+        )
+        .await
+        .unwrap();
+        let storage = lix.storage_adapter();
+        let mut writes = storage.new_write_set();
+        let mut guards = super::super::partial_push_state::stage_initial_partial_push_states(
+            &mut writes,
+            &state,
+        )
+        .unwrap();
+        guards.push(
+            super::super::partial_state::stage_partial_replica_state(&mut writes, &state, None)
+                .unwrap(),
+        );
+        storage
+            .commit_partial_replica_write_set(
+                super::super::partial_replica_write_capability(),
+                writes,
+                crate::storage_adapter::StorageWriteOptions {
+                    preconditions: guards,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let prefix = prepare_partial_ordinary_upload(
+            &read,
+            &state,
+            crate::GLOBAL_BRANCH_ID,
+            uuid::Uuid::now_v7().to_string(),
+            32,
+            1024 * 1024,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(prefix.upload.created_refs.len(), 1);
+        assert_eq!(prefix.upload.created_refs[0].branch_id, first.id);
+        assert!(
+            !prefix
+                .request
+                .ref_updates
+                .iter()
+                .any(|r| r.branch_id == second.id)
+        );
+        let mut writes = storage.new_write_set();
+        let mut guards = super::super::partial_push_state::stage_prepare_partial_upload(
+            &read,
+            &mut writes,
+            &state,
+            crate::GLOBAL_BRANCH_ID,
+            &prefix.upload,
+        )
+        .await
+        .unwrap();
+        guards.extend(prefix.control_guard);
+        drop(read);
+        storage
+            .commit_partial_replica_write_set(
+                super::super::partial_replica_write_capability(),
+                writes,
+                crate::storage_adapter::StorageWriteOptions {
+                    preconditions: guards,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let mut writes = storage.new_write_set();
+        let guards = super::super::partial_push_state::stage_acknowledge_partial_upload(
+            &read,
+            &mut writes,
+            &state,
+            crate::GLOBAL_BRANCH_ID,
+            &prefix.upload,
+            true,
+        )
+        .await
+        .unwrap();
+        drop(read);
+        storage
+            .commit_partial_replica_write_set(
+                super::super::partial_replica_write_capability(),
+                writes,
+                crate::storage_adapter::StorageWriteOptions {
+                    preconditions: guards,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let selected_upload = prepare_partial_ordinary_upload(
+            &read,
+            &state,
+            &selected,
+            uuid::Uuid::now_v7().to_string(),
+            32,
+            1024 * 1024,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            !selected_upload.request.commits.is_empty(),
+            "the eligible GLOBAL prefix makes selected source upload possible"
+        );
+        assert!(selected_upload.upload.created_refs.is_empty());
+        let latest_selected = crate::branch::observe_branch_control_coordinate(&read, &selected)
+            .await
+            .unwrap()
+            .control
+            .unwrap()
+            .head_commit_id
+            .to_string();
+        assert_ne!(
+            selected_upload.upload.target.head, latest_selected,
+            "S2 must remain pending until its GLOBAL L2 base is acknowledged"
+        );
+        let mut writes = storage.new_write_set();
+        let mut guards = super::super::partial_push_state::stage_prepare_partial_upload(
+            &read,
+            &mut writes,
+            &state,
+            &selected,
+            &selected_upload.upload,
+        )
+        .await
+        .unwrap();
+        guards.extend(selected_upload.control_guard);
+        drop(read);
+        storage
+            .commit_partial_replica_write_set(
+                super::super::partial_replica_write_capability(),
+                writes,
+                crate::storage_adapter::StorageWriteOptions {
+                    preconditions: guards,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let mut writes = storage.new_write_set();
+        let guards = super::super::partial_push_state::stage_acknowledge_partial_upload(
+            &read,
+            &mut writes,
+            &state,
+            &selected,
+            &selected_upload.upload,
+            true,
+        )
+        .await
+        .unwrap();
+        drop(read);
+        storage
+            .commit_partial_replica_write_set(
+                super::super::partial_replica_write_capability(),
+                writes,
+                crate::storage_adapter::StorageWriteOptions {
+                    preconditions: guards,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let remaining = prepare_partial_ordinary_upload(
+            &read,
+            &state,
+            crate::GLOBAL_BRANCH_ID,
+            uuid::Uuid::now_v7().to_string(),
+            32,
+            1024 * 1024,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(remaining.upload.created_refs.len(), 1);
+        assert_eq!(
+            remaining.upload.created_refs[0].branch_id, second.id,
+            "confirming the eligible selected prefix makes child S publishable"
+        );
+        let mut writes = storage.new_write_set();
+        let mut guards = super::super::partial_push_state::stage_prepare_partial_upload(
+            &read,
+            &mut writes,
+            &state,
+            crate::GLOBAL_BRANCH_ID,
+            &remaining.upload,
+        )
+        .await
+        .unwrap();
+        guards.extend(remaining.control_guard);
+        drop(read);
+        storage
+            .commit_partial_replica_write_set(
+                super::super::partial_replica_write_capability(),
+                writes,
+                crate::storage_adapter::StorageWriteOptions {
+                    preconditions: guards,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let mut writes = storage.new_write_set();
+        let guards = super::super::partial_push_state::stage_acknowledge_partial_upload(
+            &read,
+            &mut writes,
+            &state,
+            crate::GLOBAL_BRANCH_ID,
+            &remaining.upload,
+            true,
+        )
+        .await
+        .unwrap();
+        drop(read);
+        storage
+            .commit_partial_replica_write_set(
+                super::super::partial_replica_write_capability(),
+                writes,
+                crate::storage_adapter::StorageWriteOptions {
+                    preconditions: guards,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let final_selected = prepare_partial_ordinary_upload(
+            &read,
+            &state,
+            &selected,
+            uuid::Uuid::now_v7().to_string(),
+            32,
+            1024 * 1024,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            final_selected.upload.target.head, latest_selected,
+            "after L2 acknowledgment the remaining S2 suffix is dependency-closed"
+        );
+    }
+}
+
+/// Only ancestry of the confirmed authority GLOBAL coordinate can extend the
+/// tiny known-base frontier. Local presence alone is not an upload proof.
+async fn is_confirmed_global_base(
+    read: &(impl StorageAdapterRead + ?Sized),
+    base: CommitId,
+    confirmed: CommitId,
+    cache: &mut std::collections::BTreeMap<CommitId, CommitRecord>,
+) -> Result<bool, LixError> {
+    let header = crate::tracked_state::load_published_commit_state_topology(read, base)
+        .await?
+        .ok_or_else(|| {
+            crate::tracked_state::NativeMetadataRef::CommitStateHeader(base.to_string())
+                .annotate_missing(blocked("historical GLOBAL base header must be hydrated"))
+        })?;
+    if !header.global_scope() {
+        return Ok(false);
+    }
+    let source = super::partial_merge_analysis::record(read, base, true).await?;
+    if source.base_commit_id.is_some() {
+        return Ok(false);
+    }
+    super::partial_merge_analysis::bounded_ancestor(read, &source, confirmed, cache, 1024).await
+}
+#[cfg(test)]
+mod confirmed_global_base_tests {
+    use super::*;
+    use crate::storage_adapter::{Storage, StorageAdapter, StorageWriteOptions};
+    async fn ack<S: Storage + Clone + Send + Sync + 'static>(
+        storage: &StorageAdapter<S>,
+        state: &PartialReplicaState,
+        branch: &str,
+        upload: &PreparedPartialPush,
+    ) {
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let mut writes = storage.new_write_set();
+        let mut guards = super::super::partial_push_state::stage_prepare_partial_upload(
+            &read,
+            &mut writes,
+            state,
+            branch,
+            &upload.upload,
+        )
+        .await
+        .unwrap();
+        guards.extend(upload.control_guard.clone());
+        drop(read);
+        storage
+            .commit_partial_replica_write_set(
+                super::super::partial_replica_write_capability(),
+                writes,
+                StorageWriteOptions {
+                    preconditions: guards,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let mut writes = storage.new_write_set();
+        let guards = super::super::partial_push_state::stage_acknowledge_partial_upload(
+            &read,
+            &mut writes,
+            state,
+            branch,
+            &upload.upload,
+            true,
+        )
+        .await
+        .unwrap();
+        drop(read);
+        storage
+            .commit_partial_replica_write_set(
+                super::super::partial_replica_write_capability(),
+                writes,
+                StorageWriteOptions {
+                    preconditions: guards,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn older_global_base_requires_confirmed_ancestry_not_local_presence() {
+        let lix = crate::open_lix().await.unwrap();
+        let descriptor = lix.partial_replica_descriptor(None).await.unwrap();
+        let selected = descriptor.selected_branch.branch_id.clone();
+        let source = descriptor.selected_branch.head.commit_id.clone();
+        let state = PartialReplicaState::new(
+            format!("https://example.test/lix/{}", lix.lix_id()),
+            lix.active_account_id().into(),
+            uuid::Uuid::now_v7().to_string(),
+            descriptor,
+        )
+        .unwrap();
+        lix.create_branch(crate::CreateBranchOptions {
+            id: None,
+            name: "basis-L1".into(),
+            from_commit_id: Some(source.clone()),
+        })
+        .await
+        .unwrap();
+        lix.execute(
+            "INSERT INTO lix_key_value (key,value) VALUES ('older-basis','S')",
+            &[],
+        )
+        .await
+        .unwrap();
+        lix.create_branch(crate::CreateBranchOptions {
+            id: None,
+            name: "basis-L2".into(),
+            from_commit_id: Some(source.clone()),
+        })
+        .await
+        .unwrap();
+        // L3 exists only locally. Its presence must not authorize the next S2 upload.
+        lix.create_branch(crate::CreateBranchOptions {
+            id: None,
+            name: "basis-unconfirmed-L3".into(),
+            from_commit_id: Some(source),
+        })
+        .await
+        .unwrap();
+        lix.execute(
+            "UPDATE lix_key_value SET value='S2' WHERE key='older-basis'",
+            &[],
+        )
+        .await
+        .unwrap();
+        let storage = lix.storage_adapter();
+        let mut writes = storage.new_write_set();
+        let mut guards = super::super::partial_push_state::stage_initial_partial_push_states(
+            &mut writes,
+            &state,
+        )
+        .unwrap();
+        guards.push(
+            super::super::partial_state::stage_partial_replica_state(&mut writes, &state, None)
+                .unwrap(),
+        );
+        storage
+            .commit_partial_replica_write_set(
+                super::super::partial_replica_write_capability(),
+                writes,
+                StorageWriteOptions {
+                    preconditions: guards,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let global = prepare_partial_ordinary_upload(
+            &read,
+            &state,
+            crate::GLOBAL_BRANCH_ID,
+            uuid::Uuid::now_v7().to_string(),
+            2,
+            1024 * 1024,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(global.upload.created_refs.len(), 2);
+        drop(read);
+        ack(&storage, &state, crate::GLOBAL_BRANCH_ID, &global).await;
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let selected_upload = prepare_partial_ordinary_upload(
+            &read,
+            &state,
+            &selected,
+            uuid::Uuid::now_v7().to_string(),
+            32,
+            1024 * 1024,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            selected_upload
+                .request
+                .commits
+                .iter()
+                .any(|c| c.base_commit_id.as_deref() != Some(global.upload.target.head.as_str())),
+            "selected S retains its original older GLOBAL basis"
+        );
+        drop(read);
+        ack(&storage, &state, &selected, &selected_upload).await;
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let error = match prepare_partial_ordinary_upload(
+            &read,
+            &state,
+            &selected,
+            uuid::Uuid::now_v7().to_string(),
+            32,
+            1024 * 1024,
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("unconfirmed local GLOBAL L3 cannot authorize upload"),
+        };
+        assert_eq!(error.code, "LIX_PARTIAL_UPLOAD_PREPARATION_REQUIRED");
     }
 }

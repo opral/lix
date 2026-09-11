@@ -66,7 +66,8 @@ pub(crate) use row_materialization::{
 };
 pub(crate) use row_pk_index::{
     backfill_row_pk_index_for_commit, decode_row_pk_index_key, row_pk_index_scan_request,
-    stage_row_pk_index_from_deltas, stage_row_pk_index_from_members, with_row_pk_index_mutations,
+    stage_row_pk_index_from_deltas, stage_row_pk_index_from_deltas_with_base,
+    stage_row_pk_index_from_members, with_row_pk_index_mutations,
 };
 #[cfg(test)]
 pub(crate) use scoped_current_state::attest_scoped_range_root;

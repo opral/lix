@@ -2,9 +2,10 @@
 //!
 //! Lix synchronizes its existing primitives: complete immutable commits,
 //! compare-and-swap branch refs, and BLAKE3-addressed binary chunks. Live
-//! synchronization has one ordered repository cursor. Current rows and commit
-//! topology bootstraps eagerly; historical commit payloads and blobs load on
-//! demand. Platform-specific code is limited to tasks, timers, HTTP, and
+//! synchronization has one ordered repository cursor. A partial replica opens
+//! with bounded coordinates and loads native query inputs on demand. The full
+//! replica bootstrap eagerly loads current rows and commit topology.
+//! Platform-specific code is limited to tasks, timers, HTTP, and
 //! cancellation.
 
 mod partial_attempt_restart;
@@ -50,8 +51,12 @@ pub(crate) use partial_authority_merge_receipt::{
     load_authority_merge_receipt,
 };
 pub(crate) use repository::VerifiedRetainedBodyWave;
+mod partial_global_merge_runtime;
+mod partial_global_merge_settlement;
+mod partial_global_merge_state;
 mod partial_merge_protocol;
 mod partial_merge_runtime;
+pub(crate) use partial_global_merge_state::PARTIAL_GLOBAL_MERGE_SPACE;
 mod partial_merge_settlement;
 mod partial_merge_state;
 pub(crate) use partial_merge_protocol::{
@@ -72,12 +77,12 @@ pub(crate) use partial_open::{
 };
 #[cfg(test)]
 mod partial_scope_tests;
+#[cfg(test)]
+mod partial_sql_tests;
 mod partial_upload;
 mod partial_upload_cycle;
 #[cfg(test)]
 mod partial_working_diff_tests;
-#[cfg(test)]
-mod partial_sql_tests;
 pub(crate) use partial_push_state::PARTIAL_BRANCH_PUSH_SPACE;
 mod partial_state;
 pub(crate) use partial_state::{
@@ -479,3 +484,9 @@ pub(crate) use repository::{
 };
 
 pub(crate) use partial_open::authenticate_partial_source_conversion;
+
+pub(crate) use partial_state::upgrade_owned_partial_receipt;
+mod partial_branch_switch;
+pub(crate) use partial_branch_switch::{PartialBranchSwitchCompletion, switch_existing_branch};
+
+mod partial_created_refs;

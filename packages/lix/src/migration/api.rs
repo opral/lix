@@ -275,6 +275,18 @@ where
     } else {
         0
     };
+    backfill_missing_row_pk_indexes(
+        &adapter,
+        &storage,
+        options,
+        78,
+        crate::init::REPOSITORY_PROTOCOL_V78,
+        crate::init::REPOSITORY_PROTOCOL_V78,
+        "v79 complete row-PK catalog repair",
+        false,
+        true,
+    )
+    .await?;
     super::deterministic_witness::backfill(&adapter, options, true).await?;
     Ok(MigrationReport {
         from_version,
@@ -314,7 +326,11 @@ where
         Some(value) if value == crate::init::REPOSITORY_PROTOCOL_V72_COMMIT_REWRITE => {
             Some(crate::init::REPOSITORY_PROTOCOL_V72_COMMIT_REWRITE)
         }
-        Some(value) if value == crate::init::REPOSITORY_PROTOCOL_V72_ROW_PK_BOOTSTRAP => None,
+        Some(value) if value == crate::init::REPOSITORY_PROTOCOL_V72_ROW_PK_BOOTSTRAP => {
+            // Earlier binaries may have completed only a missing-index
+            // bootstrap. Revalidate existing catalogs before native SQL.
+            Some(crate::init::REPOSITORY_PROTOCOL_V72_ROW_PK_BOOTSTRAP)
+        }
         _ => {
             return Err(migration_error(
                 "v72 row-PK-index bootstrap observed an unexpected protocol marker",
@@ -331,6 +347,7 @@ where
             crate::init::REPOSITORY_PROTOCOL_V72_ROW_PK_BOOTSTRAP,
             "v72 row-PK-index bootstrap",
             false,
+            true,
         )
         .await?;
     }
@@ -517,6 +534,7 @@ where
         source_protocol,
         REPOSITORY_PROTOCOL_V74,
         "v73 row-PK-index migration",
+        true,
         true,
     )
     .await
@@ -1387,6 +1405,7 @@ async fn backfill_missing_row_pk_indexes<S>(
     target_protocol: &'static [u8],
     operation: &'static str,
     preflight_reserved_columns: bool,
+    rebuild_existing: bool,
 ) -> Result<(), LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -1423,44 +1442,46 @@ where
         ));
     }
 
-    let global_head = BranchHeadControlContext::new()
-        .reader(read.clone())
-        .load(crate::GLOBAL_BRANCH_ID)
-        .await?
-        .ok_or_else(|| migration_error("row-PK-index migration found no global branch"))?
-        .head_commit_id;
-    // Branch-family provenance was not persisted before v74. The first-parent
-    // chain is the recoverable authored lineage: merge secondary parents may
-    // come from another family and must not become global merely because the
-    // current global head reaches them.
     let mut global_commits = BTreeSet::new();
-    let mut next_global = Some(global_head);
-    while let Some(commit_id) = next_global {
-        if !global_commits.insert(commit_id) {
-            return Err(migration_error(format!(
-                "{operation} found a cycle in the global first-parent lineage at '{commit_id}'"
-            )));
-        }
-        if global_commits.len() > options.max_changes {
-            return Err(LixError::new(
-                "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
-                format!("{operation} exceeds configured global-lineage commit bound"),
-            ));
-        }
-        let ids = [commit_id];
-        let record = ChangelogContext::new()
+    if expected_version < 74 {
+        let global_head = BranchHeadControlContext::new()
             .reader(read.clone())
-            .load_commits(CommitLoadRequest { commit_ids: &ids })
+            .load(crate::GLOBAL_BRANCH_ID)
             .await?
-            .into_iter()
-            .next()
-            .and_then(|(_, record)| record)
-            .ok_or_else(|| {
-                migration_error(format!(
-                    "{operation} global lineage commit '{commit_id}' is missing"
-                ))
-            })?;
-        next_global = record.parent_commit_ids.first().copied();
+            .ok_or_else(|| migration_error("row-PK-index migration found no global branch"))?
+            .head_commit_id;
+        // Branch-family provenance was not persisted before v74. The first-parent
+        // chain is the recoverable authored lineage: merge secondary parents may
+        // come from another family and must not become global merely because the
+        // current global head reaches them.
+        let mut next_global = Some(global_head);
+        while let Some(commit_id) = next_global {
+            if !global_commits.insert(commit_id) {
+                return Err(migration_error(format!(
+                    "{operation} found a cycle in the global first-parent lineage at '{commit_id}'"
+                )));
+            }
+            if global_commits.len() > options.max_changes {
+                return Err(LixError::new(
+                    "LIX_ERROR_MIGRATION_LIMIT_EXCEEDED",
+                    format!("{operation} exceeds configured global-lineage commit bound"),
+                ));
+            }
+            let ids = [commit_id];
+            let record = ChangelogContext::new()
+                .reader(read.clone())
+                .load_commits(CommitLoadRequest { commit_ids: &ids })
+                .await?
+                .into_iter()
+                .next()
+                .and_then(|(_, record)| record)
+                .ok_or_else(|| {
+                    migration_error(format!(
+                        "{operation} global lineage commit '{commit_id}' is missing"
+                    ))
+                })?;
+            next_global = record.parent_commit_ids.first().copied();
+        }
     }
 
     let mut chunk_writes = adapter.new_write_set();
@@ -1474,7 +1495,7 @@ where
                     "{operation} commit '{commit_id}' has no commit-state manifest"
                 ))
             })?;
-        if manifest.row_pk_index_root_id.is_some() {
+        if !rebuild_existing && manifest.row_pk_index_root_id.is_some() {
             continue;
         }
         let (root, row_count) = backfill_row_pk_index_for_commit(
@@ -1487,7 +1508,9 @@ where
         visited_rows = visited_rows
             .checked_add(row_count)
             .ok_or_else(|| migration_error(format!("{operation} row count exceeds usize")))?;
-        manifest.global_scope = global_commits.contains(&commit_id);
+        if expected_version < 74 {
+            manifest.global_scope = global_commits.contains(&commit_id);
+        }
         manifest.row_pk_index_root_id = root;
         replacements.push(manifest);
     }
@@ -1849,6 +1872,7 @@ mod tests {
             REPOSITORY_PROTOCOL_V72,
             crate::init::REPOSITORY_PROTOCOL_V72_ROW_PK_BOOTSTRAP,
             "test v72 bootstrap",
+            false,
             false,
         )
         .await

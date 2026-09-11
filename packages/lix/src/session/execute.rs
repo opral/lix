@@ -12407,13 +12407,21 @@ pub(crate) async fn prepare_partial_candidate_read_scope<StorageImpl>(
     interests: &crate::hot_state::ReadInterestSnapshot,
     plugin_host: crate::plugin::runtime::PluginRuntimeHost,
     hot: crate::hot_state::HotStateContext,
+    allow_missing_selected_control: bool,
 ) -> Result<crate::sync::PreparedCandidateState, LixError>
 where
     StorageImpl: Storage + 'static,
 {
     with_static_session_sql_read::<StorageImpl, _, _, _>(read, |read| async move {
-        crate::sync::prepare_candidate_native_interests(read, state, interests, plugin_host, hot)
-            .await
+        crate::sync::prepare_candidate_native_interests(
+            read,
+            state,
+            interests,
+            plugin_host,
+            hot,
+            allow_missing_selected_control,
+        )
+        .await
     })
     .await
 }

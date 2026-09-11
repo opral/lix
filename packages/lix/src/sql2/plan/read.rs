@@ -321,6 +321,9 @@ impl UnboundSchemaRead {
         if columns.is_empty() {
             return Ok(None);
         }
+        if self.has_limit {
+            return Ok(None);
+        }
         if self.order_by_columns.is_empty() {
             if let Some(rows) = bind_identity(&self.predicate, &columns, false, 4096, &|expr| {
                 normalize_node(
@@ -343,13 +346,12 @@ impl UnboundSchemaRead {
                 }
             }
         }
-        if self.has_limit
-            || (!self.order_by_columns.is_empty()
-                && self
-                    .order_by_columns
-                    .iter()
-                    .map(String::as_str)
-                    .ne(columns.iter().copied()))
+        if !self.order_by_columns.is_empty()
+            && self
+                .order_by_columns
+                .iter()
+                .map(String::as_str)
+                .ne(columns.iter().copied())
         {
             return Ok(None);
         }
@@ -652,6 +654,7 @@ pub(crate) async fn execute_native_read<C: crate::sql2::SqlExecutionContext>(
             Filesystem::RootFileListing => {
                 sql2::execute_exact_lix_file_root_listing(
                     branch,
+                    ctx.hot_state(),
                     ctx.filesystem_path_index(),
                     ctx.branch_ref(),
                 )
@@ -660,6 +663,7 @@ pub(crate) async fn execute_native_read<C: crate::sql2::SqlExecutionContext>(
             Filesystem::RootDirectoryListing => {
                 sql2::execute_exact_lix_directory_root_listing(
                     branch,
+                    ctx.hot_state(),
                     ctx.filesystem_path_index(),
                     ctx.branch_ref(),
                 )
