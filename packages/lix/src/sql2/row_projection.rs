@@ -1899,6 +1899,7 @@ mod tests {
                 read_nullable: true,
                 insert_required: false,
                 default_expression: None,
+                description: None,
             });
         let decoder = RowProjectionDecoder::new(&spec, ["json", "null_text", "stamp"])
             .expect("direct decoder should build");

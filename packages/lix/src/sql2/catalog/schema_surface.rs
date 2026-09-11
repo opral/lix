@@ -46,11 +46,13 @@ pub(crate) struct SchemaSurfaceColumn {
     pub(crate) read_nullable: bool,
     pub(crate) insert_required: bool,
     pub(crate) default_expression: Option<String>,
+    pub(crate) description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SchemaSurfaceSpec {
     pub(crate) schema_key: String,
+    pub(crate) description: Option<String>,
     /// Fingerprint used by the typed plugin wire and durable row payloads.
     /// SQL readers bind durable rows to this resolved schema before exposing
     /// any typed value.
@@ -210,6 +212,12 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
             }
         })
         .collect();
+    // Seed documents that shipped without descriptions keep their text in
+    // the engine (see `schema::seed_schema_description`): the document is
+    // fingerprinted as written, so it cannot gain the words itself.
+    let seed_column_description = |name: &str| -> Option<String> {
+        crate::schema::seed_schema_description(&schema_key, Some(name)).map(str::to_string)
+    };
     let columns = parsed
         .columns
         .iter()
@@ -232,6 +240,10 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
                 .default_expression
                 .clone()
                 .or_else(|| column.default_value.as_ref().map(postgres_literal)),
+            description: column
+                .description
+                .clone()
+                .or_else(|| seed_column_description(&column.name)),
         })
         .collect::<Vec<_>>();
     let certifies_path_value_replacement = parsed.primary_key == ["path"]
@@ -259,8 +271,12 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
                 SchemaColumnType::String | SchemaColumnType::Integer | SchemaColumnType::Boolean
             )
     });
+    let description = parsed.description.clone().or_else(|| {
+        crate::schema::seed_schema_description(&schema_key, None).map(str::to_string)
+    });
     Ok(SchemaSurfaceSpec {
         schema_key,
+        description,
         schema_fingerprint,
         primary_key_paths,
         primary_key_component_types,
@@ -460,6 +476,44 @@ mod tests {
             ],
             "primary_key": ["path"]
         })
+    }
+
+    #[test]
+    fn seed_schemas_read_descriptions_from_the_engine_when_stored_without_them() {
+        // lix_key_value shipped without descriptions and its document is
+        // fingerprinted as written; the surface reads the engine's words.
+        let stored = json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "lix_key_value",
+            "columns": [
+                { "name": "key", "type": "text", "nullable": false },
+                { "name": "value", "type": "jsonb", "nullable": true, "description": "Kept as stored." },
+            ],
+            "primary_key": ["key"],
+        });
+        let spec = derive_schema_surface_spec_from_schema(&stored).expect("seed schema derives");
+        assert_eq!(
+            spec.description.as_deref(),
+            Some("A repository setting or application value stored under a key.")
+        );
+        assert_eq!(
+            spec.visible_column("key").unwrap().description.as_deref(),
+            Some("Unique key naming the value.")
+        );
+        assert_eq!(
+            spec.visible_column("value").unwrap().description.as_deref(),
+            Some("Kept as stored.")
+        );
+
+        let user = json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "user_note",
+            "columns": [{ "name": "id", "type": "text", "nullable": false }],
+            "primary_key": ["id"],
+        });
+        let spec = derive_schema_surface_spec_from_schema(&user).expect("user schema derives");
+        assert_eq!(spec.description, None);
+        assert_eq!(spec.visible_column("id").unwrap().description, None);
     }
 
     #[test]
