@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.16.1 - 2026-09-11
+
+### Improvements
+
+- Write results from `execute` and `executeBatch` now include `commit: { before, after }`, so you can inspect what changed without an extra query.
+- SQL metadata now includes table and column descriptions, making schemas easier to explore.
+- Improved large SQL upload performance and removed the default 64 MiB request limit. Hosts can still set their own limit.
+
+### Fixes
+
+- Fixed Undo and Redo for plugin-backed files, including restoring added and deleted files.
+- Fixed file renames after switching branches or reopening a repository, and rename failures during synchronization.
+- Fixed filesystem imports failing after files were edited in another Lix session.
+- Improved synced repository upgrades and recovery of pending local edits. Recovery tools can export retained data and restore tracked rows to a separate branch.
+- Fixed synchronization interruptions caused by concurrent browser writes during reconnect.
+- Merge now rejects conflicting file content and format renames before changing the target, with guidance to merge the rename separately.
+- Improved error messages for repository migration and browser storage failures.
+
+### Upgrade notes
+
+- Queries using `lixcol_schema_key` must use the relation name to identify the schema instead. `lix_change.schema_key` is unchanged.
+- The JavaScript SDK no longer exports `@lix-js/sdk/server-protocol`; use the remote connection API or the documented HTTP protocol.
+- Custom storage adapters must replace `BranchEquals` (`branchEquals` in JavaScript) with `KeyValueEquals` for conditional writes.
+- Retrying a SQL request with an idempotency key recorded before the upgrade returns `409 LIX_IDEMPOTENCY_KEY_REUSED`. Reconcile uncertain requests before issuing new keys.
+
 ## 0.16.0 - 2026-09-09
 
 ### Minor
