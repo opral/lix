@@ -16,3 +16,5 @@ Independent subagent review found no correctness or packaging issues. Standalone
 nine-test suite passes and the shared module compiles for wasm32-wasip2. Optimized
 LLVM comparison remaps both filenames identically so panic-location strings do
 not obscure algorithm/code-generation equality. Fresh consuming-plugin validation: `cargo nextest run -p plugin_markdown -p plugin_text -p plugin_excalidraw --no-fail-fast --test-threads 8` passed 231 tests (one existing ignored test). `cargo build --target wasm32-wasip2 -p plugin_markdown -p plugin_text -p plugin_excalidraw` passed; both logs explicitly compiled all three plugin roots from this checkout. Filename-remapped optimized LLVM IR is byte-identical, so no runtime algorithm or code-generation difference is claimed.
+
+Final review (2026-09-11) reconfirmed source identity and workspace/Docker inclusion with no correctness findings. All nine standalone shared-module tests passed again. The branch includes current main through the reviewed integration base, whose engine validation passed 3,738 tests and 10 doctests. This PR is now ready for full CI and may merge into #1729 only after those checks pass.
