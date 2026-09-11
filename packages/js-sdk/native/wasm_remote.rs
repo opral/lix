@@ -151,6 +151,14 @@ pub async fn open_remote(
 
 #[wasm_bindgen]
 impl WasmRemoteLix {
+    #[wasm_bindgen(js_name = prepare)]
+    pub async fn prepare(&self, _sql: String, _params: JsValue) -> Result<(), JsValue> {
+        Err(lix_error_to_js(LixError::new(
+            "LIX_ERROR_LOCAL_STORAGE_REQUIRED",
+            "SQL preparation requires a local storage-backed Lix handle",
+        )))
+    }
+
     #[wasm_bindgen(js_name = replicaRecoverySources)]
     pub async fn replica_recovery_sources(&self) -> Result<JsValue, JsValue> {
         Err(lix_error_to_js(LixError::new(
