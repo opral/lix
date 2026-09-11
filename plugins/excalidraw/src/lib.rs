@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 mod core;
+#[path = "../../../packages/plugin-utils/order_key.rs"]
 mod order_key;
 
 use core::{
