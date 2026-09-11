@@ -1,5 +1,10 @@
 # Partial replica with on-demand sync: performance evidence
 
+The measurements below are historical, from before removal of the public
+preparation API and the current SQL-driven dependency changes. They establish
+earlier baselines; they do not validate the current revision. Updated benchmarks
+disconnect immediately after the first SELECT and require fresh measurements.
+
 The public opener with storage and `server.mode: "partial_replica"` creates a **partial replica with
 on-demand sync**. Optimized Chromium/WASM/OPFS measurements below show bounded
 opening transfers across independently varied rows, branches, history and
@@ -15,7 +20,7 @@ OPFS reopen. Native, adapter, SDK and browser verification passes. See
 remaining boundaries. Format and protocol changes are intentional, without an
 eager fallback or compatibility shim.
 
-## Final verification (build 75 / release 5)
+## Historical verification (build 75 / release 5)
 
 Three independent fresh authority/browser processes per opening arm, with
 alternating small/large order. All eight sequential workflows passed; source,

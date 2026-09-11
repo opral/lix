@@ -440,3 +440,59 @@ pub(crate) async fn prepare_row_pk_index_mutation_inputs(
         .prepare_existing_key_mutation_inputs(store, root, &encoded)
         .await
 }
+
+/// Prepare the secondary identity paths used when publishing selected changes
+/// against an existing checkpoint. This reads no primary snapshot or inventory.
+pub(crate) async fn prepare_row_pk_mutation_inputs_at_commit(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: crate::changelog::CommitId,
+    keys: &[TrackedStateKey],
+) -> Result<(), LixError> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let topology = super::storage::load_published_commit_state_topology(store, commit_id)
+        .await?
+        .ok_or_else(|| {
+            super::NativeMetadataRef::CommitStateHeader(commit_id.to_string()).annotate_missing(
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "current mutation preparation lacks its native header",
+                ),
+            )
+        })?;
+    if let Some(root) = topology.row_pk_index_root_id() {
+        prepare_row_pk_index_mutation_inputs(store, root, keys).await?;
+    }
+    Ok(())
+}
+
+/// Prepare only mutation paths for exact returned identities at the coherent
+/// current branch head. Header lookup avoids loading the mutation inventory.
+pub(crate) async fn prepare_current_row_mutation_inputs(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: crate::changelog::CommitId,
+    keys: &[TrackedStateKey],
+) -> Result<(), LixError> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    prepare_row_pk_mutation_inputs_at_commit(store, commit_id, keys).await?;
+    if let Some(root) = super::storage::load_manifest_snapshot_commit_root(store, commit_id).await?
+    {
+        let encoded = keys
+            .iter()
+            .map(|key| {
+                bytes::Bytes::from(encode_key_ref(TrackedStateKeyRef {
+                    schema_key: &key.schema_key,
+                    file_id: key.file_id.as_deref(),
+                    row_pk: &key.row_pk,
+                }))
+            })
+            .collect::<Vec<_>>();
+        super::tree::TrackedStateTree::new()
+            .prepare_existing_key_mutation_inputs(store, &root.root_id, &encoded)
+            .await?;
+    }
+    Ok(())
+}

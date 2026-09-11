@@ -302,29 +302,71 @@ impl NativeObjectRef {
 /// UUID-addressed metadata needs authenticated authority provenance; unlike
 /// NativeObjectRef, this address supplies no content hash or completeness proof.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    content = "commitId",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
+#[serde(from = "NativeMetadataWire", into = "NativeMetadataWire")]
 pub(crate) enum NativeMetadataRef {
     CommitStateHeader(String),
     CommitGraphRecord(String),
+    ChangeLocator(String),
+}
+
+// Preserve existing commit metadata wire fields while naming change IDs accurately.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum NativeMetadataWire {
+    CommitStateHeader {
+        #[serde(rename = "commitId")]
+        commit_id: String,
+    },
+    CommitGraphRecord {
+        #[serde(rename = "commitId")]
+        commit_id: String,
+    },
+    ChangeLocator {
+        #[serde(rename = "changeId")]
+        change_id: String,
+    },
+}
+impl From<NativeMetadataWire> for NativeMetadataRef {
+    fn from(value: NativeMetadataWire) -> Self {
+        match value {
+            NativeMetadataWire::CommitStateHeader { commit_id } => {
+                Self::CommitStateHeader(commit_id)
+            }
+            NativeMetadataWire::CommitGraphRecord { commit_id } => {
+                Self::CommitGraphRecord(commit_id)
+            }
+            NativeMetadataWire::ChangeLocator { change_id } => Self::ChangeLocator(change_id),
+        }
+    }
+}
+impl From<NativeMetadataRef> for NativeMetadataWire {
+    fn from(value: NativeMetadataRef) -> Self {
+        match value {
+            NativeMetadataRef::CommitStateHeader(commit_id) => {
+                Self::CommitStateHeader { commit_id }
+            }
+            NativeMetadataRef::CommitGraphRecord(commit_id) => {
+                Self::CommitGraphRecord { commit_id }
+            }
+            NativeMetadataRef::ChangeLocator(change_id) => Self::ChangeLocator { change_id },
+        }
+    }
 }
 
 impl NativeMetadataRef {
-    pub(crate) fn commit_id(&self) -> &str {
+    pub(crate) fn id(&self) -> &str {
         match self {
-            Self::CommitStateHeader(id) | Self::CommitGraphRecord(id) => id,
+            Self::CommitStateHeader(id) | Self::CommitGraphRecord(id) | Self::ChangeLocator(id) => {
+                id
+            }
         }
     }
 
     pub(crate) fn validate_address(&self) -> Result<(), LixError> {
-        if crate::storage_codec::id_string::uuid_bytes_from_canonical(self.commit_id()).is_none() {
+        if crate::storage_codec::id_string::uuid_bytes_from_canonical(self.id()).is_none() {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
-                "native metadata commit ID must be a canonical UUID",
+                "native metadata ID must be a canonical UUID",
             ));
         }
         Ok(())
@@ -375,10 +417,28 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn change_locator_wire_uses_change_id_and_preserves_commit_wire() {
+        let id = "00000000-0000-7000-8000-000000000001";
+        let value = serde_json::to_value(NativeMetadataRef::ChangeLocator(id.into())).unwrap();
+        assert_eq!(value, json!({"kind":"change_locator", "changeId":id}));
+        assert!(
+            serde_json::from_value::<NativeMetadataRef>(
+                json!({"kind":"change_locator", "commitId":id})
+            )
+            .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(NativeMetadataRef::CommitGraphRecord(id.into())).unwrap(),
+            json!({"kind":"commit_graph_record", "commitId":id})
+        );
+    }
+
+    #[test]
     fn metadata_missing_diagnostic_preserves_errors_and_rejects_untyped_addresses() {
         for address in [
             NativeMetadataRef::CommitStateHeader("00000000-0000-0000-0000-000000000001".into()),
             NativeMetadataRef::CommitGraphRecord("00000000-0000-0000-0000-000000000002".into()),
+            NativeMetadataRef::ChangeLocator("00000000-0000-0000-0000-000000000003".into()),
         ] {
             let error = address
                 .clone()

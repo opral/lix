@@ -174,6 +174,7 @@ pub(crate) struct ReadInterestRegistry {
     max_count: usize,
     max_bytes: usize,
     durability_required: bool,
+    parent: Option<Arc<ReadInterestRegistry>>,
 }
 #[derive(Clone)]
 pub(crate) struct ReadInterestSnapshot {
@@ -203,8 +204,25 @@ impl ReadInterestRegistry {
             max_count,
             max_bytes,
             durability_required,
+            parent: None,
         })
     }
+    /// Capture every scope used by one foreground operation, including scopes
+    /// already retained by the parent. The operation keeps the parent's gate.
+    pub(crate) fn capture(parent: Arc<Self>) -> Arc<Self> {
+        Arc::new(Self {
+            gate: Arc::new(RwLock::new(())),
+            state: Mutex::new(RegistryState::default()),
+            max_count: parent.max_count,
+            max_bytes: parent.max_bytes,
+            durability_required: false,
+            parent: Some(parent),
+        })
+    }
+    pub(crate) fn capture_parent(&self) -> Option<Arc<Self>> {
+        self.parent.clone()
+    }
+
     pub(crate) fn durability_is_clean(&self) -> Result<bool, LixError> {
         let state = self
             .state
@@ -350,6 +368,10 @@ impl ReadInterestRegistry {
     /// Call before predicate lowering or physical loading, including reads
     /// returning zero rows. A duplicate leaves the revision unchanged.
     pub(crate) fn register(&self, interest: LogicalReadInterest) -> Result<(), LixError> {
+        if let Some(parent) = &self.parent {
+            parent.register(interest.clone())?;
+        }
+
         let mut encoding = BoundedEncoding {
             bytes: Vec::new(),
             limit: self.max_bytes,
@@ -406,6 +428,28 @@ mod tests {
             HotStateReadDomain::Tracked,
         )
     }
+    #[test]
+    fn operation_capture_retains_repeated_parent_scope_and_forwards_new_scope() {
+        let parent = ReadInterestRegistry::new(8, 8192);
+        let existing = negative_recipe();
+        parent.register(existing.clone()).unwrap();
+        let before = parent.snapshot().unwrap().revision;
+        let capture = ReadInterestRegistry::capture(parent.clone());
+        capture.register(existing.clone()).unwrap();
+        assert_eq!(parent.snapshot().unwrap().revision, before);
+        assert_eq!(
+            capture.snapshot().unwrap().interests.as_slice(),
+            &[Arc::new(existing)]
+        );
+        let additional = LogicalReadInterest::PackedIdentityMembership {
+            branch_id: "another-branch".into(),
+            schema_key: "example".into(),
+        };
+        capture.register(additional).unwrap();
+        assert_eq!(parent.snapshot().unwrap().interests.len(), 2);
+        assert_eq!(capture.snapshot().unwrap().interests.len(), 2);
+    }
+
     #[tokio::test]
     async fn scoped_native_reader_records_negative_request_before_access() {
         let lix = crate::open_lix().await.unwrap();

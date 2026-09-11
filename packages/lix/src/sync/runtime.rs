@@ -2266,7 +2266,7 @@ mod tests {
         );
         let history = address.clone().annotate_missing(
             LixError::new("LIX_SYNC_HISTORY_REQUIRED", "deferred")
-                .with_details(serde_json::json!({"commitIds":[address.commit_id()]})),
+                .with_details(serde_json::json!({"commitIds":[address.id()]})),
         );
         let request = native_sync_demand_request_for_error(&history)
             .unwrap()

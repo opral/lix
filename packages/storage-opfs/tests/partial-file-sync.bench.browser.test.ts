@@ -146,7 +146,8 @@ test("profiles public file tree, negative scope and editable content in OPFS", a
    // set must advance through the production descriptor watcher/publication.
    const remote = await openLix({server:{url:fixture.url,headers:fixture.headers}});
    const appeared = new Uint8Array([91,92,93]);
-   try { await remote.execute("INSERT INTO lix_file(path,content) VALUES($1,$2)", [fixture.negative,appeared]); }
+   let publicationAcknowledged = 0;
+   try { await remote.execute("INSERT INTO lix_file(path,content) VALUES($1,$2)", [fixture.negative,appeared]); publicationAcknowledged = performance.now(); }
    finally { await remote.close(); }
    await measured("remoteNegativePublication", async () => {
     const deadline = performance.now()+30_000;
@@ -157,8 +158,10 @@ test("profiles public file tree, negative scope and editable content in OPFS", a
     }
     throw new Error("Retained empty file scope did not receive remote insertion");
    });
+   // Includes remote close and up to one polling interval after INSERT acknowledgment.
+   timings.remoteNegativePublication = performance.now() - publicationAcknowledged;
    expect(Number((await lix.execute(countSql,[pattern])).rows[0]?.n)).toBe(fixture.directoryFiles+1);
-   await measured("fileHoverPrefetch", () => lix.execute(contentSql,[fixture.target]));
+   await measured("retainedFileReadAfterPublication", () => lix.execute(contentSql,[fixture.target]));
    expect((await lix.execute(contentSql,[fixture.target])).rows[0]?.content).toEqual(bytes);
    offline=true; for(const controller of inFlight) controller.abort();
    const offlineStart=transfers.length;

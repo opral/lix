@@ -1336,11 +1336,19 @@ components:
             cursor: { type: integer, minimum: 0 }
             events: { type: array, maxItems: 512, items: { $ref: "#/components/schemas/SyncEvent" } }
     NativeMetadataRef:
-      type: object
-      required: [kind, commitId]
-      properties:
-        kind: { type: string, enum: [commit_state_header, commit_graph_record] }
-        commitId: { type: string, format: uuid }
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [kind, commitId]
+          properties:
+            kind: { type: string, enum: [commit_state_header, commit_graph_record] }
+            commitId: { type: string, format: uuid }
+        - type: object
+          additionalProperties: false
+          required: [kind, changeId]
+          properties:
+            kind: { type: string, const: change_locator }
+            changeId: { type: string, format: uuid }
     NativeMetadataRequest:
       type: object
       additionalProperties: false

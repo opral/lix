@@ -16,7 +16,6 @@ use crate::branch::{
 };
 use crate::catalog::{CatalogContext, CatalogFingerprint, CatalogSnapshot, load_catalog_revision};
 use crate::changelog::CommitId;
-use crate::session::execute::CommitSpan;
 use crate::commit_graph::{CommitGraphContext, CommitGraphReader};
 use crate::domain::Domain;
 use crate::filesystem::FilesystemPathIndexReader;
@@ -29,6 +28,7 @@ use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::runtime::PluginRuntimeHost;
 use crate::row_pk::RowPk;
+use crate::session::execute::CommitSpan;
 use crate::sql2::{
     ChangelogQuerySource, SessionFileViews, SqlChangelogQuerySource, SqlExecutionContext,
     SqlPlanningCache,
@@ -757,10 +757,13 @@ where
                 "lix.perf.public_read.catalog_revision"
             ))
             .await?;
-        let hot_state = self.hot_state();
+        // Catalog dependencies remain retained for publication, but they are
+        // not returned user rows whose mutation paths need foreground warming.
+        let catalog_hot = self.hot_state.without_foreground_read_capture();
+        let hot_state = catalog_hot.reader(self.read_store.clone());
         self.catalog_context
             .compiled_catalog_for_transaction_open(
-                hot_state.as_ref(),
+                &hot_state,
                 &Domain::schema_catalog(self.active_branch_id.to_string(), true),
                 revision.as_ref(),
             )

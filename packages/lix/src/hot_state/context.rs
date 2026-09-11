@@ -335,6 +335,7 @@ pub(crate) struct HotStateContext {
     row_decoded_column_cache: crate::hot_state::RowDecodedColumnCache,
     global_key_value_rows: std::sync::Arc<GlobalKeyValueRowCache>,
     root_base_cache: std::sync::Arc<crate::hot_state::tracked_head::RootBaseBatchCache>,
+    prepared_read_rows: std::sync::Arc<std::sync::Mutex<PreparedReadRows>>,
 }
 
 impl HotStateContext {
@@ -343,6 +344,38 @@ impl HotStateContext {
         scoped.partial_scope_policy = Some(super::PartialReadScopePolicy::new(selected, global));
         scoped
     }
+    pub(crate) fn with_partial_read_preparation_epoch(mut self, epoch: &str) -> Self {
+        if let Some(policy) = &mut self.partial_scope_policy {
+            policy.set_preparation_epoch(epoch);
+        }
+        self
+    }
+
+    pub(crate) fn capture_foreground_read_interests(
+        &self,
+    ) -> Option<(Self, std::sync::Arc<super::ReadInterestRegistry>)> {
+        let parent = self.read_interest_registry.as_ref()?;
+        if self.partial_scope_policy.is_none() {
+            return None;
+        }
+        let capture = super::ReadInterestRegistry::capture(std::sync::Arc::clone(parent));
+        Some((self.with_read_interest_registry(capture.clone()), capture))
+    }
+
+    /// Planning still retains catalog interests globally, but catalog cache
+    /// misses are not rows returned by this foreground query.
+    pub(crate) fn without_foreground_read_capture(&self) -> Self {
+        let mut context = self.clone();
+        if let Some(parent) = self
+            .read_interest_registry
+            .as_ref()
+            .and_then(|registry| registry.capture_parent())
+        {
+            context.read_interest_registry = Some(parent);
+        }
+        context
+    }
+
     pub(crate) fn is_partial_replica(&self) -> bool {
         self.partial_scope_policy.is_some()
     }
@@ -403,6 +436,7 @@ impl HotStateContext {
             ),
             global_key_value_rows: std::sync::Arc::new(GlobalKeyValueRowCache::default()),
             root_base_cache: std::sync::Arc::default(),
+            prepared_read_rows: std::sync::Arc::default(),
         }
     }
 
@@ -420,10 +454,7 @@ impl HotStateContext {
     /// Reuse completed immutable-root projections across candidate retries.
     /// Every mutable serving cache and read-interest registry stays private.
     pub(crate) fn fork_for_native_candidate(&self) -> Self {
-        let mut candidate = Self::new(
-            TrackedStateContext::new(),
-            CommitGraphContext::new(),
-        );
+        let mut candidate = Self::new(TrackedStateContext::new(), CommitGraphContext::new());
         candidate.root_base_cache = std::sync::Arc::clone(&self.root_base_cache);
         candidate
     }
@@ -445,6 +476,7 @@ impl HotStateContext {
             ),
             branch_head_control_cache: None,
             root_base_cache: std::sync::Arc::clone(&self.root_base_cache),
+            prepared_read_rows: std::sync::Arc::clone(&self.prepared_read_rows),
         }
     }
 
@@ -471,6 +503,7 @@ impl HotStateContext {
             ),
             branch_head_control_cache: Some(branch_head_control_cache),
             root_base_cache: std::sync::Arc::clone(&self.root_base_cache),
+            prepared_read_rows: std::sync::Arc::clone(&self.prepared_read_rows),
         }
     }
 
@@ -507,6 +540,7 @@ impl HotStateContext {
             ),
             branch_head_control_cache: None,
             root_base_cache: std::sync::Arc::clone(&self.root_base_cache),
+            prepared_read_rows: std::sync::Arc::clone(&self.prepared_read_rows),
         }
     }
 
@@ -533,6 +567,7 @@ pub(crate) struct HotStateContextReader<S> {
     exclusive_certified_batch_cache: std::sync::Arc<ExclusiveCertifiedBatchCache>,
     branch_head_control_cache: Option<std::sync::Arc<BranchHeadControlCache>>,
     root_base_cache: std::sync::Arc<crate::hot_state::tracked_head::RootBaseBatchCache>,
+    prepared_read_rows: std::sync::Arc<std::sync::Mutex<PreparedReadRows>>,
 }
 
 impl<S> HotStateContextReader<S>
@@ -1114,6 +1149,281 @@ where
             })
             .await?;
         Ok(rows.get(0).map(MaterializedHotStateRowRef::to_owned))
+    }
+
+    /// Complete only native inputs for current rows selected by this read's
+    /// captured access recipes. Never replay SQL or execute mutation validation.
+    pub(crate) fn prepare_captured_read_interests<'a>(
+        &'a self,
+        captured: &'a super::ReadInterestSnapshot,
+        active_account_id: &'a str,
+    ) -> ReturnedChangePreparationFuture<'a> {
+        Box::pin(async move {
+            if self.partial_scope_policy.is_none() {
+                return Ok(());
+            }
+            let mut account_prepared = false;
+            for interest in &captured.interests {
+                let rows = match interest.as_ref() {
+                    super::LogicalReadInterest::Scan { request, domain } => {
+                        let batch = match domain {
+                            super::InterestDomain::Tracked => {
+                                self.scan_tracked_batch(request).await?
+                            }
+                            super::InterestDomain::Combined => self.scan_batch(request).await?,
+                            super::InterestDomain::Untracked => continue,
+                        };
+                        batch
+                            .iter()
+                            .filter(|row| !row.untracked())
+                            .filter_map(CurrentReadIdentity::from_row)
+                            .collect()
+                    }
+                    super::LogicalReadInterest::Exact {
+                        rows,
+                        projection,
+                        untracked,
+                        include_tombstones,
+                    } => {
+                        let request = HotStateExactBatchRequest {
+                            rows: rows
+                                .iter()
+                                .map(|row| crate::hot_state::HotStateExactRowRequest {
+                                    schema_key: row.schema_key.clone(),
+                                    branch_id: row.branch_id.clone(),
+                                    file_id: row.file_id.clone(),
+                                    row_pk: row.row_pk.clone(),
+                                })
+                                .collect(),
+                            projection: projection.clone(),
+                            untracked: *untracked,
+                            include_tombstones: *include_tombstones,
+                        };
+                        let batch = self.load_exact_batch(&request).await?;
+                        (0..request.rows.len())
+                            .filter_map(|i| batch.row(i))
+                            .filter(|row| !row.untracked())
+                            .filter_map(CurrentReadIdentity::from_row)
+                            .collect()
+                    }
+                    super::LogicalReadInterest::FilesystemPaths {
+                        branch_ids,
+                        include_blob_refs,
+                        ..
+                    } => {
+                        let index = self
+                            .path_index(
+                                &FilesystemPathIndexRequest::new(branch_ids.clone())
+                                    .with_blob_refs(*include_blob_refs)
+                                    .with_cached_blob_data(false),
+                            )
+                            .await?;
+                        let mut rows = Vec::new();
+                        for entry in index.entries() {
+                            if let Some(row) = CurrentReadIdentity::from_owned(&entry.live_row()) {
+                                rows.push(row);
+                            }
+                            if *include_blob_refs
+                                && let Some(blob) = entry.blob_ref_live_row()
+                                && let Some(row) = CurrentReadIdentity::from_owned(blob)
+                            {
+                                rows.push(row);
+                            }
+                        }
+                        rows
+                    }
+                    super::LogicalReadInterest::Diff {
+                        branch_id: Some(branch),
+                        from: super::DiffInterestEndpoint::WorkingCheckpoint,
+                        to: super::DiffInterestEndpoint::ActiveHead,
+                        filter,
+                        ..
+                    } => {
+                        // Only a working diff requests checkpoint publication
+                        // inputs. Ordinary current reads and fixed historical
+                        // diffs must not acquire this extra historical scope.
+                        let controls = load_branch_head_controls(
+                            &self.store,
+                            std::slice::from_ref(branch),
+                            self.branch_head_control_cache.as_deref(),
+                        )
+                        .await?;
+                        let control = controls.get(branch).ok_or_else(|| {
+                            LixError::new(
+                                "LIX_SYNC_BRANCH_CONTROLS_REQUIRED",
+                                "working diff preparation lacks its branch control",
+                            )
+                        })?;
+                        if let Some(checkpoint) = control.working_diff_checkpoint_commit_id
+                            && checkpoint != control.head_commit_id
+                        {
+                            let diff = TrackedStateContext::new()
+                                .reader(&self.store)
+                                .diff_commits(
+                                    &checkpoint.to_string(),
+                                    &control.head_commit_id.to_string(),
+                                    &crate::tracked_state::TrackedStateDiffRequest {
+                                        filter: filter.clone(),
+                                        retain_payloads: false,
+                                    },
+                                )
+                                .await?;
+                            let keys = diff
+                                .entries
+                                .iter()
+                                .map(|entry| crate::tracked_state::TrackedStateKey {
+                                    schema_key: entry.identity.schema_key().to_owned(),
+                                    file_id: entry.identity.file_id().map(str::to_owned),
+                                    row_pk: entry.identity.row_pk().clone(),
+                                })
+                                .collect::<Vec<_>>();
+                            crate::tracked_state::prepare_row_pk_mutation_inputs_at_commit(
+                                &self.store,
+                                checkpoint,
+                                &keys,
+                            )
+                            .await?;
+                        }
+                        continue;
+                    }
+                    // These recipes retain metadata, historical endpoints or
+                    // content projections. Any current row reads they perform
+                    // independently register Exact/Scan/FilesystemPaths above.
+                    super::LogicalReadInterest::CollectionGeneration { .. }
+                    | super::LogicalReadInterest::PackedIdentityMembership { .. }
+                    | super::LogicalReadInterest::Diff { .. }
+                    | super::LogicalReadInterest::FileContent { .. } => continue,
+                };
+                if !rows.is_empty() && !account_prepared {
+                    // Every local write validates this session's active actor.
+                    // Prepare its exact native value, without changing account
+                    // status or treating a read as an authorization proof.
+                    self.load_exact_batch(&HotStateExactBatchRequest {
+                        rows: vec![crate::hot_state::HotStateExactRowRequest {
+                            schema_key: "lix_account".to_owned(),
+                            branch_id: GLOBAL_BRANCH_ID.to_owned(),
+                            row_pk: RowPk::uuid_from_canonical(active_account_id).map_err(
+                                |_| {
+                                    LixError::new(
+                                        "LIX_INVALID_ACCOUNT_ID",
+                                        "active account ID is not a canonical UUID",
+                                    )
+                                },
+                            )?,
+                            file_id: None,
+                        }],
+                        projection: crate::hot_state::HotStateProjection {
+                            columns: vec!["snapshot_content".to_owned()],
+                        },
+                        untracked: None,
+                        include_tombstones: false,
+                    })
+                    .await?;
+                    account_prepared = true;
+                }
+                self.prepare_returned_rows(rows).await?;
+            }
+            Ok(())
+        })
+    }
+
+    fn prepare_returned_rows(
+        &self,
+        mut rows: Vec<CurrentReadIdentity>,
+    ) -> ReturnedChangePreparationFuture<'_> {
+        Box::pin(async move {
+            if rows.is_empty() {
+                return Ok(());
+            }
+            let epoch = self
+                .partial_scope_policy
+                .as_ref()
+                .and_then(|policy| policy.preparation_epoch());
+            let branches = rows
+                .iter()
+                .map(|row| row.branch_id.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let controls = load_branch_head_controls(
+                &self.store,
+                &branches,
+                self.branch_head_control_cache.as_deref(),
+            )
+            .await?;
+            let identity = |row: &CurrentReadIdentity| -> Result<PreparedReadKey, LixError> {
+                let control = controls.get(&row.branch_id).ok_or_else(|| {
+                    LixError::new(
+                        "LIX_SYNC_BRANCH_CONTROLS_REQUIRED",
+                        "returned row mutation preparation lacks its branch control",
+                    )
+                })?;
+                Ok((row.branch_id.clone(), control.head_commit_id, row.change_id))
+            };
+            // Validate all control coordinates before consulting an optimization.
+            for row in &rows {
+                identity(row)?;
+            }
+            if let Some(epoch) = epoch {
+                let mut cache = self
+                    .prepared_read_rows
+                    .lock()
+                    .map_err(|_| LixError::unknown("read preparation cache poisoned"))?;
+                if cache.epoch.as_deref() != Some(epoch) {
+                    cache.keys.clear();
+                    cache.epoch = Some(epoch.to_owned());
+                }
+                rows.retain(|row| {
+                    !cache
+                        .keys
+                        .contains(&identity(row).expect("validated controls"))
+                });
+            }
+            if rows.is_empty() {
+                return Ok(());
+            }
+            let ids = rows
+                .iter()
+                .map(|row| row.change_id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            crate::tracked_state::load_change_records_by_ids(&self.store, &ids).await?;
+            let mut keys = std::collections::BTreeMap::<
+                String,
+                Vec<crate::tracked_state::TrackedStateKey>,
+            >::new();
+            for row in &rows {
+                keys.entry(row.branch_id.clone())
+                    .or_default()
+                    .push(row.key.clone());
+            }
+            for (branch, mut keys) in keys {
+                keys.sort();
+                keys.dedup();
+                crate::tracked_state::prepare_current_row_mutation_inputs(
+                    &self.store,
+                    controls[&branch].head_commit_id,
+                    &keys,
+                )
+                .await?;
+            }
+            if let Some(epoch) = epoch {
+                let mut cache = self
+                    .prepared_read_rows
+                    .lock()
+                    .map_err(|_| LixError::unknown("read preparation cache poisoned"))?;
+                if cache.epoch.as_deref() == Some(epoch) {
+                    if cache.keys.len().saturating_add(rows.len()) > 4096 {
+                        cache.keys.clear();
+                    }
+                    for row in rows.into_iter().take(4096) {
+                        cache.keys.insert(identity(&row)?);
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 
     pub(crate) async fn load_exact_batch(
@@ -5013,4 +5323,63 @@ mod tests {
     fn identity(row_pk: &str) -> RowPk {
         RowPk::single(row_pk)
     }
+}
+
+// Keep native payload decoding behind its owner boundary so downstream storage
+// adapters need not prove the entire recursive read graph at their default limit.
+// StorageAdapterRead and its futures are Send on every engine target.
+type ReturnedChangePreparationFuture<'a> =
+    futures_util::future::BoxFuture<'a, Result<(), LixError>>;
+
+#[derive(Debug)]
+struct CurrentReadIdentity {
+    branch_id: String,
+    key: crate::tracked_state::TrackedStateKey,
+    change_id: crate::changelog::ChangeId,
+}
+impl CurrentReadIdentity {
+    fn from_owned(row: &MaterializedHotStateRow) -> Option<Self> {
+        if row.untracked {
+            return None;
+        }
+        Some(Self {
+            branch_id: if row.global {
+                GLOBAL_BRANCH_ID
+            } else {
+                &row.branch_id
+            }
+            .to_owned(),
+            key: crate::tracked_state::TrackedStateKey {
+                schema_key: row.schema_key.clone(),
+                file_id: row.file_id.clone(),
+                row_pk: row.row_pk.clone(),
+            },
+            change_id: row.change_id?,
+        })
+    }
+    fn from_row(row: MaterializedHotStateRowRef<'_>) -> Option<Self> {
+        Some(Self {
+            branch_id: if row.global() {
+                GLOBAL_BRANCH_ID
+            } else {
+                row.branch_id()
+            }
+            .to_owned(),
+            key: crate::tracked_state::TrackedStateKey {
+                schema_key: row.schema_key().to_owned(),
+                file_id: row.file_id().map(str::to_owned),
+                row_pk: row.row_pk().clone(),
+            },
+            change_id: row.change_id()?,
+        })
+    }
+}
+type PreparedReadKey = (String, CommitId, crate::changelog::ChangeId);
+// Partial native GC rejects incomplete ownership, so prepared immutable inputs
+// persist within this epoch. Future partial eviction MUST invalidate this cache
+// before deleting any referenced input. Capacity eviction only causes rechecking.
+#[derive(Default, Debug)]
+struct PreparedReadRows {
+    epoch: Option<String>,
+    keys: std::collections::BTreeSet<PreparedReadKey>,
 }

@@ -1479,16 +1479,21 @@ where
                     async move {
                         let active_branch_id =
                             self.active_branch_id_from_reader(&read_store).await?;
+                        let capture = self.hot_state.capture_foreground_read_interests();
+                        let read_hot = capture.as_ref().map_or_else(
+                            || Arc::clone(&self.hot_state),
+                            |(hot, _)| Arc::new(hot.clone()),
+                        );
                         let plugin_cache_snapshot = read_store.snapshot_cache_key();
                         let hot_state: Arc<dyn crate::hot_state::HotStateReader> =
-                            Arc::new(self.hot_state.reader(read_store.clone()));
+                            Arc::new(read_hot.reader(read_store.clone()));
                         let filesystem_path_index: Arc<
                             dyn crate::filesystem::FilesystemPathIndexReader,
-                        > = Arc::new(self.hot_state.reader(read_store.clone()));
+                        > = Arc::new(read_hot.reader(read_store.clone()));
                         let branch_ref: Arc<dyn BranchRefReader> =
                             Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
                         let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
-                            Arc::new(self.binary_cas.reader(read_store));
+                            Arc::new(self.binary_cas.reader(read_store.clone()));
                         // A raw file download delivers the same bytes as a direct
                         // `lix_file.content` read, so it must acknowledge rendered
                         // plugin state for subsequent collaborative writes.
@@ -1508,6 +1513,15 @@ where
                         .await?;
                         let content =
                             native_file_read_from_exact_result(result, &paths, requested_range)?;
+                        if let Some((_, capture)) = capture {
+                            self.hot_state
+                                .reader(read_store)
+                                .prepare_captured_read_interests(
+                                    &capture.snapshot()?,
+                                    self.active_account_id(),
+                                )
+                                .await?;
+                        }
                         Ok((content, file_view_collector.plugin_file_mutations()))
                     }
                 },
@@ -2674,6 +2688,11 @@ where
                 |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| {
                     let parsed = parsed.clone();
                     async move {
+                        let capture = self.hot_state.capture_foreground_read_interests();
+                        let read_hot = capture.as_ref().map_or_else(
+                            || Arc::clone(&self.hot_state),
+                            |(hot, _)| Arc::new(hot.clone()),
+                        );
                         let file_view_collector =
                             acknowledge_file_views.then(|| self.file_views.fork_for_read());
                         let active_branch_id =
@@ -2718,7 +2737,7 @@ where
                             active_branch_id: &active_branch_id,
                             active_account_id: self.active_account_id(),
                             read_store: read_store.clone(),
-                            hot_state: Arc::clone(&self.hot_state),
+                            hot_state: Arc::clone(&read_hot),
                             binary_cas: Arc::clone(&self.binary_cas),
                             branch_ctx: Arc::clone(&self.branch_ctx),
                             catalog_context: Arc::clone(&self.catalog_context),
@@ -2806,6 +2825,15 @@ where
                         }
                         drop(read_session);
                         drop(ctx);
+                        if let Some((_, capture)) = capture {
+                            self.hot_state
+                                .reader(read_store)
+                                .prepare_captured_read_interests(
+                                    &capture.snapshot()?,
+                                    self.active_account_id(),
+                                )
+                                .await?;
+                        }
                         Ok((ReadBatchResult { results, snapshot }, file_view_mutations))
                     }
                 },
@@ -3011,6 +3039,49 @@ where
         ),
         LixError,
     > {
+        let capture = self.hot_state.capture_foreground_read_interests();
+        let read_hot = capture.as_ref().map_or_else(
+            || Arc::clone(&self.hot_state),
+            |(hot, _)| Arc::new(hot.clone()),
+        );
+        let result = Box::pin(self.execute_read_statement_with_scoped_hot(
+            read_store.clone(),
+            read_hot,
+            sql,
+            statement,
+            params,
+            acknowledge_file_views,
+            read_plan,
+            has_durable_runtime_function,
+        ))
+        .await?;
+        if let Some((_, capture)) = capture {
+            self.hot_state
+                .reader(read_store)
+                .prepare_captured_read_interests(&capture.snapshot()?, self.active_account_id())
+                .await?;
+        }
+        Ok(result)
+    }
+
+    async fn execute_read_statement_with_scoped_hot(
+        &self,
+        read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>,
+        read_hot: Arc<crate::hot_state::HotStateContext>,
+        sql: &str,
+        statement: datafusion::sql::parser::Statement,
+        params: &[Value],
+        acknowledge_file_views: bool,
+        read_plan: sql2::StatementReadPlan,
+        has_durable_runtime_function: bool,
+    ) -> Result<
+        (
+            sql2::SessionReadSqlResult,
+            Vec<sql2::SessionFileViewMutation>,
+            usize,
+        ),
+        LixError,
+    > {
         let file_view_collector = acknowledge_file_views.then(|| self.file_views.fork_for_read());
         let active_branch_id = self
             .active_branch_id_from_reader(&read_store)
@@ -3023,7 +3094,7 @@ where
             active_branch_id: &active_branch_id,
             active_account_id: self.active_account_id(),
             read_store: read_store.clone(),
-            hot_state: Arc::clone(&self.hot_state),
+            hot_state: Arc::clone(&read_hot),
             binary_cas: Arc::clone(&self.binary_cas),
             branch_ctx: Arc::clone(&self.branch_ctx),
             catalog_context: Arc::clone(&self.catalog_context),
@@ -3047,7 +3118,7 @@ where
         }
         drop(native_ctx);
         let hot_state: Arc<dyn crate::hot_state::HotStateReader> =
-            Arc::new(self.hot_state.reader(read_store.clone()));
+            Arc::new(read_hot.reader(read_store.clone()));
         let runtime_functions = if has_durable_runtime_function {
             Some(FunctionContext::prepare(&read_store, None).await?)
         } else {
@@ -3067,7 +3138,7 @@ where
         // optimization requires retaining its original predicate, not only IDs.
         let late_content = read_plan
             .late_content
-            .filter(|_| self.hot_state.read_interest_registry().is_none());
+            .filter(|_| read_hot.read_interest_registry().is_none());
         let (statement, late_file_content_column, rewritten_sql) = match late_content {
             Some(plan) => {
                 let statement = *plan.statement;
@@ -3080,7 +3151,7 @@ where
             active_branch_id: &active_branch_id,
             active_account_id: self.active_account_id(),
             read_store: read_store.clone(),
-            hot_state: Arc::clone(&self.hot_state),
+            hot_state: Arc::clone(&read_hot),
             binary_cas: Arc::clone(&self.binary_cas),
             branch_ctx: Arc::clone(&self.branch_ctx),
             catalog_context: Arc::clone(&self.catalog_context),
@@ -3103,7 +3174,7 @@ where
         drop(ctx);
         if let Some(data_column_index) = late_file_content_column {
             let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
-                Arc::new(self.hot_state.reader(read_store.clone()));
+                Arc::new(read_hot.reader(read_store.clone()));
             let branch_ref: Arc<dyn BranchRefReader> =
                 Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
             let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
@@ -4561,7 +4632,11 @@ mod tests {
             }])
             .await
             .expect("nondeterministic read batch should run");
-        assert!(nondeterministic.iter().all(|result| result.commit().is_none()));
+        assert!(
+            nondeterministic
+                .iter()
+                .all(|result| result.commit().is_none())
+        );
         let reads = session
             .execute_batch(&[
                 ExecuteBatchStatement {
@@ -4591,7 +4666,10 @@ mod tests {
             .expect("statement should stage");
         assert_eq!(staged.rows_affected(), 1);
         assert_eq!(staged.commit(), None);
-        transaction.commit().await.expect("transaction should commit");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
     }
 
     #[derive(Clone)]

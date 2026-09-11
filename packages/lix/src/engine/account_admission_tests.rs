@@ -129,9 +129,8 @@ impl StorageScanSource for CountedScan<'_> {
     fn next_page(
         &mut self,
         limit: usize,
-    ) -> std::pin::Pin<
-        Box<dyn Future<Output = Result<StorageScanChunk, StorageError>> + Send + '_>,
-    > {
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<StorageScanChunk, StorageError>> + Send + '_>>
+    {
         Box::pin(async move {
             let (entries, more) = self.inner.next_page(limit).await?.into_parts();
             {
@@ -224,8 +223,7 @@ async fn authenticated_account_admission_profile() {
             &[16, 1600, 16000]
         };
         for &width in widths {
-            let store =
-                CountedStorage::new(crate::sync::durable_memory_for_test(Memory::new()));
+            let store = CountedStorage::new(crate::sync::durable_memory_for_test(Memory::new()));
             let lix = crate::open_lix().with_storage(store.clone()).await.unwrap();
             // Branch creation is fixture work, outside both timers/I/O samples.
             if dimension == "branches" {
@@ -282,9 +280,7 @@ async fn authenticated_account_admission_profile() {
             // Match the authority role that authenticated server handshakes use.
             let adapter = lix.storage_adapter();
             let read = adapter.begin_read(Default::default()).await.unwrap();
-            let revision = load_repository_mutation_revision(&read)
-                .await
-                .unwrap();
+            let revision = load_repository_mutation_revision(&read).await.unwrap();
             drop(read);
             crate::sync::admit_sync_authority_storage(&adapter, revision)
                 .await

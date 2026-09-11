@@ -104,11 +104,7 @@ Mutation retries must distinguish pre-commit dependency misses from a commit tha
 
 The authority must retain or lease baseline objects that a partial replica may still demand. A clean read can restart after expiry; pending local commits cannot silently switch bases. Define an expired-base recovery state that preserves pending work when compatible inputs are no longer available. Expiry alone is not authorization to discard local commits. Prepare and pin the dependencies needed for promised offline operations, and test authority GC/lease expiry explicitly.
 
-Keep default `execute` behavior automatic: cold statements hydrate and retry, warm statements stay local. Expose SQL-level prefetch/preparation and a local-only execution option. Public names require API review; the intended behaviors are:
-
-- **Prefetch a read:** execute its dependency-loading path ahead of use.
-- **Prepare a write or transaction workload:** load its read set, validation inputs and publication dependencies without performing the mutation or side effects.
-- **Execute locally only:** return a typed missing-dependency error instead of initiating a fetch.
+Keep `execute` behavior automatic: cold statements hydrate and retry, warm statements stay local. Applications prefetch by executing the intended SELECT on hover or ahead of interaction. Do not add a separate public preparation API. Current-row reads also hydrate supported native mutation dependencies; ordinary writes fetch any additional inputs they need while online. Offline operations with missing dependencies fail without publishing a partial mutation.
 
 Preparation readiness belongs to a dependency set and context. A new parameter that introduces an unseen uniqueness target, foreign key, plugin dependency or directory is a new cold demand. Do not advertise a generic “editable file” as covering every possible future mutation.
 
@@ -178,7 +174,7 @@ Server fallback is a read optimization after native partial-replica semantics ar
 |---|---|---|
 | A: instrumentation and partial-replica write feasibility | Bootstrap counters and a native partial-replica edit lifecycle spike | Prepared offline edit, accepted upload and preserved untouched state without full-base reads |
 | B: bounded opening | Versioned descriptor and distinct partial-replica availability/receipt mode | Constant-size bootstrap as rows, branches, history, schemas and blobs grow |
-| C: SQL-driven current hydration | Point, directory/range, schema and content demand paths; prefetch/local-only behavior | Cold load followed by correct warm offline reads and prepared writes |
+| C: SQL-driven current hydration | Point, directory/range, schema and content demand paths; prefetch/local-only behavior | Cold load followed by correct warm offline reads and supported ordinary writes |
 | D: scoped live synchronization | Membership-aware transactional updates, confirmation and recovery | Covered local writes and unrelated remote writes do not cause rehydration |
 | E: SQL fallback and broader operators | Safe versioned result fallback and additional dependency planning | Counts/joins remain correct with local writes and fixed-snapshot transactions |
 | F: browser rollout | OPFS persistence, multi-tab coordination, eviction, telemetry and feature-gated rollout | Full correctness/performance matrix passes |

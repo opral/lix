@@ -100,19 +100,16 @@ test("profiles real partial replica with on-demand sync in OPFS", async () => {
    expect(openingTransfers.some(item => item.path.includes("descriptor"))).toBe(true);
    expect(openingTransfers.every(item => item.kind === "foregroundHandshake" || item.kind === "foregroundDescriptor" || item.kind === "backgroundWatch")).toBe(true);
    expect(openingTransfers.some(item => /snapshot|native-objects|native-object-range|native-metadata|\/blob|\/chunk/.test(item.path))).toBe(false);
-   phase = "coldSql";
+   phase = "hoverPrefetch";
    const sqlStart = performance.now();
    const first = await lix.execute("SELECT value FROM lix_key_value WHERE key = $1", [fixture.key]);
-   expect(first.rows[0]?.value).toEqual(fixture.expected);
    const coldSqlMs = performance.now() - sqlStart;
-   phase = "writePreparation";
-   const preparationStart = performance.now();
-   await lix.execute("UPDATE lix_key_value SET value = $1 WHERE key = $2", ["prepared edit", fixture.key]);
-   const writePreparationMs = performance.now() - preparationStart;
+   const hoverPrefetchMs = coldSqlMs;
    offline = true;
    for (const controller of inFlight) controller.abort();
    inFlight.clear();
    const offlineStart = transfers.length;
+   expect(first.rows[0]?.value).toEqual(fixture.expected);
    const warmSelectMs: number[] = [], warmUpdateMs: number[] = [];
    for (let i = 0; i < 30; i++) {
     phase = "offlineWarmSelect";
@@ -120,7 +117,7 @@ test("profiles real partial replica with on-demand sync in OPFS", async () => {
     const read = await lix.execute("SELECT value FROM lix_key_value WHERE key = $1", [fixture.key]);
     warmSelectMs.push(performance.now() - readStart);
     expect(read.rows).toHaveLength(1);
-    expect(read.rows[0]?.value).toBe(i === 0 ? "prepared edit" : `offline profile edit ${i - 1}`);
+    expect(read.rows[0]?.value).toBe(i === 0 ? fixture.expected : `offline profile edit ${i - 1}`);
     phase = "offlineWarmUpdate";
     const updateStart = performance.now();
     await lix.execute("UPDATE lix_key_value SET value = $1 WHERE key = $2", [`offline profile edit ${i}`, fixture.key]);
@@ -144,7 +141,7 @@ test("profiles real partial replica with on-demand sync in OPFS", async () => {
     // This includes worker+WASM+OPFS initialization; do not label it WASM-only.
     beforeFirstAuthorityRequestMs: firstRequestAt === undefined ? null : firstRequestAt-started,
     wasmInitMs: null, wasmInitNote: "requires worker-side initializeWasm timing event",
-    coldSqlMs, writePreparationMs, warmSelectMs, warmUpdateMs, warmIterations: 30, offlineReopenMs,
+    coldSqlMs, hoverPrefetchMs, prefetchSemantics: "coldSqlMs and hoverPrefetchMs alias the first SELECT; no online preparation write", warmSelectMs, warmUpdateMs, warmIterations: 30, offlineReopenMs,
     offlineInputReadAttempts:transfers.slice(offlineStart).filter(isInputRead).length,offlineBackgroundUploadAttempts:transfers.slice(offlineStart).filter(isBackgroundUpload).length,
     foregroundOpeningRequests: foreground.length, foregroundOpeningResponseBytes: foreground.reduce((n,x)=>n+x.bytes,0), openingRequests: openingTransfers.length, openingResponseBytes: openingTransfers.reduce((n,x)=>n+x.bytes,0), transfers });
   } finally { phase = "close"; await lix.close(); }

@@ -106,6 +106,9 @@ pub(crate) fn stage_partial_bootstrap(
         stage_branch_head_control(writes, branch_id, control)?;
         TrackedHeadContext::new()
             .writer(read, writes)
+            .stage_empty_root_deterministic_witness(branch_id, control.tracked_generation)?;
+        TrackedHeadContext::new()
+            .writer(read, writes)
             .stage_root_current_base(
                 branch_id,
                 control.tracked_generation,
@@ -367,13 +370,18 @@ mod tests {
                 controls.scan().await.unwrap_err().code,
                 "LIX_SYNC_BRANCH_INVENTORY_REQUIRED"
             );
+            let unknown_branch = controls
+                .load("00000000-0000-7000-8000-000000000299")
+                .await
+                .expect_err("unloaded native descriptor cannot prove branch absence");
+            assert_eq!(unknown_branch.code, "LIX_COMMIT_NOT_FOUND");
             assert_eq!(
-                controls
-                    .load("00000000-0000-7000-8000-000000000299")
-                    .await
-                    .unwrap_err()
-                    .code,
-                "LIX_SYNC_BRANCH_CONTROLS_REQUIRED"
+                crate::tracked_state::NativeMetadataRef::from_missing_error(&unknown_branch)
+                    .unwrap(),
+                Some(crate::tracked_state::NativeMetadataRef::CommitGraphRecord(
+                    state.descriptor().global_branch.head.commit_id.clone(),
+                )),
+                "descriptor-only opening must demand the exact global native graph record, not invent an absent branch"
             );
             assert!(
                 super::super::repository::has_any_sync_replica_state(&read)

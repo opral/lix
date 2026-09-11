@@ -8,7 +8,7 @@ use super::native_object::base64_bytes;
 use super::partial_state::{
     PartialReplicaState, load_partial_replica_state, partial_replica_state_key,
 };
-use crate::changelog::CommitId;
+use crate::changelog::{ChangeId, CommitId};
 use crate::storage_adapter::{
     Storage, StorageAdapterRead, StorageGetManyRequest, StorageGetOptions, StorageKey,
     StoragePrecondition, StorageProjectedValue, StorageReadOptions, StorageSpace, StorageValue,
@@ -59,10 +59,13 @@ fn space(address: &NativeMetadataRef) -> StorageSpace {
             crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
         }
         NativeMetadataRef::CommitGraphRecord(_) => crate::changelog::COMMIT_SPACE,
+        NativeMetadataRef::ChangeLocator(_) => {
+            crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE
+        }
     }
 }
 fn key(address: &NativeMetadataRef) -> Result<StorageKey, LixError> {
-    let id = canonical_id(address.commit_id())?;
+    let id = canonical_id(address.id())?;
     Ok(match address {
         NativeMetadataRef::CommitStateHeader(_) => {
             crate::tracked_state::commit_state_authority_key(id)
@@ -70,10 +73,13 @@ fn key(address: &NativeMetadataRef) -> Result<StorageKey, LixError> {
         NativeMetadataRef::CommitGraphRecord(_) => {
             StorageKey(Bytes::from(crate::changelog::commit_key(id)))
         }
+        NativeMetadataRef::ChangeLocator(_) => {
+            StorageKey(Bytes::copy_from_slice(id.as_uuid().as_bytes()))
+        }
     })
 }
 fn validate_bytes(address: &NativeMetadataRef, bytes: &[u8]) -> Result<(), LixError> {
-    let id = canonical_id(address.commit_id())?;
+    let id = canonical_id(address.id())?;
     match address {
         NativeMetadataRef::CommitStateHeader(_) => {
             crate::tracked_state::decode_commit_state_authority_id(
@@ -86,6 +92,10 @@ fn validate_bytes(address: &NativeMetadataRef, bytes: &[u8]) -> Result<(), LixEr
         }
         NativeMetadataRef::CommitGraphRecord(_) => {
             crate::commit_graph::validate_native_commit_graph_record(id, bytes)
+        }
+        NativeMetadataRef::ChangeLocator(_) => {
+            crate::tracked_state::decode_change_locator(ChangeId::new(*id.as_uuid()), bytes)?;
+            Ok(())
         }
     }
 }
@@ -234,6 +244,24 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
         let mut objects = Vec::with_capacity(values.len());
         let mut total = 0usize;
         for (address, value) in request.objects.iter().zip(values) {
+            // Direct IDs normally have no physical locator row. Resolve their
+            // authenticated native owner rather than treating that absence as
+            // unavailable metadata or trusting an address-shaped guess.
+            let value = if matches!(address, NativeMetadataRef::ChangeLocator(_)) {
+                let id = canonical_id(address.id())?;
+                crate::tracked_state::load_canonical_change_locator(
+                    &read,
+                    ChangeId::new(*id.as_uuid()),
+                )
+                .await?
+                .map(|locator| {
+                    StorageProjectedValue::FullValue(Bytes::from(
+                        crate::tracked_state::encode_change_locator(locator),
+                    ))
+                })
+            } else {
+                value
+            };
             let bytes = match value {
                 Some(StorageProjectedValue::FullValue(bytes)) => bytes,
                 Some(StorageProjectedValue::KeyOnly) => {
@@ -364,6 +392,141 @@ mod tests {
     use super::*;
     use crate::storage_adapter::{StorageAdapter, StorageWriteOptions};
     use crate::{Memory, open_lix};
+
+    #[tokio::test]
+    async fn direct_change_locator_is_resolved_without_a_physical_locator_row() {
+        let authority = open_lix().await.unwrap();
+        authority
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('locator-native', 'value')",
+                &[],
+            )
+            .await
+            .unwrap();
+        let rows = authority
+            .execute(
+                "SELECT lixcol_change_id AS id FROM lix_key_value WHERE key = 'locator-native'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let change = rows.rows()[0].get::<String>("id").unwrap();
+        let address = NativeMetadataRef::ChangeLocator(change.clone());
+        let adapter = authority.storage_adapter();
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let keys = [key(&address).unwrap()];
+        let values = read
+            .get_many(&[StorageGetManyRequest {
+                space: space(&address),
+                keys: &keys,
+                opts: Default::default(),
+            }])
+            .await
+            .unwrap()
+            .values;
+        assert!(
+            values[0].is_none(),
+            "direct native changes need no persisted locator"
+        );
+        drop(read);
+        let response = authority
+            .read_sync_native_metadata(&NativeMetadataRequest {
+                epoch_id: "00000000-0000-7000-8000-000000000291".into(),
+                objects: vec![address.clone()],
+            })
+            .await
+            .unwrap();
+        let locator = crate::tracked_state::decode_change_locator(
+            ChangeId::parse_lix(&change, "test change").unwrap(),
+            &response.objects[0].bytes,
+        )
+        .unwrap();
+        assert_eq!(locator.change_id.to_string(), change);
+        assert_eq!(response.objects[0].address, address);
+        authority.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_random_locator_round_trip_is_epoch_bound_and_conflict_checked() {
+        let (state, mut request, mut response) = fixture().await;
+        let change =
+            ChangeId::new(uuid::Uuid::parse_str("91e23c10-c68a-41b6-a0d1-e9b359727441").unwrap());
+        let locator = crate::tracked_state::CommitDeltaChangeLocator {
+            change_id: change,
+            commit_id: canonical_id(&state.descriptor().selected_branch.head.commit_id).unwrap(),
+            segment_index: 7,
+            ordinal: 3,
+        };
+        let address = NativeMetadataRef::ChangeLocator(change.to_string());
+        request.objects = vec![address.clone()];
+        response.objects = vec![NativeMetadata {
+            address: address.clone(),
+            bytes: crate::tracked_state::encode_change_locator(locator),
+        }];
+        validate_bytes(&address, &response.objects[0].bytes).unwrap();
+        let adapter = StorageAdapter::new(Memory::new());
+        let mut writes = adapter.new_write_set();
+        let guard = stage_partial_replica_state(&mut writes, &state, None).unwrap();
+        adapter
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions: vec![guard],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        adapter.admit_partial_replica_writer(super::super::partial_replica_write_capability());
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let mut writes = adapter.new_write_set();
+        let guards = stage_native_metadata(&read, &mut writes, &state, &request, &response)
+            .await
+            .unwrap();
+        drop(read);
+        adapter
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions: guards,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        assert!(
+            native_metadata_is_resident(&read, &state, &address)
+                .await
+                .unwrap()
+        );
+        let mut changed = locator;
+        changed.ordinal += 1;
+        response.objects[0].bytes = crate::tracked_state::encode_change_locator(changed);
+        assert!(
+            stage_native_metadata(
+                &read,
+                &mut adapter.new_write_set(),
+                &state,
+                &request,
+                &response
+            )
+            .await
+            .is_err()
+        );
+        request.epoch_id = "00000000-0000-7000-8000-000000000292".into();
+        assert!(
+            stage_native_metadata(
+                &read,
+                &mut adapter.new_write_set(),
+                &state,
+                &request,
+                &response
+            )
+            .await
+            .is_err()
+        );
+    }
 
     async fn fixture() -> (
         PartialReplicaState,

@@ -1690,10 +1690,13 @@ pub(crate) async fn stage_deterministic_identity_witness_migration(
             "witness migration collection identity closure mismatch",
         ));
     }
-    let prior = PointReadPlan::new(DETERMINISTIC_IDENTITY_WITNESS_SPACE, std::slice::from_ref(&key))
-        .materialize(read, StorageGetOptions::default())
-        .await?
-        .value;
+    let prior = PointReadPlan::new(
+        DETERMINISTIC_IDENTITY_WITNESS_SPACE,
+        std::slice::from_ref(&key),
+    )
+    .materialize(read, StorageGetOptions::default())
+    .await?
+    .value;
     let witness_guard = match prior.into_iter().next().flatten() {
         Some(StorageProjectedValue::FullValue(expected)) => StoragePrecondition::KeyValueEquals {
             space: DETERMINISTIC_IDENTITY_WITNESS_SPACE,
@@ -4223,6 +4226,43 @@ where
         )
         .await?;
         let Some(control) = control else {
+            // A sparse root does not certify tracked collection completeness.
+            // Its separately initialized local plane can nevertheless certify
+            // that no deterministic untracked setting has ever been installed.
+            let key = StorageKey(Bytes::from(hot_collection_control_key(
+                crate::GLOBAL_BRANCH_ID,
+                branch_generation,
+                scope,
+            )));
+            let witnesses = PointReadPlan::new(DETERMINISTIC_IDENTITY_WITNESS_SPACE, &[key])
+                .materialize(&self.store, StorageGetOptions::default())
+                .await?
+                .value;
+            if let Some(Some(StorageProjectedValue::FullValue(bytes))) = witnesses.first() {
+                let witness: DeterministicIdentityWitness =
+                    storage_codec::decode("deterministic identity witness", bytes)?;
+                if !witness.collection_control.is_empty() || witness.presence != 0 {
+                    return Err(head_value_error(
+                        "deterministic setting collection control is missing",
+                    ));
+                }
+                let root_key = StorageKey(Bytes::from(hot_scope_prefix(
+                    crate::GLOBAL_BRANCH_ID,
+                    branch_generation,
+                )));
+                let roots = PointReadPlan::new(ROOT_CURRENT_BASE_SPACE, &[root_key])
+                    .materialize(&self.store, StorageGetOptions::default())
+                    .await?
+                    .value;
+                if let Some(Some(StorageProjectedValue::FullValue(root))) = roots.first()
+                    && root.len() == 16
+                {
+                    return Ok(());
+                }
+                return Err(head_value_error(
+                    "empty local deterministic witness lacks its native root",
+                ));
+            }
             return if allow_bootstrap_absence {
                 Ok(())
             } else {
@@ -5989,6 +6029,40 @@ where
         .await
     }
 
+    /// Certifies only the fresh local deterministic plane, never the tracked
+    /// collection behind a sparse root. The caller must fence this generation
+    /// empty and publish its root marker in the same write set.
+    pub(crate) fn stage_empty_root_deterministic_witness(
+        &mut self,
+        branch_id: &str,
+        generation: CommitId,
+    ) -> Result<(), LixError> {
+        if branch_id != crate::GLOBAL_BRANCH_ID {
+            return Ok(());
+        }
+        let scope = crate::collection_generation::CollectionScopeRef {
+            schema_key: EXACT_CLOSURE_SCHEMA_KEY,
+            file_id: None,
+        };
+        let witness = DeterministicIdentityWitness {
+            collection_control: Vec::new(),
+            presence: 0,
+        };
+        self.writes.put(
+            DETERMINISTIC_IDENTITY_WITNESS_SPACE,
+            StorageKey(Bytes::from(hot_collection_control_key(
+                branch_id, generation, scope,
+            ))),
+            StorageValue {
+                bytes: Bytes::from(storage_codec::encode(
+                    "deterministic identity witness",
+                    &witness,
+                )?),
+            },
+        );
+        Ok(())
+    }
+
     /// Copies locally owned untracked rows into an unpublished root generation.
     /// This stages no tracked completeness or working-diff coverage. The caller
     /// must CAS the source branch control and fence the target generation empty
@@ -6006,6 +6080,11 @@ where
             ));
         }
         let rows = load_hot_untracked_generation(self.store, branch_id, source_generation).await?;
+        if !rows.keys().any(|identity| {
+            identity.schema_key == EXACT_CLOSURE_SCHEMA_KEY && identity.file_id.is_none()
+        }) {
+            self.stage_empty_root_deterministic_witness(branch_id, target_generation)?;
+        }
         if rows.is_empty() {
             return Ok(());
         }
@@ -14787,6 +14866,88 @@ mod tests {
     /// and untracked rows share one serving generation, a tracked collection
     /// replacement would silently delete the branch's history-free rows in the
     /// same schema scope unless they are exempt.
+    #[tokio::test]
+    async fn empty_root_local_witness_does_not_mask_removed_mutated_control() {
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = CommitId::for_test_label("empty-local-witness");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let mut writes = storage.new_write_set();
+        let context = TrackedHeadContext::new();
+        let mut writer = context.writer(&read, &mut writes);
+        writer.stage_root_current_base(crate::GLOBAL_BRANCH_ID, generation, generation);
+        writer
+            .stage_empty_root_deterministic_witness(crate::GLOBAL_BRANCH_ID, generation)
+            .unwrap();
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let pk = RowPk::single("lix_deterministic_mode");
+        let identity = TrackedStateKeyRef {
+            schema_key: EXACT_CLOSURE_SCHEMA_KEY,
+            row_pk: &pk,
+            file_id: None,
+        };
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        context
+            .reader(&read)
+            .validate_deterministic_setting_absence(generation, identity, false)
+            .await
+            .unwrap();
+        drop(read);
+        // A real physical KV collection replaces the fresh-plane witness.
+        let mut rows = HotRowMap::new();
+        rows.insert(
+            HeadRowIdentity {
+                schema_key: EXACT_CLOSURE_SCHEMA_KEY.into(),
+                row_pk: RowPk::single("other-local-setting"),
+                file_id: None,
+            },
+            encoded_test_hot_value(generation, true, false),
+        );
+        let mut writes = storage.new_write_set();
+        stage_complete_collection_controls(&mut writes, crate::GLOBAL_BRANCH_ID, generation, &rows)
+            .unwrap();
+        stage_complete_hot_rows(&mut writes, crate::GLOBAL_BRANCH_ID, generation, rows);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let mut writes = storage.new_write_set();
+        writes.delete(
+            COLLECTION_CONTROL_SPACE,
+            StorageKey(Bytes::from(hot_collection_control_key(
+                crate::GLOBAL_BRANCH_ID,
+                generation,
+                crate::collection_generation::CollectionScopeRef {
+                    schema_key: EXACT_CLOSURE_SCHEMA_KEY,
+                    file_id: None,
+                },
+            ))),
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let error = context
+            .reader(&read)
+            .validate_deterministic_setting_absence(generation, identity, false)
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("collection control is missing"));
+    }
+
     #[tokio::test]
     async fn witness_migration_preserves_replaced_global_collection_with_existing_settings() {
         let generation = CommitId::for_test_label("witness-replaced-serving");

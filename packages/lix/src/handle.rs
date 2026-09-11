@@ -2043,7 +2043,8 @@ where
                     None => None,
                 };
 
-                self.session.switch_branch(options).await
+                self.retry_sync_demands(|| self.session.switch_branch(options.clone()))
+                    .await
             })
         }
     }

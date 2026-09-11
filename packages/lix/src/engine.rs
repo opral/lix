@@ -257,7 +257,8 @@ where
                         .with_partial_scope_policy(
                             &expected.descriptor().selected_branch.branch_id,
                             &expected.descriptor().global_branch.branch_id,
-                        ),
+                        )
+                        .with_partial_read_preparation_epoch(expected.epoch_id()),
                 )
             } else {
                 hot_state
@@ -875,10 +876,25 @@ where
         if control.tracked_generation != expected.serving_generation(&branch.branch_id)?
             || !matches!(marker, Some(crate::storage_adapter::StorageProjectedValue::FullValue(ref bytes)) if bytes.as_ref() == base.as_uuid().as_bytes())
         {
+            let (root_commit_id, root_bytes) = match &marker {
+                Some(crate::storage_adapter::StorageProjectedValue::FullValue(bytes)) => (
+                    uuid::Uuid::from_slice(bytes).ok().map(|id| id.to_string()),
+                    Some(bytes.len()),
+                ),
+                _ => (None, None),
+            };
             return Err(LixError::new(
                 "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
                 "partial replica native root serving coordinates disagree with its admitted base",
-            ));
+            ).with_details(serde_json::json!({
+                "branchId": branch.branch_id,
+                "headCommitId": control.head_commit_id.to_string(),
+                "servingGeneration": control.tracked_generation.to_string(),
+                "expectedServingGeneration": expected.serving_generation(&branch.branch_id)?.to_string(),
+                "rootCommitId": root_commit_id,
+                "rootBytes": root_bytes,
+                "expectedRootCommitId": base.to_string(),
+            })));
         }
     }
     Ok(Arc::from(expected.repository_id()))

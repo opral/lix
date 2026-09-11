@@ -540,7 +540,8 @@ where
     let mut renewal_deadline =
         web_time::Instant::now() + lease_renewal_delay(state.baseline_lease().expires_at_ms);
     let mut baseline_expired: Option<LixError> = None;
-    while *shutdown_rx.borrow() == SyncShutdown::Running {
+    let mut terminal_error = None;
+    'worker: while *shutdown_rx.borrow() == SyncShutdown::Running {
         if let Some(engine) = &engine {
             engine.sync_mode().ensure_partial_admission_healthy()?;
             let current = engine.sync_mode().partial_admission().ok_or_else(|| {
@@ -642,6 +643,10 @@ where
                     // trigger a zero-delay renewal loop.
                     Ok(_) => renewal_deadline = web_time::Instant::now() + Duration::from_millis(crate::gc::NATIVE_BASELINE_LEASE_TTL_MS / 2),
                     Err(error) => {
+                        if is_terminal_partial_transport_error(&error) {
+                            terminal_error = Some(error);
+                            break 'worker;
+                        }
                         tracing::warn!(code = %error.code, message = %error.message, "partial replica baseline renewal failed");
                         if error.code == "LIX_PARTIAL_BASELINE_EXPIRED" {
                             baseline_expired = Some(error);
@@ -675,6 +680,10 @@ where
                 result = upload => match result {
                     Ok(progress) => { upload_due = progress; retry_upload = false; retry_delay = Duration::from_millis(100); },
                     Err(error) => {
+                        if is_terminal_partial_transport_error(&error) {
+                            terminal_error = Some(error);
+                            break 'worker;
+                        }
                         tracing::warn!(code = %error.code, message = %error.message, "partial replica upload retained for retry");
                         retry_upload = true;
                         retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
@@ -766,6 +775,10 @@ where
                         publication = Some(Box::pin(super::partial_publication::publish_prepared_partial(engine.clone(), prepared)));
                     },
                     Err(error) => {
+                        if is_terminal_partial_transport_error(&error) {
+                            terminal_error = Some(error);
+                            break 'worker;
+                        }
                         if error.code == "LIX_PARTIAL_REPLICA_REBASE_REQUIRED" && !retry_upload { upload_due = true; }
                         tracing::warn!(code=%error.code, "partial reconciliation retained existing working set");
                         watch_after = web_time::Instant::now() + if error.code == "LIX_PARTIAL_REPLICA_BASELINE_RECOVERY_PENDING" { Duration::from_secs(30) } else { Duration::from_secs(1) };
@@ -909,7 +922,15 @@ where
                     watch_after = web_time::Instant::now();
                 }
             }
+            if let Err(error) = &result {
+                if is_terminal_partial_transport_error(error) {
+                    terminal_error = Some(error.clone());
+                }
+            }
             let _ = demand.response.send(result);
+            if terminal_error.is_some() {
+                break;
+            }
         }
     }
     // Dropping a publication completion future cannot cancel its already
@@ -919,19 +940,32 @@ where
     // Waiting here unconditionally could deadlock a caller closing while it
     // still holds an explicit transaction's operation gate.
     demand_rx.close();
+    let stopped = terminal_error.clone().unwrap_or_else(stopped_error);
+    if let Some(demand) = queued_demand {
+        let _ = demand.response.send(Err(stopped.clone()));
+    }
     while let Some(demand) = demand_rx.recv().await {
-        let _ = demand.response.send(Err(stopped_error()));
+        let _ = demand.response.send(Err(stopped.clone()));
     }
     // Close the authenticated authority session without letting a disconnected
     // network indefinitely delay local shutdown.
     let Some(transport) = transport else {
-        return Ok(());
+        return terminal_error.map_or(Ok(()), Err);
     };
     let close = transport.close_session().fuse();
     let deadline = sleep(Duration::from_secs(1)).fuse();
     futures_util::pin_mut!(close, deadline);
     select_biased! { _ = close => {}, _ = deadline => {} }
-    Ok(())
+    terminal_error.map_or(Ok(()), Err)
+}
+
+fn is_terminal_partial_transport_error(error: &LixError) -> bool {
+    matches!(
+        error.code.as_str(),
+        super::SYNC_PROTOCOL_MISMATCH_CODE
+            | super::SYNC_REPOSITORY_ID_MISMATCH_CODE
+            | super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE
+    )
 }
 
 #[cfg(test)]

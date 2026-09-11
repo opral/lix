@@ -2,7 +2,7 @@ import {openLix} from "@lix-js/sdk";
 import {OpfsStorage} from "@lix-js/storage-opfs";
 import {expect,test} from "vitest";
 
-type Fixture={dimension:string;size:number;url:string;key:string;headers?:Record<string,string>};
+type Fixture={dimension:string;size:number;url:string;key:string;expected:unknown;headers?:Record<string,string>};
 const readSql="SELECT value FROM lix_key_value WHERE key = $1";
 const writeSql="UPDATE lix_key_value SET value = $1 WHERE key = $2";
 
@@ -38,26 +38,28 @@ test("compares complete and partial OPFS warm SQL in the same WASM artifact",asy
       await lix.execute(`INSERT INTO lix_key_value(key,value) VALUES ${values}`);
      }
     }
-    await lix.execute(readSql,[fixture.key]);
-    await lix.execute(writeSql,["paired preparation",fixture.key]);
+    const hoverStart=performance.now();
+    const prefetched=await lix.execute(readSql,[fixture.key]);
+    const hoverPrefetchMs=performance.now()-hoverStart;
     offline=true;for(const controller of controllers)controller.abort();
+    expect(prefetched.rows[0]?.value).toEqual(fixture.expected);
     const selectMs:number[]=[],updateMs:number[]=[];
     for(let i=0;i<35;i++) {
      let begin=performance.now();
      const row=await lix.execute(readSql,[fixture.key]);
      const elapsed=performance.now()-begin;
-     expect(row.rows[0]?.value).toBe(i===0?"paired preparation":`paired edit ${i-1}`);
+     expect(row.rows[0]?.value).toBe(i===0?fixture.expected:`paired edit ${i-1}`);
      if(i>=5)selectMs.push(elapsed);
      begin=performance.now();await lix.execute(writeSql,[`paired edit ${i}`,fixture.key]);
      if(i>=5)updateMs.push(performance.now()-begin);
     }
     expect(attempts.filter(a=>/\/sync\/native-(objects|object-range|metadata)$/.test(a.path)||(a.method==="GET"&&/\/sync\/(blob|chunk)$/.test(a.path)))).toHaveLength(0);
-    results.push({mode,rows:fixture.size,selectMs,updateMs,offlineNetworkAttempts:attempts,excludedWarmups:5});
+    results.push({mode,rows:fixture.size,hoverPrefetchMs,selectMs,updateMs,offlineNetworkAttempts:attempts,excludedWarmups:5});
    }finally{await lix.close();}
   }
  }
  const artifact={benchmark:"same-artifact-complete-vs-partial-opfs",userAgent:navigator.userAgent,generatedAt:new Date().toISOString(),results,
-  limits:"Same SQL/keys/row count/payload and OPFS provider/WASM artifact; complete native layout is intentionally materialized, partial working set hydrated on demand. No telemetry enabled in timing pass. Background upload attempts retained in partial mode."};
+  limits:"Same SQL/keys/row count/payload and OPFS provider/WASM artifact; complete native layout is intentionally materialized, partial working set hydrated on demand. First SELECT is the only online prefetch; all updates run disconnected. Five offline warmup iterations excluded from timing arrays but included in zero-hydration checks. No telemetry enabled in timing pass. Background upload attempts retained in partial mode."};
  const saved=await fetch("/__partial_sync_profile_result",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(artifact)});
  expect(saved.ok).toBe(true);console.info(JSON.stringify(artifact));
 },600_000);

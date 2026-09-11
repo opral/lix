@@ -8071,7 +8071,20 @@ fn hydrate_compact_replacement_direct_run(
     Ok(())
 }
 
-pub(crate) async fn load_change_records_by_ids(
+// The selected native loader is shared by current reads, history, and commit
+// preparation. Erase its recursive decoding graph at this owner boundary.
+// StorageAdapterRead and its futures are Send on every engine target.
+type SelectedChangeRecordsFuture<'a> =
+    futures_util::future::BoxFuture<'a, Result<Vec<crate::changelog::ChangeRecord>, LixError>>;
+
+pub(crate) fn load_change_records_by_ids<'a>(
+    store: &'a (impl StorageAdapterRead + ?Sized),
+    change_ids: &'a [crate::changelog::ChangeId],
+) -> SelectedChangeRecordsFuture<'a> {
+    Box::pin(load_change_records_by_ids_inner(store, change_ids))
+}
+
+async fn load_change_records_by_ids_inner(
     store: &(impl StorageAdapterRead + ?Sized),
     change_ids: &[crate::changelog::ChangeId],
 ) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
@@ -8166,9 +8179,11 @@ pub(crate) async fn load_change_records_by_ids(
             .zip(locator_values.value)
             .map(|((_, change_id), value)| {
                 let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
-                    replacement_payload_error(&format!(
-                        "selected change '{change_id}' has no authoritative locator"
-                    ))
+                    super::NativeMetadataRef::ChangeLocator(change_id.to_string()).annotate_missing(
+                        replacement_payload_error(&format!(
+                            "selected change '{change_id}' has no authoritative locator"
+                        )),
+                    )
                 })?;
                 decode_change_locator(*change_id, &bytes)
             })
@@ -8208,10 +8223,12 @@ async fn load_explicit_change_records_at_locators_selected(
         let state = load_point_replay_commit_state(store, commit_id)
             .await?
             .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "tracked_state selected change references missing commit '{commit_id}'"
+                super::NativeMetadataRef::CommitStateHeader(commit_id.to_string()).annotate_missing(
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "tracked_state selected change references missing commit '{commit_id}'"
+                        ),
                     ),
                 )
             })?;
@@ -8219,10 +8236,11 @@ async fn load_explicit_change_records_at_locators_selected(
             let source = load_point_replay_commit_state(store, source_commit_id)
                 .await?
                 .ok_or_else(|| {
-                    replacement_payload_error(&format!(
-                        "selected-source commit '{}' references missing authority '{}'",
-                        state.commit_id, source_commit_id
-                    ))
+                    super::NativeMetadataRef::CommitStateHeader(source_commit_id.to_string())
+                        .annotate_missing(replacement_payload_error(&format!(
+                            "selected-source commit '{}' references missing authority '{}'",
+                            state.commit_id, source_commit_id
+                        )))
                 })?;
             if source.mutations.selected_source_commit_id().is_some() {
                 return Err(replacement_payload_error(
@@ -8863,7 +8881,7 @@ pub(crate) fn decode_change_locator(
     })
 }
 
-fn encode_change_locator(locator: CommitDeltaChangeLocator) -> Vec<u8> {
+pub(crate) fn encode_change_locator(locator: CommitDeltaChangeLocator) -> Vec<u8> {
     let packed_ordinal = u64::from(locator.segment_index)
         * u64::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS).expect("segment row limit fits u64")
         + u64::from(locator.ordinal);
@@ -11081,10 +11099,13 @@ pub(crate) async fn load_local_selected_change_owner_commit_ids(
             explicit_locators[index]
                 .map(|locator| (index, locator))
                 .ok_or_else(|| {
-                    replacement_payload_error(&format!(
+                    super::NativeMetadataRef::ChangeLocator(
+                        selected[index].value.change_id.to_string(),
+                    )
+                    .annotate_missing(replacement_payload_error(&format!(
                         "selected change '{}' has no authoritative locator",
                         selected[index].value.change_id
-                    ))
+                    )))
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;

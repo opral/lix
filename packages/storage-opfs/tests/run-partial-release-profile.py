@@ -75,7 +75,7 @@ def run(label,fixture,config,large=False,dimension=None):
   browser_manifest=folder/'browser-manifest.json';browser_manifest.write_text(json.dumps(selected,indent=2))
   env.update(LIX_PARTIAL_PROFILE_MANIFEST=str(browser_manifest),LIX_PARTIAL_PROFILE_RESULT=str(result))
   # Each invocation creates a fresh browser process and unique OPFS databases.
-  # Each run gets a newly seeded authority: preparation/offline edits mutate it.
+  # Each run gets a fresh authority; the file workflow includes a remote insertion.
   with open(folder/'browser.log','w') as log:
    subprocess.run(['./node_modules/.bin/vitest','run','--config',config,'--reporter=verbose'],cwd=repo/'packages/storage-opfs',env=env,stdout=log,stderr=subprocess.STDOUT,check=True,timeout=1200)
   assert_artifacts_unchanged()
@@ -93,7 +93,8 @@ def run(label,fixture,config,large=False,dimension=None):
      ordered=sorted(values);summary[key]={'samples':len(values),'median':statistics.median(values),'p95':ordered[math.ceil(len(values)*.95)-1]}
    if 'timings' in row:
     summary['timings']=row['timings']
-    summary['fileHoverPrefetchSemantics']='Ordinary SELECT execution loads file content without publishing a write. Historical preparation phases used different APIs and are not directly comparable.'
+    summary['retainedFileReadSemantics']='Ordinary SELECT after background publication; this phase is already warm. First-SELECT-only offline editing is covered separately. Historical preparation phases used different APIs and are not directly comparable.'
+    summary['remotePublicationSemantics']='Elapsed from remote INSERT acknowledgment through detection, including remote session close and polling overhead.'
    summaries.append(summary)
   (folder/'summary.json').write_text(json.dumps(summaries,indent=2)+'\n')
   enriched=folder/'result-with-opening-phases.json';enriched.write_text(json.dumps(payload,indent=2)+'\n')

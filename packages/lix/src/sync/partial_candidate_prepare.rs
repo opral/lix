@@ -36,9 +36,8 @@ impl crate::storage_adapter::StorageScanSource for CandidateScanSource<'_> {
         limit_rows: usize,
     ) -> std::pin::Pin<
         Box<
-            dyn Future<
-                    Output = Result<crate::storage_adapter::StorageScanChunk, StorageError>,
-                > + Send
+            dyn Future<Output = Result<crate::storage_adapter::StorageScanChunk, StorageError>>
+                + Send
                 + '_,
         >,
     > {
@@ -499,6 +498,12 @@ where
         )
         .await?;
     }
+    // Foreground row reads promise the same bounded native edit inputs. Prepare
+    // them against these unpublished controls before they become visible; this
+    // candidate context intentionally has no trusted live-epoch proof cache.
+    hot.reader(read.clone())
+        .prepare_captured_read_interests(interests, state.active_account_id())
+        .await?;
     drop(hot);
     drop(read);
     Ok(PreparedCandidateState {

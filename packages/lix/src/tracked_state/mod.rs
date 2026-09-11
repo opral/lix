@@ -73,8 +73,6 @@ pub(crate) use scoped_current_state::attest_scoped_range_root;
 pub(crate) use scoped_current_state::incomplete_touched_scope_filter;
 pub(crate) use scoped_range::{SCOPED_RANGE_NODE_SPACE, validate_scoped_range_trees};
 pub(crate) use storage::TRACKED_STATE_TREE_CHUNK_SPACE;
-#[cfg(feature = "storage-benches")]
-pub(crate) use storage::decode_change_locator;
 pub(crate) use storage::load_commit_state_authority_ids;
 pub(crate) use storage::stage_commit_state_manifest;
 #[cfg(test)]
@@ -124,6 +122,9 @@ pub(crate) use storage::{
 pub(crate) use storage::{
     arm_point_replay_authority_batch_probe_for_test, reset_commit_delta_scan_probe_for_test,
     take_commit_delta_scan_probe_for_test, take_point_replay_authority_batch_probe_for_test,
+};
+pub(crate) use storage::{
+    decode_change_locator, encode_change_locator, load_canonical_change_locator,
 };
 pub(crate) use tree::TrackedStateTree;
 // Manufacturing a repository swept by the code that shipped before the
@@ -178,4 +179,10 @@ pub mod bench {
     pub use super::bench_support::*;
 }
 
-pub(crate) use row_pk_index::prepare_row_pk_index_mutation_inputs;
+pub(crate) use row_pk_index::{
+    prepare_current_row_mutation_inputs, prepare_row_pk_index_mutation_inputs,
+    prepare_row_pk_mutation_inputs_at_commit,
+};
+
+// Exact canonical payload authority for current-row edit preparation.
+pub(crate) use storage::load_change_records_by_ids;

@@ -23,9 +23,9 @@ use crate::common::LixTimestamp;
 use crate::filesystem::stage_path_index_revision;
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::hot_state::{
-    CompleteWorkingDiffMode, HotStateContext, HotStateRowRequest, HotTrackedSnapshot,
-    MaterializedHotStateRow, TrackedHeadContext, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
-    stage_tracked_working_diff_epoch,
+    CompleteWorkingDiffMode, HotStateContext, HotStateExactBatchRequest, HotStateProjection,
+    HotTrackedSnapshot, MaterializedHotStateRow, TrackedHeadContext,
+    TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage, stage_tracked_working_diff_epoch,
 };
 use crate::row_pk::RowPk;
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
@@ -2905,7 +2905,6 @@ fn lifecycle_snapshot_commit_ids(
                 .is_some();
         let partial_checkpoint_can_reuse_generation = partial_checkpoint_rebase_commit_id(
             root,
-            staged,
             staged_commits,
             observations,
             checkpoint_epochs,
@@ -2968,7 +2967,6 @@ fn selected_refs_require_complete_snapshot(
 
 fn partial_checkpoint_rebase_commit_id(
     root: &PendingTrackedRoot,
-    staged: &StagedChangelogCommit,
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
     checkpoint_epochs: &BTreeMap<String, CheckpointEpochBinding>,
@@ -2983,12 +2981,12 @@ fn partial_checkpoint_rebase_commit_id(
             .get(&root.branch_id)
             .and_then(|observation| observation.control)
             .is_some()
-        && !selected_refs_require_complete_snapshot(&staged.selected_change_batches)
-        && staged_commits
-            .get(&checkpoint_commit_id)
-            .is_some_and(|checkpoint| {
-                !selected_refs_require_complete_snapshot(&checkpoint.selected_change_batches)
-            }))
+        // The certified checkpoint selection already closes filesystem
+        // dependencies over the before/after snapshots. Its child preserves
+        // current file/directory values: only ownership and the working-diff
+        // baseline change. Reuse the admitted native generation instead of
+        // reconstructing a complete filesystem snapshot and losing its root.
+        && staged_commits.contains_key(&checkpoint_commit_id))
     .then_some(checkpoint_commit_id)
 }
 
@@ -3938,7 +3936,6 @@ async fn stage_tracked_head(
         // instead of rebuilding the complete branch snapshot from history.
         let partial_checkpoint_commit_id = partial_checkpoint_rebase_commit_id(
             root,
-            staged,
             staged_commits,
             observations,
             checkpoint_epochs,
@@ -5738,14 +5735,11 @@ async fn stage_branch_head_control_publications(
                             .any(|branch| {
                                 branch.branch_id == *branch_id
                                     && branch.ref_change_id == old_control.ref_change_id
-                                    && branch.head.commit_id
-                                        == old_control.head_commit_id
+                                    && branch.head.commit_id == old_control.head_commit_id
                                     && state.serving_generation(branch_id).ok()
                                         == Some(old_control.tracked_generation)
                                     && old_control.working_diff_checkpoint_commit_id.is_some_and(
-                                        |checkpoint| {
-                                            checkpoint == branch.checkpoint.commit_id
-                                        },
+                                        |checkpoint| checkpoint == branch.checkpoint.commit_id,
                                     )
                             })
                     });
@@ -7276,13 +7270,22 @@ async fn validate_active_account_and_account_rows(
         crate::commit_graph::CommitGraphContext::new(),
     )
     .reader(&*read)
-    .load_row(&HotStateRowRequest {
-        schema_key: "lix_account".to_string(),
-        branch_id: crate::GLOBAL_BRANCH_ID.to_string(),
-        row_pk: account_pk,
-        file_id: NullableKeyFilter::Null,
+    .load_exact_batch(&HotStateExactBatchRequest {
+        rows: vec![crate::hot_state::HotStateExactRowRequest {
+            schema_key: "lix_account".to_string(),
+            branch_id: crate::GLOBAL_BRANCH_ID.to_string(),
+            row_pk: account_pk,
+            file_id: None,
+        }],
+        projection: HotStateProjection {
+            columns: vec!["snapshot_content".to_owned()],
+        },
+        untracked: None,
+        include_tombstones: false,
     })
-    .await?;
+    .await?
+    .row(0)
+    .map(crate::hot_state::MaterializedHotStateRowRef::to_owned);
     if let Some(account) = account {
         let account_snapshot = account.snapshot_content.ok_or_else(|| {
             LixError::new(
@@ -7533,8 +7536,7 @@ mod tests {
                         crate::storage_adapter::REVISION_SPACE,
                         "warm account validation unexpectedly loads native inputs"
                     );
-                    self.keys
-                        .fetch_add(request.keys.len(), Ordering::Relaxed);
+                    self.keys.fetch_add(request.keys.len(), Ordering::Relaxed);
                 }
                 self.inner.get_many(requests).await
             }

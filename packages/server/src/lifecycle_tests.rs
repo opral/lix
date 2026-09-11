@@ -206,7 +206,7 @@ async fn lifecycle_snapshot_import_rejects_corruption_and_retries() {
 }
 
 #[tokio::test]
-async fn local_create_then_sync_uses_original_storage_and_preserves_history() {
+async fn local_create_preserves_original_storage_and_hosted_replica_history() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let mut manager = LixRuntimeManager::new_in_memory(4);
@@ -253,17 +253,46 @@ async fn local_create_then_sync_uses_original_storage_and_preserves_history() {
         .execute("SELECT id FROM lix_commit", &[])
         .await
         .unwrap();
+    let original_rows = source
+        .execute(
+            "SELECT row_ref FROM lix_history('lix_key_value') WHERE key = 'local-before-hosting'",
+            &[],
+        )
+        .await
+        .unwrap();
     let hosted = lix_sdk::create_lix()
         .with_server(lix_sdk::ServerOptions::new(&origin).with_headers(headers.clone()))
         .from_lix(&source)
         .await
         .expect("upload existing local repository through the public API");
     source.close().await.unwrap();
-    let synced = lix_sdk::open_lix()
+    // Hosting copies the repository; it does not turn a full local store into
+    // a sparse replica or discard the original local history.
+    let original = lix_sdk::open_lix()
         .with_storage(storage)
+        .await
+        .expect("reopen the original local storage after hosting");
+    let current_history = original
+        .execute("SELECT id FROM lix_commit", &[])
+        .await
+        .unwrap();
+    let ids = current_history
+        .rows()
+        .iter()
+        .map(|row| row.get::<String>("id").unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    let original_ids = original_history
+        .rows()
+        .iter()
+        .map(|row| row.get::<String>("id").unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(ids, original_ids);
+    original.close().await.unwrap();
+    let synced = lix_sdk::open_lix()
+        .with_storage(lix_sdk::Memory::new())
         .with_server(lix_sdk::ServerOptions::new(&hosted.url).with_headers(headers.clone()))
         .await
-        .expect("connect the original local storage to its hosted copy");
+        .expect("open a sparse replica of the hosted copy");
     let data = synced
         .execute(
             "SELECT value FROM lix_key_value WHERE key='local-before-hosting'",
@@ -275,17 +304,26 @@ async fn local_create_then_sync_uses_original_storage_and_preserves_history() {
         data.rows()[0].get::<Value>("value").unwrap(),
         Value::String("retained".to_owned())
     );
-    let current_history = synced
-        .execute("SELECT id FROM lix_commit", &[])
+    let hosted_rows = synced
+        .execute(
+            "SELECT row_ref FROM lix_history('lix_key_value') WHERE key = 'local-before-hosting'",
+            &[],
+        )
         .await
         .unwrap();
-    let ids = current_history
+    let row_refs = hosted_rows
         .rows()
         .iter()
-        .map(|row| row.get::<String>("id").unwrap())
-        .collect::<std::collections::HashSet<_>>();
-    for row in original_history.rows() {
-        assert!(ids.contains(&row.get::<String>("id").unwrap()));
+        .map(|row| row.get::<lix_sdk::RowRef>("row_ref").unwrap())
+        .collect::<Vec<_>>();
+    let original_refs = original_rows
+        .rows()
+        .iter()
+        .map(|row| row.get::<lix_sdk::RowRef>("row_ref").unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(row_refs.len(), original_refs.len());
+    for row_ref in original_refs {
+        assert!(row_refs.contains(&row_ref));
     }
     synced.close().await.unwrap();
     lix_sdk::delete_lix()
