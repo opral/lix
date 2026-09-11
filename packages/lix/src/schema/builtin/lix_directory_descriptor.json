@@ -1,26 +1,22 @@
 {
   "$schema": "https://lix.dev/schema-v1.json",
   "key": "lix_directory_descriptor",
-  "description": "The identity of a directory: its name and parent. The composed `lix_directory` view derives each path from the chain of parents.",
   "columns": [
     {
       "name": "id",
       "type": "uuid",
       "nullable": false,
-      "default_expression": "uuidv7()",
-      "description": "Stable directory identifier (UUIDv7)."
+      "default_expression": "uuidv7()"
     },
     {
       "name": "name",
       "type": "text",
-      "nullable": false,
-      "description": "Directory name: the last path segment."
+      "nullable": false
     },
     {
       "name": "parent_id",
       "type": "uuid",
-      "nullable": true,
-      "description": "Parent directory (references `lix_directory_descriptor.id`); null for a top-level directory."
+      "nullable": true
     }
   ],
   "primary_key": [

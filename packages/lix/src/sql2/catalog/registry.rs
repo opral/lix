@@ -513,7 +513,6 @@ fn describe_columns(
 /// The engine-owned bookkeeping columns every relation carries.
 fn system_column_description(name: &str) -> Option<&'static str> {
     Some(match name {
-        "lixcol_schema_key" => "Key of the registered schema the row belongs to.",
         "lixcol_file_id" => {
             "File the row belongs to (references lix_file.id); null for rows not scoped to a file."
         }

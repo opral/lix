@@ -212,19 +212,11 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
             }
         })
         .collect();
-    // A repository keeps the seed schema document it was created with, so a
-    // built-in schema whose stored document predates its descriptions still
-    // reads the engine's current words. Descriptions are documentation, not
-    // contract, so no amendment commit is needed for them.
-    let seed = crate::schema::seed_schema_definition(&schema_key)
-        .and_then(|definition| lix_schema::from_value(definition.clone()).ok());
+    // Seed documents that shipped without descriptions keep their text in
+    // the engine (see `schema::seed_schema_description`): the document is
+    // fingerprinted as written, so it cannot gain the words itself.
     let seed_column_description = |name: &str| -> Option<String> {
-        seed.as_ref()?
-            .columns
-            .iter()
-            .find(|column| column.name == name)?
-            .description
-            .clone()
+        crate::schema::seed_schema_description(&schema_key, Some(name)).map(str::to_string)
     };
     let columns = parsed
         .columns
@@ -279,12 +271,12 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
                 SchemaColumnType::String | SchemaColumnType::Integer | SchemaColumnType::Boolean
             )
     });
+    let description = parsed.description.clone().or_else(|| {
+        crate::schema::seed_schema_description(&schema_key, None).map(str::to_string)
+    });
     Ok(SchemaSurfaceSpec {
         schema_key,
-        description: parsed
-            .description
-            .clone()
-            .or_else(|| seed.as_ref().and_then(|seed| seed.description.clone())),
+        description,
         schema_fingerprint,
         primary_key_paths,
         primary_key_component_types,
@@ -488,8 +480,8 @@ mod tests {
 
     #[test]
     fn seed_schemas_read_descriptions_from_the_engine_when_stored_without_them() {
-        // A repository created before lix_key_value carried descriptions
-        // still stores the old document; the surface reads today's words.
+        // lix_key_value shipped without descriptions and its document is
+        // fingerprinted as written; the surface reads the engine's words.
         let stored = json!({
             "$schema": "https://lix.dev/schema-v1.json",
             "key": "lix_key_value",
