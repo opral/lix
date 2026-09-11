@@ -288,8 +288,13 @@ async fn local_create_preserves_original_storage_and_hosted_replica_history() {
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(ids, original_ids);
     original.close().await.unwrap();
+    let replica_directory = tempfile::TempDir::new().unwrap();
     let synced = lix_sdk::open_lix()
-        .with_storage(lix_sdk::Memory::new())
+        .with_storage(
+            lix_filesystem_storage::FilesystemStorage::new(replica_directory.path())
+                .open()
+                .expect("open durable hosted replica storage"),
+        )
         .with_server(lix_sdk::ServerOptions::new(&hosted.url).with_headers(headers.clone()))
         .await
         .expect("open a sparse replica of the hosted copy");
