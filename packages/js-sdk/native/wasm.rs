@@ -29,6 +29,19 @@ use wasm_bindgen_futures::spawn_local;
 use crate::browser_storage::BrowserStorage;
 use crate::js_storage::{JsStorage, JsStorageProvider};
 
+/// Parse the engine SQL dialect for hosts that authorize public SQL.
+#[wasm_bindgen(js_name = parseSqlScript)]
+pub fn parse_sql_script(sql: String, provided_param_count: usize) -> Result<JsValue, JsValue> {
+    let plan = lix::parse_sql_script(&sql, provided_param_count).map_err(lix_error_to_js)?;
+    to_js(&serde_json::json!({
+        "statements": plan.statements.into_iter().map(|statement| serde_json::json!({
+            "sql": statement.sql,
+            "paramStart": statement.params.start,
+            "paramEnd": statement.params.end,
+        })).collect::<Vec<_>>()
+    }))
+}
+
 #[path = "wasm_remote.rs"]
 mod remote;
 #[path = "wasm_session.rs"]
