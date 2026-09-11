@@ -3487,14 +3487,16 @@ pub fn delete_hosted(
     })
 }
 
-#[expect(missing_debug_implementations)]
+// N-API registration is disabled in Rust test builds; JavaScript calls this task.
+#[cfg_attr(test, allow(dead_code))]
+#[derive(Debug)]
 pub struct ConvertReplicaToPartialTask {
     path: String,
     sync_all_files: bool,
     server: ServerOptions,
     branch_id: Option<String>,
 }
-impl napi::Task for ConvertReplicaToPartialTask {
+impl Task for ConvertReplicaToPartialTask {
     type Output = std::result::Result<(), LixError>;
     type JsValue = ();
     fn compute(&mut self) -> Result<Self::Output> {
@@ -3517,6 +3519,7 @@ impl napi::Task for ConvertReplicaToPartialTask {
         output.map_err(|error| lix_error_to_napi_error(&env, error))
     }
 }
+#[cfg_attr(test, allow(dead_code))]
 #[napi(js_name = "convertFilesystemReplicaToPartial")]
 pub fn convert_filesystem_replica_to_partial(
     path: String,
@@ -3533,13 +3536,15 @@ pub fn convert_filesystem_replica_to_partial(
     }))
 }
 
-#[expect(missing_debug_implementations)]
+// N-API registration is disabled in Rust test builds; JavaScript calls this task.
+#[cfg_attr(test, allow(dead_code))]
+#[derive(Debug)]
 pub struct RetryReplicaMigrationCleanupTask {
     path: String,
     sync_all_files: bool,
     server: ServerOptions,
 }
-impl napi::Task for RetryReplicaMigrationCleanupTask {
+impl Task for RetryReplicaMigrationCleanupTask {
     type Output = std::result::Result<u32, LixError>;
     type JsValue = u32;
     fn compute(&mut self) -> Result<Self::Output> {
@@ -3564,6 +3569,7 @@ impl napi::Task for RetryReplicaMigrationCleanupTask {
         output.map_err(|error| lix_error_to_napi_error(&env, error))
     }
 }
+#[cfg_attr(test, allow(dead_code))]
 #[napi(js_name = "retryFilesystemReplicaMigrationCleanup")]
 pub fn retry_filesystem_replica_migration_cleanup(
     path: String,
