@@ -6,7 +6,11 @@
 pub const PROTOCOL_VERSION: u32 = crate::SERVER_PROTOCOL_VERSION;
 
 #[cfg(feature = "server-protocol")]
+mod fingerprint;
+#[cfg(feature = "server-protocol")]
 mod handler;
+#[cfg(feature = "server-protocol")]
+mod request_value;
 #[cfg(feature = "server-protocol")]
 pub use handler::*;
 

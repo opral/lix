@@ -2411,12 +2411,12 @@ mod tests {
             90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90,
         ];
         let coverage: WorkingDiffIndexCoverage =
-            crate::storage_codec::decode("legacy working-diff coverage", LEGACY)
+            storage_codec::decode("legacy working-diff coverage", LEGACY)
                 .expect("decode existing coverage without a format migration");
         assert_eq!(coverage.group_count, 300);
         assert_eq!(coverage.group_key_xor, [0x5a; 32]);
         assert_eq!(
-            crate::storage_codec::encode("working-diff coverage", &coverage).unwrap(),
+            storage_codec::encode("working-diff coverage", &coverage).unwrap(),
             LEGACY,
         );
     }
