@@ -17,3 +17,6 @@ subscribers.
 Pending edits and checkpoint dependencies upload in bounded waves, including
 recovery after lost replies. SQL retries preserve the completion boundary: an
 error reported after execution or commit cannot replay the operation.
+
+Read-interest journal flushing retries expired snapshots internally, so concurrent
+tab startup can complete without replaying the SQL that registered its inputs.
