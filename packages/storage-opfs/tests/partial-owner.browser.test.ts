@@ -1,5 +1,11 @@
 import { expect, test } from "vitest";
 import { acquirePartialOwner } from "../js/partial-owner.js";
+import { physicalName } from "../js/physical-name.js";
+
+test("shared engine identity follows physical UTF-8 filenames", () => {
+ expect(physicalName("replica\ud800")).toBe(physicalName("replica\ud801"));
+ expect(physicalName("replica-a")).not.toBe(physicalName("replica-b"));
+});
 
 async function reacquire(name: string) {
  for (let i=0;i<100;i++) {

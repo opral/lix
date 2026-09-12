@@ -1,3 +1,5 @@
+import { physicalName } from "./physical-name.js";
+
 /** A synchronous acquisition handle makes cancellation safe before ready settles. */
 export function acquirePartialOwner(name: string): { ready: Promise<void>; close(): void } {
  let closed = false;
@@ -20,8 +22,7 @@ export function acquirePartialOwner(name: string): { ready: Promise<void>; close
  }
  // The OPFS filename is derived from TextEncoder bytes. Use those same bytes
  // so lone-surrogate aliases cannot acquire distinct locks for one file.
- const physicalName = Array.from(new TextEncoder().encode(name), byte => byte.toString(16).padStart(2,"0")).join("");
- void navigator.locks.request(`lix:partial-engine:${physicalName}`, {mode:"exclusive",ifAvailable:true}, async lock => {
+ void navigator.locks.request(`lix:partial-engine:${physicalName(name)}`, {mode:"exclusive",ifAvailable:true}, async lock => {
   if (closed) return;
   if (!lock) {
    rejectReady(Object.assign(new Error("This OPFS database already has a partial engine owner"), {code:"LIX_STORAGE_IN_USE"}));

@@ -4451,6 +4451,9 @@ async fn retry_auto_commit(
     expired_read_retries: &mut ExpiredReadRetryState,
     error: &LixError,
 ) -> bool {
+    if error.automatic_retry_is_forbidden() {
+        return false;
+    }
     if retry_expired_auto_commit(expired_read_retries, error).await {
         return true;
     }
@@ -4497,6 +4500,108 @@ mod tests {
         Memory,
         engine::{Engine, EngineOptions},
     };
+
+    #[tokio::test]
+    async fn auto_commit_retry_policy_preserves_completion_boundaries() {
+        for code in [
+            LixError::CODE_TRANSACTION_CONFLICT,
+            LixError::CODE_STORAGE_READ_EXPIRED,
+            LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN,
+        ] {
+            for marker in [
+                None,
+                Some("nonRetryableAfterCommit"),
+                Some("nonRetryableAfterExecution"),
+            ] {
+                let mut error = LixError::new(code, "retry policy probe");
+                if let Some(marker) = marker {
+                    error = error.with_details(serde_json::json!({marker: true}));
+                }
+                let mut conflicts = 0;
+                let mut expired = ExpiredReadRetryState::default();
+                assert_eq!(
+                    retry_auto_commit(&mut conflicts, &mut expired, &error).await,
+                    marker.is_none() && code != LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
+                );
+                if marker.is_some() {
+                    assert_eq!(conflicts, 0);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_sql_callback_conflict_and_expiry_are_not_replayed() {
+        for code in [
+            LixError::CODE_TRANSACTION_CONFLICT,
+            LixError::CODE_STORAGE_READ_EXPIRED,
+        ] {
+            let storage = Memory::default();
+            Engine::initialize(storage.clone()).await.unwrap();
+            let engine = Engine::new(storage.clone()).await.unwrap();
+            let session = engine.open_session().await.unwrap();
+            let access = session.begin_session_write_access().await.unwrap();
+            let error = session
+                .with_write_transaction_reserved_lending(
+                    access,
+                    async |transaction| {
+                        transaction
+                            .stage_engine_test_rows(RawWriteBatch::from_test_rows(vec![
+                                TransactionWriteRow {
+                                    row_pk: Some(RowPk::single("committed-retry-boundary")),
+                                    schema_key: "lix_key_value".into(),
+                                    file_id: None,
+                                    snapshot: Some(TransactionJson::from_value_for_test(
+                                        serde_json::json!({
+                                            "key": "committed-retry-boundary", "value": "persisted"
+                                        }),
+                                    )),
+                                    metadata: None,
+                                    origin: None,
+                                    created_at: None,
+                                    updated_at: None,
+                                    global: true,
+                                    change_id: None,
+                                    commit_id: None,
+                                    untracked: false,
+                                    branch_id: crate::GLOBAL_BRANCH_ID.into(),
+                                },
+                            ]))
+                            .await?;
+                        Ok(())
+                    },
+                    |_| Err(LixError::new(code, "injected completion failure")),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(error.message, "injected completion failure");
+            assert_eq!(
+                error.details.as_ref().unwrap()["nonRetryableAfterCommit"],
+                true
+            );
+            let mut conflicts = 0;
+            let mut expired = ExpiredReadRetryState::default();
+            assert!(!retry_auto_commit(&mut conflicts, &mut expired, &error).await);
+            assert_eq!(conflicts, 0);
+            drop(session);
+            drop(engine);
+            let reopened = Engine::new(storage).await.unwrap();
+            let reader = reopened.open_session().await.unwrap();
+            let rows = reader
+                .execute(
+                    "SELECT key FROM lix_key_value WHERE key = 'committed-retry-boundary'",
+                    &[],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.len(),
+                1,
+                "completion failure followed a durable mutation"
+            );
+        }
+    }
 
     async fn open_session() -> SessionContext<Memory> {
         let storage = Memory::default();

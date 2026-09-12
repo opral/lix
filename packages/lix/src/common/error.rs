@@ -215,6 +215,22 @@ impl LixError {
     /// The selected branch has no abandoned action available to replay.
     pub const CODE_NOTHING_TO_REDO: &'static str = "LIX_NOTHING_TO_REDO";
 
+    /// An operation may have completed even when its completion work failed.
+    /// Retry classification must check this before considering a transient code.
+    /// Reading an idempotency receipt remains safe; executing the operation again does not.
+    pub(crate) fn automatic_retry_is_forbidden(&self) -> bool {
+        self.code == Self::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
+            || ["nonRetryableAfterCommit", "nonRetryableAfterExecution"]
+                .iter()
+                .any(|key| {
+                    self.details
+                        .as_ref()
+                        .and_then(|details| details.get(key))
+                        .and_then(JsonValue::as_bool)
+                        == Some(true)
+                })
+    }
+
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
@@ -497,6 +513,32 @@ impl std::error::Error for LixError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_retry_respects_completion_markers_before_error_category() {
+        for code in [
+            LixError::CODE_TRANSACTION_CONFLICT,
+            LixError::CODE_STORAGE_READ_EXPIRED,
+            LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN,
+            "typed-native-demand",
+        ] {
+            let error = LixError::new(code, "original diagnostic");
+            assert_eq!(
+                error.automatic_retry_is_forbidden(),
+                code == LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
+            );
+            for marker in ["nonRetryableAfterCommit", "nonRetryableAfterExecution"] {
+                for value in [json!(true), json!(false), json!(null), json!("true")] {
+                    let marked = error.clone().with_details(json!({marker: value}));
+                    assert_eq!(
+                        marked.automatic_retry_is_forbidden(),
+                        value == json!(true)
+                            || code == LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn format_without_hint_omits_hint_line() {

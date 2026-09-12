@@ -864,7 +864,11 @@ impl WasmLix {
     }
 
     #[wasm_bindgen(js_name = openAnotherSession)]
-    pub async fn open_another_session(&self, options: JsValue) -> Result<WasmLix, JsValue> {
+    pub async fn open_another_session(
+        &self,
+        options: JsValue,
+        telemetry_dispatch: Option<Function>,
+    ) -> Result<WasmLix, JsValue> {
         let options: OpenAnotherSessionOptionsDto = from_js(options)?;
         let inner = self
             .instrument_operation(crate::session::SessionOperations::open_another_session(
@@ -874,15 +878,30 @@ impl WasmLix {
             ))
             .await
             .map_err(lix_error_to_js)?;
+        let inner = if let Some(dispatch) = telemetry_dispatch {
+            let dispatch = BrowserTelemetryDispatch(dispatch);
+            let sink = CallbackTelemetrySink::new(move |span| {
+                let Ok(span) = to_js(&crate::telemetry::TelemetrySpanDto::from(span)) else {
+                    return;
+                };
+                let _ = dispatch.0.call1(&JsValue::UNDEFINED, &span);
+            });
+            inner
+                .with_session_telemetry(Some(Arc::new(sink)))
+                .map_err(lix_error_to_js)?
+        } else {
+            inner
+        };
         self.storage_sessions
             .set(self.storage_sessions.get().saturating_add(1));
+        let telemetry_parent = inner.telemetry().map(|_| Rc::new(RefCell::new(None)));
         Ok(WasmLix {
             inner,
             storage: self.storage.clone(),
             storage_sessions: self.storage_sessions.clone(),
             closed: Cell::new(false),
             browser_sync_transport_id: self.browser_sync_transport_id.clone(),
-            telemetry_parent: self.telemetry_parent.clone(),
+            telemetry_parent,
         })
     }
 

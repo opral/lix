@@ -294,24 +294,8 @@ impl SyncRuntime {
     }
 }
 
-fn demand_replay_is_forbidden(error: &LixError) -> bool {
-    error.code == LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
-        || error
-            .details
-            .as_ref()
-            .and_then(|details| details.get("nonRetryableAfterCommit"))
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-        || error
-            .details
-            .as_ref()
-            .and_then(|details| details.get("nonRetryableAfterExecution"))
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-}
-
 fn sync_demand_request_for_error(error: &LixError) -> Result<Option<SyncDemandRequest>, LixError> {
-    if demand_replay_is_forbidden(error) {
+    if error.automatic_retry_is_forbidden() {
         return Ok(None);
     }
     let (field, context, constructor): (_, _, fn(Vec<String>) -> _) = match error.code.as_str() {
@@ -370,7 +354,7 @@ fn sync_demand_request_for_error(error: &LixError) -> Result<Option<SyncDemandRe
 pub(super) fn native_sync_demand_request_for_error(
     error: &LixError,
 ) -> Result<Option<SyncDemandRequest>, LixError> {
-    if demand_replay_is_forbidden(error) {
+    if error.automatic_retry_is_forbidden() {
         return Ok(None);
     }
     if let Some(crate::binary_cas::BlobManifestRequired(hash)) =
@@ -441,7 +425,7 @@ pub(crate) struct SyncDemandRetry {
 
 impl SyncDemandRetry {
     fn admit(&mut self, error: LixError) -> Result<SyncDemandRequest, LixError> {
-        if demand_replay_is_forbidden(&error) {
+        if error.automatic_retry_is_forbidden() {
             return Err(error);
         }
         let Some(request) = native_sync_demand_request_for_error(&error)? else {
@@ -514,6 +498,10 @@ where
 }
 
 fn is_retryable_authority_validation_error(error: &LixError) -> bool {
+    if error.automatic_retry_is_forbidden() {
+        return false;
+    }
+
     error.code == LixError::CODE_STORAGE_READ_EXPIRED
 }
 
@@ -910,6 +898,10 @@ fn is_permanent_push_rejection(error: &LixError) -> bool {
 }
 
 fn is_retryable_sync_transport_error(error: &LixError) -> bool {
+    if error.automatic_retry_is_forbidden() {
+        return false;
+    }
+
     if error.code == super::http::SYNC_TRANSPORT_ERROR_CODE {
         return true;
     }
@@ -922,6 +914,10 @@ fn is_retryable_sync_transport_error(error: &LixError) -> bool {
 }
 
 fn is_retryable_sync_demand_error(error: &LixError) -> bool {
+    if error.automatic_retry_is_forbidden() {
+        return false;
+    }
+
     // A durable browser replica can briefly have two publication workers while
     // an old page is closing. If the sibling commits first, this worker's
     // coherent read expires. The authority operation is already identified and
@@ -932,6 +928,10 @@ fn is_retryable_sync_demand_error(error: &LixError) -> bool {
 }
 
 fn retry_sync_iteration_without_reconnect(error: &LixError) -> bool {
+    if error.automatic_retry_is_forbidden() {
+        return false;
+    }
+
     error.code == LixError::CODE_STORAGE_READ_EXPIRED
 }
 

@@ -1491,7 +1491,8 @@ where
         }
         let mut opened = self
             .open_internal_session(active_branch_id.clone(), active_account_id)
-            .await?;
+            .await?
+            .with_session_telemetry(self.telemetry().cloned())?;
         opened.sync_lease = self.sync_lease.as_ref().map(|lease| lease.child());
 
         Ok(opened)
@@ -1970,9 +1971,25 @@ where
         self.engine.lix_id()
     }
 
-    /// Per-engine telemetry sink, if the host attached one.
+    /// Binding integration: replace the sink before exposing a new session.
+    #[doc(hidden)]
+    pub fn with_session_telemetry(
+        mut self,
+        telemetry: Option<Arc<dyn TelemetrySink>>,
+    ) -> Result<Self, LixError> {
+        let session = Arc::get_mut(&mut self.session).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "session telemetry must be configured before sharing the session",
+            )
+        })?;
+        session.set_telemetry(telemetry);
+        Ok(self)
+    }
+
+    /// Telemetry sink for this session, if the host attached one.
     pub fn telemetry(&self) -> Option<&Arc<dyn TelemetrySink>> {
-        self.engine.telemetry()
+        self.session.telemetry()
     }
 
     /// Records that this handle's session has bound to the repository.
@@ -2974,6 +2991,42 @@ mod tests {
             lix.open_report().initialized,
             "the rejected sync open must leave initialization to the next valid open"
         );
+    }
+
+    #[tokio::test]
+    async fn child_session_telemetry_isolated_and_inherited_by_nested_sessions() {
+        let root_spans = Arc::new(Mutex::new(Vec::<CompletedTelemetrySpan>::new()));
+        let captured = root_spans.clone();
+        let root = open_lix()
+            .with_telemetry(Arc::new(CallbackTelemetrySink::new(move |span| {
+                captured.lock().unwrap().push(span);
+            })))
+            .await
+            .unwrap();
+        let child_spans = Arc::new(Mutex::new(Vec::<CompletedTelemetrySpan>::new()));
+        let captured = child_spans.clone();
+        let child = root
+            .open_another_session()
+            .await
+            .unwrap()
+            .with_session_telemetry(Some(Arc::new(CallbackTelemetrySink::new(move |span| {
+                captured.lock().unwrap().push(span);
+            }))))
+            .unwrap();
+        let nested = child.open_another_session().await.unwrap();
+        root_spans.lock().unwrap().clear();
+        child_spans.lock().unwrap().clear();
+        child.execute("SELECT 41", &[]).await.unwrap();
+        nested.execute("SELECT 42", &[]).await.unwrap();
+        assert!(!child_spans.lock().unwrap().is_empty());
+        assert!(root_spans.lock().unwrap().is_empty());
+        child_spans.lock().unwrap().clear();
+        root.execute("SELECT 43", &[]).await.unwrap();
+        assert!(!root_spans.lock().unwrap().is_empty());
+        assert!(child_spans.lock().unwrap().is_empty());
+        nested.close().await.unwrap();
+        child.close().await.unwrap();
+        root.close().await.unwrap();
     }
 
     #[tokio::test]

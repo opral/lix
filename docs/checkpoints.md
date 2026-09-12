@@ -92,3 +92,14 @@ Selective checkpoint source dependencies remain available for offline sync.
 
 See [History](./history.md) for log, endpoint history, snapshots, and paged
 previews, and [Diff commands](./diff-commands.md) for scoped checkpoints.
+
+Partial replicas upload ordinary pending edits and checkpoint dependencies in
+bounded waves of at most 32 commits and 1 MiB of commit/ref JSON. Intermediate ordinary uploads keep
+the authority's previous checkpoint; checkpoint publication waits for its native
+dependencies. Lost replies resume the durable captured wave. Binary file content
+uses the separate bounded blob uploader and is not counted as commit JSON.
+
+A single commit or minimal checkpoint publication closure that exceeds the 1 MiB
+request budget still requires multipart body preparation, which is not implemented
+by this lane. Its local data remains pending; splitting a long sequence into waves
+does not remove that atomic-body limit.

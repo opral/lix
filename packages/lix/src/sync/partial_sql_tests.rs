@@ -17,7 +17,7 @@ use super::partial_hydration::hydrate_native_object;
 use super::partial_state::PartialReplicaState;
 
 #[derive(Default, Debug)]
-struct Fetches {
+pub(super) struct Fetches {
     object_requests: usize,
     metadata_requests: usize,
     payload_bytes: usize,
@@ -159,7 +159,9 @@ async fn prepare_baseline_jump_spines(
     Ok(())
 }
 
-async fn execute_hydrating<S: crate::storage_adapter::Storage + Clone + Send + Sync + 'static>(
+pub(super) async fn execute_hydrating<
+    S: crate::storage_adapter::Storage + Clone + Send + Sync + 'static,
+>(
     session: &SessionContext<S>,
     storage: &StorageAdapter<S>,
     state: &PartialReplicaState,

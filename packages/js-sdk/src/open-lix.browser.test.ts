@@ -277,3 +277,30 @@ test("executes a globally ordered union plan in browser WASM", async () => {
 		await lix.close();
 	}
 });
+
+test("WASM child sessions route SQL telemetry independently and nested sessions inherit", async () => {
+ const { openLixBinding } = await import("./binding.browser.js");
+ const rootSpans: import("./types.js").LixTelemetrySpan[] = [];
+ const childSpans: import("./types.js").LixTelemetrySpan[] = [];
+ const root = await openLixBinding({kind:"memory"}, span => rootSpans.push(span));
+ const child = await root.openAnotherSession({}, span => childSpans.push(span));
+ const nested = await child.openAnotherSession({});
+ try {
+  rootSpans.length=0; childSpans.length=0;
+  child.setTelemetryParent({traceId:"11111111111111111111111111111111",spanId:"1111111111111111",traceFlags:1});
+  nested.setTelemetryParent({traceId:"22222222222222222222222222222222",spanId:"2222222222222222",traceFlags:1});
+  await child.execute("SELECT 41 AS child_value", []);
+  await nested.execute("SELECT 42 AS nested_value", []);
+  expect(childSpans.filter(span => span.name === "lix.sql.query").map(span => span.attributes["db.query.text"])).toEqual([
+   "SELECT ? AS child_value", "SELECT ? AS nested_value",
+  ]);
+  expect(childSpans.filter(span => span.name === "lix.sql.query").map(span => span.traceId)).toEqual([
+   "11111111111111111111111111111111", "22222222222222222222222222222222",
+  ]);
+  expect(rootSpans.filter(span => span.name === "lix.sql.query")).toEqual([]);
+  childSpans.length=0;
+  await root.execute("SELECT 43 AS root_value", []);
+  expect(rootSpans.some(span=>span.name === "lix.sql.query")).toBe(true);
+  expect(childSpans).toEqual([]);
+ } finally { await nested.close(); await child.close(); await root.close(); }
+});

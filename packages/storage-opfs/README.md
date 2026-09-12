@@ -19,6 +19,15 @@ offline, and local commits upload in the background. The default `"remote"` mode
 rejects local storage. See
 [Collaboration and Sync](https://lix.dev/docs/collaboration-and-sync).
 
+Partial replicas coordinate one Lix engine per physical OPFS database through an
+SDK-owned SharedWorker. Each tab receives an independent session on that engine,
+so loaded data and pending offline edits are shared. Closing one tab releases its
+sessions without closing the other tabs' engine. This is automatic with the
+existing `openLix()` options and requires SharedWorker support in addition to
+OPFS and Web Locks. The physical engine-owner lock remains the final fence across
+different SDK builds. Sessions still obey the partial replica's admitted branch
+scope; sharing an engine does not admit every repository branch.
+
 `OpfsStorage` starts one package-owned dedicated worker in the page. The Lix
 engine workers use a package-internal `BroadcastChannel` RPC client, while the
 owner worker holds the SQLite Wasm OPFS SAH-pool connection. This keeps the
@@ -26,10 +35,10 @@ SQLite connection and OPFS sync handles in one worker, while multiple tabs and
 multiple Lix workers attach to the same repository. Writes are batched before
 crossing the channel and commits are serialized by the owner.
 
-The owner is deliberately a dedicated worker rather than a SharedWorker:
+The SQLite owner is deliberately a dedicated worker rather than a SharedWorker:
 SQLite's OPFS sync-access-handle VFS is only available in dedicated workers.
-A SharedWorker coordinator can be added later without changing this provider
-protocol, but it must not host the SQLite connection itself.
+The partial-engine SharedWorker uses this provider protocol and does not host
+the SQLite connection itself.
 
 After every committed write, the owner broadcasts a package-private storage
 position. Each attached provider turns a changed position into the SDK's

@@ -176,56 +176,76 @@ where
     if registry.durability_is_clean()? {
         return Ok(());
     }
+    let mut expired_reads = crate::common::ExpiredReadRetryState::default();
     for _ in 0..16 {
-        let read = storage.begin_read(Default::default()).await?;
-        let (recipes, previous, epoch_guard) = load(&read, expected).await?;
-        registry.merge_persisted(recipes)?;
-        if registry.durability_is_clean()? {
-            return Ok(());
-        }
-        let snapshot = registry.snapshot()?;
-        let next = encode(
-            expected,
-            snapshot
-                .interests
-                .iter()
-                .map(|recipe| recipe.as_ref().clone())
-                .collect(),
-        )?;
-        let mut writes = storage.new_write_set();
-        writes.put(
-            PARTIAL_READ_INTEREST_SPACE,
-            key(expected)?,
-            crate::storage_adapter::StorageValue { bytes: next },
-        );
-        drop(read);
-        let result = storage
-            .commit_partial_replica_write_set(
-                super::partial_replica_write_capability(),
-                writes,
-                StorageWriteOptions {
-                    await_durable: true,
-                    preconditions: vec![
-                        epoch_guard,
-                        StoragePrecondition::KeyValueEquals {
-                            space: PARTIAL_READ_INTEREST_SPACE,
-                            key: key(expected)?,
-                            expected: previous,
-                        },
-                    ],
-                    ..Default::default()
-                },
-            )
-            .await;
-        match result {
-            Ok(_) => {
-                registry.acknowledge_durable(snapshot.revision)?;
-                return Ok(());
+        // Only this idempotent journal unit is restarted. Its caller may have
+        // already executed or committed SQL and must never replay that SQL.
+        let result: Result<bool, LixError> = async {
+            let read = storage.begin_read(Default::default()).await?;
+            let (recipes, previous, epoch_guard) = load(&read, expected).await?;
+            registry.merge_persisted(recipes)?;
+            if registry.durability_is_clean()? {
+                return Ok(true);
             }
-            Err(crate::storage_adapter::StorageWriteSetError::Storage(
-                crate::storage_adapter::StorageError::PreconditionFailed(_),
-            )) => continue,
-            Err(error) => return Err(error.into()),
+            let snapshot = registry.snapshot()?;
+            let next = encode(
+                expected,
+                snapshot
+                    .interests
+                    .iter()
+                    .map(|recipe| recipe.as_ref().clone())
+                    .collect(),
+            )?;
+            let mut writes = storage.new_write_set();
+            writes.put(
+                PARTIAL_READ_INTEREST_SPACE,
+                key(expected)?,
+                crate::storage_adapter::StorageValue { bytes: next },
+            );
+            drop(read);
+            let result = storage
+                .commit_partial_replica_write_set(
+                    super::partial_replica_write_capability(),
+                    writes,
+                    StorageWriteOptions {
+                        await_durable: true,
+                        preconditions: vec![
+                            epoch_guard,
+                            StoragePrecondition::KeyValueEquals {
+                                space: PARTIAL_READ_INTEREST_SPACE,
+                                key: key(expected)?,
+                                expected: previous,
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                )
+                .await;
+            match result {
+                Err(crate::storage_adapter::StorageWriteSetError::Storage(
+                    crate::storage_adapter::StorageError::PreconditionFailed(_),
+                )) => return Ok(false),
+                other => {
+                    other.map_err(LixError::from)?;
+                }
+            }
+            registry.acknowledge_durable(snapshot.revision)?;
+            Ok(true)
+        }
+        .await;
+        match result {
+            Ok(true) => return Ok(()),
+            Ok(false) => continue,
+            Err(error) => {
+                if let Some(delay) = expired_reads.next_delay(&error) {
+                    tokio::task::yield_now().await;
+                    if !delay.is_zero() {
+                        crate::sync::sleep(delay).await;
+                    }
+                    continue;
+                }
+                return Err(error);
+            }
         }
     }
     Err(LixError::new(
@@ -237,6 +257,199 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[derive(Clone)]
+    struct ExpiringJournalStorage {
+        inner: crate::Memory,
+        remaining: Arc<std::sync::atomic::AtomicUsize>,
+        failures: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    struct ExpiringJournalRead {
+        inner: crate::storage_adapter::MemoryRead,
+        storage: ExpiringJournalStorage,
+    }
+    impl Storage for ExpiringJournalStorage {
+        type Read<'a> = ExpiringJournalRead;
+        type Write<'a> = crate::storage_adapter::MemoryWrite;
+        async fn acquire_session(
+            &self,
+        ) -> Result<crate::storage_adapter::StorageSessionToken, crate::storage_adapter::StorageError>
+        {
+            self.inner.acquire_session().await
+        }
+        async fn begin_read(
+            &self,
+            opts: crate::storage_adapter::StorageReadOptions,
+        ) -> Result<Self::Read<'_>, crate::storage_adapter::StorageError> {
+            Ok(ExpiringJournalRead {
+                inner: self.inner.begin_read(opts).await?,
+                storage: self.clone(),
+            })
+        }
+        async fn begin_write(
+            &self,
+            opts: StorageWriteOptions,
+        ) -> Result<Self::Write<'_>, crate::storage_adapter::StorageError> {
+            self.inner.begin_write(opts).await
+        }
+    }
+    impl crate::storage_adapter::StorageRead for ExpiringJournalRead {
+        async fn get_many(
+            &self,
+            requests: &[crate::storage_adapter::StorageGetManyRequest<'_>],
+        ) -> Result<
+            crate::storage_adapter::StorageGetManyResult,
+            crate::storage_adapter::StorageError,
+        > {
+            use std::sync::atomic::Ordering;
+            if requests
+                .iter()
+                .any(|request| request.space == PARTIAL_READ_INTEREST_SPACE)
+                && self
+                    .storage
+                    .remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+            {
+                self.storage.failures.fetch_add(1, Ordering::SeqCst);
+                return Err(crate::storage_adapter::StorageError::ReadExpired);
+            }
+            crate::storage_adapter::StorageRead::get_many(&self.inner, requests).await
+        }
+        async fn begin_scan(
+            &self,
+            space: StorageSpace,
+            range: crate::storage_adapter::StorageKeyRange,
+            opts: crate::storage_adapter::StorageBeginScanOptions,
+        ) -> Result<
+            crate::storage_adapter::StorageScanCursor<'_>,
+            crate::storage_adapter::StorageError,
+        > {
+            crate::storage_adapter::StorageRead::begin_scan(&self.inner, space, range, opts).await
+        }
+    }
+    #[tokio::test]
+    async fn journal_expired_reads_retry_only_the_flush_and_remain_bounded() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (memory_storage, state) = fixture().await;
+        let faults = ExpiringJournalStorage {
+            inner: memory_storage.storage().clone(),
+            remaining: Arc::new(AtomicUsize::new(2)),
+            failures: Arc::new(AtomicUsize::new(0)),
+        };
+        let storage = StorageAdapter::new(faults.clone());
+        storage.admit_partial_replica_writer(super::super::partial_replica_write_capability());
+        let registry = ReadInterestRegistry::new_durable(MAX_RECIPES, MAX_RECIPE_BYTES);
+        let operation = registry.begin_operation().await;
+        operation.register(recipe("survives-expiry")).unwrap();
+        drop(operation);
+        flush_partial_read_interests(&storage, &state, &registry)
+            .await
+            .unwrap();
+        assert_eq!(faults.failures.load(Ordering::SeqCst), 2);
+        assert!(registry.durability_is_clean().unwrap());
+        let revision = storage.load_mutation_revision().await.unwrap();
+        flush_partial_read_interests(&storage, &state, &registry)
+            .await
+            .unwrap();
+        assert_eq!(storage.load_mutation_revision().await.unwrap(), revision);
+        let restored = ReadInterestRegistry::new_durable(MAX_RECIPES, MAX_RECIPE_BYTES);
+        flush_partial_read_interests(&storage, &state, &restored)
+            .await
+            .unwrap();
+        assert_eq!(restored.snapshot().unwrap().interests.len(), 1);
+        faults.remaining.store(usize::MAX, Ordering::SeqCst);
+        let fresh = ReadInterestRegistry::new_durable(MAX_RECIPES, MAX_RECIPE_BYTES);
+        let error = flush_partial_read_interests(&storage, &state, &fresh)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, LixError::CODE_TRANSACTION_CONFLICT);
+        assert_eq!(faults.failures.load(Ordering::SeqCst), 18);
+        assert!(!fresh.durability_is_clean().unwrap());
+    }
+
+    #[tokio::test]
+    async fn completed_insert_survives_expired_journal_without_sql_replay() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let authority = crate::open_lix().await.unwrap();
+        let (memory_storage, state) = fixture_from_authority(&authority).await;
+        let faults = ExpiringJournalStorage {
+            inner: memory_storage.storage().clone(),
+            remaining: Arc::new(AtomicUsize::new(0)),
+            failures: Arc::new(AtomicUsize::new(0)),
+        };
+        let storage = StorageAdapter::new(faults.clone());
+        let (engine, session) = crate::engine::Engine::new_partial_replica(
+            storage.clone(),
+            crate::engine::EngineOptions::new(),
+            &state,
+        )
+        .await
+        .unwrap();
+        engine.sync_mode().admit_partial_replica(
+            Arc::new(state.clone()),
+            super::super::partial_replica_write_capability(),
+        );
+        storage.admit_partial_replica_writer(super::super::partial_replica_write_capability());
+        let mut fetches = super::super::partial_sql_tests::Fetches::default();
+        // Warm native SQL inputs before injecting a fault solely in the
+        // post-execution journal. Failed cold attempts publish no mutation.
+        super::super::partial_sql_tests::execute_hydrating(
+            &session,
+            &storage,
+            &state,
+            &authority,
+            "SELECT value FROM lix_key_value WHERE key = 'journal-insert-once'",
+            &[],
+            &mut fetches,
+        )
+        .await
+        .unwrap();
+        let registry = engine.sync_mode().read_interests().unwrap();
+        let operation = registry.begin_operation().await;
+        operation
+            .register(recipe("new-completed-insert-scope"))
+            .unwrap();
+        drop(operation);
+        faults.remaining.store(2, Ordering::SeqCst);
+        super::super::partial_sql_tests::execute_hydrating(
+            &session,
+            &storage,
+            &state,
+            &authority,
+            "INSERT INTO lix_key_value (key, value) VALUES ('journal-insert-once', 'committed')",
+            &[],
+            &mut fetches,
+        )
+        .await
+        .unwrap();
+        assert_eq!(faults.failures.load(Ordering::SeqCst), 2);
+        assert!(registry.durability_is_clean().unwrap());
+        // Replaying this INSERT would hit its primary-key constraint. Success
+        // plus a fresh engine read proves completion bookkeeping preserved it.
+        drop(session);
+        drop(engine);
+        let (_engine, reopened) = crate::engine::Engine::new_partial_replica(
+            storage,
+            crate::engine::EngineOptions::new(),
+            &state,
+        )
+        .await
+        .unwrap();
+        let result = reopened
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'journal-insert-once'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.rows().len(), 1);
+        let value = match result.rows()[0].get::<crate::Value>("value").unwrap() {
+            crate::Value::Jsonb(value) => value.as_json_string().unwrap(),
+            crate::Value::Text(value) => value,
+            value => panic!("unexpected SQL value: {value:?}"),
+        };
+        assert_eq!(value, "committed");
+    }
     fn recipe(key: &str) -> LogicalReadInterest {
         LogicalReadInterest::scan(
             &crate::hot_state::HotStateScanRequest {
@@ -253,6 +466,11 @@ mod tests {
     }
     async fn fixture() -> (StorageAdapter<crate::Memory>, PartialReplicaState) {
         let authority = crate::open_lix().await.unwrap();
+        fixture_from_authority(&authority).await
+    }
+    async fn fixture_from_authority(
+        authority: &crate::Lix<crate::Memory>,
+    ) -> (StorageAdapter<crate::Memory>, PartialReplicaState) {
         let state = PartialReplicaState::new(
             format!("https://example.test/lix/{}", authority.lix_id()),
             authority.active_account_id().into(),
