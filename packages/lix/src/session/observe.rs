@@ -240,10 +240,12 @@ where
                     return Ok(None);
                 }
                 Err(error)
-                    if matches!(
-                        error.code.as_str(),
-                        LixError::CODE_STORAGE_READ_EXPIRED | LixError::CODE_TRANSACTION_CONFLICT
-                    ) =>
+                    if !error.automatic_retry_is_forbidden()
+                        && matches!(
+                            error.code.as_str(),
+                            LixError::CODE_STORAGE_READ_EXPIRED
+                                | LixError::CODE_TRANSACTION_CONFLICT
+                        ) =>
                 {
                     // A concurrent commit invalidated this evaluation — an
                     // expired coherent read past its bounded in-execute

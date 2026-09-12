@@ -44,15 +44,31 @@ where
         })
         .ok_or_else(|| LixError::unknown("partial upload branch checkpoint disappeared"))?;
     let prepared = if target_checkpoint != push.confirmed.checkpoint {
-        super::partial_checkpoint_upload::prepare_partial_checkpoint_upload(
+        let checkpoint = super::partial_checkpoint_upload::prepare_partial_checkpoint_upload(
             &read,
             state,
             branch_id,
-            attempt_id,
+            attempt_id.clone(),
             max_commits,
             max_wire_bytes,
         )
-        .await?
+        .await;
+        match checkpoint {
+            Err(error)
+                if error.code == "LIX_PARTIAL_UPLOAD_PAGE_REQUIRED" && push.prepared.is_none() =>
+            {
+                super::partial_checkpoint_upload::prepare_partial_checkpoint_page(
+                    &read,
+                    state,
+                    branch_id,
+                    attempt_id,
+                    max_commits,
+                    max_wire_bytes,
+                )
+                .await?
+            }
+            result => result?,
+        }
     } else {
         prepare_partial_ordinary_upload(
             &read,

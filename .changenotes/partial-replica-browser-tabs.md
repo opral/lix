@@ -13,3 +13,7 @@ File checkpoints upload their blob dependencies before publishing, including
 after an offline checkpoint or a lost acknowledgment. Each browser session keeps
 its own telemetry callback and trace parent; shared background spans go to live
 subscribers.
+
+Pending edits and checkpoint dependencies upload in bounded waves, including
+recovery after lost replies. SQL retries preserve the completion boundary: an
+error reported after execution or commit cannot replay the operation.

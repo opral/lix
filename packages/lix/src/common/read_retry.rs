@@ -18,7 +18,8 @@ pub(crate) struct ExpiredReadRetryState {
 
 impl ExpiredReadRetryState {
     pub(crate) fn next_delay(&mut self, error: &LixError) -> Option<Duration> {
-        if error.code != LixError::CODE_STORAGE_READ_EXPIRED {
+        if error.automatic_retry_is_forbidden() || error.code != LixError::CODE_STORAGE_READ_EXPIRED
+        {
             return None;
         }
         let now = web_time::Instant::now();
@@ -33,5 +34,24 @@ impl ExpiredReadRetryState {
         } else {
             Duration::ZERO
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_execution_does_not_consume_expired_read_retry_budget() {
+        for marker in ["nonRetryableAfterCommit", "nonRetryableAfterExecution"] {
+            let mut state = ExpiredReadRetryState::default();
+            let error = LixError::new(LixError::CODE_STORAGE_READ_EXPIRED, "completion failed")
+                .with_details(serde_json::json!({marker: true}));
+            assert_eq!(state.next_delay(&error), None);
+            assert!(state.started_at.is_none());
+            assert_eq!(state.attempts, 0);
+            let ordinary = LixError::new(LixError::CODE_STORAGE_READ_EXPIRED, "read expired");
+            assert_eq!(state.next_delay(&ordinary), Some(Duration::ZERO));
+        }
     }
 }

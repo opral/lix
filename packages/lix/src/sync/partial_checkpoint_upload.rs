@@ -47,6 +47,143 @@ pub(super) async fn prepare_partial_checkpoint_upload(
     max_commits: usize,
     max_wire_bytes: usize,
 ) -> Result<Option<PreparedPartialPush>, LixError> {
+    prepare_checkpoint_target(
+        read,
+        state,
+        branch_id,
+        attempt_id,
+        max_commits,
+        max_wire_bytes,
+        None,
+    )
+    .await
+}
+
+/// Find the direct first-parent child without walking the whole local suffix.
+async fn first_parent_child(
+    read: &(impl StorageAdapterRead + ?Sized),
+    head: CommitId,
+    boundary: CommitId,
+) -> Result<CommitId, LixError> {
+    let base = super::partial_upload::local_record(read, boundary).await?;
+    let goal = base
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| blocked("checkpoint generation overflow"))?;
+    let mut current = super::partial_upload::local_record(read, head).await?;
+    for _ in 0..256 {
+        if current.generation == goal && current.parent_commit_ids.as_slice() == [boundary] {
+            return Ok(current.commit_id);
+        }
+        if current.generation <= goal || current.parent_commit_ids.len() != 1 {
+            return Err(blocked(
+                "checkpoint page does not extend the confirmed first-parent scope",
+            ));
+        }
+        let jump_generation = current
+            .generation
+            .checked_sub(current.first_parent_jump_span)
+            .ok_or_else(|| blocked("invalid checkpoint page jump"))?;
+        let (next, generation) = if current.first_parent_jump_span > 0 && jump_generation >= goal {
+            (current.first_parent_jump_commit_id, jump_generation)
+        } else {
+            (current.parent_commit_ids[0], current.generation - 1)
+        };
+        current = super::partial_upload::local_record(read, next).await?;
+        if current.generation != generation {
+            return Err(blocked("checkpoint page jump generation mismatch"));
+        }
+    }
+    Err(blocked("checkpoint page traversal exceeds its bound"))
+}
+
+/// Stage the earliest pending checkpoint, or a bounded ordinary prefix of its
+/// captured source. Every intermediate checkpoint has its original working
+/// child, preserving unselected rows; no body-only frontier is inferred.
+pub(super) async fn prepare_partial_checkpoint_page(
+    read: &(impl StorageAdapterRead + ?Sized),
+    state: &PartialReplicaState,
+    branch_id: &str,
+    attempt_id: String,
+    max_commits: usize,
+    max_wire_bytes: usize,
+) -> Result<Option<PreparedPartialPush>, LixError> {
+    let (push, _, _) = load_partial_push_state(read, state, branch_id).await?;
+    if push.prepared.is_some() {
+        return Err(blocked("checkpoint page cannot replace a durable attempt"));
+    }
+    let control = crate::branch::BranchHeadControlContext::new()
+        .reader(read)
+        .load(branch_id)
+        .await?
+        .ok_or_else(|| blocked("checkpoint branch disappeared"))?;
+    let latest = control
+        .working_diff_checkpoint_commit_id
+        .ok_or_else(|| blocked("checkpoint missing"))?;
+    let checkpoint = first_parent_child(read, latest, id(&push.confirmed.checkpoint)?).await?;
+    let working_tip = if checkpoint == latest {
+        control.head_commit_id
+    } else {
+        let next = first_parent_child(read, latest, checkpoint).await?;
+        let (source_branch, source) = load_sync_checkpoint_source(read, next)
+            .await?
+            .ok_or_else(|| blocked("next checkpoint source is missing"))?;
+        if source_branch != branch_id {
+            return Err(blocked("next checkpoint source belongs to another branch"));
+        }
+        source
+    };
+    let head = if working_tip == checkpoint {
+        checkpoint
+    } else {
+        first_parent_child(read, working_tip, checkpoint).await?
+    };
+    let target = PartialPushCoordinate {
+        head: head.to_string(),
+        checkpoint: checkpoint.to_string(),
+    };
+    match prepare_checkpoint_target(
+        read,
+        state,
+        branch_id,
+        attempt_id.clone(),
+        max_commits,
+        max_wire_bytes,
+        Some(target),
+    )
+    .await
+    {
+        Err(error) if error.code == "LIX_PARTIAL_UPLOAD_PAGE_REQUIRED" => {
+            match super::partial_upload::prepare_partial_checkpoint_prefix(
+                read,
+                state,
+                branch_id,
+                attempt_id,
+                max_commits,
+                max_wire_bytes,
+                checkpoint,
+            )
+            .await?
+            {
+                Some(page) => Ok(Some(page)),
+                None => Err(blocked(
+                    "minimal checkpoint closure exceeds the upload request budget; multipart body preparation is required",
+                )),
+            }
+        }
+        result => result,
+    }
+}
+
+async fn prepare_checkpoint_target(
+    read: &(impl StorageAdapterRead + ?Sized),
+    state: &PartialReplicaState,
+    branch_id: &str,
+    attempt_id: String,
+    max_commits: usize,
+    max_wire_bytes: usize,
+    page_target: Option<PartialPushCoordinate>,
+) -> Result<Option<PreparedPartialPush>, LixError> {
     if max_commits == 0
         || max_commits > super::MAX_SYNC_REQUEST_ITEMS
         || max_wire_bytes == 0
@@ -70,6 +207,7 @@ pub(super) async fn prepare_partial_checkpoint_upload(
         .prepared
         .as_ref()
         .map(|upload| upload.target.clone())
+        .or(page_target)
         .unwrap_or(PartialPushCoordinate {
             head: control.head_commit_id.to_string(),
             checkpoint: control
@@ -95,6 +233,7 @@ pub(super) async fn prepare_partial_checkpoint_upload(
         );
     }
 
+    let mut global_ancestry = BTreeMap::new();
     let mut stack = vec![(id(&target.checkpoint)?, false), (id(&target.head)?, false)];
     let mut visiting = BTreeSet::new();
     let mut done = known.clone();
@@ -122,8 +261,9 @@ pub(super) async fn prepare_partial_checkpoint_upload(
             return Err(blocked("checkpoint dependency cycle"));
         }
         if commits.len() + loaded.len() >= max_commits {
-            return Err(blocked(
-                "checkpoint closure exceeds bounded preparation; paged body preparation required",
+            return Err(LixError::new(
+                "LIX_PARTIAL_UPLOAD_PAGE_REQUIRED",
+                "checkpoint closure requires an earlier bounded upload wave",
             ));
         }
         let commit = load_sync_commit(read, current)
@@ -134,16 +274,25 @@ pub(super) async fn prepare_partial_checkpoint_upload(
                 "checkpoint dependency belongs to an unprepared account scope",
             ));
         }
-        if commit
-            .base_commit_id
-            .as_deref()
-            .map(id)
-            .transpose()?
-            .is_some_and(|base| !known.contains(&base))
-        {
-            return Err(blocked(
-                "checkpoint requires confirmed global base preparation",
-            ));
+        if let Some(base) = commit.base_commit_id.as_deref().map(id).transpose()? {
+            if !known.contains(&base)
+                && branch_id != crate::GLOBAL_BRANCH_ID
+                && super::partial_upload::is_confirmed_global_base(
+                    read,
+                    base,
+                    id(&global.confirmed.head)?,
+                    &mut global_ancestry,
+                )
+                .await?
+            {
+                known.insert(base);
+                done.insert(base);
+            }
+            if !known.contains(&base) {
+                return Err(blocked(
+                    "checkpoint requires confirmed global base preparation",
+                ));
+            }
         }
         // Blob manifests and chunks are prepared by the same bounded sender
         // used for ordinary uploads, before this checkpoint's refs are pushed.
@@ -169,8 +318,12 @@ pub(super) async fn prepare_partial_checkpoint_upload(
             }
             dependencies.insert(source);
         }
-        serde_json::to_writer(&mut body_budget, &commit)
-            .map_err(|_| blocked("checkpoint bodies exceed wire budget"))?;
+        serde_json::to_writer(&mut body_budget, &commit).map_err(|_| {
+            LixError::new(
+                "LIX_PARTIAL_UPLOAD_PAGE_REQUIRED",
+                "checkpoint bodies exceed wire budget",
+            )
+        })?;
         loaded.insert(current, commit);
         stack.push((current, true));
         for dependency in dependencies.into_iter().rev() {
@@ -213,8 +366,12 @@ pub(super) async fn prepare_partial_checkpoint_upload(
         remaining: max_wire_bytes,
         written: 0,
     };
-    serde_json::to_writer(&mut budget, &request)
-        .map_err(|_| blocked("checkpoint request exceeds wire budget"))?;
+    serde_json::to_writer(&mut budget, &request).map_err(|_| {
+        LixError::new(
+            "LIX_PARTIAL_UPLOAD_PAGE_REQUIRED",
+            "checkpoint request exceeds wire budget",
+        )
+    })?;
     let control_guard = if resumed {
         None
     } else {

@@ -48,7 +48,7 @@ impl std::io::Write for ByteBudget {
 
 /// Locally authored graph records must remain durable until upload. A missing
 /// one is not a demand for an object the authority has never received.
-async fn local_record(
+pub(super) async fn local_record(
     read: &(impl StorageAdapterRead + ?Sized),
     commit: CommitId,
 ) -> Result<CommitRecord, LixError> {
@@ -124,6 +124,94 @@ pub(super) async fn prepare_partial_ordinary_upload(
     max_commits: usize,
     max_wire_bytes: usize,
 ) -> Result<Option<PreparedPartialPush>, LixError> {
+    prepare_partial_ordinary_budgeted(
+        read,
+        state,
+        branch_id,
+        attempt_id,
+        max_commits,
+        max_wire_bytes,
+        None,
+    )
+    .await
+}
+
+/// Publish only ordinary ancestors of a locally captured checkpoint source.
+/// The authority's checkpoint remains unchanged until its full closure fits.
+pub(super) async fn prepare_partial_checkpoint_prefix(
+    read: &(impl StorageAdapterRead + ?Sized),
+    state: &PartialReplicaState,
+    branch_id: &str,
+    attempt_id: String,
+    max_commits: usize,
+    max_wire_bytes: usize,
+    checkpoint: CommitId,
+) -> Result<Option<PreparedPartialPush>, LixError> {
+    prepare_partial_ordinary_budgeted(
+        read,
+        state,
+        branch_id,
+        attempt_id,
+        max_commits,
+        max_wire_bytes,
+        Some(checkpoint),
+    )
+    .await
+}
+
+async fn prepare_partial_ordinary_budgeted(
+    read: &(impl StorageAdapterRead + ?Sized),
+    state: &PartialReplicaState,
+    branch_id: &str,
+    attempt_id: String,
+    max_commits: usize,
+    max_wire_bytes: usize,
+    checkpoint_prefix: Option<CommitId>,
+) -> Result<Option<PreparedPartialPush>, LixError> {
+    let can_shrink = load_partial_push_state(read, state, branch_id)
+        .await?
+        .0
+        .prepared
+        .is_none();
+    let mut limit = max_commits;
+    loop {
+        match prepare_partial_ordinary_upload_inner(
+            read,
+            state,
+            branch_id,
+            attempt_id.clone(),
+            limit,
+            max_wire_bytes,
+            checkpoint_prefix,
+        )
+        .await
+        {
+            Err(error)
+                if error.code == "LIX_PARTIAL_UPLOAD_PAGE_REQUIRED" && can_shrink && limit > 1 =>
+            {
+                limit = (limit / 2).max(1);
+            }
+            Err(error) if error.code == "LIX_PARTIAL_UPLOAD_PAGE_REQUIRED" => {
+                return Err(blocked(if can_shrink {
+                    "one native commit exceeds the upload request budget; multipart body preparation is required"
+                } else {
+                    "captured upload exceeds the requested byte budget; retry the immutable attempt with its original supported budget"
+                }));
+            }
+            result => return result,
+        }
+    }
+}
+
+async fn prepare_partial_ordinary_upload_inner(
+    read: &(impl StorageAdapterRead + ?Sized),
+    state: &PartialReplicaState,
+    branch_id: &str,
+    attempt_id: String,
+    max_commits: usize,
+    max_wire_bytes: usize,
+    checkpoint_prefix: Option<CommitId>,
+) -> Result<Option<PreparedPartialPush>, LixError> {
     if max_commits == 0 || max_commits > super::MAX_SYNC_REQUEST_ITEMS || max_wire_bytes == 0 {
         return Err(blocked("invalid partial upload work budget"));
     }
@@ -155,6 +243,21 @@ pub(super) async fn prepare_partial_ordinary_upload(
             head: control.head_commit_id.to_string(),
             checkpoint: checkpoint.to_string(),
         });
+    if let Some(checkpoint) = checkpoint_prefix {
+        if resumed.is_some() {
+            return Err(blocked(
+                "checkpoint prefix cannot replace a durable upload attempt",
+            ));
+        }
+        let (source_branch, source) = super::commit::load_sync_checkpoint_source(read, checkpoint)
+            .await?
+            .ok_or_else(|| blocked("checkpoint prefix requires its captured native source"))?;
+        if source_branch != branch_id {
+            return Err(blocked("checkpoint source belongs to another branch"));
+        }
+        target.head = source.to_string();
+        target.checkpoint = branch_state.confirmed.checkpoint.clone();
+    }
     if target == branch_state.confirmed {
         return Ok(None);
     }
@@ -264,8 +367,12 @@ pub(super) async fn prepare_partial_ordinary_upload(
                 "local commit requires physical source closure preparation",
             ));
         }
-        serde_json::to_writer(&mut budget, &commit)
-            .map_err(|_| blocked("local suffix exceeds wire byte budget"))?;
+        serde_json::to_writer(&mut budget, &commit).map_err(|_| {
+            LixError::new(
+                "LIX_PARTIAL_UPLOAD_PAGE_REQUIRED",
+                "local suffix exceeds wire byte budget",
+            )
+        })?;
         known.insert(record.commit_id);
         commits.push(commit);
     }
@@ -324,8 +431,12 @@ pub(super) async fn prepare_partial_ordinary_upload(
         remaining: max_wire_bytes,
         written: 0,
     };
-    serde_json::to_writer(&mut budget, &request)
-        .map_err(|_| blocked("partial upload request exceeds wire byte budget"))?;
+    serde_json::to_writer(&mut budget, &request).map_err(|_| {
+        LixError::new(
+            "LIX_PARTIAL_UPLOAD_PAGE_REQUIRED",
+            "partial upload request exceeds wire byte budget",
+        )
+    })?;
     Ok(Some(PreparedPartialPush {
         upload,
         request,
@@ -1028,7 +1139,7 @@ mod created_ref_prefix_tests {
 
 /// Only ancestry of the confirmed authority GLOBAL coordinate can extend the
 /// tiny known-base frontier. Local presence alone is not an upload proof.
-async fn is_confirmed_global_base(
+pub(super) async fn is_confirmed_global_base(
     read: &(impl StorageAdapterRead + ?Sized),
     base: CommitId,
     confirmed: CommitId,
