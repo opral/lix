@@ -1980,7 +1980,7 @@ async fn scoped_checkpoint_from_uncheckpointed_authority_survives_reconnect(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn conflicting_remote_edits_preserve_pending_local_rows_across_reopen() {
+async fn conflicting_remote_edits_converge_and_preserve_pending_rows_across_reopen() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
@@ -2011,7 +2011,19 @@ async fn conflicting_remote_edits_preserve_pending_local_rows_across_reopen() {
     remote.put_value("shared", "server").await;
     probe.set_offline(false);
     let replica = open_replica(directory.path(), &url).await;
-    wait_for_counter(&probe.merge_conflicts, 1).await;
+    tokio::time::timeout(WAIT_TIMEOUT, async {
+        loop {
+            if remote.read_value("shared").await.as_deref() == Some("pending")
+                && remote.read_value("dependent").await.as_deref() == Some("pending")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("later accepted incoming rows must converge after reconnect");
+    assert_eq!(probe.merge_conflicts.load(Ordering::Acquire), 0);
     assert_eq!(
         read_value(&replica, "shared").await.as_deref(),
         Some("pending")
@@ -2020,8 +2032,14 @@ async fn conflicting_remote_edits_preserve_pending_local_rows_across_reopen() {
         read_value(&replica, "dependent").await.as_deref(),
         Some("pending")
     );
-    assert_eq!(remote.read_value("shared").await.as_deref(), Some("server"));
-    assert_eq!(remote.read_value("dependent").await, None);
+    assert_eq!(
+        remote.read_value("shared").await.as_deref(),
+        Some("pending")
+    );
+    assert_eq!(
+        remote.read_value("dependent").await.as_deref(),
+        Some("pending")
+    );
     replica.close().await.unwrap();
     probe.set_offline(true);
     let replica = open_replica(directory.path(), &url).await;
@@ -3417,3 +3435,6 @@ async fn local_created_branch_publishes_refs_then_admits_without_losing_main() {
     replica.close().await.unwrap();
     stop_server(server).await;
 }
+
+#[path = "sync_mode/plugin_merge.rs"]
+mod plugin_merge;

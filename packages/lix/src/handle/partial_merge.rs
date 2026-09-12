@@ -316,7 +316,7 @@ where
             .session
             .with_write_transaction_lending(async |transaction| {
                 transaction
-                    .reconcile_partial_authority_kv(self.lix_id(), request.clone())
+                    .reconcile_partial_authority_merge(self.lix_id(), request.clone())
                     .await
             })
             .await;
@@ -363,6 +363,16 @@ mod tests {
             base_commit_id: base.into(),
             expected_authority_head_commit_id: remote.selected_branch.head.commit_id,
             captured_local_head_commit_id: source.selected_branch.head.commit_id.clone(),
+            expected_authority_checkpoint_commit_id: remote
+                .selected_branch
+                .checkpoint
+                .commit_id
+                .clone(),
+            captured_local_checkpoint_commit_id: remote
+                .selected_branch
+                .checkpoint
+                .commit_id
+                .clone(),
             checkpoint_commit_id: remote.selected_branch.checkpoint.commit_id,
             global_head_commit_id: remote.global_branch.head.commit_id,
             global_checkpoint_commit_id: remote.global_branch.checkpoint.commit_id,
@@ -421,10 +431,7 @@ mod tests {
     #[tokio::test]
     async fn retained_body_gc_authority_merge_and_newer_local_suffix_preserve_both_sides() {
         let memory = Memory::new();
-        let authority = open_lix()
-            .with_storage(memory.clone())
-            .await
-            .unwrap();
+        let authority = open_lix().with_storage(memory.clone()).await.unwrap();
         authority
             .set_sync_role(crate::sync::SyncRole::Authority)
             .unwrap();
@@ -563,12 +570,9 @@ mod tests {
         );
     }
     #[tokio::test]
-    async fn authority_merge_conflict_keeps_both_native_heads_and_live_attempt() {
+    async fn authority_merge_accepts_incoming_row_and_keeps_both_native_histories() {
         let memory = Memory::new();
-        let authority = open_lix()
-            .with_storage(memory.clone())
-            .await
-            .unwrap();
+        let authority = open_lix().with_storage(memory.clone()).await.unwrap();
         authority
             .set_sync_role(crate::sync::SyncRole::Authority)
             .unwrap();
@@ -605,14 +609,10 @@ mod tests {
             .await
             .unwrap();
         let request = publish_wave(&authority, &local, &base).await;
-        assert_eq!(
-            authority
-                .merge_partial_replica_for_account(&request, authority.active_account_id())
-                .await
-                .unwrap_err()
-                .code,
-            "LIX_PARTIAL_MERGE_CONFLICT"
-        );
+        let receipt = authority
+            .merge_partial_replica_for_account(&request, authority.active_account_id())
+            .await
+            .unwrap();
         assert_eq!(
             authority
                 .partial_replica_descriptor(None)
@@ -621,7 +621,28 @@ mod tests {
                 .selected_branch
                 .head
                 .commit_id,
-            request.expected_authority_head_commit_id
+            receipt.merge_commit_id
+        );
+        let value = authority
+            .execute("SELECT value FROM lix_key_value WHERE key='merge-a'", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            value.rows()[0].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!("local")
+        );
+        assert_eq!(
+            authority
+                .merge_partial_replica_for_account(&request, authority.active_account_id())
+                .await
+                .unwrap(),
+            receipt
+        );
+        assert!(
+            crate::sync::export_sync_commit(&authority, &request.expected_authority_head_commit_id)
+                .await
+                .unwrap()
+                .is_some()
         );
         assert!(
             crate::sync::export_sync_commit(&authority, &request.captured_local_head_commit_id)

@@ -10,8 +10,26 @@ use std::collections::HashSet;
 
 #[async_trait]
 pub(crate) trait BlobDataReader: Send + Sync {
+    /// Only admitted partial serving reads prepare otherwise unconsumed inputs.
+    fn requires_referenced_content_preparation(&self) -> bool {
+        false
+    }
+
     /// Called only for hashes named by actual visible file/blob references.
     async fn require_referenced_manifests(&self, _hashes: &[BlobId]) -> Result<(), LixError> {
+        Ok(())
+    }
+
+    /// Prepare resident representation inputs without promising payload verification.
+    async fn require_referenced_content(&self, hashes: &[BlobId]) -> Result<(), LixError> {
+        self.require_referenced_manifests(hashes).await?;
+        let values = self.load_bytes_many(hashes).await?.into_vec();
+        if values.len() != hashes.len() || values.iter().any(Option::is_none) {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "referenced content is missing",
+            ));
+        }
         Ok(())
     }
 
@@ -127,6 +145,10 @@ impl<S> BlobDataReader for BinaryCasStoreReader<S>
 where
     S: StorageAdapterRead + Clone + Send + Sync,
 {
+    fn requires_referenced_content_preparation(&self) -> bool {
+        self.referenced_manifest_demands
+    }
+
     async fn require_referenced_manifests(&self, hashes: &[BlobId]) -> Result<(), LixError> {
         if !self.referenced_manifest_demands {
             return Ok(());
@@ -140,6 +162,11 @@ where
             }
         }
         Ok(())
+    }
+
+    async fn require_referenced_content(&self, hashes: &[BlobId]) -> Result<(), LixError> {
+        self.require_referenced_manifests(hashes).await?;
+        crate::binary_cas::kv::require_referenced_content(&self.store, hashes).await
     }
 
     async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {

@@ -2,8 +2,8 @@
 //!
 //! Row existence is resolved as one value. When `base`, `a`, and `b` are all
 //! live JSON objects, their columns are reconciled independently. Callers
-//! canonically rank the two successors before entering this module, so `b` is
-//! always the host's last-writer-wins value.
+//! pass the current state as `a` and the incoming accepted operation as `b`.
+//! Native publication order determines the default last-writer-wins value.
 
 use std::collections::BTreeSet;
 
@@ -32,7 +32,7 @@ pub(crate) struct ColumnMerge<'a> {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ColumnMergeResult {
-    /// Keep the canonically later (`b`) value, including its missing state.
+    /// Keep the incoming (`b`) value, including its missing state.
     UseLww,
     /// Replace the column. `None` removes an optional column; it is distinct
     /// from `Some(JsonValue::Null)`.
@@ -81,12 +81,14 @@ pub(crate) fn primary_key_columns(schema: &SchemaPlan) -> Result<BTreeSet<String
     Ok(columns)
 }
 
-/// Reconciles one row. `a` and `b` must already be ordered by `ConflictRank`.
+/// Reconciles one row with `a` the current state and `b` the incoming operation.
+/// The caller supplies native acceptance order; change IDs and clocks do not rank values.
 ///
 /// The callback is invoked only when both successors changed the same column
 /// differently. Returning `None` means that no plugin owns this column and
 /// therefore selects host-native column-based LWW without a Wasm call.
 pub(crate) fn reconcile_row<F>(
+    schema_key: &str,
     base: Option<RowVersionRef<'_>>,
     a: Option<RowVersionRef<'_>>,
     b: Option<RowVersionRef<'_>>,
@@ -137,7 +139,13 @@ where
             continue;
         }
 
-        let selected = if a_value == b_value {
+        // A binary reference is one opaque content value. Its hash and
+        // size must come from the same accepted snapshot, even when one
+        // component happens to equal the base. Derived plugin blobs never
+        // enter this resolver: their semantic rows drive serialization.
+        let selected = if schema_key == "lix_binary_blob_ref" {
+            b_value.cloned()
+        } else if a_value == b_value {
             a_value.cloned()
         } else if a_value == base_value {
             b_value.cloned()
@@ -166,6 +174,7 @@ where
 /// Reconciles plugin-owned rows without converting Schema v1 values through
 /// an outer JSON row representation.
 pub(crate) fn reconcile_typed_row<F>(
+    schema_key: &str,
     base: Option<TypedRowVersionRef<'_>>,
     a: Option<TypedRowVersionRef<'_>>,
     b: Option<TypedRowVersionRef<'_>>,
@@ -212,7 +221,13 @@ where
             continue;
         }
 
-        let selected = if a_value == b_value {
+        // A binary reference is one opaque content value. Its hash and
+        // size must come from the same accepted snapshot, even when one
+        // component happens to equal the base. Derived plugin blobs never
+        // enter this resolver: their semantic rows drive serialization.
+        let selected = if schema_key == "lix_binary_blob_ref" {
+            b_value.cloned()
+        } else if a_value == b_value {
             a_value.cloned()
         } else if a_value == base_value {
             b_value.cloned()
@@ -392,12 +407,81 @@ mod tests {
     }
 
     #[test]
+    fn opaque_blob_reference_keeps_incoming_hash_and_size_together() {
+        let base = json!({"blob_hash":"base","size":1});
+        let target = json!({"blob_hash":"target","size":10});
+        let incoming = json!({"blob_hash":"incoming","size":1});
+        let merged = reconcile_row(
+            "lix_binary_blob_ref",
+            Some(row(&base)),
+            Some(row(&target)),
+            Some(row(&incoming)),
+            &no_primary_key(),
+            |_| panic!("opaque reference has no column hook"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(merged.snapshot, incoming);
+        // An arbitrary schema with similarly named columns still uses the
+        // normal disjoint-column rule, not content-specific tuple handling.
+        let generic = reconcile_row(
+            "user_schema",
+            Some(row(&base)),
+            Some(row(&target)),
+            Some(row(&incoming)),
+            &no_primary_key(),
+            |_| Ok(None),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(generic.snapshot, json!({"blob_hash":"incoming","size":10}));
+    }
+
+    #[test]
+    fn typed_opaque_reference_uses_the_same_atomic_rule() {
+        let make = |hash: &str, size: i64| WasmTypedRow {
+            schema_fingerprint: [7; 32],
+            row_pk: vec![lix_schema::Value::Text("file".into())].into(),
+            row: lix_schema::Row::from([
+                ("blob_hash".to_owned(), lix_schema::Value::Text(hash.into())),
+                ("size".to_owned(), lix_schema::Value::Int8(size)),
+            ]),
+            native_payload: std::sync::OnceLock::new(),
+            boundary_create_validation: std::sync::OnceLock::new(),
+        };
+        let base = make("base", 1);
+        let target = make("target", 10);
+        let incoming = make("incoming", 1);
+        let merged = reconcile_typed_row(
+            "lix_binary_blob_ref",
+            Some(TypedRowVersionRef {
+                snapshot: &base,
+                metadata: None,
+            }),
+            Some(TypedRowVersionRef {
+                snapshot: &target,
+                metadata: None,
+            }),
+            Some(TypedRowVersionRef {
+                snapshot: &incoming,
+                metadata: None,
+            }),
+            &no_primary_key(),
+            |_| panic!("opaque reference has no column hook"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(merged.snapshot.row, incoming.row);
+    }
+
+    #[test]
     fn composes_changes_to_different_columns_without_calling_plugin() {
         let base = json!({"id":"1","title":"old","body":"old"});
         let a = json!({"id":"1","title":"a","body":"old"});
         let b = json!({"id":"1","title":"old","body":"b"});
         let mut calls = 0;
         let merged = reconcile_row(
+            "test_schema",
             Some(row(&base)),
             Some(row(&a)),
             Some(row(&b)),
@@ -419,6 +503,7 @@ mod tests {
         let a = json!({"body":"alice"});
         let b = json!({"body":"bob"});
         let merged = reconcile_row(
+            "test_schema",
             Some(row(&base)),
             Some(row(&a)),
             Some(row(&b)),
@@ -436,6 +521,7 @@ mod tests {
         let a = json!({"body":"alice","rank":2});
         let b = json!({"body":"bob","rank":3});
         let merged = reconcile_row(
+            "test_schema",
             Some(row(&base)),
             Some(row(&a)),
             Some(row(&b)),
@@ -460,6 +546,7 @@ mod tests {
         let b = json!({});
         let mut observed = None;
         let merged = reconcile_row(
+            "test_schema",
             Some(row(&base)),
             Some(row(&a)),
             Some(row(&b)),
@@ -480,6 +567,7 @@ mod tests {
         let base = json!({"body":"old"});
         let a = json!({"body":"edited"});
         let merged = reconcile_row(
+            "test_schema",
             Some(row(&base)),
             Some(row(&a)),
             None,
@@ -496,6 +584,7 @@ mod tests {
         let a = json!({"id":"2","body":"old"});
         let b = json!({"id":"1","body":"new"});
         let error = reconcile_row(
+            "test_schema",
             Some(row(&base)),
             Some(row(&a)),
             Some(row(&b)),
@@ -528,6 +617,7 @@ mod tests {
         let a = typed_row(json!({"author": "a"}));
         let b = typed_row(json!({"author": "b"}));
         let merged = reconcile_typed_row(
+            "test_schema",
             Some(TypedRowVersionRef {
                 snapshot: &base,
                 metadata: None,

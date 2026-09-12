@@ -718,6 +718,10 @@ impl WriteContextBlobDataReader {
 
 #[async_trait]
 impl BlobDataReader for WriteContextBlobDataReader {
+    fn requires_referenced_content_preparation(&self) -> bool {
+        self.ctx.shared.is_partial_replica
+    }
+
     async fn require_referenced_manifests(&self, hashes: &[BlobId]) -> Result<(), LixError> {
         self.ctx.require_referenced_manifests(hashes).await
     }

@@ -151,3 +151,33 @@ fn exclude_checkpoint_rows(diff: &mut TrackedStateDiff) {
             && entry.identity.schema_key() != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
     });
 }
+
+/// Analyze only caller-proven incoming identities. Remote-only rows remain in
+/// the target root, so reconciliation never needs a repository-wide diff.
+pub(crate) async fn analyze_incoming_rows<S: StorageAdapterRead>(
+    reader: &mut TrackedStateStoreReader<S>,
+    base: CommitId,
+    target: CommitId,
+    source: CommitId,
+    mut source_diff: TrackedStateDiff,
+    mut target_diff: TrackedStateDiff,
+) -> Result<MergeAnalysis, LixError> {
+    exclude_checkpoint_rows(&mut source_diff);
+    exclude_checkpoint_rows(&mut target_diff);
+    let fallback = crate::tracked_state::merge_payload_fallback_ids(&target_diff, &source_diff)?;
+    let payloads = reader.load_change_payloads(&fallback).await?;
+    let plan = plan_merge(&target_diff, &source_diff, &payloads)?;
+    let stats = stats_from_plan(&plan, &source_diff)?;
+    Ok(MergeAnalysis {
+        outcome: MergeOutcome::MergeCommitted,
+        commits: MergeCommits {
+            base_commit_id: base,
+            target_commit_id: target,
+            source_commit_id: source,
+        },
+        source_diff,
+        target_diff,
+        stats,
+        merge_plan: Some(plan),
+    })
+}

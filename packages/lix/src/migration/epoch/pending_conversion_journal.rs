@@ -247,6 +247,8 @@ mod tests {
                 base_commit_id: selected.head.commit_id.clone(),
                 expected_authority_head_commit_id: selected.head.commit_id.clone(),
                 captured_local_head_commit_id: target.clone(),
+                expected_authority_checkpoint_commit_id: selected.checkpoint.commit_id.clone(),
+                captured_local_checkpoint_commit_id: selected.checkpoint.commit_id.clone(),
                 checkpoint_commit_id: selected.checkpoint.commit_id.clone(),
                 global_head_commit_id: descriptor.global_branch.head.commit_id.clone(),
                 global_checkpoint_commit_id: descriptor.global_branch.checkpoint.commit_id.clone(),

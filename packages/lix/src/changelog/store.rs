@@ -267,6 +267,8 @@ mod tests {
             // Test-only synthetic local jump frontier; deliberately no state or
             // checkpoint inventory is created or certified by this fixture.
             ("sync/partial_upload.rs .put(", 1),
+            // Test-only synthetic ancestry graphs, including corrupt jump input.
+            ("sync/partial_merge_analysis/ancestry_tests.rs .put(", 1),
         ]
         .into_iter()
         .map(|(site, count)| (site.to_string(), count))

@@ -67,51 +67,64 @@ pub(super) async fn captured_wave(
             "prepared merge wave changed its durable predecessor",
         ));
     }
-    let target = if let Some(wave) = prepared {
-        id(&wave.target)?
-    } else {
-        super::partial_upload::wave_target(
-            read,
-            id(&request.captured_local_head_commit_id)?,
-            id(previous)?,
-            32,
-        )
-        .await?
-    };
-    let mut cursor = target;
-    let mut reverse = Vec::new();
-    let mut seen = BTreeSet::new();
-    while cursor != id(previous)? {
-        if reverse.len() == 32 || !seen.insert(cursor) {
-            return Err(invalid(
-                "captured merge body wave is not bounded and linear",
-            ));
-        }
-        let commit = super::commit::load_sync_commit(read, cursor)
+    let known = [
+        &request.base_commit_id,
+        &request.expected_authority_head_commit_id,
+        &request.checkpoint_commit_id,
+        &request.expected_authority_checkpoint_commit_id,
+        &request.global_head_commit_id,
+        &request.global_checkpoint_commit_id,
+    ]
+    .into_iter()
+    .map(|value| id(value))
+    .collect::<Result<BTreeSet<_>, _>>()?;
+    // Replay the deterministic bounded local closure from immutable coordinates.
+    // The accepted cursor names a prefix, not a first-parent ancestry claim.
+    let closure = super::partial_checkpoint_upload::load_local_dependency_closure(
+        read,
+        &request.branch_id,
+        &super::partial_upload::local_record(read, id(&request.captured_local_head_commit_id)?)
             .await?
-            .ok_or_else(|| invalid("locally authored captured commit disappeared"))?;
-        if commit.is_checkpoint
-            || commit.parent_commit_ids.len() != 1
-            || commit.global_scope
-            || commit.state_alias.is_some()
-            || commit.selected_source_commit_id.is_some()
-            || commit.members.iter().any(|member| {
-                !member.authored || member.schema_key != "lix_key_value" || member.file_id.is_some()
-            })
-        {
-            return Err(invalid(
-                "merge wave extends beyond supported ordinary key/value scope",
-            ));
-        }
-        cursor = id(&commit.parent_commit_ids[0])?;
-        reverse.push(commit);
+            .account_id,
+        &[
+            id(&request.captured_local_head_commit_id)?,
+            id(&request.captured_local_checkpoint_commit_id)?,
+        ],
+        known,
+        id(&request.global_head_commit_id)?,
+        1024,
+        64 * 1024 * 1024,
+    )
+    .await?;
+    let start = if previous == request.base_commit_id {
+        0
+    } else {
+        closure
+            .iter()
+            .position(|commit| commit.commit_id == previous)
+            .ok_or_else(|| invalid("accepted body cursor is outside captured dependency closure"))?
+            + 1
+    };
+    let end = if let Some(wave) = prepared {
+        closure
+            .iter()
+            .position(|commit| commit.commit_id == wave.target)
+            .ok_or_else(|| invalid("prepared body cursor is outside captured dependency closure"))?
+            + 1
+    } else {
+        (start + 32).min(closure.len())
+    };
+    if end <= start || end - start > 32 {
+        return Err(invalid(
+            "retained body cursor does not name a bounded forward page",
+        ));
     }
-    reverse.reverse();
+    let commits = closure[start..end].to_vec();
     let wave = RetainedBodyWaveRequest {
         request: request.clone(),
         expected_previous_commit_id: previous.into(),
         bodies: super::SyncPushRequest {
-            commits: reverse,
+            commits,
             ref_updates: vec![],
             inline_blobs: vec![],
         },
@@ -196,7 +209,17 @@ where
    let read=storage.begin_read(Default::default()).await?;
    let control=crate::branch::BranchHeadControlContext::new().reader(&read).load(branch).await?.ok_or_else(||invalid("restart selected control disappeared"))?;
    let descriptor=&wrapper.wire.descriptor;
-   let request=PartialMergeRequest{attempt_id:intent.next_attempt_id.clone(),branch_id:branch.into(),base_commit_id:intent.old.base_commit_id.clone(),expected_authority_head_commit_id:descriptor.selected_branch.head.commit_id.clone(),captured_local_head_commit_id:control.head_commit_id.to_string(),checkpoint_commit_id:descriptor.selected_branch.checkpoint.commit_id.clone(),global_head_commit_id:descriptor.global_branch.head.commit_id.clone(),global_checkpoint_commit_id:descriptor.global_branch.checkpoint.commit_id.clone()};
+   let request = PartialMergeRequest {
+       attempt_id: intent.next_attempt_id.clone(), branch_id: branch.into(),
+       base_commit_id: intent.old.base_commit_id.clone(),
+       expected_authority_head_commit_id: descriptor.selected_branch.head.commit_id.clone(),
+       captured_local_head_commit_id: control.head_commit_id.to_string(),
+       checkpoint_commit_id: intent.old.checkpoint_commit_id.clone(),
+       expected_authority_checkpoint_commit_id: descriptor.selected_branch.checkpoint.commit_id.clone(),
+       captured_local_checkpoint_commit_id: control.working_diff_checkpoint_commit_id.ok_or_else(|| invalid("restart local checkpoint disappeared"))?.to_string(),
+       global_head_commit_id: descriptor.global_branch.head.commit_id.clone(),
+       global_checkpoint_commit_id: descriptor.global_branch.checkpoint.commit_id.clone(),
+   };
    if request.expected_authority_head_commit_id==request.captured_local_head_commit_id{return Err(LixError::new("LIX_PARTIAL_REPLICA_MERGE_RECOVERY_PENDING","restart authority already contains local head; preserve edits for native inclusion settlement"))}
    let mut writes=storage.new_write_set();let guards=stage_capture_restarted_partial_merge(&read,&mut writes,state,&request).await?;
    drop(read);persist(storage,writes,guards).await
@@ -223,42 +246,35 @@ where
     Box::pin(async move {
         let storage = engine.storage();
         let branch = &previous.descriptor().selected_branch.branch_id;
-        let recover_ordinary = {
-            let read = storage.begin_read(Default::default()).await?;
-            let (merge, _, _) = load_partial_merge_state(&read, &previous, branch).await?;
-            let (push, _, _) =
-                super::partial_push_state::load_partial_push_state(&read, &previous, branch).await?;
-            merge.is_none()
-                && push.prepared.as_ref().is_some_and(|attempt| {
-                    attempt.target.head == wrapper.wire.descriptor.selected_branch.head.commit_id
-                        && attempt.target.checkpoint
-                            == wrapper.wire.descriptor.selected_branch.checkpoint.commit_id
-                })
-        };
-        if recover_ordinary {
-            let storage_ref = &storage;
-            let previous_ref = previous.as_ref();
-            super::partial_upload_cycle::upload_partial_once(
-                &storage,
-                &previous,
-                branch,
-                uuid::Uuid::now_v7().to_string(),
-                32,
-                64 * 1024 * 1024,
-                |request| async move {
-                    super::partial_blob_upload::push_partial_with_blobs(
-                        storage_ref,
-                        previous_ref,
-                        transport,
-                        &request,
-                    )
-                    .await
-                },
-            )
-            .await?;
-        }
         let mut seen = BTreeSet::new();
         let candidate = transport.fork_native_baseline_lease(&wrapper.wire.lease)?;
+        // A later authority commit can hide an accepted ordinary upload from
+        // exact-head equality. Settle the exact frozen tuple by native proof;
+        // never resend it as a fresh LWW write.
+        loop {
+            wrapper.deadline.check(&wrapper.wire.lease.lease_id)?;
+            let inclusion = async {
+                let read = storage.begin_read(Default::default()).await?;
+                let mut writes = storage.new_write_set();
+                let guards = super::partial_push_state::stage_acknowledge_included_partial_upload(
+                    &read,
+                    &mut writes,
+                    &previous,
+                    &wrapper.wire.descriptor,
+                )
+                .await?;
+                drop(read);
+                if let Some(guards) = guards {
+                    persist(&storage, writes, guards).await?;
+                }
+                Ok::<(), LixError>(())
+            }
+            .await;
+            match inclusion {
+                Ok(()) => break,
+                Err(error) => hydrate(&storage, &previous, &candidate, error, &mut seen).await?,
+            }
+        }
         // Read-only inputs may hydrate before durable capture; authoring L stays
         // protected by local control CAS and the partial epoch receipt.
         loop {
@@ -310,13 +326,13 @@ where
                         .commit_id
                         .clone(),
                     captured_local_head_commit_id: control.head_commit_id.to_string(),
-                    checkpoint_commit_id: wrapper
-                        .wire
-                        .descriptor
-                        .selected_branch
-                        .checkpoint
-                        .commit_id
-                        .clone(),
+                    checkpoint_commit_id: outbox.as_ref().map_or_else(
+                        || push.confirmed.checkpoint.clone(),
+                        |record| record.request.captured_local_checkpoint_commit_id.clone(),
+                    ),
+                    expected_authority_checkpoint_commit_id: wrapper.wire.descriptor.selected_branch.checkpoint.commit_id.clone(),
+                    captured_local_checkpoint_commit_id: control.working_diff_checkpoint_commit_id
+                        .ok_or_else(|| invalid("captured local checkpoint disappeared"))?.to_string(),
                     global_head_commit_id: wrapper.wire.descriptor.global_branch.head.commit_id.clone(),
                     global_checkpoint_commit_id: wrapper
                         .wire
@@ -326,12 +342,14 @@ where
                         .commit_id
                         .clone(),
                 };
-                super::partial_merge_analysis::analyze_native_kv_divergence(
+                super::partial_merge_analysis::analyze_native_divergence(
                     &read,
                     id(&request.base_commit_id)?,
                     id(&request.expected_authority_head_commit_id)?,
                     id(&request.captured_local_head_commit_id)?,
                     previous.active_account_id(),
+        &request.branch_id,
+        &[id(&request.checkpoint_commit_id)?, id(&request.expected_authority_checkpoint_commit_id)?],
                     id(&request.global_head_commit_id)?,
                     super::PartialMergeBudget {
                         max_local_commits: 1024,
@@ -394,7 +412,8 @@ where
                 let read = storage.begin_read(Default::default()).await?;
                 let mut writes = storage.new_write_set();
                 let guards =
-                    stage_record_partial_merge_receipt(&read, &mut writes, &previous, &receipt).await?;
+                    stage_record_partial_merge_receipt(&read, &mut writes, &previous, &receipt)
+                        .await?;
                 drop(read);
                 persist(&storage, writes, guards).await?;
                 break;
@@ -428,6 +447,13 @@ where
             .await?;
             drop(read);
             persist(&storage, writes, guards).await?;
+            super::partial_blob_upload::prepare_partial_upload_blobs(
+                &storage,
+                &previous,
+                transport,
+                &wave.bodies,
+            )
+            .await?;
             if let Err(error) = transport.retained_body_wave(&wave).await {
                 if error.code == "LIX_NATIVE_UPLOAD_ATTEMPT_EXPIRED"
                     || error.code == "LIX_PARTIAL_ATTEMPT_RESTARTED"
@@ -437,7 +463,7 @@ where
                 }
                 return Err(error);
             }
-    
+
             let read = storage.begin_read(Default::default()).await?;
             let mut writes = storage.new_write_set();
             let guards = stage_acknowledge_partial_merge_body_wave(

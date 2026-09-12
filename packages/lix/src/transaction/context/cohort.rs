@@ -425,10 +425,10 @@ where
 #[derive(Clone)]
 struct CohortSemanticCandidate {
     payload: Option<StaleConflictPayload>,
-    rank: ConflictRank,
 }
 
 fn reconcile_native_frontier(
+    schema_key: &str,
     base: Option<&StaleConflictPayload>,
     candidates: &[CohortSemanticCandidate],
     primary_key_columns: &BTreeSet<String>,
@@ -449,6 +449,7 @@ fn reconcile_native_frontier(
     for candidate in candidates.iter().skip(1) {
         let next = decode_stale_payload(candidate.payload.as_ref())?;
         current = reconcile_row(
+            schema_key,
             row_version_ref(base.as_ref()),
             row_version_ref(current.as_ref()),
             row_version_ref(next.as_ref()),
@@ -495,12 +496,6 @@ where
             if !include {
                 continue;
             }
-            let change_id = row.change_id.ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "cohort row is missing change_id",
-                )
-            })?;
             let key = TrackedStateKey {
                 schema_key: row.schema_key.to_string(),
                 file_id: row.file_id.map(ToString::to_string),
@@ -548,7 +543,6 @@ where
                             })
                         })
                         .transpose()?,
-                    rank: ConflictRank::new(row.updated_at, change_id),
                 });
         }
     }
@@ -591,7 +585,8 @@ where
         let versions = candidates
             .get_mut(key)
             .expect("candidate key originates from map");
-        versions.sort_by_key(|candidate| candidate.rank);
+        // Candidates are collected in accepted cohort queue order. Sorting by
+        // client change IDs would reverse the authority's application order.
         versions.retain(|candidate| candidate.payload != base);
         let Some(first) = versions.first() else {
             continue;
@@ -610,7 +605,12 @@ where
             .expect("candidate row has primary-key metadata");
         let (current, remaining) = if !typed {
             (
-                reconcile_native_frontier(base.as_ref(), versions, &primary_key_columns)?,
+                reconcile_native_frontier(
+                    &key.schema_key,
+                    base.as_ref(),
+                    versions,
+                    &primary_key_columns,
+                )?,
                 VecDeque::new(),
             )
         } else {

@@ -18,6 +18,7 @@ pub(crate) struct VerifiedRetainedBodyWave {
     previous: CommitId,
     tip: CommitId,
     anchors: BTreeSet<CommitId>,
+    body_roots: BTreeSet<CommitId>,
 }
 impl VerifiedRetainedBodyWave {
     /// `existing_complete` contains only bodies successfully checked by the
@@ -37,7 +38,7 @@ impl VerifiedRetainedBodyWave {
         let invalid = || {
             LixError::new(
                 "LIX_PARTIAL_UPLOAD_ATTEMPT_INVALID",
-                "retained wave is not a complete contiguous ordinary KV suffix",
+                "retained wave is not a complete contiguous ordinary selected suffix",
             )
         };
         merge.validate()?;
@@ -48,41 +49,66 @@ impl VerifiedRetainedBodyWave {
         {
             return Err(invalid());
         }
-        let mut tip = previous;
-        let mut seen = BTreeSet::new();
-        for commit in &request.commits {
-            let key = CommitId::parse_lix(&commit.commit_id, "retained body")?;
-            if commit.is_checkpoint
-                || commit.global_scope
-                || commit.account_id != account
-                || commit.parent_commit_ids != vec![tip.to_string()]
-                || commit.state_alias.is_some()
-                || commit.selected_source_commit_id.is_some()
-                || !seen.insert(key)
-                || (!staged.contains_key(&key) && !existing_complete.contains(&key))
-                || commit
-                    .base_commit_id
-                    .as_ref()
-                    .is_some_and(|base| base != &merge.global_head_commit_id)
-                || commit.members.iter().any(|member| {
-                    !member.authored
-                        || member.schema_key != "lix_key_value"
-                        || member.file_id.is_some()
-                })
-            {
-                return Err(invalid());
-            }
-            tip = key;
-        }
         let anchors = [
             &merge.expected_authority_head_commit_id,
             &merge.checkpoint_commit_id,
+            &merge.expected_authority_checkpoint_commit_id,
             &merge.global_head_commit_id,
             &merge.global_checkpoint_commit_id,
         ]
         .into_iter()
         .map(|value| CommitId::parse_lix(value, "upload attempt anchor"))
         .collect::<Result<BTreeSet<_>, _>>()?;
+        let mut known = anchors.clone();
+        known.insert(CommitId::parse_lix(&merge.base_commit_id, "retained base")?);
+        known.insert(previous);
+        if let Some((attempt, _)) = crate::gc::load_native_upload_attempt(
+            read,
+            &crate::gc::NativeUploadAttemptIdentity {
+                repository_id: repository_id.into(),
+                account_id: account.into(),
+                branch_id: merge.branch_id.clone(),
+                attempt_id: merge.attempt_id.clone(),
+            },
+        )
+        .await?
+        {
+            known.extend(attempt.retained_body_roots()?);
+        }
+        let mut tip = previous;
+        let mut seen = BTreeSet::new();
+        for commit in &request.commits {
+            let key = CommitId::parse_lix(&commit.commit_id, "retained body")?;
+            let mut dependencies = commit
+                .parent_commit_ids
+                .iter()
+                .map(|id| CommitId::parse_lix(id, "retained parent"))
+                .collect::<Result<BTreeSet<_>, _>>()?;
+            if let Some(alias) = &commit.state_alias {
+                dependencies.insert(CommitId::parse_lix(
+                    &alias.source_commit_id,
+                    "retained alias",
+                )?);
+            }
+            if let Some(source) = &commit.selected_source_commit_id {
+                dependencies.insert(CommitId::parse_lix(source, "retained source")?);
+            }
+            if commit.global_scope
+                || commit.account_id != account
+                || !seen.insert(key)
+                || (!staged.contains_key(&key) && !existing_complete.contains(&key))
+                || dependencies.is_empty()
+                || !dependencies.is_subset(&known)
+                || commit
+                    .base_commit_id
+                    .as_ref()
+                    .is_some_and(|base| base != &merge.global_head_commit_id)
+            {
+                return Err(invalid());
+            }
+            known.insert(key);
+            tip = key;
+        }
         let mut anchor_guards = Vec::new();
         if initial {
             let branches = [merge.branch_id.clone(), crate::GLOBAL_BRANCH_ID.to_owned()];
@@ -93,7 +119,7 @@ impl VerifiedRetainedBodyWave {
             for (index, (head, checkpoint)) in [
                 (
                     &merge.expected_authority_head_commit_id,
-                    &merge.checkpoint_commit_id,
+                    &merge.expected_authority_checkpoint_commit_id,
                 ),
                 (
                     &merge.global_head_commit_id,
@@ -156,6 +182,7 @@ impl VerifiedRetainedBodyWave {
             previous,
             tip,
             anchors,
+            body_roots: seen,
         })
     }
     pub(crate) fn initial(&self) -> bool {
@@ -191,6 +218,9 @@ impl VerifiedRetainedBodyWave {
     pub(crate) fn tip(&self) -> CommitId {
         self.tip
     }
+    pub(crate) fn body_roots(&self) -> &BTreeSet<CommitId> {
+        &self.body_roots
+    }
     pub(crate) fn anchors(&self) -> &BTreeSet<CommitId> {
         &self.anchors
     }
@@ -220,6 +250,16 @@ mod tests {
             base_commit_id: before.selected_branch.head.commit_id.clone(),
             expected_authority_head_commit_id: after.selected_branch.head.commit_id.clone(),
             captured_local_head_commit_id: after.selected_branch.head.commit_id,
+            expected_authority_checkpoint_commit_id: before
+                .selected_branch
+                .checkpoint
+                .commit_id
+                .clone(),
+            captured_local_checkpoint_commit_id: before
+                .selected_branch
+                .checkpoint
+                .commit_id
+                .clone(),
             checkpoint_commit_id: before.selected_branch.checkpoint.commit_id,
             global_head_commit_id: before.global_branch.head.commit_id,
             global_checkpoint_commit_id: before.global_branch.checkpoint.commit_id,

@@ -44,7 +44,7 @@ pub(crate) use partial_merge_analysis::PartialMergeBudget;
 mod partial_authority_merge;
 mod partial_authority_merge_receipt;
 pub(crate) use partial_authority_merge::{
-    AuthorityKvMergePlan, AuthorityMergePreparation, prepare_authority_kv_merge,
+    AuthorityMergePlan, AuthorityMergePreparation, prepare_authority_merge,
 };
 pub(crate) use partial_authority_merge_receipt::{
     PARTIAL_AUTHORITY_MERGE_RECEIPT_SPACE, PreparedAuthorityMergeReceipt,
@@ -172,9 +172,9 @@ pub(crate) const MAX_SYNC_HISTORY_PAGE_SIZE: usize = 100;
 pub(crate) const MAX_SYNC_BLOB_BATCH_ITEMS: usize = 16;
 pub(crate) const MAX_SYNC_REQUEST_ITEMS: usize = 512;
 pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
-// v9 requires canonical checkpoint membership and its global inventory.
-// Older writers cannot publish commits without this metadata.
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 11;
+// v12 requires explicit checkpoint coordinates for authoritative partial merges.
+// SDK and server must upgrade together.
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 12;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str = "LIX_SYNC_REPOSITORY_ID_MISMATCH";

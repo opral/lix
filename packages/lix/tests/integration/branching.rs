@@ -1613,7 +1613,7 @@ simulation_test!(
         })
         .await
         .expect("same-identity changes use deterministic column LWW");
-        assert_key_value(&main, "checkpoint-bridge-conflict", Some("\"target\"")).await;
+        assert_key_value(&main, "checkpoint-bridge-conflict", Some("\"source\"")).await;
     }
 );
 

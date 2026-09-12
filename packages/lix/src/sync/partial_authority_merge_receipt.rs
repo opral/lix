@@ -204,6 +204,8 @@ mod tests {
             base_commit_id: id(3),
             expected_authority_head_commit_id: id(4),
             captured_local_head_commit_id: id(5),
+            expected_authority_checkpoint_commit_id: id(6),
+            captured_local_checkpoint_commit_id: id(6),
             checkpoint_commit_id: id(6),
             global_head_commit_id: id(7),
             global_checkpoint_commit_id: id(8),

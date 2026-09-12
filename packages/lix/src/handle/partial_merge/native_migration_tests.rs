@@ -65,6 +65,12 @@ async fn migration_native_merge_validates_disjoint_custom_unique_rows() {
         base_commit_id: base,
         expected_authority_head_commit_id: target.clone(),
         captured_local_head_commit_id: local.clone(),
+        expected_authority_checkpoint_commit_id: remote
+            .selected_branch
+            .checkpoint
+            .commit_id
+            .clone(),
+        captured_local_checkpoint_commit_id: remote.selected_branch.checkpoint.commit_id.clone(),
         checkpoint_commit_id: remote.selected_branch.checkpoint.commit_id.clone(),
         global_head_commit_id: remote.global_branch.head.commit_id.clone(),
         global_checkpoint_commit_id: remote.global_branch.checkpoint.commit_id.clone(),
@@ -159,6 +165,12 @@ async fn migration_native_merge_preserves_custom_indexes_and_exact_outcome() {
         base_commit_id: base,
         expected_authority_head_commit_id: target.clone(),
         captured_local_head_commit_id: local.clone(),
+        expected_authority_checkpoint_commit_id: remote
+            .selected_branch
+            .checkpoint
+            .commit_id
+            .clone(),
+        captured_local_checkpoint_commit_id: remote.selected_branch.checkpoint.commit_id.clone(),
         checkpoint_commit_id: remote.selected_branch.checkpoint.commit_id.clone(),
         global_head_commit_id: remote.global_branch.head.commit_id.clone(),
         global_checkpoint_commit_id: remote.global_branch.checkpoint.commit_id.clone(),
@@ -261,6 +273,12 @@ async fn migration_native_merge_preserves_ordinary_file_content() {
         base_commit_id: base,
         expected_authority_head_commit_id: target.clone(),
         captured_local_head_commit_id: local.clone(),
+        expected_authority_checkpoint_commit_id: remote
+            .selected_branch
+            .checkpoint
+            .commit_id
+            .clone(),
+        captured_local_checkpoint_commit_id: remote.selected_branch.checkpoint.commit_id.clone(),
         checkpoint_commit_id: remote.selected_branch.checkpoint.commit_id.clone(),
         global_head_commit_id: remote.global_branch.head.commit_id.clone(),
         global_checkpoint_commit_id: remote.global_branch.checkpoint.commit_id.clone(),
@@ -377,6 +395,12 @@ async fn migration_native_merge_validates_reverse_foreign_key_deletion() {
         base_commit_id: base,
         expected_authority_head_commit_id: target.clone(),
         captured_local_head_commit_id: local.clone(),
+        expected_authority_checkpoint_commit_id: remote
+            .selected_branch
+            .checkpoint
+            .commit_id
+            .clone(),
+        captured_local_checkpoint_commit_id: remote.selected_branch.checkpoint.commit_id.clone(),
         checkpoint_commit_id: remote.selected_branch.checkpoint.commit_id.clone(),
         global_head_commit_id: remote.global_branch.head.commit_id.clone(),
         global_checkpoint_commit_id: remote.global_branch.checkpoint.commit_id.clone(),
@@ -461,6 +485,12 @@ async fn migration_native_merge_validates_file_changes_without_remote_edits() {
         base_commit_id: base,
         expected_authority_head_commit_id: target.clone(),
         captured_local_head_commit_id: local.clone(),
+        expected_authority_checkpoint_commit_id: remote
+            .selected_branch
+            .checkpoint
+            .commit_id
+            .clone(),
+        captured_local_checkpoint_commit_id: remote.selected_branch.checkpoint.commit_id.clone(),
         checkpoint_commit_id: remote.selected_branch.checkpoint.commit_id.clone(),
         global_head_commit_id: remote.global_branch.head.commit_id.clone(),
         global_checkpoint_commit_id: remote.global_branch.checkpoint.commit_id.clone(),
@@ -577,6 +607,12 @@ async fn migration_cleanup_fences_changed_surviving_head_and_retries_exactly() {
         base_commit_id: base,
         expected_authority_head_commit_id: target.clone(),
         captured_local_head_commit_id: local.clone(),
+        expected_authority_checkpoint_commit_id: remote
+            .selected_branch
+            .checkpoint
+            .commit_id
+            .clone(),
+        captured_local_checkpoint_commit_id: remote.selected_branch.checkpoint.commit_id.clone(),
         checkpoint_commit_id: remote.selected_branch.checkpoint.commit_id.clone(),
         global_head_commit_id: remote.global_branch.head.commit_id.clone(),
         global_checkpoint_commit_id: remote.global_branch.checkpoint.commit_id.clone(),

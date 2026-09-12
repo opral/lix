@@ -240,6 +240,8 @@ pub(crate) fn pending_selected_conversion_request(
         base_commit_id: base.head.clone(),
         captured_local_head_commit_id: local.head.clone(),
         expected_authority_head_commit_id: descriptor.selected_branch.head.commit_id.clone(),
+        expected_authority_checkpoint_commit_id: base.checkpoint.clone(),
+        captured_local_checkpoint_commit_id: base.checkpoint.clone(),
         checkpoint_commit_id: base.checkpoint.clone(),
         global_head_commit_id: global.head.clone(),
         global_checkpoint_commit_id: global.checkpoint.clone(),
@@ -332,10 +334,8 @@ pub(crate) fn pending_conversion_request_after_global(
             "global publication proof belongs to another frozen source",
         ));
     }
-    let plan = classify_descriptor_global_conversion(
-        source,
-        &descriptor.selected_branch.branch_id,
-    )?;
+    let plan =
+        classify_descriptor_global_conversion(source, &descriptor.selected_branch.branch_id)?;
     let request = &proof.receipt().request;
     if plan.global_base.head != request.base_commit_id
         || plan.global_local.head != request.captured_local_head_commit_id
@@ -373,6 +373,8 @@ pub(crate) fn pending_conversion_request_after_global(
         base_commit_id: base.head.clone(),
         expected_authority_head_commit_id: descriptor.selected_branch.head.commit_id.clone(),
         captured_local_head_commit_id: local.head.clone(),
+        expected_authority_checkpoint_commit_id: base.checkpoint.clone(),
+        captured_local_checkpoint_commit_id: base.checkpoint.clone(),
         checkpoint_commit_id: base.checkpoint.clone(),
         global_head_commit_id: descriptor.global_branch.head.commit_id.clone(),
         global_checkpoint_commit_id: descriptor.global_branch.checkpoint.commit_id.clone(),

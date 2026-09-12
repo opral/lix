@@ -587,3 +587,9 @@ async fn file_checkpoint_upload_case(paging: bool, wire_budget: usize, ordinary_
         .unwrap();
     assert_eq!(result.rows()[0].get::<Vec<u8>>("content").unwrap(), content);
 }
+
+mod retained_files;
+
+mod conflict_file;
+
+mod included_upload;

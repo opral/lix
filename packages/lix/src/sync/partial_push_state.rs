@@ -301,6 +301,64 @@ pub(super) async fn stage_acknowledge_partial_upload(
     Ok(guards)
 }
 
+/// Recover a lost ordinary ACK from authenticated native inclusion. This does
+/// not resend a body or create a later LWW operation, and never advances local
+/// controls over a genuinely newer local suffix.
+pub(super) async fn stage_acknowledge_included_partial_upload(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    state: &PartialReplicaState,
+    authority: &super::PartialReplicaDescriptor,
+) -> Result<Option<Vec<StoragePrecondition>>, LixError> {
+    let branch = &state.descriptor().selected_branch.branch_id;
+    if authority.selected_branch.branch_id != *branch {
+        return Err(invalid("included upload authority branch differs"));
+    }
+    let (merge, _, _) =
+        super::partial_merge_state::load_partial_merge_state(read, state, branch).await?;
+    if merge.is_some() {
+        return Ok(None);
+    }
+    let (push, _, _) = load_partial_push_state(read, state, branch).await?;
+    let Some(accepted) = push.prepared.as_ref() else {
+        return Ok(None);
+    };
+    // Created refs need their own accepted ref proof; selected uploads do not
+    // carry them. Head ancestry alone cannot certify a different branch ref.
+    if !accepted.created_refs.is_empty() {
+        return Ok(None);
+    }
+    let mut cache = std::collections::BTreeMap::new();
+    for (local, remote) in [
+        (
+            &accepted.target.head,
+            &authority.selected_branch.head.commit_id,
+        ),
+        (
+            &accepted.target.checkpoint,
+            &authority.selected_branch.checkpoint.commit_id,
+        ),
+    ] {
+        let local = crate::changelog::CommitId::parse_lix(local, "included upload coordinate")?;
+        let remote =
+            crate::changelog::CommitId::parse_lix(remote, "authority inclusion coordinate")?;
+        if local == remote {
+            continue;
+        }
+        let ancestor = super::partial_merge_analysis::record(read, local, true).await?;
+        if !super::partial_merge_analysis::bounded_ancestor(
+            read, &ancestor, remote, &mut cache, 1024,
+        )
+        .await?
+        {
+            return Ok(None);
+        }
+    }
+    stage_acknowledge_partial_upload(read, writes, state, branch, accepted, true)
+        .await
+        .map(Some)
+}
+
 /// Publication of prepared remote state may advance a clean confirmed ref.
 /// Unlike an own ACK, this accompanies a new serving basis. The caller must
 /// also CAS the observed local control and prepare all retained read scopes.

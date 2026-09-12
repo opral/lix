@@ -2878,7 +2878,7 @@ async fn v3_json_same_row_branch_merge_uses_fused_conflict_and_renderer_sinks() 
 }
 
 #[tokio::test]
-async fn v2_csv_same_cell_merge_uses_canonical_stored_rank() {
+async fn v2_csv_same_cell_merge_uses_incoming_default() {
     let archive = build_csv_plugin_archive();
     let lix = open_lix().await.unwrap();
     install_reference_plugin_in_blank_registry(
@@ -2931,11 +2931,7 @@ async fn v2_csv_same_cell_merge_uses_canonical_stored_rank() {
         source_order, target_order,
         "distinct conflicting rows must have distinct durable ordering tuples"
     );
-    let expected = if source_order < target_order {
-        target_bytes
-    } else {
-        source_bytes
-    };
+    let expected = source_bytes;
     let preview = lix
         .merge_branch_preview(MergeBranchPreviewOptions {
             source_branch_id: source.id.clone(),
@@ -2952,14 +2948,14 @@ async fn v2_csv_same_cell_merge_uses_canonical_stored_rank() {
     assert_eq!(
         read_file(&lix, path).await.unwrap(),
         Some(expected),
-        "the resolver must take the canonical higher-ranked variant, independent of branch labels"
+        "the shared default must take the incoming variant despite the later target edit"
     );
 
     lix.close().await.unwrap();
 }
 
 #[tokio::test]
-async fn v3_csv_same_cell_merge_uses_canonical_stored_rank() {
+async fn v3_csv_same_cell_merge_uses_incoming_default() {
     let lix = open_lix().await.unwrap();
     install_reference_plugin_in_blank_registry(
         &lix,
@@ -3008,11 +3004,7 @@ async fn v3_csv_same_cell_merge_uses_canonical_stored_rank() {
         .expect("target same-cell edit should commit");
     let target_order = csv_row_ordering(&lix, &file_id, &row_id).await;
     assert_ne!(source_order, target_order);
-    let expected = if source_order < target_order {
-        target_bytes
-    } else {
-        source_bytes
-    };
+    let expected = source_bytes;
 
     let preview = lix
         .merge_branch_preview(MergeBranchPreviewOptions {
@@ -3033,7 +3025,7 @@ async fn v3_csv_same_cell_merge_uses_canonical_stored_rank() {
 }
 
 #[tokio::test]
-async fn v2_csv_delete_vs_edit_fails_ownership_without_a_plugin_conflict_api() {
+async fn v2_csv_incoming_edit_restores_deleted_file_and_semantic_rows() {
     let archive = build_csv_plugin_archive();
     let lix = open_lix().await.unwrap();
     install_reference_plugin_in_blank_registry(
@@ -3099,25 +3091,30 @@ async fn v2_csv_delete_vs_edit_fails_ownership_without_a_plugin_conflict_api() {
         .expect("delete-vs-edit should preview with host-native LWW");
     assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
 
-    let error = lix
-        .merge_branch(MergeBranchOptions {
-            source_branch_id: source.id,
-        })
-        .await
-        .expect_err("delete-vs-edit currently fails the ordinary ownership constraint");
-    assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+    lix.merge_branch(MergeBranchOptions {
+        source_branch_id: source.id,
+    })
+    .await
+    .expect("incoming semantic edit restores its captured file scope");
 
     assert_eq!(
         read_file(&lix, path).await.unwrap(),
-        None,
-        "the target-side file deletion wins while the source row edit cannot restore its descriptor"
+        Some(b"alpha,ONE,red\n".to_vec())
+    );
+    assert_eq!(file_id_at_path(&lix, path).await, file_id);
+    assert_eq!(
+        csv_row_id(
+            &active_csv_rows(&lix, &file_id).await,
+            &["alpha", "ONE", "red"]
+        ),
+        row_id
     );
 
     lix.close().await.unwrap();
 }
 
 #[tokio::test]
-async fn v2_csv_rename_and_same_row_edit_fail_without_a_cross_row_conflict_api() {
+async fn v2_csv_format_change_and_same_row_edit_requires_explicit_migration() {
     let archive = build_csv_plugin_archive();
     let lix = open_lix().await.unwrap();
     install_reference_plugin_in_blank_registry(
@@ -3199,7 +3196,7 @@ async fn v2_csv_rename_and_same_row_edit_fail_without_a_cross_row_conflict_api()
             source_branch_id: source.id.clone(),
         })
         .await
-        .expect_err("preview must reject unsupported descriptor-plus-row reconciliation");
+        .expect_err("preview must reject a concurrent file format change");
     assert_eq!(preview_error.code, LixError::CODE_MERGE_CONFLICT);
 
     let error = lix
@@ -3207,7 +3204,7 @@ async fn v2_csv_rename_and_same_row_edit_fail_without_a_cross_row_conflict_api()
             source_branch_id: source.id,
         })
         .await
-        .expect_err("descriptor-plus-row reconciliation needs a future cross-row API");
+        .expect_err("file format changes require explicit migration");
     assert_eq!(error.code, LixError::CODE_MERGE_CONFLICT);
 
     assert_eq!(
@@ -3221,7 +3218,7 @@ async fn v2_csv_rename_and_same_row_edit_fail_without_a_cross_row_conflict_api()
 }
 
 #[tokio::test]
-async fn v2_csv_rename_and_disjoint_row_edits_fail_without_cross_row_materialization() {
+async fn v2_csv_rename_and_disjoint_row_edits_materialize_the_merged_file() {
     let lix = open_lix().await.unwrap();
     install_plugin(&lix, "plugin_csv", &build_csv_plugin_archive())
         .await
@@ -3285,27 +3282,25 @@ async fn v2_csv_rename_and_disjoint_row_edits_fail_without_cross_row_materializa
     lix.switch_branch(SwitchBranchOptions { branch_id: target })
         .await
         .unwrap();
-    let before_rows = active_csv_rows(&lix, &file_id).await;
-    let preview_error = lix
-        .merge_branch_preview(MergeBranchPreviewOptions {
-            source_branch_id: source.id.clone(),
-        })
-        .await
-        .expect_err("renamed disjoint edits still require derived-blob materialization");
-    assert_eq!(preview_error.code, LixError::CODE_MERGE_CONFLICT);
-    let error = lix
-        .merge_branch(MergeBranchOptions {
-            source_branch_id: source.id,
-        })
-        .await
-        .expect_err("must not choose one branch's blob for merged disjoint rows");
-    assert_eq!(error.code, LixError::CODE_MERGE_CONFLICT);
+    lix.merge_branch_preview(MergeBranchPreviewOptions {
+        source_branch_id: source.id.clone(),
+    })
+    .await
+    .expect("same-format rename preview must resolve disjoint semantic rows");
+    lix.merge_branch(MergeBranchOptions {
+        source_branch_id: source.id,
+    })
+    .await
+    .expect("same-format rename must serialize the combined semantic state");
+    assert_eq!(read_file(&lix, before_path).await.unwrap(), None);
     assert_eq!(
-        read_file(&lix, before_path).await.unwrap(),
-        Some(b"TARGET,one\nbeta,two\n".to_vec())
+        read_file(&lix, after_path).await.unwrap(),
+        Some(b"TARGET,one\nSOURCE,two\n".to_vec())
     );
-    assert_eq!(read_file(&lix, after_path).await.unwrap(), None);
-    assert_eq!(active_csv_rows(&lix, &file_id).await, before_rows);
+    assert_eq!(file_id_at_path(&lix, after_path).await, file_id);
+    let merged_rows = active_csv_rows(&lix, &file_id).await;
+    csv_row_id(&merged_rows, &["TARGET", "one"]);
+    csv_row_id(&merged_rows, &["SOURCE", "two"]);
     lix.close().await.unwrap();
 }
 
@@ -4185,7 +4180,7 @@ async fn v2_json_ten_mib_same_row_canonical_b_merge_benchmark() {
         .unwrap();
         lix.execute(
             "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
-            &[Value::Text(key.clone()), Value::Text(source_value)],
+            &[Value::Text(key.clone()), Value::Text(source_value.clone())],
         )
         .await
         .expect("source conflict control row should insert");
@@ -4197,14 +4192,12 @@ async fn v2_json_ten_mib_same_row_canonical_b_merge_benchmark() {
 
         let allocation_scope = AllocationScope::start();
         let started = Instant::now();
-        let error = lix
-            .merge_branch(MergeBranchOptions {
-                source_branch_id: source.id,
-            })
-            .await
-            .expect_err("same control-row identity should remain a merge conflict");
+        lix.merge_branch(MergeBranchOptions {
+            source_branch_id: source.id,
+        })
+        .await
+        .expect("same control-row identity uses the shared incoming LWW default");
         let measurement = BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
-        assert_eq!(error.code, LixError::CODE_MERGE_CONFLICT);
         elapsed_ms.push(measurement.elapsed_ms);
         measurements.push(measurement);
         emit_sample(
@@ -4221,11 +4214,11 @@ async fn v2_json_ten_mib_same_row_canonical_b_merge_benchmark() {
                 &[Value::Text(key)],
             )
             .await
-            .expect("target control row should remain queryable after conflict");
+            .expect("target control row should remain queryable after merge");
         assert_eq!(target.len(), 1);
         assert_eq!(
             target.rows()[0].get::<serde_json::Value>("value").unwrap(),
-            serde_json::json!(target_value)
+            serde_json::json!(source_value)
         );
     }
 

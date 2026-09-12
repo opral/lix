@@ -3,7 +3,7 @@ use super::partial_authority_merge_receipt::{
     PreparedAuthorityMergeReceipt, load_authority_merge_receipt,
 };
 use super::partial_merge_analysis::{
-    NativeKvMergeAnalysis, PartialMergeBudget, analyze_native_kv_divergence,
+    NativeMergeAnalysis, PartialMergeBudget, analyze_native_divergence,
 };
 use super::partial_merge_protocol::{PartialMergeReceipt, PartialMergeRequest};
 use crate::LixError;
@@ -12,13 +12,13 @@ use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition};
 
 pub(crate) enum AuthorityMergePreparation {
     AlreadyCommitted(PartialMergeReceipt),
-    Ready(AuthorityKvMergePlan),
+    Ready(AuthorityMergePlan),
 }
-pub(crate) struct AuthorityKvMergePlan {
+pub(crate) struct AuthorityMergePlan {
     repository_id: String,
     account_id: String,
     request: PartialMergeRequest,
-    native: NativeKvMergeAnalysis,
+    native: NativeMergeAnalysis,
     control_guards: Vec<StoragePrecondition>,
 }
 fn conflict(message: &str) -> LixError {
@@ -31,7 +31,7 @@ fn id(value: &str) -> Result<CommitId, LixError> {
 /// `repository` and `account` must come from the authenticated authority session,
 /// not request JSON. Caller owns a live attempt retention lease through commit.
 /// This helper does not accept or publish an unretained upload body.
-pub(crate) async fn prepare_authority_kv_merge(
+pub(crate) async fn prepare_authority_merge(
     read: &(impl StorageAdapterRead + ?Sized),
     repository: &str,
     account: &str,
@@ -74,7 +74,7 @@ pub(crate) async fn prepare_authority_kv_merge(
     for (index, (head, checkpoint)) in [
         (
             &request.expected_authority_head_commit_id,
-            &request.checkpoint_commit_id,
+            &request.expected_authority_checkpoint_commit_id,
         ),
         (
             &request.global_head_commit_id,
@@ -96,12 +96,41 @@ pub(crate) async fn prepare_authority_kv_merge(
             ));
         }
     }
-    let native = analyze_native_kv_divergence(
+    // An incoming checkpoint is a retained native coordinate, never a client
+    // assertion about current state. Its working head must include it.
+    if request.captured_local_checkpoint_commit_id != request.checkpoint_commit_id {
+        let checkpoint = super::partial_merge_analysis::record(
+            read,
+            id(&request.captured_local_checkpoint_commit_id)?,
+            true,
+        )
+        .await?;
+        if !checkpoint.is_checkpoint
+            || !super::partial_merge_analysis::bounded_ancestor(
+                read,
+                &checkpoint,
+                id(&request.captured_local_head_commit_id)?,
+                &mut Default::default(),
+                budget.max_remote_graph_records,
+            )
+            .await?
+        {
+            return Err(conflict(
+                "incoming checkpoint is not retained in the captured working head",
+            ));
+        }
+    }
+    let native = analyze_native_divergence(
         read,
         id(&request.base_commit_id)?,
         id(&request.expected_authority_head_commit_id)?,
         id(&request.captured_local_head_commit_id)?,
         account,
+        &request.branch_id,
+        &[
+            id(&request.checkpoint_commit_id)?,
+            id(&request.expected_authority_checkpoint_commit_id)?,
+        ],
         id(&request.global_head_commit_id)?,
         budget,
     )
@@ -113,7 +142,7 @@ pub(crate) async fn prepare_authority_kv_merge(
             crate::branch::branch_head_control_precondition(branch, value.raw_token)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(AuthorityMergePreparation::Ready(AuthorityKvMergePlan {
+    Ok(AuthorityMergePreparation::Ready(AuthorityMergePlan {
         repository_id: repository.into(),
         account_id: account.into(),
         request,
@@ -121,35 +150,26 @@ pub(crate) async fn prepare_authority_kv_merge(
         control_guards,
     }))
 }
-impl AuthorityKvMergePlan {
+impl AuthorityMergePlan {
     pub(crate) fn account_id(&self) -> &str {
         &self.account_id
     }
     pub(crate) fn branch_id(&self) -> &str {
         &self.request.branch_id
     }
-    pub(crate) fn source_parent(&self) -> Result<CommitId, LixError> {
-        id(&self.request.captured_local_head_commit_id)
+    pub(crate) fn accepted_checkpoint_commit_id(&self) -> Result<CommitId, LixError> {
+        id(self.request.accepted_checkpoint_commit_id())
     }
-    pub(crate) fn groups(&self) -> &[crate::tracked_state::TrackedStateMergePlan] {
-        &self.native.groups
-    }
-    pub(crate) fn has_conflicts(&self) -> bool {
+    pub(crate) fn application(&self) -> Result<&crate::session::MergeAnalysis, LixError> {
         self.native
-            .groups
-            .iter()
-            .any(|group| !group.conflicts.is_empty())
+            .application
+            .as_ref()
+            .ok_or_else(|| conflict("incoming changes are already included"))
     }
     pub(crate) fn into_receipt(
         self,
         merge: CommitId,
     ) -> Result<PreparedAuthorityMergeReceipt, LixError> {
-        if self.has_conflicts() {
-            return Err(LixError::new(
-                "LIX_PARTIAL_MERGE_CONFLICT",
-                "native merge contains unresolved conflicts",
-            ));
-        }
         PreparedAuthorityMergeReceipt::new(
             &self.repository_id,
             &self.account_id,

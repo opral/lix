@@ -8617,9 +8617,14 @@ async fn stage_incremental_file_delete_cascades(
             file_id: delta.file_id.map(str::to_string),
         })
         .collect::<BTreeSet<_>>();
-    let identities =
-        hot_load_file_scope_identities(store, branch_id, generation, &cascades).await?;
-    let values = hot_load_primary_identity_bytes(store, &identities).await?;
+    let (identities, values) = Box::pin(hot_load_file_scope_predecessors(
+        store,
+        branch_id,
+        generation,
+        working_diff_capture_checkpoint_commit_id,
+        &cascades,
+    ))
+    .await?;
     let scope = hot_scope_prefix(branch_id, generation);
     let key_capacity = identities
         .iter()
@@ -8669,12 +8674,7 @@ async fn stage_incremental_file_delete_cascades(
                     .expect("file-backed identity requires file id"),
             )
             .expect("file scan only returns requested cascade ids");
-        let Some(previous) = previous else {
-            return Err(head_value_error(
-                "hot file-backed identity has no authoritative primary row",
-            ));
-        };
-        let existing = decode_head_value(&previous)?;
+        let existing = previous.view()?;
         // A file delete cascades only within its own lane. Since PR D a row and
         // its owning file are validated into the same lane, so the cross-lane
         // combination should never arrive here; skipping it is defence in
@@ -10804,55 +10804,100 @@ async fn hot_load_primary_identity_bytes(
         .collect()
 }
 
-async fn hot_load_file_scope_identities(
+/// Resolve deletion predecessors through the same overlay/packed/root owner
+/// as current reads. A physical ROW_SPACE scan alone misses immutable bases.
+async fn hot_load_file_scope_predecessors(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
     generation: CommitId,
+    checkpoint: Option<CommitId>,
     cascades: &BTreeMap<String, &CurrentStateDeltaRef<'_>>,
-) -> Result<Vec<HeadIdentity>, LixError> {
-    let scope = hot_scope_prefix(branch_id, generation);
-    let range = StoragePrefix {
-        bytes: Bytes::from(scope.clone()),
+) -> Result<(Vec<HeadIdentity>, Vec<CertifiedCurrentStatePredecessor>), LixError> {
+    let mut schemas = hot_file_backed_schema_keys(store, branch_id, generation)
+        .await?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let file_ids = cascades
+        .keys()
+        .cloned()
+        .map(NullableKeyFilter::Value)
+        .collect::<Vec<_>>();
+    let mut bases = packed_current_base_refs(store, branch_id, generation)
+        .await?
+        .into_iter()
+        .filter(|base| packed_base_matches_file_filter(base, &file_ids))
+        .map(|base| base.commit_id)
+        .collect::<BTreeSet<_>>();
+    if let Some(root) = load_root_current_base_commit(store, branch_id, generation).await? {
+        bases.insert(root);
     }
-    .to_range()?;
-    let mut identities = Vec::new();
-    let mut cursor = store
-        .begin_scan(
-            ROW_SPACE,
-            range,
-            StorageBeginScanOptions {
-                projection: StorageCoreProjection::KeyOnly,
-                ..StorageBeginScanOptions::default()
+    let mut native = crate::tracked_state::TrackedStateContext::new().reader(store);
+    for base in bases {
+        schemas.extend(native.schema_keys_at_commit(base).await?);
+    }
+    let reader = TrackedHeadContext::new().reader(store);
+    let mut keys = BTreeSet::new();
+    for schema_key in schemas {
+        let rows = Box::pin(reader.scan_live_batch_for_generation(
+            branch_id,
+            generation,
+            checkpoint,
+            &TrackedStateScanRequest {
+                filter: TrackedStateFilter {
+                    schema_keys: vec![schema_key],
+                    file_ids: file_ids.clone(),
+                    include_tombstones: false,
+                    ..Default::default()
+                },
+                read_columns: TrackedStateReadColumns {
+                    columns: vec!["change_id".into()],
+                },
+                limit: None,
             },
-        )
+        ))
         .await?;
-    loop {
-        let (page, page_has_more) = cursor
-            .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
-            .await?
-            .into_parts();
-        for entry in page {
-            let row = decode_hot_row_key_in_scope(entry.key.0.as_ref(), &scope)?;
-            if !row
-                .file_id
-                .as_ref()
-                .is_some_and(|file_id| cascades.contains_key(file_id))
-            {
-                continue;
-            }
-            identities.push(HeadIdentity {
-                branch_id: branch_id.to_string(),
-                generation,
-                schema_key: row.schema_key,
-                row_pk: row.row_pk,
-                file_id: row.file_id,
-            });
-        }
-        if !page_has_more {
-            break;
-        }
+        keys.extend(rows.iter().map(|row| TrackedStateKey {
+            schema_key: row.schema_key().into(),
+            file_id: row.file_id().map(str::to_owned),
+            row_pk: row.row_pk().clone(),
+        }));
     }
-    Ok(identities)
+    let keys = keys.into_iter().collect::<Vec<_>>();
+    let key_refs = keys
+        .iter()
+        .map(|key| TrackedStateKeyRef {
+            schema_key: &key.schema_key,
+            file_id: key.file_id.as_deref(),
+            row_pk: &key.row_pk,
+        })
+        .collect::<Vec<_>>();
+    let exact = Box::pin(reader.load_projected_live_batch_for_generation_refs(
+        branch_id,
+        generation,
+        checkpoint,
+        &key_refs,
+        &ChangeRecordProjection::identity_only(),
+    ))
+    .await?;
+    let mut identities = Vec::with_capacity(keys.len());
+    let mut predecessors = Vec::with_capacity(keys.len());
+    for (index, key) in keys.into_iter().enumerate() {
+        let row = exact
+            .row(index)
+            .ok_or_else(|| head_value_error("effective file scope changed inside pinned read"))?;
+        let predecessor = row.durable_predecessor().cloned().ok_or_else(|| {
+            head_value_error("effective file cascade row has no durable predecessor")
+        })?;
+        identities.push(HeadIdentity {
+            branch_id: branch_id.into(),
+            generation,
+            schema_key: key.schema_key,
+            file_id: key.file_id,
+            row_pk: key.row_pk,
+        });
+        predecessors.push(predecessor);
+    }
+    Ok((identities, predecessors))
 }
 
 fn working_diff_baseline_before(
@@ -17899,5 +17944,137 @@ mod tests {
             rows[1].is_none(),
             "a tombstone shadowing nothing must be reclaimed by the checkpoint"
         );
+    }
+}
+
+#[cfg(test)]
+mod effective_file_cascade_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn deleting_file_removes_root_backed_rows_and_preserves_other_file() {
+        const FILE: &str = "01920000-0000-7000-8000-0000000000a1";
+        const OTHER: &str = "01920000-0000-7000-8000-0000000000a2";
+        let backing = crate::storage_adapter::Memory::new();
+        let lix = crate::open_lix()
+            .with_storage(backing.clone())
+            .await
+            .unwrap();
+        let schema = serde_json::json!({
+            "$schema":"https://lix.dev/schema-v1.json", "key":"cascade_probe",
+            "columns":[{"name":"id","type":"text","nullable":false},{"name":"value","type":"text","nullable":false}],
+            "primary_key":["id"]
+        });
+        lix.execute(
+            "INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))",
+            &[crate::Value::Text(schema.to_string())],
+        )
+        .await
+        .unwrap();
+        lix.execute("INSERT INTO lix_file(id,path,content) VALUES($1,'/deleted.bin',CAST('a' AS BYTEA)),($2,'/retained.bin',CAST('b' AS BYTEA))", &[crate::Value::Text(FILE.into()),crate::Value::Text(OTHER.into())]).await.unwrap();
+        let values = (0..600)
+            .map(|index| format!("('row-{index}','value','{FILE}')"))
+            .chain(std::iter::once(format!("('retained','other','{OTHER}')")))
+            .collect::<Vec<_>>()
+            .join(",");
+        lix.execute(
+            &format!("INSERT INTO cascade_probe(id,value,lixcol_file_id) VALUES {values}"),
+            &[],
+        )
+        .await
+        .unwrap();
+        lix.create_checkpoint().await.unwrap();
+        let branch_id = lix.active_branch_id().await.unwrap();
+        let storage = lix.storage_adapter();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let observation = BranchHeadControlContext::new()
+            .reader(&read)
+            .load_observed(std::slice::from_ref(&branch_id))
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut control = observation.control.unwrap();
+        let checkpoint = control.working_diff_checkpoint_commit_id.unwrap();
+        drop(read);
+        lix.close().await.unwrap();
+        // The root-backed owner is also used by native branch admission.
+        // Build that valid serving layout from a real SQL checkpoint; leave
+        // all semantic commits intact and publish the new selector atomically.
+        let generation = CommitId::for_test_label("file-cascade-root-generation");
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let mut writes = storage.new_write_set();
+        TrackedHeadContext::new()
+            .writer(&read, &mut writes)
+            .stage_root_current_base(&branch_id, generation, checkpoint);
+        let epoch_guard =
+            stage_root_working_diff_epoch(&read, &mut writes, &branch_id, generation, checkpoint)
+                .await
+                .unwrap();
+        let control_guard =
+            crate::branch::branch_head_control_precondition(&branch_id, observation.raw_token)
+                .unwrap();
+        control.tracked_generation = generation;
+        stage_branch_head_control(&mut writes, &branch_id, control).unwrap();
+        drop(read);
+        storage
+            .commit_write_set(
+                writes,
+                crate::storage_adapter::StorageWriteOptions {
+                    preconditions: vec![epoch_guard, control_guard],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        assert_eq!(
+            load_root_current_base_commit(&read, &branch_id, generation)
+                .await
+                .unwrap(),
+            Some(checkpoint)
+        );
+        let mut physical = read
+            .begin_scan(
+                ROW_SPACE,
+                StoragePrefix {
+                    bytes: Bytes::from(hot_scope_prefix(&branch_id, generation)),
+                }
+                .to_range()
+                .unwrap(),
+                StorageBeginScanOptions {
+                    projection: StorageCoreProjection::KeyOnly,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (physical_rows, _) = physical.next_page(1).await.unwrap().into_parts();
+        assert!(
+            physical_rows.is_empty(),
+            "regression requires root-backed state with no physical HOT rows"
+        );
+        drop(physical);
+        drop(read);
+        let lix = crate::open_lix().with_storage(backing).await.unwrap();
+        lix.execute(
+            "DELETE FROM lix_file WHERE id=$1",
+            &[crate::Value::Text(FILE.into())],
+        )
+        .await
+        .unwrap();
+        let deleted = lix
+            .execute(
+                "SELECT id FROM cascade_probe WHERE lixcol_file_id=$1",
+                &[crate::Value::Text(FILE.into())],
+            )
+            .await
+            .unwrap();
+        assert!(
+            deleted.rows().is_empty(),
+            "descriptor deletion must cascade into root-backed semantic state"
+        );
+        let retained = lix.execute("SELECT id FROM cascade_probe WHERE lixcol_file_id=$1 AND id='retained' AND value='other'", &[crate::Value::Text(OTHER.into())]).await.unwrap();
+        assert_eq!(retained.rows().len(), 1);
     }
 }

@@ -141,12 +141,17 @@ pub(in crate::sync) async fn stage_capture_restarted_partial_merge(
         ));
     }
     let id = |text: &str| crate::changelog::CommitId::parse_lix(text, "restart capture coordinate");
-    let _analysis = crate::sync::partial_merge_analysis::analyze_native_kv_divergence(
+    let _analysis = crate::sync::partial_merge_analysis::analyze_native_divergence(
         read,
         id(&request.base_commit_id)?,
         id(&request.expected_authority_head_commit_id)?,
         id(&request.captured_local_head_commit_id)?,
         state.active_account_id(),
+        &request.branch_id,
+        &[
+            id(&request.checkpoint_commit_id)?,
+            id(&request.expected_authority_checkpoint_commit_id)?,
+        ],
         id(&request.global_head_commit_id)?,
         crate::sync::partial_merge_analysis::PartialMergeBudget {
             max_local_commits: 1024,
@@ -160,7 +165,7 @@ pub(in crate::sync) async fn stage_capture_restarted_partial_merge(
         (
             &request.branch_id,
             &request.captured_local_head_commit_id,
-            &request.checkpoint_commit_id,
+            &request.captured_local_checkpoint_commit_id,
         ),
         (
             &state.descriptor().global_branch.branch_id,

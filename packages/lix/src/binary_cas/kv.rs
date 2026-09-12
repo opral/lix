@@ -1885,6 +1885,39 @@ fn append_blob_range_from_chunks(
     Ok(())
 }
 
+/// Validates only the referenced representation closure and atomic chunk
+/// publication markers. Actual byte consumption still authenticates payloads.
+pub(crate) async fn require_referenced_content(
+    store: &(impl StorageAdapterRead + ?Sized),
+    hashes: &[BlobId],
+) -> Result<(), LixError> {
+    let mut blobs = BTreeSet::new();
+    let mut chunks = BTreeMap::new();
+    let mut sizes = BTreeMap::new();
+    for hash in hashes {
+        // Reuse the canonical manifest closure validator, including delta base
+        // layout/size checks and chunked manifest content-address validation.
+        mark_live_blob(store, *hash, &mut blobs, &mut chunks, &mut sizes).await?;
+    }
+    let hashes = chunks.keys().copied().collect::<Vec<_>>();
+    for group in hashes.chunks(256) {
+        let present = crate::binary_cas::transfer::chunk_presence_many(store, group).await?;
+        if present.len() != group.len() {
+            return Err(LixError::new(
+                LixError::CODE_STORAGE_ERROR,
+                "chunk readiness returned an invalid result cardinality",
+            ));
+        }
+        let missing = group
+            .iter()
+            .zip(present)
+            .filter_map(|(hash, present)| (!present).then_some(*hash))
+            .collect::<Vec<_>>();
+        require_missing_chunk_demands(store, &missing).await?;
+    }
+    Ok(())
+}
+
 async fn load_chunk_rows(
     store: &(impl StorageAdapterRead + ?Sized),
     hashes: &[ChunkHash],
@@ -1907,6 +1940,17 @@ async fn load_chunk_rows(
     if missing.is_empty() {
         return Ok(rows);
     }
+    require_missing_chunk_demands(store, &missing).await?;
+    Ok(rows)
+}
+
+async fn require_missing_chunk_demands(
+    store: &(impl StorageAdapterRead + ?Sized),
+    missing: &[ChunkHash],
+) -> Result<(), LixError> {
+    if missing.is_empty() {
+        return Ok(());
+    }
     let demand = point_values(
         store,
         BINARY_CAS_CHUNK_DEMAND_SPACE,
@@ -1927,7 +1971,8 @@ async fn load_chunk_rows(
         ));
     }
     let chunk_ids = missing
-        .into_iter()
+        .iter()
+        .copied()
         .map(ChunkHash::to_hex)
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -3440,6 +3485,123 @@ mod tests {
             chunk_offset += chunk_size;
         }
         blob_id
+    }
+
+    #[tokio::test]
+    async fn referenced_content_readiness_follows_delta_base_without_consuming_payload() {
+        let storage = StorageAdapter::new(Memory::new());
+        let base = b"base executable";
+        let chunk = ChunkHash::from_content(base);
+        let base_blob = BlobId::from_single_chunk(chunk);
+        let delta = BlobId::from_content(b"base executable!");
+        let mut writes = storage.new_write_set();
+        stage_manifest(
+            &mut writes,
+            base_blob,
+            &BinaryCasManifest::SingleChunk {
+                size_bytes: base.len() as u64,
+                chunk_hash: chunk.into_bytes(),
+            },
+        );
+        stage_manifest(
+            &mut writes,
+            delta,
+            &BinaryCasManifest::Delta {
+                size_bytes: base.len() as u64 + 1,
+                base_blob_hash: base_blob.into_bytes(),
+                base_size_bytes: base.len() as u64,
+                base_layout: StorageBinaryCasDeltaBaseLayout::SingleChunk {
+                    chunk_hash: chunk.into_bytes(),
+                },
+                segments: vec![
+                    StorageBinaryCasDeltaSegment::Copy {
+                        offset: 0,
+                        length: base.len() as u64,
+                    },
+                    StorageBinaryCasDeltaSegment::Insert {
+                        bytes: b"!".to_vec(),
+                    },
+                ],
+            },
+        );
+        stage_chunk_demand(&mut writes, chunk);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let error = require_referenced_content(&read, &[delta])
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "LIX_SYNC_CHUNKS_REQUIRED");
+        assert_eq!(
+            error.details.unwrap()["chunkIds"],
+            serde_json::json!([chunk.to_hex()])
+        );
+        drop(read);
+        let mut writes = storage.new_write_set();
+        stage_chunk(
+            &mut writes,
+            chunk,
+            BinaryChunkCodec::Raw,
+            base.len() as u64,
+            base,
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        require_referenced_content(&read, &[delta]).await.unwrap();
+        assert_eq!(
+            load_bytes_many(&read, &[delta]).await.unwrap().into_vec(),
+            vec![Some(b"base executable!".to_vec())]
+        );
+        drop(read);
+        // Readiness trusts the atomic publication marker; actual consumption
+        // must still catch corruption. It cannot be replaced by a byte read.
+        let corrupt_storage = StorageAdapter::new(Memory::new());
+        let mut writes = corrupt_storage.new_write_set();
+        stage_manifest(
+            &mut writes,
+            base_blob,
+            &BinaryCasManifest::SingleChunk {
+                size_bytes: base.len() as u64,
+                chunk_hash: chunk.into_bytes(),
+            },
+        );
+        writes.put(
+            BINARY_CAS_CHUNK_SPACE,
+            chunk_key(chunk),
+            StorageValue {
+                bytes: Bytes::from_static(b"corrupt payload"),
+            },
+        );
+        writes.put(
+            BINARY_CAS_CHUNK_PRESENCE_SPACE,
+            chunk_key(chunk),
+            StorageValue {
+                bytes: Bytes::new(),
+            },
+        );
+        corrupt_storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = corrupt_storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        require_referenced_content(&read, &[base_blob])
+            .await
+            .unwrap();
+        assert!(load_bytes_many(&read, &[base_blob]).await.is_err());
     }
 
     #[tokio::test]

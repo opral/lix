@@ -1095,6 +1095,39 @@ impl<S> TrackedStateStoreReader<S>
 where
     S: StorageAdapterRead,
 {
+    /// Enumerates authenticated schema runs, without scanning row payloads.
+    /// The rootless row-PK catalog preserves the ordinary schema prefix and
+    /// is a monotonic superset; callers still resolve exact current scopes.
+    pub(crate) async fn schema_keys_at_commit(
+        &mut self,
+        commit_id: CommitId,
+    ) -> Result<Vec<String>, LixError> {
+        if let Some(root) = self
+            .tree
+            .load_root(&self.store, &commit_id.to_string())
+            .await?
+        {
+            return self.tree.distinct_schema_keys(&self.store, &root).await;
+        }
+        let manifest = storage::load_published_commit_state_topology(&self.store, commit_id)
+            .await?
+            .ok_or_else(|| {
+                LixError::unknown(format!("commit '{commit_id}' has no commit-state manifest"))
+            })?;
+        if let Some(root) = manifest.row_pk_index_root_id() {
+            return self.tree.distinct_schema_keys(&self.store, root).await;
+        }
+        if storage::load_manifest_snapshot_commit_root(&self.store, commit_id)
+            .await?
+            .is_some_and(|root| root.row_count_estimate == 0)
+        {
+            return Ok(Vec::new());
+        }
+        Err(LixError::unknown(format!(
+            "commit '{commit_id}' has no row-PK index for schema inventory"
+        )))
+    }
+
     /// Enumerates every file-scoped identity that has used one of the exact
     /// row PKs by this commit. The returned catalog is a monotonic superset;
     /// callers must point-resolve the identities to filter deleted rows.

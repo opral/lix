@@ -80,6 +80,8 @@ async fn merged_fixture() -> (
         base_commit_id: upload.upload.expected.head.clone(),
         expected_authority_head_commit_id: remote.selected_branch.head.commit_id,
         captured_local_head_commit_id: upload.upload.target.head.clone(),
+        expected_authority_checkpoint_commit_id: upload.upload.expected.checkpoint.clone(),
+        captured_local_checkpoint_commit_id: upload.upload.expected.checkpoint.clone(),
         checkpoint_commit_id: upload.upload.expected.checkpoint.clone(),
         global_head_commit_id: remote.global_branch.head.commit_id,
         global_checkpoint_commit_id: remote.global_branch.checkpoint.commit_id,

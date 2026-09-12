@@ -3507,10 +3507,7 @@ where
     })
 }
 
-fn commit_transaction<S>(
-    lease: SessionLease<S>,
-    headers: HeaderMap,
-) -> SqlHandlerFuture<StatusCode>
+fn commit_transaction<S>(lease: SessionLease<S>, headers: HeaderMap) -> SqlHandlerFuture<StatusCode>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -3579,8 +3576,11 @@ where
                 if progress.next_offset > 0 {
                     response.headers_mut().insert(
                         RANGE,
-                        http::HeaderValue::from_str(&format!("bytes=0-{}", progress.next_offset - 1))
-                            .expect("decimal upload offset is a valid HTTP header"),
+                        http::HeaderValue::from_str(&format!(
+                            "bytes=0-{}",
+                            progress.next_offset - 1
+                        ))
+                        .expect("decimal upload offset is a valid HTTP header"),
                     );
                 }
             }
@@ -4070,9 +4070,9 @@ where
 {
     Box::pin(async move {
         let preview = lease
-            .run_cancellable_read(
-                move |lix| async move { lix.merge_branch_preview(options.into()).await },
-            )
+            .run_cancellable_read(move |lix| async move {
+                lix.merge_branch_preview(options.into()).await
+            })
             .await?;
         Ok(Json(preview.into()))
     })
@@ -8748,7 +8748,7 @@ mod tests {
     #[tokio::test]
     async fn sync_endpoint_requires_the_exact_sync_protocol_version() {
         let app = app().await;
-        for version in ["999", "not-a-number"] {
+        for version in ["11", "999", "not-a-number"] {
             let builder = Request::builder()
                 .uri("/lix/v1/sync/pull")
                 .header(SYNC_PROTOCOL_VERSION_HEADER, version);
@@ -9006,11 +9006,10 @@ mod tests {
             }))).await;
             assert_eq!(response.status(), StatusCode::OK);
         };
-        let (response, ()) = tokio::time::timeout(Duration::from_secs(2), async {
-            tokio::join!(wait, write)
-        })
-        .await
-        .expect("commit wakes descriptor waiter");
+        let (response, ()) =
+            tokio::time::timeout(Duration::from_secs(2), async { tokio::join!(wait, write) })
+                .await
+                .expect("commit wakes descriptor waiter");
         let next = response_json(response.unwrap()).await["descriptor"].clone();
         assert!(next["cursor"].as_u64().unwrap() > descriptor.cursor);
         let neutral_lease = app.server.lease(&session_id, None).await.unwrap();
@@ -15154,6 +15153,16 @@ mod tests {
             base_commit_id: base.selected_branch.head.commit_id.clone(),
             expected_authority_head_commit_id: remote.selected_branch.head.commit_id,
             captured_local_head_commit_id: source.selected_branch.head.commit_id.clone(),
+            expected_authority_checkpoint_commit_id: remote
+                .selected_branch
+                .checkpoint
+                .commit_id
+                .clone(),
+            captured_local_checkpoint_commit_id: remote
+                .selected_branch
+                .checkpoint
+                .commit_id
+                .clone(),
             checkpoint_commit_id: remote.selected_branch.checkpoint.commit_id,
             global_head_commit_id: remote.global_branch.head.commit_id,
             global_checkpoint_commit_id: remote.global_branch.checkpoint.commit_id,

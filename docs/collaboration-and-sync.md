@@ -130,17 +130,23 @@ for work requiring review.
 
 ## Concurrent changes
 
-The server decides which branch updates are accepted. Pending local commits
-upload with the last confirmed server head and checkpoint as preconditions.
-If another writer advances a pending branch incompatibly, the replica restores
-confirmed server state and discards all of its pending work, including work on
-other branches. This conservative client reset also removes global checkpoint
-catalog entries and cross-branch schema dependencies created by discarded work.
-Sync does not merge divergent heads or expose a conflict-resolution API. Own
-accepted prefixes are acknowledged without rolling back newer descendants.
+The server orders accepted updates. When a partial replica uploads changes
+based on an older head, the server reconciles them through the same native row
+merge pipeline used by branch merges. Changes to different rows or columns are
+preserved. For overlapping values, the default is last write wins in server
+acceptance order. Client timestamps and change identifiers do not decide the
+winner. An explicit branch merge uses its incoming source as the default winner.
 
-This is server-wins reconciliation, not timestamp-based last-write-wins.
-Separate branches do not protect unacknowledged work from a client reset.
+Registered schema/plugin merge hooks participate in that same pipeline and can
+return a merged row. Files parsed by plugins inherit row merging and serialize
+the resolved rows; opaque file content is atomic. Ordinary concurrent edits do
+not require user conflict resolution. Incompatible schema or plugin changes
+still require a supported migration.
+
+Acknowledgments and background updates bring replicas to the authoritative
+result while preserving newer pending local edits. A retry of an already
+accepted upload retains its identity and cannot become a new winning write.
+Resident reads and writes remain local; they do not wait for server confirmation.
 
 Historical reads hydrate immutable commit data on demand and cache it in the
 replica's storage. Repeating a cached read does not fetch that history again.
