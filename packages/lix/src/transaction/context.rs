@@ -58,23 +58,22 @@ use crate::hot_state::{
     overlay_load_exact_batch, overlay_scan_batch,
 };
 use crate::plugin::runtime::{
-    ArcByteSource, BoundCreateContext, CompiledPluginCatalog, ConflictRank, FileBytesSha256,
-    LiveBatchRowSource, OuterRowJsonOperation, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY,
-    PluginActorColdInstall, PluginActorColdOpen, PluginActorKey, PluginActorLease,
-    PluginActorStore, PluginActorStorePermit, PluginArchiveInstallPlan, PluginContentMatcher,
-    PluginFileOwner, PluginObservation, PluginRegistry, PluginRegistryEntry,
-    PluginRegistryEntryInput, PluginRowAuthorities, PluginRowAuthorityRange, PluginRuntimeHost,
-    RowVersionRef, SchemaAllowlist, TypedColumnMergeResult as HostTypedColumnMergeResult,
-    TypedRowVersionRef, ValidatedFileTransition, ValidatedSameLengthOutputSplice,
-    VecRowChangeSource, VecRowSource, WasmCreateContext, build_file_update_splices,
-    drain_file_transition_changes, drain_row_transition_edits, is_plugin_storage_path,
-    is_reservation_key, load_plugin_registry_at_commit, local_mutation_identity,
-    materialize_keyless_creates, plugin_archive_file_id_matches,
-    plugin_install_plan_from_archive_path, plugin_key_from_archive_delete_origin,
-    plugin_state_hot_state_projection, reconcile_row, reconcile_typed_row,
-    require_existing_id_authorities, reservation_tombstone_row, reserve_create_row,
-    transport_splice_preserves_prefix_exclusion, transport_splice_preserves_utf8,
-    validate_create_changes, validate_create_reservation,
+    ArcByteSource, BoundCreateContext, CompiledPluginCatalog, FileBytesSha256, LiveBatchRowSource,
+    OuterRowJsonOperation, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorColdInstall,
+    PluginActorColdOpen, PluginActorKey, PluginActorLease, PluginActorStore,
+    PluginActorStorePermit, PluginArchiveInstallPlan, PluginContentMatcher, PluginFileOwner,
+    PluginObservation, PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput,
+    PluginRowAuthorities, PluginRowAuthorityRange, PluginRuntimeHost, RowVersionRef,
+    SchemaAllowlist, TypedColumnMergeResult as HostTypedColumnMergeResult, TypedRowVersionRef,
+    ValidatedFileTransition, ValidatedSameLengthOutputSplice, VecRowChangeSource, VecRowSource,
+    WasmCreateContext, build_file_update_splices, drain_file_transition_changes,
+    drain_row_transition_edits, is_plugin_storage_path, is_reservation_key,
+    load_plugin_registry_at_commit, local_mutation_identity, materialize_keyless_creates,
+    plugin_archive_file_id_matches, plugin_install_plan_from_archive_path,
+    plugin_key_from_archive_delete_origin, plugin_state_hot_state_projection, reconcile_row,
+    reconcile_typed_row, require_existing_id_authorities, reservation_tombstone_row,
+    reserve_create_row, transport_splice_preserves_prefix_exclusion,
+    transport_splice_preserves_utf8, validate_create_changes, validate_create_reservation,
 };
 use crate::plugin::runtime::{
     ChainablePublication, PendingPluginActorPublication, PluginPublicationPolicy,
@@ -151,6 +150,7 @@ use crate::transaction::validation::{
 use crate::{LixError, NullableKeyFilter, SqlQueryResult, Value};
 
 mod cohort;
+mod native_application;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct TransactionCommitOutcome {
@@ -753,6 +753,8 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// this transaction's file rows and history. Resumable media finalization
     /// uses this lane for its completed manifest and upload receipt.
     native_migration_validation: bool,
+    /// Authority-validated existing checkpoint selected with a native merge.
+    native_merge_checkpoints: BTreeMap<String, CommitId>,
     native_migration_branch_bridges: BTreeMap<String, CheckpointRecoveryRef>,
     atomic_metadata_writes: Option<StorageWriteSet>,
     atomic_metadata_preconditions: Vec<StoragePrecondition>,
@@ -1367,11 +1369,11 @@ where
     }
 
     // The selected-ref path retains original change IDs. This entrypoint is
-    // intentionally confined to the authority-derived unchanged-catalog KV plan;
-    // it does not claim selected refs undergo general FK/unique revalidation.
-    pub(crate) async fn stage_partial_authority_kv_merge(
+    // supplies an authenticated bounded incoming plan. The shared native row
+    // owner and final selected-row projection perform normal constraint validation.
+    pub(crate) async fn stage_partial_authority_merge(
         &mut self,
-        plan: crate::sync::AuthorityKvMergePlan,
+        plan: crate::sync::AuthorityMergePlan,
     ) -> Result<crate::sync::PartialMergeReceipt, LixError> {
         if self.sync_role != crate::sync::SyncRole::Authority
             || self.active_account_id != plan.account_id()
@@ -1388,33 +1390,25 @@ where
                 "authority merge must own an otherwise unstaged selected transaction",
             ));
         }
-        if plan.has_conflicts() {
-            return Err(LixError::new(
-                "LIX_PARTIAL_MERGE_CONFLICT",
-                "divergent key/value edits require resolution; neither head was changed",
-            ));
-        }
-        let mut selected =
-        StagedCommitChangeBatchBuilder::with_capacity(
-            plan.groups().iter().map(|group| group.picks.len()).sum(),
+        // Retained native selections need the same final constraint projection
+        // as migration selections, including resolved semantic/file rows.
+        self.native_migration_validation = true;
+        let outcome = crate::session::stage_native_change_application(
+            self,
+            plan.branch_id().to_owned(),
+            plan.application()?,
+        )
+        .await?;
+        let merge = outcome.created_merge_commit_id.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "native application omitted its commit",
+            )
+        })?;
+        self.native_merge_checkpoints.insert(
+            plan.branch_id().to_owned(),
+            plan.accepted_checkpoint_commit_id()?,
         );
-        for group in plan.groups() {
-            for pick in group.picks.iter() {
-                selected.push(
-                    pick.identity.clone(),
-                    pick.selected_row.commit_id,
-                    pick.change_id,
-                    pick.selected_row.deleted,
-                    pick.selected_row.created_at,
-                    pick.selected_row.updated_at,
-                );
-            }
-        }
-        let merge = self.stage_merge_commit(
-            plan.branch_id().into(),
-            plan.source_parent()?,
-            selected.finish(),
-        )?;
         let prepared = plan.into_receipt(CommitId::parse_lix(&merge, "staged authority merge")?)?;
         let prepared = prepared
             .with_native_retention(&self.opening_read(), crate::telemetry::unix_time_ms())
@@ -1422,7 +1416,7 @@ where
         self.stage_partial_authority_merge_receipt(prepared)
     }
 
-    pub(crate) async fn reconcile_partial_authority_kv(
+    pub(crate) async fn reconcile_partial_authority_merge(
         &mut self,
         repository: &str,
         request: crate::sync::PartialMergeRequest,
@@ -1435,7 +1429,7 @@ where
                 "merge requires an account-bound selected authority transaction",
             ));
         }
-        let prepared = crate::sync::prepare_authority_kv_merge(
+        let prepared = crate::sync::prepare_authority_merge(
             &self.opening_read(),
             repository,
             &self.active_account_id,
@@ -1451,7 +1445,7 @@ where
         match prepared {
             crate::sync::AuthorityMergePreparation::AlreadyCommitted(receipt) => Ok(receipt),
             crate::sync::AuthorityMergePreparation::Ready(plan) => {
-                self.stage_partial_authority_kv_merge(plan).await
+                self.stage_partial_authority_merge(plan).await
             }
         }
     }
@@ -1807,20 +1801,10 @@ where
                 })
                 .transpose()?;
             let target_payload = stale_payload_from_tracked(target);
-            let source_change_id = source.change_id.ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "staged tracked row is missing change_id during stale reconciliation",
-                )
-            })?;
-            let source_rank = ConflictRank::new(source.updated_at, source_change_id);
-            let target_rank =
-                target.map(|row| ConflictRank::new(row.updated_at(), row.change_id()));
-            let (a_payload, b_payload) = if target_rank.is_some_and(|rank| rank < source_rank) {
-                (target_payload.as_ref(), source_payload.as_ref())
-            } else {
-                (source_payload.as_ref(), target_payload.as_ref())
-            };
+            // Commit serialization orders this incoming transaction after the
+            // current native root. Keep schema/plugin merge behavior; only the
+            // host fallback precedence is supplied by acceptance order.
+            let (a_payload, b_payload) = (target_payload.as_ref(), source_payload.as_ref());
 
             let primary_key_columns = self
                 .sql_schema_snapshot
@@ -2235,6 +2219,7 @@ where
             origin_key: None,
             idempotency_receipt: None,
             native_migration_validation: false,
+            native_merge_checkpoints: BTreeMap::new(),
             native_migration_branch_bridges: BTreeMap::new(),
             idempotency_receipt_source: None,
             atomic_metadata_writes: None,
@@ -2652,6 +2637,7 @@ where
                     &branch_checkpoint_bridges,
                     capture_sync_commits,
                     &restore_targets,
+                    &transaction.native_merge_checkpoints,
                     prepared_writes,
                 )
                 .instrument(tracing::debug_span!(
@@ -3632,6 +3618,7 @@ where
                     .await?,
             );
             let reader = self.binary_cas.reader(read);
+            require_transaction_blob_manifests(&reader, &self.staged_writes, &[wasm_hash]).await?;
             Some(
                 load_transaction_blob_bytes(&reader, &self.staged_writes, &[wasm_hash])
                     .await?
@@ -3804,6 +3791,7 @@ where
                     destinations: Vec::new(),
                 });
             reconcile_typed_row(
+                &input.key.schema_key,
                 typed_row_version_ref(Some(base))?,
                 typed_row_version_ref(Some(a))?,
                 typed_row_version_ref(Some(b))?,
@@ -3869,6 +3857,7 @@ where
             .map(|(row_index, (input, (base, a, b)))| {
                 if input.typed {
                     Ok(reconcile_typed_row(
+                        &input.key.schema_key,
                         typed_row_version_ref(input.base.as_ref())?,
                         typed_row_version_ref(input.a.as_ref())?,
                         typed_row_version_ref(input.b.as_ref())?,
@@ -3878,6 +3867,7 @@ where
                     .map(encoded_typed_stale_payload))
                 } else {
                     reconcile_row(
+                        &input.key.schema_key,
                         row_version_ref(base.as_ref()),
                         row_version_ref(a.as_ref()),
                         row_version_ref(b.as_ref()),
@@ -5420,7 +5410,6 @@ where
             }
         }
 
-
         let mut catalogs = BTreeMap::<String, Arc<CompiledPluginCatalog>>::new();
         for branch_id in &active_branch_ids {
             let registry = registries
@@ -5880,6 +5869,12 @@ where
         }
         if !missing_hashes.is_empty() {
             let base_blob_reader = self.binary_cas.reader(read.clone());
+            require_transaction_blob_manifests(
+                &base_blob_reader,
+                &self.staged_writes,
+                &missing_hashes,
+            )
+            .await?;
             let loaded = load_transaction_blob_bytes(
                 &base_blob_reader,
                 &self.staged_writes,
@@ -11983,6 +11978,10 @@ struct TransactionBlobDataReader {
 
 #[async_trait]
 impl BlobDataReader for TransactionBlobDataReader {
+    fn requires_referenced_content_preparation(&self) -> bool {
+        self.base.requires_referenced_content_preparation()
+    }
+
     async fn require_referenced_manifests(&self, hashes: &[BlobId]) -> Result<(), LixError> {
         require_transaction_blob_manifests(self.base.as_ref(), &self.staged_writes, hashes).await
     }
@@ -17823,6 +17822,50 @@ fallback={large_fallback} decoded={large_decoded}"
             "invalid-metadata",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn cold_plugin_executable_uses_exact_partial_blob_manifest_demand() {
+        let storage = Memory::new();
+        let (_hot_state, binary_cas, _branch_ref, _functions, transaction) =
+            open_test_transaction(&storage).await;
+        let adapter = StorageAdapter::new(storage.clone());
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let complete_reader = binary_cas.reader(SharedStorageAdapterRead::new(read));
+        assert!(!complete_reader.requires_referenced_content_preparation());
+        crate::plugin::runtime::prepare_executable_blobs(
+            &complete_reader,
+            [BlobId::from_content(b"unneeded complete-mode executable")],
+        )
+        .await
+        .unwrap();
+        binary_cas.enable_referenced_manifest_demands();
+        let adapter = StorageAdapter::new(storage.clone());
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let reader = binary_cas.reader(SharedStorageAdapterRead::new(read));
+        let hash = BlobId::from_content(b"missing owner executable");
+        assert!(reader.requires_referenced_content_preparation());
+        let error = crate::plugin::runtime::prepare_executable_blobs(&reader, [hash])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            crate::binary_cas::BlobManifestRequired::from_error(&error).unwrap(),
+            Some(crate::binary_cas::BlobManifestRequired(hash))
+        );
+        let error =
+            require_transaction_blob_manifests(&reader, &transaction.staged_writes, &[hash])
+                .await
+                .unwrap_err();
+        assert_eq!(
+            crate::binary_cas::BlobManifestRequired::from_error(&error).unwrap(),
+            Some(crate::binary_cas::BlobManifestRequired(hash)),
+        );
     }
 
     #[tokio::test]

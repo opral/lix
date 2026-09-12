@@ -1450,14 +1450,26 @@ async fn filesystem_namespace_domain_changed(
     if row.is_tombstone() {
         return Ok(true);
     }
-    let committed_rows = load_committed_constraint_rows(
-        input.hot_state,
-        domain,
-        row.schema_key(),
-        row.row_pk().clone(),
-        false,
-    )
-    .await?;
+    // The staged descriptor already supplies its complete native identity.
+    // A schema/row-PK scan would enumerate unrelated file identities through
+    // the secondary catalog, even though only this exact beforeimage matters.
+    let committed_batch = input
+        .hot_state
+        .load_exact_batch(&HotStateExactBatchRequest {
+            rows: vec![HotStateExactRowRequest {
+                schema_key: row.schema_key().to_string(),
+                branch_id: domain.branch_id().to_string(),
+                row_pk: row.row_pk().clone(),
+                file_id: row.file_id().map(str::to_string),
+            }],
+            projection: HotStateProjection::default(),
+            untracked: Some(domain.untracked()),
+            include_tombstones: false,
+        })
+        .await?
+        .into_present_batch();
+    let committed_rows =
+        CommittedHotStateRows::select(committed_batch, |row| domain.contains_ref(row))?;
     let Some(committed) = committed_rows.first() else {
         return Ok(true);
     };

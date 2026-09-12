@@ -1887,6 +1887,16 @@ mod tests {
                     .commit_id
                     .clone(),
                 captured_local_head_commit_id: uuid::Uuid::now_v7().to_string(),
+                expected_authority_checkpoint_commit_id: descriptor
+                    .selected_branch
+                    .checkpoint
+                    .commit_id
+                    .clone(),
+                captured_local_checkpoint_commit_id: descriptor
+                    .selected_branch
+                    .checkpoint
+                    .commit_id
+                    .clone(),
                 checkpoint_commit_id: descriptor.selected_branch.checkpoint.commit_id.clone(),
                 global_head_commit_id: descriptor.global_branch.head.commit_id.clone(),
                 global_checkpoint_commit_id: descriptor.global_branch.checkpoint.commit_id.clone(),
@@ -1931,6 +1941,16 @@ mod tests {
             base_commit_id: descriptor.selected_branch.head.commit_id.clone(),
             expected_authority_head_commit_id: descriptor.selected_branch.head.commit_id.clone(),
             captured_local_head_commit_id: uuid::Uuid::now_v7().to_string(),
+            expected_authority_checkpoint_commit_id: descriptor
+                .selected_branch
+                .checkpoint
+                .commit_id
+                .clone(),
+            captured_local_checkpoint_commit_id: descriptor
+                .selected_branch
+                .checkpoint
+                .commit_id
+                .clone(),
             checkpoint_commit_id: descriptor.selected_branch.checkpoint.commit_id.clone(),
             global_head_commit_id: descriptor.global_branch.head.commit_id.clone(),
             global_checkpoint_commit_id: descriptor.global_branch.checkpoint.commit_id.clone(),

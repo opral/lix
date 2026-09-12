@@ -22,6 +22,8 @@ async fn captured_request(
         base_commit_id: push.confirmed.head,
         expected_authority_head_commit_id: remote.selected_branch.head.commit_id,
         captured_local_head_commit_id: controls[0].head_commit_id.to_string(),
+        expected_authority_checkpoint_commit_id: push.confirmed.checkpoint.clone(),
+        captured_local_checkpoint_commit_id: push.confirmed.checkpoint.clone(),
         checkpoint_commit_id: push.confirmed.checkpoint,
         global_head_commit_id: remote.global_branch.head.commit_id,
         global_checkpoint_commit_id: remote.global_branch.checkpoint.commit_id,
@@ -115,7 +117,7 @@ async fn recorded_merge_receipt_preserves_newer_local_tip_and_original_confirmat
         .await
         .unwrap();
     assert_eq!(record.unwrap().authority_receipt, Some(receipt.clone()));
-    let mut changed = receipt;
+    let mut changed = receipt.clone();
     changed.merge_commit_id = uuid::Uuid::now_v7().to_string();
     assert!(
         stage_record_partial_merge_receipt(&read, &mut storage.new_write_set(), &old, &changed)
@@ -123,6 +125,83 @@ async fn recorded_merge_receipt_preserves_newer_local_tip_and_original_confirmat
             .is_err()
     );
     drop(read);
+    // Simulate a released v4 journal with an accepted receipt while L2 remains
+    // pending. Owned migration must change only the record version.
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let (before, raw, _) = load_partial_merge_state(&read, &old, &request.branch_id)
+        .await
+        .unwrap();
+    let before = before.unwrap();
+    let mut legacy: serde_json::Value = serde_json::from_slice(&raw.unwrap()).unwrap();
+    legacy["version"] = serde_json::json!(4);
+    let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+    let record_key = crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(
+        uuid::Uuid::parse_str(&request.branch_id)
+            .unwrap()
+            .as_bytes(),
+    ));
+    drop(read);
+    let mut writes = storage.new_write_set();
+    writes.put(
+        crate::sync::partial_merge_state::PARTIAL_BRANCH_MERGE_SPACE,
+        record_key,
+        legacy_bytes,
+    );
+    storage
+        .commit_partial_replica_write_set(
+            crate::sync::partial_replica_write_capability(),
+            writes,
+            StorageWriteOptions {
+                await_durable: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    assert!(
+        load_partial_merge_state(&read, &old, &request.branch_id)
+            .await
+            .is_err()
+    );
+    drop(read);
+    // Memory exercises the guarded migration owner directly; it does not
+    // advertise the durable-read capability required by the public opener.
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let mut writes = storage.new_write_set();
+    let guards = crate::sync::partial_merge_state::prepare_owned_partial_merge_upload_upgrade(
+        &read,
+        &mut writes,
+        &old,
+    )
+    .await
+    .unwrap();
+    drop(read);
+    storage
+        .commit_partial_replica_write_set(
+            crate::sync::partial_replica_write_capability(),
+            writes,
+            StorageWriteOptions {
+                preconditions: guards,
+                await_durable: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let (after, _, _) = load_partial_merge_state(&read, &old, &request.branch_id)
+        .await
+        .unwrap();
+    let after = after.unwrap();
+    assert_eq!(after, before);
+    assert_eq!(after.authority_receipt, Some(receipt));
+    assert_eq!(
+        blake3::hash(&serde_json::to_vec(&after.request).unwrap()),
+        blake3::hash(&serde_json::to_vec(&request).unwrap())
+    );
+    drop(read);
+    assert_eq!(admitted_controls(&storage, &old).await.unwrap(), controls);
     assert!(
         value(
             session

@@ -69,13 +69,29 @@ with O(1) cursor
 state. Each cold graph node uses normal authenticated sync-demand retries while
 retaining the cursor, so hydration does not rescan the previously visited path.
 
-
 A partial replica with on-demand sync keeps local commits while authority changes
-arrive. The initial background reconciliation scope is ordinary unfiled
-`lix_key_value` rows with unchanged global schema/checkpoint coordinates.
+arrive. Background reconciliation uses the same native row application pipeline
+as branch merging, including registered schema/plugin merge hooks and file
+serialization from resolved rows. For overlapping values without a custom merge,
+the incoming operation wins when the server durably accepts it. Client clocks
+and change IDs do not determine precedence. Opaque file content is atomic.
+
+A partial SQL read can also prepare registered schema metadata needed for later
+local writes. This uses the existing catalog validation path without loading rows
+from those schemas. Built-in schemas use their embedded definitions; their stored
+projections do not define the engine catalog. Repository opening does not perform
+this preparation.
+
 `POST /sync/retained-bodies` atomically pins each complete accepted native wave;
-`POST /sync/merge` derives an exact three-way plan and publishes `[R,L]` plus its
-immutable attempt receipt in one native transaction. Conflicts preserve both
-heads. A newer local `L2` remains pending until client candidate adoption proves
-its exact serving basis; receiving a merge receipt alone never advances ordinary
-upload confirmation. These endpoints require sync protocol11/server protocol8.
+`POST /sync/merge` derives a three-way plan and publishes `[R,L]` plus its
+immutable attempt receipt in one native transaction. Ordinary concurrent row edits
+resolve automatically. Retrying an accepted attempt returns its original receipt
+and cannot reorder that write. A newer local `L2` remains pending until client
+candidate adoption proves its exact serving basis; receiving a merge receipt
+alone never advances ordinary upload confirmation.
+
+Merge requests distinguish the original confirmed checkpoint, current authority
+checkpoint, and captured local checkpoint. Equal checkpoint overrides are omitted
+canonically, preserving existing immutable request digests. The owned persisted
+journal migration upgrades older records without resetting pending edits. These
+endpoints require sync protocol12/server protocol8; upgrade SDK and server together.

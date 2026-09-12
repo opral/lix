@@ -14,4 +14,6 @@ pub use branch::{
     MergeConflictKind, MergeConflictSide,
 };
 
-pub(crate) use branch::stage_merge_native_heads;
+pub(crate) use branch::{stage_merge_native_heads, stage_native_change_application};
+
+pub(crate) use analysis::{MergeAnalysis, analyze_incoming_rows};

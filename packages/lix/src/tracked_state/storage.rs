@@ -8488,10 +8488,19 @@ async fn load_indirect_change_records_from_state(
             .await?;
     let mut loaded = (0..locators.len()).map(|_| None).collect::<Vec<_>>();
     for ((segment_index, indices), value) in by_segment.into_iter().zip(segment_values.value) {
-        let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
-            replacement_payload_error("selected change references a missing indirect segment")
-        })?;
         let bounds = &manifest.segments[segment_index];
+        let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
+            super::NativeObjectRef::CommitDeltaPart {
+                commit_id: *state.commit_id.as_uuid().as_bytes(),
+                part_index: u32::try_from(segment_index)
+                    .expect("native part key already checked u32 index"),
+                expected_digest: bounds.content_digest,
+                replacement: bounds.replacement_part.is_some(),
+            }
+            .annotate_missing(replacement_payload_error(
+                "selected change references a missing indirect segment",
+            ))
+        })?;
         let (leaf, payloads) = decode_commit_delta_with_payloads(&bytes, Some(bounds))?;
         for index in indices {
             loaded[index] = Some(

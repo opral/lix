@@ -170,6 +170,7 @@ pub(crate) async fn commit_prepared_writes(
         &BTreeMap::new(),
         false,
         &BTreeMap::new(),
+        &BTreeMap::new(),
         prepared_writes,
     )
     .await?;
@@ -224,6 +225,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     branch_checkpoint_bridges: &BTreeMap<String, crate::gc::CheckpointRecoveryRef>,
     capture_sync_commits: bool,
     restore_targets: &BTreeMap<String, PendingRestoreIntent>,
+    native_merge_checkpoints: &BTreeMap<String, CommitId>,
     prepared_writes: PreparedWriteSet,
 ) -> Result<MaterializedCommit, LixError> {
     Box::pin(validate_active_account_and_account_rows(
@@ -649,6 +651,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &staged_creation_parents,
         &branch_control_observations,
         &checkpoint_epochs,
+        native_merge_checkpoints,
         &staged_delta_index.inventories,
         &staged_delta_index.ordered_addressable_commits,
         &replacement_generation_commits,
@@ -659,6 +662,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         "lix.perf.materialization.tracked_head"
     ))
     .await?;
+    preconditions.extend(staged_hot_heads.preconditions);
     stage_checkpoint_working_diff_epochs(
         &mut writes,
         &prepared_writes.checkpoint_publications,
@@ -2852,6 +2856,7 @@ fn select_new_rootless_ordered_commits(
 }
 
 struct StagedHotHeads {
+    preconditions: Vec<StoragePrecondition>,
     controls: BTreeMap<String, BranchHeadControl>,
     inherited_catalog_changed: bool,
 }
@@ -3608,18 +3613,53 @@ async fn stage_tracked_head(
     staged_creation_parents: &BTreeMap<String, CommitId>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
     checkpoint_epochs: &BTreeMap<String, CheckpointEpochBinding>,
+    native_merge_checkpoints: &BTreeMap<String, CommitId>,
     mutation_inventories: &BTreeMap<CommitId, CommitStateMutationInventory>,
     ordered_addressable_commits: &BTreeSet<CommitId>,
     replacement_generation_commits: &BTreeSet<CommitId>,
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
 ) -> Result<StagedHotHeads, LixError> {
-    let lifecycle_ids = lifecycle_snapshot_commit_ids(
+    let mut lifecycle_ids = lifecycle_snapshot_commit_ids(
         tracked_roots,
         staged_commits,
         explicit_branch_targets,
         observations,
         checkpoint_epochs,
     )?;
+    // Only the authority-owned native application can choose a different
+    // existing checkpoint. Its complete canonical M root is already staged;
+    // do not reconstruct every tracked row merely to rotate the local epoch.
+    let mut root_checkpoint_overrides = BTreeMap::new();
+    for root in tracked_roots.iter().filter(|root| root.publish_head) {
+        let Some(checkpoint) = native_merge_checkpoints.get(&root.branch_id) else {
+            continue;
+        };
+        let control = observations
+            .get(&root.branch_id)
+            .and_then(|observation| observation.control)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "native checkpoint publication lacks branch control",
+                )
+            })?;
+        if control.working_diff_checkpoint_commit_id == Some(*checkpoint) {
+            continue;
+        }
+        if root.parent_commit_id != Some(control.head_commit_id)
+            || root.commit_id == *checkpoint
+            || checkpoint_epochs.contains_key(&root.branch_id)
+            || explicit_branch_targets.contains_key(&root.branch_id)
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "native checkpoint publication has unrelated lifecycle work",
+            ));
+        }
+        lifecycle_ids.remove(&root.commit_id);
+        root_checkpoint_overrides.insert(root.commit_id, *checkpoint);
+    }
+    let mut publication_preconditions = Vec::new();
     let mut tracked_snapshots = build_lifecycle_tracked_snapshots(
         read,
         state_rows,
@@ -3684,6 +3724,70 @@ async fn stage_tracked_head(
             .get(&root.branch_id)
             .map(|binding| binding.commit_id);
         let is_checkpoint_publication = checkpoint_commit_id == Some(root.commit_id);
+        if let Some(checkpoint) = root_checkpoint_overrides.get(&root.commit_id).copied() {
+            let previous =
+                parent_control.expect("native checkpoint override has an observed parent");
+            if state_rows
+                .iter()
+                .any(|row| row.branch_id.as_str() == root.branch_id && row.untracked)
+                || engine_rows
+                    .iter()
+                    .any(|row| row.branch_id == root.branch_id)
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "native checkpoint publication cannot mix untracked mutations",
+                ));
+            }
+            reject_selected_tracked_refs_with_untracked_rows(
+                read,
+                &root.branch_id,
+                Some(previous),
+                &staged.selected_change_batches,
+                state_rows,
+                engine_rows,
+            )
+            .await?;
+            let generation =
+                lifecycle_generation(&root.branch_id, root.commit_id, root.ref_change_id);
+            publication_preconditions.extend(
+                crate::hot_state::root_generation_absence_preconditions(
+                    &root.branch_id,
+                    generation,
+                    checkpoint,
+                )?,
+            );
+            publication_preconditions.push(
+                crate::hot_state::stage_root_working_diff_epoch(
+                    read,
+                    writes,
+                    &root.branch_id,
+                    generation,
+                    checkpoint,
+                )
+                .await?,
+            );
+            let mut writer = tracked_head.writer(read, writes);
+            // Existing untracked identities were checked against the old head;
+            // native selected identities are checked above and ordinary rows
+            // pass transaction retention validation. The new M is not visible
+            // through this read until this same write set commits.
+            writer
+                .stage_untracked_for_root_generation(
+                    &root.branch_id,
+                    previous.tracked_generation,
+                    generation,
+                    previous.head_commit_id,
+                )
+                .await?;
+            writer.stage_root_current_base(&root.branch_id, generation, root.commit_id);
+            let mut control =
+                normal_branch_head_control(root, Some(previous), generation, Some(checkpoint))?;
+            // A sparse root cannot claim schema absence from the previous view.
+            control.schema_presence_bloom = [u64::MAX; 4];
+            insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
+            continue;
+        }
         let certified_columnar_parts = mutation_inventories
             .get(&root.commit_id)
             .and_then(|inventory| inventory.columnar_parts.as_ref());
@@ -4925,6 +5029,7 @@ async fn stage_tracked_head(
         insert_direct_branch_control(&mut controls, branch_id, control)?;
     }
     Ok(StagedHotHeads {
+        preconditions: publication_preconditions,
         controls,
         inherited_catalog_changed,
     })

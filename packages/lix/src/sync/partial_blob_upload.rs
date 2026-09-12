@@ -16,6 +16,22 @@ where
     S: Storage + Clone + Send + Sync + 'static,
     T: SyncTransport,
 {
+    prepare_partial_upload_blobs(storage, state, transport, request).await?;
+    transport.push(request).await
+}
+
+/// Prepare only blobs referenced by the exact durable native body batch.
+/// Retained merge waves use the same authenticated upload before their body RPC.
+pub(super) async fn prepare_partial_upload_blobs<S, T>(
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+    transport: &T,
+    request: &SyncPushRequest,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+    T: SyncTransport,
+{
     // Existing canonical flattening can allocate the complete requested file.
     // Bound one file independently of native commit/request output budgets.
     const MAX_PREPARED_BLOB: u64 = 64 * 1024 * 1024;
@@ -88,5 +104,5 @@ where
             ));
         }
     }
-    transport.push(request).await
+    Ok(())
 }

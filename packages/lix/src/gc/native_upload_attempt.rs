@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 pub(crate) const NATIVE_UPLOAD_ATTEMPT_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0008_000b), "gc.native_upload_attempt.v1");
 const TTL_MS: u64 = 300_000;
-const MAX_BYTES: usize = 2048;
+const MAX_BYTES: usize = 64 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct NativeUploadAttemptIdentity {
@@ -61,7 +61,7 @@ impl NativeUploadAttempt {
         key(&self.identity)?;
         if self.version != 1
             || self.anchors.is_empty()
-            || self.anchors.len() > 4
+            || self.anchors.len() > 1029
             || self.expires_at_ms == 0
             || self.accepted_commits == 0
             || self.accepted_commits > 1024
@@ -81,6 +81,9 @@ impl NativeUploadAttempt {
             return Err(invalid("duplicate upload retention anchors"));
         }
         Ok(())
+    }
+    pub(crate) fn retained_body_roots(&self) -> Result<BTreeSet<CommitId>, LixError> {
+        self.roots()
     }
     pub(crate) fn accepted_tip(&self) -> Result<CommitId, LixError> {
         CommitId::parse_lix(&self.accepted_tip, "accepted upload tip")
@@ -200,12 +203,7 @@ pub(crate) async fn stage_accepted_native_upload_wave(
             return Err(expired());
         }
         if state.binding_digest != proof.binding_digest()
-            || state
-                .anchors
-                .iter()
-                .map(|id| CommitId::parse_lix(id, "upload anchor"))
-                .collect::<Result<BTreeSet<_>, _>>()?
-                != *proof.anchors()
+            || !proof.anchors().is_subset(&state.roots()?)
             || state.merge_commit_id.is_some()
         {
             return Err(invalid("upload attempt binding changed or is terminal"));
@@ -243,6 +241,11 @@ pub(crate) async fn stage_accepted_native_upload_wave(
             return Err(invalid("attempt exceeds bounded local suffix"));
         }
     }
+    // Every accepted native body remains pinned across checkpoint/source DAG
+    // pages. Only the validated importer proof can extend these bounded roots.
+    let mut roots = state.anchors.iter().cloned().collect::<BTreeSet<_>>();
+    roots.extend(proof.body_roots().iter().map(ToString::to_string));
+    state.anchors = roots.into_iter().collect();
     state.accepted_tip = proof.tip().to_string();
     state.expires_at_ms = state.expires_at_ms.max(
         now_ms
@@ -425,6 +428,35 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn bounded_checkpoint_body_roots_are_retained_until_attempt_expiry() {
+        let adapter = StorageAdapter::new(crate::Memory::new());
+        let mut state = record();
+        state.accepted_commits = 1024;
+        state.anchors = (100..1129).map(uuid).collect();
+        let mut writes = adapter.new_write_set();
+        stage(&mut writes, &state).unwrap();
+        adapter
+            .commit_write_set(writes, Default::default())
+            .await
+            .unwrap();
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let live = load_native_upload_retention(&read, state.expires_at_ms - 1)
+            .await
+            .unwrap();
+        assert!(state.retained_body_roots().unwrap().is_subset(&live.roots));
+        assert!(live.expired_keys.is_empty());
+        let expired = load_native_upload_retention(&read, state.expires_at_ms)
+            .await
+            .unwrap();
+        assert!(expired.roots.is_empty());
+        assert_eq!(expired.expired_keys, vec![key(&state.identity).unwrap()]);
+        state.anchors.push(uuid(2000));
+        assert!(
+            stage(&mut adapter.new_write_set(), &state).is_err(),
+            "body pins cannot exceed the bounded attempt"
+        );
+    }
+    #[tokio::test]
     async fn expired_restart_fences_delayed_renewal_and_cannot_resurrect_old_attempt() {
         let adapter = StorageAdapter::new(crate::Memory::new());
         let mut state = record();
@@ -434,6 +466,8 @@ mod tests {
             base_commit_id: uuid(10),
             expected_authority_head_commit_id: uuid(11),
             captured_local_head_commit_id: state.accepted_tip.clone(),
+            expected_authority_checkpoint_commit_id: uuid(12),
+            captured_local_checkpoint_commit_id: uuid(12),
             checkpoint_commit_id: uuid(12),
             global_head_commit_id: uuid(13),
             global_checkpoint_commit_id: uuid(14),

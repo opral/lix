@@ -2371,6 +2371,7 @@ impl FileDescriptorRecord {
 
 #[derive(Clone)]
 struct PluginRenderContext {
+    hot_state: Arc<dyn HotStateReader>,
     host: PluginRuntimeHost,
     branches: BTreeMap<String, BranchPluginRenderContext>,
     owners_by_file: BTreeMap<FilesystemDescriptorKey, PluginFileOwner>,
@@ -5441,6 +5442,7 @@ async fn render_plugin_files_for_sql(
     file_paths: &BTreeMap<FilesystemDescriptorKey, String>,
 ) -> Result<BTreeMap<FilesystemDescriptorKey, Vec<u8>>, LixError> {
     let mut materialized_file_keys = Vec::new();
+    let mut execution_hashes = BTreeSet::new();
     let rendered = BTreeMap::new();
     for key in file_keys {
         let file = file_rows
@@ -5455,7 +5457,7 @@ async fn render_plugin_files_for_sql(
         let Some(branch) = plugin_render.branch(key.branch_id()) else {
             return Err(plugin_unavailable_error(file, path, owner));
         };
-        let Some(_plugin) = branch.registry.get(owner.plugin_key()) else {
+        let Some(plugin) = branch.registry.get(owner.plugin_key()) else {
             return Err(plugin_unavailable_error(file, path, owner));
         };
         let blob_key = file.blob_ref_key(live_rows);
@@ -5466,6 +5468,17 @@ async fn render_plugin_files_for_sql(
         match blob {
             Some(_) => {
                 if plugin_render.session_file_views.is_some() {
+                    crate::plugin::runtime::prepare_file_content_state(
+                        plugin_render.hot_state.as_ref(),
+                        blob_reader.as_ref(),
+                        key.branch_id(),
+                        key.descriptor_id(),
+                        plugin.schema_keys(),
+                    )
+                    .await?;
+                    if let Some(hash) = plugin.wasm_blob_hash() {
+                        execution_hashes.insert(BlobId::from_hex(hash)?);
+                    }
                     materialized_file_keys.push(key.clone());
                 }
             }
@@ -5477,6 +5490,10 @@ async fn render_plugin_files_for_sql(
             }
         }
     }
+    // A content read acknowledges the returned file for a later local edit.
+    // Retain only its actual owner's executable, not every installed plugin.
+    crate::plugin::runtime::prepare_executable_blobs(blob_reader.as_ref(), execution_hashes)
+        .await?;
     for file_key in materialized_file_keys {
         acknowledge_materialized_file(
             plugin_render,
@@ -5798,6 +5815,7 @@ async fn plugin_render_context_with_branches(
     }
 
     Ok(Some(PluginRenderContext {
+        hot_state,
         host,
         branches,
         owners_by_file,

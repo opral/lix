@@ -902,7 +902,7 @@ components:
       in: header
       required: true
       description: Exact sync wire-protocol version advertised by the handshake.
-      schema: { type: integer, const: 11 }
+      schema: { type: integer, const: 12 }
     TransactionId:
       name: Lix-Transaction-Id
       in: header
@@ -960,7 +960,7 @@ components:
       required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
         protocolVersion: { type: integer, const: 8 }
-        syncProtocolVersion: { type: integer, const: 11 }
+        syncProtocolVersion: { type: integer, const: 12 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }
@@ -1131,7 +1131,18 @@ components:
         baseCommitId: { type: string, format: uuid }
         expectedAuthorityHeadCommitId: { type: string, format: uuid }
         capturedLocalHeadCommitId: { type: string, format: uuid }
-        checkpointCommitId: { type: string, format: uuid }
+        checkpointCommitId:
+          type: string
+          format: uuid
+          description: Original confirmed checkpoint. Omitted checkpoint overrides equal this coordinate.
+        expectedAuthorityCheckpointCommitId:
+          type: string
+          format: uuid
+          description: Current authority checkpoint; omitted when equal to checkpointCommitId.
+        capturedLocalCheckpointCommitId:
+          type: string
+          format: uuid
+          description: Captured local checkpoint; omitted when equal to checkpointCommitId.
         globalHeadCommitId: { type: string, format: uuid }
         globalCheckpointCommitId: { type: string, format: uuid }
     NativeMigrationCleanupRequest:

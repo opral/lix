@@ -14,8 +14,8 @@ use crate::catalog::snapshot::{
 use crate::catalog::{CatalogSnapshot, SchemaCatalogFact};
 use crate::domain::{Domain, committed_row_ref_is_exact_branch_scoped};
 use crate::hot_state::{
-    HotStateFilter, HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
-    MaterializedHotStateRowRef,
+    HotStateExactBatchRequest, HotStateExactRowRequest, HotStateFilter, HotStateReader,
+    HotStateScanRequest, MaterializedHotStateBatch, MaterializedHotStateRowRef,
 };
 use crate::{LixError, NullableKeyFilter};
 
@@ -68,6 +68,32 @@ impl CatalogContext {
             #[cfg(test)]
             committed_catalog_warms: AtomicUsize::new(0),
         }
+    }
+
+    /// Prepare the catalog metadata required by the next transaction on each
+    /// returned branch. This runs only at safe partial read completion; it
+    /// reads schema definitions, never rows of the registered schemas.
+    pub(crate) async fn prepare_returned_row_catalogs<R: HotStateReader + ?Sized>(
+        &self,
+        reader: &R,
+        rows: &[(String, crate::tracked_state::TrackedStateKey)],
+        revision: Option<&CatalogRevision>,
+    ) -> Result<(), LixError> {
+        for branch in rows
+            .iter()
+            .map(|(branch, _)| branch)
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            for untracked in [true, false] {
+                self.compiled_catalog_for_transaction_open(
+                    reader,
+                    &Domain::schema_catalog(branch.clone(), untracked),
+                    revision,
+                )
+                .await?;
+            }
+        }
+        Ok(())
     }
 
     /// Returns the catalog captured by a transaction-opening storage snapshot.
@@ -314,15 +340,52 @@ where
                 ..HotStateFilter::default()
             },
             projection: crate::hot_state::HotStateProjection {
-                columns: vec!["raw_snapshot".to_owned()],
+                columns: vec!["row_pk".to_owned()],
             },
             ..HotStateScanRequest::default()
         };
-        let rows = if schema_domain.untracked() {
+        let identities = if schema_domain.untracked() {
             hot_state.scan_batch(&request).await?
         } else {
             hot_state.scan_tracked_batch(&request).await?
         };
+        // Engine schemas come from the embedded catalog. Their historical
+        // registration projections cannot override that authority, so do not
+        // hydrate payloads which CatalogSnapshot would discard afterward.
+        let requests = identities
+            .iter()
+            .filter(|row| {
+                row.schema_key() == REGISTERED_SCHEMA_KEY
+                    && row.file_id().is_none()
+                    && row.branch_id() == schema_domain.branch_id()
+                    && row.untracked() == schema_domain.untracked()
+                    && committed_row_ref_is_exact_branch_scoped(*row, schema_domain.branch_id())
+            })
+            .filter(|row| {
+                row.row_pk()
+                    .as_single_string()
+                    .ok()
+                    .and_then(crate::schema::seed_schema_definition)
+                    .is_none()
+            })
+            .map(|row| HotStateExactRowRequest {
+                schema_key: REGISTERED_SCHEMA_KEY.to_owned(),
+                branch_id: schema_domain.branch_id().to_owned(),
+                row_pk: row.row_pk().clone(),
+                file_id: None,
+            })
+            .collect::<Vec<_>>();
+        let rows = hot_state
+            .load_exact_batch(&HotStateExactBatchRequest {
+                rows: requests,
+                projection: crate::hot_state::HotStateProjection {
+                    columns: vec!["raw_snapshot".to_owned()],
+                },
+                untracked: Some(schema_domain.untracked()),
+                include_tombstones: false,
+            })
+            .await?
+            .into_present_batch();
         catalog_rows.push(CatalogDomainRows {
             domain: schema_domain,
             rows,
@@ -708,27 +771,34 @@ mod tests {
         let mut seed_schema = registered_schema_row("lix_key_value");
         seed_schema.untracked = false;
 
+        let mut tracked_user = registered_schema_row("tracked_user_schema");
+        tracked_user.untracked = false;
+        let reader = RowsHotStateReader::new(vec![
+            seed_schema,
+            tracked_user,
+            registered_schema_row("engine_dynamic_schema"),
+        ]);
+        let domain = Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", false);
         let facts = context
-            .schema_facts_for_domain(
-                &RowsHotStateReader::new(vec![
-                    seed_schema,
-                    registered_schema_row("engine_dynamic_schema"),
-                ]),
-                &Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", false),
-            )
+            .schema_facts_for_domain(&reader, &domain)
             .await
-            .expect("schema visibility should load");
-        let schemas = facts
-            .iter()
-            .map(SchemaCatalogFact::schema)
-            .collect::<Vec<_>>();
-
-        assert!(schemas.iter().any(|schema| {
-            schema.get("key").and_then(JsonValue::as_str) == Some("lix_key_value")
-        }));
-        assert!(!schemas.iter().any(|schema| {
-            schema.get("key").and_then(JsonValue::as_str) == Some("engine_dynamic_schema")
-        }));
+            .unwrap();
+        assert_eq!(
+            facts.len(),
+            1,
+            "only the authoritative tracked user fact is loaded"
+        );
+        assert_eq!(
+            facts[0].schema().get("key").and_then(JsonValue::as_str),
+            Some("tracked_user_schema")
+        );
+        let catalog = context
+            .compiled_catalog_for_domain(&reader, &domain)
+            .await
+            .unwrap();
+        assert!(catalog.contains("lix_key_value"));
+        assert!(catalog.contains("tracked_user_schema"));
+        assert!(!catalog.contains("engine_dynamic_schema"));
     }
 
     #[tokio::test]
@@ -817,9 +887,55 @@ mod tests {
         }));
     }
 
+    #[tokio::test]
+    async fn builtin_registration_payloads_are_not_read_but_user_facts_are_validated() {
+        let context = CatalogContext::new();
+        let domain = Domain::schema_catalog(GLOBAL_BRANCH_ID, true);
+        let mut builtin = registered_schema_row("lix_file_descriptor");
+        // This non-authoritative historical projection is intentionally not
+        // decoded. The engine's embedded definition remains authoritative.
+        builtin.snapshot_content = Some(
+            json!({
+                "schema_key":"lix_file_descriptor", "value":{"not_a_schema":true}
+            })
+            .to_string()
+            .into(),
+        );
+        let reader = RowsHotStateReader::new(vec![builtin, registered_schema_row("user_probe")]);
+        let catalog = context
+            .compiled_catalog_for_domain(&reader, &domain)
+            .await
+            .unwrap();
+        assert!(catalog.contains("lix_file_descriptor"));
+        assert!(catalog.contains("user_probe"));
+        assert_eq!(
+            *reader.payload_requests.lock().unwrap(),
+            vec![registered_schema_row_pk("user_probe")]
+        );
+
+        for schema_key in ["user_probe", "plugin_probe", "lix_future_probe"] {
+            let mut malformed = registered_schema_row(schema_key);
+            let mut payload: JsonValue =
+                serde_json::from_str(malformed.snapshot_content.as_deref().unwrap()).unwrap();
+            payload["value"]["key"] = json!("different_user_key");
+            malformed.snapshot_content = Some(payload.to_string().into());
+            let reader = RowsHotStateReader::new(vec![malformed]);
+            let error = context
+                .compiled_catalog_for_domain(&reader, &domain)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+            assert_eq!(
+                *reader.payload_requests.lock().unwrap(),
+                vec![registered_schema_row_pk(schema_key)]
+            );
+        }
+    }
+
     struct RowsHotStateReader {
         rows: Vec<MaterializedHotStateRow>,
         scan_count: AtomicUsize,
+        payload_requests: Mutex<Vec<crate::row_pk::RowPk>>,
     }
 
     impl RowsHotStateReader {
@@ -827,6 +943,7 @@ mod tests {
             Self {
                 rows,
                 scan_count: AtomicUsize::new(0),
+                payload_requests: Mutex::new(Vec::new()),
             }
         }
 
@@ -839,7 +956,7 @@ mod tests {
     impl HotStateReader for RowsHotStateReader {
         async fn load_exact_batch(
             &self,
-            request: &crate::hot_state::HotStateExactBatchRequest,
+            request: &HotStateExactBatchRequest,
         ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
             crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
         }
@@ -848,13 +965,32 @@ mod tests {
             &self,
             request: &HotStateScanRequest,
         ) -> Result<MaterializedHotStateBatch, LixError> {
-            self.scan_count.fetch_add(1, Ordering::Relaxed);
+            // The exact-read test adapter uses a filtered scan internally;
+            // count only full catalog-domain scans for cache assertions.
+            if request.filter.row_pks.is_empty() {
+                self.scan_count.fetch_add(1, Ordering::Relaxed);
+            }
+            if request
+                .projection
+                .columns
+                .iter()
+                .any(|column| column == "raw_snapshot")
+            {
+                self.payload_requests
+                    .lock()
+                    .unwrap()
+                    .extend(request.filter.row_pks.iter().cloned());
+            }
             let rows = self
                 .rows
                 .iter()
                 .filter(|row| {
                     request.filter.schema_keys.is_empty()
                         || request.filter.schema_keys.contains(&row.schema_key)
+                })
+                .filter(|row| {
+                    request.filter.row_pks.is_empty()
+                        || request.filter.row_pks.contains(&row.row_pk)
                 })
                 .filter(|row| {
                     request.filter.branch_ids.is_empty()

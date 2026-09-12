@@ -171,12 +171,15 @@ pub(crate) async fn require_unrestarted_identity(
         );
     }
     let address = StorageKey(Bytes::from(bytes));
-    let value = PointReadPlan::new(PARTIAL_ATTEMPT_RESTART_SPACE, std::slice::from_ref(&address))
-        .materialize(read, Default::default())
-        .await?
-        .value
-        .pop()
-        .flatten();
+    let value = PointReadPlan::new(
+        PARTIAL_ATTEMPT_RESTART_SPACE,
+        std::slice::from_ref(&address),
+    )
+    .materialize(read, Default::default())
+    .await?
+    .value
+    .pop()
+    .flatten();
     if let Some(value) = value {
         let StorageProjectedValue::FullValue(bytes) = value else {
             return Err(invalid("restart fence projection omitted"));
@@ -291,6 +294,7 @@ mod tests {
     use super::*;
     fn request() -> PartialAttemptRestartRequest {
         let id = || uuid::Uuid::now_v7().to_string();
+        let checkpoint = id();
         PartialAttemptRestartRequest {
             old: PartialMergeRequest {
                 attempt_id: id(),
@@ -298,7 +302,9 @@ mod tests {
                 base_commit_id: id(),
                 expected_authority_head_commit_id: id(),
                 captured_local_head_commit_id: id(),
-                checkpoint_commit_id: id(),
+                expected_authority_checkpoint_commit_id: checkpoint.clone(),
+                captured_local_checkpoint_commit_id: checkpoint.clone(),
+                checkpoint_commit_id: checkpoint,
                 global_head_commit_id: id(),
                 global_checkpoint_commit_id: id(),
             },

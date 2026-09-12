@@ -411,6 +411,9 @@ where
     );
     let blob = crate::binary_cas::BinaryCasContext::new();
     blob.enable_referenced_manifest_demands();
+    // Candidate controls are staged over the durable read. Never reuse the
+    // durable catalog revision as proof for this unpublished serving state.
+    let candidate_catalog = crate::catalog::CatalogContext::new();
     let mut mutation_identities = std::collections::BTreeMap::<
         String,
         std::collections::BTreeSet<crate::tracked_state::TrackedStateKey>,
@@ -539,12 +542,22 @@ where
                     path_predicate,
                 )
                 .await?;
-                hot.reader(read.clone())
+                let reader = hot.reader(read.clone());
+                let executable_rows = reader
                     .prepare_captured_read_interests(
                         &capture.snapshot()?,
                         state.active_account_id(),
                     )
                     .await?;
+                candidate_catalog
+                    .prepare_returned_row_catalogs(&reader, &executable_rows, None)
+                    .await?;
+                crate::plugin::runtime::prepare_returned_row_executables(
+                    &reader,
+                    &blob.reader(read.clone()),
+                    &executable_rows,
+                )
+                .await?;
             }
             LogicalReadInterest::FileContent {
                 request,
@@ -576,12 +589,22 @@ where
                     *byte_range,
                 )
                 .await?;
-                hot.reader(read.clone())
+                let reader = hot.reader(read.clone());
+                let executable_rows = reader
                     .prepare_captured_read_interests(
                         &capture.snapshot()?,
                         state.active_account_id(),
                     )
                     .await?;
+                candidate_catalog
+                    .prepare_returned_row_catalogs(&reader, &executable_rows, None)
+                    .await?;
+                crate::plugin::runtime::prepare_returned_row_executables(
+                    &reader,
+                    &blob.reader(read.clone()),
+                    &executable_rows,
+                )
+                .await?;
             }
         }
     }
@@ -602,9 +625,20 @@ where
     // Foreground row reads promise the same bounded native edit inputs. Prepare
     // them against these unpublished controls before they become visible; this
     // candidate context intentionally has no trusted live-epoch proof cache.
-    hot.reader(read.clone())
+    let reader = hot.reader(read.clone());
+    let executable_rows = reader
         .prepare_captured_read_interests(interests, state.active_account_id())
         .await?;
+    candidate_catalog
+        .prepare_returned_row_catalogs(&reader, &executable_rows, None)
+        .await?;
+    crate::plugin::runtime::prepare_returned_row_executables(
+        &reader,
+        &blob.reader(read.clone()),
+        &executable_rows,
+    )
+    .await?;
+    drop(reader);
     drop(hot);
     drop(read);
     Ok(PreparedCandidateState {

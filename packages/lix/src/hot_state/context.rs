@@ -1187,11 +1187,15 @@ where
         &'a self,
         captured: &'a super::ReadInterestSnapshot,
         active_account_id: &'a str,
-    ) -> ReturnedChangePreparationFuture<'a> {
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<Vec<(String, crate::tracked_state::TrackedStateKey)>, LixError>,
+    > {
         Box::pin(async move {
             if self.partial_scope_policy.is_none() && self.partial_scope_source.is_none() {
-                return Ok(());
+                return Ok(Vec::new());
             }
+            let mut execution_rows = std::collections::BTreeSet::new();
             let mut account_prepared = false;
             for interest in &captured.interests {
                 let rows: Vec<CurrentReadIdentity> = match interest.as_ref() {
@@ -1330,9 +1334,13 @@ where
                     .await?;
                     account_prepared = true;
                 }
+                execution_rows.extend(
+                    rows.iter()
+                        .map(|row| (row.branch_id.clone(), row.key.clone())),
+                );
                 self.prepare_returned_rows(rows).await?;
             }
-            Ok(())
+            Ok(execution_rows.into_iter().collect())
         })
     }
 

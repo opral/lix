@@ -59,9 +59,9 @@ pub(super) async fn record(
         }
     })
 }
-/// Bounded causal DAG proof. Every parent is considered, including the second
-/// parent of an earlier authority merge. A budget/missing input is an error,
-/// never evidence that the ancestor is absent. No inventory scan is used.
+/// Bounded causal DAG proof. Native jumps skip linear history segments; their
+/// index resets at merge nodes, where every parent is considered. A budget or
+/// missing input is an error, never evidence that the ancestor is absent.
 pub(super) async fn bounded_ancestor(
     read: &(impl StorageAdapterRead + ?Sized),
     ancestor: &CommitRecord,
@@ -69,9 +69,9 @@ pub(super) async fn bounded_ancestor(
     cache: &mut BTreeMap<CommitId, CommitRecord>,
     limit: usize,
 ) -> Result<bool, LixError> {
-    let mut pending = vec![(descendant, None)];
+    let mut pending = vec![(descendant, None, None)];
     let mut visited = BTreeSet::new();
-    while let Some((current, child_generation)) = pending.pop() {
+    while let Some((current, child_generation, jump_generation)) = pending.pop() {
         let node = if current == ancestor.commit_id {
             ancestor.clone()
         } else if let Some(node) = cache.get(&current) {
@@ -89,11 +89,35 @@ pub(super) async fn bounded_ancestor(
                 "causal parent generation does not precede its child",
             ));
         }
+        if jump_generation.is_some_and(|generation| node.generation != generation) {
+            return Err(blocked(
+                "causal jump target generation does not match its span",
+            ));
+        }
         if current == ancestor.commit_id {
             return Ok(true);
         }
         if !visited.insert(current) || node.generation <= ancestor.generation {
             continue;
+        }
+        if node.parent_commit_ids.len() == 1 && node.first_parent_jump_span > 1 {
+            let generation = node
+                .generation
+                .checked_sub(node.first_parent_jump_span)
+                .ok_or_else(|| blocked("causal jump span exceeds its generation"))?;
+            if node.first_parent_jump_commit_id == current {
+                return Err(blocked("causal jump contains a cycle"));
+            }
+            // Native jump construction never crosses a merge node. The
+            // skipped interval therefore has no secondary ancestry to visit.
+            if generation >= ancestor.generation {
+                pending.push((
+                    node.first_parent_jump_commit_id,
+                    Some(node.generation),
+                    Some(generation),
+                ));
+                continue;
+            }
         }
         if node.parent_commit_ids.len() > limit
             || pending.len().saturating_add(node.parent_commit_ids.len()) > limit
@@ -101,7 +125,7 @@ pub(super) async fn bounded_ancestor(
             return Err(limited("remote causal frontier budget exceeded"));
         }
         for parent in node.parent_commit_ids {
-            pending.push((parent, Some(node.generation)));
+            pending.push((parent, Some(node.generation), None));
         }
     }
     Ok(false)
@@ -170,15 +194,9 @@ pub(super) async fn prepare_partial_merge_analysis(
             .map(|key| key.to_string())
             .as_ref()
             != Some(&global.confirmed.checkpoint)
-        || candidate.descriptor().selected_branch.checkpoint.commit_id != push.confirmed.checkpoint
-        || local_control
-            .working_diff_checkpoint_commit_id
-            .map(|key| key.to_string())
-            .as_ref()
-            != Some(&push.confirmed.checkpoint)
     {
         return Err(blocked(
-            "catalog/global/checkpoint reconciliation must precede selected ordinary merge",
+            "catalog/global reconciliation must precede selected merge",
         ));
     }
     let base = id(&push.confirmed.head)?;
@@ -187,12 +205,17 @@ pub(super) async fn prepare_partial_merge_analysis(
     if local == base || remote == base {
         return Err(blocked("merge analysis requires two changed heads"));
     }
-    let native = analyze_native_kv_divergence(
+    let native = analyze_native_divergence(
         read,
         base,
         remote,
         local,
         old.active_account_id(),
+        branch,
+        &[
+            id(&push.confirmed.checkpoint)?,
+            id(&candidate.descriptor().selected_branch.checkpoint.commit_id)?,
+        ],
         id(&global.confirmed.head)?,
         budget,
     )
@@ -224,20 +247,23 @@ pub(super) async fn prepare_partial_merge_analysis(
     })
 }
 
-pub(super) struct NativeKvMergeAnalysis {
+pub(super) struct NativeMergeAnalysis {
     pub local_commits: Vec<CommitRecord>,
     pub groups: Vec<TrackedStateMergePlan>,
     pub already_in_authority: bool,
+    pub application: Option<crate::session::MergeAnalysis>,
 }
-pub(super) async fn analyze_native_kv_divergence(
+pub(super) async fn analyze_native_divergence(
     read: &(impl StorageAdapterRead + ?Sized),
     base: CommitId,
     remote: CommitId,
     local: CommitId,
     account: &str,
+    branch_id: &str,
+    known_checkpoints: &[CommitId],
     global_head: CommitId,
     budget: PartialMergeBudget,
-) -> Result<NativeKvMergeAnalysis, LixError> {
+) -> Result<NativeMergeAnalysis, LixError> {
     if budget.max_local_commits == 0
         || budget.max_local_commits > 1024
         || budget.max_local_members == 0
@@ -253,69 +279,47 @@ pub(super) async fn analyze_native_kv_divergence(
         return Err(blocked("native merge has no local suffix"));
     }
     let base_record = record(read, base, true).await?;
-    let mut commits = Vec::new();
+    let mut known = BTreeSet::from([base, remote, global_head]);
+    known.extend(known_checkpoints.iter().copied());
+    let bodies = super::partial_checkpoint_upload::load_local_dependency_closure(
+        read,
+        branch_id,
+        account,
+        &[local],
+        known,
+        global_head,
+        budget.max_local_commits,
+        budget.max_local_payload_bytes,
+    )
+    .await
+    .map_err(|error| {
+        if error.code == "LIX_PARTIAL_UPLOAD_PAGE_REQUIRED" {
+            limited("local native dependency closure exceeds the merge budget")
+        } else {
+            error
+        }
+    })?;
+    let mut commits = Vec::with_capacity(bodies.len());
     let mut keys = BTreeSet::<TrackedStateKey>::new();
-    let mut seen = BTreeSet::new();
-    let mut cursor = local;
     let mut member_count = 0usize;
-    let mut payload_bytes = 0usize;
-    while cursor != base {
-        if commits.len() >= budget.max_local_commits {
-            return Err(limited("local suffix commit budget exceeded"));
-        }
-        if !seen.insert(cursor) {
-            return Err(blocked("local suffix contains a cycle"));
-        }
-        let node = record(read, cursor, true).await?;
-        if node.is_checkpoint
-            || node.parent_commit_ids.len() != 1
-            || node.account_id != account
-            || node
-                .base_commit_id
-                .is_some_and(|key| key != global_head)
-        {
-            return Err(blocked(
-                "local suffix is not ordinary selected state at the confirmed catalog",
-            ));
-        }
-        let header = crate::tracked_state::load_published_commit_state_topology(read, cursor)
-            .await?
-            .ok_or_else(|| blocked("local commit state header is absent"))?;
+    for body in bodies {
         member_count = member_count
-            .checked_add(header.mutation_member_count() as usize)
+            .checked_add(body.members.len())
             .ok_or_else(|| limited("local member count overflow"))?;
         if member_count > budget.max_local_members {
-            return Err(limited(
-                "local member budget exceeded before payload loading",
-            ));
+            return Err(limited("local member budget exceeded"));
         }
-        let members =
-            crate::tracked_state::load_local_commit_delta_members_with_payloads(read, cursor)
-                .await?;
-        for member in members {
-            if !member.authored
-                || member.key.schema_key != "lix_key_value"
-                || member.key.file_id.is_some()
-            {
-                return Err(blocked(
-                    "first merge slice supports only authored unfiled key/value rows",
-                ));
-            }
-            payload_bytes = payload_bytes
-                .checked_add(member.change.snapshot.as_ref().map_or(0, Vec::len))
-                .ok_or_else(|| limited("local payload byte count overflow"))?;
-            if payload_bytes > budget.max_local_payload_bytes {
-                return Err(limited("local payload budget exceeded"));
-            }
-            keys.insert(member.key);
+        for member in body.members {
+            keys.insert(TrackedStateKey {
+                schema_key: member.schema_key,
+                file_id: member.file_id,
+                row_pk: crate::row_pk::RowPk::from_typed_json_array_value(&member.row_pk)
+                    .map_err(|error| blocked(&format!("invalid native row identity: {error}")))?,
+            });
         }
-        cursor = node.parent_commit_ids[0];
-        commits.push(node);
+        commits.push(record(read, id(&body.commit_id)?, true).await?);
     }
-    commits.reverse();
-    let local_record = commits
-        .last()
-        .ok_or_else(|| blocked("local suffix is empty"))?;
+    let local_record = record(read, local, true).await?;
     let mut graph = BTreeMap::new();
     if !bounded_ancestor(
         read,
@@ -332,13 +336,14 @@ pub(super) async fn analyze_native_kv_divergence(
     }
     let included = bounded_ancestor(
         read,
-        local_record,
+        &local_record,
         remote,
         &mut graph,
         budget.max_remote_graph_records,
     )
     .await?;
     let mut groups = Vec::new();
+    let mut application = None;
     if !included {
         let mut correlated = BTreeMap::<(String, Option<String>), Vec<crate::row_pk::RowPk>>::new();
         for key in keys {
@@ -348,6 +353,8 @@ pub(super) async fn analyze_native_kv_divergence(
                 .push(key.row_pk);
         }
         let mut reader = TrackedStateContext::new().reader(read);
+        let mut source_entries = Vec::new();
+        let mut target_entries = Vec::new();
         for ((schema, file), row_pks) in correlated {
             let request = TrackedStateDiffRequest {
                 filter: TrackedStateFilter {
@@ -365,20 +372,31 @@ pub(super) async fn analyze_native_kv_divergence(
             let remote_diff = reader
                 .diff_commit_members(&base.to_string(), &remote.to_string(), &request)
                 .await?;
-            let fallback =
-                crate::tracked_state::merge_payload_fallback_ids(&remote_diff, &local_diff)?;
-            let payloads = reader.load_change_payloads(&fallback).await?;
-            groups.push(crate::tracked_state::plan_merge(
-                &remote_diff,
-                &local_diff,
-                &payloads,
-            )?);
+            source_entries.extend(local_diff.entries);
+            target_entries.extend(remote_diff.entries);
         }
+        let merged = crate::session::analyze_incoming_rows(
+            &mut reader,
+            base,
+            remote,
+            local,
+            crate::tracked_state::TrackedStateDiff::from_entries(source_entries),
+            crate::tracked_state::TrackedStateDiff::from_entries(target_entries),
+        )
+        .await?;
+        groups.push(
+            merged
+                .merge_plan()
+                .expect("incoming application has a plan")
+                .clone(),
+        );
+        application = Some(merged);
     }
-    Ok(NativeKvMergeAnalysis {
+    Ok(NativeMergeAnalysis {
         local_commits: commits,
         groups,
         already_in_authority: included,
+        application,
     })
 }
 #[cfg(test)]
@@ -583,3 +601,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod ancestry_tests;

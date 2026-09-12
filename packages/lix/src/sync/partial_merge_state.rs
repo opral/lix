@@ -62,7 +62,7 @@ fn key(branch: &str) -> Result<StorageKey, LixError> {
 impl PartialBranchMergeState {
     fn validate(&self, state: &PartialReplicaState, branch: &str) -> Result<(), LixError> {
         self.request.validate()?;
-        if self.version != 4
+        if self.version != 5
             || self.epoch_id != state.epoch_id()
             || self.request.branch_id != branch
             || branch != state.descriptor().selected_branch.branch_id
@@ -80,14 +80,17 @@ impl PartialBranchMergeState {
                 return Err(invalid("merge frontier contains a noncanonical coordinate"));
             }
         }
-        if self.original_confirmed.checkpoint != self.request.checkpoint_commit_id {
+        if self.previous_receipt.is_none()
+            && self.original_confirmed.checkpoint != self.request.checkpoint_commit_id
+        {
             return Err(invalid("merge frontier changed its original checkpoint"));
         }
         if let Some(prior) = &self.previous_receipt {
             prior.validate_for(&prior.request)?;
             if self.request.base_commit_id != prior.request.captured_local_head_commit_id
                 || self.request.branch_id != prior.request.branch_id
-                || self.request.checkpoint_commit_id != prior.request.checkpoint_commit_id
+                || self.request.checkpoint_commit_id
+                    != prior.request.captured_local_checkpoint_commit_id
                 || self.request.global_head_commit_id != prior.request.global_head_commit_id
                 || self.request.global_checkpoint_commit_id
                     != prior.request.global_checkpoint_commit_id
@@ -125,10 +128,7 @@ impl PartialBranchMergeState {
                     return Err(invalid("captured upload has invalid coordinates"));
                 }
             }
-            if upload.expected != self.original_confirmed
-                || upload.expected.checkpoint != self.request.checkpoint_commit_id
-                || upload.target.checkpoint != self.request.checkpoint_commit_id
-            {
+            if upload.expected != self.original_confirmed {
                 return Err(invalid("merge attempt changed the captured upload base"));
             }
         }
@@ -293,7 +293,7 @@ pub(super) async fn stage_capture_partial_merge(
         let (head, checkpoint) = if index == 0 {
             (
                 &request.captured_local_head_commit_id,
-                &request.checkpoint_commit_id,
+                &request.captured_local_checkpoint_commit_id,
             )
         } else {
             (
@@ -326,7 +326,7 @@ pub(super) async fn stage_capture_partial_merge(
         expected: global_raw,
     });
     let record = PartialBranchMergeState {
-        version: 4,
+        version: 5,
         epoch_id: state.epoch_id().into(),
         request: request.clone(),
         original_confirmed: push.confirmed,
@@ -399,44 +399,50 @@ pub(super) async fn ordinary_upload_merge_guards(
     Ok(guards)
 }
 
-async fn require_local_ordinary_path(
+async fn require_local_dependency_closure(
     read: &(impl StorageAdapterRead + ?Sized),
     state: &PartialReplicaState,
     ancestor: &str,
     descendant: &str,
     global: &str,
 ) -> Result<(), LixError> {
-    let ancestor = crate::changelog::CommitId::parse_lix(ancestor, "merge body ancestor")?;
-    let global = crate::changelog::CommitId::parse_lix(global, "merge body global base")?;
-    let mut cursor = crate::changelog::CommitId::parse_lix(descendant, "merge body descendant")?;
-    let mut child_generation = None;
-    for _ in 0..=1024 {
-        let record = super::partial_merge_analysis::record(read, cursor, true).await?;
-        if child_generation.is_some_and(|child| record.generation >= child) {
-            return Err(invalid(
-                "local merge ancestry has a nondecreasing generation",
-            ));
-        }
-        if cursor == ancestor {
-            return Ok(());
-        }
-        if record.is_checkpoint
-            || record.parent_commit_ids.len() != 1
-            || record.base_commit_id != Some(global)
-            || record.account_id != state.active_account_id()
-        {
-            return Err(LixError::new(
-                "LIX_PARTIAL_MERGE_SCOPE_UNSUPPORTED",
-                "merge body frontier requires an ordinary local suffix at the unchanged catalog",
-            ));
-        }
-        child_generation = Some(record.generation);
-        cursor = record.parent_commit_ids[0];
+    use crate::changelog::CommitId;
+    let ancestor = CommitId::parse_lix(ancestor, "merge body ancestor")?;
+    let descendant = CommitId::parse_lix(descendant, "merge body descendant")?;
+    if ancestor == descendant {
+        return Ok(());
     }
-    Err(LixError::new(
-        "LIX_PARTIAL_MERGE_BUDGET_EXCEEDED",
-        "local merge ancestry exceeds 1024 commits",
-    ))
+    let global = CommitId::parse_lix(global, "merge body global base")?;
+    let known = [
+        ancestor,
+        global,
+        CommitId::parse_lix(
+            &state.descriptor().selected_branch.head.commit_id,
+            "merge selected base",
+        )?,
+        CommitId::parse_lix(
+            &state.descriptor().selected_branch.checkpoint.commit_id,
+            "merge checkpoint",
+        )?,
+        CommitId::parse_lix(
+            &state.descriptor().global_branch.checkpoint.commit_id,
+            "merge global checkpoint",
+        )?,
+    ]
+    .into_iter()
+    .collect();
+    super::partial_checkpoint_upload::load_local_dependency_closure(
+        read,
+        &state.descriptor().selected_branch.branch_id,
+        state.active_account_id(),
+        &[descendant],
+        known,
+        global,
+        1024,
+        64 * 1024 * 1024,
+    )
+    .await?;
+    Ok(())
 }
 
 /// Capture the exact oldest wave before sending it. Repeated capture is safe;
@@ -473,22 +479,9 @@ pub(super) async fn stage_prepare_partial_merge_body_wave(
         }
         return Ok(guards);
     }
-    require_local_ordinary_path(
-        read,
-        state,
-        previous,
-        target,
-        &request.global_head_commit_id,
-    )
-    .await?;
-    require_local_ordinary_path(
-        read,
-        state,
-        target,
-        &request.captured_local_head_commit_id,
-        &request.global_head_commit_id,
-    )
-    .await?;
+    // Reconstruct the exact deterministic captured closure page. A cursor may
+    // be a checkpoint source rather than a first-parent ancestor.
+    super::partial_merge_runtime::captured_wave(read, request, previous, Some(&wave)).await?;
     record.prepared_body_wave = Some(wave);
     record.validate(state, &request.branch_id)?;
     guards.push(stage_record(writes, &record, raw)?);
@@ -561,7 +554,7 @@ pub(super) async fn stage_rollover_partial_merge(
         .ok_or_else(|| conflict("rollover must first recover the exact authority outcome"))?;
     if request.attempt_id == record.request.attempt_id
         || request.base_commit_id != record.request.captured_local_head_commit_id
-        || request.checkpoint_commit_id != record.request.checkpoint_commit_id
+        || request.checkpoint_commit_id != record.request.captured_local_checkpoint_commit_id
         || request.global_head_commit_id != record.request.global_head_commit_id
         || request.global_checkpoint_commit_id != record.request.global_checkpoint_commit_id
     {
@@ -598,7 +591,7 @@ pub(super) async fn stage_rollover_partial_merge(
             "new authority frontier does not contain the prior merge",
         ));
     }
-    require_local_ordinary_path(
+    require_local_dependency_closure(
         read,
         state,
         &request.base_commit_id,
@@ -610,7 +603,7 @@ pub(super) async fn stage_rollover_partial_merge(
         (
             &request.branch_id,
             &request.captured_local_head_commit_id,
-            &request.checkpoint_commit_id,
+            &request.captured_local_checkpoint_commit_id,
         ),
         (
             &state.descriptor().global_branch.branch_id,
@@ -692,9 +685,9 @@ pub(super) async fn require_no_branch_merge(
     }])
 }
 
-/// Bounded one-way migration of the embedded original upload. No normal-read
-/// defaults: v3 could only have sent the single branch ref, so its frozen
-/// original request migrates with an explicitly empty created-ref list.
+/// Bounded owned migration: v3 adds the empty frozen created-ref list; v4
+/// adds explicit in-memory B/R/L checkpoints while preserving canonical wire
+/// bytes. Normal journal reads accept only v5. No controls or data are reset.
 pub(crate) async fn prepare_owned_partial_merge_upload_upgrade(
     read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
@@ -729,16 +722,23 @@ pub(crate) async fn prepare_owned_partial_merge_upload_upgrade(
             .as_object_mut()
             .ok_or_else(|| invalid("old merge record must be object"))?;
         match object.get("version").and_then(serde_json::Value::as_u64) {
-            Some(4) => {
+            Some(5) => {
                 let record: PartialBranchMergeState =
-                    serde_json::from_value(value).map_err(|_| invalid("merge v4 malformed"))?;
+                    serde_json::from_value(value).map_err(|_| invalid("merge v5 malformed"))?;
                 record.validate(state, &branch)?;
                 continue;
             }
-            Some(3) => {}
+            Some(3) | Some(4) => {}
             _ => return Err(invalid("unsupported merge migration version")),
         }
-        if let Some(upload) = object.get_mut("originalUpload").filter(|v| !v.is_null()) {
+        let old_version = object
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap();
+        if let Some(upload) = object
+            .get_mut("originalUpload")
+            .filter(|v| old_version == 3 && !v.is_null())
+        {
             let upload = upload
                 .as_object_mut()
                 .ok_or_else(|| invalid("old original upload must be object"))?;
@@ -751,7 +751,8 @@ pub(crate) async fn prepare_owned_partial_merge_upload_upgrade(
             }
             upload.insert("createdRefs".into(), serde_json::json!([]));
         }
-        object.insert("version".into(), serde_json::json!(4));
+        validate_legacy_checkpoint_encoding(&serde_json::Value::Object(object.clone()))?;
+        object.insert("version".into(), serde_json::json!(5));
         let record: PartialBranchMergeState = serde_json::from_value(value)
             .map_err(|_| invalid("upgraded merge fields malformed"))?;
         record.validate(state, &branch)?;
@@ -774,4 +775,28 @@ pub(crate) async fn prepare_owned_partial_merge_upload_upgrade(
         });
     }
     Ok(guards)
+}
+
+// v3/v4 froze one checkpoint for B/R/L. Nested previous receipts and restart
+// outcomes must retain that invariant as well as their exact canonical digest.
+fn validate_legacy_checkpoint_encoding(value: &serde_json::Value) -> Result<(), LixError> {
+    match value {
+        serde_json::Value::Object(object) => {
+            if object.contains_key("expectedAuthorityCheckpointCommitId")
+                || object.contains_key("capturedLocalCheckpointCommitId")
+            {
+                return Err(invalid("old merge record contains new checkpoint fields"));
+            }
+            for child in object.values() {
+                validate_legacy_checkpoint_encoding(child)?;
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                validate_legacy_checkpoint_encoding(child)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }

@@ -66,25 +66,9 @@ async fn test_only_row_merger_composes_text_without_a_file() {
     .expect("B edit should stage");
     a.commit().await.expect("A should commit");
     b.commit().await.expect("B should commit on its branch");
-    // Host LWW orders durable change IDs, not source/target branch roles.
-    // Canonical UUID strings preserve the byte ordering used by ConflictRank.
-    let mut change_ids = Vec::new();
-    for session in [&lix, &peer] {
-        let row = session
-            .execute(
-                "SELECT lixcol_change_id FROM merge_test_row WHERE id = $1",
-                &[Value::Text("0198b7a1-0000-7000-8000-000000000001".to_owned())],
-            )
-            .await
-            .expect("branch change ID should read");
-        change_ids.push(row.rows()[0].get::<String>("lixcol_change_id").unwrap());
-    }
-    assert_ne!(change_ids[0], change_ids[1]);
-    let expected_label = if change_ids[0] > change_ids[1] {
-        "label-a"
-    } else {
-        "label-b"
-    };
+    // Explicit branch application accepts source after target. Registered
+    // semantic merging still composes body; the fallback column takes source.
+    let expected_label = "label-b";
     lix.merge_branch(MergeBranchOptions {
         source_branch_id: source_branch.id,
     })

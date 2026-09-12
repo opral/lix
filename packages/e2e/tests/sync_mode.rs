@@ -1980,7 +1980,7 @@ async fn scoped_checkpoint_from_uncheckpointed_authority_survives_reconnect(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn conflicting_remote_edits_preserve_pending_local_rows_across_reopen() {
+async fn conflicting_remote_edits_converge_and_preserve_pending_rows_across_reopen() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
@@ -2011,7 +2011,19 @@ async fn conflicting_remote_edits_preserve_pending_local_rows_across_reopen() {
     remote.put_value("shared", "server").await;
     probe.set_offline(false);
     let replica = open_replica(directory.path(), &url).await;
-    wait_for_counter(&probe.merge_conflicts, 1).await;
+    tokio::time::timeout(WAIT_TIMEOUT, async {
+        loop {
+            if remote.read_value("shared").await.as_deref() == Some("pending")
+                && remote.read_value("dependent").await.as_deref() == Some("pending")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("later accepted incoming rows must converge after reconnect");
+    assert_eq!(probe.merge_conflicts.load(Ordering::Acquire), 0);
     assert_eq!(
         read_value(&replica, "shared").await.as_deref(),
         Some("pending")
@@ -2020,8 +2032,14 @@ async fn conflicting_remote_edits_preserve_pending_local_rows_across_reopen() {
         read_value(&replica, "dependent").await.as_deref(),
         Some("pending")
     );
-    assert_eq!(remote.read_value("shared").await.as_deref(), Some("server"));
-    assert_eq!(remote.read_value("dependent").await, None);
+    assert_eq!(
+        remote.read_value("shared").await.as_deref(),
+        Some("pending")
+    );
+    assert_eq!(
+        remote.read_value("dependent").await.as_deref(),
+        Some("pending")
+    );
     replica.close().await.unwrap();
     probe.set_offline(true);
     let replica = open_replica(directory.path(), &url).await;
@@ -3414,6 +3432,68 @@ async fn local_created_branch_publishes_refs_then_admits_without_losing_main() {
         .await;
     remote.switch_branch(&main).await;
     remote.wait_for_value("creation-value", "source").await;
+    replica.close().await.unwrap();
+    stop_server(server).await;
+}
+
+#[path = "sync_mode/plugin_merge.rs"]
+mod plugin_merge;
+
+#[tokio::test]
+async fn content_only_path_read_prepares_first_offline_opaque_update() {
+    let (storage, authority) = open_authority().await;
+    for index in 0..16 {
+        put_value(&authority, &format!("unrelated-{index}"), "untouched").await;
+    }
+    authority
+        .execute(
+            "INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))",
+            &[Value::Text(
+                json!({
+                    "$schema":"https://lix.dev/schema-v1.json", "key":"unrelated_catalog_probe",
+                    "columns":[{"name":"id","type":"text","nullable":false}], "primary_key":["id"]
+                })
+                .to_string(),
+            )],
+        )
+        .await
+        .unwrap();
+    let original = vec![48u8; 96 * 1024];
+    authority
+        .execute(
+            "INSERT INTO lix_file(path,content) VALUES($1,$2)",
+            &[
+                Value::Text("/content-only.bin".into()),
+                Value::Blob(original.clone().into()),
+            ],
+        )
+        .await
+        .unwrap();
+    authority.close().await.unwrap();
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server) = serve(storage, probe.clone()).await;
+    let directory = TempDir::new().unwrap();
+    let replica = open_replica(directory.path(), &url).await;
+    assert_eq!(
+        read_file_content(&replica, "/content-only.bin").await,
+        Some(original)
+    );
+    probe.set_offline(true);
+    let updated = vec![65u8; 96 * 1024];
+    replica
+        .execute(
+            "UPDATE lix_file SET content=$1 WHERE path=$2",
+            &[
+                Value::Blob(updated.clone().into()),
+                Value::Text("/content-only.bin".into()),
+            ],
+        )
+        .await
+        .expect("content SELECT alone prepares the first local content update");
+    assert_eq!(
+        read_file_content(&replica, "/content-only.bin").await,
+        Some(updated)
+    );
     replica.close().await.unwrap();
     stop_server(server).await;
 }

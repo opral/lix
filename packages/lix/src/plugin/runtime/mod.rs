@@ -19,7 +19,6 @@ pub(crate) use actor::tests::{failing_publication_for_test, pending_publication_
 mod archive;
 pub(crate) mod arena;
 mod component;
-mod conflict;
 mod create_context;
 mod incremental;
 mod install;
@@ -41,7 +40,6 @@ pub(crate) use actor::{
 };
 pub(crate) use archive::{ParsedPluginArchive, parse_plugin_archive_for_install};
 pub(crate) use component::{DEFAULT_PLUGIN_MEMORY_BYTES, PluginRuntimeHost};
-pub(crate) use conflict::ConflictRank;
 pub(crate) use create_context::{
     BoundCreateContext, is_reservation_key, local_mutation_identity, materialize_keyless_creates,
     require_existing_id_authorities, reservation_tombstone_row, reserve_create_row,
@@ -117,3 +115,6 @@ pub(crate) struct InstalledPluginMetadata {
 
 #[cfg(test)]
 pub(crate) use install::recovery_test_plugin_archive;
+
+mod read_dependencies;
+pub(crate) use read_dependencies::{prepare_executable_blobs, prepare_returned_row_executables, prepare_file_content_state};

@@ -233,105 +233,17 @@ async fn prepare_checkpoint_target(
         );
     }
 
-    let mut global_ancestry = BTreeMap::new();
-    let mut stack = vec![(id(&target.checkpoint)?, false), (id(&target.head)?, false)];
-    let mut visiting = BTreeSet::new();
-    let mut done = known.clone();
-    let mut loaded = BTreeMap::<CommitId, SyncCommit>::new();
-    let mut commits = Vec::new();
-    let mut body_budget = WireBudget {
-        remaining: max_wire_bytes,
-        written: 0,
-    };
-    while let Some((current, expanded)) = stack.pop() {
-        if done.contains(&current) {
-            continue;
-        }
-        if expanded {
-            visiting.remove(&current);
-            done.insert(current);
-            commits.push(
-                loaded
-                    .remove(&current)
-                    .expect("expanded native commit was loaded"),
-            );
-            continue;
-        }
-        if !visiting.insert(current) {
-            return Err(blocked("checkpoint dependency cycle"));
-        }
-        if commits.len() + loaded.len() >= max_commits {
-            return Err(LixError::new(
-                "LIX_PARTIAL_UPLOAD_PAGE_REQUIRED",
-                "checkpoint closure requires an earlier bounded upload wave",
-            ));
-        }
-        let commit = load_sync_commit(read, current)
-            .await?
-            .ok_or_else(|| blocked("locally authored checkpoint dependency is missing"))?;
-        if commit.account_id != state.active_account_id() {
-            return Err(blocked(
-                "checkpoint dependency belongs to an unprepared account scope",
-            ));
-        }
-        if let Some(base) = commit.base_commit_id.as_deref().map(id).transpose()? {
-            if !known.contains(&base)
-                && branch_id != crate::GLOBAL_BRANCH_ID
-                && super::partial_upload::is_confirmed_global_base(
-                    read,
-                    base,
-                    id(&global.confirmed.head)?,
-                    &mut global_ancestry,
-                )
-                .await?
-            {
-                known.insert(base);
-                done.insert(base);
-            }
-            if !known.contains(&base) {
-                return Err(blocked(
-                    "checkpoint requires confirmed global base preparation",
-                ));
-            }
-        }
-        // Blob manifests and chunks are prepared by the same bounded sender
-        // used for ordinary uploads, before this checkpoint's refs are pushed.
-        if commit.parent_commit_ids.len() > max_commits {
-            return Err(blocked(
-                "checkpoint parent fanout exceeds preparation budget",
-            ));
-        }
-        let mut dependencies = commit
-            .parent_commit_ids
-            .iter()
-            .map(|value| id(value))
-            .collect::<Result<BTreeSet<_>, _>>()?;
-        if let Some(alias) = &commit.state_alias {
-            dependencies.insert(id(&alias.source_commit_id)?);
-        }
-        if let Some(source) = &commit.selected_source_commit_id {
-            dependencies.insert(id(source)?);
-        }
-        if let Some((source_branch, source)) = load_sync_checkpoint_source(read, current).await? {
-            if source_branch != branch_id {
-                return Err(blocked("checkpoint provenance belongs to another branch"));
-            }
-            dependencies.insert(source);
-        }
-        serde_json::to_writer(&mut body_budget, &commit).map_err(|_| {
-            LixError::new(
-                "LIX_PARTIAL_UPLOAD_PAGE_REQUIRED",
-                "checkpoint bodies exceed wire budget",
-            )
-        })?;
-        loaded.insert(current, commit);
-        stack.push((current, true));
-        for dependency in dependencies.into_iter().rev() {
-            if !done.contains(&dependency) {
-                stack.push((dependency, false));
-            }
-        }
-    }
+    let commits = load_local_dependency_closure(
+        read,
+        branch_id,
+        state.active_account_id(),
+        &[id(&target.checkpoint)?, id(&target.head)?],
+        known,
+        id(&global.confirmed.head)?,
+        max_commits,
+        max_wire_bytes,
+    )
+    .await?;
     let resumed = branch.prepared.is_some();
     let mut upload = branch.prepared.unwrap_or(PreparedPartialUpload {
         attempt_id,
@@ -386,4 +298,123 @@ async fn prepare_checkpoint_target(
         control_guard,
         encoded_bytes: budget.written,
     }))
+}
+
+/// Shared native dependency closure for checkpoint publication and retained
+/// reconciliation bodies. Only explicit local roots and their dependencies are
+/// visited; confirmed boundary roots terminate traversal.
+pub(super) async fn load_local_dependency_closure(
+    read: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    account: &str,
+    roots: &[CommitId],
+    mut known: BTreeSet<CommitId>,
+    confirmed_global: CommitId,
+    max_commits: usize,
+    max_wire_bytes: usize,
+) -> Result<Vec<SyncCommit>, LixError> {
+    let mut global_ancestry = BTreeMap::new();
+    let mut stack = roots
+        .iter()
+        .copied()
+        .map(|root| (root, false))
+        .collect::<Vec<_>>();
+    let mut visiting = BTreeSet::new();
+    let mut done = known.clone();
+    let mut loaded = BTreeMap::<CommitId, SyncCommit>::new();
+    let mut commits = Vec::new();
+    let mut body_budget = WireBudget {
+        remaining: max_wire_bytes,
+        written: 0,
+    };
+    while let Some((current, expanded)) = stack.pop() {
+        if done.contains(&current) {
+            continue;
+        }
+        if expanded {
+            visiting.remove(&current);
+            done.insert(current);
+            commits.push(
+                loaded
+                    .remove(&current)
+                    .expect("expanded native commit was loaded"),
+            );
+            continue;
+        }
+        if !visiting.insert(current) {
+            return Err(blocked("checkpoint dependency cycle"));
+        }
+        if commits.len() + loaded.len() >= max_commits {
+            return Err(LixError::new(
+                "LIX_PARTIAL_UPLOAD_PAGE_REQUIRED",
+                "checkpoint closure requires an earlier bounded upload wave",
+            ));
+        }
+        let commit = load_sync_commit(read, current)
+            .await?
+            .ok_or_else(|| blocked("locally authored checkpoint dependency is missing"))?;
+        if commit.account_id != account {
+            return Err(blocked(
+                "checkpoint dependency belongs to an unprepared account scope",
+            ));
+        }
+        if let Some(base) = commit.base_commit_id.as_deref().map(id).transpose()? {
+            if !known.contains(&base)
+                && branch_id != crate::GLOBAL_BRANCH_ID
+                && super::partial_upload::is_confirmed_global_base(
+                    read,
+                    base,
+                    confirmed_global,
+                    &mut global_ancestry,
+                )
+                .await?
+            {
+                known.insert(base);
+                done.insert(base);
+            }
+            if !known.contains(&base) {
+                return Err(blocked(
+                    "checkpoint requires confirmed global base preparation",
+                ));
+            }
+        }
+        // Blob manifests and chunks are prepared by the same bounded sender
+        // used for ordinary uploads, before this checkpoint's refs are pushed.
+        if commit.parent_commit_ids.len() > max_commits {
+            return Err(blocked(
+                "checkpoint parent fanout exceeds preparation budget",
+            ));
+        }
+        let mut dependencies = commit
+            .parent_commit_ids
+            .iter()
+            .map(|value| id(value))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if let Some(alias) = &commit.state_alias {
+            dependencies.insert(id(&alias.source_commit_id)?);
+        }
+        if let Some(source) = &commit.selected_source_commit_id {
+            dependencies.insert(id(source)?);
+        }
+        if let Some((source_branch, source)) = load_sync_checkpoint_source(read, current).await? {
+            if source_branch != branch_id {
+                return Err(blocked("checkpoint provenance belongs to another branch"));
+            }
+            dependencies.insert(source);
+        }
+        serde_json::to_writer(&mut body_budget, &commit).map_err(|_| {
+            LixError::new(
+                "LIX_PARTIAL_UPLOAD_PAGE_REQUIRED",
+                "checkpoint bodies exceed wire budget",
+            )
+        })?;
+        loaded.insert(current, commit);
+        stack.push((current, true));
+        for dependency in dependencies.into_iter().rev() {
+            if !done.contains(&dependency) {
+                stack.push((dependency, false));
+            }
+        }
+    }
+    Ok(commits)
 }

@@ -49,7 +49,6 @@ pub(super) async fn verify_partial_merge_settlement(
     let request = &record.request;
     let descriptor = next.descriptor();
     if descriptor.selected_branch.branch_id != *branch
-        || descriptor.selected_branch.checkpoint.commit_id != request.checkpoint_commit_id
         || descriptor.global_branch.head.commit_id != request.global_head_commit_id
         || descriptor.global_branch.checkpoint.commit_id != request.global_checkpoint_commit_id
     {
@@ -67,7 +66,8 @@ pub(super) async fn verify_partial_merge_settlement(
         .control
         .ok_or_else(|| conflict("merge local control is absent"))?;
     if control.head_commit_id != id(&request.captured_local_head_commit_id)?
-        || control.working_diff_checkpoint_commit_id != Some(id(&request.checkpoint_commit_id)?)
+        || control.working_diff_checkpoint_commit_id
+            != Some(id(&request.captured_local_checkpoint_commit_id)?)
     {
         return Err(conflict(
             "newer local edits require another native reconciliation",

@@ -9,11 +9,10 @@ use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 use crate::changelog::ChangeRecordProjection;
 use crate::plugin::runtime::{
-    ConflictRank, PLUGIN_OWNER_KEY, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
-    ReconciledRow, ReconciledTypedRow, RowVersionRef,
-    TypedColumnMergeResult as HostTypedColumnMergeResult, TypedRowVersionRef,
-    WasmColumnMergeResult, WasmHostColumnMerge, load_plugin_registry_at_commit, reconcile_row,
-    reconcile_typed_row, visit_typed_row_overlaps,
+    PLUGIN_OWNER_KEY, PluginFileOwner, PluginRegistry, PluginRegistryEntry, ReconciledRow,
+    ReconciledTypedRow, RowVersionRef, TypedColumnMergeResult as HostTypedColumnMergeResult,
+    TypedRowVersionRef, WasmColumnMergeResult, WasmHostColumnMerge, load_plugin_registry_at_commit,
+    reconcile_row, reconcile_typed_row, visit_typed_row_overlaps,
 };
 use crate::row_pk::RowPk;
 use crate::storage_adapter::Storage;
@@ -295,15 +294,6 @@ where
                 "lix.perf.merge_analysis"
             ))
             .await?;
-            let derived_blob_files = async {
-                let mut reader = transaction.tracked_state_reader().await?;
-                derived_plugin_blob_conflicts(&mut reader, &analysis).await
-            }
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.merge_derived_blob_detection"
-            ))
-            .await?;
 
             if analysis.outcome == MergeOutcome::AlreadyUpToDate {
                 return Ok(MergeBranchReceipt {
@@ -337,101 +327,7 @@ where
                 });
             }
 
-            let merge_plan = analysis
-                .merge_plan()
-                .expect("merge analysis should include a plan for mergeCommitted");
-
-            let semantic_branch_id = SharedStr::from(active_branch_id.as_str());
-            let resolved_plugin_rows = resolve_row_merge_conflicts(
-                transaction,
-                &analysis,
-                &derived_blob_files,
-                &semantic_branch_id,
-            )
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.merge_plugin_conflict_resolve"
-            ))
-            .await?;
-            let plugin_resolution_stats = async {
-                let mut reader = transaction.tracked_state_reader().await?;
-                plugin_resolution_change_stats(&mut reader, &analysis, &resolved_plugin_rows).await
-            }
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.merge_plugin_resolution_stats"
-            ))
-            .await?;
-
-            let semantic_rows = async {
-                let mut reader = transaction.tracked_state_reader().await?;
-                materialized_plugin_merge_rows(
-                    &mut reader,
-                    &analysis,
-                    &derived_blob_files,
-                    &semantic_branch_id,
-                    resolved_plugin_rows,
-                )
-                .await
-            }
-            .instrument(tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.merge_materialized_rows"
-            ))
-            .await?;
-            if !semantic_rows.is_empty() {
-                transaction
-                    .stage_write(TransactionWrite::Rows {
-                        mode: TransactionWriteMode::Replace,
-                        rows: semantic_rows,
-                    })
-                    .instrument(tracing::debug_span!(
-                        target: "lix_perf",
-                        "lix.perf.merge_stage_semantic_rows"
-                    ))
-                    .await?;
-            }
-            let created_merge_commit_id = tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.merge_stage_commit"
-            )
-            .in_scope(|| {
-                let mut selected_changes =
-                    StagedCommitChangeBatchBuilder::with_capacity(merge_plan.picks.len());
-                for pick in merge_plan
-                    .picks
-                    .iter()
-                    .filter(|pick| !pick_is_derived_plugin_state(pick, &derived_blob_files))
-                {
-                    selected_changes.push(
-                        pick.identity.clone(),
-                        pick.selected_row.commit_id,
-                        pick.change_id,
-                        pick.selected_row.deleted,
-                        pick.selected_row.created_at,
-                        pick.selected_row.updated_at,
-                    );
-                }
-                transaction.stage_merge_commit(
-                    active_branch_id.clone(),
-                    analysis.commits.source_commit_id,
-                    selected_changes.finish(),
-                )
-            })?;
-            Ok(MergeBranchReceipt {
-                outcome: MergeBranchOutcome::MergeCommitted,
-                target_branch_id: active_branch_id,
-                source_branch_id,
-                base_commit_id: analysis.commits.base_commit_id.to_string(),
-                target_head_after_commit_id: created_merge_commit_id.clone(),
-                target_head_before_commit_id: analysis.commits.target_commit_id.to_string(),
-                source_head_before_commit_id: analysis.commits.source_commit_id.to_string(),
-                created_merge_commit_id: Some(created_merge_commit_id),
-                change_stats: merge_change_stats_with_plugin_resolutions(
-                    &analysis.stats,
-                    &plugin_resolution_stats,
-                ),
-            })
+            stage_native_change_application(transaction, source_branch_id, &analysis).await
         })
         .instrument(tracing::debug_span!(
             target: "lix_perf",
@@ -449,6 +345,7 @@ const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 struct DerivedPluginConflictIndex {
     owners: BTreeMap<String, PluginFileOwner>,
     files: BTreeSet<String>,
+    materialize_filesystem: bool,
 }
 
 impl DerivedPluginConflictIndex {
@@ -543,15 +440,9 @@ where
         return Ok(DerivedPluginConflictIndex::default());
     }
 
-    // Semantic resolution regenerates the derived blob through the target
-    // transaction's descriptor and component generation. Therefore it is
-    // safe only when the complete file identity is common at all three roots:
-    // the descriptor and ancestor path, plus the pinned registry entry. A
-    // source-only rename may otherwise render CSV bytes while the merge
-    // selects TSV metadata; a source-only compatible plugin upgrade may
-    // otherwise render with the target component while committing the source
-    // registry entry. Leave every such case as an ordinary conflict until
-    // file-lifecycle and generation conflicts have first-class values.
+    // Keep the same live owner and component generation. Same-format path
+    // changes are staged through the ordinary filesystem owner before semantic
+    // rows render, so the serializer receives the final transaction path.
     let candidate_file_ids = common_owners.keys().cloned().collect::<BTreeSet<_>>();
     let common_descriptors =
         historical_conflict_file_descriptors(reader, analysis, &candidate_file_ids).await?;
@@ -565,16 +456,13 @@ where
         load_plugin_registry_at_commit(reader, &analysis.commits.source_commit_id.to_string())
             .await?;
 
+    let mut materialize_filesystem = false;
     let mut derived = BTreeSet::new();
     let mut derived_owners = BTreeMap::new();
     for (file_id, owner) in common_owners {
-        let Some(path @ Some(_)) = common_descriptors.get(&file_id).cloned() else {
-            // Native row LWW still invokes the target plugin serializer. Without
-            // a common descriptor, that would combine target rendering with a
-            // source path/dialect picked later by the merge commit. Reject only
-            // files needing semantic or derived-blob conflict resolution. Even
-            // disjoint row edits require rerendering their combined bytes;
-            // choosing either blob would lose the other branch's edits.
+        let Some(Some((path, renamed))) = common_descriptors.get(&file_id).cloned() else {
+            // Missing file incarnations and format changes need their existing
+            // lifecycle/migration validation; do not render with a stale dialect.
             let needs_materialization = conflict_indices_by_file[&file_id].iter().any(|&index| {
                 let schema_key = analysis
                     .merge_plan()
@@ -589,10 +477,10 @@ where
                 return Err(LixError::new(
                     LixError::CODE_MERGE_CONFLICT,
                     format!(
-                        "cannot merge content conflicts for plugin file '{file_id}' while its descriptor or ancestor path differs"
+                        "cannot merge content for plugin file '{file_id}' across missing owners or a file format change"
                     ),
                 )
-                .with_hint("merge the file rename separately before reconciling its semantic edits"));
+                .with_hint("file format changes require explicit migration"));
             }
             continue;
         };
@@ -604,12 +492,14 @@ where
             &file_id,
         )?;
         let _ = path;
+        materialize_filesystem |= renamed;
         derived.insert(file_id.clone());
         derived_owners.insert(file_id, owner);
     }
     Ok(DerivedPluginConflictIndex {
         owners: derived_owners,
         files: derived,
+        materialize_filesystem,
     })
 }
 
@@ -690,6 +580,11 @@ fn pick_is_derived_plugin_state(
     pick: &TrackedStateMergePick,
     derived_blob_files: &DerivedPluginConflictIndex,
 ) -> bool {
+    if derived_blob_files.materialize_filesystem
+        && is_filesystem_descriptor(pick.selected_row.schema_key())
+    {
+        return true;
+    }
     let Some(file_id) = pick.selected_row.file_id() else {
         return false;
     };
@@ -1008,6 +903,7 @@ where
     for (row_index, input) in inputs.iter().enumerate() {
         if input.typed {
             let resolved = reconcile_typed_row(
+                input.identity.schema_key(),
                 input
                     .base
                     .as_ref()
@@ -1024,6 +920,7 @@ where
             let a = DecodedMergePayload::parse(input.a.as_ref())?;
             let b = DecodedMergePayload::parse(input.b.as_ref())?;
             let resolved = reconcile_row(
+                input.identity.schema_key(),
                 base.as_ref().map(DecodedMergePayload::borrowed),
                 a.as_ref().map(DecodedMergePayload::borrowed),
                 b.as_ref().map(DecodedMergePayload::borrowed),
@@ -1238,15 +1135,13 @@ struct HistoricalDirectoryDescriptor {
     name: String,
 }
 
-/// Loads a path only when the three historical roots agree on a live file
-/// descriptor. A resolver must not receive a branch-direction-dependent path:
-/// divergent renames remain ordinary merge conflicts and missing/corrupt
-/// descriptor metadata simply leaves the optional descriptor fields empty.
+/// Authenticate live paths at all three roots and require unchanged format.
+/// A differing path triggers ordinary descriptor staging before serialization.
 async fn historical_conflict_file_descriptors<S>(
     reader: &mut TrackedStateStoreReader<S>,
     analysis: &super::analysis::MergeAnalysis,
     file_ids: &BTreeSet<String>,
-) -> Result<BTreeMap<String, Option<String>>, LixError>
+) -> Result<BTreeMap<String, Option<(String, bool)>>, LixError>
 where
     S: crate::storage_adapter::StorageAdapterRead,
 {
@@ -1283,50 +1178,60 @@ where
 
     let mut descriptors = BTreeMap::new();
     for (index, file_id) in file_ids.iter().cloned().enumerate() {
-        let Some((scope_file_id, descriptor)) = common_historical_file_descriptor_ref(
-            &file_id,
+        let descriptors_at_roots = [
             base_rows.row(index),
             target_rows.row(index),
             source_rows.row(index),
-        ) else {
+        ]
+        .map(|row| historical_file_descriptor_row_ref(row, &file_id));
+        let [Some(base), Some(target), Some(source)] = descriptors_at_roots else {
             descriptors.insert(file_id, None);
             continue;
         };
-
-        // A file descriptor can agree while one ancestor directory has been
-        // renamed. Resolve all three full paths at their own historical roots
-        // and only expose a path to the plugin when it is genuinely common.
-        // A path-sensitive resolver must never receive a stale base path.
-        let base_path = historical_file_path(
-            reader,
-            &base_commit_id,
-            scope_file_id.as_deref(),
-            &descriptor,
-        )
-        .await?;
-        let target_path = historical_file_path(
-            reader,
-            &target_commit_id,
-            scope_file_id.as_deref(),
-            &descriptor,
-        )
-        .await?;
-        let source_path = historical_file_path(
-            reader,
-            &source_commit_id,
-            scope_file_id.as_deref(),
-            &descriptor,
-        )
-        .await?;
-        let Some(path) = common_historical_path(base_path, target_path, source_path) else {
+        if base.0 != target.0 || base.0 != source.0 {
             descriptors.insert(file_id, None);
             continue;
-        };
-        descriptors.insert(file_id, Some(path));
+        }
+        let base_path =
+            historical_file_path(reader, &base_commit_id, base.0.as_deref(), &base.1).await?;
+        let target_path =
+            historical_file_path(reader, &target_commit_id, target.0.as_deref(), &target.1).await?;
+        let source_path =
+            historical_file_path(reader, &source_commit_id, source.0.as_deref(), &source.1).await?;
+        let paths = compatible_historical_file_paths(base_path, target_path, source_path);
+        descriptors.insert(file_id, paths);
     }
     Ok(descriptors)
 }
 
+// A format change still needs explicit migration. Renames within the same
+// format are rendered through the ordinary file owner at the final staged path.
+fn compatible_historical_file_paths(
+    base: Option<String>,
+    target: Option<String>,
+    source: Option<String>,
+) -> Option<(String, bool)> {
+    let (Some(base), Some(target), Some(source)) = (base, target, source) else {
+        return None;
+    };
+    fn extension(path: &str) -> Option<&str> {
+        path.rsplit('/')
+            .next()?
+            .rsplit_once('.')
+            .map(|(_, extension)| extension)
+    }
+    if extension(&base) != extension(&target) || extension(&base) != extension(&source) {
+        return None;
+    }
+    let renamed = base != target || base != source;
+    Some((target, renamed))
+}
+fn is_filesystem_descriptor(schema: &str) -> bool {
+    matches!(
+        schema,
+        FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+    )
+}
 fn historical_file_descriptor_row_ref(
     row: Option<MaterializedTrackedStateRowRef<'_>>,
     expected_file_id: &str,
@@ -1335,18 +1240,6 @@ fn historical_file_descriptor_row_ref(
     let snapshot = row.snapshot_content()?;
     let descriptor = serde_json::from_str::<HistoricalFileDescriptor>(snapshot.as_str()).ok()?;
     (descriptor.id == expected_file_id).then(|| (row.file_id().map(str::to_owned), descriptor))
-}
-
-fn common_historical_file_descriptor_ref(
-    expected_file_id: &str,
-    base: Option<MaterializedTrackedStateRowRef<'_>>,
-    target: Option<MaterializedTrackedStateRowRef<'_>>,
-    source: Option<MaterializedTrackedStateRowRef<'_>>,
-) -> Option<(Option<String>, HistoricalFileDescriptor)> {
-    let base = historical_file_descriptor_row_ref(base, expected_file_id)?;
-    let target = historical_file_descriptor_row_ref(target, expected_file_id)?;
-    let source = historical_file_descriptor_row_ref(source, expected_file_id)?;
-    (base == target && base == source).then_some(base)
 }
 
 #[cfg(test)]
@@ -1373,6 +1266,7 @@ fn common_historical_file_descriptor(
     (base == target && base == source).then_some(base)
 }
 
+#[cfg(test)]
 fn common_historical_path(
     base: Option<String>,
     target: Option<String>,
@@ -1384,7 +1278,7 @@ fn common_historical_path(
 async fn historical_file_path<S>(
     reader: &mut TrackedStateStoreReader<S>,
     commit_id: &str,
-    scope_file_id: Option<&str>,
+    _scope_file_id: Option<&str>,
     descriptor: &HistoricalFileDescriptor,
 ) -> Result<Option<String>, LixError>
 where
@@ -1399,7 +1293,7 @@ where
         }
         let key = TrackedStateKey {
             schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_owned(),
-            file_id: scope_file_id.map(str::to_owned),
+            file_id: None,
             row_pk: RowPk::uuid_from_canonical(&id).map_err(|error| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -1576,22 +1470,13 @@ fn canonical_conflict_variants_ref<'a>(
             "merge conflict source side omitted its resulting row",
         )
     })?;
-    let ordering = ConflictRank::new(target_after.updated_at, target_after.change_id).cmp(
-        &ConflictRank::new(source_after.updated_at, source_after.change_id),
-    );
-    if ordering.is_eq() {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "distinct merge conflict sides share the same durable ordering key",
-        ));
-    }
-    let target = target.filter(|row| !row.deleted());
-    let source = source.filter(|row| !row.deleted());
-    if ordering.is_lt() {
-        Ok((target, source))
-    } else {
-        Ok((source, target))
-    }
+    // The caller is applying source changes to the current target. Native
+    // publication orders accepted operations; client timestamps/IDs do not.
+    let _ = (target_after, source_after);
+    Ok((
+        target.filter(|row| !row.deleted()),
+        source.filter(|row| !row.deleted()),
+    ))
 }
 
 fn push_plugin_transaction_row(
@@ -1711,6 +1596,17 @@ where
         });
     }
     debug_assert_eq!(keys.len(), key_count);
+    if derived_blob_files.materialize_filesystem {
+        for pick in &merge_plan.picks {
+            if is_filesystem_descriptor(pick.selected_row.schema_key()) {
+                keys.push(TrackedStateKeyRef {
+                    schema_key: pick.selected_row.schema_key(),
+                    file_id: pick.selected_row.file_id(),
+                    row_pk: pick.selected_row.row_pk(),
+                });
+            }
+        }
+    }
     if keys.is_empty() {
         return Ok(resolved_plugin_rows);
     }
@@ -2185,4 +2081,36 @@ mod tests {
 }
 
 mod native_migration;
-pub(crate) use native_migration::stage_merge_native_heads;
+pub(crate) use native_migration::{stage_merge_native_heads, stage_native_change_application};
+
+#[cfg(test)]
+mod incoming_path_tests {
+    use super::compatible_historical_file_paths;
+    #[test]
+    fn same_format_rename_is_rendered_at_final_transaction_path() {
+        assert_eq!(
+            compatible_historical_file_paths(
+                Some("/old/data.csv".into()),
+                Some("/new/data.csv".into()),
+                Some("/old/renamed.csv".into())
+            ),
+            Some(("/new/data.csv".into(), true))
+        );
+        assert!(
+            compatible_historical_file_paths(
+                Some("/data.csv".into()),
+                Some("/data.csv".into()),
+                Some("/data.tsv".into())
+            )
+            .is_none()
+        );
+        assert!(
+            compatible_historical_file_paths(
+                None,
+                Some("/data.csv".into()),
+                Some("/data.csv".into())
+            )
+            .is_none()
+        );
+    }
+}

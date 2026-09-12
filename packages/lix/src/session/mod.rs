@@ -195,4 +195,6 @@ pub(crate) use media_upload::{export_recoverable_uploads, has_recoverable_upload
 
 pub(crate) use execute::prepare_partial_candidate_read_scope;
 
-pub(crate) use merge::stage_merge_native_heads;
+pub(crate) use merge::{
+    MergeAnalysis, analyze_incoming_rows, stage_merge_native_heads, stage_native_change_application,
+};
