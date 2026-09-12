@@ -192,6 +192,14 @@ impl<StorageImpl> SessionContext<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    pub(crate) fn set_telemetry(&mut self, telemetry: Option<Arc<dyn TelemetrySink>>) {
+        self.telemetry = telemetry;
+    }
+
+    pub(crate) fn telemetry(&self) -> Option<&Arc<dyn TelemetrySink>> {
+        self.telemetry.as_ref()
+    }
+
     pub(crate) fn new(
         branch: SessionBranch,
         active_account_id: String,

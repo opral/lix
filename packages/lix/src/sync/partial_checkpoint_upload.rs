@@ -145,15 +145,8 @@ pub(super) async fn prepare_partial_checkpoint_upload(
                 "checkpoint requires confirmed global base preparation",
             ));
         }
-        if commit
-            .members
-            .iter()
-            .any(|member| member.schema_key == "lix_binary_blob_ref" && !member.deleted)
-        {
-            return Err(blocked(
-                "checkpoint requires binary manifest and chunk upload preparation",
-            ));
-        }
+        // Blob manifests and chunks are prepared by the same bounded sender
+        // used for ordinary uploads, before this checkpoint's refs are pushed.
         if commit.parent_commit_ids.len() > max_commits {
             return Err(blocked(
                 "checkpoint parent fanout exceeds preparation budget",

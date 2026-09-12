@@ -205,3 +205,178 @@ async fn http_dispatcher_recovers_lost_wave_and_preserves_newer_local_edit() {
     assert!(format!("{local:?}").contains("L2"));
     assert!(format!("{remote:?}").contains("R"));
 }
+
+#[tokio::test]
+async fn file_checkpoint_upload_retries_lost_ack_with_original_content() {
+    let backing = Memory::new();
+    let authority = open_lix().with_storage(backing.clone()).await.unwrap();
+    authority
+        .set_sync_role(crate::sync::SyncRole::Authority)
+        .unwrap();
+    authority
+        .execute(
+            "INSERT INTO lix_file(path,content) VALUES('/checkpoint.bin',$1)",
+            &[Value::Blob(vec![17u8; 96 * 1024].into())],
+        )
+        .await
+        .unwrap();
+    let server = open_lix()
+        .with_storage(backing)
+        .serve()
+        .with_embedded_lix_id()
+        .await
+        .unwrap();
+    let transport = HttpSyncTransport::connect_with(
+        Client {
+            server,
+            lose_body: Arc::new(AtomicBool::new(false)),
+        },
+        &format!("https://example.test/lix/{}", authority.lix_id()),
+    )
+    .await
+    .unwrap();
+    let wrapper = transport.partial_replica_descriptor(None).await.unwrap();
+    let old = Arc::new(
+        PartialReplicaState::from_leased(
+            transport.protocol_url().into(),
+            authority.active_account_id().into(),
+            uuid::Uuid::now_v7().to_string(),
+            wrapper.wire,
+        )
+        .unwrap(),
+    );
+    let storage = StorageAdapter::new(Memory::new());
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let mut writes = storage.new_write_set();
+    let preconditions = stage_partial_bootstrap(&read, &mut writes, &old).unwrap();
+    crate::init::stage_partial_repository_protocol(&mut writes);
+    drop(read);
+    storage
+        .commit_write_set(
+            writes,
+            StorageWriteOptions {
+                preconditions,
+                await_durable: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let (engine, session) =
+        Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &old)
+            .await
+            .unwrap();
+    let engine = Arc::new(engine);
+    engine
+        .sync_mode()
+        .admit_partial_replica(old.clone(), crate::sync::partial_replica_write_capability());
+    storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
+
+    let mut fetches = Fetches::default();
+    execute_hydrating(
+        &session,
+        &storage,
+        &old,
+        &authority,
+        "SELECT id,path FROM lix_file WHERE path='/checkpoint.bin'",
+        &[],
+        &mut fetches,
+    )
+    .await
+    .unwrap();
+    let content = vec![43u8; 96 * 1024];
+    execute_hydrating(
+        &session,
+        &storage,
+        &old,
+        &authority,
+        "UPDATE lix_file SET content=$1 WHERE path='/checkpoint.bin'",
+        &[Value::Blob(content.clone().into())],
+        &mut fetches,
+    )
+    .await
+    .unwrap();
+    execute_hydrating(&session, &storage, &old, &authority,
+        "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_file') WHERE to_path='/checkpoint.bin'))",
+        &[], &mut fetches,
+    ).await.unwrap();
+    let branch = &old.descriptor().selected_branch.branch_id;
+    let first = crate::sync::partial_upload_cycle::upload_partial_once(
+        &storage,
+        &old,
+        branch,
+        uuid::Uuid::now_v7().to_string(),
+        32,
+        1024 * 1024,
+        |request| {
+            let (storage, old, transport) = (&storage, &old, &transport);
+            async move {
+                crate::sync::partial_blob_upload::push_partial_with_blobs(
+                    storage, old, transport, &request,
+                )
+                .await?;
+                Err(LixError::new(
+                    "TEST_LOST_CHECKPOINT_ACK",
+                    "authority accepted checkpoint before reply was lost",
+                ))
+            }
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(first.code, "TEST_LOST_CHECKPOINT_ACK");
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let (pending, _, _) =
+        crate::sync::partial_push_state::load_partial_push_state(&read, &old, branch)
+            .await
+            .unwrap();
+    let captured = pending
+        .prepared
+        .expect("lost response retains exact upload");
+    drop(read);
+    assert!(
+        crate::sync::partial_upload_cycle::upload_partial_once(
+            &storage,
+            &old,
+            branch,
+            uuid::Uuid::now_v7().to_string(),
+            32,
+            1024 * 1024,
+            |request| {
+                let (storage, old, transport) = (&storage, &old, &transport);
+                async move {
+                    crate::sync::partial_blob_upload::push_partial_with_blobs(
+                        storage, old, transport, &request,
+                    )
+                    .await
+                }
+            },
+        )
+        .await
+        .unwrap()
+    );
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let (settled, _, _) =
+        crate::sync::partial_push_state::load_partial_push_state(&read, &old, branch)
+            .await
+            .unwrap();
+    assert!(settled.prepared.is_none());
+    assert_eq!(settled.confirmed, captured.target);
+    drop(read);
+    let descriptor = authority
+        .partial_replica_descriptor(Some(branch))
+        .await
+        .unwrap();
+    assert_eq!(
+        descriptor.selected_branch.checkpoint.commit_id,
+        captured.target.checkpoint
+    );
+    let result = authority
+        .execute(
+            "SELECT content FROM lix_file WHERE path='/checkpoint.bin'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows()[0].get::<Vec<u8>>("content").unwrap(), content);
+}

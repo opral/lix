@@ -1,7 +1,8 @@
-import type { LixBinding, SyncServerBindingOptions } from "../binding-types.js";
+import type { LixBinding, SyncServerBindingOptions, TelemetryDispatch } from "../binding-types.js";
 
 export type SharedEngineClient = {
   server: SyncServerBindingOptions;
+  telemetry?: TelemetryDispatch;
   rootAdmitted?(headers: [string, string][], accountId: string): void;
   verifyIdentity(): Promise<{ authorityUrl: string; accountId: string }>;
 };
@@ -11,7 +12,13 @@ export class SharedEngineOwner {
   private root: LixBinding | undefined;
   private readonly clients = new Set<SharedEngineClient>();
   private queue: Promise<unknown> = Promise.resolve();
-  constructor(private readonly open: (server: SyncServerBindingOptions) => Promise<LixBinding>) {}
+  constructor(private readonly open: (server: SyncServerBindingOptions, telemetry: TelemetryDispatch) => Promise<LixBinding>) {}
+
+  private readonly backgroundTelemetry: TelemetryDispatch = span => {
+    for (const client of this.clients) {
+      try { client.telemetry?.(span); } catch { /* Host telemetry cannot interrupt engine work. */ }
+    }
+  };
 
   attach(client: SharedEngineClient): Promise<LixBinding> {
     const operation = this.queue.then(async () => {
@@ -26,7 +33,7 @@ export class SharedEngineOwner {
         client.server = { ...originalServer, headers, headerProvider: undefined };
         this.clients.add(client);
         try {
-          this.root = await this.open(this.transport());
+          this.root = await this.open(this.transport(), this.backgroundTelemetry);
           client.rootAdmitted?.(headers, await this.root.activeAccountId());
         } catch (error) {
           this.clients.delete(client);
@@ -49,7 +56,7 @@ export class SharedEngineOwner {
         }
         this.clients.add(client);
         const report = opensRoot ? root.openReport?.() : undefined;
-        const child = await root.openAnotherSession({});
+        const child = await root.openAnotherSession({}, client.telemetry ?? (() => {}));
         if (report === undefined) return child;
         // Only the opening caller performed initialization/migration. Later
         // attachments must not inherit that first caller's opening report.

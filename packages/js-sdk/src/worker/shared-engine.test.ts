@@ -143,3 +143,34 @@ test("only the first attachment receives the root initialization report", async 
   await first.close();
   expect(close).toHaveBeenCalledTimes(1);
 });
+
+test("telemetry joins after a disabled opener and remains after its departure", async () => {
+  const a = vi.fn();
+  const b = vi.fn();
+  const children: Array<import("../binding-types.js").TelemetryDispatch | undefined> = [];
+  let background!: import("../binding-types.js").TelemetryDispatch;
+  const root = {
+    activeAccountId: async () => "account",
+    close: async () => {},
+    openAnotherSession: async (_options: unknown, sink: import("../binding-types.js").TelemetryDispatch) => {
+      children.push(sink);
+      return {close: async () => {}} as unknown as LixBinding;
+    },
+  } as unknown as LixBinding;
+  const owner = new SharedEngineOwner(async (_server, sink) => {background=sink;return root;});
+  const make = (telemetry?: import("../binding-types.js").TelemetryDispatch): SharedEngineClient => ({
+    server:{url:"https://example.test",headers:[]},telemetry,
+    verifyIdentity:async()=>({authorityUrl:"https://example.test",accountId:"account"}),
+  });
+  const first=make(); const second=make(a); const third=make(b);
+  await owner.attach(first); await owner.attach(second); await owner.attach(third);
+  const span={} as Parameters<typeof background>[0];
+  children[1]!(span);
+  expect(a).toHaveBeenCalledTimes(1); expect(b).not.toHaveBeenCalled();
+  await owner.detach(first); await owner.detach(second);
+  background(span);
+  expect(a).toHaveBeenCalledTimes(1); expect(b).toHaveBeenCalledTimes(1);
+  children[2]!(span);
+  expect(b).toHaveBeenCalledTimes(2);
+  await owner.detach(third);
+});
