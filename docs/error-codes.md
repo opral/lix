@@ -28,11 +28,11 @@ Defined in [routes.rs](../packages/server/src/routes.rs). These codes describe t
 | Code | HTTP status | Meaning and recovery |
 | --- | --- | --- |
 | `LIX_INVALID_ARGUMENT` | 400 | Invalid runtime argument or trusted-principal header. Correct the request. |
-| `LIX_NOT_FOUND` | 404 | URL repository ID is not a canonical UUID. Correct the URL. |
+| `LIX_NOT_FOUND` | 404 | The URL repository ID is not a canonical UUID, or its backing repository does not exist. Check the URL and whether the repository was deleted or has been provisioned. |
 | `LIX_ERROR_UNAUTHENTICATED` | 401 | Missing or invalid internal service authentication. Supply valid credentials. |
 | `LIX_ERROR_CAPACITY` | 503 | Maximum open repositories reached. Retry after capacity becomes available. |
 | `LIX_ERROR_MIGRATING` | 503 | Repository migration is underway. Retry after migration completes; details contain the source and target versions. |
-| `LIX_ERROR_MIGRATION_FAILED` | 500 | Repository migration or upgrade failed. Requires operator recovery; not automatically retryable. |
+| `LIX_ERROR_MIGRATION_FAILED` | 500 | Repository migration or upgrade failed. Requires operator recovery; not automatically retryable. `details.sourceCode` identifies the underlying upgrade error when available. |
 | `LIX_ERROR_RECOVERING` | 503 | Repository runtime is recovering. Retry after the advertised delay. |
 | `LIX_ERROR_SHUTTING_DOWN` | 503 | Server is shutting down. Retry on a healthy server. |
 | `LIX_ERROR_CACHE_CLEANUP` | 503 | Cache cleanup failed. Requires operator repair despite the 503 status. |
@@ -158,6 +158,7 @@ Inventory of literal codes in the engine, reference server, and JavaScript SDK s
 | `LIX_ERROR_READ_ONLY` | [packages/lix/src/common/error.rs](../packages/lix/src/common/error.rs) |
 | `LIX_ERROR_RECOVERING` | [packages/server/src/routes.rs](../packages/server/src/routes.rs) |
 | `LIX_ERROR_REPLICA_REPLACEMENT_UNAVAILABLE` | [packages/lix/src/sync/repository.rs](../packages/lix/src/sync/repository.rs) |
+| `LIX_ERROR_REPOSITORY_UPGRADE` | [packages/lix/src/migration/epoch.rs](../packages/lix/src/migration/epoch.rs) |
 | `LIX_ERROR_REPOSITORY_MIGRATION_REQUIRED` | [packages/lix/src/init.rs](../packages/lix/src/init.rs) |
 | `LIX_ERROR_REQUEST_BODY_TOO_LARGE` | [packages/lix/src/server_protocol/handler.rs](../packages/lix/src/server_protocol/handler.rs) |
 | `LIX_ERROR_SCHEMA_DEFINITION` | [packages/lix/src/common/error.rs](../packages/lix/src/common/error.rs) |
