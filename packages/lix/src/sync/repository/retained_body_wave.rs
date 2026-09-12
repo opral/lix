@@ -137,7 +137,12 @@ impl VerifiedRetainedBodyWave {
                         .as_ref()
                         != Some(checkpoint)
                 {
-                    return Err(invalid());
+                    // No retention attempt has been admitted yet. The immutable
+                    // request must restart against fresh authority coordinates.
+                    return Err(LixError::new(
+                        "LIX_PARTIAL_ATTEMPT_ANCHORS_CHANGED",
+                        "authority coordinates changed before initial body retention",
+                    ));
                 }
             }
             let base = crate::sync::partial_merge_analysis::record(
