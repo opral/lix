@@ -64,6 +64,7 @@ pub(super) enum SyncDemandRequest {
     NativeObject(crate::tracked_state::NativeObjectRef, LixError),
     NativeObjects(Vec<crate::tracked_state::NativeObjectRef>, LixError),
     NativeMetadata(crate::tracked_state::NativeMetadataRef, LixError),
+    NativeMetadataBatch(Vec<crate::tracked_state::NativeMetadataRef>, LixError),
     History(Vec<String>),
     Chunks(Vec<String>),
     #[cfg(test)]
@@ -375,6 +376,14 @@ pub(super) fn native_sync_demand_request_for_error(
             error.clone(),
         )));
     }
+    if let Some(addresses) =
+        crate::tracked_state::NativeMetadataRef::batch_from_missing_error(error)?
+    {
+        return Ok(Some(SyncDemandRequest::NativeMetadataBatch(
+            addresses,
+            error.clone(),
+        )));
+    }
     if let Some(address) = crate::tracked_state::NativeMetadataRef::from_missing_error(error)? {
         return Ok(Some(SyncDemandRequest::NativeMetadata(
             address,
@@ -389,6 +398,7 @@ fn full_replica_demand(request: SyncDemandRequest) -> Result<SyncDemandRequest, 
         SyncDemandRequest::NativeObject(_, error)
         | SyncDemandRequest::NativeObjects(_, error)
         | SyncDemandRequest::NativeMetadata(_, error)
+        | SyncDemandRequest::NativeMetadataBatch(_, error)
         | SyncDemandRequest::BlobManifest(_, error) => {
             sync_demand_request_for_error(&error)?.ok_or(error)
         }
@@ -968,6 +978,7 @@ where
             SyncDemandRequest::NativeObject(_, _)
             | SyncDemandRequest::NativeObjects(_, _)
             | SyncDemandRequest::NativeMetadata(_, _)
+            | SyncDemandRequest::NativeMetadataBatch(_, _)
             | SyncDemandRequest::BlobManifest(_, _) => {}
             SyncDemandRequest::History(ids) => history_ids.extend(ids),
             SyncDemandRequest::Chunks(ids) => chunk_ids.extend(ids),
@@ -1014,6 +1025,7 @@ fn resolve_sync_demand_results(
             SyncDemandRequest::NativeObject(_, error)
             | SyncDemandRequest::NativeObjects(_, error)
             | SyncDemandRequest::NativeMetadata(_, error)
+            | SyncDemandRequest::NativeMetadataBatch(_, error)
             | SyncDemandRequest::BlobManifest(_, error) => Err(error.clone()),
             SyncDemandRequest::History(_) => history_result.clone(),
             SyncDemandRequest::Chunks(_) => chunk_result.clone(),
@@ -1591,6 +1603,7 @@ where
         Some(SyncDemandRequest::NativeObject(_, original))
         | Some(SyncDemandRequest::NativeObjects(_, original))
         | Some(SyncDemandRequest::NativeMetadata(_, original))
+        | Some(SyncDemandRequest::NativeMetadataBatch(_, original))
         | Some(SyncDemandRequest::BlobManifest(_, original)) => Err(original),
         Some(SyncDemandRequest::History(ids)) => {
             hydrate_history_ids(lix, transport, ids.into_iter().collect()).await
@@ -4423,5 +4436,47 @@ mod native_batch_demand_tests {
             full_replica_demand(demand).unwrap_err().message,
             original.message
         );
+    }
+}
+
+#[cfg(test)]
+mod metadata_batch_demand_tests {
+    use super::*;
+    #[test]
+    fn metadata_frontier_preserves_full_replica_error_and_forbidden_retry() {
+        let addresses = (1..=2)
+            .map(|id| {
+                crate::tracked_state::NativeMetadataRef::ChangeLocator(format!(
+                    "00000000-0000-7000-8000-{id:012x}"
+                ))
+            })
+            .collect::<Vec<_>>();
+        let original = crate::tracked_state::NativeMetadataRef::annotate_missing_batch(
+            addresses.clone(),
+            LixError::unknown("missing selected locators"),
+        );
+        let demand = native_sync_demand_request_for_error(&original)
+            .unwrap()
+            .unwrap();
+        match &demand {
+            SyncDemandRequest::NativeMetadataBatch(actual, error) => {
+                assert_eq!(actual, &addresses);
+                assert_eq!(error.message, original.message);
+            }
+            other => panic!("expected metadata frontier, got {other:?}"),
+        }
+        assert_eq!(
+            full_replica_demand(demand).unwrap_err().message,
+            original.message
+        );
+        for marker in ["nonRetryableAfterCommit", "nonRetryableAfterExecution"] {
+            let mut details = original.details.clone().unwrap();
+            details[marker] = serde_json::json!(true);
+            assert!(
+                native_sync_demand_request_for_error(&original.clone().with_details(details))
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 }

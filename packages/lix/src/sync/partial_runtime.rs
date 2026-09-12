@@ -163,16 +163,36 @@ async fn hydrate_metadata<S: Storage + Clone + Send + Sync + 'static, C: RawHttp
     transport: &HttpSyncTransport<C>,
     address: NativeMetadataRef,
 ) -> Result<(), LixError> {
+    hydrate_metadata_batch(storage, state, transport, vec![address]).await
+}
+
+async fn hydrate_metadata_batch<S: Storage + Clone + Send + Sync + 'static, C: RawHttpClient>(
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+    transport: &HttpSyncTransport<C>,
+    addresses: Vec<NativeMetadataRef>,
+) -> Result<(), LixError> {
+    let mut request = NativeMetadataRequest {
+        epoch_id: state.epoch_id().to_owned(),
+        objects: addresses,
+    };
+    super::native_metadata::validate_native_metadata_request(&request)?;
+    let mut missing = Vec::with_capacity(request.objects.len());
     {
         let read = storage.begin_read(Default::default()).await?;
-        if native_metadata_is_resident(&read, state, &address).await? {
-            return Ok(());
+        let residency =
+            super::native_metadata::native_metadata_residency(&read, state, &request.objects)
+                .await?;
+        for (address, resident) in request.objects.into_iter().zip(residency) {
+            if !resident {
+                missing.push(address);
+            }
         }
     }
-    let request = NativeMetadataRequest {
-        epoch_id: state.epoch_id().to_owned(),
-        objects: vec![address],
-    };
+    if missing.is_empty() {
+        return Ok(());
+    }
+    request.objects = missing;
     // No local read or transaction remains open across network I/O.
     let response = transport.native_metadata(&request).await?;
     for attempt in 0..4 {
@@ -219,6 +239,32 @@ async fn demand_is_resident<S: Storage + Clone + Send + Sync + 'static>(
             let mut complete = true;
             for address in addresses {
                 complete &= native_object_is_resident(storage, state, *address).await?;
+            }
+            Ok(complete)
+        }
+        SyncDemandRequest::NativeMetadataBatch(addresses, _) => {
+            let request = NativeMetadataRequest {
+                epoch_id: state.epoch_id().to_owned(),
+                objects: addresses.clone(),
+            };
+            super::native_metadata::validate_native_metadata_request(&request)?;
+            let read = storage.begin_read(Default::default()).await?;
+            let mut complete =
+                super::native_metadata::native_metadata_residency(&read, state, addresses)
+                    .await?
+                    .into_iter()
+                    .all(|resident| resident);
+            drop(read);
+            if complete
+                && addresses
+                    .iter()
+                    .any(|address| matches!(address, NativeMetadataRef::CommitGraphRecord(_)))
+            {
+                complete = super::partial_write_frontier::next_missing_baseline_write_frontier(
+                    storage, state,
+                )
+                .await?
+                .is_none();
             }
             Ok(complete)
         }
@@ -328,6 +374,21 @@ pub(super) fn hydrate_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: 
                 )
                 .await
                 .map(|_| ())
+            }
+            SyncDemandRequest::NativeMetadataBatch(addresses, _) => {
+                let graph = addresses
+                    .iter()
+                    .any(|address| matches!(address, NativeMetadataRef::CommitGraphRecord(_)));
+                hydrate_metadata_batch(storage, state, transport, addresses).await?;
+                if graph {
+                    super::partial_write_frontier::prepare_baseline_write_frontier(
+                        storage,
+                        state,
+                        |address| hydrate_metadata(storage, state, transport, address),
+                    )
+                    .await?;
+                }
+                Ok(())
             }
             SyncDemandRequest::NativeMetadata(address, _) => {
                 let graph = matches!(address, NativeMetadataRef::CommitGraphRecord(_));
@@ -1186,8 +1247,106 @@ mod tests {
             })
         }
     }
+    #[tokio::test]
+    async fn metadata_batch_fetches_once_and_reuses_durable_residency() {
+        let (storage, state, transport, client, _) = fixture_metadata(false, true).await;
+        let addresses = client
+            .metadata
+            .objects
+            .iter()
+            .map(|object| object.address.clone())
+            .collect::<Vec<_>>();
+        hydrate_metadata_batch(&storage, &state, &transport, addresses.clone())
+            .await
+            .unwrap();
+        assert_eq!(client.fetches.load(Ordering::SeqCst), 1);
+        let backing = storage.storage().clone();
+        drop(storage);
+        let reopened = StorageAdapter::new(backing);
+        hydrate_metadata_batch(&reopened, &state, &transport, addresses.clone())
+            .await
+            .unwrap();
+        assert_eq!(client.fetches.load(Ordering::SeqCst), 1);
+        let read = reopened.begin_read(Default::default()).await.unwrap();
+        for address in addresses {
+            assert!(
+                native_metadata_is_resident(&read, &state, &address)
+                    .await
+                    .unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_batch_filters_resident_entries_and_rejects_wrong_epoch_atomically() {
+        let (storage, state, _, client, _) = fixture_metadata(false, true).await;
+        let addresses = client
+            .metadata
+            .objects
+            .iter()
+            .map(|object| object.address.clone())
+            .collect::<Vec<_>>();
+        let mut wrong = client.clone();
+        wrong.metadata.epoch_id = "00000000-0000-7000-8000-000000000999".into();
+        let transport = HttpSyncTransport::connect_with(wrong, state.remote_id())
+            .await
+            .unwrap();
+        transport
+            .bind_native_baseline_lease(state.baseline_lease())
+            .unwrap();
+        assert!(
+            hydrate_metadata_batch(&storage, &state, &transport, addresses.clone())
+                .await
+                .is_err()
+        );
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        for address in &addresses {
+            assert!(
+                !native_metadata_is_resident(&read, &state, address)
+                    .await
+                    .unwrap()
+            );
+        }
+        drop(read);
+        let mut first = client.clone();
+        first.metadata.objects.truncate(1);
+        let transport = HttpSyncTransport::connect_with(first, state.remote_id())
+            .await
+            .unwrap();
+        transport
+            .bind_native_baseline_lease(state.baseline_lease())
+            .unwrap();
+        hydrate_metadata(&storage, &state, &transport, addresses[0].clone())
+            .await
+            .unwrap();
+        let mut remaining = client.clone();
+        remaining.metadata.objects.remove(0);
+        let transport = HttpSyncTransport::connect_with(remaining, state.remote_id())
+            .await
+            .unwrap();
+        transport
+            .bind_native_baseline_lease(state.baseline_lease())
+            .unwrap();
+        hydrate_metadata_batch(&storage, &state, &transport, addresses)
+            .await
+            .unwrap();
+        assert_eq!(client.fetches.load(Ordering::SeqCst), 3);
+    }
+
     async fn fixture(
         block: bool,
+    ) -> (
+        StorageAdapter<Memory>,
+        Arc<PartialReplicaState>,
+        HttpSyncTransport<Client>,
+        Client,
+        NativeMetadataRef,
+    ) {
+        fixture_metadata(block, false).await
+    }
+    async fn fixture_metadata(
+        block: bool,
+        batch: bool,
     ) -> (
         StorageAdapter<Memory>,
         Arc<PartialReplicaState>,
@@ -1211,7 +1370,14 @@ mod tests {
         let metadata = authority
             .read_sync_native_metadata(&NativeMetadataRequest {
                 epoch_id: state.epoch_id().to_owned(),
-                objects: vec![address.clone()],
+                objects: if batch {
+                    vec![
+                        address.clone(),
+                        NativeMetadataRef::CommitGraphRecord(address.id().to_owned()),
+                    ]
+                } else {
+                    vec![address.clone()]
+                },
             })
             .await
             .unwrap();
