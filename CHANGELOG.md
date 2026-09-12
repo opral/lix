@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.17.0 - 2026-09-12
+
+### Minor
+
+- Open partial replicas with on-demand sync instead of downloading a full repository.
+
+  JavaScript clients opt in with storage and `server.mode: "partial_replica"`. Opening transfers bounded metadata; SQL fetches missing native inputs and retains them locally. Covered reads and prepared writes execute locally, including offline, while background synchronization updates the working set and uploads commits. Execute the expected SQL query to prefetch its inputs before an interaction; no separate preparation API is required.
+
+  Server mode defaults to `"remote"` and rejects client storage. Existing synchronized callers must explicitly opt into `"partial_replica"`; the former `"sync"` spelling is not supported. Upgrade SDK and server together. Existing full replicas require explicit conversion that preserves their source and pending work; see the partial replica migration guide for supported formats and recovery boundaries.
+- Resolve concurrent partial-replica edits through the same native row merge pipeline as branch merges.
+
+  Registered schema/plugin merge hooks remain active. The default for overlapping values is incoming-write precedence in server acceptance order, rather than change-ID ordering. Plugin-managed files serialize the resolved rows; opaque file content remains atomic. Accepted retries retain their original identity and cannot overwrite a later server edit by being treated as a new write.
+
+  Upgrade SDK and server together for sync protocol 12. The explicit local journal migration preserves pending edits and existing acknowledgment identities without resetting browser storage. Opening and resident SQL keep their on-demand and local execution behavior.
+
+### Patch
+
+- OPFS partial replicas now share loaded data and offline edits across browser tabs.
+
+  Tabs coordinate one engine automatically through a SharedWorker, keeping the same storage identity and `openLix()` API. Closing a tab leaves the other sessions operational. Checkpoint history also fetches missing commit metadata on demand and retains it for subsequent offline reads.
+
+  File checkpoints upload their blob dependencies before publishing, including after an offline checkpoint or a lost acknowledgment. Each browser session keeps its own telemetry callback and trace parent; shared background spans go to live subscribers.
+
+  Pending edits and checkpoint dependencies upload in bounded waves, including recovery after lost replies. SQL retries preserve the completion boundary: an error reported after execution or commit cannot replay the operation.
+
+  Read-interest journal flushing retries expired snapshots internally, so concurrent tab startup can complete without replaying the SQL that registered its inputs.
+
+  Opening an additional session retries transient read invalidation during branch and admission validation, so another tab or background synchronization can commit while the session opens. Real admission and storage errors still propagate.
+- SQL `UPDATE` statements now support scalar expressions such as `replace`, `concat`, `coalesce`, and string concatenation in file and row mutations.
+
+  Update assignments, filters, and returned expressions use the same scalar function rules as reads. Invalid expressions reject the mutation atomically. Partial replicas can use resident file content in an exact-path expression update while offline.
+
+  These additional scalar expressions, such as `upper` and `concat`, remain unsupported in registered-row `INSERT` values, upsert assignments, and insert `RETURNING`; those statements fail without changing rows.
+
 ## 0.16.1 - 2026-09-11
 
 ### Improvements
