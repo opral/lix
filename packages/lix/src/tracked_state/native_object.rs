@@ -354,6 +354,82 @@ impl From<NativeMetadataRef> for NativeMetadataWire {
 }
 
 impl NativeMetadataRef {
+    pub(crate) const MAX_MISSING_BATCH: usize = 32;
+
+    /// Report only addresses already selected by the native query's point-read
+    /// plan. The first address retains the ordinary single-miss diagnostic;
+    /// partial runtimes can use the bounded additional frontier in one fetch.
+    pub(crate) fn annotate_missing_batch(
+        addresses: impl IntoIterator<Item = Self>,
+        error: LixError,
+    ) -> LixError {
+        let mut selected = Vec::new();
+        for address in addresses {
+            if !selected.contains(&address) {
+                selected.push(address);
+            }
+            if selected.len() == Self::MAX_MISSING_BATCH {
+                break;
+            }
+        }
+        let Some(first) = selected.first().cloned() else {
+            return error;
+        };
+        let mut error = first.annotate_missing(error);
+        if selected.len() > 1 {
+            let details = error.details.get_or_insert_with(|| serde_json::json!({}));
+            details
+                .as_object_mut()
+                .expect("native diagnostic details are object")
+                .insert(
+                    "missingNativeMetadataBatch".into(),
+                    serde_json::json!({"version":1,"addresses":selected}),
+                );
+        }
+        error
+    }
+
+    pub(crate) fn batch_from_missing_error(
+        error: &LixError,
+    ) -> Result<Option<Vec<Self>>, LixError> {
+        let Some(marker) = error
+            .details
+            .as_ref()
+            .and_then(|value| value.get("missingNativeMetadataBatch"))
+        else {
+            return Ok(None);
+        };
+        let invalid = || {
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "invalid native missing-metadata batch diagnostic",
+            )
+        };
+        if marker.get("version").and_then(|v| v.as_u64()) != Some(1) {
+            return Err(invalid());
+        }
+        let values = marker
+            .get("addresses")
+            .and_then(|v| v.as_array())
+            .ok_or_else(invalid)?;
+        if values.is_empty() || values.len() > Self::MAX_MISSING_BATCH {
+            return Err(invalid());
+        }
+        let mut result = Vec::with_capacity(values.len());
+        for value in values {
+            let address: Self = serde_json::from_value(value.clone()).map_err(|_| invalid())?;
+            address.validate_address()?;
+            if result.contains(&address) {
+                return Err(invalid());
+            }
+            result.push(address);
+        }
+        if Self::from_missing_error(error)?.is_some_and(|first| Some(&first) != result.first()) {
+            return Err(invalid());
+        }
+        Ok(Some(result))
+    }
+
     pub(crate) fn id(&self) -> &str {
         match self {
             Self::CommitStateHeader(id) | Self::CommitGraphRecord(id) | Self::ChangeLocator(id) => {
@@ -696,6 +772,58 @@ mod missing_batch_tests {
             let error = LixError::unknown("missing")
                 .with_details(serde_json::json!({"missingNativeObjects":marker}));
             assert!(NativeObjectRef::batch_from_missing_error(&error).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod metadata_batch_tests {
+    use super::*;
+
+    fn address(index: usize) -> NativeMetadataRef {
+        NativeMetadataRef::ChangeLocator(format!("00000000-0000-7000-8000-{index:012x}"))
+    }
+
+    #[test]
+    fn metadata_frontier_is_bounded_deduplicated_and_preserves_singleton_error() {
+        let error = NativeMetadataRef::annotate_missing_batch(
+            (1..40).flat_map(|index| [address(index), address(index)]),
+            LixError::unknown("missing locator"),
+        );
+        let batch = NativeMetadataRef::batch_from_missing_error(&error)
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch, (1..=32).map(address).collect::<Vec<_>>());
+        assert_eq!(
+            NativeMetadataRef::from_missing_error(&error).unwrap(),
+            Some(address(1))
+        );
+        assert_eq!(error.message, "missing locator");
+        let single =
+            NativeMetadataRef::annotate_missing_batch([address(1)], LixError::unknown("one"));
+        assert!(
+            NativeMetadataRef::batch_from_missing_error(&single)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn metadata_frontier_rejects_invalid_duplicate_oversized_and_mismatched_addresses() {
+        for addresses in [
+            vec![],
+            vec![address(1), address(1)],
+            (1..=33).map(address).collect(),
+            vec![NativeMetadataRef::ChangeLocator("invalid".into())],
+            vec![address(2), address(3)],
+        ] {
+            let error = address(1).annotate_missing(LixError::unknown("missing"));
+            let mut details = error.details.clone().unwrap();
+            details["missingNativeMetadataBatch"] =
+                serde_json::json!({"version":1,"addresses":addresses});
+            assert!(
+                NativeMetadataRef::batch_from_missing_error(&error.with_details(details)).is_err()
+            );
         }
     }
 }

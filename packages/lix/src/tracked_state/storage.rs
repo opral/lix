@@ -8084,6 +8084,29 @@ pub(crate) fn load_change_records_by_ids<'a>(
     Box::pin(load_change_records_by_ids_inner(store, change_ids))
 }
 
+/// Only selected, unresolved explicit addresses are eligible for hydration.
+/// The caller decodes resident records first so corruption retains precedence.
+fn require_selected_change_locators(
+    selected: &[(crate::changelog::ChangeId, Option<CommitDeltaChangeLocator>)],
+) -> Result<Vec<CommitDeltaChangeLocator>, LixError> {
+    if let Some((first, _)) = selected.iter().find(|(_, locator)| locator.is_none()) {
+        return Err(super::NativeMetadataRef::annotate_missing_batch(
+            selected.iter().filter_map(|(id, locator)| {
+                locator
+                    .is_none()
+                    .then(|| super::NativeMetadataRef::ChangeLocator(id.to_string()))
+            }),
+            replacement_payload_error(&format!(
+                "selected change '{first}' has no authoritative locator"
+            )),
+        ));
+    }
+    Ok(selected
+        .iter()
+        .filter_map(|(_, locator)| *locator)
+        .collect())
+}
+
 async fn load_change_records_by_ids_inner(
     store: &(impl StorageAdapterRead + ?Sized),
     change_ids: &[crate::changelog::ChangeId],
@@ -8174,20 +8197,24 @@ async fn load_change_records_by_ids_inner(
         let locator_values = PointReadPlan::new(TRACKED_STATE_CHANGE_LOCATOR_SPACE, &locator_keys)
             .materialize(store, StorageGetOptions::default())
             .await?;
-        let locators = explicit
+        // Decode every resident locator before emitting a bounded frontier.
+        // A corrupt resident sibling must not be hidden by an earlier miss.
+        let selected = explicit
             .iter()
             .zip(locator_values.value)
             .map(|((_, change_id), value)| {
-                let bytes = value.and_then(full_value_bytes).ok_or_else(|| {
-                    super::NativeMetadataRef::ChangeLocator(change_id.to_string()).annotate_missing(
-                        replacement_payload_error(&format!(
-                            "selected change '{change_id}' has no authoritative locator"
-                        )),
-                    )
-                })?;
-                decode_change_locator(*change_id, &bytes)
+                let locator = value
+                    .map(|value| {
+                        let bytes = full_value_bytes(value).ok_or_else(|| {
+                            replacement_payload_error("selected locator read omitted payload")
+                        })?;
+                        decode_change_locator(*change_id, &bytes)
+                    })
+                    .transpose()?;
+                Ok((*change_id, locator))
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, LixError>>()?;
+        let locators = require_selected_change_locators(&selected)?;
         let records = Box::pin(load_explicit_change_records_at_locators(store, &locators)).await?;
         for ((output_index, _), record) in explicit.into_iter().zip(records) {
             output[output_index] = Some(record);
@@ -11015,8 +11042,12 @@ pub(crate) async fn load_local_selected_change_owner_commit_ids(
         .zip(locator_values.value)
         .map(|(member, value)| {
             value
-                .and_then(full_value_bytes)
-                .map(|bytes| decode_change_locator(member.value.change_id, &bytes))
+                .map(|value| {
+                    let bytes = full_value_bytes(value).ok_or_else(|| {
+                        replacement_payload_error("selected locator read omitted payload")
+                    })?;
+                    decode_change_locator(member.value.change_id, &bytes)
+                })
                 .transpose()
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -11102,28 +11133,15 @@ pub(crate) async fn load_local_selected_change_owner_commit_ids(
         }
     }
 
-    let explicit = explicit_indices
-        .into_iter()
-        .map(|index| {
-            explicit_locators[index]
-                .map(|locator| (index, locator))
-                .ok_or_else(|| {
-                    super::NativeMetadataRef::ChangeLocator(
-                        selected[index].value.change_id.to_string(),
-                    )
-                    .annotate_missing(replacement_payload_error(&format!(
-                        "selected change '{}' has no authoritative locator",
-                        selected[index].value.change_id
-                    )))
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let locators = explicit
+    let explicit_indices = explicit_indices.into_iter().collect::<Vec<_>>();
+    let requested = explicit_indices
         .iter()
-        .map(|(_, locator)| *locator)
+        .map(|&index| (selected[index].value.change_id, explicit_locators[index]))
         .collect::<Vec<_>>();
+    let locators = require_selected_change_locators(&requested)?;
+    let explicit = explicit_indices.into_iter().zip(locators.iter().copied());
     let records = load_explicit_change_records_at_locators(store, &locators).await?;
-    for ((index, locator), record) in explicit.into_iter().zip(records) {
+    for ((index, locator), record) in explicit.zip(records) {
         validate_selected_owner_record(&selected[index], &record)?;
         owners.insert(locator.commit_id);
     }
@@ -20267,6 +20285,64 @@ mod tests {
         assert_eq!(invocation_accounting.decoded_rows, 2);
         assert!(invocation_accounting.raw_bytes > 0);
         assert!(invocation_accounting.resident_bytes > 0);
+    }
+
+    #[tokio::test]
+    async fn selected_missing_change_locators_report_a_bounded_frontier() {
+        let storage = StorageAdapter::new(Memory::new());
+        // These explicit IDs have no direct-address coordinate.
+        let ids = (1..=40)
+            .map(|n| ChangeId::new(uuid::Uuid::from_u128(n << 32)))
+            .collect::<Vec<_>>();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let error = super::load_change_records_by_ids(&read, &ids)
+            .await
+            .unwrap_err();
+        let frontier = crate::tracked_state::NativeMetadataRef::batch_from_missing_error(&error)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            frontier,
+            ids[..32]
+                .iter()
+                .map(|id| {
+                    crate::tracked_state::NativeMetadataRef::ChangeLocator(id.to_string())
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_missing_change_locators_do_not_mask_resident_corruption() {
+        let storage = StorageAdapter::new(Memory::new());
+        let ids = [
+            ChangeId::new(uuid::Uuid::from_u128(1 << 32)),
+            ChangeId::new(uuid::Uuid::from_u128(2 << 32)),
+        ];
+        let mut writes = storage.new_write_set();
+        writes.put(
+            super::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
+            key(ids[1].as_uuid().as_bytes().to_vec()),
+            value(Vec::new()),
+        );
+        storage
+            .commit_write_set(writes, Default::default())
+            .await
+            .unwrap();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let error = super::load_change_records_by_ids(&read, &ids)
+            .await
+            .unwrap_err();
+        assert!(
+            crate::tracked_state::NativeMetadataRef::from_missing_error(&error)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::tracked_state::NativeMetadataRef::batch_from_missing_error(&error)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

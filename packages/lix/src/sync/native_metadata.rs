@@ -106,7 +106,20 @@ pub(super) async fn native_metadata_is_resident(
     state: &PartialReplicaState,
     address: &NativeMetadataRef,
 ) -> Result<bool, LixError> {
-    address.validate_address()?;
+    Ok(native_metadata_residency(read, state, std::slice::from_ref(address)).await?[0])
+}
+
+/// Validate one admitted, bounded metadata frontier with one grouped point read.
+/// Every resident payload is checked even when another entry is absent.
+pub(super) async fn native_metadata_residency(
+    read: &(impl StorageAdapterRead + ?Sized),
+    state: &PartialReplicaState,
+    addresses: &[NativeMetadataRef],
+) -> Result<Vec<bool>, LixError> {
+    validate_native_metadata_request(&NativeMetadataRequest {
+        epoch_id: state.epoch_id().to_owned(),
+        objects: addresses.to_vec(),
+    })?;
     let Some((actual, _)) = load_partial_replica_state(read).await? else {
         return Err(invalid(
             "native metadata requires an installed partial epoch",
@@ -115,31 +128,37 @@ pub(super) async fn native_metadata_is_resident(
     if &actual != state {
         return Err(invalid("native metadata partial admission changed"));
     }
-    let key = key(address)?;
-    let values = read
-        .get_many(&[StorageGetManyRequest {
+    let keys = addresses.iter().map(key).collect::<Result<Vec<_>, _>>()?;
+    let requests = addresses
+        .iter()
+        .zip(&keys)
+        .map(|(address, key)| StorageGetManyRequest {
             space: space(address),
-            keys: std::slice::from_ref(&key),
+            keys: std::slice::from_ref(key),
             opts: StorageGetOptions::default(),
-        }])
-        .await?
-        .values;
-    if values.len() != 1 {
+        })
+        .collect::<Vec<_>>();
+    let values = read.get_many(&requests).await?.values;
+    if values.len() != addresses.len() {
         return Err(invalid("native metadata storage cardinality mismatch"));
     }
-    match values.into_iter().next().flatten() {
-        None => Ok(false),
-        Some(StorageProjectedValue::FullValue(bytes)) => {
-            if bytes.len() > MAX_NATIVE_METADATA_PAYLOAD_BYTES {
-                return Err(invalid("native metadata payload exceeds bound"));
+    addresses
+        .iter()
+        .zip(values)
+        .map(|(address, value)| match value {
+            None => Ok(false),
+            Some(StorageProjectedValue::FullValue(bytes)) => {
+                if bytes.len() > MAX_NATIVE_METADATA_PAYLOAD_BYTES {
+                    return Err(invalid("native metadata payload exceeds bound"));
+                }
+                validate_bytes(address, &bytes)?;
+                Ok(true)
             }
-            validate_bytes(address, &bytes)?;
-            Ok(true)
-        }
-        Some(StorageProjectedValue::KeyOnly) => {
-            Err(invalid("native metadata read omitted payload"))
-        }
-    }
+            Some(StorageProjectedValue::KeyOnly) => {
+                Err(invalid("native metadata read omitted payload"))
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn validate_native_metadata_request(
