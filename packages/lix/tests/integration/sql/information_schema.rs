@@ -602,7 +602,10 @@ simulation_test!(
             )
             .await
             .expect("undescribed.id should be readable");
-        assert_eq!(undescribed.rows()[0].value("description").unwrap(), &Value::Null);
+        assert_eq!(
+            undescribed.rows()[0].value("description").unwrap(),
+            &Value::Null
+        );
     }
 );
 
@@ -2277,8 +2280,8 @@ simulation_test!(
                 format!("lix_diff('{relation}', lix_root_commit_id(), '{commit_id}')"),
                 format!("lix_history('{relation}')"),
             ] {
-                let is_diff = surface.starts_with("lix_diff(")
-                    || surface.starts_with("lix_history(");
+                let is_diff =
+                    surface.starts_with("lix_diff(") || surface.starts_with("lix_history(");
                 // File diffs expose content names but intentionally reject byte projection.
                 let projection = if relation == "lix_file" && is_diff {
                     "id, from_path, to_path"
@@ -2316,7 +2319,10 @@ simulation_test!(
             "SELECT result_column FROM information_schema.table_functions WHERE result_column LIKE '%lixcol_schema_key%'",
         ] {
             assert_rows_eq(
-                session.execute(sql, &[]).await.expect("catalog should load"),
+                session
+                    .execute(sql, &[])
+                    .await
+                    .expect("catalog should load"),
                 vec![],
             );
         }
@@ -2331,12 +2337,179 @@ simulation_test!(
                 .execute(sql, &[])
                 .await
                 .expect_err("removed column must not bind in writes");
-            assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND, "{sql}: {error}");
+            assert_eq!(
+                error.code,
+                LixError::CODE_COLUMN_NOT_FOUND,
+                "{sql}: {error}"
+            );
         }
         let result = session
             .execute("SELECT value FROM lix_key_value WHERE key = 'example'", &[])
             .await
             .expect("row should remain unchanged");
-        assert_rows_eq(result, vec![vec![Value::Jsonb(serde_json::json!("value").into())]]);
+        assert_rows_eq(
+            result,
+            vec![vec![Value::Jsonb(serde_json::json!("value").into())]],
+        );
+    }
+);
+
+simulation_test!(
+    datafusion_scalar_expressions_in_file_updates,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        session.execute("INSERT INTO lix_file (path, content) VALUES ('/expressions.txt', CAST('hello world' AS BYTEA))", &[]).await.unwrap();
+        for expression in [
+            "replace(cast(content as text), 'world', 'DataFusion')",
+            "concat(cast(content as text), '!', '✓')",
+            "concat(cast(content as text), NULL, ' nullable')",
+            "coalesce(NULL, cast(content as text))",
+            "cast(content as text) || ' suffix'",
+            "upper(replace(cast(content as text), 'hello', 'goodbye'))",
+        ] {
+            let expected = session.execute(&format!("SELECT CAST({expression} AS BYTEA) FROM lix_file WHERE path = '/expressions.txt'"), &[]).await.unwrap();
+            session.execute(&format!("UPDATE lix_file SET content = CAST({expression} AS BYTEA) WHERE lower(path) = '/expressions.txt'"), &[]).await.unwrap();
+            let actual = session
+                .execute(
+                    "SELECT content FROM lix_file WHERE path = '/expressions.txt'",
+                    &[],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                actual.rows()[0].values(),
+                expected.rows()[0].values(),
+                "SELECT/UPDATE mismatch for {expression}"
+            );
+        }
+        session
+            .execute(
+                "UPDATE lix_file SET content = CAST(concat($1, $2) || $3 AS BYTEA) WHERE path = $4",
+                &[
+                    Value::Text("a".into()),
+                    Value::Text("β".into()),
+                    Value::Text("c".into()),
+                    Value::Text("/expressions.txt".into()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT content FROM lix_file WHERE path = '/expressions.txt'",
+                    &[],
+                )
+                .await
+                .unwrap(),
+            vec![vec![Value::Blob("aβc".as_bytes().to_vec().into())]],
+        );
+
+        let mut tx = session.begin_transaction().await.unwrap();
+        tx.execute("UPDATE lix_file SET content = CAST(replace(CAST(content AS TEXT), 'a', 'changed') AS BYTEA) WHERE path = '/expressions.txt'", &[]).await.unwrap();
+        tx.rollback().await.unwrap();
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT content FROM lix_file WHERE path = '/expressions.txt'",
+                    &[],
+                )
+                .await
+                .unwrap(),
+            vec![vec![Value::Blob("aβc".as_bytes().to_vec().into())]],
+        );
+
+        session.execute("UPDATE lix_file SET content = CAST(replace('a', 'b') AS BYTEA) WHERE path = '/expressions.txt'", &[]).await.expect_err("DataFusion must reject invalid arity");
+        session.execute("UPDATE lix_file SET content = CAST(nonexistent_scalar('a') AS BYTEA) WHERE path = '/expressions.txt'", &[]).await.expect_err("DataFusion must reject unknown functions");
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT content FROM lix_file WHERE path = '/expressions.txt'",
+                    &[],
+                )
+                .await
+                .unwrap(),
+            vec![vec![Value::Blob("aβc".as_bytes().to_vec().into())]],
+        );
+    }
+);
+
+simulation_test!(
+    datafusion_scalar_expressions_in_row_updates,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        session.execute("INSERT INTO lix_registered_schema (value) VALUES (CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"expression_rows\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"value\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB))", &[]).await.unwrap();
+        session.execute("INSERT INTO expression_rows (id, value) VALUES ('one', 'hello world'), ('two', 'unchanged')", &[]).await.unwrap();
+        session.execute("UPDATE expression_rows SET value = upper(replace(value, 'world', 'SQL')) || '!' WHERE lower(id) = 'one'", &[]).await.unwrap();
+        assert_rows_eq(
+            session
+                .execute("SELECT id, value FROM expression_rows ORDER BY id", &[])
+                .await
+                .unwrap(),
+            vec![
+                vec![Value::Text("one".into()), Value::Text("HELLO SQL!".into())],
+                vec![Value::Text("two".into()), Value::Text("unchanged".into())],
+            ],
+        );
+        session
+            .execute(
+                "UPDATE expression_rows SET value = '1' WHERE id = 'one'",
+                &[],
+            )
+            .await
+            .unwrap();
+        session.execute("UPDATE expression_rows SET value = CAST(CAST(replace(value, '1', '2') AS BIGINT) AS TEXT)", &[]).await.expect_err("one invalid row must reject the whole mutation");
+        assert_rows_eq(
+            session
+                .execute("SELECT id, value FROM expression_rows ORDER BY id", &[])
+                .await
+                .unwrap(),
+            vec![
+                vec![Value::Text("one".into()), Value::Text("1".into())],
+                vec![Value::Text("two".into()), Value::Text("unchanged".into())],
+            ],
+        );
+    }
+);
+
+simulation_test!(
+    scalar_row_insert_and_upsert_remain_atomically_unsupported,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        session.execute("INSERT INTO lix_registered_schema (value) VALUES (CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"expression_rows\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"value\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB))", &[]).await.unwrap();
+        session
+            .execute(
+                "INSERT INTO expression_rows (id, value) VALUES ('one', 'original')",
+                &[],
+            )
+            .await
+            .unwrap();
+        for sql in [
+            "INSERT INTO expression_rows (id, value) VALUES ('two', 'new') RETURNING upper(value)",
+            "INSERT INTO expression_rows (id, value) VALUES ('one', 'changed'), ('two', 'new') ON CONFLICT (id) DO UPDATE SET value = upper(excluded.value)",
+            "INSERT INTO expression_rows (id, value) VALUES ('two', concat('new', '-row'))",
+        ] {
+            let error = session.execute(sql, &[]).await.expect_err(
+                "scalar row insert and upsert require the existing bound mutation owner's support",
+            );
+            assert_eq!(
+                error.code,
+                LixError::CODE_UNSUPPORTED_SQL,
+                "{sql}: {error:?}"
+            );
+            assert_rows_eq(
+                session
+                    .execute("SELECT id, value FROM expression_rows ORDER BY id", &[])
+                    .await
+                    .unwrap(),
+                vec![vec![
+                    Value::Text("one".into()),
+                    Value::Text("original".into()),
+                ]],
+            );
+        }
     }
 );

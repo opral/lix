@@ -30,6 +30,7 @@ pub(crate) enum BoundBinaryOperator {
     Multiply,
     Divide,
     Modulo,
+    StringConcat,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
