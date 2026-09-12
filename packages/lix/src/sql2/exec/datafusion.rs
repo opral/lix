@@ -1515,6 +1515,40 @@ fn write_provider_selection(plan: &LogicalWritePlan, target_table_name: &str) ->
     }
 }
 
+/// Bound mutations bypass the SQL planner, so apply the same coercion and
+/// function rewrites as SessionState::create_physical_expr before providers
+/// inspect or compile these expressions (including their scan filters).
+fn prepare_write_expr(
+    session: &SessionContext,
+    schema: &DFSchema,
+    expr: Expr,
+) -> Result<Expr, LixError> {
+    use datafusion::logical_expr::simplify::SimplifyContext;
+    use datafusion::optimizer::simplify_expressions::ExprSimplifier;
+
+    let state = session.state();
+    let config = state.config_options();
+    let context = SimplifyContext::default()
+        .with_schema(std::sync::Arc::new(schema.clone()))
+        .with_config_options(std::sync::Arc::clone(config))
+        .with_query_execution_start_time(state.execution_props().query_execution_start_time);
+    let simplifier = ExprSimplifier::new(context);
+    let mut expr = simplifier
+        .coerce(expr, schema)
+        .map_err(datafusion_error_to_lix_error)?;
+    for rewrite in state.analyzer().function_rewrites() {
+        expr = expr
+            .transform_up(|expr| rewrite.rewrite(expr, schema, config))
+            .map_err(datafusion_error_to_lix_error)?
+            .data;
+    }
+    // Some scalar functions (for example COALESCE) lower to executable
+    // expressions during simplification rather than physical planning.
+    simplifier
+        .simplify(expr)
+        .map_err(datafusion_error_to_lix_error)
+}
+
 fn datafusion_dml_returning(
     session: &SessionContext,
     table_schema: &Schema,
@@ -1532,7 +1566,11 @@ fn datafusion_dml_returning(
     let mut required_columns = BTreeSet::new();
 
     for item in &returning.items {
-        let expr = datafusion_expr_from_bound_expr(session, &item.expr, params)?;
+        let expr = prepare_write_expr(
+            session,
+            &df_schema,
+            datafusion_expr_from_bound_expr(session, &item.expr, params)?,
+        )?;
         let (_, inferred_field) = expr
             .to_field(&df_schema)
             .map_err(datafusion_error_to_lix_error)?;
@@ -1644,9 +1682,13 @@ fn datafusion_assignments(
             let field = schema
                 .field_with_name(&assignment.column.name)
                 .map_err(|error| LixError::unknown(format!("unknown update column: {error}")))?;
-            let expr = datafusion_expr_from_bound_expr(session, &assignment.value, params)?
-                .cast_to(field.data_type(), &df_schema)
-                .map_err(datafusion_error_to_lix_error)?;
+            let expr = prepare_write_expr(
+                session,
+                &df_schema,
+                datafusion_expr_from_bound_expr(session, &assignment.value, params)?,
+            )?
+            .cast_to(field.data_type(), &df_schema)
+            .map_err(datafusion_error_to_lix_error)?;
             Ok((assignment.column.name.clone(), expr))
         })
         .collect()
@@ -1690,9 +1732,13 @@ fn datafusion_conflict_assignments(
             let field = schema
                 .field_with_name(&assignment.column.name)
                 .map_err(|error| LixError::unknown(format!("unknown conflict column: {error}")))?;
-            let expr = datafusion_expr_from_bound_expr(session, &assignment.value, params)?
-                .cast_to(field.data_type(), &df_schema)
-                .map_err(datafusion_error_to_lix_error)?;
+            let expr = prepare_write_expr(
+                session,
+                &df_schema,
+                datafusion_expr_from_bound_expr(session, &assignment.value, params)?,
+            )?
+            .cast_to(field.data_type(), &df_schema)
+            .map_err(datafusion_error_to_lix_error)?;
             let physical =
                 datafusion::physical_expr::create_physical_expr(&expr, &df_schema, &props)
                     .map_err(datafusion_error_to_lix_error)?;
@@ -1707,8 +1753,12 @@ fn datafusion_write_filters(
     plan: &LogicalWritePlan,
     params: &[Value],
 ) -> Result<Vec<Expr>, LixError> {
+    let df_schema = DFSchema::try_from(schema.clone()).map_err(datafusion_error_to_lix_error)?;
     let mut filters =
-        datafusion_filters_from_predicate(session, schema, &plan.bound.predicate, params)?;
+        datafusion_filters_from_predicate(session, schema, &plan.bound.predicate, params)?
+            .into_iter()
+            .map(|expr| prepare_write_expr(session, &df_schema, expr))
+            .collect::<Result<Vec<_>, _>>()?;
     if plan.bound.branch_scope == BranchScope::Global {
         let branch_column = schema
             .field_with_name("branch_id")
@@ -1983,6 +2033,7 @@ fn datafusion_expr_from_bound_expr(
                 BoundBinaryOperator::Multiply => Operator::Multiply,
                 BoundBinaryOperator::Divide => Operator::Divide,
                 BoundBinaryOperator::Modulo => Operator::Modulo,
+                BoundBinaryOperator::StringConcat => Operator::StringConcat,
             },
             Box::new(datafusion_expr_from_bound_expr(session, right, params)?),
         ))),
@@ -2038,7 +2089,7 @@ fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> 
     match &plan.bound.target {
         BoundWriteTarget::Row(crate::sql2::bind::write::RowWriteSurface::Base { schema_key })
             if bound_predicate_contains_like(&plan.bound.predicate)
-                || bound_update_contains_binary(plan) =>
+                || bound_update_requires_datafusion(plan) =>
         {
             Ok(schema_key.clone())
         }
@@ -2068,27 +2119,42 @@ fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> 
     }
 }
 
-fn bound_update_contains_binary(plan: &LogicalWritePlan) -> bool {
+fn bound_update_requires_datafusion(plan: &LogicalWritePlan) -> bool {
     matches!(plan.bound.op, BoundWriteOp::Update)
         && (plan
             .bound
             .assignments
             .iter()
-            .any(|assignment| bound_expr_contains_binary(&assignment.value))
-            || bound_predicate_contains_binary(&plan.bound.predicate)
+            .any(|assignment| bound_expr_requires_datafusion(&assignment.value))
+            || bound_predicate_requires_datafusion(&plan.bound.predicate)
             || plan.bound.returning.as_ref().is_some_and(|returning| {
                 returning
                     .items
                     .iter()
-                    .any(|item| bound_expr_contains_binary(&item.expr))
+                    .any(|item| bound_expr_requires_datafusion(&item.expr))
             }))
 }
 
-fn bound_expr_contains_binary(expr: &BoundExpr) -> bool {
+fn bound_expr_requires_datafusion(expr: &BoundExpr) -> bool {
     match expr {
         BoundExpr::Binary { .. } => true,
-        BoundExpr::Cast { expr, .. } => bound_expr_contains_binary(expr),
-        BoundExpr::Function { args, .. } => args.iter().any(bound_expr_contains_binary),
+        BoundExpr::Cast { expr, .. } => bound_expr_requires_datafusion(expr),
+        BoundExpr::Function { name, args } => {
+            !matches!(
+                name.as_str(),
+                "uuidv7"
+                    | "__lix_current_timestamp"
+                    | "lix_active_branch_id"
+                    | "lix_active_branch_commit_id"
+                    | "__lix_json_get"
+                    | "__lix_json_get_text"
+                    | "__lix_json_path_get"
+                    | "__lix_json_path_get_text"
+                    | "__lix_json_contains"
+                    | "__lix_json_exists"
+                    | "__lix_jsonb"
+            ) || args.iter().any(bound_expr_requires_datafusion)
+        }
         BoundExpr::Column(_)
         | BoundExpr::ExcludedColumn(_)
         | BoundExpr::Param(_)
@@ -2096,22 +2162,23 @@ fn bound_expr_contains_binary(expr: &BoundExpr) -> bool {
     }
 }
 
-fn bound_predicate_contains_binary(predicate: &BoundPredicate) -> bool {
+fn bound_predicate_requires_datafusion(predicate: &BoundPredicate) -> bool {
     match predicate {
         BoundPredicate::Eq(left, right) => {
-            bound_expr_contains_binary(left) || bound_expr_contains_binary(right)
+            bound_expr_requires_datafusion(left) || bound_expr_requires_datafusion(right)
         }
         BoundPredicate::Like { expr, pattern, .. } => {
-            bound_expr_contains_binary(expr) || bound_expr_contains_binary(pattern)
+            bound_expr_requires_datafusion(expr) || bound_expr_requires_datafusion(pattern)
         }
         BoundPredicate::IsNull(expr) | BoundPredicate::IsNotNull(expr) => {
-            bound_expr_contains_binary(expr)
+            bound_expr_requires_datafusion(expr)
         }
         BoundPredicate::In { expr, values, .. } => {
-            bound_expr_contains_binary(expr) || values.iter().any(bound_expr_contains_binary)
+            bound_expr_requires_datafusion(expr)
+                || values.iter().any(bound_expr_requires_datafusion)
         }
         BoundPredicate::And(predicates) | BoundPredicate::Or(predicates) => {
-            predicates.iter().any(bound_predicate_contains_binary)
+            predicates.iter().any(bound_predicate_requires_datafusion)
         }
         BoundPredicate::True | BoundPredicate::False => false,
     }

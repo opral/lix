@@ -3441,6 +3441,15 @@ mod plugin_merge;
 
 #[tokio::test]
 async fn content_only_path_read_prepares_first_offline_opaque_update() {
+    content_only_path_read_prepares_offline_update(false).await;
+}
+
+#[tokio::test]
+async fn content_only_path_read_prepares_first_offline_scalar_expression_update() {
+    content_only_path_read_prepares_offline_update(true).await;
+}
+
+async fn content_only_path_read_prepares_offline_update(scalar_expression: bool) {
     let (storage, authority) = open_authority().await;
     for index in 0..16 {
         put_value(&authority, &format!("unrelated-{index}"), "untouched").await;
@@ -3479,15 +3488,21 @@ async fn content_only_path_read_prepares_first_offline_opaque_update() {
         Some(original)
     );
     probe.set_offline(true);
-    let updated = vec![65u8; 96 * 1024];
-    replica
-        .execute(
-            "UPDATE lix_file SET content=$1 WHERE path=$2",
-            &[
-                Value::Blob(updated.clone().into()),
-                Value::Text("/content-only.bin".into()),
-            ],
+    let mut updated = vec![65u8; 96 * 1024];
+    let (sql, value) = if scalar_expression {
+        updated.extend_from_slice("-β".as_bytes());
+        (
+            "UPDATE lix_file SET content=CAST(concat(replace(CAST(content AS TEXT), '0', 'A'), $1) AS BYTEA) WHERE path=$2",
+            Value::Text("-β".into()),
         )
+    } else {
+        (
+            "UPDATE lix_file SET content=$1 WHERE path=$2",
+            Value::Blob(updated.clone().into()),
+        )
+    };
+    replica
+        .execute(sql, &[value, Value::Text("/content-only.bin".into())])
         .await
         .expect("content SELECT alone prepares the first local content update");
     assert_eq!(
