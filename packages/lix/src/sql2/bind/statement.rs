@@ -1047,6 +1047,7 @@ fn bind_arithmetic_operator(op: &BinaryOperator) -> Result<BoundBinaryOperator, 
         BinaryOperator::Multiply => Ok(BoundBinaryOperator::Multiply),
         BinaryOperator::Divide => Ok(BoundBinaryOperator::Divide),
         BinaryOperator::Modulo => Ok(BoundBinaryOperator::Modulo),
+        BinaryOperator::StringConcat => Ok(BoundBinaryOperator::StringConcat),
         _ => Err(super::error::unsupported(format!(
             "unsupported SQL binary operator '{op}'"
         ))),
@@ -1163,7 +1164,7 @@ fn bind_function(
     mut bind_arg_expr: impl FnMut(&Expr, &mut ParamBinder) -> Result<BoundExpr, LixError>,
 ) -> Result<BoundExpr, LixError> {
     reject_unsupported_function_modifiers(function)?;
-    let name = bind_lix_function_name(function)?;
+    let name = bind_scalar_function_name(function)?;
     let raw_args = function_args(&function.args)?;
     let args = raw_args
         .iter()
@@ -1208,9 +1209,8 @@ fn validate_bound_function_arity(name: &str, actual: usize) -> Result<(), LixErr
         | "__lix_json_contains"
         | "__lix_json_exists" => expect_exact_function_arity(name, actual, 2),
         "__lix_jsonb" => expect_exact_function_arity(name, actual, 1),
-        _ => Err(super::error::unsupported(format!(
-            "unsupported SQL function '{name}'"
-        ))),
+        // DataFusion validates the signatures of its scalar functions.
+        _ => Ok(()),
     }
 }
 
@@ -1223,7 +1223,7 @@ fn expect_exact_function_arity(name: &str, actual: usize, expected: usize) -> Re
     Ok(())
 }
 
-fn bind_lix_function_name(function: &Function) -> Result<String, LixError> {
+fn bind_scalar_function_name(function: &Function) -> Result<String, LixError> {
     if function.name.0.len() != 1 {
         return Err(super::error::unsupported(
             "qualified SQL function names are not supported by bound writes",
@@ -1239,22 +1239,9 @@ fn bind_lix_function_name(function: &Function) -> Result<String, LixError> {
     } else {
         ident.value.to_ascii_lowercase()
     };
-    match name.as_str() {
-        "__lix_current_timestamp"
-        | "uuidv7"
-        | "lix_active_branch_id"
-        | "lix_active_branch_commit_id"
-        | "__lix_json_get"
-        | "__lix_json_get_text"
-        | "__lix_json_path_get"
-        | "__lix_json_path_get_text"
-        | "__lix_json_contains"
-        | "__lix_json_exists"
-        | "__lix_jsonb" => Ok(name),
-        _ => Err(super::error::unsupported(format!(
-            "unsupported SQL function '{name}'"
-        ))),
-    }
+    // Resolve ordinary scalar functions against the DataFusion registry during planning.
+    // The optimized row evaluator declines functions it cannot evaluate.
+    Ok(name)
 }
 
 fn function_args(args: &FunctionArguments) -> Result<Vec<&Expr>, LixError> {
