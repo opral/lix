@@ -1521,6 +1521,15 @@ where
                                     self.active_account_id(),
                                 )
                                 .await?;
+                            self.catalog_context
+                                .prepare_returned_row_catalogs(
+                                    &reader,
+                                    &executable_rows,
+                                    crate::catalog::load_catalog_revision(&read_store)
+                                        .await?
+                                        .as_ref(),
+                                )
+                                .await?;
                             crate::plugin::runtime::prepare_returned_row_executables(
                                 &reader,
                                 &self.binary_cas.reader(read_store),
@@ -2839,6 +2848,15 @@ where
                                     self.active_account_id(),
                                 )
                                 .await?;
+                            self.catalog_context
+                                .prepare_returned_row_catalogs(
+                                    &reader,
+                                    &executable_rows,
+                                    crate::catalog::load_catalog_revision(&read_store)
+                                        .await?
+                                        .as_ref(),
+                                )
+                                .await?;
                             crate::plugin::runtime::prepare_returned_row_executables(
                                 &reader,
                                 &self.binary_cas.reader(read_store),
@@ -3071,6 +3089,15 @@ where
             let reader = self.hot_state.reader(read_store.clone());
             let executable_rows = reader
                 .prepare_captured_read_interests(&capture.snapshot()?, self.active_account_id())
+                .await?;
+            self.catalog_context
+                .prepare_returned_row_catalogs(
+                    &reader,
+                    &executable_rows,
+                    crate::catalog::load_catalog_revision(&read_store)
+                        .await?
+                        .as_ref(),
+                )
                 .await?;
             crate::plugin::runtime::prepare_returned_row_executables(
                 &reader,

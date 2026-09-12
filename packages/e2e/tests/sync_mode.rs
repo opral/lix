@@ -3438,3 +3438,62 @@ async fn local_created_branch_publishes_refs_then_admits_without_losing_main() {
 
 #[path = "sync_mode/plugin_merge.rs"]
 mod plugin_merge;
+
+#[tokio::test]
+async fn content_only_path_read_prepares_first_offline_opaque_update() {
+    let (storage, authority) = open_authority().await;
+    for index in 0..16 {
+        put_value(&authority, &format!("unrelated-{index}"), "untouched").await;
+    }
+    authority
+        .execute(
+            "INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))",
+            &[Value::Text(
+                json!({
+                    "$schema":"https://lix.dev/schema-v1.json", "key":"unrelated_catalog_probe",
+                    "columns":[{"name":"id","type":"text","nullable":false}], "primary_key":["id"]
+                })
+                .to_string(),
+            )],
+        )
+        .await
+        .unwrap();
+    let original = vec![48u8; 96 * 1024];
+    authority
+        .execute(
+            "INSERT INTO lix_file(path,content) VALUES($1,$2)",
+            &[
+                Value::Text("/content-only.bin".into()),
+                Value::Blob(original.clone().into()),
+            ],
+        )
+        .await
+        .unwrap();
+    authority.close().await.unwrap();
+    let probe = Arc::new(HttpProbe::default());
+    let (url, server) = serve(storage, probe.clone()).await;
+    let directory = TempDir::new().unwrap();
+    let replica = open_replica(directory.path(), &url).await;
+    assert_eq!(
+        read_file_content(&replica, "/content-only.bin").await,
+        Some(original)
+    );
+    probe.set_offline(true);
+    let updated = vec![65u8; 96 * 1024];
+    replica
+        .execute(
+            "UPDATE lix_file SET content=$1 WHERE path=$2",
+            &[
+                Value::Blob(updated.clone().into()),
+                Value::Text("/content-only.bin".into()),
+            ],
+        )
+        .await
+        .expect("content SELECT alone prepares the first local content update");
+    assert_eq!(
+        read_file_content(&replica, "/content-only.bin").await,
+        Some(updated)
+    );
+    replica.close().await.unwrap();
+    stop_server(server).await;
+}

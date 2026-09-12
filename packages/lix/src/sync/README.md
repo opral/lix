@@ -69,13 +69,18 @@ with O(1) cursor
 state. Each cold graph node uses normal authenticated sync-demand retries while
 retaining the cursor, so hydration does not rescan the previously visited path.
 
-
 A partial replica with on-demand sync keeps local commits while authority changes
 arrive. Background reconciliation uses the same native row application pipeline
 as branch merging, including registered schema/plugin merge hooks and file
 serialization from resolved rows. For overlapping values without a custom merge,
 the incoming operation wins when the server durably accepts it. Client clocks
 and change IDs do not determine precedence. Opaque file content is atomic.
+
+A partial SQL read can also prepare registered schema metadata needed for later
+local writes. This uses the existing catalog validation path without loading rows
+from those schemas. Built-in schemas use their embedded definitions; their stored
+projections do not define the engine catalog. Repository opening does not perform
+this preparation.
 
 `POST /sync/retained-bodies` atomically pins each complete accepted native wave;
 `POST /sync/merge` derives a three-way plan and publishes `[R,L]` plus its
