@@ -120,6 +120,24 @@ configuration disables export; invalid configuration is logged. Deployments
 that depend on telemetry must verify the full receive path, not just server
 health.
 
+## Authority capability upgrades
+
+Older certified authorities need an explicit capability upgrade before they
+can serve partial replicas. A format migration alone does not update their
+authority marker. With all handles for the target repository closed, run:
+
+```sh
+lix-server upgrade-authority <repository-id>
+```
+
+The command uses the same storage configuration and live repository catalog as
+the server. It does not bind an HTTP port. The SDK verifies the old authority
+marker and absence of replica state, runs any required format migration, and
+atomically updates the authority capability fence while preserving rows and
+history. Actual replicas, unsupported authority markers, missing catalog entries,
+and deleted repositories are rejected. Repeating a successful upgrade is safe.
+After success, start the server and verify the repository handshake and reads.
+
 ## Interrupted creation
 
 Each upload attempt uses isolated storage and publishes through a conditional

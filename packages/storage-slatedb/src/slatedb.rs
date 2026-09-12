@@ -3699,7 +3699,19 @@ impl StorageWrite for SlateDBWrite {
                 written_bytes = written_bytes.saturating_add(value.len() as u64);
                 segment_writer.insert(physical_key, value)?;
             }
-            let immutable_segments = segment_writer.finish(|_| true)?;
+            let mut immutable_segments = segment_writer.finish(|_| true)?;
+            // Replacements may change bytes without changing their key or
+            // length. Ordinary immutable segment IDs hash only that shape;
+            // use the replacement payload identity so old snapshot locators
+            // keep pointing at their original, untouched objects.
+            for segment in &mut immutable_segments {
+                let mut identity =
+                    blake3::Hasher::new_derive_key("lix slatedb immutable replacement segment v1");
+                for frame in &segment.frames {
+                    identity.update(frame);
+                }
+                segment.id = Key(Bytes::copy_from_slice(identity.finalize().as_bytes()));
+            }
             let immutable_locators = immutable_segments
                 .iter()
                 .flat_map(|segment| {
@@ -5040,6 +5052,51 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), gate.acquire(true))
             .await
             .expect("cancelled foreground waiter must wake background maintenance");
+    }
+
+    #[tokio::test]
+    async fn same_length_immutable_replacements_preserve_old_readers_and_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = SlateDB::open(directory.path()).unwrap();
+        let space = TEST_IMMUTABLE_SPACE;
+        let key = Key(Bytes::from_static(b"migration-row"));
+        let batch = |value: &'static [u8]| PutBatch {
+            entries: vec![PutEntry {
+                key: key.clone(),
+                value: StoredValue {
+                    bytes: Bytes::from_static(value),
+                },
+            }],
+        };
+        let mut initial = storage.begin_write(WriteOptions::default()).await.unwrap();
+        initial.put_many(space, batch(b"old")).await.unwrap();
+        initial.commit().await.unwrap();
+        let old_read = storage.begin_read(ReadOptions::default()).await.unwrap();
+        // Same physical key and length, different bytes: a format migration can
+        // legitimately replace a non-content-addressed immutable value.
+        for value in [b"new".as_slice(), b"end".as_slice(), b"end".as_slice()] {
+            let mut write = storage.begin_write(WriteOptions::default()).await.unwrap();
+            write.replace_many(space, batch(value)).await.unwrap();
+            write.commit().await.unwrap();
+        }
+        let requests = [GetManyRequest {
+            space,
+            keys: std::slice::from_ref(&key),
+            opts: GetOptions::default(),
+        }];
+        assert_eq!(
+            old_read.get_many(&requests).await.unwrap().values,
+            vec![Some(ProjectedValue::FullValue(Bytes::from_static(b"old")))]
+        );
+        drop(old_read);
+        storage.flush().await.unwrap();
+        drop(storage);
+        let reopened = SlateDB::open(directory.path()).unwrap();
+        let read = reopened.begin_read(ReadOptions::default()).await.unwrap();
+        assert_eq!(
+            read.get_many(&requests).await.unwrap().values,
+            vec![Some(ProjectedValue::FullValue(Bytes::from_static(b"end")))]
+        );
     }
 
     #[tokio::test]

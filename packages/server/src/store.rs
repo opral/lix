@@ -353,6 +353,31 @@ pub(crate) enum LixRuntimeError {
 }
 
 impl LixRuntimeManager {
+    /// Explicit offline maintenance for a catalogued authority. All other hosts
+    /// must be stopped or have no open handles for this repository. The SDK
+    /// validates the exact old authority marker and rejects actual replicas.
+    pub async fn upgrade_authority(self: Arc<Self>, lix_id: &str) -> Result<()> {
+        if !valid_lix_id(lix_id) {
+            anyhow::bail!("invalid Lix repository ID");
+        }
+        let manager = Arc::try_unwrap(self)
+            .map_err(|_| anyhow::anyhow!("authority upgrade requires an offline manager"))?;
+        if !manager.state.lock().await.entries.is_empty() {
+            anyhow::bail!("close all repository runtimes before authority upgrade");
+        }
+        let record = manager
+            .repository_record(lix_id)
+            .await?
+            .filter(|record| record.state == "live")
+            .context("authority upgrade requires a live repository catalog entry")?;
+        let storage = manager.open_storage(&record.storage_id, SlateDBIoCounters::default())?;
+        lix_sdk::upgrade_authority_for_partial_sync(storage)
+            .await
+            .context("upgrade existing authority for partial sync")?;
+        info!(lix_id, "Lix authority upgrade completed");
+        Ok(())
+    }
+
     pub fn new(
         config: &Config,
         telemetry: Arc<dyn lix_sdk::telemetry::TelemetrySink>,
@@ -4105,6 +4130,80 @@ mod lifecycle_recovery_tests {
 mod host_provisioning_tests {
     use super::*;
     const ID: &str = "01936f4e-7b6c-7c3d-8f9a-123456789abc";
+
+    #[tokio::test]
+    async fn offline_authority_upgrade_rejects_shared_managers_and_unknown_repositories() {
+        let manager = LixRuntimeManager::new_in_memory(4);
+        let error = Arc::clone(&manager)
+            .upgrade_authority(ID)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("offline manager"));
+        let error = manager.upgrade_authority(ID).await.unwrap_err();
+        assert!(error.to_string().contains("live repository catalog entry"));
+    }
+
+    #[tokio::test]
+    async fn offline_authority_upgrade_preserves_current_authority_and_is_repeatable() {
+        let manager = LixRuntimeManager::new_in_memory(4);
+        manager
+            .provision_repository(ID.to_owned(), false)
+            .await
+            .unwrap();
+        let storage = manager
+            .open_storage(ID, SlateDBIoCounters::default())
+            .unwrap();
+        let seed = lix_sdk::open_lix()
+            .with_storage(storage.clone())
+            .await
+            .unwrap();
+        seed.execute(
+            "INSERT INTO lix_key_value(key,value) VALUES ('upgrade-proof','retained')",
+            &[],
+        )
+        .await
+        .unwrap();
+        seed.close().await.unwrap();
+        drop(seed);
+        let server = lix_sdk::open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .with_lix_id(ID)
+            .await
+            .unwrap();
+        // Serving persists the authority marker. Exercise a handshake before closing.
+        let response = server
+            .handle(
+                Request::builder()
+                    .uri(format!("/lix/v1/{ID}"))
+                    .header("lix-server-protocol-version", "8")
+                    .body(ServerProtocolBody::empty())
+                    .unwrap(),
+                ServerProtocolContext::anonymous(),
+            )
+            .await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        drop(response);
+        server.close().await.unwrap();
+        drop(server);
+        lix_sdk::upgrade_authority_for_partial_sync(storage.clone())
+            .await
+            .unwrap();
+        manager.upgrade_authority(ID).await.unwrap();
+        let reopened = lix_sdk::open_lix().with_storage(storage).await.unwrap();
+        let proof = reopened
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key='upgrade-proof'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            proof.rows()[0].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!("retained")
+        );
+        reopened.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn host_provisioning_preserves_legacy_data_and_never_recreates_deleted_storage() {
