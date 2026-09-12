@@ -135,7 +135,9 @@ export function startWorkerHost(
 					if (
 						message.operation.kind !== "open" &&
 						message.operation.kind !== "hosted.create" &&
-						message.operation.kind !== "hosted.delete"
+						message.operation.kind !== "hosted.delete" &&
+						message.operation.kind !== "replica.convert" &&
+						message.operation.kind !== "replica.cleanup"
 					) {
 						requiredLix(message.sessionId).setTelemetryParent(
 							message.telemetryParent,
