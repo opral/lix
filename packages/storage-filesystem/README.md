@@ -3,6 +3,17 @@
 Filesystem-backed storage for Lix. The Rust crate and JavaScript package expose
 the same adapter with independently versioned releases.
 
+## Exclusive repository lock
+
+`FilesystemStorage` takes an exclusive lock on the repository's RocksDB database
+at `.lix/.internal/rocksdb/LOCK`. Only one process can own a repository path at a
+time. A second process attempting to open the same repository is refused with a
+lock error (for example, `Resource temporarily unavailable`). This applies to
+both the Rust crate and the JavaScript package.
+
+Applications with multiple processes must route repository access through the
+process that owns the storage, for example via IPC or a local API.
+
 ## JavaScript
 
 ```ts
