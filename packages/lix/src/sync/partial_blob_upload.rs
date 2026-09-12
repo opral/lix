@@ -19,8 +19,34 @@ where
     // Preserve the frozen native publication tuple; inline content is a
     // deterministic transfer representation of its immutable referenced blobs.
     let mut combined = request.clone();
-    prepare_partial_upload_blobs_inner(storage, state, transport, &mut combined, true).await?;
-    transport.push(&combined).await
+    prepare_partial_upload_blobs_inner(
+        storage,
+        state,
+        transport,
+        &mut combined,
+        TransferMode::Combined,
+    )
+    .await?;
+    match transport.push(&combined).await {
+        Err(error)
+            if combined.inline_blobs.len() > request.inline_blobs.len()
+                && is_explicit_body_limit(&error) =>
+        {
+            // A 413 rejects the request before publication. Retry only the
+            // transfer representation, retaining the exact frozen native tuple.
+            let mut separate = request.clone();
+            prepare_partial_upload_blobs_inner(
+                storage,
+                state,
+                transport,
+                &mut separate,
+                TransferMode::Chunks,
+            )
+            .await?;
+            transport.push(request).await
+        }
+        result => result,
+    }
 }
 
 /// Prepare only blobs referenced by the exact durable native body batch.
@@ -36,7 +62,28 @@ where
     T: SyncTransport,
 {
     let mut transfer = request.clone();
-    prepare_partial_upload_blobs_inner(storage, state, transport, &mut transfer, false).await
+    prepare_partial_upload_blobs_inner(
+        storage,
+        state,
+        transport,
+        &mut transfer,
+        TransferMode::Prepare,
+    )
+    .await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransferMode {
+    Combined,
+    Prepare,
+    Chunks,
+}
+
+fn is_explicit_body_limit(error: &LixError) -> bool {
+    error.details.as_ref().and_then(|details| details.get("httpStatus"))
+        .and_then(serde_json::Value::as_u64) == Some(413)
+        // HttpSyncTransport maps an unstructured intermediary HTTP 413 here.
+        || (error.code == "LIX_ERROR_REQUEST_BODY_TOO_LARGE" && error.details.is_none())
 }
 
 async fn prepare_partial_upload_blobs_inner<S, T>(
@@ -44,7 +91,7 @@ async fn prepare_partial_upload_blobs_inner<S, T>(
     state: &PartialReplicaState,
     transport: &T,
     request: &mut SyncPushRequest,
-    combine: bool,
+    mode: TransferMode,
 ) -> Result<(), LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -95,9 +142,9 @@ where
         let chunks = load_canonical_blob_chunks(&read, id)
             .await?
             .ok_or_else(|| LixError::unknown("captured local blob content is missing"))?;
-        let manifest = super::blob::encode_manifest(id, &chunks)?;
+        let mut manifest = super::blob::encode_manifest(id, &chunks)?;
         drop(read);
-        if combine && manifest.inline_bytes_base64.is_some() {
+        if mode == TransferMode::Combined && manifest.inline_bytes_base64.is_some() {
             let addition = serde_json::to_vec(&manifest)
                 .map_err(|error| LixError::unknown(format!("encode inline content: {error}")))?
                 .len()
@@ -107,6 +154,9 @@ where
                 request.inline_blobs.push(manifest);
                 continue;
             }
+        }
+        if mode == TransferMode::Chunks {
+            manifest.inline_bytes_base64 = None;
         }
         let registration = transport.register_blob(&manifest).await?;
         let mut missing = std::collections::BTreeSet::new();

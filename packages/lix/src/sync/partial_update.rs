@@ -69,10 +69,13 @@ where
     S: crate::storage_adapter::Storage + Clone + Send + Sync + 'static,
 {
     use super::native_metadata::{
-        NativeMetadataRequest, NativeMetadataResponse, stage_native_metadata,
+        NativeMetadataRequest, NativeMetadataResponse, native_metadata_residency,
+        stage_native_metadata, validate_native_metadata_response,
     };
     use super::native_object::{NativeObjectResponse, stage_native_objects};
-    use crate::storage_adapter::{StoragePrecondition, StorageWriteOptions};
+    use crate::storage_adapter::{
+        StorageAdapterRead as _, StoragePrecondition, StorageWriteOptions,
+    };
     let invalid = || LixError::new(LixError::CODE_INVALID_PARAM, "invalid working-set bundle");
     if bundle
         .metadata
@@ -128,6 +131,50 @@ where
                 key: super::partial_state::partial_replica_state_key(),
                 expected: raw,
             }];
+            let headers = bundle
+                .metadata
+                .iter()
+                .filter(|object| {
+                    matches!(
+                        object.address,
+                        crate::tracked_state::NativeMetadataRef::CommitStateHeader(_)
+                    )
+                })
+                .collect::<Vec<_>>();
+            let header_keys = headers
+                .iter()
+                .map(|object| {
+                    uuid::Uuid::parse_str(object.address.id())
+                        .map(|id| {
+                            crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(
+                                id.as_bytes(),
+                            ))
+                        })
+                        .map_err(|_| invalid())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let header_values = read
+                .get_many(&[crate::storage_adapter::StorageGetManyRequest {
+                    space: crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+                    keys: &header_keys,
+                    opts: Default::default(),
+                }])
+                .await?
+                .values;
+            if header_values.len() != headers.len() {
+                return Err(invalid());
+            }
+            let mut different_headers = std::collections::BTreeSet::new();
+            for ((object, key), value) in headers.iter().zip(&header_keys).zip(header_values) {
+                if let Some(crate::storage_adapter::StorageProjectedValue::FullValue(existing)) =
+                    value
+                {
+                    if existing.as_ref() != object.bytes.as_slice() {
+                        different_headers
+                            .insert(<[u8; 16]>::try_from(key.0.as_ref()).map_err(|_| invalid())?);
+                    }
+                }
+            }
             for objects in bundle.metadata.chunks(32) {
                 let request = NativeMetadataRequest {
                     epoch_id: state.epoch_id().into(),
@@ -138,14 +185,112 @@ where
                     epoch_id: state.epoch_id().into(),
                     objects: objects.to_vec(),
                 };
-                preconditions.extend(
-                    stage_native_metadata(&read, &mut writes, state, &request, &response).await?,
-                );
+                // The UUID identifies a logical record, not its physical
+                // encoding. Own published commits may already have a valid
+                // locally authored header/locator representation. Match the
+                // ordinary hydration owner: validate both inputs, preserve
+                // resident bytes, and install only missing native metadata.
+                validate_native_metadata_response(state.repository_id(), &request, &response)?;
+                let residency = native_metadata_residency(&read, state, &request.objects).await?;
+                let missing = response
+                    .objects
+                    .into_iter()
+                    .zip(residency)
+                    .filter_map(|(object, resident)| (!resident).then_some(object))
+                    .collect::<Vec<_>>();
+                if !missing.is_empty() {
+                    let request = NativeMetadataRequest {
+                        epoch_id: state.epoch_id().into(),
+                        objects: missing
+                            .iter()
+                            .map(|object| object.address.clone())
+                            .collect(),
+                    };
+                    let response = NativeMetadataResponse {
+                        lix_id: state.repository_id().into(),
+                        epoch_id: state.epoch_id().into(),
+                        objects: missing,
+                    };
+                    preconditions.extend(
+                        stage_native_metadata(&read, &mut writes, state, &request, &response)
+                            .await?,
+                    );
+                }
             }
             for objects in bundle.objects.chunks(32) {
+                super::native_object::validate_response(
+                    state.repository_id(),
+                    &objects
+                        .iter()
+                        .map(|object| object.address)
+                        .collect::<Vec<_>>(),
+                    &NativeObjectResponse {
+                        lix_id: state.repository_id().into(),
+                        objects: objects.to_vec(),
+                    },
+                )?;
+            }
+            let keys = bundle
+                .objects
+                .iter()
+                .map(|object| {
+                    crate::storage_adapter::StorageKey(bytes::Bytes::from(
+                        object.address.storage_key(),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let requests = bundle
+                .objects
+                .iter()
+                .zip(&keys)
+                .map(
+                    |(object, key)| crate::storage_adapter::StorageGetManyRequest {
+                        space: object.address.space(),
+                        keys: std::slice::from_ref(key),
+                        opts: Default::default(),
+                    },
+                )
+                .collect::<Vec<_>>();
+            let values = read.get_many(&requests).await?.values;
+            if values.len() != bundle.objects.len() {
+                return Err(invalid());
+            }
+            let mut missing = Vec::new();
+            for ((object, key), value) in bundle.objects.iter().zip(&keys).zip(values) {
+                use crate::tracked_state::NativeObjectRef;
+                let owner = match object.address {
+                    NativeObjectRef::MutationCatalog { commit_id, .. }
+                    | NativeObjectRef::CommitDeltaPart { commit_id, .. } => Some(commit_id),
+                    _ => None,
+                };
+                if owner.is_some_and(|owner| different_headers.contains(&owner)) {
+                    // Keep the resident physical representation. These server
+                    // objects belong to a different header and are not installed;
+                    // ordinary candidate preparation validates its local inputs
+                    // before publishing any serving state or coverage.
+                    continue;
+                }
+                match value {
+                    Some(crate::storage_adapter::StorageProjectedValue::FullValue(bytes)) => {
+                        object.address.validate(&bytes)?
+                    }
+                    Some(_) => return Err(invalid()),
+                    None => {
+                        preconditions.push(StoragePrecondition::KeyAbsent {
+                            space: object.address.space(),
+                            key: key.clone(),
+                        });
+                        missing.push(object.clone());
+                    }
+                }
+            }
+            for objects in missing.chunks(32) {
                 stage_native_objects(
                     state.repository_id(),
-                    &objects.iter().map(|v| v.address).collect::<Vec<_>>(),
+                    &objects
+                        .iter()
+                        .map(|object| object.address)
+                        .collect::<Vec<_>>(),
                     &NativeObjectResponse {
                         lix_id: state.repository_id().into(),
                         objects: objects.to_vec(),

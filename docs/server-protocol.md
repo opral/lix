@@ -35,7 +35,7 @@ contract in another language. See [Hosting](./hosting.md).
 | SQL         | `/lix/v1/{lix_id}/execute`, `/lix/v1/{lix_id}/execute-batch`                    |
 | Transaction | `/lix/v1/{lix_id}/transaction/{begin,execute,commit,rollback}`                  |
 | Files       | `/lix/v1/{lix_id}/file`, `/lix/v1/{lix_id}/file/upsert{,-batch}`               |
-| Sync        | `/lix/v1/{lix_id}/sync/{push,pull,history,checkpoints,descriptor,native-objects,native-object-range,native-metadata,baseline-lease/renew,blob,chunk,retained-bodies,merge,merge/restart,migration/merge,migration/cleanup,migration/global/restart,migration/global/cleanup,migration/global/merge,migration/global/bodies}`                          |
+| Sync        | `/lix/v1/{lix_id}/sync/{push,pull,history,checkpoints,descriptor,update,native-objects,native-object-range,native-metadata,baseline-lease/renew,blob,chunk,retained-bodies,merge,merge/restart,migration/merge,migration/cleanup,migration/global/restart,migration/global/cleanup,migration/global/merge,migration/global/bodies}`                          |
 | Versioning  | `/lix/v1/{lix_id}/branch/{create,switch,merge,merge-preview}`, `/lix/v1/{lix_id}/{undo,redo}`       |
 | Observation | `/lix/v1/{lix_id}/observe`, `/lix/v1/{lix_id}/observe/multiplex`                |
 | Snapshot    | `/lix/v1/{lix_id}/snapshot`                                                     |
@@ -99,8 +99,9 @@ separate sync-chunk limits still apply.
 ## Sync
 
 Sync is Lix-scoped: the immutable ID in the path selects the Lix. Connected
-replica mutations execute on the authority; the background sync worker brings
-the resulting committed state into the local replica.
+partial-replica mutations execute locally; the background sync worker publishes
+them to the authority and reconciles its acknowledged state. Remote-mode SQL
+executes on the authority.
 
 - `POST /lix/v1/{lix_id}/sync/push` atomically uploads immutable commits and applies
   compare-and-swap branch-ref updates.
@@ -130,7 +131,7 @@ the resulting committed state into the local replica.
   `PUT /lix/v1/{lix_id}/sync/chunk?chunkId=...` transfer raw chunks. Both identities are
   64-character lowercase BLAKE3 hex digests; chunks are at most 4 MiB.
 
-All sync routes require exactly one `lix-sync-protocol-version: 10` header.
+All sync routes require exactly one `lix-sync-protocol-version: 13` header.
 Missing, duplicate, malformed, or incompatible versions are rejected before
 reading or publishing sync data. The handshake advertises
 `syncCheckpointInventory: true`. Commit bodies and headers both carry immutable
@@ -150,16 +151,17 @@ again. There is no separate presence request.
 
 ### Partial replica with on-demand sync
 
-Sync protocol 10 also defines the native transport for a partial replica with
-on-demand sync. The public sync-opening path is not switched by merely adding
-these endpoints.
+Sync protocol 13 defines the native transport for a partial replica with
+on-demand sync. SDK callers opt in with `server.mode: "partial_replica"` and
+local storage. The default server mode is `remote`. Client and server must
+upgrade together; this transport change does not alter the repository format.
 
 - `GET /sync/descriptor` returns a required `{descriptor, lease}` envelope of at
   most 6144 encoded bytes. The descriptor contains selected/default and global
   native head/checkpoint coordinates, canonical branch-ref metadata, and a
   cursor. It does not enumerate branches, rows, checkpoints, or blobs. The
   authority durably pins those exact native roots before returning the envelope. Protocol
-  10 fixes the lease TTL at 300000 ms; changing this duration requires a protocol
+  fixes the lease TTL at 300000 ms; changing this duration requires a protocol
   version change. Candidate publication uses a process-local monotonic deadline
   starting before the descriptor request, so waiting and transfer consume the
   budget. The serialized `expiresAtMs` field alone is not a cross-clock proof.
@@ -167,6 +169,18 @@ these endpoints.
   coherent descriptor. Unrelated repository changes may advance its cursor;
   receiving the response does not publish a local baseline or certify coverage.
   A candidate baseline has an independent lease until local publication.
+- `POST /sync/update` accepts the selected `branchId`, an optional long-poll
+  `after` cursor, a `knownCursor`, and retained SQL read interests. It returns a
+  leased descriptor with a bounded working-set bundle of native objects,
+  metadata and inline blobs. The bundle is capped at 1 MiB and 1024 entries;
+  individual inline blobs are capped at 256 KiB. Oversized working sets use the
+  existing on-demand hydration path. The local candidate evaluator still
+  validates coverage before publication. Initial opening uses the bounded
+  descriptor endpoint and does not collect a working set.
+- Small-file publication includes canonical inline blobs in the existing
+  `/sync/push` request, up to a 1 MiB combined request budget. Larger publications
+  retain chunk upload. Both paths use the same authoritative row merge and
+  acknowledgment machinery.
 - `POST /sync/native-objects`, `/sync/native-object-range`, and
   `/sync/native-metadata` fetch explicitly typed native inputs. They require
   `lix-native-baseline-lease`, checked against the authenticated account in the
