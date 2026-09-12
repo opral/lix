@@ -267,7 +267,8 @@ mod tests {
                 let first = headers.lines().next().unwrap();
                 let path = first.split_whitespace().nth(1).unwrap();
                 let route = path.split('?').next().unwrap();
-                let background = route.ends_with("/sync/descriptor") && path.contains('?');
+                let background = (route.ends_with("/sync/descriptor") && path.contains('?'))
+                    || route.ends_with("/sync/update");
                 let closing = first.starts_with("DELETE ");
                 let body = if closing {
                     serde_json::json!({})
@@ -276,6 +277,19 @@ mod tests {
                         descriptor.clone(),
                         authority.active_account_id(),
                     ))
+                    .unwrap()
+                } else if route.ends_with("/sync/update") {
+                    let request: crate::sync::PartialUpdateRequest =
+                        serde_json::from_slice(&bytes).unwrap();
+                    request.snapshot().unwrap();
+                    assert_eq!(request.branch_id, descriptor.selected_branch.branch_id);
+                    serde_json::to_value(crate::sync::PartialUpdateResponse {
+                        descriptor: crate::sync::LeasedPartialReplicaDescriptor::for_test(
+                            descriptor.clone(),
+                            authority.active_account_id(),
+                        ),
+                        bundle: crate::sync::WorkingSetBundle::default(),
+                    })
                     .unwrap()
                 } else if path.ends_with("/sync/native-metadata") {
                     let request: crate::sync::NativeMetadataRequest =
@@ -444,4 +458,104 @@ where
     let authenticated =
         crate::sync::authenticate_partial_conversion(server, Some(&selected)).await?;
     crate::migration::retry_published_conversion_cleanup(&storage, &authenticated).await
+}
+
+impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
+    pub(crate) async fn collect_partial_working_set(
+        &self,
+        leased: &crate::sync::LeasedPartialReplicaDescriptor,
+        interests: &crate::hot_state::ReadInterestSnapshot,
+    ) -> Result<crate::sync::WorkingSetBundle, LixError> {
+        let state = crate::sync::PartialReplicaState::from_leased(
+            format!("https://working-set.invalid/lix/{}", self.lix_id()),
+            self.active_account_id().to_owned(),
+            uuid::Uuid::now_v7().to_string(),
+            leased.clone(),
+        )?
+        .with_leased_descriptor_and_fresh_generations(leased.clone())?;
+        let storage = self.storage_adapter();
+        let read = storage.begin_read(Default::default()).await?;
+        crate::gc::require_native_baseline_lease(
+            &read,
+            &leased.lease.lease_id,
+            self.active_account_id(),
+            crate::telemetry::unix_time_ms(),
+        )
+        .await?;
+        self.engine
+            .collect_partial_working_set(read, &state, interests)
+            .await
+    }
+}
+
+#[cfg(test)]
+mod working_set_delivery_tests {
+    use super::*;
+    use crate::hot_state::{
+        FilePathInterest, HotStateScanRequest, LogicalReadInterest, ReadInterestSnapshot,
+    };
+
+    #[tokio::test]
+    async fn authority_working_set_collects_selected_file_inputs_without_mutating_controls() {
+        let authority = open_lix().await.unwrap();
+        authority.execute("INSERT INTO lix_file (id,path,content) VALUES ('00000000-0000-7000-8000-000000000123','/selected.txt', CAST('hello' AS BYTEA))", &[]).await.unwrap();
+        let descriptor = authority.partial_replica_descriptor(None).await.unwrap();
+        let state = crate::sync::PartialReplicaState::new(
+            format!("https://example.test/lix/{}", authority.lix_id()),
+            authority.active_account_id().to_owned(),
+            uuid::Uuid::now_v7().to_string(),
+            descriptor.clone(),
+        )
+        .unwrap()
+        .with_descriptor_and_fresh_generations(descriptor.clone())
+        .unwrap();
+        let mut request = HotStateScanRequest::default();
+        request.filter.branch_ids = vec![authority.active_branch_id().await.unwrap()];
+        request.filter.schema_keys = vec!["lix_file".into()];
+        request.projection.columns = vec!["content".into()];
+        let interests = ReadInterestSnapshot {
+            revision: 1,
+            serialized_bytes: 0,
+            interests: vec![Arc::new(LogicalReadInterest::FileContent {
+                request,
+                file_ids: Some(vec!["00000000-0000-7000-8000-000000000123".into()]),
+                directory_ids: None,
+                root_directory: false,
+                indexed: true,
+                path_predicate: FilePathInterest::All,
+                byte_range: None,
+            })],
+        };
+        let storage = authority.storage_adapter();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let bundle = authority
+            .engine
+            .collect_partial_working_set(read, &state, &interests)
+            .await
+            .unwrap();
+        assert!(bundle.complete);
+        assert!(!bundle.objects.is_empty());
+        assert!(!bundle.metadata.is_empty());
+        let selected_id = crate::binary_cas::BlobId::from_content(b"hello").to_hex();
+        let selected_blob = bundle
+            .blobs
+            .iter()
+            .find(|blob| blob.blob_id == selected_id)
+            .expect("selected file's canonical blob must be delivered");
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(
+                selected_blob
+                    .inline_bytes_base64
+                    .as_ref()
+                    .expect("selected content must be inline"),
+            )
+            .unwrap();
+        assert_eq!(bytes, b"hello");
+        assert_eq!(
+            authority.partial_replica_descriptor(None).await.unwrap(),
+            descriptor
+        );
+        authority.close().await.unwrap();
+    }
 }

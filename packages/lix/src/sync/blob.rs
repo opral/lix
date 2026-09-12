@@ -15,7 +15,7 @@ use crate::{Lix, LixError};
 use super::{SyncBlobChunk, SyncBlobManifest, SyncBlobRegistration};
 
 const MAX_SYNC_BLOB_CHUNKS: usize = 16_384;
-const MAX_INLINE_SYNC_BLOB_BYTES: usize = 64 * 1024;
+pub(super) const MAX_INLINE_SYNC_BLOB_BYTES: usize = 256 * 1024;
 
 pub(crate) fn validate_sync_blob_manifest(manifest: &SyncBlobManifest) -> Result<(), LixError> {
     decode_manifest(manifest).map(|_| ())

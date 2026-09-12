@@ -689,10 +689,15 @@ where
                         },
                         _ = renewal => {},
                         result = done => {
-                            if let Err(error) = result {
+                            // Successful adoption advances the cursor, so the
+                            // server long poll is the wait. Failed adoption
+                            // retains the cursor and needs the existing backoff.
+                            watch_after = web_time::Instant::now() + if let Err(error) = result {
                                 tracing::warn!(code=%error.code, "partial publication did not complete");
-                            }
-                            watch_after = web_time::Instant::now() + Duration::from_millis(100);
+                                Duration::from_millis(100)
+                            } else {
+                                Duration::ZERO
+                            };
                             continue;
                         }
                     }
@@ -768,7 +773,15 @@ where
                     upload_due = true;
                 },
                 result = upload => match result {
-                    Ok(progress) => { if progress {force_descriptor_refresh=true;} upload_due = progress; retry_upload = false; retry_delay = Duration::from_millis(100); },
+                    Ok(progress) => {
+                        if progress {
+                            force_descriptor_refresh=true;
+                            // Publication changed the authority basis. A prior
+                            // pending-edit retry delay no longer applies.
+                            watch_after=web_time::Instant::now();
+                        }
+                        upload_due = progress; retry_upload = false; retry_delay = Duration::from_millis(100);
+                    },
                     Err(error) => {
                         if is_terminal_partial_transport_error(&error) {
                             terminal_error = Some(error);
@@ -807,20 +820,33 @@ where
                     transport = Some(connected);
                 }
                 let connected = transport.as_ref().expect("connected");
-                let wrapper = if request_fresh {
-                    connected
-                        .partial_replica_descriptor(Some(
-                            &state.descriptor().selected_branch.branch_id,
-                        ))
-                        .await?
-                } else {
-                    connected
-                        .wait_partial_replica_descriptor(
-                            &state.descriptor().selected_branch.branch_id,
-                            after_cursor,
-                        )
-                        .await?
+                let interests = engine.sync_mode().read_interests()
+                    .ok_or_else(|| LixError::unknown("partial update has no retained interests"))?
+                    .snapshot()?;
+                let request = super::partial_update::PartialUpdateRequest {
+                    branch_id: state.descriptor().selected_branch.branch_id.clone(),
+                    after: if request_fresh { None } else { Some(after_cursor) },
+                    // A successful own-write acknowledgment can leave the serving
+                    // admission unchanged. Reuse the observed cursor so its
+                    // already installed working set is not delivered again.
+                    known_cursor: if blocked_cursor.is_none() {
+                        state.descriptor().cursor.max(after_cursor)
+                    } else { state.descriptor().cursor },
+                    interests: interests.interests.iter().filter_map(|interest| {
+                        match super::partial_candidate_prepare::interest_belongs_to_candidate(
+                            interest, &state.descriptor().selected_branch.branch_id,
+                            &state.descriptor().global_branch.branch_id, state.archived_branch_ids(),
+                        ) {
+                            Ok(true) => Some(Ok(interest.as_ref().clone())),
+                            Ok(false) => None,
+                            Err(error) => Some(Err(error)),
+                        }
+                    }).collect::<Result<Vec<_>, LixError>>()?,
                 };
+                let (wrapper, bundle) = connected.partial_replica_update(&request).await?;
+                wrapper.deadline.check(&wrapper.wire.lease.lease_id)?;
+                super::partial_update::install_bundle(&storage, &state, &bundle).await?;
+                wrapper.deadline.check(&wrapper.wire.lease.lease_id)?;
                 let cursor = wrapper.wire.descriptor.cursor;
                 if !request_fresh && blocked_cursor.is_some_and(|blocked| cursor <= blocked) {
                     return Ok((
@@ -891,7 +917,8 @@ where
                         force_descriptor_refresh=false;
                         if blocked_global_cursor.is_some_and(|blocked|cursor>blocked){blocked_global_cursor=None;}
                         watch_cursor = watch_cursor.max(cursor);
-                        watch_after = web_time::Instant::now() + Duration::from_millis(100);
+                        // The next request long-polls after this processed cursor.
+                        watch_after = web_time::Instant::now();
                     },
                     Ok((_, super::partial_reconcile::PreparedDescriptor::Ready(prepared))) => {
                         force_descriptor_refresh=false; blocked_global_cursor=None;
@@ -911,7 +938,8 @@ where
                             continue 'worker;
                         }
                         if error.code == "LIX_PARTIAL_REPLICA_REBASE_REQUIRED" && !retry_upload { upload_due = true; }
-                        tracing::warn!(code=%error.code, "partial reconciliation retained existing working set");
+                        tracing::warn!(code=%error.code, message=%error.message, "partial reconciliation retained existing working set");
+
                         watch_after = web_time::Instant::now() + if error.code == "LIX_PARTIAL_REPLICA_BASELINE_RECOVERY_PENDING" { Duration::from_secs(30) } else { Duration::from_secs(1) };
                     }
                 }

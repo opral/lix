@@ -456,6 +456,51 @@ paths:
           description: Requested cursor is ahead of the authority; preserve pending edits and reconcile the admitted baseline.
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         default: { $ref: "#/components/responses/Error" }
+  /lix/v1/{lix_id}/sync/update:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
+    post:
+      operationId: syncPartialUpdate
+      description: Waits for a leased descriptor and delivers a bounded bundle of immutable native inputs for retained read recipes. Opening remains metadata-only. The replica validates and prepares coverage locally; incomplete bundles use ordinary on-demand hydration. Requires SDK and server sync protocol 13 together.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [branchId, knownCursor, interests]
+              properties:
+                branchId: { type: string, format: uuid }
+                after: { type: [integer, 'null'], minimum: 0 }
+                knownCursor: { type: integer, minimum: 0 }
+                interests:
+                  type: array
+                  maxItems: 4096
+                  description: Internal versioned native read recipes, bounded to 4 MiB. Never SQL text or local coverage claims.
+                  items: { type: object }
+      responses:
+        "200":
+          description: At most 2 MiB containing one leased descriptor and bounded native metadata, objects and inline content. Empty bundles accompany idle polls; no coverage is inferred from delivery.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [descriptor, bundle]
+                properties:
+                  descriptor: { $ref: "#/components/schemas/LeasedPartialReplicaDescriptor" }
+                  bundle:
+                    type: object
+                    required: [objects, metadata, blobs, complete]
+                    properties:
+                      objects: { type: array, items: { type: object } }
+                      metadata: { type: array, items: { type: object } }
+                      blobs: { type: array, items: { $ref: "#/components/schemas/SyncBlobManifest" } }
+                      complete: { type: boolean }
+        default: { $ref: "#/components/responses/Error" }
   /lix/v1/{lix_id}/sync/checkpoints:
     parameters:
       - $ref: "#/components/parameters/LixId"
@@ -902,7 +947,7 @@ components:
       in: header
       required: true
       description: Exact sync wire-protocol version advertised by the handshake.
-      schema: { type: integer, const: 12 }
+      schema: { type: integer, const: 13 }
     TransactionId:
       name: Lix-Transaction-Id
       in: header
@@ -960,7 +1005,7 @@ components:
       required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
         protocolVersion: { type: integer, const: 8 }
-        syncProtocolVersion: { type: integer, const: 12 }
+        syncProtocolVersion: { type: integer, const: 13 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }

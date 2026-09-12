@@ -222,9 +222,7 @@ async fn partial_upload_worker_yields_to_demands_and_retries_ambiguous_acceptanc
                     .await
                     .unwrap()
                     .unwrap();
-                if push.prepared.is_none()
-                    && push.confirmed.head == control.head_commit_id
-                {
+                if push.prepared.is_none() && push.confirmed.head == control.head_commit_id {
                     break;
                 }
                 drop(read);
@@ -401,16 +399,12 @@ impl RawHttpClient for WatchingAuthorityClient {
     fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
         Box::pin(async move {
             let url = url::Url::parse(&request.url).unwrap();
-            let response = if url.path().ends_with("/sync/descriptor") {
+            let response = if url.path().ends_with("/sync/update") {
                 self.watches.fetch_add(1, Ordering::SeqCst);
-                let branch = url
-                    .query_pairs()
-                    .find(|(key, _)| key == "branchId")
-                    .map(|(_, value)| value.into_owned());
-                let after = url
-                    .query_pairs()
-                    .find(|(key, _)| key == "after")
-                    .map(|(_, value)| value.parse::<u64>().unwrap());
+                let update: crate::sync::partial_update::PartialUpdateRequest =
+                    serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+                let branch = Some(update.branch_id.clone());
+                let after = update.after;
                 let current = self
                     .base
                     .authority
@@ -420,12 +414,23 @@ impl RawHttpClient for WatchingAuthorityClient {
                     self.blocked.notify_one();
                     self.changed.notified().await;
                 }
-                serde_json::to_value(
+                let descriptor = self
+                    .base
+                    .authority
+                    .leased_partial_replica_descriptor(branch.as_deref())
+                    .await?;
+                let bundle = if descriptor.descriptor.cursor == update.known_cursor {
+                    Default::default()
+                } else {
                     self.base
                         .authority
-                        .leased_partial_replica_descriptor(branch.as_deref())
-                        .await?,
-                )
+                        .collect_partial_working_set(&descriptor, &update.snapshot()?)
+                        .await?
+                };
+                serde_json::to_value(crate::sync::partial_update::PartialUpdateResponse {
+                    descriptor,
+                    bundle,
+                })
                 .unwrap()
             } else if url.path().ends_with("/sync/native-object-range")
                 || url.path().ends_with("/sync/native-metadata")
@@ -613,9 +618,9 @@ async fn engine_worker_preempts_watch_then_publishes_retained_negative_scope() {
                 tokio::task::yield_now().await;
             }
             let native_reads = client.native_reads.load(Ordering::SeqCst);
-            assert!(
-                native_reads > 0,
-                "background candidate must hydrate authority inputs"
+            assert_eq!(
+                native_reads, 0,
+                "update carries the complete retained negative scope without hydration round trips"
             );
             for _ in 0..10 {
                 assert!(value(session.execute(sql, &[]).await.unwrap()).contains("remote"));
