@@ -4,9 +4,17 @@ use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if !arguments.is_empty() && !(arguments.len() == 2 && arguments[0] == "upgrade-authority") {
+        anyhow::bail!("usage: lix-server [upgrade-authority <repository-id>]");
+    }
     let telemetry = telemetry::init();
 
     let config = Config::from_env()?;
+    if let [_, lix_id] = arguments.as_slice() {
+        let manager = LixRuntimeManager::new(&config, telemetry.lix_sink)?;
+        return manager.upgrade_authority(lix_id).await;
+    }
     let listener = TcpListener::bind(&config.bind_addr)
         .await
         .with_context(|| format!("bind {}", config.bind_addr))?;
