@@ -773,7 +773,15 @@ where
                     upload_due = true;
                 },
                 result = upload => match result {
-                    Ok(progress) => { if progress {force_descriptor_refresh=true;} upload_due = progress; retry_upload = false; retry_delay = Duration::from_millis(100); },
+                    Ok(progress) => {
+                        if progress {
+                            force_descriptor_refresh=true;
+                            // Publication changed the authority basis. A prior
+                            // pending-edit retry delay no longer applies.
+                            watch_after=web_time::Instant::now();
+                        }
+                        upload_due = progress; retry_upload = false; retry_delay = Duration::from_millis(100);
+                    },
                     Err(error) => {
                         if is_terminal_partial_transport_error(&error) {
                             terminal_error = Some(error);
@@ -931,6 +939,7 @@ where
                         }
                         if error.code == "LIX_PARTIAL_REPLICA_REBASE_REQUIRED" && !retry_upload { upload_due = true; }
                         tracing::warn!(code=%error.code, message=%error.message, "partial reconciliation retained existing working set");
+
                         watch_after = web_time::Instant::now() + if error.code == "LIX_PARTIAL_REPLICA_BASELINE_RECOVERY_PENDING" { Duration::from_secs(30) } else { Duration::from_secs(1) };
                     }
                 }

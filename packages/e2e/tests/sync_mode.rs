@@ -1301,8 +1301,9 @@ async fn remote_branch_content_is_hydrated_only_after_explicit_selection() {
     // Each payload is just over the inline ceiling and remains one canonical
     // chunk. One survives at the child head; the other survives only at the
     // branch's pinned checkpoint after the child replaces it.
-    let inherited_head = vec![41_u8; 65 * 1024];
-    let inherited_checkpoint = vec![73_u8; 65 * 1024];
+    // Stay above the 256KiB inline ceiling to exercise deferred chunks.
+    let inherited_head = vec![41_u8; 257 * 1024];
+    let inherited_checkpoint = vec![73_u8; 257 * 1024];
     authority
         .execute_batch(&[
             ExecuteBatchStatement {
@@ -2832,6 +2833,16 @@ where
         .await
         .expect("collect HTTP request body")
         .to_bytes();
+    if parts.method == Method::POST && path.ends_with("/sync/update") {
+        probe.descriptor_pulls.fetch_add(1, Ordering::Release);
+        let request: JsonValue =
+            serde_json::from_slice(&body).expect("decode partial update probe");
+        // Working-set updates carry the same held-watch cursor in the body.
+        // Count only actual waits, not immediate refresh requests (after=null).
+        if request.get("after").is_some_and(JsonValue::is_u64) {
+            probe.descriptor_waits.fetch_add(1, Ordering::Release);
+        }
+    }
     let response = protocol
         .handle(
             Request::from_parts(parts, ServerProtocolBody::full(body)),

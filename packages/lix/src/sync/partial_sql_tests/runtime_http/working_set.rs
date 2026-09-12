@@ -111,6 +111,22 @@ async fn delivered_working_set_publishes_without_hydration_and_remains_writable_
         }
         assert!(complete);
     }
+    // Exercise the first locally authored ACK directly from initial admission,
+    // before a remote publication has prepared any additional native inputs.
+    offline.store(true, Ordering::SeqCst);
+    session
+        .execute(
+            "UPDATE lix_file SET content=CAST('first-local' AS BYTEA) WHERE path='/a.txt'",
+            &[],
+        )
+        .await
+        .expect("initial prefetched file must be writable offline");
+    offline.store(false, Ordering::SeqCst);
+    verify_own_ack_delivery(storage.clone(), engine.clone(), transport.clone()).await;
+    let old = engine.sync_mode().partial_admission().unwrap();
+    let transport = transport
+        .fork_native_baseline_lease(old.baseline_lease())
+        .unwrap();
     let interests = engine
         .sync_mode()
         .read_interests()
@@ -207,6 +223,14 @@ async fn delivered_working_set_publishes_without_hydration_and_remains_writable_
     // Deliver the authority representation back to the replica that authored
     // and durably acknowledged these commits. Metadata may already be local.
     offline.store(false, Ordering::SeqCst);
+    verify_own_ack_delivery(storage, engine, transport).await;
+}
+
+async fn verify_own_ack_delivery(
+    storage: StorageAdapter<Memory>,
+    engine: Arc<Engine<Memory>>,
+    transport: HttpSyncTransport<CountDelivery>,
+) {
     let admitted = engine.sync_mode().partial_admission().unwrap();
     let transport = transport
         .fork_native_baseline_lease(admitted.baseline_lease())
@@ -250,7 +274,10 @@ async fn delivered_working_set_publishes_without_hydration_and_remains_writable_
             .map(|interest| interest.as_ref().clone())
             .collect(),
     };
-    let (_, acknowledged_bundle) = transport.partial_replica_update(&request).await.unwrap();
+    let (wrapper, acknowledged_bundle) = transport
+        .partial_replica_update(&request)
+        .await
+        .expect("own ACK update response must load");
     assert!(acknowledged_bundle.complete);
     let read = storage.begin_read(Default::default()).await.unwrap();
     let mut resident_count = 0;
@@ -386,4 +413,24 @@ async fn delivered_working_set_publishes_without_hydration_and_remains_writable_
             .is_err(),
         "malformed delivered native object must fail even when resident"
     );
+    let prepared = crate::sync::partial_global_merge_runtime::prepare_descriptor_with_global_merge(
+        engine.clone(),
+        admitted,
+        &transport,
+        wrapper,
+        crate::sync::partial_publication::PartialRecoveryPolicy::Normal,
+    )
+    .await
+    .expect("own ACK descriptor reconciliation must complete without backoff");
+    match prepared {
+        crate::sync::partial_reconcile::PreparedDescriptor::Ready(prepared) => {
+            crate::sync::partial_publication::publish_prepared_partial(engine, prepared)
+                .await
+                .expect("own ACK candidate publication must complete");
+        }
+        crate::sync::partial_reconcile::PreparedDescriptor::NoChange => {}
+        crate::sync::partial_reconcile::PreparedDescriptor::LocalProgress => {
+            panic!("own ACK must not require another descriptor exchange")
+        }
+    }
 }
