@@ -2473,3 +2473,43 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    scalar_row_insert_and_upsert_remain_atomically_unsupported,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        session.execute("INSERT INTO lix_registered_schema (value) VALUES (CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"expression_rows\",\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false},{\"name\":\"value\",\"type\":\"text\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB))", &[]).await.unwrap();
+        session
+            .execute(
+                "INSERT INTO expression_rows (id, value) VALUES ('one', 'original')",
+                &[],
+            )
+            .await
+            .unwrap();
+        for sql in [
+            "INSERT INTO expression_rows (id, value) VALUES ('two', 'new') RETURNING upper(value)",
+            "INSERT INTO expression_rows (id, value) VALUES ('one', 'changed'), ('two', 'new') ON CONFLICT (id) DO UPDATE SET value = upper(excluded.value)",
+            "INSERT INTO expression_rows (id, value) VALUES ('two', concat('new', '-row'))",
+        ] {
+            let error = session.execute(sql, &[]).await.expect_err(
+                "scalar row insert and upsert require the existing bound mutation owner's support",
+            );
+            assert_eq!(
+                error.code,
+                LixError::CODE_UNSUPPORTED_SQL,
+                "{sql}: {error:?}"
+            );
+            assert_rows_eq(
+                session
+                    .execute("SELECT id, value FROM expression_rows ORDER BY id", &[])
+                    .await
+                    .unwrap(),
+                vec![vec![
+                    Value::Text("one".into()),
+                    Value::Text("original".into()),
+                ]],
+            );
+        }
+    }
+);
