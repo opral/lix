@@ -6083,7 +6083,7 @@ where
                     } = prepared;
                     let source_bytes = file.submitted_bytes.clone();
                     let creates = file.create_context.creates();
-                    let task = tokio::spawn(async move {
+                    let work = async move {
                         open_plugin_file(
                             factory.as_ref(),
                             descriptor,
@@ -6092,7 +6092,13 @@ where
                             &schemas,
                         )
                         .await
-                    });
+                    };
+                    #[cfg(not(target_family = "wasm"))]
+                    let task = tokio::spawn(work);
+                    // A browser worker has no Tokio reactor. Poll guest opens
+                    // on the current executor; dropping a pending open cancels it.
+                    #[cfg(target_family = "wasm")]
+                    let task: FreshPluginOpenTask = Box::pin(async move { Ok(work.await) });
                     PendingFreshPluginOpen {
                         file,
                         store_permit,
@@ -14356,14 +14362,18 @@ struct PreparedFreshPluginOpen {
     schemas: SchemaAllowlist,
 }
 
+type FreshPluginOpenResult =
+    Result<(Box<dyn WasmComponentActor>, ValidatedFileTransition), LixError>;
+#[cfg(not(target_family = "wasm"))]
+type FreshPluginOpenTask = tokio::task::JoinHandle<FreshPluginOpenResult>;
+#[cfg(target_family = "wasm")]
+type FreshPluginOpenTask =
+    std::pin::Pin<Box<dyn Future<Output = Result<FreshPluginOpenResult, LixError>> + Send>>;
+
 struct PendingFreshPluginOpen {
     file: FreshPluginFile,
     store_permit: PluginActorStorePermit,
-    task: Option<
-        tokio::task::JoinHandle<
-            Result<(Box<dyn WasmComponentActor>, ValidatedFileTransition), LixError>,
-        >,
-    >,
+    task: Option<FreshPluginOpenTask>,
 }
 
 impl PluginWriteReconciliation {

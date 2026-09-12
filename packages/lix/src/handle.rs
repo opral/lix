@@ -1528,14 +1528,14 @@ where
                 "storage session must use the same repository",
             ));
         }
-        Arc::get_mut(&mut opened.engine)
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "new storage session engine is shared",
-                )
-            })?
-            .inherit_sync_mode(self.engine.sync_mode());
+        let engine = Arc::get_mut(&mut opened.engine).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "new storage session engine is shared",
+            )
+        })?;
+        engine.inherit_storage_runtime(&self.engine);
+        engine.inherit_sync_mode(self.engine.sync_mode());
         let account = if matches!(
             self.engine.sync_mode().role(),
             crate::sync::SyncRole::Replica | crate::sync::SyncRole::PartialReplica

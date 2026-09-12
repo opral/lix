@@ -340,7 +340,14 @@ where
     }
 
     /// Storage adapter sessions retain the owning engine's runtime and plugin
-    /// resource policy before their final authenticated session is created.
+    /// resource policy before their final session is created.
+    pub(crate) fn inherit_storage_runtime<Source>(&mut self, source: &Engine<Source>)
+    where
+        Source: Storage + Clone + Send + Sync + 'static,
+    {
+        self.plugin_host = source.plugin_host.fork_for_storage_session();
+    }
+
     pub(crate) fn inherit_partial_storage_runtime<Source>(&mut self, source: &Engine<Source>)
     where
         Source: Storage + Clone + Send + Sync + 'static,

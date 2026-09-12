@@ -360,18 +360,30 @@ try {
 - The package is ESM-only.
 - The package uses conditional ESM imports internally: Node.js resolves the
   native N-API binding, while browsers and other runtimes resolve the portable
-  WebAssembly binding. Vite follows this split without consumer configuration.
+  WebAssembly binding. Vite resolves these conditional imports automatically.
+  Configure Vite to emit ES module workers because the Component compiler uses
+  top-level await:
+
+  ```js
+  // vite.config.js
+  export default { worker: { format: "es" } };
+  ```
 - If the native addon cannot load in Node.js, in-memory Lix instances fall back
-  to the bundled WebAssembly engine. Filesystem storage and Component API v1
-  plugin execution still require the native addon.
+  to the bundled WebAssembly engine. Filesystem storage still requires the native addon.
 - Every browser `openLix()` owns one dedicated worker, so database work does
   not block the page's main thread. Node.js uses the native binding's actor.
-- Node.js executes installed Component API v1 plugins with the Rust SDK's
-  Wasmtime runtime. The browser binding currently opens without a component
-  runtime: it can use ordinary Lix storage and SQL, but does not
-  execute installed plugins. A browser Component host is a separate follow-up.
+- Node.js and browsers execute installed Component API v2 plugins through the
+  same JavaScript Component host. The host adapts Component interfaces to the
+  platform's built-in WebAssembly runtime and connects them to Lix's shared Rust
+  host resources. Node.js retains its native engine and filesystem adapter;
+  the browser engine runs inside its dedicated worker.
+- Components are compiled on first use. Each file actor gets an isolated guest
+  instance. Guest functions and loops check execution deadlines, and core memory
+  declarations are capped before instantiation. Unsupported memory forms are
+  rejected rather than executed without limits.
 - A page Content Security Policy only needs to permit the package's same-origin
-  worker. WebAssembly compilation happens inside that worker, so the required
+  worker. Component bindings are generated as data URL modules and WebAssembly
+  compilation happens inside that worker, so the required
   permission can be scoped to the worker script's HTTP response instead of
   being allowed by the document:
 
@@ -380,11 +392,11 @@ try {
   Content-Security-Policy: default-src 'self'; script-src 'self'; worker-src 'self'
 
   # Lix worker response (Vite emits assets/entry.browser-<hash>.js)
-  Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'
+  Content-Security-Policy: default-src 'none'; script-src 'self' data: 'wasm-unsafe-eval'; connect-src 'self'
   ```
 
   Hosts that apply one policy to every response can use
-  `script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'` globally
+  `script-src 'self' data: 'wasm-unsafe-eval'; worker-src 'self'` globally
   instead. Worker-scoped headers keep those permissions out of the page.
 
 - SQL parameters use normal JavaScript values: `string`, finite `number`, `boolean`, `Uint8Array`, `null`, JSON-compatible arrays, and JSON-compatible plain objects.
@@ -404,7 +416,7 @@ npm run test:browser
 
 `npm run test:browser:production` additionally packs the SDK, installs the
 tarball into a minimal Vite app, makes a production build, and exercises SQL
-plus bundled-plugin archive loading in Chromium. It runs with both
+plus bundled-plugin installation and CSV row extraction in Chromium. It runs with both
 worker-scoped and global strict CSP headers.
 
 Use `npm run build:wasm:dev` while iterating on the Rust bridge when release

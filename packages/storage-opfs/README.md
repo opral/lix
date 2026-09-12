@@ -11,6 +11,13 @@ const lix = await openLix({
 });
 ```
 
+When bundling with Vite, emit ES module workers for the SDK's Component compiler:
+
+```js
+// vite.config.js
+export default { worker: { format: "es" } };
+```
+
 Combine OPFS with `server: { url: repositoryUrl, mode: "partial_replica" }`
 to keep a durable **partial replica with on-demand sync** of an existing hosted
 repository. Opening loads bounded metadata; SQL fetches missing native inputs

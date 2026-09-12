@@ -2,6 +2,9 @@ import { playwright } from "@vitest/browser-playwright";
 import { defineConfig } from "vitest/config";
 
 export default defineConfig({
+	optimizeDeps: {
+		include: ["@bytecodealliance/jco-transpile/wasm-tools"],
+	},
 	define: {
 		"import.meta.env.LIX_WASM_STORAGE_BENCH": JSON.stringify(
 			process.env.LIX_WASM_STORAGE_BENCH ?? "0",

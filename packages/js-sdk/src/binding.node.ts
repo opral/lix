@@ -1,3 +1,4 @@
+import { createComponentDispatch, type ComponentDispatch } from "./component-host/dispatch.js";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
@@ -29,11 +30,13 @@ type NativeAddon = {
 			serverUrl?: string,
 			serverHeaders?: [string, string][],
 			openProgress?: (progressJson: string) => void,
+			componentDispatch?: ComponentDispatch,
 		): Promise<NativeLixBinding>;
 		openMemoryFromSnapshot(
 			telemetry?: (spanJson: string) => void,
 			telemetryParentJson?: string,
 			openProgress?: (progressJson: string) => void,
+			componentDispatch?: ComponentDispatch,
 		): SnapshotRestoreBinding<NativeLixBinding>;
 		openFilesystemStorage(
 			path: string,
@@ -43,6 +46,7 @@ type NativeAddon = {
 			serverUrl?: string,
 			serverHeaders?: [string, string][],
 			openProgress?: (progressJson: string) => void,
+			componentDispatch?: ComponentDispatch,
 		): Promise<NativeLixBinding>;
 		openFilesystemStorageFromSnapshot(
 			path: string,
@@ -50,6 +54,7 @@ type NativeAddon = {
 			telemetry?: (spanJson: string) => void,
 			telemetryParentJson?: string,
 			openProgress?: (progressJson: string) => void,
+			componentDispatch?: ComponentDispatch,
 		): SnapshotRestoreBinding<NativeLixBinding>;
 	};
 };
@@ -238,6 +243,7 @@ export async function openNativeLixBinding(
 				}
 			}
 		: undefined;
+	const componentDispatch = createComponentDispatch();
 	switch (storage.kind) {
 		case "memory": {
 			const nativeAddon = loadAddon();
@@ -249,6 +255,7 @@ export async function openNativeLixBinding(
 					nativeTelemetry,
 					telemetryParent ? JSON.stringify(telemetryParent) : undefined,
 					nativeOpenProgress,
+					componentDispatch,
 				);
 				return normalizeNativeBinding(await restoreSnapshot(snapshot, restore));
 			}
@@ -260,6 +267,7 @@ export async function openNativeLixBinding(
 						server?.url,
 						server?.headers,
 						nativeOpenProgress,
+						componentDispatch,
 					),
 				);
 			}
@@ -270,6 +278,7 @@ export async function openNativeLixBinding(
 					server?.url,
 					server?.headers,
 					nativeOpenProgress,
+					componentDispatch,
 				),
 			);
 		}
@@ -289,6 +298,7 @@ export async function openNativeLixBinding(
 					nativeTelemetry,
 					telemetryParent ? JSON.stringify(telemetryParent) : undefined,
 					nativeOpenProgress,
+					componentDispatch,
 				);
 				return normalizeNativeBinding(await restoreSnapshot(snapshot, restore));
 			}
@@ -302,6 +312,7 @@ export async function openNativeLixBinding(
 						server?.url,
 						server?.headers,
 						nativeOpenProgress,
+						componentDispatch,
 					),
 				);
 			}
@@ -314,6 +325,7 @@ export async function openNativeLixBinding(
 					server?.url,
 					server?.headers,
 					nativeOpenProgress,
+					componentDispatch,
 				),
 			);
 		}
