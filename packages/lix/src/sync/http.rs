@@ -1842,7 +1842,7 @@ mod tests {
                 status_text: "Service Unavailable".to_owned(),
                 body: serde_json::to_vec(&serde_json::json!({
                     "error": {
-                        "code": "LIX_ERROR_LIX_MIGRATING",
+                        "code": "LIX_ERROR_MIGRATING",
                         "message": "The lix repository is being migrated.",
                         "hint": "Retry after the migration completes.",
                         "details": {
@@ -1857,7 +1857,7 @@ mod tests {
             "open sync session",
         );
 
-        assert_eq!(error.code, "LIX_ERROR_LIX_MIGRATING");
+        assert_eq!(error.code, "LIX_ERROR_MIGRATING");
         assert_eq!(
             error.hint.as_deref(),
             Some("Retry after the migration completes.")

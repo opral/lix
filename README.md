@@ -177,6 +177,7 @@ Git tracks files but has no SQL. PostgreSQL/SQLite have SQL but no files and no 
 
 - **[Getting Started Guide](https://lix.dev/docs/getting-started)** - Build your first app with Lix
 - **[Documentation](https://lix.dev/docs)** - Full API reference and guides
+- **[Error codes](./docs/error-codes.md)** - Code catalog, server responses, and retry guidance
 - **[Discord](https://discord.gg/gdMPPWy57R)** - Get help and join the community
 - **[GitHub](https://github.com/opral/lix)** - Report issues and contribute
 
