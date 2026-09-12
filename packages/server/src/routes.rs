@@ -813,7 +813,7 @@ fn protocol_timeout_response() -> Response {
     // or header alone.
     protocol_error(
         StatusCode::GATEWAY_TIMEOUT,
-        "LIX_ERROR_LIX_TIMEOUT",
+        "LIX_ERROR_TIMEOUT",
         "The lix request timed out before its outcome was known.",
         Some("Do not automatically retry this request; a mutation may still complete.".to_string()),
         Some(json!({
@@ -856,7 +856,7 @@ fn lix_error(error: LixRuntimeError) -> Response {
         ),
         LixRuntimeError::AtCapacity { max } => protocol_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "LIX_ERROR_LIX_CAPACITY",
+            "LIX_ERROR_CAPACITY",
             "The lix service is at capacity.",
             Some("Retry after an active lix closes.".to_string()),
             Some(json!({
@@ -871,7 +871,7 @@ fn lix_error(error: LixRuntimeError) -> Response {
             to_version,
         } => protocol_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "LIX_ERROR_LIX_MIGRATING",
+            "LIX_ERROR_MIGRATING",
             "The lix repository is being migrated.",
             Some("Retry after the migration completes.".to_string()),
             Some(json!({
@@ -888,7 +888,7 @@ fn lix_error(error: LixRuntimeError) -> Response {
             diagnostic,
         } => protocol_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "LIX_ERROR_LIX_MIGRATION_FAILED",
+            "LIX_ERROR_MIGRATION_FAILED",
             format!(
                 "The lix repository migration failed. {}",
                 diagnostic.message
@@ -904,7 +904,7 @@ fn lix_error(error: LixRuntimeError) -> Response {
         ),
         LixRuntimeError::UpgradeFailed(diagnostic) => protocol_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "LIX_ERROR_LIX_MIGRATION_FAILED",
+            "LIX_ERROR_MIGRATION_FAILED",
             format!("The lix repository upgrade failed. {}", diagnostic.message),
             Some("Contact the service operator to recover the repository.".to_string()),
             Some(json!({
@@ -915,7 +915,7 @@ fn lix_error(error: LixRuntimeError) -> Response {
         ),
         LixRuntimeError::Recovering => protocol_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "LIX_ERROR_LIX_RECOVERING",
+            "LIX_ERROR_RECOVERING",
             "The lix is recovering.",
             Some("Retry the request.".to_string()),
             Some(json!({
@@ -926,7 +926,7 @@ fn lix_error(error: LixRuntimeError) -> Response {
         .with_retry_after(),
         LixRuntimeError::ShuttingDown => protocol_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "LIX_ERROR_LIX_SHUTTING_DOWN",
+            "LIX_ERROR_SHUTTING_DOWN",
             "The lix server is shutting down.",
             Some("Retry the request on a healthy server.".to_string()),
             Some(json!({
@@ -939,7 +939,7 @@ fn lix_error(error: LixRuntimeError) -> Response {
             tracing::error!(error = %error, "lix cache cleanup could not complete");
             protocol_error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "LIX_ERROR_LIX_CACHE_CLEANUP",
+                "LIX_ERROR_CACHE_CLEANUP",
                 "The lix service cache needs operator repair.",
                 Some(
                     "Contact the service operator to repair the cache and restart the server."
@@ -954,12 +954,12 @@ fn lix_error(error: LixRuntimeError) -> Response {
         LixRuntimeError::Open(error) if is_unsupported_storage_format(&error) => {
             tracing::warn!(
                 error = %error,
-                error_code = "LIX_ERROR_STORAGE_FORMAT_UNSUPPORTED",
+                error_code = "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT",
                 "lix uses an unsupported storage format"
             );
             protocol_error(
                 StatusCode::CONFLICT,
-                "LIX_ERROR_STORAGE_FORMAT_UNSUPPORTED",
+                "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT",
                 "This lix uses an unsupported storage format.",
                 Some("Create a new lix.".to_string()),
                 Some(json!({
@@ -1782,7 +1782,7 @@ mod tests {
         assert_eq!(
             json_body(response).await["error"],
             json!({
-                "code": "LIX_ERROR_STORAGE_FORMAT_UNSUPPORTED",
+                "code": "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT",
                 "message": "This lix uses an unsupported storage format.",
                 "hint": "Create a new lix.",
                 "details": {
@@ -1805,7 +1805,7 @@ mod tests {
         assert_eq!(
             json_body(response).await["error"],
             json!({
-                "code": "LIX_ERROR_LIX_MIGRATING",
+                "code": "LIX_ERROR_MIGRATING",
                 "message": "The lix repository is being migrated.",
                 "hint": "Retry after the migration completes.",
                 "details": {
@@ -1836,7 +1836,7 @@ mod tests {
         assert_eq!(
             json_body(response).await["error"],
             json!({
-                "code": "LIX_ERROR_LIX_MIGRATION_FAILED",
+                "code": "LIX_ERROR_MIGRATION_FAILED",
                 "message": "The lix repository migration failed. The migration could not copy repository data because the destination write precondition failed.",
                 "hint": "Contact the service operator to recover the repository.",
                 "details": {
@@ -1863,7 +1863,7 @@ mod tests {
         assert_eq!(
             json_body(response).await["error"],
             json!({
-                "code": "LIX_ERROR_LIX_MIGRATION_FAILED",
+                "code": "LIX_ERROR_MIGRATION_FAILED",
                 "message": "The lix repository upgrade failed. The migration could not complete. The service operator can inspect the server logs for the underlying cause.",
                 "hint": "Contact the service operator to recover the repository.",
                 "details": {
@@ -1907,7 +1907,7 @@ mod tests {
         assert_eq!(
             body["error"],
             json!({
-                "code": "LIX_ERROR_LIX_CACHE_CLEANUP",
+                "code": "LIX_ERROR_CACHE_CLEANUP",
                 "message": "The lix service cache needs operator repair.",
                 "hint": "Contact the service operator to repair the cache and restart the server.",
                 "details": {
@@ -1926,7 +1926,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         assert!(response.headers().get(header::RETRY_AFTER).is_none());
         let error = json_body(response).await["error"].clone();
-        assert_eq!(error["code"], "LIX_ERROR_LIX_TIMEOUT");
+        assert_eq!(error["code"], "LIX_ERROR_TIMEOUT");
         assert_eq!(error["details"]["operation"], "lix_request");
         assert_eq!(error["details"]["retryable"], false);
         assert_eq!(error["details"]["outcome"], "unknown");
