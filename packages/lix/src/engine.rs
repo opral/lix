@@ -204,6 +204,21 @@ where
         Ok((engine, session))
     }
 
+    pub(crate) async fn collect_partial_working_set(
+        &self,
+        read: crate::storage_adapter::StorageAdapterReadScope<StorageImpl::Read<'_>>,
+        state: &crate::sync::PartialReplicaState,
+        interests: &crate::hot_state::ReadInterestSnapshot,
+    ) -> Result<crate::sync::WorkingSetBundle, LixError> {
+        crate::session::collect_partial_working_set_read_scope::<StorageImpl>(
+            read,
+            state,
+            interests,
+            self.plugin_host.clone(),
+        )
+        .await
+    }
+
     pub(crate) async fn prepare_partial_candidate(
         &self,
         read: crate::storage_adapter::StorageAdapterReadScope<StorageImpl::Read<'_>>,

@@ -55,6 +55,22 @@ impl RawHttpClient for Client {
         })
     }
 }
+#[derive(Clone)]
+struct CountPublicationRequests {
+    inner: Client,
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
+}
+impl RawHttpClient for CountPublicationRequests {
+    fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
+        if request.url.ends_with("/sync/push")
+            || (request.method != "GET"
+                && (request.url.contains("/sync/blob") || request.url.contains("/sync/chunk")))
+        {
+            self.requests.lock().unwrap().push(request.url.clone());
+        }
+        self.inner.send(request)
+    }
+}
 #[tokio::test]
 async fn http_dispatcher_recovers_lost_wave_and_preserves_newer_local_edit() {
     let backing = Memory::new();
@@ -254,10 +270,14 @@ async fn file_checkpoint_upload_case(paging: bool, wire_budget: usize, ordinary_
         .with_embedded_lix_id()
         .await
         .unwrap();
+    let publication_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
     let transport = HttpSyncTransport::connect_with(
-        Client {
-            server,
-            lose_body: Arc::new(AtomicBool::new(false)),
+        CountPublicationRequests {
+            inner: Client {
+                server,
+                lose_body: Arc::new(AtomicBool::new(false)),
+            },
+            requests: Arc::clone(&publication_requests),
         },
         &format!("https://example.test/lix/{}", authority.lix_id()),
     )
@@ -389,6 +409,15 @@ async fn file_checkpoint_upload_case(paging: bool, wire_budget: usize, ordinary_
     .await
     .unwrap_err();
     assert_eq!(first.code, "TEST_LOST_CHECKPOINT_ACK");
+    if !paging {
+        let requests = publication_requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "96KiB checkpoint publication is one HTTP request: {requests:?}"
+        );
+        assert!(requests[0].ends_with("/sync/push"));
+    }
     let read = storage.begin_read(Default::default()).await.unwrap();
     let (pending, _, _) =
         crate::sync::partial_push_state::load_partial_push_state(&read, &old, branch)
@@ -593,3 +622,5 @@ mod retained_files;
 mod conflict_file;
 
 mod included_upload;
+
+mod working_set;

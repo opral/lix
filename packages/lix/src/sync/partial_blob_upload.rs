@@ -16,8 +16,11 @@ where
     S: Storage + Clone + Send + Sync + 'static,
     T: SyncTransport,
 {
-    prepare_partial_upload_blobs(storage, state, transport, request).await?;
-    transport.push(request).await
+    // Preserve the frozen native publication tuple; inline content is a
+    // deterministic transfer representation of its immutable referenced blobs.
+    let mut combined = request.clone();
+    prepare_partial_upload_blobs_inner(storage, state, transport, &mut combined, true).await?;
+    transport.push(&combined).await
 }
 
 /// Prepare only blobs referenced by the exact durable native body batch.
@@ -32,6 +35,27 @@ where
     S: Storage + Clone + Send + Sync + 'static,
     T: SyncTransport,
 {
+    let mut transfer = request.clone();
+    prepare_partial_upload_blobs_inner(storage, state, transport, &mut transfer, false).await
+}
+
+async fn prepare_partial_upload_blobs_inner<S, T>(
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+    transport: &T,
+    request: &mut SyncPushRequest,
+    combine: bool,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+    T: SyncTransport,
+{
+    // Keep the combined request below the ordinary partial publication budget;
+    // larger content retains the existing independently bounded transfer lane.
+    const MAX_COMBINED_REQUEST_BYTES: usize = 1024 * 1024;
+    let mut encoded_bytes = serde_json::to_vec(request)
+        .map_err(|error| LixError::unknown(format!("encode combined publication: {error}")))?
+        .len();
     // Existing canonical flattening can allocate the complete requested file.
     // Bound one file independently of native commit/request output budgets.
     const MAX_PREPARED_BLOB: u64 = 64 * 1024 * 1024;
@@ -73,6 +97,17 @@ where
             .ok_or_else(|| LixError::unknown("captured local blob content is missing"))?;
         let manifest = super::blob::encode_manifest(id, &chunks)?;
         drop(read);
+        if combine && manifest.inline_bytes_base64.is_some() {
+            let addition = serde_json::to_vec(&manifest)
+                .map_err(|error| LixError::unknown(format!("encode inline content: {error}")))?
+                .len()
+                .saturating_add(usize::from(!request.inline_blobs.is_empty()));
+            if encoded_bytes.saturating_add(addition) <= MAX_COMBINED_REQUEST_BYTES {
+                encoded_bytes += addition;
+                request.inline_blobs.push(manifest);
+                continue;
+            }
+        }
         let registration = transport.register_blob(&manifest).await?;
         let mut missing = std::collections::BTreeSet::new();
         for id in &registration.missing_chunk_ids {

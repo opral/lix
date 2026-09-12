@@ -12575,3 +12575,19 @@ where
     })
     .await
 }
+
+/// Keep the authority snapshot alive until all recorded candidate reads finish.
+pub(crate) async fn collect_partial_working_set_read_scope<StorageImpl>(
+    read: StorageAdapterReadScope<StorageImpl::Read<'_>>,
+    state: &crate::sync::PartialReplicaState,
+    interests: &crate::hot_state::ReadInterestSnapshot,
+    plugin_host: crate::plugin::runtime::PluginRuntimeHost,
+) -> Result<crate::sync::WorkingSetBundle, LixError>
+where
+    StorageImpl: Storage + 'static,
+{
+    with_static_session_sql_read::<StorageImpl, _, _, _>(read, |read| async move {
+        crate::sync::collect_working_set(read, state, interests, plugin_host).await
+    })
+    .await
+}

@@ -536,6 +536,7 @@ where
     /// Waits for a newer coherent descriptor, or returns the current one after
     /// the fixed server deadline. The caller reconciles roots before publishing
     /// its cursor; receiving a descriptor does not change local coverage.
+    #[cfg(test)]
     pub(crate) fn wait_partial_replica_descriptor<'a>(
         &'a self,
         branch_id: &'a str,
@@ -588,6 +589,74 @@ where
                 wire: descriptor,
                 deadline,
             })
+        })
+    }
+
+    /// Wait for a descriptor together with the bounded native inputs for the
+    /// retained working set. Opening still uses the metadata-only descriptor.
+    pub(crate) fn partial_replica_update<'a>(
+        &'a self,
+        update: &'a super::partial_update::PartialUpdateRequest,
+    ) -> SyncTransportFuture<
+        'a,
+        (
+            TimedLeasedPartialDescriptor,
+            super::partial_working_set::WorkingSetBundle,
+        ),
+    > {
+        Box::pin(async move {
+            update.snapshot()?;
+            let mut request = self.request(
+                Method::POST,
+                "/sync/update",
+                "load partial working-set update",
+            );
+            request.response_limit = super::partial_update::MAX_PARTIAL_UPDATE_RESPONSE_BYTES;
+            request.headers.push(json_content_type());
+            let body = json_body(update, "encode partial working-set request")?;
+            if body.len() > super::partial_update::MAX_PARTIAL_UPDATE_REQUEST_BYTES {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "working-set request exceeds byte limit",
+                ));
+            }
+            request.body = Some(body);
+            let started = web_time::Instant::now();
+            let response = self.client.send(request).await?;
+            if response.body.len() > super::partial_update::MAX_PARTIAL_UPDATE_RESPONSE_BYTES {
+                return Err(response_too_large_limit(
+                    "partial working-set update",
+                    super::partial_update::MAX_PARTIAL_UPDATE_RESPONSE_BYTES,
+                ));
+            }
+            let response: super::partial_update::PartialUpdateResponse =
+                decode_response(response, "partial working-set update")?;
+            response.descriptor.validate(
+                &self.lix_id,
+                &self.active_account_id,
+                Some(&update.branch_id),
+            )?;
+            if update
+                .after
+                .is_some_and(|after| response.descriptor.descriptor.cursor < after)
+            {
+                return Err(LixError::new(
+                    super::SYNC_PROTOCOL_MISMATCH_CODE,
+                    "working-set cursor regressed",
+                ));
+            }
+            let deadline = CandidateBaselineDeadline::from_request_start(
+                &response.descriptor.lease.lease_id,
+                started,
+            );
+            deadline.check(&response.descriptor.lease.lease_id)?;
+            Ok((
+                TimedLeasedPartialDescriptor {
+                    wire: response.descriptor,
+                    deadline,
+                },
+                response.bundle,
+            ))
         })
     }
 

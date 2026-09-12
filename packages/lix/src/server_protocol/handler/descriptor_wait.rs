@@ -26,6 +26,23 @@ pub(super) async fn wait_descriptor_until<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    let descriptor = load_descriptor_until(lease, branch_id, after, deadline).await?;
+    bounded_sync_json_response(
+        descriptor,
+        "partial replica descriptor",
+        crate::sync::MAX_LEASED_DESCRIPTOR_BYTES,
+    )
+}
+
+pub(super) async fn load_descriptor_until<S>(
+    lease: SessionLease<S>,
+    branch_id: Option<String>,
+    after: Option<u64>,
+    deadline: tokio::time::Instant,
+) -> Result<crate::sync::LeasedPartialReplicaDescriptor, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
     if after.is_some() && branch_id.is_none() {
         return Err(ApiError::bad_request(
             "descriptor continuation requires the selected branchId",
@@ -38,11 +55,7 @@ where
                     .await
             })
             .await?;
-        return bounded_sync_json_response(
-            descriptor,
-            "partial replica descriptor",
-            crate::sync::MAX_LEASED_DESCRIPTOR_BYTES,
-        );
+        return Ok(descriptor);
     }
     // Subscribe first: a publication during/between descriptor read and wait
     // leaves an unseen channel version and makes changed() immediately ready.
@@ -71,11 +84,7 @@ where
                     lix.leased_partial_replica_descriptor(Some(&branch)).await
                 })
                 .await?;
-            return bounded_sync_json_response(
-                leased,
-                "partial replica descriptor",
-                crate::sync::MAX_LEASED_DESCRIPTOR_BYTES,
-            );
+            return Ok(leased);
         }
         tokio::select! {
             result = changed.changed() => { finish = result.is_err(); },

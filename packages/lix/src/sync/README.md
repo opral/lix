@@ -94,4 +94,18 @@ Merge requests distinguish the original confirmed checkpoint, current authority
 checkpoint, and captured local checkpoint. Equal checkpoint overrides are omitted
 canonically, preserving existing immutable request digests. The owned persisted
 journal migration upgrades older records without resetting pending edits. These
-endpoints require sync protocol12/server protocol8; upgrade SDK and server together.
+endpoints require sync protocol13/server protocol8; upgrade SDK and server together.
+
+Partial replicas deliver retained working-set updates through `POST /sync/update`.
+The request contains native read recipes, and the response pairs a leased descriptor
+with bounded immutable inputs selected by the same candidate evaluator used locally.
+The server does not publish client coverage: the replica installs validated bytes,
+then runs its existing candidate preparation and atomic publication. Idle polls carry
+no working-set payload. Bundles exceeding the bounded delivery budget use existing
+on-demand hydration. Initial opening still requests only bounded metadata.
+
+Small-file publication includes canonical content in the existing `inlineBlobs` push
+(up to 256 KiB per blob and a 1 MiB combined request); larger uploads retain the
+existing chunk path. Authoritative row/plugin merge semantics are unchanged.
+The new update route requires SDK and server to upgrade together. Repository storage
+format is unchanged; existing partial replicas retain their data and read interests.

@@ -64,9 +64,16 @@ pub(crate) use partial_merge_protocol::{
 };
 pub(crate) use partial_merge_state::PARTIAL_BRANCH_MERGE_SPACE;
 mod partial_reconcile;
+mod partial_update;
+mod partial_working_set;
 pub(crate) use partial_interest_journal::{
     PARTIAL_READ_INTEREST_SPACE, flush_partial_read_interests,
 };
+pub(crate) use partial_update::{
+    MAX_PARTIAL_UPDATE_REQUEST_BYTES, MAX_PARTIAL_UPDATE_RESPONSE_BYTES, PartialUpdateRequest,
+    PartialUpdateResponse,
+};
+pub(crate) use partial_working_set::{WorkingSetBundle, collect_working_set};
 mod leased_descriptor;
 mod partial_replica;
 pub(crate) use leased_descriptor::{LeasedPartialReplicaDescriptor, MAX_LEASED_DESCRIPTOR_BYTES};
@@ -172,9 +179,9 @@ pub(crate) const MAX_SYNC_HISTORY_PAGE_SIZE: usize = 100;
 pub(crate) const MAX_SYNC_BLOB_BATCH_ITEMS: usize = 16;
 pub(crate) const MAX_SYNC_REQUEST_ITEMS: usize = 512;
 pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
-// v12 requires explicit checkpoint coordinates for authoritative partial merges.
+// v13 delivers retained working-set inputs with descriptor updates.
 // SDK and server must upgrade together.
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 12;
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 13;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str = "LIX_SYNC_REPOSITORY_ID_MISMATCH";
