@@ -14,3 +14,10 @@ mod session;
 mod telemetry;
 #[cfg(target_family = "wasm")]
 mod wasm;
+
+mod component_runtime;
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) mod component_runtime_napi;
+#[cfg(target_family = "wasm")]
+pub(crate) mod component_runtime_wasm;

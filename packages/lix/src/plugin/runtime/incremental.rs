@@ -1211,7 +1211,7 @@ async fn drain_file_transition_changes_inner(
             validator.accept_eof();
             break;
         };
-        let validation_started = std::time::Instant::now();
+        let validation_started = web_time::Instant::now();
         tracing::debug_span!(
             target: "lix_perf",
             "lix.perf.plugin_drain_prevalidate_page"

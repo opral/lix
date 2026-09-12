@@ -29,6 +29,8 @@ use std::thread;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::watch;
 
+use crate::component_runtime::{self, platform::JsDispatch};
+
 type JsTelemetryDispatch = ThreadsafeFunction<String, (), String, Status, false>;
 type SharedJsTelemetryDispatch = Arc<JsTelemetryDispatch>;
 type JsOpenProgressDispatch = ThreadsafeFunction<String, (), String, Status, false>;
@@ -1726,6 +1728,7 @@ impl NativeObserveEventsInner {
 
 #[expect(missing_debug_implementations)]
 pub struct OpenFilesystemStorageTask {
+    component_runtime: Arc<dyn lix::plugin::runtime::WasmRuntime>,
     path: String,
     sync_all_files: bool,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
@@ -1738,6 +1741,7 @@ pub struct OpenFilesystemStorageTask {
 
 #[expect(missing_debug_implementations)]
 pub struct OpenMemoryTask {
+    component_runtime: Arc<dyn lix::plugin::runtime::WasmRuntime>,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
     telemetry_parent: Option<SpanContext>,
     open_progress_dispatch: Option<SharedJsOpenProgressDispatch>,
@@ -1757,6 +1761,7 @@ impl Task for OpenFilesystemStorageTask {
             self.telemetry_dispatch.take(),
             self.telemetry_parent.take(),
             self.open_progress_dispatch.take(),
+            self.component_runtime.clone(),
             self.server_url.take(),
             std::mem::take(&mut self.server_headers),
             self.snapshot
@@ -1779,6 +1784,7 @@ impl Task for OpenMemoryTask {
             self.telemetry_dispatch.take(),
             self.telemetry_parent.take(),
             self.open_progress_dispatch.take(),
+            self.component_runtime.clone(),
             self.server_url.take(),
             std::mem::take(&mut self.server_headers),
             self.snapshot
@@ -1842,6 +1848,7 @@ fn open_memory_native(
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
     telemetry_parent: Option<SpanContext>,
     open_progress_dispatch: Option<SharedJsOpenProgressDispatch>,
+    component_runtime: Arc<dyn lix::plugin::runtime::WasmRuntime>,
     server_url: Option<String>,
     server_headers: Vec<(String, String)>,
     snapshot: Option<NativeSnapshotSource>,
@@ -1853,7 +1860,9 @@ fn open_memory_native(
     let (telemetry, telemetry_parent_source) = telemetry_dispatch
         .map(telemetry_sink)
         .map_or((None, None), |(sink, parent)| (Some(sink), Some(parent)));
-    let mut builder = open_lix().with_storage(Memory::new());
+    let mut builder = open_lix()
+        .with_storage(Memory::new())
+        .with_wasm_runtime(component_runtime);
     if let Some(telemetry) = telemetry {
         builder = builder.with_telemetry(telemetry);
     }
@@ -1879,6 +1888,7 @@ fn open_filesystem_storage_native(
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
     telemetry_parent: Option<SpanContext>,
     open_progress_dispatch: Option<SharedJsOpenProgressDispatch>,
+    component_runtime: Arc<dyn lix::plugin::runtime::WasmRuntime>,
     server_url: Option<String>,
     server_headers: Vec<(String, String)>,
     snapshot: Option<NativeSnapshotSource>,
@@ -1893,7 +1903,9 @@ fn open_filesystem_storage_native(
     let (telemetry, telemetry_parent_source) = telemetry_dispatch
         .map(telemetry_sink)
         .map_or((None, None), |(sink, parent)| (Some(sink), Some(parent)));
-    let mut builder = open_lix().with_storage(storage.clone());
+    let mut builder = open_lix()
+        .with_storage(storage.clone())
+        .with_wasm_runtime(component_runtime);
     if let Some(telemetry) = telemetry {
         builder = builder.with_telemetry(telemetry);
     }
@@ -2028,8 +2040,14 @@ impl NativeLix {
         server_url: Option<String>,
         server_headers: Option<Vec<Vec<String>>>,
         open_progress_dispatch: Option<Function<'_, String, ()>>,
+        component_dispatch: Option<JsDispatch<'_>>,
     ) -> Result<AsyncTask<OpenMemoryTask>> {
+        let component_runtime = component_runtime::runtime(component_runtime::platform::create(
+            component_dispatch
+                .ok_or_else(|| Error::from_reason("JavaScript component host is required"))?,
+        )?);
         Ok(AsyncTask::new(OpenMemoryTask {
+            component_runtime,
             telemetry_dispatch: optional_telemetry_dispatch(telemetry_dispatch)?,
             telemetry_parent: crate::telemetry::parse_parent_context_json(telemetry_parent_json)
                 .map_err(Error::from_reason)?,
@@ -2045,7 +2063,12 @@ impl NativeLix {
         telemetry_dispatch: Option<Function<'_, String, ()>>,
         telemetry_parent_json: Option<String>,
         open_progress_dispatch: Option<Function<'_, String, ()>>,
+        component_dispatch: Option<JsDispatch<'_>>,
     ) -> Result<NativeSnapshotRestore> {
+        let component_runtime = component_runtime::runtime(component_runtime::platform::create(
+            component_dispatch
+                .ok_or_else(|| Error::from_reason("JavaScript component host is required"))?,
+        )?);
         let telemetry_dispatch = optional_telemetry_dispatch(telemetry_dispatch)?;
         let telemetry_parent = crate::telemetry::parse_parent_context_json(telemetry_parent_json)
             .map_err(Error::from_reason)?;
@@ -2055,6 +2078,7 @@ impl NativeLix {
                 telemetry_dispatch,
                 telemetry_parent,
                 open_progress_dispatch,
+                component_runtime,
                 None,
                 Vec::new(),
                 Some(snapshot),
@@ -2071,10 +2095,16 @@ impl NativeLix {
         server_url: Option<String>,
         server_headers: Option<Vec<Vec<String>>>,
         open_progress_dispatch: Option<Function<'_, String, ()>>,
+        component_dispatch: Option<JsDispatch<'_>>,
     ) -> Result<AsyncTask<OpenFilesystemStorageTask>> {
+        let component_runtime = component_runtime::runtime(component_runtime::platform::create(
+            component_dispatch
+                .ok_or_else(|| Error::from_reason("JavaScript component host is required"))?,
+        )?);
         Ok(AsyncTask::new(OpenFilesystemStorageTask {
             path,
             sync_all_files,
+            component_runtime,
             telemetry_dispatch: optional_telemetry_dispatch(telemetry_dispatch)?,
             telemetry_parent: crate::telemetry::parse_parent_context_json(telemetry_parent_json)
                 .map_err(Error::from_reason)?,
@@ -2092,7 +2122,12 @@ impl NativeLix {
         telemetry_dispatch: Option<Function<'_, String, ()>>,
         telemetry_parent_json: Option<String>,
         open_progress_dispatch: Option<Function<'_, String, ()>>,
+        component_dispatch: Option<JsDispatch<'_>>,
     ) -> Result<NativeSnapshotRestore> {
+        let component_runtime = component_runtime::runtime(component_runtime::platform::create(
+            component_dispatch
+                .ok_or_else(|| Error::from_reason("JavaScript component host is required"))?,
+        )?);
         let telemetry_dispatch = optional_telemetry_dispatch(telemetry_dispatch)?;
         let telemetry_parent = crate::telemetry::parse_parent_context_json(telemetry_parent_json)
             .map_err(Error::from_reason)?;
@@ -2104,6 +2139,7 @@ impl NativeLix {
                 telemetry_dispatch,
                 telemetry_parent,
                 open_progress_dispatch,
+                component_runtime,
                 None,
                 Vec::new(),
                 Some(snapshot),

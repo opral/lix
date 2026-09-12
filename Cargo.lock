@@ -3401,6 +3401,7 @@ version = "0.16.1"
 dependencies = [
  "async-channel",
  "async-stream",
+ "async-trait",
  "blake3",
  "bytes",
  "chrono",

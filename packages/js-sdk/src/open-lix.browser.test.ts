@@ -5,7 +5,6 @@ registerMemoryStorageContract({
 	name: "browser WASM",
 	loadSdk: async () => await import("@lix-js/sdk"),
 	operationTimeoutMs: 30_000,
-	supportsPluginExecution: false,
 });
 
 test("exports and restores snapshot streams in browser WASM", async () => {

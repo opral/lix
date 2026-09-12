@@ -349,7 +349,7 @@ function contentSecurityPolicy(pathWithinRoot, mode) {
 	if (mode === "global" || isBrowserWorker) {
 		return (
 			"default-src 'none'; " +
-			"script-src 'self' 'wasm-unsafe-eval'; " +
+			"script-src 'self' data: 'wasm-unsafe-eval'; " +
 			"worker-src 'self'; connect-src 'self'"
 		);
 	}

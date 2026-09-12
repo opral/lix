@@ -1,3 +1,4 @@
+import { createComponentDispatch } from "./component-host/dispatch.js";
 import type {
 	LixBinding,
 	TelemetryDispatch,
@@ -19,6 +20,7 @@ export async function openMemoryWasmBinding(
 	snapshot?: ReadableStream<Uint8Array>,
 ): Promise<LixBinding> {
 	await initializeWasm();
+	const componentDispatch = createComponentDispatch();
 	if (snapshot) {
 		return restoreSnapshot(
 			snapshot,
@@ -26,6 +28,7 @@ export async function openMemoryWasmBinding(
 				telemetry,
 				telemetryParent,
 				openProgress,
+				componentDispatch,
 			) as SnapshotRestoreBinding<LixBinding>,
 		);
 	}
@@ -34,5 +37,6 @@ export async function openMemoryWasmBinding(
 		telemetryParent,
 		undefined,
 		openProgress,
+		componentDispatch,
 	) as Promise<LixBinding>;
 }

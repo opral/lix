@@ -51,14 +51,16 @@
 		"@lix-js/sdk-win32-x64": "0.16.1"
 	},
 	"devDependencies": {
-		"@vitest/browser-playwright": "4.1.10",
 		"@types/node": "^24.10.2",
+		"@vitest/browser-playwright": "4.1.10",
 		"playwright": "1.57.0",
 		"typescript": "^5.5.4",
 		"vite": "8.1.4",
 		"vitest": "4.1.10"
 	},
 	"dependencies": {
+		"@bytecodealliance/jco-transpile": "0.13.0",
+		"binaryen": "130.0.0",
 		"fflate": "^0.8.3"
 	}
 }

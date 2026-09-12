@@ -4,9 +4,13 @@
 //! configuration remains under [`crate::wasm`], while format-neutral plugin
 //! encodings live under [`crate::plugin::wire`].
 
+#[macro_use]
+mod component_shared;
+
 #[cfg(feature = "default_wasm_runtime")]
 pub(crate) mod default;
 
+pub mod component_host;
 mod api;
 mod contract;
 

@@ -1,3 +1,4 @@
+import { createComponentDispatch } from "./component-host/dispatch.js";
 import { withConversionProvider } from "./conversion-provider.js";
 import type {
 	LixStorageConfig,
@@ -35,6 +36,7 @@ export async function openLixBinding(
 	snapshot?: ReadableStream<Uint8Array>,
 ): Promise<LixBinding> {
 	await initializeWasm();
+	const componentDispatch = createComponentDispatch();
 	switch (storage.kind) {
 		case "memory":
 			return (
@@ -45,9 +47,16 @@ export async function openLixBinding(
 								telemetry,
 								telemetryParent,
 								openProgress,
+								componentDispatch,
 							) as SnapshotRestoreBinding<LixBinding>,
 						)
-					: openMemory(telemetry, telemetryParent, server, openProgress)
+					: openMemory(
+						telemetry,
+						telemetryParent,
+						server,
+						openProgress,
+						componentDispatch,
+					)
 			) as Promise<LixBinding>;
 		case "jsStorage": {
 			const module = (await import(
@@ -68,6 +77,7 @@ export async function openLixBinding(
 								telemetry,
 								telemetryParent,
 								openProgress,
+								componentDispatch,
 							) as SnapshotRestoreBinding<LixBinding>,
 						)
 					: openJsStorage(
@@ -76,6 +86,7 @@ export async function openLixBinding(
 							telemetryParent,
 							server,
 							openProgress,
+							componentDispatch,
 						))) as unknown as LixBinding;
 				return binding;
 			} catch (error) {

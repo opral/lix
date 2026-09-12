@@ -23,6 +23,7 @@ use wasmtime_wasi::{
     ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView, p2::add_to_linker_sync,
 };
 
+mod component_backend;
 mod component_runtime;
 
 const COMPILED_COMPONENT_CACHE_CAPACITY: usize = 16;
@@ -396,7 +397,7 @@ impl WasmRuntime for WasmtimePluginRuntime {
         limits: WasmLimits,
         capabilities: lix::plugin::runtime::PluginCapabilities,
     ) -> Result<Arc<dyn lix::plugin::runtime::WasmComponentFactory>, LixError> {
-        component_runtime::compile_component(self, bytes, limits, capabilities).await
+        component_backend::compile_component(self, bytes, limits, capabilities).await
     }
 }
 
