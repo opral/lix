@@ -317,3 +317,8 @@ impl ColumnMergerGuest {
 pub(super) fn store_is_retired(_store: &HostStore) -> bool {
     false
 }
+
+// The Wasmtime linker requires these aggregate marker traits in addition to
+// the resource implementations provided by the shared host.
+impl bindings::lix::plugin::host::Host for HostState {}
+impl bindings::lix::plugin::types::Host for HostState {}

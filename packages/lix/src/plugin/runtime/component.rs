@@ -100,6 +100,17 @@ impl PluginRuntimeHost {
         })
     }
 
+    /// Separate engines have independent session/observation identities. Retain
+    /// their configured runtime and budgets without sharing actor state.
+    pub(crate) fn fork_for_storage_session(&self) -> Self {
+        Self::new_with_limits(
+            self.wasm_runtime.clone(),
+            self.plugin_wasm_limits.max_memory_bytes,
+            self.plugin_actor_cache.capacity(),
+        )
+        .expect("existing plugin resource limits are valid")
+    }
+
     pub(crate) async fn acquire_plugin_generation_read(
         &self,
     ) -> tokio::sync::OwnedRwLockReadGuard<()> {

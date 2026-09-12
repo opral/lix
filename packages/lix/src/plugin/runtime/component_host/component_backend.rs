@@ -319,12 +319,10 @@ pub(super) mod bindings {
                         resource: Resource<ResolutionSinkResource>,
                     ) -> RuntimeResult<()>;
                 }
-                pub trait Host {}
             }
             pub mod types {
                 use super::super::super::super::*;
                 use super::host::FileEdit;
-                pub trait Host {}
                 pub type PluginError = LixError;
                 #[derive(Serialize)]
                 pub struct CreateContext {

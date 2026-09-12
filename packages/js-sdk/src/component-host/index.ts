@@ -74,6 +74,7 @@ export async function compileComponent(
     async instantiate(imports) {
       const memories: WebAssembly.Memory[] = [];
       let tableCount = 0;
+      let instanceCount = 0;
       let deadline = performance.now() + Number(limits.timeoutMs ?? 5000);
       const exports = await binding.instantiate(
         (name: string) => {
@@ -83,6 +84,10 @@ export async function compileComponent(
         },
         imports,
         (module: WebAssembly.Module, coreImports: WebAssembly.Imports) => {
+          // Match Wasmtime's StoreLimitsBuilder::instances limit, including
+          // memoryless/tableless modules and repeated instances of one module.
+          if (++instanceCount > 64)
+            throw new Error("Component core instance count exceeds limit");
           if (
             memories.length &&
             WebAssembly.Module.exports(module).some(

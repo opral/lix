@@ -1805,9 +1805,6 @@ impl bindings::lix::plugin::host::HostColumnMergeSink for HostState {
     }
 }
 
-impl bindings::lix::plugin::host::Host for HostState {}
-impl bindings::lix::plugin::types::Host for HostState {}
-
 pub(super) fn host_table_error(
     error: ResourceTableError,
 ) -> bindings::lix::plugin::host::HostError {

@@ -40,7 +40,6 @@ pub trait ComponentCompiler: Send + Sync {
     /// Validate and compile the component, including its imports and declared
     /// capabilities. Implementations must enforce memory limits during
     /// instantiation and reject any unsupported execution limit.
-
     async fn compile(
         &self,
         bytes: Vec<u8>,
@@ -267,7 +266,7 @@ mod tests {
         let mut actor = factory.instantiate_actor().await.unwrap();
         let mut pending = Box::pin(actor.open_file(WasmTransitionLimits::default(), input()));
         assert!(
-            std::future::Future::poll(
+            Future::poll(
                 pending.as_mut(),
                 &mut std::task::Context::from_waker(std::task::Waker::noop())
             )

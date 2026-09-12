@@ -99,7 +99,7 @@ where
     }
     let (mut engine, initial_session) =
         Engine::new_partial_replica(admitted.adapter, options, &expected).await?;
-    engine.inherit_storage_runtime(&source.engine);
+    engine.inherit_partial_storage_runtime(&source.engine);
     engine.inherit_sync_mode(source.engine.sync_mode());
     crate::sync::admit_partial_storage_session(&engine, &expected)?;
     let session = engine
