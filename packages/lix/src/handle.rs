@@ -1560,29 +1560,35 @@ where
         active_branch_id: impl Into<String>,
         active_account_id: impl Into<String>,
     ) -> Result<Self, LixError> {
-        if self.session.is_closed() {
-            return Err(LixError::new(
-                LixError::CODE_CLOSED,
-                "cannot open a session from a closed Lix handle",
-            ));
-        }
         let active_branch_id = active_branch_id.into();
-        if self
-            .engine
-            .load_branch_head_commit_id(&active_branch_id)
-            .await?
-            .is_none()
-        {
-            return Err(LixError::branch_not_found(
-                active_branch_id,
-                "open_another_session",
-                "target",
-            ));
-        }
-        let session = self
-            .engine
-            .open_session_at_with_account(active_branch_id, active_account_id)
-            .await?;
+        let active_account_id = active_account_id.into();
+        // Admission reads can expire while another session or background sync
+        // commits. Restart only this read/validation unit; the child handle and
+        // sync lease are published once, after it succeeds.
+        let session = retry_expired_read(|| async {
+            if self.session.is_closed() {
+                return Err(LixError::new(
+                    LixError::CODE_CLOSED,
+                    "cannot open a session from a closed Lix handle",
+                ));
+            }
+            if self
+                .engine
+                .load_branch_head_commit_id(&active_branch_id)
+                .await?
+                .is_none()
+            {
+                return Err(LixError::branch_not_found(
+                    active_branch_id.clone(),
+                    "open_another_session",
+                    "target",
+                ));
+            }
+            self.engine
+                .open_session_at_with_account(active_branch_id.clone(), active_account_id.clone())
+                .await
+        })
+        .await?;
         Ok(Self {
             engine: self.engine.clone(),
             session: Arc::new(session),
@@ -3896,3 +3902,7 @@ where
 {
     partial::retry_partial_migration_cleanup(storage, server).await
 }
+
+#[cfg(test)]
+#[path = "handle/session_open_retry_tests.rs"]
+mod session_open_retry_tests;

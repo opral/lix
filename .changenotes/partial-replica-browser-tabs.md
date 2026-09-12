@@ -20,3 +20,5 @@ error reported after execution or commit cannot replay the operation.
 
 Read-interest journal flushing retries expired snapshots internally, so concurrent
 tab startup can complete without replaying the SQL that registered its inputs.
+
+Opening an additional session retries transient read invalidation during branch and admission validation, so another tab or background synchronization can commit while the session opens. Real admission and storage errors still propagate.
