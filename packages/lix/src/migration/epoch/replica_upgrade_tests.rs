@@ -15,6 +15,10 @@ struct Authority {
 
 impl Authority {
     async fn new() -> Self {
+        Self::new_with_browser_files(false).await
+    }
+
+    async fn new_with_browser_files(include_files: bool) -> Self {
         let storage = crate::Memory::new();
         let lix = crate::open_lix()
             .with_storage(storage.clone())
@@ -26,6 +30,36 @@ impl Authority {
         )
         .await
         .unwrap();
+        if include_files {
+            let schema = serde_json::json!({
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "legacy_custom_note",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "value", "type": "text", "nullable": false }
+                ],
+                "primary_key": ["id"]
+            });
+            lix.execute(
+                "INSERT INTO lix_registered_schema(value) VALUES(CAST($1 AS JSONB))",
+                &[crate::Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+            lix.execute(
+                "INSERT INTO legacy_custom_note(id,value) VALUES('legacy','custom-preserved')",
+                &[],
+            )
+            .await
+            .unwrap();
+            lix.upsert_file_content("/legacy-small.bin", vec![1, 2, 3])
+                .await
+                .unwrap();
+            let large: Vec<u8> = (0..300 * 1024).map(|index| (index % 251) as u8).collect();
+            lix.upsert_file_content("/legacy-large.bin", large)
+                .await
+                .unwrap();
+        }
         lix.close().await.unwrap();
         let protocol = crate::open_lix()
             .with_storage(storage)
@@ -34,6 +68,7 @@ impl Authority {
             .await
             .unwrap();
         let id = protocol.lix_id().to_owned();
+        let protocol = Arc::new(protocol);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/lix/{id}", listener.local_addr().unwrap());
@@ -43,24 +78,33 @@ impl Authority {
         let failing = fail_snapshot.clone();
         let runtime = tokio::runtime::Handle::current();
         let worker = std::thread::spawn(move || {
+            let mut connections = Vec::new();
             while !stopped.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        if let Err(error) = serve_request(stream, &protocol, &runtime, &failing) {
-                            // Background sync can cancel a connection while the
-                            // fixture reads a request or writes its response.
-                            // Malformed complete requests and other I/O errors
-                            // remain test failures.
-                            if !matches!(
-                                error.kind(),
-                                std::io::ErrorKind::UnexpectedEof
-                                    | std::io::ErrorKind::ConnectionReset
-                                    | std::io::ErrorKind::ConnectionAborted
-                                    | std::io::ErrorKind::BrokenPipe
-                            ) {
-                                panic!("test HTTP request: {error}");
+                        // A partial update may wait for an authority change. It must
+                        // not block concurrent immutable-object hydration requests.
+                        let protocol = protocol.clone();
+                        let runtime = runtime.clone();
+                        let failing = failing.clone();
+                        connections.push(std::thread::spawn(move || {
+                            if let Err(error) = serve_request(stream, &protocol, &runtime, &failing)
+                            {
+                                // Background sync can cancel a connection while the
+                                // fixture reads a request or writes its response.
+                                // Malformed complete requests and other I/O errors
+                                // remain test failures.
+                                if !matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::UnexpectedEof
+                                        | std::io::ErrorKind::ConnectionReset
+                                        | std::io::ErrorKind::ConnectionAborted
+                                        | std::io::ErrorKind::BrokenPipe
+                                ) {
+                                    panic!("test HTTP request: {error}");
+                                }
                             }
-                        }
+                        }));
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(2));
@@ -68,7 +112,12 @@ impl Authority {
                     Err(error) => panic!("test listener: {error}"),
                 }
             }
+            // Closing the protocol releases outstanding update waits before
+            // shutdown joins the connection handlers.
             runtime.block_on(protocol.close()).unwrap();
+            for connection in connections {
+                connection.join().unwrap();
+            }
         });
         Self {
             url,
@@ -566,15 +615,15 @@ async fn recovery_hydrates_sparse_global_history_without_inheriting_caller_rows(
         old_replica_with_recovery_data(&authority, EpochBank::A, false, true, memory.clone()).await;
     drop(old_session);
     let storage = crate::sync::durable_memory_for_test(memory);
-    // Public conversion performs the explicit format migration, then refuses
-    // to discard the retained pre-native edits. Normal opening never rebuilds.
-    let error = crate::convert_replica_to_partial(storage.clone(), authority.options(), None)
+    // This test exercises the explicit full-layout recovery writer. Admit that
+    // layout directly; partial conversion separately preserves the archive.
+    let owned = crate::storage_adapter::StorageSession::acquire(storage.clone())
         .await
-        .unwrap_err();
-    assert_eq!(
-        error.code,
-        "LIX_PARTIAL_REPLICA_CONVERSION_RECOVERY_REQUIRED"
-    );
+        .unwrap();
+    admit_repository_with_server(&owned, None, Some(&authority.options()))
+        .await
+        .unwrap();
+    drop(owned);
     let lix = crate::open_lix().with_storage(storage).await.unwrap();
     // Fixture-only authoring admission creates unrelated caller state. The
     // recovery API independently authenticates its isolated writer context.
@@ -742,4 +791,240 @@ async fn explicit_conversion_does_not_initialize_missing_storage() {
         .unwrap();
     let status = crate::migration::inspect_lix(&inspected).await.unwrap();
     assert!(matches!(status, crate::migration::MigrationStatus::Missing));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_child_admission_can_overlap_same_engine_commits() {
+    let lix = crate::open_lix().await.unwrap();
+    let (writes, opens) = tokio::join!(
+        async {
+            for i in 0..12 {
+                lix.execute(
+                    &format!(
+                        "INSERT INTO lix_key_value (key, value) VALUES ('admission-{i}', '{i}')"
+                    ),
+                    &[],
+                )
+                .await?;
+            }
+            Ok::<_, LixError>(())
+        },
+        async {
+            for _ in 0..12 {
+                let child = lix.open_another_session().await?;
+                child.close().await?;
+            }
+            Ok::<_, LixError>(())
+        }
+    );
+    writes.unwrap();
+    opens.unwrap();
+    let result = lix
+        .execute(
+            "SELECT key FROM lix_key_value WHERE key LIKE 'admission-%'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.rows().len(), 12);
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn engine_admission_restarts_expired_read_without_reinitializing() {
+    let backing = crate::migration::CommitExpiringStorage::from_memory(crate::Memory::new());
+    let adapter = StorageAdapter::new(backing.clone());
+    let initialized =
+        crate::init::initialize(adapter, &crate::tracked_state::TrackedStateContext::new())
+            .await
+            .unwrap();
+    backing.expire_after_point_read(
+        crate::init::REPOSITORY_PROTOCOL_SPACE,
+        Key(Bytes::from_static(crate::init::REPOSITORY_PROTOCOL_KEY)),
+    );
+    let engine = Engine::new(backing).await.unwrap();
+    assert_eq!(engine.lix_id(), initialized.lix_id);
+    let session = engine.open_session().await.unwrap();
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn initialization_seed_planning_survives_physical_read_expiration() {
+    let backing = crate::migration::CommitExpiringStorage::from_memory(crate::Memory::new());
+    backing.expire_after_point_read(
+        crate::init::REPOSITORY_PROTOCOL_SPACE,
+        Key(Bytes::from_static(crate::init::REPOSITORY_PROTOCOL_KEY)),
+    );
+    let adapter = StorageAdapter::new(backing.clone());
+    crate::init::initialize(adapter, &crate::tracked_state::TrackedStateContext::new())
+        .await
+        .unwrap();
+    assert!(backing.point_expiration_was_observed());
+    let lix = crate::open_lix().with_storage(backing).await.unwrap();
+    lix.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_full_sync_bootstrap_survives_read_expiry_during_candidate_install() {
+    let authority = Authority::new().await;
+    let memory = crate::Memory::new();
+    let source =
+        old_replica_with_recovery_data(&authority, EpochBank::Legacy, false, false, memory.clone())
+            .await;
+    drop(source);
+    let backing = crate::migration::CommitExpiringStorage::from_memory(memory);
+    backing.expire_after_point_read(
+        replica_generation_bank(1)
+            .unwrap()
+            .map_space(crate::sync::SYNC_REPLICA_STATE_SPACE),
+        crate::sync::replica_state_key(),
+    );
+    let storage = crate::storage_adapter::StorageSession::acquire(backing.clone())
+        .await
+        .unwrap();
+    let admitted = admit_repository_with_server(&storage, None, Some(&authority.options()))
+        .await
+        .unwrap();
+    assert!(
+        backing.point_expiration_was_observed(),
+        "must exercise candidate snapshot installation"
+    );
+    assert_eq!(admitted.report.migration.unwrap().from_format, 77);
+    let lix = crate::open_lix().with_storage(storage).await.unwrap();
+    let rows = lix
+        .execute(
+            "SELECT value FROM lix_key_value WHERE key = 'upgrade-test'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.rows()[0].get::<serde_json::Value>("value").unwrap(),
+        "preserved"
+    );
+    assert_eq!(lix.replica_recovery_sources().await.unwrap().len(), 1);
+    lix.close().await.unwrap();
+}
+
+mod browser_fixture;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_dirty_archive_survives_partial_conversion_and_remains_exportable() {
+    let authority = Authority::new().await;
+    let memory = crate::Memory::new();
+    let source =
+        old_replica_with_recovery_data(&authority, EpochBank::Legacy, true, true, memory.clone())
+            .await;
+    drop(source);
+    let storage = crate::sync::durable_memory_for_test(memory);
+    let owned = crate::storage_adapter::StorageSession::acquire(storage.clone())
+        .await
+        .unwrap();
+    admit_repository_with_server(&owned, None, Some(&authority.options()))
+        .await
+        .unwrap();
+    let full = crate::open_lix().with_storage(owned).await.unwrap();
+    let sources = full.replica_recovery_sources().await.unwrap();
+    assert_eq!(sources.len(), 1);
+    assert!(sources[0].recovery_required);
+    let id = sources[0].id.clone();
+    let before = full.export_replica_recovery(&id).await.unwrap();
+    assert!(
+        before
+            .branches
+            .iter()
+            .flat_map(|branch| &branch.rows)
+            .any(|row| row.untracked)
+    );
+    assert!(
+        before
+            .branches
+            .iter()
+            .flat_map(|branch| &branch.rows)
+            .any(|row| {
+                row.snapshot.as_ref().is_some_and(|value| {
+                    value.get("key").and_then(serde_json::Value::as_str) == Some("offline-recovery")
+                })
+            })
+    );
+    full.close().await.unwrap();
+    drop(full);
+    crate::convert_replica_to_partial(storage.clone(), authority.options(), None)
+        .await
+        .unwrap();
+    let partial = crate::open_lix()
+        .with_storage(storage)
+        .with_server(authority.options())
+        .await
+        .unwrap();
+    let sources = partial.replica_recovery_sources().await.unwrap();
+    assert!(
+        sources
+            .iter()
+            .any(|source| source.id == id && source.recovery_required)
+    );
+    let after = partial.export_replica_recovery(&id).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&after).unwrap(),
+        serde_json::to_value(&before).unwrap()
+    );
+    // Excluding background collaboration writes makes the revision assertion a
+    // proof that rejected restoration cannot leave pending GLOBAL publication.
+    let writes = partial.lock_collaboration_writes().await;
+    let adapter = partial.storage_adapter();
+    let branches = vec![
+        partial.active_branch_id().await.unwrap(),
+        crate::GLOBAL_BRANCH_ID.to_owned(),
+    ];
+    let read = adapter.begin_read(ReadOptions::default()).await.unwrap();
+    let revision_before = crate::storage_adapter::load_repository_mutation_revision(&read)
+        .await
+        .unwrap();
+    let heads_before = crate::branch::BranchHeadControlContext::new()
+        .reader(&read)
+        .load_many(&branches)
+        .await
+        .unwrap();
+    drop(read);
+    let error = partial.recover_replica(&id).await.unwrap_err();
+    assert_eq!(error.code, "LIX_PARTIAL_RECOVERY_REQUIRES_EXPORT");
+    let read = adapter.begin_read(ReadOptions::default()).await.unwrap();
+    assert_eq!(
+        crate::storage_adapter::load_repository_mutation_revision(&read)
+            .await
+            .unwrap(),
+        revision_before
+    );
+    let heads_after = crate::branch::BranchHeadControlContext::new()
+        .reader(&read)
+        .load_many(&branches)
+        .await
+        .unwrap();
+    assert_eq!(heads_after, heads_before);
+    drop(read);
+    drop(writes);
+    partial
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('after-rejected-recovery', 'usable')",
+            &[],
+        )
+        .await
+        .unwrap();
+    let rows = partial
+        .execute(
+            "SELECT value FROM lix_key_value WHERE key = 'after-rejected-recovery'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.rows()[0].get::<serde_json::Value>("value").unwrap(),
+        "usable"
+    );
+    let after_recovery = partial.export_replica_recovery(&id).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&after_recovery).unwrap(),
+        serde_json::to_value(&before).unwrap()
+    );
+    partial.close().await.unwrap();
 }

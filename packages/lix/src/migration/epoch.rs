@@ -1195,12 +1195,14 @@ where
     clear_bank(target).await?;
     let _ = copy_repository(source, target).await?;
     super::incorporation::migrate(target, super::MigrationOptions::automatic(), true).await?;
-    let read = target.begin_read(ReadOptions::default()).await?;
-    let state = crate::sync::load_partial_replica_state(&read)
-        .await?
-        .ok_or_else(|| epoch_error("partial migration lost its admission"))?
-        .0;
-    drop(read);
+    let state = crate::handle::retry_expired_read(|| async {
+        let read = target.begin_read(ReadOptions::default()).await?;
+        Ok(crate::sync::load_partial_replica_state(&read)
+            .await?
+            .ok_or_else(|| epoch_error("partial migration lost its admission"))?
+            .0)
+    })
+    .await?;
     let (engine, session) =
         Engine::new_partial_replica(target.clone(), EngineOptions::new(), &state).await?;
     drop(session);
@@ -2527,6 +2529,7 @@ pub(super) mod tests {
         generation: Arc<AtomicU64>,
         expire_next_page: Arc<AtomicBool>,
         expire_after_claim: Arc<AtomicBool>,
+        expire_after_point: Arc<std::sync::Mutex<Option<(StorageSpace, Key)>>>,
     }
 
     impl CommitExpiringStorage {
@@ -2539,6 +2542,7 @@ pub(super) mod tests {
                 generation: Arc::new(AtomicU64::new(0)),
                 expire_next_page: Arc::new(AtomicBool::new(false)),
                 expire_after_claim: Arc::new(AtomicBool::new(false)),
+                expire_after_point: Arc::default(),
             }
         }
 
@@ -2549,6 +2553,14 @@ pub(super) mod tests {
         pub(crate) fn expire_next_page(&self) {
             self.expire_next_page.store(true, Ordering::Release);
         }
+
+        pub(crate) fn expire_after_point_read(&self, space: StorageSpace, key: Key) {
+            *self.expire_after_point.lock().unwrap() = Some((space, key));
+        }
+
+        pub(crate) fn point_expiration_was_observed(&self) -> bool {
+            self.expire_after_point.lock().unwrap().is_none()
+        }
     }
 
     pub(crate) struct CommitExpiringRead {
@@ -2556,6 +2568,7 @@ pub(super) mod tests {
         generation: Arc<AtomicU64>,
         observed_generation: u64,
         expire_next_page: Arc<AtomicBool>,
+        expire_after_point: Arc<std::sync::Mutex<Option<(StorageSpace, Key)>>>,
     }
 
     impl CommitExpiringRead {
@@ -2604,7 +2617,18 @@ pub(super) mod tests {
             requests: &[GetManyRequest<'_>],
         ) -> Result<GetManyResult, StorageError> {
             self.validate()?;
-            self.inner.get_many(requests).await
+            let result = self.inner.get_many(requests).await?;
+            let mut expiration = self.expire_after_point.lock().unwrap();
+            if expiration.as_ref().is_some_and(|(space, key)| {
+                requests
+                    .iter()
+                    .any(|request| request.space == *space && request.keys.contains(key))
+            }) {
+                *expiration = None;
+                // Model a heartbeat committing after this bounded read unit.
+                self.generation.fetch_add(1, Ordering::AcqRel);
+            }
+            Ok(result)
         }
 
         async fn begin_scan(
@@ -2712,6 +2736,7 @@ pub(super) mod tests {
                 generation: Arc::clone(&self.generation),
                 observed_generation: self.generation.load(Ordering::Acquire),
                 expire_next_page: Arc::clone(&self.expire_next_page),
+                expire_after_point: Arc::clone(&self.expire_after_point),
             })
         }
 

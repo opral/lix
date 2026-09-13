@@ -39,8 +39,11 @@ async fn marker(read: &(impl StorageAdapterRead + ?Sized)) -> Result<bytes::Byte
 pub(super) async fn is_legacy_partial<S: Storage>(
     adapter: &StorageAdapter<S>,
 ) -> Result<bool, LixError> {
-    let read = adapter.begin_read(Default::default()).await?;
-    Ok(marker(&read).await?.as_ref() == crate::init::PARTIAL_REPOSITORY_PROTOCOL_V79)
+    crate::handle::retry_expired_read(|| async {
+        let read = adapter.begin_read(Default::default()).await?;
+        Ok(marker(&read).await?.as_ref() == crate::init::PARTIAL_REPOSITORY_PROTOCOL_V79)
+    })
+    .await
 }
 
 pub(super) async fn migrate<S>(

@@ -90,15 +90,10 @@ where
         ));
     }
     let admitted = admit_repository_with_server(storage, progress, Some(server)).await?;
-    if list_retained_replica_sources(storage)
-        .await?
-        .iter()
-        .any(|source| source.recovery_required)
-    {
-        return Err(conversion_required(
-            "retained local edits must be recovered before converting to a partial replica",
-        ));
-    }
+    // Retained prior replicas are independent archives, not pending writes in
+    // this active full bank. Conversion uses a fresh epoch and keeps every
+    // archive available for listing/export after partial admission. The clean
+    // proof below still rejects unacknowledged edits in the active source.
     let read = admitted.adapter.begin_read(ReadOptions::default()).await?;
     if !matches!(
         super::super::inspect_lix_with_adapter(&admitted.adapter).await?,

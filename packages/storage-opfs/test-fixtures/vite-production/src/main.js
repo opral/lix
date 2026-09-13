@@ -31,34 +31,44 @@ globalThis.__storageOpfsFinishOfflineSession = finishOfflineSession;
 globalThis.__storageOpfsStartCrashWrite = startCrashWrite;
 
 async function run() {
-	const [first, second] = await Promise.all([
-		openLix({ storage: new OpfsStorage({ name: storageName }) }),
-		openLix({ storage: new OpfsStorage({ name: storageName }) }),
-	]);
-	await first.execute(
-		"INSERT INTO lix_key_value (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-		["packed-vite", "persistent-production"],
-	);
-	const shared = await second.execute(
-		"SELECT value FROM lix_key_value WHERE key = $1",
-		["packed-vite"],
-	);
-	if (shared.rows[0]?.value !== "persistent-production") {
-		throw new Error("second Lix worker did not observe the owner commit");
-	}
-	await Promise.all([first.close(), second.close()]);
-
-	const reopened = await openLix({
-		storage: new OpfsStorage({ name: storageName }),
-	});
+	let phase = "concurrent initial opens";
 	try {
-		const persisted = await reopened.execute(
-			"SELECT value FROM lix_key_value WHERE key = $1",
-			["packed-vite"],
+		const [first, second] = await Promise.all([
+			openLix({ storage: new OpfsStorage({ name: storageName }) }),
+			openLix({ storage: new OpfsStorage({ name: storageName }) }),
+		]);
+		phase = "first write";
+		await first.execute(
+			"INSERT INTO lix_key_value (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+			["packed-vite", "persistent-production"],
 		);
-		return { message: persisted.rows[0]?.value };
-	} finally {
-		await reopened.close();
+		phase = "second session read";
+		const shared = await second.execute("SELECT value FROM lix_key_value WHERE key = $1", [
+			"packed-vite",
+		]);
+		if (shared.rows[0]?.value !== "persistent-production") {
+			throw new Error("second Lix worker did not observe the owner commit");
+		}
+		phase = "close initial sessions";
+		await Promise.all([first.close(), second.close()]);
+
+		phase = "reopen";
+		const reopened = await openLix({
+			storage: new OpfsStorage({ name: storageName }),
+		});
+		try {
+			phase = "reopened read";
+			const persisted = await reopened.execute("SELECT value FROM lix_key_value WHERE key = $1", [
+				"packed-vite",
+			]);
+			return { message: persisted.rows[0]?.value };
+		} finally {
+			await reopened.close();
+		}
+	} catch (error) {
+		throw new Error(`production smoke ${phase}: ${error.message}`, {
+			cause: error,
+		});
 	}
 }
 

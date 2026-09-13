@@ -2405,7 +2405,14 @@ where
             .await
             {
                 Ok(_) => true,
-                Err(error) if error.code == "LIX_ERROR_ALREADY_INITIALIZED" => false,
+                // Another opener can publish the seed after our empty-state
+                // check. Admit that winner below; never replay initialization.
+                Err(error)
+                    if error.code == "LIX_ERROR_ALREADY_INITIALIZED"
+                        || error.code == LixError::CODE_TRANSACTION_CONFLICT =>
+                {
+                    false
+                }
                 Err(error) => return Err(error),
             };
             new_engine(adapter, wasm_runtime, telemetry, plugin_resource_limits)
@@ -2416,7 +2423,7 @@ where
     }
 }
 
-async fn retry_expired_read<T, Operation, OperationFuture>(
+pub(crate) async fn retry_expired_read<T, Operation, OperationFuture>(
     mut operation: Operation,
 ) -> Result<T, LixError>
 where
