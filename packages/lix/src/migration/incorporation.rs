@@ -51,7 +51,7 @@ pub(super) async fn migrate<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let read = super::FrozenMigrationRead::new(adapter).await?;
+    let read = super::MigrationPlanningRead::new(adapter).await?;
     let (expected, target) = if partial {
         (
             crate::init::PARTIAL_REPOSITORY_PROTOCOL_V79,

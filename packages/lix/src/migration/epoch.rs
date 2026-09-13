@@ -1,5 +1,5 @@
-mod frozen_read;
-pub(crate) use frozen_read::FrozenMigrationRead;
+mod planning_read;
+pub(crate) use planning_read::MigrationPlanningRead;
 mod pending_conversion;
 mod pending_conversion_journal;
 pub(crate) use pending_conversion_journal::{
@@ -1452,7 +1452,7 @@ where
     // The exact migration claim already fences ordinary writers. Identify the
     // source and classify recovery work before rebuilding; local-only work is
     // retained independently and must not block opening server state.
-    let read = FrozenMigrationRead::new(source).await?;
+    let read = MigrationPlanningRead::new(source).await?;
     let Some(proof) = crate::sync::inspect_replica_rebuild_source(&read, source_format).await?
     else {
         return Ok(None);
@@ -2506,7 +2506,7 @@ fn is_admission_race(error: &StorageError) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::storage_adapter::StorageWriteOptions;
     use std::future::Future;
@@ -2522,7 +2522,7 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
-    pub(super) struct CommitExpiringStorage {
+    pub(crate) struct CommitExpiringStorage {
         inner: crate::Memory,
         generation: Arc<AtomicU64>,
         expire_next_page: Arc<AtomicBool>,
@@ -2530,9 +2530,12 @@ mod tests {
     }
 
     impl CommitExpiringStorage {
-        pub(super) fn new() -> Self {
+        pub(crate) fn new() -> Self {
+            Self::from_memory(crate::Memory::new())
+        }
+        pub(crate) fn from_memory(inner: crate::Memory) -> Self {
             Self {
-                inner: crate::Memory::new(),
+                inner,
                 generation: Arc::new(AtomicU64::new(0)),
                 expire_next_page: Arc::new(AtomicBool::new(false)),
                 expire_after_claim: Arc::new(AtomicBool::new(false)),
@@ -2543,12 +2546,12 @@ mod tests {
             self.expire_after_claim.store(true, Ordering::Release);
         }
 
-        pub(super) fn expire_next_page(&self) {
+        pub(crate) fn expire_next_page(&self) {
             self.expire_next_page.store(true, Ordering::Release);
         }
     }
 
-    pub(super) struct CommitExpiringRead {
+    pub(crate) struct CommitExpiringRead {
         inner: MemoryRead,
         generation: Arc<AtomicU64>,
         observed_generation: u64,
@@ -2626,7 +2629,7 @@ mod tests {
         }
     }
 
-    pub(super) struct CommitExpiringWrite {
+    pub(crate) struct CommitExpiringWrite {
         inner: MemoryWrite,
         generation: Arc<AtomicU64>,
         expire_next_page: Arc<AtomicBool>,

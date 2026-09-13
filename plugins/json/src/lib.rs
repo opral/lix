@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 mod core;
+mod numeric_semantics;
 
 use core::{
     ARRAY_ITEM_SCHEMA_KEY, ArenaJsonRelation, ArenaJsonScalar, ChangeEffect, Document, FileEdit,
@@ -15,13 +16,16 @@ struct JsonPlugin;
 
 const SCALAR_INDEX_STATE: &[u8] = b"json/scalar-index";
 const SCALAR_SHIFTS_STATE: &[u8] = b"json/scalar-shifts";
+const SCALAR_SHIFT_PAGE_PREFIX: &[u8] = b"json/scalar-shift-page/";
 const NODE_IDENTITIES_STATE: &[u8] = b"json/node-identities";
 const ID_NAMESPACE_STATE: &[u8] = b"json/id-namespace";
-const SCALAR_INDEX_MAGIC: &[u8; 4] = b"JSS3";
+const SCALAR_INDEX_MAGIC: &[u8; 4] = b"JSS4";
 const SCALAR_INDEX_HEADER_BYTES: u32 = 16;
 const SCALAR_INDEX_ENTRY_BYTES: u32 = 20;
-const SCALAR_PAGE_BYTES: usize = 1024 * 1024;
-const STATE_PAGE_BYTES: usize = 1024 * 1024;
+// State-operation limits include the key as well as its value. Reserve more
+// than the longest fixed page key so full pages fit the 1 MiB host batch.
+const STATE_PAGE_BYTES: usize = 1024 * 1024 - 64;
+const SCALAR_PAGE_BYTES: usize = STATE_PAGE_BYTES;
 const ROOT_SCHEMA_JSON: &str = include_str!("../schema/json_root.json");
 const OBJECT_MEMBER_SCHEMA_JSON: &str = include_str!("../schema/json_object_member.json");
 const ARRAY_ITEM_SCHEMA_JSON: &str = include_str!("../schema/json_array_item.json");
@@ -93,7 +97,6 @@ impl sdk::FileProjection for JsonPlugin {
         mut update: sdk::SerializeChangesInput<'_>,
         sink: &mut sdk::FileEditOutput<'_, '_>,
     ) -> sdk::Result<()> {
-        let before = update.before.read_all()?;
         let mut changes = Vec::new();
         while let Some(change) = update.typed_row_changes.next()? {
             changes.push(RowChange {
@@ -106,22 +109,22 @@ impl sdk::FileProjection for JsonPlugin {
                 },
             });
         }
+        if changes.is_empty() {
+            return Ok(());
+        }
         if let Some((edits, shifts)) = sparse_semantic_changes(&update.before, &changes)? {
             for edit in edits {
                 sink.replace(edit.offset, edit.delete_len, &edit.insert)?;
             }
-            if shifts.is_empty() {
-                if update.before.state_len(SCALAR_SHIFTS_STATE)?.is_some() {
-                    sink.delete_state(SCALAR_SHIFTS_STATE)?;
-                }
-            } else {
-                sink.put_state(SCALAR_SHIFTS_STATE, &encode_scalar_shifts(&shifts))?;
-            }
+            store_scalar_shifts(sink, &encode_scalar_shifts(&shifts))?;
             return Ok(());
         }
         let namespace = read_namespace(&update.before, ID_NAMESPACE_STATE)?
             .or_else(|| namespace_from_changes(&changes))
             .unwrap_or_else(|| IdNamespace::from_halves(0, 0));
+        #[cfg(test)]
+        perf_qa_tests::record_read(0);
+        let before = update.before.read_all()?;
         let document = open_cached_document(&update.before, before, namespace)?;
         let (successor, edits) = document
             .rows_changed(&changes)
@@ -193,13 +196,7 @@ impl sdk::FileProjection for JsonPlugin {
             && let Some(edit) = update.file_edits.iter().next()
             && let Some((change, shifts)) = sparse_scalar_change(&update, edit, &inserts[0])?
         {
-            if shifts.is_empty() {
-                if update.before.state_len(SCALAR_SHIFTS_STATE)?.is_some() {
-                    sink.delete_state(SCALAR_SHIFTS_STATE)?;
-                }
-            } else {
-                sink.put_state(SCALAR_SHIFTS_STATE, &shifts)?;
-            }
+            store_scalar_shifts(sink, &shifts)?;
             emit_changes([Ok(change)], update.creates, sink)?;
             return Ok(());
         }
@@ -356,12 +353,17 @@ fn store_scalar_state(successor: &mut impl StateOutput, document: &Document) -> 
             .map_err(sdk::Error::invalid_input)?,
     )?;
     successor.delete_state_prefix(b"json/scalar-index-page/")?;
+    successor.delete_state_prefix(b"json/scalar-identity-page/")?;
     successor.delete_state_prefix(b"json/scalar-page/")?;
     successor.delete_state(SCALAR_SHIFTS_STATE)?;
+    successor.delete_state_prefix(SCALAR_SHIFT_PAGE_PREFIX)?;
     store_identity_checkpoint(successor, document)?;
     successor.put_state(SCALAR_INDEX_STATE, &state.manifest)?;
     for (ordinal, page) in state.index_pages.iter().enumerate() {
         successor.put_state(&scalar_index_page_key(ordinal as u32), page)?;
+    }
+    for (ordinal, page) in state.identity_pages.iter().enumerate() {
+        successor.put_state(&scalar_identity_page_key(ordinal as u32), page)?;
     }
     for (ordinal, page) in state.scalar_pages.iter().enumerate() {
         successor.put_state(&scalar_page_key(ordinal as u32), page)?;
@@ -393,13 +395,8 @@ fn sparse_scalar_change(
         return Err(sdk::Error::invalid_input("unsupported JSON scalar index"));
     }
     let count = u32::from_le_bytes(header[4..8].try_into().expect("fixed JSON index header"));
-    let mut shifts = decode_scalar_shifts(
-        update
-            .before
-            .get_state(SCALAR_SHIFTS_STATE)?
-            .as_deref()
-            .unwrap_or_default(),
-    )?;
+    let mut shifts = read_scalar_shifts(&update.before)?;
+    let shift_prefix = scalar_shift_prefix(&shifts)?;
     let edit_end = edit
         .offset
         .checked_add(edit.delete_len)
@@ -409,7 +406,7 @@ fn sparse_scalar_change(
     while low < high {
         let middle = low + (high - low) / 2;
         let entry = read_scalar_entry(update, middle)?;
-        if effective_scalar_start(entry.start, middle, &shifts)? <= edit.offset {
+        if effective_scalar_start(entry.start, middle, &shift_prefix)? <= edit.offset {
             low = middle + 1;
         } else {
             high = middle;
@@ -420,7 +417,7 @@ fn sparse_scalar_change(
     }
     let ordinal = low - 1;
     let entry = read_scalar_entry(update, ordinal)?;
-    let start = effective_scalar_start(entry.start, ordinal, &shifts)?;
+    let start = effective_scalar_start(entry.start, ordinal, &shift_prefix)?;
     let length = effective_scalar_length(entry.length, ordinal, &shifts)?;
     let end = start
         .checked_add(length)
@@ -499,37 +496,14 @@ fn sparse_semantic_changes(
         return Err(sdk::Error::invalid_input("unsupported JSON scalar index"));
     }
     let count = u32::from_le_bytes(header[4..8].try_into().expect("scalar count"));
-    let mut shifts = decode_scalar_shifts(
-        before
-            .get_state(SCALAR_SHIFTS_STATE)?
-            .as_deref()
-            .unwrap_or_default(),
-    )?;
+    let shifts = read_scalar_shifts(before)?;
     let base_shifts = shifts.clone();
+    let shift_prefix = scalar_shift_prefix(&base_shifts)?;
+    let mut shifts = std::collections::BTreeMap::<_, _>::from_iter(shifts);
     let mut seen = std::collections::HashSet::with_capacity(changes.len());
     let mut edits = Vec::with_capacity(changes.len());
     for change in changes {
-        let mut matched = None;
-        for ordinal in 0..count {
-            let entry = read_scalar_entry_root(before, ordinal)?;
-            let bytes = before
-                .read_state_range(
-                    &scalar_page_key(entry.page),
-                    u64::from(entry.blob_offset),
-                    entry.blob_len,
-                )?
-                .ok_or_else(|| sdk::Error::invalid_input("JSON scalar page disappeared"))?;
-            let metadata = decode_scalar_metadata(&bytes)?;
-            let schema_key = match metadata.relation {
-                ArenaJsonRelation::Snapshot => ROOT_SCHEMA_KEY,
-                ArenaJsonRelation::Object => OBJECT_MEMBER_SCHEMA_KEY,
-                ArenaJsonRelation::Array => ARRAY_ITEM_SCHEMA_KEY,
-            };
-            if schema_key == change.schema_key.as_ref() && metadata.row_pk == change.row_pk {
-                matched = Some((ordinal, entry, metadata));
-                break;
-            }
-        }
+        let matched = find_scalar_identity(before, count, change)?;
         let Some((ordinal, entry, mut metadata)) = matched else {
             return Ok(None);
         };
@@ -537,7 +511,7 @@ fn sparse_semantic_changes(
         if !seen.insert(ordinal) {
             return Ok(None);
         }
-        let start = effective_scalar_start(entry.start, ordinal, &base_shifts)?;
+        let start = effective_scalar_start(entry.start, ordinal, &shift_prefix)?;
         let length = effective_scalar_length(entry.length, ordinal, &base_shifts)?;
         metadata.start = u32::try_from(start)
             .map_err(|_| sdk::Error::invalid_input("JSON scalar start exceeds u32"))?;
@@ -557,16 +531,16 @@ fn sparse_semantic_changes(
             .map_err(|_| sdk::Error::limit_exceeded("JSON scalar deletion exceeds i64"))?;
         let delta = insert_len - delete_len;
         if delta != 0 {
-            match shifts.binary_search_by_key(&ordinal, |(changed, _)| *changed) {
-                Ok(index) => {
-                    shifts[index].1 = shifts[index].1.checked_add(delta).ok_or_else(|| {
-                        sdk::Error::limit_exceeded("JSON scalar shift exceeds i64")
-                    })?;
-                    if shifts[index].1 == 0 {
-                        shifts.remove(index);
-                    }
-                }
-                Err(index) => shifts.insert(index, (ordinal, delta)),
+            let total = shifts
+                .get(&ordinal)
+                .copied()
+                .unwrap_or_default()
+                .checked_add(delta)
+                .ok_or_else(|| sdk::Error::limit_exceeded("JSON scalar shift exceeds i64"))?;
+            if total == 0 {
+                shifts.remove(&ordinal);
+            } else {
+                shifts.insert(ordinal, total);
             }
         }
         edits.push(edit);
@@ -580,13 +554,14 @@ fn sparse_semantic_changes(
     }) {
         return Ok(None);
     }
-    Ok(Some((edits, shifts)))
+    Ok(Some((edits, shifts.into_iter().collect())))
 }
 
 struct EncodedScalarState {
     manifest: Vec<u8>,
     index_pages: Vec<Vec<u8>>,
     scalar_pages: Vec<Vec<u8>>,
+    identity_pages: Vec<Vec<u8>>,
 }
 
 fn encode_scalar_state(scalars: &[ArenaJsonScalar]) -> sdk::Result<EncodedScalarState> {
@@ -652,11 +627,140 @@ fn encode_scalar_state(scalars: &[ArenaJsonScalar]) -> sdk::Result<EncodedScalar
             .map_err(|_| sdk::Error::limit_exceeded("too many JSON scalar index pages"))?
             .to_le_bytes(),
     );
+    let mut identities = scalars
+        .iter()
+        .enumerate()
+        .map(|(ordinal, scalar)| {
+            scalar_identity_hash(scalar_schema_key(scalar.relation), &scalar.row_pk)
+                .map(|hash| (hash, ordinal as u32))
+        })
+        .collect::<sdk::Result<Vec<_>>>()?;
+    identities.sort_unstable();
+    let identity_pages = identities
+        .chunks(STATE_PAGE_BYTES / 36)
+        .map(|chunk| {
+            let mut page = Vec::with_capacity(chunk.len() * 36);
+            for (hash, ordinal) in chunk {
+                page.extend_from_slice(hash);
+                page.extend_from_slice(&ordinal.to_le_bytes());
+            }
+            page
+        })
+        .collect();
     Ok(EncodedScalarState {
         manifest,
         index_pages,
         scalar_pages,
+        identity_pages,
     })
+}
+
+// Sorted fixed-width identity records let semantic updates locate a scalar with
+// logarithmic range reads, without scanning unrelated scalar metadata.
+fn scalar_identity_page_key(ordinal: u32) -> Vec<u8> {
+    let mut key = b"json/scalar-identity-page/".to_vec();
+    key.extend_from_slice(&ordinal.to_le_bytes());
+    key
+}
+
+fn scalar_schema_key(relation: ArenaJsonRelation) -> &'static str {
+    match relation {
+        ArenaJsonRelation::Snapshot => ROOT_SCHEMA_KEY,
+        ArenaJsonRelation::Object => OBJECT_MEMBER_SCHEMA_KEY,
+        ArenaJsonRelation::Array => ARRAY_ITEM_SCHEMA_KEY,
+    }
+}
+
+fn scalar_identity_hash(schema: &str, primary_key: &[sdk::TypedValue]) -> sdk::Result<[u8; 32]> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(schema.as_bytes());
+    for value in primary_key {
+        match value {
+            sdk::TypedValue::Text(value) => {
+                hasher.update(&[0]);
+                hasher.update(&(value.len() as u64).to_le_bytes());
+                hasher.update(value.as_bytes());
+            }
+            sdk::TypedValue::Uuid(value) => {
+                hasher.update(&[1]);
+                hasher.update(value.as_bytes());
+            }
+            sdk::TypedValue::Int8(value) if *value >= 0 => {
+                hasher.update(&[2]);
+                hasher.update(&value.to_le_bytes());
+            }
+            _ => return Err(sdk::Error::invalid_input("invalid JSON scalar primary key")),
+        }
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn read_scalar_identity(before: &sdk::Snapshot<'_>, index: u32) -> sdk::Result<([u8; 32], u32)> {
+    #[cfg(test)]
+    perf_qa_tests::record_read(1);
+    const PER_PAGE: u32 = (STATE_PAGE_BYTES / 36) as u32;
+    let bytes = before
+        .read_state_range(
+            &scalar_identity_page_key(index / PER_PAGE),
+            u64::from(index % PER_PAGE) * 36,
+            36,
+        )?
+        .ok_or_else(|| sdk::Error::invalid_input("missing JSON scalar identity page"))?;
+    if bytes.len() != 36 {
+        return Err(sdk::Error::invalid_input(
+            "truncated JSON scalar identity entry",
+        ));
+    }
+    Ok((
+        bytes[..32].try_into().expect("32-byte hash"),
+        u32::from_le_bytes(bytes[32..].try_into().expect("four-byte ordinal")),
+    ))
+}
+
+fn find_scalar_identity(
+    before: &sdk::Snapshot<'_>,
+    count: u32,
+    change: &RowChange,
+) -> sdk::Result<Option<(u32, ScalarEntry, ArenaJsonScalar)>> {
+    let hash = scalar_identity_hash(&change.schema_key, &change.row_pk)?;
+    let mut low = 0;
+    let mut high = count;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if read_scalar_identity(before, middle)?.0 < hash {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    while low < count {
+        let (candidate, ordinal) = read_scalar_identity(before, low)?;
+        if candidate != hash {
+            break;
+        }
+        if ordinal >= count {
+            return Err(sdk::Error::invalid_input(
+                "invalid JSON scalar identity ordinal",
+            ));
+        }
+        let entry = read_scalar_entry_root(before, ordinal)?;
+        let bytes = before
+            .read_state_range(
+                &scalar_page_key(entry.page),
+                u64::from(entry.blob_offset),
+                entry.blob_len,
+            )?
+            .ok_or_else(|| sdk::Error::invalid_input("JSON scalar page disappeared"))?;
+        let metadata = decode_scalar_metadata(&bytes)?;
+        // Verify the full identity, including in the event of a hash collision.
+        if scalar_schema_key(metadata.relation) == change.schema_key.as_ref()
+            && metadata.row_pk == change.row_pk
+        {
+            return Ok(Some((ordinal, entry, metadata)));
+        }
+        low += 1;
+    }
+    Ok(None)
 }
 
 fn encode_scalar_metadata(scalar: &ArenaJsonScalar) -> sdk::Result<Vec<u8>> {
@@ -667,11 +771,19 @@ fn encode_scalar_metadata(scalar: &ArenaJsonScalar) -> sdk::Result<Vec<u8>> {
         }
         (
             ArenaJsonRelation::Object,
-            [sdk::TypedValue::Text(parent_id), sdk::TypedValue::Text(key)],
+            [
+                sdk::TypedValue::Text(parent_id),
+                sdk::TypedValue::Text(key),
+                sdk::TypedValue::Int8(occurrence),
+            ],
         ) => {
             output.push(1);
             push_state_bytes(&mut output, parent_id.as_bytes())?;
             push_state_bytes(&mut output, key.as_bytes())?;
+            if *occurrence < 0 {
+                return Err(sdk::Error::invalid_input("invalid JSON key occurrence"));
+            }
+            output.extend_from_slice(&occurrence.to_le_bytes());
             push_state_bytes(
                 &mut output,
                 scalar
@@ -739,15 +851,30 @@ fn decode_scalar_metadata(bytes: &[u8]) -> sdk::Result<ArenaJsonScalar> {
             None,
             None,
         ),
-        1 => (
-            ArenaJsonRelation::Object,
-            vec![
-                sdk::TypedValue::Text(take_state_text(&mut input)?),
-                sdk::TypedValue::Text(take_state_text(&mut input)?),
-            ],
-            None,
-            Some(take_state_text(&mut input)?),
-        ),
+        1 => {
+            let parent = take_state_text(&mut input)?;
+            let key = take_state_text(&mut input)?;
+            let bytes: [u8; 8] = input
+                .get(..8)
+                .ok_or_else(|| sdk::Error::invalid_input("truncated JSON key occurrence"))?
+                .try_into()
+                .expect("eight-byte occurrence");
+            input = &input[8..];
+            let occurrence = i64::from_le_bytes(bytes);
+            if occurrence < 0 {
+                return Err(sdk::Error::invalid_input("negative JSON key occurrence"));
+            }
+            (
+                ArenaJsonRelation::Object,
+                vec![
+                    sdk::TypedValue::Text(parent),
+                    sdk::TypedValue::Text(key),
+                    sdk::TypedValue::Int8(occurrence),
+                ],
+                None,
+                Some(take_state_text(&mut input)?),
+            )
+        }
         2 => {
             let id = take_state_uuid(&mut input)?;
             (
@@ -830,6 +957,13 @@ fn read_scalar_entry_root(root: &sdk::Snapshot<'_>, ordinal: u32) -> sdk::Result
             SCALAR_INDEX_ENTRY_BYTES,
         )?
         .ok_or_else(|| sdk::Error::invalid_input("JSON scalar index disappeared"))?;
+    if bytes.len() != SCALAR_INDEX_ENTRY_BYTES as usize {
+        return Err(sdk::Error::invalid_input(
+            "truncated JSON scalar index entry",
+        ));
+    }
+    #[cfg(test)]
+    perf_qa_tests::record_read(2);
     Ok(ScalarEntry {
         start: u32::from_le_bytes(bytes[0..4].try_into().expect("fixed scalar entry")),
         length: u32::from_le_bytes(bytes[4..8].try_into().expect("fixed scalar entry")),
@@ -839,26 +973,32 @@ fn read_scalar_entry_root(root: &sdk::Snapshot<'_>, ordinal: u32) -> sdk::Result
     })
 }
 
-fn effective_scalar_start(base: u32, ordinal: u32, shifts: &[(u32, i64)]) -> sdk::Result<u64> {
+fn scalar_shift_prefix(shifts: &[(u32, i64)]) -> sdk::Result<Vec<(u32, i64)>> {
+    let mut total = 0_i64;
+    shifts
+        .iter()
+        .map(|(ordinal, delta)| {
+            total = total
+                .checked_add(*delta)
+                .ok_or_else(|| sdk::Error::invalid_input("JSON scalar shift overflowed"))?;
+            Ok((*ordinal, total))
+        })
+        .collect()
+}
+
+fn effective_scalar_start(base: u32, ordinal: u32, prefix: &[(u32, i64)]) -> sdk::Result<u64> {
+    let index = prefix.partition_point(|(changed, _)| *changed < ordinal);
     apply_scalar_shift(
         u64::from(base),
-        shifts
-            .iter()
-            .filter(|(changed, _)| *changed < ordinal)
-            .try_fold(0_i64, |total, (_, delta)| total.checked_add(*delta))
-            .ok_or_else(|| sdk::Error::invalid_input("JSON scalar shift overflowed"))?,
+        index.checked_sub(1).map_or(0, |i| prefix[i].1),
     )
 }
 
 fn effective_scalar_length(base: u32, ordinal: u32, shifts: &[(u32, i64)]) -> sdk::Result<u64> {
-    apply_scalar_shift(
-        u64::from(base),
-        shifts
-            .iter()
-            .filter(|(changed, _)| *changed == ordinal)
-            .try_fold(0_i64, |total, (_, delta)| total.checked_add(*delta))
-            .ok_or_else(|| sdk::Error::invalid_input("JSON scalar shift overflowed"))?,
-    )
+    let delta = shifts
+        .binary_search_by_key(&ordinal, |(changed, _)| *changed)
+        .map_or(0, |index| shifts[index].1);
+    apply_scalar_shift(u64::from(base), delta)
 }
 
 fn apply_scalar_shift(base: u64, delta: i64) -> sdk::Result<u64> {
@@ -882,11 +1022,79 @@ fn scalar_index_page_key(ordinal: u32) -> Vec<u8> {
     key
 }
 
+fn scalar_shift_page_key(ordinal: usize) -> Vec<u8> {
+    let mut key = SCALAR_SHIFT_PAGE_PREFIX.to_vec();
+    key.extend_from_slice(&(ordinal as u64).to_le_bytes());
+    key
+}
+
+fn store_scalar_shifts(sink: &mut impl StateOutput, bytes: &[u8]) -> sdk::Result<()> {
+    sink.delete_state_prefix(SCALAR_SHIFT_PAGE_PREFIX)?;
+    if bytes.is_empty() {
+        return sink.delete_state(SCALAR_SHIFTS_STATE);
+    }
+    sink.put_state(SCALAR_SHIFTS_STATE, &(bytes.len() as u64).to_le_bytes())?;
+    for (ordinal, page) in bytes.chunks(STATE_PAGE_BYTES).enumerate() {
+        sink.put_state(&scalar_shift_page_key(ordinal), page)?;
+    }
+    Ok(())
+}
+
+fn read_scalar_shifts(before: &sdk::Snapshot<'_>) -> sdk::Result<Vec<(u32, i64)>> {
+    let Some(header) = before.get_state(SCALAR_SHIFTS_STATE)? else {
+        return Ok(Vec::new());
+    };
+    let length = u64::from_le_bytes(
+        header
+            .as_slice()
+            .try_into()
+            .map_err(|_| sdk::Error::invalid_input("invalid JSON scalar shift manifest"))?,
+    );
+    let length = usize::try_from(length)
+        .map_err(|_| sdk::Error::limit_exceeded("JSON scalar shifts exceed guest address space"))?;
+    if length == 0 || length % 12 != 0 {
+        return Err(sdk::Error::invalid_input(
+            "invalid JSON scalar shift overlay length",
+        ));
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| sdk::Error::limit_exceeded("JSON scalar shift allocation failed"))?;
+    for ordinal in 0..length.div_ceil(STATE_PAGE_BYTES) {
+        let expected = (length - bytes.len()).min(STATE_PAGE_BYTES);
+        let page = before
+            .read_state_range(&scalar_shift_page_key(ordinal), 0, expected as u32)?
+            .ok_or_else(|| sdk::Error::invalid_input("missing JSON scalar shift page"))?;
+        if page.len() != expected {
+            return Err(sdk::Error::invalid_input(
+                "truncated JSON scalar shift page",
+            ));
+        }
+        bytes.extend_from_slice(&page);
+    }
+    decode_scalar_shifts(&bytes)
+}
+
 fn decode_scalar_shifts(bytes: &[u8]) -> sdk::Result<Vec<(u32, i64)>> {
     if bytes.len() % 12 != 0 {
         return Err(sdk::Error::invalid_input(
             "truncated JSON scalar shift overlay",
         ));
+    }
+    let records = bytes
+        .chunks_exact(12)
+        .map(|record| {
+            (
+                u32::from_le_bytes(record[..4].try_into().expect("fixed shift record")),
+                i64::from_le_bytes(record[4..].try_into().expect("fixed shift record")),
+            )
+        })
+        .collect::<Vec<_>>();
+    if records.windows(2).all(|pair| pair[0].0 < pair[1].0)
+        && records.iter().all(|(_, delta)| *delta != 0)
+    {
+        return Ok(records);
     }
     let mut shifts = std::collections::BTreeMap::<u32, i64>::new();
     for record in bytes.chunks_exact(12) {
@@ -1227,7 +1435,7 @@ mod tests {
             .expect("nested name row");
         assert!(matches!(
             name.row_pk.as_slice(),
-            [sdk::TypedValue::Text(_), sdk::TypedValue::Text(key)] if key == "name"
+            [sdk::TypedValue::Text(_), sdk::TypedValue::Text(key), sdk::TypedValue::Int8(0)] if key == "name"
         ));
         assert_eq!(
             name.row.get("scalar_json"),
@@ -1350,6 +1558,7 @@ mod tests {
             row_pk: vec![
                 sdk::TypedValue::Text("root".to_owned()),
                 sdk::TypedValue::Text("a".to_owned()),
+                sdk::TypedValue::Int8(0),
             ],
             parent_id: None,
             order_key: Some("80".to_owned()),
@@ -1374,3 +1583,9 @@ mod structural_format_qa_tests;
 
 #[cfg(test)]
 mod structural_moves_qa_tests;
+
+#[cfg(test)]
+mod perf_qa_tests;
+
+#[cfg(test)]
+mod lossless_qa_tests;

@@ -97,7 +97,7 @@ pub(super) async fn reconcile_global_source<S: Storage + Clone + Send + Sync + '
         new_branches: plan.new_branches.clone(),
     };
     request.validate()?;
-    let read = FrozenMigrationRead::new(source).await?;
+    let read = MigrationPlanningRead::new(source).await?;
     crate::sync::prove_local_descriptor_global_source(&read, &request, state.active_account_id())
         .await?;
     let boundaries =
