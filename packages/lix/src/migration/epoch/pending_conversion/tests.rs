@@ -8,29 +8,39 @@ use std::{
 };
 #[tokio::test]
 async fn pending_native_conversion_resumes_lost_merge_and_preserves_source() {
-    run_pending_native_conversion(false, false, false, false).await;
+    run_pending_native_conversion(false, false, false, false, false).await;
 }
 #[tokio::test]
 async fn pending_file_and_custom_schema_conversion_resumes_lost_merge_and_preserves_source() {
-    run_pending_native_conversion(true, false, false, false).await;
+    run_pending_native_conversion(true, false, false, false, false).await;
 }
 #[tokio::test]
 async fn pending_two_branches_recover_each_lost_merge_before_conversion() {
-    run_pending_native_conversion(false, true, false, false).await;
+    run_pending_native_conversion(false, true, false, false, false).await;
 }
 #[tokio::test]
 async fn pending_cleanup_lost_response_retries_from_closed_partial_storage() {
-    run_pending_native_conversion(false, false, true, false).await;
+    run_pending_native_conversion(false, false, true, false, false).await;
 }
 #[tokio::test]
 async fn pending_new_branch_recovers_global_and_selected_lost_outcomes() {
-    run_pending_native_conversion(false, false, false, true).await;
+    run_pending_native_conversion(false, false, false, true, false).await;
 }
+/// Exports synthetic, complete B/L/R replica evidence for real OPFS conversion.
+/// The canonical HTTP authority deliberately loses its first successful merge
+/// response, exactly as the native regression above does.
+#[tokio::test]
+#[ignore = "manual browser fixture authority; requires manifest and stop paths"]
+async fn pending_browser_conversion_fixture_authority() {
+    run_pending_native_conversion(true, true, false, false, true).await;
+}
+
 async fn run_pending_native_conversion(
     with_files: bool,
     with_branches: bool,
     with_cleanup_loss: bool,
     with_new_branch: bool,
+    browser_fixture: bool,
 ) {
     let authority_memory = crate::Memory::new();
     let authority = crate::open_lix()
@@ -406,6 +416,78 @@ async fn run_pending_native_conversion(
         .as_ref()
         .map(|(branch, _, _)| branch.clone())
         .unwrap_or_else(|| base.selected_branch.branch_id.clone());
+    if browser_fixture {
+        let manifest_path = std::env::var("LIX_BROWSER_CONVERSION_MANIFEST")
+            .expect("set a synthetic fixture manifest output path");
+        let stop_path = std::env::var("LIX_BROWSER_CONVERSION_STOP")
+            .expect("set a synthetic fixture stop-file path");
+        assert!(
+            !std::path::Path::new(&stop_path).exists(),
+            "remove stale stop file"
+        );
+        let owned = crate::storage_adapter::StorageSession::acquire(local_storage.clone())
+            .await
+            .unwrap();
+        let (PointerState::Active { bank, .. }, pointer) =
+            load_pointer(&owned).await.unwrap().unwrap()
+        else {
+            panic!("fixture requires an active full replica");
+        };
+        let adapter = StorageAdapter::for_epoch(owned, bank, pointer);
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let mut exported = Vec::new();
+        for &space in crate::storage_spaces::ALL_STORAGE_SPACES {
+            let mut cursor = read
+                .begin_scan(
+                    space,
+                    KeyRange {
+                        lower: Bound::Unbounded,
+                        upper: Bound::Unbounded,
+                    },
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+            loop {
+                let (entries, more) = cursor.next_page(256).await.unwrap().into_parts();
+                for entry in entries {
+                    let ProjectedValue::FullValue(value) = entry.value else {
+                        panic!("fixture export requires complete values");
+                    };
+                    exported.push(serde_json::json!({
+                        "space": bank.map_space(space).id.0,
+                        "key": entry.key.0.to_vec(),
+                        "value": value.to_vec(),
+                    }));
+                }
+                if !more {
+                    break;
+                }
+            }
+        }
+        drop(read);
+        drop(adapter);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec(&serde_json::json!({
+                "url": locator,
+                "repositoryId": repository,
+                "branchId": requested_branch,
+                "additionalBranchId": additional_branch,
+                "entries": exported,
+                "expected": {"local": "L", "remote": "R", "otherLocal": "XL", "otherRemote": "XR"},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        eprintln!("Synthetic pending replica browser fixture ready: {manifest_path}");
+        while !std::path::Path::new(&stop_path).exists() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        stopped.store(true, Ordering::SeqCst);
+        thread.join().unwrap();
+        return;
+    }
     let first = crate::convert_replica_to_partial(
         local_storage.clone(),
         options.clone(),
@@ -593,10 +675,7 @@ async fn run_pending_native_conversion(
             load_pointer(&owned).await.unwrap().unwrap().1,
             pointer_before
         );
-        assert_eq!(
-            admit_partial_epoch(&owned).await.unwrap().state,
-            before
-        );
+        assert_eq!(admit_partial_epoch(&owned).await.unwrap().state, before);
         let (journal, _) = load_pending_conversion_journal(
             &owned,
             &bank_code(bank),

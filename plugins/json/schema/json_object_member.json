@@ -1,13 +1,13 @@
 {
   "$schema": "https://lix.dev/schema-v1.json",
   "key": "json_object_member",
-  "description": "One recursively indexed JSON object member. Its stable identity is the stable parent container identity plus the decoded member key.",
+  "description": "One recursively indexed JSON object member. Identity consists of parent_id, decoded key, and a nonnegative occurrence disambiguator.",
   "columns": [
     {
       "name": "container_id",
       "type": "text",
       "nullable": true,
-      "description": "Deterministic child-container identity derived from parent_id and decoded key. Present only when kind is object or array."
+      "description": "Stable, nonempty child-container identity unique within the file. Fresh imports derive it from parent_id, key, and occurrence; SQL may supply an identity and retain it across renames and moves. Present only for object or array values."
     },
     {
       "name": "empty_json",
@@ -28,16 +28,25 @@
       "description": "The JSON value kind represented by this member."
     },
     {
+      "name": "occurrence",
+      "type": "int8",
+      "nullable": false,
+      "default_value": 0,
+      "description": "Zero-based occurrence of this decoded key on import. Defaults to zero for ordinary unique-key SQL inserts. Preserved across SQL edits; file observations reassign occurrences by source order."
+    },
+    {
       "name": "order_key",
       "type": "text",
       "nullable": false,
-      "description": "A stable fractional order key for deterministic object rendering."
+      "description": "Lexically sorted lowercase hex bytes, nonempty with an even length and no trailing 00. Defaults to 80; equal keys sort by member key and occurrence, not insertion time.",
+      "default_value": "80"
     },
     {
       "name": "parent_id",
       "type": "text",
       "nullable": false,
-      "description": "Stable identity of the containing object."
+      "description": "Stable identity of the containing object.",
+      "default_value": "root"
     },
     {
       "name": "prefix_json",
@@ -66,6 +75,7 @@
   ],
   "primary_key": [
     "parent_id",
-    "key"
+    "key",
+    "occurrence"
   ]
 }

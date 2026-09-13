@@ -95,6 +95,24 @@ async fn descriptor_only_upload_retries_accepted_request_preserving_newer_local_
             .execute(update, &[key.clone(), Value::Text("newer".into())])
             .await
             .unwrap();
+        // SELECT has its own native read footprint; preparing UPDATE alone
+        // does not certify it. Warm it before ACK so later reads remain offline.
+        assert_eq!(
+            value(
+                execute_hydrating(
+                    &session,
+                    &storage,
+                    &state,
+                    &authority,
+                    select,
+                    &[key.clone()],
+                    &mut fetches
+                )
+                .await
+                .unwrap()
+            ),
+            "newer"
+        );
         let before = admitted_controls(&storage, &state).await.unwrap();
         let read = storage.begin_read(Default::default()).await.unwrap();
         let captured = load_partial_push_state(&read, &state, &branch)

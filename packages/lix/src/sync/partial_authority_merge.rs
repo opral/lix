@@ -76,12 +76,16 @@ pub(crate) async fn prepare_authority_merge(
         .control
         .as_ref()
         .ok_or_else(|| conflict("merge GLOBAL control is absent"))?;
-    if global.head_commit_id != id(&request.global_head_commit_id)?
-        || global.working_diff_checkpoint_commit_id
-            != Some(id(&request.global_checkpoint_commit_id)?)
+    if !super::partial_merge_analysis::catalog_contains(
+        read,
+        id(&request.global_head_commit_id)?,
+        global.head_commit_id,
+        budget.max_remote_graph_records,
+    )
+    .await?
     {
         return Err(conflict(
-            "authority GLOBAL coordinates changed before merge analysis",
+            "authority GLOBAL no longer contains the captured catalog",
         ));
     }
     let selected = observed[0]
@@ -98,7 +102,7 @@ pub(crate) async fn prepare_authority_merge(
         false,
     )
     .await?;
-    if !super::partial_merge_analysis::bounded_ancestor(
+    if !super::partial_merge_analysis::incorporated(
         read,
         &captured_remote,
         current_head,
@@ -108,7 +112,7 @@ pub(crate) async fn prepare_authority_merge(
     .await?
     {
         return Err(conflict(
-            "authority no longer contains the captured remote frontier",
+            "authority no longer incorporates the captured remote frontier",
         ));
     }
     let mut accepted_checkpoint =

@@ -382,6 +382,12 @@ impl LixRuntimeManager {
         config: &Config,
         telemetry: Arc<dyn lix_sdk::telemetry::TelemetrySink>,
     ) -> Result<Arc<Self>> {
+        // SlateDB repositories own disposable Tokio runtimes, but their S3
+        // client and connection pool are shared with the server catalog. Pin
+        // requests and response-body I/O to the server runtime so closing one
+        // repository cannot retire another request's HTTP dispatch task.
+        let io_runtime =
+            Handle::try_current().context("S3 storage requires a server Tokio runtime")?;
         let storage = &config.storage;
         let request_budget = S3_REQUEST_BUDGET;
         // The configured root is the single-process ownership boundary. The
@@ -402,6 +408,9 @@ impl LixRuntimeManager {
         let cache = cache_options(&storage.cache, config.max_open_lixes, namespace_root);
         let object_store: Arc<dyn ObjectStore> = Arc::new(
             AmazonS3Builder::new()
+                .with_http_connector(object_store::client::SpawnedReqwestConnector::new(
+                    io_runtime,
+                ))
                 .with_endpoint(&storage.endpoint)
                 .with_bucket_name(&storage.bucket)
                 .with_access_key_id(&storage.access_key_id)
@@ -3374,6 +3383,87 @@ mod tests {
             .as_str()
             .expect("protocol handshake session id")
             .to_string()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn s3_response_and_catalog_survive_repository_runtime_shutdown() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let release_body = Arc::new(Notify::new());
+        let body_gate = Arc::clone(&release_body);
+        let app = axum::Router::new().fallback(move || {
+            let gate = Arc::clone(&body_gate);
+            async move {
+                let stream = futures_util::stream::once(async move {
+                    gate.notified().await;
+                    Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"{}"))
+                });
+                http::Response::builder()
+                    .header("content-length", "2")
+                    .header("last-modified", "Sun, 13 Sep 2026 00:00:00 GMT")
+                    .header("etag", "\"fixture\"")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let cache = tempfile::tempdir().unwrap();
+        let config = Config {
+            bind_addr: "127.0.0.1:0".into(),
+            public_url: "https://server.test".into(),
+            internal_token: None,
+            max_open_lixes: 1,
+            protocol_timeout: Duration::from_secs(10),
+            recovery_close_timeout: Duration::from_secs(10),
+            storage: crate::config::S3StorageConfig {
+                endpoint,
+                bucket: "test-bucket".into(),
+                access_key_id: "test-key".into(),
+                secret_access_key: "test-secret".into(),
+                region: "auto".into(),
+                prefix: "test".into(),
+                allow_http: true,
+                cache: SlateDBCacheConfig {
+                    root_folder: cache.path().to_owned(),
+                    max_disk_cache_bytes: 1024 * 1024,
+                    block_cache_bytes: 1024 * 1024,
+                    metadata_cache_bytes: 1024 * 1024,
+                },
+            },
+        };
+        let manager = LixRuntimeManager::new(&config, test_telemetry_sink()).unwrap();
+        let (store, _) = manager.catalog_store();
+        let repository_store = Arc::clone(&store);
+        // The same S3 client is used by disposable SlateDB runtimes. Return a
+        // live body, then destroy the runtime that initiated its HTTP request.
+        let response = tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime
+                .block_on(repository_store.get(&ObjectPath::from("repository-object")))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        release_body.notify_one();
+        let bytes = tokio::time::timeout(Duration::from_secs(2), response.bytes())
+            .await
+            .expect("S3 body must not stall after repository runtime shutdown")
+            .expect("S3 body must remain owned by the server runtime");
+        assert_eq!(bytes.as_ref(), b"{}");
+        // A later catalog request also reuses the client after that runtime is gone.
+        release_body.notify_one();
+        let catalog = store
+            .get(&ObjectPath::from(".lix-repositories/test.json"))
+            .await
+            .unwrap();
+        assert_eq!(catalog.bytes().await.unwrap().as_ref(), b"{}");
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]

@@ -13,7 +13,8 @@
       "name": "id",
       "type": "text",
       "nullable": false,
-      "description": "The constant identity of the document root."
+      "description": "The constant identity of the document root.",
+      "default_value": "root"
     },
     {
       "name": "kind",

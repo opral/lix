@@ -975,6 +975,7 @@ mod tests {
         mutations: CommitStateMutationInventory,
     ) -> CommitStateManifest {
         CommitStateManifest {
+            incorporation: crate::tracked_state::CommitStateIncorporation::None,
             commit_id,
             change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             replay_debt: CommitStateReplayDebt {

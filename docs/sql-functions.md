@@ -20,8 +20,11 @@ operators; there are no public `lix_json_*` functions.
 `lix_row_ref` takes the relation's typed primary-key values in declared order:
 
 ```sql
-SELECT lix_row_ref('json_object_member', $1, $2) AS row_ref;
+SELECT lix_row_ref('json_object_member', $1, $2, $3) AS row_ref;
 ```
+
+For `json_object_member`, the components are `parent_id`, decoded `key`, and
+`occurrence` (zero for an ordinary unique key).
 
 ## JSONB
 

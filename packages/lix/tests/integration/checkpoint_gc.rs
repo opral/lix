@@ -22,6 +22,21 @@ simulation_test!(
             )
             .await
             .expect("first interval write should succeed");
+        session
+            .execute(
+                "UPDATE lix_key_value SET value='temporary' WHERE key='gc-key'",
+                &[],
+            )
+            .await
+            .expect("disposable interval write should succeed");
+        let obsolete_payload = branch_head(&engine, sim.main_branch_id()).await;
+        session
+            .execute(
+                "UPDATE lix_key_value SET value='interval-one' WHERE key='gc-key'",
+                &[],
+            )
+            .await
+            .expect("superseding interval write should succeed");
         let interval_one_first = branch_head(&engine, sim.main_branch_id()).await;
         session
             .fs
@@ -35,9 +50,11 @@ simulation_test!(
             .await
             .expect("second checkpoint should succeed");
         assert_commits(&session, &[&interval_one_first, &interval_one_second], true).await;
+        assert_payloads(&engine, &[&obsolete_payload], true).await;
 
         advance_to_next_gc(&session, 1).await;
         assert_commits(&session, &[&interval_one_first, &interval_one_second], true).await;
+        assert_payloads(&engine, &[&obsolete_payload], true).await;
 
         session
             .execute(
@@ -59,12 +76,9 @@ simulation_test!(
             .await
             .expect("third checkpoint should succeed");
 
-        wait_for_commits(
-            &session,
-            &[&interval_one_first, &interval_one_second],
-            false,
-        )
-        .await;
+        wait_for_payload_retirement(&engine, &[&obsolete_payload]).await;
+        // Source graph proofs remain even when obsolete mutation payloads retire.
+        assert_commits(&session, &[&interval_one_first, &interval_one_second], true).await;
         assert_commits(&session, &[&interval_two_first, &interval_two_second], true).await;
         assert_commits(
             &session,
@@ -350,6 +364,7 @@ simulation_test!(
             .await
             .expect("replacement delete should succeed");
         first.commit().await.expect("first churn should commit");
+        let obsolete_payload = branch_head(&engine, sim.main_branch_id()).await;
 
         let mut second = session
             .begin_transaction()
@@ -383,7 +398,7 @@ simulation_test!(
             .await
             .expect("replacement insert should succeed");
         second.commit().await.expect("second churn should commit");
-        let retired_head = branch_head(&engine, sim.main_branch_id()).await;
+        let retained_source = branch_head(&engine, sim.main_branch_id()).await;
 
         session
             .create_checkpoint()
@@ -395,7 +410,8 @@ simulation_test!(
                 .await
                 .expect("padding checkpoint should succeed");
         }
-        wait_for_commits(&session, &[&retired_head], false).await;
+        wait_for_payload_retirement(&engine, &[&obsolete_payload]).await;
+        assert_commits(&session, &[&retained_source], true).await;
 
         assert_replay_gc_state(&session).await;
         let history = session
@@ -541,35 +557,48 @@ async fn assert_commits(
 /// publication is the foreground guarantee, while collection may complete
 /// after the API returns. Bound the wait so this test verifies eventual
 /// collection without introducing timing-sensitive assertions.
-async fn wait_for_commits(
-    session: &support::simulation_test::engine::SimSession,
-    commit_ids: &[&str],
-    expected_present: bool,
-) {
+async fn wait_for_payload_retirement(engine: &lix::engine::Engine, commit_ids: &[&str]) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let mut matches = true;
-        for commit_id in commit_ids {
-            let result = session
-                .execute(
-                    &format!("SELECT id FROM lix_commit WHERE id = '{commit_id}'"),
-                    &[],
-                )
-                .await
-                .expect("commit existence query should succeed");
-            let present = !result.is_empty();
-            if present != expected_present {
-                matches = false;
-                break;
-            }
-        }
-        if matches {
+        if payload_presence(engine, commit_ids)
+            .await
+            .iter()
+            .all(|present| !present)
+        {
             return;
         }
         if Instant::now() >= deadline {
-            assert_commits(session, commit_ids, expected_present).await;
+            assert_payloads(engine, commit_ids, false).await;
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn payload_presence(engine: &lix::engine::Engine, commit_ids: &[&str]) -> Vec<bool> {
+    let storage = engine.storage();
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let inventory = crate::tracked_state::scan_commit_delta_inventory(&read)
+        .await
+        .unwrap();
+    commit_ids
+        .iter()
+        .map(|id| {
+            inventory.commits.contains_key(
+                &crate::changelog::CommitId::parse_lix(id, "GC payload witness").unwrap(),
+            )
+        })
+        .collect()
+}
+
+async fn assert_payloads(engine: &lix::engine::Engine, commit_ids: &[&str], expected: bool) {
+    for (id, present) in commit_ids
+        .iter()
+        .zip(payload_presence(engine, commit_ids).await)
+    {
+        assert_eq!(
+            present, expected,
+            "unexpected payload retention for commit {id}"
+        );
     }
 }

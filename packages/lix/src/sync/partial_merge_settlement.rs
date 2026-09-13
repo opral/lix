@@ -48,13 +48,18 @@ pub(super) async fn verify_partial_merge_settlement(
         .ok_or_else(|| conflict("merge outcome has not been recorded durably"))?;
     let request = &record.request;
     let descriptor = next.descriptor();
-    if descriptor.selected_branch.branch_id != *branch
-        || descriptor.global_branch.head.commit_id != request.global_head_commit_id
-        || descriptor.global_branch.checkpoint.commit_id != request.global_checkpoint_commit_id
+    if descriptor.selected_branch.branch_id != *branch {
+        return Err(conflict("merge adoption changed the selected branch"));
+    }
+    if !super::partial_merge_analysis::catalog_contains(
+        read,
+        id(&request.global_head_commit_id)?,
+        id(&descriptor.global_branch.head.commit_id)?,
+        1024,
+    )
+    .await?
     {
-        return Err(conflict(
-            "merge adoption changed checkpoint or global dependencies",
-        ));
+        return Err(conflict("merge adoption lost the captured catalog"));
     }
     let observed = crate::branch::BranchHeadControlContext::new()
         .reader(read)
@@ -76,7 +81,7 @@ pub(super) async fn verify_partial_merge_settlement(
     let merge =
         super::partial_merge_analysis::record(read, id(&receipt.merge_commit_id)?, false).await?;
     verify_authority_merge_record(read, request, &merge, previous.active_account_id()).await?;
-    if !super::partial_merge_analysis::bounded_ancestor(
+    if !super::partial_merge_analysis::incorporated(
         read,
         &merge,
         id(&descriptor.selected_branch.head.commit_id)?,
@@ -121,12 +126,24 @@ pub(super) async fn verify_authority_merge_record(
     };
     if merge.is_checkpoint
         || !canonical_parents
-        || merge.base_commit_id != Some(id(&request.global_head_commit_id)?)
+        || merge.base_commit_id.is_none()
         || merge.account_id != account
     {
         return Err(LixError::new(
             "LIX_PARTIAL_MERGE_STATE_INVALID",
             "authority acknowledgment does not contain captured local history and catalog",
+        ));
+    }
+    if !super::partial_merge_analysis::catalog_contains(
+        read,
+        id(&request.global_head_commit_id)?,
+        merge.base_commit_id.expect("validated merge catalog"),
+        1024,
+    )
+    .await?
+    {
+        return Err(conflict(
+            "authority acknowledgment lost the captured catalog",
         ));
     }
     let captured = super::partial_merge_analysis::record(
@@ -135,7 +152,7 @@ pub(super) async fn verify_authority_merge_record(
         false,
     )
     .await?;
-    if !super::partial_merge_analysis::bounded_ancestor(
+    if !super::partial_merge_analysis::incorporated(
         read,
         &captured,
         parents[0],

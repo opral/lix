@@ -692,6 +692,7 @@ fn stage_test_commit_state_manifest(
         staged.replay_debt
     };
     let manifest = CommitStateManifest {
+        incorporation: crate::tracked_state::CommitStateIncorporation::None,
         commit_id: staged.record.commit_id,
         change_account_id: staged.record.account_id.clone(),
         replay_debt,

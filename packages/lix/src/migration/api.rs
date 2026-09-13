@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::storage_adapter::SharedStorageAdapterRead;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
@@ -11,7 +13,7 @@ use crate::init::{
     RepositoryProtocolStatus, parse_repository_protocol,
 };
 use crate::storage_adapter::{
-    SharedStorageAdapterRead, Storage, StorageAdapterRead as _, StorageBeginScanOptions,
+    Storage, StorageAdapterRead as _, StorageBeginScanOptions,
     StorageCoreProjection as CoreProjection, StorageError, StorageGetManyRequest as GetManyRequest,
     StorageGetOptions as GetOptions, StorageKey as Key, StorageKeyRange,
     StoragePrecondition as Precondition, StorageProjectedValue as ProjectedValue,
@@ -109,7 +111,7 @@ where
     inspect_lix_read(&read).await
 }
 
-async fn inspect_lix_read(
+pub(crate) async fn inspect_lix_read(
     read: &impl crate::storage_adapter::StorageAdapterRead,
 ) -> Result<MigrationStatus, LixError> {
     let keys = [Key(Bytes::from_static(REPOSITORY_PROTOCOL_KEY))];
@@ -159,12 +161,9 @@ pub(crate) async fn migrate_lix_with_adapter<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let read = SharedStorageAdapterRead::new(
-        adapter
-            .begin_read(ReadOptions::default())
-            .await
-            .map_err(storage_error)?,
-    );
+    let read = super::MigrationPlanningRead::new(&adapter)
+        .await
+        .map_err(storage_error)?;
     let protocol_status = crate::init::repository_protocol_status(&read).await?;
     // The v75 chain traverses commit records with the v5-arity decoder before
     // rewriting them to v6. Repositories below v72 still carry older record
@@ -182,7 +181,7 @@ where
     }
     let from_version = match protocol_status {
         RepositoryProtocolStatus::MigrationRequired {
-            found_version: found_version @ (72 | 73 | 74 | 75 | 76 | 77 | 78),
+            found_version: found_version @ (72 | 73 | 74 | 75 | 76 | 77 | 78 | 79),
         } => found_version,
         RepositoryProtocolStatus::Current => {
             return Ok(MigrationReport {
@@ -209,7 +208,9 @@ where
         }
     };
     read.finish().map_err(storage_error)?;
-    super::deterministic_witness::backfill(&adapter, options, false).await?;
+    if from_version <= 78 {
+        super::deterministic_witness::backfill(&adapter, options, false).await?;
+    }
     // Every step from here on loads commit records through the current
     // v6 decoder, so the v5 records are rewritten first, under whichever
     // marker the repository currently carries.
@@ -230,8 +231,7 @@ where
         0
     };
     if from_version == 75 {
-        let read = adapter
-            .begin_read(ReadOptions::default())
+        let read = super::MigrationPlanningRead::new(&adapter)
             .await
             .map_err(storage_error)?;
         let expected_revision = crate::storage_adapter::load_repository_mutation_revision(&read)
@@ -253,8 +253,7 @@ where
         // each commit; the current engine's immutable catalog is authoritative.
         // Custom schemas are still loaded from the repository and validated when
         // the migrated engine opens it.
-        let read = adapter
-            .begin_read(ReadOptions::default())
+        let read = super::MigrationPlanningRead::new(&adapter)
             .await
             .map_err(storage_error)?;
         let expected_revision = crate::storage_adapter::load_repository_mutation_revision(&read)
@@ -275,19 +274,22 @@ where
     } else {
         0
     };
-    backfill_missing_row_pk_indexes(
-        &adapter,
-        &storage,
-        options,
-        78,
-        crate::init::REPOSITORY_PROTOCOL_V78,
-        crate::init::REPOSITORY_PROTOCOL_V78,
-        "v79 complete row-PK catalog repair",
-        false,
-        true,
-    )
-    .await?;
-    super::deterministic_witness::backfill(&adapter, options, true).await?;
+    if from_version <= 78 {
+        backfill_missing_row_pk_indexes(
+            &adapter,
+            &storage,
+            options,
+            78,
+            crate::init::REPOSITORY_PROTOCOL_V78,
+            crate::init::REPOSITORY_PROTOCOL_V78,
+            "v79 complete row-PK catalog repair",
+            false,
+            true,
+        )
+        .await?;
+        super::deterministic_witness::backfill(&adapter, options, true).await?;
+    }
+    super::incorporation::migrate(&adapter, options, false).await?;
     Ok(MigrationReport {
         from_version,
         to_version: CURRENT_FORMAT_VERSION,
@@ -352,12 +354,9 @@ where
         .await?;
     }
 
-    let read = SharedStorageAdapterRead::new(
-        adapter
-            .begin_read(ReadOptions::default())
-            .await
-            .map_err(storage_error)?,
-    );
+    let read = super::MigrationPlanningRead::new(adapter)
+        .await
+        .map_err(storage_error)?;
     match crate::init::repository_protocol_status(&read).await? {
         RepositoryProtocolStatus::MigrationRequired { found_version: 72 } => {}
         status => {
@@ -448,12 +447,9 @@ where
     }
     drop(engine);
 
-    let read = SharedStorageAdapterRead::new(
-        adapter
-            .begin_read(ReadOptions::default())
-            .await
-            .map_err(storage_error)?,
-    );
+    let read = super::MigrationPlanningRead::new(adapter)
+        .await
+        .map_err(storage_error)?;
     let expected_revision = crate::storage_adapter::load_repository_mutation_revision(&read)
         .await
         .map_err(storage_error)?;
@@ -474,8 +470,7 @@ pub(super) async fn load_repository_protocol_marker<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let read = adapter
-        .begin_read(ReadOptions::default())
+    let read = super::MigrationPlanningRead::new(adapter)
         .await
         .map_err(storage_error)?;
     let values = crate::storage_adapter::PointReadPlan::new(
@@ -574,12 +569,9 @@ where
     };
     let (members_injected, repaired_manifests) =
         repair_filesystem_closure(adapter, storage, options, source_protocol).await?;
-    let read = SharedStorageAdapterRead::new(
-        adapter
-            .begin_read(ReadOptions::default())
-            .await
-            .map_err(storage_error)?,
-    );
+    let read = super::MigrationPlanningRead::new(adapter)
+        .await
+        .map_err(storage_error)?;
     let expected_revision = crate::storage_adapter::load_repository_mutation_revision(&read)
         .await
         .map_err(storage_error)?;
@@ -787,12 +779,9 @@ where
     }
 
     let operation = "v74 filesystem-closure repair";
-    let read = SharedStorageAdapterRead::new(
-        adapter
-            .begin_read(ReadOptions::default())
-            .await
-            .map_err(storage_error)?,
-    );
+    let read = super::MigrationPlanningRead::new(adapter)
+        .await
+        .map_err(storage_error)?;
     let expected_revision = crate::storage_adapter::load_repository_mutation_revision(&read)
         .await
         .map_err(storage_error)?;
@@ -1168,12 +1157,9 @@ where
             )));
         }
     }
-    let read = SharedStorageAdapterRead::new(
-        adapter
-            .begin_read(ReadOptions::default())
-            .await
-            .map_err(storage_error)?,
-    );
+    let read = super::MigrationPlanningRead::new(adapter)
+        .await
+        .map_err(storage_error)?;
     let expected_revision = crate::storage_adapter::load_repository_mutation_revision(&read)
         .await
         .map_err(storage_error)?;
@@ -1410,12 +1396,9 @@ async fn backfill_missing_row_pk_indexes<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let read = SharedStorageAdapterRead::new(
-        adapter
-            .begin_read(ReadOptions::default())
-            .await
-            .map_err(storage_error)?,
-    );
+    let read = super::MigrationPlanningRead::new(adapter)
+        .await
+        .map_err(storage_error)?;
     match crate::init::repository_protocol_status(&read).await? {
         RepositoryProtocolStatus::MigrationRequired { found_version }
             if found_version == expected_version => {}

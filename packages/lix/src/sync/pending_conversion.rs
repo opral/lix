@@ -339,7 +339,7 @@ where
             }
         }
         if let Some(pin) = &current.native_source_pin {
-            let read = crate::migration::FrozenMigrationRead::new(source).await?;
+            let read = crate::migration::MigrationPlanningRead::new(source).await?;
             let wave = native_migration_pin_upload::native_migration_pin_wave(
                 &read,
                 &current.request,
@@ -376,7 +376,7 @@ where
                 target: target.clone(),
             }
         });
-        let read = crate::migration::FrozenMigrationRead::new(source).await?;
+        let read = crate::migration::MigrationPlanningRead::new(source).await?;
         let wave = partial_merge_runtime::captured_wave(
             &read,
             &current.request,
@@ -574,9 +574,7 @@ pub(crate) async fn cleanup_pending_conversion_authenticated(
     let _ = transport.close_session().await;
     result
 }
-pub(crate) async fn finish_conversion_cleanup_bounded<
-    F: Future<Output = Result<(), LixError>>,
->(
+pub(crate) async fn finish_conversion_cleanup_bounded<F: Future<Output = Result<(), LixError>>>(
     cleanup: F,
 ) {
     use futures_util::FutureExt as _;

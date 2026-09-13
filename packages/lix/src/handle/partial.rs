@@ -167,6 +167,31 @@ where
     let _owner = storage
         .acquire_partial_replica_owner(storage.token())
         .await?;
+    // Another browser client may have completed this explicit conversion while
+    // we waited for the shared admission queue. Validate the durable receipt
+    // under the same exclusive owner before treating that outcome as success.
+    match crate::migration::admit_partial_epoch(&storage).await {
+        Ok(admitted) => {
+            let selected = &admitted.state.descriptor().selected_branch.branch_id;
+            if branch_id
+                .as_ref()
+                .is_some_and(|requested| requested != selected)
+            {
+                return Err(LixError::new(
+                    "LIX_PARTIAL_CONVERSION_BRANCH_MISMATCH",
+                    "the converted replica selected a different branch",
+                ));
+            }
+            let authenticated =
+                crate::sync::authenticate_partial_conversion(server, Some(selected)).await?;
+            // This validates repository, account and normalized remote identity
+            // and resumes any retained post-publication cleanup obligations.
+            crate::migration::retry_published_conversion_cleanup(&storage, &authenticated).await?;
+            return Ok(());
+        }
+        Err(error) if error.code == "LIX_PARTIAL_REPLICA_MIGRATION_REQUIRED" => {}
+        Err(error) => return Err(error),
+    }
     let authenticated =
         crate::sync::authenticate_partial_source_conversion(server, branch_id.as_deref()).await?;
     crate::migration::convert_clean_replica_to_partial(&storage, &authenticated, None).await?;
@@ -352,12 +377,26 @@ mod tests {
                 .await
                 .is_err()
         );
+        let error = lix
+            .open_another_session()
+            .with_branch("00000000-0000-7000-8000-000000000599")
+            .await
+            .err()
+            .expect("an unprepared branch cannot open a partial child session");
+        assert_eq!(error.code, "LIX_PARTIAL_REPLICA_SCOPE_NOT_PREPARED");
         let child = lix.open_another_session().await.unwrap();
         assert_eq!(child.active_account_id(), lix.active_account_id());
+        let global = lix
+            .open_another_session()
+            .with_branch(crate::GLOBAL_BRANCH_ID)
+            .await
+            .unwrap();
+        assert_eq!(global.active_branch_id().await.unwrap(), crate::GLOBAL_BRANCH_ID);
+        global.close().await.unwrap();
         assert_eq!(
             requests.load(Ordering::SeqCst),
             2,
-            "same-account session opening must not hydrate account rows"
+            "partial session admission and scope rejection must not hydrate cold rows"
         );
         let sql = "SELECT value FROM lix_key_value WHERE key = $1";
         let params = [Value::Text("partial-handle".into())];

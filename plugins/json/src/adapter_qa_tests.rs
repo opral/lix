@@ -255,6 +255,7 @@ fn native_object_insert_delete_and_rename_are_supported() {
             primary_key: vec![
                 sdk::TypedValue::Text("root".into()),
                 sdk::TypedValue::Text("new".into()),
+                sdk::TypedValue::Int8(0),
             ],
             row: Some(insertion),
             local_ref: None,
@@ -589,23 +590,26 @@ fn native_paged_identities_restore_and_shrink_without_stale_pages() {
 }
 
 #[test]
-fn native_duplicate_member_keys_fail_before_rows_are_accepted() {
+fn native_duplicate_member_keys_roundtrip_with_occurrences() {
     for source in [
         br#"{"a":1,"a":2}"#.as_slice(),
         br#"{"a":1,"\u0061":2}"#,
         br#"[{"a":1,"a":2}]"#,
     ] {
-        let file = Snapshot {
-            file_id: "duplicates".into(),
-            path: "data.json".into(),
-            bytes: source.to_vec(),
-            ..Snapshot::default()
-        };
-        assert!(
-            Harness::<JsonPlugin>::default()
-                .parse(&file, sdk::CreateContext::from_namespace_bytes([0xf0; 12]))
-                .is_err(),
-            "accepted duplicate fields {source:?}"
+        let (file, rows) = parse(source);
+        assert_eq!(render(&file, &rows, false).snapshot().bytes, source);
+        let members = rows
+            .iter()
+            .filter(|row| row.schema_key.as_ref() == OBJECT_MEMBER_SCHEMA_KEY)
+            .collect::<Vec<_>>();
+        assert_eq!(members.len(), 2);
+        assert_eq!(
+            members[0].row.get("occurrence"),
+            Some(&sdk::TypedValue::Int8(0))
+        );
+        assert_eq!(
+            members[1].row.get("occurrence"),
+            Some(&sdk::TypedValue::Int8(1))
         );
     }
 }

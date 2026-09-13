@@ -679,3 +679,67 @@ async fn recovery_hydrates_sparse_global_history_without_inheriting_caller_rows(
     recovered.close().await.unwrap();
     lix.close().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_conversion_readmits_already_partial_without_initializing_or_rebinding() {
+    let authority = Authority::new().await;
+    let storage = crate::sync::durable_memory_for_test(crate::Memory::new());
+    let authenticated = crate::sync::authenticate_partial_conversion(authority.options(), None)
+        .await
+        .unwrap();
+    let selected = authenticated
+        .state()
+        .descriptor()
+        .selected_branch
+        .branch_id
+        .clone();
+    install_fresh_partial_epoch(storage.clone(), authenticated.state())
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        crate::convert_replica_to_partial(storage.clone(), authority.options(), Some(&selected))
+            .await
+            .unwrap();
+    }
+    let wrong_branch = "00000000-0000-7000-8000-000000000599";
+    let error =
+        crate::convert_replica_to_partial(storage.clone(), authority.options(), Some(wrong_branch))
+            .await
+            .unwrap_err();
+    assert_eq!(error.code, "LIX_PARTIAL_CONVERSION_BRANCH_MISMATCH");
+    let other = Authority::new().await;
+    assert!(
+        crate::convert_replica_to_partial(storage.clone(), other.options(), None)
+            .await
+            .is_err()
+    );
+    // Each public conversion acquires a new writer generation. Inspect through
+    // a newly acquired session rather than the raw adapter's original token.
+    let inspected = crate::storage_adapter::StorageSession::acquire(storage.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        admit_partial_epoch(&inspected)
+            .await
+            .unwrap()
+            .state
+            .repository_id(),
+        authenticated.state().repository_id()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_conversion_does_not_initialize_missing_storage() {
+    let authority = Authority::new().await;
+    let storage = crate::sync::durable_memory_for_test(crate::Memory::new());
+    assert!(
+        crate::convert_replica_to_partial(storage.clone(), authority.options(), None)
+            .await
+            .is_err()
+    );
+    let inspected = crate::storage_adapter::StorageSession::acquire(storage)
+        .await
+        .unwrap();
+    let status = crate::migration::inspect_lix(&inspected).await.unwrap();
+    assert!(matches!(status, crate::migration::MigrationStatus::Missing));
+}

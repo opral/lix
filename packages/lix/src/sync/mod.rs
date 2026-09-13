@@ -20,7 +20,9 @@ mod bootstrap;
 mod commit;
 mod partial_checkpoint_upload;
 #[cfg(test)]
-pub(crate) use commit::export_sync_commit;
+pub(crate) use commit::{
+    export_sync_commit, load_sync_commit as load_sync_commit_for_migration_test,
+};
 mod contract;
 mod current_coverage;
 mod http;
@@ -108,6 +110,7 @@ pub use recovery::{
     ReplicaRecoveryBlob, ReplicaRecoveryBranch, ReplicaRecoveryExport, ReplicaRecoveryFile,
     ReplicaRecoveryReceipt, ReplicaRecoveryRow, ReplicaRecoverySource,
 };
+pub(crate) use repository::collect_certified_snapshot_omitted_owners;
 mod runtime;
 #[cfg(test)]
 mod simulation_tests;
@@ -130,8 +133,8 @@ pub(crate) use bootstrap::{
 };
 pub(crate) use commit::{
     SYNC_CHECKPOINT_SOURCE_SPACE, SYNC_MATERIALIZED_STATE_ALIAS_SPACE,
-    stage_delete_materialized_sync_state_alias, stage_delete_sync_checkpoint_source,
-    stage_sync_checkpoint_source,
+    load_complete_state_alias_source, stage_delete_materialized_sync_state_alias,
+    stage_delete_sync_checkpoint_source, stage_sync_checkpoint_source,
 };
 pub(crate) use commit::{
     SyncCommit, SyncCommitMemberRef, SyncCommitStateAlias, encode_sync_commit_member,
@@ -179,9 +182,10 @@ pub(crate) const MAX_SYNC_HISTORY_PAGE_SIZE: usize = 100;
 pub(crate) const MAX_SYNC_BLOB_BATCH_ITEMS: usize = 16;
 pub(crate) const MAX_SYNC_REQUEST_ITEMS: usize = 512;
 pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
-// v13 delivers retained working-set inputs with descriptor updates.
+// v14 settles partial merges against the authority head at admission, which
+// can differ from the head captured by the client's attempt.
 // SDK and server must upgrade together.
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 13;
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 14;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str = "LIX_SYNC_REPOSITORY_ID_MISMATCH";

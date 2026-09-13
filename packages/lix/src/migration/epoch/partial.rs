@@ -1,5 +1,5 @@
-//! Bounded epoch admission for partial replicas. Ordinary migration/recovery
-//! remains explicit: this path never scans, clears banks, or follows history.
+//! Current-format partial admission stays bounded. A legacy v79 epoch first
+//! copies its resident inputs through the migration owner before admission.
 
 use super::*;
 use crate::storage_adapter::{StorageReadDurability, StorageWriteSetError};
@@ -107,6 +107,27 @@ pub(crate) async fn admit_partial_epoch<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    // The v79 upgrade copies only resident native inputs through the ordinary
+    // epoch owner. It never rebuilds from the authority or drops pending work.
+    if let Some((pointer, raw)) = durable_pointer(storage).await? {
+        let source = match pointer {
+            PointerState::Active {
+                bank, format: 79, ..
+            } => Some(bank),
+            PointerState::Migrating {
+                source,
+                source_format: 79,
+                ..
+            } => Some(source),
+            _ => None,
+        };
+        if let Some(source) = source {
+            let adapter = StorageAdapter::for_epoch_migration(storage.clone(), source, raw);
+            if super::super::incorporation::is_legacy_partial(&adapter).await? {
+                Box::pin(admit_existing_repository(storage)).await?;
+            }
+        }
+    }
     let Some((PointerState::Active { bank, format, .. }, pointer)) =
         durable_pointer(storage).await?
     else {
@@ -254,6 +275,55 @@ mod tests {
             authority.partial_replica_descriptor(None).await.unwrap(),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn legacy_partial_epoch_migrates_resident_state_without_full_inputs() {
+        let state = state().await;
+        let backing = crate::Memory::new();
+        let storage = crate::sync::durable_memory_for_test(backing.clone());
+        let admitted = install_fresh_partial_epoch(storage.clone(), &state)
+            .await
+            .unwrap();
+        crate::migration::downgrade_headers_for_test(&admitted.adapter, true).await;
+        let legacy = encode_pointer(PointerState::Active {
+            bank: EpochBank::Legacy,
+            generation: 1,
+            format: 79,
+            publication: None,
+        });
+        let mut write = backing.begin_write(WriteOptions::default()).await.unwrap();
+        put_pointer(&mut write, legacy).await.unwrap();
+        write.commit().await.unwrap();
+        let reopened = admit_partial_epoch(&storage).await.unwrap();
+        assert_eq!(reopened.state, state);
+        assert!(matches!(
+            durable_pointer(&storage).await.unwrap().unwrap().0,
+            PointerState::Active {
+                bank: EpochBank::A,
+                format: 80,
+                ..
+            }
+        ));
+        let read = reopened
+            .adapter
+            .begin_read(Default::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::sync::load_partial_replica_state(&read)
+                .await
+                .unwrap()
+                .unwrap()
+                .0,
+            state
+        );
+        drop(read);
+        assert_eq!(admit_partial_epoch(&storage).await.unwrap().state, state);
+        assert!(matches!(
+            admitted.adapter.begin_read(Default::default()).await,
+            Err(StorageError::Fenced)
+        ));
     }
 
     #[tokio::test]

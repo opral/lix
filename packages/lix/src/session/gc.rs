@@ -349,20 +349,14 @@ mod tests {
         let mut interior = Vec::new();
         let mut checkpoints = Vec::new();
         for round in 0..ROUNDS {
+            if round > 0 {
+                interior.push(disposable_commit(&session, &engine, &branch_id).await);
+            }
             for write in 0..WRITES_PER_ROUND {
                 session.execute(
                     "INSERT INTO lix_key_value (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
                     &[Value::Text(format!("gc-conflict-k{write}")), Value::Jsonb(json!({"round": round, "write": write}).into())],
                 ).await.expect("write commits");
-                if write == 0 && round > 0 {
-                    interior.push(
-                        engine
-                            .load_branch_head_commit_id(&branch_id)
-                            .await
-                            .expect("head loads")
-                            .expect("head exists"),
-                    );
-                }
             }
             checkpoints.push(
                 session
@@ -458,7 +452,7 @@ mod tests {
             .expect("debt remains due");
         assert!(!plan.sweep.has_more);
         assert!(plan.profile.history_manifests_missing > 0);
-        assert!(present(&session, &interior).await.is_empty());
+        assert!(payloads_present(&session, &interior).await.is_empty());
         assert_eq!(
             present(&session, &checkpoints).await,
             checkpoints,
@@ -590,7 +584,10 @@ mod tests {
         );
     }
 
-    async fn head(engine: &Engine<Memory>, branch_id: &str) -> String {
+    async fn head<S: crate::storage::Storage + Clone + Send + Sync + 'static>(
+        engine: &Engine<S>,
+        branch_id: &str,
+    ) -> String {
         engine
             .load_branch_head_commit_id(branch_id)
             .await
@@ -617,6 +614,48 @@ mod tests {
             }
         }
         present
+    }
+
+    async fn disposable_commit<S: crate::storage::Storage + Clone + Send + Sync + 'static>(
+        session: &SessionContext<S>,
+        engine: &Engine<S>,
+        branch_id: &str,
+    ) -> String {
+        session
+            .execute(
+                "INSERT INTO lix_key_value(key,value) VALUES('gc-disposable','temporary')",
+                &[],
+            )
+            .await
+            .unwrap();
+        let commit = head(engine, branch_id).await;
+        session
+            .execute("DELETE FROM lix_key_value WHERE key='gc-disposable'", &[])
+            .await
+            .unwrap();
+        commit
+    }
+
+    async fn payloads_present<S: crate::storage::Storage + Clone + Send + Sync + 'static>(
+        session: &SessionContext<S>,
+        ids: &[String],
+    ) -> Vec<String> {
+        let read = session
+            .storage
+            .begin_read(Default::default())
+            .await
+            .unwrap();
+        let inventory = crate::tracked_state::scan_commit_delta_inventory(&read)
+            .await
+            .unwrap();
+        ids.iter()
+            .filter(|id| {
+                inventory
+                    .commits
+                    .contains_key(&CommitId::parse_lix(id, "GC witness").unwrap())
+            })
+            .cloned()
+            .collect()
     }
 
     /// End-to-end engagement for the ratio trigger's two estimates.
@@ -882,6 +921,8 @@ mod tests {
         session: &SessionContext<S>,
         commit_id: CommitId,
     ) -> Result<(), LixError> {
+        // Pre-format-80 damage cannot carry newly certified incorporation edges.
+        crate::migration::mark_header_incorporation_unknown_for_test(&session.storage).await;
         let read = session
             .storage
             .begin_read(StorageReadOptions::default())
@@ -929,24 +970,22 @@ mod tests {
     ///
     /// # What it asserts, and what it deliberately does not
     ///
-    /// Interior commits — the intra-interval heads a round's checkpoint
-    /// supersedes — must be gone. Checkpoint commits must not: they stay on the
-    /// head's first-parent chain, and a test asserting they leave would encode
-    /// a false invariant and pass for the wrong reason.
+    /// Disposable intra-interval row payloads must retire. Their graph/header
+    /// proofs may remain for checkpoint incorporation. Checkpoint history must
+    /// also remain: it stays on the head's first-parent chain.
     #[tokio::test]
     async fn checkpoint_gc_reclaims_on_a_repository_already_swept_before_the_history_fix() {
         let (engine, session) = open().await;
         let branch_id = session.branch.get().expect("session branch resolves");
 
-        // Interior commits: the head after the first write of every round
-        // after the first. The round's checkpoint supersedes each one, it
-        // leaves the first-parent chain, and the collector is entitled to it.
-        // Round 0's is deliberately not recorded — it is the branch's oldest
-        // interval anchor and the collector keeps it, so requiring its removal
-        // would fail for a reason unrelated to reclaim.
+        // Transient rows are overwritten before each checkpoint, so no retained
+        // selected history owns their payload. Their graph proofs may remain.
         let mut interior_commits = Vec::new();
         let mut checkpoints = Vec::new();
         for round in 0..ROUNDS {
+            if round > 0 {
+                interior_commits.push(disposable_commit(&session, &engine, &branch_id).await);
+            }
             for write in 0..WRITES_PER_ROUND {
                 session
                     .execute(
@@ -959,9 +998,6 @@ mod tests {
                     )
                     .await
                     .expect("write commits");
-                if write == 0 && round > 0 {
-                    interior_commits.push(head(&engine, &branch_id).await);
-                }
             }
             checkpoints.push(
                 session
@@ -1012,13 +1048,13 @@ mod tests {
                     panic!("a sweep must not fail on a repository swept before the fix: {error:?}")
                 }
             }
-            let remaining = present(&session, &interior_commits).await;
+            let remaining = payloads_present(&session, &interior_commits).await;
             if remaining.is_empty() {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "checkpoint GC did not reclaim the interior commits {remaining:?}; a repository \
+                "checkpoint GC did not retire interior payloads {remaining:?}; a repository \
                  whose history a pre-fix sweep already took must still collect"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;

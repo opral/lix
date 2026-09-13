@@ -77,6 +77,9 @@ impl VerifiedRetainedBodyWave {
         }
         let mut tip = previous;
         let mut seen = BTreeSet::new();
+        let captured_catalog =
+            CommitId::parse_lix(&merge.global_head_commit_id, "captured catalog")?;
+        let mut catalog_bases = BTreeSet::from([captured_catalog]);
         for commit in &request.commits {
             let key = CommitId::parse_lix(&commit.commit_id, "retained body")?;
             let mut dependencies = commit
@@ -93,18 +96,36 @@ impl VerifiedRetainedBodyWave {
             if let Some(source) = &commit.selected_source_commit_id {
                 dependencies.insert(CommitId::parse_lix(source, "retained source")?);
             }
+            if let Some(source) = &commit.complete_incorporation_source_commit_id {
+                dependencies.insert(CommitId::parse_lix(
+                    source,
+                    "retained incorporation source",
+                )?);
+            }
             if commit.global_scope
                 || commit.account_id != account
                 || !seen.insert(key)
                 || (!staged.contains_key(&key) && !existing_complete.contains(&key))
                 || dependencies.is_empty()
                 || !dependencies.is_subset(&known)
-                || commit
-                    .base_commit_id
-                    .as_ref()
-                    .is_some_and(|base| base != &merge.global_head_commit_id)
             {
                 return Err(invalid());
+            }
+            if let Some(base) = &commit.base_commit_id {
+                let base = CommitId::parse_lix(base, "retained catalog base")?;
+                if !catalog_bases.contains(&base) {
+                    if !crate::sync::partial_merge_analysis::catalog_contains(
+                        read,
+                        base,
+                        captured_catalog,
+                        1024,
+                    )
+                    .await?
+                    {
+                        return Err(invalid());
+                    }
+                    catalog_bases.insert(base);
+                }
             }
             known.insert(key);
             tip = key;
@@ -116,15 +137,16 @@ impl VerifiedRetainedBodyWave {
                 .reader(read)
                 .load_observed(&branches)
                 .await?;
-            // The selected head may advance while immutable bodies travel.
-            // GLOBAL remains an exact catalog dependency for this operation.
+            // Both authority frontiers may advance while immutable bodies travel.
+            // The original GLOBAL coordinate remains a retained body dependency.
             let global = observed[1].control.as_ref().ok_or_else(invalid)?;
-            if global.head_commit_id.to_string() != merge.global_head_commit_id
-                || global
-                    .working_diff_checkpoint_commit_id
-                    .map(|id| id.to_string())
-                    .as_ref()
-                    != Some(&merge.global_checkpoint_commit_id)
+            if !crate::sync::partial_merge_analysis::catalog_contains(
+                read,
+                CommitId::parse_lix(&merge.global_head_commit_id, "captured catalog")?,
+                global.head_commit_id,
+                1024,
+            )
+            .await?
             {
                 return Err(invalid());
             }
@@ -138,7 +160,7 @@ impl VerifiedRetainedBodyWave {
                 false,
             )
             .await?;
-            if !crate::sync::partial_merge_analysis::bounded_ancestor(
+            if !crate::sync::partial_merge_analysis::incorporated(
                 read,
                 &captured_remote,
                 selected.head_commit_id,
@@ -147,7 +169,10 @@ impl VerifiedRetainedBodyWave {
             )
             .await?
             {
-                return Err(invalid());
+                return Err(LixError::new(
+                    "LIX_PARTIAL_UPLOAD_ATTEMPT_INVALID",
+                    "retention authority no longer incorporates the captured selected frontier",
+                ));
             }
             let base = crate::sync::partial_merge_analysis::record(
                 read,
@@ -159,7 +184,7 @@ impl VerifiedRetainedBodyWave {
                 &merge.expected_authority_head_commit_id,
                 "retention authority head",
             )?;
-            if !crate::sync::partial_merge_analysis::bounded_ancestor(
+            if !crate::sync::partial_merge_analysis::incorporated(
                 read,
                 &base,
                 remote,
@@ -168,7 +193,10 @@ impl VerifiedRetainedBodyWave {
             )
             .await?
             {
-                return Err(invalid());
+                return Err(LixError::new(
+                    "LIX_PARTIAL_UPLOAD_ATTEMPT_INVALID",
+                    "retention authority does not incorporate the captured merge base",
+                ));
             }
             for (branch, observation) in branches.iter().zip(observed) {
                 anchor_guards.push(crate::branch::branch_head_control_precondition(
@@ -244,7 +272,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_global_staleness_rejects_retention_of_complete_native_bodies() {
+    async fn authority_advancement_preserves_retention_of_complete_native_bodies() {
         initial_anchor_case(true, false, true).await;
         initial_anchor_case(true, true, true).await;
         initial_anchor_case(true, true, false).await;
@@ -329,10 +357,10 @@ mod tests {
             },
         )
         .await;
-        if complete && !global_stale {
+        if complete {
             assert!(
                 result.is_ok(),
-                "selected advancement must retain the same request"
+                "authority advancement must retain the same request"
             );
         } else {
             assert_eq!(

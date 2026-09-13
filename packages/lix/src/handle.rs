@@ -1511,6 +1511,29 @@ where
     where
         Backing: Storage + Clone + Send + Sync + 'static,
     {
+        let operation = self.open_storage_session_inner(storage);
+        #[cfg(not(target_family = "wasm"))]
+        {
+            // SAFETY: like open_another_session, this operation borrows only a
+            // Send + Sync Lix and owns Send backing storage. Storage read/write
+            // handles satisfy the Storage contract; retained scan-scope and
+            // admission references point to Sync state. The raw Memory future
+            // and borrowing-adapter obligations are checked in partial tests.
+            unsafe { crate::session::AssumeSendFuture::new(operation) }.await
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            operation.await
+        }
+    }
+
+    async fn open_storage_session_inner<Backing>(
+        &self,
+        storage: Backing,
+    ) -> Result<Lix<Backing>, LixError>
+    where
+        Backing: Storage + Clone + Send + Sync + 'static,
+    {
         if self.session.is_closed() {
             return Err(LixError::new(
                 LixError::CODE_CLOSED,
@@ -1572,11 +1595,15 @@ where
                     "cannot open a session from a closed Lix handle",
                 ));
             }
-            if self
-                .engine
-                .load_branch_head_commit_id(&active_branch_id)
-                .await?
-                .is_none()
+            // Partial session admission owns its selected/GLOBAL scope policy.
+            // Do not probe an unadmitted branch first: resolving absent controls
+            // can require cold descriptor objects and hide the scope error.
+            if self.engine.sync_mode().role() != crate::sync::SyncRole::PartialReplica
+                && self
+                    .engine
+                    .load_branch_head_commit_id(&active_branch_id)
+                    .await?
+                    .is_none()
             {
                 return Err(LixError::branch_not_found(
                     active_branch_id.clone(),

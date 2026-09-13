@@ -133,6 +133,10 @@ pub struct SyncCommitHeader {
     pub created_at: String,
     #[serde(default)]
     pub global_scope: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complete_incorporation_source_commit_id: Option<String>,
+    #[serde(default)]
+    pub incorporation_unknown: bool,
     /// Monotonic authenticated generation used by commit topology checks.
     pub generation: u64,
     /// Optional logarithmic first-parent jump target.

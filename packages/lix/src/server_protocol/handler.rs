@@ -8761,7 +8761,7 @@ mod tests {
     #[tokio::test]
     async fn sync_endpoint_requires_the_exact_sync_protocol_version() {
         let app = app().await;
-        for version in ["11", "999", "not-a-number"] {
+        for version in ["11", "13", "999", "not-a-number"] {
             let builder = Request::builder()
                 .uri("/lix/v1/sync/pull")
                 .header(SYNC_PROTOCOL_VERSION_HEADER, version);
@@ -8793,6 +8793,50 @@ mod tests {
         assert_eq!(
             error_code(missing).await,
             crate::sync::SYNC_PROTOCOL_MISMATCH_CODE
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_partial_merge_session_is_rejected_before_request_decoding() {
+        let app = app().await;
+        let handshake = request(&app.router, "GET", "/lix/v1/", None, None).await;
+        assert_eq!(handshake.status(), StatusCode::OK);
+        let handshake = response_json(handshake).await;
+        let session_id = handshake["sessionId"].as_str().unwrap();
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/lix/v1/sync/merge")
+                    .header(SESSION_ID_HEADER, session_id)
+                    .header(SYNC_PROTOCOL_VERSION_HEADER, "13")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from("invalid JSON"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let response = response_json(response).await;
+        assert_eq!(
+            response["error"]["code"],
+            crate::sync::SYNC_PROTOCOL_MISMATCH_CODE
+        );
+        assert_eq!(
+            response["error"]["details"]["clientSyncProtocolVersion"],
+            13
+        );
+        assert_eq!(
+            response["error"]["details"]["serverSyncProtocolVersion"],
+            crate::sync::SYNC_PROTOCOL_VERSION
+        );
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("upgrade")
         );
     }
 

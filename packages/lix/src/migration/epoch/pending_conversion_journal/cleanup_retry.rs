@@ -124,10 +124,8 @@ pub(crate) async fn retry_published_conversion_cleanup<
         .await?;
         completed += 1;
     }
-    completed += native_global_journal_io::retry_published_global_conversion_cleanup(
-        storage,
-        authenticated,
-    )
-    .await?;
+    completed +=
+        native_global_journal_io::retry_published_global_conversion_cleanup(storage, authenticated)
+            .await?;
     Ok(completed)
 }

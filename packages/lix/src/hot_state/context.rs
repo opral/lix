@@ -2048,6 +2048,15 @@ struct HotStateScanScope {
     branch_heads: BranchHeads,
 }
 
+#[test]
+fn borrowed_scan_scope_is_send_for_storage_session_open() {
+    fn assert_send<T: Send>() {}
+    fn assert_borrowed_scope<'a>() {
+        assert_send::<&'a HotStateScanScope>();
+    }
+    assert_borrowed_scope();
+}
+
 /// Rows read from one durable hot-state branch source.
 ///
 /// A matching hot-state projection is storage-key ordered by visible identity
@@ -3637,6 +3646,7 @@ mod tests {
             stage_commit_state_manifest(
                 &mut writes,
                 &CommitStateManifest {
+                    incorporation: crate::tracked_state::CommitStateIncorporation::None,
                     commit_id: record.commit_id,
                     change_account_id: record.account_id.clone(),
                     replay_debt: CommitStateReplayDebt::default(),
@@ -3862,6 +3872,7 @@ mod tests {
             stage_commit_state_manifest(
                 &mut writes,
                 &CommitStateManifest {
+                    incorporation: crate::tracked_state::CommitStateIncorporation::None,
                     commit_id: record.commit_id,
                     change_account_id: record.account_id.clone(),
                     replay_debt: CommitStateReplayDebt {
@@ -4076,6 +4087,7 @@ mod tests {
             stage_commit_state_manifest(
                 writes,
                 &CommitStateManifest {
+                    incorporation: crate::tracked_state::CommitStateIncorporation::None,
                     commit_id: record.commit_id,
                     change_account_id: record.account_id.clone(),
                     replay_debt: CommitStateReplayDebt::default(),

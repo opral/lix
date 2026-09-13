@@ -26,13 +26,15 @@
       "name": "order_key",
       "type": "text",
       "nullable": false,
-      "description": "A stable fractional order key; array position is derived from ordering and is not identity."
+      "description": "Lexically sorted lowercase hex bytes, nonempty with an even length and no trailing 00. Defaults to 80; equal keys sort by member key or array UUID, not insertion time.",
+      "default_value": "80"
     },
     {
       "name": "parent_id",
       "type": "text",
       "nullable": false,
-      "description": "Stable identity of the containing array."
+      "description": "Stable identity of the containing array.",
+      "default_value": "root"
     },
     {
       "name": "prefix_json",

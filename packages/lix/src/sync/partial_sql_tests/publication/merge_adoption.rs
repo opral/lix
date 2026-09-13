@@ -23,6 +23,83 @@ async fn commit_bookkeeping(
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn legacy_sparse_epoch_preserves_pending_sql_and_exact_merge_attempt_on_reopen() {
+    let (_authority, engine, session, old, _) = merged_fixture().await;
+    let adapter = engine.storage();
+    let memory = adapter.storage().clone();
+    let expected = session
+        .execute("SELECT value FROM lix_key_value WHERE key='resident'", &[])
+        .await
+        .unwrap();
+    let read = adapter.begin_read(Default::default()).await.unwrap();
+    let pending =
+        load_partial_merge_state(&read, &old, &old.descriptor().selected_branch.branch_id)
+            .await
+            .unwrap()
+            .0
+            .unwrap();
+    drop(read);
+    drop(session);
+    drop(engine);
+    let mut writes = adapter.new_write_set();
+    crate::migration::stage_legacy_partial_epoch_for_test(&mut writes);
+    adapter
+        .commit_write_set(writes, Default::default())
+        .await
+        .unwrap();
+    crate::migration::downgrade_headers_for_test(&adapter, true).await;
+    let durable = crate::sync::durable_memory_for_test(memory);
+    let migrated = crate::migration::admit_partial_epoch(&durable)
+        .await
+        .unwrap();
+    assert_eq!(migrated.state, *old);
+    let read = migrated
+        .adapter
+        .begin_read(Default::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        load_partial_merge_state(&read, &old, &old.descriptor().selected_branch.branch_id)
+            .await
+            .unwrap()
+            .0
+            .unwrap(),
+        pending
+    );
+    drop(read);
+    let (engine, session) =
+        Engine::new_partial_replica(migrated.adapter, EngineOptions::new(), &old)
+            .await
+            .unwrap();
+    assert_eq!(
+        session
+            .execute("SELECT value FROM lix_key_value WHERE key='resident'", &[])
+            .await
+            .unwrap()
+            .rows(),
+        expected.rows()
+    );
+    drop(session);
+    drop(engine);
+    let reopened = crate::migration::admit_partial_epoch(&durable)
+        .await
+        .unwrap();
+    let read = reopened
+        .adapter
+        .begin_read(Default::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        load_partial_merge_state(&read, &old, &old.descriptor().selected_branch.branch_id)
+            .await
+            .unwrap()
+            .0
+            .unwrap(),
+        pending
+    );
+}
 async fn merged_fixture() -> (
     Lix<Memory>,
     Arc<Engine<Memory>>,
