@@ -232,7 +232,7 @@ pub(super) async fn convert_pending_replica<S: Storage + Clone + Send + Sync + '
     let result = async {
         let source =
             StorageAdapter::for_epoch_migration(storage.clone(), source_bank, claim.clone());
-        let read = source.begin_read(ReadOptions::default()).await?;
+        let read = FrozenMigrationRead::new(&source).await?;
         let current = crate::sync::inspect_full_conversion_manifest(&read).await?;
         let current_digest = *blake3::hash(
             &serde_json::to_vec(current.manifest()).map_err(|e| epoch_error(e.to_string()))?,

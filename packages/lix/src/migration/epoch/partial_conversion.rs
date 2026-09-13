@@ -152,7 +152,7 @@ where
     let mut published = false;
     let result = async {
         let source = StorageAdapter::for_epoch_migration(storage.clone(), source_bank, claim.clone());
-        let read = source.begin_read(ReadOptions::default()).await?;
+        let read = FrozenMigrationRead::new(&source).await?;
         let proof = crate::sync::inspect_replica_rebuild_source(&read, format).await?
             .ok_or_else(|| conversion_required("source sync admission disappeared"))?;
         check_clean_conversion_identity(&proof, state)?;
@@ -238,7 +238,7 @@ mod tests {
             (false, true, false),
             (false, false, true),
         ] {
-            let storage = crate::sync::durable_memory_for_test(crate::Memory::new());
+            let storage = super::super::tests::CommitExpiringStorage::new();
             let full = crate::open_lix()
                 .with_storage(storage.clone())
                 .await
@@ -291,6 +291,7 @@ mod tests {
             .unwrap();
             full.close().await.unwrap();
             drop(full);
+            storage.expire_scan_after_next_migration_claim();
             let storage = crate::storage::StorageSession::acquire(storage)
                 .await
                 .unwrap();
