@@ -1,9 +1,11 @@
-import type { LixBinding, SyncServerBindingOptions, TelemetryDispatch } from "../binding-types.js";
+import type { LixBinding, SyncServerBindingOptions, TelemetryDispatch, TelemetryParentContext, OpenProgressDispatch } from "../binding-types.js";
 
 export type SharedEngineClient = {
   server: SyncServerBindingOptions;
   isDisconnected?(): boolean;
   telemetry?: TelemetryDispatch;
+  parent?: TelemetryParentContext;
+  progress?: OpenProgressDispatch;
   rootAdmitted?(headers: [string, string][], accountId: string): void;
   verifyIdentity(): Promise<{ authorityUrl: string; accountId: string }>;
 };
@@ -13,7 +15,7 @@ export class SharedEngineOwner {
   private root: LixBinding | undefined;
   private readonly clients = new Set<SharedEngineClient>();
   private queue: Promise<unknown> = Promise.resolve();
-  constructor(private readonly open: (server: SyncServerBindingOptions, telemetry: TelemetryDispatch) => Promise<LixBinding>) {}
+  constructor(private readonly open: (server: SyncServerBindingOptions, telemetry: TelemetryDispatch, client: SharedEngineClient) => Promise<LixBinding>) {}
 
   private readonly backgroundTelemetry: TelemetryDispatch = span => {
     for (const client of this.clients) {
@@ -35,7 +37,7 @@ export class SharedEngineOwner {
         client.server = { ...originalServer, headers, headerProvider: undefined };
         this.clients.add(client);
         try {
-          this.root = await this.open(this.transport(), this.backgroundTelemetry);
+          this.root = await this.open(this.transport(), this.backgroundTelemetry, client);
           client.rootAdmitted?.(headers, await this.root.activeAccountId());
         } catch (error) {
           this.clients.delete(client);

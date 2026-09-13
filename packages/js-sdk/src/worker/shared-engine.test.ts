@@ -285,3 +285,37 @@ test("an aborted active conversion releases admission for the next live client",
   await f.owner.attach(f.client());
   expect(f.open).toHaveBeenCalledTimes(1);
 });
+
+test("conversion-first and reopened roots use the current opener's context", async () => {
+  const root = {
+    activeAccountId: async () => "account-a",
+    openAnotherSession: async () => ({ close: async () => {} }),
+    close: async () => {},
+  } as unknown as LixBinding;
+  const parents: unknown[] = [];
+  const owner = new SharedEngineOwner(async (_server, _telemetry, opener) => {
+    parents.push(opener.parent);
+    opener.progress?.({ phase: "complete", toFormat: 78 });
+    return root;
+  });
+  const f = fixture();
+  let release!: () => void;
+  const conversion = owner.convert(f.client(), async () => {
+    await new Promise<void>(resolve => { release = resolve; });
+  });
+  await Promise.resolve();
+  const first = { ...f.client(), parent: { traceId: "first", spanId: "first", traceFlags: 1 }, progress: vi.fn() };
+  const queued = owner.attach(first);
+  release();
+  await conversion;
+  await queued;
+  expect(parents).toEqual([first.parent]);
+  expect(first.progress).toHaveBeenCalledTimes(1);
+  await owner.detach(first);
+  const second = { ...f.client(), parent: { traceId: "second", spanId: "second", traceFlags: 1 }, progress: vi.fn() };
+  await owner.attach(second);
+  expect(parents).toEqual([first.parent, second.parent]);
+  expect(second.progress).toHaveBeenCalledTimes(1);
+  expect(first.progress).toHaveBeenCalledTimes(1);
+  await owner.detach(second);
+});

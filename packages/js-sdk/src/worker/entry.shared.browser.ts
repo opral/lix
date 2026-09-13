@@ -80,8 +80,8 @@ scope.onconnect = (event) => {
         },
       };
       if (!owner) {
-        owner = new SharedEngineOwner(async (transport, backgroundTelemetry) => {
-          const root = await openLixBinding(storage, backgroundTelemetry, parent, transport, progress);
+        owner = new SharedEngineOwner(async (transport, backgroundTelemetry, opener) => {
+          const root = await openLixBinding(storage, backgroundTelemetry, opener.parent, transport, opener.progress);
           try {
             rootAccount = await root.activeAccountId();
             return root;
@@ -95,6 +95,8 @@ scope.onconnect = (event) => {
         server: routed,
         isDisconnected: () => disconnected,
         telemetry,
+        parent,
+        progress,
         rootAdmitted: (headers, account) => {
           admitted.record(raw.url, headers, account);
           verified.set(sharedCredentialKey(raw.url, headers), account);
