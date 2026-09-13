@@ -1,3 +1,5 @@
+mod frozen_read;
+pub(crate) use frozen_read::FrozenMigrationRead;
 mod pending_conversion;
 mod pending_conversion_journal;
 pub(crate) use pending_conversion_journal::{
@@ -1405,7 +1407,7 @@ where
     // The exact migration claim already fences ordinary writers. Identify the
     // source and classify recovery work before rebuilding; local-only work is
     // retained independently and must not block opening server state.
-    let read = source.begin_read(ReadOptions::default()).await?;
+    let read = FrozenMigrationRead::new(source).await?;
     let Some(proof) = crate::sync::inspect_replica_rebuild_source(&read, source_format).await?
     else {
         return Ok(None);
@@ -2475,27 +2477,33 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
-    struct CommitExpiringStorage {
+    pub(super) struct CommitExpiringStorage {
         inner: crate::Memory,
         generation: Arc<AtomicU64>,
         expire_next_page: Arc<AtomicBool>,
+        expire_after_claim: Arc<AtomicBool>,
     }
 
     impl CommitExpiringStorage {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             Self {
                 inner: crate::Memory::new(),
                 generation: Arc::new(AtomicU64::new(0)),
                 expire_next_page: Arc::new(AtomicBool::new(false)),
+                expire_after_claim: Arc::new(AtomicBool::new(false)),
             }
         }
 
-        fn expire_next_page(&self) {
+        pub(super) fn expire_scan_after_next_migration_claim(&self) {
+            self.expire_after_claim.store(true, Ordering::Release);
+        }
+
+        pub(super) fn expire_next_page(&self) {
             self.expire_next_page.store(true, Ordering::Release);
         }
     }
 
-    struct CommitExpiringRead {
+    pub(super) struct CommitExpiringRead {
         inner: MemoryRead,
         generation: Arc<AtomicU64>,
         observed_generation: u64,
@@ -2573,9 +2581,12 @@ mod tests {
         }
     }
 
-    struct CommitExpiringWrite {
+    pub(super) struct CommitExpiringWrite {
         inner: MemoryWrite,
         generation: Arc<AtomicU64>,
+        expire_next_page: Arc<AtomicBool>,
+        expire_after_claim: Arc<AtomicBool>,
+        invalidate_scan_on_commit: bool,
     }
 
     impl StorageWrite for CommitExpiringWrite {
@@ -2584,6 +2595,18 @@ mod tests {
             space: StorageSpace,
             entries: PutBatch,
         ) -> Result<(), StorageError> {
+            if space == REPOSITORY_EPOCH_SPACE
+                && entries.entries.iter().any(|entry| {
+                    entry.key.0.as_ref() == REPOSITORY_EPOCH_KEY
+                        && matches!(
+                            decode_pointer(&entry.value.bytes),
+                            Ok(PointerState::Migrating { .. })
+                        )
+                })
+                && self.expire_after_claim.swap(false, Ordering::AcqRel)
+            {
+                self.invalidate_scan_on_commit = true;
+            }
             self.inner.put_many(space, entries).await
         }
 
@@ -2614,6 +2637,9 @@ mod tests {
         async fn commit(self) -> Result<CommitResult, StorageError> {
             let result = self.inner.commit().await?;
             self.generation.fetch_add(1, Ordering::AcqRel);
+            if self.invalidate_scan_on_commit {
+                self.expire_next_page.store(true, Ordering::Release);
+            }
             Ok(result)
         }
 
@@ -2630,7 +2656,8 @@ mod tests {
             self.inner.acquire_session().await
         }
 
-        async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+        async fn begin_read(&self, mut opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            opts.durability = crate::storage_adapter::StorageReadDurability::Visible;
             let inner = self.inner.begin_read(opts).await?;
             Ok(CommitExpiringRead {
                 inner,
@@ -2640,10 +2667,17 @@ mod tests {
             })
         }
 
-        async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, StorageError> {
+        async fn begin_write(
+            &self,
+            mut opts: WriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            opts.await_durable = false;
             Ok(CommitExpiringWrite {
                 inner: self.inner.begin_write(opts).await?,
                 generation: Arc::clone(&self.generation),
+                expire_next_page: Arc::clone(&self.expire_next_page),
+                expire_after_claim: Arc::clone(&self.expire_after_claim),
+                invalidate_scan_on_commit: false,
             })
         }
     }

@@ -339,7 +339,7 @@ where
             }
         }
         if let Some(pin) = &current.native_source_pin {
-            let read = source.begin_read(Default::default()).await?;
+            let read = crate::migration::FrozenMigrationRead::new(source).await?;
             let wave = native_migration_pin_upload::native_migration_pin_wave(
                 &read,
                 &current.request,
@@ -376,7 +376,7 @@ where
                 target: target.clone(),
             }
         });
-        let read = source.begin_read(Default::default()).await?;
+        let read = crate::migration::FrozenMigrationRead::new(source).await?;
         let wave = partial_merge_runtime::captured_wave(
             &read,
             &current.request,

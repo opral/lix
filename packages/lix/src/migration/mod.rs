@@ -30,3 +30,5 @@ pub(crate) use epoch::PendingConversionJournal;
 pub(crate) use epoch::retry_published_conversion_cleanup;
 
 pub(crate) use epoch::GlobalConversionJournal;
+
+pub(crate) use epoch::FrozenMigrationRead;
