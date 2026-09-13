@@ -1,6 +1,6 @@
-package lix:plugin-file-projection-world@2.0.0;
+package lix:plugin-file-projection-world;
 
 world file-projection-plugin {
-  import lix:plugin/host@2.0.0;
-  export lix:plugin/file-projection@2.0.0;
+  import lix:plugin-v2/host;
+  export lix:plugin-v2/file-projection;
 }

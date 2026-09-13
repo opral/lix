@@ -871,83 +871,86 @@ async fn assert_partial_admission<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let read = storage.begin_read(StorageReadOptions::default()).await?;
-    if !crate::init::is_partial_repository_protocol(&read).await? {
-        return Err(LixError::new(
-            "LIX_PARTIAL_REPLICA_MIGRATION_REQUIRED",
-            "partial replica layout requires explicit migration before opening",
-        ));
-    }
-    let stored = crate::sync::load_partial_replica_state(&read).await?;
-    if stored.as_ref().map(|(state, _)| state) != Some(expected) {
-        return Err(LixError::new(
-            "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
-            "partial replica admission does not match the durable repository, account, remote and epoch",
-        ));
-    }
-    // These are local authoritative serving coordinates, not optional cache
-    // entries. Without a root marker HOT can interpret an absent row as empty.
-    // Validate only the two admitted branches, never enumerate the repository.
-    for branch in [
-        &expected.descriptor().selected_branch,
-        &expected.descriptor().global_branch,
-    ] {
-        let control = crate::branch::BranchHeadControlContext::new()
-            .reader(&read)
-            .load(&branch.branch_id)
-            .await?
-            .ok_or_else(|| {
-                LixError::new(
-                    "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
-                    "partial replica is missing its branch control",
-                )
-            })?;
-        let key = crate::storage_adapter::StorageKey(bytes::Bytes::from(
-            crate::hot_state::hot_generation_scope_prefix(
-                &branch.branch_id,
-                control.tracked_generation,
-            ),
-        ));
-        let marker = crate::storage_adapter::PointReadPlan::new(
-            crate::hot_state::ROOT_CURRENT_BASE_SPACE,
-            &[key],
-        )
-        .materialize(&read, Default::default())
-        .await?
-        .value
-        .pop()
-        .flatten();
-        let base = crate::changelog::CommitId::parse(&branch.head.commit_id).map_err(|_| {
-            LixError::new(
-                "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
-                "partial replica base ID is invalid",
-            )
-        })?;
-        if control.tracked_generation != expected.serving_generation(&branch.branch_id)?
-            || !matches!(marker, Some(crate::storage_adapter::StorageProjectedValue::FullValue(ref bytes)) if bytes.as_ref() == base.as_uuid().as_bytes())
-        {
-            let (root_commit_id, root_bytes) = match &marker {
-                Some(crate::storage_adapter::StorageProjectedValue::FullValue(bytes)) => (
-                    uuid::Uuid::from_slice(bytes).ok().map(|id| id.to_string()),
-                    Some(bytes.len()),
-                ),
-                _ => (None, None),
-            };
+    crate::handle::retry_expired_read(|| async {
+        let read = storage.begin_read(StorageReadOptions::default()).await?;
+        if !crate::init::is_partial_repository_protocol(&read).await? {
+            return Err(LixError::new(
+                "LIX_PARTIAL_REPLICA_MIGRATION_REQUIRED",
+                "partial replica layout requires explicit migration before opening",
+            ));
+        }
+        let stored = crate::sync::load_partial_replica_state(&read).await?;
+        if stored.as_ref().map(|(state, _)| state) != Some(expected) {
             return Err(LixError::new(
                 "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
-                "partial replica native root serving coordinates disagree with its admitted base",
-            ).with_details(serde_json::json!({
-                "branchId": branch.branch_id,
-                "headCommitId": control.head_commit_id.to_string(),
-                "servingGeneration": control.tracked_generation.to_string(),
-                "expectedServingGeneration": expected.serving_generation(&branch.branch_id)?.to_string(),
-                "rootCommitId": root_commit_id,
-                "rootBytes": root_bytes,
-                "expectedRootCommitId": base.to_string(),
-            })));
+                "partial replica admission does not match the durable repository, account, remote and epoch",
+            ));
         }
-    }
-    Ok(Arc::from(expected.repository_id()))
+        // These are local authoritative serving coordinates, not optional cache
+        // entries. Without a root marker HOT can interpret an absent row as empty.
+        // Validate only the two admitted branches, never enumerate the repository.
+        for branch in [
+            &expected.descriptor().selected_branch,
+            &expected.descriptor().global_branch,
+        ] {
+            let control = crate::branch::BranchHeadControlContext::new()
+                .reader(&read)
+                .load(&branch.branch_id)
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
+                        "partial replica is missing its branch control",
+                    )
+                })?;
+            let key = crate::storage_adapter::StorageKey(bytes::Bytes::from(
+                crate::hot_state::hot_generation_scope_prefix(
+                    &branch.branch_id,
+                    control.tracked_generation,
+                ),
+            ));
+            let marker = crate::storage_adapter::PointReadPlan::new(
+                crate::hot_state::ROOT_CURRENT_BASE_SPACE,
+                &[key],
+            )
+            .materialize(&read, Default::default())
+            .await?
+            .value
+            .pop()
+            .flatten();
+            let base = crate::changelog::CommitId::parse(&branch.head.commit_id).map_err(|_| {
+                LixError::new(
+                    "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
+                    "partial replica base ID is invalid",
+                )
+            })?;
+            if control.tracked_generation != expected.serving_generation(&branch.branch_id)?
+                || !matches!(marker, Some(crate::storage_adapter::StorageProjectedValue::FullValue(ref bytes)) if bytes.as_ref() == base.as_uuid().as_bytes())
+            {
+                let (root_commit_id, root_bytes) = match &marker {
+                    Some(crate::storage_adapter::StorageProjectedValue::FullValue(bytes)) => (
+                        uuid::Uuid::from_slice(bytes).ok().map(|id| id.to_string()),
+                        Some(bytes.len()),
+                    ),
+                    _ => (None, None),
+                };
+                return Err(LixError::new(
+                    "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
+                    "partial replica native root serving coordinates disagree with its admitted base",
+                ).with_details(serde_json::json!({
+                    "branchId": branch.branch_id,
+                    "headCommitId": control.head_commit_id.to_string(),
+                    "servingGeneration": control.tracked_generation.to_string(),
+                    "expectedServingGeneration": expected.serving_generation(&branch.branch_id)?.to_string(),
+                    "rootCommitId": root_commit_id,
+                    "rootBytes": root_bytes,
+                    "expectedRootCommitId": base.to_string(),
+                })));
+            }
+        }
+        Ok(Arc::from(expected.repository_id()))
+    })
+    .await
 }
 
 async fn repository_has_changelog_commit(

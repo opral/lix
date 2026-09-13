@@ -5,6 +5,7 @@
 //! recovered commit alive. The checkpoint transaction stages the rotation in
 //! the same storage write set that publishes the compacted checkpoint.
 
+mod incorporation;
 mod native_baseline_lease;
 mod native_global_retention;
 pub(crate) use native_global_retention::{
@@ -20,8 +21,7 @@ pub(crate) use native_baseline_lease::{
 pub(crate) use native_upload_attempt::{
     NATIVE_UPLOAD_ATTEMPT_SPACE, NativeUploadAttempt, NativeUploadAttemptIdentity,
     load_native_upload_attempt, require_native_upload_attempt, stage_accepted_native_upload_wave,
-    stage_finalize_native_upload_attempt,
-    stage_revoke_expired_upload_attempt,
+    stage_finalize_native_upload_attempt, stage_revoke_expired_upload_attempt,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -915,6 +915,7 @@ struct AuthenticatedServingDependencyClosure {
     physical_authorities: BTreeSet<CommitId>,
     physical_dependencies: BTreeSet<CommitId>,
     semantic_dependencies: BTreeSet<CommitId>,
+    proof_metadata: BTreeSet<CommitId>,
     cas_logical_dependencies: BTreeSet<CommitId>,
     mutation_nodes: BTreeSet<[u8; 32]>,
     scoped_nodes: BTreeSet<[u8; 32]>,
@@ -967,8 +968,11 @@ where
         .copied()
         .collect::<BTreeSet<_>>();
     let mut physical_authorities = chronology_roots.clone();
-    let mut physical_dependencies = serving_dependencies.clone();
-    physical_dependencies.extend(history_dependencies.iter().copied());
+    // Authenticated serving rows are self-contained, but retain their original
+    // semantic commit IDs after snapshot import. Their deferred history is not
+    // a physical dependency of those independently materialized rows.
+    let mut provenance_dependencies = serving_dependencies.clone();
+    let mut physical_dependencies = history_dependencies.clone();
     let mut semantic_dependencies = serving_dependencies;
     semantic_dependencies.extend(history_dependencies.iter().copied());
     // Retain the delta of every graph-reachable commit that still has one.
@@ -981,8 +985,9 @@ where
     // `collect_checkpoint_garbage_best_effort` swallows the error, so
     // collection would simply stop forever while writes kept succeeding.
     //
-    // Nothing else is relaxed. Serving dependencies, selected-source owners and
-    // physical authorities keep their existing hard demand, so a manifest
+    // Physical serving dependencies, selected-source owners and physical
+    // authorities keep their hard demand. Self-contained row provenance is
+    // handled separately below and may name explicitly deferred history. A manifest
     // missing from any of those classes still fails the sweep exactly as it
     // does today. Within this set we *cannot* tell a commit swept before the
     // fix from a manifest missing for a reason that should not happen -- after
@@ -1105,12 +1110,13 @@ where
         }
     }
     let native_commit_dependencies =
-        crate::tracked_state::load_native_current_state_part_owners(store, &native_parts).await?;
-    physical_dependencies.extend(native_commit_dependencies.iter().copied());
+        crate::tracked_state::load_native_current_state_part_commit_ids(store, &native_parts)
+            .await?;
+    provenance_dependencies.extend(native_commit_dependencies.iter().copied());
     semantic_dependencies.extend(native_commit_dependencies);
 
     let missing_dependency_ids = physical_dependencies
-        .iter()
+        .union(&provenance_dependencies)
         .filter(|commit_id| !manifests.contains_key(commit_id))
         .copied()
         .collect::<Vec<_>>();
@@ -1120,6 +1126,12 @@ where
         .into_iter()
         .zip(missing_dependency_manifests)
     {
+        if manifest.is_none()
+            && !physical_dependencies.contains(&commit_id)
+            && crate::tracked_state::commit_history_is_deferred(store, commit_id).await?
+        {
+            continue;
+        }
         let manifest = manifest.ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -1128,6 +1140,7 @@ where
                 ),
             )
         })?;
+        physical_dependencies.insert(commit_id);
         manifests.insert(commit_id, manifest);
     }
     collect_active_point_replay_dependencies(
@@ -1229,6 +1242,11 @@ where
             .extend(crate::tracked_state::collect_mutation_directory_node_ids(store, &root).await?);
     }
 
+    let retained_physical = retained_physical_ids.iter().copied().collect();
+    let proof = incorporation::retain(store, &manifests, &retained_physical).await?;
+    semantic_dependencies.extend(proof.graph_commits);
+    mutation_nodes.extend(proof.mutation_nodes);
+    scoped_nodes.extend(proof.scoped_nodes);
     Ok(AuthenticatedServingDependencyClosure {
         expired_baseline_leases: Vec::new(),
         more_expired_baseline_leases: false,
@@ -1238,6 +1256,7 @@ where
         physical_authorities,
         physical_dependencies,
         semantic_dependencies,
+        proof_metadata: proof.commits,
         cas_logical_dependencies,
         mutation_nodes,
         scoped_nodes,
@@ -1455,6 +1474,7 @@ where
         physical_authorities: active_authority_ids,
         physical_dependencies: active_dependency_ids,
         semantic_dependencies: active_semantic_dependency_ids,
+        proof_metadata: active_proof_metadata,
         cas_logical_dependencies: active_cas_dependency_ids,
         mutation_nodes: active_mutation_nodes,
         scoped_nodes: active_scoped_nodes,
@@ -1554,6 +1574,7 @@ where
                 &mut candidate_writes,
                 commit_id,
                 RetainedPhysicalState {
+                    topology_commits: &active_proof_metadata,
                     mutation_nodes: &active_mutation_nodes,
                     scoped_nodes: &active_scoped_nodes,
                     native_parts: &active_current_parts,
@@ -2205,6 +2226,7 @@ where
         store,
         writes,
         RetainedPhysicalState {
+            topology_commits: &BTreeSet::new(),
             mutation_nodes: &live_mutation_directory_nodes,
             scoped_nodes: &live_scoped_range_nodes,
             native_parts: &live_current_state_data_parts,
@@ -3179,6 +3201,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_gc_owners_validate_standalone_authority_and_reject_unresolved_members() {
+        for standalone in [0, 1, 2] {
+            let storage = StorageAdapter::new(Memory::new());
+            let timestamp =
+                LixTimestamp::expect_parse("standalone selected owner", "2026-01-01T00:00:00Z");
+            let selector = replay_commit_record("standalone-selector", 0, None, timestamp);
+            let selected = packed_change("standalone-selected-change", "expected-row", true);
+            let mut writes = storage.new_write_set();
+            let mut deltas = commit_delta_refs(selector.commit_id, std::slice::from_ref(&selected));
+            deltas[0].authored = false;
+            let staged = stage_commit_deltas_for_commit_state(&mut writes, &deltas).unwrap();
+            let mut manifest =
+                test_commit_state_manifest(&selector, staged.mutation_inventory().clone());
+            manifest.replay_debt = CommitStateReplayDebt::default();
+            manifest.snapshot_root = Some(Box::new(test_snapshot_root(selector.commit_id)));
+            if standalone != 0 {
+                let mut record = selected.clone();
+                if standalone == 2 {
+                    record.row_pk = RowPk::single("wrong-row");
+                }
+                let mut read = storage.begin_read(Default::default()).await.unwrap();
+                ChangelogContext::new()
+                    .writer(&mut read, &mut writes)
+                    .stage_append(ChangelogAppend {
+                        commits: Vec::new(),
+                        changes: vec![record],
+                    })
+                    .await
+                    .unwrap();
+            }
+            persist_replay_closure_fixture(&storage, writes, &[selector.clone()], &[manifest])
+                .await;
+            let read = storage.begin_read(Default::default()).await.unwrap();
+            let result = crate::tracked_state::load_local_selected_change_owner_commit_ids(
+                &read,
+                selector.commit_id,
+            )
+            .await;
+            match standalone {
+                1 => assert!(
+                    result.unwrap().is_empty(),
+                    "standalone authority must not invent a native locator owner"
+                ),
+                2 => assert!(result.unwrap_err().message.contains("different identity")),
+                _ => assert!(
+                    result
+                        .unwrap_err()
+                        .message
+                        .contains("has no authoritative locator")
+                ),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_row_provenance_does_not_override_required_physical_parent() {
+        for (physical_parent, deferred) in [(false, true), (true, true), (false, false)] {
+            let timestamp =
+                LixTimestamp::expect_parse("provenance fixture", "2026-01-01T00:00:00Z");
+            let active = replay_commit_record("provenance-active", 0, None, timestamp);
+            let source = replay_commit_record("provenance-source", 0, None, timestamp);
+            let mut manifest =
+                test_commit_state_manifest(&active, CommitStateMutationInventory::default());
+            manifest.replay_debt = CommitStateReplayDebt::default();
+            let mut root = test_snapshot_root(active.commit_id);
+            if physical_parent {
+                root.parent_roots.push(TrackedStateCommitRootParent {
+                    commit_id: source.commit_id,
+                    root_id: test_snapshot_root(source.commit_id).root_id,
+                });
+            }
+            manifest.snapshot_root = Some(Box::new(root));
+            let storage = StorageAdapter::new(Memory::new());
+            let mut writes = storage.new_write_set();
+            if deferred {
+                crate::tracked_state::stage_commit_history_deferred_with_scope(
+                    &mut writes,
+                    source.commit_id,
+                    false,
+                );
+            }
+            persist_replay_closure_fixture(
+                &storage,
+                writes,
+                &[active.clone(), source.clone()],
+                &[manifest],
+            )
+            .await;
+            let read = storage.begin_read(Default::default()).await.unwrap();
+            let result = super::load_authenticated_serving_dependency_closure(
+                &&read,
+                BTreeSet::from([active.commit_id]),
+                BTreeSet::from([source.commit_id]),
+                BTreeSet::new(),
+                BTreeSet::new(),
+            )
+            .await;
+            if !physical_parent && deferred {
+                let closure = result.unwrap();
+                assert!(closure.semantic_dependencies.contains(&source.commit_id));
+                assert!(!closure.physical_dependencies.contains(&source.commit_id));
+            } else {
+                let error = result
+                    .err()
+                    .expect("missing physical or undeclared history must fail closed");
+                assert_eq!(
+                    error.message,
+                    format!(
+                        "active GC serving dependency '{}' has no authenticated physical manifest",
+                        source.commit_id
+                    )
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn authenticated_closure_accepts_rootless_selected_owner_without_semantic_projection() {
         let timestamp =
             LixTimestamp::expect_parse("rootless selected owner timestamp", "2026-01-01T00:00:00Z");
@@ -3789,12 +3928,12 @@ mod tests {
             .await
             .expect("native dependency read should open");
         assert_eq!(
-            crate::tracked_state::load_native_current_state_part_owners(
+            crate::tracked_state::load_native_current_state_part_commit_ids(
                 &read,
                 &BTreeSet::from([encoded.digest]),
             )
             .await
-            .expect("native owner should decode"),
+            .expect("native semantic provenance should decode"),
             BTreeSet::from([owner.commit_id])
         );
         drop(read);
@@ -3928,6 +4067,7 @@ mod tests {
         let timestamp =
             LixTimestamp::expect_parse("tree sweep fixture timestamp", "2026-01-01T00:00:00Z");
         let manifest = CommitStateManifest {
+            incorporation: crate::tracked_state::CommitStateIncorporation::None,
             commit_id,
             change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             replay_debt: CommitStateReplayDebt::default(),
@@ -4067,6 +4207,7 @@ mod tests {
             complete_state_fence: false,
         };
         let manifest = |commit_id, snapshot_root| CommitStateManifest {
+            incorporation: crate::tracked_state::CommitStateIncorporation::None,
             commit_id,
             change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             replay_debt: CommitStateReplayDebt::default(),
@@ -5058,6 +5199,7 @@ mod tests {
             &mut writes,
             orphan.commit_id,
             crate::tracked_state::RetainedPhysicalState {
+                topology_commits: &BTreeSet::new(),
                 mutation_nodes: &BTreeSet::new(),
                 scoped_nodes: &BTreeSet::new(),
                 native_parts: &BTreeSet::new(),
@@ -5168,6 +5310,7 @@ mod tests {
             &read,
             &mut sweep,
             crate::tracked_state::RetainedPhysicalState {
+                topology_commits: &BTreeSet::new(),
                 mutation_nodes: &live,
                 scoped_nodes: &live,
                 native_parts: &live,
@@ -6235,6 +6378,7 @@ mod tests {
         mutations: CommitStateMutationInventory,
     ) -> CommitStateManifest {
         CommitStateManifest {
+            incorporation: crate::tracked_state::CommitStateIncorporation::None,
             commit_id: record.commit_id,
             change_account_id: record.account_id.clone(),
             replay_debt: CommitStateReplayDebt {
@@ -6315,6 +6459,12 @@ mod tests {
         writes.delete(
             MUTABLE_MANIFEST_SPACE,
             crate::tracked_state::commit_state_authority_key(commit_id),
+        );
+        // Deferred provenance cannot excuse loss of a required physical root.
+        crate::tracked_state::stage_commit_history_deferred_with_scope(
+            &mut writes,
+            commit_id,
+            false,
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())

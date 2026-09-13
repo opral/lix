@@ -114,8 +114,14 @@ async fn descriptor_only_file_content_reads_and_prepared_writes_remain_local() {
             )
             .await
             .unwrap();
-        let original = (0..96 * 1024)
-            .map(|index| ((index * 37 + index / 251) % 256) as u8)
+        // Exceed inline transfer admission so this gate exercises chunk demand.
+        let original = (0..super::super::blob::MAX_INLINE_SYNC_BLOB_BYTES + 96 * 1024)
+            .map(|index| {
+                ((index as u64)
+                    .wrapping_mul(6364136223846793005)
+                    .rotate_left((index % 61) as u32)
+                    >> 29) as u8
+            })
             .collect::<Vec<_>>();
         let unrelated = vec![231u8; 1024 * 1024];
         authority.execute("INSERT INTO lix_file (path, content) VALUES ('/target.bin', $1), ('/unrelated.bin', $2)", &[Value::Blob(original.clone().into()), Value::Blob(unrelated.clone().into())]).await.unwrap();

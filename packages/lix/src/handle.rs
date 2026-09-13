@@ -1511,6 +1511,29 @@ where
     where
         Backing: Storage + Clone + Send + Sync + 'static,
     {
+        let operation = self.open_storage_session_inner(storage);
+        #[cfg(not(target_family = "wasm"))]
+        {
+            // SAFETY: like open_another_session, this operation borrows only a
+            // Send + Sync Lix and owns Send backing storage. Storage read/write
+            // handles satisfy the Storage contract; retained scan-scope and
+            // admission references point to Sync state. The raw Memory future
+            // and borrowing-adapter obligations are checked in partial tests.
+            unsafe { crate::session::AssumeSendFuture::new(operation) }.await
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            operation.await
+        }
+    }
+
+    async fn open_storage_session_inner<Backing>(
+        &self,
+        storage: Backing,
+    ) -> Result<Lix<Backing>, LixError>
+    where
+        Backing: Storage + Clone + Send + Sync + 'static,
+    {
         if self.session.is_closed() {
             return Err(LixError::new(
                 LixError::CODE_CLOSED,
@@ -2382,7 +2405,14 @@ where
             .await
             {
                 Ok(_) => true,
-                Err(error) if error.code == "LIX_ERROR_ALREADY_INITIALIZED" => false,
+                // Another opener can publish the seed after our empty-state
+                // check. Admit that winner below; never replay initialization.
+                Err(error)
+                    if error.code == "LIX_ERROR_ALREADY_INITIALIZED"
+                        || error.code == LixError::CODE_TRANSACTION_CONFLICT =>
+                {
+                    false
+                }
                 Err(error) => return Err(error),
             };
             new_engine(adapter, wasm_runtime, telemetry, plugin_resource_limits)

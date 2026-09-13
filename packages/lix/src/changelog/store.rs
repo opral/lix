@@ -269,6 +269,10 @@ mod tests {
             ("sync/partial_upload.rs .put(", 1),
             // Test-only synthetic ancestry graphs, including corrupt jump input.
             ("sync/partial_merge_analysis/ancestry_tests.rs .put(", 1),
+            // Test-only sparse legacy migration fixture removes graph metadata.
+            ("migration/incorporation/tests.rs .delete(", 1),
+            // Test-only corruption fixture must not receive snapshot repair.
+            ("sync/snapshot_omission_migration_tests.rs .delete(", 1),
         ]
         .into_iter()
         .map(|(site, count)| (site.to_string(), count))

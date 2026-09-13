@@ -112,12 +112,16 @@ pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
 /// schema required to interpret engine rows.
 /// v78 stores checkpoint membership in canonical v7 commit metadata.
 /// v79 requires native deterministic-setting identity witnesses for bounded absence checks.
-pub(crate) const CURRENT_FORMAT_VERSION: u32 = 79;
+/// v80 records complete checkpoint incorporation independently of commit membership.
+pub(crate) const CURRENT_FORMAT_VERSION: u32 = 80;
 const REPOSITORY_PROTOCOL_PREFIX: &[u8] = b"tracked-default-branch.v";
-pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v79";
+pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v80";
+pub(crate) const REPOSITORY_PROTOCOL_V79: &[u8] = b"tracked-default-branch.v79";
 pub(crate) const REPOSITORY_PROTOCOL_V78: &[u8] = b"tracked-default-branch.v78";
 // Older full-layout parsers reject the nonnumeric suffix before reading rows.
 pub(crate) const PARTIAL_REPOSITORY_PROTOCOL_VALUE: &[u8] =
+    b"tracked-default-branch.v80-partial-replica.v1";
+pub(crate) const PARTIAL_REPOSITORY_PROTOCOL_V79: &[u8] =
     b"tracked-default-branch.v79-partial-replica.v1";
 pub(crate) const REPOSITORY_PROTOCOL_V77: &[u8] = b"tracked-default-branch.v77";
 pub(crate) const REPOSITORY_PROTOCOL_V77_CHECKPOINT_REWRITE: &[u8] =
@@ -723,6 +727,7 @@ where
             crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
                 &mut writes,
                 &CommitStateManifest {
+                    incorporation: crate::tracked_state::CommitStateIncorporation::None,
                     commit_id: plan.global_commit.id,
                     change_account_id: plan.global_commit.account_id.clone(),
                     replay_debt: CommitStateReplayDebt::default(),
@@ -815,6 +820,7 @@ where
         let _main_state = crate::tracked_state::stage_certified_commit_state_manifest_with_handle(
             &mut writes,
             &CommitStateManifest {
+                incorporation: crate::tracked_state::CommitStateIncorporation::None,
                 commit_id: plan.main_commit.id,
                 change_account_id: plan.main_commit.account_id.clone(),
                 replay_debt: CommitStateReplayDebt::default(),
@@ -1597,11 +1603,15 @@ mod tests {
         );
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v79"),
-            RepositoryProtocolStatus::Current
+            RepositoryProtocolStatus::MigrationRequired { found_version: 79 }
         );
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v80"),
-            RepositoryProtocolStatus::TooNew { found_version: 80 }
+            RepositoryProtocolStatus::Current
+        );
+        assert_eq!(
+            parse_repository_protocol(b"tracked-default-branch.v81"),
+            RepositoryProtocolStatus::TooNew { found_version: 81 }
         );
         assert_eq!(
             parse_repository_protocol(b"not-a-lix-format"),

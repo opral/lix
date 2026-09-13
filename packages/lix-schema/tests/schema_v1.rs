@@ -233,17 +233,17 @@ fn bundled_native_jsonb_schemas_match_canonical_fixtures_and_fingerprints() {
         (
             "json",
             "json_root",
-            "f9983019fd1050c5234ae1957ecf300757d0a43eb89a24e91ed184c85599f3ad",
+            "54916ea6df172c6fe79b9a9f13e997dd3ef3cd141d505ec3ab612205c4ff1e49",
         ),
         (
             "json",
             "json_object_member",
-            "83dd43c644fd996fdec5b907ab08396270adfbe7fdc2f4792e00827f51304bb3",
+            "b7e4f4671f04b6233702dfec9aeb4db70c653df78b7365d5772ccbb85a027c7f",
         ),
         (
             "json",
             "json_array_item",
-            "e5eba027bc7ceb323bfa045dfcf39134565bfc23f84844be628283db1bc62422",
+            "b58a8f33fdb6c9846a81f877f7b6cb6ab44bccb979f86015fdaccf78547a040f",
         ),
         (
             "excalidraw",

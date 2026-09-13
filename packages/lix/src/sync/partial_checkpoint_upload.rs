@@ -120,28 +120,15 @@ pub(super) async fn prepare_partial_checkpoint_page(
     let latest = control
         .working_diff_checkpoint_commit_id
         .ok_or_else(|| blocked("checkpoint missing"))?;
-    let checkpoint = first_parent_child(read, latest, id(&push.confirmed.checkpoint)?).await?;
-    let working_tip = if checkpoint == latest {
-        control.head_commit_id
-    } else {
-        let next = first_parent_child(read, latest, checkpoint).await?;
-        let (source_branch, source) = load_sync_checkpoint_source(read, next)
-            .await?
-            .ok_or_else(|| blocked("next checkpoint source is missing"))?;
-        if source_branch != branch_id {
-            return Err(blocked("next checkpoint source belongs to another branch"));
-        }
-        source
-    };
-    let head = if working_tip == checkpoint {
-        checkpoint
-    } else {
-        first_parent_child(read, working_tip, checkpoint).await?
-    };
-    let target = PartialPushCoordinate {
-        head: head.to_string(),
-        checkpoint: checkpoint.to_string(),
-    };
+    let target = next_checkpoint_target(
+        read,
+        branch_id,
+        control.head_commit_id,
+        latest,
+        id(&push.confirmed.checkpoint)?,
+    )
+    .await?;
+    let checkpoint = id(&target.checkpoint)?;
     match prepare_checkpoint_target(
         read,
         state,
@@ -173,6 +160,39 @@ pub(super) async fn prepare_partial_checkpoint_page(
         }
         result => result,
     }
+}
+
+/// The earliest pending checkpoint includes its original working child, so
+/// publishing its intent cannot discard rows excluded by the checkpoint.
+pub(super) async fn next_checkpoint_target(
+    read: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    working_head: CommitId,
+    latest: CommitId,
+    confirmed_checkpoint: CommitId,
+) -> Result<PartialPushCoordinate, LixError> {
+    let checkpoint = first_parent_child(read, latest, confirmed_checkpoint).await?;
+    let working_tip = if checkpoint == latest {
+        working_head
+    } else {
+        let next = first_parent_child(read, latest, checkpoint).await?;
+        let (source_branch, source) = load_sync_checkpoint_source(read, next)
+            .await?
+            .ok_or_else(|| blocked("next checkpoint source is missing"))?;
+        if source_branch != branch_id {
+            return Err(blocked("next checkpoint source belongs to another branch"));
+        }
+        source
+    };
+    let head = if working_tip == checkpoint {
+        checkpoint
+    } else {
+        first_parent_child(read, working_tip, checkpoint).await?
+    };
+    Ok(PartialPushCoordinate {
+        head: head.to_string(),
+        checkpoint: checkpoint.to_string(),
+    })
 }
 
 async fn prepare_checkpoint_target(
@@ -394,6 +414,9 @@ pub(super) async fn load_local_dependency_closure(
             dependencies.insert(id(&alias.source_commit_id)?);
         }
         if let Some(source) = &commit.selected_source_commit_id {
+            dependencies.insert(id(source)?);
+        }
+        if let Some(source) = &commit.complete_incorporation_source_commit_id {
             dependencies.insert(id(source)?);
         }
         if let Some((source_branch, source)) = load_sync_checkpoint_source(read, current).await? {

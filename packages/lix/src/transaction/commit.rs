@@ -405,6 +405,10 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     let checkpoint_epochs = checkpoint_epoch_bindings(&prepared_writes.checkpoint_publications)?;
     let checkpoint_state_sources =
         checkpoint_state_source_bindings(&prepared_writes.checkpoint_publications)?;
+    let checkpoint_incorporation_sources = checkpoint_incorporation_bindings(
+        &prepared_writes.checkpoint_publications,
+        &tracked_roots,
+    )?;
     // The current-state protocol removes the automatic mutable branch-ref
     // row for a normal branch-head advance, but `lix_change` remains an
     // unscoped public ledger. Retain one tiny direct change fact per
@@ -628,6 +632,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &external_parent_manifests,
         &state_rows,
         &row_index.tracked_row_indices_by_commit,
+        &checkpoint_incorporation_sources,
     )
     .await?;
     // HOT publication has adapter-specific checkpoint, packed-base, and
@@ -763,6 +768,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
             &ordered_replacements,
             &staged_delta_index,
             &checkpoint_state_sources,
+            &checkpoint_incorporation_sources,
             &staged_snapshot_roots,
             &commit_rows
                 .iter()
@@ -2251,6 +2257,7 @@ fn materialize_staged_sync_commits(
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
     staged_delta_index: &StagedCommitDeltaIndex,
     checkpoint_state_sources: &BTreeMap<CommitId, CommitId>,
+    checkpoint_incorporation_sources: &BTreeMap<CommitId, CommitId>,
     staged_snapshot_roots: &BTreeMap<CommitId, TrackedStateCommitRoot>,
     global_commit_ids: &BTreeSet<CommitId>,
 ) -> Result<Vec<crate::sync::SyncCommit>, LixError> {
@@ -2425,6 +2432,10 @@ fn materialize_staged_sync_commits(
             })
             .transpose()?;
         let commit = SyncCommit {
+            complete_incorporation_source_commit_id: checkpoint_incorporation_sources
+                .get(commit_id)
+                .map(ToString::to_string),
+            incorporation_unknown: false,
             is_checkpoint: staged.record.is_checkpoint,
             commit_id: staged.record.commit_id.to_string(),
             parent_commit_ids: staged
@@ -5929,6 +5940,31 @@ fn checkpoint_state_source_bindings(
     Ok(bindings)
 }
 
+fn checkpoint_incorporation_bindings(
+    publications: &[crate::gc::CheckpointPublication],
+    roots: &[PendingTrackedRoot],
+) -> Result<BTreeMap<CommitId, CommitId>, LixError> {
+    publications
+        .iter()
+        .map(|publication| {
+            let recovery = &publication.recovery_ref;
+            let complete = roots
+                .iter()
+                .find(|root| root.publish_head && root.branch_id == recovery.branch_id)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "checkpoint has no complete working-state publication",
+                    )
+                })?;
+            // Full selection publishes C; partial selection publishes C plus W.
+            // The planner's complete partition certifies only the final working
+            // state. Selected C alone must never claim all of the captured source.
+            Ok((complete.commit_id, recovery.recovered_head_commit_id))
+        })
+        .collect()
+}
+
 fn release_validated_canonical_value_columns(state_rows: &mut PreparedStateBatch) {
     state_rows.release_validated_canonical_value_columns();
 }
@@ -6486,6 +6522,7 @@ fn stage_commit_state_manifests<'a, S>(
     >,
     state_rows: &'a PreparedStateBatch,
     row_indices: &'a BTreeMap<CommitId, Vec<RowIndex>>,
+    checkpoint_incorporation_sources: &'a BTreeMap<CommitId, CommitId>,
 ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
 where
     S: StorageAdapterRead + ?Sized + 'a,
@@ -6869,6 +6906,13 @@ where
                 mutations.parts.clear();
             }
             let manifest = CommitStateManifest {
+                incorporation: checkpoint_incorporation_sources
+                    .get(&record.commit_id)
+                    .copied()
+                    .map_or(
+                        crate::tracked_state::CommitStateIncorporation::None,
+                        crate::tracked_state::CommitStateIncorporation::Complete,
+                    ),
                 commit_id: record.commit_id,
                 change_account_id: record.account_id.clone(),
                 replay_debt: if rootless {
@@ -10473,6 +10517,7 @@ mod tests {
             &BTreeMap::new(),
             &external_parent_manifests,
             &PreparedStateBatch::default(),
+            &BTreeMap::new(),
             &BTreeMap::new(),
         )
         .await

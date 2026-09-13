@@ -1,4 +1,4 @@
-//! Safety obligations for the single owned conversion Send assertion.
+//! Safety obligations for conversion and backing-storage session Send assertions.
 use super::*;
 use crate::session::borrowing_proof_storage::{BorrowingRead, BorrowingStorage};
 use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapterReadScope};
@@ -16,12 +16,24 @@ fn complete_unwrapped_memory_conversion_future_is_send() {
     is_send(&raw);
 }
 
+#[tokio::test]
+async fn complete_unwrapped_memory_storage_session_future_is_send() {
+    let storage = Memory::new();
+    let source = open_lix().with_storage(storage.clone()).await.unwrap();
+    is_send(&source.open_storage_session_inner(storage.clone()));
+    is_send(&source.open_storage_session(storage.clone()));
+    let child = source.open_storage_session(storage).await.unwrap();
+    child.execute("SELECT 1", &[]).await.unwrap();
+    child.close().await.unwrap();
+    source.close().await.unwrap();
+}
+
 // A free lifetime proves these obligations universally, rather than only at
 // 'static. The actual borrowing adapter reproduces native RocksDB/Filesystem
 // read-handle lifetimes; whole-future inference at this shape is the compiler
 // limitation documented by session::assume_send_future_proofs_borrowing.
 #[allow(dead_code)]
-fn native_storage_obligations<'a, S: Storage + Clone + Send + Sync + 'a>() {
+fn native_storage_obligations<'a, S: Storage + Clone + Send + Sync + 'static>() {
     assert_send::<S::Read<'a>>();
     assert_sync::<S::Read<'a>>();
     assert_send::<S::Write<'a>>();
@@ -32,10 +44,12 @@ fn native_storage_obligations<'a, S: Storage + Clone + Send + Sync + 'a>() {
     assert_send::<StorageSession<S>>();
     assert_sync::<StorageSession<S>>();
     assert_sync::<crate::storage_adapter::StorageAdapter<S>>();
+    assert_send::<Lix<S>>();
+    assert_sync::<Lix<S>>();
 }
 #[allow(dead_code)]
 fn borrowing_adapter_obligations<'a>() {
-    native_storage_obligations::<'a, BorrowingStorage>();
+    native_storage_obligations::<BorrowingStorage>();
     assert_send::<SharedStorageAdapterRead<BorrowingRead<'a>>>();
     assert_sync::<SharedStorageAdapterRead<BorrowingRead<'a>>>();
 }

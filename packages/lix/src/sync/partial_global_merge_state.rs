@@ -394,7 +394,9 @@ pub(super) async fn stage_capture_partial_global_merge(
     }
     let selected = &state.descriptor().selected_branch.branch_id;
     if selected != GLOBAL_BRANCH_ID {
-        guards.extend(super::partial_merge_state::ordinary_upload_merge_guards(read, state).await?);
+        guards.extend(
+            super::partial_merge_state::ordinary_upload_merge_guards(read, state, selected).await?,
+        );
         let (selected_push, selected_raw, selected_epoch) =
             super::partial_push_state::load_partial_push_state(read, state, selected).await?;
         let selected_observation =

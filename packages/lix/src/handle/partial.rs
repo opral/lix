@@ -391,7 +391,10 @@ mod tests {
             .with_branch(crate::GLOBAL_BRANCH_ID)
             .await
             .unwrap();
-        assert_eq!(global.active_branch_id().await.unwrap(), crate::GLOBAL_BRANCH_ID);
+        assert_eq!(
+            global.active_branch_id().await.unwrap(),
+            crate::GLOBAL_BRANCH_ID
+        );
         global.close().await.unwrap();
         assert_eq!(
             requests.load(Ordering::SeqCst),

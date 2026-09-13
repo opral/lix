@@ -892,6 +892,15 @@ where
             .await
             .map_err(storage_error)?;
         let candidate_result = async {
+            if Box::pin(migrate_sparse_candidate(
+                &migration_source,
+                &target,
+                from_format,
+            ))
+            .await?
+            {
+                return Ok::<(), LixError>(());
+            }
             let replica = Box::pin(inspect_replica_rebuild(
                 &migration_source,
                 from_format,
@@ -1089,6 +1098,15 @@ where
         );
 
         let candidate_result = async {
+            if Box::pin(migrate_sparse_candidate(
+                &migration_source,
+                &target,
+                from_format,
+            ))
+            .await?
+            {
+                return Ok::<(), LixError>(());
+            }
             let replica = Box::pin(inspect_replica_rebuild(
                 &migration_source,
                 from_format,
@@ -1161,6 +1179,35 @@ where
     }
     .await;
     finish_after_heartbeat(heartbeat, result).await
+}
+
+async fn migrate_sparse_candidate<S>(
+    source: &StorageAdapter<S>,
+    target: &StorageAdapter<S>,
+    from_format: u32,
+) -> Result<bool, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    if from_format != 79 || !super::incorporation::is_legacy_partial(source).await? {
+        return Ok(false);
+    }
+    clear_bank(target).await?;
+    let _ = copy_repository(source, target).await?;
+    super::incorporation::migrate(target, super::MigrationOptions::automatic(), true).await?;
+    let state = crate::handle::retry_expired_read(|| async {
+        let read = target.begin_read(ReadOptions::default()).await?;
+        Ok(crate::sync::load_partial_replica_state(&read)
+            .await?
+            .ok_or_else(|| epoch_error("partial migration lost its admission"))?
+            .0)
+    })
+    .await?;
+    let (engine, session) =
+        Engine::new_partial_replica(target.clone(), EngineOptions::new(), &state).await?;
+    drop(session);
+    drop(engine);
+    Ok(true)
 }
 
 fn schedule_legacy_retirement<S>(storage: S, active_pointer: Bytes) -> Result<(), LixError>
@@ -3722,3 +3769,19 @@ mod native_global_conversion_journal;
 mod native_global_epoch_owner;
 mod native_global_journal_io;
 pub(crate) use native_global_conversion_journal::GlobalConversionJournal;
+#[cfg(test)]
+pub(crate) fn stage_legacy_partial_epoch_for_test(
+    writes: &mut crate::storage_adapter::StorageWriteSet,
+) {
+    let pointer = encode_pointer(PointerState::Active {
+        bank: EpochBank::Legacy,
+        generation: 1,
+        format: 79,
+        publication: None,
+    });
+    writes.put(
+        REPOSITORY_EPOCH_SPACE,
+        REPOSITORY_EPOCH_KEY,
+        pointer.as_ref(),
+    );
+}

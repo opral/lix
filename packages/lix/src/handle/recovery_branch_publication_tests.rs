@@ -1,4 +1,4 @@
-use crate::branch::{BranchRefReader as _, branch_descriptor_stage_row, BranchHeadWrite};
+use crate::branch::{BranchHeadWrite, BranchRefReader as _, branch_descriptor_stage_row};
 use crate::transaction_types::{
     RawWriteBatch, TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteRow,
 };

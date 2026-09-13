@@ -21,10 +21,75 @@ use super::{
 use wasmtime::Store;
 use wasmtime::component::{Component, Linker};
 pub(super) mod bindings {
+    mod generated {
+        wasmtime::component::bindgen!({
+            path: "wit",
+            world: "plugin",
+            with: {
+                "lix:plugin-v2/host.snapshot": super::super::SnapshotResource,
+                "lix:plugin-v2/host.transition": super::super::TransitionResource,
+                "lix:plugin-v2/host.column-merge-source": super::super::ConflictSourceResource,
+                "lix:plugin-v2/host.row-source": super::super::RowSourceResource,
+                "lix:plugin-v2/host.column-merge-sink": super::super::ResolutionSinkResource,
+            },
+        });
+    }
+    pub use generated::Plugin;
+    pub mod lix {
+        pub use super::generated::lix::plugin_v2 as plugin;
+    }
+    pub mod exports {
+        pub mod lix {
+            pub use super::super::generated::exports::lix::plugin_v2 as plugin;
+        }
+    }
+}
+
+pub(super) mod file_projection_bindings {
+    mod generated {
+        wasmtime::component::bindgen!({
+            path: "wit",
+            world: "file-projection-plugin",
+            with: {
+                "lix:plugin-v2/host": super::super::bindings::lix::plugin::host,
+                "lix:plugin-v2/types": super::super::bindings::lix::plugin::types,
+            },
+        });
+    }
+    pub use generated::FileProjectionPlugin;
+    pub mod exports {
+        pub mod lix {
+            pub use super::super::generated::exports::lix::plugin_v2 as plugin;
+        }
+    }
+}
+
+pub(super) mod column_merger_bindings {
+    mod generated {
+        wasmtime::component::bindgen!({
+            path: "wit",
+            world: "column-merger-plugin",
+            with: {
+                "lix:plugin-v2/host": super::super::bindings::lix::plugin::host,
+                "lix:plugin-v2/types": super::super::bindings::lix::plugin::types,
+            },
+        });
+    }
+    pub use generated::ColumnMergerPlugin;
+    pub mod exports {
+        pub mod lix {
+            pub use super::super::generated::exports::lix::plugin_v2 as plugin;
+        }
+    }
+}
+
+// Retained host bindings for archives built before the major-only package name.
+pub(super) mod legacy_bindings {
     wasmtime::component::bindgen!({
-        path: "wit",
+        path: "wit-legacy-v2",
         world: "plugin",
         with: {
+            "lix:plugin/types": super::bindings::lix::plugin::types,
             "lix:plugin/host.snapshot": super::SnapshotResource,
             "lix:plugin/host.transition": super::TransitionResource,
             "lix:plugin/host.column-merge-source": super::ConflictSourceResource,
@@ -34,23 +99,23 @@ pub(super) mod bindings {
     });
 }
 
-pub(super) mod file_projection_bindings {
+pub(super) mod legacy_file_projection_bindings {
     wasmtime::component::bindgen!({
-        path: "wit",
+        path: "wit-legacy-v2",
         world: "file-projection-plugin",
         with: {
-            "lix:plugin/host": super::bindings::lix::plugin::host,
+            "lix:plugin/host": super::legacy_bindings::lix::plugin::host,
             "lix:plugin/types": super::bindings::lix::plugin::types,
         },
     });
 }
 
-pub(super) mod column_merger_bindings {
+pub(super) mod legacy_column_merger_bindings {
     wasmtime::component::bindgen!({
-        path: "wit",
+        path: "wit-legacy-v2",
         world: "column-merger-plugin",
         with: {
-            "lix:plugin/host": super::bindings::lix::plugin::host,
+            "lix:plugin/host": super::legacy_bindings::lix::plugin::host,
             "lix:plugin/types": super::bindings::lix::plugin::types,
         },
     });
@@ -66,6 +131,9 @@ pub(super) struct ComponentFactory {
 }
 
 enum ComponentLinker {
+    LegacyCombined(Arc<Linker<WasiHostState>>),
+    LegacyFileProjection(Arc<Linker<WasiHostState>>),
+    LegacyColumnMerger(Arc<Linker<WasiHostState>>),
     Combined(Arc<Linker<WasiHostState>>),
     FileProjection(Arc<Linker<WasiHostState>>),
     ColumnMerger(Arc<Linker<WasiHostState>>),
@@ -100,8 +168,48 @@ pub(super) async fn compile_component(
     let mut linker = Linker::<WasiHostState>::new(engine);
     add_to_linker_sync(&mut linker)
         .map_err(|error| wasm_runtime_error("failed to configure component WASI linker", error))?;
-    let linker = match (capabilities.column_merger, capabilities.file_projection) {
-        (true, true) => {
+    let legacy = component.component_type().exports(engine).any(|(name, _)| {
+        matches!(
+            name,
+            "lix:plugin/file-projection@2.0.0" | "lix:plugin/column-merger@2.0.0"
+        )
+    });
+    let linker = match (
+        legacy,
+        capabilities.column_merger,
+        capabilities.file_projection,
+    ) {
+        (true, true, true) => {
+            legacy_bindings::Plugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
+                &mut linker,
+                |state| state,
+            )
+            .map_err(|error| {
+                wasm_runtime_error("failed to configure combined plugin linker", error)
+            })?;
+            ComponentLinker::LegacyCombined(Arc::new(linker))
+        }
+        (true, false, true) => {
+            legacy_file_projection_bindings::FileProjectionPlugin::add_to_linker::<
+                _,
+                wasmtime::component::HasSelf<_>,
+            >(&mut linker, |state| state)
+            .map_err(|error| {
+                wasm_runtime_error("failed to configure file projection linker", error)
+            })?;
+            ComponentLinker::LegacyFileProjection(Arc::new(linker))
+        }
+        (true, true, false) => {
+            legacy_column_merger_bindings::ColumnMergerPlugin::add_to_linker::<
+                _,
+                wasmtime::component::HasSelf<_>,
+            >(&mut linker, |state| state)
+            .map_err(|error| {
+                wasm_runtime_error("failed to configure column merger linker", error)
+            })?;
+            ComponentLinker::LegacyColumnMerger(Arc::new(linker))
+        }
+        (false, true, true) => {
             bindings::Plugin::add_to_linker::<_, wasmtime::component::HasSelf<_>>(
                 &mut linker,
                 |state| state,
@@ -111,7 +219,7 @@ pub(super) async fn compile_component(
             })?;
             ComponentLinker::Combined(Arc::new(linker))
         }
-        (false, true) => {
+        (false, false, true) => {
             file_projection_bindings::FileProjectionPlugin::add_to_linker::<
                 _,
                 wasmtime::component::HasSelf<_>,
@@ -121,7 +229,7 @@ pub(super) async fn compile_component(
             })?;
             ComponentLinker::FileProjection(Arc::new(linker))
         }
-        (true, false) => {
+        (false, true, false) => {
             column_merger_bindings::ColumnMergerPlugin::add_to_linker::<
                 _,
                 wasmtime::component::HasSelf<_>,
@@ -131,7 +239,7 @@ pub(super) async fn compile_component(
             })?;
             ComponentLinker::ColumnMerger(Arc::new(linker))
         }
-        (false, false) => {
+        (_, false, false) => {
             return Err(component_error(
                 "cannot compile a plugin component without an executable capability",
             ));
@@ -166,6 +274,53 @@ impl WasmComponentFactory for ComponentFactory {
         let mut store = create_store(engine, self.limits)?;
         store.epoch_deadline_trap();
         let (file_projection, column_merger) = match &self.linker {
+            ComponentLinker::LegacyCombined(linker) => {
+                let instance =
+                    legacy_bindings::Plugin::instantiate(&mut store, &self.component, linker)
+                        .map_err(|error| {
+                            wasm_runtime_error("failed to instantiate combined plugin actor", error)
+                        })?;
+                (
+                    Some(FileProjectionGuest::LegacyCombined(
+                        instance.lix_plugin_file_projection().clone(),
+                    )),
+                    Some(ColumnMergerGuest::LegacyCombined(
+                        instance.lix_plugin_column_merger().clone(),
+                    )),
+                )
+            }
+            ComponentLinker::LegacyFileProjection(linker) => {
+                let instance = legacy_file_projection_bindings::FileProjectionPlugin::instantiate(
+                    &mut store,
+                    &self.component,
+                    linker,
+                )
+                .map_err(|error| {
+                    wasm_runtime_error("failed to instantiate file projection actor", error)
+                })?;
+                (
+                    Some(FileProjectionGuest::LegacyNarrow(
+                        instance.lix_plugin_file_projection().clone(),
+                    )),
+                    None,
+                )
+            }
+            ComponentLinker::LegacyColumnMerger(linker) => {
+                let instance = legacy_column_merger_bindings::ColumnMergerPlugin::instantiate(
+                    &mut store,
+                    &self.component,
+                    linker,
+                )
+                .map_err(|error| {
+                    wasm_runtime_error("failed to instantiate column merger actor", error)
+                })?;
+                (
+                    None,
+                    Some(ColumnMergerGuest::LegacyNarrow(
+                        instance.lix_plugin_column_merger().clone(),
+                    )),
+                )
+            }
             ComponentLinker::Combined(linker) => {
                 let instance = bindings::Plugin::instantiate(&mut store, &self.component, linker)
                     .map_err(|error| {
@@ -173,10 +328,10 @@ impl WasmComponentFactory for ComponentFactory {
                 })?;
                 (
                     Some(FileProjectionGuest::Combined(
-                        instance.lix_plugin_file_projection().clone(),
+                        instance.lix_plugin_v2_file_projection().clone(),
                     )),
                     Some(ColumnMergerGuest::Combined(
-                        instance.lix_plugin_column_merger().clone(),
+                        instance.lix_plugin_v2_column_merger().clone(),
                     )),
                 )
             }
@@ -191,7 +346,7 @@ impl WasmComponentFactory for ComponentFactory {
                 })?;
                 (
                     Some(FileProjectionGuest::Narrow(
-                        instance.lix_plugin_file_projection().clone(),
+                        instance.lix_plugin_v2_file_projection().clone(),
                     )),
                     None,
                 )
@@ -208,7 +363,7 @@ impl WasmComponentFactory for ComponentFactory {
                 (
                     None,
                     Some(ColumnMergerGuest::Narrow(
-                        instance.lix_plugin_column_merger().clone(),
+                        instance.lix_plugin_v2_column_merger().clone(),
                     )),
                 )
             }
@@ -241,11 +396,15 @@ impl WasmComponentFactory for ComponentFactory {
 }
 
 pub(super) enum FileProjectionGuest {
+    LegacyCombined(legacy_bindings::exports::lix::plugin::file_projection::Guest),
+    LegacyNarrow(legacy_file_projection_bindings::exports::lix::plugin::file_projection::Guest),
     Combined(bindings::exports::lix::plugin::file_projection::Guest),
     Narrow(file_projection_bindings::exports::lix::plugin::file_projection::Guest),
 }
 
 pub(super) enum ColumnMergerGuest {
+    LegacyCombined(legacy_bindings::exports::lix::plugin::column_merger::Guest),
+    LegacyNarrow(legacy_column_merger_bindings::exports::lix::plugin::column_merger::Guest),
     Combined(bindings::exports::lix::plugin::column_merger::Guest),
     Narrow(column_merger_bindings::exports::lix::plugin::column_merger::Guest),
 }
@@ -258,6 +417,8 @@ impl FileProjectionGuest {
         output: Resource<TransitionResource>,
     ) -> wasmtime::Result<Result<(), bindings::lix::plugin::types::PluginError>> {
         match self {
+            Self::LegacyCombined(guest) => guest.call_parse(store, input, output),
+            Self::LegacyNarrow(guest) => guest.call_parse(store, input, output),
             Self::Combined(guest) => guest.call_parse(store, input, output),
             Self::Narrow(guest) => guest.call_parse(store, input, output),
         }
@@ -270,6 +431,8 @@ impl FileProjectionGuest {
         output: Resource<TransitionResource>,
     ) -> wasmtime::Result<Result<(), bindings::lix::plugin::types::PluginError>> {
         match self {
+            Self::LegacyCombined(guest) => guest.call_parse_changes(store, input, output),
+            Self::LegacyNarrow(guest) => guest.call_parse_changes(store, input, output),
             Self::Combined(guest) => guest.call_parse_changes(store, input, output),
             Self::Narrow(guest) => guest.call_parse_changes(store, input, output),
         }
@@ -282,6 +445,8 @@ impl FileProjectionGuest {
         output: Resource<TransitionResource>,
     ) -> wasmtime::Result<Result<(), bindings::lix::plugin::types::PluginError>> {
         match self {
+            Self::LegacyCombined(guest) => guest.call_serialize(store, input, output),
+            Self::LegacyNarrow(guest) => guest.call_serialize(store, input, output),
             Self::Combined(guest) => guest.call_serialize(store, input, output),
             Self::Narrow(guest) => guest.call_serialize(store, input, output),
         }
@@ -294,6 +459,8 @@ impl FileProjectionGuest {
         output: Resource<TransitionResource>,
     ) -> wasmtime::Result<Result<(), bindings::lix::plugin::types::PluginError>> {
         match self {
+            Self::LegacyCombined(guest) => guest.call_serialize_changes(store, input, output),
+            Self::LegacyNarrow(guest) => guest.call_serialize_changes(store, input, output),
             Self::Combined(guest) => guest.call_serialize_changes(store, input, output),
             Self::Narrow(guest) => guest.call_serialize_changes(store, input, output),
         }
@@ -308,6 +475,8 @@ impl ColumnMergerGuest {
         output: Resource<ResolutionSinkResource>,
     ) -> wasmtime::Result<Result<(), bindings::lix::plugin::types::PluginError>> {
         match self {
+            Self::LegacyCombined(guest) => guest.call_merge(store, input, output),
+            Self::LegacyNarrow(guest) => guest.call_merge(store, input, output),
             Self::Combined(guest) => guest.call_merge(store, input, output),
             Self::Narrow(guest) => guest.call_merge(store, input, output),
         }
@@ -322,3 +491,406 @@ pub(super) fn store_is_retired(_store: &HostStore) -> bool {
 // the resource implementations provided by the shared host.
 impl bindings::lix::plugin::host::Host for HostState {}
 impl bindings::lix::plugin::types::Host for HostState {}
+
+// Legacy interface names retain the same v2 host behavior.
+impl legacy_bindings::lix::plugin::host::HostSnapshot for HostState {
+    fn file_len(&mut self, resource: Resource<SnapshotResource>) -> u64 {
+        <Self as bindings::lix::plugin::host::HostSnapshot>::file_len(self, resource)
+    }
+    fn read_file(
+        &mut self,
+        resource: Resource<SnapshotResource>,
+        offset: u64,
+        length: u32,
+    ) -> Result<Vec<u8>, legacy_bindings::lix::plugin::host::HostError> {
+        <Self as bindings::lix::plugin::host::HostSnapshot>::read_file(
+            self, resource, offset, length,
+        )
+        .map_err(Into::into)
+    }
+    fn read_state(
+        &mut self,
+        resource: Resource<SnapshotResource>,
+        key: Vec<u8>,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<
+        Option<legacy_bindings::lix::plugin::host::RecordChunk>,
+        legacy_bindings::lix::plugin::host::HostError,
+    > {
+        <Self as bindings::lix::plugin::host::HostSnapshot>::read_state(
+            self, resource, key, offset, max_bytes,
+        )
+        .map(|value| value.map(Into::into))
+        .map_err(Into::into)
+    }
+    fn drop(&mut self, resource: Resource<SnapshotResource>) -> RuntimeResult<()> {
+        <Self as bindings::lix::plugin::host::HostSnapshot>::drop(self, resource)
+    }
+}
+impl legacy_bindings::lix::plugin::host::HostTransition for HostState {
+    fn max_batch_bytes(&mut self, resource: Resource<TransitionResource>) -> u32 {
+        <Self as bindings::lix::plugin::host::HostTransition>::max_batch_bytes(self, resource)
+    }
+    fn put_state(
+        &mut self,
+        resource: Resource<TransitionResource>,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Result<(), legacy_bindings::lix::plugin::host::HostError> {
+        <Self as bindings::lix::plugin::host::HostTransition>::put_state(self, resource, key, value)
+            .map_err(Into::into)
+    }
+    fn delete_state(
+        &mut self,
+        resource: Resource<TransitionResource>,
+        key: Vec<u8>,
+    ) -> Result<(), legacy_bindings::lix::plugin::host::HostError> {
+        <Self as bindings::lix::plugin::host::HostTransition>::delete_state(self, resource, key)
+            .map_err(Into::into)
+    }
+    fn delete_state_prefix(
+        &mut self,
+        resource: Resource<TransitionResource>,
+        prefix: Vec<u8>,
+    ) -> Result<(), legacy_bindings::lix::plugin::host::HostError> {
+        <Self as bindings::lix::plugin::host::HostTransition>::delete_state_prefix(
+            self, resource, prefix,
+        )
+        .map_err(Into::into)
+    }
+    fn emit_rows(
+        &mut self,
+        resource: Resource<TransitionResource>,
+        page: legacy_bindings::lix::plugin::host::RowPage,
+    ) -> Result<(), legacy_bindings::lix::plugin::host::HostError> {
+        <Self as bindings::lix::plugin::host::HostTransition>::emit_rows(
+            self,
+            resource,
+            page.into(),
+        )
+        .map_err(Into::into)
+    }
+    fn replace_all_rows(
+        &mut self,
+        resource: Resource<TransitionResource>,
+    ) -> Result<(), legacy_bindings::lix::plugin::host::HostError> {
+        <Self as bindings::lix::plugin::host::HostTransition>::replace_all_rows(self, resource)
+            .map_err(Into::into)
+    }
+    fn emit_file_edit(
+        &mut self,
+        resource: Resource<TransitionResource>,
+        edit: legacy_bindings::lix::plugin::host::FileEdit,
+    ) -> Result<(), legacy_bindings::lix::plugin::host::HostError> {
+        <Self as bindings::lix::plugin::host::HostTransition>::emit_file_edit(
+            self,
+            resource,
+            edit.into(),
+        )
+        .map_err(Into::into)
+    }
+    fn begin_file_replacement(
+        &mut self,
+        resource: Resource<TransitionResource>,
+        total_length: u64,
+    ) -> Result<(), legacy_bindings::lix::plugin::host::HostError> {
+        <Self as bindings::lix::plugin::host::HostTransition>::begin_file_replacement(
+            self,
+            resource,
+            total_length,
+        )
+        .map_err(Into::into)
+    }
+    fn write_file_replacement(
+        &mut self,
+        resource: Resource<TransitionResource>,
+        chunk: Vec<u8>,
+    ) -> Result<(), legacy_bindings::lix::plugin::host::HostError> {
+        <Self as bindings::lix::plugin::host::HostTransition>::write_file_replacement(
+            self, resource, chunk,
+        )
+        .map_err(Into::into)
+    }
+    fn finish_file_replacement(
+        &mut self,
+        resource: Resource<TransitionResource>,
+    ) -> Result<(), legacy_bindings::lix::plugin::host::HostError> {
+        <Self as bindings::lix::plugin::host::HostTransition>::finish_file_replacement(
+            self, resource,
+        )
+        .map_err(Into::into)
+    }
+    fn drop(&mut self, resource: Resource<TransitionResource>) -> RuntimeResult<()> {
+        <Self as bindings::lix::plugin::host::HostTransition>::drop(self, resource)
+    }
+}
+impl legacy_bindings::lix::plugin::host::HostRowSource for HostState {
+    fn next_page(
+        &mut self,
+        resource: Resource<RowSourceResource>,
+        max_bytes: u32,
+    ) -> Result<
+        Option<legacy_bindings::lix::plugin::host::RowPage>,
+        legacy_bindings::lix::plugin::host::HostError,
+    > {
+        <Self as bindings::lix::plugin::host::HostRowSource>::next_page(self, resource, max_bytes)
+            .map(|value| value.map(Into::into))
+            .map_err(Into::into)
+    }
+    fn drop(&mut self, resource: Resource<RowSourceResource>) -> RuntimeResult<()> {
+        <Self as bindings::lix::plugin::host::HostRowSource>::drop(self, resource)
+    }
+}
+impl legacy_bindings::lix::plugin::host::HostColumnMergeSource for HostState {
+    fn len(&mut self, resource: Resource<ConflictSourceResource>) -> u32 {
+        <Self as bindings::lix::plugin::host::HostColumnMergeSource>::len(self, resource)
+    }
+    fn get(
+        &mut self,
+        resource: Resource<ConflictSourceResource>,
+        index: u32,
+    ) -> Result<
+        legacy_bindings::lix::plugin::host::ColumnMergeMeta,
+        legacy_bindings::lix::plugin::host::HostError,
+    > {
+        <Self as bindings::lix::plugin::host::HostColumnMergeSource>::get(self, resource, index)
+            .map(Into::into)
+            .map_err(Into::into)
+    }
+    fn read_value(
+        &mut self,
+        resource: Resource<ConflictSourceResource>,
+        index: u32,
+        side: legacy_bindings::lix::plugin::host::MergeSide,
+        offset: u64,
+        length: u32,
+    ) -> Result<Option<Vec<u8>>, legacy_bindings::lix::plugin::host::HostError> {
+        <Self as bindings::lix::plugin::host::HostColumnMergeSource>::read_value(
+            self,
+            resource,
+            index,
+            side.into(),
+            offset,
+            length,
+        )
+        .map_err(Into::into)
+    }
+    fn read_row(
+        &mut self,
+        resource: Resource<ConflictSourceResource>,
+        index: u32,
+        side: legacy_bindings::lix::plugin::host::MergeSide,
+        offset: u64,
+        length: u32,
+    ) -> Result<Vec<u8>, legacy_bindings::lix::plugin::host::HostError> {
+        <Self as bindings::lix::plugin::host::HostColumnMergeSource>::read_row(
+            self,
+            resource,
+            index,
+            side.into(),
+            offset,
+            length,
+        )
+        .map_err(Into::into)
+    }
+    fn drop(&mut self, resource: Resource<ConflictSourceResource>) -> RuntimeResult<()> {
+        <Self as bindings::lix::plugin::host::HostColumnMergeSource>::drop(self, resource)
+    }
+}
+impl legacy_bindings::lix::plugin::host::HostColumnMergeSink for HostState {
+    fn max_batch_bytes(&mut self, resource: Resource<ResolutionSinkResource>) -> u32 {
+        <Self as bindings::lix::plugin::host::HostColumnMergeSink>::max_batch_bytes(self, resource)
+    }
+    fn use_lww(
+        &mut self,
+        resource: Resource<ResolutionSinkResource>,
+        ordinal: u32,
+    ) -> Result<(), legacy_bindings::lix::plugin::host::HostError> {
+        <Self as bindings::lix::plugin::host::HostColumnMergeSink>::use_lww(self, resource, ordinal)
+            .map_err(Into::into)
+    }
+    fn begin_replace(
+        &mut self,
+        resource: Resource<ResolutionSinkResource>,
+        ordinal: u32,
+        total_length: Option<u64>,
+    ) -> Result<(), legacy_bindings::lix::plugin::host::HostError> {
+        <Self as bindings::lix::plugin::host::HostColumnMergeSink>::begin_replace(
+            self,
+            resource,
+            ordinal,
+            total_length,
+        )
+        .map_err(Into::into)
+    }
+    fn write_replacement(
+        &mut self,
+        resource: Resource<ResolutionSinkResource>,
+        chunk: Vec<u8>,
+    ) -> Result<(), legacy_bindings::lix::plugin::host::HostError> {
+        <Self as bindings::lix::plugin::host::HostColumnMergeSink>::write_replacement(
+            self, resource, chunk,
+        )
+        .map_err(Into::into)
+    }
+    fn finish_replace(
+        &mut self,
+        resource: Resource<ResolutionSinkResource>,
+    ) -> Result<(), legacy_bindings::lix::plugin::host::HostError> {
+        <Self as bindings::lix::plugin::host::HostColumnMergeSink>::finish_replace(self, resource)
+            .map_err(Into::into)
+    }
+    fn drop(&mut self, resource: Resource<ResolutionSinkResource>) -> RuntimeResult<()> {
+        <Self as bindings::lix::plugin::host::HostColumnMergeSink>::drop(self, resource)
+    }
+}
+impl legacy_bindings::lix::plugin::host::Host for HostState {}
+impl From<bindings::lix::plugin::host::RecordChunk>
+    for legacy_bindings::lix::plugin::host::RecordChunk
+{
+    fn from(value: bindings::lix::plugin::host::RecordChunk) -> Self {
+        Self {
+            total_len: value.total_len,
+            bytes: value.bytes,
+        }
+    }
+}
+impl From<legacy_bindings::lix::plugin::host::RecordChunk>
+    for bindings::lix::plugin::host::RecordChunk
+{
+    fn from(value: legacy_bindings::lix::plugin::host::RecordChunk) -> Self {
+        Self {
+            total_len: value.total_len,
+            bytes: value.bytes,
+        }
+    }
+}
+impl From<bindings::lix::plugin::host::RowPage> for legacy_bindings::lix::plugin::host::RowPage {
+    fn from(value: bindings::lix::plugin::host::RowPage) -> Self {
+        Self {
+            payload: value.payload,
+            attachments: value.attachments,
+        }
+    }
+}
+impl From<legacy_bindings::lix::plugin::host::RowPage> for bindings::lix::plugin::host::RowPage {
+    fn from(value: legacy_bindings::lix::plugin::host::RowPage) -> Self {
+        Self {
+            payload: value.payload,
+            attachments: value.attachments,
+        }
+    }
+}
+impl From<bindings::lix::plugin::host::FileEdit> for legacy_bindings::lix::plugin::host::FileEdit {
+    fn from(value: bindings::lix::plugin::host::FileEdit) -> Self {
+        Self {
+            offset: value.offset,
+            delete_len: value.delete_len,
+            insert: value.insert,
+        }
+    }
+}
+impl From<legacy_bindings::lix::plugin::host::FileEdit> for bindings::lix::plugin::host::FileEdit {
+    fn from(value: legacy_bindings::lix::plugin::host::FileEdit) -> Self {
+        Self {
+            offset: value.offset,
+            delete_len: value.delete_len,
+            insert: value.insert,
+        }
+    }
+}
+impl From<bindings::lix::plugin::host::ColumnMergeMeta>
+    for legacy_bindings::lix::plugin::host::ColumnMergeMeta
+{
+    fn from(value: bindings::lix::plugin::host::ColumnMergeMeta) -> Self {
+        Self {
+            ordinal: value.ordinal,
+            schema_key: value.schema_key,
+            primary_key: value.primary_key,
+            schema_fingerprint: value.schema_fingerprint,
+            file_id: value.file_id,
+            column: value.column,
+            base_len: value.base_len,
+            a_len: value.a_len,
+            b_len: value.b_len,
+            base_row_len: value.base_row_len,
+            a_row_len: value.a_row_len,
+            b_row_len: value.b_row_len,
+        }
+    }
+}
+impl From<legacy_bindings::lix::plugin::host::ColumnMergeMeta>
+    for bindings::lix::plugin::host::ColumnMergeMeta
+{
+    fn from(value: legacy_bindings::lix::plugin::host::ColumnMergeMeta) -> Self {
+        Self {
+            ordinal: value.ordinal,
+            schema_key: value.schema_key,
+            primary_key: value.primary_key,
+            schema_fingerprint: value.schema_fingerprint,
+            file_id: value.file_id,
+            column: value.column,
+            base_len: value.base_len,
+            a_len: value.a_len,
+            b_len: value.b_len,
+            base_row_len: value.base_row_len,
+            a_row_len: value.a_row_len,
+            b_row_len: value.b_row_len,
+        }
+    }
+}
+impl From<bindings::lix::plugin::host::HostError>
+    for legacy_bindings::lix::plugin::host::HostError
+{
+    fn from(value: bindings::lix::plugin::host::HostError) -> Self {
+        match value {
+            bindings::lix::plugin::host::HostError::InvalidRange => Self::InvalidRange,
+            bindings::lix::plugin::host::HostError::LimitExceeded(message) => {
+                Self::LimitExceeded(message)
+            }
+            bindings::lix::plugin::host::HostError::Rejected(message) => Self::Rejected(message),
+        }
+    }
+}
+impl From<legacy_bindings::lix::plugin::host::MergeSide>
+    for bindings::lix::plugin::host::MergeSide
+{
+    fn from(value: legacy_bindings::lix::plugin::host::MergeSide) -> Self {
+        match value {
+            legacy_bindings::lix::plugin::host::MergeSide::Base => Self::Base,
+            legacy_bindings::lix::plugin::host::MergeSide::A => Self::A,
+            legacy_bindings::lix::plugin::host::MergeSide::B => Self::B,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wasmtime::component::{Component, Linker};
+    use wasmtime::{Engine, Store};
+
+    #[test]
+    fn major_only_host_can_add_functions_without_rebuilding_existing_components() {
+        // This frozen component imports only existing-operation. Adding another
+        // host function under the same major identity must not change its ABI.
+        let engine = Engine::default();
+        let component = Component::new(
+            &engine,
+            include_bytes!("../../../../tests/fixtures/plugin-api/v2/import-subset.wasm"),
+        )
+        .expect("frozen component should compile");
+        let mut linker = Linker::<()>::new(&engine);
+        let mut host = linker.instance("lix:plugin-v2/host").unwrap();
+        host.func_wrap("existing-operation", |_, (): ()| Ok((7_u32,)))
+            .unwrap();
+        host.func_wrap("new-operation", |_, (): ()| Ok((9_u32,)))
+            .unwrap();
+        let mut store = Store::new(&engine, ());
+        let instance = linker.instantiate(&mut store, &component).unwrap();
+        let run = instance
+            .get_typed_func::<(), (u32,)>(&mut store, "run")
+            .unwrap();
+        assert_eq!(run.call(&mut store, ()).unwrap(), (7,));
+    }
+}

@@ -1267,6 +1267,20 @@ mod tests {
         assert!(error.message.contains("unsupported"));
     }
 
+    #[test]
+    fn sync_handshake_rejects_captured_head_merge_protocol() {
+        let error = validate_handshake(&HandshakeResponse {
+            protocol_version: crate::SERVER_PROTOCOL_VERSION,
+            sync_protocol_version: Some(13),
+            lix_id: Some("01936f4e-7b6c-7c3d-8f9a-123456789abc".to_owned()),
+            session_id: "session-1".to_owned(),
+            active_account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
+        })
+        .expect_err("captured-head merge peers must not admit a partial replica");
+        assert_eq!(error.code, super::super::SYNC_PROTOCOL_MISMATCH_CODE);
+        assert!(error.message.contains("upgrade"));
+    }
+
     #[derive(Debug)]
     struct VersionMismatchClient;
 

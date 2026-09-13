@@ -609,11 +609,23 @@ simulation_test!(
         let mut rng = TinyRng::new(0x0bad_c0de);
 
         // Build history the sweep must not damage, and record intra-interval
-        // commits the sweep is expected to reclaim. Those recorded commits are
+        // commits whose disposable payloads the sweep must retire. Those commits are
         // the engagement check: without them a passing run cannot distinguish
         // "GC ran and preserved everything" from "GC never ran".
         let mut reclaimable_commits = Vec::new();
         for round in 0..6 {
+            if round > 0 {
+                let disposable = format!("{prefix}disposable");
+                upsert(
+                    &main,
+                    &disposable,
+                    &JsonValue::String("temporary".into()),
+                    "reclaim witness",
+                )
+                .await;
+                reclaimable_commits.push(branch_head(&engine, sim.main_branch_id()).await);
+                delete(&main, &disposable, "retire witness payload").await;
+            }
             for write in 0..3 {
                 let key = keys[rng.usize(keys.len())].clone();
                 let label = format!("seed round {round}, write {write}");
@@ -624,15 +636,6 @@ simulation_test!(
                     let value = random_value(&mut rng);
                     upsert(&main, &key, &value, &label).await;
                     model.upsert(&key, value);
-                }
-                // Round 0's first commit is deliberately not recorded: it is
-                // the branch's oldest interval anchor and the collector keeps
-                // it, so requiring its removal would make this check fail for
-                // a reason that has nothing to do with reclaim safety. Every
-                // later round's intra-interval commit is required to go, which
-                // is what proves a sweep actually ran.
-                if write == 0 && round > 0 {
-                    reclaimable_commits.push(branch_head(&engine, sim.main_branch_id()).await);
                 }
             }
             main.create_checkpoint()
@@ -656,7 +659,7 @@ simulation_test!(
         // Engagement check: the sweep is asynchronous, so wait for it, then
         // assert. A run where nothing was ever reclaimed proves nothing about
         // reclaim safety and must fail here rather than pass silently.
-        wait_until_reclaimed(&main, &reclaimable_commits).await;
+        wait_until_reclaimed(&engine, &reclaimable_commits).await;
 
         if fault == InjectedFault::Reclaim {
             model
@@ -916,19 +919,19 @@ async fn branch_head(engine: &lix::engine::Engine, branch_id: &str) -> String {
         .expect("branch head should exist")
 }
 
-/// Waits until every recorded intra-interval commit has been reclaimed, then
-/// asserts it. Collection is asynchronous, so this bounds the wait; it does not
-/// tolerate a run in which nothing was collected.
-async fn wait_until_reclaimed(session: &SimSession, commit_ids: &[String]) {
+/// Waits until every recorded disposable payload has retired. Graph/header
+/// proofs may remain for incorporation. Collection is asynchronous, so this
+/// bounds the wait without tolerating a run in which no payload was collected.
+async fn wait_until_reclaimed(engine: &lix::engine::Engine, commit_ids: &[String]) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let remaining = present_commits(session, commit_ids).await;
+        let remaining = present_payloads(engine, commit_ids).await;
         if remaining.is_empty() {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "checkpoint GC did not reclaim intra-interval commits at rounds {remaining:?} of \
+            "checkpoint GC did not retire intra-interval payloads at rounds {remaining:?} of \
              {}; without a sweep this test proves nothing about reclaim safety",
             commit_ids.len()
         );
@@ -936,17 +939,18 @@ async fn wait_until_reclaimed(session: &SimSession, commit_ids: &[String]) {
     }
 }
 
-async fn present_commits(session: &SimSession, commit_ids: &[String]) -> Vec<usize> {
+async fn present_payloads(engine: &lix::engine::Engine, commit_ids: &[String]) -> Vec<usize> {
+    let storage = engine.storage();
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let inventory = crate::tracked_state::scan_commit_delta_inventory(&read)
+        .await
+        .unwrap();
     let mut present = Vec::new();
     for (index, commit_id) in commit_ids.iter().enumerate() {
-        let result = session
-            .execute(
-                "SELECT id FROM lix_commit WHERE id = $1",
-                &[Value::Text(commit_id.clone())],
-            )
-            .await
-            .expect("commit existence query should succeed");
-        if !result.is_empty() {
+        if inventory
+            .commits
+            .contains_key(&crate::changelog::CommitId::parse_lix(commit_id, "GC witness").unwrap())
+        {
             present.push(index);
         }
     }

@@ -420,3 +420,252 @@ fn structural_moves_nested_object_rekey_updates_container_chain_and_keeps_array_
         br#"{"new":{"nested":{"list":[999]}}}"#
     );
 }
+
+#[test]
+fn structural_moves_custom_container_ids_survive_rename_and_warm_cold_file_edits() {
+    let harness = Harness::<JsonPlugin>::default();
+    let (file, mut rows) = parse(br#"{"old":{"value":1}}"#);
+    let parent = rows
+        .iter()
+        .find(|r| r.row.get("key") == Some(&text("old")))
+        .unwrap()
+        .clone();
+    let mut renamed = parent.clone();
+    renamed.primary_key[1] = text("new");
+    renamed.row.insert("key", text("new"));
+    renamed.row.insert("container_id", text("my-container"));
+    let mut leaf = rows
+        .iter()
+        .find(|r| r.row.get("key") == Some(&text("value")))
+        .unwrap()
+        .clone();
+    let old_leaf = leaf.clone();
+    leaf.primary_key[0] = text("my-container");
+    leaf.row.insert("parent_id", text("my-container"));
+    let changes = [
+        delete(&parent),
+        delete(&old_leaf),
+        upsert(&renamed),
+        upsert(&leaf),
+    ];
+    let file = harness
+        .serialize_changes(&file, &changes)
+        .unwrap()
+        .into_snapshot();
+    apply(&mut rows, &changes);
+    assert_eq!(file.bytes, br#"{"new":{"value":1}}"#);
+    assert_eq!(cold_bytes(&file, &rows), file.bytes);
+    // Change structure so reconciliation, rather than only the scalar fast path, runs.
+    let replacement = br#"{"new":{"value":2,"added":true}}"#;
+    for cold in [false, true] {
+        let mut before = file.clone();
+        if cold {
+            before.state.clear();
+        }
+        let changed = harness
+            .parse_changes(
+                &before,
+                &before.path,
+                &[sdk::FileEdit {
+                    offset: 0,
+                    delete_len: before.bytes.len() as u64,
+                    insert: replacement.to_vec(),
+                }],
+                cold.then_some(rows.as_slice()),
+                sdk::CreateContext::from_namespace_bytes([0x31; 12]),
+            )
+            .unwrap();
+        let mut updated = rows.clone();
+        apply(&mut updated, &changed.row_changes);
+        let parent = updated
+            .iter()
+            .find(|r| r.row.get("key") == Some(&text("new")))
+            .unwrap();
+        assert_eq!(parent.row.get("container_id"), Some(&text("my-container")));
+        for key in ["value", "added"] {
+            let child = updated
+                .iter()
+                .find(|r| r.row.get("key") == Some(&text(key)))
+                .unwrap();
+            assert_eq!(child.row.get("parent_id"), Some(&text("my-container")));
+        }
+        assert_eq!(cold_bytes(changed.snapshot(), &updated), replacement);
+    }
+}
+
+#[test]
+fn structural_moves_duplicate_or_empty_container_ids_are_rejected() {
+    let harness = Harness::<JsonPlugin>::default();
+    let (file, rows) = parse(br#"{"left":{},"right":{}}"#);
+    let mut left = rows
+        .iter()
+        .find(|r| r.row.get("key") == Some(&text("left")))
+        .unwrap()
+        .clone();
+    let right = rows
+        .iter()
+        .find(|r| r.row.get("key") == Some(&text("right")))
+        .unwrap();
+    for id in [
+        text(""),
+        text("root"),
+        right.row.get("container_id").unwrap().clone(),
+    ] {
+        left.row.insert("container_id", id);
+        assert!(harness.serialize_changes(&file, &[upsert(&left)]).is_err());
+    }
+}
+
+#[test]
+fn structural_moves_custom_ids_inside_moved_array_subtree_remain_stable() {
+    let harness = Harness::<JsonPlugin>::default();
+    let (file, mut rows) = parse(br#"[[{"box":{"value":1}}],[]]"#);
+    let box_row = rows
+        .iter()
+        .find(|r| r.row.get("key") == Some(&text("box")))
+        .unwrap()
+        .clone();
+    let leaf = rows
+        .iter()
+        .find(|r| r.row.get("key") == Some(&text("value")))
+        .unwrap()
+        .clone();
+    let mut custom_box = box_row.clone();
+    custom_box.row.insert("container_id", text("custom-box"));
+    let mut custom_leaf = leaf.clone();
+    custom_leaf.primary_key[0] = text("custom-box");
+    custom_leaf.row.insert("parent_id", text("custom-box"));
+    let changes = [upsert(&custom_box), delete(&leaf), upsert(&custom_leaf)];
+    let file = harness
+        .serialize_changes(&file, &changes)
+        .unwrap()
+        .into_snapshot();
+    apply(&mut rows, &changes);
+    let mut moved = rows
+        .iter()
+        .find(|r| {
+            r.schema_key.as_ref() == ARRAY_ITEM_SCHEMA_KEY
+                && r.row.get("kind") == Some(&text("object"))
+        })
+        .unwrap()
+        .clone();
+    let destination = rows
+        .iter()
+        .find(|r| {
+            r.schema_key.as_ref() == ARRAY_ITEM_SCHEMA_KEY
+                && r.row.get("parent_id") == Some(&text("root"))
+                && Some(&array_id(r)) != moved.row.get("parent_id")
+        })
+        .unwrap();
+    moved.row.insert("parent_id", array_id(destination));
+    let changes = [upsert(&moved)];
+    let file = harness
+        .serialize_changes(&file, &changes)
+        .unwrap()
+        .into_snapshot();
+    apply(&mut rows, &changes);
+    assert_eq!(file.bytes, br#"[[],[{"box":{"value":1}}]]"#);
+    let replacement = br#"[[],[{"box":{"value":2,"extra":3}}]]"#;
+    let changed = harness
+        .parse_changes(
+            &file,
+            &file.path,
+            &[sdk::FileEdit {
+                offset: 0,
+                delete_len: file.bytes.len() as u64,
+                insert: replacement.to_vec(),
+            }],
+            None,
+            sdk::CreateContext::from_namespace_bytes([0x41; 12]),
+        )
+        .unwrap();
+    apply(&mut rows, &changed.row_changes);
+    let custom = rows
+        .iter()
+        .find(|r| r.row.get("key") == Some(&text("box")))
+        .unwrap();
+    assert_eq!(custom.row.get("container_id"), Some(&text("custom-box")));
+    assert_eq!(cold_bytes(changed.snapshot(), &rows), replacement);
+}
+
+#[test]
+fn structural_moves_source_insert_cannot_alias_a_custom_container_identity() {
+    let harness = Harness::<JsonPlugin>::default();
+    let (file, mut rows) = parse(br#"{"left":{}}"#);
+    let replacement = br#"{"left":{},"right":{"value":1}}"#;
+    let (_, future) = parse(replacement);
+    let future_id = future
+        .iter()
+        .find(|r| r.row.get("key") == Some(&text("right")))
+        .unwrap()
+        .row
+        .get("container_id")
+        .unwrap()
+        .clone();
+    let mut left = rows
+        .iter()
+        .find(|r| r.row.get("key") == Some(&text("left")))
+        .unwrap()
+        .clone();
+    left.row.insert("container_id", future_id);
+    let changes = [upsert(&left)];
+    let file = harness
+        .serialize_changes(&file, &changes)
+        .unwrap()
+        .into_snapshot();
+    apply(&mut rows, &changes);
+    let result = harness.parse_changes(
+        &file,
+        &file.path,
+        &[sdk::FileEdit {
+            offset: 0,
+            delete_len: file.bytes.len() as u64,
+            insert: replacement.to_vec(),
+        }],
+        None,
+        sdk::CreateContext::from_namespace_bytes([0x51; 12]),
+    );
+    // Reject atomically or allocate a distinct identity; never accept an ambiguous graph.
+    if let Ok(changed) = result {
+        apply(&mut rows, &changed.row_changes);
+        assert_eq!(cold_bytes(changed.snapshot(), &rows), replacement);
+    }
+}
+
+#[test]
+fn structural_moves_sql_null_representation_is_unambiguous_for_null_kind() {
+    let harness = Harness::<JsonPlugin>::default();
+    for source in [b"null".as_slice(), br#"{"value":null}"#, b"[null]"] {
+        let (file, rows) = parse(source);
+        let original = rows
+            .iter()
+            .find(|r| r.row.get("kind") == Some(&text("null")))
+            .unwrap();
+        for scalar in [None, Some(sdk::TypedValue::Null)] {
+            let mut changed = original.clone();
+            if let Some(value) = scalar {
+                changed.row.insert("scalar_json", value);
+            } else {
+                let mut row = sdk::TypedRow::new();
+                for (key, value) in changed.row.iter() {
+                    if key != "scalar_json" {
+                        row.insert(key, value.clone());
+                    }
+                }
+                changed.row = row;
+            }
+            let changes = [upsert(&changed)];
+            let updated = harness.serialize_changes(&file, &changes).unwrap();
+            assert_eq!(updated.snapshot().bytes, source);
+            let mut cold_rows = rows.clone();
+            apply(&mut cold_rows, &changes);
+            assert_eq!(cold_bytes(updated.snapshot(), &cold_rows), source);
+            changed.row.insert("kind", text("number"));
+            assert!(
+                harness
+                    .serialize_changes(&file, &[upsert(&changed)])
+                    .is_err()
+            );
+        }
+    }
+}

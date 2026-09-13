@@ -31,12 +31,12 @@ pub mod file_projection_bindings {
     pub use super::combined_bindings::lix;
 }
 
-use self::combined_bindings::exports::lix::plugin::column_merger::Guest as CombinedColumnMergerGuest;
-use self::combined_bindings::exports::lix::plugin::file_projection::Guest as CombinedFileProjectionGuest;
-use self::combined_bindings::lix::plugin::host::{
+use self::combined_bindings::exports::lix::plugin_v2::column_merger::Guest as CombinedColumnMergerGuest;
+use self::combined_bindings::exports::lix::plugin_v2::file_projection::Guest as CombinedFileProjectionGuest;
+use self::combined_bindings::lix::plugin_v2::host::{
     ColumnMergeSink, ColumnMergeSource, Transition as WitTransition,
 };
-use self::combined_bindings::lix::plugin::types::{
+use self::combined_bindings::lix::plugin_v2::types::{
     ParseChangesRequest as WitParseChangesRequest, ParseRequest as WitParseRequest, PluginError,
     SerializeChangesRequest as WitSerializeChangesRequest, SerializeRequest as WitSerializeRequest,
 };
@@ -92,8 +92,8 @@ fn plugin_error(error: Error) -> PluginError {
     }
 }
 
-fn column_plugin_error(error: Error) -> column_merger_bindings::lix::plugin::types::PluginError {
-    use column_merger_bindings::lix::plugin::types::PluginError as Target;
+fn column_plugin_error(error: Error) -> column_merger_bindings::lix::plugin_v2::types::PluginError {
+    use column_merger_bindings::lix::plugin_v2::types::PluginError as Target;
     match error {
         Error::InvalidInput(message) => Target::InvalidInput(message),
         Error::LimitExceeded(message) => Target::LimitExceeded(message),
@@ -103,8 +103,8 @@ fn column_plugin_error(error: Error) -> column_merger_bindings::lix::plugin::typ
 
 fn projection_plugin_error(
     error: Error,
-) -> file_projection_bindings::lix::plugin::types::PluginError {
-    use file_projection_bindings::lix::plugin::types::PluginError as Target;
+) -> file_projection_bindings::lix::plugin_v2::types::PluginError {
+    use file_projection_bindings::lix::plugin_v2::types::PluginError as Target;
     match error {
         Error::InvalidInput(message) => Target::InvalidInput(message),
         Error::LimitExceeded(message) => Target::LimitExceeded(message),
@@ -224,21 +224,21 @@ trait ColumnMergeSinkHost {
 
 macro_rules! impl_projection_hosts {
     ($bindings:ident) => {
-        fn map_host_error(error: $bindings::lix::plugin::host::HostError) -> CommonHostError {
+        fn map_host_error(error: $bindings::lix::plugin_v2::host::HostError) -> CommonHostError {
             match error {
-                $bindings::lix::plugin::host::HostError::InvalidRange => {
+                $bindings::lix::plugin_v2::host::HostError::InvalidRange => {
                     CommonHostError::InvalidRange
                 }
-                $bindings::lix::plugin::host::HostError::LimitExceeded(message) => {
+                $bindings::lix::plugin_v2::host::HostError::LimitExceeded(message) => {
                     CommonHostError::LimitExceeded(message)
                 }
-                $bindings::lix::plugin::host::HostError::Rejected(message) => {
+                $bindings::lix::plugin_v2::host::HostError::Rejected(message) => {
                     CommonHostError::Rejected(message)
                 }
             }
         }
 
-        impl SnapshotHost for $bindings::lix::plugin::host::Snapshot {
+        impl SnapshotHost for $bindings::lix::plugin_v2::host::Snapshot {
             fn file_len(&self) -> u64 {
                 self.file_len()
             }
@@ -266,7 +266,7 @@ macro_rules! impl_projection_hosts {
             }
         }
 
-        impl RowSourceHost for $bindings::lix::plugin::host::RowSource {
+        impl RowSourceHost for $bindings::lix::plugin_v2::host::RowSource {
             fn next_page(
                 &self,
                 max_bytes: u32,
@@ -277,7 +277,7 @@ macro_rules! impl_projection_hosts {
             }
         }
 
-        impl TransitionHost for $bindings::lix::plugin::host::Transition {
+        impl TransitionHost for $bindings::lix::plugin_v2::host::Transition {
             fn max_batch_bytes(&self) -> u32 {
                 self.max_batch_bytes()
             }
@@ -302,7 +302,7 @@ macro_rules! impl_projection_hosts {
                 payload: Vec<u8>,
                 attachments: Vec<Vec<u8>>,
             ) -> std::result::Result<(), CommonHostError> {
-                self.emit_rows(&$bindings::lix::plugin::host::RowPage {
+                self.emit_rows(&$bindings::lix::plugin_v2::host::RowPage {
                     payload,
                     attachments,
                 })
@@ -317,7 +317,7 @@ macro_rules! impl_projection_hosts {
                 delete_len: u64,
                 insert: &[u8],
             ) -> std::result::Result<(), CommonHostError> {
-                self.emit_file_edit(&$bindings::lix::plugin::host::FileEdit {
+                self.emit_file_edit(&$bindings::lix::plugin_v2::host::FileEdit {
                     offset,
                     delete_len,
                     insert: insert.to_vec(),
@@ -350,27 +350,27 @@ mod combined_hosts {
 
 macro_rules! impl_column_hosts {
     ($bindings:ident) => {
-        fn map_host_error(error: $bindings::lix::plugin::host::HostError) -> CommonHostError {
+        fn map_host_error(error: $bindings::lix::plugin_v2::host::HostError) -> CommonHostError {
             match error {
-                $bindings::lix::plugin::host::HostError::InvalidRange => {
+                $bindings::lix::plugin_v2::host::HostError::InvalidRange => {
                     CommonHostError::InvalidRange
                 }
-                $bindings::lix::plugin::host::HostError::LimitExceeded(message) => {
+                $bindings::lix::plugin_v2::host::HostError::LimitExceeded(message) => {
                     CommonHostError::LimitExceeded(message)
                 }
-                $bindings::lix::plugin::host::HostError::Rejected(message) => {
+                $bindings::lix::plugin_v2::host::HostError::Rejected(message) => {
                     CommonHostError::Rejected(message)
                 }
             }
         }
-        fn side(side: MergeSide) -> $bindings::lix::plugin::host::MergeSide {
+        fn side(side: MergeSide) -> $bindings::lix::plugin_v2::host::MergeSide {
             match side {
-                MergeSide::Base => $bindings::lix::plugin::host::MergeSide::Base,
-                MergeSide::A => $bindings::lix::plugin::host::MergeSide::A,
-                MergeSide::B => $bindings::lix::plugin::host::MergeSide::B,
+                MergeSide::Base => $bindings::lix::plugin_v2::host::MergeSide::Base,
+                MergeSide::A => $bindings::lix::plugin_v2::host::MergeSide::A,
+                MergeSide::B => $bindings::lix::plugin_v2::host::MergeSide::B,
             }
         }
-        impl ColumnMergeSourceHost for $bindings::lix::plugin::host::ColumnMergeSource {
+        impl ColumnMergeSourceHost for $bindings::lix::plugin_v2::host::ColumnMergeSource {
             fn len(&self) -> u32 {
                 self.len()
             }
@@ -416,7 +416,7 @@ macro_rules! impl_column_hosts {
                     .map_err(map_host_error)
             }
         }
-        impl ColumnMergeSinkHost for $bindings::lix::plugin::host::ColumnMergeSink {
+        impl ColumnMergeSinkHost for $bindings::lix::plugin_v2::host::ColumnMergeSink {
             fn max_batch_bytes(&self) -> u32 {
                 self.max_batch_bytes()
             }
@@ -1712,13 +1712,13 @@ impl<C: ColumnMerger, F: 'static> CombinedColumnMergerGuest for Component<C, F> 
     }
 }
 
-impl<C: ColumnMerger> column_merger_bindings::exports::lix::plugin::column_merger::Guest
+impl<C: ColumnMerger> column_merger_bindings::exports::lix::plugin_v2::column_merger::Guest
     for ColumnMergerComponent<C>
 {
     fn merge(
-        input: column_merger_bindings::lix::plugin::host::ColumnMergeSource,
-        output: &column_merger_bindings::lix::plugin::host::ColumnMergeSink,
-    ) -> std::result::Result<(), column_merger_bindings::lix::plugin::types::PluginError> {
+        input: column_merger_bindings::lix::plugin_v2::host::ColumnMergeSource,
+        output: &column_merger_bindings::lix::plugin_v2::host::ColumnMergeSink,
+    ) -> std::result::Result<(), column_merger_bindings::lix::plugin_v2::types::PluginError> {
         apply_column_merges::<C>(&input, output).map_err(column_plugin_error)
     }
 }
@@ -1833,13 +1833,13 @@ impl<C: 'static, F: FileProjection> CombinedFileProjectionGuest for Component<C,
     }
 }
 
-impl<F: FileProjection> file_projection_bindings::exports::lix::plugin::file_projection::Guest
+impl<F: FileProjection> file_projection_bindings::exports::lix::plugin_v2::file_projection::Guest
     for FileProjectionComponent<F>
 {
     fn parse(
-        input: file_projection_bindings::lix::plugin::types::ParseRequest,
-        output: &file_projection_bindings::lix::plugin::host::Transition,
-    ) -> std::result::Result<(), file_projection_bindings::lix::plugin::types::PluginError> {
+        input: file_projection_bindings::lix::plugin_v2::types::ParseRequest,
+        output: &file_projection_bindings::lix::plugin_v2::host::Transition,
+    ) -> std::result::Result<(), file_projection_bindings::lix::plugin_v2::types::PluginError> {
         let mut transition = TransitionOutput::new(output).map_err(projection_plugin_error)?;
         let file = Snapshot { inner: &input.file };
         let input = ParseInput {
@@ -1859,9 +1859,9 @@ impl<F: FileProjection> file_projection_bindings::exports::lix::plugin::file_pro
     }
 
     fn parse_changes(
-        input: file_projection_bindings::lix::plugin::types::ParseChangesRequest,
-        output: &file_projection_bindings::lix::plugin::host::Transition,
-    ) -> std::result::Result<(), file_projection_bindings::lix::plugin::types::PluginError> {
+        input: file_projection_bindings::lix::plugin_v2::types::ParseChangesRequest,
+        output: &file_projection_bindings::lix::plugin_v2::host::Transition,
+    ) -> std::result::Result<(), file_projection_bindings::lix::plugin_v2::types::PluginError> {
         let max_batch_bytes = output.max_batch_bytes();
         let edits: Vec<FileEdit> = input
             .file_edits
@@ -1899,9 +1899,9 @@ impl<F: FileProjection> file_projection_bindings::exports::lix::plugin::file_pro
     }
 
     fn serialize(
-        input: file_projection_bindings::lix::plugin::types::SerializeRequest,
-        output: &file_projection_bindings::lix::plugin::host::Transition,
-    ) -> std::result::Result<(), file_projection_bindings::lix::plugin::types::PluginError> {
+        input: file_projection_bindings::lix::plugin_v2::types::SerializeRequest,
+        output: &file_projection_bindings::lix::plugin_v2::host::Transition,
+    ) -> std::result::Result<(), file_projection_bindings::lix::plugin_v2::types::PluginError> {
         let max_batch_bytes = output.max_batch_bytes();
         let before = input
             .before
@@ -1922,9 +1922,9 @@ impl<F: FileProjection> file_projection_bindings::exports::lix::plugin::file_pro
     }
 
     fn serialize_changes(
-        input: file_projection_bindings::lix::plugin::types::SerializeChangesRequest,
-        output: &file_projection_bindings::lix::plugin::host::Transition,
-    ) -> std::result::Result<(), file_projection_bindings::lix::plugin::types::PluginError> {
+        input: file_projection_bindings::lix::plugin_v2::types::SerializeChangesRequest,
+        output: &file_projection_bindings::lix::plugin_v2::host::Transition,
+    ) -> std::result::Result<(), file_projection_bindings::lix::plugin_v2::types::PluginError> {
         let max_batch_bytes = output.max_batch_bytes();
         let update = SerializeChangesInput {
             file_id: &input.file_id,

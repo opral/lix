@@ -574,9 +574,7 @@ pub(crate) async fn cleanup_pending_conversion_authenticated(
     let _ = transport.close_session().await;
     result
 }
-pub(crate) async fn finish_conversion_cleanup_bounded<
-    F: Future<Output = Result<(), LixError>>,
->(
+pub(crate) async fn finish_conversion_cleanup_bounded<F: Future<Output = Result<(), LixError>>>(
     cleanup: F,
 ) {
     use futures_util::FutureExt as _;

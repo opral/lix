@@ -1,6 +1,6 @@
-package lix:plugin-column-merger-world@2.0.0;
+package lix:plugin-column-merger-world;
 
 world column-merger-plugin {
-  import lix:plugin/host@2.0.0;
-  export lix:plugin/column-merger@2.0.0;
+  import lix:plugin-v2/host;
+  export lix:plugin-v2/column-merger;
 }

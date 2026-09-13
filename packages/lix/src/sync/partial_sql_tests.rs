@@ -478,8 +478,8 @@ async fn descriptor_only_sql_hydrates_then_reads_and_writes_offline() {
             value(reopened.execute(sql, &params).await.unwrap()),
             "after-2"
         );
-        // Rotate only admission epoch, retaining the same heads and native
-        // bytes. An old session must not acquire the new writer identity from
+        // Rotate only the remote binding, retaining the epoch, pending tuples,
+        // heads and native bytes. An old session must not acquire the new identity from
         // storage implicitly or publish a mutation under its stale binding.
         let read = reopened_storage
             .begin_read(Default::default())
@@ -496,9 +496,9 @@ async fn descriptor_only_sql_hydrates_then_reads_and_writes_offline() {
             .unwrap()
             .unwrap();
         let replacement = PartialReplicaState::new(
-            state.remote_id().to_owned(),
+            format!("https://mirror.example.test/lix/{}", state.repository_id()),
             state.active_account_id().to_owned(),
-            "00000000-0000-7000-8000-000000000499".to_owned(),
+            state.epoch_id().to_owned(),
             state.descriptor().clone(),
         )
         .unwrap();
@@ -542,13 +542,30 @@ async fn descriptor_only_sql_hydrates_then_reads_and_writes_offline() {
             .unwrap();
         assert_eq!(
             after_control, before_control,
-            "stale epoch rejection must not publish a local commit"
+            "stale remote rejection must not publish a local commit"
         );
         drop(read);
         assert_eq!(
-            value(reopened.execute(sql, &params).await.unwrap()),
+            reopened.execute(sql, &params).await.unwrap_err().code,
+            "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH"
+        );
+        let (replacement_engine, replacement_session) = Engine::new_partial_replica(
+            reopened_storage.clone(),
+            EngineOptions::new(),
+            &replacement,
+        )
+        .await
+        .unwrap();
+        replacement_engine.sync_mode().admit_partial_replica(
+            std::sync::Arc::new(replacement),
+            super::partial_replica_write_capability(),
+        );
+        assert_eq!(
+            value(replacement_session.execute(sql, &params).await.unwrap()),
             "after-2"
         );
+        drop(replacement_session);
+        drop(replacement_engine);
         reopened.close().await.unwrap();
     }
 }

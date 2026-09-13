@@ -175,7 +175,8 @@ impl PluginRegistryEntry {
         replacement: &Self,
     ) -> Result<(), LixError> {
         let incompatible = self.key != replacement.key
-            || self.api_version != replacement.api_version
+            || normalized_api_version(&self.api_version)
+                != normalized_api_version(&replacement.api_version)
             || self.capabilities != replacement.capabilities
             || self.path_glob != replacement.path_glob
             || self.content != replacement.content
@@ -1423,6 +1424,14 @@ fn invalid_registry(message: impl Into<String>) -> LixError {
     )
 }
 
+// Historical registry metadata and the canonical major name describe the same ABI.
+fn normalized_api_version(version: &str) -> &str {
+    match version {
+        "2.0.0" => "2",
+        version => version,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -1518,7 +1527,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_registry_rejects_non_v1_component_api() {
+    fn durable_registry_rejects_unsupported_component_api() {
         let mut prototype = component_entry('a');
         prototype.api_version = "4.0.0".to_owned();
         let plugins = vec![prototype];
@@ -1530,10 +1539,22 @@ mod tests {
         };
 
         let error =
-            PluginRegistry::from_wire(wire).expect_err("durable non-v1 components must hard fail");
+            PluginRegistry::from_wire(wire).expect_err("unsupported components must hard fail");
         assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
         assert!(error.message.contains("lix:plugin"));
         assert!(error.message.contains("2.0.0"));
+    }
+
+    #[test]
+    fn owned_component_upgrade_accepts_the_legacy_spelling_of_the_same_major() {
+        let previous = component_entry('a');
+        let mut replacement = component_entry('b');
+        replacement.api_version = "2".into();
+        previous
+            .validate_owned_upgrade_contract(&replacement)
+            .expect("renaming the package does not change its API major");
+        validate_runtime_api_version(replacement.runtime, &replacement.api_version)
+            .expect("new durable major metadata should validate");
     }
 
     #[test]

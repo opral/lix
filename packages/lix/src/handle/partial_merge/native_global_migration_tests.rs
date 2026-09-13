@@ -9,10 +9,7 @@ async fn global_migration_restarts_after_authority_moves_with_original_bodies_re
 }
 async fn run_global_migration(restart: bool) {
     let memory = Memory::new();
-    let authority = open_lix()
-        .with_storage(memory.clone())
-        .await
-        .unwrap();
+    let authority = open_lix().with_storage(memory.clone()).await.unwrap();
     authority
         .execute(
             "INSERT INTO lix_key_value(key,value) VALUES('base','initial')",
@@ -319,10 +316,7 @@ async fn run_global_migration(restart: bool) {
 #[tokio::test]
 async fn global_migration_rejects_existing_target_even_when_its_head_matches() {
     let memory = Memory::new();
-    let authority = open_lix()
-        .with_storage(memory.clone())
-        .await
-        .unwrap();
+    let authority = open_lix().with_storage(memory.clone()).await.unwrap();
     let base = authority.partial_replica_descriptor(None).await.unwrap();
     let local = open_lix()
         .with_storage(memory.fork().unwrap())

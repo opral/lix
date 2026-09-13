@@ -87,6 +87,8 @@ export function createComponentDispatch(): (
           const resources = resourceTypes();
           const instance = await factory.instantiate({
             ...wasiImports(),
+            "lix:plugin-v2/host": resources,
+            // Previously published v2 components retain their original identity.
             "lix:plugin/host": resources,
           });
           const id = allocate();

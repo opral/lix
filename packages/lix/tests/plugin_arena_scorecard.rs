@@ -12,7 +12,7 @@ fn plugin_v1_wit_is_valid_and_exposes_independent_row_first_capabilities() {
         .push_dir(&path)
         .unwrap_or_else(|error| panic!("parse {}: {error:#}", path.display()));
     let wit = std::fs::read_to_string(path.join("lix-plugin.wit")).unwrap();
-    assert!(wit.contains("package lix:plugin@2.0.0"));
+    assert!(wit.contains("package lix:plugin-v2"));
     assert!(wit.contains("resource snapshot"));
     assert!(wit.contains("resource transition"));
     assert!(wit.contains("output: borrow<transition>"));
