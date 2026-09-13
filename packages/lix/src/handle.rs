@@ -1572,11 +1572,15 @@ where
                     "cannot open a session from a closed Lix handle",
                 ));
             }
-            if self
-                .engine
-                .load_branch_head_commit_id(&active_branch_id)
-                .await?
-                .is_none()
+            // Partial session admission owns its selected/GLOBAL scope policy.
+            // Do not probe an unadmitted branch first: resolving absent controls
+            // can require cold descriptor objects and hide the scope error.
+            if self.engine.sync_mode().role() != crate::sync::SyncRole::PartialReplica
+                && self
+                    .engine
+                    .load_branch_head_commit_id(&active_branch_id)
+                    .await?
+                    .is_none()
             {
                 return Err(LixError::branch_not_found(
                     active_branch_id.clone(),

@@ -3,14 +3,16 @@
 //! The open path runs this work in a hidden epoch. The arity rewrite has its
 //! own fence so direct/restarted migration cannot advertise v7 records to a
 //! v77 reader. The final metadata publication and repository marker are atomic.
+#[cfg(test)]
+use crate::storage_adapter::{SharedStorageAdapterRead, StorageReadOptions};
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
 use crate::branch::BranchHeadControlContext;
 use crate::changelog::{CommitId, CommitRecord};
 use crate::storage_adapter::{
-    SharedStorageAdapterRead, Storage, StorageAdapter, StorageBeginScanOptions,
-    StorageCoreProjection, StorageKeyRange, StorageProjectedValue, StorageReadOptions,
+    Storage, StorageAdapter, StorageBeginScanOptions,
+    StorageCoreProjection, StorageKeyRange, StorageProjectedValue,
 };
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateFilter, TrackedStateReadColumns, TrackedStateScanRequest,
@@ -129,8 +131,7 @@ where
         .await?
         .ok_or_else(|| failure("checkpoint migration has no repository marker"))?;
     if marker.as_ref() == crate::init::REPOSITORY_PROTOCOL_V77 {
-        let read =
-            SharedStorageAdapterRead::new(adapter.begin_read(StorageReadOptions::default()).await?);
+        let read = super::MigrationPlanningRead::new(adapter).await?;
         let revision = crate::storage_adapter::load_repository_mutation_revision(&read).await?;
         let records = records(&read, options).await?;
         let mut plan = PublicationPlan::bounded(options.max_changes, options.max_preflight_bytes);
@@ -156,8 +157,7 @@ where
         ));
     }
 
-    let read =
-        SharedStorageAdapterRead::new(adapter.begin_read(StorageReadOptions::default()).await?);
+    let read = super::MigrationPlanningRead::new(adapter).await?;
     let revision = crate::storage_adapter::load_repository_mutation_revision(&read).await?;
     let mut records = records(&read, options).await?;
     let controls = BranchHeadControlContext::new()

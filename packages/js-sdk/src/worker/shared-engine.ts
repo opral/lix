@@ -2,6 +2,7 @@ import type { LixBinding, SyncServerBindingOptions, TelemetryDispatch } from "..
 
 export type SharedEngineClient = {
   server: SyncServerBindingOptions;
+  isDisconnected?(): boolean;
   telemetry?: TelemetryDispatch;
   rootAdmitted?(headers: [string, string][], accountId: string): void;
   verifyIdentity(): Promise<{ authorityUrl: string; accountId: string }>;
@@ -22,6 +23,7 @@ export class SharedEngineOwner {
 
   attach(client: SharedEngineClient): Promise<LixBinding> {
     const operation = this.queue.then(async () => {
+      if (client.isDisconnected?.()) throw new Error("Shared engine client disconnected before admission");
       const opensRoot = this.root === undefined;
       if (!this.root) {
         const originalServer = client.server;
@@ -74,6 +76,36 @@ export class SharedEngineOwner {
           this.root = undefined;
         }
         throw error;
+      }
+    });
+    this.queue = operation.catch(() => undefined);
+    return operation;
+  }
+
+  /** Serialize closed-storage conversion with root admission across all ports. */
+  convert(client: SharedEngineClient, conversion: (server: SyncServerBindingOptions) => Promise<void>, branchId?: string): Promise<void> {
+    const operation = this.queue.then(async () => {
+      if (client.isDisconnected?.()) throw new Error("Shared engine client disconnected before conversion");
+      if (this.root) {
+        const identity = await client.verifyIdentity();
+        if (client.server.url !== identity.authorityUrl ||
+            (await this.root.activeAccountId()) !== identity.accountId) {
+          throw Object.assign(new Error("Shared engine repository/account does not match this client"),
+            { code: "LIX_SHARED_ENGINE_IDENTITY_MISMATCH" });
+        }
+        if (branchId !== undefined && branchId !== await this.root.activeBranchId()) {
+          throw Object.assign(new Error("The converted replica selected a different branch"),
+            { code: "LIX_PARTIAL_CONVERSION_BRANCH_MISMATCH" });
+        }
+        // A competing caller already admitted the converted partial store.
+        // Never close its live sessions just to repeat an explicit conversion.
+        return;
+      }
+      this.clients.add(client);
+      try {
+        await conversion(this.transport());
+      } finally {
+        this.clients.delete(client);
       }
     });
     this.queue = operation.catch(() => undefined);

@@ -6,11 +6,11 @@ use futures_lite::io::sink;
 use super::format::{
     SnapshotDecoder, SnapshotEncoder, SnapshotEntry, SnapshotTrailer, invalid_snapshot,
 };
-use crate::migration::{MigrationStatus, begin_fresh_epoch_import, inspect_lix_with_adapter};
+use crate::migration::{MigrationStatus, begin_fresh_epoch_import, inspect_lix_read};
 use crate::storage_adapter::{
     MAX_SCAN_PAGE_ROWS, PutBatch, PutEntry, StorageAdapter, StorageAdapterRead as _,
     StorageBeginScanOptions, StorageCoreProjection, StorageKey, StorageKeyRange,
-    StorageProjectedValue, StorageReadOptions, StorageSession, StorageSpaceId, StorageValue,
+    StorageProjectedValue, StorageSession, StorageSpaceId, StorageValue,
     Storage,
 };
 use crate::LixError;
@@ -145,9 +145,10 @@ async fn validate_protocol_version<S>(
     expected: u32,
 ) -> Result<(), LixError>
 where
-    S: Storage,
+    S: Storage + Clone + Send + Sync + 'static,
 {
-    let observed = inspect_lix_with_adapter(candidate).await?;
+    let read = crate::migration::MigrationPlanningRead::new(candidate).await?;
+    let observed = inspect_lix_read(&read).await?;
     let observed_version = match observed {
         MigrationStatus::Current { version } => version,
         MigrationStatus::Required { from_version, .. } => from_version,
@@ -171,8 +172,9 @@ async fn candidate_digest<S>(
     format: u32,
 ) -> Result<SnapshotTrailer, LixError>
 where
-    S: Storage,
+    S: Storage + Clone + Send + Sync + 'static,
 {
+    let read = crate::migration::MigrationPlanningRead::new(candidate).await?;
     let mut output = sink();
     let mut encoder = SnapshotEncoder::new(&mut output, format).await?;
     // The wire registry is append-only. Rehash spaces retired by a future
@@ -181,44 +183,21 @@ where
         .iter()
         .copied()
     {
-        let mut lower = Bound::Unbounded;
+        let mut cursor = read
+            .begin_scan(
+                space,
+                StorageKeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                StorageBeginScanOptions {
+                    projection: StorageCoreProjection::FullValue,
+                    ..Default::default()
+                },
+            )
+            .await?;
         loop {
-            // Heartbeat commits may expire an OPFS read generation. Reopen one
-            // bounded read per page; the hidden candidate itself is immutable.
-            // Every candidate batch already completed an await-durable
-            // commit. Rehash through a normal coherent read so adapters such
-            // as Memory, which have no distinct durable-read boundary, remain
-            // valid restore destinations.
-            let read = candidate
-                .begin_read(StorageReadOptions::default())
-                .await?;
-            let mut cursor = read
-                .begin_scan(
-                    space,
-                    StorageKeyRange {
-                        lower: lower.clone(),
-                        upper: Bound::Unbounded,
-                    },
-                    StorageBeginScanOptions {
-                        projection: StorageCoreProjection::FullValue,
-                        ..StorageBeginScanOptions::default()
-                    },
-                )
-                .await?;
-            let (entries, has_more) = cursor
-                .next_page(MAX_SCAN_PAGE_ROWS)
-                .await?
-                .into_parts();
-            if entries.is_empty() {
-                break;
-            }
-            lower = Bound::Excluded(
-                entries
-                    .last()
-                    .expect("a nonempty page has a last key")
-                    .key
-                    .clone(),
-            );
+            let (entries, has_more) = cursor.next_page(MAX_SCAN_PAGE_ROWS).await?.into_parts();
             for entry in entries {
                 let StorageProjectedValue::FullValue(value) = entry.value else {
                     return Err(LixError::new(
@@ -267,6 +246,23 @@ mod tests {
         StorageSessionToken, StorageSpace, StorageWriteOptions,
     };
     use crate::open_lix;
+
+    #[tokio::test]
+    async fn candidate_digest_retries_revoked_pages_without_changing_trailer() {
+        let storage = crate::migration::CommitExpiringStorage::new();
+        let candidate = crate::storage_adapter::StorageAdapter::new(storage.clone());
+        crate::engine::Engine::initialize_with_adapter(candidate.clone(), None)
+            .await
+            .unwrap();
+        let expected = super::candidate_digest(&candidate, crate::init::CURRENT_FORMAT_VERSION)
+            .await
+            .unwrap();
+        storage.expire_next_page();
+        let actual = super::candidate_digest(&candidate, crate::init::CURRENT_FORMAT_VERSION)
+            .await
+            .unwrap();
+        assert_eq!(actual, expected);
+    }
 
     struct PendingSnapshotReader;
 

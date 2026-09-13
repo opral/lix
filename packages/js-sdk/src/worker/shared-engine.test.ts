@@ -174,3 +174,114 @@ test("telemetry joins after a disabled opener and remains after its departure", 
   expect(b).toHaveBeenCalledTimes(2);
   await owner.detach(third);
 });
+
+test("explicit conversion serializes with opening and never closes live clients", async () => {
+  const f = fixture();
+  let complete!: () => void;
+  const held = new Promise<void>(resolve => { complete = resolve; });
+  const convert = vi.fn(async () => { await held; });
+  const first = f.owner.convert(f.client(), convert);
+  await Promise.resolve();
+  const attached = f.owner.attach(f.client());
+  await Promise.resolve();
+  expect(f.open).not.toHaveBeenCalled();
+  complete();
+  await first;
+  await attached;
+  expect(f.open).toHaveBeenCalledTimes(1);
+  await f.owner.convert(f.client(), convert);
+  expect(convert).toHaveBeenCalledTimes(1);
+  expect(f.rootClose).not.toHaveBeenCalled();
+});
+
+test("concurrent explicit converters never overlap physical storage ownership", async () => {
+  const f = fixture();
+  let active = 0;
+  let maximum = 0;
+  const convert = vi.fn(async () => {
+    active += 1;
+    maximum = Math.max(maximum, active);
+    await Promise.resolve();
+    active -= 1;
+  });
+  await Promise.all([f.owner.convert(f.client(), convert), f.owner.convert(f.client(), convert)]);
+  expect(maximum).toBe(1);
+  expect(convert).toHaveBeenCalledTimes(2);
+  expect(f.open).not.toHaveBeenCalled();
+});
+
+test("failed conversion propagates without opening or initializing missing storage", async () => {
+  const f = fixture();
+  const missing = Object.assign(new Error("missing source"), { code: "LIX_NOT_FOUND" });
+  await expect(f.owner.convert(f.client(), async () => { throw missing; })).rejects.toBe(missing);
+  expect(f.open).not.toHaveBeenCalled();
+  await f.owner.attach(f.client());
+  expect(f.open).toHaveBeenCalledTimes(1);
+});
+
+test("conversion cannot bypass the identity of an already admitted partial root", async () => {
+  const f = fixture();
+  await f.owner.attach(f.client());
+  const convert = vi.fn(async () => {});
+  await expect(f.owner.convert(f.client("account-b"), convert)).rejects.toMatchObject({
+    code: "LIX_SHARED_ENGINE_IDENTITY_MISMATCH",
+  });
+  expect(convert).not.toHaveBeenCalled();
+  expect(f.rootClose).not.toHaveBeenCalled();
+});
+
+test("conversion rejects a different requested branch on a live partial root", async () => {
+  const root = {
+    activeAccountId: async () => "account",
+    activeBranchId: async () => "selected",
+    openAnotherSession: async () => ({ close: async () => {} }),
+    close: vi.fn(async () => {}),
+  } as unknown as LixBinding;
+  const owner = new SharedEngineOwner(async () => root);
+  const client = (): SharedEngineClient => ({
+    server: { url: "https://example.test", headers: [] },
+    verifyIdentity: async () => ({ authorityUrl: "https://example.test", accountId: "account" }),
+  });
+  await owner.attach(client());
+  const conversion = vi.fn(async () => {});
+  await expect(owner.convert(client(), conversion, "different")).rejects.toMatchObject({ code: "LIX_PARTIAL_CONVERSION_BRANCH_MISMATCH" });
+  await owner.convert(client(), conversion, "selected");
+  expect(conversion).not.toHaveBeenCalled();
+  expect(root.close).not.toHaveBeenCalled();
+});
+
+test("a disconnected queued converter cannot revive a dead transport", async () => {
+  const f = fixture();
+  let release!: () => void;
+  const first = f.owner.convert(f.client(), async () => {
+    await new Promise<void>(resolve => { release = resolve; });
+  });
+  await Promise.resolve();
+  let disconnected = false;
+  const second = { ...f.client(), isDisconnected: () => disconnected };
+  const conversion = vi.fn(async () => {});
+  const queued = f.owner.convert(second, conversion);
+  disconnected = true;
+  f.owner.deactivate(second);
+  release();
+  await first;
+  await expect(queued).rejects.toThrow("disconnected before conversion");
+  expect(conversion).not.toHaveBeenCalled();
+  await f.owner.attach(f.client());
+  expect(f.open).toHaveBeenCalledTimes(1);
+});
+
+test("an aborted active conversion releases admission for the next live client", async () => {
+  const f = fixture();
+  let reject!: (error: Error) => void;
+  const client = f.client();
+  const conversion = f.owner.convert(client, async () => {
+    await new Promise<void>((_resolve, fail) => { reject = fail; });
+  });
+  await Promise.resolve();
+  f.owner.deactivate(client);
+  reject(new Error("transport closed"));
+  await expect(conversion).rejects.toThrow("transport closed");
+  await f.owner.attach(f.client());
+  expect(f.open).toHaveBeenCalledTimes(1);
+});

@@ -1,5 +1,5 @@
 /// <reference lib="webworker" />
-import { openLixBinding } from "#binding";
+import { openLixBinding, convertReplicaBinding } from "#binding";
 import { openRemoteLixBinding } from "../remote/client.js";
 import {
   SharedAdmissionCache,
@@ -25,14 +25,8 @@ scope.onconnect = (event) => {
   let client: SharedEngineClient | undefined;
   let disconnected = false;
   let input: ((message: WorkerInput) => void) | undefined;
-  const controller = startWorkerHost(
-    {
-      postMessage: (message: WorkerResponse) => port.postMessage(message),
-      onMessage: (listener) => {
-        input = listener;
-      },
-    },
-    async (storage, telemetry, parent, server, progress, snapshot) => {
+  const prepareClient = async (...args: Parameters<typeof openLixBinding>) => {
+    const [storage, telemetry, parent, server, progress, snapshot] = args;
       if (!server || snapshot)
         throw new Error("Shared partial engines require a server and existing storage");
       const config = JSON.stringify([storage, server.url]);
@@ -99,6 +93,7 @@ scope.onconnect = (event) => {
       }
       client = {
         server: routed,
+        isDisconnected: () => disconnected,
         telemetry,
         rootAdmitted: (headers, account) => {
           admitted.record(raw.url, headers, account);
@@ -112,12 +107,26 @@ scope.onconnect = (event) => {
           })(),
         }),
       };
-      const binding = await owner.attach(client);
+      return { owner, client };
+  };
+  const controller = startWorkerHost(
+    {
+      postMessage: (message: WorkerResponse) => port.postMessage(message),
+      onMessage: (listener) => { input = listener; },
+    },
+    async (...args) => {
+      const prepared = await prepareClient(...args);
+      const binding = await prepared.owner.attach(prepared.client);
       if (disconnected) {
         await binding.close();
         throw new Error("Shared engine client disconnected during open");
       }
       return binding;
+    },
+    async (storage, server, branchId) => {
+      const prepared = await prepareClient(storage, undefined, undefined, server);
+      await prepared.owner.convert(prepared.client, transport =>
+        convertReplicaBinding(storage, transport, branchId), branchId);
     },
   );
   const disconnect = async () => {
