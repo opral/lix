@@ -73,6 +73,15 @@ impl RawHttpClient for CountPublicationRequests {
 }
 #[tokio::test]
 async fn http_dispatcher_recovers_lost_wave_and_preserves_newer_local_edit() {
+    lost_wave_with_pending_edit(false).await;
+}
+
+#[tokio::test]
+async fn http_dispatcher_restarts_initial_stale_anchors_and_preserves_newer_local_edit() {
+    lost_wave_with_pending_edit(true).await;
+}
+
+async fn lost_wave_with_pending_edit(advance_after_descriptor: bool) {
     let backing = Memory::new();
     let authority = open_lix().with_storage(backing.clone()).await.unwrap();
     authority
@@ -155,11 +164,23 @@ async fn http_dispatcher_recovers_lost_wave_and_preserves_newer_local_edit() {
         .execute("UPDATE lix_key_value SET value='R' WHERE key='remote'", &[])
         .await
         .unwrap();
+    let captured_descriptor = transport.partial_replica_descriptor(None).await.unwrap();
+    if advance_after_descriptor {
+        // Capture R, then accept R2 before the first retained wave reaches the
+        // authority. Its otherwise valid immutable request must restart.
+        authority
+            .execute(
+                "UPDATE lix_key_value SET value='R2' WHERE key='remote'",
+                &[],
+            )
+            .await
+            .unwrap();
+    }
     let first = prepare_descriptor_with_merge(
         engine.clone(),
         old.clone(),
         &transport,
-        transport.partial_replica_descriptor(None).await.unwrap(),
+        captured_descriptor,
         crate::sync::partial_publication::PartialRecoveryPolicy::Normal,
     )
     .await;
@@ -219,7 +240,7 @@ async fn http_dispatcher_recovers_lost_wave_and_preserves_newer_local_edit() {
         .await
         .unwrap();
     assert!(format!("{local:?}").contains("L2"));
-    assert!(format!("{remote:?}").contains("R"));
+    assert!(format!("{remote:?}").contains(if advance_after_descriptor { "R2" } else { "R" }));
 }
 
 #[tokio::test]
