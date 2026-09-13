@@ -22,7 +22,8 @@ use bytes::Bytes;
 
 pub const PACKET_FORMAT_V2: u16 = 2;
 pub const CURRENT_PACKET_FORMAT: u16 = PACKET_FORMAT_V2;
-pub const WASM_COMPONENT_API_VERSION: &str = "2.0.0";
+/// Durable major version; the canonical WIT package is `lix:plugin-v2`.
+pub const WASM_COMPONENT_API_VERSION: &str = "2";
 /// Canonical ABI page charge for one renderer splice before inline insert
 /// bytes. Both inline and output-backed edits pay this fixed metadata cost.
 pub const EDIT_SPLICE_METADATA_BYTES: u64 = 24;
@@ -2125,7 +2126,7 @@ mod tests {
     #[test]
     fn production_wit_is_versioned_and_row_first() {
         let wit = include_str!("../../../wit/lix-plugin.wit");
-        assert!(wit.starts_with("package lix:plugin@2.0.0;"));
+        assert!(wit.starts_with("package lix:plugin-v2;"));
         assert!(wit.contains("resource transition"));
         assert!(wit.contains("interface column-merger"));
         assert!(wit.contains("interface file-projection"));

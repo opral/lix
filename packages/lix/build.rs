@@ -12,42 +12,42 @@ fn main() {
         Vec::new(),
     );
     generate(
-        "lix:plugin-column-merger-world/column-merger-plugin@2.0.0",
+        "lix:plugin-column-merger-world/column-merger-plugin",
         "column_merger_bindings.rs",
         "export_column_merger_component",
         Some("column_merger"),
         vec![
             remap(
-                "lix:plugin/host@2.0.0",
-                "crate::plugin::api::combined_bindings::lix::plugin::host",
+                "lix:plugin-v2/host",
+                "crate::plugin::api::combined_bindings::lix::plugin_v2::host",
             ),
             remap(
-                "lix:plugin/types@2.0.0",
-                "crate::plugin::api::combined_bindings::lix::plugin::types",
+                "lix:plugin-v2/types",
+                "crate::plugin::api::combined_bindings::lix::plugin_v2::types",
             ),
             remap(
-                "lix:plugin/column-merger@2.0.0",
-                "crate::plugin::api::combined_bindings::exports::lix::plugin::column_merger",
+                "lix:plugin-v2/column-merger",
+                "crate::plugin::api::combined_bindings::exports::lix::plugin_v2::column_merger",
             ),
         ],
     );
     generate(
-        "lix:plugin-file-projection-world/file-projection-plugin@2.0.0",
+        "lix:plugin-file-projection-world/file-projection-plugin",
         "file_projection_bindings.rs",
         "export_file_projection_component",
         Some("file_projection"),
         vec![
             remap(
-                "lix:plugin/host@2.0.0",
-                "crate::plugin::api::combined_bindings::lix::plugin::host",
+                "lix:plugin-v2/host",
+                "crate::plugin::api::combined_bindings::lix::plugin_v2::host",
             ),
             remap(
-                "lix:plugin/types@2.0.0",
-                "crate::plugin::api::combined_bindings::lix::plugin::types",
+                "lix:plugin-v2/types",
+                "crate::plugin::api::combined_bindings::lix::plugin_v2::types",
             ),
             remap(
-                "lix:plugin/file-projection@2.0.0",
-                "crate::plugin::api::combined_bindings::exports::lix::plugin::file_projection",
+                "lix:plugin-v2/file-projection",
+                "crate::plugin::api::combined_bindings::exports::lix::plugin_v2::file_projection",
             ),
         ],
     );

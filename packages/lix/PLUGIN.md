@@ -15,7 +15,10 @@ cargo build --release --target wasm32-wasip2
 
 The build selects Lix's small plugin-authoring surface automatically; it does
 not compile the repository engine, query stack, storage machinery, or default
-Wasm runtime. The WIT package is `lix:plugin@2.0.0`.
+Wasm runtime. The WIT package is `lix:plugin-v2`. Compatible additions retain
+this identity; breaking changes require a new major. Existing compiled archives
+using `lix:plugin@2.0.0` remain supported. See the
+[plugin API compatibility policy](../../docs/plugin-api-versioning.md).
 
 ## Author contract
 
@@ -96,7 +99,8 @@ archive contains executable capabilities. `file_match` is present exactly when
 the component exports `FileProjection`; a row-only `ColumnMerger` has no file
 matcher. The legacy `match` key is rejected. Do not declare capability flags,
 `materialization`, `runtime`, or `api_version`; the host validates the component
-and durable registry against `lix:plugin@2.0.0`.
+and durable registry against supported plugin API majors. New installations
+record major `2`; historical registry entries containing `2.0.0` remain valid.
 
 See [the v2 design and profiling contract](../../rfcs/universal-plugin-api.md)
 for the wire shape, correctness gates, and cross-format measurement matrix.

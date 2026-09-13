@@ -8,10 +8,13 @@ type Lix = Awaited<ReturnType<Sdk["openLix"]>>;
 export function registerPluginExecutionContract(
   name: string,
   loadSdk: () => Promise<Sdk>,
+  loadArchives?: Sdk["bundledPluginArchives"],
 ): void {
   describe(`${name} plugin execution`, () => {
     test("CSV detects file edits, renders SQL edits, and merges independent rows", async () => {
-      const { openLix, bundledPluginArchives } = await loadSdk();
+      const sdk = await loadSdk();
+      const { openLix } = sdk;
+      const bundledPluginArchives = loadArchives ?? sdk.bundledPluginArchives;
       const lix = await openLix();
       try {
         const csv = (await bundledPluginArchives()).find(
@@ -68,7 +71,9 @@ export function registerPluginExecutionContract(
     }, 120_000);
 
     test("CSV merges different cells of the same row through the plugin column merger", async () => {
-      const { openLix, bundledPluginArchives } = await loadSdk();
+      const sdk = await loadSdk();
+      const { openLix } = sdk;
+      const bundledPluginArchives = loadArchives ?? sdk.bundledPluginArchives;
       const lix = await openLix();
       try {
         const csv = (await bundledPluginArchives()).find(
@@ -103,13 +108,31 @@ export function registerPluginExecutionContract(
         expect(await read(lix, "/same-row.csv")).toBe(
           "name,age\nAda Lovelace,37\n",
         );
+        const snapshot = new Uint8Array(
+          await new Response(lix.exportSnapshot()).arrayBuffer(),
+        );
+        await lix.close();
+        const reopened = await openLix.fromSnapshot(snapshot);
+        try {
+          await reopened.execute(
+            "UPDATE csv_row SET cells = $1 WHERE id = $2",
+            [["Ada Lovelace", "38"], id],
+          );
+          expect(await read(reopened, "/same-row.csv")).toBe(
+            "name,age\nAda Lovelace,38\n",
+          );
+        } finally {
+          await reopened.close();
+        }
       } finally {
         await lix.close();
       }
     }, 120_000);
 
     test("Markdown detects nodes and renders a SQL edit after snapshot restore", async () => {
-      const { openLix, bundledPluginArchives } = await loadSdk();
+      const sdk = await loadSdk();
+      const { openLix } = sdk;
+      const bundledPluginArchives = loadArchives ?? sdk.bundledPluginArchives;
       const source = await openLix();
       let restored: Lix | undefined;
       try {

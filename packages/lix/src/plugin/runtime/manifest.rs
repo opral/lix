@@ -60,15 +60,20 @@ impl PluginContentMatcher {
 }
 
 /// Validates the resolved durable ABI. Author manifests do not repeat these
-/// constants; the component package is canonically `lix:plugin@2.0.0`.
+/// constants; the component package is canonically `lix:plugin-v2`.
+/// Existing repositories may retain the historical `2.0.0` spelling.
 pub(crate) fn validate_runtime_api_version(
     runtime: PluginRuntime,
     api_version: &str,
 ) -> Result<(), LixError> {
-    if runtime != PluginRuntime::WasmComponent || api_version != WASM_COMPONENT_API_VERSION {
+    if runtime != PluginRuntime::WasmComponent
+        || !matches!(api_version, WASM_COMPONENT_API_VERSION | "2.0.0")
+    {
         return Err(LixError::new(
             LixError::CODE_INVALID_PLUGIN,
-            format!("plugin component must use lix:plugin@{WASM_COMPONENT_API_VERSION}"),
+            format!(
+                "plugin component requires unsupported API {api_version}; supported API: lix:plugin-v{WASM_COMPONENT_API_VERSION} (legacy lix:plugin@2.0.0)"
+            ),
         ));
     }
     Ok(())

@@ -222,3 +222,8 @@ ruzstd = { version = "0.8", default-features = false, features = ["std"] }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 wasm-bindgen-futures = "0.4"
+
+[[test]]
+name = "plugin_api_compatibility"
+path = "tests/plugin_api_compatibility.rs"
+required-features = ["default_wasm_runtime"]

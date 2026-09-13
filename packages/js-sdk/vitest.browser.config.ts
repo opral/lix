@@ -1,7 +1,16 @@
 import { playwright } from "@vitest/browser-playwright";
 import { defineConfig } from "vitest/config";
+import { fileURLToPath } from "node:url";
 
 export default defineConfig({
+	server: {
+		fs: {
+			allow: [
+				fileURLToPath(new URL(".", import.meta.url)),
+				fileURLToPath(new URL("../lix/tests/fixtures/plugin-api", import.meta.url)),
+			],
+		},
+	},
 	optimizeDeps: {
 		include: ["@bytecodealliance/jco-transpile/wasm-tools"],
 	},
