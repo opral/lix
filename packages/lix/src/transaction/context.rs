@@ -134,11 +134,11 @@ use crate::transaction_types::{
 };
 
 use crate::plugin::runtime::{
-    WASM_COMPONENT_API_VERSION, WasmChangeEffect, WasmColdFileUpdate, WasmColumnMergeResult,
-    WasmComponentActor, WasmComponentFactory, WasmDocumentHandle, WasmFileDescriptor,
-    WasmFileUpdate, WasmHostBytes, WasmHostColumnMerge, WasmHostRow, WasmHostRowChanges,
-    WasmOpenFileInput, WasmOpenRowsInput, WasmPluginSelection, WasmRow, WasmRowChange, WasmRowKey,
-    WasmRowUpdate, WasmTransitionCounters, WasmTransitionLimits,
+    WasmChangeEffect, WasmColdFileUpdate, WasmColumnMergeResult, WasmComponentActor,
+    WasmComponentFactory, WasmDocumentHandle, WasmFileDescriptor, WasmFileUpdate, WasmHostBytes,
+    WasmHostColumnMerge, WasmHostRow, WasmHostRowChanges, WasmOpenFileInput, WasmOpenRowsInput,
+    WasmPluginSelection, WasmRow, WasmRowChange, WasmRowKey, WasmRowUpdate, WasmTransitionCounters,
+    WasmTransitionLimits,
 };
 use crate::row_payload::TypedRow as WasmTypedRow;
 use crate::telemetry::TelemetryAttribute;
@@ -4844,7 +4844,7 @@ where
             let entry = PluginRegistryEntry::new(PluginRegistryEntryInput {
                 key: plugin_key.clone(),
                 runtime: crate::plugin::runtime::PluginRuntime::WasmComponent,
-                api_version: WASM_COMPONENT_API_VERSION.to_owned(),
+                api_version: parsed.api_version.clone(),
                 capabilities: parsed.capabilities,
                 path_glob: parsed
                     .manifest

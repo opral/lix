@@ -5,6 +5,9 @@ The SDK provides helpers through `lix::plugin`. Plugins still implement the four
 a full rebuild must preserve existing row identities, and warm calls intentionally
 avoid loading all accepted rows.
 
+For API evolution and frozen compiled compatibility fixtures, see
+[Plugin API compatibility](plugin-api-versioning.md).
+
 ## Validated edits
 
 `EditSet` validates all edits against the length of the accepted file before any

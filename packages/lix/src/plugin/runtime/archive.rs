@@ -20,6 +20,7 @@ use super::{PluginCapabilities, PluginManifest, parse_plugin_manifest_json};
 /// stage the extracted component in the binary CAS without reopening the ZIP.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ParsedPluginArchive {
+    pub api_version: String,
     pub manifest: PluginManifest,
     pub normalized_manifest_json: String,
     pub schemas: Vec<JsonValue>,
@@ -117,13 +118,19 @@ pub(crate) fn parse_plugin_archive_for_install(
     let loaded = load_plugin_archive(archive_bytes, true, PluginArchiveLimits::DEFAULT)?;
     let wasm_bytes = loaded.wasm;
     let wasm_hash = wasm_bytes.as_deref().map(BlobId::from_content);
-    let capabilities = wasm_bytes
+    let (api_version, capabilities) = wasm_bytes
         .as_deref()
-        .map(detect_plugin_capabilities)
+        .map(detect_plugin_api)
         .transpose()?
-        .unwrap_or_default();
+        .unwrap_or_else(|| {
+            (
+                super::WASM_COMPONENT_API_VERSION.to_owned(),
+                PluginCapabilities::default(),
+            )
+        });
     validate_manifest_capabilities(&loaded.manifest, capabilities)?;
     Ok(ParsedPluginArchive {
+        api_version,
         manifest: loaded.manifest,
         normalized_manifest_json: loaded.normalized_manifest_json,
         schemas: loaded.schemas,
@@ -150,18 +157,23 @@ pub(crate) fn load_installed_plugin_from_archive_bytes(
     }
     let wasm = loaded.wasm;
     let wasm_hash = wasm.as_deref().map(BlobId::from_content);
-    let capabilities = wasm
+    let (api_version, capabilities) = wasm
         .as_deref()
-        .map(detect_plugin_capabilities)
+        .map(detect_plugin_api)
         .transpose()?
-        .unwrap_or_default();
+        .unwrap_or_else(|| {
+            (
+                super::WASM_COMPONENT_API_VERSION.to_owned(),
+                PluginCapabilities::default(),
+            )
+        });
     validate_manifest_capabilities(&loaded.manifest, capabilities)?;
     let file_match = loaded.manifest.file_match.as_ref();
 
     Ok(InstalledPlugin {
         key: loaded.manifest.key,
         runtime: super::PluginRuntime::WasmComponent,
-        api_version: crate::plugin::runtime::WASM_COMPONENT_API_VERSION.to_owned(),
+        api_version,
         capabilities,
         path_glob: file_match.map(|matcher| matcher.path_glob.clone()),
         content: file_match.and_then(|matcher| matcher.content),
@@ -865,9 +877,37 @@ fn ensure_valid_plugin_wasm(bytes: &[u8]) -> Result<(), LixError> {
     Ok(())
 }
 
-fn detect_plugin_capabilities(bytes: &[u8]) -> Result<PluginCapabilities, LixError> {
-    const COLUMN_MERGER_EXPORT: &str = "lix:plugin/column-merger@2.0.0";
-    const FILE_PROJECTION_EXPORT: &str = "lix:plugin/file-projection@2.0.0";
+fn detect_plugin_api(bytes: &[u8]) -> Result<(String, PluginCapabilities), LixError> {
+    let mut identity = None;
+    let mut inspect_interface = |name: &str| -> Result<Option<String>, LixError> {
+        if !name.starts_with("lix:plugin/") && !name.starts_with("lix:plugin-v") {
+            return Ok(None);
+        }
+        let (family, interface) = if let Some(interface) = name.strip_prefix("lix:plugin-v2/") {
+            if interface.contains('@') {
+                return Err(invalid_plugin(format!(
+                    "Unsupported plugin API interface '{name}'; supported API: lix:plugin-v2"
+                )));
+            }
+            ("v2", interface)
+        } else if let Some(interface) = name
+            .strip_prefix("lix:plugin/")
+            .and_then(|name| name.strip_suffix("@2.0.0"))
+        {
+            ("legacy-v2", interface)
+        } else {
+            return Err(invalid_plugin(format!(
+                "Unsupported plugin API interface '{name}'; supported API: lix:plugin-v2 (legacy lix:plugin@2.0.0)"
+            )));
+        };
+        if identity.is_some_and(|previous| previous != family) {
+            return Err(invalid_plugin(
+                "Plugin component mixes canonical and legacy plugin API interfaces",
+            ));
+        }
+        identity = Some(family);
+        Ok(Some(interface.to_owned()))
+    };
 
     let mut capabilities = PluginCapabilities::default();
     let mut saw_root = false;
@@ -887,17 +927,26 @@ fn detect_plugin_capabilities(bytes: &[u8]) -> Result<PluginCapabilities, LixErr
             wasmparser::Payload::End(_) => {
                 depth = depth.saturating_sub(1);
             }
+            wasmparser::Payload::ComponentImportSection(imports) if depth == 0 => {
+                for import in imports {
+                    let import = import.map_err(|error| {
+                        invalid_plugin(format!("Plugin component import is invalid: {error}"))
+                    })?;
+                    inspect_interface(import.name.0)?;
+                }
+            }
             wasmparser::Payload::ComponentExportSection(exports) if depth == 0 => {
                 for export in exports {
                     let export = export.map_err(|error| {
                         invalid_plugin(format!("Plugin component export is invalid: {error}"))
                     })?;
+                    let interface = inspect_interface(export.name.0)?;
                     if export.kind != wasmparser::ComponentExternalKind::Instance {
                         continue;
                     }
-                    match export.name.0 {
-                        COLUMN_MERGER_EXPORT => capabilities.column_merger = true,
-                        FILE_PROJECTION_EXPORT => capabilities.file_projection = true,
+                    match interface.as_deref() {
+                        Some("column-merger") => capabilities.column_merger = true,
+                        Some("file-projection") => capabilities.file_projection = true,
                         _ => {}
                     }
                 }
@@ -910,7 +959,9 @@ fn detect_plugin_capabilities(bytes: &[u8]) -> Result<PluginCapabilities, LixErr
             "Plugin component must export column-merger, file-projection, or both",
         ));
     }
-    Ok(capabilities)
+    // Both accepted interface spellings above identify major 2. Derive this
+    // from the component contract, never from the engine's newest API.
+    Ok(("2".to_owned(), capabilities))
 }
 
 fn validate_manifest_capabilities(
@@ -1000,6 +1051,56 @@ mod tests {
                 .message
                 .contains("dot")
         );
+    }
+
+    #[test]
+    fn detects_canonical_and_legacy_api_as_the_same_major() {
+        for export in ["lix:plugin-v2/file-projection", FILE_PROJECTION_EXPORT] {
+            let wasm = capability_component(&[export]);
+            let parsed =
+                parse_plugin_archive_for_install(&plugin_archive(CompressionMethod::Stored, &wasm))
+                    .expect("both published API identities must remain installable");
+            assert_eq!(parsed.api_version, "2");
+            assert!(parsed.capabilities.file_projection);
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_or_mixed_root_api_exports() {
+        for exports in [
+            vec!["lix:plugin-v3/file-projection"],
+            vec!["lix:plugin/file-projection@2.1.0"],
+            vec!["lix:plugin-v2/file-projection@2.0.0"],
+            vec![
+                "lix:plugin-v2/file-projection",
+                "lix:plugin/column-merger@2.0.0",
+            ],
+        ] {
+            let error = super::detect_plugin_api(&capability_component(&exports)).unwrap_err();
+            assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
+            assert!(error.message.contains("API"), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn validates_root_host_import_identity_against_exports() {
+        for (import, export, supported) in [
+            ("lix:plugin-v2/host", "lix:plugin-v2/file-projection", true),
+            ("lix:plugin/host@2.0.0", FILE_PROJECTION_EXPORT, true),
+            ("lix:plugin-v3/host", "lix:plugin-v2/file-projection", false),
+            (
+                "lix:plugin/host@2.0.0",
+                "lix:plugin-v2/file-projection",
+                false,
+            ),
+        ] {
+            let mut component = ComponentBuilder::default();
+            let ty = component.type_instance(None, &wasm_encoder::InstanceType::new());
+            let instance = component.import(import, wasm_encoder::ComponentTypeRef::Instance(ty));
+            component.export(export, ComponentExportKind::Instance, instance, None);
+            let result = super::detect_plugin_api(&component.finish());
+            assert_eq!(result.is_ok(), supported, "{import}, {export}: {result:?}");
+        }
     }
 
     #[test]
@@ -1558,7 +1659,7 @@ mod benchmark_probe {
         for requested in [base + 3, base + 130, base + 16_388, 2 * 1024 * 1024] {
             let component = capability_component_with_size(requested);
             assert_eq!(component.len(), requested);
-            let capabilities = super::detect_plugin_capabilities(&component)
+            let (_, capabilities) = super::detect_plugin_api(&component)
                 .expect("padded benchmark component should remain valid");
             assert!(capabilities.file_projection);
             assert!(!capabilities.column_merger);
