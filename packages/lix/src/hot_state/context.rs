@@ -2048,6 +2048,15 @@ struct HotStateScanScope {
     branch_heads: BranchHeads,
 }
 
+#[test]
+fn borrowed_scan_scope_is_send_for_storage_session_open() {
+    fn assert_send<T: Send>() {}
+    fn assert_borrowed_scope<'a>() {
+        assert_send::<&'a HotStateScanScope>();
+    }
+    assert_borrowed_scope();
+}
+
 /// Rows read from one durable hot-state branch source.
 ///
 /// A matching hot-state projection is storage-key ordered by visible identity
