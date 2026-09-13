@@ -77,6 +77,9 @@ impl VerifiedRetainedBodyWave {
         }
         let mut tip = previous;
         let mut seen = BTreeSet::new();
+        let captured_catalog =
+            CommitId::parse_lix(&merge.global_head_commit_id, "captured catalog")?;
+        let mut catalog_bases = BTreeSet::from([captured_catalog]);
         for commit in &request.commits {
             let key = CommitId::parse_lix(&commit.commit_id, "retained body")?;
             let mut dependencies = commit
@@ -93,18 +96,36 @@ impl VerifiedRetainedBodyWave {
             if let Some(source) = &commit.selected_source_commit_id {
                 dependencies.insert(CommitId::parse_lix(source, "retained source")?);
             }
+            if let Some(source) = &commit.complete_incorporation_source_commit_id {
+                dependencies.insert(CommitId::parse_lix(
+                    source,
+                    "retained incorporation source",
+                )?);
+            }
             if commit.global_scope
                 || commit.account_id != account
                 || !seen.insert(key)
                 || (!staged.contains_key(&key) && !existing_complete.contains(&key))
                 || dependencies.is_empty()
                 || !dependencies.is_subset(&known)
-                || commit
-                    .base_commit_id
-                    .as_ref()
-                    .is_some_and(|base| base != &merge.global_head_commit_id)
             {
                 return Err(invalid());
+            }
+            if let Some(base) = &commit.base_commit_id {
+                let base = CommitId::parse_lix(base, "retained catalog base")?;
+                if !catalog_bases.contains(&base) {
+                    if !crate::sync::partial_merge_analysis::catalog_contains(
+                        read,
+                        base,
+                        captured_catalog,
+                        1024,
+                    )
+                    .await?
+                    {
+                        return Err(invalid());
+                    }
+                    catalog_bases.insert(base);
+                }
             }
             known.insert(key);
             tip = key;
@@ -116,38 +137,42 @@ impl VerifiedRetainedBodyWave {
                 .reader(read)
                 .load_observed(&branches)
                 .await?;
-            // Validate GLOBAL first: the ordinary restart owner preserves its
-            // coordinates and cannot capture a successor across GLOBAL changes.
-            for (index, head, checkpoint) in [
-                (
-                    1,
-                    &merge.global_head_commit_id,
-                    &merge.global_checkpoint_commit_id,
-                ),
-                (
-                    0,
+            // Both authority frontiers may advance while immutable bodies travel.
+            // The original GLOBAL coordinate remains a retained body dependency.
+            let global = observed[1].control.as_ref().ok_or_else(invalid)?;
+            if !crate::sync::partial_merge_analysis::catalog_contains(
+                read,
+                CommitId::parse_lix(&merge.global_head_commit_id, "captured catalog")?,
+                global.head_commit_id,
+                1024,
+            )
+            .await?
+            {
+                return Err(invalid());
+            }
+            let selected = observed[0].control.as_ref().ok_or_else(invalid)?;
+            let captured_remote = crate::sync::partial_merge_analysis::record(
+                read,
+                CommitId::parse_lix(
                     &merge.expected_authority_head_commit_id,
-                    &merge.expected_authority_checkpoint_commit_id,
-                ),
-            ] {
-                let control = observed[index].control.as_ref().ok_or_else(invalid)?;
-                if control.head_commit_id != head.as_str()
-                    || control
-                        .working_diff_checkpoint_commit_id
-                        .map(|id| id.to_string())
-                        .as_ref()
-                        != Some(checkpoint)
-                {
-                    if index == 1 {
-                        return Err(invalid());
-                    }
-                    // No retention attempt has been admitted yet. The immutable
-                    // request must restart against fresh authority coordinates.
-                    return Err(LixError::new(
-                        "LIX_ERROR_PARTIAL_ATTEMPT_ANCHORS_CHANGED",
-                        "authority coordinates changed before initial body retention",
-                    ));
-                }
+                    "captured authority",
+                )?,
+                false,
+            )
+            .await?;
+            if !crate::sync::partial_merge_analysis::incorporated(
+                read,
+                &captured_remote,
+                selected.head_commit_id,
+                &mut BTreeMap::new(),
+                1024,
+            )
+            .await?
+            {
+                return Err(LixError::new(
+                    "LIX_PARTIAL_UPLOAD_ATTEMPT_INVALID",
+                    "retention authority no longer incorporates the captured selected frontier",
+                ));
             }
             let base = crate::sync::partial_merge_analysis::record(
                 read,
@@ -159,7 +184,7 @@ impl VerifiedRetainedBodyWave {
                 &merge.expected_authority_head_commit_id,
                 "retention authority head",
             )?;
-            if !crate::sync::partial_merge_analysis::bounded_ancestor(
+            if !crate::sync::partial_merge_analysis::incorporated(
                 read,
                 &base,
                 remote,
@@ -168,7 +193,10 @@ impl VerifiedRetainedBodyWave {
             )
             .await?
             {
-                return Err(invalid());
+                return Err(LixError::new(
+                    "LIX_PARTIAL_UPLOAD_ATTEMPT_INVALID",
+                    "retention authority does not incorporate the captured merge base",
+                ));
             }
             for (branch, observation) in branches.iter().zip(observed) {
                 anchor_guards.push(crate::branch::branch_head_control_precondition(
@@ -244,7 +272,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_global_anchors_never_enter_selected_branch_restart() {
+    async fn authority_advancement_preserves_retention_of_complete_native_bodies() {
         initial_anchor_case(true, false, true).await;
         initial_anchor_case(true, true, true).await;
         initial_anchor_case(true, true, false).await;
@@ -309,7 +337,7 @@ mod tests {
             ref_updates: vec![],
             inline_blobs: vec![],
         };
-        let error = VerifiedRetainedBodyWave::from_validated_import(
+        let result = VerifiedRetainedBodyWave::from_validated_import(
             &read,
             true,
             lix.lix_id(),
@@ -328,16 +356,17 @@ mod tests {
                 BTreeSet::new()
             },
         )
-        .await
-        .err()
-        .unwrap();
-        assert_eq!(
-            error.code,
-            if complete && selected_stale && !global_stale {
-                "LIX_ERROR_PARTIAL_ATTEMPT_ANCHORS_CHANGED"
-            } else {
+        .await;
+        if complete {
+            assert!(
+                result.is_ok(),
+                "authority advancement must retain the same request"
+            );
+        } else {
+            assert_eq!(
+                result.err().unwrap().code,
                 "LIX_PARTIAL_UPLOAD_ATTEMPT_INVALID"
-            }
-        );
+            );
+        }
     }
 }

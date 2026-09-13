@@ -100,7 +100,8 @@ impl PartialReplicaState {
                     || state.active_account_id() != expected_account
                     || state.epoch_id() != expected_epoch
                 {
-                    return Err(invalid(
+                    return Err(LixError::new(
+                        "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
                         "partial read admission belongs to another storage owner",
                     ));
                 }
@@ -408,6 +409,63 @@ mod tests {
             authority.partial_replica_descriptor(None).await.unwrap(),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn read_scope_distinguishes_valid_owner_mismatch_from_corrupt_admission() {
+        let original = state().await;
+        for axis in ["epoch", "account", "remote", "repository", "malformed"] {
+            let mut descriptor = original.descriptor().clone();
+            if axis == "repository" {
+                descriptor.lix_id = uuid::Uuid::now_v7().to_string();
+            }
+            let replacement = PartialReplicaState::new(
+                if axis == "remote" {
+                    "https://mirror.example.test/lix/other".into()
+                } else {
+                    original.remote_id().into()
+                },
+                if axis == "account" {
+                    uuid::Uuid::now_v7().to_string()
+                } else {
+                    original.active_account_id().into()
+                },
+                if axis == "epoch" {
+                    uuid::Uuid::now_v7().to_string()
+                } else {
+                    original.epoch_id().into()
+                },
+                descriptor,
+            )
+            .unwrap();
+            let adapter = StorageAdapter::new(Memory::new());
+            let mut writes = adapter.new_write_set();
+            let bytes = if axis == "malformed" {
+                b"{}".to_vec()
+            } else {
+                serde_json::to_vec(&replacement).unwrap()
+            };
+            writes.put(
+                PARTIAL_REPLICA_STATE_SPACE,
+                partial_replica_state_key(),
+                bytes,
+            );
+            adapter
+                .commit_write_set(writes, Default::default())
+                .await
+                .unwrap();
+            let read = adapter.begin_read(Default::default()).await.unwrap();
+            let error = original.read_scope_source().load(&read).await.unwrap_err();
+            assert_eq!(
+                error.code,
+                if axis == "malformed" {
+                    "LIX_PARTIAL_REPLICA_STATE_INVALID"
+                } else {
+                    "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH"
+                },
+                "{axis}"
+            );
+        }
     }
 
     #[tokio::test]

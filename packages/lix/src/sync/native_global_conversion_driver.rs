@@ -82,8 +82,7 @@ async fn prepare_wave(
     let target = match &frontier.prepared {
         Some(target) => id(target)?,
         None => {
-            partial_upload::wave_target(read, id(final_head)?, id(&frontier.accepted)?, 32)
-                .await?
+            partial_upload::wave_target(read, id(final_head)?, id(&frontier.accepted)?, 32).await?
         }
     };
     let mut cursor = target;

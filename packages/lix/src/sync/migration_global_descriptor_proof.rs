@@ -169,10 +169,7 @@ pub(crate) async fn prove_local_descriptor_global_source(
 ) -> Result<(), LixError> {
     request.validate()?;
     let b = CommitId::parse_lix(&request.base_commit_id, "global source base")?;
-    let l = CommitId::parse_lix(
-        &request.captured_local_head_commit_id,
-        "global source head",
-    )?;
+    let l = CommitId::parse_lix(&request.captured_local_head_commit_id, "global source head")?;
     prove_descriptor_only_global_merge(read, b, b, l, account, &request.branch_ids()).await?;
     Ok(())
 }

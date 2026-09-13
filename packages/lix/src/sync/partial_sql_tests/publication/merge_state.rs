@@ -277,7 +277,7 @@ async fn merge_capture_racing_a_local_write_fails_without_creating_an_attempt() 
 }
 
 #[tokio::test]
-async fn merge_capture_invalidates_staged_ack_and_fences_both_ordinary_lanes() {
+async fn merge_capture_invalidates_staged_ack_and_keeps_global_lane_available() {
     use crate::sync::partial_push_state::{
         PartialPushCoordinate, PreparedPartialUpload, load_partial_push_state,
         stage_acknowledge_partial_upload, stage_prepare_partial_upload,
@@ -403,15 +403,22 @@ async fn merge_capture_invalidates_staged_ack_and_fences_both_ordinary_lanes() {
                 target: push.confirmed,
             }
         };
-        let error = stage_prepare_partial_upload(
+        let prepared = stage_prepare_partial_upload(
             &read,
             &mut storage.new_write_set(),
             &old,
             branch,
             &attempt,
         )
-        .await
-        .unwrap_err();
+        .await;
+        if branch == crate::GLOBAL_BRANCH_ID {
+            assert!(
+                prepared.is_ok(),
+                "independent GLOBAL publication must remain available"
+            );
+            continue;
+        }
+        let error = prepared.unwrap_err();
         assert_eq!(error.code, "LIX_PARTIAL_REPLICA_MERGE_PENDING");
         for ref_accepted in [false, true] {
             let error = stage_acknowledge_partial_upload(

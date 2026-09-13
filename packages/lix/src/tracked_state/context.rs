@@ -4688,6 +4688,139 @@ where
         self.staged_roots.values()
     }
 
+    /// Certify checkpoint state, preserving every value identity and lifetime
+    /// except the native Added-row lifetime rebase at the checkpoint boundary.
+    pub(crate) async fn complete_state_matches_source(
+        &self,
+        commit_id: CommitId,
+        source_id: CommitId,
+        checkpoint_base: Option<CommitId>,
+    ) -> Result<bool, LixError> {
+        let context = TrackedStateContext::new();
+        let mut native = context.reader(self.store);
+        let mut roots = Vec::with_capacity(2);
+        let mut patches = Vec::with_capacity(2);
+        for id in [commit_id, source_id] {
+            if let Some(root) = self.staged_roots.get(&id.to_string()) {
+                roots.push(root.root_id.clone());
+                patches.push(None);
+                continue;
+            }
+            let mut anchor = id;
+            let mut seen = BTreeSet::new();
+            loop {
+                if !seen.insert(anchor) {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "incorporation replay ancestry contains a cycle",
+                    ));
+                }
+                let node = native.load_point_replay_commit(anchor).await?;
+                if let Some(root) = node.root_id {
+                    roots.push(root);
+                    break;
+                }
+                anchor = node.parent_commit_id.ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "incorporation replay has no rooted ancestor",
+                    )
+                })?;
+            }
+            // Rootless native packets are compared as a sparse interval patch,
+            // never by rebuilding or materializing the complete repository.
+            patches.push(if anchor == id {
+                None
+            } else {
+                Some(
+                    native
+                        .diff_semantic_tree_entries_at_commits(
+                            &anchor.to_string(),
+                            &id.to_string(),
+                            &TrackedStateTreeScanRequest::default(),
+                        )
+                        .await?,
+                )
+            });
+        }
+        if roots[0] == roots[1] && patches.iter().all(Option::is_none) {
+            return Ok(true);
+        }
+        let staged_read = storage::TrackedStateStagedRead::new(self.store, &self.chunk_overlay);
+        let diff = self
+            .tree
+            .diff(
+                &staged_read,
+                Some(&roots[0]),
+                Some(&roots[1]),
+                &TrackedStateTreeScanRequest::default(),
+            )
+            .await?;
+        let owned_key = |key: TrackedStateKeyRef<'_>| TrackedStateKey {
+            schema_key: key.schema_key.to_owned(),
+            file_id: key.file_id.map(str::to_owned),
+            row_pk: key.row_pk.clone(),
+        };
+        let mut compared = diff
+            .rows()
+            .map(|(_, key, left, right)| (owned_key(key), (left.cloned(), right.cloned())))
+            .collect::<BTreeMap<_, _>>();
+        for (side, patch) in patches.iter().enumerate() {
+            for (_, key, before, after) in patch.iter().flat_map(|patch| patch.rows()) {
+                let pair = compared
+                    .entry(owned_key(key))
+                    .or_insert_with(|| (before.cloned(), before.cloned()));
+                if side == 0 {
+                    pair.0 = after.cloned();
+                } else {
+                    pair.1 = after.cloned();
+                }
+            }
+        }
+        let mut rebased = Vec::new();
+        for (key, (left, right)) in compared {
+            // Checkpoint fences omit tombstones for identities already absent
+            // at their base; both representations are logically deleted.
+            if left.as_ref().is_none_or(|value| value.deleted)
+                && right.as_ref().is_none_or(|value| value.deleted)
+            {
+                continue;
+            }
+            match (left, right) {
+                (Some(left), Some(right))
+                    if left.change_id == right.change_id
+                        && left.deleted == right.deleted
+                        && left.updated_at == right.updated_at =>
+                {
+                    if left.created_at != right.created_at {
+                        if left.deleted || left.created_at != right.updated_at {
+                            return Ok(false);
+                        }
+                        rebased.push(key);
+                    }
+                }
+                (None, None) => {}
+                _ => return Ok(false),
+            }
+        }
+        if rebased.is_empty() {
+            return Ok(true);
+        }
+        let Some(base) = checkpoint_base else {
+            return Ok(false);
+        };
+        let base_values = if self.staged_roots.contains_key(&base.to_string()) {
+            self.root_values_at_commit(base, &rebased).await?
+        } else {
+            native
+                .index_values_at_commit(&base.to_string(), &rebased)
+                .await?
+        };
+        Ok(base_values
+            .iter()
+            .all(|value| value.as_ref().is_none_or(|value| value.deleted)))
+    }
+
     /// Reads exact identities from a root staged in this write set, or from an
     /// already-published root in the coherent base snapshot.
     pub(crate) async fn root_values_at_commit(
@@ -5936,6 +6069,7 @@ mod tests {
         snapshot_root: TrackedStateCommitRoot,
     ) -> Result<(), LixError> {
         let manifest = crate::tracked_state::CommitStateManifest {
+            incorporation: crate::tracked_state::CommitStateIncorporation::None,
             commit_id: snapshot_root.commit_id,
             change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             replay_debt: Default::default(),

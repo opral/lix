@@ -1,8 +1,18 @@
 //! Lost ordinary ACK is settled as inclusion, never replayed as a later write.
 use super::*;
+use std::collections::BTreeMap;
 
 #[tokio::test]
 async fn included_frozen_upload_preserves_later_authority_winner_and_new_local_suffix() {
+    included_upload_case(false).await;
+}
+
+#[tokio::test]
+async fn lost_ordinary_ack_then_authority_checkpoint_is_settled_without_replay() {
+    included_upload_case(true).await;
+}
+
+async fn included_upload_case(checkpoint_authority: bool) {
     let backing = Memory::new();
     let authority = open_lix().with_storage(backing.clone()).await.unwrap();
     authority
@@ -114,6 +124,15 @@ async fn included_frozen_upload_preserves_later_authority_winner_and_new_local_s
         )
         .await
         .unwrap();
+    if checkpoint_authority {
+        authority
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))",
+                &[],
+            )
+            .await
+            .unwrap();
+    }
     execute_hydrating(
         &session,
         &storage,
@@ -134,6 +153,40 @@ async fn included_frozen_upload_preserves_later_authority_winner_and_new_local_s
     let leased = transport
         .fork_native_baseline_lease(&remote.wire.lease)
         .unwrap();
+    if checkpoint_authority {
+        assert_ne!(
+            remote.wire.descriptor.selected_branch.checkpoint.commit_id, frozen.target.checkpoint,
+            "recovery must cross a checkpoint created after the lost ACK"
+        );
+        let authority_storage = authority.storage_adapter();
+        let read = authority_storage
+            .begin_read(Default::default())
+            .await
+            .unwrap();
+        let accepted = crate::sync::partial_merge_analysis::record(
+            &read,
+            crate::changelog::CommitId::parse_lix(&frozen.target.head, "accepted upload").unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !crate::sync::partial_merge_analysis::bounded_ancestor(
+                &read,
+                &accepted,
+                crate::changelog::CommitId::parse_lix(
+                    &remote.wire.descriptor.selected_branch.head.commit_id,
+                    "compacted authority head",
+                )
+                .unwrap(),
+                &mut BTreeMap::new(),
+                32,
+            )
+            .await
+            .unwrap(),
+            "the checkpoint must remove the accepted upload from causal ancestry"
+        );
+    }
     for attempt in 0..64 {
         let read = storage.begin_read(Default::default()).await.unwrap();
         let mut writes = storage.new_write_set();

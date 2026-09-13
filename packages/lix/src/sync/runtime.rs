@@ -890,6 +890,7 @@ fn is_terminal_sync_error(error: &LixError) -> bool {
             | super::SYNC_PROTOCOL_MISMATCH_CODE
             | super::SYNC_REPOSITORY_ID_MISMATCH_CODE
             | super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE
+            | "LIX_PARTIAL_MERGE_PROOF_UNAVAILABLE"
     )
 }
 
@@ -2234,6 +2235,8 @@ mod tests {
             global_scope: false,
             selected_source_commit_id: None,
             state_alias: None,
+            complete_incorporation_source_commit_id: None,
+            incorporation_unknown: false,
             members: vec![super::super::commit::SyncCommitMember {
                 change_id: crate::changelog::ChangeId::for_test_label("runtime-inline-change")
                     .to_string(),

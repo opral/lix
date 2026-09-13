@@ -14205,6 +14205,7 @@ mod tests {
             crate::tracked_state::stage_commit_state_manifest(
                 &mut writes,
                 &crate::tracked_state::CommitStateManifest {
+                    incorporation: crate::tracked_state::CommitStateIncorporation::None,
                     commit_id,
                     change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
                     replay_debt: crate::tracked_state::CommitStateReplayDebt {

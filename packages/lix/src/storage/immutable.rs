@@ -244,14 +244,15 @@ impl SegmentBuilder {
             .map_err(|_| StorageError::Io("immutable value exceeds u64".to_string()))?;
         let key_len = u64::try_from(key.0.len()).map_err(|_| StorageError::InvalidKey)?;
         if self.values.is_empty() {
-            self.identity = blake3::Hasher::new_derive_key("lix immutable segment identity v1");
+            self.identity = blake3::Hasher::new_derive_key("lix immutable segment identity v2");
         }
         self.identity.update(&key_len.to_le_bytes());
         self.identity.update(&key.0);
         self.identity.update(&value_len.to_le_bytes());
+        self.identity.update(&value);
         #[cfg(feature = "storage-benches")]
         crate::storage_bench::record_immutable_segment_identity_hash_bytes(
-            size_of::<u64>() + key.0.len() + size_of::<u64>(),
+            size_of::<u64>() + key.0.len() + size_of::<u64>() + value.len(),
         );
 
         let mut header = BytesMut::with_capacity(IMMUTABLE_VALUE_MAGIC.len() + size_of::<u64>());
@@ -283,7 +284,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn segment_identity_depends_on_ordered_identities_and_lengths() {
+    fn segment_identity_depends_on_keys_lengths_and_contents() {
         let mut left = ImmutableSegmentWriter::default();
         left.insert(Key(Bytes::from_static(b"a")), Bytes::from_static(b"AA"))
             .expect("insert a");
@@ -299,7 +300,12 @@ mod tests {
             .insert(Key(Bytes::from_static(b"b")), Bytes::from_static(b"YYY"))
             .expect("insert b");
         let same_shape = same_shape.finish(|_| true).expect("finish same shape");
-        assert_eq!(left[0].id, same_shape[0].id);
+        assert_ne!(left[0].id, same_shape[0].id);
+
+        let mut identical = ImmutableSegmentWriter::default();
+        identical.insert(Key(Bytes::from_static(b"a")), Bytes::from_static(b"AA")).unwrap();
+        identical.insert(Key(Bytes::from_static(b"b")), Bytes::from_static(b"BBB")).unwrap();
+        assert_eq!(left[0].id, identical.finish(|_| true).unwrap()[0].id);
 
         let mut changed_length = ImmutableSegmentWriter::default();
         changed_length

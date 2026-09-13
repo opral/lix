@@ -112,6 +112,7 @@ fn stage_bench_commit_deltas(
     crate::tracked_state::stage_commit_state_manifest(
         writes,
         &crate::tracked_state::CommitStateManifest {
+            incorporation: crate::tracked_state::CommitStateIncorporation::None,
             commit_id,
             change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             global_scope: false,
@@ -1798,6 +1799,7 @@ where
         crate::tracked_state::stage_commit_state_manifest(
             &mut writes,
             &crate::tracked_state::CommitStateManifest {
+                incorporation: crate::tracked_state::CommitStateIncorporation::None,
                 commit_id: record.commit_id,
                 change_account_id: record.account_id.clone(),
                 global_scope: false,

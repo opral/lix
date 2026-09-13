@@ -342,10 +342,7 @@ mod tests {
                 full.close().await.unwrap();
             } else {
                 let converted = converted.unwrap();
-                assert_eq!(
-                    admit_partial_epoch(&storage).await.unwrap().state,
-                    state
-                );
+                assert_eq!(admit_partial_epoch(&storage).await.unwrap().state, state);
                 assert_ne!(load_pointer(&storage).await.unwrap().unwrap().1, before);
                 let retained = list_retained_replica_sources(&storage).await.unwrap();
                 assert_eq!(retained.len(), 1);

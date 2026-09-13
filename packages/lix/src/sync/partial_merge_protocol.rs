@@ -86,15 +86,6 @@ fn invalid(message: &str) -> LixError {
     LixError::new("LIX_PARTIAL_MERGE_PROTOCOL_INVALID", message)
 }
 impl PartialMergeRequest {
-    /// A checkpoint is a changed field relative to the captured base, just as
-    /// row columns are. An unchanged local value must not erase newer authority work.
-    pub(crate) fn accepted_checkpoint_commit_id(&self) -> &str {
-        if self.captured_local_checkpoint_commit_id == self.checkpoint_commit_id {
-            &self.expected_authority_checkpoint_commit_id
-        } else {
-            &self.captured_local_checkpoint_commit_id
-        }
-    }
     pub(crate) fn validate(&self) -> Result<(), LixError> {
         for value in [
             &self.attempt_id,

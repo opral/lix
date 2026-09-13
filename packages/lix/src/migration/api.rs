@@ -181,7 +181,7 @@ where
     }
     let from_version = match protocol_status {
         RepositoryProtocolStatus::MigrationRequired {
-            found_version: found_version @ (72 | 73 | 74 | 75 | 76 | 77 | 78),
+            found_version: found_version @ (72 | 73 | 74 | 75 | 76 | 77 | 78 | 79),
         } => found_version,
         RepositoryProtocolStatus::Current => {
             return Ok(MigrationReport {
@@ -208,7 +208,9 @@ where
         }
     };
     read.finish().map_err(storage_error)?;
-    super::deterministic_witness::backfill(&adapter, options, false).await?;
+    if from_version <= 78 {
+        super::deterministic_witness::backfill(&adapter, options, false).await?;
+    }
     // Every step from here on loads commit records through the current
     // v6 decoder, so the v5 records are rewritten first, under whichever
     // marker the repository currently carries.
@@ -272,19 +274,22 @@ where
     } else {
         0
     };
-    backfill_missing_row_pk_indexes(
-        &adapter,
-        &storage,
-        options,
-        78,
-        crate::init::REPOSITORY_PROTOCOL_V78,
-        crate::init::REPOSITORY_PROTOCOL_V78,
-        "v79 complete row-PK catalog repair",
-        false,
-        true,
-    )
-    .await?;
-    super::deterministic_witness::backfill(&adapter, options, true).await?;
+    if from_version <= 78 {
+        backfill_missing_row_pk_indexes(
+            &adapter,
+            &storage,
+            options,
+            78,
+            crate::init::REPOSITORY_PROTOCOL_V78,
+            crate::init::REPOSITORY_PROTOCOL_V78,
+            "v79 complete row-PK catalog repair",
+            false,
+            true,
+        )
+        .await?;
+        super::deterministic_witness::backfill(&adapter, options, true).await?;
+    }
+    super::incorporation::migrate(&adapter, options, false).await?;
     Ok(MigrationReport {
         from_version,
         to_version: CURRENT_FORMAT_VERSION,

@@ -131,7 +131,7 @@ executes on the authority.
   `PUT /lix/v1/{lix_id}/sync/chunk?chunkId=...` transfer raw chunks. Both identities are
   64-character lowercase BLAKE3 hex digests; chunks are at most 4 MiB.
 
-All sync routes require exactly one `lix-sync-protocol-version: 13` header.
+All sync routes require exactly one `lix-sync-protocol-version: 14` header.
 Missing, duplicate, malformed, or incompatible versions are rejected before
 reading or publishing sync data. The handshake advertises
 `syncCheckpointInventory: true`. Commit bodies and headers both carry immutable
@@ -151,10 +151,16 @@ again. There is no separate presence request.
 
 ### Partial replica with on-demand sync
 
-Sync protocol 13 defines the native transport for a partial replica with
+Sync protocol 14 defines the native transport for a partial replica with
 on-demand sync. SDK callers opt in with `server.mode: "partial_replica"` and
 local storage. The default server mode is `remote`. Client and server must
 upgrade together; this transport change does not alter the repository format.
+
+Partial merge receipts use the authority head at admission as the first parent,
+which may differ from the head captured when the client prepared its attempt.
+Protocol 13 clients require that captured head as the first parent and cannot
+settle these receipts. Both handshakes and requests on existing sessions reject
+incompatible sync versions before sync work; upgrade SDK and server together.
 
 - `GET /sync/descriptor` returns a required `{descriptor, lease}` envelope of at
   most 6144 encoded bytes. The descriptor contains selected/default and global
