@@ -16,7 +16,13 @@ concurrency:
 
 jobs:
   release-pr:
-    name: Open release PR
+    name: Open ${{ matrix.target }} release PR
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [lix, plugin_json, plugin_csv, plugin_markdown, plugin_text, plugin_excalidraw]
+    env:
+      RELEASE_TARGET: ${{ matrix.target }}
     runs-on: ubicloud-standard-2-ubuntu-2404
 
     steps:
@@ -31,13 +37,13 @@ jobs:
         with:
           script: |
             const { checkReleaseFreeze } = await import(`${process.env.GITHUB_WORKSPACE}/scripts/release-candidate.mjs`);
-            await checkReleaseFreeze({ github, context, core });
+            await checkReleaseFreeze({ github, context, core, target: process.env.RELEASE_TARGET });
 
       - name: Prepare release changes
         if: steps.freeze.outputs.frozen != 'true'
         id: prepare
         run: |
-          output="$(node scripts/prepare-release.mjs)"
+          output="$(node scripts/prepare-release.mjs --target "$RELEASE_TARGET")"
           echo "$output"
           version="$(printf '%s\n' "$output" | sed -n 's/^version=//p')"
           if [ -z "$version" ]; then
@@ -46,6 +52,7 @@ jobs:
           fi
           echo "has_release=true" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$output" | sed -n '/^tag=/p; /^branch=/p' >> "$GITHUB_OUTPUT"
 
       - name: Validate prepared release metadata
         if: steps.prepare.outputs.has_release == 'true'
@@ -61,7 +68,7 @@ jobs:
         with:
           script: |
             const { checkReleaseFreeze } = await import(`${process.env.GITHUB_WORKSPACE}/scripts/release-candidate.mjs`);
-            await checkReleaseFreeze({ github, context, core });
+            await checkReleaseFreeze({ github, context, core, target: process.env.RELEASE_TARGET });
 
       - name: Create or update release PR
         if: steps.prepare.outputs.has_release == 'true' && steps.recheck.outputs.frozen == 'false'
@@ -69,11 +76,11 @@ jobs:
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          branch: release/v${{ steps.prepare.outputs.version }}
+          branch: ${{ steps.prepare.outputs.branch }}
           delete-branch: true
           draft: true
-          commit-message: Release v${{ steps.prepare.outputs.version }}
-          title: Release v${{ steps.prepare.outputs.version }}
+          commit-message: Release ${{ steps.prepare.outputs.tag }}
+          title: Release ${{ steps.prepare.outputs.tag }}
           body: |
             This PR was generated from `.changenotes/*` fragments.
 
@@ -82,27 +89,24 @@ jobs:
             To include newer changes, return this PR to draft and manually run the Release PR workflow.
             Draft updates validate metadata; automated updates leave ready candidates untouched.
 
-            Merging this PR updates `CHANGELOG.md`, bumps lockstep package versions,
-            and enables the release workflow to create `v${{ steps.prepare.outputs.version }}` and publish packages.
+            This candidate releases `${{ matrix.target }}` as `${{ steps.prepare.outputs.tag }}`.
+            Merging updates this target's version and changelog and enables its publisher.
+            Other release targets retain their versions and pending change notes.
 
-      - name: Close superseded release PRs
+      - name: Close superseded release PRs for this target
         if: steps.release_pr.outputs.pull-request-number != ''
+        uses: actions/github-script@v7
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CURRENT_PR: ${{ steps.release_pr.outputs.pull-request-number }}
-          TARGET_BRANCH: release/v${{ steps.prepare.outputs.version }}
-        run: |
-          gh pr list \
-            --state open \
-            --base main \
-            --limit 100 \
-            --json number,headRefName,isCrossRepository,isDraft \
-            --jq '.[] | select(.isDraft == true and .isCrossRepository == false and (.headRefName | test("^release/v[0-9]+\\.[0-9]+\\.[0-9]+$"))) | [.number, .headRefName] | @tsv' |
-          while IFS=$'\t' read -r number branch; do
-            if [ "$branch" = "$TARGET_BRANCH" ]; then
-              continue
-            fi
-
-            gh pr close "$number" \
-              --comment "Superseded by #${CURRENT_PR}, which contains the current release changes."
-          done
+          TARGET_BRANCH: ${{ steps.prepare.outputs.branch }}
+        with:
+          script: |
+            const target = process.env.RELEASE_TARGET;
+            const prefix = target === 'lix' ? 'release/v' : `release/${target}/v`;
+            const candidates = await github.paginate(github.rest.pulls.list, { ...context.repo, state: 'open', base: 'main', per_page: 100 });
+            for (const pr of candidates) {
+              if (!pr.draft || pr.head.repo?.full_name !== `${context.repo.owner}/${context.repo.repo}` ||
+                  !pr.head.ref.startsWith(prefix) || !/^\d+\.\d+\.\d+$/.test(pr.head.ref.slice(prefix.length)) ||
+                  pr.head.ref === process.env.TARGET_BRANCH) continue;
+              await github.rest.pulls.update({ ...context.repo, pull_number: pr.number, state: 'closed' });
+            }

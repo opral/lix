@@ -185,7 +185,9 @@ test("release PR updates validate metadata and defer full CI until ready for rev
 	assert.doesNotMatch(releasePrWorkflow, /draft: always-true/);
 	assert.match(releasePrWorkflow, /steps\.freeze\.outputs\.frozen != 'true'/);
 	assert.match(releasePrWorkflow, /steps\.recheck\.outputs\.frozen == 'false'/);
-	assert.match(releasePrWorkflow, /select\(\.isDraft == true/);
+	assert.match(releasePrWorkflow, /!pr\.draft/);
+	assert.match(releasePrWorkflow, /target: process\.env\.RELEASE_TARGET/);
+	assert.match(releasePrWorkflow, /!pr\.head\.ref\.startsWith\(prefix\)/);
 	assert.match(
 		releasePrWorkflow,
 		/node scripts\/validate-publish-surface\.mjs/,

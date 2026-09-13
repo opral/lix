@@ -1,0 +1,91 @@
+name: Publish plugins
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Plugin to retry from its prepared release commit
+        required: true
+        type: choice
+        options: [plugin_json, plugin_csv, plugin_markdown, plugin_text, plugin_excalidraw]
+      source_sha:
+        description: Full release commit SHA reachable from main
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  select:
+    name: Select plugin releases
+    runs-on: ubicloud-standard-2-ubuntu-2404
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+      has_release: ${{ steps.select.outputs.has_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Select changed plugin versions
+        id: select
+        env:
+          RELEASE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.source_sha || github.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          RELEASE_TARGET: ${{ inputs.target }}
+        run: node scripts/publish-plugin.mjs
+
+  publish:
+    name: Publish ${{ matrix.target }} v${{ matrix.version }}
+    needs: select
+    if: needs.select.outputs.has_release == 'true'
+    runs-on: ubicloud-standard-30-ubuntu-2404
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.select.outputs.matrix) }}
+    concurrency:
+      group: publish-plugin-${{ matrix.target }}-${{ matrix.version }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      PLUGIN_TARGET: ${{ matrix.target }}
+      PLUGIN_VERSION: ${{ matrix.version }}
+      RELEASE_SHA: ${{ matrix.sha }}
+      PLUGIN_OUTPUT: ${{ github.workspace }}/dist/plugin-release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.sha }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install plugin build dependencies
+        run: npm ci --prefix packages/js-sdk
+      - name: Test plugin archive packaging
+        run: node --test scripts/plugin-archive.test.mjs
+      - name: Install Rust toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: plugin-release
+      - name: Build selected plugin archive
+        run: node scripts/build-plugin.mjs "$PLUGIN_TARGET" --out-dir "$PLUGIN_OUTPUT"
+      - name: Test plugin and install compiled archive
+        run: |
+          cargo test --locked -p "$PLUGIN_TARGET"
+          cargo run --locked -p lix --example validate_plugin_archive -- "$PLUGIN_TARGET" "$PLUGIN_OUTPUT/$PLUGIN_TARGET.lixplugin"
+      - name: Publish verified release assets
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { publishPlugin, pluginVersionAt } = await import(`${process.env.GITHUB_WORKSPACE}/scripts/publish-plugin.mjs`);
+            const { PLUGIN_TARGET: target, PLUGIN_VERSION: version, RELEASE_SHA: sha, PLUGIN_OUTPUT: directory } = process.env;
+            if (pluginVersionAt(process.env.GITHUB_WORKSPACE, sha, target) !== version) throw new Error('Release version changed');
+            await publishPlugin({ github, ...context.repo, target, version, sha, directory });

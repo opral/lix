@@ -22,6 +22,9 @@ console.log(result.rows[0]?.message);
 await lix.close();
 ```
 
+For compiled plugin downloads, installation, updates, and uninstalling, see
+[Installing and managing plugins](../../docs/plugins.md).
+
 ## Hosted lifecycle
 
 `openLix()` selects execution from storage and the explicit server mode:

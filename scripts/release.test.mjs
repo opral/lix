@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
@@ -6,6 +6,12 @@ import assert from "node:assert/strict";
 
 import {
 	bumpVersion,
+	currentVersion,
+	prepareRelease,
+	prepareManualRelease,
+	releaseTag,
+	releaseBranch,
+	releaseTarget,
 	changelogEntry,
 	loadChanges,
 	manualReleaseVersion,
@@ -74,6 +80,7 @@ test("loadChanges validates and parses fragments", () => {
 	assert.deepEqual(loadChanges(root), [
 		{
 			path: ".changenotes/native-bindings.md",
+			target: "lix",
 			type: "patch",
 			body: "Fixed native binding loading on Linux. [#1](https://github.com/opral/lix/pull/1)",
 			summary: "Fixed native binding loading on Linux. [#1](https://github.com/opral/lix/pull/1)",
@@ -102,6 +109,7 @@ test("loadChanges preserves changelog summary and explainer paragraphs", () => {
 	assert.deepEqual(loadChanges(root), [
 		{
 			path: ".changenotes/sqlite-reads.md",
+			target: "lix",
 			type: "patch",
 			body: "Improved SQLite storage read performance.\n\nThe storage now avoids loading values for key-only reads. Wrapped lines stay in the same paragraph.",
 			summary: "Improved SQLite storage read performance.",
@@ -120,6 +128,7 @@ test("loadChanges preserves fenced code blocks", () => {
 	assert.deepEqual(loadChanges(root), [
 		{
 			path: ".changenotes/file-api.md",
+			target: "lix",
 			type: "patch",
 			body: 'Added a typed file API:\n\n```js\nawait lix.fs.writeFile("/orders.xlsx", bytes);\nconst bytes = await lix.fs.readFile("/orders.xlsx");\n```',
 			summary: "Added a typed file API:",
@@ -366,4 +375,104 @@ test("updatePackageVersion pins every lockstep npm package", () => {
 		],
 		"0.7.0",
 	);
+});
+
+function releaseFixture() {
+	const root = mkdtempSync(join(tmpdir(), "lix-release-target-test-"));
+	const put = (path, text) => {
+		mkdirSync(join(root, path, ".."), { recursive: true });
+		writeFileSync(join(root, path), text);
+	};
+	put("Cargo.toml", '[workspace.package]\nversion = "0.16.1"\n[workspace.dependencies]\nlix = { path = "packages/lix", version = "=0.16.1" }\n');
+	put("packages/lix/Cargo.toml", '[package]\nname = "lix"\nversion.workspace = true\n');
+	for (const key of ["json", "csv"]) {
+		put(`plugins/${key}/Cargo.toml`, `[package]\nname = "plugin_${key}"\nversion = "0.16.1"\n`);
+	}
+	for (const path of ["js-sdk", "storage-filesystem", "storage-opfs"]) {
+		put(`packages/${path}/package.json`, JSON.stringify({ name: `@lix-js/${path === "js-sdk" ? "sdk" : path}`, version: "0.16.1" }));
+		put(`packages/${path}/package-lock.json`, JSON.stringify({ version: "0.16.1", packages: { "": { version: "0.16.1" } } }));
+	}
+	put("CHANGELOG.md", "# Changelog\n");
+	put(".changenotes/core.md", "---\ntype: patch\n---\n\nCore fix.\n");
+	put(".changenotes/json.md", "---\ntype: minor\ntarget: plugin_json\n---\n\nJSON feature.\n");
+	put(".changenotes/csv.md", "---\ntype: patch\ntarget: plugin_csv\n---\n\nCSV fix.\n");
+	return { root, put };
+}
+
+const preparation = { date: "2026-09-15", runCargo() {} };
+
+test("plugin release changes only its version, changelog, and notes", () => {
+	const { root } = releaseFixture();
+	const coreManifest = readFileSync(join(root, "Cargo.toml"), "utf8");
+	const sdk = readFileSync(join(root, "packages/js-sdk/package.json"), "utf8");
+	const result = prepareRelease(root, { ...preparation, target: "plugin_json" });
+	assert.equal(result.version, "0.17.0");
+	assert.equal(result.tag, "plugin_json/v0.17.0");
+	assert.equal(result.branch, "release/plugin_json/v0.17.0");
+	assert.equal(currentVersion(root, "plugin_json"), "0.17.0");
+	assert.equal(currentVersion(root, "plugin_csv"), "0.16.1");
+	assert.equal(readFileSync(join(root, "Cargo.toml"), "utf8"), coreManifest);
+	assert.equal(readFileSync(join(root, "packages/js-sdk/package.json"), "utf8"), sdk);
+	assert.equal(readFileSync(join(root, "CHANGELOG.md"), "utf8"), "# Changelog\n");
+	assert.match(readFileSync(join(root, "plugins/json/CHANGELOG.md"), "utf8"), /JSON feature/);
+	assert.deepEqual(loadChanges(root).map(change => change.target).sort(), ["lix", "plugin_csv"]);
+	assert.equal(prepareRelease(root, { ...preparation, target: "plugin_json" }), null);
+});
+
+test("default Lix release leaves plugin versions and fragments independent", () => {
+	const { root } = releaseFixture();
+	const result = prepareRelease(root, preparation);
+	assert.equal(result.version, "0.16.2");
+	assert.equal(result.tag, "v0.16.2");
+	assert.equal(result.branch, "release/v0.16.2");
+	assert.equal(currentVersion(root, "plugin_json"), "0.16.1");
+	assert.equal(currentVersion(root, "plugin_csv"), "0.16.1");
+	assert.deepEqual(loadChanges(root).map(change => change.target).sort(), ["plugin_csv", "plugin_json"]);
+	assert.doesNotMatch(readFileSync(join(root, "CHANGELOG.md"), "utf8"), /JSON feature|CSV fix/);
+	assert.equal(existsSync(join(root, "plugins/json/CHANGELOG.md")), false);
+});
+
+test("manual Lix releases never consume plugin fragments", () => {
+	const { root } = releaseFixture();
+	const result = prepareManualRelease(root, "0.18.0", preparation);
+	assert.equal(result.changes.length, 1);
+	assert.equal(result.changes[0].target, "lix");
+	assert.equal(currentVersion(root, "plugin_json"), "0.16.1");
+	assert.equal(loadChanges(root).length, 2);
+});
+
+test("unknown targets fail before preparing release files", () => {
+	const { root, put } = releaseFixture();
+	for (const target of ["plugin_jsno", "__proto__", "plugin_json/v1.0.0"]) {
+		assert.throws(() => releaseTarget(target), /Unknown release target/);
+		assert.throws(() => prepareRelease(root, { ...preparation, target }), /Unknown release target/);
+	}
+	put(".changenotes/invalid.md", "---\ntype: patch\ntarget: plugin_jsno\n---\n\nTypo.\n");
+	assert.throws(() => prepareRelease(root, preparation), /Unknown release target/);
+	assert.equal(currentVersion(root), "0.16.1");
+});
+
+test("Lix lockstep updates exclude explicitly versioned plugin packages", () => {
+	const { root, put } = releaseFixture();
+	put("tooling/Cargo.toml", '[dependencies]\nplugin_json = { path = "../plugins/json", version = "=0.16.1" }\nlix = { path = "../packages/lix", version = "=0.16.1" }\n');
+	updateCargoToml(root, "0.17.0");
+	validateCargoLockstepVersions(root, "0.17.0");
+	assert.equal(currentVersion(root, "plugin_json"), "0.16.1");
+	const tooling = readFileSync(join(root, "tooling/Cargo.toml"), "utf8");
+	assert.match(tooling, /plugin_json = .*version = "=0.16.1"/);
+	assert.match(tooling, /lix = .*version = "=0.17.0"/);
+});
+
+test("release tag and branch helpers validate stable versions", () => {
+	assert.equal(releaseTag("plugin_csv", "1.2.3"), "plugin_csv/v1.2.3");
+	assert.equal(releaseBranch("lix", "1.2.3"), "release/v1.2.3");
+	assert.throws(() => releaseTag("plugin_csv", "1.2.3-beta"), /Unsupported release version/);
+});
+
+test("mistyped or duplicate target metadata cannot silently become a Lix note", () => {
+	const { root, put } = releaseFixture();
+	for (const metadata of ["targets: plugin_json", "target: plugin_json\ntarget: lix"]) {
+		put(".changenotes/invalid.md", `---\ntype: patch\n${metadata}\n---\n\nInvalid.\n`);
+		assert.throws(() => loadChanges(root), /frontmatter field/);
+	}
 });

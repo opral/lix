@@ -1,6 +1,6 @@
 [package]
 name = "plugin_json"
-version.workspace = true
+version = "0.16.1"
 authors.workspace = true
 edition.workspace = true
 description = "JSON plugin for the row-first Lix Wasm Component API v2"
