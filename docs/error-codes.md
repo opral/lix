@@ -136,6 +136,7 @@ Inventory of literal codes in the engine, reference server, and JavaScript SDK s
 | `LIX_ERROR_MIGRATION_LIMIT_EXCEEDED` | [packages/lix/src/hot_state/tracked_head/hot.rs](../packages/lix/src/hot_state/tracked_head/hot.rs) |
 | `LIX_ERROR_MIGRATION_SCHEMA_INCOMPATIBLE` | [packages/lix/src/migration/api.rs](../packages/lix/src/migration/api.rs) |
 | `LIX_ERROR_NOT_INITIALIZED` | [packages/lix/src/engine.rs](../packages/lix/src/engine.rs) |
+| `LIX_ERROR_PARTIAL_ATTEMPT_ANCHORS_CHANGED` | [packages/lix/src/sync/repository/retained_body_wave.rs](../packages/lix/src/sync/repository/retained_body_wave.rs) |
 | `LIX_ERROR_PATH_DOT_SEGMENT` | [packages/lix/src/common/lix_path.rs](../packages/lix/src/common/lix_path.rs) |
 | `LIX_ERROR_PATH_EMPTY_SEGMENT` | [packages/lix/src/common/lix_path.rs](../packages/lix/src/common/lix_path.rs) |
 | `LIX_ERROR_PATH_INVALID_DIRECTORY_PARENT` | [packages/lix/src/common/lix_path.rs](../packages/lix/src/common/lix_path.rs) |

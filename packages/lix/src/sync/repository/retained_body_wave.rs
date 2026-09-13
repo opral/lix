@@ -116,19 +116,20 @@ impl VerifiedRetainedBodyWave {
                 .reader(read)
                 .load_observed(&branches)
                 .await?;
-            for (index, (head, checkpoint)) in [
+            // Validate GLOBAL first: the ordinary restart owner preserves its
+            // coordinates and cannot capture a successor across GLOBAL changes.
+            for (index, head, checkpoint) in [
                 (
-                    &merge.expected_authority_head_commit_id,
-                    &merge.expected_authority_checkpoint_commit_id,
-                ),
-                (
+                    1,
                     &merge.global_head_commit_id,
                     &merge.global_checkpoint_commit_id,
                 ),
-            ]
-            .into_iter()
-            .enumerate()
-            {
+                (
+                    0,
+                    &merge.expected_authority_head_commit_id,
+                    &merge.expected_authority_checkpoint_commit_id,
+                ),
+            ] {
                 let control = observed[index].control.as_ref().ok_or_else(invalid)?;
                 if control.head_commit_id != head.as_str()
                     || control
@@ -137,10 +138,13 @@ impl VerifiedRetainedBodyWave {
                         .as_ref()
                         != Some(checkpoint)
                 {
+                    if index == 1 {
+                        return Err(invalid());
+                    }
                     // No retention attempt has been admitted yet. The immutable
                     // request must restart against fresh authority coordinates.
                     return Err(LixError::new(
-                        "LIX_PARTIAL_ATTEMPT_ANCHORS_CHANGED",
+                        "LIX_ERROR_PARTIAL_ATTEMPT_ANCHORS_CHANGED",
                         "authority coordinates changed before initial body retention",
                     ));
                 }
@@ -236,6 +240,17 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn incomplete_native_body_closure_cannot_mint_a_retention_root() {
+        initial_anchor_case(false, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn stale_global_anchors_never_enter_selected_branch_restart() {
+        initial_anchor_case(true, false, true).await;
+        initial_anchor_case(true, true, true).await;
+        initial_anchor_case(true, true, false).await;
+    }
+
+    async fn initial_anchor_case(complete: bool, selected_stale: bool, global_stale: bool) {
         let lix = crate::open_lix().await.unwrap();
         let before = lix.partial_replica_descriptor(None).await.unwrap();
         lix.execute(
@@ -253,7 +268,11 @@ mod tests {
             attempt_id: uuid::Uuid::now_v7().to_string(),
             branch_id: before.selected_branch.branch_id,
             base_commit_id: before.selected_branch.head.commit_id.clone(),
-            expected_authority_head_commit_id: after.selected_branch.head.commit_id.clone(),
+            expected_authority_head_commit_id: if selected_stale {
+                before.selected_branch.head.commit_id.clone()
+            } else {
+                after.selected_branch.head.commit_id.clone()
+            },
             captured_local_head_commit_id: after.selected_branch.head.commit_id,
             expected_authority_checkpoint_commit_id: before
                 .selected_branch
@@ -269,6 +288,20 @@ mod tests {
             global_head_commit_id: before.global_branch.head.commit_id,
             global_checkpoint_commit_id: before.global_branch.checkpoint.commit_id,
         };
+        if global_stale {
+            let global = lix
+                .open_another_session()
+                .with_branch(crate::GLOBAL_BRANCH_ID)
+                .await
+                .unwrap();
+            global
+                .execute(
+                    "INSERT INTO lix_key_value(key,value) VALUES('global-race','changed')",
+                    &[],
+                )
+                .await
+                .unwrap();
+        }
         let storage = lix.storage_adapter();
         let read = storage.begin_read(Default::default()).await.unwrap();
         let request = SyncPushRequest {
@@ -278,18 +311,33 @@ mod tests {
         };
         let error = VerifiedRetainedBodyWave::from_validated_import(
             &read,
-            false,
+            true,
             lix.lix_id(),
             &merge,
             &request,
             lix.active_account_id(),
             CommitId::parse_lix(&merge.base_commit_id, "test base").unwrap(),
             &BTreeMap::new(),
-            &BTreeSet::new(),
+            &if complete {
+                BTreeSet::from([CommitId::parse_lix(
+                    &merge.captured_local_head_commit_id,
+                    "test complete body",
+                )
+                .unwrap()])
+            } else {
+                BTreeSet::new()
+            },
         )
         .await
         .err()
         .unwrap();
-        assert_eq!(error.code, "LIX_PARTIAL_UPLOAD_ATTEMPT_INVALID");
+        assert_eq!(
+            error.code,
+            if complete && selected_stale && !global_stale {
+                "LIX_ERROR_PARTIAL_ATTEMPT_ANCHORS_CHANGED"
+            } else {
+                "LIX_PARTIAL_UPLOAD_ATTEMPT_INVALID"
+            }
+        );
     }
 }

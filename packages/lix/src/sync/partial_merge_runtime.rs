@@ -457,7 +457,7 @@ where
             if let Err(error) = transport.retained_body_wave(&wave).await {
                 if error.code == "LIX_NATIVE_UPLOAD_ATTEMPT_EXPIRED"
                     || error.code == "LIX_PARTIAL_ATTEMPT_RESTARTED"
-                    || error.code == "LIX_PARTIAL_ATTEMPT_ANCHORS_CHANGED"
+                    || error.code == "LIX_ERROR_PARTIAL_ATTEMPT_ANCHORS_CHANGED"
                 {
                     recover_expired_attempt(&storage, &previous, transport, branch).await?;
                     continue;
