@@ -14,7 +14,7 @@ mod publish;
 mod registry;
 
 pub(crate) use api::{
-    MigrationOptions, MigrationStatus, inspect_lix, inspect_lix_with_adapter,
+    MigrationOptions, MigrationStatus, inspect_lix, inspect_lix_read, inspect_lix_with_adapter,
     migrate_lix_with_adapter,
 };
 pub(crate) use epoch::{
@@ -31,4 +31,8 @@ pub(crate) use epoch::retry_published_conversion_cleanup;
 
 pub(crate) use epoch::GlobalConversionJournal;
 
-pub(crate) use epoch::FrozenMigrationRead;
+pub(crate) use epoch::MigrationPlanningRead;
+
+
+#[cfg(test)]
+pub(crate) use epoch::tests::CommitExpiringStorage;

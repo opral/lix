@@ -1,29 +1,56 @@
 //! Migration control/target commits may revoke physical reads (notably OPFS).
-//! The source bank is frozen by the exact migration claim. Reopen bounded read
-//! units while checking that claim and the source's mutation revision, rather
-//! than retaining a physical snapshot across heartbeat or target commits.
+//! Reopen bounded read units while checking the exact epoch fence and the
+//! bank mutation revision. This supports immutable source inspection and
+//! candidate read-only planning between writes. Candidate publication must
+//! retain its revision precondition; a planner never spans its own writes.
 use super::*;
 use crate::storage_adapter::StorageScanOrder as ScanOrder;
 
-pub(crate) struct FrozenMigrationRead<S> {
+pub(crate) struct MigrationPlanningRead<S> {
+    inner: Arc<MigrationReadState<S>>,
+}
+
+struct MigrationReadState<S> {
     source: StorageAdapter<S>,
     revision: Option<Bytes>,
 }
 
-impl<S: Storage + Clone + Send + Sync + 'static> FrozenMigrationRead<S> {
+impl<S> Clone for MigrationPlanningRead<S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<S: Storage + Clone + Send + Sync + 'static> MigrationPlanningRead<S> {
     pub(crate) async fn new(source: &StorageAdapter<S>) -> Result<Self, StorageError> {
         let revision = retry_read(|| source.load_mutation_revision()).await?;
         Ok(Self {
-            source: source.clone(),
-            revision,
+            inner: Arc::new(MigrationReadState {
+                source: source.clone(),
+                revision,
+            }),
         })
+    }
+
+    pub(crate) fn finish(self) -> Result<(), StorageError> {
+        Arc::try_unwrap(self.inner).map_err(|read| {
+            StorageError::Io(format!(
+                "migration planning read still has {} active handles",
+                Arc::strong_count(&read) - 1
+            ))
+        })?;
+        Ok(())
     }
 
     async fn read(
         &self,
     ) -> Result<crate::storage_adapter::StorageAdapterReadScope<S::Read<'_>>, StorageError> {
-        let read = self.source.begin_read(ReadOptions::default()).await?;
-        if StorageAdapter::<S>::load_mutation_revision_from_read(&read).await? != self.revision {
+        let read = self.inner.source.begin_read(ReadOptions::default()).await?;
+        if StorageAdapter::<S>::load_mutation_revision_from_read(&read).await?
+            != self.inner.revision
+        {
             return Err(StorageError::Fenced);
         }
         Ok(read)
@@ -31,7 +58,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> FrozenMigrationRead<S> {
 }
 
 impl<S: Storage + Clone + Send + Sync + 'static> crate::storage_adapter::StorageAdapterRead
-    for FrozenMigrationRead<S>
+    for MigrationPlanningRead<S>
 {
     async fn get_many(
         &self,
@@ -73,7 +100,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> crate::storage_adapter::Storage
 }
 
 struct FrozenScan<'a, S> {
-    source: &'a FrozenMigrationRead<S>,
+    source: &'a MigrationPlanningRead<S>,
     space: StorageSpace,
     range: KeyRange,
     opts: BeginScanOptions,
@@ -185,11 +212,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn planning_read_finish_rejects_live_clones() {
+        let (_, source, _) = fixture().await;
+        let read = MigrationPlanningRead::new(&source).await.unwrap();
+        let clone = read.clone();
+        assert!(matches!(read.finish(), Err(StorageError::Io(_))));
+        clone.finish().unwrap();
+    }
+
+    #[tokio::test]
     async fn frozen_source_survives_heartbeat_and_target_commits_between_scan_pages() {
         for projection in [CoreProjection::FullValue, CoreProjection::KeyOnly] {
             let (storage, source, claim) = fixture().await;
             let ordinary = source.begin_read(Default::default()).await.unwrap();
-            let frozen = FrozenMigrationRead::new(&source).await.unwrap();
+            let frozen = MigrationPlanningRead::new(&source).await.unwrap();
             let keys = [Key(Bytes::from_static(&[2]))];
             let requests = [GetManyRequest {
                 space: SPACE,
@@ -250,7 +286,7 @@ mod tests {
     async fn frozen_source_rejects_changed_source_revision_and_replaced_migration_claim() {
         for change_source in [true, false] {
             let (storage, source, claim) = fixture().await;
-            let frozen = FrozenMigrationRead::new(&source).await.unwrap();
+            let frozen = MigrationPlanningRead::new(&source).await.unwrap();
             let mut scan = frozen
                 .begin_scan(
                     SPACE,
@@ -298,7 +334,7 @@ mod tests {
     #[tokio::test]
     async fn frozen_source_preserves_unsupported_scan_errors() {
         let (_, source, _) = fixture().await;
-        let frozen = FrozenMigrationRead::new(&source).await.unwrap();
+        let frozen = MigrationPlanningRead::new(&source).await.unwrap();
         let mut scan = frozen
             .begin_scan(
                 SPACE,

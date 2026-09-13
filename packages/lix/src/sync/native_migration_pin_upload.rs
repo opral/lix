@@ -120,7 +120,7 @@ where
     }
     for blob in super::repository::sync_commit_blob_ids(&request.commits)? {
         let id = BlobId::from_hex(&blob)?;
-        let read = crate::migration::FrozenMigrationRead::new(storage).await?;
+        let read = crate::migration::MigrationPlanningRead::new(storage).await?;
         let metadata = load_metadata_many(&read, &[id])
             .await?
             .into_vec()

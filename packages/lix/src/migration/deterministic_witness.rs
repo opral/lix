@@ -17,7 +17,7 @@ pub(super) async fn backfill<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let read = adapter.begin_read(Default::default()).await?;
+    let read = super::MigrationPlanningRead::new(adapter).await?;
     let marker = crate::storage_adapter::PointReadPlan::new(
         crate::init::REPOSITORY_PROTOCOL_SPACE,
         &[StorageKey(bytes::Bytes::from_static(

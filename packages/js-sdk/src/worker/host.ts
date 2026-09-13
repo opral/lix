@@ -31,6 +31,7 @@ import {
 export function startWorkerHost(
 	endpoint: WorkerHostEndpoint,
 	openBinding: typeof openLixBinding = openLixBinding,
+	convertBinding: typeof convertReplicaBinding = convertReplicaBinding,
 ): { close(): Promise<void> } {
 	let closed = false;
 	const sessions = new Map<number, LixBinding>();
@@ -254,7 +255,7 @@ export function startWorkerHost(
                 return retryReplicaMigrationCleanupBinding(operation.storage,createSyncServerBridge(operation.server)!);
             case "replica.convert":
                 if (sessions.size>0) throw workerStateError("Conversion requires closed storage");
-                return convertReplicaBinding(operation.storage,createSyncServerBridge(operation.server)!,operation.branchId);
+                return convertBinding(operation.storage,createSyncServerBridge(operation.server)!,operation.branchId);
 			case "hosted.create":
 				return createHostedBinding(operation.server);
 			case "hosted.delete":

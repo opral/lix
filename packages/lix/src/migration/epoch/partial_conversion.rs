@@ -152,7 +152,7 @@ where
     let mut published = false;
     let result = async {
         let source = StorageAdapter::for_epoch_migration(storage.clone(), source_bank, claim.clone());
-        let read = FrozenMigrationRead::new(&source).await?;
+        let read = MigrationPlanningRead::new(&source).await?;
         let proof = crate::sync::inspect_replica_rebuild_source(&read, format).await?
             .ok_or_else(|| conversion_required("source sync admission disappeared"))?;
         check_clean_conversion_identity(&proof, state)?;

@@ -949,7 +949,12 @@ export async function hostedLixWorkerOperation<T>(
 }
 
 export async function convertReplicaWorkerOperation(storage:LixStorageConfig,server:SyncServerRuntimeOptions,branchId?:string):Promise<void> {
- const client=new LixWorkerClient();
+ const providerOptions = storage.kind === "jsStorage" ? storage.options : undefined;
+ const sharedKey = providerOptions && typeof providerOptions === "object"
+  && "sharedEngineKey" in providerOptions && typeof providerOptions.sharedEngineKey === "string"
+  && providerOptions.sharedEngineKey.startsWith("lix:opfs:") ? providerOptions.sharedEngineKey : undefined;
+ const connection = sharedKey ? createSharedWorkerConnection(sharedKey) : undefined;
+ const client = connection ? new LixWorkerClient(connection, false) : new LixWorkerClient();
  client.beginLease(undefined,undefined,server);
  try { await client.request({kind:"replica.convert",storage,server:serializeSyncServer(server)!,branchId},0); }
  finally { await client.terminate(); }

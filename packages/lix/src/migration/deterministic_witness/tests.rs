@@ -507,3 +507,27 @@ async fn v78_existing_incomplete_merge_catalog_is_rebuilt_without_changing_pendi
         );
     }
 }
+
+#[tokio::test]
+async fn candidate_witness_planning_survives_revoked_scan_page() {
+    let (memory, adapter) = fixture().await;
+    let read = adapter.begin_read(Default::default()).await.unwrap();
+    let expected = snapshot(&read, crate::hot_state::ROW_SPACE).await;
+    drop(read);
+    let storage = super::super::epoch::tests::CommitExpiringStorage::from_memory(memory);
+    let candidate = StorageAdapter::new(storage.clone());
+    storage.expire_next_page();
+    backfill(&candidate, MigrationOptions::default(), true)
+        .await
+        .unwrap();
+    let read = candidate.begin_read(Default::default()).await.unwrap();
+    assert_eq!(snapshot(&read, crate::hot_state::ROW_SPACE).await, expected);
+    assert!(
+        !snapshot(
+            &read,
+            crate::hot_state::DETERMINISTIC_IDENTITY_WITNESS_SPACE
+        )
+        .await
+        .is_empty()
+    );
+}
