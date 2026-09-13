@@ -5,11 +5,27 @@ Working branch: `fix/partial-replica-qa-1772`.
 
 ## Current status
 
-Pre-commit verification is complete on the round-fourteen source and pinned
+Verification is complete on the round-fourteen source and pinned
 artifacts. Native tests, strict Clippy, optimized WASM, doctests, adapters,
 SDK/OPFS checks, manual native profiles and all eight pinned browser runs passed.
-The commit and a fresh post-commit review remain pending. Earlier pending/failure
-notes below describe their historical snapshots, not the final pre-commit status.
+Implementation commit: `d4e32178c62845f97e8095ab96b67c7b10ebe0e6`.
+Three fresh independent post-commit reviewers reported no actionable findings.
+Earlier pending/failure notes below describe their historical snapshots, not
+the completed local QA loop. No merge or deployment claim is made.
+
+The fresh convergence reviewer independently passed 48 focused test executions;
+the migration/GC reviewer passed another 16. The performance reviewer checked
+the traversal and migration bounds, raw profile results, gate logs and source
+manifest. Runtime and test source matched the pinned inputs; only this evidence
+document changed after profiling. No reviewer changed code or rebuilt artifacts.
+
+Residual coverage limits: browser tests establish graceful offline durability,
+reopen and owner lifecycle, not every browser reconnect, lost-ACK, divergence or
+abrupt process-death interleaving. Native and worker tests cover portions of those
+contracts. Cold arbitrary merge proofs still require linear metadata round trips;
+GC cost includes retained mutation metadata and separate directory traversals.
+The measured warm-read overhead below remains an optimization opportunity, not
+a demonstrated scaling defect or a claim of parity.
 
 Final adapters passed all 111 tests with zero skipped in 1.842 seconds (run
 `d9b35028-da8d-437b-ab19-ac57ded9fe3c`; total including lock wait was 10m20s).
@@ -132,11 +148,12 @@ rollback/reopen validation is still required.
 - An immutable segment's identity includes its contents. Publication still
   rejects changing bytes already assigned to a committed immutable key.
 
-## Validation status
+## Historical validation
 
-In progress. Historical performance documents and the starting commit's handoff
-are context, not verification of this working revision. No completion, merge,
-deployment or browser convergence claim is made by this record.
+The following entries record earlier snapshots. Historical performance documents
+and the starting commit's handoff are context, not verification of the final
+revision. Completion evidence is summarized above; earlier results alone do not
+establish completion or browser convergence.
 
 The initial native run (`a1ad3f0b-22c7-48be-b468-5c3968630897`) compiled an early
 round-1 source snapshot with all simulations and server protocol. It ran 4093
@@ -548,4 +565,5 @@ repairs positively proven historical selected aliases, not arbitrary locator
 corruption: unsupported layouts are retained and normal readers remain strict.
 `migration_locator_classification_shares_owner_reads_and_isolates_missing_parts`
 checks 3, 300 and 3,000 same-owner candidates, mixed membership, missing parts,
-and resident identity/ordinal errors. Final execution is pending.
+and resident identity/ordinal errors. This gate passed in the final round-fourteen
+suite at 3, 300 and 3,000 locators.
