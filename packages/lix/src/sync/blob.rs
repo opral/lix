@@ -193,14 +193,17 @@ where
     pub(crate) async fn has_sync_blob_manifest(&self, blob_id: &str) -> Result<bool, LixError> {
         let blob_id = BlobId::from_hex(blob_id)?;
         let adapter = self.storage_adapter();
-        let read = adapter.begin_read(StorageReadOptions::default()).await?;
-        Ok(load_metadata_many(&read, &[blob_id])
-            .await?
-            .into_vec()
-            .into_iter()
-            .next()
-            .flatten()
-            .is_some())
+        crate::handle::retry_expired_read(|| async {
+            let read = adapter.begin_read(StorageReadOptions::default()).await?;
+            Ok(load_metadata_many(&read, &[blob_id])
+                .await?
+                .into_vec()
+                .into_iter()
+                .next()
+                .flatten()
+                .is_some())
+        })
+        .await
     }
 
     /// Returns a canonical flat manifest and ensures all chunks it names can
@@ -322,18 +325,20 @@ where
     ) -> Result<Option<Vec<u8>>, LixError> {
         let chunk_id = ChunkHash::from_hex(chunk_id)?;
         let adapter = self.storage_adapter();
-        let read = adapter.begin_read(StorageReadOptions::default()).await?;
-        if let Some(id) = lease_id {
-            crate::gc::require_native_baseline_lease(
-                &read,
-                id,
-                self.active_account_id(),
-                crate::telemetry::unix_time_ms(),
-            )
-            .await?;
-        }
-
-        load_verified_chunk(&read, chunk_id).await
+        crate::handle::retry_expired_read(|| async {
+            let read = adapter.begin_read(StorageReadOptions::default()).await?;
+            if let Some(id) = lease_id {
+                crate::gc::require_native_baseline_lease(
+                    &read,
+                    id,
+                    self.active_account_id(),
+                    crate::telemetry::unix_time_ms(),
+                )
+                .await?;
+            }
+            load_verified_chunk(&read, chunk_id).await
+        })
+        .await
     }
 
     pub(crate) async fn put_sync_chunk(
@@ -344,12 +349,17 @@ where
         let _collaboration_guard = self.lock_collaboration_writes().await;
         let chunk_id = ChunkHash::from_hex(chunk_id)?;
         let adapter = self.storage_adapter();
-        let read = adapter.begin_read(StorageReadOptions::default()).await?;
-        let mut writes = adapter.new_write_set();
-        let mut preconditions = Vec::new();
-        stage_verified_raw_chunk(&mut writes, chunk_id, bytes)?;
-        stage_transfer_publication_fence(&read, &mut writes, &mut preconditions).await?;
-        drop(read);
+        // Only precommit planning is restartable. A physical read may expire
+        // during a migration heartbeat, but a commit outcome must not replay.
+        let (writes, preconditions) = crate::handle::retry_expired_read(|| async {
+            let mut writes = adapter.new_write_set();
+            let mut preconditions = Vec::new();
+            stage_verified_raw_chunk(&mut writes, chunk_id, bytes)?;
+            let read = adapter.begin_read(StorageReadOptions::default()).await?;
+            stage_transfer_publication_fence(&read, &mut writes, &mut preconditions).await?;
+            Ok((writes, preconditions))
+        })
+        .await?;
         let options = StorageWriteOptions {
             preconditions,
             await_durable: true,
@@ -440,21 +450,30 @@ where
         let manifest = decode_manifest(wire)?;
         let inline = decode_inline_bytes(wire)?;
         let adapter = self.storage_adapter();
-        let read = adapter.begin_read(StorageReadOptions::default()).await?;
-        let mut writes = adapter.new_write_set();
-        let mut preconditions = Vec::new();
-        let missing_chunk_ids = if let Some(bytes) = inline {
-            stage_verified_inline_canonical_blob(&mut writes, &manifest, &bytes)?;
-            Vec::new()
-        } else {
-            stage_deferred_canonical_manifest(&read, &mut writes, &manifest)
-                .await?
-                .into_iter()
-                .map(|chunk| chunk.to_hex())
-                .collect::<Vec<_>>()
-        };
-        stage_transfer_publication_fence(&read, &mut writes, &mut preconditions).await?;
-        drop(read);
+        // Rebuild the complete unpublished plan after expiration so chunk
+        // presence and the reclamation fence come from one coherent read.
+        // Keep the durable commit outside this retry boundary.
+        let (writes, preconditions, missing_chunk_ids) =
+            crate::handle::retry_expired_read(|| async {
+                let mut writes = adapter.new_write_set();
+                let mut preconditions = Vec::new();
+                if let Some(bytes) = inline.as_ref() {
+                    stage_verified_inline_canonical_blob(&mut writes, &manifest, bytes)?;
+                }
+                let read = adapter.begin_read(StorageReadOptions::default()).await?;
+                let missing_chunk_ids = if inline.is_some() {
+                    Vec::new()
+                } else {
+                    stage_deferred_canonical_manifest(&read, &mut writes, &manifest)
+                        .await?
+                        .into_iter()
+                        .map(|chunk| chunk.to_hex())
+                        .collect::<Vec<_>>()
+                };
+                stage_transfer_publication_fence(&read, &mut writes, &mut preconditions).await?;
+                Ok((writes, preconditions, missing_chunk_ids))
+            })
+            .await?;
         let options = StorageWriteOptions {
             preconditions,
             await_durable: true,
@@ -498,6 +517,74 @@ mod tests {
             inline_bytes_base64: inline_bytes
                 .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
         }
+    }
+
+    #[tokio::test]
+    async fn deferred_manifest_replans_after_heartbeat_before_publication() {
+        let storage = crate::migration::CommitExpiringStorage::new();
+        let lix = crate::open_lix()
+            .with_storage(storage.clone())
+            .await
+            .unwrap();
+        let bytes = vec![42; MAX_INLINE_SYNC_BLOB_BYTES + 1];
+        let canonical = CanonicalBlobManifest::from_bytes(&bytes);
+        let manifest = wire_manifest(canonical.clone(), None);
+        let first = canonical.chunks.first().unwrap();
+        // Expire after observing chunk presence, before reading the CAS
+        // reclamation fence. Reusing that physical plan must fail.
+        storage.expire_after_point_read(
+            lix.storage_adapter()
+                .epoch_bank()
+                .map_space(crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE),
+            crate::storage_adapter::StorageKey(bytes::Bytes::copy_from_slice(
+                first.hash.as_bytes(),
+            )),
+        );
+        let registration = lix
+            .register_deferred_sync_blob_manifest(&manifest)
+            .await
+            .unwrap();
+        assert!(storage.point_expiration_was_observed());
+        assert_eq!(
+            registration.missing_chunk_ids,
+            canonical
+                .chunks
+                .iter()
+                .map(|chunk| chunk.hash.to_hex())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+        assert!(lix.has_sync_blob_manifest(&manifest.blob_id).await.unwrap());
+        let mut offset = 0;
+        for chunk in &canonical.chunks {
+            let end = offset + chunk.size_bytes as usize;
+            lix.put_sync_chunk(&chunk.hash.to_hex(), &bytes[offset..end])
+                .await
+                .unwrap();
+            offset = end;
+        }
+        assert!(
+            lix.register_deferred_sync_blob_manifest(&manifest)
+                .await
+                .unwrap()
+                .missing_chunk_ids
+                .is_empty()
+        );
+        let adapter = lix.storage_adapter();
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::binary_cas::load_bytes_many(&read, &[canonical.blob_id])
+                .await
+                .unwrap()
+                .into_vec(),
+            vec![Some(bytes)]
+        );
+        drop(read);
+        lix.close().await.unwrap();
     }
 
     #[test]

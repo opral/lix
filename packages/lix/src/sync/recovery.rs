@@ -172,10 +172,24 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
         export_source(&source, ReplicaRecoverySource::from(&retained)).await
     }
 
-    /// Restores captured tracked rows into separate branches, preserving file IDs.
+    /// Restores captured tracked rows into separate branches on a full replica,
+    /// preserving file IDs. Partial replicas must export their saved changes.
     /// Original history and local-only rows remain in the retained source/export.
     /// Retrying returns durable receipts without rewriting a recovered branch.
     pub async fn recover_replica(&self, id: &str) -> Result<ReplicaRecoveryReceipt, LixError> {
+        let adapter = self.storage_adapter();
+        let partial = crate::handle::retry_expired_read(|| async {
+            let read = adapter.begin_read(StorageReadOptions::default()).await?;
+            Ok(super::load_partial_replica_state(&read).await?.is_some())
+        })
+        .await?;
+        if partial {
+            return Err(LixError::new(
+                "LIX_PARTIAL_RECOVERY_REQUIRES_EXPORT",
+                "Restoring saved device changes is not supported on a partial replica",
+            )
+            .with_hint("Export the saved device changes with export_replica_recovery; the original recovery copy remains preserved."));
+        }
         let export = self.export_replica_recovery(id).await?;
         self.restore_recovery_export(&export).await
     }

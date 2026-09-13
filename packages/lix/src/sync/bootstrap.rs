@@ -56,7 +56,7 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     super::repository::migrate_legacy_sync_replica_state(adapter).await?;
-    match inspect_once(&adapter, remote_id).await? {
+    match crate::handle::retry_expired_read(|| inspect_once(adapter, remote_id)).await? {
         BootstrapInspection::Prepare => Ok(SyncBootstrapAdmission::Prepare),
         BootstrapInspection::Ready { account_id } => {
             Ok(SyncBootstrapAdmission::Ready { account_id })

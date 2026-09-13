@@ -604,18 +604,21 @@ where
                 return Ok(session);
             }
             self.validate_active_account(&active_account_id).await?;
-            let read = SharedStorageAdapterRead::new(
-                self.storage
-                    .begin_read(StorageReadOptions::default())
-                    .await?,
-            );
-            let active_branch_id = crate::session::load_default_branch_id_from_index(
-                self.hot_state.as_ref(),
-                self.branch_ctx.as_ref(),
-                &read,
-            )
+            let active_branch_id = crate::handle::retry_expired_read(|| async {
+                let read = SharedStorageAdapterRead::new(
+                    self.storage
+                        .begin_read(StorageReadOptions::default())
+                        .await?,
+                );
+                let branch_id = crate::session::load_default_branch_id_from_index(
+                    self.hot_state.as_ref(),
+                    self.branch_ctx.as_ref(),
+                    &read,
+                )
+                .await?;
+                Ok(branch_id)
+            })
             .await?;
-            drop(read);
             Ok(SessionContext::new(
                 SessionBranch::new(active_branch_id),
                 active_account_id,
@@ -739,52 +742,55 @@ where
     }
 
     async fn validate_active_account(&self, account_id: &str) -> Result<(), LixError> {
-        let account_pk = RowPk::uuid_from_canonical(account_id).map_err(|_| {
-            LixError::new(
-                "LIX_INVALID_ACCOUNT_ID",
-                format!("active account id '{account_id}' is not a canonical UUID"),
-            )
-        })?;
-        let read = SharedStorageAdapterRead::new(
-            self.storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
-        let row = self
-            .hot_state
-            .reader(read)
-            .load_row(&HotStateRowRequest {
-                schema_key: "lix_account".to_string(),
-                branch_id: GLOBAL_BRANCH_ID.to_string(),
-                row_pk: account_pk,
-                file_id: NullableKeyFilter::Null,
-            })
-            .await?
-            .ok_or_else(|| {
+        crate::handle::retry_expired_read(|| async {
+            let account_pk = RowPk::uuid_from_canonical(account_id).map_err(|_| {
                 LixError::new(
-                    "LIX_ACCOUNT_NOT_FOUND",
-                    format!("active account '{account_id}' does not exist"),
+                    "LIX_INVALID_ACCOUNT_ID",
+                    format!("active account id '{account_id}' is not a canonical UUID"),
                 )
             })?;
-        let snapshot = row.snapshot_content.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("account '{account_id}' has no snapshot projection"),
-            )
-        })?;
-        let value: serde_json::Value = serde_json::from_str(&snapshot).map_err(|error| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("account '{account_id}' has invalid projected JSON: {error}"),
-            )
-        })?;
-        if value.get("status").and_then(serde_json::Value::as_str) != Some("active") {
-            return Err(LixError::new(
-                "LIX_ACCOUNT_DISABLED",
-                format!("active account '{account_id}' is disabled"),
-            ));
-        }
-        Ok(())
+            let read = SharedStorageAdapterRead::new(
+                self.storage
+                    .begin_read(StorageReadOptions::default())
+                    .await?,
+            );
+            let row = self
+                .hot_state
+                .reader(read)
+                .load_row(&HotStateRowRequest {
+                    schema_key: "lix_account".to_string(),
+                    branch_id: GLOBAL_BRANCH_ID.to_string(),
+                    row_pk: account_pk,
+                    file_id: NullableKeyFilter::Null,
+                })
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ACCOUNT_NOT_FOUND",
+                        format!("active account '{account_id}' does not exist"),
+                    )
+                })?;
+            let snapshot = row.snapshot_content.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("account '{account_id}' has no snapshot projection"),
+                )
+            })?;
+            let value: serde_json::Value = serde_json::from_str(&snapshot).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("account '{account_id}' has invalid projected JSON: {error}"),
+                )
+            })?;
+            if value.get("status").and_then(serde_json::Value::as_str) != Some("active") {
+                return Err(LixError::new(
+                    "LIX_ACCOUNT_DISABLED",
+                    format!("active account '{account_id}' is disabled"),
+                ));
+            }
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -796,63 +802,66 @@ async fn assert_initialized<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let read =
-        SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
-    if crate::sync::load_partial_replica_state(&read)
-        .await?
-        .is_some()
-    {
-        return Err(LixError::new(
-            "LIX_PARTIAL_REPLICA_REQUIRES_ON_DEMAND_SYNC",
-            "partial replica storage requires its admitted on-demand sync opener",
-        ));
-    }
-    let protocol_status = crate::init::repository_protocol_status(&read).await?;
-    let protocol_accepted = protocol_status == crate::init::RepositoryProtocolStatus::Current
-        || matches!(
-            protocol_status,
-            crate::init::RepositoryProtocolStatus::MigrationRequired { found_version }
-                if migration_source_version == Some(found_version)
-        );
-    if protocol_accepted {
-        // The protocol check must precede the live-state read: tracked-head
-        // spaces keep their physical IDs across hard layout cuts, so an old
-        // group value could otherwise be decoded before we reject it.
-        let reader = hot_state.reader(read);
-        let row = reader
-            .load_row(&HotStateRowRequest {
-                schema_key: "lix_key_value".to_string(),
-                branch_id: GLOBAL_BRANCH_ID.to_string(),
-                row_pk: RowPk::single("lix_id"),
-                file_id: NullableKeyFilter::Null,
-            })
-            .await?;
-        return match row {
-            Some(row) => lix_id_from_snapshot(row.snapshot_content.as_deref()),
-            None => Err(not_initialized_error()),
-        };
-    }
-    match protocol_status {
-        crate::init::RepositoryProtocolStatus::Current => {
-            unreachable!("current protocol status was accepted above")
+    crate::handle::retry_expired_read(|| async {
+        let read =
+            SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
+        if crate::sync::load_partial_replica_state(&read)
+            .await?
+            .is_some()
+        {
+            return Err(LixError::new(
+                "LIX_PARTIAL_REPLICA_REQUIRES_ON_DEMAND_SYNC",
+                "partial replica storage requires its admitted on-demand sync opener",
+            ));
         }
-        crate::init::RepositoryProtocolStatus::MigrationRequired { found_version } => {
-            Err(crate::init::migration_required_error(found_version))
+        let protocol_status = crate::init::repository_protocol_status(&read).await?;
+        let protocol_accepted = protocol_status == crate::init::RepositoryProtocolStatus::Current
+            || matches!(
+                protocol_status,
+                crate::init::RepositoryProtocolStatus::MigrationRequired { found_version }
+                    if migration_source_version == Some(found_version)
+            );
+        if protocol_accepted {
+            // The protocol check must precede the live-state read: tracked-head
+            // spaces keep their physical IDs across hard layout cuts, so an old
+            // group value could otherwise be decoded before we reject it.
+            let reader = hot_state.reader(read);
+            let row = reader
+                .load_row(&HotStateRowRequest {
+                    schema_key: "lix_key_value".to_string(),
+                    branch_id: GLOBAL_BRANCH_ID.to_string(),
+                    row_pk: RowPk::single("lix_id"),
+                    file_id: NullableKeyFilter::Null,
+                })
+                .await?;
+            return match row {
+                Some(row) => lix_id_from_snapshot(row.snapshot_content.as_deref()),
+                None => Err(not_initialized_error()),
+            };
         }
-        crate::init::RepositoryProtocolStatus::TooNew { .. }
-        | crate::init::RepositoryProtocolStatus::Malformed => {
-            Err(crate::init::unsupported_repository_protocol_error())
-        }
-        crate::init::RepositoryProtocolStatus::Missing => {
-            // A raw changelog key is the initialization sentinel. Unlike a
-            // live-state lookup it cannot parse an old tracked-head layout.
-            if repository_has_changelog_commit(&read).await? {
+        match protocol_status {
+            crate::init::RepositoryProtocolStatus::Current => {
+                unreachable!("current protocol status was accepted above")
+            }
+            crate::init::RepositoryProtocolStatus::MigrationRequired { found_version } => {
+                Err(crate::init::migration_required_error(found_version))
+            }
+            crate::init::RepositoryProtocolStatus::TooNew { .. }
+            | crate::init::RepositoryProtocolStatus::Malformed => {
                 Err(crate::init::unsupported_repository_protocol_error())
-            } else {
-                Err(not_initialized_error())
+            }
+            crate::init::RepositoryProtocolStatus::Missing => {
+                // A raw changelog key is the initialization sentinel. Unlike a
+                // live-state lookup it cannot parse an old tracked-head layout.
+                if repository_has_changelog_commit(&read).await? {
+                    Err(crate::init::unsupported_repository_protocol_error())
+                } else {
+                    Err(not_initialized_error())
+                }
             }
         }
-    }
+    })
+    .await
 }
 
 async fn assert_partial_admission<StorageImpl>(

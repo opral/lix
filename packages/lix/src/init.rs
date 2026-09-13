@@ -21,7 +21,7 @@ use crate::schema::{
     registered_schema_row_pk, schema_key_from_definition, seed_schema_definitions,
 };
 use crate::storage_adapter::Storage;
-use crate::storage_adapter::{PointReadPlan, SharedStorageAdapterRead, StorageAdapterRead};
+use crate::storage_adapter::{PointReadPlan, StorageAdapterRead};
 use crate::storage_adapter::{
     StorageAdapter, StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpace,
     StorageSpaceId, StorageWriteSet, ValueSemantics,
@@ -583,12 +583,13 @@ pub(crate) async fn initialize_with_main_branch_id<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let mut read = SharedStorageAdapterRead::new(
-        storage
-            .begin_read(crate::storage_adapter::StorageReadOptions::default())
-            .await?,
-    );
-    assert_empty_repository_for_initialize::<StorageImpl>(&read).await?;
+    // Candidate initialization runs while the migration lease heartbeat writes
+    // epoch control. Keep seed planning coherent at the logical bank revision
+    // without retaining a physical read across the entire seed construction.
+    let mut read = crate::migration::MigrationPlanningRead::new(&storage).await?;
+    let expected_revision =
+        crate::storage_adapter::load_repository_mutation_revision(&read).await?;
+    assert_empty_repository_for_initialize(&read).await?;
 
     let functions = FunctionProviderHandle::system();
     let plan = plan_init_seed_with_main_branch_id(functions, requested_main_branch_id)?;
@@ -913,10 +914,18 @@ where
     crate::account::stage_account_revision(&mut writes);
     stage_repository_protocol(&mut writes);
 
+    read.finish()?;
     storage
         .commit_write_set(
             writes,
-            crate::storage_adapter::StorageWriteOptions::default(),
+            crate::storage_adapter::StorageWriteOptions {
+                preconditions: vec![
+                    StorageAdapter::<StorageImpl>::mutation_revision_precondition(
+                        expected_revision,
+                    ),
+                ],
+                ..Default::default()
+            },
         )
         .await?;
     Ok(receipt)
@@ -926,12 +935,9 @@ where
 /// spaces intentionally retain their physical IDs across protocol cuts, so
 /// writing a new protocol marker over existing bytes would make old values
 /// look like current layout state.
-async fn assert_empty_repository_for_initialize<StorageImpl>(
-    read: &SharedStorageAdapterRead<StorageImpl::Read<'_>>,
-) -> Result<(), LixError>
-where
-    StorageImpl: Storage + Clone + Send + Sync + 'static,
-{
+async fn assert_empty_repository_for_initialize(
+    read: &impl StorageAdapterRead,
+) -> Result<(), LixError> {
     match repository_protocol_status(read).await? {
         RepositoryProtocolStatus::Current => Err(LixError::new(
             "LIX_ERROR_ALREADY_INITIALIZED",
@@ -941,7 +947,7 @@ where
         | RepositoryProtocolStatus::TooNew { .. }
         | RepositoryProtocolStatus::Malformed => Err(unsupported_repository_protocol_error()),
         RepositoryProtocolStatus::Missing => {
-            if StorageAdapter::<StorageImpl>::load_mutation_revision_from_read(read)
+            if crate::storage_adapter::load_repository_mutation_revision(read)
                 .await?
                 .is_some()
             {

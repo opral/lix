@@ -4742,7 +4742,13 @@ where
             ));
         }
         let adapter = self.storage_adapter();
-        let read = adapter.begin_read(StorageReadOptions::default()).await?;
+        // Legacy replica replacement installs this snapshot in a hidden bank
+        // while the migration heartbeat commits in the control space. Keep a
+        // logical plan pinned to that bank/revision, not one revocable physical
+        // read spanning every incoming header and row.
+        let read = crate::migration::MigrationPlanningRead::new(&adapter).await?;
+        let expected_revision =
+            crate::storage_adapter::load_repository_mutation_revision(&read).await?;
         match inspect_sync_replica_binding(&read).await? {
             SyncReplicaBinding::Unbound => {}
             SyncReplicaBinding::Bound { .. } => {
@@ -5404,7 +5410,9 @@ where
             }
             .to_range()?,
         });
-        drop(read);
+        preconditions
+            .push(StorageAdapter::<StorageImpl>::mutation_revision_precondition(expected_revision));
+        read.finish()?;
         adapter
             .commit_certified_replica_write_set(
                 super::certified_replica_write_capability(),

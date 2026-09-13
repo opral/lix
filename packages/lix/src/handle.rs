@@ -2393,7 +2393,7 @@ where
     }
 }
 
-async fn retry_expired_read<T, Operation, OperationFuture>(
+pub(crate) async fn retry_expired_read<T, Operation, OperationFuture>(
     mut operation: Operation,
 ) -> Result<T, LixError>
 where
