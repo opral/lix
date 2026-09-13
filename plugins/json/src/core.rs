@@ -387,6 +387,7 @@ enum NodeRelation {
     Object {
         parent_id: Arc<str>,
         key: Arc<str>,
+        occurrence: i64,
         order_key: Arc<str>,
         container_id: Option<Arc<str>>,
     },
@@ -574,9 +575,15 @@ impl Node {
     fn identity(&self) -> RowIdentity {
         match &self.relation {
             NodeRelation::Snapshot => RowIdentity::Snapshot,
-            NodeRelation::Object { parent_id, key, .. } => RowIdentity::Object {
+            NodeRelation::Object {
+                parent_id,
+                key,
+                occurrence,
+                ..
+            } => RowIdentity::Object {
                 parent_id: Arc::clone(parent_id),
                 key: Arc::clone(key),
+                occurrence: *occurrence,
             },
             NodeRelation::Array { id, .. } => RowIdentity::Array(Arc::clone(id)),
         }
@@ -586,7 +593,11 @@ impl Node {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum RowIdentity {
     Snapshot,
-    Object { parent_id: Arc<str>, key: Arc<str> },
+    Object {
+        parent_id: Arc<str>,
+        key: Arc<str>,
+        occurrence: i64,
+    },
     Array(Arc<str>),
 }
 
@@ -602,10 +613,15 @@ impl RowIdentity {
     fn row_pk(&self) -> Vec<sdk::TypedValue> {
         match self {
             Self::Snapshot => vec![sdk::TypedValue::Text(ROOT_ID.to_owned())],
-            Self::Object { parent_id, key } => {
+            Self::Object {
+                parent_id,
+                key,
+                occurrence,
+            } => {
                 vec![
                     sdk::TypedValue::Text(parent_id.to_string()),
                     sdk::TypedValue::Text(key.to_string()),
+                    sdk::TypedValue::Int8(*occurrence),
                 ]
             }
             Self::Array(id) => vec![sdk::TypedValue::Uuid(
@@ -620,14 +636,20 @@ impl RowIdentity {
             (ROOT_SCHEMA_KEY, _) => Err("json_root requires the single key \"root\"".to_owned()),
             (
                 OBJECT_MEMBER_SCHEMA_KEY,
-                [sdk::TypedValue::Text(parent_id), sdk::TypedValue::Text(key)],
-            ) => Ok(Self::Object {
+                [
+                    sdk::TypedValue::Text(parent_id),
+                    sdk::TypedValue::Text(key),
+                    sdk::TypedValue::Int8(occurrence),
+                ],
+            ) if *occurrence >= 0 => Ok(Self::Object {
                 parent_id: Arc::from(parent_id.as_str()),
                 key: Arc::from(key.as_str()),
+                occurrence: *occurrence,
             }),
-            (OBJECT_MEMBER_SCHEMA_KEY, _) => {
-                Err("json_object_member requires parent_id and key components".to_owned())
-            }
+            (OBJECT_MEMBER_SCHEMA_KEY, _) => Err(
+                "json_object_member requires parent_id, key and nonnegative occurrence components"
+                    .to_owned(),
+            ),
             (ARRAY_ITEM_SCHEMA_KEY, [sdk::TypedValue::Uuid(id)]) => {
                 Ok(Self::Array(Arc::from(id.to_string())))
             }
@@ -651,9 +673,14 @@ fn intern_string(strings: &mut HashSet<Arc<str>>, value: &str) -> Arc<str> {
 fn intern_identity(identity: RowIdentity, strings: &mut HashSet<Arc<str>>) -> RowIdentity {
     match identity {
         RowIdentity::Snapshot => RowIdentity::Snapshot,
-        RowIdentity::Object { parent_id, key } => RowIdentity::Object {
+        RowIdentity::Object {
+            parent_id,
+            key,
+            occurrence,
+        } => RowIdentity::Object {
             parent_id: intern_string(strings, parent_id.as_ref()),
             key: intern_string(strings, key.as_ref()),
+            occurrence,
         },
         RowIdentity::Array(id) => RowIdentity::Array(intern_string(strings, id.as_ref())),
     }
@@ -662,9 +689,13 @@ fn intern_identity(identity: RowIdentity, strings: &mut HashSet<Arc<str>>) -> Ro
 fn identity_fingerprint(identity: &RowIdentity) -> [u8; 16] {
     match identity {
         RowIdentity::Snapshot => fingerprint_components(ROOT_SCHEMA_KEY, &[ROOT_ID]),
-        RowIdentity::Object { parent_id, key } => fingerprint_components(
+        RowIdentity::Object {
+            parent_id,
+            key,
+            occurrence,
+        } => fingerprint_components(
             OBJECT_MEMBER_SCHEMA_KEY,
-            &[parent_id.as_ref(), key.as_ref()],
+            &[parent_id.as_ref(), key.as_ref(), &occurrence.to_string()],
         ),
         RowIdentity::Array(id) => fingerprint_components(ARRAY_ITEM_SCHEMA_KEY, &[id.as_ref()]),
     }
@@ -673,9 +704,14 @@ fn identity_fingerprint(identity: &RowIdentity) -> [u8; 16] {
 fn identity_fingerprint_node(node: &Node) -> [u8; 16] {
     match &node.relation {
         NodeRelation::Snapshot => fingerprint_components(ROOT_SCHEMA_KEY, &[ROOT_ID]),
-        NodeRelation::Object { parent_id, key, .. } => fingerprint_components(
+        NodeRelation::Object {
+            parent_id,
+            key,
+            occurrence,
+            ..
+        } => fingerprint_components(
             OBJECT_MEMBER_SCHEMA_KEY,
-            &[parent_id.as_ref(), key.as_ref()],
+            &[parent_id.as_ref(), key.as_ref(), &occurrence.to_string()],
         ),
         NodeRelation::Array { id, .. } => {
             fingerprint_components(ARRAY_ITEM_SCHEMA_KEY, &[id.as_ref()])
@@ -709,8 +745,15 @@ fn fingerprint_components(schema_key: &str, components: &[&str]) -> [u8; 16] {
 #[derive(Clone, Debug)]
 enum RelationSeed {
     Snapshot,
-    Object { parent_id: Arc<str>, key: Arc<str> },
-    Array { id: Arc<str>, parent_id: Arc<str> },
+    Object {
+        parent_id: Arc<str>,
+        key: Arc<str>,
+        occurrence: i64,
+    },
+    Array {
+        id: Arc<str>,
+        parent_id: Arc<str>,
+    },
 }
 
 struct JsonParser<'a> {
@@ -735,6 +778,7 @@ impl<'a> JsonParser<'a> {
             nodes: Vec::new(),
         };
         let root = parser.parse_value(RelationSeed::Snapshot, None, 0, 0)?;
+        parser.parse_containers(root)?;
         let suffix_start = parser.cursor;
         parser.skip_whitespace();
         parser.set_suffix_layout(root, suffix_start, parser.cursor)?;
@@ -774,13 +818,22 @@ impl<'a> JsonParser<'a> {
         };
         let relation = match relation {
             RelationSeed::Snapshot => NodeRelation::Snapshot,
-            RelationSeed::Object { parent_id, key } => {
+            RelationSeed::Object {
+                parent_id,
+                key,
+                occurrence,
+            } => {
                 let container_id = kind.is_container().then(|| {
-                    Arc::<str>::from(derive_object_container_id(parent_id.as_ref(), key.as_ref()))
+                    Arc::<str>::from(derive_object_container_id(
+                        parent_id.as_ref(),
+                        key.as_ref(),
+                        occurrence,
+                    ))
                 });
                 NodeRelation::Object {
                     parent_id,
                     key,
+                    occurrence,
                     order_key: Arc::from("01"),
                     container_id,
                 }
@@ -810,8 +863,7 @@ impl<'a> JsonParser<'a> {
         });
 
         match kind {
-            NodeKind::Object => self.parse_object(index, depth + 1)?,
-            NodeKind::Array => self.parse_array(index, depth + 1)?,
+            NodeKind::Object | NodeKind::Array => self.cursor += 1,
             NodeKind::String => {
                 self.cursor = scan_string_end(self.bytes, self.cursor)?;
                 serde_json::from_slice::<String>(&self.bytes[start..self.cursor])
@@ -840,128 +892,118 @@ impl<'a> JsonParser<'a> {
         Ok(index)
     }
 
-    fn parse_object(&mut self, node: u32, depth: usize) -> Result<(), String> {
-        self.cursor += 1;
-        let mut prefix_start = self.cursor;
-        self.skip_whitespace();
-        let parent_id = self.nodes[usize::try_from(node).expect("u32 fits usize")]
-            .container_id()
-            .expect("object node has a stable container ID");
-        let mut children = Vec::new();
-        let mut keys = HashSet::new();
-        if self.bytes.get(self.cursor) == Some(&b'}') {
-            self.set_empty_layout(node, prefix_start, self.cursor)?;
-            self.cursor += 1;
+    /// Heap frames keep the documented nesting limit independent of the host stack.
+    fn parse_containers(&mut self, root: u32) -> Result<(), String> {
+        struct Frame {
+            node: u32,
+            prefix_start: usize,
+            children: Vec<u32>,
+            keys: HashMap<String, i64>,
+            separator: bool,
+        }
+        if !self.nodes[root as usize].kind.is_container() {
             return Ok(());
         }
-        loop {
-            let key_start = self.cursor;
-            let key_end = scan_string_end(self.bytes, key_start)?;
-            let key: String = serde_json::from_slice(&self.bytes[key_start..key_end])
-                .map_err(|error| format!("invalid JSON object key: {error}"))?;
-            if !keys.insert(key.clone()) {
-                return Err(format!("duplicate JSON object key {key:?}"));
+        let mut frames = vec![Frame {
+            node: root,
+            prefix_start: self.cursor,
+            children: Vec::new(),
+            keys: HashMap::new(),
+            separator: false,
+        }];
+        while !frames.is_empty() {
+            let depth = frames.len();
+            let frame = frames.last_mut().expect("nonempty parser frames");
+            let node = frame.node;
+            let object = self.nodes[node as usize].kind == NodeKind::Object;
+            let closing = if object { b'}' } else { b']' };
+            if frame.separator {
+                let suffix_start = self.cursor;
+                self.skip_whitespace();
+                self.set_suffix_layout(
+                    *frame.children.last().expect("completed child"),
+                    suffix_start,
+                    self.cursor,
+                )?;
+                match self.bytes.get(self.cursor) {
+                    Some(byte) if *byte == closing => {}
+                    Some(b',') => {
+                        self.cursor += 1;
+                        frame.prefix_start = self.cursor;
+                        self.skip_whitespace();
+                        if self.bytes.get(self.cursor) == Some(&closing) {
+                            return Err("JSON containers cannot have a trailing comma".to_owned());
+                        }
+                        frame.separator = false;
+                        continue;
+                    }
+                    _ => {
+                        return Err(format!(
+                            "JSON container requires ',' or closing delimiter at offset {}",
+                            self.cursor
+                        ));
+                    }
+                }
+            } else {
+                self.skip_whitespace();
             }
-            self.cursor = key_end;
-            self.skip_whitespace();
-            if self.bytes.get(self.cursor) != Some(&b':') {
-                return Err(format!(
-                    "JSON object key at offset {key_start} is not followed by ':'"
-                ));
+            if self.bytes.get(self.cursor) == Some(&closing) {
+                if frame.children.is_empty() {
+                    self.set_empty_layout(node, frame.prefix_start, self.cursor)?;
+                }
+                self.cursor += 1;
+                self.nodes[node as usize].value_len =
+                    u32::try_from(self.cursor - self.nodes[node as usize].value_start as usize)
+                        .map_err(|_| "JSON value exceeds 4GiB")?;
+                let frame = frames.pop().expect("completed container");
+                self.link_and_order_children(node, &frame.children)?;
+                continue;
             }
-            self.cursor += 1;
-            let child = self.parse_value(
+            let parent_id = self.nodes[node as usize]
+                .container_id()
+                .expect("container has identity");
+            let relation = if object {
+                let key_start = self.cursor;
+                let key_end = scan_string_end(self.bytes, key_start)?;
+                let key: String = serde_json::from_slice(&self.bytes[key_start..key_end])
+                    .map_err(|error| format!("invalid JSON object key: {error}"))?;
+                let count = frame.keys.entry(key.clone()).or_default();
+                let occurrence = *count;
+                *count += 1;
+                self.cursor = key_end;
+                self.skip_whitespace();
+                if self.bytes.get(self.cursor) != Some(&b':') {
+                    return Err(format!(
+                        "JSON object key at offset {key_start} is not followed by ':'"
+                    ));
+                }
+                self.cursor += 1;
                 RelationSeed::Object {
-                    parent_id: Arc::clone(&parent_id),
+                    parent_id,
                     key: Arc::from(key),
-                },
-                Some(node),
-                depth,
-                prefix_start,
-            )?;
-            children.push(child);
-            let suffix_start = self.cursor;
-            self.skip_whitespace();
-            self.set_suffix_layout(child, suffix_start, self.cursor)?;
-            match self.bytes.get(self.cursor) {
-                Some(b',') => {
-                    self.cursor += 1;
-                    prefix_start = self.cursor;
-                    self.skip_whitespace();
-                    if self.bytes.get(self.cursor) == Some(&b'}') {
-                        return Err("JSON objects cannot have a trailing comma".to_owned());
-                    }
+                    occurrence,
                 }
-                Some(b'}') => {
-                    self.cursor += 1;
-                    break;
-                }
-                _ => {
-                    return Err(format!(
-                        "JSON object requires ',' or '}}' at offset {}",
-                        self.cursor
-                    ));
-                }
+            } else {
+                let id = Arc::from(self.namespace.encode(self.next_array_ordinal));
+                self.next_array_ordinal = self
+                    .next_array_ordinal
+                    .checked_add(1)
+                    .ok_or_else(|| "JSON array ID ordinal overflow".to_owned())?;
+                RelationSeed::Array { id, parent_id }
+            };
+            let child = self.parse_value(relation, Some(node), depth, frame.prefix_start)?;
+            frame.children.push(child);
+            frame.separator = true;
+            if self.nodes[child as usize].kind.is_container() {
+                frames.push(Frame {
+                    node: child,
+                    prefix_start: self.cursor,
+                    children: Vec::new(),
+                    keys: HashMap::new(),
+                    separator: false,
+                });
             }
         }
-        self.link_and_order_children(node, &children)?;
-        Ok(())
-    }
-
-    fn parse_array(&mut self, node: u32, depth: usize) -> Result<(), String> {
-        self.cursor += 1;
-        let mut prefix_start = self.cursor;
-        self.skip_whitespace();
-        let parent_id = self.nodes[usize::try_from(node).expect("u32 fits usize")]
-            .container_id()
-            .expect("array node has a stable container ID");
-        let mut children = Vec::new();
-        if self.bytes.get(self.cursor) == Some(&b']') {
-            self.set_empty_layout(node, prefix_start, self.cursor)?;
-            self.cursor += 1;
-            return Ok(());
-        }
-        loop {
-            let id = Arc::<str>::from(self.namespace.encode(self.next_array_ordinal));
-            self.next_array_ordinal = self
-                .next_array_ordinal
-                .checked_add(1)
-                .ok_or_else(|| "JSON array ID ordinal overflow".to_owned())?;
-            let child = self.parse_value(
-                RelationSeed::Array {
-                    id,
-                    parent_id: Arc::clone(&parent_id),
-                },
-                Some(node),
-                depth,
-                prefix_start,
-            )?;
-            children.push(child);
-            let suffix_start = self.cursor;
-            self.skip_whitespace();
-            self.set_suffix_layout(child, suffix_start, self.cursor)?;
-            match self.bytes.get(self.cursor) {
-                Some(b',') => {
-                    self.cursor += 1;
-                    prefix_start = self.cursor;
-                    self.skip_whitespace();
-                    if self.bytes.get(self.cursor) == Some(&b']') {
-                        return Err("JSON arrays cannot have a trailing comma".to_owned());
-                    }
-                }
-                Some(b']') => {
-                    self.cursor += 1;
-                    break;
-                }
-                _ => {
-                    return Err(format!(
-                        "JSON array requires ',' or ']' at offset {}",
-                        self.cursor
-                    ));
-                }
-            }
-        }
-        self.link_and_order_children(node, &children)?;
         Ok(())
     }
 
@@ -1148,9 +1190,20 @@ impl Document {
             .map(|node| {
                 let id = match &node.relation {
                     NodeRelation::Array { id, .. } => Some(id.to_string()),
+                    NodeRelation::Object { container_id, .. } => {
+                        container_id.as_deref().map(str::to_owned)
+                    }
                     _ => None,
                 };
-                (id, relation_order(&node.relation).to_owned())
+                let order = match &node.relation {
+                    NodeRelation::Object {
+                        occurrence,
+                        order_key,
+                        ..
+                    } => format!("{order_key}:{occurrence}"),
+                    _ => relation_order(&node.relation).to_owned(),
+                };
+                (id, order)
             })
             .collect()
     }
@@ -1164,13 +1217,48 @@ impl Document {
         if nodes.len() != checkpoint.len() {
             return Err("JSON identity checkpoint does not match accepted nodes".to_owned());
         }
-        for (ordinal, (id, order)) in checkpoint.iter().enumerate() {
+        for (ordinal, (id, encoded_order)) in checkpoint.iter().enumerate() {
+            let order =
+                if let NodeRelation::Object { occurrence, .. } = &mut nodes[ordinal].relation {
+                    let (order, encoded_occurrence) = encoded_order
+                        .split_once(':')
+                        .ok_or_else(|| "JSON object checkpoint is missing occurrence".to_owned())?;
+                    *occurrence = encoded_occurrence
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|value| *value >= 0)
+                        .ok_or_else(|| "invalid JSON checkpoint occurrence".to_owned())?;
+                    order
+                } else {
+                    encoded_order.as_str()
+                };
+            if let Some(parent) = nodes[ordinal].parent {
+                let parent_id = nodes[parent as usize]
+                    .container_id()
+                    .ok_or_else(|| "JSON checkpoint parent is not a container".to_owned())?;
+                refresh_parent(&mut nodes, ordinal as u32, parent_id);
+            }
             match (&mut nodes[ordinal].relation, id) {
                 (NodeRelation::Array { id: current, .. }, Some(id)) => {
                     parse_uuid(id, "checkpoint id")?;
                     *current = Arc::from(id.as_str());
                 }
-                (NodeRelation::Snapshot | NodeRelation::Object { .. }, None) => {}
+                (
+                    NodeRelation::Object {
+                        container_id: current,
+                        ..
+                    },
+                    Some(id),
+                ) if current.is_some() && !id.is_empty() => {
+                    *current = Some(Arc::from(id.as_str()));
+                }
+                (
+                    NodeRelation::Snapshot
+                    | NodeRelation::Object {
+                        container_id: None, ..
+                    },
+                    None,
+                ) => {}
                 _ => return Err("JSON identity checkpoint relation mismatch".to_owned()),
             }
             if nodes[ordinal].parent.is_some() {
@@ -1179,13 +1267,8 @@ impl Document {
             } else if !order.is_empty() {
                 return Err("JSON root checkpoint cannot have an order key".to_owned());
             }
-            if let Some(parent) = nodes[ordinal].parent {
-                let parent_id = nodes[parent as usize]
-                    .container_id()
-                    .ok_or_else(|| "JSON checkpoint parent is not a container".to_owned())?;
-                refresh_parent(&mut nodes, ordinal as u32, parent_id);
-            }
         }
+        validate_container_identities(&nodes)?;
         Self::from_parts(PersistentBlob::from_shared(Arc::new(bytes))?, nodes, 0)
     }
 
@@ -1342,6 +1425,7 @@ impl Document {
                     NodeRelation::Object {
                         parent_id,
                         key,
+                        occurrence,
                         order_key,
                         ..
                     } => (
@@ -1349,6 +1433,7 @@ impl Document {
                         vec![
                             sdk::TypedValue::Text(parent_id.to_string()),
                             sdk::TypedValue::Text(key.to_string()),
+                            sdk::TypedValue::Int8(*occurrence),
                         ],
                         None,
                         Some(order_key.to_string()),
@@ -1424,13 +1509,18 @@ impl Document {
             }
             (
                 ArenaJsonRelation::Object,
-                [sdk::TypedValue::Text(parent_id), sdk::TypedValue::Text(key)],
+                [
+                    sdk::TypedValue::Text(parent_id),
+                    sdk::TypedValue::Text(key),
+                    sdk::TypedValue::Int8(occurrence),
+                ],
             ) => {
                 row.insert(
                     "parent_id".to_owned(),
                     sdk::TypedValue::Text(parent_id.to_owned()),
                 );
                 row.insert("key".to_owned(), sdk::TypedValue::Text(key.to_owned()));
+                row.insert("occurrence", sdk::TypedValue::Int8(*occurrence));
                 row.insert(
                     "order_key".to_owned(),
                     sdk::TypedValue::Text(
@@ -1572,6 +1662,7 @@ impl Document {
             &after_bytes,
             splices,
         )?;
+        validate_container_identities(&after_nodes)?;
         let after = Self::from_parts(after_blob, after_nodes, 0)?;
         self.full_file_changed_from_parsed(after, &before_bytes)
     }
@@ -1982,6 +2073,7 @@ enum SemanticRow {
     Object {
         parent_id: Arc<str>,
         key: Arc<str>,
+        occurrence: i64,
         order_key: Arc<str>,
         kind: NodeKind,
         scalar_json: Option<Value>,
@@ -2008,7 +2100,8 @@ impl SemanticRow {
         );
         let row = &record.row;
         let kind = required_text(row, "kind").and_then(NodeKind::parse)?;
-        let scalar_json = optional_jsonb(row, "scalar_json")?;
+        let scalar_json = optional_jsonb(row, "scalar_json")?
+            .or_else(|| (kind == NodeKind::Null).then_some(Value::Null));
         let scalar_text = optional_text(row, "scalar_text")?;
         if let Some(text) = &scalar_text {
             parse_complete_scalar(text.as_bytes())?;
@@ -2038,10 +2131,14 @@ impl SemanticRow {
                     layout,
                 })
             }
-            RowIdentity::Object { parent_id, key } => {
+            RowIdentity::Object {
+                parent_id,
+                key,
+                occurrence,
+            } => {
                 require_fields(
                     row,
-                    &["parent_id", "key", "order_key", "kind"],
+                    &["parent_id", "key", "occurrence", "order_key", "kind"],
                     &[
                         "scalar_json",
                         "scalar_text",
@@ -2053,17 +2150,16 @@ impl SemanticRow {
                 )?;
                 if required_text(row, "parent_id")? != parent_id.as_ref()
                     || required_text(row, "key")? != key.as_ref()
+                    || row.get("occurrence") != Some(&sdk::TypedValue::Int8(occurrence))
                 {
                     return Err("json_object_member row does not match its primary key".to_owned());
                 }
                 let order_key = parse_order_key(required_text(row, "order_key")?)?;
                 let container_id = optional_text(row, "container_id")?;
                 if kind.is_container() {
-                    let expected = derive_object_container_id(&parent_id, &key);
-                    if container_id.as_deref() != Some(expected.as_str()) {
+                    if container_id.as_deref().is_none_or(str::is_empty) {
                         return Err(
-                            "json_object_member container_id is not derived from parent/key"
-                                .to_owned(),
+                            "JSON object container requires a nonempty container_id".to_owned()
                         );
                     }
                 } else if container_id.is_some() {
@@ -2072,6 +2168,7 @@ impl SemanticRow {
                 Ok(Self::Object {
                     parent_id,
                     key,
+                    occurrence,
                     order_key: intern_string(strings, &order_key),
                     kind,
                     scalar_json,
@@ -2115,9 +2212,15 @@ impl SemanticRow {
     fn identity(&self) -> RowIdentity {
         match self {
             Self::Snapshot { .. } => RowIdentity::Snapshot,
-            Self::Object { parent_id, key, .. } => RowIdentity::Object {
+            Self::Object {
+                parent_id,
+                key,
+                occurrence,
+                ..
+            } => RowIdentity::Object {
                 parent_id: Arc::clone(parent_id),
                 key: Arc::clone(key),
+                occurrence: *occurrence,
             },
             Self::Array { id, .. } => RowIdentity::Array(Arc::clone(id)),
         }
@@ -2241,12 +2344,14 @@ impl SemanticRow {
             Self::Object {
                 parent_id,
                 key,
+                occurrence,
                 order_key,
                 container_id,
                 ..
             } => NodeRelation::Object {
                 parent_id: Arc::clone(parent_id),
                 key: Arc::clone(key),
+                occurrence: *occurrence,
                 order_key: Arc::clone(order_key),
                 container_id: container_id.clone(),
             },
@@ -2311,7 +2416,13 @@ impl SemanticModel {
     fn new(rows: Vec<SemanticRow>) -> Result<Self, String> {
         let mut by_identity = HashMap::with_capacity(rows.len());
         let mut children: HashMap<Arc<str>, Vec<RowIdentity>> = HashMap::new();
+        let mut containers = HashSet::new();
         for row in rows {
+            if let Some(id) = row.container_id()
+                && !containers.insert(id.to_owned())
+            {
+                return Err(format!("duplicate JSON container identity {id:?}"));
+            }
             let identity = row.identity();
             if let Some(parent_id) = row.parent_id_arc() {
                 children
@@ -2330,8 +2441,16 @@ impl SemanticModel {
             identities.sort_unstable_by(|left, right| {
                 let left = &by_identity[left];
                 let right = &by_identity[right];
-                (left.order_key(), identity_tiebreak(left))
-                    .cmp(&(right.order_key(), identity_tiebreak(right)))
+                (
+                    left.order_key(),
+                    identity_tiebreak(left),
+                    identity_occurrence(left),
+                )
+                    .cmp(&(
+                        right.order_key(),
+                        identity_tiebreak(right),
+                        identity_occurrence(right),
+                    ))
             });
         }
         Ok(Self {
@@ -2341,141 +2460,109 @@ impl SemanticModel {
     }
 
     fn render_document(&self) -> Result<(Vec<u8>, Vec<Node>), String> {
+        enum Event<'a> {
+            Row(&'a RowIdentity, Option<u32>, usize),
+            Comma,
+            Close(&'a RowIdentity, u32),
+        }
+        let root = RowIdentity::Snapshot;
+        let mut events = vec![Event::Row(&root, None, 0)];
         let mut output = Vec::new();
-        let mut nodes = Vec::with_capacity(self.rows.len());
+        let mut nodes: Vec<Node> = Vec::with_capacity(self.rows.len());
+        let mut last_children: Vec<Option<u32>> = Vec::with_capacity(self.rows.len());
         let mut visiting = HashSet::new();
         let mut visited = HashSet::new();
-        self.render_row(
-            &RowIdentity::Snapshot,
-            None,
-            &mut output,
-            &mut nodes,
-            &mut visiting,
-            &mut visited,
-            0,
-        )?;
+        while let Some(event) = events.pop() {
+            match event {
+                Event::Comma => output.push(b','),
+                Event::Close(identity, index) => {
+                    let node = &mut nodes[index as usize];
+                    match node.kind {
+                        NodeKind::Object => output.push(b'}'),
+                        NodeKind::Array => output.push(b']'),
+                        _ => {}
+                    }
+                    node.value_len = u32::try_from(output.len())
+                        .map_err(|_| "JSON output size exceeds 4GiB")?
+                        .checked_sub(node.value_start)
+                        .ok_or_else(|| "JSON output span underflow".to_owned())?;
+                    self.rows[identity].write_suffix(&mut output);
+                    visiting.remove(identity);
+                    if !visited.insert(identity.clone()) {
+                        return Err("JSON row graph has multiple owning parents".to_owned());
+                    }
+                }
+                Event::Row(identity, parent, depth) => {
+                    if depth > 1024 {
+                        return Err("JSON row graph nesting exceeds 1024 levels".to_owned());
+                    }
+                    if !visiting.insert(identity.clone()) {
+                        return Err("JSON row graph contains an owning cycle".to_owned());
+                    }
+                    let row = self
+                        .rows
+                        .get(identity)
+                        .ok_or_else(|| format!("missing JSON row {identity:?}"))?;
+                    row.write_prefix(&mut output)?;
+                    let index = u32::try_from(nodes.len())
+                        .map_err(|_| "JSON has too many semantic nodes")?;
+                    nodes.push(Node {
+                        relation: row.node_relation(),
+                        kind: row.kind(),
+                        layout: row.layout().cloned(),
+                        parent,
+                        first_child: None,
+                        next_sibling: None,
+                        value_start: u32::try_from(output.len())
+                            .map_err(|_| "JSON output offset exceeds 4GiB")?,
+                        value_len: 0,
+                    });
+                    last_children.push(None);
+                    if let Some(parent) = parent {
+                        if let Some(previous) = last_children[parent as usize] {
+                            nodes[previous as usize].next_sibling = Some(index);
+                        } else {
+                            nodes[parent as usize].first_child = Some(index);
+                        }
+                        last_children[parent as usize] = Some(index);
+                    }
+                    events.push(Event::Close(identity, index));
+                    if row.kind().is_container() {
+                        output.push(if row.kind() == NodeKind::Object {
+                            b'{'
+                        } else {
+                            b'['
+                        });
+                        let container = row
+                            .container_id()
+                            .ok_or_else(|| "JSON container has no identity".to_owned())?;
+                        let children = self.children.get(container).map_or(&[][..], Vec::as_slice);
+                        row.write_empty_layout(&mut output, !children.is_empty())?;
+                        for (position, child) in children.iter().enumerate().rev() {
+                            let matches = matches!(
+                                (row.kind(), self.rows.get(child)),
+                                (NodeKind::Object, Some(SemanticRow::Object { .. }))
+                                    | (NodeKind::Array, Some(SemanticRow::Array { .. }))
+                            );
+                            if !matches {
+                                return Err("JSON container contains a row of the wrong relation"
+                                    .to_owned());
+                            }
+                            events.push(Event::Row(child, Some(index), depth + 1));
+                            if position > 0 {
+                                events.push(Event::Comma);
+                            }
+                        }
+                    } else {
+                        output.extend_from_slice(&row.scalar_bytes()?);
+                    }
+                }
+            }
+        }
         if visited.len() != self.rows.len() {
             return Err("JSON row graph contains unreachable rows".to_owned());
         }
         Ok((output, nodes))
-    }
-
-    fn render_row(
-        &self,
-        identity: &RowIdentity,
-        parent: Option<u32>,
-        output: &mut Vec<u8>,
-        nodes: &mut Vec<Node>,
-        visiting: &mut HashSet<RowIdentity>,
-        visited: &mut HashSet<RowIdentity>,
-        depth: usize,
-    ) -> Result<u32, String> {
-        if depth > 1024 {
-            return Err("JSON row graph nesting exceeds 1024 levels".to_owned());
-        }
-        if !visiting.insert(identity.clone()) {
-            return Err("JSON row graph contains an owning cycle".to_owned());
-        }
-        let row = self
-            .rows
-            .get(identity)
-            .ok_or_else(|| format!("missing JSON row {identity:?}"))?;
-        row.write_prefix(output)?;
-        let start = u32::try_from(output.len()).map_err(|_| "JSON output offset exceeds 4GiB")?;
-        let node_index =
-            u32::try_from(nodes.len()).map_err(|_| "JSON has too many semantic nodes")?;
-        nodes.push(Node {
-            relation: row.node_relation(),
-            kind: row.kind(),
-            layout: row.layout().cloned(),
-            parent,
-            first_child: None,
-            next_sibling: None,
-            value_start: start,
-            value_len: 0,
-        });
-        let mut rendered_children = Vec::new();
-        match row.kind() {
-            NodeKind::Object => {
-                output.push(b'{');
-                let container_id = row
-                    .container_id()
-                    .ok_or_else(|| "JSON object has no container identity".to_owned())?;
-                let children = self
-                    .children
-                    .get(container_id)
-                    .map_or(&[][..], Vec::as_slice);
-                row.write_empty_layout(output, !children.is_empty())?;
-                for (position, child_identity) in children.iter().enumerate() {
-                    if !matches!(
-                        self.rows.get(child_identity),
-                        Some(SemanticRow::Object { .. })
-                    ) {
-                        return Err("JSON object contains a non-object-member row".to_owned());
-                    }
-                    if position > 0 {
-                        output.push(b',');
-                    }
-                    rendered_children.push(self.render_row(
-                        child_identity,
-                        Some(node_index),
-                        output,
-                        nodes,
-                        visiting,
-                        visited,
-                        depth + 1,
-                    )?);
-                }
-                output.push(b'}');
-            }
-            NodeKind::Array => {
-                output.push(b'[');
-                let container_id = row
-                    .container_id()
-                    .ok_or_else(|| "JSON array has no container identity".to_owned())?;
-                let children = self
-                    .children
-                    .get(container_id)
-                    .map_or(&[][..], Vec::as_slice);
-                row.write_empty_layout(output, !children.is_empty())?;
-                for (position, child_identity) in children.iter().enumerate() {
-                    if !matches!(self.rows[child_identity], SemanticRow::Array { .. }) {
-                        return Err("JSON array contains a non-array-item row".to_owned());
-                    }
-                    if position > 0 {
-                        output.push(b',');
-                    }
-                    rendered_children.push(self.render_row(
-                        child_identity,
-                        Some(node_index),
-                        output,
-                        nodes,
-                        visiting,
-                        visited,
-                        depth + 1,
-                    )?);
-                }
-                output.push(b']');
-            }
-            _ => output.extend_from_slice(&row.scalar_bytes()?),
-        }
-        if let Some(first) = rendered_children.first().copied() {
-            nodes[usize::try_from(node_index).expect("u32 fits usize")].first_child = Some(first);
-        }
-        for pair in rendered_children.windows(2) {
-            nodes[usize::try_from(pair[0]).expect("u32 fits usize")].next_sibling = Some(pair[1]);
-        }
-        nodes[usize::try_from(node_index).expect("u32 fits usize")].value_len =
-            u32::try_from(output.len())
-                .map_err(|_| "JSON output size exceeds 4GiB")?
-                .checked_sub(start)
-                .ok_or_else(|| "JSON output span underflow".to_owned())?;
-        row.write_suffix(output);
-        visiting.remove(identity);
-        if !visited.insert(identity.clone()) {
-            return Err("JSON row graph has multiple owning parents".to_owned());
-        }
-        Ok(node_index)
     }
 }
 
@@ -2572,6 +2659,7 @@ fn typed_row_for_node(node: &Node, scalar: Option<Value>) -> Result<sdk::TypedRo
         NodeRelation::Object {
             parent_id,
             key,
+            occurrence: _,
             order_key,
             container_id,
         } => {
@@ -2654,7 +2742,11 @@ fn typed_row_for_node(node: &Node, scalar: Option<Value>) -> Result<sdk::TypedRo
             ]
         }
     };
-    sdk::TypedRow::from_sorted_entries(entries).map_err(str::to_owned)
+    let mut row = sdk::TypedRow::from_sorted_entries(entries).map_err(str::to_owned)?;
+    if let NodeRelation::Object { occurrence, .. } = &node.relation {
+        row.insert("occurrence", sdk::TypedValue::Int8(*occurrence));
+    }
+    Ok(row)
 }
 
 fn set_scalar_text(row: &mut sdk::TypedRow, raw: &[u8]) -> Result<(), String> {
@@ -2697,6 +2789,9 @@ fn insert_text(row: &mut sdk::TypedRow, name: &str, value: &str) {
 }
 
 pub(crate) fn rows_equal_without_layout(before: &sdk::TypedRow, after: &sdk::TypedRow) -> bool {
+    if !super::numeric_semantics::rows_have_equal_numbers(before, after) {
+        return false;
+    }
     let mut before = before.clone();
     let mut after = after.clone();
     for name in ["prefix_json", "suffix_json", "empty_json", "scalar_text"] {
@@ -2765,10 +2860,13 @@ impl SpliceProvenance {
 
     fn before_span(&self, after_start: u32, len: u32) -> Option<(u32, u32)> {
         let after_end = after_start.checked_add(len)?;
-        let segment = self
+        let index = self
             .segments
-            .iter()
-            .find(|segment| segment.after_start <= after_start && after_end <= segment.after_end)?;
+            .partition_point(|segment| segment.after_start <= after_start);
+        let segment = self.segments.get(index.checked_sub(1)?)?;
+        if after_end > segment.after_end {
+            return None;
+        }
         Some((
             segment.before_start + after_start - segment.after_start,
             len,
@@ -2790,7 +2888,35 @@ fn reconcile_trees(
         u32::try_from(before_bytes.len()).map_err(|_| "JSON file exceeds 4GiB")?,
         splices,
     )?;
-    reconcile_node(before, after, 0, 0, before_bytes, after_bytes, &provenance)
+    let hashes = ReconcileHashes {
+        before: subtree_hashes(before, before_bytes),
+        after: subtree_hashes(after, after_bytes),
+    };
+    let mut pending = vec![ReconcileEvent::Node(0, 0)];
+    while let Some(event) = pending.pop() {
+        match event {
+            ReconcileEvent::Node(old, new) => reconcile_node(
+                before,
+                after,
+                old,
+                new,
+                before_bytes,
+                after_bytes,
+                &provenance,
+                &hashes,
+                &mut pending,
+            )?,
+            ReconcileEvent::Order(old, new, matches) => {
+                reconcile_child_order(before, after, &old, &new, &matches)?
+            }
+        }
+    }
+    Ok(())
+}
+
+enum ReconcileEvent {
+    Node(u32, u32),
+    Order(Vec<u32>, Vec<u32>, Vec<(u32, u32)>),
 }
 
 fn reconcile_node(
@@ -2801,10 +2927,31 @@ fn reconcile_node(
     before_bytes: &[u8],
     after_bytes: &[u8],
     provenance: &SpliceProvenance,
+    hashes: &ReconcileHashes,
+    pending: &mut Vec<ReconcileEvent>,
 ) -> Result<(), String> {
+    #[cfg(test)]
+    super::perf_qa_tests::record_structural_work(0, 1);
+    if hashes.before[before_index as usize] == hashes.after[after_index as usize]
+        && node_bytes(&before[before_index as usize], before_bytes)
+            == node_bytes(&after[after_index as usize], after_bytes)
+    {
+        // Identical bytes imply identical parse topology. Adopt the accepted
+        // identities in one traversal; do not compare the same nested bytes
+        // again at every child. The parent's pending order event still runs.
+        let mut identical = vec![(before_index, after_index)];
+        while let Some((old, new)) = identical.pop() {
+            after[new as usize].relation = before[old as usize].relation.clone();
+            let old_children = direct_children(before, old);
+            let new_children = direct_children(after, new);
+            debug_assert_eq!(old_children.len(), new_children.len());
+            identical.extend(old_children.into_iter().zip(new_children));
+        }
+        return Ok(());
+    }
     let before_node = before[usize::try_from(before_index).expect("u32 fits usize")].clone();
     let after_kind = after[usize::try_from(after_index).expect("u32 fits usize")].kind;
-    let adopted_array_id = if let (
+    if let (
         NodeRelation::Array {
             id: before_id,
             order_key: before_order,
@@ -2817,16 +2964,29 @@ fn reconcile_node(
     ) {
         *id = Arc::clone(before_id);
         *order_key = Arc::clone(before_order);
-        true
-    } else {
-        false
-    };
-    if adopted_array_id {
-        rebase_descendants(after, after_index);
+    }
+    if let (
+        NodeRelation::Object {
+            container_id: Some(before_id),
+            ..
+        },
+        NodeRelation::Object {
+            container_id: current @ Some(_),
+            ..
+        },
+    ) = (
+        &before_node.relation,
+        &mut after[after_index as usize].relation,
+    ) {
+        *current = Some(Arc::clone(before_id));
     }
     if before_node.kind != after_kind {
+        rebase_descendants(after, after_index);
         return Ok(());
     }
+    // Matched descendants will be visited once by the event stack. Rebasing
+    // their entire subtree here would repeat the work at every ancestor.
+
     let Some(after_parent_id) =
         after[usize::try_from(after_index).expect("u32 fits usize")].container_id()
     else {
@@ -2838,33 +2998,40 @@ fn reconcile_node(
         NodeKind::Object => {
             let mut old_by_key = HashMap::with_capacity(before_children.len());
             for old in &before_children {
-                if let NodeRelation::Object { key, .. } =
-                    &before[usize::try_from(*old).expect("u32 fits usize")].relation
+                if let NodeRelation::Object {
+                    key, occurrence, ..
+                } = &before[usize::try_from(*old).expect("u32 fits usize")].relation
                 {
-                    old_by_key.insert(key.to_string(), *old);
+                    old_by_key.insert((key.to_string(), *occurrence), *old);
                 }
             }
             let mut matches = Vec::new();
             for new in &after_children {
                 refresh_parent(after, *new, Arc::clone(&after_parent_id));
                 let key = match &after[usize::try_from(*new).expect("u32 fits usize")].relation {
-                    NodeRelation::Object { key, .. } => key.to_string(),
+                    NodeRelation::Object {
+                        key, occurrence, ..
+                    } => (key.to_string(), *occurrence),
                     _ => continue,
                 };
                 if let Some(old) = old_by_key.get(&key) {
                     matches.push((*old, *new));
-                    reconcile_node(
-                        before,
-                        after,
-                        *old,
-                        *new,
-                        before_bytes,
-                        after_bytes,
-                        provenance,
-                    )?;
+                } else {
+                    rebase_descendants(after, *new);
                 }
             }
-            reconcile_child_order(before, after, &before_children, &after_children, &matches)?;
+            let children = matches.clone();
+            pending.push(ReconcileEvent::Order(
+                before_children,
+                after_children,
+                matches,
+            ));
+            pending.extend(
+                children
+                    .into_iter()
+                    .rev()
+                    .map(|(old, new)| ReconcileEvent::Node(old, new)),
+            );
         }
         NodeKind::Array => {
             let matches = match_array_children(
@@ -2875,27 +3042,27 @@ fn reconcile_node(
                 before_bytes,
                 after_bytes,
                 provenance,
+                hashes,
             );
-            let match_by_new = matches
-                .iter()
-                .copied()
-                .map(|(old, new)| (new, old))
-                .collect::<HashMap<_, _>>();
+            let matched_new = matches.iter().map(|(_, new)| *new).collect::<HashSet<_>>();
             for new in &after_children {
                 refresh_parent(after, *new, Arc::clone(&after_parent_id));
-                if let Some(old) = match_by_new.get(new) {
-                    reconcile_node(
-                        before,
-                        after,
-                        *old,
-                        *new,
-                        before_bytes,
-                        after_bytes,
-                        provenance,
-                    )?;
+                if !matched_new.contains(new) {
+                    rebase_descendants(after, *new);
                 }
             }
-            reconcile_child_order(before, after, &before_children, &after_children, &matches)?;
+            let children = matches.clone();
+            pending.push(ReconcileEvent::Order(
+                before_children,
+                after_children,
+                matches,
+            ));
+            pending.extend(
+                children
+                    .into_iter()
+                    .rev()
+                    .map(|(old, new)| ReconcileEvent::Node(old, new)),
+            );
         }
         _ => {}
     }
@@ -2903,14 +3070,19 @@ fn reconcile_node(
 }
 
 fn rebase_descendants(nodes: &mut [Node], parent: u32) {
-    let Some(parent_id) = nodes[usize::try_from(parent).expect("u32 fits usize")].container_id()
-    else {
-        return;
-    };
-    let children = direct_children(nodes, parent);
-    for child in children {
-        refresh_parent(nodes, child, Arc::clone(&parent_id));
-        rebase_descendants(nodes, child);
+    let mut pending = vec![parent];
+    while let Some(parent) = pending.pop() {
+        let Some(parent_id) = nodes[parent as usize].container_id() else {
+            continue;
+        };
+        for child in direct_children(nodes, parent) {
+            #[cfg(test)]
+            super::perf_qa_tests::record_structural_work(1, 1);
+            refresh_parent(nodes, child, Arc::clone(&parent_id));
+            if nodes[child as usize].kind.is_container() {
+                pending.push(child);
+            }
+        }
     }
 }
 
@@ -2922,7 +3094,11 @@ fn match_array_children(
     before_bytes: &[u8],
     after_bytes: &[u8],
     provenance: &SpliceProvenance,
+    hashes: &ReconcileHashes,
 ) -> Vec<(u32, u32)> {
+    if before_children.len() == 1 && after_children.len() == 1 {
+        return vec![(before_children[0], after_children[0])];
+    }
     let old_by_span = before_children
         .iter()
         .map(|old| {
@@ -2953,10 +3129,7 @@ fn match_array_children(
             continue;
         }
         old_by_hash
-            .entry(node_hash(
-                &before[usize::try_from(*old).expect("u32 fits usize")],
-                before_bytes,
-            ))
+            .entry(hashes.before[*old as usize])
             .or_default()
             .push_back(*old);
     }
@@ -2964,10 +3137,7 @@ fn match_array_children(
         if matched_new.contains(new) {
             continue;
         }
-        let hash = node_hash(
-            &after[usize::try_from(*new).expect("u32 fits usize")],
-            after_bytes,
-        );
+        let hash = hashes.after[*new as usize];
         let Some(candidates) = old_by_hash.get_mut(&hash) else {
             continue;
         };
@@ -3185,12 +3355,17 @@ fn refresh_parent(nodes: &mut [Node], child: u32, parent_id: Arc<str>) {
         NodeRelation::Object {
             parent_id: current,
             key,
+            occurrence,
             container_id,
             ..
         } => {
             *current = Arc::clone(&parent_id);
             *container_id = node.kind.is_container().then(|| {
-                Arc::<str>::from(derive_object_container_id(parent_id.as_ref(), key.as_ref()))
+                Arc::<str>::from(derive_object_container_id(
+                    parent_id.as_ref(),
+                    key.as_ref(),
+                    *occurrence,
+                ))
             });
         }
         NodeRelation::Array {
@@ -3215,13 +3390,47 @@ fn node_bytes<'a>(node: &Node, bytes: &'a [u8]) -> &'a [u8] {
     &bytes[start..end]
 }
 
-fn node_hash(node: &Node, bytes: &[u8]) -> [u8; 32] {
-    *blake3::hash(node_bytes(node, bytes)).as_bytes()
+struct ReconcileHashes {
+    before: Vec<[u8; 32]>,
+    after: Vec<[u8; 32]>,
 }
 
-fn derive_object_container_id(parent_id: &str, key: &str) -> String {
+// Hash each node's own source fragments and the already-computed child hashes.
+// Nodes are in preorder, so reverse iteration visits children first. Every
+// source byte is hashed once, rather than once per enclosing array.
+fn subtree_hashes(nodes: &[Node], bytes: &[u8]) -> Vec<[u8; 32]> {
+    let mut hashes = vec![[0; 32]; nodes.len()];
+    for (index, node) in nodes.iter().enumerate().rev() {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"lix-json-subtree-v1");
+        let mut cursor = node.value_start as usize;
+        let mut child = node.first_child;
+        while let Some(ordinal) = child {
+            let node = &nodes[ordinal as usize];
+            let start = node.value_start as usize;
+            let fragment = &bytes[cursor..start];
+            #[cfg(test)]
+            super::perf_qa_tests::record_structural_work(2, fragment.len());
+            hasher.update(&(fragment.len() as u64).to_le_bytes());
+            hasher.update(fragment);
+            hasher.update(&hashes[ordinal as usize]);
+            cursor = start + node.value_len as usize;
+            child = node.next_sibling;
+        }
+        let fragment = &bytes[cursor..node.value_start as usize + node.value_len as usize];
+        #[cfg(test)]
+        super::perf_qa_tests::record_structural_work(2, fragment.len());
+        hasher.update(&(fragment.len() as u64).to_le_bytes());
+        hasher.update(fragment);
+        hashes[index] = *hasher.finalize().as_bytes();
+    }
+    hashes
+}
+
+fn derive_object_container_id(parent_id: &str, key: &str, occurrence: i64) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(OBJECT_CONTAINER_DOMAIN);
+    hasher.update(&occurrence.to_be_bytes());
     hasher.update(
         &u64::try_from(parent_id.len())
             .expect("usize fits u64")
@@ -3629,4 +3838,23 @@ mod fresh_import_tests {
         assert!(!reconcilable.0.lookup.is_empty());
         assert_eq!(fresh.bytes(), reconcilable.bytes());
     }
+}
+
+fn identity_occurrence(row: &SemanticRow) -> i64 {
+    match row {
+        SemanticRow::Object { occurrence, .. } => *occurrence,
+        _ => 0,
+    }
+}
+
+fn validate_container_identities(nodes: &[Node]) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    for node in nodes {
+        if let Some(id) = node.container_id()
+            && !seen.insert(id.clone())
+        {
+            return Err(format!("duplicate JSON container identity {id:?}"));
+        }
+    }
+    Ok(())
 }

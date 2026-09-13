@@ -515,3 +515,5 @@ async fn fresh_import_and_plugin_reselection_preserve_rows_across_rollback() {
     assert_eq!(members.rows()[0].get::<String>("key").unwrap(), "followup");
     lix.close().await.unwrap();
 }
+
+mod json_row_mapping_qa;
