@@ -43,17 +43,23 @@ async fn rollover_fixture() -> (
         ..record.request.clone()
     };
     drop(read);
-    // Native M is an explicit authenticated dependency, not a fabricated test
-    // record. The M==R2 proof terminates without scanning unrelated ancestry.
-    hydrate_metadata(
-        &storage,
-        &old,
-        &authority,
-        NativeMetadataRef::CommitGraphRecord(receipt.merge_commit_id.clone()),
-        &mut Fetches::default(),
-    )
-    .await
-    .unwrap();
+    // Verify the receipt's actual first parent against its captured remote
+    // frontier using authority metadata, just as demand hydration does in the
+    // worker. M alone does not establish this ancestry relationship.
+    for commit in [
+        &receipt.merge_commit_id,
+        &record.request.expected_authority_head_commit_id,
+    ] {
+        hydrate_metadata(
+            &storage,
+            &old,
+            &authority,
+            NativeMetadataRef::CommitGraphRecord(commit.clone()),
+            &mut Fetches::default(),
+        )
+        .await
+        .unwrap();
+    }
     (authority, engine, session, old, receipt, request)
 }
 

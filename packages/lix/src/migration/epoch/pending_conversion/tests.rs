@@ -593,10 +593,7 @@ async fn run_pending_native_conversion(
             load_pointer(&owned).await.unwrap().unwrap().1,
             pointer_before
         );
-        assert_eq!(
-            admit_partial_epoch(&owned).await.unwrap().state,
-            before
-        );
+        assert_eq!(admit_partial_epoch(&owned).await.unwrap().state, before);
         let (journal, _) = load_pending_conversion_journal(
             &owned,
             &bank_code(bank),

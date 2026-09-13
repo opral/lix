@@ -5090,13 +5090,28 @@ mod tests {
         drop(read);
         // Committed immutable assignments remain protected.
         let mut conflicting = storage.begin_write(WriteOptions::default()).await.unwrap();
+        conflicting
+            .put_many(TEST_IMMUTABLE_SPACE, batch(b"third"))
+            .await
+            .unwrap();
+        // Publication validates against the latest visible values under the
+        // writer gate, after speculative object uploads have completed.
         assert!(matches!(
-            conflicting
-                .put_many(TEST_IMMUTABLE_SPACE, batch(b"third"))
-                .await,
+            conflicting.commit().await,
             Err(StorageError::Corruption(_))
         ));
-        conflicting.rollback().await.unwrap();
+        let read = storage.begin_read(ReadOptions::default()).await.unwrap();
+        assert_eq!(
+            read.get_many(&[GetManyRequest {
+                space: TEST_IMMUTABLE_SPACE,
+                keys: std::slice::from_ref(&key),
+                opts: GetOptions::default(),
+            }])
+            .await
+            .unwrap()
+            .values,
+            result.values
+        );
     }
 
     #[tokio::test]

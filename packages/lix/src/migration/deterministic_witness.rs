@@ -36,7 +36,9 @@ where
             "setting witness migration has no protocol marker",
         ));
     };
-    if marker.as_ref() == crate::init::REPOSITORY_PROTOCOL_VALUE {
+    if marker.as_ref() == crate::init::REPOSITORY_PROTOCOL_VALUE
+        || marker.as_ref() == crate::init::REPOSITORY_PROTOCOL_V79
+    {
         return Ok(());
     }
     if finish && marker.as_ref() != crate::init::REPOSITORY_PROTOCOL_V78 {
@@ -89,7 +91,11 @@ where
         expected: marker,
     });
     if finish {
-        crate::init::stage_repository_protocol(&mut writes);
+        writes.put(
+            crate::init::REPOSITORY_PROTOCOL_SPACE,
+            crate::init::REPOSITORY_PROTOCOL_KEY,
+            crate::init::REPOSITORY_PROTOCOL_V79,
+        );
     }
     drop(read);
     // Migration already owns the hidden epoch and must preserve its copied

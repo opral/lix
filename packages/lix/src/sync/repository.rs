@@ -8,6 +8,9 @@ mod native_global_conversion_manifest;
 mod verified_global_migration_body;
 pub(crate) use verified_global_migration_body::VerifiedGlobalMigrationBody;
 mod full_conversion_manifest;
+mod incorporation_cycle;
+mod omitted_snapshot_sources;
+pub(crate) use omitted_snapshot_sources::collect_certified_snapshot_omitted_owners;
 mod retained_body_wave;
 pub(crate) use full_conversion_manifest::{
     FullConversionManifest, InspectedFullConversion, inspect_full_conversion_manifest,
@@ -52,16 +55,15 @@ use crate::storage_adapter::{
 use crate::tracked_state::{
     CertifiedCommitStateTopologyParent, CommitDeltaChangeLocator, CommitStateManifest,
     CommitStateMutationInventory, CommitStateReplayDebt, MaterializedTrackedStateRow,
-    StagedCommitStateManifest, TRACKED_STATE_CHANGE_LOCATOR_SPACE, TrackedStateChunkOverlay,
-    TrackedStateCommitDeltaRef, TrackedStateContext, TrackedStateDeltaRef, TrackedStateDiffRequest,
-    TrackedStateFilter, TrackedStateKey, TrackedStateKeyRef, TrackedStateReadColumns,
-    TrackedStateRootId, TrackedStateScanRequest, commit_delta_member_scopes,
-    commit_history_is_deferred, deferred_commit_global_scope, direct_change_locator,
-    encode_key_ref, incomplete_touched_scope_filter, load_change_record_by_id,
-    load_commit_state_manifest, load_published_commit_state_topology,
-    stage_certified_commit_state_manifest_with_handle, stage_change_locators,
-    stage_commit_history_available, stage_commit_history_deferred_with_scope,
-    stage_commit_state_manifest_with_handle,
+    StagedCommitStateManifest, TrackedStateChunkOverlay, TrackedStateCommitDeltaRef,
+    TrackedStateContext, TrackedStateDeltaRef, TrackedStateDiffRequest, TrackedStateFilter,
+    TrackedStateKey, TrackedStateKeyRef, TrackedStateReadColumns, TrackedStateRootId,
+    TrackedStateScanRequest, commit_delta_member_scopes, commit_history_is_deferred,
+    deferred_commit_global_scope, direct_change_locator, encode_key_ref,
+    incomplete_touched_scope_filter, load_change_record_by_id, load_commit_state_manifest,
+    load_published_commit_state_topology, stage_certified_commit_state_manifest_with_handle,
+    stage_change_locators, stage_commit_history_available,
+    stage_commit_history_deferred_with_scope, stage_commit_state_manifest_with_handle,
     stage_current_state_scoped_ranges_from_complete_state_source,
     stage_current_state_scoped_ranges_from_topology, stage_imported_addressable_commit_deltas,
     stage_row_pk_index_from_deltas, stage_row_pk_index_from_members, staged_commit_delta_members,
@@ -206,8 +208,6 @@ fn sync_change_records_equal(
 fn stage_imported_commit_body(
     writes: &mut StorageWriteSet,
     commit: &ParsedCommit,
-    imported_authored_change_ids: &mut BTreeSet<ChangeId>,
-    selected_fallbacks: &mut BTreeMap<ChangeId, CommitDeltaChangeLocator>,
     authored: &mut BTreeMap<ChangeId, CommitDeltaChangeLocator>,
 ) -> Result<CommitStateMutationInventory, LixError> {
     let deltas = commit
@@ -242,62 +242,12 @@ fn stage_imported_commit_body(
             ));
         }
     }
-    imported_authored_change_ids.extend(authored_change_ids.iter().copied());
     for locator in staged.locators.iter().cloned() {
         if authored_change_ids.contains(&locator.change_id) {
             authored.insert(locator.change_id, locator);
-        } else {
-            selected_fallbacks
-                .entry(locator.change_id)
-                .or_insert(locator);
         }
     }
     Ok(staged.mutation_inventory().clone())
-}
-
-async fn stage_missing_selected_change_locators(
-    read: &(impl StorageAdapterRead + ?Sized),
-    writes: &mut StorageWriteSet,
-    preconditions: &mut Vec<StoragePrecondition>,
-    selected_fallbacks: BTreeMap<ChangeId, CommitDeltaChangeLocator>,
-) -> Result<(), LixError> {
-    if selected_fallbacks.is_empty() {
-        return Ok(());
-    }
-    let locators = selected_fallbacks.into_values().collect::<Vec<_>>();
-    let keys = locators
-        .iter()
-        .map(|locator| {
-            StorageKey(Bytes::copy_from_slice(
-                locator.change_id.as_uuid().as_bytes(),
-            ))
-        })
-        .collect::<Vec<_>>();
-    let existing = exact_get_many(
-        read,
-        &[StorageGetManyRequest {
-            space: TRACKED_STATE_CHANGE_LOCATOR_SPACE,
-            keys: &keys,
-            opts: StorageGetOptions::default(),
-        }],
-    )
-    .await?;
-    let missing = locators
-        .into_iter()
-        .zip(keys)
-        .zip(existing.values)
-        .filter_map(|((locator, key), existing)| {
-            existing.is_none().then(|| {
-                preconditions.push(StoragePrecondition::KeyAbsent {
-                    space: TRACKED_STATE_CHANGE_LOCATOR_SPACE,
-                    key,
-                });
-                locator
-            })
-        })
-        .collect::<Vec<_>>();
-    stage_change_locators(writes, &missing);
-    Ok(())
 }
 
 fn format_sync_state_root_id(root_id: &TrackedStateRootId) -> String {
@@ -522,7 +472,11 @@ fn sync_live_value_root<'a>(
     Ok(SyncLiveValueRootId(*root.finalize().as_bytes()))
 }
 
-fn sync_header_from_record(record: &CommitRecord, global_scope: bool) -> SyncCommitHeader {
+fn sync_header_from_record(
+    record: &CommitRecord,
+    global_scope: bool,
+    incorporation: crate::tracked_state::CommitStateIncorporation,
+) -> SyncCommitHeader {
     SyncCommitHeader {
         is_checkpoint: record.is_checkpoint,
         commit_id: record.commit_id.to_string(),
@@ -535,6 +489,14 @@ fn sync_header_from_record(record: &CommitRecord, global_scope: bool) -> SyncCom
         account_id: record.account_id.clone(),
         created_at: record.created_at.to_string(),
         global_scope,
+        complete_incorporation_source_commit_id: match incorporation {
+            crate::tracked_state::CommitStateIncorporation::Complete(source) => {
+                Some(source.to_string())
+            }
+            _ => None,
+        },
+        incorporation_unknown: incorporation
+            == crate::tracked_state::CommitStateIncorporation::LegacyUnknown,
         generation: record.generation,
         first_parent_jump_commit_id: (record.first_parent_jump_span > 0)
             .then(|| record.first_parent_jump_commit_id.to_string()),
@@ -1398,6 +1360,38 @@ pub(crate) async fn load_replayable_repository_event_commit_ids(
 /// outside canonical parent ancestry, so the pending outbox closure follows
 /// both edge kinds. Only confirmed ref coordinates stop provenance traversal;
 /// body-only acknowledgments must not permit collection of pending source proofs.
+async fn load_sync_pending_sources(
+    read: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+) -> Result<BTreeSet<CommitId>, LixError> {
+    let mut sources = BTreeSet::new();
+    if let Some(alias) = load_sync_commit_state_alias(read, commit_id).await? {
+        sources.insert(CommitId::parse_lix(
+            &alias.source_commit_id,
+            "pending sync state source",
+        )?);
+    }
+    if let Some(topology) = load_published_commit_state_topology(read, commit_id).await?
+        && let crate::tracked_state::CommitStateIncorporation::Complete(source) =
+            topology.incorporation()
+    {
+        sources.insert(source);
+    }
+    Ok(sources)
+}
+
+// Call only beyond the confirmed outbox boundary. Certified historical headers
+// need source metadata, not an upload of their retired complete source payload.
+async fn load_sync_pending_dependencies(
+    read: &(impl StorageAdapterRead + ?Sized),
+    record: &CommitRecord,
+) -> Result<BTreeSet<CommitId>, LixError> {
+    let mut dependencies = load_sync_pending_sources(read, record.commit_id).await?;
+    dependencies.extend(record.parent_commit_ids.iter().copied());
+    dependencies.extend(record.base_commit_id);
+    Ok(dependencies)
+}
+
 pub(crate) async fn load_pending_sync_export_commit_ids(
     read: &(impl StorageAdapterRead + ?Sized),
     controls: &[(String, BranchHeadControl)],
@@ -1505,17 +1499,12 @@ pub(crate) async fn load_pending_sync_export_commit_ids(
             {
                 pending.push((source, false));
             }
-            pending.extend(record.parent_commit_ids.iter().map(|id| (*id, required)));
-            pending.extend(record.base_commit_id.map(|id| (id, required)));
-            if let Some(alias) = load_sync_commit_state_alias(read, commit_id).await? {
-                pending.push((
-                    CommitId::parse_lix(
-                        &alias.source_commit_id,
-                        "pending sync export complete-state source",
-                    )?,
-                    required,
-                ));
-            }
+            pending.extend(
+                load_sync_pending_dependencies(read, &record)
+                    .await?
+                    .into_iter()
+                    .map(|id| (id, required)),
+            );
         }
     }
     Ok(retained)
@@ -2056,11 +2045,13 @@ struct ParsedCommit {
     created_at: LixTimestamp,
     selected_source_commit_id: Option<CommitId>,
     state_alias: Option<(CommitId, TrackedStateRootId)>,
+    incorporation: crate::tracked_state::CommitStateIncorporation,
     members: Vec<ParsedMember>,
 }
 
 #[derive(Clone)]
 struct ParsedSyncHeader {
+    incorporation: crate::tracked_state::CommitStateIncorporation,
     is_checkpoint: bool,
     commit_id: CommitId,
     parent_commit_ids: Vec<CommitId>,
@@ -2076,6 +2067,23 @@ struct ParsedSyncHeader {
 impl ParsedSyncHeader {
     fn parse(header: &SyncCommitHeader) -> Result<Self, LixError> {
         let commit_id = CommitId::parse_lix(&header.commit_id, "sync commit header")?;
+        let incorporation = if let Some(source) = &header.complete_incorporation_source_commit_id {
+            let source = CommitId::parse_lix(source, "sync header incorporation source")?;
+            if source == commit_id
+                || header.incorporation_unknown
+                || header.parent_commit_ids.len() != 1
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "sync header has invalid incorporation ownership",
+                ));
+            }
+            crate::tracked_state::CommitStateIncorporation::Complete(source)
+        } else if header.incorporation_unknown {
+            crate::tracked_state::CommitStateIncorporation::LegacyUnknown
+        } else {
+            crate::tracked_state::CommitStateIncorporation::None
+        };
         if header.account_id.is_empty() {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
@@ -2145,6 +2153,7 @@ impl ParsedSyncHeader {
         }
         Ok(Self {
             is_checkpoint: header.is_checkpoint,
+            incorporation,
             commit_id,
             parent_commit_ids,
             base_commit_id,
@@ -2450,6 +2459,16 @@ impl ParsedCommit {
             .iter()
             .map(parse_sync_member)
             .collect::<Result<Vec<_>, LixError>>()?;
+        let incorporation = if let Some(source) = &wire.complete_incorporation_source_commit_id {
+            crate::tracked_state::CommitStateIncorporation::Complete(CommitId::parse_lix(
+                source,
+                "sync incorporation source",
+            )?)
+        } else if wire.incorporation_unknown {
+            crate::tracked_state::CommitStateIncorporation::LegacyUnknown
+        } else {
+            crate::tracked_state::CommitStateIncorporation::None
+        };
         Ok(Self {
             wire: wire.clone(),
             commit_id,
@@ -2459,16 +2478,40 @@ impl ParsedCommit {
             created_at,
             selected_source_commit_id,
             state_alias,
+            incorporation,
             members,
         })
     }
 
     fn dependencies(&self) -> impl Iterator<Item = CommitId> + '_ {
+        self.metadata_dependencies(false)
+    }
+
+    fn replay_dependencies(
+        &self,
+        materialized_boundary: bool,
+    ) -> impl Iterator<Item = CommitId> + '_ {
         self.parent_commit_ids
             .iter()
             .copied()
             .chain(self.base_commit_id)
-            .chain(self.state_alias.iter().map(|(source, _)| *source))
+            .chain(
+                self.state_alias
+                    .iter()
+                    .filter(move |_| !materialized_boundary)
+                    .map(|(source, _)| *source),
+            )
+    }
+
+    fn metadata_dependencies(
+        &self,
+        materialized_boundary: bool,
+    ) -> impl Iterator<Item = CommitId> + '_ {
+        self.replay_dependencies(materialized_boundary)
+            .chain(match self.incorporation {
+                crate::tracked_state::CommitStateIncorporation::Complete(source) => Some(source),
+                _ => None,
+            })
     }
 }
 
@@ -2524,6 +2567,82 @@ fn parse_sync_member(member: &SyncCommitMember) -> Result<ParsedMember, LixError
         change_account_id: member.change_account_id.clone(),
         origin_key: member.origin_key.clone(),
     })
+}
+
+async fn validate_incorporation_graph(
+    read: &(impl StorageAdapterRead + ?Sized),
+    parsed: &BTreeMap<CommitId, ParsedCommit>,
+    existing: &BTreeSet<CommitId>,
+) -> Result<(), LixError> {
+    let incoming = parsed
+        .iter()
+        .map(|(id, commit)| {
+            let mut edges = commit.parent_commit_ids.clone();
+            edges.extend(commit.state_alias.as_ref().map(|(source, _)| *source));
+            if let crate::tracked_state::CommitStateIncorporation::Complete(source) =
+                commit.incorporation
+            {
+                edges.push(source);
+            }
+            (*id, incorporation_cycle::Dependencies { edges })
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut targets = Vec::new();
+    for commit in parsed
+        .values()
+        .filter(|commit| !existing.contains(&commit.commit_id))
+    {
+        let mut sources = commit
+            .state_alias
+            .as_ref()
+            .map(|(source, _)| *source)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if let crate::tracked_state::CommitStateIncorporation::Complete(source) =
+            commit.incorporation
+        {
+            sources.insert(source);
+        }
+        if !sources.is_empty() {
+            targets.push(commit.commit_id);
+        }
+        for source in sources {
+            let global_scope = if let Some(source) = parsed.get(&source) {
+                source.wire.global_scope
+            } else {
+                load_published_commit_state_topology(read, source)
+                    .await?
+                    .ok_or_else(|| {
+                        crate::tracked_state::NativeMetadataRef::CommitStateHeader(
+                            source.to_string(),
+                        )
+                        .annotate_missing(LixError::new(
+                            LixError::CODE_COMMIT_NOT_FOUND,
+                            "sync incorporation source metadata is missing",
+                        ))
+                    })?
+                    .global_scope()
+            };
+            if global_scope != commit.wire.global_scope {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "sync incorporation source crosses GLOBAL scope",
+                ));
+            }
+        }
+    }
+    // Authority import has no sparse-fetch owner. Missing inputs fail closed;
+    // a retry revalidates this bounded request and its reachable native graph.
+    if incorporation_cycle::Guard::new(targets)
+        .run(read, &incoming, 256)
+        .await?
+    {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "sync complete-state source creates an incorporation cycle",
+        ));
+    }
+    Ok(())
 }
 
 fn parse_sync_timestamp(context: &str, value: &str) -> Result<LixTimestamp, LixError> {
@@ -2861,12 +2980,7 @@ async fn pending_commit_reaches(
         {
             pending.push(source);
         }
-        if let Some(alias) = load_sync_commit_state_alias(read, id).await? {
-            pending.push(CommitId::parse_lix(
-                &alias.source_commit_id,
-                "pending checkpoint source",
-            )?);
-        }
+        pending.extend(load_sync_pending_sources(read, id).await?);
     }
     Ok(false)
 }
@@ -3629,20 +3743,7 @@ where
                                             ),
                                         )
                                     })?;
-                                let mut cursor_dependencies = record
-                                    .parent_commit_ids
-                                    .into_iter()
-                                    .chain(record.base_commit_id)
-                                    .collect::<BTreeSet<_>>();
-                                if let Some(alias) =
-                                    load_sync_commit_state_alias(&read, cursor).await?
-                                {
-                                    cursor_dependencies.insert(CommitId::parse_lix(
-                                        &alias.source_commit_id,
-                                        "local sync complete-state source",
-                                    )?);
-                                }
-                                entry.insert(cursor_dependencies);
+                                entry.insert(load_sync_pending_dependencies(&read, &record).await?);
                             }
                             pending.extend(
                                 dependencies
@@ -4878,6 +4979,12 @@ where
         let mut existing_complete = BTreeSet::new();
         let mut appended_records = Vec::with_capacity(header_by_id.len());
         for header in header_by_id.values() {
+            if deferred_commit_global_scope(&read, header.commit_id)
+                .await?
+                .is_some_and(|scope| scope != header.global_scope)
+            {
+                return Err(immutable_object_mismatch("commit", header.commit_id));
+            }
             if let Some(existing) = load_commit_record(&read, header.commit_id).await? {
                 if !header.matches_record(&existing) {
                     return Err(immutable_object_mismatch("commit", header.commit_id));
@@ -5084,6 +5191,75 @@ where
 
         let mut writes = adapter.new_write_set();
         let mut preconditions = Vec::new();
+        let mut omitted_sources = BTreeMap::new();
+        for row in &parsed_rows {
+            let scope = if advertised_branches.contains(row.branch_id.as_str()) {
+                row.branch_id == crate::GLOBAL_BRANCH_ID
+            } else {
+                let owner = CommitId::parse_lix(&row.branch_id, "snapshot row owner")?;
+                header_by_id
+                    .get(&owner)
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INVALID_PARAM,
+                            "snapshot checkpoint row owner has no authenticated header",
+                        )
+                    })?
+                    .global_scope
+            };
+            if omitted_sources
+                .insert(row.commit_id, scope)
+                .is_some_and(|old| old != scope)
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "snapshot semantic source has contradictory branch scopes",
+                ));
+            }
+        }
+        for commit in parsed_heads.values() {
+            for source in commit
+                .state_alias
+                .as_ref()
+                .map(|(source, _)| *source)
+                .into_iter()
+                .chain(match commit.incorporation {
+                    crate::tracked_state::CommitStateIncorporation::Complete(source) => {
+                        Some(source)
+                    }
+                    _ => None,
+                })
+            {
+                if omitted_sources
+                    .insert(source, commit.wire.global_scope)
+                    .is_some_and(|old| old != commit.wire.global_scope)
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "snapshot complete source has contradictory branch scopes",
+                    ));
+                }
+            }
+        }
+        for (source, scope) in omitted_sources {
+            if header_by_id.contains_key(&source)
+                || load_published_commit_state_topology(&read, source)
+                    .await?
+                    .is_some()
+            {
+                continue;
+            }
+            if deferred_commit_global_scope(&read, source)
+                .await?
+                .is_some_and(|old| old != scope)
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "snapshot semantic source disagrees with its retained scope",
+                ));
+            }
+            crate::tracked_state::stage_commit_history_omitted(&mut writes, source, Some(scope));
+        }
         for commit_id in header_by_id.keys().copied() {
             if parsed_heads.contains_key(&commit_id) || existing_complete.contains(&commit_id) {
                 stage_commit_history_available(&mut writes, commit_id);
@@ -5137,13 +5313,9 @@ where
         let mut head_mutations = BTreeMap::new();
         // A sparse bootstrap can include a checkpoint/head selection while the
         // commit that originally authored one of its changes remains deferred.
-        // The selected payload is self-contained, so let it temporarily own
-        // the canonical locator. If an authored body is present in the same
-        // snapshot it wins; later history hydration replaces the fallback with
-        // the original authored locator.
-        let mut selected_fallback_locators = BTreeMap::new();
+        // Its canonical payload lives in the standalone changelog until the
+        // authored body arrives. A selected reference cannot own a locator.
         let mut authored_locators = BTreeMap::new();
-        let mut imported_authored_change_ids = BTreeSet::new();
         for commit in parsed_heads
             .iter()
             .filter(|(commit_id, _)| {
@@ -5151,13 +5323,8 @@ where
             })
             .map(|(_, commit)| commit)
         {
-            let mutations = stage_imported_commit_body(
-                &mut writes,
-                commit,
-                &mut imported_authored_change_ids,
-                &mut selected_fallback_locators,
-                &mut authored_locators,
-            )?;
+            let mutations =
+                stage_imported_commit_body(&mut writes, commit, &mut authored_locators)?;
             for member in &commit.members {
                 let change = member.change_record();
                 if changes
@@ -5169,15 +5336,6 @@ where
             }
             head_mutations.insert(commit.commit_id, mutations);
         }
-        selected_fallback_locators
-            .retain(|change_id, _| !imported_authored_change_ids.contains(change_id));
-        stage_missing_selected_change_locators(
-            &read,
-            &mut writes,
-            &mut preconditions,
-            selected_fallback_locators,
-        )
-        .await?;
         stage_change_locators(
             &mut writes,
             &authored_locators.into_values().collect::<Vec<_>>(),
@@ -5249,6 +5407,7 @@ where
                 &mut writes,
                 &CommitStateManifest {
                     commit_id: head,
+                    incorporation: header.incorporation,
                     change_account_id: record.account_id.clone(),
                     replay_debt: CommitStateReplayDebt::default(),
                     mutations,
@@ -5470,7 +5629,14 @@ where
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
         let mut new_records = Vec::new();
         let mut writes = adapter.new_write_set();
+        let mut resolved_omissions = false;
         for header in parsed.values() {
+            if deferred_commit_global_scope(&read, header.commit_id)
+                .await?
+                .is_some_and(|scope| scope != header.global_scope)
+            {
+                return Err(immutable_object_mismatch("commit", header.commit_id));
+            }
             if let Some(existing) = load_commit_record(&read, header.commit_id).await? {
                 if !header.matches_record(&existing) {
                     return Err(immutable_object_mismatch("commit", header.commit_id));
@@ -5483,6 +5649,14 @@ where
                 if existing_scope.is_some_and(|scope| scope != header.global_scope) {
                     return Err(immutable_object_mismatch("commit", header.commit_id));
                 }
+                if crate::tracked_state::commit_history_is_omitted(&read, header.commit_id).await? {
+                    stage_commit_history_deferred_with_scope(
+                        &mut writes,
+                        header.commit_id,
+                        header.global_scope,
+                    );
+                    resolved_omissions = true;
+                }
             } else {
                 new_records.push(header.record());
                 stage_commit_history_deferred_with_scope(
@@ -5492,7 +5666,7 @@ where
                 );
             }
         }
-        if new_records.is_empty() {
+        if new_records.is_empty() && !resolved_omissions {
             return Ok(());
         }
         ChangelogContext::new()
@@ -5976,14 +6150,17 @@ where
                             "unknown sync commit bodies must belong to the authenticated account",
                         ));
                     }
-                    let record = load_commit_record(&read, *commit_id)
-                        .await?
-                        .ok_or_else(|| {
-                            LixError::new(
-                                LixError::CODE_INTERNAL_ERROR,
-                                format!("deferred sync commit '{commit_id}' lost its header"),
-                            )
-                        })?;
+                    let Some(record) = load_commit_record(&read, *commit_id).await? else {
+                        if crate::tracked_state::commit_history_is_omitted(&read, *commit_id)
+                            .await?
+                        {
+                            return Err(error);
+                        }
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("deferred sync commit '{commit_id}' lost its header"),
+                        ));
+                    };
                     if record.is_checkpoint != commit.wire.is_checkpoint
                         || record.parent_commit_ids != commit.parent_commit_ids
                         || record.base_commit_id != commit.base_commit_id
@@ -6022,24 +6199,25 @@ where
         let dependencies = parsed
             .iter()
             .flat_map(|(commit_id, commit)| {
-                commit
-                    .parent_commit_ids
-                    .iter()
-                    .copied()
-                    .chain(commit.base_commit_id)
-                    .chain(
-                        (!boundary_rows.contains_key(commit_id))
-                            .then_some(commit.state_alias.as_ref())
-                            .flatten()
-                            .map(|(source, _)| *source),
-                    )
+                let materialized = boundary_rows.contains_key(commit_id);
+                commit.replay_dependencies(materialized).chain(
+                    import
+                        .is_authority_push()
+                        .then_some(commit.incorporation)
+                        .and_then(|proof| match proof {
+                            crate::tracked_state::CommitStateIncorporation::Complete(source) => {
+                                Some(source)
+                            }
+                            _ => None,
+                        }),
+                )
             })
             .filter(|dependency| !parsed.contains_key(dependency))
             .collect::<BTreeSet<_>>();
         let required_external_topologies = parsed
             .iter()
             .filter(|(commit_id, _)| !boundary_rows.contains_key(commit_id))
-            .flat_map(|(_, commit)| commit.dependencies())
+            .flat_map(|(_, commit)| commit.replay_dependencies(false))
             .filter(|dependency| !parsed.contains_key(dependency))
             .collect::<BTreeSet<_>>();
         for dependency in dependencies {
@@ -6142,8 +6320,19 @@ where
                     let global_scope = load_published_commit_state_topology(&read, *target)
                         .await?
                         .map(|topology| topology.global_scope())
-                        .or(deferred_commit_global_scope(&read, *target).await?)
-                        .unwrap_or(false);
+                        .or(deferred_commit_global_scope(&read, *target).await?);
+                    if global_scope.is_none()
+                        && crate::tracked_state::commit_history_is_omitted(&read, *target).await?
+                    {
+                        return Err(crate::tracked_state::NativeMetadataRef::CommitStateHeader(
+                            target.to_string(),
+                        )
+                        .annotate_missing(LixError::new(
+                            "LIX_SYNC_HISTORY_REQUIRED",
+                            "omitted global ref target scope must be hydrated",
+                        )));
+                    }
+                    let global_scope = global_scope.unwrap_or(false);
                     (global_scope, record.base_commit_id)
                 };
                 if !global_scope || base_commit_id.is_some() {
@@ -6179,6 +6368,9 @@ where
         }
         for commit_id in parsed.keys().copied() {
             stage_commit_history_available(&mut writes, commit_id);
+        }
+        if import.is_authority_push() {
+            validate_incorporation_graph(&read, &parsed, &existing).await?;
         }
 
         // Every protocol commit is a root fence. Build roots first with one
@@ -6340,6 +6532,52 @@ where
             root_remaining.remove(&commit_id);
         }
         if import.is_authority_push() {
+            for commit in parsed.values() {
+                if existing.contains(&commit.commit_id) {
+                    continue;
+                }
+                let crate::tracked_state::CommitStateIncorporation::Complete(source) =
+                    commit.incorporation
+                else {
+                    continue;
+                };
+                let parent_is_checkpoint = commit.parent_commit_ids.first().is_some_and(|parent| {
+                    parsed
+                        .get(parent)
+                        .map(|parent| parent.wire.is_checkpoint)
+                        .or_else(|| records.get(parent).map(|parent| parent.is_checkpoint))
+                        .unwrap_or(false)
+                });
+                if !commit.wire.is_checkpoint && !parent_is_checkpoint {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "sync incorporation target is neither checkpoint nor checkpoint continuation",
+                    ));
+                }
+                let checkpoint_base = if commit.wire.is_checkpoint {
+                    commit.parent_commit_ids.first().copied()
+                } else {
+                    commit.parent_commit_ids.first().and_then(|checkpoint| {
+                        parsed
+                            .get(checkpoint)
+                            .and_then(|checkpoint| checkpoint.parent_commit_ids.first().copied())
+                            .or_else(|| {
+                                records.get(checkpoint).and_then(|checkpoint| {
+                                    checkpoint.parent_commit_ids.first().copied()
+                                })
+                            })
+                    })
+                };
+                if !tracked_writer
+                    .complete_state_matches_source(commit.commit_id, source, checkpoint_base)
+                    .await?
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "sync compact incorporation does not certify its complete native source state",
+                    ));
+                }
+            }
             let authored_by_change = parsed
                 .values()
                 .flat_map(|commit| commit.members.iter())
@@ -6503,9 +6741,7 @@ where
             }
         }
         let mut newly_imported = Vec::new();
-        let mut selected_fallback_locators = BTreeMap::new();
         let mut authored_locators = BTreeMap::new();
-        let mut imported_authored_change_ids = BTreeSet::new();
         let mut remaining = parsed
             .keys()
             .filter(|commit_id| !existing.contains(commit_id))
@@ -6533,13 +6769,8 @@ where
             let commit = &parsed[&commit_id];
             // Commit membership comes only from the canonical body. Boundary
             // rows certify a complete state root but never redefine a delta.
-            let mutations = stage_imported_commit_body(
-                &mut writes,
-                commit,
-                &mut imported_authored_change_ids,
-                &mut selected_fallback_locators,
-                &mut authored_locators,
-            )?;
+            let mutations =
+                stage_imported_commit_body(&mut writes, commit, &mut authored_locators)?;
             for member in &commit.members {
                 let change = member.change_record();
                 match load_existing_sync_change(&read, change.change_id).await? {
@@ -6648,6 +6879,7 @@ where
                     &mut writes,
                     &CommitStateManifest {
                         commit_id,
+                        incorporation: commit.incorporation,
                         change_account_id: commit.account_id.clone(),
                         replay_debt: CommitStateReplayDebt::default(),
                         mutations,
@@ -6724,6 +6956,7 @@ where
                 };
                 let manifest = CommitStateManifest {
                     commit_id,
+                    incorporation: commit.incorporation,
                     change_account_id: commit.account_id.clone(),
                     replay_debt: CommitStateReplayDebt::default(),
                     mutations,
@@ -6831,15 +7064,6 @@ where
             remaining.remove(&commit_id);
         }
 
-        selected_fallback_locators
-            .retain(|change_id, _| !imported_authored_change_ids.contains(change_id));
-        stage_missing_selected_change_locators(
-            &read,
-            &mut writes,
-            &mut preconditions,
-            selected_fallback_locators,
-        )
-        .await?;
         stage_change_locators(
             &mut writes,
             &authored_locators.into_values().collect::<Vec<_>>(),
@@ -7635,14 +7859,24 @@ where
             let record = load_commit_record(&read, commit_id)
                 .await?
                 .expect("validated history boundary remains present");
-            let global_scope =
+            let (global_scope, incorporation) =
                 match load_published_commit_state_topology(&read, record.commit_id).await? {
-                    Some(topology) => topology.global_scope(),
-                    None => deferred_commit_global_scope(&read, record.commit_id)
-                        .await?
-                        .unwrap_or(false),
+                    Some(topology) => (topology.global_scope(), topology.incorporation()),
+                    None => {
+                        return Err(crate::tracked_state::NativeMetadataRef::CommitStateHeader(
+                            record.commit_id.to_string(),
+                        )
+                        .annotate_missing(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "sync history requires native incorporation header metadata",
+                        )));
+                    }
                 };
-            commit_headers.push(sync_header_from_record(&record, global_scope));
+            commit_headers.push(sync_header_from_record(
+                &record,
+                global_scope,
+                incorporation,
+            ));
         }
         let mut boundaries = Vec::with_capacity(boundary_ids.len());
         for commit_id in boundary_ids {
@@ -7873,12 +8107,29 @@ where
             .transpose()?;
         let (records, next) =
             crate::checkpoint::checkpoint_commit_page(&read, after, limit).await?;
+        let mut commit_headers = Vec::with_capacity(records.len());
+        for record in records {
+            let incorporation = load_published_commit_state_topology(&read, record.commit_id)
+                .await?
+                .ok_or_else(|| {
+                    crate::tracked_state::NativeMetadataRef::CommitStateHeader(
+                        record.commit_id.to_string(),
+                    )
+                    .annotate_missing(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "checkpoint inventory requires native incorporation header metadata",
+                    ))
+                })?
+                .incorporation();
+            commit_headers.push(sync_header_from_record(
+                &record,
+                record.base_commit_id.is_none(),
+                incorporation,
+            ));
+        }
         Ok(super::SyncCheckpointInventoryPage {
             cursor,
-            commit_headers: records
-                .into_iter()
-                .map(|record| sync_header_from_record(&record, record.base_commit_id.is_none()))
-                .collect(),
+            commit_headers,
             continuation: next.map(|id| id.to_string()),
         })
     }
@@ -7938,10 +8189,12 @@ pub(crate) async fn recovery_bootstrap_fixture(
 
 #[cfg(test)]
 mod tests {
+    include!("snapshot_omission_migration_tests.rs");
     include!("upload_plan_profile_tests.rs");
     include!("upload_frontier_tests.rs");
     include!("upload_proof_tests.rs");
     include!("upload_cache_tests.rs");
+    include!("materialized_alias_gc_tests.rs");
     use super::*;
     use crate::engine::Engine;
     use crate::hot_state::{HotStateContext, HotStateRowRequest};
@@ -8373,7 +8626,11 @@ mod tests {
             .expect("load ancestor")
             .expect("ancestor exists");
         drop(read);
-        let mut merge_header = sync_header_from_record(&ancestor_record, false);
+        let mut merge_header = sync_header_from_record(
+            &ancestor_record,
+            false,
+            crate::tracked_state::CommitStateIncorporation::None,
+        );
         merge_header.commit_id = merge.to_string();
         // The walker is LIFO. Put the absent parent last so it is visited
         // before the known ancestor and cannot mask the reachable path.
@@ -11427,6 +11684,25 @@ mod tests {
             .expect("checkpoint should contain a selected member");
         forged_member.change_id = ChangeId::for_test_label("unknown-checkpoint-change").to_string();
         let forged_id = forged_checkpoint.commit_id.clone();
+        forged_checkpoint.complete_incorporation_source_commit_id = Some(
+            authority_commit
+                .state_alias
+                .as_ref()
+                .unwrap()
+                .source_commit_id
+                .clone(),
+        );
+        let error = authority
+            .push_sync_repository(&SyncPushRequest {
+                commits: vec![forged_checkpoint.clone()],
+                ref_updates: Vec::new(),
+                inline_blobs: Vec::new(),
+            })
+            .await
+            .expect_err("selected payload equality cannot invent complete source incorporation");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert!(error.message.contains("complete native source state"));
+        forged_checkpoint.complete_incorporation_source_commit_id = None;
         authority
             .push_sync_repository(&SyncPushRequest {
                 commits: vec![forged_checkpoint.clone()],
@@ -11534,7 +11810,7 @@ mod tests {
         let restored_locators = exact_get_many(
             &read,
             &[StorageGetManyRequest {
-                space: TRACKED_STATE_CHANGE_LOCATOR_SPACE,
+                space: crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
                 keys: &locator_keys,
                 opts: StorageGetOptions::default(),
             }],
@@ -11542,8 +11818,8 @@ mod tests {
         .await
         .expect("selected locator rows should load");
         assert!(
-            restored_locators.values.iter().all(Option::is_some),
-            "ordinary history import must restore every missing selected locator",
+            restored_locators.values.iter().all(Option::is_none),
+            "selected references must not be installed as canonical change owners",
         );
         let selected_records = ChangelogContext::new()
             .reader(&read)
@@ -12646,6 +12922,7 @@ mod tests {
             account_id: crate::SYSTEM_ACCOUNT_ID.to_owned(),
             created_at: LixTimestamp::expect_parse("created_at", "2026-05-12T00:00:00Z"),
             global_scope: true,
+            incorporation: crate::tracked_state::CommitStateIncorporation::None,
             generation: 4,
             first_parent_jump_commit_id: CommitId::for_test_label("sparse-inventory-jump"),
             first_parent_jump_span: 3,
@@ -12712,7 +12989,11 @@ mod tests {
             .await
             .unwrap();
         let record = load_commit_record(&read, head).await.unwrap().unwrap();
-        let mut wire = sync_header_from_record(&record, false);
+        let mut wire = sync_header_from_record(
+            &record,
+            false,
+            crate::tracked_state::CommitStateIncorporation::None,
+        );
         let header = ParsedSyncHeader::parse(&wire).unwrap();
         assert!(header.matches_record(&record));
         wire.account_id = "0197bf96-8733-7000-8000-000000000099".to_owned();

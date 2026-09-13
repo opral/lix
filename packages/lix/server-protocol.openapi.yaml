@@ -461,7 +461,7 @@ paths:
       - $ref: "#/components/parameters/LixId"
     post:
       operationId: syncPartialUpdate
-      description: Waits for a leased descriptor and delivers a bounded bundle of immutable native inputs for retained read recipes. Opening remains metadata-only. The replica validates and prepares coverage locally; incomplete bundles use ordinary on-demand hydration. Requires SDK and server sync protocol 13 together.
+      description: Waits for a leased descriptor and delivers a bounded bundle of immutable native inputs for retained read recipes. Opening remains metadata-only. The replica validates and prepares coverage locally; incomplete bundles use ordinary on-demand hydration. Requires SDK and server sync protocol 14 together.
       parameters:
         - $ref: "#/components/parameters/RequiredSessionId"
         - $ref: "#/components/parameters/SyncProtocolVersion"
@@ -947,7 +947,7 @@ components:
       in: header
       required: true
       description: Exact sync wire-protocol version advertised by the handshake.
-      schema: { type: integer, const: 13 }
+      schema: { type: integer, const: 14 }
     TransactionId:
       name: Lix-Transaction-Id
       in: header
@@ -1005,7 +1005,7 @@ components:
       required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
         protocolVersion: { type: integer, const: 8 }
-        syncProtocolVersion: { type: integer, const: 13 }
+        syncProtocolVersion: { type: integer, const: 14 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }
@@ -1110,6 +1110,13 @@ components:
         selectedSourceCommitId:
           type: [string, "null"]
           description: Exactly parentCommitIds[1] for a merge with selected members; null otherwise.
+        completeIncorporationSourceCommitId:
+          type: [string, "null"]
+          description: Native-certified complete checkpoint source, independent of selected members. Must differ from commitId and cannot coexist with incorporationUnknown true.
+        incorporationUnknown:
+          type: boolean
+          default: false
+          description: Legacy provenance is unavailable; absence of an incorporation witness must not be interpreted as non-inclusion.
         stateAlias:
           oneOf:
             - { $ref: "#/components/schemas/SyncCommitStateAlias" }
@@ -1322,6 +1329,13 @@ components:
         generation: { type: integer, minimum: 0 }
         firstParentJumpCommitId: { type: [string, "null"] }
         firstParentJumpSpan: { type: [integer, "null"], minimum: 1 }
+        completeIncorporationSourceCommitId:
+          type: [string, "null"]
+          description: Native-certified complete checkpoint source, preserved independently of mutation members. Cannot coexist with incorporationUnknown true.
+        incorporationUnknown:
+          type: boolean
+          default: false
+          description: Legacy complete-incorporation provenance is unavailable.
     SyncSnapshotRow:
       type: object
       required: [branchId, schemaKey, rowPk, snapshot, snapshotPayload, changeId, commitId, createdAt, updatedAt, changeAccountId, changeCreatedAt]

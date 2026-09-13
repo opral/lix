@@ -132,15 +132,21 @@ pub(in crate::sync) async fn stage_capture_restarted_partial_merge(
         || request.base_commit_id != record.request.base_commit_id
         || request.branch_id != record.request.branch_id
         || request.checkpoint_commit_id != record.request.checkpoint_commit_id
-        || request.global_head_commit_id != record.request.global_head_commit_id
-        || request.global_checkpoint_commit_id != record.request.global_checkpoint_commit_id
         || record.authority_receipt.is_some()
     {
-        return Err(conflict(
-            "restart capture changed its durable base or catalog",
-        ));
+        return Err(conflict("restart capture changed its durable base"));
     }
     let id = |text: &str| crate::changelog::CommitId::parse_lix(text, "restart capture coordinate");
+    if !crate::sync::partial_merge_analysis::catalog_contains(
+        read,
+        id(&record.request.global_head_commit_id)?,
+        id(&request.global_head_commit_id)?,
+        1024,
+    )
+    .await?
+    {
+        return Err(conflict("restart lost its previous catalog dependency"));
+    }
     let _analysis = crate::sync::partial_merge_analysis::analyze_native_divergence(
         read,
         id(&request.base_commit_id)?,
@@ -182,8 +188,22 @@ pub(in crate::sync) async fn stage_capture_restarted_partial_merge(
         let control = observed
             .control
             .ok_or_else(|| conflict("restart capture branch disappeared"))?;
-        if control.head_commit_id != id(head)?
-            || control.working_diff_checkpoint_commit_id != Some(id(checkpoint)?)
+        if branch == &request.branch_id {
+            require_captured_local_frontier(
+                read,
+                head,
+                checkpoint,
+                control.head_commit_id,
+                control.working_diff_checkpoint_commit_id,
+            )
+            .await?;
+        } else if !crate::sync::partial_merge_analysis::catalog_contains(
+            read,
+            id(head)?,
+            control.head_commit_id,
+            1024,
+        )
+        .await?
         {
             return Err(conflict("restart capture raced newer local publication"));
         }
@@ -197,7 +217,6 @@ pub(in crate::sync) async fn stage_capture_restarted_partial_merge(
         load_partial_push_state(read, state, crate::GLOBAL_BRANCH_ID).await?;
     if push.confirmed != record.original_confirmed
         || push.prepared != record.original_upload
-        || global.prepared.is_some()
         || global.confirmed.head != request.global_head_commit_id
         || global.confirmed.checkpoint != request.global_checkpoint_commit_id
     {

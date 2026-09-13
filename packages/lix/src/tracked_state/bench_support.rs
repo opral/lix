@@ -54,6 +54,7 @@ fn stage_bench_commit_deltas(
     super::storage::stage_commit_state_manifest(
         writes,
         &CommitStateManifest {
+            incorporation: crate::tracked_state::CommitStateIncorporation::None,
             commit_id,
             change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             global_scope: false,
@@ -547,6 +548,7 @@ where
         .await
         .expect("stage benchmark merge serving root");
         let merged = CommitStateManifest {
+            incorporation: crate::tracked_state::CommitStateIncorporation::None,
             commit_id: merge_id,
             change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             global_scope: false,
@@ -771,6 +773,7 @@ fn bench_current_state_manifest(
     current_state_scoped_ranges: Option<Box<super::types::CurrentStateScopedRangeRoot>>,
 ) -> CommitStateManifest {
     CommitStateManifest {
+        incorporation: crate::tracked_state::CommitStateIncorporation::None,
         commit_id,
         change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
         global_scope: false,

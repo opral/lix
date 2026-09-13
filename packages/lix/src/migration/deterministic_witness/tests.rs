@@ -108,7 +108,7 @@ async fn v78_backfill_preserves_native_rows_history_and_controls() {
             .unwrap()
             .unwrap()
             .as_ref(),
-        crate::init::REPOSITORY_PROTOCOL_VALUE
+        crate::init::REPOSITORY_PROTOCOL_V79
     );
     let read = adapter.begin_read(Default::default()).await.unwrap();
     for (space, expected) in spaces.into_iter().zip(before) {
@@ -123,6 +123,9 @@ async fn v78_backfill_preserves_native_rows_history_and_controls() {
         .is_empty()
     );
     drop(read);
+    super::super::incorporation::migrate(&adapter, MigrationOptions::default(), false)
+        .await
+        .unwrap();
     let engine =
         crate::engine::Engine::new_with_adapter(adapter, crate::engine::EngineOptions::new())
             .await

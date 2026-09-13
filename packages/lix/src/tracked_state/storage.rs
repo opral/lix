@@ -144,7 +144,10 @@ const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD18";
 // Version 12 authenticates the secondary `(schema_key, row_pk, file_id)`
 // identity tree beside the canonical snapshot root. V10 and V11 remain
 // readable for offline migration and historical compatibility.
-const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS12";
+// Version 13 records complete checkpoint incorporation independently from
+// physical state aliases and selected mutation membership.
+const COMMIT_STATE_MANIFEST_FORMAT_MAGIC: &[u8] = b"LXCS13";
+const COMMIT_STATE_MANIFEST_V12_FORMAT_MAGIC: &[u8] = b"LXCS12";
 const COMMIT_STATE_MANIFEST_V11_FORMAT_MAGIC: &[u8] = b"LXCS11";
 const COMMIT_STATE_MANIFEST_V10_FORMAT_MAGIC: &[u8] = b"LXCS10";
 // Version 3 authenticates direct-part ownership bitmaps. LXMI1 has a
@@ -757,6 +760,31 @@ struct StoredCommitStateManifest {
     row_pk_index_root_id: Option<TrackedStateRootId>,
     #[musli(with = storage_codec::option)]
     snapshot_root: Option<Box<TrackedStateCommitRoot>>,
+    incorporation: crate::tracked_state::CommitStateIncorporation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct StoredCommitStateManifestV12 {
+    commit_id: CommitId,
+    change_account_id: String,
+    replay_debt: crate::tracked_state::CommitStateReplayDebt,
+    #[musli(with = storage_codec::option)]
+    selected_source_commit_id: Option<[u8; 16]>,
+    mutation_inventory_digest: [u8; 32],
+    mutation_transition_digest: [u8; 32],
+    mutation_member_count: u32,
+    mutation_part_count: u32,
+    #[musli(with = storage_codec::option)]
+    mutation_directory_root: Option<super::mutation_directory::MutationDirectoryRoot>,
+    touched_scope_filter: crate::tracked_state::types::CommitStateTouchedScopeFilter,
+    global_scope: bool,
+    #[musli(with = storage_codec::option)]
+    current_state_scoped_ranges: Option<Box<CurrentStateScopedRangeRoot>>,
+    #[musli(with = storage_codec::option)]
+    row_pk_index_root_id: Option<TrackedStateRootId>,
+    #[musli(with = storage_codec::option)]
+    snapshot_root: Option<Box<TrackedStateCommitRoot>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
@@ -824,9 +852,32 @@ struct TrackedStateCommitRootV11 {
     complete_state_fence: bool,
 }
 
+impl From<StoredCommitStateManifestV12> for StoredCommitStateManifest {
+    fn from(stored: StoredCommitStateManifestV12) -> Self {
+        Self {
+            commit_id: stored.commit_id,
+            change_account_id: stored.change_account_id,
+            replay_debt: stored.replay_debt,
+            selected_source_commit_id: stored.selected_source_commit_id,
+            mutation_inventory_digest: stored.mutation_inventory_digest,
+            mutation_transition_digest: stored.mutation_transition_digest,
+            mutation_member_count: stored.mutation_member_count,
+            mutation_part_count: stored.mutation_part_count,
+            mutation_directory_root: stored.mutation_directory_root,
+            touched_scope_filter: stored.touched_scope_filter,
+            global_scope: stored.global_scope,
+            current_state_scoped_ranges: stored.current_state_scoped_ranges,
+            row_pk_index_root_id: stored.row_pk_index_root_id,
+            snapshot_root: stored.snapshot_root,
+            incorporation: crate::tracked_state::CommitStateIncorporation::LegacyUnknown,
+        }
+    }
+}
+
 impl From<StoredCommitStateManifestV11> for StoredCommitStateManifest {
     fn from(stored: StoredCommitStateManifestV11) -> Self {
         Self {
+            incorporation: crate::tracked_state::CommitStateIncorporation::LegacyUnknown,
             commit_id: stored.commit_id,
             change_account_id: stored.change_account_id,
             replay_debt: stored.replay_debt,
@@ -858,6 +909,7 @@ impl From<StoredCommitStateManifestV11> for StoredCommitStateManifest {
 impl From<StoredCommitStateManifestV10> for StoredCommitStateManifest {
     fn from(stored: StoredCommitStateManifestV10) -> Self {
         Self {
+            incorporation: crate::tracked_state::CommitStateIncorporation::LegacyUnknown,
             commit_id: stored.commit_id,
             change_account_id: stored.change_account_id,
             replay_debt: stored.replay_debt,
@@ -3698,6 +3750,14 @@ pub(crate) struct PublishedCommitStateTopology {
 }
 
 impl PublishedCommitStateTopology {
+    pub(crate) fn incorporation(&self) -> crate::tracked_state::CommitStateIncorporation {
+        self.header.incorporation
+    }
+
+    pub(crate) fn snapshot_root(&self) -> Option<&TrackedStateCommitRoot> {
+        self.header.snapshot_root.as_deref()
+    }
+
     pub(crate) fn commit_id(&self) -> CommitId {
         self.header.commit_id
     }
@@ -7228,6 +7288,204 @@ pub(crate) fn stage_delete_change_locators(
     );
 }
 
+#[cfg(test)]
+pub(crate) async fn change_locator_selects_reference_for_migration(
+    store: &(impl StorageAdapterRead + ?Sized),
+    locator: CommitDeltaChangeLocator,
+) -> Result<bool, LixError> {
+    match load_explicit_change_records_at_locators(store, &[locator]).await {
+        Ok(_) => Ok(false),
+        Err(error) if error.code == STALE_SELECTED_CHANGE_LOCATOR => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+/// Classifies the bounded migration candidate set with shared owner and segment
+/// reads. Only an authenticated selected row matching its canonical identity
+/// permits deleting a historical fallback locator.
+pub(crate) async fn change_locators_select_references_for_migration(
+    store: &(impl StorageAdapterRead + ?Sized),
+    candidates: &[(CommitDeltaChangeLocator, TrackedStateKey)],
+) -> Result<Vec<bool>, LixError> {
+    let mut owners = BTreeMap::<CommitId, Vec<usize>>::new();
+    for (index, (locator, _)) in candidates.iter().enumerate() {
+        owners.entry(locator.commit_id).or_default().push(index);
+    }
+    let mut selected = vec![false; candidates.len()];
+    let mut checked_sources = BTreeMap::<CommitId, bool>::new();
+    for (owner, indices) in owners {
+        let state = match load_point_replay_commit_state(store, owner).await {
+            Ok(Some(state)) => state,
+            Ok(None) => continue,
+            Err(error) if migration_locator_authority_missing(&error)? => continue,
+            Err(error) => return Err(error),
+        };
+        if let Some(source) = state.mutations.selected_source_commit_id() {
+            let available = if let Some(available) = checked_sources.get(&source) {
+                *available
+            } else {
+                let available = match load_point_replay_commit_state(store, source).await {
+                    Ok(Some(source)) => {
+                        if source.mutations.selected_source_commit_id().is_some() {
+                            return Err(replacement_payload_error(
+                                "selected-source mutation authority cannot alias another source",
+                            ));
+                        }
+                        true
+                    }
+                    Ok(None) => false,
+                    Err(error) if migration_locator_authority_missing(&error)? => false,
+                    Err(error) => return Err(error),
+                };
+                checked_sources.insert(source, available);
+                available
+            };
+            if !available {
+                continue;
+            }
+        }
+        if !state.mutations.inline_part.is_empty() {
+            let (leaf, payloads) =
+                decode_commit_delta_with_payloads(&state.mutations.inline_part, None)?;
+            if leaf.len() != state.mutations.member_count as usize {
+                return Err(replacement_payload_error(
+                    "inline migration authority row count disagrees with its header",
+                ));
+            }
+            for index in indices {
+                let (locator, record) = &candidates[index];
+                if locator.segment_index != 0 {
+                    return Err(replacement_payload_error(
+                        "inline migration locator names a nonzero segment",
+                    ));
+                }
+                selected[index] = migration_locator_selects_decoded_reference(
+                    &leaf,
+                    &payloads,
+                    *locator,
+                    record,
+                    &state.change_account_id,
+                )?;
+            }
+        } else if state
+            .mutation_directory_root
+            .as_ref()
+            .is_some_and(|root| root.layout == super::mutation_directory::LAYOUT_BOUNDED_INDIRECT)
+        {
+            let manifest = match load_commit_state_manifest(store, owner).await {
+                Ok(Some(manifest)) => manifest,
+                Ok(None) => continue,
+                Err(error) if migration_locator_authority_missing(&error)? => continue,
+                Err(error) => return Err(error),
+            };
+            let manifest =
+                match expanded_commit_delta_manifest_from_commit_state(store, &manifest).await {
+                    Ok(manifest) => manifest,
+                    Err(error) if migration_locator_authority_missing(&error)? => continue,
+                    Err(error) => return Err(error),
+                };
+            if manifest.inline_segment().is_some() || manifest.columnar_parts.is_some() {
+                return Err(replacement_payload_error(
+                    "indirect migration authority has an invalid physical layout",
+                ));
+            }
+            let mut segments = BTreeMap::<usize, Vec<usize>>::new();
+            for index in indices {
+                segments
+                    .entry(candidates[index].0.segment_index as usize)
+                    .or_default()
+                    .push(index);
+            }
+            for (segment, indices) in segments {
+                let bounds = manifest.segments.get(segment).ok_or_else(|| {
+                    replacement_payload_error("migration locator names an absent indirect segment")
+                })?;
+                let key = StorageKey(Bytes::from(commit_delta_segment_key_for_bounds(
+                    owner, segment, bounds,
+                )?));
+                let values = PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &[key])
+                    .materialize(store, StorageGetOptions::default())
+                    .await?;
+                let bytes = match values.value.into_iter().next().flatten() {
+                    None => continue,
+                    Some(StorageProjectedValue::FullValue(bytes)) => bytes,
+                    Some(_) => {
+                        return Err(replacement_payload_error(
+                            "migration indirect authority read omitted its value",
+                        ));
+                    }
+                };
+                let (leaf, payloads) = decode_commit_delta_with_payloads(&bytes, Some(bounds))?;
+                for index in indices {
+                    let (locator, record) = &candidates[index];
+                    selected[index] = migration_locator_selects_decoded_reference(
+                        &leaf,
+                        &payloads,
+                        *locator,
+                        record,
+                        &state.change_account_id,
+                    )?;
+                }
+            }
+        }
+        // Other layouts do not establish this legacy selected-alias repair.
+        // Keep their locators without making migration an authored-payload
+        // integrity scrub. Ordinary readers retain their strict validation.
+    }
+    Ok(selected)
+}
+
+fn migration_locator_authority_missing(error: &LixError) -> Result<bool, LixError> {
+    Ok(super::NativeObjectRef::from_missing_error(error)?.is_some()
+        || super::NativeMetadataRef::from_missing_error(error)?.is_some())
+}
+
+fn validate_migration_canonical_identity(
+    actual: &crate::changelog::ChangeRecord,
+    canonical: &TrackedStateKey,
+) -> Result<(), LixError> {
+    if actual.schema_key != canonical.schema_key
+        || actual.file_id != canonical.file_id
+        || actual.row_pk != canonical.row_pk
+    {
+        return Err(replacement_payload_error(
+            "migration selected locator references canonical authority for a different identity",
+        ));
+    }
+    Ok(())
+}
+
+fn migration_locator_selects_decoded_reference<S: AsRef<[u8]>>(
+    leaf: &DecodedLeafNodeRef,
+    payloads: &CommitDeltaPayloadIndex<S>,
+    locator: CommitDeltaChangeLocator,
+    canonical: &TrackedStateKey,
+    account_id: &str,
+) -> Result<bool, LixError> {
+    match decode_change_at_locator_from_decoded(leaf, payloads, locator, account_id) {
+        Ok(actual) => {
+            validate_migration_canonical_identity(&actual.change_record, canonical)?;
+            Ok(false)
+        }
+        Err(error) if error.code == STALE_SELECTED_CHANGE_LOCATOR => {
+            let entry = leaf
+                .entry(usize::from(locator.ordinal))
+                .expect("decoder validated ordinal");
+            let key = decode_key(entry.key)?;
+            if key.schema_key != canonical.schema_key
+                || key.file_id != canonical.file_id
+                || key.row_pk != canonical.row_pk
+            {
+                return Err(replacement_payload_error(
+                    "migration selected locator references canonical authority for a different identity",
+                ));
+            }
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) async fn load_change_record_by_id(
     store: &(impl StorageAdapterRead + ?Sized),
     change_id: crate::changelog::ChangeId,
@@ -9789,6 +10047,76 @@ pub(crate) fn stage_commit_history_deferred_with_scope(
     );
 }
 
+/// An authenticated snapshot names this semantic source without transporting
+/// its graph or body. Unknown scope is explicit and must be hydrated, not guessed.
+pub(crate) fn stage_commit_history_omitted(
+    writes: &mut StorageWriteSet,
+    commit_id: CommitId,
+    global_scope: Option<bool>,
+) {
+    writes.put(
+        TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE,
+        StorageKey(Bytes::from(commit_key(commit_id))),
+        StorageValue {
+            bytes: Bytes::from_static(match global_scope {
+                Some(true) => b"omitted-global",
+                Some(false) => b"omitted-local",
+                None => b"omitted-unknown",
+            }),
+        },
+    );
+}
+
+enum DeferredCommitHistory {
+    Header { global_scope: bool },
+    Omitted { global_scope: Option<bool> },
+}
+
+async fn load_deferred_commit_history(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+) -> Result<Option<DeferredCommitHistory>, LixError> {
+    let Some(bytes) = get_one(
+        store,
+        TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE,
+        commit_key(commit_id),
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let marker = match bytes.as_ref() {
+        b"deferred" | b"deferred-local" => DeferredCommitHistory::Header {
+            global_scope: false,
+        },
+        b"deferred-global" => DeferredCommitHistory::Header { global_scope: true },
+        b"omitted-local" => DeferredCommitHistory::Omitted {
+            global_scope: Some(false),
+        },
+        b"omitted-global" => DeferredCommitHistory::Omitted {
+            global_scope: Some(true),
+        },
+        b"omitted-unknown" => DeferredCommitHistory::Omitted { global_scope: None },
+        _ => {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("commit '{commit_id}' has an invalid deferred-history marker"),
+            ));
+        }
+    };
+    Ok(Some(marker))
+}
+
+pub(crate) async fn commit_history_is_omitted(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+) -> Result<bool, LixError> {
+    Ok(matches!(
+        load_deferred_commit_history(store, commit_id).await?,
+        Some(DeferredCommitHistory::Omitted { .. })
+    ))
+}
+
 /// Marks one commit's tracked history as locally available.
 ///
 /// This deletion is staged in the same write set as the hydrated history, so
@@ -9805,18 +10133,9 @@ pub(crate) async fn commit_history_is_deferred(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
 ) -> Result<bool, LixError> {
-    let result = PointReadPlan::new(
-        TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE,
-        &[StorageKey(Bytes::from(commit_key(commit_id)))],
-    )
-    .materialize(
-        store,
-        StorageGetOptions {
-            projection: StorageCoreProjection::KeyOnly,
-        },
-    )
-    .await?;
-    Ok(result.value.into_iter().next().flatten().is_some())
+    Ok(load_deferred_commit_history(store, commit_id)
+        .await?
+        .is_some())
 }
 
 /// Returns the immutable branch-family provenance retained with a deferred
@@ -9826,23 +10145,13 @@ pub(crate) async fn deferred_commit_global_scope(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
 ) -> Result<Option<bool>, LixError> {
-    let Some(bytes) = get_one(
-        store,
-        TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE,
-        commit_key(commit_id),
+    Ok(
+        match load_deferred_commit_history(store, commit_id).await? {
+            Some(DeferredCommitHistory::Header { global_scope }) => Some(global_scope),
+            Some(DeferredCommitHistory::Omitted { global_scope }) => global_scope,
+            None => None,
+        },
     )
-    .await?
-    else {
-        return Ok(None);
-    };
-    match bytes.as_ref() {
-        b"deferred" | b"deferred-local" => Ok(Some(false)),
-        b"deferred-global" => Ok(Some(true)),
-        _ => Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("commit '{commit_id}' has an invalid deferred-history marker"),
-        )),
-    }
 }
 
 pub(crate) async fn has_deferred_commit_history(
@@ -11018,6 +11327,32 @@ pub(crate) async fn load_local_selected_change_owner_commit_ids(
         .into_iter()
         .filter(|member| !member.authored && !member.selected_tombstone)
         .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+
+    // Snapshot import can own selected payloads as canonical standalone
+    // ChangeRecords while their authored history remains omitted. Match the
+    // ordinary change reader's precedence; these records have no native owner.
+    let change_ids = selected
+        .iter()
+        .map(|member| member.value.change_id)
+        .collect::<Vec<_>>();
+    let standalone = ChangelogContext::new()
+        .reader(store)
+        .load_changes(ChangeLoadRequest {
+            change_ids: &change_ids,
+        })
+        .await?;
+    let mut unresolved = Vec::new();
+    for (member, (_, record)) in selected.into_iter().zip(standalone) {
+        if let Some(record) = record {
+            validate_selected_owner_record(&member, &record)?;
+        } else {
+            unresolved.push(member);
+        }
+    }
+    let selected = unresolved;
     if selected.is_empty() {
         return Ok(BTreeSet::new());
     }
@@ -13716,6 +14051,10 @@ async fn scan_commit_delta_plane(
                 ),
             ));
         }
+        let retirement = load_retirement_cursor_rows(store, commit_id).await?;
+        if retirement.len() == 1 && retirement[0] == retirement_marker_key(commit_id) {
+            continue;
+        }
         authorities.push((commit_id, stored, stored_inventory));
     }
     debug_assert!(inventory_rows.is_empty());
@@ -13963,6 +14302,7 @@ pub(crate) async fn stage_delete_commit_state_manifest_for_gc(
 /// does not also name.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RetainedPhysicalState<'a> {
+    pub(crate) topology_commits: &'a BTreeSet<CommitId>,
     pub(crate) mutation_nodes: &'a BTreeSet<[u8; 32]>,
     pub(crate) scoped_nodes: &'a BTreeSet<[u8; 32]>,
     pub(crate) native_parts: &'a BTreeSet<[u8; 32]>,
@@ -14113,14 +14453,22 @@ async fn load_retirement_cursor_rows(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
 ) -> Result<Vec<StorageKey>, LixError> {
-    let prefix = commit_id.as_uuid().as_bytes();
-    Ok(
-        scan_full_space(store, crate::gc::COMMIT_RETIREMENT_INTENT_SPACE)
-            .await?
-            .into_iter()
-            .filter_map(|(key, _)| key.0.starts_with(prefix).then_some(key))
-            .collect(),
-    )
+    let range = StoragePrefix {
+        bytes: Bytes::copy_from_slice(commit_id.as_uuid().as_bytes()),
+    }
+    .to_range()?;
+    let mut cursor = store
+        .begin_scan(
+            crate::gc::COMMIT_RETIREMENT_INTENT_SPACE,
+            range,
+            StorageBeginScanOptions::default(),
+        )
+        .await?;
+    let mut rows = Vec::new();
+    while let Some(entries) = cursor.next_chunk().await? {
+        rows.extend(entries.into_iter().map(|entry| entry.key));
+    }
+    Ok(rows)
 }
 
 fn stage_final_retirement_authority(writes: &mut StorageWriteSet, commit_id: CommitId) {
@@ -14173,6 +14521,7 @@ pub(crate) async fn stage_retire_commit_physical_state_bounded(
 ) -> Result<bool, LixError> {
     let cursor_rows = load_retirement_cursor_rows(store, commit_id).await?;
     let marker_key = retirement_marker_key(commit_id);
+    let retain_topology = retained.topology_commits.contains(&commit_id);
     if cursor_rows.iter().any(|key| key == &marker_key) {
         let intents = cursor_rows
             .into_iter()
@@ -14203,8 +14552,10 @@ pub(crate) async fn stage_retire_commit_physical_state_bounded(
         if !can_finish {
             return Ok(false);
         }
-        stage_final_retirement_authority(writes, commit_id);
-        writes.delete(crate::gc::COMMIT_RETIREMENT_INTENT_SPACE, marker_key);
+        if !retain_topology {
+            stage_final_retirement_authority(writes, commit_id);
+            writes.delete(crate::gc::COMMIT_RETIREMENT_INTENT_SPACE, marker_key);
+        }
         return Ok(true);
     }
 
@@ -14258,8 +14609,18 @@ pub(crate) async fn stage_retire_commit_physical_state_bounded(
     }
     stage_delete_commit_state_manifest_for_gc(store, &mut compact_retirement, commit_id, &manifest)
         .await?;
-    let compact_deletes = compact_retirement.into_point_deletes();
-    let compact_mutations = compact_deletes.len();
+    let compact_deletes = compact_retirement
+        .into_point_deletes()
+        .into_iter()
+        .filter(|(space, _)| {
+            !retain_topology
+                || (space.id != TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE.id
+                    && space.id != TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE.id)
+        })
+        .collect::<Vec<_>>();
+    let compact_mutations = compact_deletes
+        .len()
+        .saturating_add(usize::from(retain_topology));
     let locator_budget = max_mutations.map(|limit| {
         if compact_mutations <= limit {
             limit - compact_mutations
@@ -14291,6 +14652,18 @@ pub(crate) async fn stage_retire_commit_physical_state_bounded(
     if cursor_rows.is_empty() && compact_mutations <= remaining {
         for (space, target) in compact_deletes {
             writes.delete(space, target);
+        }
+        if retain_topology {
+            // The existing sealed retirement cursor with no remaining intents
+            // records completed payload retirement. Later sweeps skip payload
+            // decoding while keeping the immutable proof header/inventory.
+            writes.put(
+                crate::gc::COMMIT_RETIREMENT_INTENT_SPACE,
+                marker_key,
+                StorageValue {
+                    bytes: Bytes::new(),
+                },
+            );
         }
         return Ok(true);
     }
@@ -14352,7 +14725,8 @@ pub(crate) async fn stage_retire_commit_physical_state_bounded(
 /// A scoped-range descriptor is authority for the digest, but not proof that
 /// the immutable payload still exists; treating a missing payload as an empty
 /// live set would silently turn corruption into deletion, so this fails closed.
-pub(crate) async fn load_native_current_state_part_owners(
+/// Semantic provenance carried by self-contained rows, not payload ownership.
+pub(crate) async fn load_native_current_state_part_commit_ids(
     store: &(impl StorageAdapterRead + ?Sized),
     digests: &BTreeSet<[u8; 32]>,
 ) -> Result<BTreeSet<CommitId>, LixError> {
@@ -16567,6 +16941,7 @@ fn encode_commit_state_manifest(
     );
     mutation_inventory.extend_from_slice(stored_payload);
     let header = StoredCommitStateManifest {
+        incorporation: manifest.incorporation,
         commit_id: manifest.commit_id,
         change_account_id: manifest.change_account_id.clone(),
         replay_debt: manifest.replay_debt,
@@ -16891,6 +17266,7 @@ fn assemble_commit_state_manifest(
         ));
     }
     let manifest = CommitStateManifest {
+        incorporation: stored.incorporation,
         commit_id: stored.commit_id,
         change_account_id: stored.change_account_id,
         replay_debt: stored.replay_debt,
@@ -16980,6 +17356,7 @@ fn assemble_shallow_commit_state_manifest(
         parts: Vec::new(),
     };
     Ok(CommitStateManifest {
+        incorporation: stored.incorporation,
         commit_id: stored.commit_id,
         change_account_id: stored.change_account_id,
         replay_debt: stored.replay_debt,
@@ -17010,6 +17387,10 @@ fn decode_stored_commit_state_manifest(
 ) -> Result<StoredCommitStateManifest, LixError> {
     let stored = if let Some(payload) = bytes.strip_prefix(COMMIT_STATE_MANIFEST_FORMAT_MAGIC) {
         storage_codec::decode("tracked_state commit_state_manifest", payload)?
+    } else if let Some(payload) = bytes.strip_prefix(COMMIT_STATE_MANIFEST_V12_FORMAT_MAGIC) {
+        let stored: StoredCommitStateManifestV12 =
+            storage_codec::decode("tracked_state v12 commit_state_manifest", payload)?;
+        stored.into()
     } else if let Some(payload) = bytes.strip_prefix(COMMIT_STATE_MANIFEST_V11_FORMAT_MAGIC) {
         let stored: StoredCommitStateManifestV11 =
             storage_codec::decode("tracked_state v11 commit_state_manifest", payload)?;
@@ -17034,6 +17415,8 @@ fn validate_commit_state_manifest_header(
     if stored.mutation_inventory_digest == [0; 32]
         || stored.mutation_transition_digest == [0; 32]
         || stored.selected_source_commit_id == Some(*stored.commit_id.as_uuid().as_bytes())
+        || stored.incorporation
+            == crate::tracked_state::CommitStateIncorporation::Complete(stored.commit_id)
     {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -17130,6 +17513,46 @@ fn validate_commit_state_manifest_header(
         ));
     }
     Ok(())
+}
+
+/// Header-only migration preserves the authenticated mutation inventory bytes.
+pub(crate) fn rewrite_commit_state_incorporation_for_migration(
+    bytes: &[u8],
+    incorporation: crate::tracked_state::CommitStateIncorporation,
+) -> Result<Vec<u8>, LixError> {
+    let mut header = decode_stored_commit_state_manifest(bytes)?;
+    header.incorporation = incorporation;
+    validate_commit_state_manifest_header(&header)?;
+    let payload = storage_codec::encode("tracked_state commit_state_manifest", &header)?;
+    let mut encoded = COMMIT_STATE_MANIFEST_FORMAT_MAGIC.to_vec();
+    encoded.extend_from_slice(&payload);
+    Ok(encoded)
+}
+
+#[cfg(test)]
+pub(crate) fn encode_legacy_commit_state_header_for_migration_test(
+    bytes: &[u8],
+) -> Result<Vec<u8>, LixError> {
+    let header = decode_stored_commit_state_manifest(bytes)?;
+    let old = StoredCommitStateManifestV12 {
+        commit_id: header.commit_id,
+        change_account_id: header.change_account_id,
+        replay_debt: header.replay_debt,
+        selected_source_commit_id: header.selected_source_commit_id,
+        mutation_inventory_digest: header.mutation_inventory_digest,
+        mutation_transition_digest: header.mutation_transition_digest,
+        mutation_member_count: header.mutation_member_count,
+        mutation_part_count: header.mutation_part_count,
+        mutation_directory_root: header.mutation_directory_root,
+        touched_scope_filter: header.touched_scope_filter,
+        global_scope: header.global_scope,
+        current_state_scoped_ranges: header.current_state_scoped_ranges,
+        row_pk_index_root_id: header.row_pk_index_root_id,
+        snapshot_root: header.snapshot_root,
+    };
+    let mut encoded = COMMIT_STATE_MANIFEST_V12_FORMAT_MAGIC.to_vec();
+    encoded.extend_from_slice(&storage_codec::encode("legacy v12 commit header", &old)?);
+    Ok(encoded)
 }
 
 fn validate_commit_state_manifest(manifest: &CommitStateManifest) -> Result<(), LixError> {
@@ -17447,7 +17870,7 @@ fn validate_compact_replacement_inventory(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashSet};
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
     use std::fs;
     use std::future::Future;
     use std::path::{Path, PathBuf};
@@ -17484,11 +17907,13 @@ mod tests {
         DecodedCommitDeltaBatch, DecodedCommitDeltaCache, DecodedCommitDeltaSegment,
         GENERIC_COMMIT_DELTA_SEGMENT_MAX_ROWS, PreparedCompactNativeCache,
         TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, TrackedStateChunkOverlay,
-        columnar_identity_row_map, decode_commit_delta_with_payloads,
+        change_locators_select_references_for_migration, columnar_identity_row_map,
+        commit_delta_segment_key_for_bounds, decode_commit_delta_with_payloads,
         decode_encoded_commit_state_manifest, decode_stored_commit_state_authority,
         encode_commit_delta_segment, encode_commit_delta_segment_with_payloads,
-        encode_commit_delta_segment_with_raw_sidecar, encode_commit_state_manifest, key,
-        load_change_record_by_id, load_commit_delta_change_ids, load_commit_delta_change_records,
+        encode_commit_delta_segment_with_raw_sidecar, encode_commit_state_manifest,
+        expanded_commit_delta_manifest_from_commit_state, key, load_change_record_by_id,
+        load_commit_delta_change_ids, load_commit_delta_change_records,
         load_commit_delta_members_with_payloads, load_commit_delta_values_encoded,
         load_commit_state_manifest, load_owned_commit_delta_entries,
         prepare_new_authored_typed_commit_delta_segment, scan_change_records_from_commit_deltas,
@@ -17540,6 +17965,7 @@ mod tests {
         let empty = BTreeSet::new();
         let retained_mutation_nodes = BTreeSet::from([retained_digest]);
         let retained = super::RetainedPhysicalState {
+            topology_commits: &BTreeSet::new(),
             mutation_nodes: &retained_mutation_nodes,
             scoped_nodes: &empty,
             native_parts: &empty,
@@ -18196,6 +18622,7 @@ mod tests {
         mutations: CommitStateMutationInventory,
     ) -> CommitStateManifest {
         CommitStateManifest {
+            incorporation: crate::tracked_state::CommitStateIncorporation::None,
             commit_id,
             change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             replay_debt: CommitStateReplayDebt {
@@ -19026,6 +19453,148 @@ mod tests {
             .durable_payload()
             .expect("test typed snapshot should encode")
             .to_vec()
+    }
+
+    #[tokio::test]
+    async fn migration_locator_classification_shares_owner_reads_and_isolates_missing_parts() {
+        for count in [3usize, 300, 3000] {
+            let storage = StorageAdapter::new(Memory::new());
+            let owner = CommitId::for_test_label(&format!("migration-locator-owner-{count}"));
+            let template = packed_commit_delta_fixtures().remove(1);
+            let fixtures = (0..count)
+                .map(|index| {
+                    let mut fixture = template.clone();
+                    fixture.row_pk = RowPk::single(format!("migration-row-{index:05}"));
+                    fixture.change_id =
+                        ChangeId::for_test_label(&format!("migration-change-{index}"));
+                    fixture
+                })
+                .collect::<Vec<_>>();
+            let fixture_indices = fixtures
+                .iter()
+                .enumerate()
+                .map(|(index, fixture)| (fixture.change_id, index))
+                .collect::<BTreeMap<_, _>>();
+            let mut deltas = commit_delta_refs(owner, &fixtures);
+            for (index, delta) in deltas.iter_mut().enumerate() {
+                delta.authored = index % 3 == 0;
+            }
+            let mut writes = storage.new_write_set();
+            let locators = stage_commit_deltas(&mut writes, &deltas).unwrap();
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .unwrap();
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .unwrap();
+            let candidates = locators
+                .iter()
+                .map(|locator| {
+                    let fixture = &fixtures[fixture_indices[&locator.change_id]];
+                    (
+                        *locator,
+                        TrackedStateKey {
+                            schema_key: fixture.schema_key.clone(),
+                            file_id: fixture.file_id.clone(),
+                            row_pk: fixture.row_pk.clone(),
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(candidates.len(), count);
+            let counted = ManifestCountingRead {
+                inner: &read,
+                get_many_calls: Default::default(),
+                manifest_requests: Default::default(),
+                inventory_requests: Default::default(),
+                directory_requests: Default::default(),
+            };
+            let result = change_locators_select_references_for_migration(&counted, &candidates)
+                .await
+                .unwrap();
+            for ((locator, _), selected) in candidates.iter().zip(result) {
+                let index = fixture_indices[&locator.change_id];
+                assert_eq!(selected, index % 3 != 0);
+            }
+            assert!(
+                counted.manifest_requests.load(Ordering::Relaxed) <= 2,
+                "owner header reads must not grow with {count} locators"
+            );
+            assert!(
+                counted.inventory_requests.load(Ordering::Relaxed) <= 2,
+                "owner inventory reads must not grow with {count} locators"
+            );
+
+            let selected_index = candidates
+                .iter()
+                .position(|(locator, _)| fixture_indices[&locator.change_id] % 3 != 0)
+                .unwrap();
+            let mut wrong_identity = candidates[selected_index].clone();
+            wrong_identity.1.row_pk = RowPk::single("different-canonical-row");
+            assert!(
+                change_locators_select_references_for_migration(&read, &[wrong_identity])
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("different identity")
+            );
+            if count < 300 {
+                continue;
+            }
+            let manifest = load_commit_state_manifest(&read, owner)
+                .await
+                .unwrap()
+                .unwrap();
+            let manifest = expanded_commit_delta_manifest_from_commit_state(&read, &manifest)
+                .await
+                .unwrap();
+            assert!(manifest.segments.len() > 1);
+            let first_segment = 0usize;
+            let missing_key = commit_delta_segment_key_for_bounds(
+                owner,
+                first_segment,
+                &manifest.segments[first_segment],
+            )
+            .unwrap();
+            drop(read);
+            let mut writes = storage.new_write_set();
+            writes.delete(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, missing_key);
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .unwrap();
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .unwrap();
+            let result = change_locators_select_references_for_migration(&read, &candidates)
+                .await
+                .unwrap();
+            for ((locator, _), selected) in candidates.iter().zip(result) {
+                let index = fixture_indices[&locator.change_id];
+                assert_eq!(selected, locator.segment_index != 0 && index % 3 != 0);
+            }
+            let missing = candidates
+                .iter()
+                .find(|(locator, _)| locator.segment_index == 0)
+                .unwrap()
+                .clone();
+            let mut malformed = candidates
+                .iter()
+                .find(|(locator, _)| locator.segment_index != 0)
+                .unwrap()
+                .clone();
+            malformed.0.ordinal = u16::MAX;
+            assert!(
+                change_locators_select_references_for_migration(&read, &[missing, malformed])
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("absent ordinal")
+            );
+        }
     }
 
     fn commit_delta_refs(
@@ -23277,6 +23846,7 @@ mod tests {
             .into(),
         };
         CommitStateManifest {
+            incorporation: crate::tracked_state::CommitStateIncorporation::None,
             commit_id,
             change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             replay_debt: CommitStateReplayDebt {
@@ -23337,6 +23907,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         CommitStateManifest {
+            incorporation: crate::tracked_state::CommitStateIncorporation::None,
             commit_id,
             change_account_id: crate::ANONYMOUS_ACCOUNT_ID.to_string(),
             replay_debt: CommitStateReplayDebt {
@@ -23617,6 +24188,8 @@ mod tests {
 
         let decoded = super::decode_stored_commit_state_manifest(&bytes)
             .expect("deployed v10 manifest should remain readable");
+        let mut stored = stored;
+        stored.incorporation = crate::tracked_state::CommitStateIncorporation::LegacyUnknown;
         assert_eq!(decoded, stored);
         assert!(!decoded.snapshot_root.unwrap().complete_state_fence);
     }

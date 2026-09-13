@@ -3637,6 +3637,7 @@ mod tests {
             stage_commit_state_manifest(
                 &mut writes,
                 &CommitStateManifest {
+                    incorporation: crate::tracked_state::CommitStateIncorporation::None,
                     commit_id: record.commit_id,
                     change_account_id: record.account_id.clone(),
                     replay_debt: CommitStateReplayDebt::default(),
@@ -3862,6 +3863,7 @@ mod tests {
             stage_commit_state_manifest(
                 &mut writes,
                 &CommitStateManifest {
+                    incorporation: crate::tracked_state::CommitStateIncorporation::None,
                     commit_id: record.commit_id,
                     change_account_id: record.account_id.clone(),
                     replay_debt: CommitStateReplayDebt {
@@ -4076,6 +4078,7 @@ mod tests {
             stage_commit_state_manifest(
                 writes,
                 &CommitStateManifest {
+                    incorporation: crate::tracked_state::CommitStateIncorporation::None,
                     commit_id: record.commit_id,
                     change_account_id: record.account_id.clone(),
                     replay_debt: CommitStateReplayDebt::default(),

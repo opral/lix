@@ -55,6 +55,52 @@ where
     super::partial_runtime::hydrate_demand(storage, state, transport, demand).await
 }
 
+/// A local catalog publication may depend on selected work preceding it. Drain
+/// only that selected prefix; later commits become eligible after GLOBAL ACK.
+async fn captured_ordinary_prefix(
+    read: &(impl StorageAdapterRead + ?Sized),
+    head: CommitId,
+    boundary: CommitId,
+    catalog: CommitId,
+) -> Result<CommitId, LixError> {
+    let target = super::partial_upload::wave_target(read, head, boundary, 256).await?;
+    let mut current = target;
+    let mut reverse = Vec::new();
+    while current != boundary {
+        let record = super::partial_upload::local_record(read, current).await?;
+        if record.parent_commit_ids.len() != 1 || record.is_checkpoint {
+            // Nonlinear native closures keep their existing bounded analysis.
+            return Ok(target);
+        }
+        if reverse.len() == 256 {
+            return Err(invalid("captured ordinary prefix exceeds its native bound"));
+        }
+        current = record.parent_commit_ids[0];
+        reverse.push(record);
+    }
+    let mut eligible = boundary;
+    let mut known = BTreeSet::from([catalog]);
+    for record in reverse.into_iter().rev() {
+        let base = record
+            .base_commit_id
+            .ok_or_else(|| invalid("selected prefix has no catalog"))?;
+        if !known.contains(&base) {
+            if !super::partial_merge_analysis::catalog_contains(read, base, catalog, 1024).await? {
+                break;
+            }
+            known.insert(base);
+        }
+        eligible = record.commit_id;
+    }
+    if eligible == boundary && target != boundary {
+        return Err(LixError::new(
+            "LIX_PARTIAL_REPLICA_MERGE_PENDING",
+            "selected suffix awaits its local catalog publication",
+        ));
+    }
+    Ok(eligible)
+}
+
 pub(super) async fn captured_wave(
     read: &(impl StorageAdapterRead + ?Sized),
     request: &PartialMergeRequest,
@@ -208,24 +254,45 @@ where
     let mut seen = BTreeSet::new();
     loop {
         wrapper.deadline.check(&wrapper.wire.lease.lease_id)?;
-        let result=async {
-   let read=storage.begin_read(Default::default()).await?;
-   let control=crate::branch::BranchHeadControlContext::new().reader(&read).load(branch).await?.ok_or_else(||invalid("restart selected control disappeared"))?;
-   let descriptor=&wrapper.wire.descriptor;
-   let request = PartialMergeRequest {
-       attempt_id: intent.next_attempt_id.clone(), branch_id: branch.into(),
-       base_commit_id: intent.old.base_commit_id.clone(),
-       expected_authority_head_commit_id: descriptor.selected_branch.head.commit_id.clone(),
-       captured_local_head_commit_id: control.head_commit_id.to_string(),
-       checkpoint_commit_id: intent.old.checkpoint_commit_id.clone(),
-       expected_authority_checkpoint_commit_id: descriptor.selected_branch.checkpoint.commit_id.clone(),
-       captured_local_checkpoint_commit_id: control.working_diff_checkpoint_commit_id.ok_or_else(|| invalid("restart local checkpoint disappeared"))?.to_string(),
-       global_head_commit_id: descriptor.global_branch.head.commit_id.clone(),
-       global_checkpoint_commit_id: descriptor.global_branch.checkpoint.commit_id.clone(),
-   };
-   let mut writes=storage.new_write_set();let guards=stage_capture_restarted_partial_merge(&read,&mut writes,state,&request).await?;
-   drop(read);persist(storage,writes,guards).await
-  }.await;
+        let result = async {
+            let read = storage.begin_read(Default::default()).await?;
+            let descriptor = &wrapper.wire.descriptor;
+            let (global, _, _) = super::partial_push_state::load_partial_push_state(
+                &read,
+                state,
+                crate::GLOBAL_BRANCH_ID,
+            )
+            .await?;
+            let request = PartialMergeRequest {
+                attempt_id: intent.next_attempt_id.clone(),
+                branch_id: branch.into(),
+                base_commit_id: intent.old.base_commit_id.clone(),
+                expected_authority_head_commit_id: descriptor
+                    .selected_branch
+                    .head
+                    .commit_id
+                    .clone(),
+                captured_local_head_commit_id: intent.old.captured_local_head_commit_id.clone(),
+                checkpoint_commit_id: intent.old.checkpoint_commit_id.clone(),
+                expected_authority_checkpoint_commit_id: descriptor
+                    .selected_branch
+                    .checkpoint
+                    .commit_id
+                    .clone(),
+                captured_local_checkpoint_commit_id: intent
+                    .old
+                    .captured_local_checkpoint_commit_id
+                    .clone(),
+                global_head_commit_id: global.confirmed.head,
+                global_checkpoint_commit_id: global.confirmed.checkpoint,
+            };
+            let mut writes = storage.new_write_set();
+            let guards =
+                stage_capture_restarted_partial_merge(&read, &mut writes, state, &request).await?;
+            drop(read);
+            persist(storage, writes, guards).await
+        }
+        .await;
         match result {
             Ok(()) => return Ok(()),
             Err(error) => hydrate(storage, state, &candidate, error, &mut seen).await?,
@@ -301,8 +368,7 @@ where
                 }
                 if let Some(outbox) = &outbox {
                     if outbox.authority_receipt.is_none()
-                        || control.head_commit_id
-                            == outbox.request.captured_local_head_commit_id
+                        || control.head_commit_id == outbox.request.captured_local_head_commit_id
                     {
                         return Ok(true);
                     }
@@ -312,6 +378,89 @@ where
                     .map_or(push.confirmed.head.clone(), |record| {
                         record.request.captured_local_head_commit_id.clone()
                     });
+                let (global, _, _) = super::partial_push_state::load_partial_push_state(
+                    &read,
+                    &previous,
+                    crate::GLOBAL_BRANCH_ID,
+                )
+                .await?;
+                let checkpoint = outbox.as_ref().map_or_else(
+                    || push.confirmed.checkpoint.clone(),
+                    |record| record.request.captured_local_checkpoint_commit_id.clone(),
+                );
+                let local_checkpoint = control
+                    .working_diff_checkpoint_commit_id
+                    .ok_or_else(|| invalid("captured local checkpoint disappeared"))?;
+                let (captured_head, captured_checkpoint) = if local_checkpoint == checkpoint {
+                    (
+                        captured_ordinary_prefix(
+                            &read,
+                            control.head_commit_id,
+                            id(&base)?,
+                            id(&global.confirmed.head)?,
+                        )
+                        .await?,
+                        local_checkpoint,
+                    )
+                } else {
+                    let target = super::partial_checkpoint_upload::next_checkpoint_target(
+                        &read,
+                        branch,
+                        control.head_commit_id,
+                        local_checkpoint,
+                        id(&checkpoint)?,
+                    )
+                    .await?;
+                    let target_checkpoint = id(&target.checkpoint)?;
+                    let (source_branch, source) =
+                        super::commit::load_sync_checkpoint_source(&read, target_checkpoint)
+                            .await?
+                            .ok_or_else(|| invalid("pending checkpoint has no retained source"))?;
+                    if source_branch != *branch {
+                        return Err(invalid(
+                            "pending checkpoint source belongs to another branch",
+                        ));
+                    }
+                    let prefix = if source == id(&base)? {
+                        source
+                    } else {
+                        captured_ordinary_prefix(
+                            &read,
+                            source,
+                            id(&base)?,
+                            id(&global.confirmed.head)?,
+                        )
+                        .await?
+                    };
+                    if prefix == source {
+                        let mut checkpoint_eligible = true;
+                        for target in [id(&target.head)?, target_checkpoint] {
+                            let record = super::partial_upload::local_record(&read, target).await?;
+                            let catalog = record
+                                .base_commit_id
+                                .ok_or_else(|| invalid("selected checkpoint has no catalog"))?;
+                            checkpoint_eligible &= super::partial_merge_analysis::catalog_contains(
+                                &read,
+                                catalog,
+                                id(&global.confirmed.head)?,
+                                1024,
+                            )
+                            .await?;
+                        }
+                        if checkpoint_eligible {
+                            (id(&target.head)?, target_checkpoint)
+                        } else if source != id(&base)? {
+                            (source, id(&checkpoint)?)
+                        } else {
+                            return Err(LixError::new(
+                                "LIX_PARTIAL_REPLICA_MERGE_PENDING",
+                                "selected checkpoint awaits its local catalog publication",
+                            ));
+                        }
+                    } else {
+                        (prefix, id(&checkpoint)?)
+                    }
+                };
                 let request = PartialMergeRequest {
                     attempt_id: uuid::Uuid::now_v7().to_string(),
                     branch_id: branch.clone(),
@@ -323,22 +472,18 @@ where
                         .head
                         .commit_id
                         .clone(),
-                    captured_local_head_commit_id: control.head_commit_id.to_string(),
-                    checkpoint_commit_id: outbox.as_ref().map_or_else(
-                        || push.confirmed.checkpoint.clone(),
-                        |record| record.request.captured_local_checkpoint_commit_id.clone(),
-                    ),
-                    expected_authority_checkpoint_commit_id: wrapper.wire.descriptor.selected_branch.checkpoint.commit_id.clone(),
-                    captured_local_checkpoint_commit_id: control.working_diff_checkpoint_commit_id
-                        .ok_or_else(|| invalid("captured local checkpoint disappeared"))?.to_string(),
-                    global_head_commit_id: wrapper.wire.descriptor.global_branch.head.commit_id.clone(),
-                    global_checkpoint_commit_id: wrapper
+                    captured_local_head_commit_id: captured_head.to_string(),
+                    checkpoint_commit_id: checkpoint,
+                    expected_authority_checkpoint_commit_id: wrapper
                         .wire
                         .descriptor
-                        .global_branch
+                        .selected_branch
                         .checkpoint
                         .commit_id
                         .clone(),
+                    captured_local_checkpoint_commit_id: captured_checkpoint.to_string(),
+                    global_head_commit_id: global.confirmed.head,
+                    global_checkpoint_commit_id: global.confirmed.checkpoint,
                 };
                 super::partial_merge_analysis::analyze_native_divergence(
                     &read,
@@ -346,8 +491,11 @@ where
                     id(&request.expected_authority_head_commit_id)?,
                     id(&request.captured_local_head_commit_id)?,
                     previous.active_account_id(),
-        &request.branch_id,
-        &[id(&request.checkpoint_commit_id)?, id(&request.expected_authority_checkpoint_commit_id)?],
+                    &request.branch_id,
+                    &[
+                        id(&request.checkpoint_commit_id)?,
+                        id(&request.expected_authority_checkpoint_commit_id)?,
+                    ],
                     id(&request.global_head_commit_id)?,
                     super::PartialMergeBudget {
                         max_local_commits: 1024,

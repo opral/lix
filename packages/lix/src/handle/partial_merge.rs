@@ -363,6 +363,15 @@ mod tests {
         base: &str,
         base_checkpoint: Option<&str>,
     ) -> crate::sync::PartialMergeRequest {
+        publish_wave_with_checkpoints(authority, local, base, base_checkpoint, None).await
+    }
+    async fn publish_wave_with_checkpoints(
+        authority: &Lix<Memory>,
+        local: &Lix<Memory>,
+        base: &str,
+        base_checkpoint: Option<&str>,
+        local_checkpoint: Option<&str>,
+    ) -> crate::sync::PartialMergeRequest {
         let remote = authority.partial_replica_descriptor(None).await.unwrap();
         let source = local.partial_replica_descriptor(None).await.unwrap();
         let request = crate::sync::PartialMergeRequest {
@@ -376,11 +385,9 @@ mod tests {
                 .checkpoint
                 .commit_id
                 .clone(),
-            captured_local_checkpoint_commit_id: source
-                .selected_branch
-                .checkpoint
-                .commit_id
-                .clone(),
+            captured_local_checkpoint_commit_id: local_checkpoint
+                .map(str::to_owned)
+                .unwrap_or_else(|| source.selected_branch.checkpoint.commit_id.clone()),
             checkpoint_commit_id: base_checkpoint
                 .map(str::to_owned)
                 .unwrap_or(remote.selected_branch.checkpoint.commit_id),
@@ -417,6 +424,9 @@ mod tests {
                 dependencies.push(alias.source_commit_id.clone());
             }
             if let Some(source) = &commit.selected_source_commit_id {
+                dependencies.push(source.clone());
+            }
+            if let Some(source) = &commit.complete_incorporation_source_commit_id {
                 dependencies.push(source.clone());
             }
             loaded.insert(id.clone(), commit);
@@ -874,6 +884,177 @@ mod tests {
                 .unwrap(),
             receipt
         );
+    }
+
+    #[tokio::test]
+    async fn genuine_checkpoint_intent_survives_a_newer_authority_checkpoint() {
+        divergent_checkpoint_case(None).await;
+    }
+
+    #[tokio::test]
+    async fn retained_local_checkpoint_is_dependency_closed_without_authority_compaction() {
+        let memory = Memory::new();
+        let authority = open_lix().with_storage(memory.clone()).await.unwrap();
+        authority
+            .set_sync_role(crate::sync::SyncRole::Authority)
+            .unwrap();
+        authority.execute(
+            "INSERT INTO lix_key_value(key,value) VALUES('retained-local','base'),('retained-remote','base')",
+            &[],
+        ).await.unwrap();
+        let base = authority.partial_replica_descriptor(None).await.unwrap();
+        let local = open_lix()
+            .with_storage(memory.fork().unwrap())
+            .await
+            .unwrap();
+        local
+            .execute(
+                "UPDATE lix_key_value SET value='local' WHERE key='retained-local'",
+                &[],
+            )
+            .await
+            .unwrap();
+        local.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
+        authority
+            .execute(
+                "UPDATE lix_key_value SET value='remote' WHERE key='retained-remote'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let request = publish_wave_with_base_checkpoint(
+            &authority,
+            &local,
+            &base.selected_branch.head.commit_id,
+            Some(&base.selected_branch.checkpoint.commit_id),
+        )
+        .await;
+        let checkpoint = crate::sync::export_sync_commit(
+            &authority,
+            &request.captured_local_checkpoint_commit_id,
+        )
+        .await
+        .unwrap()
+        .expect("retention must import a complete native checkpoint");
+        assert!(checkpoint.is_checkpoint);
+        assert!(
+            crate::sync::export_sync_commit(&authority, &request.captured_local_head_commit_id,)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn authority_rejects_checkpoint_intent_outside_the_captured_local_history() {
+        divergent_checkpoint_case(Some(false)).await;
+        divergent_checkpoint_case(Some(true)).await;
+    }
+
+    async fn divergent_checkpoint_case(invalid_checkpoint: Option<bool>) {
+        let memory = Memory::new();
+        let authority = open_lix().with_storage(memory.clone()).await.unwrap();
+        authority
+            .set_sync_role(crate::sync::SyncRole::Authority)
+            .unwrap();
+        authority.execute(
+            "INSERT INTO lix_key_value(key,value) VALUES('checkpoint-local','base'),('checkpoint-remote','base')",
+            &[],
+        ).await.unwrap();
+        let base = authority.partial_replica_descriptor(None).await.unwrap();
+        let local = open_lix()
+            .with_storage(memory.fork().unwrap())
+            .await
+            .unwrap();
+        local
+            .execute(
+                "UPDATE lix_key_value SET value='local' WHERE key='checkpoint-local'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let ordinary_head = local
+            .partial_replica_descriptor(None)
+            .await
+            .unwrap()
+            .selected_branch
+            .head
+            .commit_id;
+        local.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
+        authority
+            .execute(
+                "UPDATE lix_key_value SET value='remote' WHERE key='checkpoint-remote'",
+                &[],
+            )
+            .await
+            .unwrap();
+        authority.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
+        let local_descriptor = local.partial_replica_descriptor(None).await.unwrap();
+        let remote = authority.partial_replica_descriptor(None).await.unwrap();
+        let forged = invalid_checkpoint.map(|non_checkpoint| {
+            if non_checkpoint {
+                ordinary_head.as_str()
+            } else {
+                remote.selected_branch.checkpoint.commit_id.as_str()
+            }
+        });
+        let request = publish_wave_with_checkpoints(
+            &authority,
+            &local,
+            &base.selected_branch.head.commit_id,
+            Some(&base.selected_branch.checkpoint.commit_id),
+            forged,
+        )
+        .await;
+        // Acceptance must use the current authority coordinate, not the one
+        // captured while retaining the incoming checkpoint's original bodies.
+        authority
+            .execute(
+                "UPDATE lix_key_value SET value='remote-later' WHERE key='checkpoint-remote'",
+                &[],
+            )
+            .await
+            .unwrap();
+        authority.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
+        let before = authority.partial_replica_descriptor(None).await.unwrap();
+        let outcome = authority
+            .merge_partial_replica_for_account(&request, authority.active_account_id())
+            .await;
+        if invalid_checkpoint.is_some() {
+            assert_eq!(
+                outcome.unwrap_err().code,
+                "LIX_PARTIAL_MERGE_AUTHORITY_CHANGED"
+            );
+            let after = authority.partial_replica_descriptor(None).await.unwrap();
+            assert_eq!(after.selected_branch.head, before.selected_branch.head);
+            assert_eq!(
+                after.selected_branch.checkpoint,
+                before.selected_branch.checkpoint
+            );
+        } else {
+            let receipt = outcome.unwrap();
+            let after = authority.partial_replica_descriptor(None).await.unwrap();
+            assert_eq!(
+                after.selected_branch.checkpoint.commit_id,
+                local_descriptor.selected_branch.checkpoint.commit_id
+            );
+            let values = authority.execute("SELECT key,value FROM lix_key_value WHERE key IN ('checkpoint-local','checkpoint-remote') ORDER BY key", &[]).await.unwrap();
+            assert_eq!(
+                values.rows()[0].get::<serde_json::Value>("value").unwrap(),
+                serde_json::json!("local")
+            );
+            assert_eq!(
+                values.rows()[1].get::<serde_json::Value>("value").unwrap(),
+                serde_json::json!("remote-later")
+            );
+            assert_eq!(
+                authority
+                    .merge_partial_replica_for_account(&request, authority.active_account_id())
+                    .await
+                    .unwrap(),
+                receipt
+            );
+        }
     }
 }
 

@@ -1569,6 +1569,7 @@ mod tests {
         crate::tracked_state::stage_resealed_commit_state_manifest_for_test(
             writes,
             &CommitStateManifest {
+                incorporation: crate::tracked_state::CommitStateIncorporation::None,
                 commit_id: record.commit_id,
                 change_account_id: record.account_id.clone(),
                 replay_debt: CommitStateReplayDebt {

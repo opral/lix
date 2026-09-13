@@ -233,7 +233,8 @@ pub(super) async fn stage_prepare_partial_upload(
 ) -> Result<Vec<StoragePrecondition>, LixError> {
     upload.validate()?;
     let global_outbox_guards = ordinary_global_outbox_guards(read, state, branch_id).await?;
-    let mut guards = super::partial_merge_state::ordinary_upload_merge_guards(read, state).await?;
+    let mut guards =
+        super::partial_merge_state::ordinary_upload_merge_guards(read, state, branch_id).await?;
     guards.extend(global_outbox_guards);
     let (mut record, previous, epoch_guard) =
         load_partial_push_state(read, state, branch_id).await?;
@@ -281,7 +282,8 @@ pub(super) async fn stage_acknowledge_partial_upload(
 ) -> Result<Vec<StoragePrecondition>, LixError> {
     accepted.validate()?;
     let global_outbox_guards = ordinary_global_outbox_guards(read, state, branch_id).await?;
-    let mut guards = super::partial_merge_state::ordinary_upload_merge_guards(read, state).await?;
+    let mut guards =
+        super::partial_merge_state::ordinary_upload_merge_guards(read, state, branch_id).await?;
     guards.extend(global_outbox_guards);
     let (mut record, previous, epoch_guard) =
         load_partial_push_state(read, state, branch_id).await?;
@@ -329,14 +331,16 @@ pub(super) async fn stage_acknowledge_included_partial_upload(
         return Ok(None);
     }
     let mut cache = std::collections::BTreeMap::new();
-    for (local, remote) in [
+    for (local, remote, working_head) in [
         (
             &accepted.target.head,
             &authority.selected_branch.head.commit_id,
+            true,
         ),
         (
             &accepted.target.checkpoint,
             &authority.selected_branch.checkpoint.commit_id,
+            false,
         ),
     ] {
         let local = crate::changelog::CommitId::parse_lix(local, "included upload coordinate")?;
@@ -346,11 +350,16 @@ pub(super) async fn stage_acknowledge_included_partial_upload(
             continue;
         }
         let ancestor = super::partial_merge_analysis::record(read, local, true).await?;
-        if !super::partial_merge_analysis::bounded_ancestor(
-            read, &ancestor, remote, &mut cache, 1024,
-        )
-        .await?
-        {
+        let included = if working_head {
+            super::partial_merge_analysis::incorporated(read, &ancestor, remote, &mut cache, 1024)
+                .await?
+        } else {
+            super::partial_merge_analysis::bounded_ancestor(
+                read, &ancestor, remote, &mut cache, 1024,
+            )
+            .await?
+        };
+        if !included {
             return Ok(None);
         }
     }
@@ -753,7 +762,12 @@ pub(super) async fn clean_branch_source_guards(
     read: &(impl StorageAdapterRead + ?Sized),
     state: &PartialReplicaState,
 ) -> Result<Vec<StoragePrecondition>, LixError> {
-    let mut guards = super::partial_merge_state::ordinary_upload_merge_guards(read, state).await?;
+    let mut guards = super::partial_merge_state::ordinary_upload_merge_guards(
+        read,
+        state,
+        &state.descriptor().selected_branch.branch_id,
+    )
+    .await?;
     let mut branches = std::collections::BTreeSet::new();
     for branch in [
         &state.descriptor().selected_branch,

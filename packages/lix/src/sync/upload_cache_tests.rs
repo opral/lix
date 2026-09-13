@@ -11,6 +11,543 @@ async fn upload_cache_head(lix: &Lix<Memory>) -> String {
 }
 
 #[tokio::test]
+async fn cached_upload_sql_checkpoint_before_first_page_preserves_source_order() {
+    for full in [false, true] {
+        let authority = open_lix().await.unwrap();
+        let snapshot = authority.pull_sync_repository(None, 1).await.unwrap();
+        let replica = replica_from_snapshot(&authority, &snapshot).await;
+        write_key_value(&replica, "checkpoint-first-a", "selected").await;
+        write_key_value(&replica, "checkpoint-first-a", "selected-updated").await;
+        write_key_value(&replica, "checkpoint-first-b", "working").await;
+        write_key_value(&replica, "checkpoint-first-b", "working-updated").await;
+        let source = upload_cache_head(&replica).await;
+        replica.execute(if full {
+            "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))"
+        } else {
+            "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key='checkpoint-first-a'))"
+        }, &[]).await.unwrap();
+        let target = upload_cache_head(&replica).await;
+        let mut cache = None;
+        let mut uploaded = BTreeSet::new();
+        let mut claims = 0;
+        for _ in 0..32 {
+            let Some(request) = replica
+                .build_sync_push_with_plan(TEST_REMOTE, 1, &mut cache)
+                .await
+                .unwrap()
+            else {
+                break;
+            };
+            for commit in &request.commits {
+                if let Some(source) = &commit.complete_incorporation_source_commit_id {
+                    assert!(
+                        uploaded.contains(source),
+                        "complete source must be accepted before its claimant"
+                    );
+                    claims += 1;
+                    let mut forged = commit.clone();
+                    forged.commit_id =
+                        CommitId::for_test_label(&format!("forged-added-lifetime-{full}"))
+                            .to_string();
+                    let selected = forged
+                        .members
+                        .iter_mut()
+                        .find(|member| !member.authored && member.schema_key == "lix_key_value")
+                        .unwrap();
+                    selected.row_created_at = "2000-01-01T00:00:00Z".to_owned();
+                    let error = authority
+                        .push_sync_repository(&SyncPushRequest {
+                            commits: vec![forged],
+                            ref_updates: Vec::new(),
+                            inline_blobs: Vec::new(),
+                        })
+                        .await
+                        .unwrap_err();
+                    assert_eq!(error.code, LixError::CODE_INVALID_PARAM, "{error:?}");
+                    assert!(
+                        error.message.contains("complete native source state"),
+                        "{error:?}"
+                    );
+                }
+                uploaded.insert(commit.commit_id.clone());
+            }
+            frontier_apply_upload(&authority, &replica, &request).await;
+            cache.as_mut().unwrap().acknowledge().unwrap();
+            if cache.as_ref().unwrap().is_complete() {
+                break;
+            }
+        }
+        assert!(uploaded.contains(&source));
+        assert!(claims > 0);
+        assert_eq!(upload_cache_head(&authority).await, target);
+    }
+}
+
+#[tokio::test]
+async fn legacy_checkpoint_known_wire_import_is_independent_of_local_nomination() {
+    for physical_alias in [false, true] {
+        let memory = Memory::new();
+        let authority = open_lix().with_storage(memory.clone()).await.unwrap();
+        write_key_value(&authority, "migration-wire", "preserved").await;
+        let sql = if physical_alias {
+            "SELECT commit_id FROM lix_create_checkpoint()"
+        } else {
+            "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))"
+        };
+        let checkpoint = authority.execute(sql, &[]).await.unwrap().rows()[0]
+            .get::<String>("commit_id")
+            .unwrap();
+        let other = open_lix()
+            .with_storage(memory.fork().unwrap())
+            .await
+            .unwrap();
+        let id = CommitId::parse_lix(&checkpoint, "migration checkpoint").unwrap();
+        let adapter = other.storage_adapter();
+        let mut writes = adapter.new_write_set();
+        writes.delete(
+            crate::sync::SYNC_CHECKPOINT_SOURCE_SPACE,
+            id.as_uuid().as_bytes().to_vec(),
+        );
+        adapter
+            .commit_certified_replica_write_set(
+                super::super::certified_replica_write_capability(),
+                writes,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        for adapter in [authority.storage_adapter(), other.storage_adapter()] {
+            crate::migration::downgrade_headers_for_test(&adapter, false).await;
+            crate::migration::migrate_headers_for_test(&adapter, false).await;
+        }
+        let body = export_sync_commit(&other, &checkpoint)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(body.incorporation_unknown);
+        assert_eq!(body.state_alias.is_some(), physical_alias);
+        assert_eq!(
+            body,
+            export_sync_commit(&authority, &checkpoint)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        authority
+            .push_sync_repository(&SyncPushRequest {
+                commits: vec![body],
+                ref_updates: Vec::new(),
+                inline_blobs: Vec::new(),
+            })
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn snapshot_omitted_source_survives_gc_then_hydrates_normal_history() {
+    for sql in [
+        "SELECT commit_id FROM lix_create_checkpoint()",
+        "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))",
+        "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key='omitted-source'))",
+    ] {
+        let authority = open_lix().await.unwrap();
+        authority.execute("INSERT INTO lix_key_value (key,value) VALUES ('omitted-source','preserved'),('omitted-other','retained')", &[]).await.unwrap();
+        let source = upload_cache_head(&authority).await;
+        let source_body = export_sync_commit(&authority, &source)
+            .await
+            .unwrap()
+            .unwrap();
+        let selected_changes = source_body
+            .members
+            .iter()
+            .map(|member| {
+                ChangeId::parse_lix(&member.change_id, "snapshot authored change").unwrap()
+            })
+            .collect::<Vec<_>>();
+        authority.execute(sql, &[]).await.unwrap();
+        let head = upload_cache_head(&authority).await;
+        let snapshot = authority.pull_sync_repository(None, 1).await.unwrap();
+        let replica = replica_from_snapshot(&authority, &snapshot).await;
+        let id = CommitId::parse_lix(&source, "omitted source").unwrap();
+        let adapter = replica.storage_adapter();
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let head_id = CommitId::parse_lix(&head, "complete snapshot head").unwrap();
+        assert_eq!(
+            load_published_commit_state_topology(&read, head_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .incorporation(),
+            crate::tracked_state::CommitStateIncorporation::Complete(id)
+        );
+        assert!(
+            load_published_commit_state_topology(&read, id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::tracked_state::commit_history_is_omitted(&read, id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            deferred_commit_global_scope(&read, id).await.unwrap(),
+            Some(false)
+        );
+        let error = load_sync_commit(&read, id).await.unwrap_err();
+        assert_eq!(
+            crate::tracked_state::NativeMetadataRef::from_missing_error(&error).unwrap(),
+            Some(crate::tracked_state::NativeMetadataRef::CommitGraphRecord(
+                source.clone()
+            ))
+        );
+        drop(read);
+        for pass in 0..2 {
+            let read = adapter.begin_read(Default::default()).await.unwrap();
+            let standalone = ChangelogContext::new()
+                .reader(&read)
+                .load_changes(ChangeLoadRequest {
+                    change_ids: &selected_changes,
+                })
+                .await
+                .unwrap();
+            assert!(
+                standalone.iter().all(|(_, record)| record.is_some()),
+                "checkpoint mode {sql}, GC pass {pass}: imported canonical standalone payloads must be resident before owner discovery"
+            );
+            let mut writes = adapter.new_write_set();
+            let mut preconditions = Vec::new();
+            crate::gc::stage_repository_gc_with_preconditions(
+                &read,
+                &mut writes,
+                &mut preconditions,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("checkpoint mode {sql}, GC pass {pass}: {error:?}"));
+            drop(read);
+            adapter
+                .commit_write_set(
+                    writes,
+                    StorageWriteOptions {
+                        preconditions,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let standalone = ChangelogContext::new()
+            .reader(&read)
+            .load_changes(ChangeLoadRequest {
+                change_ids: &selected_changes,
+            })
+            .await
+            .unwrap();
+        assert!(
+            standalone.iter().all(|(_, record)| record.is_some()),
+            "checkpoint mode {sql}: both GC passes must retain canonical selected payloads"
+        );
+        assert!(
+            load_published_commit_state_topology(&read, id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::tracked_state::commit_history_is_omitted(&read, id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            load_published_commit_state_topology(&read, head_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .incorporation(),
+            crate::tracked_state::CommitStateIncorporation::Complete(id)
+        );
+        drop(read);
+        // Migration may know a semantic omission without knowing the source lane.
+        let mut writes = adapter.new_write_set();
+        crate::tracked_state::stage_commit_history_omitted(&mut writes, id, None);
+        adapter
+            .commit_write_set(writes, Default::default())
+            .await
+            .unwrap();
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        assert!(commit_history_is_deferred(&read, id).await.unwrap());
+        assert_eq!(deferred_commit_global_scope(&read, id).await.unwrap(), None);
+        drop(read);
+        hydrate_history_commit(&authority, &replica, &source).await;
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        assert!(!commit_history_is_deferred(&read, id).await.unwrap());
+        assert_eq!(
+            load_sync_commit(&read, id).await.unwrap(),
+            Some(source_body)
+        );
+        drop(read);
+        assert_eq!(
+            read_key_value(&replica, "omitted-source").await,
+            "preserved"
+        );
+        assert_eq!(read_key_value(&replica, "omitted-other").await, "retained");
+    }
+}
+
+#[tokio::test]
+async fn malformed_deferred_marker_is_not_a_missing_history_permission() {
+    let lix = open_lix().await.unwrap();
+    let adapter = lix.storage_adapter();
+    let id = CommitId::for_test_label("invalid-omission-marker");
+    let mut writes = adapter.new_write_set();
+    writes.put(
+        crate::tracked_state::TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE,
+        commit_key(id),
+        b"not-a-deferred-state".to_vec(),
+    );
+    adapter
+        .commit_write_set(writes, Default::default())
+        .await
+        .unwrap();
+    let read = adapter.begin_read(Default::default()).await.unwrap();
+    assert!(commit_history_is_deferred(&read, id).await.is_err());
+    assert!(deferred_commit_global_scope(&read, id).await.is_err());
+}
+
+#[tokio::test]
+async fn materialized_legacy_alias_is_shared_by_incorporation_and_cycle_proofs() {
+    let authority = open_lix().await.unwrap();
+    write_key_value(&authority, "materialized-proof", "preserved").await;
+    let source = upload_cache_head(&authority).await;
+    let checkpoint = authority.create_checkpoint().await.unwrap().commit_id;
+    let snapshot = authority.pull_sync_repository(None, 1).await.unwrap();
+    let replica = replica_from_snapshot(&authority, &snapshot).await;
+    let source = CommitId::parse_lix(&source, "materialized source").unwrap();
+    let checkpoint = CommitId::parse_lix(&checkpoint, "materialized checkpoint").unwrap();
+    let adapter = replica.storage_adapter();
+    crate::migration::mark_header_incorporation_unknown_for_test(&adapter).await;
+    let read = adapter.begin_read(Default::default()).await.unwrap();
+    let topology = load_published_commit_state_topology(&read, checkpoint)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(topology.complete_state_source_commit_id().is_none());
+    assert_eq!(
+        crate::sync::commit::load_complete_state_alias_source(&read, checkpoint, None)
+            .await
+            .unwrap(),
+        Some(source)
+    );
+    let authority_read = authority
+        .storage_adapter()
+        .begin_read(Default::default())
+        .await
+        .unwrap();
+    let source_record = crate::sync::partial_merge_analysis::record(&authority_read, source, false)
+        .await
+        .unwrap();
+    assert!(
+        crate::sync::partial_merge_analysis::incorporated(
+            &read,
+            &source_record,
+            checkpoint,
+            &mut BTreeMap::new(),
+            32,
+        )
+        .await
+        .unwrap()
+    );
+    let incoming = BTreeMap::from([(
+        source,
+        incorporation_cycle::Dependencies {
+            edges: vec![checkpoint],
+        },
+    )]);
+    assert!(
+        incorporation_cycle::Guard::new([source])
+            .run(&read, &incoming, 32)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn authority_rejects_complete_source_cycle_through_existing_deferred_checkpoint() {
+    let authority = open_lix().await.unwrap();
+    write_key_value(&authority, "cycle-native", "unchanged").await;
+    let checkpoint = authority.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
+    let mut body = export_sync_commit(&authority, &checkpoint)
+        .await
+        .unwrap()
+        .unwrap();
+    let source = authority
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("commit_id")
+        .unwrap();
+    assert_ne!(checkpoint, source);
+    body.complete_incorporation_source_commit_id = Some(source);
+    let id = CommitId::parse_lix(&checkpoint, "cycle checkpoint").unwrap();
+    let adapter = authority.storage_adapter();
+    let mut writes = adapter.new_write_set();
+    writes.delete(
+        crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+        id.as_uuid().as_bytes().to_vec(),
+    );
+    writes.delete(
+        crate::tracked_state::TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
+        id.as_uuid().as_bytes().to_vec(),
+    );
+    stage_commit_history_deferred_with_scope(&mut writes, id, body.global_scope);
+    adapter
+        .commit_certified_replica_write_set(
+            super::super::certified_replica_write_capability(),
+            writes,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let error = authority
+        .push_sync_repository(&SyncPushRequest {
+            commits: vec![body],
+            ref_updates: Vec::new(),
+            inline_blobs: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, LixError::CODE_INVALID_PARAM, "{error:?}");
+    assert!(error.message.contains("incorporation cycle"), "{error:?}");
+}
+
+#[tokio::test]
+async fn checkpoint_source_certificate_rejects_modified_lifetime_and_rootless_value_changes() {
+    let authority = open_lix().await.unwrap();
+    write_key_value(&authority, "lifetime-existing", "base").await;
+    let base = authority.create_checkpoint().await.unwrap().commit_id;
+    write_key_value(&authority, "lifetime-existing", "modified").await;
+    let source = upload_cache_head(&authority).await;
+    let adapter = authority.storage_adapter();
+    let read = adapter.begin_read(Default::default()).await.unwrap();
+    let context = TrackedStateContext::new();
+    let rows = context
+        .reader(&read)
+        .scan_batch_at_commit(&source, &TrackedStateScanRequest::default())
+        .await
+        .unwrap();
+    let forged = CommitId::for_test_label("forged-modified-native-lifetime");
+    let mut scratch = adapter.new_write_set();
+    let mut writer = context.writer(&read, &mut scratch);
+    writer
+        .stage_commit_root(
+            &forged.to_string(),
+            None,
+            rows.iter().map(|row| TrackedStateDeltaRef {
+                schema_key: row.schema_key(),
+                file_id: row.file_id(),
+                row_pk: row.row_pk(),
+                change_id: row.change_id(),
+                commit_id: forged,
+                deleted: row.deleted(),
+                created_at: row.updated_at(),
+                updated_at: row.updated_at(),
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !writer
+            .complete_state_matches_source(
+                forged,
+                CommitId::parse_lix(&source, "source").unwrap(),
+                Some(CommitId::parse_lix(&base, "base").unwrap())
+            )
+            .await
+            .unwrap()
+    );
+    drop(writer);
+    drop(read);
+    authority.create_checkpoint().await.unwrap();
+    write_key_value(&authority, "rootless-other-key", "different").await;
+    let other = upload_cache_head(&authority).await;
+    let read = adapter.begin_read(Default::default()).await.unwrap();
+    let mut scratch = adapter.new_write_set();
+    assert!(
+        !context
+            .writer(&read, &mut scratch)
+            .complete_state_matches_source(
+                CommitId::parse_lix(&source, "left").unwrap(),
+                CommitId::parse_lix(&other, "right").unwrap(),
+                None
+            )
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_source_certificate_preserves_recreated_row_lifetimes() {
+    for deleted_base in [false, true] {
+        for full in [false, true] {
+            let authority = open_lix().await.unwrap();
+            write_key_value(&authority, "recreated", "base").await;
+            if deleted_base {
+                authority
+                    .execute("DELETE FROM lix_key_value WHERE key='recreated'", &[])
+                    .await
+                    .unwrap();
+            }
+            authority.create_checkpoint().await.unwrap();
+            let snapshot = authority.pull_sync_repository(None, 1).await.unwrap();
+            let replica = replica_from_snapshot(&authority, &snapshot).await;
+            if !deleted_base {
+                replica
+                    .execute("DELETE FROM lix_key_value WHERE key='recreated'", &[])
+                    .await
+                    .unwrap();
+            }
+            write_key_value(&replica, "recreated", "new-lifetime").await;
+            write_key_value(&replica, "recreated", "modified-again").await;
+            write_key_value(&replica, "unselected-lifetime", "working").await;
+            write_key_value(&replica, "transient-before-checkpoint", "temporary").await;
+            replica
+                .execute(
+                    "DELETE FROM lix_key_value WHERE key='transient-before-checkpoint'",
+                    &[],
+                )
+                .await
+                .unwrap();
+            replica.execute(if full {
+                "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))"
+            } else {
+                "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key='recreated'))"
+            }, &[]).await.unwrap();
+            let target = upload_cache_head(&replica).await;
+            let mut cache = None;
+            for _ in 0..32 {
+                let Some(request) = replica
+                    .build_sync_push_with_plan(TEST_REMOTE, 1, &mut cache)
+                    .await
+                    .unwrap()
+                else {
+                    break;
+                };
+                frontier_apply_upload(&authority, &replica, &request).await;
+                cache.as_mut().unwrap().acknowledge().unwrap();
+                if cache.as_ref().unwrap().is_complete() {
+                    break;
+                }
+            }
+            assert_eq!(upload_cache_head(&authority).await, target);
+        }
+    }
+}
+
+#[tokio::test]
 async fn cached_upload_wave_publishes_captured_refs_despite_continuous_appends() {
     let authority = open_lix().await.expect("authority");
     let snapshot = authority
@@ -608,6 +1145,9 @@ async fn cached_upload_recreated_branch_invalidates_an_already_captured_deletion
         .await
         .unwrap();
         assert_eq!(upload_cache_head(lix).await, replacement_head);
-        assert_eq!(read_key_value(lix, "recreated-during-upload").await, "value-7");
+        assert_eq!(
+            read_key_value(lix, "recreated-during-upload").await,
+            "value-7"
+        );
     }
 }

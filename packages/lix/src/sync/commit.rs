@@ -137,7 +137,16 @@ pub struct SyncCommit {
     /// exact persistent tree the authority captured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_alias: Option<SyncCommitStateAlias>,
+    /// Complete compact-state provenance, independent of delta membership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complete_incorporation_source_commit_id: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub incorporation_unknown: bool,
     pub members: Vec<SyncCommitMember>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -221,6 +230,24 @@ pub(crate) async fn load_sync_commit_state_alias(
         return Ok(Some(alias));
     }
     load_manifest_sync_state_alias(store, commit_id).await
+}
+
+/// Snapshot materialization preserves the authenticated alias separately from
+/// its independently rooted native state. Absence is not a negative proof.
+pub(crate) async fn load_complete_state_alias_source(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    native_source: Option<CommitId>,
+) -> Result<Option<CommitId>, LixError> {
+    if native_source.is_some() {
+        return Ok(native_source);
+    }
+    load_materialized_sync_state_alias(store, commit_id)
+        .await?
+        .map(|alias| {
+            CommitId::parse_lix(&alias.source_commit_id, "materialized state alias source")
+        })
+        .transpose()
 }
 
 async fn load_manifest_sync_state_alias(
@@ -418,6 +445,23 @@ impl SyncCommit {
         if selected_source_commit_id == Some(commit_id) {
             return invalid("sync commit cannot select itself as its source");
         }
+        if let Some(source) = &self.complete_incorporation_source_commit_id {
+            let source = CommitId::parse_lix(source, "sync incorporation source")?;
+            if source == commit_id
+                || self.incorporation_unknown
+                || self.parent_commit_ids.len() != 1
+                || self.selected_source_commit_id.is_some()
+            {
+                return invalid("sync compact incorporation has invalid ownership or source");
+            }
+            if self
+                .state_alias
+                .as_ref()
+                .is_some_and(|alias| alias.source_commit_id != source)
+            {
+                return invalid("sync alias and incorporation sources disagree");
+            }
+        }
         if let Some(alias) = &self.state_alias {
             let source = CommitId::parse_lix(
                 &alias.source_commit_id,
@@ -559,6 +603,15 @@ where
         .next()
         .and_then(|(_, record)| record);
     let Some(record) = record else {
+        if crate::tracked_state::commit_history_is_omitted(store, commit_id).await? {
+            return Err(crate::tracked_state::NativeMetadataRef::CommitGraphRecord(
+                commit_id.to_string(),
+            )
+            .annotate_missing(LixError::new(
+                "LIX_SYNC_HISTORY_REQUIRED",
+                "snapshot semantic source graph must be hydrated before its history body",
+            )));
+        }
         return Ok(None);
     };
 
@@ -623,6 +676,21 @@ where
     let selected_source_commit_id = (has_selected_members && record.parent_commit_ids.len() > 1)
         .then(|| record.parent_commit_ids[1]);
 
+    let topology = crate::tracked_state::load_published_commit_state_topology(store, commit_id)
+        .await?
+        .ok_or_else(|| {
+            LixError::unknown(format!(
+                "sync commit '{commit_id}' has no tracked-state authority"
+            ))
+        })?;
+    let (complete_incorporation_source_commit_id, incorporation_unknown) =
+        match topology.incorporation() {
+            crate::tracked_state::CommitStateIncorporation::None => (None, false),
+            crate::tracked_state::CommitStateIncorporation::Complete(source) => {
+                (Some(source.to_string()), false)
+            }
+            crate::tracked_state::CommitStateIncorporation::LegacyUnknown => (None, true),
+        };
     let exported = SyncCommit {
         is_checkpoint: record.is_checkpoint,
         commit_id: record.commit_id.to_string(),
@@ -634,16 +702,11 @@ where
         base_commit_id: record.base_commit_id.map(|base| base.to_string()),
         account_id: record.account_id,
         created_at: record.created_at.to_string(),
-        global_scope: crate::tracked_state::load_published_commit_state_topology(store, commit_id)
-            .await?
-            .ok_or_else(|| {
-                LixError::unknown(format!(
-                    "sync commit '{commit_id}' has no tracked-state authority"
-                ))
-            })?
-            .global_scope(),
+        global_scope: topology.global_scope(),
         selected_source_commit_id: selected_source_commit_id.map(|source| source.to_string()),
         state_alias,
+        complete_incorporation_source_commit_id,
+        incorporation_unknown,
         members,
     };
     exported.validate()?;
@@ -1036,6 +1099,43 @@ mod tests {
     }
 
     #[test]
+    fn incorporation_wire_preserves_unknown_and_rejects_contradictory_proofs() {
+        let mut commit = SyncCommit {
+            is_checkpoint: true,
+            commit_id: CommitId::for_test_label("incorporation-target").to_string(),
+            parent_commit_ids: vec![CommitId::for_test_label("incorporation-parent").to_string()],
+            base_commit_id: Some(CommitId::for_test_label("incorporation-catalog").to_string()),
+            account_id: crate::ANONYMOUS_ACCOUNT_ID.to_owned(),
+            created_at: "2026-08-19T00:00:00Z".to_owned(),
+            global_scope: false,
+            selected_source_commit_id: None,
+            state_alias: None,
+            complete_incorporation_source_commit_id: None,
+            incorporation_unknown: true,
+            members: Vec::new(),
+        };
+        commit.validate().expect("legacy uncertainty is explicit");
+        let wire = serde_json::to_value(&commit).expect("serialize unknown proof");
+        assert_eq!(wire["incorporationUnknown"], true);
+        assert!(wire.get("completeIncorporationSourceCommitId").is_none());
+        let decoded: SyncCommit = serde_json::from_value(wire).expect("decode unknown proof");
+        assert_eq!(decoded, commit);
+        commit.complete_incorporation_source_commit_id =
+            Some(CommitId::for_test_label("incorporation-source").to_string());
+        commit
+            .validate()
+            .expect_err("complete and unknown are exclusive");
+        commit.incorporation_unknown = false;
+        commit
+            .validate()
+            .expect("complete source has valid wire shape");
+        commit.complete_incorporation_source_commit_id = Some(commit.commit_id.clone());
+        commit
+            .validate()
+            .expect_err("self incorporation is invalid");
+    }
+
+    #[test]
     fn validation_rejects_noncanonical_member_order_and_authorship() {
         let commit_id = CommitId::for_test_label("sync-validation");
         let member = |label: &str, ordinal: u32| {
@@ -1069,6 +1169,8 @@ mod tests {
             global_scope: false,
             selected_source_commit_id: None,
             state_alias: None,
+            complete_incorporation_source_commit_id: None,
+            incorporation_unknown: false,
             members: vec![member("b", 1), member("a", 2)],
         };
         assert!(
@@ -1137,6 +1239,8 @@ mod tests {
                 source_commit_id: source.to_string(),
                 state_root_id: blake3::hash(b"alias-root").to_hex().to_string(),
             }),
+            complete_incorporation_source_commit_id: None,
+            incorporation_unknown: false,
             members: Vec::new(),
         };
         commit.validate().expect("canonical state alias validates");

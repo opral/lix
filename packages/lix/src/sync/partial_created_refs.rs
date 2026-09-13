@@ -83,6 +83,31 @@ pub(super) async fn capture_created_refs(
     // Bodies are taken from the already dependency-closed native upload request.
     known.extend(commits.iter().map(|commit| commit.commit_id.clone()));
     let selected_id = &state.descriptor().selected_branch.branch_id;
+    let accepted_merge_head = if selected_id != crate::GLOBAL_BRANCH_ID {
+        let (merge, _, _) =
+            super::partial_merge_state::load_partial_merge_state(read, state, selected_id).await?;
+        if let Some(merge) = merge.filter(|merge| merge.authority_receipt.is_some()) {
+            let receipt = merge.authority_receipt.as_ref().expect("filtered receipt");
+            let record = super::partial_merge_analysis::record(
+                read,
+                crate::changelog::CommitId::parse_lix(&receipt.merge_commit_id, "accepted merge")?,
+                false,
+            )
+            .await?;
+            super::partial_merge_settlement::verify_authority_merge_record(
+                read,
+                &merge.request,
+                &record,
+                state.active_account_id(),
+            )
+            .await?;
+            Some(record.commit_id)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let selected_control = crate::branch::observe_branch_control_coordinate(read, selected_id)
         .await?
         .control
@@ -137,6 +162,20 @@ pub(super) async fn capture_created_refs(
             {
                 known.insert(source.clone());
                 continue;
+            }
+            if let Some(accepted) = accepted_merge_head {
+                if super::partial_merge_analysis::incorporated(
+                    read,
+                    &source_record,
+                    accepted,
+                    &mut Default::default(),
+                    1024,
+                )
+                .await?
+                {
+                    known.insert(source.clone());
+                    continue;
+                }
             }
             let will_be_uploaded = selected_can_progress
                 && (Some(source.as_str()) == selected_checkpoint.as_deref()

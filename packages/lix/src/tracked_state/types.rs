@@ -492,15 +492,24 @@ impl CommitStateMutationInventory {
     }
 }
 
-/// Immutable physical authority for one tracked commit.
-///
-/// Compact topology projections, point locators, current-state HOT rows, and
-/// snapshot tree chunks remain rebuildable serving indexes. None may carry
-/// semantic commit facts, which belong exclusively to `changelog.commit`.
+/// Native full-state publication provenance, independent of causal parents and
+/// selected commit membership. Legacy uncertainty must not certify exclusion.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, musli::Encode, musli::Decode)]
+pub(crate) enum CommitStateIncorporation {
+    #[default]
+    None,
+    Complete(CommitId),
+    LegacyUnknown,
+}
+
+/// Immutable physical authority for one tracked commit. Causal commit facts
+/// remain owned by `changelog.commit`; incorporation records a certified native
+/// state source without changing those parents or public commit membership.
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct CommitStateManifest {
     pub(crate) commit_id: CommitId,
+    pub(crate) incorporation: CommitStateIncorporation,
     /// Physical decode dictionary for authored mutation rows. This is not
     /// commit-account authority: it remains with retained immutable payloads
     /// even if GC removes the semantic commit projection.

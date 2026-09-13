@@ -166,7 +166,10 @@ async fn hydrate_metadata<S: Storage + Clone + Send + Sync + 'static, C: RawHttp
     hydrate_metadata_batch(storage, state, transport, vec![address]).await
 }
 
-async fn hydrate_metadata_batch<S: Storage + Clone + Send + Sync + 'static, C: RawHttpClient>(
+pub(super) async fn hydrate_metadata_batch<
+    S: Storage + Clone + Send + Sync + 'static,
+    C: RawHttpClient,
+>(
     storage: &StorageAdapter<S>,
     state: &PartialReplicaState,
     transport: &HttpSyncTransport<C>,
@@ -375,7 +378,14 @@ pub(super) fn hydrate_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: 
                 .await
                 .map(|_| ())
             }
-            SyncDemandRequest::NativeMetadataBatch(addresses, _) => {
+            SyncDemandRequest::NativeMetadataBatch(addresses, error) => {
+                if super::partial_merge_analysis::ancestry::hydrate(
+                    storage, state, transport, &error,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
                 let graph = addresses
                     .iter()
                     .any(|address| matches!(address, NativeMetadataRef::CommitGraphRecord(_)));
@@ -390,7 +400,14 @@ pub(super) fn hydrate_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: 
                 }
                 Ok(())
             }
-            SyncDemandRequest::NativeMetadata(address, _) => {
+            SyncDemandRequest::NativeMetadata(address, error) => {
+                if super::partial_merge_analysis::ancestry::hydrate(
+                    storage, state, transport, &error,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
                 let graph = matches!(address, NativeMetadataRef::CommitGraphRecord(_));
                 hydrate_metadata(storage, state, transport, address).await?;
                 if graph {
@@ -1100,6 +1117,12 @@ where
     // it is not an acknowledgement that an accepted publication has finished.
     // Waiting here unconditionally could deadlock a caller closing while it
     // still holds an explicit transaction's operation gate.
+    // A terminal transport failure also terminates this session's admission.
+    // Otherwise covered SQL keeps accepting edits after its only sync worker
+    // has stopped, and the actionable failure is visible only during close.
+    if let (Some(engine), Some(error)) = (&engine, &terminal_error) {
+        engine.sync_mode().fail_partial_admission(error.clone());
+    }
     demand_rx.close();
     let stopped = terminal_error.clone().unwrap_or_else(stopped_error);
     if let Some(demand) = queued_demand {
@@ -1126,6 +1149,7 @@ fn is_terminal_partial_transport_error(error: &LixError) -> bool {
         super::SYNC_PROTOCOL_MISMATCH_CODE
             | super::SYNC_REPOSITORY_ID_MISMATCH_CODE
             | super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE
+            | "LIX_PARTIAL_MERGE_PROOF_UNAVAILABLE"
     )
 }
 
@@ -1303,6 +1327,137 @@ mod tests {
                     .unwrap()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn ancestry_demand_hydrates_complete_proof_before_retrying_analysis() {
+        use crate::changelog::{CommitId, CommitRecord};
+        use std::collections::BTreeMap;
+
+        #[derive(Clone)]
+        struct GraphClient {
+            handshake: Client,
+            records: Arc<BTreeMap<CommitId, CommitRecord>>,
+        }
+        impl RawHttpClient for GraphClient {
+            fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
+                Box::pin(async move {
+                    if !request.url.ends_with("/sync/native-metadata") {
+                        return self.handshake.send(request).await;
+                    }
+                    self.handshake.fetches.fetch_add(1, Ordering::SeqCst);
+                    let request: NativeMetadataRequest =
+                        serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+                    let objects = request
+                        .objects
+                        .into_iter()
+                        .map(|address| {
+                            let id = CommitId::parse_lix(address.id(), "test metadata").unwrap();
+                            super::super::native_metadata::NativeMetadata {
+                                address,
+                                bytes: crate::changelog::encode_commit_record(&self.records[&id])
+                                    .unwrap(),
+                            }
+                        })
+                        .collect();
+                    let response = NativeMetadataResponse {
+                        lix_id: self.handshake.state.repository_id().to_owned(),
+                        epoch_id: request.epoch_id,
+                        objects,
+                    };
+                    Ok(RawHttpResponse {
+                        status: 200,
+                        status_text: "OK".into(),
+                        body: serde_json::to_vec(&response).unwrap(),
+                    })
+                })
+            }
+        }
+
+        let (storage, state, transport, client, address) = fixture_metadata(false, true).await;
+        hydrate_metadata_batch(
+            &storage,
+            &state,
+            &transport,
+            client
+                .metadata
+                .objects
+                .iter()
+                .map(|object| object.address.clone())
+                .collect(),
+        )
+        .await
+        .unwrap();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let base = super::super::partial_merge_analysis::record(
+            &read,
+            CommitId::parse_lix(address.id(), "test base").unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        drop(read);
+        let mut records = BTreeMap::from([(base.commit_id, base.clone())]);
+        let mut head = base.commit_id;
+        for index in 0..8 {
+            let mut local = base.clone();
+            local.commit_id = CommitId::for_test_label(&format!("hydrate-local-{index}"));
+            local.generation = records[&head].generation + 1;
+            local.parent_commit_ids = vec![head];
+            local.first_parent_jump_commit_id = head;
+            local.first_parent_jump_span = 1;
+            let mut merged = local.clone();
+            merged.commit_id = CommitId::for_test_label(&format!("hydrate-merge-{index}"));
+            merged.generation += 1;
+            merged.parent_commit_ids = vec![head, local.commit_id];
+            merged.first_parent_jump_commit_id = merged.commit_id;
+            merged.first_parent_jump_span = 0;
+            head = merged.commit_id;
+            records.insert(local.commit_id, local);
+            records.insert(merged.commit_id, merged);
+        }
+        let transport = HttpSyncTransport::connect_with(
+            GraphClient {
+                handshake: client.clone(),
+                records: Arc::new(records),
+            },
+            state.remote_id(),
+        )
+        .await
+        .unwrap();
+        transport
+            .bind_native_baseline_lease(state.baseline_lease())
+            .unwrap();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let error = super::super::partial_merge_analysis::bounded_ancestor(
+            &read,
+            &base,
+            head,
+            &mut BTreeMap::new(),
+            4,
+        )
+        .await
+        .unwrap_err();
+        drop(read);
+        let demand = super::super::runtime::native_sync_demand_request_for_error(&error)
+            .unwrap()
+            .unwrap();
+        hydrate_demand(&storage, &state, &transport, demand)
+            .await
+            .unwrap();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        assert!(
+            super::super::partial_merge_analysis::bounded_ancestor(
+                &read,
+                &base,
+                head,
+                &mut BTreeMap::new(),
+                4,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(client.fetches.load(Ordering::SeqCst), 17);
     }
 
     #[tokio::test]

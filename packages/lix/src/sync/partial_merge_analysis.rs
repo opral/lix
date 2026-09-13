@@ -16,6 +16,7 @@ pub(crate) struct PartialMergeBudget {
     pub max_local_commits: usize,
     pub max_local_members: usize,
     pub max_local_payload_bytes: usize,
+    /// Graph edges processed per cooperative work slice, not a history-age cap.
     pub max_remote_graph_records: usize,
 }
 pub(super) struct PartialMergeAnalysis {
@@ -59,9 +60,10 @@ pub(super) async fn record(
         }
     })
 }
-/// Bounded causal DAG proof. Native jumps skip linear history segments; their
-/// index resets at merge nodes, where every parent is considered. A budget or
-/// missing input is an error, never evidence that the ancestor is absent.
+pub(super) mod ancestry;
+pub(super) use ancestry::incorporated;
+
+/// Causal DAG proof with bounded work slices and resumable cold hydration.
 pub(super) async fn bounded_ancestor(
     read: &(impl StorageAdapterRead + ?Sized),
     ancestor: &CommitRecord,
@@ -69,66 +71,28 @@ pub(super) async fn bounded_ancestor(
     cache: &mut BTreeMap<CommitId, CommitRecord>,
     limit: usize,
 ) -> Result<bool, LixError> {
-    let mut pending = vec![(descendant, None, None)];
-    let mut visited = BTreeSet::new();
-    while let Some((current, child_generation, jump_generation)) = pending.pop() {
-        let node = if current == ancestor.commit_id {
-            ancestor.clone()
-        } else if let Some(node) = cache.get(&current) {
-            node.clone()
-        } else {
-            if cache.len() >= limit {
-                return Err(limited("remote causal ancestry budget exceeded"));
-            }
-            let node = record(read, current, false).await?;
-            cache.insert(current, node.clone());
-            node
-        };
-        if child_generation.is_some_and(|generation| node.generation >= generation) {
-            return Err(blocked(
-                "causal parent generation does not precede its child",
-            ));
-        }
-        if jump_generation.is_some_and(|generation| node.generation != generation) {
-            return Err(blocked(
-                "causal jump target generation does not match its span",
-            ));
-        }
-        if current == ancestor.commit_id {
-            return Ok(true);
-        }
-        if !visited.insert(current) || node.generation <= ancestor.generation {
-            continue;
-        }
-        if node.parent_commit_ids.len() == 1 && node.first_parent_jump_span > 1 {
-            let generation = node
-                .generation
-                .checked_sub(node.first_parent_jump_span)
-                .ok_or_else(|| blocked("causal jump span exceeds its generation"))?;
-            if node.first_parent_jump_commit_id == current {
-                return Err(blocked("causal jump contains a cycle"));
-            }
-            // Native jump construction never crosses a merge node. The
-            // skipped interval therefore has no secondary ancestry to visit.
-            if generation >= ancestor.generation {
-                pending.push((
-                    node.first_parent_jump_commit_id,
-                    Some(node.generation),
-                    Some(generation),
-                ));
-                continue;
-            }
-        }
-        if node.parent_commit_ids.len() > limit
-            || pending.len().saturating_add(node.parent_commit_ids.len()) > limit
-        {
-            return Err(limited("remote causal frontier budget exceeded"));
-        }
-        for parent in node.parent_commit_ids {
-            pending.push((parent, Some(node.generation), None));
-        }
+    ancestry::Walk::new(ancestor.clone(), descendant)
+        .run(read, cache, limit)
+        .await
+}
+
+/// A submitted selected history retains its immutable catalog dependency even
+/// when the authority advances GLOBAL. Native application validates its rows
+/// against the current catalog; this proof only establishes causal retention.
+pub(super) async fn catalog_contains(
+    read: &(impl StorageAdapterRead + ?Sized),
+    captured: CommitId,
+    current: CommitId,
+    limit: usize,
+) -> Result<bool, LixError> {
+    if captured == current {
+        return Ok(true);
     }
-    Ok(false)
+    let captured = record(read, captured, false).await?;
+    if captured.base_commit_id.is_some() {
+        return Err(blocked("captured catalog is not a GLOBAL commit"));
+    }
+    incorporated(read, &captured, current, &mut BTreeMap::new(), limit).await
 }
 
 pub(super) async fn prepare_partial_merge_analysis(
@@ -321,7 +285,7 @@ pub(super) async fn analyze_native_divergence(
     }
     let local_record = record(read, local, true).await?;
     let mut graph = BTreeMap::new();
-    if !bounded_ancestor(
+    if !incorporated(
         read,
         &base_record,
         remote,
@@ -334,10 +298,11 @@ pub(super) async fn analyze_native_divergence(
             "authority no longer descends from the confirmed merge base",
         ));
     }
-    let included = bounded_ancestor(
+    let included = ancestry::incorporated_since(
         read,
         &local_record,
         remote,
+        &base_record,
         &mut graph,
         budget.max_remote_graph_records,
     )
@@ -435,6 +400,13 @@ mod tests {
     async fn divergent_fixture(
         same_identity: bool,
     ) -> (Lix<Memory>, PartialReplicaState, PartialReplicaState) {
+        divergent_fixture_with_checkpoint(same_identity, false).await
+    }
+
+    async fn divergent_fixture_with_checkpoint(
+        same_identity: bool,
+        checkpoint: bool,
+    ) -> (Lix<Memory>, PartialReplicaState, PartialReplicaState) {
         let memory = Memory::new();
         let authority = open_lix().with_storage(memory.clone()).await.unwrap();
         authority
@@ -488,6 +460,9 @@ mod tests {
             )
             .await
             .unwrap();
+        if checkpoint {
+            local.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
+        }
         let storage = local.storage_adapter();
         let mut writes = storage.new_write_set();
         let mut preconditions =
@@ -509,6 +484,52 @@ mod tests {
             .await
             .unwrap();
         (local, old, candidate)
+    }
+
+    #[tokio::test]
+    async fn legacy_unknown_sql_checkpoint_does_not_certify_nonincorporation() {
+        let (local, _, candidate) = divergent_fixture_with_checkpoint(false, true).await;
+        let checkpoint = local
+            .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("commit_id")
+            .unwrap();
+        let storage = local.storage_adapter();
+        crate::migration::mark_header_incorporation_unknown_for_test(&storage).await;
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let remote = record(
+            &read,
+            id(&candidate.descriptor().selected_branch.head.commit_id).unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        let error = incorporated(
+            &read,
+            &remote,
+            id(&checkpoint).unwrap(),
+            &mut BTreeMap::new(),
+            32,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "LIX_PARTIAL_MERGE_PROOF_UNAVAILABLE");
+    }
+
+    #[tokio::test]
+    async fn legacy_unknown_ordinary_history_still_proves_divergence() {
+        let (local, old, candidate) = divergent_fixture(false).await;
+        let storage = local.storage_adapter();
+        crate::migration::mark_header_incorporation_unknown_for_test(&storage).await;
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let result = prepare_partial_merge_analysis(&read, &old, &candidate, budget())
+            .await
+            .unwrap();
+        assert!(!result.already_in_authority);
+        assert_eq!(result.local_commits.len(), 1);
+        assert_eq!(result.groups[0].picks.len(), 1);
     }
 
     #[tokio::test]

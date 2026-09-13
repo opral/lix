@@ -73,15 +73,79 @@ impl RawHttpClient for CountPublicationRequests {
 }
 #[tokio::test]
 async fn http_dispatcher_recovers_lost_wave_and_preserves_newer_local_edit() {
-    lost_wave_with_pending_edit(false).await;
+    lost_wave_with_pending_edit(false, PendingScenario::Ordinary, 1).await;
 }
 
 #[tokio::test]
 async fn http_dispatcher_accepts_current_authority_and_preserves_newer_local_edit() {
-    lost_wave_with_pending_edit(true).await;
+    lost_wave_with_pending_edit(true, PendingScenario::Ordinary, 1).await;
 }
 
-async fn lost_wave_with_pending_edit(advance_after_descriptor: bool) {
+#[tokio::test]
+async fn http_dispatcher_accepts_global_drift_and_preserves_newer_local_edit() {
+    lost_wave_with_pending_edit(true, PendingScenario::GlobalBeforeReceipt, 1).await;
+}
+
+#[tokio::test]
+async fn http_dispatcher_settles_after_global_drift_with_newer_local_edit() {
+    lost_wave_with_pending_edit(true, PendingScenario::GlobalAfterReceipt, 1).await;
+}
+
+#[tokio::test]
+async fn local_branch_creation_between_pending_selected_edits_converges() {
+    lost_wave_with_pending_edit(true, PendingScenario::LocalBranch, 1).await;
+}
+
+#[tokio::test]
+async fn http_dispatcher_accepts_account_admission_during_pending_merge() {
+    lost_wave_with_pending_edit(true, PendingScenario::AccountAdmission, 1).await;
+}
+
+#[tokio::test]
+async fn http_dispatcher_pages_long_offline_history_against_divergent_authority() {
+    lost_wave_with_pending_edit(true, PendingScenario::Ordinary, 1025).await;
+}
+
+#[tokio::test]
+async fn http_dispatcher_pages_long_checkpoint_source_against_divergent_authority() {
+    lost_wave_with_pending_edit(true, PendingScenario::Checkpoint, 1025).await;
+}
+
+#[tokio::test]
+async fn http_dispatcher_pages_multiple_pending_checkpoints_against_divergent_authority() {
+    lost_wave_with_pending_edit(true, PendingScenario::Checkpoints, 1025).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingScenario {
+    Ordinary,
+    GlobalBeforeReceipt,
+    GlobalAfterReceipt,
+    AccountAdmission,
+    Checkpoint,
+    Checkpoints,
+    LocalBranch,
+}
+
+async fn advance_unrelated_global(authority: &Lix<Memory>) {
+    authority
+        .open_another_session()
+        .with_branch(crate::GLOBAL_BRANCH_ID)
+        .await
+        .unwrap()
+        .execute(
+            "INSERT INTO lix_key_value(key,value) VALUES('global-race','changed')",
+            &[],
+        )
+        .await
+        .unwrap();
+}
+
+async fn lost_wave_with_pending_edit(
+    advance_after_descriptor: bool,
+    scenario: PendingScenario,
+    offline_commits: usize,
+) {
     let backing = Memory::new();
     let authority = open_lix().with_storage(backing.clone()).await.unwrap();
     authority
@@ -117,6 +181,9 @@ async fn lost_wave_with_pending_edit(advance_after_descriptor: bool) {
         )
         .unwrap(),
     );
+    transport
+        .bind_native_baseline_lease(old.baseline_lease())
+        .unwrap();
     let storage = StorageAdapter::new(Memory::new());
     let read = storage.begin_read(Default::default()).await.unwrap();
     let mut writes = storage.new_write_set();
@@ -152,6 +219,46 @@ async fn lost_wave_with_pending_edit(advance_after_descriptor: bool) {
             .await
             .unwrap();
     }
+    for index in 1..offline_commits {
+        session
+            .execute(
+                &format!("UPDATE lix_key_value SET value='offline-{index}' WHERE key='local'"),
+                &[],
+            )
+            .await
+            .unwrap();
+        if scenario == PendingScenario::Checkpoints && index == offline_commits / 2 {
+            execute_hydrating(
+                &session, &storage, &old, &authority,
+                "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))",
+                &[], &mut fetches,
+            ).await.unwrap();
+        }
+    }
+    let pending_checkpoint = if matches!(
+        scenario,
+        PendingScenario::Checkpoint | PendingScenario::Checkpoints
+    ) {
+        execute_hydrating(
+            &session, &storage, &old, &authority,
+            "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))",
+            &[], &mut fetches,
+        ).await.unwrap();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        Some(
+            crate::branch::BranchHeadControlContext::new()
+                .reader(&read)
+                .load(&old.descriptor().selected_branch.branch_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .working_diff_checkpoint_commit_id
+                .unwrap()
+                .to_string(),
+        )
+    } else {
+        None
+    };
     prepare_baseline_jump_spines(&storage, &old, &authority, &mut fetches)
         .await
         .unwrap();
@@ -209,6 +316,14 @@ async fn lost_wave_with_pending_edit(advance_after_descriptor: bool) {
         captured_remote
     );
     drop(read);
+    if scenario == PendingScenario::GlobalBeforeReceipt {
+        advance_unrelated_global(&authority).await;
+    } else if scenario == PendingScenario::AccountAdmission {
+        authority
+            .ensure_account(&uuid::Uuid::now_v7().to_string(), "new principal", "human")
+            .await
+            .unwrap();
+    }
     let remote_checkpoint = if advance_after_descriptor {
         authority
             .execute(
@@ -235,6 +350,23 @@ async fn lost_wave_with_pending_edit(advance_after_descriptor: bool) {
         .execute("UPDATE lix_key_value SET value='L2' WHERE key='local'", &[])
         .await
         .unwrap();
+    let created_branch = if scenario == PendingScenario::LocalBranch {
+        let branch = global_during_merge::create_branch(&session, &storage, &old, &transport).await;
+        execute_hydrating(
+            &session,
+            &storage,
+            &old,
+            &authority,
+            "UPDATE lix_key_value SET value='L3' WHERE key='local'",
+            &[],
+            &mut Fetches::default(),
+        )
+        .await
+        .unwrap();
+        Some(branch)
+    } else {
+        None
+    };
     // Recover the captured L result first; exact local CAS prevents adopting over L2.
     let second = prepare_descriptor_with_merge(
         engine.clone(),
@@ -244,22 +376,47 @@ async fn lost_wave_with_pending_edit(advance_after_descriptor: bool) {
         crate::sync::partial_publication::PartialRecoveryPolicy::Normal,
     )
     .await;
+    let second_error = second.err().expect("newer local work remains pending");
     assert_eq!(
-        second.err().unwrap().code,
-        "LIX_PARTIAL_REPLICA_MERGE_PENDING"
+        second_error.code, "LIX_PARTIAL_REPLICA_MERGE_PENDING",
+        "{second_error:?}"
     );
-    let third = prepare_descriptor_with_merge(
-        engine.clone(),
-        old.clone(),
-        &transport,
-        transport.partial_replica_descriptor(None).await.unwrap(),
-        crate::sync::partial_publication::PartialRecoveryPolicy::Normal,
-    )
-    .await
-    .unwrap();
-    let crate::sync::partial_reconcile::PreparedDescriptor::Ready(prepared) = third else {
-        panic!("merged descriptor must be prepared")
+    if scenario == PendingScenario::GlobalAfterReceipt {
+        advance_unrelated_global(&authority).await;
+    }
+    let mut rounds = 0;
+    let prepared = loop {
+        rounds += 1;
+        assert!(
+            rounds <= 8,
+            "bounded prefixes must converge after writers stop"
+        );
+        if created_branch.is_some() {
+            global_during_merge::upload_if_ready(&storage, &old, &transport).await;
+        }
+        let result = prepare_descriptor_with_merge(
+            engine.clone(),
+            old.clone(),
+            &transport,
+            transport.partial_replica_descriptor(None).await.unwrap(),
+            crate::sync::partial_publication::PartialRecoveryPolicy::Normal,
+        )
+        .await;
+        match result {
+            Ok(crate::sync::partial_reconcile::PreparedDescriptor::Ready(prepared)) => {
+                break prepared;
+            }
+            Err(error) if error.code == "LIX_PARTIAL_REPLICA_MERGE_PENDING" => {}
+            Err(error)
+                if created_branch.is_some()
+                    && error.code == "LIX_PARTIAL_REPLICA_REBASE_REQUIRED" => {}
+            Err(error) => panic!("prefix reconciliation failed: {error}"),
+            Ok(_) => panic!("merged descriptor must be prepared"),
+        }
     };
+    if offline_commits > 1024 {
+        assert!(rounds >= 4, "large local history must use bounded prefixes");
+    }
     crate::sync::partial_publication::publish_prepared_partial(engine.clone(), prepared)
         .await
         .unwrap();
@@ -271,9 +428,30 @@ async fn lost_wave_with_pending_edit(advance_after_descriptor: bool) {
         .execute("SELECT value FROM lix_key_value WHERE key='remote'", &[])
         .await
         .unwrap();
-    assert!(format!("{local:?}").contains("L2"));
+    assert!(format!("{local:?}").contains(if created_branch.is_some() { "L3" } else { "L2" }));
+    if let Some(branch) = created_branch {
+        assert!(
+            authority
+                .partial_replica_descriptor(Some(&branch))
+                .await
+                .is_ok(),
+            "GLOBAL upload must publish the branch whose source was pending L2"
+        );
+        assert_eq!(
+            session
+                .execute("SELECT value FROM lix_key_value WHERE key='local'", &[])
+                .await
+                .unwrap()
+                .rows(),
+            authority
+                .execute("SELECT value FROM lix_key_value WHERE key='local'", &[])
+                .await
+                .unwrap()
+                .rows(),
+        );
+    }
     assert!(format!("{remote:?}").contains(if advance_after_descriptor { "R3" } else { "R" }));
-    if let Some(checkpoint) = remote_checkpoint {
+    if let Some(checkpoint) = pending_checkpoint.or(remote_checkpoint) {
         assert_eq!(
             authority
                 .partial_replica_descriptor(None)
@@ -283,7 +461,7 @@ async fn lost_wave_with_pending_edit(advance_after_descriptor: bool) {
                 .checkpoint
                 .commit_id,
             checkpoint,
-            "unchanged local checkpoint must retain the current authority checkpoint"
+            "only a newly captured checkpoint intent changes the authority checkpoint"
         );
     }
 }
@@ -687,6 +865,7 @@ mod retained_files;
 
 mod conflict_file;
 
+mod global_during_merge;
 mod included_upload;
 
 mod working_set;

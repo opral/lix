@@ -91,9 +91,6 @@ impl PartialBranchMergeState {
                 || self.request.branch_id != prior.request.branch_id
                 || self.request.checkpoint_commit_id
                     != prior.request.captured_local_checkpoint_commit_id
-                || self.request.global_head_commit_id != prior.request.global_head_commit_id
-                || self.request.global_checkpoint_commit_id
-                    != prior.request.global_checkpoint_commit_id
                 || self.request.attempt_id == prior.request.attempt_id
             {
                 return Err(invalid(
@@ -246,6 +243,46 @@ pub(super) async fn load_partial_merge_state(
         ],
     ))
 }
+/// A bounded captured prefix may precede current local edits. Publication still
+/// guards the exact observed control, and settlement only adopts at exact L.
+pub(super) async fn require_captured_local_frontier(
+    read: &(impl StorageAdapterRead + ?Sized),
+    captured_head: &str,
+    captured_checkpoint: &str,
+    actual_head: crate::changelog::CommitId,
+    actual_checkpoint: Option<crate::changelog::CommitId>,
+) -> Result<(), LixError> {
+    let id = |text: &str| crate::changelog::CommitId::parse_lix(text, "captured merge frontier");
+    if actual_head == id(captured_head)? && actual_checkpoint == Some(id(captured_checkpoint)?) {
+        return Ok(());
+    }
+    let captured = super::partial_merge_analysis::record(read, id(captured_head)?, true).await?;
+    let checkpoint =
+        super::partial_merge_analysis::record(read, id(captured_checkpoint)?, false).await?;
+    if !super::partial_merge_analysis::incorporated(
+        read,
+        &captured,
+        actual_head,
+        &mut Default::default(),
+        1024,
+    )
+    .await?
+        || !super::partial_merge_analysis::bounded_ancestor(
+            read,
+            &checkpoint,
+            captured.commit_id,
+            &mut Default::default(),
+            1024,
+        )
+        .await?
+    {
+        return Err(conflict(
+            "captured merge prefix is outside the current local history",
+        ));
+    }
+    Ok(())
+}
+
 /// Capture before sending any merge request. Native analysis separately proves
 /// B→L ancestry and uploadable bodies; these guards freeze its local coordinates.
 #[must_use = "persist capture durably with all guards before network I/O"]
@@ -274,7 +311,6 @@ pub(super) async fn stage_capture_partial_merge(
         || push.confirmed.checkpoint != request.checkpoint_commit_id
         || global.confirmed.head != request.global_head_commit_id
         || global.confirmed.checkpoint != request.global_checkpoint_commit_id
-        || global.prepared.is_some()
     {
         return Err(conflict("merge capture changed confirmed coordinates"));
     }
@@ -301,12 +337,22 @@ pub(super) async fn stage_capture_partial_merge(
                 &request.global_checkpoint_commit_id,
             )
         };
-        if control.head_commit_id != head.as_str()
-            || control
-                .working_diff_checkpoint_commit_id
-                .map(|id| id.to_string())
-                .as_ref()
-                != Some(checkpoint)
+        if index == 0 {
+            require_captured_local_frontier(
+                read,
+                head,
+                checkpoint,
+                control.head_commit_id,
+                control.working_diff_checkpoint_commit_id,
+            )
+            .await?;
+        } else if !super::partial_merge_analysis::catalog_contains(
+            read,
+            crate::changelog::CommitId::parse_lix(head, "captured catalog")?,
+            control.head_commit_id,
+            1024,
+        )
+        .await?
         {
             return Err(conflict("merge capture raced local publication"));
         }
@@ -381,12 +427,16 @@ pub(super) async fn stage_record_partial_merge_receipt(
     Ok(guards)
 }
 
-/// Both ordinary lanes must remain fenced while the selected branch has a
-/// durable merge attempt. The absence guard also rejects a capture racing ACK.
+/// The selected upload lane remains fenced by its durable merge owner. GLOBAL
+/// has a separate upload owner and may publish catalog descendants meanwhile.
 pub(super) async fn ordinary_upload_merge_guards(
     read: &(impl StorageAdapterRead + ?Sized),
     state: &PartialReplicaState,
+    branch_id: &str,
 ) -> Result<Vec<StoragePrecondition>, LixError> {
+    if branch_id == crate::GLOBAL_BRANCH_ID {
+        return Ok(Vec::new());
+    }
     let (record, _, guards) =
         load_partial_merge_state(read, state, &state.descriptor().selected_branch.branch_id)
             .await?;
@@ -404,6 +454,7 @@ async fn require_local_dependency_closure(
     state: &PartialReplicaState,
     ancestor: &str,
     descendant: &str,
+    checkpoint: &str,
     global: &str,
 ) -> Result<(), LixError> {
     use crate::changelog::CommitId;
@@ -416,6 +467,7 @@ async fn require_local_dependency_closure(
     let known = [
         ancestor,
         global,
+        CommitId::parse_lix(checkpoint, "merge confirmed checkpoint")?,
         CommitId::parse_lix(
             &state.descriptor().selected_branch.head.commit_id,
             "merge selected base",
@@ -555,14 +607,22 @@ pub(super) async fn stage_rollover_partial_merge(
     if request.attempt_id == record.request.attempt_id
         || request.base_commit_id != record.request.captured_local_head_commit_id
         || request.checkpoint_commit_id != record.request.captured_local_checkpoint_commit_id
-        || request.global_head_commit_id != record.request.global_head_commit_id
-        || request.global_checkpoint_commit_id != record.request.global_checkpoint_commit_id
     {
         return Err(conflict(
             "rollover changed the previous captured native frontier",
         ));
     }
     let id = |text: &str| crate::changelog::CommitId::parse_lix(text, "merge rollover coordinate");
+    if !super::partial_merge_analysis::catalog_contains(
+        read,
+        id(&record.request.global_head_commit_id)?,
+        id(&request.global_head_commit_id)?,
+        1024,
+    )
+    .await?
+    {
+        return Err(conflict("rollover lost its previous catalog dependency"));
+    }
     let merge =
         super::partial_merge_analysis::record(read, id(&prior.merge_commit_id)?, false).await?;
     super::partial_merge_settlement::verify_authority_merge_record(
@@ -572,7 +632,7 @@ pub(super) async fn stage_rollover_partial_merge(
         state.active_account_id(),
     )
     .await?;
-    if !super::partial_merge_analysis::bounded_ancestor(
+    if !super::partial_merge_analysis::incorporated(
         read,
         &merge,
         id(&request.expected_authority_head_commit_id)?,
@@ -590,6 +650,7 @@ pub(super) async fn stage_rollover_partial_merge(
         state,
         &request.base_commit_id,
         &request.captured_local_head_commit_id,
+        &request.checkpoint_commit_id,
         &request.global_head_commit_id,
     )
     .await?;
@@ -614,8 +675,22 @@ pub(super) async fn stage_rollover_partial_merge(
         let control = observed
             .control
             .ok_or_else(|| conflict("rollover branch absent"))?;
-        if control.head_commit_id != id(head)?
-            || control.working_diff_checkpoint_commit_id != Some(id(checkpoint)?)
+        if branch == &request.branch_id {
+            require_captured_local_frontier(
+                read,
+                head,
+                checkpoint,
+                control.head_commit_id,
+                control.working_diff_checkpoint_commit_id,
+            )
+            .await?;
+        } else if !super::partial_merge_analysis::catalog_contains(
+            read,
+            id(head)?,
+            control.head_commit_id,
+            1024,
+        )
+        .await?
         {
             return Err(conflict("rollover raced local branch publication"));
         }
@@ -629,7 +704,6 @@ pub(super) async fn stage_rollover_partial_merge(
         load_partial_push_state(read, state, crate::GLOBAL_BRANCH_ID).await?;
     if push.confirmed != record.original_confirmed
         || push.prepared != record.original_upload
-        || global.prepared.is_some()
         || global.confirmed.head != request.global_head_commit_id
         || global.confirmed.checkpoint != request.global_checkpoint_commit_id
     {

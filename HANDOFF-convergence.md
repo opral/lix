@@ -1,5 +1,10 @@
 # Partial replica convergence — engineer handoff (2026-09-13)
 
+Historical handoff for the starting revision `f6136a19c`. The continuing QA work
+is recorded in [docs/partial-replica-qa-1772.md](docs/partial-replica-qa-1772.md).
+The status, workspace directions, and validation statements below describe that
+earlier revision, not the current working tree.
+
 ## Objective and status
 
 Finish server-authoritative convergence for Lixray's **partial replica with on-demand sync**. Use server acceptance order and existing native row/plugin merge semantics; no user-facing conflicts or new public preparation API. Preserve bounded opening and fast local warm reads/writes. User allows breaking changes, with old repositories remaining readable/migratable.
