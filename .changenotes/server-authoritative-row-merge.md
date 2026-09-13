@@ -15,5 +15,7 @@ migration preserves pending edits and existing acknowledgment identities without
 resetting browser storage. Opening and resident SQL keep their on-demand and
 local execution behavior.
 
-Concurrent writes also recover when the server advances before a replica begins
-uploading its pending changes, preserving newer local edits and exact retries.
+Pending edits are accepted against the server's current branch state even when
+other writers advance it during upload. Exact retries keep their original outcome,
+already included rows are not applied again, and newer local edits remain pending
+for their own acceptance.

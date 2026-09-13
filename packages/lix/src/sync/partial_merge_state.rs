@@ -565,19 +565,13 @@ pub(super) async fn stage_rollover_partial_merge(
     let id = |text: &str| crate::changelog::CommitId::parse_lix(text, "merge rollover coordinate");
     let merge =
         super::partial_merge_analysis::record(read, id(&prior.merge_commit_id)?, false).await?;
-    if merge.is_checkpoint
-        || merge.parent_commit_ids
-            != vec![
-                id(&prior.request.expected_authority_head_commit_id)?,
-                id(&prior.request.captured_local_head_commit_id)?,
-            ]
-        || merge.base_commit_id != Some(id(&request.global_head_commit_id)?)
-        || merge.account_id != state.active_account_id()
-    {
-        return Err(invalid(
-            "rollover receipt disagrees with its native merge record",
-        ));
-    }
+    super::partial_merge_settlement::verify_authority_merge_record(
+        read,
+        &prior.request,
+        &merge,
+        state.active_account_id(),
+    )
+    .await?;
     if !super::partial_merge_analysis::bounded_ancestor(
         read,
         &merge,

@@ -4,7 +4,7 @@ use super::partial_merge_state::{PartialBranchMergeState, load_partial_merge_sta
 use super::partial_push_state::PartialPushCoordinate;
 use super::partial_state::PartialReplicaState;
 use crate::LixError;
-use crate::changelog::CommitId;
+use crate::changelog::{CommitId, CommitRecord};
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition};
 
 pub(super) struct VerifiedPartialMergeSettlement {
@@ -75,20 +75,7 @@ pub(super) async fn verify_partial_merge_settlement(
     }
     let merge =
         super::partial_merge_analysis::record(read, id(&receipt.merge_commit_id)?, false).await?;
-    if merge.is_checkpoint
-        || merge.parent_commit_ids
-            != vec![
-                id(&request.expected_authority_head_commit_id)?,
-                id(&request.captured_local_head_commit_id)?,
-            ]
-        || merge.base_commit_id != Some(id(&request.global_head_commit_id)?)
-        || merge.account_id != previous.active_account_id()
-    {
-        return Err(LixError::new(
-            "LIX_PARTIAL_MERGE_STATE_INVALID",
-            "authority merge native record does not contain the captured parents and catalog",
-        ));
-    }
+    verify_authority_merge_record(read, request, &merge, previous.active_account_id()).await?;
     if !super::partial_merge_analysis::bounded_ancestor(
         read,
         &merge,
@@ -114,4 +101,53 @@ pub(super) async fn verify_partial_merge_settlement(
         },
         guards,
     })
+}
+
+/// The immutable receipt names M. Its native first parent records the actual
+/// authority frontier at acceptance; the request's remote coordinate is capture
+/// evidence, not a network-spanning compare-and-swap promise.
+pub(super) async fn verify_authority_merge_record(
+    read: &(impl StorageAdapterRead + ?Sized),
+    request: &super::PartialMergeRequest,
+    merge: &CommitRecord,
+    account: &str,
+) -> Result<(), LixError> {
+    let local = id(&request.captured_local_head_commit_id)?;
+    let parents = &merge.parent_commit_ids;
+    let canonical_parents = match parents.as_slice() {
+        [only] => *only == local,
+        [first, second] => *second == local && *first != local,
+        _ => false,
+    };
+    if merge.is_checkpoint
+        || !canonical_parents
+        || merge.base_commit_id != Some(id(&request.global_head_commit_id)?)
+        || merge.account_id != account
+    {
+        return Err(LixError::new(
+            "LIX_PARTIAL_MERGE_STATE_INVALID",
+            "authority acknowledgment does not contain captured local history and catalog",
+        ));
+    }
+    let captured = super::partial_merge_analysis::record(
+        read,
+        id(&request.expected_authority_head_commit_id)?,
+        false,
+    )
+    .await?;
+    if !super::partial_merge_analysis::bounded_ancestor(
+        read,
+        &captured,
+        parents[0],
+        &mut Default::default(),
+        1024,
+    )
+    .await?
+    {
+        return Err(LixError::new(
+            "LIX_PARTIAL_MERGE_STATE_INVALID",
+            "authority acknowledgment lost the captured remote frontier",
+        ));
+    }
+    Ok(())
 }

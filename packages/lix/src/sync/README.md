@@ -83,15 +83,25 @@ projections do not define the engine catalog. Repository opening does not perfor
 this preparation.
 
 `POST /sync/retained-bodies` atomically pins each complete accepted native wave;
-`POST /sync/merge` derives a three-way plan and publishes `[R,L]` plus its
-immutable attempt receipt in one native transaction. Ordinary concurrent row edits
+`POST /sync/merge` applies the frozen `B -> L` intent against the current selected
+head `R` observed inside the authority transaction and publishes `[R,L]` plus its
+immutable attempt receipt under that transaction's control guards. The request's
+captured remote head remains identity and ancestry evidence, not a compare-and-swap
+promise spanning network requests. Already included intent publishes an empty native
+acknowledgment through the same owner without reapplying rows; identical parents are
+deduplicated. Once captured L is already included, its checkpoint intent is not
+replayed over the current authority checkpoint either. GLOBAL coordinates remain exact: crossing a catalog change with an
+outstanding selected attempt requires separate reconciliation and is not handled by
+selected-head acceptance. Ordinary concurrent row edits
 resolve automatically. Retrying an accepted attempt returns its original receipt
 and cannot reorder that write. A newer local `L2` remains pending until client
 candidate adoption proves its exact serving basis; receiving a merge receipt
 alone never advances ordinary upload confirmation.
 
-Merge requests distinguish the original confirmed checkpoint, current authority
-checkpoint, and captured local checkpoint. Equal checkpoint overrides are omitted
+Merge requests distinguish the original confirmed checkpoint, captured authority
+checkpoint, and captured local checkpoint. At acceptance, an unchanged local
+checkpoint preserves the current authority checkpoint; an explicit local checkpoint
+change retains its incoming precedence. Equal checkpoint overrides are omitted
 canonically, preserving existing immutable request digests. The owned persisted
 journal migration upgrades older records without resetting pending edits. These
 endpoints require sync protocol13/server protocol8; upgrade SDK and server together.

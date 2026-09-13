@@ -256,11 +256,15 @@ async fn conflicting_file_case_at_path(
     } else {
         None
     };
+    let captured_remote = transport.partial_replica_descriptor(None).await.unwrap();
+    if checkpoint {
+        authority.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_file')))", &[]).await.unwrap();
+    }
     let mut prepared = prepare_descriptor_with_merge(
         engine.clone(),
         old.clone(),
         &transport,
-        transport.partial_replica_descriptor(None).await.unwrap(),
+        captured_remote,
         crate::sync::partial_publication::PartialRecoveryPolicy::Normal,
     )
     .await;

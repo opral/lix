@@ -355,6 +355,14 @@ mod tests {
         local: &Lix<Memory>,
         base: &str,
     ) -> crate::sync::PartialMergeRequest {
+        publish_wave_with_base_checkpoint(authority, local, base, None).await
+    }
+    async fn publish_wave_with_base_checkpoint(
+        authority: &Lix<Memory>,
+        local: &Lix<Memory>,
+        base: &str,
+        base_checkpoint: Option<&str>,
+    ) -> crate::sync::PartialMergeRequest {
         let remote = authority.partial_replica_descriptor(None).await.unwrap();
         let source = local.partial_replica_descriptor(None).await.unwrap();
         let request = crate::sync::PartialMergeRequest {
@@ -368,24 +376,62 @@ mod tests {
                 .checkpoint
                 .commit_id
                 .clone(),
-            captured_local_checkpoint_commit_id: remote
+            captured_local_checkpoint_commit_id: source
                 .selected_branch
                 .checkpoint
                 .commit_id
                 .clone(),
-            checkpoint_commit_id: remote.selected_branch.checkpoint.commit_id,
+            checkpoint_commit_id: base_checkpoint
+                .map(str::to_owned)
+                .unwrap_or(remote.selected_branch.checkpoint.commit_id),
             global_head_commit_id: remote.global_branch.head.commit_id,
             global_checkpoint_commit_id: remote.global_branch.checkpoint.commit_id,
         };
-        let commit = crate::sync::export_sync_commit(local, &source.selected_branch.head.commit_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let mut known = std::collections::BTreeSet::from([
+            request.base_commit_id.clone(),
+            request.checkpoint_commit_id.clone(),
+            request.expected_authority_head_commit_id.clone(),
+            request.expected_authority_checkpoint_commit_id.clone(),
+            request.global_head_commit_id.clone(),
+            request.global_checkpoint_commit_id.clone(),
+        ]);
+        known.remove(&request.captured_local_head_commit_id);
+        let mut stack = vec![(request.captured_local_head_commit_id.clone(), false)];
+        let mut loaded = std::collections::BTreeMap::new();
+        let mut commits = Vec::new();
+        while let Some((id, expanded)) = stack.pop() {
+            if known.contains(&id) {
+                continue;
+            }
+            if expanded {
+                commits.push(loaded.remove(&id).unwrap());
+                known.insert(id);
+                continue;
+            }
+            let commit = crate::sync::export_sync_commit(local, &id)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut dependencies = commit.parent_commit_ids.clone();
+            if let Some(alias) = &commit.state_alias {
+                dependencies.push(alias.source_commit_id.clone());
+            }
+            if let Some(source) = &commit.selected_source_commit_id {
+                dependencies.push(source.clone());
+            }
+            loaded.insert(id.clone(), commit);
+            stack.push((id, true));
+            stack.extend(dependencies.into_iter().rev().map(|id| (id, false)));
+            assert!(
+                stack.len() + commits.len() <= 32,
+                "fixture must fit one retained wave"
+            );
+        }
         let wave = crate::sync::RetainedBodyWaveRequest {
             request: request.clone(),
             expected_previous_commit_id: base.into(),
             bodies: crate::sync::SyncPushRequest {
-                commits: vec![commit],
+                commits,
                 ref_updates: vec![],
                 inline_blobs: vec![],
             },
@@ -649,6 +695,184 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn included_native_attempt_acknowledges_without_reapplying_rows() {
+        for later_remote in [false, true] {
+            let memory = Memory::new();
+            let authority = open_lix().with_storage(memory.clone()).await.unwrap();
+            authority
+                .set_sync_role(crate::sync::SyncRole::Authority)
+                .unwrap();
+            authority
+                .execute(
+                    "INSERT INTO lix_key_value(key,value) VALUES('included','base')",
+                    &[],
+                )
+                .await
+                .unwrap();
+            let base = authority
+                .partial_replica_descriptor(None)
+                .await
+                .unwrap()
+                .selected_branch
+                .head
+                .commit_id;
+            authority
+                .execute(
+                    "UPDATE lix_key_value SET value='included-L' WHERE key='included'",
+                    &[],
+                )
+                .await
+                .unwrap();
+            let local = open_lix()
+                .with_storage(memory.fork().unwrap())
+                .await
+                .unwrap();
+            if later_remote {
+                authority
+                    .execute(
+                        "UPDATE lix_key_value SET value='remote-R' WHERE key='included'",
+                        &[],
+                    )
+                    .await
+                    .unwrap();
+            }
+            let request = publish_wave(&authority, &local, &base).await;
+            let receipt = authority
+                .merge_partial_replica_for_account(&request, authority.active_account_id())
+                .await
+                .unwrap();
+            let commit = crate::sync::export_sync_commit(&authority, &receipt.merge_commit_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut expected_parents = vec![request.expected_authority_head_commit_id.clone()];
+            if later_remote {
+                expected_parents.push(request.captured_local_head_commit_id.clone());
+            }
+            assert_eq!(commit.parent_commit_ids, expected_parents);
+            assert!(
+                commit.members.is_empty(),
+                "already included rows must not be authored again"
+            );
+            let rows = authority
+                .execute("SELECT value FROM lix_key_value WHERE key='included'", &[])
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.rows()[0].get::<serde_json::Value>("value").unwrap(),
+                serde_json::json!(if later_remote {
+                    "remote-R"
+                } else {
+                    "included-L"
+                })
+            );
+            authority
+                .execute(
+                    "UPDATE lix_key_value SET value='after-ACK-loss' WHERE key='included'",
+                    &[],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                authority
+                    .merge_partial_replica_for_account(&request, authority.active_account_id())
+                    .await
+                    .unwrap(),
+                receipt
+            );
+            let rows = authority
+                .execute("SELECT value FROM lix_key_value WHERE key='included'", &[])
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.rows()[0].get::<serde_json::Value>("value").unwrap(),
+                serde_json::json!("after-ACK-loss")
+            );
+        }
+    }
+    #[tokio::test]
+    async fn included_checkpoint_intent_does_not_restore_an_older_checkpoint() {
+        let memory = Memory::new();
+        let authority = open_lix().with_storage(memory.clone()).await.unwrap();
+        authority
+            .set_sync_role(crate::sync::SyncRole::Authority)
+            .unwrap();
+        authority
+            .execute(
+                "INSERT INTO lix_key_value(key,value) VALUES('checkpoint-included','base')",
+                &[],
+            )
+            .await
+            .unwrap();
+        let base = authority.partial_replica_descriptor(None).await.unwrap();
+        authority
+            .execute(
+                "UPDATE lix_key_value SET value='L' WHERE key='checkpoint-included'",
+                &[],
+            )
+            .await
+            .unwrap();
+        authority.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
+        let local = open_lix()
+            .with_storage(memory.fork().unwrap())
+            .await
+            .unwrap();
+        authority
+            .execute(
+                "UPDATE lix_key_value SET value='R-later' WHERE key='checkpoint-included'",
+                &[],
+            )
+            .await
+            .unwrap();
+        authority.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
+        let later = authority.partial_replica_descriptor(None).await.unwrap();
+        let request = publish_wave_with_base_checkpoint(
+            &authority,
+            &local,
+            &base.selected_branch.head.commit_id,
+            Some(&base.selected_branch.checkpoint.commit_id),
+        )
+        .await;
+        assert_ne!(
+            request.captured_local_checkpoint_commit_id,
+            request.checkpoint_commit_id
+        );
+        assert_ne!(
+            request.captured_local_checkpoint_commit_id,
+            later.selected_branch.checkpoint.commit_id
+        );
+        let receipt = authority
+            .merge_partial_replica_for_account(&request, authority.active_account_id())
+            .await
+            .unwrap();
+        assert_eq!(
+            authority
+                .partial_replica_descriptor(None)
+                .await
+                .unwrap()
+                .selected_branch
+                .checkpoint
+                .commit_id,
+            later.selected_branch.checkpoint.commit_id
+        );
+        assert!(
+            crate::sync::export_sync_commit(&authority, &receipt.merge_commit_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .members
+                .is_empty()
+        );
+        assert_eq!(
+            authority
+                .merge_partial_replica_for_account(&request, authority.active_account_id())
+                .await
+                .unwrap(),
+            receipt
         );
     }
 }

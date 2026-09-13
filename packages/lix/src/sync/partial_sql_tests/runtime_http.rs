@@ -77,7 +77,7 @@ async fn http_dispatcher_recovers_lost_wave_and_preserves_newer_local_edit() {
 }
 
 #[tokio::test]
-async fn http_dispatcher_restarts_initial_stale_anchors_and_preserves_newer_local_edit() {
+async fn http_dispatcher_accepts_current_authority_and_preserves_newer_local_edit() {
     lost_wave_with_pending_edit(true).await;
 }
 
@@ -165,6 +165,13 @@ async fn lost_wave_with_pending_edit(advance_after_descriptor: bool) {
         .await
         .unwrap();
     let captured_descriptor = transport.partial_replica_descriptor(None).await.unwrap();
+    let captured_remote = captured_descriptor
+        .wire
+        .descriptor
+        .selected_branch
+        .head
+        .commit_id
+        .clone();
     if advance_after_descriptor {
         // Capture R, then accept R2 before the first retained wave reaches the
         // authority. Its otherwise valid immutable request must restart.
@@ -197,7 +204,32 @@ async fn lost_wave_with_pending_edit(advance_after_descriptor: bool) {
     assert!(pending.prepared_body_wave.is_some());
     assert_eq!(pending.accepted_body_tip, pending.request.base_commit_id);
     assert!(pending.authority_receipt.is_none());
+    assert_eq!(
+        pending.request.expected_authority_head_commit_id,
+        captured_remote
+    );
     drop(read);
+    let remote_checkpoint = if advance_after_descriptor {
+        authority
+            .execute(
+                "UPDATE lix_key_value SET value='R3' WHERE key='remote'",
+                &[],
+            )
+            .await
+            .unwrap();
+        authority.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
+        Some(
+            authority
+                .partial_replica_descriptor(None)
+                .await
+                .unwrap()
+                .selected_branch
+                .checkpoint
+                .commit_id,
+        )
+    } else {
+        None
+    };
     // Native foreground write stays offline while an exact remote wave is pending.
     session
         .execute("UPDATE lix_key_value SET value='L2' WHERE key='local'", &[])
@@ -240,7 +272,20 @@ async fn lost_wave_with_pending_edit(advance_after_descriptor: bool) {
         .await
         .unwrap();
     assert!(format!("{local:?}").contains("L2"));
-    assert!(format!("{remote:?}").contains(if advance_after_descriptor { "R2" } else { "R" }));
+    assert!(format!("{remote:?}").contains(if advance_after_descriptor { "R3" } else { "R" }));
+    if let Some(checkpoint) = remote_checkpoint {
+        assert_eq!(
+            authority
+                .partial_replica_descriptor(None)
+                .await
+                .unwrap()
+                .selected_branch
+                .checkpoint
+                .commit_id,
+            checkpoint,
+            "unchanged local checkpoint must retain the current authority checkpoint"
+        );
+    }
 }
 
 #[tokio::test]

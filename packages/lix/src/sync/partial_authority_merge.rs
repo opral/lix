@@ -19,6 +19,7 @@ pub(crate) struct AuthorityMergePlan {
     account_id: String,
     request: PartialMergeRequest,
     native: NativeMergeAnalysis,
+    accepted_checkpoint: CommitId,
     control_guards: Vec<StoragePrecondition>,
 }
 fn conflict(message: &str) -> LixError {
@@ -71,31 +72,51 @@ pub(crate) async fn prepare_authority_merge(
         .reader(read)
         .load_observed(&ids)
         .await?;
-    for (index, (head, checkpoint)) in [
-        (
-            &request.expected_authority_head_commit_id,
-            &request.expected_authority_checkpoint_commit_id,
-        ),
-        (
-            &request.global_head_commit_id,
-            &request.global_checkpoint_commit_id,
-        ),
-    ]
-    .into_iter()
-    .enumerate()
+    let global = observed[1]
+        .control
+        .as_ref()
+        .ok_or_else(|| conflict("merge GLOBAL control is absent"))?;
+    if global.head_commit_id != id(&request.global_head_commit_id)?
+        || global.working_diff_checkpoint_commit_id
+            != Some(id(&request.global_checkpoint_commit_id)?)
     {
-        let control = observed[index]
-            .control
-            .as_ref()
-            .ok_or_else(|| conflict("merge branch control is absent"))?;
-        if control.head_commit_id != id(head)?
-            || control.working_diff_checkpoint_commit_id != Some(id(checkpoint)?)
-        {
-            return Err(conflict(
-                "authority selected/global coordinates changed before merge analysis",
-            ));
-        }
+        return Err(conflict(
+            "authority GLOBAL coordinates changed before merge analysis",
+        ));
     }
+    let selected = observed[0]
+        .control
+        .as_ref()
+        .ok_or_else(|| conflict("merge selected control is absent"))?;
+    let current_head = selected.head_commit_id;
+    let current_checkpoint = selected
+        .working_diff_checkpoint_commit_id
+        .ok_or_else(|| conflict("merge selected checkpoint is absent"))?;
+    let captured_remote = super::partial_merge_analysis::record(
+        read,
+        id(&request.expected_authority_head_commit_id)?,
+        false,
+    )
+    .await?;
+    if !super::partial_merge_analysis::bounded_ancestor(
+        read,
+        &captured_remote,
+        current_head,
+        &mut Default::default(),
+        budget.max_remote_graph_records,
+    )
+    .await?
+    {
+        return Err(conflict(
+            "authority no longer contains the captured remote frontier",
+        ));
+    }
+    let mut accepted_checkpoint =
+        if request.captured_local_checkpoint_commit_id == request.checkpoint_commit_id {
+            current_checkpoint
+        } else {
+            id(&request.captured_local_checkpoint_commit_id)?
+        };
     // An incoming checkpoint is a retained native coordinate, never a client
     // assertion about current state. Its working head must include it.
     if request.captured_local_checkpoint_commit_id != request.checkpoint_commit_id {
@@ -123,18 +144,25 @@ pub(crate) async fn prepare_authority_merge(
     let native = analyze_native_divergence(
         read,
         id(&request.base_commit_id)?,
-        id(&request.expected_authority_head_commit_id)?,
+        current_head,
         id(&request.captured_local_head_commit_id)?,
         account,
         &request.branch_id,
         &[
             id(&request.checkpoint_commit_id)?,
             id(&request.expected_authority_checkpoint_commit_id)?,
+            current_checkpoint,
         ],
         id(&request.global_head_commit_id)?,
         budget,
     )
     .await?;
+    if native.already_in_authority {
+        // The validated checkpoint intent is part of captured L. A terminal
+        // acknowledgment never reapplies it over a later selected checkpoint,
+        // which may legitimately come from another checkpoint ancestry.
+        accepted_checkpoint = current_checkpoint;
+    }
     let control_guards = ids
         .iter()
         .zip(observed)
@@ -147,6 +175,7 @@ pub(crate) async fn prepare_authority_merge(
         account_id: account.into(),
         request,
         native,
+        accepted_checkpoint,
         control_guards,
     }))
 }
@@ -158,13 +187,13 @@ impl AuthorityMergePlan {
         &self.request.branch_id
     }
     pub(crate) fn accepted_checkpoint_commit_id(&self) -> Result<CommitId, LixError> {
-        id(self.request.accepted_checkpoint_commit_id())
+        Ok(self.accepted_checkpoint)
     }
     pub(crate) fn application(&self) -> Result<&crate::session::MergeAnalysis, LixError> {
         self.native
             .application
             .as_ref()
-            .ok_or_else(|| conflict("incoming changes are already included"))
+            .ok_or_else(|| conflict("native application omitted its validated row plan"))
     }
     pub(crate) fn into_receipt(
         self,

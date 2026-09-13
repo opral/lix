@@ -343,7 +343,7 @@ pub(super) async fn analyze_native_divergence(
     )
     .await?;
     let mut groups = Vec::new();
-    let mut application = None;
+    let application;
     if !included {
         let mut correlated = BTreeMap::<(String, Option<String>), Vec<crate::row_pk::RowPk>>::new();
         for key in keys {
@@ -391,6 +391,21 @@ pub(super) async fn analyze_native_divergence(
                 .clone(),
         );
         application = Some(merged);
+    } else {
+        // Already accepted rows must not be applied again as a newer LWW write.
+        // Publish only a native acknowledgment through the ordinary merge owner.
+        let mut reader = TrackedStateContext::new().reader(read);
+        application = Some(
+            crate::session::analyze_incoming_rows(
+                &mut reader,
+                base,
+                remote,
+                local,
+                crate::tracked_state::TrackedStateDiff::from_entries(Vec::new()),
+                crate::tracked_state::TrackedStateDiff::from_entries(Vec::new()),
+            )
+            .await?,
+        );
     }
     Ok(NativeMergeAnalysis {
         local_commits: commits,

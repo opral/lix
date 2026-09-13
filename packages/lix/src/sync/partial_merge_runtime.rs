@@ -67,7 +67,7 @@ pub(super) async fn captured_wave(
             "prepared merge wave changed its durable predecessor",
         ));
     }
-    let known = [
+    let mut known = [
         &request.base_commit_id,
         &request.expected_authority_head_commit_id,
         &request.checkpoint_commit_id,
@@ -78,6 +78,9 @@ pub(super) async fn captured_wave(
     .into_iter()
     .map(|value| id(value))
     .collect::<Result<BTreeSet<_>, _>>()?;
+    // Even an already included head needs a complete retained body for the
+    // immutable attempt before its acknowledgment can be committed.
+    known.remove(&id(&request.captured_local_head_commit_id)?);
     // Replay the deterministic bounded local closure from immutable coordinates.
     // The accepted cursor names a prefix, not a first-parent ancestry claim.
     let closure = super::partial_checkpoint_upload::load_local_dependency_closure(
@@ -220,7 +223,6 @@ where
        global_head_commit_id: descriptor.global_branch.head.commit_id.clone(),
        global_checkpoint_commit_id: descriptor.global_branch.checkpoint.commit_id.clone(),
    };
-   if request.expected_authority_head_commit_id==request.captured_local_head_commit_id{return Err(LixError::new("LIX_PARTIAL_REPLICA_MERGE_RECOVERY_PENDING","restart authority already contains local head; preserve edits for native inclusion settlement"))}
    let mut writes=storage.new_write_set();let guards=stage_capture_restarted_partial_merge(&read,&mut writes,state,&request).await?;
    drop(read);persist(storage,writes,guards).await
   }.await;
@@ -304,10 +306,6 @@ where
                     {
                         return Ok(true);
                     }
-                }
-                if wrapper.wire.descriptor.selected_branch.head.commit_id==control.head_commit_id {
-                    return Err(LixError::new("LIX_PARTIAL_REPLICA_MERGE_RECOVERY_PENDING",
-                        "authority already has the local head without a matching ordinary receipt; preserve local state for native inclusion settlement"));
                 }
                 let base = outbox
                     .as_ref()
@@ -457,7 +455,6 @@ where
             if let Err(error) = transport.retained_body_wave(&wave).await {
                 if error.code == "LIX_NATIVE_UPLOAD_ATTEMPT_EXPIRED"
                     || error.code == "LIX_PARTIAL_ATTEMPT_RESTARTED"
-                    || error.code == "LIX_ERROR_PARTIAL_ATTEMPT_ANCHORS_CHANGED"
                 {
                     recover_expired_attempt(&storage, &previous, transport, branch).await?;
                     continue;

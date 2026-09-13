@@ -3699,19 +3699,7 @@ impl StorageWrite for SlateDBWrite {
                 written_bytes = written_bytes.saturating_add(value.len() as u64);
                 segment_writer.insert(physical_key, value)?;
             }
-            let mut immutable_segments = segment_writer.finish(|_| true)?;
-            // Replacements may change bytes without changing their key or
-            // length. Ordinary immutable segment IDs hash only that shape;
-            // use the replacement payload identity so old snapshot locators
-            // keep pointing at their original, untouched objects.
-            for segment in &mut immutable_segments {
-                let mut identity =
-                    blake3::Hasher::new_derive_key("lix slatedb immutable replacement segment v1");
-                for frame in &segment.frames {
-                    identity.update(frame);
-                }
-                segment.id = Key(Bytes::copy_from_slice(identity.finalize().as_bytes()));
-            }
+            let immutable_segments = segment_writer.finish(|_| true)?;
             let immutable_locators = immutable_segments
                 .iter()
                 .flat_map(|segment| {
@@ -5052,6 +5040,63 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), gate.acquire(true))
             .await
             .expect("cancelled foreground waiter must wake background maintenance");
+    }
+
+    #[tokio::test]
+    async fn rolled_back_immutable_upload_does_not_reserve_unpublished_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = SlateDB::open(directory.path()).unwrap();
+        let key = Key(Bytes::from_static(b"unpublished-row"));
+        let batch = |value: &'static [u8]| PutBatch {
+            entries: vec![PutEntry {
+                key: key.clone(),
+                value: StoredValue {
+                    bytes: Bytes::from_static(value),
+                },
+            }],
+        };
+        let mut aborted = storage.begin_write(WriteOptions::default()).await.unwrap();
+        aborted
+            .put_many(TEST_IMMUTABLE_SPACE, batch(b"first"))
+            .await
+            .unwrap();
+        aborted.rollback().await.unwrap();
+        // The object upload happened, but no immutable key was published.
+        // A retry can legitimately stage different same-length bytes for it.
+        let mut retry = storage.begin_write(WriteOptions::default()).await.unwrap();
+        retry
+            .put_many(TEST_IMMUTABLE_SPACE, batch(b"other"))
+            .await
+            .unwrap();
+        retry.commit().await.unwrap();
+        storage.flush().await.unwrap();
+        drop(storage);
+        let storage = SlateDB::open(directory.path()).unwrap();
+        let read = storage.begin_read(ReadOptions::default()).await.unwrap();
+        let result = read
+            .get_many(&[GetManyRequest {
+                space: TEST_IMMUTABLE_SPACE,
+                keys: std::slice::from_ref(&key),
+                opts: GetOptions::default(),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(
+            result.values,
+            vec![Some(ProjectedValue::FullValue(Bytes::from_static(
+                b"other"
+            )))]
+        );
+        drop(read);
+        // Committed immutable assignments remain protected.
+        let mut conflicting = storage.begin_write(WriteOptions::default()).await.unwrap();
+        assert!(matches!(
+            conflicting
+                .put_many(TEST_IMMUTABLE_SPACE, batch(b"third"))
+                .await,
+            Err(StorageError::Corruption(_))
+        ));
+        conflicting.rollback().await.unwrap();
     }
 
     #[tokio::test]

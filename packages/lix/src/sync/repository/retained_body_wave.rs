@@ -116,38 +116,38 @@ impl VerifiedRetainedBodyWave {
                 .reader(read)
                 .load_observed(&branches)
                 .await?;
-            // Validate GLOBAL first: the ordinary restart owner preserves its
-            // coordinates and cannot capture a successor across GLOBAL changes.
-            for (index, head, checkpoint) in [
-                (
-                    1,
-                    &merge.global_head_commit_id,
-                    &merge.global_checkpoint_commit_id,
-                ),
-                (
-                    0,
+            // The selected head may advance while immutable bodies travel.
+            // GLOBAL remains an exact catalog dependency for this operation.
+            let global = observed[1].control.as_ref().ok_or_else(invalid)?;
+            if global.head_commit_id.to_string() != merge.global_head_commit_id
+                || global
+                    .working_diff_checkpoint_commit_id
+                    .map(|id| id.to_string())
+                    .as_ref()
+                    != Some(&merge.global_checkpoint_commit_id)
+            {
+                return Err(invalid());
+            }
+            let selected = observed[0].control.as_ref().ok_or_else(invalid)?;
+            let captured_remote = crate::sync::partial_merge_analysis::record(
+                read,
+                CommitId::parse_lix(
                     &merge.expected_authority_head_commit_id,
-                    &merge.expected_authority_checkpoint_commit_id,
-                ),
-            ] {
-                let control = observed[index].control.as_ref().ok_or_else(invalid)?;
-                if control.head_commit_id != head.as_str()
-                    || control
-                        .working_diff_checkpoint_commit_id
-                        .map(|id| id.to_string())
-                        .as_ref()
-                        != Some(checkpoint)
-                {
-                    if index == 1 {
-                        return Err(invalid());
-                    }
-                    // No retention attempt has been admitted yet. The immutable
-                    // request must restart against fresh authority coordinates.
-                    return Err(LixError::new(
-                        "LIX_ERROR_PARTIAL_ATTEMPT_ANCHORS_CHANGED",
-                        "authority coordinates changed before initial body retention",
-                    ));
-                }
+                    "captured authority",
+                )?,
+                false,
+            )
+            .await?;
+            if !crate::sync::partial_merge_analysis::bounded_ancestor(
+                read,
+                &captured_remote,
+                selected.head_commit_id,
+                &mut BTreeMap::new(),
+                1024,
+            )
+            .await?
+            {
+                return Err(invalid());
             }
             let base = crate::sync::partial_merge_analysis::record(
                 read,
@@ -244,7 +244,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_global_anchors_never_enter_selected_branch_restart() {
+    async fn only_global_staleness_rejects_retention_of_complete_native_bodies() {
         initial_anchor_case(true, false, true).await;
         initial_anchor_case(true, true, true).await;
         initial_anchor_case(true, true, false).await;
@@ -309,7 +309,7 @@ mod tests {
             ref_updates: vec![],
             inline_blobs: vec![],
         };
-        let error = VerifiedRetainedBodyWave::from_validated_import(
+        let result = VerifiedRetainedBodyWave::from_validated_import(
             &read,
             true,
             lix.lix_id(),
@@ -328,16 +328,17 @@ mod tests {
                 BTreeSet::new()
             },
         )
-        .await
-        .err()
-        .unwrap();
-        assert_eq!(
-            error.code,
-            if complete && selected_stale && !global_stale {
-                "LIX_ERROR_PARTIAL_ATTEMPT_ANCHORS_CHANGED"
-            } else {
+        .await;
+        if complete && !global_stale {
+            assert!(
+                result.is_ok(),
+                "selected advancement must retain the same request"
+            );
+        } else {
+            assert_eq!(
+                result.err().unwrap().code,
                 "LIX_PARTIAL_UPLOAD_ATTEMPT_INVALID"
-            }
-        );
+            );
+        }
     }
 }
