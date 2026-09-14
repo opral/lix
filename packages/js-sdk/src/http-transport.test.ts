@@ -60,3 +60,21 @@ test("typed network attestation survives worker reconstruction without construct
   expect(reconstructed).not.toBeInstanceOf(HttpTransportError);
   await expect(fetchTransport(async()=>{throw reconstructed;})(request)).rejects.toBe(reconstructed);
 });
+
+for (const status of [204, 205, 304]) {
+  test(`null-body status ${status} remains valid through instrumented fetch`, async () => {
+    for (const mode of ["buffered", "streaming"] as const) {
+      const cancel = vi.fn();
+      const response = new Response(new ReadableStream({cancel}), {headers: {"x-test": "preserved"}});
+      Object.defineProperty(response, "status", {value: status});
+      vi.stubGlobal("fetch", async () => response);
+      try {
+        const result = await fetchTransport()({...request, response: mode === "buffered" ? {mode, maxBytes: 8} : {mode}});
+        expect(result.status).toBe(status);
+        expect(result.body).toBeNull();
+        expect(result.headers.get("x-test")).toBe("preserved");
+        expect(cancel).toHaveBeenCalledTimes(1);
+      } finally {vi.unstubAllGlobals();}
+    }
+  });
+}

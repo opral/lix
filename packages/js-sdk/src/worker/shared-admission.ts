@@ -62,6 +62,9 @@ export class SharedAdmissionCache {
     if (this.proofs.size >= 64) this.proofs.delete(this.proofs.keys().next().value!);
     this.proofs.set(sharedCredentialKey(url, headers), { ...identity });
   }
+  remove(url: string, headers: [string, string][]): void {
+    this.proofs.delete(sharedCredentialKey(url, headers));
+  }
   async verify(url: string, headers: [string, string][], expected: AdmissionIdentity | undefined,
     probe: () => Promise<AdmissionIdentity>, allowOffline = true): Promise<{ identity: AdmissionIdentity; online: boolean }> {
     let identity: AdmissionIdentity;

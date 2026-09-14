@@ -34,6 +34,12 @@ export async function networkFetch(input: RequestInfo | URL, init?: RequestInit)
 // Keep error classification attached to the body producer, including failures
 // after response headers. This wrapper preserves pull-driven backpressure.
 function classifiedResponse(response: Response, classify: (error: unknown) => Error): Response {
+  // Fetch instrumentation may expose an empty stream for a status whose
+  // body is forbidden by the Response constructor.
+  if (response.status === 204 || response.status === 205 || response.status === 304) {
+    void response.body?.cancel().catch(() => undefined);
+    return new Response(null, {status: response.status, statusText: response.statusText, headers: response.headers});
+  }
   if (!response.body) return response;
   const reader = response.body.getReader();
   let released = false;
