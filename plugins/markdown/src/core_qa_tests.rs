@@ -765,3 +765,15 @@ fn qa_excessive_block_nesting_returns_an_error() {
         .is_ok()
     );
 }
+
+#[test]
+fn qa_many_unmatched_emphasis_openers_import_losslessly() {
+    let source = format!("{}a\n", "*a ".repeat(10_000));
+    let (document, _) = Document::open_file(
+        source.as_bytes().to_vec(),
+        Some("openers.md"),
+        IdNamespace::from_halves(38, 3),
+    )
+    .unwrap();
+    assert_eq!(document.bytes(), source.as_bytes());
+}

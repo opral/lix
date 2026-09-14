@@ -1223,6 +1223,23 @@ fn escape_text_with_context(
     // the current line length and avoids rescanning the growing string with
     // `rsplit_once` for every input character.
     let leading_pipe_end = input.len() - input.trim_start_matches('|').len();
+    let last_closers = [
+        ("*", false),
+        ("_", true),
+        ("++", false),
+        ("==", false),
+        ("~~", false),
+    ]
+    .map(|(marker, underscore)| {
+        input
+            .match_indices(marker)
+            .filter(|(offset, _)| {
+                !input[offset + marker.len()..].starts_with(marker)
+                    && text_delimiter_can_close(input, *offset, marker.len(), underscore)
+            })
+            .map(|(offset, _)| offset)
+            .last()
+    });
     let avoid_star_edges = context.avoid_star_edges;
     let mut output = String::new();
     let mut line_digit_prefix = 0usize;
@@ -1334,11 +1351,25 @@ fn escape_text_with_context(
                 output.push('\\');
                 output.push(char);
             }
-            '*' if text_attention_delimiter_can_start(input, offset, "*", false) => {
+            '*' if text_attention_delimiter_can_start(
+                input,
+                offset,
+                "*",
+                false,
+                last_closers[0],
+            ) =>
+            {
                 output.push('\\');
                 output.push(char);
             }
-            '_' if text_attention_delimiter_can_start(input, offset, "_", true) => {
+            '_' if text_attention_delimiter_can_start(
+                input,
+                offset,
+                "_",
+                true,
+                last_closers[1],
+            ) =>
+            {
                 output.push('\\');
                 output.push(char);
             }
@@ -1367,7 +1398,7 @@ fn escape_text_with_context(
                 output.push('\\');
                 output.push(char);
             }
-            '~' if text_tilde_can_start(input, offset) => {
+            '~' if text_tilde_can_start(input, offset, last_closers[4]) => {
                 output.push('\\');
                 output.push(char);
             }
@@ -1375,11 +1406,25 @@ fn escape_text_with_context(
                 output.push('\\');
                 output.push(char);
             }
-            '+' if text_attention_delimiter_can_start(input, offset, "++", false) => {
+            '+' if text_attention_delimiter_can_start(
+                input,
+                offset,
+                "++",
+                false,
+                last_closers[2],
+            ) =>
+            {
                 output.push('\\');
                 output.push(char);
             }
-            '=' if text_attention_delimiter_can_start(input, offset, "==", false) => {
+            '=' if text_attention_delimiter_can_start(
+                input,
+                offset,
+                "==",
+                false,
+                last_closers[3],
+            ) =>
+            {
                 output.push('\\');
                 output.push(char);
             }
@@ -1410,6 +1455,7 @@ fn text_attention_delimiter_can_start(
     offset: usize,
     marker: &str,
     underscore: bool,
+    last_closer: Option<usize>,
 ) -> bool {
     if !input[offset..].starts_with(marker) {
         return false;
@@ -1423,16 +1469,7 @@ fn text_attention_delimiter_can_start(
         return false;
     }
 
-    let mut cursor = offset + marker.len();
-    while let Some(candidate) = input[cursor..].find(marker).map(|index| cursor + index) {
-        if !input[candidate + marker.len()..].starts_with(marker)
-            && text_delimiter_can_close(input, candidate, marker.len(), underscore)
-        {
-            return true;
-        }
-        cursor = candidate + marker.len();
-    }
-    false
+    last_closer.is_some_and(|closer| closer >= offset + marker.len())
 }
 
 fn text_delimiter_can_open(
@@ -1547,9 +1584,9 @@ fn text_math_can_start(input: &str, offset: usize) -> bool {
     find_same_char_run(input, after_open, '$', marker_len).is_some()
 }
 
-fn text_tilde_can_start(input: &str, offset: usize) -> bool {
+fn text_tilde_can_start(input: &str, offset: usize, last_closer: Option<usize>) -> bool {
     if input[offset..].starts_with("~~") {
-        return text_attention_delimiter_can_start(input, offset, "~~", false)
+        return text_attention_delimiter_can_start(input, offset, "~~", false, last_closer)
             || text_simple_delimiter_can_start(input, offset, '~');
     }
     text_simple_delimiter_can_start(input, offset, '~')
