@@ -2045,21 +2045,43 @@ impl Document {
         identities: &[RowIdentity],
     ) -> Result<Self, String> {
         let document = Self::open_file_with_stored_dialect(bytes, dialect, namespace)?.0;
-        let mut records = document.row_records()?;
-        if records.len() != identities.len() + 1 {
+        if document.row_count() != identities.len() {
             return Err("CSV identity checkpoint row count does not match the file".to_owned());
         }
-        for (record, identity) in records.iter_mut().skip(1).zip(identities) {
-            record.row_pk = vec![TypedValue::Uuid(identity.id)];
-            record
-                .row
-                .insert("id".to_owned(), TypedValue::Uuid(identity.id));
-            record.row.insert(
-                "order_key".to_owned(),
-                TypedValue::Text(identity.order_key.clone()),
-            );
+        let mut id_bytes = Vec::with_capacity(identities.len() * 16);
+        let mut ranges = Vec::with_capacity(identities.len());
+        let mut overrides = HashMap::new();
+        for (ordinal, identity) in identities.iter().enumerate() {
+            if !valid_order_key(&identity.order_key) {
+                return Err("CSV identity checkpoint order key is invalid".to_owned());
+            }
+            if ordinal > 0 {
+                let previous = &identities[ordinal - 1];
+                if (&previous.order_key, previous.id) >= (&identity.order_key, identity.id) {
+                    return Err("CSV identity checkpoint rows are not in order".to_owned());
+                }
+            }
+            ranges.push(IdentityRange {
+                start: u32::try_from(id_bytes.len())
+                    .map_err(|_| "CSV identity bytes exceed 4GiB")?,
+                len: 16,
+            });
+            id_bytes.extend_from_slice(identity.id.as_bytes());
+            let location = document
+                .0
+                .index
+                .ordinal_location(ordinal)
+                .expect("validated row count");
+            let row = document.0.index.row(location).1;
+            if identity.order_key != format!("{:016x}", row.order_rank) {
+                overrides.insert(row.id_slot, Arc::from(identity.order_key.as_str()));
+            }
         }
-        Self::open_rows(records).map(|(document, _)| document)
+        let identities = IdentityStore::from_noncompact(id_bytes, ranges)?;
+        let mut inner = Arc::try_unwrap(document.0).expect("fresh document has one owner");
+        inner.identities = identities;
+        inner.order_overrides = OrderKeyStore::from_base(overrides);
+        Ok(Self(Arc::new(inner)))
     }
 
     pub fn fork(&self) -> Self {
