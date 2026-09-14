@@ -247,10 +247,16 @@ fn serialize_block(
                 FrontmatterKind::Yaml => "---",
                 FrontmatterKind::Toml => "+++",
             };
-            Ok(format!(
-                "{fence}\n{}\n{fence}",
-                trim_trailing_newline(&node.value)
-            ))
+            if node
+                .value
+                .lines()
+                .any(|line| line.trim_end_matches([' ', '\t']) == fence)
+            {
+                return Err(SerializeError::UnsupportedNode(
+                    "frontmatter value contains its closing delimiter line",
+                ));
+            }
+            Ok(format!("{fence}\n{}\n{fence}", node.value))
         }
         Block::MdxEsm(node) => Ok(node.value.clone()),
         Block::MdxExpression(node) => Ok(format!("{{{}}}", node.value)),

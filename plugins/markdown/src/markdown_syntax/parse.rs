@@ -508,7 +508,10 @@ fn parse_frontmatter(
                 cursor + 1,
             ));
         }
-        push_line(&mut value, lines[cursor].text);
+        if cursor > index + 1 {
+            value.push('\n');
+        }
+        value.push_str(lines[cursor].text);
         cursor += 1;
     }
 

@@ -858,3 +858,42 @@ fn qa_unrepresentable_single_item_loose_list_is_rejected() {
     ));
     assert_eq!(document.bytes(), b"- x\n");
 }
+
+#[test]
+fn qa_frontmatter_edits_preserve_value_or_reject_delimiter_lines() {
+    for value in [
+        "\nkey: value\n",
+        "key: value\n---\nother: value",
+        "key: value\n---  \nother: value",
+    ] {
+        let (document, _) = Document::open_file(
+            b"---\nkey: old\n---\n".to_vec(),
+            Some("frontmatter.md"),
+            IdNamespace::from_halves(42, 1),
+        )
+        .unwrap();
+        let mut node = document.tree.materialize().children.remove(0).node;
+        node.payload["value"] = serde_json::json!(value);
+        let result = document.rows_changed(vec![RowChange {
+            schema_key: NODE_SCHEMA_KEY.into(),
+            row_pk: vec![node.id],
+            row: Some(node_to_typed_row(&node).unwrap()),
+            effect: ChangeEffect::Content,
+        }]);
+        if value.contains("---") {
+            assert!(matches!(result, Err(PluginError::InvalidInput(_))));
+        } else {
+            let (updated, _) = result.unwrap();
+            let (reopened, _) = Document::open_file(
+                updated.bytes(),
+                Some("frontmatter.md"),
+                IdNamespace::from_halves(42, 2),
+            )
+            .unwrap();
+            assert_eq!(
+                reopened.tree.materialize().children[0].node.payload["value"],
+                value
+            );
+        }
+    }
+}
