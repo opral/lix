@@ -473,7 +473,7 @@ impl Document {
         &self,
         old_for_new: &[Option<usize>],
     ) -> Result<Vec<OrderKey>, String> {
-        let anchors = longest_increasing_old_indexes(old_for_new, self.lines());
+        let anchors = longest_increasing_by(old_for_new, |index| &self.lines()[index].order_key);
         let mut order_keys = vec![None; old_for_new.len()];
         for &position in &anchors {
             let old_index =
@@ -539,23 +539,61 @@ impl Document {
             return Ok(edits);
         }
 
-        let (prefix, suffix) = common_prefix_and_suffix(self.bytes(), after.bytes());
-        let delete_len = self
-            .bytes()
-            .len()
-            .checked_sub(prefix)
-            .and_then(|length| length.checked_sub(suffix))
-            .ok_or_else(|| "invalid common byte range".to_owned())?;
-        let insert_end = after
-            .bytes()
-            .len()
-            .checked_sub(suffix)
-            .ok_or_else(|| "invalid common byte suffix".to_owned())?;
-        Ok(vec![lix::ByteEdit::new(
-            usize_to_u64(prefix, "render edit offset")?,
-            usize_to_u64(delete_len, "render edit delete length")?,
-            after.bytes()[prefix..insert_end].to_vec(),
-        )])
+        let before_indexes: HashMap<_, _> = self
+            .lines()
+            .iter()
+            .enumerate()
+            .map(|(index, line)| (line.id, index))
+            .collect();
+        let matches = after
+            .lines()
+            .iter()
+            .map(|line| {
+                before_indexes
+                    .get(&line.id)
+                    .copied()
+                    .filter(|&index| self.lines()[index].bytes == line.bytes)
+            })
+            .collect::<Vec<_>>();
+        let anchors = longest_increasing_by(&matches, |index| index);
+        let mut before_offsets = vec![0usize];
+        let mut after_offsets = vec![0usize];
+        for line in self.lines() {
+            before_offsets.push(before_offsets.last().unwrap() + line.bytes.len());
+        }
+        for line in after.lines() {
+            after_offsets.push(after_offsets.last().unwrap() + line.bytes.len());
+        }
+        let mut before_cursor = 0;
+        let mut after_cursor = 0;
+        let mut edits = Vec::new();
+        for position in anchors
+            .into_iter()
+            .chain(std::iter::once(after.lines().len()))
+        {
+            let old_index = if position == after.lines().len() {
+                self.lines().len()
+            } else {
+                matches[position].unwrap()
+            };
+            let old_end = before_offsets[old_index];
+            let new_end = after_offsets[position];
+            let old = &self.bytes()[before_cursor..old_end];
+            let new = &after.bytes()[after_cursor..new_end];
+            let (prefix, suffix) = common_prefix_and_suffix(old, new);
+            if prefix != old.len() || prefix != new.len() {
+                edits.push(lix::ByteEdit::new(
+                    usize_to_u64(before_cursor + prefix, "render offset")?,
+                    usize_to_u64(old.len() - prefix - suffix, "render delete length")?,
+                    new[prefix..new.len() - suffix].to_vec(),
+                ));
+            }
+            if position < after.lines().len() {
+                before_cursor = before_offsets[old_index + 1];
+                after_cursor = after_offsets[position + 1];
+            }
+        }
+        Ok(edits)
     }
 }
 
@@ -749,10 +787,21 @@ fn validate_text(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn longest_increasing_old_indexes(
+fn longest_increasing_by<K: Ord>(
     old_for_new: &[Option<usize>],
-    lines: &[Arc<Line>],
+    key: impl Fn(usize) -> K,
 ) -> Vec<usize> {
+    let matched = old_for_new
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, old)| old.map(|old| (pos, old)))
+        .collect::<Vec<_>>();
+    if matched
+        .windows(2)
+        .all(|pair| key(pair[0].1) < key(pair[1].1))
+    {
+        return matched.into_iter().map(|(pos, _)| pos).collect();
+    }
     let mut tails = Vec::<usize>::new();
     let mut predecessors = vec![None; old_for_new.len()];
 
@@ -761,9 +810,8 @@ fn longest_increasing_old_indexes(
             continue;
         };
         let insertion = tails.partition_point(|tail_position| {
-            lines[old_for_new[*tail_position].expect("LIS tails only contain matched positions")]
-                .order_key
-                < lines[*old_index].order_key
+            key(old_for_new[*tail_position].expect("LIS tails only contain matched positions"))
+                < key(*old_index)
         });
         if insertion != 0 {
             predecessors[position] = Some(tails[insertion - 1]);

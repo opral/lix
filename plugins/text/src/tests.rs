@@ -521,3 +521,22 @@ fn sql_payload_representation_is_canonical() {
     }
 }
 
+#[test]
+fn distant_structural_sql_edits_do_not_resend_unchanged_lines() {
+    let mut source = b"first\n".to_vec();
+    source.extend(b"unchanged\n".repeat(10_000));
+    source.extend(b"last\n");
+    let (document, _) = open(&source);
+    let (after, edits) = document
+        .rows_changed([
+            lix::RowChange::delete(LINE_SCHEMA_KEY, row_pk(document.lines()[1].id()).to_vec()),
+            lix::RowChange::delete(
+                LINE_SCHEMA_KEY,
+                row_pk(document.lines()[10_000].id()).to_vec(),
+            ),
+        ])
+        .unwrap();
+    assert_eq!(edits.len(), 2);
+    assert!(edits.iter().all(|edit| edit.insert.is_empty()));
+    assert_eq!(apply_edits(&source, &edits), after.bytes());
+}
