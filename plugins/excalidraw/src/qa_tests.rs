@@ -524,3 +524,35 @@ fn qa_unrepresentable_jsonb_is_rejected_without_panicking_or_mutation() {
     assert!(h.parse(&file, ctx(1)).is_err());
     assert_eq!(file, before);
 }
+
+#[test]
+fn qa_marker_text_in_metadata_roundtrips_and_marker_relocation_rejects() {
+    let harness = Harness::<ExcalidrawPlugin>::default();
+    let file = Snapshot {
+        path: "markers.excalidraw".into(),
+        bytes: br#"{"elements":[],"appState":{"name":"__LIX_EXCALIDRAW_ELEMENTS_9A7E__","other":"__LIX_EXCALIDRAW_FILES_4C2B__"}}"#.to_vec(),
+        ..Snapshot::default()
+    };
+    let parsed = harness.parse(&file, ctx(1)).unwrap();
+    let mut rows = Vec::new();
+    accept(&mut rows, &parsed.row_changes);
+    let rendered = harness.serialize(&file.file_id, &file.path, &rows, None).unwrap();
+    assert_eq!(rendered.snapshot().bytes, file.bytes);
+
+    let (harness, file, rows) = initial();
+    for template in [
+        r#"{"elements":[{"id":"a","type":"rectangle","x":999},{"id":"b","type":"text"}],"other":[__LIX_EXCALIDRAW_ELEMENTS_9A7E__],"files":{__LIX_EXCALIDRAW_FILES_4C2B__}}"#,
+        r#"{"elements":[__LIX_EXCALIDRAW_ELEMENTS_9A7E__],"files":{__LIX_EXCALIDRAW_FILES_4C2B__},"appState":{},"appState":{}}"#,
+        r#"{"elements":[__LIX_EXCALIDRAW_ELEMENTS_9A7E__],"files":{"image":{}},"other":{__LIX_EXCALIDRAW_FILES_4C2B__}}"#,
+    ] {
+        let mut scene = rows
+            .iter()
+            .find(|r| r.schema_key.as_ref() == core::SCENE_SCHEMA_KEY)
+            .unwrap()
+            .clone();
+        scene
+            .row
+            .insert("template_json", sdk::TypedValue::Text(template.into()));
+        assert!(harness.serialize_changes(&file, &[change(&scene)]).is_err());
+    }
+}

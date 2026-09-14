@@ -226,13 +226,7 @@ impl SceneRow {
     }
 
     fn validate_template(&self) -> Result<(), String> {
-        require_marker_count(&self.template_json, ELEMENTS_MARKER, 1, "elements")?;
-        require_marker_count(
-            &self.template_json,
-            FILES_MARKER,
-            usize::from(self.files_present),
-            "files",
-        )?;
+        template_markers(&self.template_json, self.files_present)?;
         if !is_json_whitespace(&self.elements_tail_json) {
             return Err("elements_tail_json must contain only JSON whitespace".to_owned());
         }
@@ -1358,17 +1352,7 @@ fn render_document(
     files: &[FileRow],
 ) -> Result<RenderedDocument, String> {
     let template = scene.template_json.as_bytes();
-    let mut markers = vec![(
-        find_unique(template, ELEMENTS_MARKER.as_bytes(), "elements")?,
-        Marker::Elements,
-    )];
-    if scene.files_present {
-        markers.push((
-            find_unique(template, FILES_MARKER.as_bytes(), "files")?,
-            Marker::Files,
-        ));
-    }
-    markers.sort_unstable_by_key(|marker| marker.0);
+    let markers = template_markers(&scene.template_json, scene.files_present)?;
     let mut bytes = Vec::with_capacity(scene.template_json.len());
     let mut element_spans = HashMap::with_capacity(elements.len());
     let mut file_spans = HashMap::with_capacity(files.len());
@@ -1462,21 +1446,76 @@ fn render_files(
     Ok(())
 }
 
-fn find_unique(haystack: &[u8], needle: &[u8], name: &str) -> Result<usize, String> {
-    let positions = haystack
-        .windows(needle.len())
-        .enumerate()
-        .filter_map(|(offset, window)| (window == needle).then_some(offset))
-        .collect::<Vec<_>>();
-    match positions.as_slice() {
-        [offset] => Ok(*offset),
-        [] => Err(format!(
-            "Excalidraw scene template is missing its {name} marker"
-        )),
-        _ => Err(format!(
-            "Excalidraw scene template contains multiple {name} markers"
-        )),
+// Markers are syntax, never text within JSON strings. Blanking them preserves
+// byte coordinates while allowing the normal scanner to validate their placement.
+fn template_markers(source: &str, files_present: bool) -> Result<Vec<(usize, Marker)>, String> {
+    let mut blanked = source.as_bytes().to_vec();
+    let mut markers = Vec::new();
+    let mut cursor = 0;
+    while cursor < blanked.len() {
+        if blanked[cursor] == b'"' {
+            cursor += 1;
+            while cursor < blanked.len() {
+                match blanked[cursor] {
+                    b'\\' => cursor += 2,
+                    b'"' => {
+                        cursor += 1;
+                        break;
+                    }
+                    _ => cursor += 1,
+                }
+            }
+            continue;
+        }
+        let marker = if blanked[cursor..].starts_with(ELEMENTS_MARKER.as_bytes()) {
+            Some(Marker::Elements)
+        } else if blanked[cursor..].starts_with(FILES_MARKER.as_bytes()) {
+            Some(Marker::Files)
+        } else {
+            None
+        };
+        if let Some(marker) = marker {
+            let end = cursor + marker.bytes().len();
+            blanked[cursor..end].fill(b' ');
+            markers.push((cursor, marker));
+            cursor = end;
+        } else {
+            cursor += 1;
+        }
     }
+    let fields = scan_root_fields(&blanked)?;
+    for (name, token, present, opening, closing) in [
+        ("elements", ELEMENTS_MARKER, true, b'[', b']'),
+        ("files", FILES_MARKER, files_present, b'{', b'}'),
+    ] {
+        let field = unique_field(&fields, name)?;
+        if !present {
+            if field.is_some()
+                || markers
+                    .iter()
+                    .any(|(_, marker)| marker.bytes() == token.as_bytes())
+            {
+                return Err(format!("unexpected Excalidraw {name} collection or marker"));
+            }
+            continue;
+        }
+        let field = field.ok_or_else(|| format!("missing Excalidraw {name} collection"))?;
+        let raw = &source.as_bytes()[field.value_start..field.value_end];
+        if raw.first() != Some(&opening)
+            || raw.last() != Some(&closing)
+            || raw.get(1..raw.len().saturating_sub(1)) != Some(token.as_bytes())
+            || markers
+                .iter()
+                .filter(|(_, marker)| marker.bytes() == token.as_bytes())
+                .count()
+                != 1
+        {
+            return Err(format!(
+                "Excalidraw {name} marker must fill its top-level collection"
+            ));
+        }
+    }
+    Ok(markers)
 }
 
 trait OrderedRow {
