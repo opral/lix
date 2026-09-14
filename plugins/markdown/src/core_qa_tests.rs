@@ -1,5 +1,35 @@
 use super::*;
 
+#[test]
+fn qa_nested_subtree_signatures_use_linear_space() {
+    let (document, _) = Document::open_file(
+        b"leaf\n".to_vec(),
+        Some("nested.md"),
+        IdNamespace::from_halves(30, 1),
+    )
+    .unwrap();
+    let mut tree = document.tree.materialize().children.remove(0);
+    let node = tree.node.clone();
+    for _ in 0..32 {
+        tree = NodeTree {
+            node: node.clone(),
+            children: vec![tree],
+        };
+    }
+    let signature = tree.subtree_signature();
+    assert!(
+        signature.len() < 32_000,
+        "signature grew to {} bytes",
+        signature.len()
+    );
+    let mut different = tree.clone();
+    different.children.push(NodeTree {
+        node,
+        children: vec![],
+    });
+    assert_ne!(signature, different.subtree_signature());
+}
+
 fn edit_target(document: &Document) -> Document {
     let tree = document.tree.materialize();
     let mut node = tree
