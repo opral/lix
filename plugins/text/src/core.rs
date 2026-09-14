@@ -152,11 +152,22 @@ impl Document {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let document = Self::from_lines(lines)?;
-        if document.bytes() != bytes.as_slice() {
+        let mut ids = std::collections::HashSet::with_capacity(lines.len());
+        for line in &lines {
+            if !ids.insert(line.id) {
+                return Err(format!("duplicate line row ID '{}'", line.id));
+            }
+        }
+        if lines
+            .windows(2)
+            .any(|pair| (&pair[0].order_key, pair[0].id) >= (&pair[1].order_key, pair[1].id))
+        {
             return Err("Text identity order does not match accepted bytes".to_owned());
         }
-        Ok(document)
+        Ok(Self(Arc::new(DocumentInner {
+            bytes,
+            lines: lines.into_iter().map(Arc::new).collect(),
+        })))
     }
 
     pub(crate) fn identities(&self) -> Vec<LineIdentity> {
@@ -202,6 +213,9 @@ impl Document {
     ) -> Result<(Self, Vec<lix::RowChange>), String> {
         let bytes = Arc::new(apply_splices(self.bytes(), splices)?);
         validate_text(&bytes)?;
+        if bytes.as_slice() == self.bytes() {
+            return Ok((self.clone(), Vec::new()));
+        }
         let chunks = split_lines(Arc::clone(&bytes));
 
         // Preserve the overwhelmingly common unchanged prefix and suffix
@@ -365,17 +379,10 @@ impl Document {
 
     fn from_lines(mut lines: Vec<Line>) -> Result<Self, String> {
         let mut ids = BTreeSet::new();
-        let mut order_keys = BTreeSet::new();
         for line in &lines {
             validate_line_bytes(line.bytes.as_slice())?;
             if !ids.insert(line.id.clone()) {
                 return Err(format!("duplicate line row ID '{}'", line.id));
-            }
-            if !order_keys.insert(line.order_key.clone()) {
-                return Err(format!(
-                    "duplicate line order key '{}'",
-                    line.order_key.to_snapshot_string()
-                ));
             }
         }
         lines.sort_by(|left, right| {
@@ -466,7 +473,7 @@ impl Document {
         &self,
         old_for_new: &[Option<usize>],
     ) -> Result<Vec<OrderKey>, String> {
-        let anchors = longest_increasing_old_indexes(old_for_new);
+        let anchors = longest_increasing_old_indexes(old_for_new, self.lines());
         let mut order_keys = vec![None; old_for_new.len()];
         for &position in &anchors {
             let old_index =
@@ -709,7 +716,10 @@ fn validate_text(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn longest_increasing_old_indexes(old_for_new: &[Option<usize>]) -> Vec<usize> {
+fn longest_increasing_old_indexes(
+    old_for_new: &[Option<usize>],
+    lines: &[Arc<Line>],
+) -> Vec<usize> {
     let mut tails = Vec::<usize>::new();
     let mut predecessors = vec![None; old_for_new.len()];
 
@@ -718,8 +728,9 @@ fn longest_increasing_old_indexes(old_for_new: &[Option<usize>]) -> Vec<usize> {
             continue;
         };
         let insertion = tails.partition_point(|tail_position| {
-            old_for_new[*tail_position].expect("LIS tails only contain matched positions")
-                < *old_index
+            lines[old_for_new[*tail_position].expect("LIS tails only contain matched positions")]
+                .order_key
+                < lines[*old_index].order_key
         });
         if insertion != 0 {
             predecessors[position] = Some(tails[insertion - 1]);

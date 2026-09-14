@@ -430,3 +430,33 @@ fn sequential_end_allocations_keep_order_storage_linear() {
         assert!(total <= 34 * 20_000, "end keys must have bounded storage");
     }
 }
+
+#[test]
+fn concurrent_order_ties_render_deterministically_and_accept_followup_edits() {
+    let (document, changes) = open(b"a\nb\n");
+    let mut rows = records(&changes);
+    let first_order = rows[0].row["order_key"].clone();
+    rows[1].row.insert("order_key", first_order);
+    let tied = Document::open_rows(rows.clone()).unwrap();
+    rows.reverse();
+    assert_eq!(Document::open_rows(rows).unwrap(), tied);
+    assert_eq!(tied.bytes(), document.bytes());
+    let hydrated =
+        Document::open_file_with_identities(tied.bytes().to_vec(), tied.identities()).unwrap();
+    assert_eq!(hydrated, tied);
+    let (_, noop) = tied.file_changed(&[], |n| test_id(2, n)).unwrap();
+    assert!(noop.is_empty());
+    let (after, mutations) = tied
+        .file_changed(
+            &[FileEdit {
+                offset: 0,
+                delete_len: 1,
+                insert: b"A".to_vec(),
+            }],
+            |n| test_id(2, n),
+        )
+        .unwrap();
+    let (replayed, _) = tied.rows_changed(mutations).unwrap();
+    assert_eq!(replayed, after);
+    assert_eq!(after.bytes(), b"A\nb\n");
+}
