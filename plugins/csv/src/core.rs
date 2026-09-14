@@ -1442,6 +1442,7 @@ struct DocumentInner {
 #[derive(Clone, Debug, Default)]
 struct OrderKeyStore {
     base: Arc<HashMap<u32, Arc<str>>>,
+    compact: Arc<Vec<u64>>,
     overlay: Option<Arc<OrderKeyOverlay>>,
 }
 
@@ -1456,19 +1457,28 @@ impl OrderKeyStore {
     fn from_base(base: HashMap<u32, Arc<str>>) -> Self {
         Self {
             base: Arc::new(base),
+            compact: Arc::new(Vec::new()),
             overlay: None,
         }
     }
 
-    fn get(&self, slot: u32) -> Option<&str> {
+    fn get(&self, slot: u32, rank: u64) -> Option<std::borrow::Cow<'_, str>> {
         let mut overlay = self.overlay.as_deref();
         while let Some(value) = overlay {
             if value.slot == slot {
-                return value.value.as_deref();
+                return value.value.as_deref().map(std::borrow::Cow::Borrowed);
             }
             overlay = value.previous.as_deref();
         }
-        self.base.get(&slot).map(AsRef::as_ref)
+        self.base
+            .get(&slot)
+            .map(|value| std::borrow::Cow::Borrowed(value.as_ref()))
+            .or_else(|| {
+                self.compact
+                    .get(slot as usize)
+                    .filter(|value| **value != rank)
+                    .map(|value| std::borrow::Cow::Owned(format!("{value:016x}")))
+            })
     }
 
     fn with_key(&self, slot: u32, order_key: &str, order_rank: u64) -> Self {
@@ -1476,6 +1486,7 @@ impl OrderKeyStore {
         let value = (order_key != canonical).then(|| Arc::from(order_key));
         Self {
             base: Arc::clone(&self.base),
+            compact: Arc::clone(&self.compact),
             overlay: Some(Arc::new(OrderKeyOverlay {
                 previous: self.overlay.clone(),
                 slot,
@@ -1490,6 +1501,7 @@ impl OrderKeyStore {
             .values()
             .map(|value| value.len() + size_of::<(u32, Arc<str>)>())
             .sum::<usize>();
+        bytes += self.compact.len() * size_of::<u64>();
         let mut overlay = self.overlay.as_deref();
         while let Some(value) = overlay {
             bytes +=
@@ -2014,17 +2026,64 @@ impl Document {
         } else if dialect.bom != bytes.starts_with(UTF8_BOM) {
             return Err("CSV stored BOM metadata does not match accepted bytes".to_owned());
         }
-        let prefix_len = if dialect.bom { UTF8_BOM.len() } else { 0 };
-        let mut drafts = scan_rows(&bytes, prefix_len, bytes.len(), dialect)?;
+        let (drafts, fields) = scan_cold_rows(&bytes, dialect)?;
         if infer_terminator {
             dialect.terminator =
                 preferred_terminator(drafts.iter().map(|row| row.ending), Terminator::Lf);
         }
-        let identities = IdentityStore::initial(namespace, drafts.len())?;
-        assign_initial_rows(&mut drafts);
+        let row_count = u32::try_from(drafts.len()).map_err(|_| "CSV has too many rows")?;
+        let field_count = u32::try_from(fields.len()).map_err(|_| "CSV has too many fields")?;
+        let mut chunks = Vec::with_capacity(drafts.len().div_ceil(ROWS_PER_CHUNK));
+        let mut next_key = 0;
+        for (chunk_ordinal, group) in drafts.chunks(ROWS_PER_CHUNK).enumerate() {
+            let start = group[0].start;
+            let first_field = group[0].first_field;
+            let last = group.last().expect("nonempty chunk");
+            let end_field = last.first_field as usize + last.field_count as usize;
+            let rows = group
+                .iter()
+                .enumerate()
+                .map(|(offset, row)| {
+                    let ordinal = (chunk_ordinal * ROWS_PER_CHUNK + offset) as u32;
+                    CompactRow {
+                        relative_start: row.start - start,
+                        byte_len: row.byte_len,
+                        first_field: row.first_field - first_field,
+                        field_count: row.field_count,
+                        ending: match row.ending {
+                            None => 0,
+                            Some(Terminator::Lf) => 1,
+                            Some(Terminator::CrLf) => 2,
+                            Some(Terminator::Cr) => 3,
+                        },
+                        id_slot: ordinal,
+                        order_rank: (((u128::from(ordinal) + 1) * u128::from(u64::MAX)
+                            / (u128::from(row_count) + 1))
+                            as u64)
+                            | 1,
+                    }
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            chunks.push(ChunkRef {
+                key: next_chunk_key(&mut next_key)?,
+                byte_start: start,
+                data: Arc::new(RowChunk {
+                    rows,
+                    fields: fields[first_field as usize..end_field]
+                        .to_vec()
+                        .into_boxed_slice(),
+                }),
+            });
+        }
+        // Avoid retaining per-row Vec allocations and both identity sets while
+        // opening a large structural successor in bounded Wasm memory.
+        drop(drafts);
+        drop(fields);
+        let identities = IdentityStore::initial(namespace, row_count as usize)?;
         let document = Self(Arc::new(DocumentInner {
             blob: PersistentBlob::from_vec(bytes)?,
-            index: RowIndex::from_drafts(drafts)?,
+            index: RowIndex::from_initial_chunks(chunks, row_count, field_count, next_key)?,
             identities,
             order_overrides: OrderKeyStore::default(),
             dialect,
@@ -2044,22 +2103,43 @@ impl Document {
         namespace: IdNamespace,
         identities: &[RowIdentity],
     ) -> Result<Self, String> {
+        let mut identities_iter = identities.iter();
+        Self::open_file_with_identity_reader(bytes, dialect, namespace, identities.len(), || {
+            identities_iter
+                .next()
+                .cloned()
+                .ok_or_else(|| "CSV checkpoint truncated".to_owned())
+        })
+    }
+
+    pub fn open_file_with_identity_reader(
+        bytes: Vec<u8>,
+        dialect: Dialect,
+        namespace: IdNamespace,
+        count: usize,
+        mut next: impl FnMut() -> Result<RowIdentity, String>,
+    ) -> Result<Self, String> {
         let document = Self::open_file_with_stored_dialect(bytes, dialect, namespace)?.0;
-        if document.row_count() != identities.len() {
+        if document.row_count() != count {
             return Err("CSV identity checkpoint row count does not match the file".to_owned());
         }
-        let mut id_bytes = Vec::with_capacity(identities.len() * 16);
-        let mut ranges = Vec::with_capacity(identities.len());
+        let mut inner = Arc::try_unwrap(document.0).expect("fresh document has one owner");
+        // Release the provisional dense identities before restoring durable IDs.
+        inner.identities = IdentityStore::initial(namespace, 0)?;
+        let mut id_bytes = Vec::with_capacity(count * 16);
+        let mut ranges = Vec::with_capacity(count);
         let mut overrides = HashMap::new();
-        for (ordinal, identity) in identities.iter().enumerate() {
+        let mut compact = Vec::with_capacity(count);
+        let mut previous: Option<RowIdentity> = None;
+        for ordinal in 0..count {
+            let identity = next()?;
             if !valid_order_key(&identity.order_key) {
                 return Err("CSV identity checkpoint order key is invalid".to_owned());
             }
-            if ordinal > 0 {
-                let previous = &identities[ordinal - 1];
-                if (&previous.order_key, previous.id) >= (&identity.order_key, identity.id) {
-                    return Err("CSV identity checkpoint rows are not in order".to_owned());
-                }
+            if previous.as_ref().is_some_and(|previous| {
+                (&previous.order_key, previous.id) >= (&identity.order_key, identity.id)
+            }) {
+                return Err("CSV identity checkpoint rows are not in order".to_owned());
             }
             ranges.push(IdentityRange {
                 start: u32::try_from(id_bytes.len())
@@ -2067,20 +2147,26 @@ impl Document {
                 len: 16,
             });
             id_bytes.extend_from_slice(identity.id.as_bytes());
-            let location = document
-                .0
+            let location = inner
                 .index
                 .ordinal_location(ordinal)
                 .expect("validated row count");
-            let row = document.0.index.row(location).1;
-            if identity.order_key != format!("{:016x}", row.order_rank) {
+            let row = inner.index.row(location).1;
+            if identity.order_key.len() == 16 {
+                compact
+                    .push(u64::from_str_radix(&identity.order_key, 16).expect("validated hex key"));
+            } else {
+                compact.push(row.order_rank);
                 overrides.insert(row.id_slot, Arc::from(identity.order_key.as_str()));
             }
+            previous = Some(identity);
         }
-        let identities = IdentityStore::from_noncompact(id_bytes, ranges)?;
-        let mut inner = Arc::try_unwrap(document.0).expect("fresh document has one owner");
-        inner.identities = identities;
-        inner.order_overrides = OrderKeyStore::from_base(overrides);
+        inner.identities = IdentityStore::from_noncompact(id_bytes, ranges)?;
+        inner.order_overrides = OrderKeyStore {
+            base: Arc::new(overrides),
+            compact: Arc::new(compact),
+            overlay: None,
+        };
         Ok(Self(Arc::new(inner)))
     }
 
@@ -2123,7 +2209,13 @@ impl Document {
         for (ordinal, location) in self.0.index.locations().enumerate() {
             let ordinal_u32 = u32::try_from(ordinal).ok()?;
             let (chunk, row) = self.0.index.row(location);
-            if row.id_slot != ordinal_u32 || self.0.order_overrides.get(row.id_slot).is_some() {
+            if row.id_slot != ordinal_u32
+                || self
+                    .0
+                    .order_overrides
+                    .get(row.id_slot, row.order_rank)
+                    .is_some()
+            {
                 return None;
             }
             let (row_namespace, identity_ordinal) =
@@ -2563,23 +2655,18 @@ impl Document {
         Ok(records)
     }
 
+    pub fn row_identities(&self) -> impl Iterator<Item = RowIdentity> + '_ {
+        self.0.index.locations().map(|location| {
+            let (_, row) = self.0.index.row(location);
+            RowIdentity {
+                id: self.row_id(location),
+                order_key: self.order_key(row),
+            }
+        })
+    }
+
     pub fn identity_checkpoint(&self) -> (Dialect, Vec<RowIdentity>) {
-        let mut locations = self.0.index.locations().collect::<Vec<_>>();
-        locations.sort_unstable_by_key(|&location| {
-            let (chunk, row) = self.0.index.row(location);
-            chunk.byte_start + row.relative_start
-        });
-        let identities = locations
-            .into_iter()
-            .map(|location| {
-                let (_, row) = self.0.index.row(location);
-                RowIdentity {
-                    id: self.row_id(location),
-                    order_key: self.order_key(row),
-                }
-            })
-            .collect();
-        (self.0.dialect, identities)
+        (self.0.dialect, self.row_identities().collect())
     }
 
     fn typed_row(&self, location: RowLocation) -> Result<TypedRow, String> {
@@ -2592,8 +2679,11 @@ impl Document {
     fn order_key(&self, row: &CompactRow) -> String {
         self.0
             .order_overrides
-            .get(row.id_slot)
-            .map_or_else(|| format!("{:016x}", row.order_rank), ToOwned::to_owned)
+            .get(row.id_slot, row.order_rank)
+            .map_or_else(
+                || format!("{:016x}", row.order_rank),
+                |key| key.into_owned(),
+            )
     }
 
     fn row_id(&self, location: RowLocation) -> uuid::Uuid {

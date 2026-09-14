@@ -127,3 +127,33 @@ fn variable_length_batches_update_offsets_across_pages_and_reopen() {
     assert!(result.snapshot().bytes.ends_with(b"tail,b\n"));
     assert_eq!(result.file_edits.len(), 1);
 }
+
+#[test]
+fn structural_checkpoint_streams_across_pages_and_preserves_order_overrides() {
+    let (file, index) = indexed_file(300_000);
+    let mut harness = sdk::testing::Harness::<CsvPlugin>::default();
+    harness.max_batch_bytes = 2 * 1024 * 1024;
+    let mut deletion = edit(&index, 0, &["a", "b"]);
+    deletion.row = None;
+    let file = harness
+        .serialize_changes(&file, &[deletion])
+        .unwrap()
+        .into_snapshot();
+    assert!(file.state.contains_key(CSV_IDENTITIES_KEY));
+    assert!(!file.state.contains_key(CSV_INDEX_KEY));
+    // The original 16-digit order keys no longer match the new row-count ranks.
+    // Reopening must preserve them across checkpoint page/record boundaries.
+    let result = harness
+        .serialize_changes(&file, &[edit(&index, 262_144, &["changed", "b"])])
+        .unwrap();
+    let offset = (262_144 - 1) * 4;
+    assert_eq!(
+        &result.snapshot().bytes[offset..offset + 10],
+        b"changed,b\n"
+    );
+    assert_eq!(result.file_edits.len(), 1);
+    let next = harness
+        .serialize_changes(result.snapshot(), &[edit(&index, 299_999, &["tail", "b"])])
+        .unwrap();
+    assert!(next.snapshot().bytes.ends_with(b"tail,b\n"));
+}

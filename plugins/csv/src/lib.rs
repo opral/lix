@@ -573,30 +573,42 @@ fn delete_identity_checkpoint(sink: &mut impl StateOutput) -> sdk::Result<()> {
 
 fn store_identity_checkpoint(sink: &mut impl StateOutput, document: &Document) -> sdk::Result<()> {
     sink.delete_state_prefix(b"csv/identity-page/")?;
-    let (dialect, identities) = document.identity_checkpoint();
-    let mut payload = Vec::new();
-    for identity in &identities {
-        payload.extend_from_slice(identity.id.as_bytes());
-        payload.extend_from_slice(
-            &u32::try_from(identity.order_key.len())
-                .map_err(|_| sdk::Error::limit_exceeded("CSV order key is too large"))?
-                .to_le_bytes(),
-        );
-        payload.extend_from_slice(identity.order_key.as_bytes());
+    let dialect = document.dialect();
+    let mut page = Vec::with_capacity(CSV_IDENTITY_PAGE_BYTES);
+    let mut page_count = 0u32;
+    for identity in document.row_identities() {
+        let length = u32::try_from(identity.order_key.len())
+            .map_err(|_| sdk::Error::limit_exceeded("CSV order key is too large"))?
+            .to_le_bytes();
+        for mut bytes in [
+            identity.id.as_bytes().as_slice(),
+            &length,
+            identity.order_key.as_bytes(),
+        ] {
+            while !bytes.is_empty() {
+                let take = bytes.len().min(CSV_IDENTITY_PAGE_BYTES - page.len());
+                page.extend_from_slice(&bytes[..take]);
+                bytes = &bytes[take..];
+                if page.len() == CSV_IDENTITY_PAGE_BYTES {
+                    sink.put_state(&identity_page_key(page_count), &page)?;
+                    page_count += 1;
+                    page.clear();
+                }
+            }
+        }
     }
-    let pages = payload.chunks(CSV_IDENTITY_PAGE_BYTES).collect::<Vec<_>>();
+    if !page.is_empty() {
+        sink.put_state(&identity_page_key(page_count), &page)?;
+        page_count += 1;
+    }
     let mut manifest = Vec::with_capacity(16);
     manifest.extend_from_slice(CSV_IDENTITIES_MAGIC);
     manifest.extend_from_slice(
-        &u32::try_from(identities.len())
+        &u32::try_from(document.row_count())
             .map_err(|_| sdk::Error::limit_exceeded("too many CSV identities"))?
             .to_le_bytes(),
     );
-    manifest.extend_from_slice(
-        &u32::try_from(pages.len())
-            .map_err(|_| sdk::Error::limit_exceeded("too many CSV identity pages"))?
-            .to_le_bytes(),
-    );
+    manifest.extend_from_slice(&page_count.to_le_bytes());
     manifest.extend_from_slice(&[
         dialect.delimiter,
         dialect.quote.unwrap_or(0),
@@ -608,9 +620,6 @@ fn store_identity_checkpoint(sink: &mut impl StateOutput, document: &Document) -
         u8::from(dialect.bom),
     ]);
     sink.put_state(CSV_IDENTITIES_KEY, &manifest)?;
-    for (ordinal, page) in pages.iter().enumerate() {
-        sink.put_state(&identity_page_key(ordinal as u32), page)?;
-    }
     Ok(())
 }
 
@@ -645,57 +654,73 @@ fn decode_identity_manifest(bytes: &[u8]) -> sdk::Result<(u32, u32, Dialect)> {
     ))
 }
 
-fn read_identity_checkpoint(
-    root: &sdk::Snapshot<'_>,
-) -> sdk::Result<Option<(Dialect, Vec<RowIdentity>)>> {
-    let Some(manifest) = root.get_state(CSV_IDENTITIES_KEY)? else {
-        return Ok(None);
-    };
-    let (row_count, page_count, dialect) = decode_identity_manifest(&manifest)?;
-    let mut payload = Vec::new();
-    for ordinal in 0..page_count {
-        payload.extend_from_slice(
-            &root
-                .get_state(&identity_page_key(ordinal))?
-                .ok_or_else(|| sdk::Error::invalid_input("CSV identity page disappeared"))?,
-        );
+struct IdentityCheckpointReader<'a, 'b> {
+    root: &'a sdk::Snapshot<'b>,
+    page_count: u32,
+    next_page: u32,
+    page: Vec<u8>,
+    offset: usize,
+}
+
+impl IdentityCheckpointReader<'_, '_> {
+    fn read(&mut self, length: usize) -> sdk::Result<Vec<u8>> {
+        let available = u64::from(self.page_count - self.next_page)
+            * CSV_IDENTITY_PAGE_BYTES as u64
+            + (self.page.len() - self.offset) as u64;
+        if length as u64 > available {
+            return Err(sdk::Error::invalid_input(
+                "CSV identity checkpoint is truncated",
+            ));
+        }
+        let mut output = Vec::with_capacity(length);
+        while output.len() < length {
+            if self.offset == self.page.len() {
+                if self.next_page == self.page_count {
+                    return Err(sdk::Error::invalid_input(
+                        "CSV identity checkpoint is truncated",
+                    ));
+                }
+                self.page = self
+                    .root
+                    .get_state(&identity_page_key(self.next_page))?
+                    .ok_or_else(|| sdk::Error::invalid_input("CSV identity page disappeared"))?;
+                self.next_page += 1;
+                self.offset = 0;
+                if self.page.is_empty()
+                    || self.page.len() > CSV_IDENTITY_PAGE_BYTES
+                    || (self.next_page < self.page_count
+                        && self.page.len() != CSV_IDENTITY_PAGE_BYTES)
+                {
+                    return Err(sdk::Error::invalid_input(
+                        "CSV identity page has invalid length",
+                    ));
+                }
+            }
+            let take = (length - output.len()).min(self.page.len() - self.offset);
+            output.extend_from_slice(&self.page[self.offset..self.offset + take]);
+            self.offset += take;
+        }
+        Ok(output)
     }
-    let mut offset = 0usize;
-    let mut identities = Vec::with_capacity(row_count as usize);
-    for _ in 0..row_count {
-        let id_end = offset
-            .checked_add(16)
-            .filter(|end| *end <= payload.len())
-            .ok_or_else(|| sdk::Error::invalid_input("CSV identity checkpoint is truncated"))?;
-        let id = uuid::Uuid::from_slice(&payload[offset..id_end])
+
+    fn next(&mut self) -> sdk::Result<RowIdentity> {
+        let header = self.read(20)?;
+        let id = uuid::Uuid::from_slice(&header[..16])
             .map_err(|_| sdk::Error::invalid_input("CSV checkpoint identity is invalid"))?;
-        offset = id_end;
-        let length_end = offset
-            .checked_add(4)
-            .filter(|end| *end <= payload.len())
-            .ok_or_else(|| sdk::Error::invalid_input("CSV identity checkpoint is truncated"))?;
-        let length = u32::from_le_bytes(
-            payload[offset..length_end]
-                .try_into()
-                .expect("order length"),
-        ) as usize;
-        offset = length_end;
-        let order_end = offset
-            .checked_add(length)
-            .filter(|end| *end <= payload.len())
-            .ok_or_else(|| sdk::Error::invalid_input("CSV identity checkpoint is truncated"))?;
-        let order_key = std::str::from_utf8(&payload[offset..order_end])
-            .map_err(|_| sdk::Error::invalid_input("CSV checkpoint order key is not UTF-8"))?
-            .to_owned();
-        offset = order_end;
-        identities.push(RowIdentity { id, order_key });
+        let length = u32::from_le_bytes(header[16..].try_into().expect("order length"));
+        let order_key = String::from_utf8(self.read(length as usize)?)
+            .map_err(|_| sdk::Error::invalid_input("CSV checkpoint order key is not UTF-8"))?;
+        Ok(RowIdentity { id, order_key })
     }
-    if offset != payload.len() {
-        return Err(sdk::Error::invalid_input(
-            "CSV identity checkpoint contains trailing bytes",
-        ));
+
+    fn finish(&self) -> sdk::Result<()> {
+        if self.next_page != self.page_count || self.offset != self.page.len() {
+            return Err(sdk::Error::invalid_input(
+                "CSV identity checkpoint contains trailing bytes",
+            ));
+        }
+        Ok(())
     }
-    Ok(Some((dialect, identities)))
 }
 
 fn open_document(
@@ -704,7 +729,7 @@ fn open_document(
     namespace: IdNamespace,
     snapshot: &sdk::Snapshot<'_>,
 ) -> sdk::Result<Document> {
-    let Some((dialect, identities)) = read_identity_checkpoint(snapshot)? else {
+    let Some(manifest) = snapshot.get_state(CSV_IDENTITIES_KEY)? else {
         let document = match snapshot.read_state_range(CSV_INDEX_KEY, 0, CSV_INDEX_HEADER_BYTES)? {
             Some(header) => Document::open_file_with_stored_dialect(
                 bytes,
@@ -717,8 +742,24 @@ fn open_document(
             .map(|(document, _)| document)
             .map_err(sdk::Error::invalid_input);
     };
-    Document::open_file_with_identities(bytes, dialect, namespace, &identities)
-        .map_err(sdk::Error::invalid_input)
+    let (row_count, page_count, dialect) = decode_identity_manifest(&manifest)?;
+    let mut reader = IdentityCheckpointReader {
+        root: snapshot,
+        page_count,
+        next_page: 0,
+        page: Vec::new(),
+        offset: 0,
+    };
+    let document = Document::open_file_with_identity_reader(
+        bytes,
+        dialect,
+        namespace,
+        row_count as usize,
+        || reader.next().map_err(|error| format!("{error:?}")),
+    )
+    .map_err(sdk::Error::invalid_input)?;
+    reader.finish()?;
+    Ok(document)
 }
 
 fn fallback_file_changed(
