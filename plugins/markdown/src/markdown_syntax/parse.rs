@@ -5218,9 +5218,6 @@ fn parse_link(
     }
     let label_end = label_end?;
     let label_source = &input[index + 1..label_end];
-    if label_contains_link(label_source, base_offset + index + 1, options, definitions) {
-        return None;
-    }
     let after_label = label_end + 1;
     if input.as_bytes().get(after_label) == Some(&b'(') {
         // A present-but-invalid `(...)` resource is not an inline link, but
@@ -5228,6 +5225,9 @@ fn parse_link(
         // the invalid `(...)` as literal text (links 568) — so fall through to
         // the reference branches below instead of bailing out of parse_link.
         if let Some((close, resource)) = parse_link_resource(input, after_label) {
+            if label_contains_link(label_source, base_offset + index + 1, options, definitions) {
+                return None;
+            }
             return Some((
                 close,
                 Inline::Link(Link {
@@ -5257,6 +5257,9 @@ fn parse_link(
             label
         };
         if definition_exists(definitions, identifier) {
+            if label_contains_link(label_source, base_offset + index + 1, options, definitions) {
+                return None;
+            }
             return Some((
                 close + 1,
                 Inline::LinkReference(LinkReference {
@@ -5289,6 +5292,9 @@ fn parse_link(
         return None;
     }
     if definition_exists(definitions, label_source) {
+        if label_contains_link(label_source, base_offset + index + 1, options, definitions) {
+            return None;
+        }
         return Some((
             after_label,
             Inline::LinkReference(LinkReference {
@@ -6654,7 +6660,7 @@ pub(crate) fn normalize_label(label: &str) -> String {
 }
 
 fn definition_exists(definitions: &[String], label: &str) -> bool {
-    if label.is_empty() || !reference_label_is_within_limit(label) {
+    if definitions.is_empty() || label.is_empty() || !reference_label_is_within_limit(label) {
         return false;
     }
 

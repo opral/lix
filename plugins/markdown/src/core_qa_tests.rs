@@ -805,3 +805,17 @@ fn qa_table_pipes_adjacent_to_ambiguous_emphasis_import() {
         assert_eq!(document.bytes(), source.as_bytes());
     }
 }
+
+#[test]
+fn qa_balanced_nonlink_brackets_do_not_speculatively_reparse() {
+    for depth in [24, 1_000] {
+        let source = format!("{}a{}\n", "[".repeat(depth), "]".repeat(depth));
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("balanced.md"),
+            IdNamespace::from_halves(40, 2),
+        )
+        .unwrap();
+        assert_eq!(document.bytes(), source.as_bytes());
+    }
+}
