@@ -120,6 +120,9 @@ impl LixRuntimeManager {
                 anyhow::bail!("existing admission lacks the exact prepared adoption proof");
             }
             report["admissionPublished"] = true.into();
+            objects
+                .put(&report_path, serde_json::to_vec(&report)?.into())
+                .await?;
             return Ok(report);
         }
         manager.reject_adoption_aliases(&manifest).await?;
@@ -442,12 +445,33 @@ mod tests {
         assert_eq!(rows.rows().len(), 1);
         lix.close().await.unwrap();
         drop(lix);
+        let report_path = ObjectPath::from(format!(
+            ".lix-adoption-reports/{}/{}.json",
+            manifest.hosted_repository_id, manifest.staged_storage_id
+        ));
+        let mut pending = result.clone();
+        pending["admissionPublished"] = false.into();
+        objects
+            .put(&report_path, serde_json::to_vec(&pending).unwrap().into())
+            .await
+            .unwrap();
         let retried = restarted
             .adopt_staged_repository_offline(&path)
             .await
             .unwrap();
         assert_eq!(retried["manifestDigest"], result["manifestDigest"]);
         assert_eq!(retried["admissionPublished"], true);
+        let durable: serde_json::Value = serde_json::from_slice(
+            &objects
+                .get(&report_path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(durable["admissionPublished"], true);
     }
     #[tokio::test]
     async fn adoption_proof_chain_requires_exact_source_and_patched_tool() {

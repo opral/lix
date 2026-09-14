@@ -70,3 +70,24 @@ report is saved fails closed: retain that stage for diagnosis and create a fresh
 stage from the verified migration output; never edit or delete the original.
 The command requires the global stopped-writer barrier because catalog listing
 and object hashing are not a cross-repository transaction.
+
+## Retain deleted repository sources
+
+`lix-server retain-tombstone /absolute/manifest.json` is an offline,
+metadata-only operation. Its manifest contains `schemaVersion: 1`,
+`hostedRepositoryId`, `controlInventoryPath`, `controlInventoryBlake3`,
+`controlDeletedAt`, `catalogBlake3`, and `physicalSources`. Each physical source
+has `storageId` and the complete `objects` array of `key`, `bytes`, and `blake3`.
+The sources must cover the active physical ID and every retired ID exactly.
+
+The command requires the target control row to have exactly the reviewed
+nonempty `deleted_at` in the digest-bound control inventory. It verifies source
+bytes, requires the exact reviewed live catalog hash, saves its original bytes
+and version in a prepared report, and publishes the tombstone using catalog CAS.
+It preserves unknown catalog metadata, physical IDs, and all physical objects;
+only state, admission, and fingerprint change. It never opens storage or calls
+cleanup. Exact retries revalidate retained bytes and recover the prepared report.
+
+Ordinary lifecycle DELETE has different behavior and deletes physical sources.
+Never use it for this retention operation. Keep serving/lifecycle writers and
+automatic restarts stopped throughout verification and publication.

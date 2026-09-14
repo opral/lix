@@ -3,6 +3,8 @@ mod adoption;
 #[cfg(feature = "offline-migration")]
 mod maintenance;
 #[cfg(feature = "offline-migration")]
+mod retained_tombstone;
+#[cfg(feature = "offline-migration")]
 pub use maintenance::AuthorityMigrationReport;
 mod inventory;
 pub use inventory::{AuthorityInventory, AuthorityInventoryEntry};
@@ -3860,9 +3862,8 @@ impl LixRuntimeManager {
                         "Idempotency-Key was already used with another create request.",
                     ));
                 }
-                self.sweep_retired(&record.retired)
-                    .await
-                    .map_err(lifecycle_failure)?;
+                // A create retry must not delete retained migration sources.
+                // Physical retirement requires an explicit cleanup operation.
                 return Ok(id);
             }
             if record.state == "deleted" {
@@ -4188,6 +4189,58 @@ impl lix_sdk::server_protocol::LixLifecycleStore for LifecycleHost {
 mod lifecycle_recovery_tests {
     use super::*;
     use lix_sdk::server_protocol::LixLifecycleStore as _;
+
+    #[tokio::test]
+    async fn live_create_retry_preserves_retained_migration_source() {
+        let manager = LixRuntimeManager::new_in_memory(4);
+        let id = uuid::Uuid::new_v4().to_string();
+        let retired = uuid::Uuid::new_v4().to_string();
+        let (objects, prefix) = manager.catalog_store();
+        let source = ObjectPath::from(format!("{prefix}{retired}/retained"));
+        objects
+            .put(&source, b"original-source".to_vec().into())
+            .await
+            .unwrap();
+        let record = RepositoryRecord {
+            state: "live".into(),
+            fingerprint: Some(empty_create_fingerprint()),
+            storage_id: uuid::Uuid::new_v4().to_string(),
+            retired: vec![retired],
+            admission: Some(AuthorityAdmission::current()),
+        };
+        let catalog = ObjectPath::from(format!("{prefix}.lix-repositories/{id}.json"));
+        let bytes = serde_json::to_vec(&record).unwrap();
+        objects.put(&catalog, bytes.clone().into()).await.unwrap();
+        assert_eq!(
+            manager
+                .create_repository_at_id(id.clone(), None, false)
+                .await
+                .unwrap(),
+            id
+        );
+        assert_eq!(
+            objects
+                .get(&source)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            b"original-source"
+        );
+        assert_eq!(
+            objects
+                .get(&catalog)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            bytes
+        );
+    }
 
     #[tokio::test]
     async fn interrupted_catalog_reservation_recovers_after_manager_restart() {

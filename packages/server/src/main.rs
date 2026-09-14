@@ -11,11 +11,14 @@ async fn main() -> anyhow::Result<()> {
         && !(arguments.len() == 2
             && matches!(
                 arguments[0].as_str(),
-                "upgrade-authority" | "inspect-physical" | "adopt-staged-repository"
+                "upgrade-authority"
+                    | "inspect-physical"
+                    | "adopt-staged-repository"
+                    | "retain-tombstone"
             ))
     {
         anyhow::bail!(
-            "usage: lix-server [inventory-authorities | migrate-authorities | upgrade-authority <repository-id> | inspect-physical <storage-id> | adopt-staged-repository <manifest.json>]"
+            "usage: lix-server [inventory-authorities | migrate-authorities | upgrade-authority <repository-id> | inspect-physical <storage-id> | adopt-staged-repository <manifest.json> | retain-tombstone <manifest.json>]"
         );
     }
     let telemetry = telemetry::init();
@@ -82,6 +85,24 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(not(feature = "offline-migration"))]
         anyhow::bail!(
             "Adoption requires the detached offline-migration build and stopped serving hosts."
+        );
+    }
+    if arguments
+        .first()
+        .is_some_and(|command| command == "retain-tombstone")
+    {
+        #[cfg(feature = "offline-migration")]
+        {
+            let manager = LixRuntimeManager::new(&config, telemetry.lix_sink)?;
+            let report = manager
+                .retain_tombstone_offline(std::path::Path::new(&arguments[1]))
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            return Ok(());
+        }
+        #[cfg(not(feature = "offline-migration"))]
+        anyhow::bail!(
+            "Retained tombstones require the detached offline-migration build and stopped writers."
         );
     }
     if let [_, lix_id] = arguments.as_slice() {
