@@ -1,15 +1,19 @@
+import { releaseTarget } from "./release.mjs";
+
 // Kept small and pure so the release policy is covered without building Lix.
-export function frozenReleaseCandidates(prs, repository) {
+export function frozenReleaseCandidates(prs, repository, target = "lix") {
+	releaseTarget(target);
+	const pattern = target === "lix" ? /^release\/v\d+\.\d+\.\d+$/ : new RegExp(`^release/${target}/v\\d+\\.\\d+\\.\\d+$`);
 	return prs.filter(pr => pr.state === "open" && !pr.draft &&
 		pr.base.ref === "main" && pr.head.repo?.full_name === repository &&
-		/^release\/v\d+\.\d+\.\d+$/.test(pr.head.ref));
+		pattern.test(pr.head.ref));
 }
 
-export async function checkReleaseFreeze({ github, context, core }) {
+export async function checkReleaseFreeze({ github, context, core, target = "lix" }) {
 	const prs = await github.paginate(github.rest.pulls.list, {
 		...context.repo, state: "open", base: "main", per_page: 100,
 	});
-	const frozen = frozenReleaseCandidates(prs, `${context.repo.owner}/${context.repo.repo}`);
+	const frozen = frozenReleaseCandidates(prs, `${context.repo.owner}/${context.repo.repo}`, target);
 	core.setOutput("frozen", frozen.length > 0 ? "true" : "false");
 	if (frozen.length) core.info(`Release candidate frozen: ${frozen.map(pr => `#${pr.number}`).join(", ")}. Return it to draft and dispatch Release PR to refresh.`);
 }

@@ -11,6 +11,35 @@ import { dirname, join, relative, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 
 export const CHANGE_TYPES = ["minor", "patch"];
+
+// Release identities match plugin keys and Cargo package names.
+export const RELEASE_TARGETS = Object.freeze({
+	lix: { path: "." },
+	plugin_csv: { path: "plugins/csv" },
+	plugin_excalidraw: { path: "plugins/excalidraw" },
+	plugin_json: { path: "plugins/json" },
+	plugin_markdown: { path: "plugins/markdown" },
+	plugin_text: { path: "plugins/text" },
+});
+export const PLUGIN_RELEASE_TARGETS = Object.keys(RELEASE_TARGETS).filter(target => target !== "lix");
+
+export function releaseTarget(target = "lix") {
+	if (!Object.hasOwn(RELEASE_TARGETS, target)) {
+		throw new Error(`Unknown release target: ${target}`);
+	}
+	return RELEASE_TARGETS[target];
+}
+
+export function releaseTag(target, version) {
+	releaseTarget(target);
+	if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error(`Unsupported release version: ${version}`);
+	return target === "lix" ? `v${version}` : `${target}/v${version}`;
+}
+
+export function releaseBranch(target, version) {
+	return `release/${releaseTag(target, version)}`;
+}
+
 export const JS_SDK_NATIVE_PACKAGES = [
 	"@lix-js/sdk-darwin-arm64",
 	"@lix-js/sdk-linux-arm64",
@@ -39,7 +68,15 @@ export function writeJson(root, path, value) {
 	writeText(root, path, `${JSON.stringify(value, null, "\t")}\n`);
 }
 
-export function currentVersion(root) {
+export function currentVersion(root, target = "lix") {
+	const config = releaseTarget(target);
+	if (target !== "lix") {
+		const match = readText(root, `${config.path}/Cargo.toml`).match(
+			/\[package\]([\s\S]*?)(?=\n\[|$)/,
+		)?.[1].match(/^version\s*=\s*"(\d+\.\d+\.\d+)"\s*$/m);
+		if (!match) throw new Error(`${target} must have an explicit stable Cargo package version`);
+		return match[1];
+	}
 	const match = readText(root, "Cargo.toml").match(
 		/\[workspace\.package\][\s\S]*?\nversion\s*=\s*"([^"]+)"/,
 	);
@@ -99,8 +136,7 @@ export function parseChange(root, path) {
 	if (!match) {
 		throw new Error(`${path}: expected frontmatter followed by a changelog body`);
 	}
-	const metadata = Object.fromEntries(
-		match[1]
+	const entries = match[1]
 			.split("\n")
 			.map((line) => line.trim())
 			.filter(Boolean)
@@ -108,9 +144,16 @@ export function parseChange(root, path) {
 				const separator = line.indexOf(":");
 				if (separator === -1) throw new Error(`${path}: invalid frontmatter line "${line}"`);
 				return [line.slice(0, separator).trim(), line.slice(separator + 1).trim()];
-			}),
-	);
+			});
+	const metadata = {};
+	for (const [key, value] of entries) {
+		if (!["type", "target"].includes(key)) throw new Error(`${path}: unknown frontmatter field ${key}`);
+		if (Object.hasOwn(metadata, key)) throw new Error(`${path}: duplicate frontmatter field ${key}`);
+		metadata[key] = value;
+	}
 	const type = metadata.type;
+	const target = metadata.target ?? "lix";
+	try { releaseTarget(target); } catch (error) { throw new Error(`${path}: ${error.message}`); }
 	const bodyParagraphs = changeBodyParagraphs(match[2]);
 	if (!CHANGE_TYPES.includes(type)) {
 		throw new Error(`${path}: type must be one of ${CHANGE_TYPES.join(", ")}`);
@@ -121,6 +164,7 @@ export function parseChange(root, path) {
 	return {
 		path,
 		type,
+		target,
 		body: bodyParagraphs.join("\n\n"),
 		summary: bodyParagraphs[0],
 		details: bodyParagraphs.slice(1),
@@ -513,8 +557,9 @@ export function updateCargoLockfiles(root, { runCargo = execFileSync } = {}) {
 	}
 }
 
-export function updateChangelog(root, version, date, changes) {
-	const path = "CHANGELOG.md";
+export function updateChangelog(root, version, date, changes, target = "lix") {
+	const config = releaseTarget(target);
+	const path = target === "lix" ? "CHANGELOG.md" : `${config.path}/CHANGELOG.md`;
 	const existing = existsSync(join(root, path)) ? readText(root, path).trimEnd() : "# Changelog\n";
 	const entry = changelogEntry(version, date, changes).trimEnd();
 	const next =
@@ -524,42 +569,51 @@ export function updateChangelog(root, version, date, changes) {
 	writeText(root, path, next);
 }
 
-export function prepareRelease(root, { date = new Date().toISOString().slice(0, 10) } = {}) {
-	const changes = loadChanges(root);
-	if (changes.length === 0) {
-		return null;
+function updateReleaseVersion(root, target, version) {
+	if (target === "lix") {
+		updateCargoToml(root, version);
+		validateCargoLockstepVersions(root, version);
+		updatePackageVersion(root, version);
+		return;
 	}
+	const path = `${releaseTarget(target).path}/Cargo.toml`;
+	const previous = currentVersion(root, target);
+	writeText(root, path, readText(root, path).replace(
+		/(\[package\][\s\S]*?\nversion\s*=\s*")[^"]+("\s*(?:\n|$))/,
+		`$1${version}$2`,
+	));
+	if (currentVersion(root, target) !== version) {
+		throw new Error(`Failed to update ${target} from ${previous} to ${version}`);
+	}
+}
+
+export function prepareRelease(root, {
+	target = "lix", date = new Date().toISOString().slice(0, 10), runCargo = execFileSync,
+} = {}) {
+	releaseTarget(target);
+	const changes = loadChanges(root).filter(change => change.target === target);
+	if (changes.length === 0) return null;
 	const type = highestChangeType(changes);
-	const version = bumpVersion(currentVersion(root), type);
-	updateCargoToml(root, version);
-	validateCargoLockstepVersions(root, version);
-	updatePackageVersion(root, version);
-	updateChangelog(root, version, date, changes);
-	for (const change of changes) {
-		rmSync(join(root, change.path));
-	}
-	updateCargoLockfiles(root);
-	return { version, type, changes };
+	const version = bumpVersion(currentVersion(root, target), type);
+	updateReleaseVersion(root, target, version);
+	updateChangelog(root, version, date, changes, target);
+	updateCargoLockfiles(root, { runCargo });
+	for (const change of changes) rmSync(join(root, change.path));
+	return { target, version, type, changes, tag: releaseTag(target, version), branch: releaseBranch(target, version) };
 }
 
 export function prepareManualRelease(
 	root,
 	requestedVersion,
-	{ date = new Date().toISOString().slice(0, 10), runCargo = execFileSync } = {},
+	{ target = "lix", date = new Date().toISOString().slice(0, 10), runCargo = execFileSync } = {},
 ) {
-	const version = manualReleaseVersion(currentVersion(root), requestedVersion);
-	const changes = loadChanges(root);
-	updateCargoToml(root, version);
-	validateCargoLockstepVersions(root, version);
-	updatePackageVersion(root, version);
-	if (changes.length > 0) {
-		updateChangelog(root, version, date, changes);
-		for (const change of changes) {
-			rmSync(join(root, change.path));
-		}
-	}
+	const version = manualReleaseVersion(currentVersion(root, target), requestedVersion);
+	const changes = loadChanges(root).filter(change => change.target === target);
+	updateReleaseVersion(root, target, version);
+	if (changes.length > 0) updateChangelog(root, version, date, changes, target);
 	updateCargoLockfiles(root, { runCargo });
-	return { version, changes };
+	for (const change of changes) rmSync(join(root, change.path));
+	return { target, version, changes };
 }
 
 export function releaseTagForHead(root) {
