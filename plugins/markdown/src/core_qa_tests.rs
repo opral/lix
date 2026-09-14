@@ -819,3 +819,20 @@ fn qa_balanced_nonlink_brackets_do_not_speculatively_reparse() {
         assert_eq!(document.bytes(), source.as_bytes());
     }
 }
+
+#[test]
+fn qa_mixed_punctuation_prefixes_stabilize() {
+    for source in [
+        "&amp;>>>>>>>>",
+        "&\t>`>|*>-://&",
+        "&amp;>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>",
+    ] {
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("mixed.md"),
+            IdNamespace::from_halves(41, 1),
+        )
+        .unwrap();
+        assert_eq!(document.bytes(), source.as_bytes());
+    }
+}

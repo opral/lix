@@ -818,6 +818,7 @@ fn serialize_inlines_with_context(
                         && output_line_len(&output) == 0,
                     trailing_ws.is_empty() && text_is_at_line_end(inlines, index),
                     context,
+                    after_literal_autolink,
                 ));
                 output.push_str(trailing_ws);
             }
@@ -1217,6 +1218,7 @@ fn escape_text_with_context(
     preserve_leading: bool,
     preserve_trailing: bool,
     context: InlineSerializeContext,
+    after_literal_autolink: bool,
 ) -> String {
     // This function encodes source line endings as entities below, so its
     // output never contains a literal newline. `output.len()` is therefore
@@ -1319,7 +1321,8 @@ fn escape_text_with_context(
             line_digit_prefix = usize::MAX;
             continue;
         }
-        if output.is_empty()
+        if preserve_leading
+            && output.is_empty()
             && matches!(char, '-' | '+')
             && chars
                 .peek()
@@ -1331,7 +1334,8 @@ fn escape_text_with_context(
             line_digit_prefix = usize::MAX;
             continue;
         }
-        if output.is_empty()
+        if preserve_leading
+            && output.is_empty()
             && ((char == '-' && chars.peek().is_some_and(|(_, next)| *next == '-')) || char == '=')
         {
             output.push('\\');
@@ -1377,7 +1381,7 @@ fn escape_text_with_context(
                 output.push('\\');
                 output.push(char);
             }
-            '>' if output.is_empty() => {
+            '>' if (preserve_leading || after_literal_autolink) && output.is_empty() => {
                 output.push('\\');
                 output.push(char);
             }
