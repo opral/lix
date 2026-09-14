@@ -1400,7 +1400,10 @@ fn block_from_tree(tree: &NodeTree) -> Result<md::Block, PluginError> {
         })),
         NodeKind::Definition => Ok(md::Block::Definition(md::Definition {
             meta: authored_meta(),
-            label: owned_string_field(&tree.node.format, "label")?,
+            label: effective_reference_label(
+                string_field(&tree.node.payload, "identifier")?,
+                string_field(&tree.node.format, "label")?,
+            ),
             identifier: owned_string_field(&tree.node.payload, "identifier")?,
             destination: owned_string_field(&tree.node.payload, "destination")?,
             destination_kind: parse_link_destination(
@@ -1415,7 +1418,10 @@ fn block_from_tree(tree: &NodeTree) -> Result<md::Block, PluginError> {
         })),
         NodeKind::FootnoteDefinition => Ok(md::Block::FootnoteDefinition(md::FootnoteDefinition {
             meta: authored_meta(),
-            label: owned_string_field(&tree.node.format, "label")?,
+            label: effective_reference_label(
+                string_field(&tree.node.payload, "identifier")?,
+                string_field(&tree.node.format, "label")?,
+            ),
             identifier: owned_string_field(&tree.node.payload, "identifier")?,
             children: child_blocks(tree)?,
         })),
@@ -1603,6 +1609,27 @@ fn raw_inline(value: &str) -> md::Inline {
     })
 }
 
+fn effective_reference_label(identifier: &str, label: &str) -> String {
+    if crate::parse::normalize_label(label) == identifier {
+        label.to_owned()
+    } else {
+        identifier.to_owned()
+    }
+}
+
+fn effective_character_reference(value: &str, reference: &str) -> String {
+    if crate::parse::parse_character_reference(reference, 0)
+        .is_some_and(|(end, decoded)| end == reference.len() && decoded == value)
+    {
+        reference.to_owned()
+    } else {
+        value
+            .chars()
+            .map(|character| format!("&#x{:X};", u32::from(character)))
+            .collect()
+    }
+}
+
 fn inline_to_ast(node: &InlineNode, output: &mut Vec<md::Inline>) -> Result<(), PluginError> {
     let meta = md::NodeMeta::default();
     match &node.content {
@@ -1617,7 +1644,7 @@ fn inline_to_ast(node: &InlineNode, output: &mut Vec<md::Inline>) -> Result<(), 
         InlineContent::CharacterReference { value, format } => {
             output.push(md::Inline::CharacterReference(md::CharacterReference {
                 meta,
-                reference: format.reference.clone(),
+                reference: effective_character_reference(value, &format.reference),
                 value: value.clone(),
             }));
         }
@@ -1658,7 +1685,11 @@ fn inline_to_ast(node: &InlineNode, output: &mut Vec<md::Inline>) -> Result<(), 
         InlineContent::Code { value, format } => output.push(md::Inline::Code(md::CodeInline {
             meta,
             value: value.clone(),
-            raw: format.raw.clone(),
+            raw: if crate::parse::normalize_code_span(&format.raw) == *value {
+                format.raw.clone()
+            } else {
+                String::new()
+            },
             fence_length: format.fence_length,
         })),
         InlineContent::Link {
@@ -1702,7 +1733,7 @@ fn inline_to_ast(node: &InlineNode, output: &mut Vec<md::Inline>) -> Result<(), 
         } => output.push(md::Inline::LinkReference(md::LinkReference {
             meta: authored_meta(),
             identifier: identifier.clone(),
-            label: format.label.clone(),
+            label: effective_reference_label(identifier, &format.label),
             kind: parse_reference_kind(&format.kind, node)?,
             children: inlines_to_ast(children)?,
         })),
@@ -1713,7 +1744,7 @@ fn inline_to_ast(node: &InlineNode, output: &mut Vec<md::Inline>) -> Result<(), 
         } => output.push(md::Inline::ImageReference(md::ImageReference {
             meta: authored_meta(),
             identifier: identifier.clone(),
-            label: format.label.clone(),
+            label: effective_reference_label(identifier, &format.label),
             kind: parse_reference_kind(&format.kind, node)?,
             alt: inlines_to_ast(alt)?,
         })),
@@ -1725,13 +1756,26 @@ fn inline_to_ast(node: &InlineNode, output: &mut Vec<md::Inline>) -> Result<(), 
             destination: destination.clone(),
             kind: match format.kind.as_str() {
                 "angle" => md::AutolinkKind::Angle,
-                "literal" => md::AutolinkKind::GfmLiteral {
-                    original: format.original.clone().ok_or_else(|| {
-                        PluginError::InvalidInput(
-                            "literal autolink format must contain original spelling".to_string(),
-                        )
-                    })?,
-                },
+                "literal" => {
+                    let original = format.original.as_deref().unwrap_or(destination);
+                    let spelling = if crate::parse::parse_literal_autolink(original, 0, true, false)
+                        .is_some_and(|(end, parsed)| {
+                            end == original.len() && parsed == *destination
+                        }) {
+                        original
+                    } else {
+                        destination.strip_prefix("mailto:").unwrap_or(destination)
+                    };
+                    if crate::parse::parse_literal_autolink(spelling, 0, true, false).is_some_and(
+                        |(end, parsed)| end == spelling.len() && parsed == *destination,
+                    ) {
+                        md::AutolinkKind::GfmLiteral {
+                            original: spelling.to_owned(),
+                        }
+                    } else {
+                        md::AutolinkKind::Angle
+                    }
+                }
                 value => return Err(invalid_inline_field(node, "kind", value)),
             },
         })),
@@ -1753,7 +1797,7 @@ fn inline_to_ast(node: &InlineNode, output: &mut Vec<md::Inline>) -> Result<(), 
         InlineContent::FootnoteReference { identifier, format } => {
             output.push(md::Inline::FootnoteReference(md::FootnoteReference {
                 meta: authored_meta(),
-                label: format.label.clone(),
+                label: effective_reference_label(identifier, &format.label),
                 identifier: identifier.clone(),
             }));
         }

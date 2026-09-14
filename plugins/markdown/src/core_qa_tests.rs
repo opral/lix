@@ -379,3 +379,89 @@ fn qa_bulk_incompatible_siblings_preserve_existing_identities() {
         assert_eq!(old.node.id, new.node.id);
     }
 }
+
+#[test]
+fn qa_semantic_inline_edits_override_stale_spelling() {
+    for (source, field, value, expected) in [
+        ("&amp;\n", "value", "<", "&#x3C;\n"),
+        ("`old`\n", "value", "new", "`new`\n"),
+        (
+            "https://old.example\n",
+            "destination",
+            "https://new.example",
+            "https://new.example\n",
+        ),
+    ] {
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("edit.md"),
+            IdNamespace::from_halves(31, 1),
+        )
+        .unwrap();
+        let mut node = document.tree.materialize().children.remove(0).node;
+        node.payload["inline"][0][field] = serde_json::json!(value);
+        let (updated, _) = document
+            .rows_changed(vec![RowChange {
+                schema_key: NODE_SCHEMA_KEY.into(),
+                row_pk: vec![node.id],
+                row: Some(node_to_typed_row(&node).unwrap()),
+                effect: ChangeEffect::Content,
+            }])
+            .unwrap();
+        assert_eq!(String::from_utf8(updated.bytes()).unwrap(), expected);
+        let (reopened, _) = Document::open_file(
+            updated.bytes(),
+            Some("edit.md"),
+            IdNamespace::from_halves(31, 2),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.tree.materialize().children[0].node.payload["inline"][0][field],
+            value
+        );
+    }
+}
+
+#[test]
+fn qa_reference_identifier_edits_override_stale_labels() {
+    for source in ["[old]: /url\n\n[old]\n", "[^old]: note\n\n[^old]\n"] {
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("edit.md"),
+            IdNamespace::from_halves(31, 3),
+        )
+        .unwrap();
+        let mut node = document
+            .tree
+            .materialize()
+            .children
+            .into_iter()
+            .find(|node| node.node.payload.get("identifier").is_some())
+            .unwrap()
+            .node;
+        node.payload["identifier"] = serde_json::json!("new");
+        let (updated, _) = document
+            .rows_changed(vec![RowChange {
+                schema_key: NODE_SCHEMA_KEY.into(),
+                row_pk: vec![node.id],
+                row: Some(node_to_typed_row(&node).unwrap()),
+                effect: ChangeEffect::Content,
+            }])
+            .unwrap();
+        let (reopened, _) = Document::open_file(
+            updated.bytes(),
+            Some("edit.md"),
+            IdNamespace::from_halves(31, 4),
+        )
+        .unwrap();
+        assert!(
+            reopened.tree.materialize().children.iter().any(|node| node
+                .node
+                .payload
+                .get("identifier")
+                == Some(&serde_json::json!("new"))),
+            "{}",
+            String::from_utf8_lossy(&updated.bytes())
+        );
+    }
+}

@@ -5623,7 +5623,7 @@ fn find_code_span_close(input: &str, start: usize, marker_len: usize) -> Option<
     None
 }
 
-fn normalize_code_span(input: &str) -> String {
+pub(crate) fn normalize_code_span(input: &str) -> String {
     let mut normalized = String::new();
     let mut cursor = 0;
     while cursor < input.len() {
@@ -7531,7 +7531,7 @@ fn is_email_autolink(input: &str) -> bool {
 // returned destination is the synthesized href (a `http://`/`mailto:` prefix
 // may be prepended); the caller keeps `input[index..end]` as the visible
 // original.
-fn parse_literal_autolink(
+pub(crate) fn parse_literal_autolink(
     input: &str,
     index: usize,
     gfm: bool,
