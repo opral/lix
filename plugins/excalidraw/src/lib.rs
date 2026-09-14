@@ -189,14 +189,19 @@ impl sdk::FileProjection for ExcalidrawPlugin {
                 insert,
             })
             .collect::<Vec<_>>();
+        update.file_edits.validated(update.before.len())?;
         if update.before_path == update.after_path
-            && update.file_edits.iter().len() == 1
-            && let Some(edit) = update.file_edits.iter().next()
-            && let Some((change, successor_shifts)) =
-                sparse_element_change(&update, edit, &inserts[0])?
+            && let Some((changes, shifts)) = sparse_file_changes(&update)?
         {
-            sink.put_state(ELEMENT_SHIFTS_KEY, &successor_shifts)?;
-            emit_changes([Ok(change)], sink)?;
+            if update
+                .before
+                .get_state(ELEMENT_SHIFTS_KEY)?
+                .unwrap_or_default()
+                != shifts
+            {
+                sink.put_state(ELEMENT_SHIFTS_KEY, &shifts)?;
+            }
+            emit_changes(changes.into_iter().map(Ok), sink)?;
             return Ok(());
         }
 
@@ -488,11 +493,100 @@ fn apply_edits(mut bytes: Vec<u8>, edits: &[core::ByteEdit]) -> sdk::Result<Vec<
     Ok(bytes)
 }
 
+fn sparse_file_changes(
+    update: &sdk::ParseChangesInput<'_>,
+) -> sdk::Result<Option<(Vec<RowChange>, Vec<u8>)>> {
+    let Some(count) = index_count(&update.before)? else {
+        return Ok(None);
+    };
+    let shifts = decode_shifts(
+        &update
+            .before
+            .get_state(ELEMENT_SHIFTS_KEY)?
+            .unwrap_or_default(),
+    )?;
+    let mut successor = shifts.clone();
+    let edits: Vec<_> = update.file_edits.iter().collect();
+    let mut cursor = 0;
+    let mut changes = Vec::new();
+    while cursor < edits.len() {
+        let first = edits[cursor];
+        let mut low = 0;
+        let mut high = count;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let entry = read_index_entry(&update.before, middle)?;
+            if effective_offset(entry.offset, middle, &shifts)? <= first.offset {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        if low == 0 {
+            return Ok(None);
+        }
+        let ordinal = low - 1;
+        let entry = read_index_entry(&update.before, ordinal)?;
+        let start = effective_offset(entry.offset, ordinal, &shifts)?;
+        let end = start
+            .checked_add(effective_length(entry.length, ordinal, &shifts)?)
+            .ok_or_else(|| sdk::Error::invalid_input("element span overflow"))?;
+        if first.offset + first.delete_len > end {
+            return Ok(None);
+        }
+        let group_start = cursor;
+        cursor += 1;
+        while cursor < edits.len() && edits[cursor].offset <= end {
+            if edits[cursor].offset + edits[cursor].delete_len > end {
+                return Ok(None);
+            }
+            cursor += 1;
+        }
+        let last = edits[cursor - 1];
+        let delete_len = last.offset + last.delete_len - first.offset;
+        let mut insert = if cursor - group_start == 1 {
+            first.insert.clone()
+        } else {
+            update.before.read_range(first.offset, delete_len)?
+        };
+        if cursor - group_start > 1 {
+            for edit in edits[group_start..cursor].iter().rev() {
+                let from = (edit.offset - first.offset) as usize;
+                let to = from + edit.delete_len as usize;
+                insert.splice(from..to, edit.insert.iter().copied());
+            }
+        }
+        let combined = sdk::FileEdit {
+            offset: first.offset,
+            delete_len,
+            insert,
+        };
+        let Some((change, _)) = sparse_element_change(update, &combined, &combined.insert)? else {
+            return Ok(None);
+        };
+        if let Some(change) = change {
+            changes.push(change);
+        }
+        let delta = i64::try_from(combined.insert.len())
+            .ok()
+            .and_then(|n| {
+                i64::try_from(delete_len)
+                    .ok()
+                    .and_then(|old| n.checked_sub(old))
+            })
+            .ok_or_else(|| sdk::Error::limit_exceeded("element edit length exceeds i64"))?;
+        if !add_element_shift(&mut successor, ordinal, delta)? {
+            return Ok(None);
+        }
+    }
+    Ok(Some((changes, encode_shifts(&successor))))
+}
+
 fn sparse_element_change(
     update: &sdk::ParseChangesInput<'_>,
     edit: &sdk::FileEdit,
     insert: &[u8],
-) -> sdk::Result<Option<(RowChange, Vec<u8>)>> {
+) -> sdk::Result<Option<(Option<RowChange>, Vec<u8>)>> {
     match update.before.state_len(ELEMENT_INDEX_KEY)? {
         Some(_) => {}
         None => return Ok(None),
@@ -593,7 +687,7 @@ fn sparse_element_change(
     let element_json = String::from_utf8(element)
         .map_err(|error| sdk::Error::invalid_input(format!("invalid Excalidraw UTF-8: {error}")))?;
     if element_json.as_bytes() == previous {
-        return Ok(None);
+        return Ok(Some((None, encode_shifts(&shifts))));
     }
     let Some(mut change) =
         Document::element_change_from_source(&id, order_key, leading_json, element_json)
@@ -623,7 +717,7 @@ fn sparse_element_change(
     if !add_element_shift(&mut shifts, ordinal, delta)? {
         return Ok(None);
     }
-    Ok(Some((change, encode_shifts(&shifts))))
+    Ok(Some((Some(change), encode_shifts(&shifts))))
 }
 
 struct EncodedElementIndex {

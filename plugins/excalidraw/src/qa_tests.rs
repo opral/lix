@@ -961,3 +961,42 @@ fn qa_default_order_ties_sort_by_id_and_accept_file_insertion_between_ties() {
         changed.snapshot().bytes
     );
 }
+
+#[test]
+fn qa_multi_field_and_multi_element_file_edits_stay_sparse() {
+    let (h, file, rows) = initial();
+    let edits = vec![
+        replace(&file, "\"x\": 1", "\"x\": 123"),
+        replace(&file, "\"n\":4e0", "\"n\":5e0"),
+        replace(&file, "untouched", "changed"),
+    ];
+    let warm = h
+        .parse_changes(&file, &file.path, &edits, None, ctx(2))
+        .unwrap();
+    assert_eq!(warm.row_changes.len(), 2);
+    assert!(warm.metrics.file_bytes_read < 500);
+    assert!(warm.metrics.state_bytes_written <= 24);
+    let mut cold = file.clone();
+    cold.state.clear();
+    let cold = h
+        .parse_changes(&cold, &cold.path, &edits, Some(&rows), ctx(2))
+        .unwrap();
+    let mut warm_rows = rows.clone();
+    let mut cold_rows = rows;
+    accept(&mut warm_rows, &warm.row_changes);
+    accept(&mut cold_rows, &cold.row_changes);
+    assert_eq!(canonical_rows(&warm_rows), canonical_rows(&cold_rows));
+    assert_eq!(warm.snapshot().bytes, cold.snapshot().bytes);
+    let file = warm.into_snapshot();
+    let edits = vec![
+        replace(&file, "\"x\": 123", "\"x\": 123"),
+        replace(&file, "\"n\":5e0", "\"n\":5e0"),
+        replace(&file, "changed", "changed"),
+    ];
+    let noop = h
+        .parse_changes(&file, &file.path, &edits, None, ctx(3))
+        .unwrap();
+    assert!(noop.row_changes.is_empty());
+    assert!(noop.metrics.file_bytes_read < 500);
+    assert_eq!(noop.metrics.state_bytes_written, 0);
+}
