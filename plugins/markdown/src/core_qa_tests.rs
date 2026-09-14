@@ -540,3 +540,32 @@ fn qa_text_edits_after_autolinks_remain_literal() {
             .contains("emphasis")
     );
 }
+
+#[test]
+fn qa_table_inline_markers_preserve_cell_source_positions() {
+    let source = "| _a_ | __b__ |\n| - | - |\n| café \\| _c_ | __d__ |\n";
+    let (document, _) = Document::open_file(
+        source.as_bytes().to_vec(),
+        Some("table.md"),
+        IdNamespace::from_halves(34, 1),
+    )
+    .unwrap();
+    let tree = document.tree.materialize();
+    let table = &tree.children[0];
+    let mut markers = Vec::new();
+    for row in table
+        .children
+        .iter()
+        .filter(|child| child.node.kind == NodeKind::TableRow)
+    {
+        for cell in &row.children {
+            for inline in cell.node.payload["inline"].as_array().unwrap() {
+                if let Some(marker) = inline.get("format").and_then(|format| format.get("marker")) {
+                    markers.push(marker.as_str().unwrap().to_owned());
+                }
+            }
+        }
+    }
+    assert_eq!(markers, ["_", "__", "_", "__"]);
+    assert_eq!(document.bytes(), source.as_bytes());
+}

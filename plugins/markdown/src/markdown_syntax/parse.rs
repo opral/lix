@@ -3494,7 +3494,7 @@ fn parse_table(
         return None;
     }
     let alignments = parse_table_delimiter(delimiter, options.constructs.spoiler)?;
-    let headers = split_table_row(lines[index].text, options.constructs.spoiler);
+    let headers = split_table_row_spans(lines[index].text, options.constructs.spoiler);
     if headers.len() != alignments.len() {
         return None;
     }
@@ -3504,15 +3504,15 @@ fn parse_table(
         meta: NodeMeta::new(Some(Span::new(lines[index].start, lines[index].end))),
         cells: headers
             .iter()
-            .map(|cell| TableCell {
-                meta: NodeMeta::default(),
-                children: parse_inlines(
-                    cell.trim(),
-                    lines[index].start,
+            .map(|(value, span)| {
+                parse_table_cell(
+                    value,
+                    &lines[index].text[span.start..span.end],
+                    lines[index].start + span.start,
                     options,
                     definitions,
                     diagnostics,
-                ),
+                )
             })
             .collect(),
     });
@@ -3529,23 +3529,28 @@ fn parse_table(
         if row.trim().is_empty() || table_body_line_ends_table(lines[cursor].text, options) {
             break;
         }
-        let cells = split_table_row(row, options.constructs.spoiler);
+        let cells = split_table_row_spans(row, options.constructs.spoiler);
         rows.push(TableRow {
             meta: NodeMeta::new(Some(Span::new(lines[cursor].start, lines[cursor].end))),
             cells: alignments
                 .iter()
                 .enumerate()
                 .map(|(cell_index, _)| {
-                    let value = cells.get(cell_index).map(String::as_str).unwrap_or("");
-                    TableCell {
-                        meta: NodeMeta::default(),
-                        children: parse_inlines(
-                            value.trim(),
-                            lines[cursor].start,
+                    if let Some((value, span)) = cells.get(cell_index) {
+                        let indent = lines[cursor].text.len() - row.len();
+                        parse_table_cell(
+                            value,
+                            &row[span.start..span.end],
+                            lines[cursor].start + indent + span.start,
                             options,
                             definitions,
                             diagnostics,
-                        ),
+                        )
+                    } else {
+                        TableCell {
+                            meta: NodeMeta::default(),
+                            children: Vec::new(),
+                        }
                     }
                 })
                 .collect(),
@@ -3564,6 +3569,45 @@ fn parse_table(
         }),
         cursor,
     ))
+}
+
+fn parse_table_cell(
+    value: &str,
+    raw: &str,
+    base: usize,
+    options: &SyntaxOptions,
+    definitions: &[String],
+    diagnostics: &mut Vec<Diagnostic>,
+) -> TableCell {
+    // Table splitting removes escape backslashes before pipes. Map the
+    // resulting inline spans back to their actual source bytes, including
+    // whitespace trimmed from either side of the cell.
+    let mut offsets = Vec::with_capacity(value.len() + 1);
+    let mut cursor = 0;
+    for byte in value.bytes() {
+        while raw.as_bytes().get(cursor) != Some(&byte) && cursor < raw.len() {
+            cursor += 1;
+        }
+        offsets.push(base + cursor);
+        cursor += 1;
+    }
+    offsets.push(base + raw.len());
+    let trim = value.len() - value.trim_start().len();
+    let mut children = parse_inlines(value.trim(), trim, options, definitions, diagnostics);
+    fn remap(nodes: &mut [Inline], offsets: &[usize]) {
+        for node in nodes {
+            if let Some(span) = node.meta_mut().span.as_mut() {
+                span.start = offsets[span.start];
+                span.end = offsets[span.end];
+            }
+            remap(node.children_mut(), offsets);
+        }
+    }
+    remap(&mut children, &offsets);
+    TableCell {
+        meta: NodeMeta::new(Some(Span::new(base, base + raw.len()))),
+        children,
+    }
 }
 
 fn parse_setext_heading(
@@ -7056,7 +7100,16 @@ fn table_backslash_pipe_run(input: &str, cursor: usize) -> Option<(usize, bool)>
 }
 
 fn split_table_row(input: &str, spoiler: bool) -> Vec<String> {
+    split_table_row_spans(input, spoiler)
+        .into_iter()
+        .map(|(value, _)| value)
+        .collect()
+}
+
+fn split_table_row_spans(input: &str, spoiler: bool) -> Vec<(String, Span)> {
     let trimmed = input.trim();
+    let base = input.len() - input.trim_start().len();
+    let mut cell_start = 0;
     let mut cells = Vec::new();
     let mut cell = String::new();
     let mut cursor = 0;
@@ -7141,7 +7194,11 @@ fn split_table_row(input: &str, spoiler: bool) -> Vec<String> {
         }
 
         if char == '|' && !spoiler_open && !is_escaped_at(trimmed, cursor) {
-            cells.push(core::mem::take(&mut cell));
+            cells.push((
+                core::mem::take(&mut cell),
+                Span::new(base + cell_start, base + cursor),
+            ));
+            cell_start = next;
             // A delimiter ends the cell; spoiler state never spans a cell boundary.
             spoiler_open = false;
             trailing_delimiter_end = Some(next);
@@ -7150,7 +7207,7 @@ fn split_table_row(input: &str, spoiler: bool) -> Vec<String> {
         }
         cursor = next;
     }
-    cells.push(cell);
+    cells.push((cell, Span::new(base + cell_start, base + trimmed.len())));
 
     if trimmed.starts_with('|') {
         cells.remove(0);

@@ -970,6 +970,10 @@ macro_rules! impl_meta_accessors {
                 match self { $( $enum::$variant(node) => &node.meta, )+ }
             }
 
+            pub(crate) fn meta_mut(&mut self) -> &mut NodeMeta {
+                match self { $( $enum::$variant(node) => &mut node.meta, )+ }
+            }
+
             /// This node's source span, if it carries one.
             pub fn span(&self) -> Option<Span> {
                 self.meta().span
@@ -1088,6 +1092,27 @@ impl Inline {
             Inline::InlineFootnote(n) => &n.children,
             Inline::TextDirective(n) => &n.label,
             _ => &[],
+        }
+    }
+
+    pub(crate) fn children_mut(&mut self) -> &mut [Inline] {
+        match self {
+            Inline::Emphasis(n) => &mut n.children,
+            Inline::Strong(n) => &mut n.children,
+            Inline::Underline(n) => &mut n.children,
+            Inline::Delete(n) => &mut n.children,
+            Inline::Insert(n) => &mut n.children,
+            Inline::Mark(n) => &mut n.children,
+            Inline::Subscript(n) => &mut n.children,
+            Inline::Superscript(n) => &mut n.children,
+            Inline::Spoiler(n) => &mut n.children,
+            Inline::Link(n) => &mut n.children,
+            Inline::Image(n) => &mut n.alt,
+            Inline::LinkReference(n) => &mut n.children,
+            Inline::ImageReference(n) => &mut n.alt,
+            Inline::InlineFootnote(n) => &mut n.children,
+            Inline::TextDirective(n) => &mut n.label,
+            _ => &mut [],
         }
     }
 }
