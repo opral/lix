@@ -1693,6 +1693,13 @@ fn effective_character_reference(value: &str, reference: &str) -> String {
 }
 
 fn inline_to_ast(node: &InlineNode, output: &mut Vec<md::Inline>) -> Result<(), PluginError> {
+    if let InlineContent::Code { value, .. } = &node.content
+        && (value.is_empty() || value.contains(['\r', '\n']))
+    {
+        return Err(PluginError::InvalidInput(
+            "inline code value must be nonempty and contain no line endings; Markdown code spans normalize them".into(),
+        ));
+    }
     let meta = md::NodeMeta::default();
     match &node.content {
         InlineContent::Text { value } => output.push(md::Inline::Text(md::Text {
@@ -1747,7 +1754,12 @@ fn inline_to_ast(node: &InlineNode, output: &mut Vec<md::Inline>) -> Result<(), 
         InlineContent::Code { value, format } => output.push(md::Inline::Code(md::CodeInline {
             meta,
             value: value.clone(),
-            raw: if crate::parse::normalize_code_span(&format.raw) == *value {
+            raw: if crate::parse::normalize_code_span(&format.raw) == *value
+                && format.fence_length > 0
+                && !format
+                    .raw
+                    .contains(&"`".repeat(format.fence_length.min(format.raw.len() + 1)))
+            {
                 format.raw.clone()
             } else {
                 String::new()

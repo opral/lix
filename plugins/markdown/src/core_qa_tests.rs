@@ -655,3 +655,26 @@ fn qa_indented_code_edits_preserve_boundary_blank_lines() {
         );
     }
 }
+
+#[test]
+fn qa_unrepresentable_inline_code_edits_are_rejected() {
+    for value in ["", "a\nb", "a\rb"] {
+        let (document, _) = Document::open_file(
+            b"`old`\n".to_vec(),
+            Some("code.md"),
+            IdNamespace::from_halves(36, 3),
+        )
+        .unwrap();
+        let mut node = document.tree.materialize().children.remove(0).node;
+        node.payload["inline"][0]["value"] = serde_json::json!(value);
+        assert!(matches!(
+            document.rows_changed(vec![RowChange {
+                schema_key: NODE_SCHEMA_KEY.into(),
+                row_pk: vec![node.id],
+                row: Some(node_to_typed_row(&node).unwrap()),
+                effect: ChangeEffect::Content
+            }]),
+            Err(PluginError::InvalidInput(_))
+        ));
+    }
+}
