@@ -122,7 +122,9 @@ impl LixRuntimeManager {
                 || !valid_lix_id(source)
                 || !valid_lix_id(destination)
                 || destination == source
-                || entries.iter().any(|entry| entry.repository_id != repository && entry.storage_id == destination)
+                || entries.iter().any(|entry| {
+                    entry.repository_id != repository && entry.storage_id == destination
+                })
                 || name != format!("{repository}/{destination}.json")
                 || !entries
                     .iter()

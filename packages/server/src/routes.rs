@@ -257,33 +257,96 @@ async fn repository_admission(
     mut request: Request<Body>,
 ) -> Response {
     if !authorized(request.headers(), state.internal_token.as_deref()) {
-        return protocol_error(StatusCode::NOT_FOUND, "LIX_NOT_FOUND", "Lix not found.", None, None);
+        return protocol_error(
+            StatusCode::NOT_FOUND,
+            "LIX_NOT_FOUND",
+            "Lix not found.",
+            None,
+            None,
+        );
     }
-    if uuid::Uuid::parse_str(&id).ok().map(|id| id.to_string()).as_deref() != Some(id.as_str()) {
-        return protocol_error(StatusCode::BAD_REQUEST, "LIX_INVALID_ARGUMENT", "Repository ID must be a canonical UUID.", None, None);
+    if uuid::Uuid::parse_str(&id)
+        .ok()
+        .map(|id| id.to_string())
+        .as_deref()
+        != Some(id.as_str())
+    {
+        return protocol_error(
+            StatusCode::BAD_REQUEST,
+            "LIX_INVALID_ARGUMENT",
+            "Repository ID must be a canonical UUID.",
+            None,
+            None,
+        );
     }
-    let mut versions = request.headers().get_all("lix-sync-protocol-version").iter();
-    if versions.next().and_then(|value| value.to_str().ok()) != Some(lix_sdk::SYNC_PROTOCOL_VERSION.to_string().as_str()) || versions.next().is_some() {
-        return protocol_error(StatusCode::CONFLICT, "LIX_PROTOCOL_VERSION_MISMATCH", "Reload with the current Lix client before repository admission.", None, None);
+    let mut versions = request
+        .headers()
+        .get_all("lix-sync-protocol-version")
+        .iter();
+    if versions.next().and_then(|value| value.to_str().ok())
+        != Some(lix_sdk::SYNC_PROTOCOL_VERSION.to_string().as_str())
+        || versions.next().is_some()
+    {
+        return protocol_error(
+            StatusCode::CONFLICT,
+            "LIX_PROTOCOL_VERSION_MISMATCH",
+            "Reload with the current Lix client before repository admission.",
+            None,
+            None,
+        );
     }
     let principal = match take_trusted_principal(&mut request, state.internal_token.is_some()) {
         Ok(Some(principal)) => principal.account_id,
         Ok(None) => "00000000-0000-7000-8000-000000000002".to_owned(),
-        Err(message) => return protocol_error(StatusCode::BAD_REQUEST, "LIX_INVALID_ARGUMENT", message, None, None),
+        Err(message) => {
+            return protocol_error(
+                StatusCode::BAD_REQUEST,
+                "LIX_INVALID_ARGUMENT",
+                message,
+                None,
+                None,
+            );
+        }
     };
-    let admission = match tokio::time::timeout(state.protocol_timeout, state.manager.authority_admission(&id)).await {
+    let admission = match tokio::time::timeout(
+        state.protocol_timeout,
+        state.manager.authority_admission(&id),
+    )
+    .await
+    {
         Ok(Ok(Some(admission))) => admission,
-        Ok(Ok(None)) => return protocol_error(StatusCode::NOT_FOUND, "LIX_NOT_FOUND", "Lix not found.", None, None),
-        Ok(Err(error)) => return protocol_error(error.status, error.code, error.message, None, None),
-        Err(_) => return protocol_error(StatusCode::SERVICE_UNAVAILABLE, "LIX_CATALOG_UNAVAILABLE", "Repository admission metadata is unavailable.", None, None),
+        Ok(Ok(None)) => {
+            return protocol_error(
+                StatusCode::NOT_FOUND,
+                "LIX_NOT_FOUND",
+                "Lix not found.",
+                None,
+                None,
+            );
+        }
+        Ok(Err(error)) => {
+            return protocol_error(error.status, error.code, error.message, None, None);
+        }
+        Err(_) => {
+            return protocol_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "LIX_CATALOG_UNAVAILABLE",
+                "Repository admission metadata is unavailable.",
+                None,
+                None,
+            );
+        }
     };
     let mut response = Json(json!({
         "repositoryId": id,
         "principalId": principal,
         "protocolEpoch": admission.protocol_epoch,
         "storageEpoch": admission.storage_epoch,
-    })).into_response();
-    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }))
+    .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 
@@ -1096,22 +1159,46 @@ mod tests {
     async fn composed_browser_shared_admission_and_opfs() {
         let manager = LixRuntimeManager::new_in_memory(4);
         let repository = "00000000-0000-7000-8000-000000000004";
-        manager.provision_repository(repository.to_owned(), false).await.expect("provision current authority");
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind integration authority");
+        manager
+            .provision_repository(repository.to_owned(), false)
+            .await
+            .expect("provision current authority");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind integration authority");
         let address = listener.local_addr().unwrap();
-        let app = router(manager.clone(), Some("browser-integration-only".to_owned()), Duration::from_secs(30), InFlightSqlRegistry::default());
+        let app = router(
+            manager.clone(),
+            Some("browser-integration-only".to_owned()),
+            Duration::from_secs(30),
+            InFlightSqlRegistry::default(),
+        );
         let serving = tokio::spawn(async move { axum::serve(listener, app).await });
         let status = tokio::task::spawn_blocking(move || {
             std::process::Command::new("node")
                 .current_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../js-sdk"))
-                .args(["node_modules/vitest/vitest.mjs", "run", "--config", "admission-composition.browser.config.ts"])
+                .args([
+                    "node_modules/vitest/vitest.mjs",
+                    "run",
+                    "--config",
+                    "admission-composition.browser.config.ts",
+                ])
                 .env("LIX_TEST_AUTHORITY_URL", format!("http://{address}"))
-                .status().expect("run actual browser composition")
-        }).await.expect("join browser test");
+                .status()
+                .expect("run actual browser composition")
+        })
+        .await
+        .expect("join browser test");
         serving.abort();
         let _ = serving.await;
-        manager.shutdown().await.expect("close integration authority");
-        assert!(status.success(), "actual browser composition failed: {status}");
+        manager
+            .shutdown()
+            .await
+            .expect("close integration authority");
+        assert!(
+            status.success(),
+            "actual browser composition failed: {status}"
+        );
     }
 
     use super::*;

@@ -436,11 +436,19 @@ async fn send_js_http_cancellable(
     set_js(&transport_request, "url", JsValue::from_str(&request.url))?;
     set_js(&transport_request, "init", init.into())?;
     let response_policy = js_sys::Object::new();
-    set_js(&response_policy, "mode", JsValue::from_str(if stream { "streaming" } else { "buffered" }))?;
+    set_js(
+        &response_policy,
+        "mode",
+        JsValue::from_str(if stream { "streaming" } else { "buffered" }),
+    )?;
     if !stream {
         // Remote finite protocol operations share a bounded response policy;
         // observations and snapshot transfer use the streaming path.
-        set_js(&response_policy, "maxBytes", JsValue::from_f64(16.0 * 1024.0 * 1024.0))?;
+        set_js(
+            &response_policy,
+            "maxBytes",
+            JsValue::from_f64(16.0 * 1024.0 * 1024.0),
+        )?;
     }
     set_js(&transport_request, "response", response_policy.into())?;
     let promise = http
@@ -658,7 +666,9 @@ fn set_js(object: &js_sys::Object, key: &str, value: JsValue) -> Result<(), LixE
 }
 
 fn fetch_unavailable(error: JsValue) -> LixError {
-    let code = Reflect::get(&error, &"code".into()).ok().and_then(|value| value.as_string())
+    let code = Reflect::get(&error, &"code".into())
+        .ok()
+        .and_then(|value| value.as_string())
         .filter(|code| code.starts_with("LIX_"));
     if let Some(code) = code {
         return LixError::new(code, js_error_message(error));

@@ -4610,7 +4610,7 @@ mod tests {
         let attempts = std::sync::atomic::AtomicUsize::new(0);
         let result =
             execute_coherent_session_read::<Memory, _, _, _>(&session.storage, true, |read| {
-                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
                 async move {
                     let buffered = vec![attempt];
                     drop(read);
@@ -4624,7 +4624,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, vec![1]);
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -4643,7 +4643,7 @@ mod tests {
                 &session.storage,
                 replayable,
                 |read| {
-                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    attempts.fetch_add(1, Ordering::SeqCst);
                     async move {
                         drop(read);
                         let mut error = LixError::from(StorageError::ReadExpired);
@@ -4656,7 +4656,7 @@ mod tests {
             )
             .await;
             assert!(result.is_err());
-            assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
         }
     }
 

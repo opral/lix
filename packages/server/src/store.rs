@@ -375,7 +375,9 @@ impl LixRuntimeManager {
         }
         let report = manager.migrate_authority_offline(lix_id).await?;
         if !report.admission_published {
-            anyhow::bail!("semantic preservation was not verified; migration report retained and admission withheld");
+            anyhow::bail!(
+                "semantic preservation was not verified; migration report retained and admission withheld"
+            );
         }
         info!(lix_id, "Lix authority migration verified");
         Ok(())
@@ -3557,7 +3559,10 @@ pub(crate) struct AuthorityAdmission {
 
 impl AuthorityAdmission {
     fn current() -> Self {
-        Self { protocol_epoch: lix_sdk::SYNC_PROTOCOL_VERSION, storage_epoch: lix_sdk::CURRENT_STORAGE_FORMAT_VERSION }
+        Self {
+            protocol_epoch: lix_sdk::SYNC_PROTOCOL_VERSION,
+            storage_epoch: lix_sdk::CURRENT_STORAGE_FORMAT_VERSION,
+        }
     }
 }
 
@@ -3619,11 +3624,13 @@ impl LixRuntimeManager {
         id: &str,
     ) -> Result<Option<AuthorityAdmission>, lix_sdk::server_protocol::LifecycleError> {
         use lix_sdk::server_protocol::LifecycleError;
-        let record = self.repository_record(id).await.map_err(|_| LifecycleError::new(
-            http::StatusCode::SERVICE_UNAVAILABLE,
-            "LIX_CATALOG_UNAVAILABLE",
-            "Repository admission metadata is unavailable.",
-        ))?;
+        let record = self.repository_record(id).await.map_err(|_| {
+            LifecycleError::new(
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                "LIX_CATALOG_UNAVAILABLE",
+                "Repository admission metadata is unavailable.",
+            )
+        })?;
         let Some(record) = record.filter(|record| record.state == "live") else {
             return Ok(None);
         };
@@ -4314,7 +4321,10 @@ mod host_provisioning_tests {
             .handle(
                 Request::builder()
                     .uri(format!("/lix/v1/{ID}"))
-                    .header("lix-server-protocol-version", lix_sdk::SERVER_PROTOCOL_VERSION)
+                    .header(
+                        "lix-server-protocol-version",
+                        lix_sdk::SERVER_PROTOCOL_VERSION,
+                    )
                     .body(ServerProtocolBody::empty())
                     .unwrap(),
                 ServerProtocolContext::anonymous(),
@@ -4344,14 +4354,46 @@ mod host_provisioning_tests {
             .await
             .unwrap();
         manager.upgrade_authority(ID).await.unwrap();
-        let record: RepositoryRecord = serde_json::from_slice(&objects.get(&ObjectPath::from(format!(".lix-repositories/{ID}.json"))).await.unwrap().bytes().await.unwrap()).unwrap();
-        assert_ne!(record.storage_id, source_storage_id, "migration must publish a separate physical store");
-        assert!(record.retired.iter().any(|source| source == &source_storage_id));
+        let record: RepositoryRecord = serde_json::from_slice(
+            &objects
+                .get(&ObjectPath::from(format!(".lix-repositories/{ID}.json")))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(
+            record.storage_id, source_storage_id,
+            "migration must publish a separate physical store"
+        );
+        assert!(
+            record
+                .retired
+                .iter()
+                .any(|source| source == &source_storage_id)
+        );
         assert_eq!(record.admission, Some(AuthorityAdmission::current()));
-        let destination = SlateDB::open_object_store_with_options_and_io_counters(&record.storage_id, objects, SlateDBObjectStoreOptions::default(), SlateDBIoCounters::default()).unwrap();
+        let destination = SlateDB::open_object_store_with_options_and_io_counters(
+            &record.storage_id,
+            objects,
+            SlateDBObjectStoreOptions::default(),
+            SlateDBIoCounters::default(),
+        )
+        .unwrap();
         let current = lix_sdk::open_lix().with_storage(destination).await.unwrap();
-        let value = current.execute("SELECT value FROM lix_key_value WHERE key='upgrade-proof'", &[]).await.unwrap();
-        assert_eq!(value.rows()[0].get::<serde_json::Value>("value").unwrap(), serde_json::json!("retained"));
+        let value = current
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key='upgrade-proof'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            value.rows()[0].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!("retained")
+        );
         current.close().await.unwrap();
         let reopened = lix_sdk::open_lix().with_storage(storage).await.unwrap();
         let proof = reopened
@@ -4496,18 +4538,34 @@ mod admission_tests {
         let manager = LixRuntimeManager::new_in_memory(1);
         // Deliberately no repository storage: opening an engine would fail.
         manager.write_record(ID, "live", None, true).await.unwrap();
-        let app = crate::router(manager.clone(), Some("internal".into()), Duration::from_secs(2), Default::default());
-        let response = app.oneshot(Request::builder()
-            .uri(format!("/lix/v1/{ID}/admission"))
-            .header("authorization", "Bearer internal")
-            .header("x-lix-account-id", ACCOUNT)
-            .header("lix-sync-protocol-version", lix_sdk::SYNC_PROTOCOL_VERSION)
-            .body(Body::empty()).unwrap()).await.unwrap();
+        let app = crate::router(
+            manager.clone(),
+            Some("internal".into()),
+            Duration::from_secs(2),
+            Default::default(),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/lix/v1/{ID}/admission"))
+                    .header("authorization", "Bearer internal")
+                    .header("x-lix-account-id", ACCOUNT)
+                    .header("lix-sync-protocol-version", lix_sdk::SYNC_PROTOCOL_VERSION)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["cache-control"], "no-store");
-        let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body, serde_json::json!({"repositoryId":ID,"principalId":ACCOUNT,"protocolEpoch":lix_sdk::SYNC_PROTOCOL_VERSION,"storageEpoch":lix_sdk::CURRENT_STORAGE_FORMAT_VERSION}));
+        assert_eq!(
+            body,
+            serde_json::json!({"repositoryId":ID,"principalId":ACCOUNT,"protocolEpoch":lix_sdk::SYNC_PROTOCOL_VERSION,"storageEpoch":lix_sdk::CURRENT_STORAGE_FORMAT_VERSION})
+        );
         assert!(manager.state.lock().await.entries.is_empty());
         assert!(!manager.legacy_storage_present(ID).await.unwrap());
     }
@@ -4517,11 +4575,23 @@ mod admission_tests {
         let manager = LixRuntimeManager::new_in_memory(1);
         let (store, prefix) = manager.catalog_store();
         let path = ObjectPath::from(format!("{prefix}.lix-repositories/{ID}.json"));
-        let original = serde_json::json!({"state":"live","fingerprint":null,"storage_id":ID,"retired":[]}).to_string();
+        let original =
+            serde_json::json!({"state":"live","fingerprint":null,"storage_id":ID,"retired":[]})
+                .to_string();
         store.put(&path, original.clone().into()).await.unwrap();
         let error = manager.authority_admission(ID).await.unwrap_err();
         assert_eq!(error.code, "LIX_MIGRATION_REQUIRED");
-        assert_eq!(store.get(&path).await.unwrap().bytes().await.unwrap().as_ref(), original.as_bytes());
+        assert_eq!(
+            store
+                .get(&path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            original.as_bytes()
+        );
         assert!(manager.state.lock().await.entries.is_empty());
     }
 
@@ -4529,13 +4599,37 @@ mod admission_tests {
     async fn admission_rejects_old_protocol_and_untrusted_identity() {
         let manager = LixRuntimeManager::new_in_memory(1);
         manager.write_record(ID, "live", None, true).await.unwrap();
-        let app = crate::router(manager.clone(), Some("internal".into()), Duration::from_secs(2), Default::default());
-        for (token, version, expected) in [("wrong", lix_sdk::SYNC_PROTOCOL_VERSION, StatusCode::NOT_FOUND), ("internal", lix_sdk::SYNC_PROTOCOL_VERSION - 1, StatusCode::CONFLICT)] {
-            let response = app.clone().oneshot(Request::builder().uri(format!("/lix/v1/{ID}/admission"))
-                .header("authorization", format!("Bearer {token}"))
-                .header("x-lix-account-id", ACCOUNT)
-                .header("lix-sync-protocol-version", version)
-                .body(Body::empty()).unwrap()).await.unwrap();
+        let app = crate::router(
+            manager.clone(),
+            Some("internal".into()),
+            Duration::from_secs(2),
+            Default::default(),
+        );
+        for (token, version, expected) in [
+            (
+                "wrong",
+                lix_sdk::SYNC_PROTOCOL_VERSION,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "internal",
+                lix_sdk::SYNC_PROTOCOL_VERSION - 1,
+                StatusCode::CONFLICT,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/lix/v1/{ID}/admission"))
+                        .header("authorization", format!("Bearer {token}"))
+                        .header("x-lix-account-id", ACCOUNT)
+                        .header("lix-sync-protocol-version", version)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
             assert_eq!(response.status(), expected);
         }
         assert!(manager.state.lock().await.entries.is_empty());

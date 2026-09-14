@@ -1820,8 +1820,12 @@ async fn closed_js_replica_operation(
 
 /// Read-only routing metadata; available in the current-format runtime.
 #[wasm_bindgen(js_name = inspectJsStorageRepository)]
-pub async fn inspect_js_storage_repository(provider: JsStorageProvider) -> Result<JsValue, JsValue> {
-    let report = lix::migration::inspect_repository(BrowserStorage::Js(JsStorage::new(provider))).await.map_err(lix_error_to_js)?;
+pub async fn inspect_js_storage_repository(
+    provider: JsStorageProvider,
+) -> Result<JsValue, JsValue> {
+    let report = lix::migration::inspect_repository(BrowserStorage::Js(JsStorage::new(provider)))
+        .await
+        .map_err(lix_error_to_js)?;
     to_js(&report)
 }
 
@@ -1829,11 +1833,19 @@ pub async fn inspect_js_storage_repository(provider: JsStorageProvider) -> Resul
 /// destination publication/recovery lifecycle.
 #[cfg(feature = "offline-migration")]
 #[wasm_bindgen(js_name = migrateJsStorageRepository)]
-pub async fn migrate_js_storage_repository(provider: JsStorageProvider, limits: Option<JsValue>) -> Result<JsValue, JsValue> {
+pub async fn migrate_js_storage_repository(
+    provider: JsStorageProvider,
+    limits: Option<JsValue>,
+) -> Result<JsValue, JsValue> {
     let options = match limits {
         Some(value) if !value.is_null() && !value.is_undefined() => from_js(value)?,
         _ => lix::migration::MigrationOptions::default(),
     };
-    let report = lix::migration::migrate_repository_with_options(BrowserStorage::Js(JsStorage::new(provider)), options).await.map_err(lix_error_to_js)?;
+    let report = lix::migration::migrate_repository_with_options(
+        BrowserStorage::Js(JsStorage::new(provider)),
+        options,
+    )
+    .await
+    .map_err(lix_error_to_js)?;
     to_js(&report)
 }

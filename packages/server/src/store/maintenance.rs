@@ -230,8 +230,14 @@ impl LixRuntimeManager {
                 "reconcile malformed catalog or unreferenced physical storage before fleet migration"
             );
         }
-        if inventory.entries.iter().any(|entry| entry.state == "live" && !entry.storage_present) {
-            anyhow::bail!("live authority physical storage is missing; fleet migration is incomplete");
+        if inventory
+            .entries
+            .iter()
+            .any(|entry| entry.state == "live" && !entry.storage_present)
+        {
+            anyhow::bail!(
+                "live authority physical storage is missing; fleet migration is incomplete"
+            );
         }
         let mut reports = Vec::new();
         for entry in inventory
@@ -254,10 +260,7 @@ impl LixRuntimeManager {
     }
 }
 
-async fn object_digest(
-    objects: &Arc<dyn ObjectStore>,
-    path: &ObjectPath,
-) -> Result<String> {
+async fn object_digest(objects: &Arc<dyn ObjectStore>, path: &ObjectPath) -> Result<String> {
     let mut chunks = objects.get(path).await?.into_stream();
     let mut digest = Hasher::new();
     while let Some(chunk) = chunks.try_next().await? {
@@ -327,7 +330,13 @@ mod tests {
     async fn current_admission_never_hides_missing_physical_storage_in_fleet() {
         let manager = LixRuntimeManager::new_in_memory(1);
         manager.write_record(ID, "live", None, true).await.unwrap();
-        assert!(manager.migrate_authority_fleet().await.unwrap_err().to_string().contains("physical storage is missing"));
+        assert!(
+            manager
+                .migrate_authority_fleet()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("physical storage is missing")
+        );
     }
-
 }
