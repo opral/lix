@@ -540,3 +540,23 @@ fn distant_structural_sql_edits_do_not_resend_unchanged_lines() {
     assert!(edits.iter().all(|edit| edit.insert.is_empty()));
     assert_eq!(apply_edits(&source, &edits), after.bytes());
 }
+
+#[test]
+fn repeated_edits_do_not_retain_one_document_buffer_per_changed_line() {
+    let source = b"unchanged line\n".repeat(1_000);
+    let (mut document, _) = open(&source);
+    for index in 0..100 {
+        document = document
+            .file_changed(
+                &[FileEdit {
+                    offset: (index * 15) as u64,
+                    delete_len: 1,
+                    insert: b"U".to_vec(),
+                }],
+                |n| test_id(2, n),
+            )
+            .unwrap()
+            .0;
+    }
+    assert!(document.retained_backing_bytes() <= 3 * source.len());
+}

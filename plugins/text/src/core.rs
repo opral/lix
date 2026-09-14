@@ -315,7 +315,7 @@ impl Document {
                 lines.push(Arc::new(Line {
                     id,
                     order_key,
-                    bytes,
+                    bytes: LineBytes::owned(bytes.as_slice().to_vec()),
                 }));
             }
         }
@@ -895,4 +895,16 @@ pub(crate) fn allocate_order_keys(
         }
     }
     OrderKey::evenly_between(previous, next, count)
+}
+
+#[cfg(test)]
+impl Document {
+    pub(crate) fn retained_backing_bytes(&self) -> usize {
+        let mut buffers = HashMap::new();
+        buffers.insert(Arc::as_ptr(&self.0.bytes), self.0.bytes.len());
+        for line in self.lines() {
+            buffers.insert(Arc::as_ptr(&line.bytes.backing), line.bytes.backing.len());
+        }
+        buffers.into_values().sum()
+    }
 }
