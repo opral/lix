@@ -32,6 +32,8 @@ const MIB: u64 = 1024 * 1024;
 const MIB_U32: u32 = 1024 * 1024;
 const TRANSITION_PAGE_BYTES: u32 = 2 * MIB_U32;
 const COLD_TRANSITION_MAX_PAGE_BYTES: u64 = 16 * MIB;
+const FILE_TRANSITION_MAX_TOTAL_BYTES: u64 = 2 * 1024 * MIB;
+const FILE_TRANSITION_OUTPUT_EXPANSION: u64 = 16;
 const COLD_TRANSITION_RECORD_OVERHEAD_BYTES: u64 = 64 * 1024;
 const COLD_FILE_MAX_DEADLINE_NANOSECONDS: u64 = 60_000_000_000;
 const COLD_FILE_EXTRA_DEADLINE_NANOSECONDS_PER_MIB: u64 = 1_000_000_000;
@@ -76,7 +78,7 @@ impl WasmTransitionLimits {
     /// one semantic record derived from the supplied file bytes.
     pub fn for_file_bytes(file_bytes: u64) -> Self {
         let mut limits = Self::default();
-        limits.scale_page_for_file_bytes(file_bytes);
+        limits.scale_for_file_bytes(file_bytes);
         limits
     }
 
@@ -89,7 +91,7 @@ impl WasmTransitionLimits {
     /// for a plugin to make the hot path proportional to file size.
     pub fn for_cold_file_bytes(file_bytes: u64) -> Self {
         let mut limits = Self::default();
-        limits.scale_page_for_file_bytes(file_bytes);
+        limits.scale_for_file_bytes(file_bytes);
         let extra = file_bytes
             .div_ceil(MIB)
             .saturating_mul(COLD_FILE_EXTRA_DEADLINE_NANOSECONDS_PER_MIB);
@@ -100,7 +102,13 @@ impl WasmTransitionLimits {
         limits
     }
 
-    fn scale_page_for_file_bytes(&mut self, file_bytes: u64) {
+    fn scale_for_file_bytes(&mut self, file_bytes: u64) {
+        // A source record expands into typed cells, identity/order columns,
+        // and framing. Aggregate streamed traffic is independent of guest
+        // linear memory; a million-row CSV must not hit the small-file budget.
+        self.max_total_bytes = file_bytes
+            .saturating_mul(FILE_TRANSITION_OUTPUT_EXPANSION)
+            .clamp(self.max_total_bytes, FILE_TRANSITION_MAX_TOTAL_BYTES);
         // Text rows encode their byte-exact content as unpadded base64.
         // A generated/source-map file may legitimately be one long line, so
         // its single semantic record can be larger than the normal 2 MiB
@@ -1972,6 +1980,34 @@ mod tests {
         assert_eq!(
             WasmTransitionLimits::for_cold_file_bytes(128 * MIB).total_deadline_nanoseconds,
             COLD_FILE_MAX_DEADLINE_NANOSECONDS
+        );
+    }
+
+    #[test]
+    fn file_output_budget_admits_large_row_streams_and_remains_capped() {
+        for make in [
+            WasmTransitionLimits::for_file_bytes,
+            WasmTransitionLimits::for_cold_file_bytes,
+        ] {
+            assert_eq!(
+                make(0).max_total_bytes,
+                WasmTransitionLimits::default().max_total_bytes
+            );
+            // The 45 MB million-row CSV emits more than the old 128 MiB cap.
+            let limits = make(45_000_000);
+            assert!(limits.max_total_bytes >= 512 * MIB);
+            assert_eq!(
+                make(u64::MAX).max_total_bytes,
+                FILE_TRANSITION_MAX_TOTAL_BYTES
+            );
+            assert_eq!(limits.max_pages, WasmTransitionLimits::default().max_pages);
+            limits.validate().unwrap();
+            make(u64::MAX).validate().unwrap();
+        }
+        // Enlarging streamed output does not extend hot-operation time.
+        assert_eq!(
+            WasmTransitionLimits::for_file_bytes(u64::MAX).total_deadline_nanoseconds,
+            WasmTransitionLimits::default().total_deadline_nanoseconds
         );
     }
 
