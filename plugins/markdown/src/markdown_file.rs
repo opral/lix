@@ -969,6 +969,7 @@ pub(crate) fn render_tree(root: &NodeTree) -> Result<Vec<u8>, PluginError> {
             "Markdown state must contain a document node".to_string(),
         ));
     }
+    validate_child_kinds(root)?;
     let mut document = md::Document {
         meta: md::NodeMeta::default(),
         children: root
@@ -999,6 +1000,44 @@ pub(crate) fn render_tree(root: &NodeTree) -> Result<Vec<u8>, PluginError> {
         remove_line_containing(&mut rendered, &sentinel);
     }
     Ok(rendered.into_bytes())
+}
+
+fn validate_child_kinds(tree: &NodeTree) -> Result<(), PluginError> {
+    for child in &tree.children {
+        let valid = match tree.node.kind {
+            NodeKind::Document
+            | NodeKind::BlockQuote
+            | NodeKind::ListItem
+            | NodeKind::FootnoteDefinition => matches!(
+                child.node.kind,
+                NodeKind::Frontmatter
+                    | NodeKind::Paragraph
+                    | NodeKind::Heading
+                    | NodeKind::ThematicBreak
+                    | NodeKind::BlockQuote
+                    | NodeKind::List
+                    | NodeKind::CodeBlock
+                    | NodeKind::HtmlBlock
+                    | NodeKind::Definition
+                    | NodeKind::FootnoteDefinition
+                    | NodeKind::Table
+            ),
+            NodeKind::List => child.node.kind == NodeKind::ListItem,
+            NodeKind::Table => {
+                matches!(child.node.kind, NodeKind::TableColumn | NodeKind::TableRow)
+            }
+            NodeKind::TableRow => child.node.kind == NodeKind::TableCell,
+            _ => false,
+        };
+        if !valid {
+            return Err(PluginError::InvalidInput(format!(
+                "Markdown {:?} node '{}' cannot contain {:?} child '{}'",
+                tree.node.kind, tree.node.id, child.node.kind, child.node.id,
+            )));
+        }
+        validate_child_kinds(child)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

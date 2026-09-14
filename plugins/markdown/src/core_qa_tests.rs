@@ -485,3 +485,26 @@ fn qa_literal_punctuation_runs_import_losslessly() {
         assert_eq!(reopened.bytes(), source.as_bytes());
     }
 }
+
+#[test]
+fn qa_invalid_parent_changes_are_rejected_without_losing_rows() {
+    for source in ["first\n\nsecond\n", "| a |\n| - |\n\nsecond\n"] {
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("parent.md"),
+            IdNamespace::from_halves(32, 2),
+        )
+        .unwrap();
+        let tree = document.tree.materialize();
+        let mut node = tree.children.last().unwrap().node.clone();
+        node.parent_id = Some(tree.children[0].node.id);
+        let result = document.rows_changed(vec![RowChange {
+            schema_key: NODE_SCHEMA_KEY.into(),
+            row_pk: vec![node.id],
+            row: Some(node_to_typed_row(&node).unwrap()),
+            effect: ChangeEffect::Content,
+        }]);
+        assert!(matches!(result, Err(PluginError::InvalidInput(_))));
+        assert_eq!(document.bytes(), source.as_bytes());
+    }
+}
