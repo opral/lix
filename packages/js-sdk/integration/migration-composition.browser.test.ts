@@ -1,11 +1,12 @@
 import {expect,test} from 'vitest';
 import {openLix,networkFetch,HttpTransportError} from '../dist/index.js';
+import type {RepositoryMigrationReport} from '../dist/migration.js';
 import {OpfsStorage} from '../../storage-opfs/dist/index.js';
 import {migrateOpfsReplica} from '../../storage-opfs/dist/migration.js';
 import {OPFS_RPC_PROTOCOL_VERSION} from '../../storage-opfs/js/rpc.js';
-async function stored(name:string,downgrade=false,phase="inspect"):Promise<string>{
+async function stored(name:string,downgrade=false,phase="inspect",format=80,partial=true):Promise<string>{
  const worker=new Worker(new URL('./migration-stage.browser.worker.ts',import.meta.url),{type:'module'});
- try{return await new Promise((resolve,reject)=>{worker.onerror=e=>reject(new Error(e.message));worker.onmessage=({data})=>data.error?reject(new Error(`${phase}: ${data.error}`)):resolve(data.digest);worker.postMessage({name,downgrade});});}
+ try{return await new Promise((resolve,reject)=>{worker.onerror=e=>reject(new Error(e.message));worker.onmessage=({data})=>data.error?reject(new Error(`${phase}: ${data.error}`)):resolve(data.digest);worker.postMessage({name,downgrade,format,partial});});}
  finally{worker.terminate();}
 }
 test('detached WASM and built OPFS migrator preserve offline work through owner loss and v80 cutover',async()=>{
@@ -52,3 +53,29 @@ test('actual OPFS migrator accepts a fresh empty profile without migration work'
  const result=await migrateOpfsReplica({sourceName:`migration-empty-${suffix}`,destinationName:`migration-empty-${suffix}-v81`,server:{url:`${location.origin}/lix/00000000-0000-7000-8000-000000000004`,headers:[]}});
  expect(result.empty).toBe(true);
 },30000);
+
+
+// v77 accepts an interrupted commit-arity rewrite already containing v7 records.
+// This exercises the older source witness in the actual detached WASM artifact.
+test('detached WASM qualifies a full v77 OPFS source using source descriptor invariants',async()=>{
+ const name=`migration-v77-${crypto.randomUUID()}`;
+ const lix=await openLix({storage:new OpfsStorage({name})});
+ try{await lix.execute("INSERT INTO lix_key_value (key,value) VALUES ('v77-wasm','retained')",[]);}
+ finally{await lix.close();}
+ await stored(name,true,'stage full v77',77,false);
+ const worker=new Worker(new URL('./migration-stage.browser.worker.ts',import.meta.url),{type:'module'});
+ try{
+  const report=await new Promise<RepositoryMigrationReport>((resolve,reject)=>{
+   worker.onerror=event=>reject(new Error(event.message));
+   worker.onmessage=({data})=>data.error?reject(new Error(data.error)):resolve(data.report);
+   worker.postMessage({name,migrate:true});
+  });
+  expect(report.before.format).toBe(77);
+  expect(report.after.current).toBe(true);
+  expect(report.semantic_preservation_verified).toBe(true);
+  expect(report.preservation_basis).toBe('source-descriptors-canonical-chain-v1');
+ }finally{worker.terminate();}
+ const reopened=await openLix({storage:new OpfsStorage({name})});
+ try{expect((await reopened.execute("SELECT value FROM lix_key_value WHERE key='v77-wasm'",[])).rows).toEqual([{value:'retained'}]);}
+ finally{await reopened.close();}
+},120000);

@@ -9,6 +9,8 @@ pub struct AuthorityInventory {
     pub target_storage_epoch: u32,
     pub entries: Vec<AuthorityInventoryEntry>,
     pub unreferenced_storage: Vec<String>,
+    /// Complete physical prefix inventory, including retained and staged sources.
+    pub physical_storage: Vec<String>,
     /// Unpublished or retained migration destinations; never ordinary authorities.
     pub staged_storage: Vec<String>,
     /// Explicitly retained nonlive sources, verified against their complete manifest.
@@ -187,6 +189,7 @@ impl LixRuntimeManager {
             target_protocol_epoch: lix_sdk::SYNC_PROTOCOL_VERSION,
             target_storage_epoch: lix_sdk::CURRENT_STORAGE_FORMAT_VERSION,
             entries,
+            physical_storage: physical.keys().cloned().collect(),
             unreferenced_storage: physical
                 .into_keys()
                 .filter(|id| !referenced.contains(id))
@@ -405,6 +408,7 @@ mod quarantine_tests {
             .unwrap();
         let inventory = manager.inventory_authorities().await.unwrap();
         assert_eq!(inventory.quarantined_storage, [ID]);
+        assert_eq!(inventory.physical_storage, [ID]);
         assert!(inventory.unreferenced_storage.is_empty());
         assert!(inventory.entries.is_empty());
         assert_eq!(
