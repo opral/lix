@@ -35,7 +35,43 @@ async fn pending_browser_conversion_fixture_authority() {
     run_pending_native_conversion(true, true, false, false, true).await;
 }
 
-async fn run_pending_native_conversion(
+// Construct the large multi-phase conversion future outside the fixture's poll
+// frame. Boxing inline still reserves its construction temporary on that frame.
+#[inline(never)]
+fn convert_fixture_replica<'a, S>(
+    storage: S,
+    server: crate::ServerOptions,
+    branch_id: Option<&'a str>,
+) -> std::pin::Pin<Box<dyn Future<Output = Result<(), LixError>> + 'a>>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    Box::pin(crate::convert_replica_to_partial(
+        storage, server, branch_id,
+    ))
+}
+
+// The test runtime must hold only a pointer to this large end-to-end scenario.
+// Constructing it in the async test body keeps an additional scenario-sized
+// temporary on that body's poll frame even when Box::pin is used inline.
+#[inline(never)]
+fn run_pending_native_conversion(
+    with_files: bool,
+    with_branches: bool,
+    with_cleanup_loss: bool,
+    with_new_branch: bool,
+    browser_fixture: bool,
+) -> std::pin::Pin<Box<dyn Future<Output = ()>>> {
+    Box::pin(run_pending_native_conversion_inner(
+        with_files,
+        with_branches,
+        with_cleanup_loss,
+        with_new_branch,
+        browser_fixture,
+    ))
+}
+
+async fn run_pending_native_conversion_inner(
     with_files: bool,
     with_branches: bool,
     with_cleanup_loss: bool,
@@ -488,14 +524,11 @@ async fn run_pending_native_conversion(
         thread.join().unwrap();
         return;
     }
-    // Conversion contains several migration phases. Keep that future on the
-    // heap so this end-to-end fixture leaves room for ordinary SQL execution
-    // on the default test-thread stack.
-    let first = Box::pin(crate::convert_replica_to_partial(
+    let first = convert_fixture_replica(
         local_storage.clone(),
         options.clone(),
         Some(&requested_branch),
-    ))
+    )
     .await;
     assert!(first.is_err());
     assert!(lost.load(Ordering::SeqCst));
@@ -527,11 +560,11 @@ async fn run_pending_native_conversion(
     drop(owned);
     let mut completed = false;
     for _ in 0..3 {
-        let result = Box::pin(crate::convert_replica_to_partial(
+        let result = convert_fixture_replica(
             local_storage.clone(),
             options.clone(),
             Some(&requested_branch),
-        ))
+        )
         .await;
         if result.is_ok() {
             completed = true;
