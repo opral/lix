@@ -383,3 +383,28 @@ fn nonfinal_unterminated_rows_are_rejected_before_identity_state_can_drift() {
         after
     );
 }
+
+#[test]
+fn duplicate_middle_matching_consumes_each_identity_once() {
+    let mut before = b"head\n".to_vec();
+    before.extend(b"same\n".repeat(20_000));
+    before.extend(b"tail\n");
+    let (document, _) = open(&before);
+    let mut after = before.clone();
+    after[..4].copy_from_slice(b"HEAD");
+    let end = after.len();
+    after[end - 5..end - 1].copy_from_slice(b"TAIL");
+    let (updated, changes) = document
+        .file_changed(
+            &[FileEdit {
+                offset: 0,
+                delete_len: before.len() as u64,
+                insert: after.clone(),
+            }],
+            |n| test_id(2, n),
+        )
+        .unwrap();
+    assert_eq!(updated.bytes(), after);
+    assert_eq!(ids(&updated), ids(&document));
+    assert_eq!(changes.len(), 2);
+}

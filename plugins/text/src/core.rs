@@ -1,5 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -239,36 +238,21 @@ impl Document {
         // identity even across a reorder. Remaining old/new positions are
         // paired in order, preserving an edited line's ID without inventing a
         // parser-specific identity rule for arbitrary text.
-        let mut exact =
-            Vec::with_capacity(self.lines().len().saturating_sub(prefix_len + suffix_len));
-        for (old_index, line) in self.lines()[prefix_len..self.lines().len() - suffix_len]
-            .iter()
-            .enumerate()
-            .map(|(index, line)| (prefix_len + index, line))
-        {
-            exact.push((line_hash(line.bytes.as_slice()), old_index));
+        let mut exact: HashMap<&[u8], VecDeque<usize>> = HashMap::new();
+        for old_index in prefix_len..self.lines().len() - suffix_len {
+            exact
+                .entry(self.lines()[old_index].bytes.as_slice())
+                .or_default()
+                .push_back(old_index);
         }
-        exact.sort_unstable();
-        for (new_index, bytes) in chunks[prefix_len..chunks.len() - suffix_len]
-            .iter()
-            .enumerate()
-            .map(|(index, bytes)| (prefix_len + index, bytes))
-        {
-            let hash = line_hash(bytes.as_slice());
-            let start = exact.partition_point(|(candidate, _)| *candidate < hash);
-            let end = exact.partition_point(|(candidate, _)| *candidate <= hash);
-            let Some(old_index) = exact[start..end]
-                .iter()
-                .map(|(_, old_index)| *old_index)
-                .find(|old_index| {
-                    !old_used[*old_index]
-                        && self.lines()[*old_index].bytes.as_slice() == bytes.as_slice()
-                })
-            else {
-                continue;
-            };
-            old_for_new[new_index] = Some(old_index);
-            old_used[old_index] = true;
+        for new_index in prefix_len..chunks.len() - suffix_len {
+            if let Some(old_index) = exact
+                .get_mut(chunks[new_index].as_slice())
+                .and_then(VecDeque::pop_front)
+            {
+                old_for_new[new_index] = Some(old_index);
+                old_used[old_index] = true;
+            }
         }
 
         let unmatched_old = old_used
@@ -640,12 +624,6 @@ impl Line {
             self.typed_row()?,
         ))
     }
-}
-
-fn line_hash(bytes: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
 }
 
 fn split_lines(bytes: Arc<Vec<u8>>) -> Vec<LineBytes> {
