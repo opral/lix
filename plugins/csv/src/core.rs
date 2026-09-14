@@ -559,7 +559,9 @@ impl IdentityStore {
             let end = start + usize::try_from(range.len).expect("u32 fits usize");
             let id = uuid::Uuid::from_slice(&bytes[start..end])
                 .map_err(|_| "CSV import contains an invalid UUID identity".to_owned())?;
-            if let Some((namespace, ordinal)) = decode_generated_id(id) {
+            if let Some((namespace, ordinal)) = decode_generated_id(id).filter(|(namespace, _)| {
+                namespace_lookup.contains_key(namespace) || namespaces.len() <= u16::MAX as usize
+            }) {
                 let namespace_index = if let Some(index) = namespace_lookup.get(&namespace) {
                     usize::from(*index)
                 } else {
@@ -704,8 +706,11 @@ impl IdentityStore {
         {
             u16::try_from(index).map_err(|_| "too many ID namespaces".to_owned())?
         } else {
-            let index = u16::try_from(self.namespaces.len())
-                .map_err(|_| "too many ID namespaces".to_owned())?;
+            let Ok(index) = u16::try_from(self.namespaces.len()) else {
+                let slot = self.len_u32()?;
+                self.append_identity(StoredIdentity::NonCompact(namespace.encode(ordinal)))?;
+                return Ok(slot);
+            };
             Arc::make_mut(&mut self.namespaces).push(namespace.0);
             Arc::make_mut(&mut self.dense_slot_bases).push(None);
             index
@@ -734,8 +739,10 @@ impl IdentityStore {
             {
                 u16::try_from(index).map_err(|_| "too many ID namespaces".to_owned())?
             } else {
-                let index = u16::try_from(self.namespaces.len())
-                    .map_err(|_| "too many ID namespaces".to_owned())?;
+                let Ok(index) = u16::try_from(self.namespaces.len()) else {
+                    self.append_identity(StoredIdentity::NonCompact(id))?;
+                    return Ok(slot);
+                };
                 Arc::make_mut(&mut self.namespaces).push(namespace);
                 Arc::make_mut(&mut self.dense_slot_bases).push(None);
                 index
