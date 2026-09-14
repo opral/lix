@@ -743,3 +743,45 @@ fn qa_scene_metadata_and_new_file_rows_need_no_template_edits() {
         metadata["appState"]
     );
 }
+
+#[test]
+fn qa_layout_changes_are_format_only_and_metadata_changes_are_content() {
+    for (needle, insert) in [
+        ("[\r\n    {", "[\r\n     {"),
+        (" }\r\n  ]", " }\r\n   ]"),
+        ("\"files\": { \"image\" :", "\"files\": {  \"image\"  :"),
+        ("{\r\n  \"type\"", "{\r\n   \"type\""),
+    ] {
+        let (h, file, _) = initial();
+        let out = h
+            .parse_changes(
+                &file,
+                &file.path,
+                &[replace(&file, needle, insert)],
+                None,
+                ctx(2),
+            )
+            .unwrap();
+        assert!(!out.row_changes.is_empty());
+        assert!(
+            out.row_changes
+                .iter()
+                .all(|c| c.effect == sdk::ChangeEffect::FormatOnly),
+            "{needle:?}: {:?}",
+            out.row_changes
+        );
+        assert_eq!(json(&out.snapshot().bytes), json(&file.bytes));
+    }
+    let (h, file, _) = initial();
+    let out = h
+        .parse_changes(
+            &file,
+            &file.path,
+            &[replace(&file, "\"theme\":\"dark\"", "\"theme\":\"light\"")],
+            None,
+            ctx(2),
+        )
+        .unwrap();
+    assert_eq!(out.row_changes.len(), 1);
+    assert_eq!(out.row_changes[0].effect, sdk::ChangeEffect::Content);
+}

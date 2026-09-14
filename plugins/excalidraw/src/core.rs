@@ -1827,8 +1827,17 @@ fn diff_records(before: Vec<RowRecord>, after: Vec<RowRecord>) -> Result<Vec<Row
             let format_only = before.get(&key).is_some_and(|before| {
                 let mut before = before.clone();
                 let mut after = record.row.clone();
-                before.remove("source_json");
-                after.remove("source_json");
+                for field in [
+                    "source_json",
+                    "leading_json",
+                    "prefix_json",
+                    "template_json",
+                    "elements_tail_json",
+                    "files_tail_json",
+                ] {
+                    before.remove(field);
+                    after.remove(field);
+                }
                 before == after
             });
             let mut change = RowChange::upsert(record);
