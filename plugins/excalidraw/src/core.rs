@@ -82,7 +82,7 @@ pub struct ByteEdit {
 
 type RowKey = (Arc<str>, String);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SceneRow {
     template_json: String,
     elements_tail_json: String,
@@ -119,6 +119,22 @@ pub struct ArenaElementSpan {
     pub id: String,
     pub order_key: String,
     pub leading_json: String,
+    pub offset: u64,
+    pub length: u64,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ProjectionLayout {
+    scene: SceneRow,
+    pub elements: Vec<LayoutRow>,
+    pub files: Vec<LayoutRow>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct LayoutRow {
+    id: String,
+    order_key: String,
+    prefix: String,
     pub offset: u64,
     pub length: u64,
 }
@@ -466,19 +482,25 @@ impl Document {
     }
 
     fn from_rows(
-        mut scene: SceneRow,
+        scene: SceneRow,
         mut elements: Vec<ElementRow>,
         mut files: Vec<FileRow>,
     ) -> Result<Self, String> {
         scene.validate_template()?;
         sort_and_validate_elements(&mut elements)?;
         sort_and_validate_files(&mut files)?;
-        if !scene.files_present && !files.is_empty() {
-            scene.template_json = canonical_scene_template(&scene.metadata()?, true);
-            scene.files_present = true;
+        let mut rendering_scene = scene.clone();
+        if !rendering_scene.files_present && !files.is_empty() {
+            rendering_scene.template_json = canonical_scene_template(&scene.metadata()?, true);
+            rendering_scene.files_present = true;
         }
-        let rendered = render_document(&scene, &elements, &files)?;
-        validate_rendered_graph(&rendered.bytes, &elements, &files, scene.files_present)?;
+        let rendered = render_document(&rendering_scene, &elements, &files)?;
+        validate_rendered_graph(
+            &rendered.bytes,
+            &elements,
+            &files,
+            rendering_scene.files_present,
+        )?;
         Ok(Self(Arc::new(DocumentInner {
             bytes: Arc::new(rendered.bytes),
             scene,
@@ -489,51 +511,97 @@ impl Document {
         })))
     }
 
-    pub fn order_keys(&self) -> Vec<(String, String, String)> {
-        self.0
-            .elements
-            .iter()
-            .map(|row| {
-                (
-                    ELEMENT_SCHEMA_KEY.to_owned(),
-                    row.id.clone(),
-                    row.order_key.clone(),
-                )
-            })
-            .chain(self.0.files.iter().map(|row| {
-                (
-                    FILE_SCHEMA_KEY.to_owned(),
-                    row.id.clone(),
-                    row.order_key.clone(),
-                )
-            }))
-            .collect()
+    pub fn layout(&self) -> ProjectionLayout {
+        ProjectionLayout {
+            scene: self.0.scene.clone(),
+            elements: self
+                .0
+                .elements
+                .iter()
+                .map(|row| {
+                    let span = self.0.element_spans[&row.id];
+                    LayoutRow {
+                        id: row.id.clone(),
+                        order_key: row.order_key.clone(),
+                        prefix: row.leading_json.clone(),
+                        offset: span.offset,
+                        length: span.length,
+                    }
+                })
+                .collect(),
+            files: self
+                .0
+                .files
+                .iter()
+                .map(|row| {
+                    let span = self.0.file_spans[&row.id];
+                    LayoutRow {
+                        id: row.id.clone(),
+                        order_key: row.order_key.clone(),
+                        prefix: row.prefix_json.clone(),
+                        offset: span.offset,
+                        length: span.length,
+                    }
+                })
+                .collect(),
+        }
     }
 
-    pub fn restore_order_keys(
-        &mut self,
-        keys: Vec<(String, String, String)>,
-    ) -> Result<(), String> {
-        let mut keys = keys
-            .into_iter()
-            .map(|(schema, id, key)| ((schema, id), key))
-            .collect::<HashMap<_, _>>();
-        let inner = Arc::get_mut(&mut self.0).ok_or("cannot restore shared document order")?;
-        for row in Arc::make_mut(&mut inner.elements) {
-            row.order_key = keys
-                .remove(&(ELEMENT_SCHEMA_KEY.to_owned(), row.id.clone()))
-                .ok_or("missing element order key")?;
-            validate_order_key(&row.order_key)?;
+    pub fn restore_layout(&mut self, layout: ProjectionLayout) -> Result<(), String> {
+        let inner = Arc::get_mut(&mut self.0).ok_or("cannot restore shared document layout")?;
+        let source = |row: &LayoutRow| -> Result<String, String> {
+            let end = row
+                .offset
+                .checked_add(row.length)
+                .ok_or("layout span overflow")?;
+            let start = usize::try_from(row.offset).map_err(|_| "layout offset exceeds memory")?;
+            let end = usize::try_from(end).map_err(|_| "layout end exceeds memory")?;
+            let bytes = inner
+                .bytes
+                .get(start..end)
+                .ok_or("layout span outside file")?;
+            bytes_to_string(bytes)
+        };
+        let mut elements = Vec::with_capacity(layout.elements.len());
+        let mut element_spans = HashMap::new();
+        for row in layout.elements {
+            let element =
+                ElementRow::from_source(row.order_key.clone(), row.prefix.clone(), source(&row)?)?;
+            if element.id != row.id {
+                return Err("element layout identity mismatch".into());
+            }
+            element_spans.insert(
+                row.id,
+                Span {
+                    offset: row.offset,
+                    length: row.length,
+                },
+            );
+            elements.push(element);
         }
-        for row in Arc::make_mut(&mut inner.files) {
-            row.order_key = keys
-                .remove(&(FILE_SCHEMA_KEY.to_owned(), row.id.clone()))
-                .ok_or("missing file order key")?;
-            validate_order_key(&row.order_key)?;
+        let mut files = Vec::with_capacity(layout.files.len());
+        let mut file_spans = HashMap::new();
+        for row in layout.files {
+            let file = FileRow::from_source(
+                row.id.clone(),
+                row.order_key.clone(),
+                row.prefix.clone(),
+                source(&row)?,
+            )?;
+            file_spans.insert(
+                row.id,
+                Span {
+                    offset: row.offset,
+                    length: row.length,
+                },
+            );
+            files.push(file);
         }
-        if !keys.is_empty() {
-            return Err("order index contains unknown rows".into());
-        }
+        inner.scene = layout.scene;
+        inner.elements = Arc::new(elements);
+        inner.files = Arc::new(files);
+        inner.element_spans = Arc::new(element_spans);
+        inner.file_spans = Arc::new(file_spans);
         Ok(())
     }
 

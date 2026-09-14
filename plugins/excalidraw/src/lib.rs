@@ -112,7 +112,7 @@ impl sdk::FileProjection for ExcalidrawPlugin {
             .unwrap_or_else(|| IdNamespace::from_halves(0, 0));
         let (mut document, _) = Document::open_file(before.clone(), Some(update.path), namespace)
             .map_err(sdk::Error::invalid_input)?;
-        restore_document_order(&update.before, &mut document)?;
+        restore_document_layout(&update.before, &mut document)?;
         let (successor, edits) = document
             .rows_changed(&changes)
             .map_err(sdk::Error::invalid_input)?;
@@ -205,7 +205,7 @@ impl sdk::FileProjection for ExcalidrawPlugin {
             accepted_namespace,
         )
         .map_err(sdk::Error::invalid_input)?;
-        restore_document_order(&update.before, &mut document)?;
+        restore_document_layout(&update.before, &mut document)?;
         let (document, changes) = document
             .file_changed(&splices, create_namespace)
             .map_err(sdk::Error::invalid_input)?;
@@ -233,37 +233,58 @@ fn store_document_indexes(sink: &mut impl StateOutput, document: &Document) -> s
         sink.put_state(&id_page_key(page as u32), &bytes)?;
     }
     sink.delete_state_prefix(ORDER_PREFIX)?;
-    let keys = document.order_keys();
-    let pages = keys.len().div_ceil(1024);
+    let bytes =
+        serde_json::to_vec(&document.layout()).map_err(|e| sdk::Error::internal(e.to_string()))?;
+    let pages = bytes.len().div_ceil(ELEMENT_INDEX_PAGE_BYTES);
     sink.put_state(ORDER_ROOT, &(pages as u64).to_le_bytes())?;
-    for (page, keys) in keys.chunks(1024).enumerate() {
+    for (page, bytes) in bytes.chunks(ELEMENT_INDEX_PAGE_BYTES).enumerate() {
         let key = format!("excalidraw/order/{page}");
-        let bytes = serde_json::to_vec(keys).map_err(|e| sdk::Error::internal(e.to_string()))?;
-        sink.put_state(key.as_bytes(), &bytes)?;
+        sink.put_state(key.as_bytes(), bytes)?;
     }
     Ok(())
 }
 
-fn restore_document_order(before: &sdk::Snapshot<'_>, document: &mut Document) -> sdk::Result<()> {
+fn restore_document_layout(before: &sdk::Snapshot<'_>, document: &mut Document) -> sdk::Result<()> {
     let Some(root) = before.get_state(ORDER_ROOT)? else {
         return Ok(());
     };
     let pages = u64::from_le_bytes(
         root.try_into()
-            .map_err(|_| sdk::Error::invalid_input("invalid order index"))?,
+            .map_err(|_| sdk::Error::invalid_input("invalid layout index"))?,
     );
-    let mut keys = Vec::new();
+    let mut bytes = Vec::new();
     for page in 0..pages {
         let key = format!("excalidraw/order/{page}");
-        let bytes = before
-            .get_state(key.as_bytes())?
-            .ok_or_else(|| sdk::Error::invalid_input("missing order page"))?;
-        let page: Vec<(String, String, String)> =
-            serde_json::from_slice(&bytes).map_err(|e| sdk::Error::invalid_input(e.to_string()))?;
-        keys.extend(page);
+        bytes.extend(
+            before
+                .get_state(key.as_bytes())?
+                .ok_or_else(|| sdk::Error::invalid_input("missing layout page"))?,
+        );
+    }
+    let mut layout: core::ProjectionLayout =
+        serde_json::from_slice(&bytes).map_err(|e| sdk::Error::invalid_input(e.to_string()))?;
+    let shifts = decode_shifts(&before.get_state(ELEMENT_SHIFTS_KEY)?.unwrap_or_default())?;
+    for file in &mut layout.files {
+        let mut delta = 0_i64;
+        for (ordinal, shift) in &shifts {
+            let element = layout
+                .elements
+                .get(*ordinal as usize)
+                .ok_or_else(|| sdk::Error::invalid_input("invalid layout shift"))?;
+            if element.offset < file.offset {
+                delta = delta
+                    .checked_add(*shift)
+                    .ok_or_else(|| sdk::Error::invalid_input("layout shift overflow"))?;
+            }
+        }
+        file.offset = apply_shift(file.offset, delta)?;
+    }
+    for (ordinal, row) in layout.elements.iter_mut().enumerate() {
+        row.offset = effective_offset(row.offset, ordinal as u32, &shifts)?;
+        row.length = effective_length(row.length, ordinal as u32, &shifts)?;
     }
     document
-        .restore_order_keys(keys)
+        .restore_layout(layout)
         .map_err(sdk::Error::invalid_input)
 }
 

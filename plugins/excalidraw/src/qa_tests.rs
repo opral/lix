@@ -815,3 +815,91 @@ fn qa_integral_float_scene_metadata_keeps_exact_spelling() {
         file.bytes
     );
 }
+
+#[test]
+fn qa_first_file_insert_delete_and_reordered_whitespace_restore_exactly() {
+    let (h, _, fixtures) = initial();
+    let source = Snapshot {
+        path: "new.excalidraw".into(),
+        bytes: br#"{ "elements": [] }"#.to_vec(),
+        ..Snapshot::default()
+    };
+    let parsed = h.parse(&source, ctx(1)).unwrap();
+    let mut rows = Vec::new();
+    accept(&mut rows, &parsed.row_changes);
+    let file = parsed.into_snapshot();
+    let image = fixtures
+        .iter()
+        .find(|r| r.schema_key.as_ref() == core::FILE_SCHEMA_KEY)
+        .unwrap();
+    let add = change(image);
+    let added = h
+        .serialize_changes(&file, std::slice::from_ref(&add))
+        .unwrap();
+    accept(&mut rows, &[add]);
+    assert_eq!(
+        h.serialize(&file.file_id, &file.path, &rows, None)
+            .unwrap()
+            .snapshot()
+            .bytes,
+        added.snapshot().bytes
+    );
+    let mut delete = change(image);
+    delete.row = None;
+    let deleted = h
+        .serialize_changes(added.snapshot(), std::slice::from_ref(&delete))
+        .unwrap();
+    accept(&mut rows, &[delete]);
+    assert_eq!(deleted.snapshot().bytes, source.bytes);
+    assert_eq!(
+        h.serialize(&file.file_id, &file.path, &rows, None)
+            .unwrap()
+            .snapshot()
+            .bytes,
+        deleted.snapshot().bytes
+    );
+
+    let source = Snapshot {
+        path: "space.excalidraw".into(),
+        bytes:
+            br#"{"elements":[{"id":"a","type":"text"}  ,{"id":"b","type":"text"} ],"appState":{}}"#
+                .to_vec(),
+        ..Snapshot::default()
+    };
+    let parsed = h.parse(&source, ctx(2)).unwrap();
+    let mut rows = Vec::new();
+    accept(&mut rows, &parsed.row_changes);
+    let mut file = parsed.into_snapshot();
+    let mut a = element(&rows, "a");
+    a.row
+        .insert("order_key", sdk::TypedValue::Text("f0".into()));
+    let update = change(&a);
+    let out = h
+        .serialize_changes(&file, std::slice::from_ref(&update))
+        .unwrap();
+    accept(&mut rows, &[update]);
+    file = out.into_snapshot();
+    for n in 1..4 {
+        let mut scene = rows
+            .iter()
+            .find(|r| r.schema_key.as_ref() == core::SCENE_SCHEMA_KEY)
+            .unwrap()
+            .clone();
+        let mut metadata = payload(&scene, "scene_json");
+        metadata["appState"]["n"] = json!(n);
+        set_payload(&mut scene, "scene_json", metadata);
+        let update = change(&scene);
+        let out = h
+            .serialize_changes(&file, std::slice::from_ref(&update))
+            .unwrap();
+        accept(&mut rows, &[update]);
+        file = out.into_snapshot();
+        assert_eq!(
+            h.serialize(&file.file_id, &file.path, &rows, None)
+                .unwrap()
+                .snapshot()
+                .bytes,
+            file.bytes
+        );
+    }
+}
