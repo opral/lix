@@ -157,3 +157,21 @@ fn structural_checkpoint_streams_across_pages_and_preserves_order_overrides() {
         .unwrap();
     assert!(next.snapshot().bytes.ends_with(b"tail,b\n"));
 }
+
+#[test]
+fn malformed_checkpoint_length_fails_before_missing_page_allocation() {
+    let (mut file, index) = indexed_file(1);
+    file.state.remove(CSV_INDEX_KEY);
+    let mut manifest = CSV_IDENTITIES_MAGIC.to_vec();
+    manifest.extend_from_slice(&1u32.to_le_bytes());
+    manifest.extend_from_slice(&4097u32.to_le_bytes());
+    manifest.extend_from_slice(&[b',', b'"', 1, 0]);
+    file.state.insert(CSV_IDENTITIES_KEY.to_vec(), manifest);
+    let mut page = vec![0; CSV_IDENTITY_PAGE_BYTES];
+    page[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+    file.state.insert(identity_page_key(0), page);
+    let error = sdk::testing::Harness::<CsvPlugin>::default()
+        .serialize_changes(&file, &[edit(&index, 0, &["x", "b"])])
+        .unwrap_err();
+    assert!(format!("{error:?}").contains("identity page disappeared"));
+}

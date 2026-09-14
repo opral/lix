@@ -672,7 +672,8 @@ impl IdentityCheckpointReader<'_, '_> {
                 "CSV identity checkpoint is truncated",
             ));
         }
-        let mut output = Vec::with_capacity(length);
+        // Grow only after validating an actual page, not a declared key length.
+        let mut output = Vec::new();
         while output.len() < length {
             if self.offset == self.page.len() {
                 if self.next_page == self.page_count {
