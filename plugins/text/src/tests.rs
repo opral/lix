@@ -610,3 +610,133 @@ fn content_edits_write_no_identity_state_and_deletions_retire_old_pages() {
     .unwrap();
     assert_eq!((sink.puts, sink.deletes), (1, pages.len()));
 }
+
+#[test]
+fn randomized_byte_edits_replay_rows_render_and_hydrate_losslessly() {
+    let mut seed = 0x5eed_u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed as usize
+    };
+    let alphabet = [b'a', b'b', b'\r', b'\n', 0xff, 0xfe];
+    for _ in 0..10_000 {
+        let source = (0..next() % 80)
+            .map(|_| alphabet[next() % alphabet.len()])
+            .collect::<Vec<_>>();
+        let (before, _) = open(&source);
+        let start = next() % (source.len() + 1);
+        let delete = next() % (source.len() - start + 1);
+        let insert = (0..next() % 20)
+            .map(|_| alphabet[next() % alphabet.len()])
+            .collect::<Vec<_>>();
+        let mut expected = source.clone();
+        expected.splice(start..start + delete, insert.clone());
+        let (after, changes) = before
+            .file_changed(
+                &[FileEdit {
+                    offset: start as u64,
+                    delete_len: delete as u64,
+                    insert,
+                }],
+                |n| test_id(2, n),
+            )
+            .unwrap();
+        assert_eq!(after.bytes(), expected);
+        let (replayed, edits) = before.rows_changed(changes).unwrap();
+        assert_eq!(replayed, after);
+        assert_eq!(apply_edits(&source, &edits), expected);
+        assert_eq!(
+            Document::open_file_with_identities(expected, after.identities()).unwrap(),
+            after
+        );
+    }
+}
+
+#[test]
+#[ignore = "manual scaling probe; run with plugin_text opt-level=3 and --nocapture"]
+fn text_core_scaling_probe() {
+    use std::time::Instant;
+    fn median(mut run: impl FnMut()) -> f64 {
+        let mut samples = (0..5)
+            .map(|_| {
+                let start = Instant::now();
+                run();
+                start.elapsed().as_secs_f64() * 1000.0
+            })
+            .collect::<Vec<_>>();
+        samples.sort_by(f64::total_cmp);
+        samples[2]
+    }
+    println!(
+        "lines,bytes,open_ms,file_edit_ms,row_edit_ms,duplicate_ms,sparse_ms,sparse_insert_bytes"
+    );
+    for count in [1_000, 10_000, 100_000] {
+        let source = (0..count)
+            .map(|n| format!("line {n:08} with example content\n"))
+            .collect::<String>()
+            .into_bytes();
+        let (document, _) = open(&source);
+        let open_ms = median(|| {
+            std::hint::black_box(open(&source));
+        });
+        let splice = FileEdit {
+            offset: (source.len() / 2) as u64,
+            delete_len: 1,
+            insert: b"X".to_vec(),
+        };
+        let file_ms = median(|| {
+            std::hint::black_box(
+                document
+                    .file_changed(std::slice::from_ref(&splice), |n| test_id(2, n))
+                    .unwrap(),
+            );
+        });
+        let line = &document.lines()[count / 2];
+        let change = lix::RowChange::upsert(
+            LINE_SCHEMA_KEY,
+            row_pk(line.id()).to_vec(),
+            row_with_bytes(line, b"changed\n"),
+        );
+        let row_ms = median(|| {
+            std::hint::black_box(document.rows_changed([change.clone()]).unwrap());
+        });
+        let mut duplicate = b"head\n".to_vec();
+        duplicate.extend(b"same\n".repeat(count));
+        duplicate.extend(b"tail\n");
+        let (dup_document, _) = open(&duplicate);
+        duplicate[..4].copy_from_slice(b"HEAD");
+        let len = duplicate.len();
+        duplicate[len - 5..len - 1].copy_from_slice(b"TAIL");
+        let dup_splice = FileEdit {
+            offset: 0,
+            delete_len: duplicate.len() as u64,
+            insert: duplicate,
+        };
+        let duplicate_ms = median(|| {
+            std::hint::black_box(
+                dup_document
+                    .file_changed(std::slice::from_ref(&dup_splice), |n| test_id(2, n))
+                    .unwrap(),
+            );
+        });
+        let deletes = [
+            lix::RowChange::delete(LINE_SCHEMA_KEY, row_pk(document.lines()[1].id()).to_vec()),
+            lix::RowChange::delete(
+                LINE_SCHEMA_KEY,
+                row_pk(document.lines()[count - 2].id()).to_vec(),
+            ),
+        ];
+        let mut inserted = 0;
+        let sparse_ms = median(|| {
+            let (_, edits) = document.rows_changed(deletes.clone()).unwrap();
+            inserted = edits.iter().map(|edit| edit.insert.len()).sum::<usize>();
+            assert_eq!(edits.len(), 2);
+        });
+        println!(
+            "{count},{},{open_ms:.3},{file_ms:.3},{row_ms:.3},{duplicate_ms:.3},{sparse_ms:.3},{inserted}",
+            source.len()
+        );
+    }
+}

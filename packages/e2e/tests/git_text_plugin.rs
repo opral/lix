@@ -540,16 +540,30 @@ async fn sql_line_edits_survive_file_edits_reopen_and_history() {
 
 #[tokio::test]
 async fn representation_switch_merges_keep_exactly_one_payload() {
-    for (base, edited, switched) in [
+    for (base, edited, switched, both_switch) in [
         (
             b"base\n".as_slice(),
             b"edit\n".as_slice(),
             b"\xff\n".as_slice(),
+            false,
         ),
         (
             b"\xff\n".as_slice(),
             b"\xfe\n".as_slice(),
             b"text\n".as_slice(),
+            false,
+        ),
+        (
+            b"base\n".as_slice(),
+            b"\xfe\n".as_slice(),
+            b"\xff\n".as_slice(),
+            true,
+        ),
+        (
+            b"\xff\n".as_slice(),
+            b"left\n".as_slice(),
+            b"right\n".as_slice(),
+            true,
         ),
     ] {
         for reverse in [false, true] {
@@ -586,8 +600,13 @@ async fn representation_switch_merges_keep_exactly_one_payload() {
             })
             .await
             .unwrap();
-            assert_eq!(read_file(&lix, path).await.unwrap(), switched);
-            assert_eq!(render_rows(&git_text_rows(&lix, &file_id).await), switched);
+            let merged = read_file(&lix, path).await.unwrap();
+            if both_switch {
+                assert!(merged == edited || merged == switched);
+            } else {
+                assert_eq!(merged, switched);
+            }
+            assert_eq!(render_rows(&git_text_rows(&lix, &file_id).await), merged);
             write_file(&lix, path, b"later\n").await.unwrap();
             assert_eq!(read_file(&lix, path).await.unwrap(), b"later\n");
             lix.close().await.unwrap();
@@ -634,7 +653,12 @@ async fn concurrent_gap_insertions_merge_and_remain_editable() {
     assert_eq!(rows.len(), 4);
     assert!(rows.iter().any(|row| row.id == x.id));
     assert!(rows.iter().any(|row| row.id == y.id));
-    let mut expected = render_rows(&rows);
+    let mut expected = if x.id < y.id {
+        b"A\nX\nY\nZ\n".to_vec()
+    } else {
+        b"A\nY\nX\nZ\n".to_vec()
+    };
+    assert_eq!(render_rows(&rows), expected);
     assert_eq!(read_file(&lix, path).await.unwrap(), expected);
     expected[0] = b'a';
     write_file(&lix, path, &expected).await.unwrap();
@@ -655,3 +679,97 @@ fn optional_text(value: Value) -> Option<String> {
         _ => panic!("expected nullable text"),
     }
 }
+
+#[tokio::test]
+async fn conflicting_line_boundary_merge_fails_without_changing_target() {
+    let lix = open_lix().await.unwrap();
+    install_plugin(&lix, &build_plugin_archive()).await.unwrap();
+    let path = "/boundary.txt";
+    write_file(&lix, path, b"a\n").await.unwrap();
+    let file_id = file_id_at_path(&lix, path).await;
+    let target = lix.active_branch_id().await.unwrap();
+    let source = lix
+        .create_branch(CreateBranchOptions {
+            id: None,
+            name: "append".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .unwrap();
+    write_file(&lix, path, b"a").await.unwrap();
+    let target_rows = git_text_rows(&lix, &file_id).await;
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: source.id.clone(),
+    })
+    .await
+    .unwrap();
+    write_file(&lix, path, b"a\nb\n").await.unwrap();
+    lix.switch_branch(SwitchBranchOptions { branch_id: target })
+        .await
+        .unwrap();
+    assert!(
+        lix.merge_branch(MergeBranchOptions {
+            source_branch_id: source.id
+        })
+        .await
+        .is_err()
+    );
+    assert_eq!(read_file(&lix, path).await.unwrap(), b"a");
+    assert_eq!(git_text_rows(&lix, &file_id).await, target_rows);
+    write_file(&lix, path, b"next\n").await.unwrap();
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "manual end-to-end scaling probe; includes Wasm and in-memory storage"]
+async fn text_sql_scaling_probe() {
+    use std::time::Instant;
+    println!("lines,bytes,import_ms,file_update_ms,sql_update_ms");
+    for count in [1_000, 10_000, 100_000] {
+        let lix = open_lix().await.unwrap();
+        install_plugin(&lix, &build_plugin_archive()).await.unwrap();
+        let mut bytes = (0..count)
+            .map(|n| format!("line {n:08} with example content\n"))
+            .collect::<String>()
+            .into_bytes();
+        let start = Instant::now();
+        write_file(&lix, "/scale.txt", &bytes).await.unwrap();
+        let import = start.elapsed().as_secs_f64() * 1000.0;
+        let file_id = file_id_at_path(&lix, "/scale.txt").await;
+        let rows = git_text_rows(&lix, &file_id).await;
+        let id = &rows[count / 2].id;
+        let mut file_samples = Vec::new();
+        let mut sql_samples = Vec::new();
+        for n in 0..3 {
+            bytes[0] = b'A' + n;
+            let start = Instant::now();
+            write_file(&lix, "/scale.txt", &bytes).await.unwrap();
+            file_samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        for n in 0..3 {
+            let start = Instant::now();
+            lix.execute(
+                "UPDATE text_line SET content = $1 WHERE lixcol_file_id = $2 AND id = $3",
+                &[
+                    Value::Text(format!("SQL edit {n}")),
+                    Value::Text(file_id.clone()),
+                    Value::Text(id.clone()),
+                ],
+            )
+            .await
+            .unwrap();
+            sql_samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        file_samples.sort_by(f64::total_cmp);
+        sql_samples.sort_by(f64::total_cmp);
+        assert_eq!(git_text_rows(&lix, &file_id).await.len(), count);
+        println!(
+            "{count},{},{import:.3},{:.3},{:.3}",
+            bytes.len(),
+            file_samples[1],
+            sql_samples[1]
+        );
+        lix.close().await.unwrap();
+    }
+}
+
