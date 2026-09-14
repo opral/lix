@@ -466,10 +466,9 @@ fn serialize_list_with_marker_spacing(
             && matches!(item.children.as_slice(), [Block::Paragraph(_)])
             && !inner.is_empty()
         {
-            output.push_str(marker.trim_end());
-            output.push_str("\n\n");
-            output.push_str(&prefix_lines(&inner, &" ".repeat(marker.len())));
-            continue;
+            return Err(SerializeError::UnsupportedNode(
+                "a loose single-item list needs multiple block children; one paragraph cannot encode looseness",
+            ));
         }
         output.push_str(&marker);
         output.push_str(&indent_after_first_line(&inner, marker.len()));

@@ -836,3 +836,25 @@ fn qa_mixed_punctuation_prefixes_stabilize() {
         assert_eq!(document.bytes(), source.as_bytes());
     }
 }
+
+#[test]
+fn qa_unrepresentable_single_item_loose_list_is_rejected() {
+    let (document, _) = Document::open_file(
+        b"- x\n".to_vec(),
+        Some("list.md"),
+        IdNamespace::from_halves(41, 2),
+    )
+    .unwrap();
+    let mut node = document.tree.materialize().children.remove(0).node;
+    node.payload["tight"] = serde_json::json!(false);
+    assert!(matches!(
+        document.rows_changed(vec![RowChange {
+            schema_key: NODE_SCHEMA_KEY.into(),
+            row_pk: vec![node.id],
+            row: Some(node_to_typed_row(&node).unwrap()),
+            effect: ChangeEffect::Content
+        }]),
+        Err(PluginError::InvalidInput(_))
+    ));
+    assert_eq!(document.bytes(), b"- x\n");
+}
