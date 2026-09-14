@@ -623,3 +623,35 @@ fn qa_adding_titles_chooses_default_quote_style() {
         );
     }
 }
+
+#[test]
+fn qa_indented_code_edits_preserve_boundary_blank_lines() {
+    for value in ["\nnew\n\n", "\n", ""] {
+        let (document, _) = Document::open_file(
+            b"    old\n".to_vec(),
+            Some("code.md"),
+            IdNamespace::from_halves(36, 1),
+        )
+        .unwrap();
+        let mut node = document.tree.materialize().children.remove(0).node;
+        node.payload["value"] = serde_json::json!(value);
+        let (updated, _) = document
+            .rows_changed(vec![RowChange {
+                schema_key: NODE_SCHEMA_KEY.into(),
+                row_pk: vec![node.id],
+                row: Some(node_to_typed_row(&node).unwrap()),
+                effect: ChangeEffect::Content,
+            }])
+            .unwrap();
+        let (reopened, _) = Document::open_file(
+            updated.bytes(),
+            Some("code.md"),
+            IdNamespace::from_halves(36, 2),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.tree.materialize().children[0].node.payload["value"],
+            value
+        );
+    }
+}

@@ -1415,7 +1415,27 @@ fn block_from_tree(tree: &NodeTree) -> Result<md::Block, PluginError> {
         NodeKind::CodeBlock => {
             let style = string_field(&tree.node.format, "style")?;
             let kind = match style {
-                "indented" => md::CodeBlockKind::Indented,
+                "indented" => {
+                    let value = string_field(&tree.node.payload, "value")?;
+                    let loses_blank_lines = value
+                        .lines()
+                        .next()
+                        .is_none_or(|line| line.trim().is_empty())
+                        || value
+                            .lines()
+                            .last()
+                            .is_some_and(|line| line.trim().is_empty());
+                    if loses_blank_lines
+                        || optional_string_field(&tree.node.payload, "info")?.is_some()
+                    {
+                        md::CodeBlockKind::Fenced {
+                            marker: md::FenceMarker::Backtick,
+                            length: 3,
+                        }
+                    } else {
+                        md::CodeBlockKind::Indented
+                    }
+                }
                 "fenced" => md::CodeBlockKind::Fenced {
                     marker: match string_field(&tree.node.format, "marker")? {
                         "backtick" => md::FenceMarker::Backtick,
