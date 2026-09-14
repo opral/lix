@@ -84,7 +84,7 @@ fn cold_parse_changes(
         .map_err(sdk::Error::invalid_input)?;
     sink.put_state(ID_NAMESPACE_STATE, &accepted_namespace.0[..12])?;
     store_document_indexes(sink, &successor)?;
-    emit_changes(changes.into_iter().map(Ok), sink)
+    emit_changes(changes, sink)
 }
 
 impl sdk::FileProjection for ExcalidrawPlugin {
@@ -129,15 +129,17 @@ impl sdk::FileProjection for ExcalidrawPlugin {
         mut input: sdk::SerializeInput<'_>,
         sink: &mut sdk::FileOutput<'_, '_>,
     ) -> sdk::Result<()> {
-        let mut records = Vec::new();
+        let mut builder = RowImportBuilder::new();
         while let Some(row) = input.typed_rows.next()? {
-            records.push(RowRecord {
-                schema_key: row.schema_key,
-                row_pk: row.primary_key,
-                row: row.row,
-            });
+            builder
+                .push(RowRecord {
+                    schema_key: row.schema_key,
+                    row_pk: row.primary_key,
+                    row: row.row,
+                })
+                .map_err(sdk::Error::invalid_input)?;
         }
-        let (rendered, _) = Document::open_rows(records).map_err(sdk::Error::invalid_input)?;
+        let (rendered, _) = builder.finish().map_err(sdk::Error::invalid_input)?;
         let document = rendered;
         let bytes = document.bytes();
         if input
@@ -217,7 +219,7 @@ impl sdk::FileProjection for ExcalidrawPlugin {
             .map_err(sdk::Error::invalid_input)?;
         store_document_indexes(sink, &document)?;
         sink.delete_state(ELEMENT_SHIFTS_KEY)?;
-        emit_changes(changes.into_iter().map(Ok), sink)?;
+        emit_changes(changes, sink)?;
         Ok(())
     }
 }
@@ -238,6 +240,8 @@ fn store_document_indexes(sink: &mut impl StateOutput, document: &Document) -> s
             .collect();
         sink.put_state(&id_page_key(page as u32), &bytes)?;
     }
+    drop(ids);
+    drop(spans);
     sink.delete_state_prefix(ORDER_PREFIX)?;
     let bytes =
         serde_json::to_vec(&document.layout()).map_err(|e| sdk::Error::internal(e.to_string()))?;

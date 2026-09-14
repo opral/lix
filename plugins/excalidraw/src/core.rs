@@ -1,7 +1,7 @@
 use crate::order_key::OrderKey;
 use lix::plugin::{TypedRow, TypedValue};
 use serde_json::{Map, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub const SCENE_SCHEMA_KEY: &str = "excalidraw_scene";
@@ -154,14 +154,26 @@ struct DocumentInner {
 
 #[derive(Clone, Debug)]
 pub struct InitialChanges {
-    changes: VecDeque<RowChange>,
+    document: Document,
+    ordinal: usize,
 }
 
 impl Iterator for InitialChanges {
     type Item = Result<RowChange, String>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.changes.pop_front().map(Ok)
+        let inner = &self.document.0;
+        let record = if self.ordinal == 0 {
+            inner.scene.record()
+        } else if let Some(element) = inner.elements.get(self.ordinal - 1) {
+            element.record()
+        } else if let Some(file) = inner.files.get(self.ordinal - 1 - inner.elements.len()) {
+            file.record()
+        } else {
+            return None;
+        };
+        self.ordinal += 1;
+        Some(record.map(RowChange::upsert))
     }
 }
 
@@ -614,21 +626,10 @@ impl Document {
     }
 
     pub fn initial_changes(&self) -> InitialChanges {
-        let mut changes = VecDeque::with_capacity(1 + self.0.elements.len() + self.0.files.len());
-        changes.push_back(RowChange::upsert(
-            self.0.scene.record().expect("validated scene serializes"),
-        ));
-        for element in self.0.elements.iter() {
-            changes.push_back(RowChange::upsert(
-                element.record().expect("validated element serializes"),
-            ));
+        InitialChanges {
+            document: self.clone(),
+            ordinal: 0,
         }
-        for file in self.0.files.iter() {
-            changes.push_back(RowChange::upsert(
-                file.record().expect("validated file serializes"),
-            ));
-        }
-        InitialChanges { changes }
     }
 
     pub fn arena_element_spans(&self) -> Vec<ArenaElementSpan> {
@@ -701,16 +702,16 @@ impl Document {
         &self,
         splices: &[FileEdit<'_>],
         _namespace: IdNamespace,
-    ) -> Result<(Self, Vec<RowChange>), String> {
+    ) -> Result<(Self, DocumentChanges), String> {
         if splices.is_empty() {
-            return Ok((self.clone(), Vec::new()));
+            return Ok((self.clone(), DocumentChanges::empty(self.clone())));
         }
         let bytes = apply_splices(&self.0.bytes, splices)?;
         let mut parsed = parse_file(&bytes)?;
         reconcile_order_keys(&self.0.elements, &mut parsed.elements)?;
         reconcile_order_keys(&self.0.files, &mut parsed.files)?;
         let after = Self::from_parsed_source(bytes, parsed);
-        let changes = diff_records(self.records()?, after.records()?)?;
+        let changes = DocumentChanges::new(self.clone(), after.clone());
         Ok((after, changes))
     }
 
@@ -724,28 +725,53 @@ impl Document {
             return Ok(result);
         }
 
-        let mut records = self
-            .records()?
-            .into_iter()
-            .map(|record| Ok((record_key(&record)?, record)))
-            .collect::<Result<HashMap<_, _>, String>>()?;
+        let mut scene = Some(self.0.scene.clone());
+        let mut elements: HashMap<_, _> = self
+            .0
+            .elements
+            .iter()
+            .map(|row| (row.id.clone(), row.clone()))
+            .collect();
+        let mut files: HashMap<_, _> = self
+            .0
+            .files
+            .iter()
+            .map(|row| (row.id.clone(), row.clone()))
+            .collect();
         for change in changes {
             validate_change_key(change)?;
-            let key = change_key(change)?;
-            if let Some(row) = &change.row {
-                records.insert(
-                    key,
-                    RowRecord {
-                        schema_key: change.schema_key.clone(),
-                        row_pk: change.row_pk.clone(),
-                        row: row.clone(),
-                    },
-                );
-            } else {
-                records.remove(&key);
+            let id = text_key_component(&change.row_pk)?;
+            let record = change.row.as_ref().map(|row| RowRecord {
+                schema_key: change.schema_key.clone(),
+                row_pk: change.row_pk.clone(),
+                row: row.clone(),
+            });
+            match change.schema_key.as_ref() {
+                SCENE_SCHEMA_KEY => scene = record.as_ref().map(SceneRow::parse).transpose()?,
+                ELEMENT_SCHEMA_KEY => match record {
+                    Some(record) => {
+                        elements.insert(id.to_owned(), ElementRow::parse(&record)?);
+                    }
+                    None => {
+                        elements.remove(id);
+                    }
+                },
+                FILE_SCHEMA_KEY => match record {
+                    Some(record) => {
+                        files.insert(id.to_owned(), FileRow::parse(&record)?);
+                    }
+                    None => {
+                        files.remove(id);
+                    }
+                },
+                _ => unreachable!("validated schema key"),
             }
         }
-        let (after, _) = Self::open_rows(records.into_values().collect())?;
+        let after = Self::from_rows(
+            scene.ok_or("Excalidraw requires a scene row")?,
+            elements.into_values().collect(),
+            files.into_values().collect(),
+        )?;
         if after.0.bytes == self.0.bytes {
             return Ok((after, Vec::new()));
         }
@@ -1013,6 +1039,7 @@ fn parse_file(bytes: &[u8]) -> Result<ParsedFile, String> {
     if !value.is_object() {
         return Err("Excalidraw document root must be a JSON object".to_owned());
     }
+    drop(value);
     let fields = scan_root_fields(bytes)?;
     let elements_field = unique_field(&fields, "elements")?
         .ok_or_else(|| "Excalidraw document requires a top-level elements array".to_owned())?;
@@ -1876,52 +1903,171 @@ fn validate_rendered_graph(
     Ok(())
 }
 
-fn diff_records(before: Vec<RowRecord>, after: Vec<RowRecord>) -> Result<Vec<RowChange>, String> {
-    let before = before
-        .into_iter()
-        .map(|record| Ok((record_key(&record)?, record.row)))
-        .collect::<Result<HashMap<_, _>, String>>()?;
-    let after = after
-        .into_iter()
-        .map(|record| Ok((record_key(&record)?, record)))
-        .collect::<Result<HashMap<_, _>, String>>()?;
-    let mut changes = Vec::new();
-    for (schema_key, row_id) in before.keys() {
-        if !after.contains_key(&(schema_key.clone(), row_id.clone())) {
-            changes.push(RowChange::delete(schema_key, row_id));
+#[derive(Debug)]
+pub struct DocumentChanges {
+    before: Document,
+    after: Document,
+    elements: HashMap<String, usize>,
+    files: HashMap<String, usize>,
+    phase: u8,
+    ordinal: usize,
+}
+
+impl DocumentChanges {
+    fn empty(document: Document) -> Self {
+        Self {
+            before: document.clone(),
+            after: document,
+            elements: HashMap::new(),
+            files: HashMap::new(),
+            phase: 5,
+            ordinal: 0,
         }
     }
-    for (key, record) in after {
-        if before.get(&key) != Some(&record.row) {
-            let format_only = before.get(&key).is_some_and(|before| {
-                let mut before = before.clone();
-                let mut after = record.row.clone();
-                for field in [
-                    "source_json",
-                    "leading_json",
-                    "prefix_json",
-                    "template_json",
-                    "elements_tail_json",
-                    "files_tail_json",
-                ] {
-                    before.remove(field);
-                    after.remove(field);
-                }
-                before == after
-            });
-            let mut change = RowChange::upsert(record);
-            if format_only {
-                change.effect = ChangeEffect::FormatOnly;
-            }
-            changes.push(change);
+
+    fn new(before: Document, after: Document) -> Self {
+        let elements = before
+            .0
+            .elements
+            .iter()
+            .enumerate()
+            .map(|(i, row)| (row.id.clone(), i))
+            .collect();
+        let files = before
+            .0
+            .files
+            .iter()
+            .enumerate()
+            .map(|(i, row)| (row.id.clone(), i))
+            .collect();
+        Self {
+            before,
+            after,
+            elements,
+            files,
+            phase: 0,
+            ordinal: 0,
         }
     }
-    changes.sort_unstable_by(|left, right| {
-        change_key(left)
-            .expect("validated Excalidraw change")
-            .cmp(&change_key(right).expect("validated Excalidraw change"))
+}
+
+fn changed_record(before: Option<RowRecord>, after: RowRecord) -> Option<RowChange> {
+    if before
+        .as_ref()
+        .is_some_and(|before| before.row == after.row)
+    {
+        return None;
+    }
+    let formatting = |field: &str| {
+        matches!(
+            field,
+            "source_json"
+                | "leading_json"
+                | "prefix_json"
+                | "template_json"
+                | "elements_tail_json"
+                | "files_tail_json"
+        )
+    };
+    let format_only = before.as_ref().is_some_and(|before| {
+        before
+            .row
+            .iter()
+            .filter(|(key, _)| !formatting(key))
+            .eq(after.row.iter().filter(|(key, _)| !formatting(key)))
     });
-    Ok(changes)
+    let mut change = RowChange::upsert(after);
+    if format_only {
+        change.effect = ChangeEffect::FormatOnly;
+    }
+    Some(change)
+}
+
+impl Iterator for DocumentChanges {
+    type Item = Result<RowChange, String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let ordinal = self.ordinal;
+            self.ordinal += 1;
+            let candidate: Result<Option<RowChange>, String> = match self.phase {
+                0 => {
+                    self.phase = 1;
+                    self.ordinal = 0;
+                    if self.before.0.scene == self.after.0.scene {
+                        continue;
+                    }
+                    self.before.0.scene.record().and_then(|before| {
+                        self.after
+                            .0
+                            .scene
+                            .record()
+                            .map(|after| changed_record(Some(before), after))
+                    })
+                }
+                1 => {
+                    let Some(row) = self.before.0.elements.get(ordinal) else {
+                        self.phase = 2;
+                        self.ordinal = 0;
+                        continue;
+                    };
+                    if self.after.0.element_spans.contains_key(&row.id) {
+                        continue;
+                    }
+                    Ok(Some(RowChange::delete(ELEMENT_SCHEMA_KEY, &row.id)))
+                }
+                2 => {
+                    let Some(row) = self.before.0.files.get(ordinal) else {
+                        self.phase = 3;
+                        self.ordinal = 0;
+                        continue;
+                    };
+                    if self.after.0.file_spans.contains_key(&row.id) {
+                        continue;
+                    }
+                    Ok(Some(RowChange::delete(FILE_SCHEMA_KEY, &row.id)))
+                }
+                3 => {
+                    let Some(row) = self.after.0.elements.get(ordinal) else {
+                        self.phase = 4;
+                        self.ordinal = 0;
+                        continue;
+                    };
+                    let before = self
+                        .elements
+                        .get(&row.id)
+                        .map(|i| &self.before.0.elements[*i]);
+                    if before == Some(row) {
+                        continue;
+                    }
+                    before
+                        .map(ElementRow::record)
+                        .transpose()
+                        .and_then(|before| row.record().map(|after| changed_record(before, after)))
+                }
+                4 => {
+                    let Some(row) = self.after.0.files.get(ordinal) else {
+                        self.phase = 5;
+                        return None;
+                    };
+                    let before = self.files.get(&row.id).map(|i| &self.before.0.files[*i]);
+                    if before == Some(row) {
+                        continue;
+                    }
+                    before
+                        .map(FileRow::record)
+                        .transpose()
+                        .and_then(|before| row.record().map(|after| changed_record(before, after)))
+                }
+                _ => return None,
+            };
+            match candidate {
+                Ok(Some(change)) => return Some(Ok(change)),
+                Ok(None) => {}
+                Err(error) => return Some(Err(error)),
+            }
+        }
+    }
 }
 
 fn apply_splices(before: &[u8], splices: &[FileEdit<'_>]) -> Result<Vec<u8>, String> {

@@ -729,3 +729,152 @@ fn build_plugin_archive(wasm_path: &Path, manifest: &str, schemas: &[(&str, &str
     writer.write_all(&wasm).unwrap();
     writer.finish().unwrap().into_inner()
 }
+
+#[tokio::test]
+async fn excalidraw_sql_and_file_point_edits_preserve_bytes_after_reopen() {
+    excalidraw_point_workflow(128, 128_000, 3).await;
+}
+
+#[tokio::test]
+async fn excalidraw_hundred_thousand_elements_import_structure_and_reopen() {
+    excalidraw_point_workflow(100_000, 0, 1).await;
+}
+
+#[tokio::test]
+#[ignore = "Excalidraw SQL/Wasm scaling and allocation profile"]
+async fn profile_excalidraw_point_edits() {
+    let counts =
+        std::env::var("LIX_EXCALIDRAW_PROFILE_ROWS").unwrap_or_else(|_| "100,1000,10000".into());
+    for count in counts.split(',').map(|n| n.parse::<usize>().unwrap()) {
+        for attachment in [0, 1_000_000] {
+            excalidraw_point_workflow(count, attachment, 21).await;
+        }
+    }
+}
+
+async fn excalidraw_point_workflow(count: usize, attachment: usize, samples: usize) {
+    let storage = lix::Memory::new();
+    let lix = open_lix().with_storage(storage.clone()).await.unwrap();
+    let archive = match std::env::var("LIX_EXCALIDRAW_PROFILE_ARCHIVE") {
+        Ok(path) => fs::read(path).unwrap(),
+        Err(_) => build_excalidraw_plugin_archive(),
+    };
+    install_plugin(&lix, "plugin_excalidraw", &archive).await;
+    write_file(&lix, "/warmup.excalidraw", br#"{"elements":[]}"#).await;
+    let path = "/scale.excalidraw";
+    let mut expected = serde_json::json!({"type":"excalidraw","version":2,"elements":(0..count).map(|i|serde_json::json!({"id":format!("e{i:08}"),"type":"rectangle","x":1,"y":2})).collect::<Vec<_>>(),"appState":{"theme":"dark"},"files":{}});
+    if attachment > 0 {
+        expected["files"]["image"] =
+            serde_json::json!({"dataURL":"A".repeat(attachment),"mimeType":"image/png"});
+    }
+    let bytes = serde_json::to_vec(&expected).unwrap();
+    let scope = AllocationScope::start();
+    let start = Instant::now();
+    write_file(&lix, path, &bytes).await;
+    let import_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let memory = scope.finish();
+    assert_eq!(read_file(&lix, path).await, bytes);
+    println!(
+        "EXCALIDRAW_IMPORT rows={count} attachment={attachment} bytes={} ms={import_ms:.3} host_allocated={} host_peak_live_delta={}",
+        bytes.len(),
+        memory.allocated_bytes,
+        memory.peak_live_bytes_delta
+    );
+    for sql in [true, false] {
+        let mut times = Vec::new();
+        let mut allocations = Vec::new();
+        let mut peaks = Vec::new();
+        for sample in 0..samples + 3 {
+            let ordinal = [0, count / 2, count - 1][sample % 3];
+            expected["elements"][ordinal]["x"] =
+                serde_json::json!(if sample % 2 == 0 { 12345 } else { 1 });
+            let payload = expected["elements"][ordinal].clone();
+            let next = serde_json::to_vec(&expected).unwrap();
+            let scope = AllocationScope::start();
+            let started = Instant::now();
+            if sql {
+                lix.execute(
+                    "UPDATE excalidraw_element SET element_json=$1 WHERE id=$2",
+                    &[
+                        Value::Jsonb(payload.into()),
+                        Value::Text(format!("e{ordinal:08}")),
+                    ],
+                )
+                .await
+                .unwrap();
+            } else {
+                write_file(&lix, path, &next).await;
+            }
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            let memory = scope.finish();
+            if sample >= 3 {
+                times.push(elapsed);
+                allocations.push(memory.allocated_bytes);
+                peaks.push(memory.peak_live_bytes_delta);
+            }
+            assert_eq!(read_file(&lix, path).await, next);
+        }
+        times.sort_by(f64::total_cmp);
+        allocations.sort_unstable();
+        peaks.sort_unstable();
+        println!(
+            "EXCALIDRAW_POINT mode={} rows={count} attachment={attachment} p50_ms={:.3} p95_ms={:.3} host_allocated_p50={} host_peak_live_delta_p50={} samples={times:?}",
+            if sql { "sql" } else { "file" },
+            times[times.len() / 2],
+            times[(times.len() * 95).div_ceil(100).saturating_sub(1)],
+            allocations[allocations.len() / 2],
+            peaks[peaks.len() / 2]
+        );
+    }
+    expected["elements"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"id":"appended","type":"ellipse","x":0}));
+    let next = serde_json::to_vec(&expected).unwrap();
+    let start = Instant::now();
+    write_file(&lix, path, &next).await;
+    let append_ms = start.elapsed().as_secs_f64() * 1000.0;
+    assert_eq!(read_file(&lix, path).await, next);
+    let start = Instant::now();
+    lix.execute("DELETE FROM excalidraw_element WHERE id='appended'", &[])
+        .await
+        .unwrap();
+    let delete_ms = start.elapsed().as_secs_f64() * 1000.0;
+    expected["elements"].as_array_mut().unwrap().pop();
+    assert_eq!(
+        read_file(&lix, path).await,
+        serde_json::to_vec(&expected).unwrap()
+    );
+    println!(
+        "EXCALIDRAW_STRUCTURAL rows={count} attachment={attachment} append_ms={append_ms:.3} delete_ms={delete_ms:.3}"
+    );
+    lix.close().await.unwrap();
+    let start = Instant::now();
+    let reopened = open_lix().with_storage(storage).await.unwrap();
+    assert_eq!(
+        read_file(&reopened, path).await,
+        serde_json::to_vec(&expected).unwrap()
+    );
+    let reopen_ms = start.elapsed().as_secs_f64() * 1000.0;
+    expected["elements"][count / 2]["x"] = serde_json::json!(987654);
+    let start = Instant::now();
+    reopened
+        .execute(
+            "UPDATE excalidraw_element SET element_json=$1 WHERE id=$2",
+            &[
+                Value::Jsonb(expected["elements"][count / 2].clone().into()),
+                Value::Text(format!("e{:08}", count / 2)),
+            ],
+        )
+        .await
+        .unwrap();
+    let edit_ms = start.elapsed().as_secs_f64() * 1000.0;
+    assert_eq!(
+        read_file(&reopened, path).await,
+        serde_json::to_vec(&expected).unwrap()
+    );
+    println!(
+        "EXCALIDRAW_REOPEN rows={count} attachment={attachment} reopen_and_read_ms={reopen_ms:.3} edit_ms={edit_ms:.3}"
+    );
+    reopened.close().await.unwrap();
+}
