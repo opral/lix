@@ -678,3 +678,45 @@ fn qa_unrepresentable_inline_code_edits_are_rejected() {
         ));
     }
 }
+
+#[test]
+fn qa_emphasis_edits_preserve_boundary_whitespace() {
+    for source in ["*old*\n", "**old**\n", "_old_\n", "__old__\n"] {
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("emphasis.md"),
+            IdNamespace::from_halves(37, 1),
+        )
+        .unwrap();
+        let mut node = document.tree.materialize().children.remove(0).node;
+        let expected_kind = node.payload["inline"][0]["type"].clone();
+        node.payload["inline"][0]["children"][0]["value"] = serde_json::json!(" new ");
+        let (updated, _) = document
+            .rows_changed(vec![RowChange {
+                schema_key: NODE_SCHEMA_KEY.into(),
+                row_pk: vec![node.id],
+                row: Some(node_to_typed_row(&node).unwrap()),
+                effect: ChangeEffect::Content,
+            }])
+            .unwrap();
+        let (reopened, _) = Document::open_file(
+            updated.bytes(),
+            Some("emphasis.md"),
+            IdNamespace::from_halves(37, 2),
+        )
+        .unwrap();
+        let tree = reopened.tree.materialize();
+        assert_eq!(tree.children[0].node.kind, NodeKind::Paragraph);
+        assert_eq!(
+            tree.children[0].node.payload["inline"][0]["type"],
+            expected_kind
+        );
+        let text = tree.children[0].node.payload["inline"][0]["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|inline| inline["value"].as_str())
+            .collect::<String>();
+        assert_eq!(text, " new ");
+    }
+}

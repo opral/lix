@@ -1895,12 +1895,55 @@ fn push_delimited_inlines(
         meta: md::NodeMeta::default(),
         value: marker.to_string(),
     }));
-    output.extend(inlines_to_ast(children)?);
+    let mut children = inlines_to_ast(children)?;
+    protect_delimited_whitespace(&mut children);
+    output.extend(children);
     output.push(md::Inline::Html(md::HtmlInline {
         meta: md::NodeMeta::default(),
         value: marker.to_string(),
     }));
     Ok(())
+}
+
+fn protect_delimited_whitespace(children: &mut Vec<md::Inline>) {
+    let last = children.len().saturating_sub(1);
+    let mut protected = Vec::with_capacity(children.len());
+    for (index, node) in children.drain(..).enumerate() {
+        let md::Inline::Text(text) = &node else {
+            protected.push(node);
+            continue;
+        };
+        let start = if index == 0 {
+            text.value.len() - text.value.trim_start().len()
+        } else {
+            0
+        };
+        let end = if index == last {
+            text.value.trim_end().len().max(start)
+        } else {
+            text.value.len()
+        };
+        let reference = |value: &str| {
+            md::Inline::CharacterReference(md::CharacterReference {
+                meta: md::NodeMeta::default(),
+                reference: value
+                    .chars()
+                    .map(|character| format!("&#x{:X};", u32::from(character)))
+                    .collect(),
+                value: value.to_owned(),
+            })
+        };
+        if start > 0 {
+            protected.push(reference(&text.value[..start]));
+        }
+        if start < end {
+            protected.push(md::Inline::Text(md::Text::new(&text.value[start..end])));
+        }
+        if end < text.value.len() {
+            protected.push(reference(&text.value[end..]));
+        }
+    }
+    *children = protected;
 }
 
 fn validate_delimiter(marker: &str, strong: bool) -> Result<(), PluginError> {
