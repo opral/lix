@@ -50,16 +50,17 @@ fn assert_files_resolve_directories(
 
 #[tokio::test]
 async fn checkpointed_directories_survive_the_v74_migration() {
-    let lix = open_lix()
-        .from_snapshot(Cursor::new(V72_FILESYSTEM_SNAPSHOT))
-        .await
-        .expect("opening the v72 filesystem fixture should migrate it automatically");
-    let migration = lix
-        .open_report()
-        .migration
-        .expect("the open report should record the automatic migration");
-    assert_eq!(migration.from_format, 72);
-    assert_eq!(migration.to_format, 80);
+    let storage = lix::Memory::new();
+    let report = lix::migration::restore_and_migrate_repository(
+        storage.clone(),
+        Cursor::new(V72_FILESYSTEM_SNAPSHOT),
+    )
+    .await
+    .expect("explicit historical migration");
+    assert_eq!(report.before.format, Some(72));
+    assert!(report.after.current);
+    let lix = open_lix().with_storage(storage).await.unwrap();
+    assert!(lix.open_report().migration.is_none());
 
     let checkpoints = lix
         .execute(

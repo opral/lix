@@ -5,15 +5,35 @@ use tokio::net::TcpListener;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    if !arguments.is_empty() && !(arguments.len() == 2 && arguments[0] == "upgrade-authority") {
-        anyhow::bail!("usage: lix-server [upgrade-authority <repository-id>]");
+    if !arguments.is_empty() && arguments != ["inventory-authorities"] && arguments != ["migrate-authorities"] && !(arguments.len() == 2 && arguments[0] == "upgrade-authority") {
+        anyhow::bail!("usage: lix-server [inventory-authorities | migrate-authorities | upgrade-authority <repository-id>]");
     }
     let telemetry = telemetry::init();
 
     let config = Config::from_env()?;
-    if let [_, lix_id] = arguments.as_slice() {
+    if arguments == ["inventory-authorities"] {
         let manager = LixRuntimeManager::new(&config, telemetry.lix_sink)?;
-        return manager.upgrade_authority(lix_id).await;
+        println!("{}", serde_json::to_string_pretty(&manager.inventory_authorities().await?)?);
+        return Ok(());
+    }
+    if arguments == ["migrate-authorities"] {
+        #[cfg(feature = "offline-migration")]
+        {
+            let manager = LixRuntimeManager::new(&config, telemetry.lix_sink)?;
+            println!("{}", serde_json::to_string_pretty(&manager.migrate_authority_fleet().await?)?);
+            return Ok(());
+        }
+        #[cfg(not(feature = "offline-migration"))]
+        anyhow::bail!("Fleet migration requires the detached offline-migration tool build and stopped serving hosts.");
+    }
+    if let [_, lix_id] = arguments.as_slice() {
+        #[cfg(feature = "offline-migration")]
+        {
+            let manager = LixRuntimeManager::new(&config, telemetry.lix_sink)?;
+            return manager.upgrade_authority(lix_id).await;
+        }
+        #[cfg(not(feature = "offline-migration"))]
+        anyhow::bail!("Repository {lix_id} must be migrated using the offline-migration tool build, with serving hosts stopped.");
     }
     let listener = TcpListener::bind(&config.bind_addr)
         .await

@@ -371,6 +371,7 @@ jobs:
           path: |
             packages/js-sdk/dist
             packages/js-sdk/lix_js_sdk.node
+            packages/js-sdk/lix_js_sdk_migration.node
           if-no-files-found: error
 
       - name: Upload filesystem storage package build
@@ -441,7 +442,9 @@ jobs:
           path: packages/storage-opfs/dist
 
       - name: Restore generated WASM source link
-        run: ln -s ../dist/wasm packages/js-sdk/src/wasm
+        run: |
+          ln -s ../dist/wasm packages/js-sdk/src/wasm
+          ln -s ../dist/migration-wasm packages/js-sdk/src/migration-wasm
 
       - name: Test JS SDK package
         working-directory: packages/js-sdk

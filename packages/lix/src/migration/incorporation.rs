@@ -58,12 +58,12 @@ where
     let (expected, target) = if partial {
         (
             crate::init::PARTIAL_REPOSITORY_PROTOCOL_V79,
-            crate::init::PARTIAL_REPOSITORY_PROTOCOL_VALUE,
+            crate::init::PARTIAL_REPOSITORY_PROTOCOL_V80,
         )
     } else {
         (
             crate::init::REPOSITORY_PROTOCOL_V79,
-            crate::init::REPOSITORY_PROTOCOL_VALUE,
+            crate::init::REPOSITORY_PROTOCOL_V80,
         )
     };
     let actual = marker(&read).await?;
@@ -76,6 +76,17 @@ where
         ));
     }
     let revision = crate::storage_adapter::load_repository_mutation_revision(&read).await?;
+    let plan = preservation_plan(&read, options).await?;
+    drop(read);
+    publish(adapter, revision, expected, target, plan).await
+}
+
+/// Exact, bounded canonical transformations allowed by v79 -> v80. Detached
+/// verification projects these over the source before mutating any candidate.
+pub(super) async fn preservation_plan(
+    read: &(impl StorageAdapterRead + ?Sized),
+    options: MigrationOptions,
+) -> Result<PublicationPlan, LixError> {
     let space = crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE;
     let mut cursor = read
         .begin_scan(
@@ -107,7 +118,7 @@ where
                 uuid::Uuid::from_slice(&entry.key.0)
                     .map_err(|_| failure("incorporation header key is not a UUID"))?,
             );
-            let topology = load_published_commit_state_topology(&read, id)
+            let topology = load_published_commit_state_topology(read, id)
                 .await?
                 .ok_or_else(|| failure("incorporation header disappeared"))?;
             let incorporation = topology.incorporation();
@@ -116,12 +127,11 @@ where
         }
     }
     drop(cursor);
-    super::selected_locators::stage_repair(&read, &mut plan, &options, &mut entries, &mut bytes)
+    super::selected_locators::stage_repair(read, &mut plan, &options, &mut entries, &mut bytes)
         .await?;
-    super::omitted_owners::stage_repair(&read, &mut plan, &options, &mut entries, &mut bytes)
+    super::omitted_owners::stage_repair(read, &mut plan, &options, &mut entries, &mut bytes)
         .await?;
-    drop(read);
-    publish(adapter, revision, expected, target, plan).await
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -132,7 +142,10 @@ pub(crate) async fn migrate_headers_for_test<S: Storage + Clone + Send + Sync + 
     adapter: &StorageAdapter<S>,
     partial: bool,
 ) {
-    migrate(adapter, MigrationOptions::automatic(), partial)
+    migrate(adapter, MigrationOptions::default(), partial)
+        .await
+        .unwrap();
+    super::runtime_epoch::migrate(adapter, partial)
         .await
         .unwrap();
 }

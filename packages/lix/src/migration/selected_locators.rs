@@ -224,7 +224,7 @@ mod tests {
             let error = stage_repair(
                 &corrupted,
                 &mut plan,
-                &MigrationOptions::automatic(),
+                &MigrationOptions::default(),
                 &mut 0,
                 &mut 0,
             )

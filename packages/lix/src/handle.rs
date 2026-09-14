@@ -200,7 +200,7 @@ impl<StorageImpl> OpenLixBuilder<StorageImpl> {
         self
     }
 
-    /// Observes automatic repository inspection, migration, and opening.
+    /// Observes current-format repository inspection and opening. Migration is explicit.
     ///
     /// ```no_run
     /// # async fn example() -> Result<(), lix::LixError> {
@@ -1307,7 +1307,7 @@ struct RepositoryAdmission<StorageImpl> {
 async fn ensure_current_repository<StorageImpl>(
     storage: &StorageImpl,
     progress: Option<&Arc<dyn OpenProgressSink>>,
-    server: Option<&ServerOptions>,
+    _server: Option<&ServerOptions>,
 ) -> Result<RepositoryAdmission<StorageImpl>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -1324,7 +1324,7 @@ where
         },
     );
     let admission =
-        crate::migration::admit_repository_with_server(storage, progress, server).await?;
+        crate::migration::admit_current_repository(storage, true).await?;
     Ok(RepositoryAdmission {
         adapter: admission.adapter,
         report: admission.report,
@@ -1867,6 +1867,7 @@ where
                         "execute_coherent_read_batch only accepts read statements without durable runtime functions",
                     ));
                 }
+                crate::common::with_read_deadline(async {
                 let mut retry = crate::sync::SyncDemandRetry::default();
                 loop {
                     let result = retry_expired_read(|| {
@@ -1879,6 +1880,7 @@ where
                         Err(error) => retry.hydrate_for_retry(demand_tx.as_ref(), error).await?,
                     }
                 }
+                }).await
             })
         }
     }
@@ -2153,16 +2155,17 @@ where
         Operation: FnMut() -> OperationFuture,
         OperationFuture: Future<Output = Result<T, LixError>>,
     {
-        if route != ExecutionDisposition::Durable
-            && matches!(
-                self.engine.sync_mode().role(),
-                crate::sync::SyncRole::Replica | crate::sync::SyncRole::PartialReplica
-            )
-        {
-            retry_expired_read(operation).await
-        } else {
-            operation().await
+        if route == ExecutionDisposition::Durable {
+            return operation().await;
         }
+        // Includes typed input preparation/hydration between complete local
+        // attempts. The deadline never wraps a durable operation.
+        crate::common::with_read_deadline(async {
+            if matches!(self.engine.sync_mode().role(),
+                crate::sync::SyncRole::Replica | crate::sync::SyncRole::PartialReplica) {
+                retry_expired_read(operation).await
+            } else { operation().await }
+        }).await
     }
 
     pub async fn close(&self) -> Result<(), LixError> {
@@ -3912,6 +3915,7 @@ mod recovery_branch_publication_tests;
 /// branch-descriptor additions reconcile natively before publication. Other
 /// unsupported global/checkpoint/reset changes preserve the full
 /// source and return an explicit recovery error. Migration may inspect all data.
+#[cfg(any(feature = "offline-migration", test))]
 pub async fn convert_replica_to_partial<S>(
     storage: S,
     server: ServerOptions,
@@ -3927,6 +3931,7 @@ where
 /// This explicit maintenance may inspect journals and contact the authority;
 /// ordinary opening and the published local working set remain unchanged.
 /// Returns the number of newly acknowledged cleanup records.
+#[cfg(any(feature = "offline-migration", test))]
 pub async fn retry_replica_migration_cleanup<S>(
     storage: S,
     server: ServerOptions,

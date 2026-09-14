@@ -127,6 +127,7 @@ mod upload_plan_profile {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
             .await
             .unwrap();
+        crate::migration::admit_repository(&storage, None).await.unwrap();
         let mut replica = open_lix().with_storage(storage.clone()).await.unwrap();
         replica
             .set_sync_role(crate::sync::SyncRole::Replica)

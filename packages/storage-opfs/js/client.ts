@@ -36,6 +36,8 @@ export class OpfsStorageClient implements LixStorageProvider {
 		resolve: (value: unknown) => void;
 		reject: (error: Error) => void;
 		accepted?: () => void;
+		operation: OpfsRpcRequest["operation"];
+		retryable: boolean;
 	}>();
 	readonly #changes = new StorageChangeNotifier();
 	#storageState: string | undefined;
@@ -43,6 +45,7 @@ export class OpfsStorageClient implements LixStorageProvider {
 	#heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 	#heartbeatPending = false;
 	#closed = false;
+	#closing: Promise<void> | undefined;
 	readonly #partialOwners = new PartialOwnerLifetimes();
 
 	private constructor(
@@ -147,18 +150,26 @@ export class OpfsStorageClient implements LixStorageProvider {
 		return this.#changes.watch();
 	}
 
-	async close(): Promise<void> {
-		await this.#partialOwners.close();
-		if (this.#closed) return;
-		this.#closed = true;
-		try { await this.#rpc("close", undefined, false); }
-		finally {
+	close(): Promise<void> {
+		return this.#closing ??= (async () => {
+			this.#closed = true;
 			if (this.#heartbeatTimer) clearInterval(this.#heartbeatTimer);
-			for (const pending of this.#pending.values()) pending.reject(storageError("LIX_STORAGE_CLOSED", "storage client is closed"));
-			this.#pending.clear();
-			this.#changes.close(storageError("LIX_STORAGE_CLOSED", "storage client is closed"));
-			this.#channel.close();
-		}
+			// Stop retry emitters before posting close, not after its acknowledgement.
+			for (const pending of this.#pending.values()) {
+				if (pending.retryable) pending.reject(storageError("LIX_STORAGE_CLOSED", "storage client is closing"));
+			}
+			await this.#partialOwners.close();
+			try { await this.#rpc("close", undefined, false); }
+			finally {
+				for (const pending of this.#pending.values()) pending.reject(storageError(
+					pending.operation === "commit" ? "LIX_STORAGE_COMMIT_OUTCOME_UNKNOWN" : "LIX_STORAGE_CLOSED",
+					"storage client closed before the operation response was confirmed",
+				));
+				this.#pending.clear();
+				this.#changes.close(storageError("LIX_STORAGE_CLOSED", "storage client is closed"));
+				this.#channel.close();
+			}
+		})();
 	}
 
 	/** Package-internal liveness probe which also repairs a missed announcement. */
@@ -219,6 +230,8 @@ export class OpfsStorageClient implements LixStorageProvider {
 			scheduleTimeout(operation === "open" ? 2_000 : 15_000, operation === "open" ? "owner discovery" : "owner request");
 			const retryTimer = retry ? setInterval(() => this.#channel.postMessage(request), 50) : undefined;
 			this.#pending.set(requestId, {
+				operation,
+				retryable: retry,
 				resolve: (value) => finish(resolve, value),
 				reject: (error) => finish(reject, error),
 				accepted: operation === "open" ? () => {

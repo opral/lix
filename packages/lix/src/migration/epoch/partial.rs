@@ -1,5 +1,5 @@
-//! Current-format partial admission stays bounded. A legacy v79 epoch first
-//! copies its resident inputs through the migration owner before admission.
+//! Current-format partial admission is bounded and read-only. Legacy epochs
+//! require the detached migrator before admission.
 
 use super::*;
 use crate::storage_adapter::{StorageReadDurability, StorageWriteSetError};
@@ -107,27 +107,6 @@ pub(crate) async fn admit_partial_epoch<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    // The v79 upgrade copies only resident native inputs through the ordinary
-    // epoch owner. It never rebuilds from the authority or drops pending work.
-    if let Some((pointer, raw)) = durable_pointer(storage).await? {
-        let source = match pointer {
-            PointerState::Active {
-                bank, format: 79, ..
-            } => Some(bank),
-            PointerState::Migrating {
-                source,
-                source_format: 79,
-                ..
-            } => Some(source),
-            _ => None,
-        };
-        if let Some(source) = source {
-            let adapter = StorageAdapter::for_epoch_migration(storage.clone(), source, raw);
-            if super::super::incorporation::is_legacy_partial(&adapter).await? {
-                Box::pin(admit_existing_repository(storage)).await?;
-            }
-        }
-    }
     let Some((PointerState::Active { bank, format, .. }, pointer)) =
         durable_pointer(storage).await?
     else {
@@ -152,12 +131,12 @@ where
             "partial replica repository protocol requires explicit migration",
         ));
     }
-    drop(read);
-    let Some(state) = crate::sync::upgrade_owned_partial_receipt(&adapter).await? else {
+    let Some((state, _)) = crate::sync::load_partial_replica_state(&read).await? else {
         return Err(migration_required(
             "existing full repositories require explicit conversion to a partial replica",
         ));
     };
+    drop(read);
     Ok(PartialEpochAdmission { adapter, state })
 }
 
@@ -295,13 +274,15 @@ mod tests {
         let mut write = backing.begin_write(WriteOptions::default()).await.unwrap();
         put_pointer(&mut write, legacy).await.unwrap();
         write.commit().await.unwrap();
+        assert!(admit_partial_epoch(&storage).await.is_err());
+        admit_repository(&storage, None).await.unwrap();
         let reopened = admit_partial_epoch(&storage).await.unwrap();
         assert_eq!(reopened.state, state);
         assert!(matches!(
             durable_pointer(&storage).await.unwrap().unwrap().0,
             PointerState::Active {
                 bank: EpochBank::A,
-                format: 80,
+                format: crate::init::CURRENT_FORMAT_VERSION,
                 ..
             }
         ));

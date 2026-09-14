@@ -133,7 +133,7 @@ pub(crate) async fn collect_plan(
     }
     #[cfg(feature = "storage-benches")]
     let started = crate::sql_profile::is_active().then(Instant::now);
-    let result = collect_adapted_input_plan(plan, task_ctx).await;
+    let result = collect_bounded_read_output(plan, task_ctx).await;
     #[cfg(feature = "storage-benches")]
     if let Some(started) = started {
         crate::sql_profile::record_phase(
@@ -525,6 +525,78 @@ pub(crate) async fn collect_input_plan(
 ) -> Result<Vec<RecordBatch>> {
     let plan = adapt_runtime_plan(plan)?;
     collect_adapted_input_plan(plan, task_ctx).await
+}
+
+async fn collect_bounded_read_output(
+    plan: Arc<dyn ExecutionPlan>,
+    task_ctx: Arc<TaskContext>,
+) -> Result<Vec<RecordBatch>> {
+    let mut budget = crate::common::ReadResultBudget::default();
+    let mut batches = Vec::new();
+    for partition in 0..plan.output_partitioning().partition_count() {
+        collect_bounded_read_stream(
+            plan.execute(partition, Arc::clone(&task_ctx))?,
+            &mut budget,
+            &mut batches,
+        )
+        .await?;
+    }
+    Ok(batches)
+}
+
+async fn collect_bounded_read_stream(
+    mut stream: SendableRecordBatchStream,
+    budget: &mut crate::common::ReadResultBudget,
+    batches: &mut Vec<RecordBatch>,
+) -> Result<()> {
+    while let Some(batch) = stream.try_next().await? {
+        budget
+            .charge(batch.get_array_memory_size(), batch.num_rows())
+            .map_err(super::error::lix_error_to_datafusion_error)?;
+        batches.push(batch);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod read_output_tests {
+    use super::*;
+    #[tokio::test]
+    async fn result_collection_stops_polling_before_retaining_oversized_batch() {
+        use datafusion::arrow::{
+            array::NullArray,
+            datatypes::{DataType, Field, Schema},
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Null, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(NullArray::new(
+                crate::common::MAX_READ_RESULT_ROWS + 1,
+            ))],
+        )
+        .unwrap();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = polls.clone();
+        let stream = RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(vec![Ok(batch.clone()), Ok(batch)]).map(move |batch| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                batch
+            }),
+        );
+        let mut result = Vec::new();
+        let error =
+            collect_bounded_read_stream(Box::pin(stream), &mut Default::default(), &mut result)
+                .await
+                .unwrap_err();
+        assert_eq!(
+            crate::sql2::error::datafusion_error_to_lix_error(error).code,
+            "LIX_READ_RESOURCE_EXHAUSTED"
+        );
+        assert!(result.is_empty());
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
 }
 
 async fn collect_adapted_input_plan(

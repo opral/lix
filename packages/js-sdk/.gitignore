@@ -3,3 +3,8 @@ dist/
 native-packages/
 src/wasm
 src/wasm/
+
+src/migration-wasm
+src/migration-wasm/
+
+.vitest-attachments/

@@ -1,15 +1,16 @@
 /// <reference lib="webworker" />
 import { openLixBinding, convertReplicaBinding } from "#binding";
-import { openRemoteLixBinding } from "../remote/client.js";
+import { fetchTransport } from "../http-transport.js";
 import {
   SharedAdmissionCache,
-  SharedProbeNetworkFailure,
+  requestAdmission,
+  type AdmissionIdentity,
   sharedCredentialKey,
 } from "./shared-admission.js";
 import { startWorkerHost } from "./host.js";
 import { SharedEngineOwner, type SharedEngineClient } from "./shared-engine.js";
 import type { SyncServerBindingOptions } from "../binding-types.js";
-import type { WorkerInput, WorkerResponse } from "./protocol.js";
+import { serializeWorkerError, type WorkerInput, type WorkerResponse } from "./protocol.js";
 
 const scope = globalThis as unknown as SharedWorkerGlobalScope;
 let owner: SharedEngineOwner | undefined;
@@ -18,7 +19,7 @@ let configuration: string | undefined;
 // previously admitted in this worker may attach offline; new credentials need
 // an authenticated probe. Never persist these credentials.
 const admitted = new SharedAdmissionCache();
-let rootAccount: string | undefined;
+let rootIdentity: AdmissionIdentity | undefined;
 
 scope.onconnect = (event) => {
   const port = event.ports[0]!;
@@ -36,59 +37,41 @@ scope.onconnect = (event) => {
       const raw = server;
       const readHeaders = async () =>
         raw.headerProvider ? await raw.headerProvider() : raw.headers;
-      const verified = new Map<string, string>();
-      const authenticate = async (headers: [string, string][], forceProbe = false) => {
-        const key = sharedCredentialKey(raw.url, headers);
-        if (!forceProbe && verified.has(key)) return verified.get(key)!;
-        const account = await admitted.verify(raw.url, headers, rootAccount!, async () => {
-          let networkFailure: unknown;
-          const fetcher = raw.fetch ?? globalThis.fetch;
-          let remote;
-          try {
-            remote = await openRemoteLixBinding({
-              url: raw.url,
-              headers,
-              fetch: async (input, init) => {
-                try {
-                  return await fetcher(input, init);
-                } catch (error) {
-                  if (error instanceof Error && error.name === "TypeError" && !init?.signal?.aborted) networkFailure = error;
-                  throw error;
-                }
-              },
-            });
-          } catch (error) {
-            if (networkFailure !== undefined) throw new SharedProbeNetworkFailure(networkFailure);
-            throw error;
-          }
-          try {
-            return await remote.activeAccountId();
-          } finally {
-            await remote.close();
-          }
-        });
-        if (verified.size >= 64) verified.delete(verified.keys().next().value!);
-        verified.set(key, account);
-        return account;
+      let verifiedKey: string | undefined;
+      let candidateIdentity: AdmissionIdentity | undefined;
+      const transport = raw.transport ?? fetchTransport();
+      const authenticate = async (headers: [string, string][], allowOffline: boolean) => {
+        const result = await admitted.verify(raw.url, headers, rootIdentity,
+          () => requestAdmission(raw.url, headers, transport), allowOffline);
+        if (result.online) verifiedKey = sharedCredentialKey(raw.url, headers);
+        candidateIdentity = result.identity;
+        return result;
       };
       const routed: SyncServerBindingOptions = {
         ...raw,
+        transport: async (request) => {
+          try {
+            const response = await transport(request);
+            if (response.status === 401 || response.status === 403) verifiedKey = undefined;
+            return response;
+          } catch (error) {
+            verifiedKey = undefined;
+            throw error;
+          }
+        },
         headerProvider: async () => {
           const headers = await readHeaders();
-          if (rootAccount !== undefined) await authenticate(headers);
+          if (sharedCredentialKey(raw.url, headers) !== verifiedKey) {
+            // Failure only suspends this remote lease; local sessions survive.
+            verifiedKey = undefined;
+            await authenticate(headers, false);
+          }
           return headers;
         },
       };
       if (!owner) {
         owner = new SharedEngineOwner(async (transport, backgroundTelemetry, opener) => {
-          const root = await openLixBinding(storage, backgroundTelemetry, opener.parent, transport, opener.progress);
-          try {
-            rootAccount = await root.activeAccountId();
-            return root;
-          } catch (error) {
-            await root.close();
-            throw error;
-          }
+          return openLixBinding(storage, backgroundTelemetry, opener.parent, transport, opener.progress);
         });
       }
       client = {
@@ -97,17 +80,15 @@ scope.onconnect = (event) => {
         telemetry,
         parent,
         progress,
-        rootAdmitted: (headers, account) => {
-          admitted.record(raw.url, headers, account);
-          verified.set(sharedCredentialKey(raw.url, headers), account);
+        commitIdentity: () => {
+          if (!candidateIdentity) throw new Error("Missing verified owner identity");
+          rootIdentity ??= candidateIdentity;
         },
-        verifyIdentity: async () => ({
-          authorityUrl: raw.url,
-          accountId: await (async () => {
-            const headers = await readHeaders();
-            return authenticate(headers, !verified.has(sharedCredentialKey(raw.url, headers)));
-          })(),
-        }),
+        verifyIdentity: async () => {
+          const headers = await readHeaders();
+          const {identity, online} = await authenticate(headers, true);
+          return { authorityUrl: raw.url, accountId: identity.principalId, headers, online };
+        },
       };
       return { owner, client };
   };
@@ -135,15 +116,12 @@ scope.onconnect = (event) => {
     if (disconnected) return;
     disconnected = true;
     if (client) owner?.deactivate(client);
+    let failure: unknown;
+    try { await controller.close(); } catch (error) { failure = error; }
+    try { if (client) await owner?.detach(client); } catch (error) { failure ??= error; }
     try {
-      await controller.close();
-    } finally {
-      try {
-        if (client) await owner?.detach(client);
-      } finally {
-        port.close();
-      }
-    }
+      port.postMessage({kind:"shared.disconnected", error: failure === undefined ? undefined : serializeWorkerError(failure)});
+    } finally { port.close(); }
   };
   port.onmessage = (event) => {
     const message = event.data;

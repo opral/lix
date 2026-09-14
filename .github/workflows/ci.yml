@@ -621,9 +621,12 @@ jobs:
           else
             if [ "$SDK_RUNTIME" = native ]; then
               npm --prefix packages/js-sdk run build:native
+              npm --prefix packages/js-sdk run build:migration:native
               npm --prefix packages/js-sdk run build:wasm:dev
+              LIX_WASM_PROFILE=dev npm --prefix packages/js-sdk run build:migration:wasm
             else
               npm --prefix packages/js-sdk run build:wasm
+              npm --prefix packages/js-sdk run build:migration:wasm
             fi
             npm --prefix packages/js-sdk run build:plugins
             node scripts/ci-sdk-cache.mjs save "$SDK_RUNTIME" "$BINARY_KEY"

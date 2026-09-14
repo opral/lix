@@ -126,6 +126,7 @@ where
 // Keep explicit migration's large owned future out of ordinary caller poll
 // frames, including SQL performed before the migration itself is awaited.
 /// Normal partial opening never invokes this explicit conversion operation.
+#[cfg(any(feature = "offline-migration", test))]
 pub(crate) fn convert_full_replica_for_partial_open<S>(
     storage: S,
     server: ServerOptions,
@@ -155,6 +156,7 @@ where
 
 // Kept separate so the compile-time safety proof inspects the raw operation,
 // not an already-asserted Send wrapper.
+#[cfg(any(feature = "offline-migration", test))]
 async fn convert_full_replica_owned<S>(
     storage: S,
     server: ServerOptions,
@@ -479,6 +481,7 @@ mod browser_file_profile_authority;
 
 /// Explicitly retry retained native migration pins. Storage must be closed;
 /// success never changes the published serving baseline or cached working set.
+#[cfg(any(feature = "offline-migration", test))]
 pub(crate) async fn retry_partial_migration_cleanup<S>(
     storage: S,
     server: ServerOptions,

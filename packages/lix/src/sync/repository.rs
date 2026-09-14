@@ -9022,6 +9022,7 @@ mod tests {
         let receipt = Engine::initialize(storage.clone())
             .await
             .expect("replica storage should initialize");
+        crate::migration::admit_repository(&storage, None).await.unwrap();
         let replica = open_lix()
             .with_storage(storage.clone())
             .await
@@ -9089,6 +9090,7 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
             .await
             .expect("replica storage should initialize");
+        crate::migration::admit_repository(&storage, None).await.unwrap();
         let replica = open_lix()
             .with_storage(storage.clone())
             .await
@@ -9203,6 +9205,7 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
             .await
             .unwrap();
+        crate::migration::admit_repository(&storage, None).await.unwrap();
         let mut replica = open_lix().with_storage(storage.clone()).await.unwrap();
         replica
             .set_sync_role(super::super::SyncRole::Replica)
@@ -10470,6 +10473,7 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
             .await
             .expect("replica storage should initialize");
+        crate::migration::admit_repository(&storage, None).await.unwrap();
         let mut replica = open_lix()
             .with_storage(storage)
             .await
@@ -10506,6 +10510,7 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
             .await
             .expect("replica storage should initialize");
+        crate::migration::admit_repository(&storage, None).await.unwrap();
         let first = open_lix()
             .with_storage(storage.clone())
             .await
@@ -10663,6 +10668,7 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
             .await
             .expect("replica storage should initialize");
+        crate::migration::admit_repository(&storage, None).await.unwrap();
         let mut replica = open_lix()
             .with_storage(storage)
             .await
@@ -12847,6 +12853,7 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&default_branch_id))
             .await
             .expect("replica storage should initialize");
+        crate::migration::admit_repository(&storage, None).await.unwrap();
         let replica = open_lix()
             .with_storage(storage)
             .await
@@ -12898,6 +12905,7 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&secondary.id))
             .await
             .expect("replica storage should initialize");
+        crate::migration::admit_repository(&storage, None).await.unwrap();
         let replica = open_lix()
             .with_storage(storage)
             .await
@@ -13146,6 +13154,7 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
             .await
             .expect("local storage should initialize with the same branch id");
+        crate::migration::admit_repository(&storage, None).await.unwrap();
         let local = open_lix()
             .with_storage(storage)
             .await
@@ -13229,6 +13238,7 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
             .await
             .expect("replica storage should initialize");
+        crate::migration::admit_repository(&storage, None).await.unwrap();
         let replica = open_lix()
             .with_storage(storage)
             .await
@@ -13289,6 +13299,7 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
             .await
             .expect("replica storage should initialize");
+        crate::migration::admit_repository(&storage, None).await.unwrap();
         let replica = open_lix()
             .with_storage(storage)
             .await

@@ -1,3 +1,10 @@
+#[cfg(feature = "offline-migration")]
+mod maintenance;
+#[cfg(feature = "offline-migration")]
+pub use maintenance::AuthorityMigrationReport;
+mod inventory;
+pub use inventory::{AuthorityInventory, AuthorityInventoryEntry};
+
 use crate::{Config, config::SlateDBCacheConfig};
 use anyhow::{Context, Result};
 use axum::{body::Body, http::Request};
@@ -356,6 +363,7 @@ impl LixRuntimeManager {
     /// Explicit offline maintenance for a catalogued authority. All other hosts
     /// must be stopped or have no open handles for this repository. The SDK
     /// validates the exact old authority marker and rejects actual replicas.
+    #[cfg(feature = "offline-migration")]
     pub async fn upgrade_authority(self: Arc<Self>, lix_id: &str) -> Result<()> {
         if !valid_lix_id(lix_id) {
             anyhow::bail!("invalid Lix repository ID");
@@ -365,16 +373,11 @@ impl LixRuntimeManager {
         if !manager.state.lock().await.entries.is_empty() {
             anyhow::bail!("close all repository runtimes before authority upgrade");
         }
-        let record = manager
-            .repository_record(lix_id)
-            .await?
-            .filter(|record| record.state == "live")
-            .context("authority upgrade requires a live repository catalog entry")?;
-        let storage = manager.open_storage(&record.storage_id, SlateDBIoCounters::default())?;
-        lix_sdk::upgrade_authority_for_partial_sync(storage)
-            .await
-            .context("upgrade existing authority for partial sync")?;
-        info!(lix_id, "Lix authority upgrade completed");
+        let report = manager.migrate_authority_offline(lix_id).await?;
+        if !report.admission_published {
+            anyhow::bail!("semantic preservation was not verified; migration report retained and admission withheld");
+        }
+        info!(lix_id, "Lix authority migration verified");
         Ok(())
     }
 
@@ -3535,10 +3538,27 @@ mod tests {
 // SlateDB prefix, so cache eviction and storage open can never create a resource.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RepositoryRecord {
+    /// Written only after explicit creation/migration validates the authority.
+    /// Missing metadata is a migration requirement, never inferred from this binary.
+    #[serde(default)]
+    admission: Option<AuthorityAdmission>,
     state: String,
     fingerprint: Option<String>,
     storage_id: String,
     retired: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AuthorityAdmission {
+    pub protocol_epoch: u32,
+    pub storage_epoch: u32,
+}
+
+impl AuthorityAdmission {
+    fn current() -> Self {
+        Self { protocol_epoch: lix_sdk::SYNC_PROTOCOL_VERSION, storage_epoch: lix_sdk::CURRENT_STORAGE_FORMAT_VERSION }
+    }
 }
 
 fn lifecycle_failure(error: impl fmt::Display) -> lix_sdk::server_protocol::LifecycleError {
@@ -3593,6 +3613,30 @@ impl LixRuntimeManager {
             Err(error) => Err(error.into()),
         }
     }
+    /// Catalog-only admission: never obtains a runtime or opens storage.
+    pub(crate) async fn authority_admission(
+        &self,
+        id: &str,
+    ) -> Result<Option<AuthorityAdmission>, lix_sdk::server_protocol::LifecycleError> {
+        use lix_sdk::server_protocol::LifecycleError;
+        let record = self.repository_record(id).await.map_err(|_| LifecycleError::new(
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "LIX_CATALOG_UNAVAILABLE",
+            "Repository admission metadata is unavailable.",
+        ))?;
+        let Some(record) = record.filter(|record| record.state == "live") else {
+            return Ok(None);
+        };
+        match record.admission {
+            Some(admission) if admission == AuthorityAdmission::current() => Ok(Some(admission)),
+            _ => Err(LifecycleError::new(
+                http::StatusCode::CONFLICT,
+                "LIX_MIGRATION_REQUIRED",
+                "The authority requires explicit migration before admission.",
+            )),
+        }
+    }
+
     async fn repository_exists(&self, id: &str) -> Result<bool> {
         Ok(self
             .repository_record(id)
@@ -3609,6 +3653,7 @@ impl LixRuntimeManager {
     ) -> Result<()> {
         let (store, prefix) = self.catalog_store();
         let bytes = serde_json::to_vec(&RepositoryRecord {
+            admission: Some(AuthorityAdmission::current()),
             state: state.to_owned(),
             fingerprint,
             storage_id: id.to_owned(),
@@ -3723,6 +3768,7 @@ impl LixRuntimeManager {
             .put_opts(
                 &ObjectPath::from(format!("{prefix}.lix-repositories/{id}.json")),
                 serde_json::to_vec(&RepositoryRecord {
+                    admission: Some(AuthorityAdmission::current()),
                     state: "live".to_owned(),
                     fingerprint: None,
                     storage_id: id.clone(),
@@ -3850,6 +3896,7 @@ impl LixRuntimeManager {
         }
         let storage_id = uuid::Uuid::new_v4().to_string();
         let reservation = RepositoryRecord {
+            admission: None,
             state: "creating".to_owned(),
             fingerprint: None,
             storage_id: storage_id.clone(),
@@ -3938,6 +3985,7 @@ impl LixRuntimeManager {
         match initialized {
             Ok(fingerprint) => {
                 let published = RepositoryRecord {
+                    admission: Some(AuthorityAdmission::current()),
                     state: "live".to_owned(),
                     fingerprint: Some(fingerprint),
                     storage_id: storage_id.clone(),
@@ -4022,6 +4070,7 @@ impl LixRuntimeManager {
         // no handshake or old create receipt can bring this repository back.
         let (catalog, prefix) = self.catalog_store();
         let tombstone = RepositoryRecord {
+            admission: None,
             state: "deleted".to_owned(),
             fingerprint: None,
             storage_id: storage_id.clone(),
@@ -4222,6 +4271,7 @@ mod host_provisioning_tests {
     const ID: &str = "01936f4e-7b6c-7c3d-8f9a-123456789abc";
 
     #[tokio::test]
+    #[cfg(feature = "offline-migration")]
     async fn offline_authority_upgrade_rejects_shared_managers_and_unknown_repositories() {
         let manager = LixRuntimeManager::new_in_memory(4);
         let error = Arc::clone(&manager)
@@ -4234,14 +4284,12 @@ mod host_provisioning_tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "offline-migration")]
     async fn offline_authority_upgrade_preserves_current_authority_and_is_repeatable() {
         let manager = LixRuntimeManager::new_in_memory(4);
-        manager
-            .provision_repository(ID.to_owned(), false)
-            .await
-            .unwrap();
+        let source_storage_id = uuid::Uuid::new_v4().to_string();
         let storage = manager
-            .open_storage(ID, SlateDBIoCounters::default())
+            .open_storage(&source_storage_id, SlateDBIoCounters::default())
             .unwrap();
         let seed = lix_sdk::open_lix()
             .with_storage(storage.clone())
@@ -4266,7 +4314,7 @@ mod host_provisioning_tests {
             .handle(
                 Request::builder()
                     .uri(format!("/lix/v1/{ID}"))
-                    .header("lix-server-protocol-version", "8")
+                    .header("lix-server-protocol-version", lix_sdk::SERVER_PROTOCOL_VERSION)
                     .body(ServerProtocolBody::empty())
                     .unwrap(),
                 ServerProtocolContext::anonymous(),
@@ -4279,7 +4327,32 @@ mod host_provisioning_tests {
         lix_sdk::upgrade_authority_for_partial_sync(storage.clone())
             .await
             .unwrap();
+        let (objects, _) = manager.catalog_store();
+        objects
+            .put(
+                &ObjectPath::from(format!(".lix-repositories/{ID}.json")),
+                serde_json::to_vec(&RepositoryRecord {
+                    state: "live".to_owned(),
+                    fingerprint: None,
+                    storage_id: source_storage_id.clone(),
+                    retired: Vec::new(),
+                    admission: Some(AuthorityAdmission::current()),
+                })
+                .unwrap()
+                .into(),
+            )
+            .await
+            .unwrap();
         manager.upgrade_authority(ID).await.unwrap();
+        let record: RepositoryRecord = serde_json::from_slice(&objects.get(&ObjectPath::from(format!(".lix-repositories/{ID}.json"))).await.unwrap().bytes().await.unwrap()).unwrap();
+        assert_ne!(record.storage_id, source_storage_id, "migration must publish a separate physical store");
+        assert!(record.retired.iter().any(|source| source == &source_storage_id));
+        assert_eq!(record.admission, Some(AuthorityAdmission::current()));
+        let destination = SlateDB::open_object_store_with_options_and_io_counters(&record.storage_id, objects, SlateDBObjectStoreOptions::default(), SlateDBIoCounters::default()).unwrap();
+        let current = lix_sdk::open_lix().with_storage(destination).await.unwrap();
+        let value = current.execute("SELECT value FROM lix_key_value WHERE key='upgrade-proof'", &[]).await.unwrap();
+        assert_eq!(value.rows()[0].get::<serde_json::Value>("value").unwrap(), serde_json::json!("retained"));
+        current.close().await.unwrap();
         let reopened = lix_sdk::open_lix().with_storage(storage).await.unwrap();
         let proof = reopened
             .execute(
@@ -4406,5 +4479,65 @@ mod host_provisioning_tests {
                 .is_err(),
             "adoption must not initialize empty storage"
         );
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt as _;
+
+    const ID: &str = "11111111-1111-4111-8111-111111111111";
+    const ACCOUNT: &str = "22222222-2222-4222-8222-222222222222";
+
+    #[tokio::test]
+    async fn admission_is_catalog_only_and_binds_verified_principal() {
+        let manager = LixRuntimeManager::new_in_memory(1);
+        // Deliberately no repository storage: opening an engine would fail.
+        manager.write_record(ID, "live", None, true).await.unwrap();
+        let app = crate::router(manager.clone(), Some("internal".into()), Duration::from_secs(2), Default::default());
+        let response = app.oneshot(Request::builder()
+            .uri(format!("/lix/v1/{ID}/admission"))
+            .header("authorization", "Bearer internal")
+            .header("x-lix-account-id", ACCOUNT)
+            .header("lix-sync-protocol-version", lix_sdk::SYNC_PROTOCOL_VERSION)
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body, serde_json::json!({"repositoryId":ID,"principalId":ACCOUNT,"protocolEpoch":lix_sdk::SYNC_PROTOCOL_VERSION,"storageEpoch":lix_sdk::CURRENT_STORAGE_FORMAT_VERSION}));
+        assert!(manager.state.lock().await.entries.is_empty());
+        assert!(!manager.legacy_storage_present(ID).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn admission_rejects_unmigrated_catalog_without_opening_or_mutating() {
+        let manager = LixRuntimeManager::new_in_memory(1);
+        let (store, prefix) = manager.catalog_store();
+        let path = ObjectPath::from(format!("{prefix}.lix-repositories/{ID}.json"));
+        let original = serde_json::json!({"state":"live","fingerprint":null,"storage_id":ID,"retired":[]}).to_string();
+        store.put(&path, original.clone().into()).await.unwrap();
+        let error = manager.authority_admission(ID).await.unwrap_err();
+        assert_eq!(error.code, "LIX_MIGRATION_REQUIRED");
+        assert_eq!(store.get(&path).await.unwrap().bytes().await.unwrap().as_ref(), original.as_bytes());
+        assert!(manager.state.lock().await.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn admission_rejects_old_protocol_and_untrusted_identity() {
+        let manager = LixRuntimeManager::new_in_memory(1);
+        manager.write_record(ID, "live", None, true).await.unwrap();
+        let app = crate::router(manager.clone(), Some("internal".into()), Duration::from_secs(2), Default::default());
+        for (token, version, expected) in [("wrong", lix_sdk::SYNC_PROTOCOL_VERSION, StatusCode::NOT_FOUND), ("internal", lix_sdk::SYNC_PROTOCOL_VERSION - 1, StatusCode::CONFLICT)] {
+            let response = app.clone().oneshot(Request::builder().uri(format!("/lix/v1/{ID}/admission"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("x-lix-account-id", ACCOUNT)
+                .header("lix-sync-protocol-version", version)
+                .body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        assert!(manager.state.lock().await.entries.is_empty());
     }
 }

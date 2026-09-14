@@ -104,7 +104,7 @@ impl ProtocolHttp for JsHttp {
         &self,
         request: ProtocolHttpRequest,
     ) -> Result<ProtocolHttpStream, LixError> {
-        let (response, cancel) = send_js_http_cancellable(self, &request).await?;
+        let (response, cancel) = send_js_http_cancellable(self, &request, true).await?;
         let mut cancel_on_error = JsCancelOnDrop(Some(cancel.clone()));
         let status = js_status(&response)?;
         let headers = js_headers(&response)?;
@@ -380,9 +380,9 @@ fn observe_event_to_js(event: lix::ObserveEvent) -> Result<JsValue, JsValue> {
 async fn send_js_http(
     http: &JsHttp,
     request: &ProtocolHttpRequest,
-    _stream: bool,
+    stream: bool,
 ) -> Result<JsValue, LixError> {
-    send_js_http_cancellable(http, request)
+    send_js_http_cancellable(http, request, stream)
         .await
         .map(|(response, _)| response)
 }
@@ -390,6 +390,7 @@ async fn send_js_http(
 async fn send_js_http_cancellable(
     http: &JsHttp,
     request: &ProtocolHttpRequest,
+    stream: bool,
 ) -> Result<(JsValue, Arc<dyn Fn()>), LixError> {
     let init = js_sys::Object::new();
     set_js(&init, "method", JsValue::from_str(&request.method))?;
@@ -431,9 +432,20 @@ async fn send_js_http_cancellable(
     } else {
         Arc::new(|| {})
     };
+    let transport_request = js_sys::Object::new();
+    set_js(&transport_request, "url", JsValue::from_str(&request.url))?;
+    set_js(&transport_request, "init", init.into())?;
+    let response_policy = js_sys::Object::new();
+    set_js(&response_policy, "mode", JsValue::from_str(if stream { "streaming" } else { "buffered" }))?;
+    if !stream {
+        // Remote finite protocol operations share a bounded response policy;
+        // observations and snapshot transfer use the streaming path.
+        set_js(&response_policy, "maxBytes", JsValue::from_f64(16.0 * 1024.0 * 1024.0))?;
+    }
+    set_js(&transport_request, "response", response_policy.into())?;
     let promise = http
         .fetch
-        .call2(&JsValue::UNDEFINED, &JsValue::from_str(&request.url), &init)
+        .call1(&JsValue::UNDEFINED, &transport_request)
         .map_err(|error| fetch_unavailable(error))?;
     let mut cancel_on_drop = JsCancelOnDrop(Some(cancel.clone()));
     let response = JsFuture::from(Promise::from(promise))
@@ -646,13 +658,13 @@ fn set_js(object: &js_sys::Object, key: &str, value: JsValue) -> Result<(), LixE
 }
 
 fn fetch_unavailable(error: JsValue) -> LixError {
-    LixError::new(
-        "LIX_REMOTE_UNAVAILABLE",
-        "The remote Lix server is unavailable",
-    )
-    .with_details(serde_json::json!({
-        "cause": js_error_message(error),
-    }))
+    let code = Reflect::get(&error, &"code".into()).ok().and_then(|value| value.as_string())
+        .filter(|code| code.starts_with("LIX_"));
+    if let Some(code) = code {
+        return LixError::new(code, js_error_message(error));
+    }
+    // Unclassified callback failures are not evidence of a network outage.
+    LixError::new("LIX_TRANSPORT_CALLBACK", "Remote HTTP adapter failed")
 }
 
 fn header_error(error: JsValue) -> LixError {

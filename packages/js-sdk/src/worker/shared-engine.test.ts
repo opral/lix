@@ -31,11 +31,11 @@ function fixture() {
     server: {
       url: "https://example.test/lix/repository",
       headers: [["authorization", account]],
-      fetch: vi.fn(async () => new Response(account)),
+      transport: vi.fn(async () => new Response(account)),
     },
     verifyIdentity: async () => ({
       authorityUrl: "https://example.test/lix/repository",
-      accountId: account,
+      accountId: account, headers: [["authorization", account]],
     }),
   });
   return { owner, open, rootClose, client, transport: () => transport!, sessions };
@@ -67,8 +67,8 @@ test("a different authenticated account cannot receive a session or replace tran
     code: "LIX_SHARED_ENGINE_IDENTITY_MISMATCH",
   });
   expect(f.sessions).toHaveLength(1);
-  await f.transport().fetch!("https://example.test", {});
-  expect(a.server.fetch).toHaveBeenCalledTimes(1);
+  await f.transport().transport!({url: "https://example.test", init: {}, response: {mode: "buffered", maxBytes: 1024}});
+  expect(a.server.transport).toHaveBeenCalledTimes(1);
 });
 
 test("transport hands off only to attached clients and rejects when none remain", async () => {
@@ -78,12 +78,12 @@ test("transport hands off only to attached clients and rejects when none remain"
   await f.owner.attach(a);
   await f.owner.attach(b);
   f.owner.deactivate(a);
-  await f.transport().fetch!("https://example.test", {});
-  expect(a.server.fetch).not.toHaveBeenCalled();
-  expect(b.server.fetch).toHaveBeenCalledTimes(1);
+  await f.transport().transport!({url: "https://example.test", init: {}, response: {mode: "buffered", maxBytes: 1024}});
+  expect(a.server.transport).not.toHaveBeenCalled();
+  expect(b.server.transport).toHaveBeenCalledTimes(1);
   f.owner.deactivate(b);
-  await expect(f.transport().fetch!("https://example.test", {})).rejects.toMatchObject({
-    code: "LIX_NETWORK_ERROR",
+  await expect(f.transport().transport!({url: "https://example.test", init: {}, response: {mode: "buffered", maxBytes: 1024}})).rejects.toMatchObject({
+    code: "LIX_TRANSPORT_UNAVAILABLE",
   });
   await f.owner.detach(b);
 });
@@ -100,7 +100,7 @@ test("root admission records the exact frozen opening credentials", async () => 
   const sent: string[] = [];
   const owner = new SharedEngineOwner(async (server) => {
     value = "new-token";
-    await server.fetch!("https://example.test/handshake", {});
+    await server.transport!({url: "https://example.test/handshake", init: {}, response: {mode: "buffered", maxBytes: 1024}});
     return root;
   });
   await owner.attach({
@@ -108,16 +108,14 @@ test("root admission records the exact frozen opening credentials", async () => 
       url: "https://example.test",
       headers: [],
       headerProvider: async () => [["Authorization", value]],
-      fetch: async (_input, init) => {
+      transport: async ({init}) => {
         sent.push(new Headers(init?.headers).get("authorization")!);
         return new Response();
       },
     },
-    verifyIdentity: async () => ({ authorityUrl: "https://example.test", accountId: "account-a" }),
-    rootAdmitted: admitted,
+    verifyIdentity: async () => ({ authorityUrl: "https://example.test", accountId: "account-a", headers: [["Authorization", value]] as [string, string][] }),
   });
   expect(sent).toEqual(["old-token"]);
-  expect(admitted).toHaveBeenCalledWith([["Authorization", "old-token"]], "account-a");
 });
 
 test("only the first attachment receives the root initialization report", async () => {
@@ -133,7 +131,7 @@ test("only the first attachment receives the root initialization report", async 
   const owner = new SharedEngineOwner(async () => root);
   const client = (): SharedEngineClient => ({
     server: { url: "https://example.test", headers: [] },
-    verifyIdentity: async () => ({ authorityUrl: "https://example.test", accountId: "account-a" }),
+    verifyIdentity: async () => ({ authorityUrl: "https://example.test", accountId: "account-a", headers: [] }),
   });
   const first = await owner.attach(client());
   const second = await owner.attach(client());
@@ -160,7 +158,7 @@ test("telemetry joins after a disabled opener and remains after its departure", 
   const owner = new SharedEngineOwner(async (_server, sink) => {background=sink;return root;});
   const make = (telemetry?: import("../binding-types.js").TelemetryDispatch): SharedEngineClient => ({
     server:{url:"https://example.test",headers:[]},telemetry,
-    verifyIdentity:async()=>({authorityUrl:"https://example.test",accountId:"account"}),
+    verifyIdentity:async()=>({authorityUrl:"https://example.test",accountId:"account",headers:[]}),
   });
   const first=make(); const second=make(a); const third=make(b);
   await owner.attach(first); await owner.attach(second); await owner.attach(third);
@@ -240,7 +238,7 @@ test("conversion rejects a different requested branch on a live partial root", a
   const owner = new SharedEngineOwner(async () => root);
   const client = (): SharedEngineClient => ({
     server: { url: "https://example.test", headers: [] },
-    verifyIdentity: async () => ({ authorityUrl: "https://example.test", accountId: "account" }),
+    verifyIdentity: async () => ({ authorityUrl: "https://example.test", accountId: "account", headers: [] }),
   });
   await owner.attach(client());
   const conversion = vi.fn(async () => {});
@@ -318,4 +316,64 @@ test("conversion-first and reopened roots use the current opener's context", asy
   expect(second.progress).toHaveBeenCalledTimes(1);
   expect(first.progress).toHaveBeenCalledTimes(1);
   await owner.detach(second);
+});
+
+test("failed close retains physical ownership and blocks fresh attachment", async () => {
+  const f = fixture();
+  const first = f.client();
+  expect(f.owner.lifecycleState).toBe("closed");
+  await f.owner.attach(first);
+  expect(f.owner.lifecycleState).toBe("ready");
+  f.rootClose.mockRejectedValueOnce(new Error("storage close incomplete"));
+  await expect(f.owner.detach(first)).rejects.toThrow("storage close incomplete");
+  expect(f.owner.lifecycleState).toBe("closing");
+  await expect(f.owner.attach(f.client())).rejects.toMatchObject({code: "LIX_OWNER_CLOSE_FAILED"});
+  expect(f.open).toHaveBeenCalledTimes(1);
+  await f.owner.detach(first);
+  expect(f.owner.lifecycleState).toBe("closed");
+});
+
+test("disconnect during metadata admission never opens a storage engine", async () => {
+  const f = fixture();
+  let disconnected = false;
+  const client = f.client();
+  const verify = client.verifyIdentity;
+  client.isDisconnected = () => disconnected;
+  client.verifyIdentity = async () => { disconnected = true; return verify(); };
+  await expect(f.owner.attach(client)).rejects.toMatchObject({code: "LIX_TRANSPORT_UNAVAILABLE"});
+  expect(f.open).not.toHaveBeenCalled();
+});
+
+test("wrong authority admission is rejected before opening physical storage", async () => {
+  const f = fixture();
+  const client = f.client();
+  client.verifyIdentity = async () => ({authorityUrl: "https://other.test", accountId: "account-a", headers: []});
+  await expect(f.owner.attach(client)).rejects.toMatchObject({code: "LIX_SHARED_ENGINE_IDENTITY_MISMATCH"});
+  expect(f.open).not.toHaveBeenCalled();
+});
+
+test("cached offline admission cannot install a remote lease when reopening a root", async () => {
+  const f = fixture();
+  const client = f.client();
+  const verify = client.verifyIdentity;
+  client.verifyIdentity = async () => ({...await verify(), online: false});
+  f.open.mockImplementationOnce(async (server) => {
+    await expect(server.transport!({url: client.server.url, init: {}, response: {mode:"buffered",maxBytes:16}}))
+      .rejects.toMatchObject({code:"LIX_IDENTITY_UNVERIFIED_OFFLINE"});
+    return {activeAccountId: async()=>"account-a", openAnotherSession:async()=>({}),close:async()=>{}} as unknown as LixBinding;
+  });
+  await f.owner.attach(client);
+  expect(client.server.transport).not.toHaveBeenCalled();
+});
+
+test("failed initial root validation never commits a provisional owner identity", async () => {
+  const f = fixture();
+  const wrong = {...f.client("account-b"),commitIdentity:vi.fn()};
+  await expect(f.owner.attach(wrong)).rejects.toMatchObject({code:"LIX_SHARED_ENGINE_IDENTITY_MISMATCH"});
+  expect(wrong.commitIdentity).not.toHaveBeenCalled();
+  expect(f.owner.lifecycleState).toBe("closed");
+  const valid = {...f.client(),commitIdentity:vi.fn()};
+  await f.owner.attach(valid);
+  expect(valid.commitIdentity).toHaveBeenCalledOnce();
+  expect(f.open).toHaveBeenCalledTimes(2);
 });

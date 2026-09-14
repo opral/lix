@@ -23,6 +23,7 @@ async fn public_execution_and_observation_futures_are_send() {
     assert_send(lix.active_branch_id());
     assert_send(lix.open_another_session());
     assert_send(lix.execute("SELECT 1", &[]));
+    #[cfg(feature = "offline-migration")]
     assert_send(lix::convert_replica_to_partial(
         lix::Memory::new(),
         lix::ServerOptions::new("https://example.invalid/lix/test"),
