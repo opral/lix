@@ -7,10 +7,13 @@ pub(crate) const READ_DEADLINE: Duration = Duration::from_secs(30);
 pub(crate) const MAX_READ_RESULT_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_READ_RESULT_ROWS: usize = 1_000_000;
 
-pub(crate) async fn with_read_deadline<T>(
+pub(crate) fn with_read_deadline<T>(
     operation: impl Future<Output = Result<T, LixError>>,
-) -> Result<T, LixError> {
-    read_deadline(operation, READ_DEADLINE).await
+) -> impl Future<Output = Result<T, LixError>> {
+    // Keep the SQL operation out of the deadline future's inline state. Large
+    // provider futures otherwise multiply through each async wrapper and can
+    // overflow ordinary executor stacks even for small query results.
+    read_deadline(Box::pin(operation), READ_DEADLINE)
 }
 
 async fn read_deadline<T>(

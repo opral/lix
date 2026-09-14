@@ -3386,6 +3386,7 @@ dependencies = [
  "futures-util",
  "lix",
  "object_store 0.14.0",
+ "serde_json",
  "slatedb",
  "slatedb-common",
  "tempfile",

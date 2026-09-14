@@ -1,11 +1,10 @@
 //! Read-only inventory and detached operator entry points. Inspection never
 //! admits an engine or repairs a repository as a side effect.
+#[cfg(feature = "offline-migration")]
+use crate::storage_adapter::StorageAdapterRead as _;
 use crate::{
     LixError,
-    storage_adapter::{
-        PointReadPlan, Storage, StorageAdapterRead as _, StorageKey, StorageProjectedValue,
-        StorageSession,
-    },
+    storage_adapter::{PointReadPlan, Storage, StorageKey, StorageProjectedValue, StorageSession},
 };
 use bytes::Bytes;
 use serde::Serialize;
@@ -175,7 +174,20 @@ where
         ));
     }
     let before_content_digest = content_digest(storage).await?;
-    let (preservation_basis, expected_content_digest) = if before.format == Some(79) {
+    let older_witness = if matches!(before.format, Some(74 | 77 | 78)) {
+        Some(
+            super::older_witness::plan(storage, options, before.role == RepositoryRole::Authority)
+                .await?,
+        )
+    } else {
+        None
+    };
+    let (preservation_basis, expected_content_digest) = if let Some(witness) = &older_witness {
+        (
+            "source-descriptors-canonical-chain-v1",
+            witness.expected_digest.clone(),
+        )
+    } else if before.format == Some(79) {
         let adapter = super::epoch::inspect_existing_epoch_adapter(storage).await?;
         let read = super::MigrationPlanningRead::new(&adapter).await?;
         let plan = super::incorporation::preservation_plan(&read, options).await?;
@@ -188,6 +200,9 @@ where
         ("exact-records-v1", before_content_digest.clone())
     };
     super::epoch::admit_repository_with_options(storage, None, None, options).await?;
+    if before.role == RepositoryRole::Authority {
+        super::authority_baseline_fence::upgrade_authority_native_baseline_fence(storage).await?;
+    }
     let after = inspect_owned(storage).await?;
     if !after.current || before.role != after.role {
         return Err(LixError::new(
@@ -198,9 +213,13 @@ where
     let embedded_repository_id = validated_repository_id(storage, after.role).await?;
     // Witness the final candidate, including anything identity validation touched.
     let after_content_digest = content_digest(storage).await?;
+    if let Some(witness) = &older_witness {
+        witness.verify(storage, options).await?;
+    }
     Ok(RepositoryMigrationReport {
         embedded_repository_id,
-        semantic_preservation_verified: before.format.is_some_and(|format| format >= 79)
+        semantic_preservation_verified: (older_witness.is_some()
+            || before.format.is_some_and(|format| format >= 79))
             && expected_content_digest == after_content_digest,
         preservation_basis,
         expected_content_digest,
@@ -250,7 +269,7 @@ where
 /// marker and mutation revision, the two intended v81 migration publications.
 /// Includes pending operations, blobs, history, and all deduplication receipts.
 #[cfg(feature = "offline-migration")]
-async fn content_digest<S>(storage: &S) -> Result<String, LixError>
+pub(super) async fn content_digest<S>(storage: &S) -> Result<String, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -568,4 +587,142 @@ where
     }
     let owned = StorageSession::acquire(storage).await?;
     migrate_owned(&owned, options).await
+}
+
+/// Sealed source witness for explicit standalone-to-authority certification.
+/// Keep the physical owner barrier until verification and catalog publication.
+#[cfg(feature = "offline-migration")]
+#[derive(Debug)]
+pub struct AuthorityActivationWitness {
+    before_content_digest: String,
+    expected_content_digest: String,
+}
+
+#[cfg(feature = "offline-migration")]
+#[derive(Debug, Serialize)]
+pub struct AuthorityActivationReport {
+    pub before_content_digest: String,
+    pub after_content_digest: String,
+    pub semantic_preservation_verified: bool,
+}
+
+/// Prepare the only permitted activation mutation: install the current exact
+/// authority capability marker. Serving must still perform its full eligibility
+/// validation; this helper does not promote storage or admit an engine.
+#[cfg(feature = "offline-migration")]
+pub async fn prepare_authority_activation<S>(
+    storage: S,
+) -> Result<AuthorityActivationWitness, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let storage = StorageSession::acquire(storage).await?;
+    let state = inspect_owned(&storage).await?;
+    if !state.current || state.role != RepositoryRole::Standalone {
+        return Err(LixError::new(
+            "LIX_AUTHORITY_ACTIVATION_INVALID",
+            "activation witness requires a current standalone source",
+        ));
+    }
+    let before_content_digest = content_digest(&storage).await?;
+    let mut plan = super::publish::PublicationPlan::bounded(1, 1024);
+    plan.put_mutable(
+        crate::sync::SYNC_AUTHORITY_STATE_SPACE,
+        vec![(
+            crate::sync::authority_state_key().0.to_vec(),
+            crate::sync::AUTHORITY_STATE_VALUE.to_vec(),
+        )],
+    )?;
+    let expected_content_digest = content_digest_with_plan(&storage, Some(plan)).await?;
+    Ok(AuthorityActivationWitness {
+        before_content_digest,
+        expected_content_digest,
+    })
+}
+
+/// Verify all logical bytes after ordinary explicit serving certification.
+/// A successful engine open or an Authority role alone is not preservation.
+#[cfg(feature = "offline-migration")]
+pub async fn verify_authority_activation<S>(
+    storage: S,
+    witness: AuthorityActivationWitness,
+) -> Result<AuthorityActivationReport, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let storage = StorageSession::acquire(storage).await?;
+    let state = inspect_owned(&storage).await?;
+    let after_content_digest = content_digest(&storage).await?;
+    if !state.current
+        || state.role != RepositoryRole::Authority
+        || after_content_digest != witness.expected_content_digest
+    {
+        return Err(LixError::new(
+            "LIX_MIGRATION_PRESERVATION_FAILED",
+            "authority activation changed records beyond the exact capability marker",
+        ));
+    }
+    Ok(AuthorityActivationReport {
+        before_content_digest: witness.before_content_digest,
+        after_content_digest,
+        semantic_preservation_verified: true,
+    })
+}
+
+#[cfg(all(test, feature = "offline-migration", feature = "server-protocol"))]
+mod activation_tests {
+    use super::*;
+    use crate::storage_adapter::{PutBatch, PutEntry, StorageValue, StorageWrite};
+    #[tokio::test]
+    async fn activation_witness_accepts_only_the_capability_marker() {
+        for tamper in [false, true] {
+            let storage = StorageSession::acquire(crate::Memory::new()).await.unwrap();
+            crate::open_lix()
+                .with_storage(storage.clone())
+                .await
+                .unwrap()
+                .close()
+                .await
+                .unwrap();
+            let witness = prepare_authority_activation(storage.clone()).await.unwrap();
+            let server = crate::open_lix()
+                .with_storage(storage.clone())
+                .serve()
+                .with_lix_id("00000000-0000-7000-8000-000000000811")
+                .await
+                .unwrap();
+            server.close().await.unwrap();
+            drop(server);
+            if tamper {
+                let adapter = super::super::epoch::inspect_existing_epoch_adapter(&storage)
+                    .await
+                    .unwrap();
+                let mut write = adapter
+                    .begin_migration_write(Default::default())
+                    .await
+                    .unwrap();
+                write
+                    .put_many(
+                        crate::init::REPOSITORY_PROTOCOL_SPACE,
+                        PutBatch {
+                            entries: vec![PutEntry {
+                                key: StorageKey(Bytes::from_static(b"unplanned-activation-change")),
+                                value: StorageValue {
+                                    bytes: Bytes::from_static(b"must-fail"),
+                                },
+                            }],
+                        },
+                    )
+                    .await
+                    .unwrap();
+                write.commit().await.unwrap();
+            }
+            let result = verify_authority_activation(storage, witness).await;
+            if tamper {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().semantic_preservation_verified);
+            }
+        }
+    }
 }

@@ -594,7 +594,7 @@ where
     // Candidate initialization runs while the migration lease heartbeat writes
     // epoch control. Keep seed planning coherent at the logical bank revision
     // without retaining a physical read across the entire seed construction.
-    let mut read = crate::migration::MigrationPlanningRead::new(&storage).await?;
+    let mut read = crate::migration::MigrationPlanningRead::for_initialization(&storage).await?;
     let expected_revision =
         crate::storage_adapter::load_repository_mutation_revision(&read).await?;
     assert_empty_repository_for_initialize(&read).await?;
@@ -1611,7 +1611,7 @@ mod tests {
         );
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v80"),
-            RepositoryProtocolStatus::MigrationRequired { found_version:80 }
+            RepositoryProtocolStatus::MigrationRequired { found_version: 80 }
         );
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v81"),

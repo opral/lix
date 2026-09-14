@@ -6,12 +6,13 @@
 mod api;
 mod inspection;
 mod public_api;
-pub use public_api::{RepositoryInspection, RepositoryLayout, RepositoryRole, inspect_repository};
 #[cfg(feature = "offline-migration")]
 pub use public_api::{
-    RepositoryMigrationReport, migrate_repository, migrate_repository_with_options,
-    restore_and_migrate_repository,
+    AuthorityActivationReport, AuthorityActivationWitness, RepositoryMigrationReport,
+    migrate_repository, migrate_repository_with_options, prepare_authority_activation,
+    restore_and_migrate_repository, verify_authority_activation,
 };
+pub use public_api::{RepositoryInspection, RepositoryLayout, RepositoryRole, inspect_repository};
 #[cfg(any(feature = "offline-migration", test))]
 mod authority_baseline_fence;
 mod bounded_read;
@@ -73,3 +74,6 @@ pub(crate) use epoch::convert_clean_replica_to_partial;
 
 #[cfg(test)]
 pub(crate) use epoch::admit_repository;
+
+#[cfg(feature = "offline-migration")]
+mod older_witness;

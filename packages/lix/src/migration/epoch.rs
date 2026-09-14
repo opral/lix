@@ -3990,8 +3990,13 @@ where
 }
 
 #[cfg(test)]
-pub(super) async fn stage_repository_format_for_test<S>(storage: &S, partial: bool, format: u32) -> Result<(), LixError>
-where S: Storage + Clone + Send + Sync + 'static,
+pub(super) async fn stage_repository_format_for_test<S>(
+    storage: &S,
+    partial: bool,
+    format: u32,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
 {
     let (
         PointerState::Active {

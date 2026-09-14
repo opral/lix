@@ -3637,7 +3637,7 @@ where
     F: FnMut(SharedStorageAdapterRead<StorageImpl::Read<'static>>) -> Fut,
     Fut: Future<Output = Result<T, LixError>>,
 {
-    let operation = async {
+    let operation = Box::pin(async {
         let mut retries = ExpiredReadRetryState::default();
         loop {
             let result = match storage.begin_read(StorageReadOptions::default()).await {
@@ -3675,7 +3675,7 @@ where
                 }
             }
         }
-    };
+    });
     if replayable {
         crate::common::with_read_deadline(operation).await
     } else {

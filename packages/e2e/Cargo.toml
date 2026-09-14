@@ -61,6 +61,8 @@ zstd = "0.13"
 mimalloc.workspace = true
 
 [dev-dependencies]
+# Historical fixtures use the detached tool explicitly, never ordinary opening.
+lix = { workspace = true, features = ["offline-migration"] }
 ahash = "0.8"
 async-trait = "0.1"
 base64 = "0.22"
