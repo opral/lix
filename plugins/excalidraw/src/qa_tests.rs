@@ -785,3 +785,33 @@ fn qa_layout_changes_are_format_only_and_metadata_changes_are_content() {
     assert_eq!(out.row_changes.len(), 1);
     assert_eq!(out.row_changes[0].effect, sdk::ChangeEffect::Content);
 }
+
+#[test]
+fn qa_integral_float_scene_metadata_keeps_exact_spelling() {
+    let h = Harness::<ExcalidrawPlugin>::default();
+    let file = Snapshot {
+        path: "numeric.excalidraw".into(),
+        bytes: br#"{ "elements": [], "appState": {"zoom":1.0,"n":4e0,"zero":-0.0} }"#.to_vec(),
+        ..Snapshot::default()
+    };
+    let parsed = h.parse(&file, ctx(1)).unwrap();
+    let mut rows = Vec::new();
+    accept(&mut rows, &parsed.row_changes);
+    assert_eq!(
+        h.serialize(&file.file_id, &file.path, &rows, None)
+            .unwrap()
+            .snapshot()
+            .bytes,
+        file.bytes
+    );
+    assert_eq!(
+        h.serialize_changes(
+            parsed.snapshot(),
+            &rows.iter().map(change).collect::<Vec<_>>()
+        )
+        .unwrap()
+        .snapshot()
+        .bytes,
+        file.bytes
+    );
+}

@@ -223,7 +223,12 @@ impl SceneRow {
         };
         scene.files_present = template_has_files(&scene.template_json)?;
         scene.validate_template()?;
-        if scene.metadata()? != *metadata {
+        if TypedValue::Jsonb(scene.metadata()?.into())
+            != *record
+                .row
+                .get("scene_json")
+                .expect("validated scene metadata")
+        {
             scene.template_json = canonical_scene_template(metadata, scene.files_present);
         }
         scene.validate_template()?;
