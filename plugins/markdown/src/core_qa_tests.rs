@@ -508,3 +508,35 @@ fn qa_invalid_parent_changes_are_rejected_without_losing_rows() {
         assert_eq!(document.bytes(), source.as_bytes());
     }
 }
+
+#[test]
+fn qa_text_edits_after_autolinks_remain_literal() {
+    let (document, _) = Document::open_file(
+        b"https://example.com tail\n".to_vec(),
+        Some("text.md"),
+        IdNamespace::from_halves(33, 1),
+    )
+    .unwrap();
+    let mut node = document.tree.materialize().children.remove(0).node;
+    node.payload["inline"][1]["value"] = serde_json::json!(" *oops*");
+    let (updated, _) = document
+        .rows_changed(vec![RowChange {
+            schema_key: NODE_SCHEMA_KEY.into(),
+            row_pk: vec![node.id],
+            row: Some(node_to_typed_row(&node).unwrap()),
+            effect: ChangeEffect::Content,
+        }])
+        .unwrap();
+    assert_eq!(updated.bytes(), b"https://example.com \\*oops\\*\n");
+    let (reopened, _) = Document::open_file(
+        updated.bytes(),
+        Some("text.md"),
+        IdNamespace::from_halves(33, 2),
+    )
+    .unwrap();
+    assert!(
+        !serde_json::to_string(&reopened.tree.materialize().children[0].node.payload)
+            .unwrap()
+            .contains("emphasis")
+    );
+}

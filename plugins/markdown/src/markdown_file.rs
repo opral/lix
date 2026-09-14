@@ -1606,14 +1606,10 @@ fn inlines_to_ast(nodes: &[InlineNode]) -> Result<Vec<md::Inline>, PluginError> 
                 body = &body[..body.len() - 1];
             }
             if !body.is_empty() {
-                if follows_autolink {
-                    output.push(raw_inline(body));
-                } else {
-                    output.push(md::Inline::Text(md::Text {
-                        meta: md::NodeMeta::default(),
-                        value: body.to_string(),
-                    }));
-                }
+                output.push(md::Inline::Text(md::Text {
+                    meta: md::NodeMeta::default(),
+                    value: body.to_string(),
+                }));
             }
             if trailing_bracket {
                 output.push(raw_inline("["));
