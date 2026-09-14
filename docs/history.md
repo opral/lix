@@ -20,6 +20,26 @@ the statement. Pass the same explicit anchor across requests to keep a page
 stable while the branch advances. Automatic commits that compaction removes
 are not permanently retained.
 
+`lix_as_of` and the explicit commit arguments of `lix_diff` also accept
+uncorrelated scalar subqueries. They resolve within the same statement read
+context as the outer query, so a branch lookup needs no separate round trip:
+
+```sql
+SELECT id, path, content
+FROM lix_as_of('lix_file', (
+  SELECT commit_id FROM lix_branch WHERE name = $1
+));
+```
+
+The commit argument must resolve to one non-null text commit ID. A scalar
+subquery returning multiple rows produces an error; no rows yields NULL, which
+must be handled (for example, with `COALESCE`) or the commit argument is rejected.
+References to rows of the outer query are not supported in these commit
+arguments. Relation names retain their existing argument rules.
+Each commit argument resolves independently. Bind a shared commit ID when
+multiple arguments must reuse a value computed by a volatile expression;
+CTEs do not guarantee shared evaluation across arguments.
+
 ## Commit log
 
 ```sql
@@ -112,6 +132,12 @@ FROM lix_as_of('lix_file', $1)
 WHERE id = $2;
 ```
 
+An absent file returns no row; an existing empty file returns a row with
+zero-length `BYTEA` content. Read or reconstruction failures produce errors,
+not missing rows or empty content. For each present side of a file diff,
+`from_content` / `to_content` equals the snapshot's `content` at that endpoint.
+Use `diff_type` to distinguish absent diff sides from nullable values.
+
 Select only metadata columns when bytes are unnecessary. Content projections
 can demand deferred historical state and blob chunks on partial replicas,
 including in working diffs. Snapshot reads use live relation columns
@@ -131,8 +157,9 @@ FROM lix_branch
 WHERE id = lix_active_branch_id();
 ```
 
-The one-argument diff uses the private working baseline and current head. The
-baseline can be an ordinary commit after branch creation or restore. It must
+The one-argument diff uses the active branch's `working_base_commit_id` and
+`commit_id` (current head), pinned for the statement. The baseline can be an
+ordinary commit after branch creation or restore. It must
 not be inferred from the latest checkpoint. Read the branch pair and diff in a
 coherent batch when an empty diff still needs an addressable context.
 

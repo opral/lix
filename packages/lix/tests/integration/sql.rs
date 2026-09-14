@@ -114,6 +114,7 @@ mod row_ref;
 mod schema_history;
 mod schema_view;
 mod state_at;
+mod temporal_arguments;
 mod subquery_reads;
 mod subquery_writes;
 mod udfs;
