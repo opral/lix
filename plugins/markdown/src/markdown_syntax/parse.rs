@@ -27,7 +27,7 @@ std::thread_local! {
 #[derive(Default)]
 struct InlineScanCache {
     depth: usize,
-    labels: std::collections::HashMap<(usize, usize, usize), bool>,
+    labels: std::collections::HashMap<(usize, usize), bool>,
 }
 
 std::thread_local! {
@@ -62,7 +62,7 @@ impl NestingGuard {
             if depth.get() >= MAX_NESTING {
                 diagnostics.push(Diagnostic::new(
                     DiagnosticSeverity::Error,
-                    DiagnosticCode::InvalidDocument,
+                    DiagnosticCode::NestingLimit,
                     Span::new(0, 0),
                     format!("Markdown nesting exceeds the supported limit of {MAX_NESTING}"),
                 ));
@@ -4292,6 +4292,13 @@ fn parse_inlines_with_context(
     let mut delimiters: Vec<DelimMarker> = Vec::new();
 
     while index < bytes.len() {
+        if diagnostics
+            .last()
+            .is_some_and(|diagnostic| diagnostic.code == DiagnosticCode::NestingLimit)
+        {
+            return Vec::new();
+        }
+
         if bytes[index] == b'\\' {
             if let Some((next_index, char)) = next_char(input, index + 1) {
                 if char.is_ascii_punctuation() {
@@ -5260,7 +5267,13 @@ fn parse_link(
         // the invalid `(...)` as literal text (links 568) — so fall through to
         // the reference branches below instead of bailing out of parse_link.
         if let Some((close, resource)) = parse_link_resource(input, after_label) {
-            if label_contains_link(label_source, base_offset + index + 1, options, definitions) {
+            if label_contains_link(
+                label_source,
+                base_offset + index + 1,
+                options,
+                definitions,
+                diagnostics,
+            ) {
                 return None;
             }
             return Some((
@@ -5292,7 +5305,13 @@ fn parse_link(
             label
         };
         if definition_exists(definitions, identifier) {
-            if label_contains_link(label_source, base_offset + index + 1, options, definitions) {
+            if label_contains_link(
+                label_source,
+                base_offset + index + 1,
+                options,
+                definitions,
+                diagnostics,
+            ) {
                 return None;
             }
             return Some((
@@ -5327,7 +5346,13 @@ fn parse_link(
         return None;
     }
     if definition_exists(definitions, label_source) {
-        if label_contains_link(label_source, base_offset + index + 1, options, definitions) {
+        if label_contains_link(
+            label_source,
+            base_offset + index + 1,
+            options,
+            definitions,
+            diagnostics,
+        ) {
             return None;
         }
         return Some((
@@ -5387,24 +5412,27 @@ fn label_contains_link(
     base_offset: usize,
     options: &SyntaxOptions,
     definitions: &[String],
+    diagnostics: &mut Vec<Diagnostic>,
 ) -> bool {
-    let key = (
-        label_source.as_ptr().addr(),
-        label_source.len(),
-        PARSE_NESTING.with(std::cell::Cell::get),
-    );
+    let key = (label_source.as_ptr().addr(), label_source.len());
     if let Some(cached) = INLINE_SCAN_CACHE.with(|cache| cache.borrow().labels.get(&key).copied()) {
         return cached;
     }
-    let mut diagnostics = Vec::new();
+    let diagnostic_start = diagnostics.len();
     let inlines = parse_inlines_with_context(
         label_source,
         base_offset,
         options,
         definitions,
-        &mut diagnostics,
+        diagnostics,
         InlineContext::default(),
     );
+    if diagnostics[diagnostic_start..]
+        .iter()
+        .any(|diagnostic| diagnostic.code == DiagnosticCode::NestingLimit)
+    {
+        return false;
+    }
     let contains = contains_link_inline(&inlines);
     INLINE_SCAN_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();

@@ -974,3 +974,27 @@ fn qa_nested_link_candidates_reuse_speculative_results() {
         assert_eq!(document.bytes(), source.as_bytes());
     }
 }
+
+#[test]
+fn qa_excessive_nested_link_candidates_stop_at_the_nesting_budget() {
+    let mut source = "a".to_owned();
+    for _ in 0..400 {
+        source = format!("[{source}](u)");
+    }
+    assert!(matches!(
+        Document::open_file(
+            source.into_bytes(),
+            Some("nested-links.md"),
+            IdNamespace::from_halves(44, 2)
+        ),
+        Err(PluginError::InvalidInput(_))
+    ));
+    assert!(
+        Document::open_file(
+            b"[a](u)\n".to_vec(),
+            Some("next.md"),
+            IdNamespace::from_halves(44, 3)
+        )
+        .is_ok()
+    );
+}

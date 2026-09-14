@@ -25,6 +25,8 @@ pub enum DiagnosticCode {
     UnclosedDirectiveContainer,
     /// Malformed MDX syntax.
     InvalidMdx,
+    /// Parsing exceeded its bounded recursive nesting budget.
+    NestingLimit,
     /// A strict-mode parse promoted a configured extension diagnostic to an error.
     StrictParse,
     /// AST validation failure (an invalid or unsupported node shape), the single
