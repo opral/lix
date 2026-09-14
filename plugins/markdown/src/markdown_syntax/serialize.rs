@@ -1752,9 +1752,8 @@ fn normalize_reference_label(input: &str) -> String {
 /// matching label, so it is only whole if those children fold back to the
 /// definition identifier. Under RAW label matching the children can re-escape
 /// in a fold-breaking way (e.g. a leading `^` becomes `\^`), so when the
-/// children no longer reproduce the identifier we substitute the escaped raw
-/// label as the bracket body — keeping the Shortcut/Collapsed kind (and its
-/// re-parse) intact instead of degrading it into a Full reference.
+/// children no longer reproduce the identifier, use an explicit Full reference
+/// so the display text and target both survive the next parse.
 fn push_reference_body(
     output: &mut String,
     kind: ReferenceKind,
@@ -1762,16 +1761,14 @@ fn push_reference_body(
     children_match_identifier: bool,
     escaped_label: &str,
 ) {
-    // For a Shortcut/Collapsed reference the bracket body must fold back to the
-    // identifier on its own. Substitute the escaped raw label when the rendered
-    // children would not (keeping the reference kind), but a Full reference
-    // always keeps its rendered text since its explicit label does the matching.
-    let use_label_body = !children_match_identifier && !matches!(kind, ReferenceKind::Full);
-    let body = if use_label_body {
-        escaped_label
+    // An explicit reference preserves edited display text when it no longer
+    // spells the target identifier. Never replace semantic children with a label.
+    let kind = if children_match_identifier {
+        kind
     } else {
-        rendered
+        ReferenceKind::Full
     };
+    let body = rendered;
 
     output.push('[');
     output.push_str(body);
