@@ -491,8 +491,8 @@ async fn sql_line_edits_survive_file_edits_reopen_and_history() {
     .unwrap();
     assert_eq!(read_file(&lix, path).await.unwrap(), b"edited\nlast\n");
     lix.execute(
-        "INSERT INTO text_line (content, order_key, line_ending, lixcol_file_id) VALUES ('middle', '60', $2, $1)",
-        &[Value::Text(file_id.clone()), Value::Text("\n".to_owned())],
+        "INSERT INTO text_line (content, order_key, lixcol_file_id) VALUES ('middle', '60', $1)",
+        &[Value::Text(file_id.clone())],
     )
     .await
     .unwrap();

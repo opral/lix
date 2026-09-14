@@ -22,7 +22,8 @@
     {
       "name": "line_ending",
       "type": "text",
-      "nullable": false
+      "nullable": false,
+      "default_value": "\n"
     },
     {
       "name": "order_key",
