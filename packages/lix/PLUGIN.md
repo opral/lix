@@ -107,6 +107,9 @@ for the wire shape, correctness gates, and cross-format measurement matrix.
 
 ## Installing a plugin
 
+For downloading compiled releases and managing installed plugins from JavaScript,
+see [Installing and managing plugins](../../docs/plugins.md).
+
 Installing a plugin is a normal tracked repository file write. Write the
 `.lixplugin` archive to its canonical path:
 

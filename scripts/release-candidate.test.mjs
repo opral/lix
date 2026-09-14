@@ -114,3 +114,21 @@ test("unknown or inconsistent preview scope fails closed", () => {
 	input.needs["preview-server-image"].result = "failure";
 	assert.throws(() => assertReleaseReady(input), /preview scope/);
 });
+
+test("ready candidates freeze only their release target", async () => {
+	const lix = pr();
+	const json = pr({ number: 2, head: { ...lix.head, ref: "release/plugin_json/v0.17.0" } });
+	const csv = pr({ number: 3, head: { ...lix.head, ref: "release/plugin_csv/v0.16.2" } });
+	const candidates = [lix, json, csv];
+	assert.deepEqual(frozenReleaseCandidates(candidates, "opral/lix"), [lix]);
+	assert.deepEqual(frozenReleaseCandidates(candidates, "opral/lix", "plugin_json"), [json]);
+	assert.deepEqual(frozenReleaseCandidates(candidates, "opral/lix", "plugin_text"), []);
+	const outputs = {};
+	await checkReleaseFreeze({
+		target: "plugin_text",
+		github: { rest: { pulls: { list() {} } }, paginate: async () => candidates },
+		context: { repo: { owner: "opral", repo: "lix" } },
+		core: { setOutput: (key, value) => { outputs[key] = value; }, info() {} },
+	});
+	assert.equal(outputs.frozen, "false");
+});

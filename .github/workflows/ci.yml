@@ -191,7 +191,7 @@ jobs:
         run: node scripts/validate-server-protocol-docs.mjs
 
       - name: Validate CI workflow invariants
-        run: node --test scripts/native-build.test.mjs scripts/ci-workflow.test.mjs scripts/ci-merge-reuse.test.mjs scripts/ci-rust-scope.test.mjs scripts/ci-sdk-cache.test.mjs scripts/ci-server-image.test.mjs scripts/release-candidate.test.mjs
+        run: node --test scripts/native-build.test.mjs scripts/ci-workflow.test.mjs scripts/ci-merge-reuse.test.mjs scripts/ci-rust-scope.test.mjs scripts/ci-sdk-cache.test.mjs scripts/ci-server-image.test.mjs scripts/release.test.mjs scripts/release-candidate.test.mjs scripts/publish-plugin.test.mjs
 
   cargo-config:
     name: Cargo config (${{ matrix.name }})
@@ -607,6 +607,9 @@ jobs:
       - name: Install JS SDK dependencies
         working-directory: packages/js-sdk
         run: npm ci
+
+      - name: Test plugin archive packaging
+        run: node --test scripts/plugin-archive.test.mjs
 
       - name: Install filesystem storage dependencies
         if: matrix.runtime == 'native'
