@@ -408,3 +408,25 @@ fn duplicate_middle_matching_consumes_each_identity_once() {
     assert_eq!(ids(&updated), ids(&document));
     assert_eq!(changes.len(), 2);
 }
+
+#[test]
+fn sequential_end_allocations_keep_order_storage_linear() {
+    use crate::core::allocate_order_keys;
+    for append in [false, true] {
+        let mut key = allocate_order_keys(None, None, 1).unwrap().remove(0);
+        let mut total = 0;
+        for _ in 0..20_000 {
+            let next = if append {
+                allocate_order_keys(Some(&key), None, 1)
+            } else {
+                allocate_order_keys(None, Some(&key), 1)
+            }
+            .unwrap()
+            .remove(0);
+            assert!(if append { next > key } else { next < key });
+            total += next.to_snapshot_string().len();
+            key = next;
+        }
+        assert!(total <= 34 * 20_000, "end keys must have bounded storage");
+    }
+}

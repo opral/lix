@@ -107,7 +107,7 @@ impl Document {
         validate_text(&bytes)?;
         let bytes = Arc::new(bytes);
         let chunks = split_lines(Arc::clone(&bytes));
-        let order_keys = OrderKey::evenly_between(None, None, chunks.len())?;
+        let order_keys = allocate_order_keys(None, None, chunks.len())?;
         let mut lines = Vec::with_capacity(chunks.len());
         for (ordinal, (bytes, order_key)) in chunks.into_iter().zip(order_keys).enumerate() {
             lines.push(Arc::new(Line {
@@ -481,8 +481,7 @@ impl Document {
                 .as_ref()
                 .expect("an order anchor key was assigned")
                 .clone();
-            let allocated =
-                OrderKey::evenly_between(previous.as_ref(), Some(&next), anchor - cursor)?;
+            let allocated = allocate_order_keys(previous.as_ref(), Some(&next), anchor - cursor)?;
             for (position, key) in (cursor..anchor).zip(allocated) {
                 order_keys[position] = Some(key);
             }
@@ -491,8 +490,7 @@ impl Document {
                 .checked_add(1)
                 .ok_or_else(|| "line order cursor overflow".to_owned())?;
         }
-        let allocated =
-            OrderKey::evenly_between(previous.as_ref(), None, old_for_new.len() - cursor)?;
+        let allocated = allocate_order_keys(previous.as_ref(), None, old_for_new.len() - cursor)?;
         for (position, key) in (cursor..old_for_new.len()).zip(allocated) {
             order_keys[position] = Some(key);
         }
@@ -760,4 +758,49 @@ fn common_prefix_and_suffix(before: &[u8], after: &[u8]) -> (usize, usize) {
 
 fn usize_to_u64(value: usize, context: &str) -> Result<u64, String> {
     u64::try_from(value).map_err(|_| format!("{context} exceeds u64"))
+}
+
+// Reserve a wide integer stride at open ends. Repeated midpoint allocation
+// otherwise adds a byte every eight appends/prepends and grows total key
+// storage quadratically. Interior fractional allocation remains unchanged.
+pub(crate) fn allocate_order_keys(
+    previous: Option<&OrderKey>,
+    next: Option<&OrderKey>,
+    count: usize,
+) -> Result<Vec<OrderKey>, String> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if previous.is_some() != next.is_some() {
+        let bound = previous.or(next).unwrap();
+        let raw = bound.to_snapshot_string();
+        let prefix = &raw[..raw.len().min(32)];
+        let padded = format!("{prefix:0<32}");
+        let value = u128::from_str_radix(&padded, 16).expect("hex order key");
+        let distance = (count as u128).checked_mul(1u128 << 64);
+        let start = distance.and_then(|distance| {
+            if previous.is_some() {
+                value.checked_add(distance).map(|_| value)
+            } else {
+                value.checked_sub(distance)
+            }
+        });
+        if let Some(start) = start {
+            let keys = (0..count)
+                .map(|i| {
+                    let step = if previous.is_some() { i + 1 } else { i };
+                    OrderKey::from_snapshot_string(&format!(
+                        "{:032x}01",
+                        start + ((step as u128) << 64)
+                    ))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if previous.is_none_or(|bound| bound < &keys[0])
+                && next.is_none_or(|bound| &keys[keys.len() - 1] < bound)
+            {
+                return Ok(keys);
+            }
+        }
+    }
+    OrderKey::evenly_between(previous, next, count)
 }
