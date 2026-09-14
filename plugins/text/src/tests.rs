@@ -47,9 +47,19 @@ fn records(changes: &[lix::RowChange]) -> Vec<lix::RowRecord> {
 
 fn row_with_bytes(line: &Line, bytes: &[u8]) -> ::lix::plugin::TypedRow {
     let mut row = line.typed_row().expect("test line should have a UUID id");
+    let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let (content, fallback) = match std::str::from_utf8(body) {
+        Ok(text) => (TypedValue::Text(text.to_owned()), TypedValue::Null),
+        Err(_) => (
+            TypedValue::Null,
+            TypedValue::Text(URL_SAFE_NO_PAD.encode(body)),
+        ),
+    };
+    row.insert("content", content);
+    row.insert("content_base64", fallback);
     row.insert(
-        "content_base64".to_owned(),
-        TypedValue::Text(URL_SAFE_NO_PAD.encode(bytes)),
+        "line_ending",
+        TypedValue::Text(if bytes.ends_with(b"\n") { "\n" } else { "" }.to_owned()),
     );
     row
 }
@@ -460,3 +470,54 @@ fn concurrent_order_ties_render_deterministically_and_accept_followup_edits() {
     assert_eq!(replayed, after);
     assert_eq!(after.bytes(), b"A\nb\n");
 }
+
+#[test]
+fn sql_content_is_readable_and_edits_preserve_line_endings() {
+    let (document, _) = open(b"hello\r\nworld");
+    let first = &document.lines()[0];
+    let mut row = first.typed_row().unwrap();
+    assert_eq!(row["content"], TypedValue::Text("hello\r".to_owned()));
+    assert_eq!(row["line_ending"], TypedValue::Text("\n".to_owned()));
+    assert_eq!(row["content_base64"], TypedValue::Null);
+    row.insert("content", TypedValue::Text("updated\r".to_owned()));
+    let (after, edits) = document
+        .rows_changed([lix::RowChange::upsert(
+            LINE_SCHEMA_KEY,
+            row_pk(first.id()).to_vec(),
+            row,
+        )])
+        .unwrap();
+    assert_eq!(after.bytes(), b"updated\r\nworld");
+    assert_eq!(apply_edits(document.bytes(), &edits), after.bytes());
+}
+
+#[test]
+fn sql_payload_representation_is_canonical() {
+    let (document, _) = open(b"hello\n");
+    let first = &document.lines()[0];
+    for (content, fallback) in [
+        (TypedValue::Null, TypedValue::Null),
+        (
+            TypedValue::Text("hello".into()),
+            TypedValue::Text("_w".into()),
+        ),
+        (
+            TypedValue::Null,
+            TypedValue::Text(URL_SAFE_NO_PAD.encode(b"hello")),
+        ),
+    ] {
+        let mut row = first.typed_row().unwrap();
+        row.insert("content", content);
+        row.insert("content_base64", fallback);
+        assert!(
+            document
+                .rows_changed([lix::RowChange::upsert(
+                    LINE_SCHEMA_KEY,
+                    row_pk(first.id()).to_vec(),
+                    row,
+                )])
+                .is_err()
+        );
+    }
+}
+

@@ -577,9 +577,20 @@ impl Line {
 
     pub(crate) fn typed_row(&self) -> Result<TypedRow, String> {
         let mut row = TypedRow::new();
+        let raw = self.bytes.as_slice();
+        let body = raw.strip_suffix(b"\n").unwrap_or(raw);
+        let (content, fallback) = match std::str::from_utf8(body) {
+            Ok(text) => (TypedValue::Text(text.to_owned()), TypedValue::Null),
+            Err(_) => (
+                TypedValue::Null,
+                TypedValue::Text(URL_SAFE_NO_PAD.encode(body)),
+            ),
+        };
+        row.insert("content", content);
+        row.insert("content_base64", fallback);
         row.insert(
-            "content_base64".to_owned(),
-            TypedValue::Text(URL_SAFE_NO_PAD.encode(self.bytes.as_slice())),
+            "line_ending",
+            TypedValue::Text(if raw.ends_with(b"\n") { "\n" } else { "" }.to_owned()),
         );
         row.insert("id".to_owned(), TypedValue::Uuid(self.id));
         row.insert(
@@ -590,10 +601,12 @@ impl Line {
     }
 
     fn from_typed_row(row: &TypedRow) -> Result<Self, String> {
-        if let Some(field) = row
-            .keys()
-            .find(|field| !matches!(*field, "content_base64" | "id" | "order_key"))
-        {
+        if let Some(field) = row.keys().find(|field| {
+            !matches!(
+                *field,
+                "content" | "content_base64" | "id" | "line_ending" | "order_key"
+            )
+        }) {
             return Err(format!(
                 "line typed row contains unsupported field '{field}'"
             ));
@@ -607,13 +620,33 @@ impl Line {
                 .map_err(|error| format!("invalid line order key: {error}"))?,
             _ => return Err("line typed row order_key must be text".to_owned()),
         };
-        let content_base64 = match row.get("content_base64") {
-            Some(TypedValue::Text(value)) => value,
-            _ => return Err("line typed row content_base64 must be text".to_owned()),
+        let mut bytes = match (row.get("content"), row.get("content_base64")) {
+            (Some(TypedValue::Text(text)), None | Some(TypedValue::Null)) => {
+                text.as_bytes().to_vec()
+            }
+            (None | Some(TypedValue::Null), Some(TypedValue::Text(encoded))) => {
+                let bytes = URL_SAFE_NO_PAD
+                    .decode(encoded)
+                    .map_err(|error| format!("invalid line content_base64: {error}"))?;
+                if std::str::from_utf8(&bytes).is_ok() {
+                    return Err("valid UTF-8 must use content instead of content_base64".to_owned());
+                }
+                bytes
+            }
+            _ => {
+                return Err(
+                    "exactly one of content and content_base64 must be non-NULL text".to_owned(),
+                );
+            }
         };
-        let bytes = URL_SAFE_NO_PAD
-            .decode(content_base64)
-            .map_err(|error| format!("invalid line content_base64: {error}"))?;
+        if bytes.contains(&b'\n') {
+            return Err("line content cannot contain embedded LF bytes".to_owned());
+        }
+        match row.get("line_ending") {
+            Some(TypedValue::Text(ending)) if ending == "\n" => bytes.push(b'\n'),
+            Some(TypedValue::Text(ending)) if ending.is_empty() => {}
+            _ => return Err("line_ending must be LF or an empty string".to_owned()),
+        }
         validate_line_bytes(&bytes)?;
         Ok(Self {
             id,
@@ -711,7 +744,7 @@ fn validate_row_key(schema_key: &str, row_pk: &[TypedValue]) -> Result<(), Strin
 
 fn validate_text(bytes: &[u8]) -> Result<(), String> {
     if bytes[..bytes.len().min(TEXT_PREFIX_SCAN_BYTES)].contains(&0) {
-        return Err("Text documents cannot contain NUL in their first 8 KiB".to_owned());
+        return Err("Text documents cannot contain NUL in their first 8,000 bytes".to_owned());
     }
     Ok(())
 }

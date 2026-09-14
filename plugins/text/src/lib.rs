@@ -2,7 +2,7 @@
 //!
 //! A line is a durable row rather than a display-only diff hunk. The
 //! component preserves source bytes exactly, including invalid UTF-8 and final
-//! unterminated lines, by storing each LF-delimited byte segment as base64.
+//! unterminated lines, using readable text with an invalid-UTF-8 base64 fallback.
 #![allow(dead_code)]
 
 mod core;
@@ -512,4 +512,21 @@ pub const SCHEMAS: [(&str, &str); 1] = [(
 mod tests;
 
 #[cfg(target_family = "wasm")]
-lix::plugin::export_capabilities! { file_projection: TextPlugin }
+lix::plugin::export_capabilities! { file_projection: TextPlugin, column_merger: TextPlugin }
+
+// A representation switch changes both optional payload columns. Prefer that
+// switch over an edit to the old representation, keeping exactly one payload.
+impl sdk::ColumnMerger for TextPlugin {
+    fn merge(input: sdk::ColumnMerge<'_>) -> sdk::Result<sdk::ColumnMergeResult> {
+        if input.row.schema_key == "text_line"
+            && matches!(input.column.as_str(), "content" | "content_base64")
+            && (input.a.value()? == Some(sdk::TypedValue::Null)
+                || input.b.value()? == Some(sdk::TypedValue::Null))
+        {
+            return Ok(sdk::ColumnMergeResult::Replace(
+                sdk::OwnedColumnValue::Typed(sdk::TypedValue::Null),
+            ));
+        }
+        Ok(sdk::ColumnMergeResult::UseLww)
+    }
+}
