@@ -54,3 +54,33 @@ test("admission accepts the server's bounded opaque account identity contract", 
 test.each([409,426])("HTTP %s reports migration/version requirement without offline fallback",async status=>{
   await expect(requestAdmission(url,headers,async()=>new Response(null,{status}))).rejects.toMatchObject({code:"LIX_ADMISSION_EPOCH"});
 });
+
+
+test("another port's rejection prevents an in-flight successful probe from restoring admission", async () => {
+  const cache = new SharedAdmissionCache();
+  let complete!: (value: AdmissionIdentity) => void;
+  const pending = cache.verify(url, headers, identity, () => new Promise(resolve => {complete = resolve;}));
+  cache.remove(url, headers);
+  complete(identity);
+  await expect(pending).rejects.toMatchObject({code:"LIX_ADMISSION_AUTH_REJECTED"});
+  await expect(cache.verify(url, headers, identity, offline)).rejects.toMatchObject({code:"LIX_IDENTITY_UNVERIFIED_OFFLINE"});
+  expect((await cache.verify(url, headers, identity, async () => identity)).online).toBe(true);
+});
+
+test("another port's rejection removes a delayed durable write and invalidates the old lease generation", async () => {
+  const cache = new SharedAdmissionCache();
+  await cache.verify(url, headers, identity, async () => identity);
+  const generation = cache.generation(url, headers);
+  let finish!: () => void;
+  let persisted = false;
+  const pending = cache.persistLocal(url, headers, generation,
+    async () => {await new Promise<void>(resolve => {finish = resolve;}); persisted = true;},
+    async () => {persisted = false;});
+  cache.remove(url, headers);
+  expect(cache.generation(url, headers)).not.toBe(generation);
+  finish(); await pending;
+  expect(persisted).toBe(false);
+  const write = vi.fn(async () => {});
+  await cache.persistLocal(url, headers, generation, write, async () => {});
+  expect(write).not.toHaveBeenCalled();
+});
