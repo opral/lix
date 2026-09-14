@@ -666,11 +666,13 @@ fn match_table_columns(
     old_used: &mut [bool],
     used_ids: &mut BTreeSet<Uuid>,
 ) {
+    let old_signatures = table_column_signatures(old);
+    let new_signatures = table_column_signatures(new);
     let mut old_by_signature = HashMap::<String, Vec<usize>>::new();
     for (index, column) in old.children.iter().enumerate() {
         if column.node.kind == NodeKind::TableColumn && !old_used[index] {
             old_by_signature
-                .entry(table_column_signature(old, column))
+                .entry(old_signatures[&column.node.id].clone())
                 .or_default()
                 .push(index);
         }
@@ -679,7 +681,7 @@ fn match_table_columns(
     for column in &new.children {
         if column.node.kind == NodeKind::TableColumn {
             *new_counts
-                .entry(table_column_signature(new, column))
+                .entry(new_signatures[&column.node.id].clone())
                 .or_default() += 1;
         }
     }
@@ -687,7 +689,7 @@ fn match_table_columns(
         if column.node.kind != NodeKind::TableColumn || old_for_new[new_index].is_some() {
             continue;
         }
-        let signature = table_column_signature(new, column);
+        let signature = new_signatures[&column.node.id].clone();
         let Some(old_indices) = old_by_signature.get(&signature) else {
             continue;
         };
@@ -701,25 +703,47 @@ fn match_table_columns(
     }
 }
 
-fn table_column_signature(table: &NodeTree, column: &NodeTree) -> String {
-    let mut cells = Vec::new();
-    for row in table
+fn table_column_signatures(table: &NodeTree) -> HashMap<Uuid, String> {
+    let columns = table
+        .children
+        .iter()
+        .filter(|child| child.node.kind == NodeKind::TableColumn)
+        .collect::<Vec<_>>();
+    let rows = table
         .children
         .iter()
         .filter(|child| child.node.kind == NodeKind::TableRow)
-    {
-        let cell = row.children.iter().find(|cell| {
-            cell.node
+        .collect::<Vec<_>>();
+    let mut cells = columns
+        .iter()
+        .map(|column| (column.node.id, vec![None; rows.len()]))
+        .collect::<HashMap<_, _>>();
+    for (index, row) in rows.iter().enumerate() {
+        for cell in &row.children {
+            if let Some(column) = cell
+                .node
                 .payload
                 .get("column_id")
                 .and_then(serde_json::Value::as_str)
                 .and_then(|id| Uuid::parse_str(id).ok())
-                == Some(column.node.id)
-        });
-        cells.push(cell.map(NodeTree::subtree_signature));
+                .and_then(|id| cells.get_mut(&id))
+                && column[index].is_none()
+            {
+                column[index] = Some(cell.subtree_signature());
+            }
+        }
     }
-    serde_json::to_string(&(column.node.content_signature(), cells))
-        .expect("table column signature must serialize")
+    columns
+        .into_iter()
+        .map(|column| {
+            let signature = serde_json::to_string(&(
+                column.node.content_signature(),
+                cells.remove(&column.node.id).unwrap(),
+            ))
+            .expect("table column signature must serialize");
+            (column.node.id, signature)
+        })
+        .collect()
 }
 
 fn preserve_table_cell_order_keys(
