@@ -465,3 +465,23 @@ fn qa_reference_identifier_edits_override_stale_labels() {
         );
     }
 }
+
+#[test]
+fn qa_literal_punctuation_runs_import_losslessly() {
+    for source in [
+        "||||||||".to_owned(),
+        "]>||~`>1.".to_owned(),
+        "|".repeat(10_000),
+    ] {
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("punctuation.md"),
+            IdNamespace::from_halves(32, 1),
+        )
+        .unwrap();
+        assert_eq!(document.bytes(), source.as_bytes());
+        let (root, blocks) = document.arena_state().unwrap();
+        let reopened = Document::open_arena(document.bytes(), &root, blocks).unwrap();
+        assert_eq!(reopened.bytes(), source.as_bytes());
+    }
+}

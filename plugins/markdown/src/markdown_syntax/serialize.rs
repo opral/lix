@@ -1222,6 +1222,7 @@ fn escape_text_with_context(
     // output never contains a literal newline. `output.len()` is therefore
     // the current line length and avoids rescanning the growing string with
     // `rsplit_once` for every input character.
+    let leading_pipe_end = input.len() - input.trim_start_matches('|').len();
     let avoid_star_edges = context.avoid_star_edges;
     let mut output = String::new();
     let mut line_digit_prefix = 0usize;
@@ -1325,7 +1326,7 @@ fn escape_text_with_context(
         match char {
             '*' if avoid_star_edges => output.push_str("&#x2A;"),
             '|' if context.table_cell => output.push_str("&#x7C;"),
-            '|' if output.is_empty() => {
+            '|' if offset < leading_pipe_end => {
                 output.push('\\');
                 output.push(char);
             }
