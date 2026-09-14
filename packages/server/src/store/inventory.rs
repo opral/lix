@@ -11,6 +11,8 @@ pub struct AuthorityInventory {
     pub unreferenced_storage: Vec<String>,
     /// Unpublished or retained migration destinations; never ordinary authorities.
     pub staged_storage: Vec<String>,
+    /// Explicitly retained nonlive sources, verified against their complete manifest.
+    pub quarantined_storage: Vec<String>,
     pub malformed_catalog: Vec<String>,
 }
 
@@ -38,6 +40,7 @@ impl LixRuntimeManager {
         let mut listed = objects.list(base.as_ref());
         let mut catalog = Vec::new();
         let mut stages = Vec::new();
+        let mut quarantine = Vec::new();
         let mut physical: BTreeMap<String, (u64, u64)> = BTreeMap::new();
         while let Some(object) = listed.try_next().await? {
             let Some(relative) = object.location.as_ref().strip_prefix(&prefix) else {
@@ -47,6 +50,8 @@ impl LixRuntimeManager {
                 catalog.push((name.to_owned(), object.location));
             } else if let Some(name) = relative.strip_prefix(".lix-migration-stages/") {
                 stages.push((name.to_owned(), object.location));
+            } else if let Some(name) = relative.strip_prefix(".lix-quarantine/") {
+                quarantine.push((name.to_owned(), object.location));
             } else if let Some((storage_id, _)) = relative.split_once('/') {
                 if !storage_id.starts_with('.') {
                     let counts = physical.entry(storage_id.to_owned()).or_default();
@@ -142,6 +147,40 @@ impl LixRuntimeManager {
             referenced.insert(destination.to_owned());
             staged_storage.insert(destination.to_owned());
         }
+        let mut quarantined_storage = Vec::new();
+        for (name, path) in quarantine {
+            let bytes = objects.get(&path).await?.bytes().await?;
+            let record = serde_json::from_slice::<QuarantineManifest>(&bytes);
+            let valid = match record {
+                Ok(record)
+                    if name == format!("{}.json", record.storage_id)
+                        && !referenced.contains(&record.storage_id)
+                        && !record.reason.trim().is_empty()
+                        && valid_digest(&record.control_plane_digest) =>
+                {
+                    match verify_physical_manifest(
+                        &objects,
+                        &prefix,
+                        &record.storage_id,
+                        &record.objects,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            quarantined_storage.push(record.storage_id.clone());
+                            referenced.insert(record.storage_id);
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                }
+                _ => false,
+            };
+            if !valid {
+                malformed_catalog.push(format!("quarantine/{name}"));
+            }
+        }
+        quarantined_storage.sort();
         entries.sort_by(|a, b| a.repository_id.cmp(&b.repository_id));
         malformed_catalog.sort();
         Ok(AuthorityInventory {
@@ -154,6 +193,7 @@ impl LixRuntimeManager {
                 .collect(),
             malformed_catalog,
             staged_storage: staged_storage.into_iter().collect(),
+            quarantined_storage,
         })
     }
 }
@@ -248,5 +288,171 @@ mod tests {
             .unwrap();
         let inventory = manager.inventory_authorities().await.unwrap();
         assert_eq!(inventory.malformed_catalog.len(), 1);
+    }
+}
+
+/// Exact immutable physical-source witness used by detached reconciliation tools.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PhysicalManifestEntry {
+    pub key: String,
+    pub bytes: u64,
+    pub blake3: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct QuarantineManifest {
+    pub storage_id: String,
+    pub reason: String,
+    pub control_plane_digest: String,
+    pub objects: Vec<PhysicalManifestEntry>,
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+pub(super) async fn verify_physical_manifest(
+    objects: &Arc<dyn ObjectStore>,
+    prefix: &str,
+    storage_id: &str,
+    entries: &[PhysicalManifestEntry],
+) -> Result<()> {
+    if !valid_lix_id(storage_id) || entries.is_empty() {
+        anyhow::bail!("invalid or empty physical source manifest");
+    }
+    let source_prefix = format!("{prefix}{storage_id}/");
+    let source_path = ObjectPath::from(source_prefix.clone());
+    let listed: Vec<_> = objects.list(Some(&source_path)).try_collect().await?;
+    let expected: BTreeMap<_, _> = entries
+        .iter()
+        .map(|entry| (entry.key.as_str(), entry))
+        .collect();
+    if expected.len() != entries.len() || listed.len() != entries.len() {
+        anyhow::bail!("physical source object inventory changed");
+    }
+    for object in &listed {
+        let key = object
+            .location
+            .as_ref()
+            .strip_prefix(&source_prefix)
+            .context("physical source escaped prefix")?;
+        let entry = expected
+            .get(key)
+            .context("unexpected physical source object")?;
+        if object.size != entry.bytes || !valid_digest(&entry.blake3) {
+            anyhow::bail!("physical source object metadata changed");
+        }
+        let mut stream = objects.get(&object.location).await?.into_stream();
+        let mut digest = Hasher::new();
+        while let Some(bytes) = stream.try_next().await? {
+            digest.update(&bytes);
+        }
+        if digest.finalize().to_hex().as_str() != entry.blake3 {
+            anyhow::bail!("physical source content changed");
+        }
+    }
+    let after: Vec<_> = objects.list(Some(&source_path)).try_collect().await?;
+    let signature = |values: &[object_store::ObjectMeta]| {
+        values
+            .iter()
+            .map(|object| {
+                (
+                    object.location.to_string(),
+                    (
+                        object.size,
+                        object.e_tag.clone(),
+                        object.version.clone(),
+                        object.last_modified,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    if signature(&listed) != signature(&after) {
+        anyhow::bail!("physical source changed during verification");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod quarantine_tests {
+    use super::*;
+    const ID: &str = "11111111-1111-4111-8111-111111111111";
+    #[tokio::test]
+    async fn quarantined_source_is_retained_and_changed_content_blocks_inventory() {
+        let manager = LixRuntimeManager::new_in_memory(1);
+        let (objects, _) = manager.catalog_store();
+        let path = ObjectPath::from(format!("{ID}/data"));
+        objects.put(&path, "original".into()).await.unwrap();
+        let manifest = QuarantineManifest {
+            storage_id: ID.to_owned(),
+            reason: "no live control mapping; preserve for recovery".into(),
+            control_plane_digest: blake3::hash(b"control inventory").to_hex().to_string(),
+            objects: vec![PhysicalManifestEntry {
+                key: "data".into(),
+                bytes: 8,
+                blake3: blake3::hash(b"original").to_hex().to_string(),
+            }],
+        };
+        objects
+            .put(
+                &ObjectPath::from(format!(".lix-quarantine/{ID}.json")),
+                serde_json::to_vec(&manifest).unwrap().into(),
+            )
+            .await
+            .unwrap();
+        let inventory = manager.inventory_authorities().await.unwrap();
+        assert_eq!(inventory.quarantined_storage, [ID]);
+        assert!(inventory.unreferenced_storage.is_empty());
+        assert!(inventory.entries.is_empty());
+        assert_eq!(
+            objects.get(&path).await.unwrap().bytes().await.unwrap(),
+            "original"
+        );
+        objects.put(&path, "modified".into()).await.unwrap();
+        let inventory = manager.inventory_authorities().await.unwrap();
+        assert!(inventory.quarantined_storage.is_empty());
+        assert_eq!(inventory.unreferenced_storage, [ID]);
+        assert_eq!(
+            inventory.malformed_catalog,
+            [format!("quarantine/{ID}.json")]
+        );
+    }
+
+    #[tokio::test]
+    async fn quarantine_cannot_hide_a_catalogued_repository() {
+        let manager = LixRuntimeManager::new_in_memory(1);
+        manager.write_record(ID, "live", None, true).await.unwrap();
+        let (objects, _) = manager.catalog_store();
+        objects
+            .put(&ObjectPath::from(format!("{ID}/data")), "original".into())
+            .await
+            .unwrap();
+        let manifest = QuarantineManifest {
+            storage_id: ID.to_owned(),
+            reason: "invalid quarantine".into(),
+            control_plane_digest: blake3::hash(b"control").to_hex().to_string(),
+            objects: vec![PhysicalManifestEntry {
+                key: "data".into(),
+                bytes: 8,
+                blake3: blake3::hash(b"original").to_hex().to_string(),
+            }],
+        };
+        objects
+            .put(
+                &ObjectPath::from(format!(".lix-quarantine/{ID}.json")),
+                serde_json::to_vec(&manifest).unwrap().into(),
+            )
+            .await
+            .unwrap();
+        let inventory = manager.inventory_authorities().await.unwrap();
+        assert!(inventory.quarantined_storage.is_empty());
+        assert_eq!(inventory.entries.len(), 1);
+        assert_eq!(
+            inventory.malformed_catalog,
+            [format!("quarantine/{ID}.json")]
+        );
     }
 }
