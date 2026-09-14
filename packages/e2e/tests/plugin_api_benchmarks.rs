@@ -26,6 +26,150 @@ const BENCHMARK: &str = "plugin_api_public_workflows";
 const DEFAULT_SAMPLES: usize = 7;
 const CSV_MERGE_BASE: &[u8] = b"name,score,color\nalice,1,red\n";
 
+#[tokio::test]
+async fn ordinary_sql_point_edits_preserve_bytes_and_reopen() {
+    point_edit_workflows(128, 3).await;
+}
+
+#[tokio::test]
+#[ignore = "matched SQL/Wasm point-edit profile"]
+async fn profile_sql_point_edits() {
+    for count in [1_000, 10_000, 100_000] {
+        point_edit_workflows(count, 21).await;
+    }
+}
+
+async fn point_edit_workflows(count: usize, samples: usize) {
+    for markdown in [false, true] {
+        // Baseline Markdown exhausts guest memory importing 100k paragraphs.
+        // Keep this matched profile within the supported import envelope.
+        if markdown && count > 10_000 {
+            continue;
+        }
+        let storage = lix::Memory::new();
+        let lix = open_lix().with_storage(storage.clone()).await.unwrap();
+        let (plugin, path, archive) = if markdown {
+            (
+                "plugin_markdown",
+                "/point.md",
+                build_markdown_plugin_archive(),
+            )
+        } else {
+            ("plugin_text", "/point.txt", build_text_plugin_archive())
+        };
+        install_plugin(&lix, plugin, &archive).await;
+        // Exclude initial component compilation from import and point timings.
+        write_file(
+            &lix,
+            if markdown {
+                "/warmup.md"
+            } else {
+                "/warmup.txt"
+            },
+            b"",
+        )
+        .await;
+        let separator = if markdown { "\n\n" } else { "\n" };
+        let source = format!(
+            "{}\n",
+            vec!["Ordinary paragraph text."; count].join(separator)
+        )
+        .into_bytes();
+        let start = Instant::now();
+        write_file(&lix, path, &source).await;
+        let import_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let selection = if markdown {
+            "SELECT id, payload_json FROM markdown_node WHERE kind='paragraph' ORDER BY order_key, id"
+        } else {
+            "SELECT id, content FROM text_line ORDER BY order_key, id"
+        };
+        let rows = lix.execute(selection, &[]).await.unwrap();
+        assert_eq!(rows.rows().len(), count);
+        let row = &rows.rows()[count / 2];
+        let id: Value = row.get("id").unwrap();
+        let payload = if markdown {
+            let Value::Jsonb(value) = row.get::<Value>("payload_json").unwrap() else {
+                panic!("JSONB payload")
+            };
+            Some(value.to_value())
+        } else {
+            None
+        };
+        let sql = if markdown {
+            "UPDATE markdown_node SET payload_json=$1 WHERE id=$2"
+        } else {
+            "UPDATE text_line SET content=$1 WHERE id=$2"
+        };
+        let mut times = Vec::new();
+        let mut allocated = Vec::new();
+        let mut peaks = Vec::new();
+        let mut expected = source;
+        for sample in 0..samples + 3 {
+            let content = if sample % 2 == 0 {
+                "Short text."
+            } else {
+                "A longer ordinary paragraph text."
+            };
+            let value = if let Some(payload) = &payload {
+                let mut payload = payload.clone();
+                payload["inline"][0]["value"] = serde_json::json!(content);
+                Value::Text(payload.to_string())
+            } else {
+                Value::Text(content.into())
+            };
+            let scope = AllocationScope::start();
+            let started = Instant::now();
+            lix.execute(sql, &[value.clone(), id.clone()])
+                .await
+                .unwrap();
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            let memory = scope.finish();
+            if sample >= 3 {
+                times.push(elapsed);
+                allocated.push(memory.allocated_bytes);
+                peaks.push(memory.peak_live_bytes_delta);
+            }
+            let mut paragraphs = vec!["Ordinary paragraph text."; count];
+            paragraphs[count / 2] = content;
+            expected = format!("{}\n", paragraphs.join(separator)).into_bytes();
+            assert_eq!(read_file(&lix, path).await, expected);
+        }
+        times.sort_by(f64::total_cmp);
+        allocated.sort_unstable();
+        peaks.sort_unstable();
+        println!(
+            "SQL_POINT_MEMORY plugin={plugin} rows={count} allocated_p50={} peak_live_delta_p50={}",
+            allocated[allocated.len() / 2],
+            peaks[peaks.len() / 2]
+        );
+        println!(
+            "SQL_POINT plugin={plugin} rows={count} import_ms={import_ms:.3} p50_ms={:.3} p95_ms={:.3} samples={times:?}",
+            times[times.len() / 2],
+            times[(times.len() * 95).div_ceil(100).saturating_sub(1)]
+        );
+        lix.close().await.unwrap();
+        let reopened = open_lix().with_storage(storage).await.unwrap();
+        assert_eq!(read_file(&reopened, path).await, expected);
+        let content = "Edited after reopening.";
+        let value = if let Some(mut payload) = payload {
+            payload["inline"][0]["value"] = serde_json::json!(content);
+            Value::Text(payload.to_string())
+        } else {
+            Value::Text(content.into())
+        };
+        reopened.execute(sql, &[value, id.clone()]).await.unwrap();
+        let mut paragraphs = vec!["Ordinary paragraph text."; count];
+        paragraphs[count / 2] = content;
+        expected = format!("{}\n", paragraphs.join(separator)).into_bytes();
+        assert_eq!(read_file(&reopened, path).await, expected);
+        assert_eq!(
+            reopened.execute(selection, &[]).await.unwrap().rows().len(),
+            count
+        );
+        reopened.close().await.unwrap();
+    }
+}
+
 struct PluginFixture {
     key: &'static str,
     extension: &'static str,

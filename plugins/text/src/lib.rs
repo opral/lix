@@ -6,13 +6,17 @@
 #![allow(dead_code)]
 
 mod core;
+mod indexed;
 mod model;
 #[path = "../../../packages/plugin-utils/order_key.rs"]
 mod order_key;
+#[cfg(test)]
+mod point_profile;
 
 use core::{Document, FileEdit, LineIdentity};
 use lix::plugin as sdk;
 use model::{ChangeEffect, RowChange, RowRecord};
+use sdk::StateOutput;
 use std::sync::OnceLock;
 
 struct TextPlugin;
@@ -56,7 +60,7 @@ impl sdk::FileProjection for TextPlugin {
                     created_uuid(creates, local_ref(ordinal))
                 })
                 .map_err(sdk::Error::invalid_input)?;
-            replace_identities(&update.before, output, &after)?;
+            replace_identities(&update.before, &before, output, &after)?;
             return emit_changes(changes.into_iter().map(Ok), creates, output);
         }
 
@@ -111,7 +115,6 @@ impl sdk::FileProjection for TextPlugin {
         mut update: sdk::SerializeChangesInput<'_>,
         output: &mut sdk::FileEditOutput<'_, '_>,
     ) -> sdk::Result<()> {
-        let before = read_document(&update.before)?;
         let mut changes = Vec::new();
         while let Some(change) = update.typed_row_changes.next()? {
             changes.push(RowChange {
@@ -124,13 +127,17 @@ impl sdk::FileProjection for TextPlugin {
                 },
             });
         }
+        if indexed::serialize_changes(&update.before, &changes, output)? {
+            return Ok(());
+        }
+        let before = read_document(&update.before)?;
         let (after, edits) = before
             .rows_changed(changes)
             .map_err(sdk::Error::invalid_input)?;
         for edit in edits {
             output.replace(edit.offset, edit.delete_len, &edit.insert)?;
         }
-        replace_identities(&update.before, output, &after)
+        replace_identities(&update.before, &before, output, &after)
     }
 
     fn serialize(
@@ -173,11 +180,13 @@ fn store_identities(successor: &mut impl StateOutput, document: &Document) -> sd
     for (ordinal, page) in pages.iter().enumerate() {
         successor.put_state(&line_identity_page_key(ordinal as u32), page)?;
     }
+    indexed::build(successor, document)?;
     Ok(())
 }
 
 fn replace_identities(
     before: &sdk::Snapshot<'_>,
+    previous: &Document,
     successor: &mut impl StateOutput,
     document: &Document,
 ) -> sdk::Result<()> {
@@ -186,7 +195,18 @@ fn replace_identities(
         |ordinal| before.get_state(&line_identity_page_key(ordinal)),
         successor,
         document,
-    )
+    )?;
+    if before.state_len(b"text/point/root")?.is_none()
+        || previous.lines().len() != document.lines().len()
+        || previous
+            .lines()
+            .iter()
+            .zip(document.lines())
+            .any(|(a, b)| !a.same_index_entry(b))
+    {
+        indexed::build(successor, document)?;
+    }
+    Ok(())
 }
 
 fn replace_identity_pages(
@@ -402,29 +422,6 @@ where
     }
     Ok(())
 }
-
-trait StateOutput {
-    fn put_state(&mut self, key: &[u8], value: &[u8]) -> sdk::Result<()>;
-    fn delete_state(&mut self, key: &[u8]) -> sdk::Result<()>;
-}
-
-macro_rules! impl_state_output {
-    ($type:ty) => {
-        impl StateOutput for $type {
-            fn put_state(&mut self, key: &[u8], value: &[u8]) -> sdk::Result<()> {
-                <$type>::put_state(self, key, value)
-            }
-            fn delete_state(&mut self, key: &[u8]) -> sdk::Result<()> {
-                <$type>::delete_state(self, key)
-            }
-        }
-    };
-}
-
-impl_state_output!(sdk::RowOutput<'_, '_>);
-impl_state_output!(sdk::RowChangeOutput<'_, '_>);
-impl_state_output!(sdk::FileOutput<'_, '_>);
-impl_state_output!(sdk::FileEditOutput<'_, '_>);
 
 trait MutationOutput {
     fn create(&mut self, schema_key: &str, local_ref: u32, row: &sdk::TypedRow) -> sdk::Result<()>;

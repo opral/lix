@@ -9,6 +9,7 @@ mod lix_json_get_text;
 mod lix_json_predicate;
 mod lix_jsonb;
 mod lix_octet_length;
+mod lix_order_between;
 mod lix_root_commit_id;
 mod lix_row_ref;
 mod uuidv7;
@@ -55,6 +56,7 @@ pub(crate) fn register_static_sql2_functions(ctx: &SessionContext) {
     ));
     ctx.register_udf(ScalarUDF::from(lix_jsonb::LixJsonb::new()));
     ctx.register_udf(ScalarUDF::from(lix_octet_length::LixOctetLength::new()));
+    ctx.register_udf(ScalarUDF::from(lix_order_between::LixOrderBetween::new()));
 }
 
 /// Installs the per-statement execution functions once, for the lifetime of

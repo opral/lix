@@ -8,6 +8,8 @@
 
 mod edits;
 pub use edits::EditSet;
+mod index;
+pub use index::UuidIndex;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod testing;
