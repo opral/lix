@@ -34,8 +34,10 @@
 
 pub const SERVER_PROTOCOL_VERSION: u32 = 9;
 /// Current persisted repository format. Old stores require explicit migration.
+#[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
 pub const CURRENT_STORAGE_FORMAT_VERSION: u32 = init::CURRENT_FORMAT_VERSION;
 /// Current sync wire epoch; obsolete clients are rejected before mutation.
+#[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
 pub const SYNC_PROTOCOL_VERSION: u32 = sync::SYNC_PROTOCOL_VERSION;
 
 // Hosts can parse SQL with the same dialect and parameter rules as execution.

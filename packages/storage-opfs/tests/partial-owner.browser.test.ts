@@ -73,7 +73,7 @@ test("provider shutdown waits for owned work to release its handle",async()=>{
  expect(closed).toBe(true);
 });
 
-test("actual OPFS client close preserves storage until owner release",async()=>{
+test("actual OPFS client close rejects new work while waiting for owner release",async()=>{
  const { OpfsStorage } = await import("@lix-js/storage-opfs");
  const { OpfsStorageClient } = await import("../js/client.js");
  const name=`partial-owner-client-${crypto.randomUUID()}`;
@@ -88,8 +88,7 @@ test("actual OPFS client close preserves storage until owner release",async()=>{
  try {
   await Promise.resolve();
   expect(closed).toBe(false);
-  const read=await client.beginRead({durability:"visible",consistency:"snapshot",sessionToken:token});
-  expect(await read.getMany([])).toEqual([]);
+  await expect(client.beginRead({durability:"visible",consistency:"snapshot",sessionToken:token})).rejects.toMatchObject({code:"LIX_STORAGE_CLOSED"});
  } finally { owner.close(); await closing; }
  expect(closed).toBe(true);
 },30_000);
