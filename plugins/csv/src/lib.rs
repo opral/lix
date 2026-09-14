@@ -101,7 +101,6 @@ impl sdk::FileProjection for CsvPlugin {
         mut update: sdk::SerializeChangesInput<'_>,
         sink: &mut sdk::FileEditOutput<'_, '_>,
     ) -> sdk::Result<()> {
-        let before = update.before.read_all()?;
         let mut changes = Vec::new();
         while let Some(change) = update.typed_row_changes.next()? {
             changes.push(RowChange {
@@ -114,10 +113,14 @@ impl sdk::FileProjection for CsvPlugin {
                 },
             });
         }
+        if serialize_indexed_updates(&update.before, &changes, sink)? {
+            return Ok(());
+        }
+        let before = update.before.read_all()?;
         let namespace = read_namespace(&update.before)?
             .or_else(|| namespace_from_changes(&changes))
             .unwrap_or_else(|| IdNamespace::from_halves(0, 0));
-        let document = open_document(before.clone(), update.path, namespace, &update.before)?;
+        let document = open_document(before, update.path, namespace, &update.before)?;
         let (successor, edits) = document
             .rows_changed(&changes)
             .map_err(sdk::Error::invalid_input)?;
@@ -372,6 +375,156 @@ fn store_csv_index(successor: &mut impl StateOutput, state: &[u8]) -> sdk::Resul
         successor.put_state(&csv_index_page_key(ordinal as u32), page)?;
     }
     Ok(())
+}
+
+/// Render point/batched cell edits using only the affected source records. The
+/// dense identity/order mapping survives these edits, including length changes.
+fn serialize_indexed_updates(
+    before: &sdk::Snapshot<'_>,
+    changes: &[RowChange],
+    sink: &mut sdk::FileEditOutput<'_, '_>,
+) -> sdk::Result<bool> {
+    if changes.is_empty() {
+        return Ok(true);
+    }
+    // Respect the host's bounded inline splice count; bulk replacements use
+    // the complete renderer.
+    if changes.len() > 4096 {
+        return Ok(false);
+    }
+    if before.state_len(CSV_IDENTITIES_KEY)?.is_some() {
+        return Ok(false);
+    }
+    let Some(mut header) = before.get_state(CSV_INDEX_KEY)? else {
+        return Ok(false);
+    };
+    let index = decode_csv_index_header(&header)?;
+    if index.file_len() != before.len() {
+        return Err(sdk::Error::invalid_input(
+            "CSV index length does not match accepted file",
+        ));
+    }
+    let read_start = |ordinal: u32| -> sdk::Result<u64> {
+        if ordinal == index.row_count() {
+            return Ok(before.len());
+        }
+        let per_page = (CSV_INDEX_PAGE_BYTES / 4) as u32;
+        let bytes = before
+            .read_state_range(
+                &csv_index_page_key(ordinal / per_page),
+                u64::from(ordinal % per_page) * 4,
+                4,
+            )?
+            .ok_or_else(|| sdk::Error::invalid_input("CSV index page disappeared"))?;
+        let bytes: [u8; 4] = bytes
+            .try_into()
+            .map_err(|_| sdk::Error::invalid_input("CSV index offset was truncated"))?;
+        Ok(u64::from(u32::from_le_bytes(bytes)))
+    };
+    let mut replacements = std::collections::BTreeMap::new();
+    for change in changes {
+        let Some(ordinal) = index
+            .update_ordinal(change)
+            .map_err(sdk::Error::invalid_input)?
+        else {
+            return Ok(false);
+        };
+        let start = read_start(ordinal)?;
+        let end = read_start(ordinal + 1)?;
+        if end <= start || end > before.len() {
+            return Err(sdk::Error::invalid_input("CSV index row span is invalid"));
+        }
+        let rendered = index
+            .render_update(ordinal, change.row.as_ref().expect("update row"))
+            .map_err(sdk::Error::invalid_input)?;
+        replacements.insert(ordinal, (start, end, rendered));
+    }
+    // Check boundaries against the simultaneous successor, including a changed
+    // neighbor. The general renderer quotes empty records at ambiguous joins.
+    for (&ordinal, (start, end, rendered)) in &replacements {
+        if rendered.first() == Some(&b'\n') && ordinal > 0 {
+            let previous = if let Some((_, _, bytes)) = replacements.get(&(ordinal - 1)) {
+                bytes.last().copied()
+            } else {
+                before.read_range(start - 1, 1)?.first().copied()
+            };
+            if previous == Some(b'\r') {
+                return Ok(false);
+            }
+        }
+        if rendered.last() == Some(&b'\r') && ordinal + 1 < index.row_count() {
+            let next = if let Some((_, _, bytes)) = replacements.get(&(ordinal + 1)) {
+                bytes.first().copied()
+            } else {
+                before.read_range(*end, 1)?.first().copied()
+            };
+            if next == Some(b'\n') {
+                return Ok(false);
+            }
+        }
+    }
+    let mut delta = 0i64;
+    let mut shifts = Vec::new();
+    for (&ordinal, (start, end, rendered)) in &replacements {
+        let change = i64::try_from(rendered.len())
+            .map_err(|_| sdk::Error::limit_exceeded("CSV row too large"))?
+            - i64::try_from(end - start).expect("CSV span fits i64");
+        if change != 0 {
+            shifts.push((ordinal, change));
+        }
+        delta += change;
+    }
+    let new_len = before
+        .len()
+        .checked_add_signed(delta)
+        .filter(|len| *len <= u64::from(u32::MAX))
+        .ok_or_else(|| sdk::Error::limit_exceeded("CSV supports files smaller than 4GiB"))?;
+    // Equal-size edits leave every index page unchanged. Variable-size edits
+    // update offset pages, without reading or copying unaffected file bytes.
+    if !shifts.is_empty() {
+        let per_page = (CSV_INDEX_PAGE_BYTES / 4) as u32;
+        let first_page = (shifts[0].0 + 1) / per_page;
+        let mut shift_index = 0usize;
+        let mut running_delta = 0i64;
+        for page in first_page..index.row_count().div_ceil(per_page) {
+            let key = csv_index_page_key(page);
+            let mut bytes = before
+                .get_state(&key)?
+                .ok_or_else(|| sdk::Error::invalid_input("CSV index page disappeared"))?;
+            let expected = (index.row_count() - page * per_page).min(per_page) as usize * 4;
+            if bytes.len() != expected {
+                return Err(sdk::Error::invalid_input("CSV index page truncated"));
+            }
+            let mut changed = false;
+            for (offset, raw) in bytes.chunks_exact_mut(4).enumerate() {
+                let ordinal = page * per_page + offset as u32;
+                while shift_index < shifts.len() && shifts[shift_index].0 < ordinal {
+                    running_delta += shifts[shift_index].1;
+                    shift_index += 1;
+                }
+                if running_delta != 0 {
+                    let old = u32::from_le_bytes(raw.try_into().expect("offset"));
+                    let next = i64::from(old)
+                        .checked_add(running_delta)
+                        .and_then(|n| u32::try_from(n).ok())
+                        .ok_or_else(|| sdk::Error::limit_exceeded("CSV offset overflow"))?;
+                    raw.copy_from_slice(&next.to_le_bytes());
+                    changed = true;
+                }
+            }
+            if changed {
+                sink.put_state(&key, &bytes)?;
+            }
+        }
+        header[20..28].copy_from_slice(&new_len.to_le_bytes());
+        sink.put_state(CSV_INDEX_KEY, &header)?;
+    }
+    for (_, (start, end, rendered)) in replacements {
+        if before.read_range(start, end - start)? != rendered {
+            sink.replace(start, end - start, &rendered)?;
+        }
+    }
+    Ok(true)
 }
 
 fn split_csv_index(state: &[u8]) -> sdk::Result<(&[u8], Vec<&[u8]>)> {
@@ -1350,3 +1503,11 @@ mod adapter_qa_tests {
 #[cfg(test)]
 #[path = "qa_merge_tests.rs"]
 mod qa_merge_tests;
+
+#[cfg(test)]
+#[path = "qa_indexed_tests.rs"]
+mod qa_indexed_tests;
+
+#[cfg(test)]
+#[path = "qa_adapter_tests.rs"]
+mod qa_adapter_tests;

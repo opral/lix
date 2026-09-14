@@ -2457,13 +2457,73 @@ impl Document {
             }
         }
 
-        // Multi-row sparse sets and dialect mutation use the exact cold
-        // renderer. Every single-row content/delete/insert/reorder case above
-        // stays local except an unterminated-EOF reorder.
+        if changes.len() > 1 && changes.len() <= 4096 {
+            if let Some(result) = self.update_sparse_batch(changes)? {
+                return Ok(result);
+            }
+        }
+        // Structural batches, dialect mutations, and ambiguous row boundaries
+        // use the exact cold renderer.
         let records = apply_row_changes(self.row_records()?, changes)?;
         let (document, mut edit) = Self::open_rows(records)?;
         edit.delete_len = u64::try_from(self.0.blob.len()).expect("file length fits u64");
         Ok((document, vec![edit]))
+    }
+
+    fn update_sparse_batch(
+        &self,
+        changes: &[RowChange],
+    ) -> Result<Option<(Self, Vec<ByteEdit>)>, String> {
+        let mut updates = std::collections::BTreeMap::new();
+        for change in changes {
+            if change.schema_key.as_ref() != ROW_SCHEMA_KEY {
+                return Ok(None);
+            }
+            let Some(row) = &change.row else {
+                return Ok(None);
+            };
+            let semantic = parse_csv_row(row)?;
+            if change.row_pk != [TypedValue::Uuid(semantic.id)] {
+                return Err("CSV row id does not match row key".to_owned());
+            }
+            let Some(location) = self
+                .0
+                .identities
+                .slot_for_id(semantic.id)
+                .and_then(|slot| self.0.index.location_for_identity_slot(slot))
+            else {
+                return Ok(None);
+            };
+            let source = self.0.index.row(location).1;
+            if semantic.order_key != self.order_key(source) {
+                return Ok(None);
+            }
+            updates.insert(self.0.index.ordinal_of(location), (location, semantic));
+        }
+        let mut document = self.clone();
+        let mut edits = Vec::with_capacity(updates.len());
+        for (&ordinal, (original, semantic)) in &updates {
+            let location = document
+                .0
+                .index
+                .ordinal_location(ordinal)
+                .expect("existing row");
+            let rank = document.0.index.row(location).1.order_rank;
+            let (successor, mut edit) = document.replace_sparse_row(location, semantic, rank, 0)?;
+            let mut edit = edit.pop().expect("one replacement");
+            edit.offset = u64::from(self.0.index.row_start(*original));
+            edit.delete_len = u64::from(self.0.index.row(*original).1.byte_len);
+            edits.push(edit);
+            document = successor;
+        }
+        for ordinal in updates.keys() {
+            if !document.boundary_is_unambiguous(*ordinal)?
+                || !document.boundary_is_unambiguous(ordinal + 1)?
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some((document, edits)))
     }
 
     fn boundary_is_unambiguous(&self, ordinal: usize) -> Result<bool, String> {
@@ -3142,6 +3202,57 @@ pub struct ArenaRowIndex {
 
 #[allow(dead_code)]
 impl ArenaRowIndex {
+    pub fn row_count(&self) -> u32 {
+        self.row_count
+    }
+    pub fn file_len(&self) -> u64 {
+        self.file_len
+    }
+
+    /// Dense imports retain the generated UUID ordinal and initial order key.
+    /// Updates with different identities/order or structural changes use the
+    /// general document path instead.
+    pub fn update_ordinal(&self, change: &RowChange) -> Result<Option<u32>, String> {
+        if change.schema_key.as_ref() != ROW_SCHEMA_KEY {
+            return Ok(None);
+        }
+        let Some(row) = &change.row else {
+            return Ok(None);
+        };
+        let semantic = parse_csv_row(row)?;
+        if change.row_pk != [TypedValue::Uuid(semantic.id)] {
+            return Err("CSV row id does not match row key".to_owned());
+        }
+        let bytes = semantic.id.as_bytes();
+        if bytes[..12] != self.namespace {
+            return Ok(None);
+        }
+        let ordinal = u32::from_be_bytes(bytes[12..].try_into().expect("UUID ordinal"));
+        if ordinal >= self.row_count {
+            return Ok(None);
+        }
+        let rank = ((u128::from(ordinal) + 1) * u128::from(u64::MAX)
+            / (u128::from(self.row_count) + 1)) as u64
+            | 1;
+        Ok((semantic.order_key == format!("{rank:016x}")).then_some(ordinal))
+    }
+
+    pub fn render_update(&self, ordinal: u32, row: &TypedRow) -> Result<Vec<u8>, String> {
+        let semantic = parse_csv_row(row)?;
+        let ending = semantic
+            .layout
+            .ending(self.dialect)
+            .or_else(|| (ordinal + 1 != self.row_count).then_some(self.dialect.terminator));
+        render_row_with_layout(
+            &semantic.cells,
+            self.dialect,
+            ending,
+            &semantic.layout.force_quote,
+            &semantic.layout.unquoted_quote,
+            ordinal == 0 && !self.dialect.bom,
+        )
+    }
+
     pub fn dialect(&self) -> Dialect {
         self.dialect
     }
@@ -5068,6 +5179,12 @@ pub fn parse_csv_row(row: &TypedRow) -> Result<CsvRow, String> {
     .collect::<Result<Vec<_>, _>>()?;
     if cells.is_empty() {
         return Err("CSV rows require at least one cell".to_owned());
+    }
+    if cells.len() > u16::MAX as usize {
+        return Err("CSV row has more than 65535 fields".to_owned());
+    }
+    for cell in &cells {
+        validate_csv_text(cell.as_bytes())?;
     }
     let layout = match row.get("layout") {
         Some(TypedValue::Null) => RowLayout::default(),

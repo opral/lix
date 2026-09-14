@@ -304,3 +304,46 @@ fn qa_sql_reordering_unterminated_row_does_not_override_new_last_ending() {
         "move unterminated row before terminated row",
     );
 }
+
+#[test]
+fn qa_sql_noncanonical_batches_emit_original_coordinate_splices() {
+    for source in [b"a\nb\nc\nd\n".as_slice(), b"a\rb\n\nlast"] {
+        let seed = open(source);
+        let mut records = seed.row_records().unwrap();
+        for (index, record) in records.iter_mut().enumerate().skip(1) {
+            let mut row = parse_csv_row(&record.row).unwrap();
+            row.id = uuid::Uuid::from_u128(1000 + index as u128);
+            row.order_key = format!("{:02x}", index * 2 + 1);
+            record.row_pk = vec![TypedValue::Uuid(row.id)];
+            record.row = csv_typed_row(row).unwrap();
+        }
+        let document = Document::open_rows(records).unwrap().0;
+        for values in [["much longer", ""], ["\n", "\u{feff}"], ["", "much longer"]] {
+            let records = document.row_records().unwrap();
+            let changes = [1usize, 3]
+                .into_iter()
+                .zip(values)
+                .map(|(index, value)| {
+                    let mut row = parse_csv_row(&records[index].row).unwrap();
+                    row.cells = vec![value.to_owned()];
+                    row_change(&records[index], Some(row))
+                })
+                .collect::<Vec<_>>();
+            let (after, edits) = document.rows_changed(&changes).unwrap();
+            let mut bytes = document.bytes();
+            for edit in edits.iter().rev() {
+                let start = edit.offset as usize;
+                bytes.splice(
+                    start..start + edit.delete_len as usize,
+                    edit.insert.iter().copied(),
+                );
+            }
+            assert_eq!(bytes, after.bytes(), "{source:?} {values:?}");
+            assert_mutation(
+                &document,
+                &changes,
+                &format!("noncanonical batch {source:?} {values:?}"),
+            );
+        }
+    }
+}
