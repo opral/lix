@@ -56,7 +56,9 @@ Reorder rows and their header/body roles together. Add or remove a
 column and its cells in one transaction.
 
 Unordered list delimiters are `dash`, `plus`, and `asterisk`. Ordered lists use
-`period` or `paren` and an integer `start`. Code fences use `backtick` or `tilde`.
+`period` or `paren` and an integer `start`. When switching list type, update
+`ordered`, `start` (integer for ordered, null for unordered), and the delimiter
+together. Code fences use `backtick` or `tilde`.
 Reference identifiers use the parser's whitespace-collapsed, case-folded label.
 Rename definitions and their referencing inlines in the same transaction.
 The `label` format field preserves original spelling while it identifies the same
@@ -147,8 +149,8 @@ and should not be authored through SQL.
 
 Rendered row edits are reparsed and compared semantically before acceptance.
 Unrepresentable structures, HTML block values that become ordinary paragraphs,
-and inconsistent table roles return an error. A loose single-item list needs more
-than one paragraph block to express its loose layout. Code block values use LF
+and inconsistent table roles return an error. A loose single-item list needs
+multiple block children to express its loose layout. Code block values use LF
 and end in LF unless empty. Frontmatter values exclude the newline separating
 the value from its closing fence; additional boundary blank lines are content.
 
