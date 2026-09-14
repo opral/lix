@@ -66,24 +66,65 @@ fn qa_roundtrip_nonfirst_bom_cell_stays_unquoted() {
     assert_eq!(restored.bytes(), bytes);
 }
 
-
 #[test]
 fn qa_roundtrip_delete_exposing_bom_cell() {
-    let (before, _) = Document::open_file("first\n\u{feff}alpha\n".as_bytes().to_vec(), None, IdNamespace::from_namespace_bytes([0x61;12])).unwrap();
+    let (before, _) = Document::open_file(
+        "first\n\u{feff}alpha\n".as_bytes().to_vec(),
+        None,
+        IdNamespace::from_namespace_bytes([0x61; 12]),
+    )
+    .unwrap();
     let records = before.row_records().unwrap();
-    let change = RowChange { schema_key: ROW_SCHEMA_KEY.into(), row_pk: records[1].row_pk.clone(), row: None, effect: ChangeEffect::Content };
+    let change = RowChange {
+        schema_key: ROW_SCHEMA_KEY.into(),
+        row_pk: records[1].row_pk.clone(),
+        row: None,
+        effect: ChangeEffect::Content,
+    };
     let (after, _) = before.rows_changed(&[change]).unwrap();
-    let (reopened, _) = Document::open_file(after.bytes(), None, IdNamespace::from_namespace_bytes([0x62;12])).unwrap();
-    assert_eq!(parse_csv_row(&reopened.row_records().unwrap()[1].row).unwrap().cells, vec!["\u{feff}alpha"]);
+    let (reopened, _) = Document::open_file(
+        after.bytes(),
+        None,
+        IdNamespace::from_namespace_bytes([0x62; 12]),
+    )
+    .unwrap();
+    assert_eq!(
+        parse_csv_row(&reopened.row_records().unwrap()[1].row)
+            .unwrap()
+            .cells,
+        vec!["\u{feff}alpha"]
+    );
 }
 
 #[test]
 fn qa_roundtrip_reorder_exposing_bom_cell() {
-    let (before, _) = Document::open_file("first\n\u{feff}alpha\n".as_bytes().to_vec(), None, IdNamespace::from_namespace_bytes([0x61;12])).unwrap();
+    let (before, _) = Document::open_file(
+        "first\n\u{feff}alpha\n".as_bytes().to_vec(),
+        None,
+        IdNamespace::from_namespace_bytes([0x61; 12]),
+    )
+    .unwrap();
     let mut records = before.row_records().unwrap();
-    records[2].row.insert("order_key", lix_schema::Value::Text("01".into()));
-    let change = RowChange { schema_key: ROW_SCHEMA_KEY.into(), row_pk: records[2].row_pk.clone(), row: Some(records[2].row.clone()), effect: ChangeEffect::Content };
+    records[2]
+        .row
+        .insert("order_key", lix_schema::Value::Text("01".into()));
+    let change = RowChange {
+        schema_key: ROW_SCHEMA_KEY.into(),
+        row_pk: records[2].row_pk.clone(),
+        row: Some(records[2].row.clone()),
+        effect: ChangeEffect::Content,
+    };
     let (after, _) = before.rows_changed(&[change]).unwrap();
-    let (reopened, _) = Document::open_file(after.bytes(), None, IdNamespace::from_namespace_bytes([0x62;12])).unwrap();
-    assert_eq!(parse_csv_row(&reopened.row_records().unwrap()[1].row).unwrap().cells, vec!["\u{feff}alpha"]);
+    let (reopened, _) = Document::open_file(
+        after.bytes(),
+        None,
+        IdNamespace::from_namespace_bytes([0x62; 12]),
+    )
+    .unwrap();
+    assert_eq!(
+        parse_csv_row(&reopened.row_records().unwrap()[1].row)
+            .unwrap()
+            .cells,
+        vec!["\u{feff}alpha"]
+    );
 }
