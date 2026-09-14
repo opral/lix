@@ -181,14 +181,34 @@ fn replace_identities(
     successor: &mut impl StateOutput,
     document: &Document,
 ) -> sdk::Result<()> {
-    let old_page_count = match before.get_state(LINE_IDENTITIES_STATE)? {
-        Some(manifest) => decode_identity_manifest(&manifest)?.1,
+    replace_identity_pages(
+        before.get_state(LINE_IDENTITIES_STATE)?,
+        |ordinal| before.get_state(&line_identity_page_key(ordinal)),
+        successor,
+        document,
+    )
+}
+
+fn replace_identity_pages(
+    old_manifest: Option<Vec<u8>>,
+    mut read_page: impl FnMut(u32) -> sdk::Result<Option<Vec<u8>>>,
+    successor: &mut impl StateOutput,
+    document: &Document,
+) -> sdk::Result<()> {
+    let old_page_count = match &old_manifest {
+        Some(manifest) => decode_identity_manifest(manifest)?.1,
         None => 0,
     };
     let (manifest, pages) = encode_identities(&document.identities())?;
-    successor.put_state(LINE_IDENTITIES_STATE, &manifest)?;
+    if old_manifest.as_deref() != Some(manifest.as_slice()) {
+        successor.put_state(LINE_IDENTITIES_STATE, &manifest)?;
+    }
     for (ordinal, page) in pages.iter().enumerate() {
-        successor.put_state(&line_identity_page_key(ordinal as u32), page)?;
+        if ordinal >= old_page_count as usize
+            || read_page(ordinal as u32)?.as_deref() != Some(page.as_slice())
+        {
+            successor.put_state(&line_identity_page_key(ordinal as u32), page)?;
+        }
     }
     for ordinal in pages.len() as u32..old_page_count {
         successor.delete_state(&line_identity_page_key(ordinal))?;

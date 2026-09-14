@@ -560,3 +560,53 @@ fn repeated_edits_do_not_retain_one_document_buffer_per_changed_line() {
     }
     assert!(document.retained_backing_bytes() <= 3 * source.len());
 }
+
+#[test]
+fn content_edits_write_no_identity_state_and_deletions_retire_old_pages() {
+    #[derive(Default)]
+    struct Sink {
+        puts: usize,
+        deletes: usize,
+    }
+    impl crate::StateOutput for Sink {
+        fn put_state(&mut self, _: &[u8], _: &[u8]) -> ::lix::plugin::Result<()> {
+            self.puts += 1;
+            Ok(())
+        }
+        fn delete_state(&mut self, _: &[u8]) -> ::lix::plugin::Result<()> {
+            self.deletes += 1;
+            Ok(())
+        }
+    }
+    let (document, _) = open(&b"line\n".repeat(50_000));
+    let (manifest, pages) = encode_identities(&document.identities()).unwrap();
+    assert!(pages.len() > 1);
+    let (after, _) = document
+        .file_changed(
+            &[FileEdit {
+                offset: 0,
+                delete_len: 1,
+                insert: b"L".to_vec(),
+            }],
+            |n| test_id(2, n),
+        )
+        .unwrap();
+    let mut sink = Sink::default();
+    crate::replace_identity_pages(
+        Some(manifest.clone()),
+        |i| Ok(pages.get(i as usize).cloned()),
+        &mut sink,
+        &after,
+    )
+    .unwrap();
+    assert_eq!((sink.puts, sink.deletes), (0, 0));
+    let (empty, _) = open(b"");
+    crate::replace_identity_pages(
+        Some(manifest),
+        |i| Ok(pages.get(i as usize).cloned()),
+        &mut sink,
+        &empty,
+    )
+    .unwrap();
+    assert_eq!((sink.puts, sink.deletes), (1, pages.len()));
+}
