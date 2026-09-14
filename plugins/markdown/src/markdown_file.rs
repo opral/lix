@@ -1980,6 +1980,11 @@ fn ambiguous_delimited_source(node: &InlineNode) -> Option<(String, char)> {
         source.push_str(&simple_inline_source(child)?);
     }
     source.push_str(marker);
+    // Raw inline spelling cannot carry a literal table pipe. Let the typed
+    // serializer escape those children with the surrounding table context.
+    if source.contains('|') {
+        return None;
+    }
     Some((source, marker.chars().next()?))
 }
 

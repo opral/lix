@@ -720,3 +720,26 @@ fn qa_emphasis_edits_preserve_boundary_whitespace() {
         assert_eq!(text, " new ");
     }
 }
+
+#[test]
+fn qa_ambiguous_emphasis_with_escaped_table_pipe_imports() {
+    let source = "| a | b |\n| - | - |\n| _\\|__!_ |\n";
+    let (document, _) = Document::open_file(
+        source.as_bytes().to_vec(),
+        Some("pipes.md"),
+        IdNamespace::from_halves(37, 3),
+    )
+    .unwrap();
+    assert_eq!(document.bytes(), source.as_bytes());
+    let tree = document.tree.materialize();
+    let row = tree.children[0]
+        .children
+        .iter()
+        .filter(|child| child.node.kind == NodeKind::TableRow)
+        .nth(1)
+        .unwrap();
+    assert_eq!(
+        row.children[0].node.payload["inline"][0]["type"],
+        "emphasis"
+    );
+}
