@@ -9040,7 +9040,10 @@ where
         statement: DataFusionStatement,
         params: Vec<Value>,
     ) -> Result<SqlQueryResult, LixError> {
-        self.execute_read_sql_statement_with_resolved_statement(sql, statement, params)
+        // The shared reader owns a complete planning/execution future. Keep it
+        // boxed so adding resolved endpoints does not grow every write future
+        // that performs a transaction read.
+        Box::pin(self.execute_read_sql_statement_with_resolved_statement(sql, statement, params))
             .await
             .map(|(result, _)| result)
     }
@@ -10751,8 +10754,12 @@ where
         let statement = crate::sql2::parse_statement(&query_sql)?;
         // Use the exact endpoints resolved while planning the selection query.
         // Evaluating scalar subqueries again could select a different source range.
-        let (result, resolved_statement) = self
-            .execute_read_sql_statement_with_resolved_statement(query_sql, statement, params.clone())
+        let (result, resolved_statement) =
+            Box::pin(self.execute_read_sql_statement_with_resolved_statement(
+                query_sql,
+                statement,
+                params.clone(),
+            ))
             .await?;
         let source_commits = if command == DiffCommand::Apply {
             let source = diff_command_source_commits(&resolved_statement, &params)?;
