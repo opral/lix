@@ -618,8 +618,8 @@ impl Line {
         let raw = self.bytes.as_slice();
         let body = raw.strip_suffix(b"\n").unwrap_or(raw);
         let (content, fallback) = match std::str::from_utf8(body) {
-            Ok(text) => (TypedValue::Text(text.to_owned()), TypedValue::Null),
-            Err(_) => (
+            Ok(text) if !body.contains(&0) => (TypedValue::Text(text.to_owned()), TypedValue::Null),
+            _ => (
                 TypedValue::Null,
                 TypedValue::Text(URL_SAFE_NO_PAD.encode(body)),
             ),
@@ -660,14 +660,19 @@ impl Line {
         };
         let mut bytes = match (row.get("content"), row.get("content_base64")) {
             (Some(TypedValue::Text(text)), None | Some(TypedValue::Null)) => {
+                if text.contains('\0') {
+                    return Err("NUL-bearing lines must use content_base64".to_owned());
+                }
                 text.as_bytes().to_vec()
             }
             (None | Some(TypedValue::Null), Some(TypedValue::Text(encoded))) => {
                 let bytes = URL_SAFE_NO_PAD
                     .decode(encoded)
                     .map_err(|error| format!("invalid line content_base64: {error}"))?;
-                if std::str::from_utf8(&bytes).is_ok() {
-                    return Err("valid UTF-8 must use content instead of content_base64".to_owned());
+                if std::str::from_utf8(&bytes).is_ok() && !bytes.contains(&0) {
+                    return Err(
+                        "NUL-free UTF-8 must use content instead of content_base64".to_owned()
+                    );
                 }
                 bytes
             }

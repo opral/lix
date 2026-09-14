@@ -49,8 +49,8 @@ fn row_with_bytes(line: &Line, bytes: &[u8]) -> ::lix::plugin::TypedRow {
     let mut row = line.typed_row().expect("test line should have a UUID id");
     let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
     let (content, fallback) = match std::str::from_utf8(body) {
-        Ok(text) => (TypedValue::Text(text.to_owned()), TypedValue::Null),
-        Err(_) => (
+        Ok(text) if !body.contains(&0) => (TypedValue::Text(text.to_owned()), TypedValue::Null),
+        _ => (
             TypedValue::Null,
             TypedValue::Text(URL_SAFE_NO_PAD.encode(body)),
         ),

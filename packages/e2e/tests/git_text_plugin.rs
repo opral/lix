@@ -773,3 +773,40 @@ async fn text_sql_scaling_probe() {
     }
 }
 
+#[tokio::test]
+async fn late_nul_uses_byte_fallback_and_survives_sql_and_reopen() {
+    let storage = lix::Memory::new();
+    let lix = open_lix().with_storage(storage.clone()).await.unwrap();
+    install_plugin(&lix, &build_plugin_archive()).await.unwrap();
+    let path = "/late-nul.txt";
+    let mut bytes = vec![b'x'; 8_000];
+    bytes.extend_from_slice(b"\0late\n");
+    write_file(&lix, path, &bytes).await.unwrap();
+    let file_id = file_id_at_path(&lix, path).await;
+    let rows = git_text_rows(&lix, &file_id).await;
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].content.is_none());
+    assert_eq!(render_rows(&rows), bytes);
+    bytes[8_001] = b'L';
+    lix.execute(
+        "UPDATE text_line SET content_base64 = $1 WHERE lixcol_file_id = $2 AND id = $3",
+        &[
+            Value::Text(URL_SAFE_NO_PAD.encode(&bytes[..bytes.len() - 1])),
+            Value::Text(file_id.clone()),
+            Value::Text(rows[0].id.clone()),
+        ],
+    )
+    .await
+    .unwrap();
+    lix.close().await.unwrap();
+    let reopened = open_lix().with_storage(storage).await.unwrap();
+    assert_eq!(read_file(&reopened, path).await.unwrap(), bytes);
+    assert_eq!(
+        render_rows(&git_text_rows(&reopened, &file_id).await),
+        bytes
+    );
+    bytes[8_002] = b'A';
+    write_file(&reopened, path, &bytes).await.unwrap();
+    assert_eq!(read_file(&reopened, path).await.unwrap(), bytes);
+    reopened.close().await.unwrap();
+}

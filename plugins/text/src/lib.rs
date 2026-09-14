@@ -2,7 +2,7 @@
 //!
 //! A line is a durable row rather than a display-only diff hunk. The
 //! component preserves source bytes exactly, including invalid UTF-8 and final
-//! unterminated lines, using readable text with an invalid-UTF-8 base64 fallback.
+//! unterminated lines, using readable text with a base64 fallback for invalid UTF-8 or NUL-bearing lines.
 #![allow(dead_code)]
 
 mod core;
