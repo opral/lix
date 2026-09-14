@@ -112,6 +112,16 @@ test("version selection ignores inheritance migration and isolates plugin bumps"
   git("commit", "--allow-empty", "-qm", "unrelated later change");
   const later = git("rev-parse", "HEAD"); git("update-ref", "refs/remotes/origin/main", later);
   assert.throws(() => selectPluginReleases(root, { sha: later, target: "plugin_json" }), /commit that increased/);
+  assert.deepEqual(selectPluginReleases(root, { before: decoupled, sha: later }), [
+    { target: "plugin_json", version: "0.16.2", sha, tag: "plugin_json/v0.16.2" },
+  ]);
+  writeFileSync(join(root, "plugins/json/Cargo.toml"), '[package]\nversion = "0.16.3"\n');
+  git("add", "."); git("commit", "-qm", "second json release");
+  const second = git("rev-parse", "HEAD"); git("update-ref", "refs/remotes/origin/main", second);
+  assert.deepEqual(selectPluginReleases(root, { before: decoupled, sha: second }), [
+    { target: "plugin_json", version: "0.16.2", sha, tag: "plugin_json/v0.16.2" },
+    { target: "plugin_json", version: "0.16.3", sha: second, tag: "plugin_json/v0.16.3" },
+  ]);
 });
 
 

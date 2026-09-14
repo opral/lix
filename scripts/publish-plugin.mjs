@@ -20,6 +20,19 @@ export function pluginVersionAt(root, ref, target) {
 export function selectPluginReleases(root, { sha, before, target }) {
   if (!/^[a-f0-9]{40}$/.test(sha)) throw new Error("Release source must be a full commit SHA");
   git(root, "merge-base", "--is-ancestor", sha, "origin/main");
+  if (!target) {
+    if (!/^[a-f0-9]{40}$/.test(before)) throw new Error("Previous source must be a full commit SHA");
+    git(root, "merge-base", "--is-ancestor", before, sha);
+    // A push can contain several merged releases and unrelated commits. Build
+    // each version from its own merge commit so automatic and manual retries
+    // agree on the immutable tag source.
+    const commits = git(root, "rev-list", "--first-parent", "--reverse", `${before}..${sha}`).split("\n").filter(Boolean);
+    return commits.flatMap(commit => selectPluginReleasesAt(root, commit, `${commit}^`));
+  }
+  return selectPluginReleasesAt(root, sha, `${sha}^`, target);
+}
+
+function selectPluginReleasesAt(root, sha, before, target) {
   const targets = target ? [target] : PLUGIN_RELEASE_TARGETS;
   return targets.flatMap(key => {
     const version = pluginVersionAt(root, sha, key);
@@ -27,10 +40,10 @@ export function selectPluginReleases(root, { sha, before, target }) {
       // The migration commit may replace workspace inheritance with an equal
       // explicit version; it must not accidentally publish every plugin.
       const path = releaseTarget(key).path;
-      const old = git(root, "show", `${target ? `${sha}^` : before}:${path}/Cargo.toml`);
+      const old = git(root, "show", `${before}:${path}/Cargo.toml`);
       let previous = old.match(/\[package\][\s\S]*?\nversion\s*=\s*"(\d+\.\d+\.\d+)"/)?.[1];
       if (!previous && /^version\.workspace\s*=\s*true$/m.test(old)) {
-        const workspace = git(root, "show", `${target ? `${sha}^` : before}:Cargo.toml`);
+        const workspace = git(root, "show", `${before}:Cargo.toml`);
         previous = workspace.match(/\[workspace\.package\][\s\S]*?\nversion\s*=\s*"(\d+\.\d+\.\d+)"/)?.[1];
       }
       if (!previous) throw new Error(`Cannot determine previous version for ${key}`);
