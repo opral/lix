@@ -1659,6 +1659,22 @@ impl RowImportBuilder {
             }
         }
 
+        // A bare LF empty record after CR would be consumed as CRLF.
+        let boundary_quote = |index: usize| {
+            if index == 0 {
+                return false;
+            }
+            let previous = &self.rows[index - 1];
+            let current = &self.rows[index];
+            let ending = |row: &ImportedRow| {
+                layouts
+                    .get(&(row.id.start, row.id.len))
+                    .map_or(Some(self.dialect.terminator), |layout| {
+                        layout.ending(self.dialect)
+                    })
+            };
+            ending(previous) == Some(Terminator::Cr) && ending(current) == Some(Terminator::Lf)
+        };
         let prefix_len = if self.dialect.bom { UTF8_BOM.len() } else { 0 };
         let rendered_len =
             self.rows
@@ -1683,7 +1699,9 @@ impl RowImportBuilder {
                                 cell,
                                 self.dialect,
                                 layout.is_some_and(|layout| layout.force_quotes(index))
-                                    || (row.cell_count == 1 && ending.is_none() && cell.is_empty())
+                                    || (row.cell_count == 1
+                                        && cell.is_empty()
+                                        && (ending.is_none() || boundary_quote(row_index)))
                                     || (row_index == 0
                                         && index == 0
                                         && !self.dialect.bom
@@ -1748,8 +1766,10 @@ impl RowImportBuilder {
                     self.dialect,
                     layout.is_some_and(|layout| layout.force_quotes(cell_index))
                         || (row.cell_count == 1
-                            && layout.is_some_and(|layout| layout.ending(self.dialect).is_none())
-                            && cell.is_empty())
+                            && cell.is_empty()
+                            && (layout
+                                .is_some_and(|layout| layout.ending(self.dialect).is_none())
+                                || boundary_quote(index)))
                         || (index == 0
                             && cell_index == 0
                             && !self.dialect.bom
@@ -2371,39 +2391,46 @@ impl Document {
         {
             return Err("CSV table root cannot be deleted".to_owned());
         }
-        let exposes_bom = !self.0.dialect.bom && self.row_count() > 1 && {
-            let second = self.0.index.ordinal_location(1).expect("second row");
-            let start = self.0.index.row_start(second) as usize;
-            self.0
-                .blob
-                .range(start, (start + 3).min(self.byte_len()))?
-                .starts_with(UTF8_BOM)
-        };
-        if !exposes_bom && changes.len() == 1 && changes[0].schema_key.as_ref() == ROW_SCHEMA_KEY {
+        if changes.len() == 1 && changes[0].schema_key.as_ref() == ROW_SCHEMA_KEY {
             let change = &changes[0];
             let PrimaryKey::Row(id) = primary_key(&change.schema_key, &change.row_pk)? else {
                 unreachable!("CSV row schema has a UUID primary key")
             };
             let slot = self.0.identities.slot_for_id(id);
             let existing = slot.and_then(|slot| self.0.index.location_for_identity_slot(slot));
-            match (&change.row, existing) {
-                (None, Some(location)) => return self.delete_sparse_row(location),
+            let candidate = match (&change.row, existing) {
+                (None, Some(location)) => Some(self.delete_sparse_row(location)?),
                 (None, None) => return Ok((self.clone(), Vec::new())),
                 (Some(row), Some(location)) => {
                     let semantic = parse_csv_row(row)?;
                     if semantic.id != id {
                         return Err("CSV row id does not match row key".to_owned());
                     }
-                    if let Some(result) = self.update_or_reorder_sparse_row(location, &semantic)? {
-                        return Ok(result);
-                    }
+                    self.update_or_reorder_sparse_row(location, &semantic)?
                 }
                 (Some(row), None) => {
                     let semantic = parse_csv_row(row)?;
                     if semantic.id != id {
                         return Err("CSV row id does not match row key".to_owned());
                     }
-                    return self.insert_sparse_row(slot, &semantic);
+                    Some(self.insert_sparse_row(slot, &semantic)?)
+                }
+            };
+            if let Some((document, edits)) = candidate {
+                let old_ordinal = existing.map(|location| self.0.index.ordinal_of(location));
+                let new_ordinal = document
+                    .0
+                    .identities
+                    .slot_for_id(id)
+                    .and_then(|slot| document.0.index.location_for_identity_slot(slot))
+                    .map(|location| document.0.index.ordinal_of(location));
+                let mut safe = document.boundary_is_unambiguous(0)?;
+                for ordinal in old_ordinal.into_iter().chain(new_ordinal) {
+                    safe &= document.boundary_is_unambiguous(ordinal)?;
+                    safe &= document.boundary_is_unambiguous(ordinal + 1)?;
+                }
+                if safe {
+                    return Ok((document, edits));
                 }
             }
         }
@@ -2415,6 +2442,26 @@ impl Document {
         let (document, mut edit) = Self::open_rows(records)?;
         edit.delete_len = u64::try_from(self.0.blob.len()).expect("file length fits u64");
         Ok((document, vec![edit]))
+    }
+
+    fn boundary_is_unambiguous(&self, ordinal: usize) -> Result<bool, String> {
+        let Some(location) = self.0.index.ordinal_location(ordinal) else {
+            return Ok(true);
+        };
+        let start = self.0.index.row_start(location) as usize;
+        let prefix = self.0.blob.range(start, (start + 3).min(self.byte_len()))?;
+        if ordinal == 0 {
+            return Ok(self.0.dialect.bom || !prefix.starts_with(UTF8_BOM));
+        }
+        let previous = self
+            .0
+            .index
+            .ordinal_location(ordinal - 1)
+            .expect("previous row");
+        Ok(
+            !(self.0.index.row(previous).1.ending() == Some(Terminator::Cr)
+                && prefix.starts_with(b"\n")),
+        )
     }
 
     pub fn row_records(&self) -> Result<Vec<RowRecord>, String> {
@@ -2756,6 +2803,16 @@ impl Document {
                 .expect("nonempty CSV has a last row");
             let (_, last_row) = self.0.index.row(last);
             if last_row.ending().is_none() {
+                if self.0.dialect.terminator == Terminator::Cr && insert == b"\n" {
+                    insert = render_row_with_layout(
+                        &semantic.cells,
+                        self.0.dialect,
+                        ending,
+                        &[1],
+                        &semantic.layout.unquoted_quote,
+                        false,
+                    )?;
+                }
                 let mut prefixed = self.0.dialect.terminator.bytes().to_vec();
                 prefixed.append(&mut insert);
                 insert = prefixed;
@@ -5176,3 +5233,7 @@ pub fn describe_memory(document: &Document) -> String {
 #[cfg(test)]
 #[path = "core_qa_tests.rs"]
 mod core_qa_tests;
+
+#[cfg(test)]
+#[path = "qa_sql_tests.rs"]
+mod qa_sql_tests;
