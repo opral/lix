@@ -65,3 +65,24 @@ currently unsupported; the probe selects IDs before its bound-ID bulk update.
 The separate [plugin API report](PLUGIN_API_IMPROVEMENTS.md) proposes accepted-row
 lookup, indexed-state helpers, normalization feedback, ordering helpers, query
 planning improvements, and observable resource budgets.
+
+## Full local CI follow-up
+
+The follow-up validation removed one obsolete synchronous-WASI import that
+failed Clippy after the asynchronous host migration. On Linux, all three CI
+Clippy commands passed with `-D warnings`: the root workspace, tooling workspace,
+and E2E targets with CI's explicit feature list.
+
+The broader CI checks also passed:
+
+- Root all-feature nextest suite: 5,080 passed, 89 skipped.
+- Tooling nextest suite: 69 passed; E2E suite: 228 passed, 27 skipped.
+- Root and tooling doctests, default-feature test compilation, Rust 1.93 consumer
+  compilation, and an external WASIp2 plugin built from the packaged crates.
+- Native SDK: 281 passed; filesystem package: 3 passed.
+- Release-Wasm browser SDK: 49 passed, 1 skipped; OPFS: 56 passed.
+- SDK/storage typechecks and builds, package validation, both packed Vite
+  production checks, and 74 CI/release-script tests.
+
+These are local executions of the Linux CI checks. Platform-specific hosted
+jobs and artifact publication remain separate CI results.
