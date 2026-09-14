@@ -762,6 +762,8 @@ where
                         tracing::warn!(code = %error.code, message = %error.message, "partial replica baseline renewal failed");
                         if error.code == "LIX_PARTIAL_BASELINE_EXPIRED" {
                             baseline_expired = Some(error);
+                            force_descriptor_refresh = true;
+                            watch_after = web_time::Instant::now();
                         } else {
                             renewal_deadline = web_time::Instant::now() + Duration::from_secs(5);
                         }
@@ -1020,6 +1022,7 @@ where
         }
         let result = {
             let hydrate = async {
+                let mut recovered_expired_baseline = false;
                 for attempt in 0..3 {
                     if let Some(engine) = &engine {
                         engine.sync_mode().ensure_partial_admission_healthy()?;
@@ -1071,6 +1074,79 @@ where
                     if result.is_ok() {
                         return result;
                     }
+                    if result
+                        .as_ref()
+                        .is_err_and(|error| error.code == "LIX_PARTIAL_BASELINE_EXPIRED")
+                        && !recovered_expired_baseline
+                        && attempt < 2
+                    {
+                        if let Some(engine) = &engine {
+                            recovered_expired_baseline = true;
+                            baseline_expired = result.as_ref().err().cloned();
+                            force_descriptor_refresh = true;
+                            watch_after = web_time::Instant::now();
+                            if transport.is_none() {
+                                let connected = connect().await?;
+                                validate_admission(&storage, &state, &connected).await?;
+                                transport = Some(connected);
+                            }
+                            let recovery = async {
+                                let connected = transport.as_ref().expect("connected");
+                                // Expiration is a reconnect condition. Request a fresh
+                                // authority pin immediately, even when its cursor has
+                                // not advanced; a normal watch could long-poll here.
+                                let wrapper = connected
+                                    .partial_replica_descriptor(Some(
+                                        &state.descriptor().selected_branch.branch_id,
+                                    ))
+                                    .await?;
+                                let prepared = super::partial_reconcile::prepare_clean_descriptor(
+                                    engine.clone(),
+                                    state.clone(),
+                                    connected,
+                                    wrapper,
+                                    super::partial_publication::PartialRecoveryPolicy::ExpiredBaseline,
+                                )
+                                .await?;
+                                if let super::partial_reconcile::PreparedDescriptor::Ready(prepared) =
+                                    prepared
+                                {
+                                    // Publication owns the clean checks, CAS guards
+                                    // and cancellation-safe durable commit.
+                                    super::partial_publication::publish_prepared_partial(
+                                        engine.clone(),
+                                        prepared,
+                                    )
+                                    .await?;
+                                }
+                                Ok::<_, LixError>(())
+                            }.await;
+                            let current = engine.sync_mode().partial_admission();
+                            let admission_changed = current.as_deref() != Some(state.as_ref());
+                            if let Err(error) = recovery {
+                                // A concurrent owned publication can win the CAS.
+                                // Retry only if its admitted result actually changed.
+                                if error.code != LixError::CODE_TRANSACTION_CONFLICT
+                                    || !admission_changed
+                                {
+                                    return Err(error);
+                                }
+                            }
+                            if let Some(current) = current {
+                                if !super::partial_publication::same_serving_basis(
+                                    state.descriptor(), current.descriptor(),
+                                ) {
+                                    return Err(LixError::new(
+                                        super::runtime::PARTIAL_ADMISSION_CHANGED_CODE,
+                                        "baseline recovery changed the serving basis; restart the local operation",
+                                    ));
+                                }
+                            }
+                            if admission_changed {
+                                continue;
+                            }
+                        }
+                    }
                     let admission_changed = engine.as_ref().is_some_and(|engine| {
                         engine.sync_mode().partial_admission().as_deref() != Some(state.as_ref())
                     });
@@ -1097,6 +1173,7 @@ where
             if let Err(error) = &result {
                 if error.code == "LIX_PARTIAL_BASELINE_EXPIRED" {
                     baseline_expired = Some(error.clone());
+                    force_descriptor_refresh = true;
                     watch_after = web_time::Instant::now();
                 }
             }
