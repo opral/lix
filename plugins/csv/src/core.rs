@@ -2556,7 +2556,7 @@ impl Document {
             }
         }
 
-        if changes.len() > 1 && changes.len() <= 4096 {
+        if changes.len() > 1 {
             if let Some(result) = self.update_sparse_batch(changes)? {
                 return Ok(result);
             }
@@ -2599,22 +2599,96 @@ impl Document {
             }
             updates.insert(self.0.index.ordinal_of(location), (location, semantic));
         }
-        let mut document = self.clone();
-        let mut edits = Vec::with_capacity(updates.len());
-        for (&ordinal, (original, semantic)) in &updates {
-            let location = document
-                .0
-                .index
-                .ordinal_location(ordinal)
-                .expect("existing row");
-            let rank = document.0.index.row(location).1.order_rank;
-            let (successor, mut edit) = document.replace_sparse_row(location, semantic, rank, 0)?;
-            let mut edit = edit.pop().expect("one replacement");
-            edit.offset = u64::from(self.0.index.row_start(*original));
-            edit.delete_len = u64::from(self.0.index.row(*original).1.byte_len);
-            edits.push(edit);
-            document = successor;
+        let ordered = updates.iter().collect::<Vec<_>>();
+        let mut index = self.0.index.clone();
+        let mut edits = Vec::new();
+        let mut delta_before = 0i64;
+        let mut rows_touched = 0;
+        let mut cursor = 0;
+        while cursor < ordered.len() {
+            let first = cursor;
+            cursor += 1;
+            while cursor < ordered.len()
+                && *ordered[cursor].0 - *ordered[cursor - 1].0
+                    <= if updates.len() > 4096 {
+                        ROWS_PER_CHUNK
+                    } else {
+                        1
+                    }
+                && *ordered[cursor].0 - *ordered[first].0 < ROWS_PER_CHUNK
+            {
+                cursor += 1;
+            }
+            let first_ordinal = *ordered[first].0;
+            let last_ordinal = *ordered[cursor - 1].0;
+            let start = self.0.index.row_start(ordered[first].1.0);
+            let end = self.0.index.row_end(ordered[cursor - 1].1.0);
+            let shifted_start = shift_u32(start, delta_before)?;
+            let mut insert = Vec::new();
+            let mut drafts = Vec::with_capacity(cursor - first);
+            for ordinal in first_ordinal..=last_ordinal {
+                let location = self.0.index.ordinal_location(ordinal).expect("group row");
+                let row = self.0.index.row(location).1;
+                let bytes = if let Some((_, semantic)) = updates.get(&ordinal) {
+                    let ending = semantic.layout.ending(self.0.dialect).or_else(|| {
+                        (ordinal + 1 != self.row_count()).then_some(self.0.dialect.terminator)
+                    });
+                    render_row_with_layout(
+                        &semantic.cells,
+                        self.0.dialect,
+                        ending,
+                        &semantic.layout.force_quote,
+                        &semantic.layout.unquoted_quote,
+                        ordinal == 0 && !self.0.dialect.bom,
+                    )?
+                } else {
+                    self.0.blob.range(
+                        self.0.index.row_start(location) as usize,
+                        self.0.index.row_end(location) as usize,
+                    )?
+                };
+                let row_start = shifted_start
+                    .checked_add(u32::try_from(insert.len()).map_err(|_| "CSV batch too large")?)
+                    .ok_or_else(|| "CSV row offset overflow".to_owned())?;
+                drafts.push(row_draft_from_rendered(
+                    &bytes,
+                    row_start,
+                    row.id_slot,
+                    row.order_rank,
+                    self.0.dialect,
+                )?);
+                insert.extend_from_slice(&bytes);
+            }
+            let mut next_key = index.next_chunk_key;
+            let chunks = build_chunks(drafts, &mut next_key)?;
+            let delta = insert.len() as i64 - i64::from(end - start);
+            let (successor, touched) =
+                replace_index_range(&index, first_ordinal, last_ordinal + 1, chunks, delta)?;
+            index = successor;
+            rows_touched += touched;
+            delta_before += delta;
+            edits.push(ByteEdit {
+                offset: u64::from(start),
+                delete_len: u64::from(end - start),
+                insert: Arc::new(insert),
+            });
         }
+        let splices = edits
+            .iter()
+            .map(|edit| FileEdit {
+                offset: edit.offset,
+                delete_len: edit.delete_len,
+                insert: edit.insert.as_slice(),
+            })
+            .collect::<Vec<_>>();
+        let document = Self(Arc::new(DocumentInner {
+            blob: self.0.blob.splice(&splices)?,
+            index,
+            identities: self.0.identities.clone(),
+            order_overrides: self.0.order_overrides.clone(),
+            dialect: self.0.dialect,
+            sparse_rows_touched: rows_touched,
+        }));
         for ordinal in updates.keys() {
             if !document.boundary_is_unambiguous(*ordinal)?
                 || !document.boundary_is_unambiguous(ordinal + 1)?

@@ -124,9 +124,7 @@ impl sdk::FileProjection for CsvPlugin {
         let (successor, edits) = document
             .rows_changed(&changes)
             .map_err(sdk::Error::invalid_input)?;
-        for edit in edits {
-            sink.replace(edit.offset, edit.delete_len, &edit.insert)?;
-        }
+        emit_csv_edits(edits, &update.before, sink)?;
         store_identity_checkpoint(sink, &successor)?;
         delete_csv_index(sink)?;
         Ok(())
@@ -377,6 +375,43 @@ fn store_csv_index(successor: &mut impl StateOutput, state: &[u8]) -> sdk::Resul
     Ok(())
 }
 
+fn emit_csv_edits(
+    mut edits: Vec<core::ByteEdit>,
+    before: &sdk::Snapshot<'_>,
+    sink: &mut sdk::FileEditOutput<'_, '_>,
+) -> sdk::Result<()> {
+    let coalesce_gaps = edits.len() > 4096;
+    if edits.len() > 1 {
+        // Coalesce nearby records in bounded buffers, preserving unchanged
+        // gaps. Large batches need fewer splices than changed row count.
+        let mut merged: Vec<core::ByteEdit> = Vec::new();
+        for edit in edits {
+            if let Some(previous) = merged.last_mut()
+                && previous.offset + previous.delete_len <= edit.offset
+                && (coalesce_gaps || previous.offset + previous.delete_len == edit.offset)
+                && previous.insert.len() as u64 + edit.offset
+                    - (previous.offset + previous.delete_len)
+                    + edit.insert.len() as u64
+                    <= 1024 * 1024
+            {
+                let end = previous.offset + previous.delete_len;
+                let gap = before.read_range(end, edit.offset - end)?;
+                previous.delete_len = edit.offset + edit.delete_len - previous.offset;
+                let bytes = std::sync::Arc::make_mut(&mut previous.insert);
+                bytes.extend_from_slice(&gap);
+                bytes.extend_from_slice(&edit.insert);
+            } else {
+                merged.push(edit);
+            }
+        }
+        edits = merged;
+    }
+    for edit in edits {
+        sink.replace(edit.offset, edit.delete_len, &edit.insert)?;
+    }
+    Ok(())
+}
+
 /// Render point/batched cell edits using only the affected source records. The
 /// dense identity/order mapping survives these edits, including length changes.
 fn serialize_indexed_updates(
@@ -386,11 +421,6 @@ fn serialize_indexed_updates(
 ) -> sdk::Result<bool> {
     if changes.is_empty() {
         return Ok(true);
-    }
-    // Respect the host's bounded inline splice count; bulk replacements use
-    // the complete renderer.
-    if changes.len() > 4096 {
-        return Ok(false);
     }
     if before.state_len(CSV_IDENTITIES_KEY)?.is_some() {
         return Ok(false);
@@ -519,11 +549,17 @@ fn serialize_indexed_updates(
         header[20..28].copy_from_slice(&new_len.to_le_bytes());
         sink.put_state(CSV_INDEX_KEY, &header)?;
     }
+    let mut edits = Vec::with_capacity(replacements.len());
     for (_, (start, end, rendered)) in replacements {
         if before.read_range(start, end - start)? != rendered {
-            sink.replace(start, end - start, &rendered)?;
+            edits.push(core::ByteEdit {
+                offset: start,
+                delete_len: end - start,
+                insert: std::sync::Arc::new(rendered),
+            });
         }
     }
+    emit_csv_edits(edits, before, sink)?;
     Ok(true)
 }
 

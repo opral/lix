@@ -51,7 +51,8 @@ fn qa_roundtrip_sparse_batches_keep_original_offsets_and_last_duplicate() {
             });
         }
         let (after, edits) = doc.rows_changed(&changes).unwrap();
-        assert_eq!(edits.len(), 5);
+        assert!(edits.len() <= 5);
+        assert!(edits.iter().map(|edit| edit.delete_len).sum::<u64>() < 1024);
         let mut replay = Vec::new();
         let before = doc.bytes();
         let mut cursor = 0;
@@ -69,4 +70,57 @@ fn qa_roundtrip_sparse_batches_keep_original_offsets_and_last_duplicate() {
         assert_eq!(after.row_records().unwrap(), cold.row_records().unwrap());
         doc = after;
     }
+}
+
+#[test]
+fn qa_roundtrip_large_sparse_batch_preserves_coalesced_unchanged_rows() {
+    let ns = IdNamespace::from_namespace_bytes([0x51; 12]);
+    let source = b"a,b\n\"untouched\",x\r\n".repeat(4_500);
+    let before = Document::open_file(source.clone(), None, ns).unwrap().0;
+    let records = before.row_records().unwrap();
+    let mut changes = Vec::new();
+    let mut expected = Vec::new();
+    for ordinal in 0..9_000 {
+        if ordinal % 2 == 0 {
+            let mut row = records[ordinal + 1].row.clone();
+            let value = if ordinal % 4 == 0 { "longer" } else { "" };
+            row.insert(
+                "cells",
+                lix_schema::Value::Jsonb(serde_json::json!([value]).into()),
+            );
+            changes.push(RowChange {
+                schema_key: ROW_SCHEMA_KEY.into(),
+                row_pk: records[ordinal + 1].row_pk.clone(),
+                row: Some(row),
+                effect: ChangeEffect::Content,
+            });
+            expected.extend_from_slice(value.as_bytes());
+            expected.push(b'\n');
+        } else {
+            expected.extend_from_slice(b"\"untouched\",x\r\n");
+        }
+    }
+    let (after, edits) = before.rows_changed(&changes).unwrap();
+    assert!(edits.len() < 40);
+    assert_eq!(after.bytes(), expected);
+    assert_eq!(
+        after.identity_checkpoint().1,
+        before.identity_checkpoint().1
+    );
+    let mut replay = Vec::new();
+    let mut cursor = 0;
+    for edit in edits {
+        replay.extend_from_slice(&source[cursor..edit.offset as usize]);
+        replay.extend_from_slice(&edit.insert);
+        cursor = (edit.offset + edit.delete_len) as usize;
+    }
+    replay.extend_from_slice(&source[cursor..]);
+    assert_eq!(replay, expected);
+    assert_eq!(
+        Document::open_rows(after.row_records().unwrap())
+            .unwrap()
+            .0
+            .bytes(),
+        expected
+    );
 }

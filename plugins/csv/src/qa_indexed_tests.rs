@@ -159,6 +159,42 @@ fn structural_checkpoint_streams_across_pages_and_preserves_order_overrides() {
 }
 
 #[test]
+fn bulk_updates_preserve_unchanged_gaps_before_and_after_checkpoint() {
+    for stride in [1, 2] {
+        let (file, index) = indexed_file(10_000);
+        let mut harness = sdk::testing::Harness::<CsvPlugin>::default();
+        harness.max_batch_bytes = 2 * 1024 * 1024;
+        let updates = (1..=4097)
+            .map(|ordinal| edit(&index, ordinal * stride, &["longer", "b"]))
+            .collect::<Vec<_>>();
+        let expected = |deleted| {
+            (u32::from(deleted)..10_000)
+                .flat_map(|ordinal| {
+                    if ordinal > 0 && ordinal % stride == 0 && ordinal / stride <= 4097 {
+                        b"longer,b\n".as_slice()
+                    } else {
+                        b"a,b\n".as_slice()
+                    }
+                })
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        let result = harness.serialize_changes(&file, &updates).unwrap();
+        assert!(result.file_edits.len() <= 4096);
+        assert_eq!(result.snapshot().bytes, expected(false));
+        let mut deletion = edit(&index, 0, &["a", "b"]);
+        deletion.row = None;
+        let file = harness
+            .serialize_changes(&file, &[deletion])
+            .unwrap()
+            .into_snapshot();
+        let result = harness.serialize_changes(&file, &updates).unwrap();
+        assert!(result.file_edits.len() <= 4096);
+        assert_eq!(result.snapshot().bytes, expected(true));
+    }
+}
+
+#[test]
 fn malformed_checkpoint_length_fails_before_missing_page_allocation() {
     let (mut file, index) = indexed_file(1);
     file.state.remove(CSV_INDEX_KEY);
