@@ -556,29 +556,45 @@ fn reconcile_children(
         }
     }
 
+    // Index unmatched siblings once. Scanning all old nodes for every new
+    // incompatible block makes insertions and replacements quadratic.
+    let compatible_kind = |kind| match kind {
+        NodeKind::Heading => NodeKind::Paragraph,
+        other => other,
+    };
+    let mut available = BTreeMap::<NodeKind, BTreeSet<usize>>::new();
+    for (index, child) in old.children.iter().enumerate() {
+        if !old_used[index] {
+            available
+                .entry(compatible_kind(child.node.kind))
+                .or_default()
+                .insert(index);
+        }
+    }
     let mut search_start = 0;
     for (new_index, child) in new.children.iter().enumerate() {
-        if old_for_new[new_index].is_some() {
+        if old_for_new[new_index].is_some()
+            || has_available_unique_global_match(
+                child,
+                global_subtrees,
+                new_signature_counts,
+                old_hashes,
+                new_hashes,
+                used_ids,
+            )
+        {
             continue;
         }
-        let matching = (search_start..old.children.len())
-            .chain(0..search_start)
-            .find(|old_index| {
-                !old_used[*old_index]
-                    && node_kinds_are_identity_compatible(
-                        old.children[*old_index].node.kind,
-                        child.node.kind,
-                    )
-                    && !has_available_unique_global_match(
-                        child,
-                        global_subtrees,
-                        new_signature_counts,
-                        old_hashes,
-                        new_hashes,
-                        used_ids,
-                    )
-            });
+        let Some(indices) = available.get_mut(&compatible_kind(child.node.kind)) else {
+            continue;
+        };
+        let matching = indices
+            .range(search_start..)
+            .next()
+            .or_else(|| indices.first())
+            .copied();
         if let Some(old_index) = matching {
+            indices.remove(&old_index);
             old_for_new[new_index] = Some(old_index);
             old_used[old_index] = true;
             used_ids.insert(old.children[old_index].node.id);

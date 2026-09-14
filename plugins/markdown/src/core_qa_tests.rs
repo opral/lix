@@ -347,3 +347,35 @@ fn qa_legacy_encoded_file_edit_matches_cold_parse() {
         render_tree(&cold.tree.materialize()).unwrap()
     );
 }
+
+#[test]
+fn qa_bulk_incompatible_siblings_preserve_existing_identities() {
+    let source = (0..1_000)
+        .map(|i| format!("paragraph {i}\n\n"))
+        .collect::<String>();
+    let (document, _) = Document::open_file(
+        source.as_bytes().to_vec(),
+        Some("bulk.md"),
+        IdNamespace::from_halves(30, 2),
+    )
+    .unwrap();
+    let before = document.tree.materialize();
+    let append = (0..1_000)
+        .map(|i| format!("```\ncode {i}\n```\n\n"))
+        .collect::<String>();
+    let (updated, _) = document
+        .file_changed(
+            &[FileEdit {
+                offset: source.len() as u64,
+                delete_len: 0,
+                insert: append.as_bytes(),
+            }],
+            IdNamespace::from_halves(30, 3),
+        )
+        .unwrap();
+    let after = updated.tree.materialize();
+    assert_eq!(after.children.len(), 2_000);
+    for (old, new) in before.children.iter().zip(&after.children) {
+        assert_eq!(old.node.id, new.node.id);
+    }
+}
