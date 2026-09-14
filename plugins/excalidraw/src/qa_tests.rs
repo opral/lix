@@ -616,3 +616,59 @@ fn qa_structural_file_edits_then_sql_edits_preserve_durable_order() {
         warm.snapshot().bytes
     );
 }
+
+#[test]
+fn qa_sql_point_edits_read_only_changed_elements_at_scale() {
+    for count in [100, 1_000, 10_000] {
+        let mut h = Harness::<ExcalidrawPlugin>::default();
+        h.max_batch_bytes = 2 * 1024 * 1024;
+        let source = json!({"elements": (0..count).map(|i| json!({"id":format!("e{i}"),"type":"rectangle","x":1})).collect::<Vec<_>>(), "files":{"image":{"dataURL":"A".repeat(1_000_000)}}});
+        let file = Snapshot {
+            path: "scale.excalidraw".into(),
+            bytes: serde_json::to_vec(&source).unwrap(),
+            ..Snapshot::default()
+        };
+        let parsed = h.parse(&file, ctx(1)).unwrap();
+        let rows: Vec<_> = parsed
+            .row_changes
+            .iter()
+            .map(|c| sdk::TypedRowRecord {
+                schema_key: c.schema_key.clone(),
+                schema_fingerprint: c.schema_fingerprint,
+                primary_key: c.primary_key.clone(),
+                row: c.row.clone().unwrap(),
+            })
+            .collect();
+        let mut file = parsed.into_snapshot();
+        let mut expected = source;
+        for (i, x) in [(0, 12345), (count / 2, 12345), (count - 1, 12345), (0, 1)] {
+            let mut row = element(&rows, &format!("e{i}"));
+            let mut value = payload(&row, "element_json");
+            value["x"] = json!(x);
+            set_payload(&mut row, "element_json", value);
+            let out = h.serialize_changes(&file, &[change(&row)]).unwrap();
+            assert!(
+                out.metrics.file_bytes_read < 128,
+                "{count}: {:?}",
+                out.metrics
+            );
+            assert!(
+                out.metrics.state_bytes_read < 16_384,
+                "{count}: {:?}",
+                out.metrics
+            );
+            assert!(
+                out.metrics.state_bytes_written <= 36,
+                "{count}: {:?}",
+                out.metrics
+            );
+            expected["elements"][i]["x"] = json!(x);
+            assert_eq!(out.snapshot().bytes, serde_json::to_vec(&expected).unwrap());
+            file = out.into_snapshot();
+            let noop = h.serialize_changes(&file, &[change(&row)]).unwrap();
+            assert!(noop.file_edits.is_empty());
+            assert_eq!(noop.metrics.state_bytes_written, 0);
+            assert!(noop.metrics.file_bytes_read < 128);
+        }
+    }
+}

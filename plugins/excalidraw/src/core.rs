@@ -577,6 +577,28 @@ impl Document {
         spans
     }
 
+    pub fn element_row_source(
+        change: &RowChange,
+    ) -> Result<Option<(String, String, String, String)>, String> {
+        if change.schema_key.as_ref() != ELEMENT_SCHEMA_KEY {
+            return Ok(None);
+        }
+        let Some(row) = &change.row else {
+            return Ok(None);
+        };
+        let row = ElementRow::parse(&RowRecord {
+            schema_key: change.schema_key.clone(),
+            row_pk: change.row_pk.clone(),
+            row: row.clone(),
+        })?;
+        Ok(Some((
+            row.id,
+            row.order_key,
+            row.leading_json,
+            row.element_json,
+        )))
+    }
+
     pub fn element_change_from_source(
         id: &str,
         order_key: String,
