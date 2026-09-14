@@ -248,17 +248,17 @@ fn bundled_native_jsonb_schemas_match_canonical_fixtures_and_fingerprints() {
         (
             "excalidraw",
             "excalidraw_scene",
-            "f65d9cc1904cd6279ec391790e83c198a23d053e5cbce7b0526200a4a8a2c601",
+            "77c887d6cd7dbc6119f655eb4952fa534bb34a7a5442d9c34ea000c8f7f7769a",
         ),
         (
             "excalidraw",
             "excalidraw_element",
-            "6f2a49b904fe1f46d484e1488f43c7454e4f0c07c27c299a0bf740ce7e36843b",
+            "3b8d46ade01074bae9f83d2347e7ccc499fb31d4de699abf52c3d5a91ab36c0c",
         ),
         (
             "excalidraw",
             "excalidraw_file",
-            "20b7f07a50252241780f2f772f9bcd537d3b42a82d44876f7de6fad2bb241bbd",
+            "40b14d5b53445e3b97ed909f6ccad57e07ddecd450d888678f4d73e821cc2e74",
         ),
     ];
 

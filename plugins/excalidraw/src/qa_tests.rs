@@ -671,3 +671,75 @@ fn qa_sql_point_edits_read_only_changed_elements_at_scale() {
         }
     }
 }
+
+#[test]
+fn qa_scene_metadata_and_new_file_rows_need_no_template_edits() {
+    let (h, file, mut rows) = initial();
+    let mut scene = rows
+        .iter()
+        .find(|r| r.schema_key.as_ref() == core::SCENE_SCHEMA_KEY)
+        .unwrap()
+        .clone();
+    let mut metadata = payload(&scene, "scene_json");
+    metadata["appState"]["theme"] = json!("light");
+    metadata["future"]["new"] = json!([null, "hello"]);
+    set_payload(&mut scene, "scene_json", metadata.clone());
+    let out = h.serialize_changes(&file, &[change(&scene)]).unwrap();
+    let value = json(&out.snapshot().bytes);
+    assert_eq!(value["appState"], metadata["appState"]);
+    assert_eq!(value["future"], metadata["future"]);
+    assert_eq!(value["elements"], json(&file.bytes)["elements"]);
+    accept(&mut rows, &[change(&scene)]);
+    assert_eq!(
+        h.serialize(&file.file_id, &file.path, &rows, None)
+            .unwrap()
+            .snapshot()
+            .bytes,
+        out.snapshot().bytes
+    );
+
+    // Files can be introduced into a document that originally omitted files.
+    let source = Snapshot {
+        path: "new.excalidraw".into(),
+        bytes: br#"{"elements":[],"appState":{"keep":1}}"#.to_vec(),
+        ..Snapshot::default()
+    };
+    let parsed = h.parse(&source, ctx(2)).unwrap();
+    let source = parsed.into_snapshot();
+    let mut image = rows
+        .iter()
+        .find(|r| r.schema_key.as_ref() == core::FILE_SCHEMA_KEY)
+        .unwrap()
+        .clone();
+    image.primary_key = vec![sdk::TypedValue::Text("new-image".into())];
+    image
+        .row
+        .insert("id", sdk::TypedValue::Text("new-image".into()));
+    // An old key spelling is a hint; a rename does not require editing it.
+    let out = h.serialize_changes(&source, &[change(&image)]).unwrap();
+    assert_eq!(
+        json(&out.snapshot().bytes)["files"]["new-image"],
+        payload(&image, "file_json")
+    );
+    assert_eq!(json(&out.snapshot().bytes)["appState"], json!({"keep":1}));
+    image.row.remove("prefix_json");
+    assert_eq!(
+        h.serialize_changes(&source, &[change(&image)])
+            .unwrap()
+            .snapshot()
+            .bytes,
+        out.snapshot().bytes
+    );
+    scene.row.remove("template_json");
+    rows.retain(|r| r.schema_key.as_ref() != core::SCENE_SCHEMA_KEY);
+    rows.push(scene);
+    assert_eq!(
+        json(
+            &h.serialize(&file.file_id, &file.path, &rows, None)
+                .unwrap()
+                .snapshot()
+                .bytes
+        )["appState"],
+        metadata["appState"]
+    );
+}

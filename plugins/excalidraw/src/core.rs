@@ -185,10 +185,7 @@ impl SceneRow {
             "files_tail_json".to_owned(),
             TypedValue::Text(self.files_tail_json.clone()),
         );
-        row.insert(
-            "files_present".to_owned(),
-            TypedValue::Boolean(self.files_present),
-        );
+        row.insert("scene_json", TypedValue::Jsonb(self.metadata()?.into()));
         Ok(RowRecord {
             schema_key: SCENE_SCHEMA_KEY.into(),
             row_pk: vec![TypedValue::Text(SCENE_ID.to_owned())],
@@ -203,26 +200,49 @@ impl SceneRow {
         }
         require_fields(
             &record.row,
-            &[
-                "id",
-                "template_json",
-                "elements_tail_json",
-                "files_tail_json",
-                "files_present",
-            ],
+            &["id", "elements_tail_json", "files_tail_json", "scene_json"],
         )?;
         if required_text(&record.row, "id")? != SCENE_ID {
             return Err("excalidraw_scene row id must be \"scene\"".to_owned());
         }
-        let files_present = required_typed_bool(&record.row, "files_present")?;
-        let scene = Self {
-            template_json: required_text(&record.row, "template_json")?.to_owned(),
+        let metadata = required_jsonb(&record.row, "scene_json")?;
+        let object = metadata.as_object().ok_or("scene_json must be an object")?;
+        if object.contains_key("elements") || object.contains_key("files") {
+            return Err("scene_json excludes elements and files; edit their rows instead".into());
+        }
+        let template = match record.row.get("template_json") {
+            Some(TypedValue::Text(value)) => Some(value.clone()),
+            None | Some(TypedValue::Null) => None,
+            _ => return Err("template_json must be text or null".into()),
+        };
+        let mut scene = Self {
+            template_json: template.unwrap_or_else(|| canonical_scene_template(metadata, true)),
             elements_tail_json: required_text(&record.row, "elements_tail_json")?.to_owned(),
             files_tail_json: required_text(&record.row, "files_tail_json")?.to_owned(),
-            files_present,
+            files_present: false,
         };
+        scene.files_present = template_has_files(&scene.template_json)?;
+        scene.validate_template()?;
+        if scene.metadata()? != *metadata {
+            scene.template_json = canonical_scene_template(metadata, scene.files_present);
+        }
         scene.validate_template()?;
         Ok(scene)
+    }
+
+    fn metadata(&self) -> Result<Value, String> {
+        let markers = template_markers(&self.template_json, self.files_present)?;
+        let mut source = self.template_json.clone();
+        for (offset, marker) in markers.into_iter().rev() {
+            source.replace_range(offset..offset + marker.bytes().len(), "");
+        }
+        let mut value: Value = serde_json::from_str(&source).map_err(|e| e.to_string())?;
+        let object = value
+            .as_object_mut()
+            .ok_or("scene template must be an object")?;
+        object.remove("elements");
+        object.remove("files");
+        Ok(value)
     }
 
     fn validate_template(&self) -> Result<(), String> {
@@ -388,10 +408,7 @@ impl FileRow {
     fn parse(record: &RowRecord) -> Result<Self, String> {
         require_key(record, FILE_SCHEMA_KEY)?;
         let id = text_primary_key(record)?;
-        require_fields(
-            &record.row,
-            &["id", "order_key", "prefix_json", "file_json"],
-        )?;
+        require_fields(&record.row, &["id", "order_key", "file_json"])?;
         if required_text(&record.row, "id")? != id {
             return Err("excalidraw_file row id does not match its key".to_owned());
         }
@@ -399,7 +416,17 @@ impl FileRow {
         Self::from_source(
             id.to_owned(),
             required_text(&record.row, "order_key")?.to_owned(),
-            required_text(&record.row, "prefix_json")?.to_owned(),
+            match record.row.get("prefix_json") {
+                Some(TypedValue::Text(prefix))
+                    if parse_file_prefix(prefix).ok().as_deref() == Some(id) =>
+                {
+                    prefix.clone()
+                }
+                None | Some(TypedValue::Null) | Some(TypedValue::Text(_)) => {
+                    format!("{}:", serde_json::to_string(id).map_err(|e| e.to_string())?)
+                }
+                _ => return Err("prefix_json must be text or null".into()),
+            },
             file_json,
         )
     }
@@ -434,7 +461,7 @@ impl Document {
     }
 
     fn from_rows(
-        scene: SceneRow,
+        mut scene: SceneRow,
         mut elements: Vec<ElementRow>,
         mut files: Vec<FileRow>,
     ) -> Result<Self, String> {
@@ -442,7 +469,8 @@ impl Document {
         sort_and_validate_elements(&mut elements)?;
         sort_and_validate_files(&mut files)?;
         if !scene.files_present && !files.is_empty() {
-            return Err("file rows require a files marker in the scene".to_owned());
+            scene.template_json = canonical_scene_template(&scene.metadata()?, true);
+            scene.files_present = true;
         }
         let rendered = render_document(&scene, &elements, &files)?;
         validate_rendered_graph(&rendered.bytes, &elements, &files, scene.files_present)?;
@@ -1493,6 +1521,33 @@ fn render_files(
     Ok(())
 }
 
+fn canonical_scene_template(metadata: &Value, files_present: bool) -> String {
+    let mut source = serde_json::to_string(metadata).expect("validated JSON metadata");
+    source.pop();
+    if source.len() > 1 {
+        source.push(',');
+    }
+    source.push_str("\"elements\":[");
+    source.push_str(ELEMENTS_MARKER);
+    source.push(']');
+    if files_present {
+        source.push_str(",\"files\":{");
+        source.push_str(FILES_MARKER);
+        source.push('}');
+    }
+    source.push('}');
+    source
+}
+
+fn template_has_files(source: &str) -> Result<bool, String> {
+    // Validate both possible layouts rather than searching marker-like text in metadata.
+    if template_markers(source, false).is_ok() {
+        Ok(false)
+    } else {
+        template_markers(source, true).map(|_| true)
+    }
+}
+
 // Markers are syntax, never text within JSON strings. Blanking them preserves
 // byte coordinates while allowing the normal scanner to validate their placement.
 fn template_markers(source: &str, files_present: bool) -> Result<Vec<(usize, Marker)>, String> {
@@ -1862,6 +1917,8 @@ fn require_fields(row: &TypedRow, required: &[&str]) -> Result<(), String> {
     }
     for field in row.keys() {
         if !expected.contains(field)
+            && !(field == "template_json" && expected.contains("scene_json"))
+            && !(field == "prefix_json" && expected.contains("file_json"))
             && !(field == "source_json"
                 && (expected.contains("element_json") || expected.contains("file_json")))
         {

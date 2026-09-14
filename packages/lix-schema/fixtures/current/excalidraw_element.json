@@ -19,13 +19,15 @@
       "name": "leading_json",
       "type": "text",
       "nullable": false,
-      "description": "Exact whitespace before this array item; commas are supplied by the renderer."
+      "description": "Exact whitespace before this array item; commas are supplied by the renderer.",
+      "default_value": ""
     },
     {
       "name": "order_key",
       "type": "text",
       "nullable": false,
-      "description": "A stable fractional key representing array order independently from identity."
+      "description": "A stable fractional key representing array order independently from identity.",
+      "default_value": "80"
     },
     {
       "name": "source_json",
