@@ -86,3 +86,12 @@ The broader CI checks also passed:
 
 These are local executions of the Linux CI checks. Platform-specific hosted
 jobs and artifact publication remain separate CI results.
+
+After synchronizing with main `d9a1d6b12`, the updated workflow and SDK package
+scripts were validated together. Both normal and offline-migration native/Wasm
+builds passed, as did all three strict Clippy commands. The merged tree passed
+5,158 root tests (91 skipped), 69 tooling tests, 236 E2E tests (27 skipped),
+312 native SDK tests, 49 browser SDK tests (2 skipped), and 63 OPFS tests.
+Doctests, compatibility checks, packaged-plugin compilation, SDK binary-cache
+validation, and both packed Vite production checks also passed. This repeat
+covers the migration build steps absent from the earlier PR-head validation.
