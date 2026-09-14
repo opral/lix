@@ -229,6 +229,98 @@ pub(crate) enum ExactLixFileReadSelector {
 type SharedLixFileDmlSourceState = Arc<Mutex<Option<LixFileDmlSourceState>>>;
 
 impl LixFileSpec {
+    async fn scan_file_conflict_candidates(
+        &self,
+        write_ctx: &SqlWriteContext,
+        proposed: &RecordBatch,
+        target: &UpsertConflictTarget,
+        include_content: bool,
+    ) -> Result<RecordBatch> {
+        // Existing rows matching the proposed conflict identity, rendered as
+        // a full `lix_file` schema (materializing only requested bytes) so the driver can
+        // build the augmented `excluded.*` batch the conflict assignments run
+        // over.
+        let (target_file_ids, path_predicate) = match target.kind() {
+            UpsertConflictKind::Id => (
+                proposed_file_id_constraint(proposed)?,
+                FilePathPredicate::All,
+            ),
+            UpsertConflictKind::Path => (
+                FileIdConstraint::All,
+                proposed_file_path_predicate(proposed)?,
+            ),
+        };
+        let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
+        request.filter.branch_ids = resolve_provider_branch_ids(
+            self.branch_ref.as_ref(),
+            &self.branch_binding,
+            request.filter.branch_ids,
+        )
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
+
+        let indexed_matches = if target.kind() == UpsertConflictKind::Path {
+            let index = self
+                .filesystem_path_index
+                .path_index(
+                    &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
+                        .with_blob_refs(true),
+                )
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
+            Some(indexed_file_matches(index, &path_predicate))
+        } else {
+            self.indexed_dml_matches(&request, &[], &target_file_ids)
+                .await?
+        };
+
+        let hot_state: Arc<dyn HotStateReader> =
+            Arc::new(WriteContextHotStateReader::new(write_ctx.clone()));
+        let prepared = if let Some(indexed_matches) = indexed_matches.as_ref() {
+            // Conflict probes only need the proposed exact IDs or paths. Use
+            // the visible filesystem index for descriptor matching, then fetch
+            // correlated blob refs solely for those files.
+            let rows = match &target_file_ids {
+                FileIdConstraint::Ids(file_ids) => {
+                    scan_exact_file_blob_batch(hot_state.clone(), &request, file_ids).await
+                }
+                FileIdConstraint::All | FileIdConstraint::None => {
+                    scan_indexed_file_batch(indexed_matches, true)
+                }
+            }
+            .map_err(lix_error_to_datafusion_error)?;
+            prepare_indexed_lix_file_rows(indexed_matches, rows)
+        } else {
+            let rows = scan_lix_file_live_batch(hot_state.clone(), &request, &target_file_ids)
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
+            prepare_lix_file_rows(rows, &FilePathPredicate::All)
+        }
+        .map_err(lix_error_to_datafusion_error)?;
+        let plugin_render = if prepared.needs_plugin_render(include_content) {
+            plugin_render_context_for_lix_file_scan(
+                Arc::clone(&hot_state),
+                &request,
+                self.plugin_host.clone(),
+                &prepared,
+                false,
+            )
+            .await
+            .map_err(plugin_discovery_error)?
+        } else {
+            None
+        };
+        lix_file_record_batch_from_prepared(
+            &self.schema,
+            &self.blob_reader,
+            plugin_render,
+            include_content,
+            prepared,
+        )
+        .await
+        .map_err(lix_error_to_datafusion_error)
+    }
+
     async fn indexed_dml_matches(
         &self,
         request: &HotStateScanRequest,
@@ -1420,7 +1512,7 @@ impl TableSpec for LixFileSpec {
                     .returning_post_image(
                         &write_ctx,
                         &keys,
-                        returning.required_columns().contains("content"),
+                        returning.new_columns().contains("content"),
                     )
                     .await?;
                 returning.capture(returning.project(&post_image)?);
@@ -1571,7 +1663,7 @@ impl LixFileSpec {
             })
             || returning
                 .as_ref()
-                .is_some_and(|returning| returning.required_columns().contains("content"));
+                .is_some_and(|returning| returning.old_columns().contains("content"));
         let target_file_ids = file_id_constraint_from_filters(filters)?;
         let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
         request.filter.branch_ids = resolve_provider_branch_ids(
@@ -1719,10 +1811,12 @@ impl LixFileSpec {
                         .returning_post_image(
                             &write_ctx,
                             &keys,
-                            returning.required_columns().contains("content"),
+                            returning.new_columns().contains("content"),
                         )
                         .await?;
-                    returning.capture(returning.project(&post_image)?);
+                    returning.capture(
+                        returning.project_images(Some(&matched_batch), Some(&post_image))?,
+                    );
                 }
                 Ok(count)
             }
@@ -1892,7 +1986,7 @@ impl UpsertSupport for LixFileSpec {
             .returning_post_image(
                 write_ctx,
                 &keys,
-                returning.required_columns().contains("content"),
+                returning.new_columns().contains("content"),
             )
             .await?;
         returning.capture(returning.project(&post_image)?);
@@ -1905,89 +1999,38 @@ impl UpsertSupport for LixFileSpec {
         proposed: &RecordBatch,
         target: &UpsertConflictTarget,
     ) -> Result<RecordBatch> {
-        // Existing rows matching the proposed conflict identity, rendered as
-        // a full `lix_file` batch (with materialized `content`) so the driver can
-        // build the augmented `excluded.*` batch the conflict assignments run
-        // over.
-        let (target_file_ids, path_predicate) = match target.kind() {
-            UpsertConflictKind::Id => (
-                proposed_file_id_constraint(proposed)?,
-                FilePathPredicate::All,
-            ),
-            UpsertConflictKind::Path => (
-                FileIdConstraint::All,
-                proposed_file_path_predicate(proposed)?,
-            ),
-        };
-        let mut request = lix_file_scan_request(self.branch_binding.active_branch_id(), None, None);
-        request.filter.branch_ids = resolve_provider_branch_ids(
-            self.branch_ref.as_ref(),
-            &self.branch_binding,
-            request.filter.branch_ids,
-        )
-        .await
-        .map_err(lix_error_to_datafusion_error)?;
-
-        let indexed_matches = if target.kind() == UpsertConflictKind::Path {
-            let index = self
-                .filesystem_path_index
-                .path_index(
-                    &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
-                        .with_blob_refs(true),
-                )
-                .await
-                .map_err(lix_error_to_datafusion_error)?;
-            Some(indexed_file_matches(index, &path_predicate))
-        } else {
-            self.indexed_dml_matches(&request, &[], &target_file_ids)
-                .await?
-        };
-
-        let hot_state: Arc<dyn HotStateReader> =
-            Arc::new(WriteContextHotStateReader::new(write_ctx.clone()));
-        let prepared = if let Some(indexed_matches) = indexed_matches.as_ref() {
-            // Conflict probes only need the proposed exact IDs or paths. Use
-            // the visible filesystem index for descriptor matching, then fetch
-            // correlated blob refs solely for those files.
-            let rows = match &target_file_ids {
-                FileIdConstraint::Ids(file_ids) => {
-                    scan_exact_file_blob_batch(hot_state.clone(), &request, file_ids).await
-                }
-                FileIdConstraint::All | FileIdConstraint::None => {
-                    scan_indexed_file_batch(indexed_matches, true)
-                }
-            }
-            .map_err(lix_error_to_datafusion_error)?;
-            prepare_indexed_lix_file_rows(indexed_matches, rows)
-        } else {
-            let rows = scan_lix_file_live_batch(hot_state.clone(), &request, &target_file_ids)
-                .await
-                .map_err(lix_error_to_datafusion_error)?;
-            prepare_lix_file_rows(rows, &FilePathPredicate::All)
-        }
-        .map_err(lix_error_to_datafusion_error)?;
-        let plugin_render = if prepared.needs_plugin_render(true) {
-            plugin_render_context_for_lix_file_scan(
-                Arc::clone(&hot_state),
-                &request,
-                self.plugin_host.clone(),
-                &prepared,
-                false,
-            )
+        self.scan_file_conflict_candidates(write_ctx, proposed, target, true)
             .await
-            .map_err(plugin_discovery_error)?
-        } else {
-            None
-        };
-        lix_file_record_batch_from_prepared(
-            &self.schema,
-            &self.blob_reader,
-            plugin_render,
-            true,
-            prepared,
-        )
-        .await
-        .map_err(lix_error_to_datafusion_error)
+    }
+
+    async fn scan_conflict_candidates_for_write(
+        &self,
+        write_ctx: &SqlWriteContext,
+        proposed: &RecordBatch,
+        target: &UpsertConflictTarget,
+        action: &super::upsert::UpsertAction,
+        returning: Option<&DmlReturning>,
+    ) -> Result<RecordBatch> {
+        fn reads_content(expr: &Arc<dyn PhysicalExpr>) -> bool {
+            expr.as_any()
+                .downcast_ref::<datafusion::physical_expr::expressions::Column>()
+                .is_some_and(|column| column.name() == "content")
+                || expr.children().iter().any(|child| reads_content(child))
+        }
+        let include_content = returning
+            .is_some_and(|returning| returning.old_columns().contains("content"))
+            || match action {
+                super::upsert::UpsertAction::DoNothing => false,
+                super::upsert::UpsertAction::DoUpdate { assignments } => {
+                    assignments.iter().any(|(name, expr)| {
+                        // Moving across plugin ownership boundaries can rewrite bytes.
+                        matches!(name.as_str(), "path" | "name" | "directory_id")
+                            || reads_content(expr)
+                    })
+                }
+            };
+        self.scan_file_conflict_candidates(write_ctx, proposed, target, include_content)
+            .await
     }
 
     fn validate_conflict_pair(
@@ -8488,6 +8531,7 @@ mod tests {
 
     #[derive(Default)]
     struct CapturingWriteContext {
+        blob_reads: AtomicUsize,
         rows: Vec<MaterializedHotStateRow>,
         blob_bytes_by_hash: BTreeMap<BlobId, Vec<u8>>,
         writes: Vec<TransactionWrite>,
@@ -8527,6 +8571,7 @@ mod tests {
     #[async_trait]
     impl BlobDataReader for CapturingWriteContext {
         async fn load_bytes_many(&self, hashes: &[BlobId]) -> Result<BlobBytesBatch, LixError> {
+            self.blob_reads.fetch_add(hashes.len(), Ordering::SeqCst);
             Ok(BlobBytesBatch::new(
                 hashes
                     .iter()
@@ -11689,6 +11734,59 @@ mod tests {
         assert_eq!(write_context.exact_load_requests.len(), 1);
         assert_eq!(write_context.exact_load_requests[0].rows.len(), 1);
         assert_eq!(write_context.scan_count, 0);
+    }
+
+    #[tokio::test]
+    async fn file_upsert_overwrite_does_not_read_unrequested_large_old_blob() {
+        let data = vec![0_u8; 40 * 1024 * 1024];
+        let blob_hash = BlobId::from_content(&data);
+        let rows = vec![
+            live_file_row(
+                "01920000-0000-7000-8000-0000000000d2",
+                "01920000-0000-7000-8000-0000000000b1",
+                r#"{"id":"01920000-0000-7000-8000-0000000000d2","directory_id":null,"name":"readme.md"}"#,
+            ),
+            live_blob_ref_row(
+                "01920000-0000-7000-8000-0000000000d2",
+                "01920000-0000-7000-8000-0000000000b1",
+                "01920000-0000-7000-8000-0000000000d2",
+                &blob_hash.to_hex(),
+                data.len(),
+            ),
+        ];
+        let mut write_context = CapturingWriteContext {
+            rows,
+            // Deliberately unavailable: projecting OLD.content would require a blob read.
+            ..CapturingWriteContext::default()
+        };
+        let write_ctx = SqlWriteContext::new(&mut write_context);
+        let spec = file_dml_spec(write_ctx.clone());
+
+        let candidates = spec
+            .scan_conflict_candidates_for_write(
+                &write_ctx,
+                &file_insert_batch(false),
+                &UpsertConflictTarget::id(super::LIX_FILE_IDENTITY),
+                &super::super::upsert::UpsertAction::DoUpdate {
+                    assignments: vec![(
+                        "content".into(),
+                        Arc::new(datafusion::physical_expr::expressions::Column::new(
+                            "excluded.content",
+                            0,
+                        )),
+                    )],
+                },
+                None,
+            )
+            .await
+            .expect("scan exact ID conflict candidates");
+
+        assert_eq!(candidates.num_rows(), 1);
+        assert_eq!(write_context.path_index_count, 1);
+        assert_eq!(write_context.exact_load_requests.len(), 1);
+        assert_eq!(write_context.exact_load_requests[0].rows.len(), 1);
+        assert_eq!(write_context.scan_count, 0);
+        assert_eq!(write_context.blob_reads.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

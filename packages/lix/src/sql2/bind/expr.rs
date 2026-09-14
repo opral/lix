@@ -69,8 +69,24 @@ pub(crate) enum BoundLiteral {
     Json(serde_json::Value),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) enum ReturningImage {
+    Old,
+    New,
+}
+
+impl ReturningImage {
+    pub(crate) fn qualifier(self) -> &'static str {
+        match self {
+            Self::Old => "old",
+            Self::New => "new",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct BoundColumnRef {
+    pub(crate) image: Option<ReturningImage>,
     pub(crate) table: String,
     pub(crate) column_id: usize,
     pub(crate) name: String,
@@ -113,4 +129,18 @@ fn unsupported_public_cast(expr: &Expr, data_type: &SqlDataType) -> LixError {
     .with_hint(
         "Use one of the canonical PostgreSQL cast types supported by Lix: TEXT, BYTEA, BIGINT, DOUBLE PRECISION, BOOLEAN, or JSONB.",
     )
+}
+
+impl BoundExpr {
+    pub(crate) fn references_image(&self, image: ReturningImage) -> bool {
+        match self {
+            Self::Column(column) => column.image == Some(image),
+            Self::Cast { expr, .. } => expr.references_image(image),
+            Self::Function { args, .. } => args.iter().any(|expr| expr.references_image(image)),
+            Self::Binary { left, right, .. } => {
+                left.references_image(image) || right.references_image(image)
+            }
+            _ => false,
+        }
+    }
 }

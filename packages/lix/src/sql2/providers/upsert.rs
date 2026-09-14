@@ -122,6 +122,7 @@ impl StagedUpsert {
 /// batch for a conflict update; either way it retains the stable row identity.
 #[derive(Clone)]
 pub(super) struct UpsertReturningRow {
+    existed: bool,
     batch: RecordBatch,
     row_index: usize,
 }
@@ -129,6 +130,7 @@ pub(super) struct UpsertReturningRow {
 impl UpsertReturningRow {
     fn proposed(batch: &RecordBatch, row_index: usize) -> Self {
         Self {
+            existed: false,
             batch: batch.clone(),
             row_index,
         }
@@ -136,9 +138,14 @@ impl UpsertReturningRow {
 
     fn existing(batch: &RecordBatch, row_index: usize) -> Self {
         Self {
+            existed: true,
             batch: batch.clone(),
             row_index,
         }
+    }
+
+    pub(super) fn old_batch(&self) -> Option<&RecordBatch> {
+        self.existed.then_some(&self.batch)
     }
 
     pub(super) fn batch(&self) -> &RecordBatch {
@@ -240,6 +247,20 @@ pub(super) trait UpsertSupport: Send + Sync {
         target: &UpsertConflictTarget,
     ) -> Result<RecordBatch>;
 
+    /// Projection-aware probe. Providers can omit expensive old columns unused by
+    /// conflict assignments and RETURNING; the default preserves full rows.
+    async fn scan_conflict_candidates_for_write(
+        &self,
+        write_ctx: &SqlWriteContext,
+        proposed: &RecordBatch,
+        target: &UpsertConflictTarget,
+        _action: &UpsertAction,
+        _returning: Option<&DmlReturning>,
+    ) -> Result<RecordBatch> {
+        self.scan_conflict_candidates(write_ctx, proposed, target)
+            .await
+    }
+
     /// Validate a matched existing/proposed pair before applying the conflict
     /// action. Most tables need no extra check; filesystem path targets use it
     /// to reject tracked/untracked namespace collisions.
@@ -297,7 +318,7 @@ pub(super) async fn execute_upsert<S: UpsertSupport + ?Sized>(
     for batch in &proposed_batches {
         spec.validate_proposed_batch(batch)?;
         let existing = spec
-            .scan_conflict_candidates(write_ctx, batch, target)
+            .scan_conflict_candidates_for_write(write_ctx, batch, target, action, None)
             .await?;
         let existing_by_identity = index_by_identity(&existing, conflict_columns)?;
 
@@ -387,7 +408,7 @@ pub(super) async fn execute_upsert_with_returning<S: UpsertSupport + ?Sized>(
     for batch in &normalized_batches {
         spec.validate_proposed_batch(batch)?;
         let existing = spec
-            .scan_conflict_candidates(write_ctx, batch, target)
+            .scan_conflict_candidates_for_write(write_ctx, batch, target, action, Some(&returning))
             .await?;
         let existing_by_identity = index_by_identity(&existing, conflict_columns)?;
 
@@ -457,6 +478,7 @@ pub(super) async fn execute_upsert_with_returning<S: UpsertSupport + ?Sized>(
         }
     }
 
+    returning.capture_upsert_old(&returning_rows)?;
     stage_upsert(write_ctx, staged, affected).await?;
     spec.capture_upsert_returning(write_ctx, returning_rows, returning)
         .await?;
