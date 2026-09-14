@@ -15,8 +15,6 @@ import type {
 import { restoreSnapshot } from "./snapshot-restore.js";
 
 type NativeAddon = {
- retryFilesystemReplicaMigrationCleanup(path:string,syncAllFiles:boolean,url:string,headers:[string,string][]):Promise<number>;
- convertFilesystemReplicaToPartial(path:string,syncAllFiles:boolean,url:string,headers:[string,string][],branchId?:string):Promise<void>;
 	createHosted(
 		url: string,
 		headers: [string, string][],
@@ -103,7 +101,7 @@ function normalizeNativeBinding(binding: NativeLixBinding): LixBinding {
 			}
 			if (property === "recoverReplicaWithServer") {
                 return async (id: string, server: import("./binding-types.js").SyncServerBindingOptions) => {
-                    if(server.fetch) throw new Error("Custom fetch is unsupported for native recovery");
+                    if(server.transport) throw new Error("Custom fetch is unsupported for native recovery");
                     const headers = server.headerProvider ? await server.headerProvider() : server.headers;
                     return target.recoverReplicaWithServer(id, server.url, headers);
                 };
@@ -229,7 +227,7 @@ export async function openNativeLixBinding(
 	openProgress?: OpenProgressDispatch,
 	snapshot?: ReadableStream<Uint8Array>,
 ): Promise<LixBinding> {
-	if (server?.fetch) {
+	if (server?.transport) {
 		throw new TypeError(
 			"Custom sync fetch is only supported by the browser worker",
 		);
@@ -349,14 +347,14 @@ export async function deleteHostedBinding(
 
 export async function convertReplicaBinding(storage:LixStorageConfig,server:SyncServerBindingOptions,branchId?:string):Promise<void> {
  if(storage.kind!=="filesystem")throw new TypeError("Node conversion requires FilesystemStorage");
- if(server.fetch)throw new TypeError("Custom sync fetch is only supported in browsers");
+ if(server.transport)throw new TypeError("Custom sync fetch is only supported in browsers");
  const headers=server.headerProvider ? await server.headerProvider() : server.headers;
- await loadAddon().convertFilesystemReplicaToPartial(storage.path,storage.syncAllFiles,server.url,headers,branchId);
+ await (await import("./migration-binding.node.js")).loadMigrationAddon().convertFilesystemReplicaToPartial(storage.path,storage.syncAllFiles,server.url,headers,branchId);
 }
 
 export async function retryReplicaMigrationCleanupBinding(storage:LixStorageConfig,server:SyncServerBindingOptions):Promise<number> {
  if(storage.kind!=="filesystem")throw new TypeError("Node migration cleanup requires FilesystemStorage");
- if(server.fetch)throw new TypeError("Custom sync fetch is only supported in browsers");
+ if(server.transport)throw new TypeError("Custom sync fetch is only supported in browsers");
  const headers=server.headerProvider ? await server.headerProvider() : server.headers;
- return loadAddon().retryFilesystemReplicaMigrationCleanup(storage.path,storage.syncAllFiles,server.url,headers);
+ return (await import("./migration-binding.node.js")).loadMigrationAddon().retryFilesystemReplicaMigrationCleanup(storage.path,storage.syncAllFiles,server.url,headers);
 }

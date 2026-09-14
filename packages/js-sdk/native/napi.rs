@@ -3480,12 +3480,14 @@ pub fn delete_hosted(
 // N-API registration is disabled in Rust test builds; JavaScript calls this task.
 #[cfg_attr(test, allow(dead_code))]
 #[derive(Debug)]
+#[cfg(feature = "offline-migration")]
 pub struct ConvertReplicaToPartialTask {
     path: String,
     sync_all_files: bool,
     server: ServerOptions,
     branch_id: Option<String>,
 }
+#[cfg(feature = "offline-migration")]
 impl Task for ConvertReplicaToPartialTask {
     type Output = std::result::Result<(), LixError>;
     type JsValue = ();
@@ -3510,6 +3512,7 @@ impl Task for ConvertReplicaToPartialTask {
     }
 }
 #[cfg_attr(test, allow(dead_code))]
+#[cfg(feature = "offline-migration")]
 #[napi(js_name = "convertFilesystemReplicaToPartial")]
 pub fn convert_filesystem_replica_to_partial(
     path: String,
@@ -3529,11 +3532,13 @@ pub fn convert_filesystem_replica_to_partial(
 // N-API registration is disabled in Rust test builds; JavaScript calls this task.
 #[cfg_attr(test, allow(dead_code))]
 #[derive(Debug)]
+#[cfg(feature = "offline-migration")]
 pub struct RetryReplicaMigrationCleanupTask {
     path: String,
     sync_all_files: bool,
     server: ServerOptions,
 }
+#[cfg(feature = "offline-migration")]
 impl Task for RetryReplicaMigrationCleanupTask {
     type Output = std::result::Result<u32, LixError>;
     type JsValue = u32;
@@ -3560,6 +3565,7 @@ impl Task for RetryReplicaMigrationCleanupTask {
     }
 }
 #[cfg_attr(test, allow(dead_code))]
+#[cfg(feature = "offline-migration")]
 #[napi(js_name = "retryFilesystemReplicaMigrationCleanup")]
 pub fn retry_filesystem_replica_migration_cleanup(
     path: String,

@@ -18,6 +18,68 @@ use crate::{
     validate::is_directive_name,
 };
 
+pub(crate) const MAX_NESTING: usize = 64;
+
+std::thread_local! {
+    static PARSE_NESTING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[derive(Default)]
+struct InlineScanCache {
+    depth: usize,
+    labels: std::collections::HashMap<(usize, usize), bool>,
+}
+
+std::thread_local! {
+    static INLINE_SCAN_CACHE: std::cell::RefCell<InlineScanCache> = std::cell::RefCell::new(InlineScanCache::default());
+}
+
+struct InlineScanGuard;
+impl InlineScanGuard {
+    fn enter() -> Self {
+        INLINE_SCAN_CACHE.with(|cache| cache.borrow_mut().depth += 1);
+        Self
+    }
+}
+impl Drop for InlineScanGuard {
+    fn drop(&mut self) {
+        INLINE_SCAN_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.depth -= 1;
+            if cache.depth == 0 {
+                // Keys refer only to immutable slices borrowed during this
+                // outer scan. Never reuse them for another source or dialect.
+                cache.labels = std::collections::HashMap::new();
+            }
+        });
+    }
+}
+
+struct NestingGuard;
+impl NestingGuard {
+    fn enter(diagnostics: &mut Vec<Diagnostic>) -> Option<Self> {
+        PARSE_NESTING.with(|depth| {
+            if depth.get() >= MAX_NESTING {
+                diagnostics.push(Diagnostic::new(
+                    DiagnosticSeverity::Error,
+                    DiagnosticCode::NestingLimit,
+                    Span::new(0, 0),
+                    format!("Markdown nesting exceeds the supported limit of {MAX_NESTING}"),
+                ));
+                None
+            } else {
+                depth.set(depth.get() + 1);
+                Some(Self)
+            }
+        })
+    }
+}
+impl Drop for NestingGuard {
+    fn drop(&mut self) {
+        PARSE_NESTING.with(|depth| depth.set(depth.get() - 1));
+    }
+}
+
 /// The result of a tolerant parse: the document plus any diagnostics gathered
 /// along the way (empty on a clean parse).
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -195,6 +257,9 @@ fn parse_blocks_from_lines(
     definitions: &[String],
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<Block> {
+    let Some(_nesting) = NestingGuard::enter(diagnostics) else {
+        return Vec::new();
+    };
     let mut blocks = Vec::new();
     let mut index = 0;
 
@@ -474,7 +539,10 @@ fn parse_frontmatter(
                 cursor + 1,
             ));
         }
-        push_line(&mut value, lines[cursor].text);
+        if cursor > index + 1 {
+            value.push('\n');
+        }
+        value.push_str(lines[cursor].text);
         cursor += 1;
     }
 
@@ -3494,7 +3562,7 @@ fn parse_table(
         return None;
     }
     let alignments = parse_table_delimiter(delimiter, options.constructs.spoiler)?;
-    let headers = split_table_row(lines[index].text, options.constructs.spoiler);
+    let headers = split_table_row_spans(lines[index].text, options.constructs.spoiler);
     if headers.len() != alignments.len() {
         return None;
     }
@@ -3504,15 +3572,15 @@ fn parse_table(
         meta: NodeMeta::new(Some(Span::new(lines[index].start, lines[index].end))),
         cells: headers
             .iter()
-            .map(|cell| TableCell {
-                meta: NodeMeta::default(),
-                children: parse_inlines(
-                    cell.trim(),
-                    lines[index].start,
+            .map(|(value, span)| {
+                parse_table_cell(
+                    value,
+                    &lines[index].text[span.start..span.end],
+                    lines[index].start + span.start,
                     options,
                     definitions,
                     diagnostics,
-                ),
+                )
             })
             .collect(),
     });
@@ -3529,23 +3597,28 @@ fn parse_table(
         if row.trim().is_empty() || table_body_line_ends_table(lines[cursor].text, options) {
             break;
         }
-        let cells = split_table_row(row, options.constructs.spoiler);
+        let cells = split_table_row_spans(row, options.constructs.spoiler);
         rows.push(TableRow {
             meta: NodeMeta::new(Some(Span::new(lines[cursor].start, lines[cursor].end))),
             cells: alignments
                 .iter()
                 .enumerate()
                 .map(|(cell_index, _)| {
-                    let value = cells.get(cell_index).map(String::as_str).unwrap_or("");
-                    TableCell {
-                        meta: NodeMeta::default(),
-                        children: parse_inlines(
-                            value.trim(),
-                            lines[cursor].start,
+                    if let Some((value, span)) = cells.get(cell_index) {
+                        let indent = lines[cursor].text.len() - row.len();
+                        parse_table_cell(
+                            value,
+                            &row[span.start..span.end],
+                            lines[cursor].start + indent + span.start,
                             options,
                             definitions,
                             diagnostics,
-                        ),
+                        )
+                    } else {
+                        TableCell {
+                            meta: NodeMeta::default(),
+                            children: Vec::new(),
+                        }
                     }
                 })
                 .collect(),
@@ -3564,6 +3637,45 @@ fn parse_table(
         }),
         cursor,
     ))
+}
+
+fn parse_table_cell(
+    value: &str,
+    raw: &str,
+    base: usize,
+    options: &SyntaxOptions,
+    definitions: &[String],
+    diagnostics: &mut Vec<Diagnostic>,
+) -> TableCell {
+    // Table splitting removes escape backslashes before pipes. Map the
+    // resulting inline spans back to their actual source bytes, including
+    // whitespace trimmed from either side of the cell.
+    let mut offsets = Vec::with_capacity(value.len() + 1);
+    let mut cursor = 0;
+    for byte in value.bytes() {
+        while raw.as_bytes().get(cursor) != Some(&byte) && cursor < raw.len() {
+            cursor += 1;
+        }
+        offsets.push(base + cursor);
+        cursor += 1;
+    }
+    offsets.push(base + raw.len());
+    let trim = value.len() - value.trim_start().len();
+    let mut children = parse_inlines(value.trim(), trim, options, definitions, diagnostics);
+    fn remap(nodes: &mut [Inline], offsets: &[usize]) {
+        for node in nodes {
+            if let Some(span) = node.meta_mut().span.as_mut() {
+                span.start = offsets[span.start];
+                span.end = offsets[span.end];
+            }
+            remap(node.children_mut(), offsets);
+        }
+    }
+    remap(&mut children, &offsets);
+    TableCell {
+        meta: NodeMeta::new(Some(Span::new(base, base + raw.len()))),
+        children,
+    }
 }
 
 fn parse_setext_heading(
@@ -4163,6 +4275,11 @@ fn parse_inlines_with_context(
     diagnostics: &mut Vec<Diagnostic>,
     context: InlineContext,
 ) -> Vec<Inline> {
+    let Some(_nesting) = NestingGuard::enter(diagnostics) else {
+        return Vec::new();
+    };
+    let _scan = InlineScanGuard::enter();
+    let label_ends = link_label_ends(input);
     let bytes = input.as_bytes();
     let mut nodes = Vec::new();
     let mut text_start = 0;
@@ -4175,6 +4292,13 @@ fn parse_inlines_with_context(
     let mut delimiters: Vec<DelimMarker> = Vec::new();
 
     while index < bytes.len() {
+        if diagnostics
+            .last()
+            .is_some_and(|diagnostic| diagnostic.code == DiagnosticCode::NestingLimit)
+        {
+            return Vec::new();
+        }
+
         if bytes[index] == b'\\' {
             if let Some((next_index, char)) = next_char(input, index + 1) {
                 if char.is_ascii_punctuation() {
@@ -4650,9 +4774,15 @@ fn parse_inlines_with_context(
         }
 
         if bytes[index] == b'!' && index + 1 < bytes.len() && bytes[index + 1] == b'[' {
-            if let Some((end, image)) =
-                parse_image(input, index, base_offset, options, definitions, diagnostics)
-            {
+            if let Some((end, image)) = parse_image(
+                input,
+                index,
+                base_offset,
+                options,
+                definitions,
+                diagnostics,
+                label_ends.get(&(index + 1)).copied(),
+            ) {
                 flush_text(&mut nodes, &mut text, text_start, base_offset + index);
                 nodes.push(image);
                 index = end;
@@ -4677,6 +4807,7 @@ fn parse_inlines_with_context(
                 definitions,
                 diagnostics,
                 context,
+                label_ends.get(&index).copied(),
             ) {
                 flush_text(&mut nodes, &mut text, text_start, base_offset + index);
                 nodes.push(link);
@@ -5029,9 +5160,10 @@ fn parse_image(
     options: &SyntaxOptions,
     definitions: &[String],
     diagnostics: &mut Vec<Diagnostic>,
+    label_end: Option<usize>,
 ) -> Option<(usize, Inline)> {
     let label_start = index + 2;
-    let label_end = find_link_label_end(input, index + 1)?;
+    let label_end = label_end?;
     let alt_source = &input[label_start..label_end];
     let after_label = label_end + 1;
     if input.as_bytes().get(after_label) == Some(&b'(') {
@@ -5121,15 +5253,13 @@ fn parse_link(
     definitions: &[String],
     diagnostics: &mut Vec<Diagnostic>,
     context: InlineContext,
+    label_end: Option<usize>,
 ) -> Option<(usize, Inline)> {
     if !context.allow_links {
         return None;
     }
-    let label_end = find_link_label_end(input, index)?;
+    let label_end = label_end?;
     let label_source = &input[index + 1..label_end];
-    if label_contains_link(label_source, base_offset + index + 1, options, definitions) {
-        return None;
-    }
     let after_label = label_end + 1;
     if input.as_bytes().get(after_label) == Some(&b'(') {
         // A present-but-invalid `(...)` resource is not an inline link, but
@@ -5137,6 +5267,15 @@ fn parse_link(
         // the invalid `(...)` as literal text (links 568) — so fall through to
         // the reference branches below instead of bailing out of parse_link.
         if let Some((close, resource)) = parse_link_resource(input, after_label) {
+            if label_contains_link(
+                label_source,
+                base_offset + index + 1,
+                options,
+                definitions,
+                diagnostics,
+            ) {
+                return None;
+            }
             return Some((
                 close,
                 Inline::Link(Link {
@@ -5166,6 +5305,15 @@ fn parse_link(
             label
         };
         if definition_exists(definitions, identifier) {
+            if label_contains_link(
+                label_source,
+                base_offset + index + 1,
+                options,
+                definitions,
+                diagnostics,
+            ) {
+                return None;
+            }
             return Some((
                 close + 1,
                 Inline::LinkReference(LinkReference {
@@ -5198,6 +5346,15 @@ fn parse_link(
         return None;
     }
     if definition_exists(definitions, label_source) {
+        if label_contains_link(
+            label_source,
+            base_offset + index + 1,
+            options,
+            definitions,
+            diagnostics,
+        ) {
+            return None;
+        }
         return Some((
             after_label,
             Inline::LinkReference(LinkReference {
@@ -5255,17 +5412,35 @@ fn label_contains_link(
     base_offset: usize,
     options: &SyntaxOptions,
     definitions: &[String],
+    diagnostics: &mut Vec<Diagnostic>,
 ) -> bool {
-    let mut diagnostics = Vec::new();
+    let key = (label_source.as_ptr().addr(), label_source.len());
+    if let Some(cached) = INLINE_SCAN_CACHE.with(|cache| cache.borrow().labels.get(&key).copied()) {
+        return cached;
+    }
+    let diagnostic_start = diagnostics.len();
     let inlines = parse_inlines_with_context(
         label_source,
         base_offset,
         options,
         definitions,
-        &mut diagnostics,
+        diagnostics,
         InlineContext::default(),
     );
-    contains_link_inline(&inlines)
+    if diagnostics[diagnostic_start..]
+        .iter()
+        .any(|diagnostic| diagnostic.code == DiagnosticCode::NestingLimit)
+    {
+        return false;
+    }
+    let contains = contains_link_inline(&inlines);
+    INLINE_SCAN_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.depth > 0 {
+            cache.labels.insert(key, contains);
+        }
+    });
+    contains
 }
 
 fn contains_link_inline(inlines: &[Inline]) -> bool {
@@ -5277,6 +5452,51 @@ fn contains_link_inline(inlines: &[Inline]) -> bool {
         Inline::TextDirective(node) => contains_link_inline(&node.label),
         _ => false,
     })
+}
+
+fn link_label_ends(input: &str) -> std::collections::HashMap<usize, usize> {
+    let mut ends = std::collections::HashMap::new();
+    if !input.contains('[') {
+        return ends;
+    }
+    let mut opens = Vec::new();
+    let mut cursor = 0;
+    while cursor < input.len() {
+        let (next, character) = next_char(input, cursor).expect("UTF-8 cursor");
+        match character {
+            '\\' => {
+                cursor = next_char(input, next).map_or(next, |(end, _)| end);
+                continue;
+            }
+            '`' => {
+                if let Some((end, _)) = parse_code_span(input, cursor) {
+                    cursor = end;
+                    continue;
+                }
+            }
+            '<' => {
+                if let Some(end) = parse_autolink_end(input, cursor)
+                    && is_autolink(&input[cursor..end])
+                {
+                    cursor = end;
+                    continue;
+                }
+                if let Some((end, _)) = parse_html_inline(input, cursor) {
+                    cursor = end;
+                    continue;
+                }
+            }
+            '[' => opens.push(cursor),
+            ']' => {
+                if let Some(open) = opens.pop() {
+                    ends.insert(open, cursor);
+                }
+            }
+            _ => {}
+        }
+        cursor = next;
+    }
+    ends
 }
 
 fn find_link_label_end(input: &str, open: usize) -> Option<usize> {
@@ -5623,7 +5843,7 @@ fn find_code_span_close(input: &str, start: usize, marker_len: usize) -> Option<
     None
 }
 
-fn normalize_code_span(input: &str) -> String {
+pub(crate) fn normalize_code_span(input: &str) -> String {
     let mut normalized = String::new();
     let mut cursor = 0;
     while cursor < input.len() {
@@ -6518,7 +6738,7 @@ pub(crate) fn normalize_label(label: &str) -> String {
 }
 
 fn definition_exists(definitions: &[String], label: &str) -> bool {
-    if label.is_empty() || !reference_label_is_within_limit(label) {
+    if definitions.is_empty() || label.is_empty() || !reference_label_is_within_limit(label) {
         return false;
     }
 
@@ -7056,7 +7276,16 @@ fn table_backslash_pipe_run(input: &str, cursor: usize) -> Option<(usize, bool)>
 }
 
 fn split_table_row(input: &str, spoiler: bool) -> Vec<String> {
+    split_table_row_spans(input, spoiler)
+        .into_iter()
+        .map(|(value, _)| value)
+        .collect()
+}
+
+fn split_table_row_spans(input: &str, spoiler: bool) -> Vec<(String, Span)> {
     let trimmed = input.trim();
+    let base = input.len() - input.trim_start().len();
+    let mut cell_start = 0;
     let mut cells = Vec::new();
     let mut cell = String::new();
     let mut cursor = 0;
@@ -7141,7 +7370,11 @@ fn split_table_row(input: &str, spoiler: bool) -> Vec<String> {
         }
 
         if char == '|' && !spoiler_open && !is_escaped_at(trimmed, cursor) {
-            cells.push(core::mem::take(&mut cell));
+            cells.push((
+                core::mem::take(&mut cell),
+                Span::new(base + cell_start, base + cursor),
+            ));
+            cell_start = next;
             // A delimiter ends the cell; spoiler state never spans a cell boundary.
             spoiler_open = false;
             trailing_delimiter_end = Some(next);
@@ -7150,7 +7383,7 @@ fn split_table_row(input: &str, spoiler: bool) -> Vec<String> {
         }
         cursor = next;
     }
-    cells.push(cell);
+    cells.push((cell, Span::new(base + cell_start, base + trimmed.len())));
 
     if trimmed.starts_with('|') {
         cells.remove(0);
@@ -7531,7 +7764,7 @@ fn is_email_autolink(input: &str) -> bool {
 // returned destination is the synthesized href (a `http://`/`mailto:` prefix
 // may be prepended); the caller keeps `input[index..end]` as the visible
 // original.
-fn parse_literal_autolink(
+pub(crate) fn parse_literal_autolink(
     input: &str,
     index: usize,
     gfm: bool,

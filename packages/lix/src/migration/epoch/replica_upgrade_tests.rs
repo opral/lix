@@ -860,8 +860,9 @@ async fn initialization_seed_planning_survives_physical_read_expiration() {
         .await
         .unwrap();
     assert!(backing.point_expiration_was_observed());
-    let lix = crate::open_lix().with_storage(backing).await.unwrap();
-    lix.close().await.unwrap();
+    let engine = Engine::new(backing).await.unwrap();
+    let session = engine.open_session().await.unwrap();
+    session.close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

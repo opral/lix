@@ -1,3 +1,4 @@
+import { fetchTransport } from "../http-transport.js";
 import type { LixBinding } from "../binding-types.js";
 import { initializeWasm } from "../wasm-init.js";
 import type { LixServerOptions } from "../types.js";
@@ -42,7 +43,7 @@ export async function openRemoteLixBinding(
 	await initializeWasm();
 	return await openRemote(
 		protocolLocator,
-		remoteFetch,
+		fetchTransport(options.fetch),
 		options.headers,
 		clientOptions.initialActiveBranchId,
 	);

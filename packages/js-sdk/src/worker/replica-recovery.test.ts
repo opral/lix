@@ -125,9 +125,7 @@ test("explicit recovery keeps concurrent authentication and fetch scopes separat
  const lix = await openHarness({
   recoverReplicaWithServer: async (id, server) => {
    const headers = await server.headerProvider!();
-   const response = await server.fetch!(server.url, {
-    headers, lixResponseLimit: 4096,
-   } as RequestInit);
+   const response = await server.transport!({url: server.url, init: {headers}, response: {mode: "buffered", maxBytes: 4096}});
    expect(await response.text()).toBe(id);
    return {branchIds:[id],restoredFiles:0,restoredRows:1,unresolved:[]};
   }, close: async () => {},

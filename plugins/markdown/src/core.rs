@@ -556,29 +556,45 @@ fn reconcile_children(
         }
     }
 
+    // Index unmatched siblings once. Scanning all old nodes for every new
+    // incompatible block makes insertions and replacements quadratic.
+    let compatible_kind = |kind| match kind {
+        NodeKind::Heading => NodeKind::Paragraph,
+        other => other,
+    };
+    let mut available = BTreeMap::<NodeKind, BTreeSet<usize>>::new();
+    for (index, child) in old.children.iter().enumerate() {
+        if !old_used[index] {
+            available
+                .entry(compatible_kind(child.node.kind))
+                .or_default()
+                .insert(index);
+        }
+    }
     let mut search_start = 0;
     for (new_index, child) in new.children.iter().enumerate() {
-        if old_for_new[new_index].is_some() {
+        if old_for_new[new_index].is_some()
+            || has_available_unique_global_match(
+                child,
+                global_subtrees,
+                new_signature_counts,
+                old_hashes,
+                new_hashes,
+                used_ids,
+            )
+        {
             continue;
         }
-        let matching = (search_start..old.children.len())
-            .chain(0..search_start)
-            .find(|old_index| {
-                !old_used[*old_index]
-                    && node_kinds_are_identity_compatible(
-                        old.children[*old_index].node.kind,
-                        child.node.kind,
-                    )
-                    && !has_available_unique_global_match(
-                        child,
-                        global_subtrees,
-                        new_signature_counts,
-                        old_hashes,
-                        new_hashes,
-                        used_ids,
-                    )
-            });
+        let Some(indices) = available.get_mut(&compatible_kind(child.node.kind)) else {
+            continue;
+        };
+        let matching = indices
+            .range(search_start..)
+            .next()
+            .or_else(|| indices.first())
+            .copied();
         if let Some(old_index) = matching {
+            indices.remove(&old_index);
             old_for_new[new_index] = Some(old_index);
             old_used[old_index] = true;
             used_ids.insert(old.children[old_index].node.id);
@@ -650,11 +666,13 @@ fn match_table_columns(
     old_used: &mut [bool],
     used_ids: &mut BTreeSet<Uuid>,
 ) {
+    let old_signatures = table_column_signatures(old);
+    let new_signatures = table_column_signatures(new);
     let mut old_by_signature = HashMap::<String, Vec<usize>>::new();
     for (index, column) in old.children.iter().enumerate() {
         if column.node.kind == NodeKind::TableColumn && !old_used[index] {
             old_by_signature
-                .entry(table_column_signature(old, column))
+                .entry(old_signatures[&column.node.id].clone())
                 .or_default()
                 .push(index);
         }
@@ -663,7 +681,7 @@ fn match_table_columns(
     for column in &new.children {
         if column.node.kind == NodeKind::TableColumn {
             *new_counts
-                .entry(table_column_signature(new, column))
+                .entry(new_signatures[&column.node.id].clone())
                 .or_default() += 1;
         }
     }
@@ -671,7 +689,7 @@ fn match_table_columns(
         if column.node.kind != NodeKind::TableColumn || old_for_new[new_index].is_some() {
             continue;
         }
-        let signature = table_column_signature(new, column);
+        let signature = new_signatures[&column.node.id].clone();
         let Some(old_indices) = old_by_signature.get(&signature) else {
             continue;
         };
@@ -685,25 +703,47 @@ fn match_table_columns(
     }
 }
 
-fn table_column_signature(table: &NodeTree, column: &NodeTree) -> String {
-    let mut cells = Vec::new();
-    for row in table
+fn table_column_signatures(table: &NodeTree) -> HashMap<Uuid, String> {
+    let columns = table
+        .children
+        .iter()
+        .filter(|child| child.node.kind == NodeKind::TableColumn)
+        .collect::<Vec<_>>();
+    let rows = table
         .children
         .iter()
         .filter(|child| child.node.kind == NodeKind::TableRow)
-    {
-        let cell = row.children.iter().find(|cell| {
-            cell.node
+        .collect::<Vec<_>>();
+    let mut cells = columns
+        .iter()
+        .map(|column| (column.node.id, vec![None; rows.len()]))
+        .collect::<HashMap<_, _>>();
+    for (index, row) in rows.iter().enumerate() {
+        for cell in &row.children {
+            if let Some(column) = cell
+                .node
                 .payload
                 .get("column_id")
                 .and_then(serde_json::Value::as_str)
                 .and_then(|id| Uuid::parse_str(id).ok())
-                == Some(column.node.id)
-        });
-        cells.push(cell.map(NodeTree::subtree_signature));
+                .and_then(|id| cells.get_mut(&id))
+                && column[index].is_none()
+            {
+                column[index] = Some(cell.subtree_signature());
+            }
+        }
     }
-    serde_json::to_string(&(column.node.content_signature(), cells))
-        .expect("table column signature must serialize")
+    columns
+        .into_iter()
+        .map(|column| {
+            let signature = serde_json::to_string(&(
+                column.node.content_signature(),
+                cells.remove(&column.node.id).unwrap(),
+            ))
+            .expect("table column signature must serialize");
+            (column.node.id, signature)
+        })
+        .collect()
 }
 
 fn preserve_table_cell_order_keys(
@@ -1475,6 +1515,12 @@ fn build_tree(
     visiting: &mut BTreeSet<Uuid>,
     visited: &mut BTreeSet<Uuid>,
 ) -> Result<NodeTree, PluginError> {
+    if visiting.len() >= crate::parse::MAX_NESTING {
+        return Err(PluginError::InvalidInput(format!(
+            "Markdown row graph nesting exceeds the supported limit of {}",
+            crate::parse::MAX_NESTING,
+        )));
+    }
     if !visiting.insert(node.id) {
         return Err(PluginError::InvalidInput(format!(
             "Markdown graph contains a cycle at node '{}'",
@@ -1872,14 +1918,29 @@ fn node_from_typed_row(row: &TypedRow) -> Result<NodeSnapshot, PluginError> {
             ));
         }
     };
-    Ok(NodeSnapshot {
+    let node = NodeSnapshot {
         id: uuid("id")?,
         kind,
         parent_id: optional_uuid("parent_id")?,
         order_key: optional_text("order_key")?,
         payload: json_object("payload_json")?,
         format: json_object("format_json")?,
-    })
+    };
+    if node.kind == NodeKind::CodeBlock
+        && let Some(value) = node
+            .payload
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+        && ((node.format.get("style").and_then(serde_json::Value::as_str) != Some("indented")
+            && !value.is_empty()
+            && !value.ends_with('\n'))
+            || value.contains('\r'))
+    {
+        return Err(PluginError::InvalidInput(
+            "code block values must use LF line endings; fenced values must end with LF unless empty".into(),
+        ));
+    }
+    Ok(node)
 }
 
 fn fresh_tree_to_row_changes(root: &NodeTree) -> Result<Vec<RowChange>, PluginError> {
@@ -1949,6 +2010,107 @@ fn minimal_byte_edit(before: &[u8], after: Vec<u8>) -> Vec<ByteEdit> {
         delete_len: u64::try_from(before.len() - prefix - suffix).expect("usize fits u64"),
         insert: Arc::new(after[prefix..after.len() - suffix].to_vec()),
     }]
+}
+
+fn semantic_tree_value(tree: &NodeTree) -> serde_json::Value {
+    fn normalize_inlines(nodes: &mut Vec<serde_json::Value>) {
+        let mut normalized: Vec<serde_json::Value> = Vec::with_capacity(nodes.len());
+        for mut node in nodes.drain(..) {
+            for key in ["children", "alt"] {
+                if let Some(children) = node.get_mut(key).and_then(serde_json::Value::as_array_mut)
+                {
+                    normalize_inlines(children);
+                }
+            }
+            if matches!(
+                node.get("type").and_then(serde_json::Value::as_str),
+                Some("text" | "escape" | "character_reference")
+            ) {
+                let value = node
+                    .get("value")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                if value.is_empty() {
+                    continue;
+                }
+                if let Some(previous) = normalized.last_mut()
+                    && previous["type"] == "text"
+                {
+                    if let serde_json::Value::String(text) = &mut previous["value"] {
+                        text.push_str(&value);
+                    }
+                } else {
+                    normalized.push(serde_json::json!({"type":"text", "value":value}));
+                }
+            } else {
+                normalized.push(node);
+            }
+        }
+        *nodes = normalized;
+    }
+    fn visit(tree: &NodeTree, columns: Option<&[Uuid]>) -> serde_json::Value {
+        let mut payload = semantic_payload(&tree.node.payload);
+        if let Some(inline) = payload
+            .get_mut("inline")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            normalize_inlines(inline);
+        }
+        if tree.node.kind == NodeKind::TableCell {
+            payload.as_object_mut().unwrap().remove("column_id");
+        }
+        let children = if tree.node.kind == NodeKind::Table {
+            let columns = tree
+                .children
+                .iter()
+                .filter(|child| child.node.kind == NodeKind::TableColumn)
+                .map(|child| child.node.id)
+                .collect::<Vec<_>>();
+            tree.children
+                .iter()
+                .filter(|child| child.node.kind == NodeKind::TableColumn)
+                .chain(
+                    tree.children
+                        .iter()
+                        .filter(|child| child.node.kind == NodeKind::TableRow),
+                )
+                .map(|child| visit(child, Some(&columns)))
+                .collect::<Vec<_>>()
+        } else if tree.node.kind == NodeKind::TableRow {
+            let cells = tree
+                .children
+                .iter()
+                .map(|cell| (cell.node.payload["column_id"].as_str().unwrap_or(""), cell))
+                .collect::<HashMap<_, _>>();
+            columns
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|id| cells.get(id.to_string().as_str()))
+                .map(|child| visit(child, None))
+                .collect()
+        } else {
+            tree.children
+                .iter()
+                .map(|child| visit(child, None))
+                .collect()
+        };
+        serde_json::json!({"kind":tree.node.kind,"payload":payload,"children":children})
+    }
+    visit(tree, None)
+}
+
+fn validate_rendered_semantics(root: &NodeTree, bytes: &[u8]) -> Result<(), PluginError> {
+    let parsed = parse_file(&File {
+        filename: None,
+        content: bytes.to_vec(),
+    })?;
+    if semantic_tree_value(root) != semantic_tree_value(&parsed.root) {
+        return Err(PluginError::InvalidInput(
+            "Markdown row edits cannot be represented without changing semantic content; check node kinds, table header roles, references, and block boundaries".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn simple_top_level_ranges(root: &NodeTree, bytes: &[u8]) -> Vec<Range<usize>> {
@@ -2188,7 +2350,9 @@ impl Document {
                             .into(),
                     ));
                 }
-                (render_tree_with_lexical_fallback(&root)?, false)
+                let bytes = render_tree_with_lexical_fallback(&root)?;
+                validate_rendered_semantics(&root, &bytes)?;
+                (bytes, false)
             }
         };
         let top_level_ranges = simple_top_level_ranges(&root, &bytes);
@@ -2451,6 +2615,7 @@ impl Document {
                 &self.bytes.materialize(),
             )?,
         };
+        validate_rendered_semantics(&root, &bytes)?;
         if render_tree(&root)? != bytes {
             root.node.format[LEXICAL_FALLBACK_FIELD] =
                 serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&bytes));
@@ -2638,6 +2803,15 @@ impl Document {
             || new.id != old.id
             || new.parent_id != old.parent_id
             || new.order_key != old.order_key
+        {
+            return Ok(None);
+        }
+
+        // Only literal prose can bypass full-document semantic validation.
+        // References, delimiters, and structural edits need the surrounding file.
+        let inlines = parse_inline_payload(&new.payload).map_err(PluginError::InvalidInput)?;
+        if !matches!(inlines.as_slice(), [InlineNode { content: InlineContent::Text { value }, .. }]
+            if crate::markdown_file::literal_paragraph_source_is_safe(value))
         {
             return Ok(None);
         }

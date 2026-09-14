@@ -1,3 +1,4 @@
+import { validateHttpRequest, type HttpRequest, type HttpTransport } from "../http-transport.js";
 import {
 	openLixBinding,
 	convertReplicaBinding,
@@ -491,7 +492,7 @@ export function startWorkerHost(
 				url: string;
 				headers: [string, string][];
 				headerProvider?: () => Promise<[string, string][]>;
-				fetch?: typeof fetch;
+				transport?: HttpTransport;
 		  }
 		| undefined {
 		if (!server) return undefined;
@@ -508,52 +509,28 @@ export function startWorkerHost(
 						});
 					}
 				: undefined,
-			fetch: server.customFetch ? (input, init) => bridgeFetch(input, init, transportScope) : undefined,
+			transport: (request) => bridgeFetch(request, transportScope),
 		};
 	}
 
 	async function bridgeFetch(
-		input: RequestInfo | URL,
-		init?: RequestInit,
+        httpRequest: HttpRequest,
         transportScope?: number,
-	): Promise<Response> {
-		const extension = init as
-			| (RequestInit & {
-					lixResponseLimit?: unknown;
-					lixResponseStream?: unknown;
-			  })
-			| undefined;
-		const streaming = extension?.lixResponseStream === true;
-		const responseLimit = extension?.lixResponseLimit;
-		if (
-			!streaming &&
-			(typeof responseLimit !== "number" ||
-				!Number.isSafeInteger(responseLimit) ||
-				responseLimit <= 0)
-		) {
-			throw new TypeError("Browser sync fetch has no valid response limit");
-		}
+    ): Promise<Response> {
+        validateHttpRequest(httpRequest);
+        const { url: input, init, response: policy } = httpRequest;
+        const streaming = policy.mode === "streaming";
 		if (closed) throw workerStateError("Worker client disconnected");
                     const requestId = nextSyncRequestId++;
 		const requestBase = {
-			url:
-				typeof input === "string"
-					? input
-					: input instanceof URL
-						? input.toString()
-						: input.url,
+            url: input,
 			method: init?.method ?? "GET",
 			headers: headerEntries(init?.headers),
 			body: serializableBody(init?.body),
 			credentials: init?.credentials,
+            cache: init?.cache, redirect: init?.redirect,
 		};
-		const request: WorkerSyncFetchRequest = streaming
-			? { ...requestBase, responseMode: "stream" }
-			: {
-					...requestBase,
-					responseMode: "buffered",
-					responseLimit: responseLimit as number,
-				};
+        const request: WorkerSyncFetchRequest = {...requestBase, response: policy};
 		const response = new Promise<WorkerSyncFetchResponse>((resolve, reject) => {
 			pendingSyncFetch.set(requestId, { resolve, reject });
 			endpoint.postMessage({ kind: "sync.fetch", requestId, request, transportScope });

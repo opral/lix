@@ -10,6 +10,9 @@ repository.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+offline-migration = ["lix_sdk/offline-migration"]
+
 [dependencies]
 anyhow = "1.0.100"
 axum = "0.8.9"

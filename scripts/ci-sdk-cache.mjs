@@ -27,7 +27,8 @@ export function isBuildInput(path) {
 	return (
 		!(
 			/^packages\/js-sdk\/src\/.+\.ts$/.test(path) &&
-			!path.startsWith("packages/js-sdk/src/wasm/")
+			!path.startsWith("packages/js-sdk/src/wasm/") &&
+			!path.startsWith("packages/js-sdk/src/migration-wasm/")
 		) &&
 		!/^\.changenotes\/[^/]+\.md$/.test(path) &&
 		path !== "CHANGELOG.md"
@@ -73,15 +74,16 @@ export function cacheKey(root, runtime, env = process.env) {
 		);
 		hash.update("\0");
 	}
-	return `sdk-binaries-v1-${runtime}-${hash.digest("hex")}`;
+	return `sdk-binaries-v2-${runtime}-${hash.digest("hex")}`;
 }
 
 function outputs(runtime) {
 	validateRuntime(runtime);
 	return [
 		"dist/wasm",
+		"dist/migration-wasm",
 		"dist/bundled-plugins",
-		...(runtime === "native" ? ["lix_js_sdk.node"] : []),
+		...(runtime === "native" ? ["lix_js_sdk.node", "lix_js_sdk_migration.node"] : []),
 	];
 }
 
@@ -101,6 +103,9 @@ function manifest(root, runtime, key) {
 		"dist/wasm/lix_js_sdk.js",
 		"dist/wasm/lix_js_sdk.d.ts",
 		"dist/wasm/lix_js_sdk_bg.wasm",
+		"dist/migration-wasm/lix_js_sdk.js",
+		"dist/migration-wasm/lix_js_sdk.d.ts",
+		"dist/migration-wasm/lix_js_sdk_bg.wasm",
 		"dist/bundled-plugins/plugin_csv.lixplugin",
 		"dist/bundled-plugins/plugin_markdown.lixplugin",
 	]) {
@@ -154,6 +159,8 @@ export function restoreBinaries(sdk, cache, runtime, key) {
 	mkdirSync(join(sdk, "src"), { recursive: true });
 	rmSync(join(sdk, "src/wasm"), { recursive: true, force: true });
 	symlinkSync("../dist/wasm", join(sdk, "src/wasm"), "dir");
+	rmSync(join(sdk, "src/migration-wasm"), { recursive: true, force: true });
+	symlinkSync("../dist/migration-wasm", join(sdk, "src/migration-wasm"), "dir");
 }
 
 if (

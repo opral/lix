@@ -27,7 +27,9 @@ async fn snapshot_open_rejects_v68_at_the_intentional_hard_cut() {
             "unexpected rejection: {error:?}"
         );
         assert!(
-            error.message.contains("v80"),
+            error
+                .message
+                .contains(&format!("v{}", lix::CURRENT_STORAGE_FORMAT_VERSION)),
             "unexpected rejection: {error:?}"
         );
         let Err(retry) = open_lix()
@@ -48,5 +50,9 @@ async fn automatic_open_rejects_v68_before_reading_commit_authority() {
     };
     assert_eq!(error.code, "LIX_ERROR_MIGRATION_FAILED");
     assert!(error.message.contains("v68"));
-    assert!(error.message.contains("v80"));
+    assert!(
+        error
+            .message
+            .contains(&format!("v{}", lix::CURRENT_STORAGE_FORMAT_VERSION))
+    );
 }

@@ -1,3 +1,5 @@
+import { ADMISSION_PROTOCOL_EPOCH, ADMISSION_STORAGE_EPOCH } from "./shared-admission.js";
+import { fetchTransport, type HttpTransport } from "../http-transport.js";
 import { createWorkerConnection, createSharedWorkerConnection, openDirectLixBinding } from "#worker-factory";
 import type {
 	LixBinding,
@@ -9,7 +11,6 @@ import type {
 	LixTelemetryOptions,
 	LixOpenProgress,
 	LixOpenReport,
-	RemoteLixFetch,
 	LixServerOptions,
 } from "../types.js";
 import { ownedSnapshotRestoreChunks } from "../snapshot-restore.js";
@@ -23,7 +24,7 @@ import {
 	type WorkerSyncServerOptions,
 } from "./protocol.js";
 
-type SyncServerRuntimeOptions = LixServerOptions;
+type SyncServerRuntimeOptions = LixServerOptions & { transport?: HttpTransport };
 
 type PendingRequest = {
 	resolve(value: unknown): void;
@@ -50,7 +51,7 @@ export async function openLixWorker(
 	const sharedKey = !snapshot && server && providerOptions && typeof providerOptions === "object"
 		&& "sharedEngineKey" in providerOptions && typeof providerOptions.sharedEngineKey === "string"
 		&& providerOptions.sharedEngineKey.startsWith("lix:opfs:") ? providerOptions.sharedEngineKey : undefined;
-	const sharedConnection = sharedKey ? createSharedWorkerConnection(sharedKey) : undefined;
+	const sharedConnection = sharedKey ? createSharedWorkerConnection(`${sharedKey}:protocol-${ADMISSION_PROTOCOL_EPOCH}:storage-${ADMISSION_STORAGE_EPOCH}`) : undefined;
 	let client = sharedConnection ? new LixWorkerClient(sharedConnection, false) : idleWorkers.pop();
 	while (client?.isDisposed) client = idleWorkers.pop();
 	client ??= new LixWorkerClient();
@@ -496,7 +497,7 @@ export class LixWorkerClient {
     private nextTransportScope = 1;
     async withRecoveryServer<T>(server: import("../binding-types.js").SyncServerBindingOptions, operation: (scope: number, server: WorkerSyncServerOptions) => Promise<T>): Promise<T> {
         const scope = this.nextTransportScope++;
-        const runtime = {url: server.url, headers: server.headerProvider ?? server.headers, fetch: server.fetch};
+        const runtime = {url: server.url, headers: server.headerProvider ?? server.headers, transport: server.transport};
         this.scopedServers.set(scope, runtime);
         try { return await operation(scope, serializeSyncServer(runtime)!); }
         finally { this.scopedServers.delete(scope); }
@@ -673,25 +674,17 @@ export class LixWorkerClient {
 		request: import("./protocol.js").WorkerSyncFetchRequest,
         transportScope?: number,
 	): Promise<void> {
-		const fetcher: RemoteLixFetch | undefined = (transportScope === undefined ? this.syncServer : this.scopedServers.get(transportScope))?.fetch;
-		if (!fetcher) {
-			this.notify({
-				kind: "sync.fetch.result",
-				requestId,
-				result: {
-					ok: false,
-					error: serializeWorkerError(
-						new Error("Sync fetch bridge is unavailable"),
-					),
-				},
-			});
-			return;
-		}
+        const server = transportScope === undefined ? this.syncServer : this.scopedServers.get(transportScope);
+        if (!server) {
+            this.notify({ kind: "sync.fetch.result", requestId, result: {ok: false, error: serializeWorkerError(workerClosedError())} });
+            return;
+        }
+        const transport = server.transport ?? fetchTransport(server.fetch);
 		const controller = new AbortController();
 		this.syncFetchControllers.set(requestId, controller);
 		let retainedStream = false;
 		try {
-			const response = await fetcher(request.url, {
+			const response = await transport({ url: request.url, response: request.response, init: {
 				method: request.method,
 				headers: request.headers,
 				body:
@@ -700,7 +693,8 @@ export class LixWorkerClient {
 						: request.body?.slice().buffer,
 				credentials: request.credentials,
 				signal: controller.signal,
-			});
+                cache: request.cache, redirect: request.redirect,
+			}});
 			if (
 				this.syncFetchControllers.get(requestId) !== controller ||
 				controller.signal.aborted
@@ -708,7 +702,7 @@ export class LixWorkerClient {
 				await response.body?.cancel().catch(() => undefined);
 				return;
 			}
-			if (request.responseMode === "stream") {
+			if (request.response.mode === "streaming") {
 				this.syncFetchStreams.set(requestId, response.body?.getReader());
 				retainedStream = true;
 				this.notify({
@@ -726,11 +720,7 @@ export class LixWorkerClient {
 				});
 				return;
 			}
-			const body = await readSyncResponseBody(
-				response,
-				request.responseLimit,
-				controller,
-			);
+            const body = new Uint8Array(await response.arrayBuffer());
 			this.notify({
 				kind: "sync.fetch.result",
 				requestId,
@@ -745,6 +735,7 @@ export class LixWorkerClient {
 				},
 			});
 		} catch (error) {
+            if (isSyncResponseTooLarge(error)) controller.abort(error);
 			if (!controller.signal.aborted || isSyncResponseTooLarge(error)) {
 				this.notify({
 					kind: "sync.fetch.result",
@@ -827,68 +818,11 @@ export class LixWorkerClient {
 	}
 }
 
-async function readSyncResponseBody(
-	response: Response,
-	limit: number,
-	controller: AbortController,
-): Promise<Uint8Array> {
-	if (!Number.isSafeInteger(limit) || limit <= 0) {
-		throw new TypeError("Browser sync fetch has no valid response limit");
-	}
-	const declaredLength = Number(response.headers.get("content-length"));
-	if (Number.isFinite(declaredLength) && declaredLength > limit) {
-		const error = syncResponseTooLarge(limit);
-		controller.abort(error);
-		throw error;
-	}
-	const stream = response.body;
-	if (!stream) return new Uint8Array();
-
-	const reader = stream.getReader();
-	const chunks: Uint8Array[] = [];
-	let total = 0;
-	try {
-		while (true) {
-			const { done, value } = await reader.read();
-			if (done) break;
-			total += value.byteLength;
-			if (total > limit) {
-				const error = syncResponseTooLarge(limit);
-				controller.abort(error);
-				await reader.cancel(error).catch(() => undefined);
-				throw error;
-			}
-			chunks.push(value);
-		}
-	} finally {
-		reader.releaseLock();
-	}
-
-	const body = new Uint8Array(total);
-	let offset = 0;
-	for (const chunk of chunks) {
-		body.set(chunk, offset);
-		offset += chunk.byteLength;
-	}
-	return body;
-}
-
-function syncResponseTooLarge(limit: number): Error & { code: string } {
-	const error = new Error(
-		`sync fetch response exceeds ${limit} bytes`,
-	) as Error & {
-		code: string;
-	};
-	error.name = "LixError";
-	error.code = "LIX_ERROR_SYNC_RESPONSE_TOO_LARGE";
-	return error;
-}
-
 function isSyncResponseTooLarge(error: unknown): boolean {
 	return (
 		error instanceof Error &&
 		(error as Error & { code?: string }).code ===
-			"LIX_ERROR_SYNC_RESPONSE_TOO_LARGE"
+			"LIX_TRANSPORT_RESPONSE_LIMIT"
 	);
 }
 
@@ -910,7 +844,6 @@ function serializeSyncServer(
 				? undefined
 				: headerEntries(server.headers),
 		dynamicHeaders: typeof server.headers === "function",
-		customFetch: server.fetch !== undefined,
 	};
 }
 
@@ -929,7 +862,7 @@ async function resolveDirectSyncServer(
 	return {
 		url: new URL(server.url).toString(),
 		headers: headerEntries(headers),
-		fetch: server.fetch,
+		transport: server.fetch ? fetchTransport(server.fetch) : undefined,
 	};
 }
 
@@ -953,7 +886,7 @@ export async function convertReplicaWorkerOperation(storage:LixStorageConfig,ser
  const sharedKey = providerOptions && typeof providerOptions === "object"
   && "sharedEngineKey" in providerOptions && typeof providerOptions.sharedEngineKey === "string"
   && providerOptions.sharedEngineKey.startsWith("lix:opfs:") ? providerOptions.sharedEngineKey : undefined;
- const connection = sharedKey ? createSharedWorkerConnection(sharedKey) : undefined;
+ const connection = sharedKey ? createSharedWorkerConnection(`${sharedKey}:protocol-${ADMISSION_PROTOCOL_EPOCH}:storage-${ADMISSION_STORAGE_EPOCH}`) : undefined;
  const client = connection ? new LixWorkerClient(connection, false) : new LixWorkerClient();
  client.beginLease(undefined,undefined,server);
  try { await client.request({kind:"replica.convert",storage,server:serializeSyncServer(server)!,branchId},0); }

@@ -23,6 +23,7 @@ path = "native/lib.rs"
 
 [features]
 storage-bridge-bench = []
+offline-migration = ["lix/offline-migration"]
 
 [dependencies]
 async-trait = "0.1"

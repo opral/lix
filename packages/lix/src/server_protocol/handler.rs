@@ -7876,7 +7876,9 @@ mod tests {
         }
 
         let storage = DurableMemoryStorage::new();
-        Engine::initialize_with_main_branch_id(storage.clone(), Some(default_branch_id))
+        let adapter = crate::migration::admit_current_repository(&storage, true)
+            .await.expect("create current sparse epoch").adapter;
+        Engine::initialize_with_adapter(adapter, Some(default_branch_id))
             .await
             .expect("initialize sparse replica storage");
         let mut replica = open_lix()
@@ -15141,10 +15143,10 @@ mod tests {
     #[tokio::test]
     async fn persisted_sync_replica_cannot_be_served_as_an_authority() {
         let storage = Memory::new();
-        Engine::initialize(storage.clone())
-            .await
-            .expect("initialize replica storage");
-        let adapter = crate::storage_adapter::StorageAdapter::new(storage.clone());
+        let adapter = crate::migration::admit_current_repository(&storage, true)
+            .await.expect("create current epoch").adapter;
+        Engine::initialize_with_adapter(adapter.clone(), None)
+            .await.expect("initialize replica storage");
         let mut writes = adapter.new_write_set();
         writes.put(
             crate::sync::SYNC_REPLICA_STATE_SPACE,

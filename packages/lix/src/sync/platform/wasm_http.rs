@@ -183,12 +183,6 @@ impl AuthorityHttp {
             .map_err(js_transport_error)?;
         Reflect::set(&init, &"redirect".into(), &"error".into()).map_err(js_transport_error)?;
         Reflect::set(&init, &"cache".into(), &"no-store".into()).map_err(js_transport_error)?;
-        Reflect::set(
-            &init,
-            &"lixResponseLimit".into(),
-            &JsValue::from_f64(HOSTED_RESPONSE_LIMIT as f64),
-        )
-        .map_err(js_transport_error)?;
         let controller_constructor = Reflect::get(&global, &"AbortController".into())
             .map_err(js_transport_error)?
             .dyn_into::<Function>()
@@ -271,8 +265,7 @@ impl AuthorityHttp {
             global.into()
         };
         let response = JsFuture::from(
-            fetch
-                .call2(&this, &request.url.into(), &init)
+            call_http_transport(&fetch, &this, &request.url, &init, Some(HOSTED_RESPONSE_LIMIT))
                 .map_err(js_transport_error)?
                 .dyn_into::<Promise>()
                 .map_err(js_transport_error)?,
@@ -419,7 +412,6 @@ async fn authority_stream(
     Reflect::set(&init, &"method".into(), &request.method.into()).map_err(js_transport_error)?;
     Reflect::set(&init, &"credentials".into(), &"include".into()).map_err(js_transport_error)?;
     Reflect::set(&init, &"cache".into(), &"no-store".into()).map_err(js_transport_error)?;
-    Reflect::set(&init, &"lixResponseStream".into(), &JsValue::TRUE).map_err(js_transport_error)?;
     let header_pairs = Array::new();
     for (name, value) in &headers {
         let pair = Array::new();
@@ -474,8 +466,7 @@ async fn authority_stream(
     } else {
         global.into()
     };
-    let promise = fetch
-        .call2(&this, &request.url.into(), &init)
+    let promise = call_http_transport(&fetch, &this, &request.url, &init, None)
         .map_err(js_transport_error)?
         .dyn_into::<Promise>()
         .map_err(js_transport_error)?;
@@ -682,12 +673,6 @@ async fn fetch(
     if !cache_immutable {
         Reflect::set(&init, &"cache".into(), &"no-store".into()).map_err(js_transport_error)?;
     }
-    Reflect::set(
-        &init,
-        &"lixResponseLimit".into(),
-        &JsValue::from_f64(response_limit as f64),
-    )
-    .map_err(js_transport_error)?;
     let header_pairs = Array::new();
     for (name, value) in headers {
         let pair = Array::new();
@@ -713,8 +698,7 @@ async fn fetch(
     } else {
         global.clone().into()
     };
-    let promise = fetch
-        .call2(&this, &url.into(), &init)
+    let promise = call_http_transport(&fetch, &this, url, &init, Some(response_limit))
         .map_err(js_transport_error)?
         .dyn_into::<Promise>()
         .map_err(js_transport_error)?;
@@ -916,4 +900,31 @@ fn js_error_detail(error: &JsValue) -> String {
         .and_then(|message| message.as_string())
         .unwrap_or_else(|| format!("{error:?}"));
     detail
+}
+
+/// Internal JS transports take an explicit request object. Native browser fetch
+/// is adapted here, and never receives private RequestInit extensions.
+fn call_http_transport(
+    transport: &Function,
+    this: &JsValue,
+    url: &str,
+    init: &Object,
+    max_bytes: Option<usize>,
+) -> Result<JsValue, JsValue> {
+    if !this.is_undefined() {
+        return transport.call2(this, &url.into(), init);
+    }
+    let request = Object::new();
+    Reflect::set(&request, &"url".into(), &url.into())?;
+    Reflect::set(&request, &"init".into(), init)?;
+    let response = Object::new();
+    match max_bytes {
+        Some(limit) => {
+            Reflect::set(&response, &"mode".into(), &"buffered".into())?;
+            Reflect::set(&response, &"maxBytes".into(), &JsValue::from_f64(limit as f64))?;
+        }
+        None => { Reflect::set(&response, &"mode".into(), &"streaming".into())?; }
+    }
+    Reflect::set(&request, &"response".into(), &response)?;
+    transport.call1(&JsValue::UNDEFINED, &request)
 }

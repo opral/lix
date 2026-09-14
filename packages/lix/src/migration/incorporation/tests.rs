@@ -238,6 +238,9 @@ async fn legacy_sql_checkpoints_preserve_members_without_inferred_provenance() {
         migrate(&adapter, MigrationOptions::default(), false)
             .await
             .unwrap();
+        super::super::runtime_epoch::migrate(&adapter, false)
+            .await
+            .unwrap();
         let engine = crate::engine::Engine::new_with_adapter(
             adapter.clone(),
             crate::engine::EngineOptions::new(),
@@ -331,13 +334,16 @@ async fn legacy_headers_upgrade_without_rewriting_rows_history_or_membership() {
     let read = adapter.begin_read(Default::default()).await.unwrap();
     assert_eq!(
         marker(&read).await.unwrap().as_ref(),
-        crate::init::REPOSITORY_PROTOCOL_VALUE
+        crate::init::REPOSITORY_PROTOCOL_V80
     );
     for (space, expected) in spaces.into_iter().zip(before) {
         assert_eq!(snapshot(&read, space).await, expected);
     }
     drop(read);
     migrate(&adapter, MigrationOptions::default(), false)
+        .await
+        .unwrap();
+    super::super::runtime_epoch::migrate(&adapter, false)
         .await
         .unwrap();
     let engine =
@@ -440,6 +446,6 @@ async fn sparse_missing_graph_preserves_explicit_unknown_headers() {
     );
     assert_eq!(
         marker(&read).await.unwrap().as_ref(),
-        crate::init::PARTIAL_REPOSITORY_PROTOCOL_VALUE
+        crate::init::PARTIAL_REPOSITORY_PROTOCOL_V80
     );
 }

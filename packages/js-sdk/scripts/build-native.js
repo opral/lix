@@ -27,7 +27,8 @@ const artifactName = target ? targetArtifacts[target] :
 		: process.platform === "win32"
 			? "lix_js_sdk.dll"
 			: "liblix_js_sdk.so";
-const destination = join(packageDir, "lix_js_sdk.node");
+const migrationArtifact = process.env.LIX_OFFLINE_MIGRATION === "1";
+const destination = join(packageDir, migrationArtifact ? "lix_js_sdk_migration.node" : "lix_js_sdk.node");
 
 function run(cmd, args, opts = {}) {
 	return new Promise((resolve, reject) => {
@@ -85,6 +86,7 @@ const args = [
 ];
 
 if (target) args.push("--target", target);
+if (migrationArtifact) args.push("--features", "offline-migration");
 args.push("--timings");
 
 await run("cargo", args);

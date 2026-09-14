@@ -1733,6 +1733,144 @@ pub(crate) async fn stage_deterministic_identity_witness_migration(
     ])
 }
 
+/// Independent detached-migration qualification. Reads the original physical
+/// identities directly; does not invoke the witness staging implementation.
+#[cfg(feature = "offline-migration")]
+pub(crate) async fn verify_migrated_deterministic_witness(
+    source: &(impl StorageAdapterRead + ?Sized),
+    target: &(impl StorageAdapterRead + ?Sized),
+    generation: CommitId,
+    max_rows: usize,
+    max_bytes: usize,
+) -> Result<(), LixError> {
+    let scope = crate::collection_generation::CollectionScopeRef {
+        schema_key: EXACT_CLOSURE_SCHEMA_KEY,
+        file_id: None,
+    };
+    let key = StorageKey(Bytes::from(hot_collection_control_key(
+        crate::GLOBAL_BRANCH_ID,
+        generation,
+        scope,
+    )));
+    let control = PointReadPlan::new(COLLECTION_CONTROL_SPACE, std::slice::from_ref(&key))
+        .materialize(source, Default::default())
+        .await?
+        .value
+        .pop()
+        .flatten();
+    let mut witnesses = target
+        .begin_scan(
+            DETERMINISTIC_IDENTITY_WITNESS_SPACE,
+            StoragePrefix {
+                bytes: Bytes::new(),
+            }
+            .to_range()?,
+            Default::default(),
+        )
+        .await?;
+    let (mut witness_rows, mut witness_bytes) = (0usize, 0usize);
+    while let Some(page) = witnesses.next_chunk().await? {
+        for entry in page {
+            let value = full_value_bytes(entry.value)?;
+            witness_rows = witness_rows.saturating_add(1);
+            witness_bytes = witness_bytes
+                .saturating_add(entry.key.0.len())
+                .saturating_add(value.len());
+            if witness_rows > max_rows || witness_bytes > max_bytes {
+                return Err(head_value_error(
+                    "witness inventory exceeds qualification bounds",
+                ));
+            }
+            if entry.key == key && control.is_some() {
+                continue;
+            }
+            let old = PointReadPlan::new(DETERMINISTIC_IDENTITY_WITNESS_SPACE, &[entry.key])
+                .materialize(source, Default::default())
+                .await?
+                .value
+                .pop()
+                .flatten();
+            if !matches!(old, Some(StorageProjectedValue::FullValue(old)) if old == value) {
+                return Err(head_value_error(
+                    "migration invented an unrelated deterministic witness",
+                ));
+            }
+        }
+    }
+    let Some(StorageProjectedValue::FullValue(control)) = control else {
+        return Ok(());
+    };
+    let prefix = hot_scope_prefix(crate::GLOBAL_BRANCH_ID, generation);
+    let mut selected = prefix.clone();
+    write_key_string(&mut selected, EXACT_CLOSURE_SCHEMA_KEY, KEY_PART_FINAL);
+    let mut cursor = source
+        .begin_scan(
+            ROW_SPACE,
+            StoragePrefix {
+                bytes: Bytes::from(selected),
+            }
+            .to_range()?,
+            Default::default(),
+        )
+        .await?;
+    let (mut rows, mut bytes, mut presence) = (0usize, 0usize, 0u8);
+    while let Some(page) = cursor.next_chunk().await? {
+        for entry in page {
+            let value = full_value_bytes(entry.value)?;
+            rows = rows.saturating_add(1);
+            bytes = bytes
+                .saturating_add(entry.key.0.len())
+                .saturating_add(value.len());
+            if rows > max_rows || bytes > max_bytes {
+                return Err(head_value_error(
+                    "deterministic witness qualification exceeds bounds",
+                ));
+            }
+            let identity = decode_hot_row_key_in_scope(&entry.key.0, &prefix)?;
+            let canonical = encode_hot_row_key_parts(
+                crate::GLOBAL_BRANCH_ID,
+                generation,
+                &identity.schema_key,
+                &identity.row_pk,
+                identity.file_id.as_deref(),
+            );
+            validate_canonical_exact_collection_key(&entry.key.0, &canonical)?;
+            if identity.schema_key != EXACT_CLOSURE_SCHEMA_KEY {
+                return Err(head_value_error(
+                    "deterministic witness qualification escaped scope",
+                ));
+            }
+            // Presence is physical, including tombstones and fenced rows.
+            // A missing value must never be certified from visibility filters.
+            if identity.file_id.is_none() {
+                if identity.row_pk == RowPk::single("lix_deterministic_mode") {
+                    presence |= 1;
+                }
+                if identity.row_pk == RowPk::single("lix_deterministic_sequence_number") {
+                    presence |= 2;
+                }
+            }
+        }
+    }
+    let value = PointReadPlan::new(DETERMINISTIC_IDENTITY_WITNESS_SPACE, &[key])
+        .materialize(target, Default::default())
+        .await?
+        .value
+        .pop()
+        .flatten();
+    let Some(StorageProjectedValue::FullValue(value)) = value else {
+        return Err(head_value_error("migrated deterministic witness absent"));
+    };
+    let witness: DeterministicIdentityWitness =
+        storage_codec::decode("migrated deterministic witness", &value)?;
+    if witness.collection_control != control.as_ref() || witness.presence != presence {
+        return Err(head_value_error(
+            "migrated deterministic witness differs from source identities/control",
+        ));
+    }
+    Ok(())
+}
+
 fn deterministic_identity_bit(pk: &RowPk) -> Option<u8> {
     if pk == &RowPk::single("lix_deterministic_mode") {
         Some(1)

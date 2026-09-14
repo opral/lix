@@ -1,0 +1,853 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 14c9e2ebe..9f14555c4 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3058,6 +3058,7 @@ dependencies = [
+  "futures-util",
+  "lix",
+  "object_store 0.14.0",
++ "serde_json",
+  "slatedb",
+  "slatedb-common",
+  "tempfile",
+diff --git a/packages/lix/src/hot_state/mod.rs b/packages/lix/src/hot_state/mod.rs
+index 675093bae..d6f0c0624 100644
+--- a/packages/lix/src/hot_state/mod.rs
++++ b/packages/lix/src/hot_state/mod.rs
+@@ -87,3 +87,6 @@ pub(crate) use visibility::{
+ };
+ #[cfg(test)]
+ pub(crate) use visibility::{blob_ref_probe_stats, reset_blob_ref_probe_stats};
++
++pub(crate) use tracked_head::bridge_hot_semantics;
++pub(crate) use tracked_head::bridge_account_schema_amendment;
+diff --git a/packages/lix/src/hot_state/tracked_head.rs b/packages/lix/src/hot_state/tracked_head.rs
+index a714bd1aa..4e16e83a2 100644
+--- a/packages/lix/src/hot_state/tracked_head.rs
++++ b/packages/lix/src/hot_state/tracked_head.rs
+@@ -5173,3 +5173,27 @@ mod tests {
+         }
+     }
+ }
++
++/// Detached historical bridge proof: omit derived working-diff acceleration.
++pub(crate) fn bridge_hot_semantics(bytes:&[u8])->Result<String,LixError>{
++ let value=decode_head_value(bytes)?;
++ Ok(format!("{:?}|{:?}|{}|{}|{:?}|{:?}|{:?}|{:?}",value.change_id,value.commit_id,value.untracked,value.deleted,value.created_at,value.updated_at,value.snapshot,value.metadata))
++}
++
++/// The sole logical amendment in the pinned bridge adds profile_uri to lix_account.
++pub(crate) fn bridge_account_schema_amendment(key:&[u8], before:&[u8], after:&[u8])->Result<bool,LixError>{
++ let identity=decode_hot_row_key_for_migration(key)?;
++ if identity.schema_key!="lix_registered_schema" {return Ok(false)}
++ let before=decode_head_value(before)?;let after=decode_head_value(after)?;
++ if before.deleted || after.deleted || before.untracked!=after.untracked || before.metadata!=after.metadata {return Ok(false)}
++ let(Some(before_payload),Some(after_payload))=(before.snapshot,after.snapshot)else{return Ok(false)};
++ let before_row=WasmTypedRow::decode_durable_payload(Arc::from(before_payload),&identity.schema_key,&identity.row_pk)?;
++ let after_row=WasmTypedRow::decode_durable_payload(Arc::from(after_payload),&identity.schema_key,&identity.row_pk)?;
++ if before_row.row.get("schema_key")!=Some(&lix_schema::Value::Text("lix_account".to_owned())) || after_row.row.get("schema_key")!=before_row.row.get("schema_key") {return Ok(false)}
++ let(Some(lix_schema::Value::Jsonb(before_schema)),Some(lix_schema::Value::Jsonb(after_schema)))=(before_row.row.get("value"),after_row.row.get("value"))else{return Ok(false)};
++ let target=crate::schema::seed_schema_definition("lix_account").expect("builtin account schema");
++ if &after_schema.clone().into_value()!=target{return Ok(false)}
++ let source=lix_schema::from_value(before_schema.clone().into_value()).map_err(|error|head_value_error(&error.to_string()))?;
++ let target=lix_schema::from_value(target.clone()).map_err(|error|head_value_error(&error.to_string()))?;
++ Ok(lix_schema::validate_amendment(&source,&target).is_ok())
++}
+diff --git a/packages/lix/src/migration/commit_plan.rs b/packages/lix/src/migration/commit_plan.rs
+index a9c4f6b3e..74be79517 100644
+--- a/packages/lix/src/migration/commit_plan.rs
++++ b/packages/lix/src/migration/commit_plan.rs
+@@ -49,6 +49,7 @@ struct OwnedMember {
+ pub(super) struct CommitAuthorityPlan {
+     pub(super) member_count: u64,
+     pub(super) recovered_changes: Vec<RewrittenChange>,
++    pub(super) source_members: Vec<(CommitId, Vec<(TrackedStateKey, TrackedStateIndexValue)>)>,
+ }
+ 
+ #[derive(Clone, Copy)]
+@@ -493,6 +494,7 @@ pub(super) async fn plan_commit_authorities(
+     let mut change_locators = BTreeMap::<ChangeId, PlannedChangeLocator>::new();
+     let mut member_count = 0u64;
+     let mut recovered_changes = BTreeMap::new();
++    let mut source_members = Vec::new();
+     for commit_id in commit_ids.iter().copied() {
+         let old = load_commit_state_manifest(read, commit_id)
+             .await?
+@@ -512,6 +514,7 @@ pub(super) async fn plan_commit_authorities(
+             ));
+         }
+         let members = load_members(read, &old, &changes, catalog).await?;
++        source_members.push((commit_id, members.iter().map(|member| (member.key.clone(), member.value.clone())).collect()));
+         for member in &members {
+             if let Some(change) = member.authored_change.as_ref() {
+                 recovered_changes
+@@ -626,6 +629,7 @@ pub(super) async fn plan_commit_authorities(
+     Ok(CommitAuthorityPlan {
+         member_count,
+         recovered_changes: recovered_changes.into_values().collect(),
++        source_members,
+     })
+ }
+ 
+diff --git a/packages/lix/src/migration/mod.rs b/packages/lix/src/migration/mod.rs
+index 195078b39..2ee45e58d 100644
+--- a/packages/lix/src/migration/mod.rs
++++ b/packages/lix/src/migration/mod.rs
+@@ -33,3 +33,6 @@ mod v68_to_v69_rows;
+ pub use api::{
+     MigrationOptions, MigrationReport, MigrationStatus, inspect_lix, migrate_lix,
+ };
++
++mod bridge;
++pub use bridge::{bridge_qualify,bridge_recheck,bridge_negative_check};
+diff --git a/packages/lix/src/migration/publish.rs b/packages/lix/src/migration/publish.rs
+index 555b6fa73..bf7316e53 100644
+--- a/packages/lix/src/migration/publish.rs
++++ b/packages/lix/src/migration/publish.rs
+@@ -88,6 +88,10 @@ impl PublicationPlan {
+         }
+     }
+ 
++    pub(super) fn bridge_values(&self, space: StorageSpace) -> Vec<(Vec<u8>,Vec<u8>)> {
++        self.mutable_puts.iter().chain(&self.replacements).filter(|(candidate,_)| *candidate==space).flat_map(|(_,batch)|batch.entries.iter().map(|entry|(entry.key.0.to_vec(),entry.value.bytes.to_vec()))).collect()
++    }
++
+     fn account(&mut self, batch: &PutBatch) -> Result<(), LixError> {
+         let entries = batch.entries.len();
+         let bytes = batch
+diff --git a/packages/storage-slatedb/Cargo.toml b/packages/storage-slatedb/Cargo.toml
+index aab7d7926..6cc210d7e 100644
+--- a/packages/storage-slatedb/Cargo.toml
++++ b/packages/storage-slatedb/Cargo.toml
+@@ -28,3 +28,6 @@ slatedb = { version = "0.14.1", default-features = false, features = ["moka", "z
+ slatedb-common = "0.14.1"
+ tempfile = "3"
+ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
++
++[dev-dependencies]
++serde_json = "1"
+diff --git a/packages/lix/src/migration/bridge.rs b/packages/lix/src/migration/bridge.rs
+new file mode 100644
+index 000000000..7189c9287
+--- /dev/null
++++ b/packages/lix/src/migration/bridge.rs
+@@ -0,0 +1,601 @@
++//! Detached historical qualification; never linked into the current runtime.
++use super::MigrationOptions;
++use crate::{
++    LixError,
++    changelog::{ChangeId, ChangeRecord},
++    storage_adapter::*,
++};
++use std::collections::BTreeMap;
++use std::ops::Bound;
++
++fn failure(message: impl Into<String>) -> LixError {
++    LixError::new("LIX_BRIDGE_VERIFICATION_FAILED", message)
++}
++fn canonical_record(record: &ChangeRecord) -> Result<Vec<u8>, LixError> {
++    let mut record = record.clone();
++    record.format_version = 0;
++    crate::changelog::encode_change_record(&record)
++}
++fn digest(bytes: &[u8]) -> String {
++    blake3::hash(bytes).to_hex().to_string()
++}
++fn hex(bytes: &[u8]) -> String {
++    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
++}
++async fn entries(
++    read: &(impl StorageAdapterRead + ?Sized),
++    space: StorageSpace,
++) -> Result<Vec<(Vec<u8>, Vec<u8>)>, LixError> {
++    let mut scan = read
++        .begin_scan(
++            space,
++            StorageKeyRange {
++                lower: Bound::Unbounded,
++                upper: Bound::Unbounded,
++            },
++            StorageBeginScanOptions {
++                projection: StorageCoreProjection::FullValue,
++                ..Default::default()
++            },
++        )
++        .await?;
++    let mut output = Vec::new();
++    let mut bytes = 0usize;
++    while let Some(chunk) = scan.next_chunk().await? {
++        for entry in chunk {
++            let StorageProjectedValue::FullValue(value) = entry.value else {
++                return Err(failure("missing scan value"));
++            };
++            bytes = bytes.saturating_add(entry.key.0.len() + value.len());
++            if output.len() >= 250000 || bytes > 512 * 1024 * 1024 {
++                return Err(failure("witness space budget exceeded"));
++            }
++            output.push((entry.key.0.to_vec(), value.to_vec()));
++        }
++    }
++    Ok(output)
++}
++
++/// Records a source-derived retained-history witness before attempting migration.
++/// Full cutover approval additionally requires current-state and next-hop proof.
++pub async fn bridge_qualify<S>(storage: S, report_path: &str) -> Result<serde_json::Value, LixError>
++where
++    S: Storage + Clone + Send + Sync + 'static,
++{
++    let status = super::inspect_lix(&storage).await?;
++    let version = match status {
++        super::MigrationStatus::Required { from_version, .. }
++            if [68, 71].contains(&from_version) =>
++        {
++            from_version
++        }
++        _ => {
++            return Err(failure(format!(
++                "bridge accepts only68/71; found {status:?}"
++            )));
++        }
++    };
++    let adapter = StorageAdapter::new(storage.clone());
++    let read = adapter.begin_read(Default::default()).await?;
++    let options = MigrationOptions::default();
++    let source_branches = crate::branch::BranchHeadControlContext::new()
++        .reader(&read)
++        .scan()
++        .await?
++        .into_iter()
++        .collect::<BTreeMap<_, _>>();
++    let mut expected = BTreeMap::<ChangeId, ChangeRecord>::new();
++    let mut standalone_ids = std::collections::BTreeSet::new();
++    let mut expected_members = Vec::new();
++    let expected_hot;
++    if version == 68 {
++        let (source, retained) = super::v68::preflight_standalone_changelog(
++            &read,
++            options.max_changes,
++            options.max_preflight_bytes,
++        )
++        .await?;
++        let registrations = super::commit_plan::discover_registered_schema_changes(
++            &read,
++            options.max_changes.saturating_sub(source.len()),
++            options.max_preflight_bytes.saturating_sub(retained),
++        )
++        .await?;
++        let mut plan =
++            super::publish::PublicationPlan::bounded(usize::MAX, options.max_preflight_bytes);
++        let standalone =
++            super::standalone_plan::plan_standalone_changes(source, &registrations, &mut plan)?;
++        let authorities = super::commit_plan::plan_commit_authorities(
++            &read,
++            &standalone.rewritten,
++            &standalone.catalog,
++            options
++                .max_changes
++                .saturating_sub(standalone.rewritten.len()),
++            &mut plan,
++        )
++        .await?;
++        standalone_ids.extend(
++            standalone
++                .rewritten
++                .iter()
++                .map(|change| change.record.change_id),
++        );
++        expected_members = authorities.source_members;
++        let mut all_changes = standalone.rewritten.clone();
++        all_changes.extend(authorities.recovered_changes.iter().cloned());
++        super::hot_plan::plan_hot_rows(
++            &read,
++            &all_changes,
++            &standalone.catalog,
++            options.max_changes,
++            &mut plan,
++        )
++        .await?;
++        expected_hot = plan.bridge_values(crate::hot_state::ROW_SPACE);
++        for change in standalone
++            .rewritten
++            .into_iter()
++            .chain(authorities.recovered_changes)
++        {
++            if let Some(previous) = expected.insert(change.record.change_id, change.record.clone())
++            {
++                if previous != change.record {
++                    return Err(failure("source gives conflicting canonical change records"));
++                }
++            }
++        }
++    } else {
++        expected_hot = entries(&read, crate::hot_state::ROW_SPACE).await?;
++        for (key, value) in entries(&read, crate::changelog::CHANGE_SPACE).await? {
++            let id = ChangeId::new(
++                uuid::Uuid::from_slice(&key).map_err(|error| failure(error.to_string()))?,
++            );
++            standalone_ids.insert(id);
++            expected.insert(id, crate::changelog::decode_change_record(&value, id)?);
++        }
++        for commit in crate::tracked_state::scan_commit_state_manifest_commit_ids(&read).await? {
++            let delta = crate::tracked_state::scan_commit_delta_values(&read, commit, &[]).await?;
++            expected_members.push((
++                commit,
++                delta
++                    .iter()
++                    .map(|row| {
++                        let key = row.key_ref();
++                        (
++                            crate::tracked_state::TrackedStateKey {
++                                schema_key: key.schema_key.to_owned(),
++                                file_id: key.file_id.map(str::to_owned),
++                                row_pk: key.row_pk.clone(),
++                            },
++                            row.value().clone(),
++                        )
++                    })
++                    .collect(),
++            ));
++            for row in delta.iter() {
++                let id = row.value().change_id;
++                let record = crate::tracked_state::load_change_record_by_id(&read, id)
++                    .await?
++                    .ok_or_else(|| failure(format!("source change {id} unavailable")))?;
++                expected.insert(id, record);
++            }
++        }
++    }
++    let source_hot_bytes = expected_hot.clone().into_iter().collect::<BTreeMap<_, _>>();
++    let expected_hot = expected_hot
++        .into_iter()
++        .map(|(key, value)| {
++            Ok((
++                key,
++                digest(crate::hot_state::bridge_hot_semantics(&value)?.as_bytes()),
++            ))
++        })
++        .collect::<Result<BTreeMap<_, _>, LixError>>()?;
++    let mut preserved = Vec::new();
++    let mut space_inventory = Vec::new();
++    for &space in crate::storage_spaces::ALL_STORAGE_SPACES {
++        let values = entries(&read, space).await?;
++        space_inventory.push(serde_json::json!({"space":space.name,"entries":values.len()}));
++        if space == crate::changelog::COMMIT_SPACE
++            || space.name.starts_with("binary_cas.")
++            || space.name.contains("receipt")
++            || space.name.contains("upload")
++            || space.name.starts_with("sync.")
++        {
++            preserved.push((
++                space,
++                values
++                    .into_iter()
++                    .map(|(key, value)| (key, digest(&value)))
++                    .collect::<Vec<_>>(),
++            ));
++        }
++    }
++    let expected_records=expected.iter().map(|(id,record)|Ok(serde_json::json!({"id":id.to_string(),"recordDigest":digest(&canonical_record(record)?)}))).collect::<Result<Vec<_>,LixError>>()?;
++    let raw_records=preserved.iter().map(|(space,values)|serde_json::json!({"space":space.name,"records":values.iter().map(|(key,digest)|serde_json::json!({"key":hex(key),"digest":digest})).collect::<Vec<_>>()})).collect::<Vec<_>>();
++    let mut report = serde_json::json!({"historicalRevision":"6e1efebb3953e8e4e5945fd9a9269a69803970c8","fromVersion":version,"targetVersion":74,"sourceInventory":space_inventory,"sourceBranches":source_branches.iter().map(|(id,control)|serde_json::json!({"id":id,"head":control.head_commit_id.to_string(),"trackedGeneration":control.tracked_generation.to_string(),"createdAt":control.created_at.to_string()})).collect::<Vec<_>>(),"expectedChanges":expected_records,"protectedSourceRecords":raw_records,"sourceHotRows":expected_hot.iter().map(|(key,value)|serde_json::json!({"key":hex(key),"digest":value})).collect::<Vec<_>>(),"sourceMembership":expected_members.iter().map(|(commit,members)|serde_json::json!({"commit":commit.to_string(),"digest":digest(format!("{members:?}").as_bytes()),"members":members.len()})).collect::<Vec<_>>(),"retainedHistoryVerified":false,"fullSemanticPreservationVerified":false});
++    std::fs::write(report_path, serde_json::to_vec_pretty(&report).unwrap())
++        .map_err(|error| failure(error.to_string()))?;
++    drop(read);
++    let migration = super::migrate_lix(storage.clone(), options).await?;
++    let read = adapter.begin_read(Default::default()).await?;
++    let mut retain = Vec::new();
++    for id in standalone_ids {
++        let values = PointReadPlan::new(
++            crate::changelog::CHANGE_SPACE,
++            &[StorageKey(bytes::Bytes::copy_from_slice(
++                id.as_uuid().as_bytes(),
++            ))],
++        )
++        .materialize(&read, Default::default())
++        .await?
++        .value;
++        if values.first().is_some_and(Option::is_none) {
++            retain.push((
++                id.as_uuid().as_bytes().to_vec(),
++                crate::changelog::encode_change_record(&expected[&id])?,
++            ));
++        }
++    }
++    let retained_standalone = retain.len();
++    if !retain.is_empty() {
++        let revision = StorageAdapter::<S>::load_mutation_revision_from_read(&read).await?;
++        drop(read);
++        let mut plan = super::publish::PublicationPlan::bounded(
++            options.max_changes,
++            options.max_preflight_bytes,
++        );
++        plan.put_mutable(crate::changelog::CHANGE_SPACE, retain)?;
++        super::publish::publish(
++            &storage,
++            revision,
++            b"tracked-default-branch.v74",
++            b"tracked-default-branch.v74",
++            plan,
++        )
++        .await?;
++    } else {
++        drop(read);
++    }
++    let read = adapter.begin_read(Default::default()).await?;
++    for (id, expected) in &expected {
++        let actual = crate::tracked_state::load_change_record_by_id(&read, *id).await?;
++        let actual = if let Some(actual) = actual {
++            actual
++        } else {
++            let values = PointReadPlan::new(
++                crate::changelog::CHANGE_SPACE,
++                &[StorageKey(bytes::Bytes::copy_from_slice(
++                    id.as_uuid().as_bytes(),
++                ))],
++            )
++            .materialize(&read, Default::default())
++            .await?
++            .value;
++            let Some(Some(StorageProjectedValue::FullValue(value))) = values.first() else {
++                return Err(failure(format!(
++                    "lost retained change {id}; schema={}",
++                    expected.schema_key
++                )));
++            };
++            crate::changelog::decode_change_record(value, *id)?
++        };
++        if canonical_record(&actual)? != canonical_record(expected)? {
++            return Err(failure(format!(
++                "retained change {id} differs: format={} account={} schema={} row_pk={} file={} snapshot={} metadata={} timestamp={} origin={}",
++                actual.format_version != expected.format_version,
++                actual.account_id != expected.account_id,
++                actual.schema_key != expected.schema_key,
++                actual.row_pk != expected.row_pk,
++                actual.file_id != expected.file_id,
++                actual.snapshot != expected.snapshot,
++                actual.metadata != expected.metadata,
++                actual.created_at != expected.created_at,
++                actual.origin_key != expected.origin_key
++            )));
++        }
++    }
++    for (space, source) in preserved {
++        let actual = entries(&read, space)
++            .await?
++            .into_iter()
++            .map(|(key, value)| (key, digest(&value)))
++            .collect::<BTreeMap<_, _>>();
++        for (key, digest) in source {
++            if actual.get(&key) != Some(&digest) {
++                return Err(failure(format!(
++                    "protected source record changed in {}",
++                    space.name
++                )));
++            }
++        }
++    }
++    for (commit, expected) in &expected_members {
++        let delta = crate::tracked_state::scan_commit_delta_values(&read, *commit, &[]).await?;
++        let actual = delta
++            .iter()
++            .map(|row| {
++                let key = row.key_ref();
++                (
++                    crate::tracked_state::TrackedStateKey {
++                        schema_key: key.schema_key.to_owned(),
++                        file_id: key.file_id.map(str::to_owned),
++                        row_pk: key.row_pk.clone(),
++                    },
++                    row.value().clone(),
++                )
++            })
++            .collect::<Vec<_>>();
++        if &actual != expected {
++            return Err(failure(format!("commit {commit} membership changed")));
++        }
++    }
++    let destination_branches = crate::branch::BranchHeadControlContext::new()
++        .reader(&read)
++        .scan()
++        .await?
++        .into_iter()
++        .collect::<BTreeMap<_, _>>();
++    if destination_branches.keys().ne(source_branches.keys()) {
++        return Err(failure("branch identity set changed"));
++    }
++    let mut amendment_heads = std::collections::BTreeSet::new();
++    for (id, before) in &source_branches {
++        let after = &destination_branches[id];
++        if before.created_at != after.created_at
++            || before.tracked_generation != after.tracked_generation
++        {
++            return Err(failure(format!("branch {id} identity/generation changed")));
++        }
++        if before.head_commit_id != after.head_commit_id {
++            let key = StorageKey(bytes::Bytes::copy_from_slice(
++                after.head_commit_id.as_uuid().as_bytes(),
++            ));
++            let result = PointReadPlan::new(crate::changelog::COMMIT_SPACE, &[key])
++                .materialize(&read, Default::default())
++                .await?
++                .value;
++            let Some(Some(StorageProjectedValue::FullValue(value))) = result.first() else {
++                return Err(failure("amendment commit unavailable"));
++            };
++            let commit: crate::changelog::CommitRecord =
++                crate::storage_codec::decode("bridge amendment commit", value)?;
++            if commit.parent_commit_ids != vec![before.head_commit_id] {
++                return Err(failure(format!("branch {id} amendment rewrote ancestry")));
++            }
++            let delta =
++                crate::tracked_state::scan_commit_delta_values(&read, after.head_commit_id, &[])
++                    .await?;
++            if delta.len() != 1
++                || delta.iter().any(|row| {
++                    row.key_ref().schema_key != "lix_registered_schema"
++                        || row.key_ref().row_pk != &crate::row_pk::RowPk::single("lix_account")
++                })
++            {
++                return Err(failure(format!(
++                    "branch {id} amendment contains unexpected user changes"
++                )));
++            }
++            amendment_heads.insert(after.head_commit_id.as_uuid().as_bytes().to_vec());
++        }
++    }
++    let final_commits = entries(&read, crate::changelog::COMMIT_SPACE).await?;
++    let source_commit_keys = report["protectedSourceRecords"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .find(|entry| entry["space"] == crate::changelog::COMMIT_SPACE.name)
++        .unwrap()["records"]
++        .as_array()
++        .unwrap()
++        .iter()
++        .map(|entry| entry["key"].as_str().unwrap().to_owned())
++        .collect::<std::collections::BTreeSet<_>>();
++    if final_commits
++        .iter()
++        .filter(|(key, _)| !source_commit_keys.contains(&hex(key)))
++        .map(|(key, _)| key.clone())
++        .collect::<std::collections::BTreeSet<_>>()
++        != amendment_heads
++    {
++        return Err(failure("unexpected added commit outside schema amendments"));
++    }
++    let actual_hot_bytes = entries(&read, crate::hot_state::ROW_SPACE)
++        .await?
++        .into_iter()
++        .collect::<BTreeMap<_, _>>();
++    let actual_hot = actual_hot_bytes
++        .clone()
++        .into_iter()
++        .map(|(key, value)| {
++            Ok((
++                key,
++                digest(crate::hot_state::bridge_hot_semantics(&value)?.as_bytes()),
++            ))
++        })
++        .collect::<Result<BTreeMap<_, _>, LixError>>()?;
++    if actual_hot.keys().ne(expected_hot.keys()) {
++        return Err(failure("current row identity set changed"));
++    }
++    let mut amended_rows = Vec::new();
++    for (key, expected) in &expected_hot {
++        if actual_hot.get(key) != Some(expected) {
++            if let Some(after) = actual_hot_bytes.get(key) {
++                if crate::hot_state::bridge_account_schema_amendment(
++                    key,
++                    &source_hot_bytes[key],
++                    after,
++                )? {
++                    amended_rows.push(hex(key));
++                    continue;
++                }
++            }
++            return Err(failure(format!("source current row changed: {}", hex(key))));
++        }
++    }
++    report["verifiedDestinationDigest"] = content_digest(&read).await?.into();
++    report["fullSemanticPreservationVerified"] = true.into();
++    report["branchAncestryVerified"] = true.into();
++    report["schemaAmendmentRows"] = serde_json::json!(amended_rows);
++    report["retainedHistoryVerified"] = true.into();
++    report["currentRowsVerified"] = true.into();
++    report["retainedStandaloneRecords"] = retained_standalone.into();
++    report["commitMembershipVerified"] = true.into();
++    report["toVersion"] = migration.to_version.into();
++    std::fs::write(report_path, serde_json::to_vec_pretty(&report).unwrap())
++        .map_err(|error| failure(error.to_string()))?;
++    Ok(report)
++}
++
++async fn content_digest(read: &(impl StorageAdapterRead + ?Sized)) -> Result<String, LixError> {
++    let mut hasher = blake3::Hasher::new();
++    for &space in crate::storage_spaces::ALL_STORAGE_SPACES {
++        hasher.update(&space.id.0.to_be_bytes());
++        for (key, value) in entries(read, space).await? {
++            hasher.update(&(key.len() as u64).to_be_bytes());
++            hasher.update(&key);
++            hasher.update(&(value.len() as u64).to_be_bytes());
++            hasher.update(&value);
++        }
++    }
++    Ok(hasher.finalize().to_hex().to_string())
++}
++
++/// Rechecks the sealed destination after successful source-derived verification.
++/// This detects later mutation; it is never a substitute for source proof.
++pub async fn bridge_recheck<S: Storage>(
++    storage: S,
++    report: &serde_json::Value,
++) -> Result<(), LixError> {
++    if report["retainedHistoryVerified"] != true
++        || report["branchAncestryVerified"] != true
++        || report["commitMembershipVerified"] != true
++        || report["currentRowsVerified"] != true
++    {
++        return Err(failure("source proof incomplete"));
++    }
++    let adapter = StorageAdapter::new(storage);
++    let read = adapter.begin_read(Default::default()).await?;
++    if report["verifiedDestinationDigest"].as_str() != Some(content_digest(&read).await?.as_str()) {
++        return Err(failure("verified destination changed after source proof"));
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[tokio::test]
++    async fn source_witness_seal_rejects_deleted_or_changed_standalone_history() {
++        for alter in [false, true] {
++            let storage = crate::Memory::from_snapshot(include_bytes!(
++                "../../tests/fixtures/v68_bundled_csv_history.snapshot"
++            ))
++            .unwrap();
++            let path = std::env::temp_dir()
++                .join(format!("lix-bridge-witness-{}.json", uuid::Uuid::new_v4()));
++            let report = bridge_qualify(storage.clone(), path.to_str().unwrap())
++                .await
++                .unwrap();
++            bridge_recheck(storage.clone(), &report).await.unwrap();
++            bridge_recheck(storage.clone(), &report).await.unwrap();
++            let adapter = StorageAdapter::new(storage.clone());
++            let read = adapter.begin_read(Default::default()).await.unwrap();
++            let (key, value) = entries(&read, crate::changelog::CHANGE_SPACE)
++                .await
++                .unwrap()
++                .into_iter()
++                .find(|(key, value)| {
++                    let id = ChangeId::new(uuid::Uuid::from_slice(key).unwrap());
++                    crate::changelog::decode_change_record(value, id)
++                        .is_ok_and(|record| record.schema_key == "lix_branch_ref")
++                })
++                .expect("retained branch reference change");
++            drop(read);
++            let mut write = storage.begin_write(Default::default()).await.unwrap();
++            if alter {
++                let mut value = value;
++                value.push(0);
++                write
++                    .put_many(
++                        crate::changelog::CHANGE_SPACE,
++                        PutBatch {
++                            entries: vec![PutEntry {
++                                key: StorageKey(key.into()),
++                                value: crate::storage::StoredValue {
++                                    bytes: value.into(),
++                                },
++                            }],
++                        },
++                    )
++                    .await
++                    .unwrap();
++            } else {
++                write
++                    .delete_many(crate::changelog::CHANGE_SPACE, &[StorageKey(key.into())])
++                    .await
++                    .unwrap();
++            }
++            write.commit().await.unwrap();
++            assert_eq!(
++                bridge_recheck(storage, &report).await.unwrap_err().code,
++                "LIX_BRIDGE_VERIFICATION_FAILED"
++            );
++            std::fs::remove_file(path).unwrap();
++        }
++    }
++}
++
++/// Destructive qualification probe. Operator CLI exposes this only for disposable copies.
++#[doc(hidden)]
++pub async fn bridge_negative_check<S: Storage + Clone>(
++    storage: S,
++    report: &serde_json::Value,
++    alter: bool,
++) -> Result<(), LixError> {
++    bridge_recheck(storage.clone(), report).await?;
++    let adapter = StorageAdapter::new(storage.clone());
++    let read = adapter.begin_read(Default::default()).await?;
++    let (key, value) = entries(&read, crate::changelog::CHANGE_SPACE)
++        .await?
++        .into_iter()
++        .find(|(key, value)| {
++            let Ok(uuid) = uuid::Uuid::from_slice(key) else {
++                return false;
++            };
++            crate::changelog::decode_change_record(value, ChangeId::new(uuid))
++                .is_ok_and(|record| record.schema_key == "lix_branch_ref")
++        })
++        .ok_or_else(|| failure("no retained branch ref for negative probe"))?;
++    drop(read);
++    let mut write = storage.begin_write(Default::default()).await?;
++    if alter {
++        let mut value = value;
++        value.push(0);
++        write
++            .put_many(
++                crate::changelog::CHANGE_SPACE,
++                PutBatch {
++                    entries: vec![PutEntry {
++                        key: StorageKey(key.into()),
++                        value: crate::storage::StoredValue {
++                            bytes: value.into(),
++                        },
++                    }],
++                },
++            )
++            .await?;
++    } else {
++        write
++            .delete_many(crate::changelog::CHANGE_SPACE, &[StorageKey(key.into())])
++            .await?;
++    }
++    write.commit().await?;
++    match bridge_recheck(storage, report).await {
++        Err(error) if error.code == "LIX_BRIDGE_VERIFICATION_FAILED" => Ok(()),
++        other => Err(failure(format!(
++            "negative corruption probe was not rejected: {other:?}"
++        ))),
++    }
++}
+diff --git a/packages/storage-slatedb/examples/historical_bridge.rs b/packages/storage-slatedb/examples/historical_bridge.rs
+new file mode 100644
+index 000000000..aaf838cb3
+--- /dev/null
++++ b/packages/storage-slatedb/examples/historical_bridge.rs
+@@ -0,0 +1,112 @@
++//! Offline qualification only. Argument must be a disposable physical copy.
++use lix_storage_slatedb::SlateDB;
++#[tokio::main]
++async fn main() -> Result<(), Box<dyn std::error::Error>> {
++    let mut arguments = std::env::args().skip(1);
++    let directory = arguments
++        .next()
++        .ok_or("expected disposable physical directory")?;
++    let report_path = arguments.next().ok_or("expected witness report path")?;
++    if arguments.next().as_deref() != Some("--isolated-copy") {
++        return Err("explicit --isolated-copy required".into());
++    }
++    let directory = std::path::PathBuf::from(directory);
++    let root = directory.parent().ok_or("directory needs parent")?;
++    let prefix = directory
++        .file_name()
++        .ok_or("directory needs name")?
++        .to_str()
++        .ok_or("directory is not UTF-8")?;
++    let objects = std::sync::Arc::new(object_store::local::LocalFileSystem::new_with_prefix(root)?);
++    let operation = arguments.next();
++    if operation.as_deref() == Some("--manifest-only") {
++        println!(
++            "{}",
++            serde_json::to_string_pretty(&physical_manifest(&directory)?)?
++        );
++        return Ok(());
++    }
++    let patch_hash = std::env::var("LIX_HISTORICAL_PATCH_SHA256")
++        .map_err(|_| "run through the pinned historical-migration operator script")?;
++    if patch_hash.len() != 64 || !patch_hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
++        return Err("invalid historical patch provenance".into());
++    }
++    let source_objects = physical_manifest(&directory)?;
++    if operation.is_none() {
++        std::fs::write(
++            format!("{report_path}.physical-source.json"),
++            serde_json::to_vec_pretty(&source_objects)?,
++        )?;
++    }
++    let storage = SlateDB::open_object_store_with_options(prefix, objects, Default::default())?;
++    let mut report = if matches!(
++        operation.as_deref(),
++        Some("--verify-only" | "--negative-delete" | "--negative-alter")
++    ) {
++        let report: serde_json::Value = serde_json::from_slice(&std::fs::read(&report_path)?)?;
++        match operation.as_deref() {
++            Some("--negative-delete") => {
++                lix::migration::bridge_negative_check(storage, &report, false).await?
++            }
++            Some("--negative-alter") => {
++                lix::migration::bridge_negative_check(storage, &report, true).await?
++            }
++            _ => lix::migration::bridge_recheck(storage, &report).await?,
++        }
++        report
++    } else {
++        lix::migration::bridge_qualify(storage, &report_path).await?
++    };
++    if operation.is_none() {
++        report["bridgePatchSha256"] = patch_hash.into();
++        report["sourceObjects"] = source_objects;
++        report["verifiedDestinationObjects"] = physical_manifest(&directory)?;
++        std::fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
++    }
++    if operation.as_deref() == Some("--verify-only") {
++        report["verifiedDestinationObjects"] = physical_manifest(&directory)?;
++        std::fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
++    }
++    println!("{}", serde_json::to_string_pretty(&report)?);
++    Ok(())
++}
++
++fn physical_manifest(
++    root: &std::path::Path,
++) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
++    fn collect(
++        root: &std::path::Path,
++        dir: &std::path::Path,
++        rows: &mut Vec<serde_json::Value>,
++    ) -> Result<(), Box<dyn std::error::Error>> {
++        for entry in std::fs::read_dir(dir)? {
++            let entry = entry?;
++            let path = entry.path();
++            if entry.file_type()?.is_symlink() {
++                return Err("symlink in physical source".into());
++            }
++            if path.is_dir() {
++                collect(root, &path, rows)?
++            } else if path.is_file() {
++                let mut file = std::fs::File::open(&path)?;
++                let mut hasher = blake3::Hasher::new();
++                let mut buffer = [0u8; 65536];
++                let mut size = 0u64;
++                loop {
++                    let n = std::io::Read::read(&mut file, &mut buffer)?;
++                    if n == 0 {
++                        break;
++                    }
++                    hasher.update(&buffer[..n]);
++                    size += n as u64;
++                }
++                rows.push(serde_json::json!({"key":path.strip_prefix(root)?.to_str().ok_or("invalid path")?,"bytes":size,"blake3":hasher.finalize().to_hex().to_string()}));
++            }
++        }
++        Ok(())
++    }
++    let mut rows = Vec::new();
++    collect(root, root, &mut rows)?;
++    rows.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
++    Ok(serde_json::json!(rows))
++}

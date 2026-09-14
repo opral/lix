@@ -185,7 +185,8 @@ pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 // v14 settles partial merges against the authority head at admission, which
 // can differ from the head captured by the client's attempt.
 // SDK and server must upgrade together.
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 14;
+// v15 requires format81 and explicit repository/principal admission.
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 15;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str = "LIX_SYNC_REPOSITORY_ID_MISMATCH";

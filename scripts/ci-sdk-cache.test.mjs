@@ -87,9 +87,12 @@ for (const runtime of ["native", "browser"]) {
 			"dist/wasm/lix_js_sdk.js",
 			"dist/wasm/lix_js_sdk.d.ts",
 			"dist/wasm/lix_js_sdk_bg.wasm",
+		"dist/migration-wasm/lix_js_sdk.js",
+		"dist/migration-wasm/lix_js_sdk.d.ts",
+		"dist/migration-wasm/lix_js_sdk_bg.wasm",
 			"dist/bundled-plugins/plugin_csv.lixplugin",
 			"dist/bundled-plugins/plugin_markdown.lixplugin",
-			...(runtime === "native" ? ["lix_js_sdk.node"] : []),
+			...(runtime === "native" ? ["lix_js_sdk.node", "lix_js_sdk_migration.node"] : []),
 		])
 			write(`sdk/${path}`);
 		saveBinaries(sdk, cache, runtime, "key");

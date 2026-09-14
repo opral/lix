@@ -18,7 +18,7 @@ type BackendEntry = {
 	opening?: Promise<OpfsBackend | undefined>;
 	clients: Map<string, number>;
 	queue: Promise<void>;
-	idleTimer?: ReturnType<typeof setTimeout>;
+	closing?: Promise<void>;
 	acceptedOpenRequests: Map<string, string>;
 	ownsRepository: boolean;
 };
@@ -30,24 +30,33 @@ const channel = new BroadcastChannel(
 );
 const inFlightRequests = new Map<string, Promise<void>>();
 const completedRequests = new Map<string, number>();
-const MAX_WARM_IDLE_BACKENDS = 2;
+const closedClients = new Map<string, number>();
 const COMPLETED_REQUEST_TTL_MS = 30_000;
+// A bounded 30s WASM read can delay its SharedWorker heartbeat. Liveness
+// expiry must exceed that budget; explicit close still releases immediately.
+const CLIENT_LIVENESS_TTL_MS = 60_000;
 
 setInterval(() => {
 	const now = Date.now();
-	const cutoff = now - 15_000;
+	const cutoff = now - CLIENT_LIVENESS_TTL_MS;
 	for (const [name, entry] of backends) {
 		for (const [clientId, lastSeen] of entry.clients) {
 			if (lastSeen < cutoff) entry.clients.delete(clientId);
 		}
-		scheduleIdleClose(name, entry);
+		void closeIdleBackend(name, entry).catch(() => undefined);
 	}
 	pruneCompletedRequests(now);
+	for (const [client, closedAt] of closedClients) {
+		if (closedAt < now - CLIENT_LIVENESS_TTL_MS) closedClients.delete(client);
+	}
 }, 5_000);
 
 channel.onmessage = (event: MessageEvent<OpfsRpcRequest>) => {
 	const request = event.data;
 	if (!request || request.kind !== "request") return;
+	if (request.operation === "close") closedClients.set(request.clientId, Date.now());
+	else if (closedClients.has(request.clientId)) return;
+
 	// BroadcastChannel retries can deliver the same request while a SQLite
 	// operation is still running, and queued retry events can arrive after it
 	// completes. Retain completed IDs past the client's retry deadline so one
@@ -76,24 +85,34 @@ channel.onmessage = (event: MessageEvent<OpfsRpcRequest>) => {
 };
 
 async function dispatch(request: OpfsRpcRequest): Promise<boolean> {
+	// Also fence requests that were waiting for a closing backend to drain.
+	if (request.operation !== "close" && closedClients.has(request.clientId)) return false;
 	const entry = getEntry(request.storageName);
+	if (entry.closing) {
+		try { await entry.closing; }
+		catch (error) {
+			postResponse({kind:"response", requestId:request.requestId, clientId:request.clientId, ok:false, error:serializeError(error)});
+			return true;
+		}
+		return dispatch(request);
+	}
 	if (request.operation === "close") {
 		entry.clients.delete(request.clientId);
-		scheduleIdleClose(request.storageName, entry);
-		postResponse({
-			kind: "response",
-			requestId: request.requestId,
-			clientId: request.clientId,
-			ok: true,
-			result: undefined,
-		});
+		try {
+			await entry.opening;
+			// Relay workers must never acknowledge another owner's close.
+			if (!entry.ownsRepository) {
+				if (entry.clients.size === 0 && backends.get(request.storageName) === entry) backends.delete(request.storageName);
+				return false;
+			}
+			await closeIdleBackend(request.storageName, entry);
+			postResponse({kind:"response",requestId:request.requestId,clientId:request.clientId,ok:true,result:undefined});
+		} catch (error) {
+			postResponse({kind:"response",requestId:request.requestId,clientId:request.clientId,ok:false,error:serializeError(error)});
+		}
 		return true;
 	}
 	entry.clients.set(request.clientId, Date.now());
-	if (entry.idleTimer) {
-		clearTimeout(entry.idleTimer);
-		entry.idleTimer = undefined;
-	}
 	if (request.operation === "open") {
 		entry.acceptedOpenRequests.set(request.requestId, request.clientId);
 		if (entry.ownsRepository) {
@@ -149,11 +168,6 @@ async function dispatch(request: OpfsRpcRequest): Promise<boolean> {
 			case "open":
 				return storageState(request.storageName, entry, backend);
 			case "heartbeat":
-				entry.clients.set(request.clientId, Date.now());
-				if (entry.idleTimer) {
-					clearTimeout(entry.idleTimer);
-					entry.idleTimer = undefined;
-				}
 				return storageState(request.storageName, entry, backend);
 			case "acquireSession":
 				return backend.acquireSession();
@@ -316,29 +330,24 @@ function isAlreadyOwned(error: unknown): boolean {
 	);
 }
 
-function scheduleIdleClose(name: string, entry: BackendEntry): void {
-	if (entry.clients.size > 0 || entry.idleTimer) return;
-	// Keep the SQLite/OPFS handle warm for the common close/reopen path, but
-	// bound that cache: every distinct SAH-pool VFS owns browser resources, and
-	// a burst across repositories must not stall the next open.
-	const warmIdle = [...backends].filter(
-		([otherName, other]) => otherName !== name && other.idleTimer,
-	);
-	while (warmIdle.length >= MAX_WARM_IDLE_BACKENDS) {
-		const oldest = warmIdle.shift();
-		if (oldest) closeIdleBackend(...oldest);
-	}
-	entry.idleTimer = setTimeout(() => {
-		closeIdleBackend(name, entry);
-	}, 30_000);
-}
-
-function closeIdleBackend(name: string, entry: BackendEntry): void {
-	if (entry.clients.size > 0) return;
-	if (entry.idleTimer) clearTimeout(entry.idleTimer);
-	entry.idleTimer = undefined;
-	backends.delete(name);
-	if (entry.backend) void entry.backend.close().catch(() => undefined);
+/** Close acknowledgement is a physical ownership boundary, not an idle hint. */
+function closeIdleBackend(name: string, entry: BackendEntry): Promise<void> {
+	if (entry.closing) return entry.closing;
+	if (entry.clients.size > 0) return Promise.resolve();
+	const closing = (async () => {
+		await entry.opening;
+		await entry.queue;
+		if (entry.clients.size > 0) return;
+		await entry.backend?.close();
+		entry.backend = undefined;
+		entry.epoch = undefined;
+		entry.ownsRepository = false;
+		if (backends.get(name) === entry) backends.delete(name);
+	})();
+	entry.closing = closing.then(() => {entry.closing = undefined;});
+	// Preserve a failed close as a failed ownership state. Never silently
+	// create a competing backend when physical release was not confirmed.
+	return entry.closing;
 }
 
 function postResponse(response: OpfsRpcResponse): void {

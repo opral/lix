@@ -9,6 +9,10 @@ export type LixServerOptions = {
 	mode?: "remote" | "partial_replica";
 	url: string | URL;
 	headers?: HeadersInit | (() => HeadersInit | Promise<HeadersInit>);
+    /** Network/telemetry adapter. Preserve the supplied credential headers;
+     * delegate actual I/O to `networkFetch` to preserve typed network failures.
+     * Injecting an account through hidden cookies or replacement credentials is unsupported.
+     */
 	fetch?: RemoteLixFetch;
 };
 

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Filesystem-backed Lix storage and synchronization.
 //!
 //! This adapter uses the RocksDB storage adapter for Lix metadata while keeping

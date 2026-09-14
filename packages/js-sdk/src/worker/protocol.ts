@@ -1,3 +1,4 @@
+import type { HttpResponsePolicy } from "../http-transport.js";
 import type {
 	BindingBatchStatement,
 	BindingParam,
@@ -20,7 +21,6 @@ export type WorkerSyncServerOptions = {
 	url: string;
 	headers?: [string, string][];
 	dynamicHeaders: boolean;
-	customFetch: boolean;
 };
 
 export type WorkerSyncFetchRequest = {
@@ -29,10 +29,10 @@ export type WorkerSyncFetchRequest = {
 	headers: [string, string][];
 	body?: string | Uint8Array;
 	credentials?: RequestCredentials;
-} & (
-	| { responseMode: "buffered"; responseLimit: number }
-	| { responseMode: "stream" }
-);
+    cache?: RequestCache;
+    redirect?: RequestRedirect;
+    response: HttpResponsePolicy;
+};
 
 type WorkerSyncFetchResponseHead = {
 	status: number;
@@ -162,6 +162,7 @@ export type WorkerHostEndpoint = {
 };
 
 export type SerializedWorkerError = {
+    cause?: SerializedWorkerError;
 	name: string;
 	message: string;
 	stack?: string;
@@ -180,9 +181,9 @@ export type WorkerResponse =
 	| { kind: "sync.fetch.stream.pull"; requestId: number }
 	| { kind: "sync.fetch.cancel"; requestId: number };
 
-export function serializeWorkerError(error: unknown): SerializedWorkerError {
+export function serializeWorkerError(error: unknown, depth = 0): SerializedWorkerError {
 	if (!(error instanceof Error)) {
-		return { name: "Error", message: String(error) };
+		return { name: "Error", message: "Non-error failure" };
 	}
 	const lixError = error as Error & {
 		code?: unknown;
@@ -191,16 +192,17 @@ export function serializeWorkerError(error: unknown): SerializedWorkerError {
 	};
 	return {
 		name: error.name,
-		message: error.message,
-		stack: error.stack,
+		message: redactDiagnostic(error.message),
+		stack: error.stack ? redactDiagnostic(error.stack) : undefined,
 		code: typeof lixError.code === "string" ? lixError.code : undefined,
-		hint: typeof lixError.hint === "string" ? lixError.hint : undefined,
-		details: lixError.details,
+		hint: typeof lixError.hint === "string" ? redactDiagnostic(lixError.hint) : undefined,
+		details: redactDetails(lixError.details),
+        cause: depth < 3 && error.cause !== undefined ? serializeWorkerError(error.cause, depth + 1) : undefined,
 	};
 }
 
 export function deserializeWorkerError(error: SerializedWorkerError): Error {
-	const restored = new Error(error.message) as Error & {
+	const restored = new Error(error.message, error.cause ? {cause: deserializeWorkerError(error.cause)} : undefined) as Error & {
 		code?: string;
 		hint?: string;
 		details?: unknown;
@@ -211,4 +213,18 @@ export function deserializeWorkerError(error: SerializedWorkerError): Error {
 	restored.hint = error.hint;
 	restored.details = error.details;
 	return restored;
+}
+
+function redactDiagnostic(value: string): string {
+    return value.slice(0, 4096).replace(/Bearer\s+[^\s,;"']+/gi, "Bearer [redacted]")
+        .replace(/((?:authorization|cookie|token|password|secret)\s*[:=]\s*)[^\n]+/gi, "$1[redacted]");
+}
+function redactDetails(value: unknown, depth = 0): unknown {
+    if (depth > 3) return "[truncated]";
+    if (typeof value === "string") return redactDiagnostic(value);
+    if (value === null || typeof value === "number" || typeof value === "boolean" || value === undefined) return value;
+    if (Array.isArray(value)) return value.slice(0, 32).map(item => redactDetails(item, depth + 1));
+    if (typeof value === "object") return Object.fromEntries(Object.entries(value).slice(0, 32).map(([key, item]) =>
+        [key, /authorization|cookie|token|password|secret|headers/i.test(key) ? "[redacted]" : redactDetails(item, depth + 1)]));
+    return "[unsupported]";
 }

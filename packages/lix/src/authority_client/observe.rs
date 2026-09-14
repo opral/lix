@@ -1121,7 +1121,7 @@ fn is_retryable_observe_status(status: u16) -> bool {
 }
 
 fn is_retryable_observe_error(error: &LixError) -> bool {
-    error.code == "LIX_REMOTE_UNAVAILABLE"
+    matches!(error.code.as_str(), "LIX_REMOTE_UNAVAILABLE" | "LIX_TRANSPORT_NETWORK")
 }
 
 impl<H> ObserveTransport for super::ClientCore<H>
@@ -1353,5 +1353,17 @@ mod tests {
         checkpoints.close();
         real_parent.close();
         hub.close().await;
+    }
+}
+
+#[cfg(test)]
+mod transport_error_tests {
+    use super::*;
+    #[test]
+    fn only_attested_network_failures_restart_observations() {
+        assert!(is_retryable_observe_error(&LixError::new("LIX_TRANSPORT_NETWORK", "offline")));
+        for code in ["LIX_TRANSPORT_CALLBACK", "LIX_TRANSPORT_CONTRACT", "LIX_TRANSPORT_ABORTED", "LIX_ADMISSION_AUTH_REJECTED"] {
+            assert!(!is_retryable_observe_error(&LixError::new(code, "stop")));
+        }
     }
 }

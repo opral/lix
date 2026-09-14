@@ -52,8 +52,12 @@ position. Each attached provider turns a changed position into the SDK's
 payload-free storage invalidation signal, so `lix.observe()` reruns in other Lix
 workers and browser tabs. Periodic heartbeats announce the current position as
 well, allowing a client to recover if a `BroadcastChannel` message was missed.
-Read handles are invalidated when the owner generation changes rather than
-materializing a full historical SQLite snapshot.
+Read handles retain a coherent view across commits through a bounded owner-local
+SQLite undo history of changed keys. Writers never wait for an asynchronous read.
+The history retains at most 512 committed generations and 32 MiB of accounted
+key/value data; older reads expire and complete buffered engine read operations
+restart within their bounded retry budget. This is not a full-database copy.
+Owner loss still invalidates every handle.
 If a commit response is lost after SQLite has accepted the transaction, the
 client reports `LIX_STORAGE_COMMIT_OUTCOME_UNKNOWN` rather than replaying it.
 
@@ -64,6 +68,17 @@ goes away. The generic `@lix-js/sdk` storage protocol exposes only
 to this package. Browsers without workers or BroadcastChannel use the package's
 direct-worker fallback; that fallback is single-owner and does not provide
 multi-tab attachment.
+
+Closing the last attached client drains accepted storage operations and releases
+the SQLite handle and physical Web Lock before acknowledging close. Idle owners
+do not cache an open backend. Failed close remains an ownership failure rather
+than allowing a competing backend. Internal RPC version 4 isolates these close
+acknowledgements from older relay workers; the physical data lock remains
+unversioned so a different protocol cannot bypass an existing owner.
+
+The separate `@lix-js/storage-opfs/migration` entry copies retained source stores
+to unpublished namespaces. It is loaded before ordinary opening only when a
+browser profile needs routing/migration. It never clears a failed source.
 
 ## Development
 

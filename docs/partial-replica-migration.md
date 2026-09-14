@@ -8,10 +8,12 @@ run the former eager full-replica upgrade as a fallback.
 JavaScript callers must explicitly set `server.mode: "partial_replica"` when
 opening the converted storage. Omitting the mode defaults to `"remote"`, which
 rejects storage. Replace the former `"sync"` spelling; there is no compatibility
-alias. Conversion and recovery helpers remain explicit storage operations.
+alias. Conversion and recovery helpers remain explicit storage operations exported from
+`@lix-js/sdk/migration`, backed by the separate migration WASM artifact.
 
-This change introduces repository format 80. Registered full-repository
-migrations cover formats 72–79. Previously unsupported formats, including the
+The current runtime uses format 81; see [the cutover contract](architectural-cutover-v81.md).
+Detached registered full-repository migrations cover formats 72–80. The format-80
+repair described below remains part of that explicit historical chain. Previously unsupported formats, including the
 existing format-68 hard cut, still fail explicitly; this does not introduce a
 compatibility shim for them. Released format-72 and format-75 fixtures retain
 their tested schema, file/checkpoint and cold-reopen semantics after migration.

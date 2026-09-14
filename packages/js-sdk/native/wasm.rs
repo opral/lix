@@ -593,7 +593,7 @@ async fn open_browser_storage(
             let mut parsed =
                 serde_wasm_bindgen::from_value::<BrowserSyncServerOptions>(value.clone())?;
             let header_provider = optional_function_property(&value, "headerProvider")?;
-            let fetch = optional_function_property(&value, "fetch")?;
+            let fetch = optional_function_property(&value, "transport")?;
             if header_provider.is_some() || fetch.is_some() {
                 let id = format!(
                     "browser-{}",
@@ -804,7 +804,7 @@ impl WasmLix {
         }
         let mut options = serde_wasm_bindgen::from_value::<Options>(server.clone())?;
         let headers = optional_function_property(&server, "headerProvider")?;
-        let fetch = optional_function_property(&server, "fetch")?;
+        let fetch = optional_function_property(&server, "transport")?;
         struct Registration(Option<String>);
         impl Drop for Registration {
             fn drop(&mut self) {
@@ -1742,6 +1742,7 @@ fn hosted_create_builder(value: JsValue) -> Result<lix::CreateLixBuilder, JsValu
     Ok(builder)
 }
 
+#[cfg(feature = "offline-migration")]
 #[wasm_bindgen(js_name = convertJsStorageReplicaToPartial)]
 pub async fn convert_js_storage_replica_to_partial(
     provider: JsStorageProvider,
@@ -1752,6 +1753,7 @@ pub async fn convert_js_storage_replica_to_partial(
         .await
         .map(|_| ())
 }
+#[cfg(feature = "offline-migration")]
 #[wasm_bindgen(js_name = retryJsStorageReplicaMigrationCleanup)]
 pub async fn retry_js_storage_replica_migration_cleanup(
     provider: JsStorageProvider,
@@ -1759,6 +1761,7 @@ pub async fn retry_js_storage_replica_migration_cleanup(
 ) -> Result<u32, JsValue> {
     closed_js_replica_operation(provider, server, None, true).await
 }
+#[cfg(feature = "offline-migration")]
 async fn closed_js_replica_operation(
     provider: JsStorageProvider,
     server: JsValue,
@@ -1772,7 +1775,7 @@ async fn closed_js_replica_operation(
     }
     let mut options = serde_wasm_bindgen::from_value::<Options>(server.clone())?;
     let header_provider = optional_function_property(&server, "headerProvider")?;
-    let fetch = optional_function_property(&server, "fetch")?;
+    let fetch = optional_function_property(&server, "transport")?;
     struct TransportRegistration(Option<String>);
     impl Drop for TransportRegistration {
         fn drop(&mut self) {
@@ -1813,4 +1816,36 @@ async fn closed_js_replica_operation(
     // The JS binding owns provider close, including failures before this call.
     drop(registration);
     result.map_err(lix_error_to_js)
+}
+
+/// Read-only routing metadata; available in the current-format runtime.
+#[wasm_bindgen(js_name = inspectJsStorageRepository)]
+pub async fn inspect_js_storage_repository(
+    provider: JsStorageProvider,
+) -> Result<JsValue, JsValue> {
+    let report = lix::migration::inspect_repository(BrowserStorage::Js(JsStorage::new(provider)))
+        .await
+        .map_err(lix_error_to_js)?;
+    to_js(&report)
+}
+
+/// Detached migration artifact only. Caller owns the physical source lock and
+/// destination publication/recovery lifecycle.
+#[cfg(feature = "offline-migration")]
+#[wasm_bindgen(js_name = migrateJsStorageRepository)]
+pub async fn migrate_js_storage_repository(
+    provider: JsStorageProvider,
+    limits: Option<JsValue>,
+) -> Result<JsValue, JsValue> {
+    let options = match limits {
+        Some(value) if !value.is_null() && !value.is_undefined() => from_js(value)?,
+        _ => lix::migration::MigrationOptions::default(),
+    };
+    let report = lix::migration::migrate_repository_with_options(
+        BrowserStorage::Js(JsStorage::new(provider)),
+        options,
+    )
+    .await
+    .map_err(lix_error_to_js)?;
+    to_js(&report)
 }

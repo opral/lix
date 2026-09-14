@@ -112,12 +112,14 @@ try {
 		/^entry\.browser-.*\.js$/,
 		"browser worker",
 	);
-	const engineWasm = findBuiltAsset(
-		builtAssets,
-		/^lix_js_sdk_bg-.*\.wasm$/,
-		"engine WASM",
-	);
 	const workerSource = await readFile(join(assetsDir, browserWorker), "utf8");
+	// Detached migration contributes a separate engine artifact. The normal
+	// worker must still reference exactly one engine directly.
+	const engineWasm = findBuiltAsset(
+		builtAssets.filter((file) => workerSource.includes(file)),
+		/^lix_js_sdk_bg-.*\.wasm$/,
+		"normal worker engine WASM",
+	);
 	const browserJavaScriptSources = await Promise.all(
 		builtAssets
 			.filter((file) => file.endsWith(".js"))

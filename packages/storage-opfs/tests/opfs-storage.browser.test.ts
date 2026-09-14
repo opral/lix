@@ -713,7 +713,7 @@ test("keeps a complete SQL read coherent during cross-client commit churn", asyn
 		for (const outcome of outcomes) {
 			if (outcome.status === "rejected") throw outcome.reason;
 		}
-		expect(expiredReads).toBeGreaterThan(1);
+		expect(expiredReads).toBe(0);
 	} finally {
 		monitor.close();
 		await Promise.all([writer.close(), lix.close()]);
@@ -837,3 +837,70 @@ function postRpcAndWait(
 		2_000,
 	);
 }
+
+test("opens and reads while an independent OPFS writer remains active", async () => {
+
+ const name = `lix-opfs-open-progress:${crypto.randomUUID()}`;
+ const initialized = await openLix({storage:new OpfsStorage({name})});
+ await initialized.close();
+ const writer = await openProvider(new OpfsStorage({name}).lixStorage);
+ const sessionToken = await writer.acquireSession();
+ const space: LixStorageSpace = {id:2_000_000_001,name:"open-progress",valueSemantics:"mutable",valueIntegrity:"backendVerified"};
+ let stop = false, count = 0, maxWriteMs = 0;
+ let started!: () => void;
+ const active = new Promise<void>(resolve => {started=resolve;});
+ const writes = (async () => {
+  while(!stop) {
+   const before=performance.now();
+   const write=await writer.beginWrite({awaitDurable:false,preconditions:[],batchCapacityHintBytes:16,sessionToken});
+   await write.putMany(space,[{key:new Uint8Array([1]),value:new Uint8Array([count%256])}]);
+   await write.commit(); count++;
+   maxWriteMs=Math.max(maxWriteMs,performance.now()-before);
+   started();
+  }
+ })();
+ let opened: Awaited<ReturnType<typeof openLix>> | undefined;
+ try {
+  await active;
+  const beforeCount=count, before=performance.now();
+  opened=await openLix({storage:new OpfsStorage({name})});
+  const openMs=performance.now()-before, writesDuringOpen=count-beforeCount;
+  let maxReadMs=0;
+  for(let i=0;i<12;i++) {
+   const readStart=performance.now();
+   const result=await opened.execute("SELECT key FROM lix_key_value WHERE key = $1",["absent-during-open-progress"]);
+   expect(result.rows).toHaveLength(0);
+   maxReadMs=Math.max(maxReadMs,performance.now()-readStart);
+  }
+  console.log("OPFS engine open progress",JSON.stringify({openMs,maxReadMs,maxWriteMs,writesDuringOpen,count}));
+  expect(openMs).toBeLessThan(2000);
+  expect(maxReadMs).toBeLessThan(250);
+  expect(maxWriteMs).toBeLessThan(100);
+  expect(writesDuringOpen).toBeGreaterThan(0);
+ } finally {stop=true;await writes;await opened?.close();await writer.close();}
+},30000);
+
+
+test("late requests from a closed client cannot reacquire physical storage", async () => {
+ const name = `lix-opfs-closed-client:${crypto.randomUUID()}`;
+ const channelName = `lix-opfs-close-channel:${crypto.randomUUID()}`;
+ const ownerUrl = new URL("../dist/owner.js", import.meta.url);
+ ownerUrl.searchParams.set("rpcChannel",channelName);
+ const monitor = new BroadcastChannel(channelName);
+ const opening = new Promise<OpfsRpcRequest>(resolve => {monitor.onmessage = ({data}: MessageEvent<OpfsRpcRequest>) => {if(data.kind === "request" && data.operation === "open") resolve(data);};});
+ const owner = new Worker(ownerUrl,{type:"module"});
+ try {
+  const first = await OpfsStorageClient.open(name,channelName);
+  const original = await opening;
+  const closing = first.close();
+  expect(first.close()).toBe(closing);
+  await closing;
+  // A delayed retry has a new request ID: request deduplication alone cannot fence it.
+  monitor.postMessage({...original,requestId:crypto.randomUUID(),operation:"heartbeat"});
+  const next = await OpfsStorageClient.open(name,channelName);
+  await next.close();
+  await navigator.locks.request(`lix:opfs-sqlite:${name}`,{ifAvailable:true},lock => {
+   expect(lock, "closed client was revived and retained the physical owner").not.toBeNull();
+  });
+ } finally {monitor.close();owner.terminate();}
+});

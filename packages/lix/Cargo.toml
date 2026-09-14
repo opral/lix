@@ -21,6 +21,8 @@ workspace = true
 [features]
 default = ["default_wasm_runtime"]
 all-simulations = []
+# Detached operator/browser migration artifact only; never enabled by the ordinary runtime.
+offline-migration = []
 storage-benches = []
 # Per-node cost attribution for commit-root replay (experiment AA). Kept out of
 # `storage-benches` so timing A/B runs never pay for the inline `Instant::now()`.
@@ -114,14 +116,17 @@ path = "tests/migration_v68.rs"
 [[test]]
 name = "migration_v72"
 path = "tests/migration_v72.rs"
+required-features = ["offline-migration"]
 
 [[test]]
 name = "migration_v72_filesystem"
 path = "tests/migration_v72_filesystem.rs"
+required-features = ["offline-migration"]
 
 [[test]]
 name = "migration_v75"
 path = "tests/migration_v75.rs"
+required-features = ["offline-migration"]
 
 [[test]]
 name = "snapshot_untracked"
@@ -212,6 +217,7 @@ wit-parser = "0.247"
 wit-bindgen-rust = "0.57"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+futures-timer = "3"
 zstd = "0.13"
 notify-debouncer-full = { version = "0.7.0", default-features = false, features = ["macos_kqueue"] }
 tokio = { version = "1", features = ["rt", "sync", "time"] }

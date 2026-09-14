@@ -1,5 +1,35 @@
 use super::*;
 
+#[test]
+fn qa_nested_subtree_signatures_use_linear_space() {
+    let (document, _) = Document::open_file(
+        b"leaf\n".to_vec(),
+        Some("nested.md"),
+        IdNamespace::from_halves(30, 1),
+    )
+    .unwrap();
+    let mut tree = document.tree.materialize().children.remove(0);
+    let node = tree.node.clone();
+    for _ in 0..32 {
+        tree = NodeTree {
+            node: node.clone(),
+            children: vec![tree],
+        };
+    }
+    let signature = tree.subtree_signature();
+    assert!(
+        signature.len() < 32_000,
+        "signature grew to {} bytes",
+        signature.len()
+    );
+    let mut different = tree.clone();
+    different.children.push(NodeTree {
+        node,
+        children: vec![],
+    });
+    assert_ne!(signature, different.subtree_signature());
+}
+
 fn edit_target(document: &Document) -> Document {
     let tree = document.tree.materialize();
     let mut node = tree
@@ -316,4 +346,714 @@ fn qa_legacy_encoded_file_edit_matches_cold_parse() {
         render_tree(&next.tree.materialize()).unwrap(),
         render_tree(&cold.tree.materialize()).unwrap()
     );
+}
+
+#[test]
+fn qa_bulk_incompatible_siblings_preserve_existing_identities() {
+    let source = (0..1_000)
+        .map(|i| format!("paragraph {i}\n\n"))
+        .collect::<String>();
+    let (document, _) = Document::open_file(
+        source.as_bytes().to_vec(),
+        Some("bulk.md"),
+        IdNamespace::from_halves(30, 2),
+    )
+    .unwrap();
+    let before = document.tree.materialize();
+    let append = (0..1_000)
+        .map(|i| format!("```\ncode {i}\n```\n\n"))
+        .collect::<String>();
+    let (updated, _) = document
+        .file_changed(
+            &[FileEdit {
+                offset: source.len() as u64,
+                delete_len: 0,
+                insert: append.as_bytes(),
+            }],
+            IdNamespace::from_halves(30, 3),
+        )
+        .unwrap();
+    let after = updated.tree.materialize();
+    assert_eq!(after.children.len(), 2_000);
+    for (old, new) in before.children.iter().zip(&after.children) {
+        assert_eq!(old.node.id, new.node.id);
+    }
+}
+
+#[test]
+fn qa_semantic_inline_edits_override_stale_spelling() {
+    for (source, field, value, expected) in [
+        ("&amp;\n", "value", "<", "&#x3C;\n"),
+        ("`old`\n", "value", "new", "`new`\n"),
+        (
+            "https://old.example\n",
+            "destination",
+            "https://new.example",
+            "https://new.example\n",
+        ),
+    ] {
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("edit.md"),
+            IdNamespace::from_halves(31, 1),
+        )
+        .unwrap();
+        let mut node = document.tree.materialize().children.remove(0).node;
+        node.payload["inline"][0][field] = serde_json::json!(value);
+        let (updated, _) = document
+            .rows_changed(vec![RowChange {
+                schema_key: NODE_SCHEMA_KEY.into(),
+                row_pk: vec![node.id],
+                row: Some(node_to_typed_row(&node).unwrap()),
+                effect: ChangeEffect::Content,
+            }])
+            .unwrap();
+        assert_eq!(String::from_utf8(updated.bytes()).unwrap(), expected);
+        let (reopened, _) = Document::open_file(
+            updated.bytes(),
+            Some("edit.md"),
+            IdNamespace::from_halves(31, 2),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.tree.materialize().children[0].node.payload["inline"][0][field],
+            value
+        );
+    }
+}
+
+#[test]
+fn qa_reference_identifier_edits_override_stale_labels() {
+    for source in ["[old]: /url\n\n[old]\n", "[^old]: note\n\n[^old]\n"] {
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("edit.md"),
+            IdNamespace::from_halves(31, 3),
+        )
+        .unwrap();
+        let mut changes = Vec::new();
+        document.tree.materialize().visit_mut(&mut |node| {
+            let payload = serde_json::to_string(&node.payload).unwrap();
+            let updated = payload.replace("\"identifier\":\"old\"", "\"identifier\":\"new\"");
+            if updated != payload {
+                node.payload = serde_json::from_str(&updated).unwrap();
+                changes.push(RowChange {
+                    schema_key: NODE_SCHEMA_KEY.into(),
+                    row_pk: vec![node.id],
+                    row: Some(node_to_typed_row(node).unwrap()),
+                    effect: ChangeEffect::Content,
+                });
+            }
+        });
+        let (updated, _) = document.rows_changed(changes).unwrap();
+        let (reopened, _) = Document::open_file(
+            updated.bytes(),
+            Some("edit.md"),
+            IdNamespace::from_halves(31, 4),
+        )
+        .unwrap();
+        assert!(
+            reopened.tree.materialize().children.iter().any(|node| node
+                .node
+                .payload
+                .get("identifier")
+                == Some(&serde_json::json!("new"))),
+            "{}",
+            String::from_utf8_lossy(&updated.bytes())
+        );
+    }
+}
+
+#[test]
+fn qa_literal_punctuation_runs_import_losslessly() {
+    for source in [
+        "||||||||".to_owned(),
+        "]>||~`>1.".to_owned(),
+        "|".repeat(10_000),
+    ] {
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("punctuation.md"),
+            IdNamespace::from_halves(32, 1),
+        )
+        .unwrap();
+        assert_eq!(document.bytes(), source.as_bytes());
+        let (root, blocks) = document.arena_state().unwrap();
+        let reopened = Document::open_arena(document.bytes(), &root, blocks).unwrap();
+        assert_eq!(reopened.bytes(), source.as_bytes());
+    }
+}
+
+#[test]
+fn qa_invalid_parent_changes_are_rejected_without_losing_rows() {
+    for source in ["first\n\nsecond\n", "| a |\n| - |\n\nsecond\n"] {
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("parent.md"),
+            IdNamespace::from_halves(32, 2),
+        )
+        .unwrap();
+        let tree = document.tree.materialize();
+        let mut node = tree.children.last().unwrap().node.clone();
+        node.parent_id = Some(tree.children[0].node.id);
+        let result = document.rows_changed(vec![RowChange {
+            schema_key: NODE_SCHEMA_KEY.into(),
+            row_pk: vec![node.id],
+            row: Some(node_to_typed_row(&node).unwrap()),
+            effect: ChangeEffect::Content,
+        }]);
+        assert!(matches!(result, Err(PluginError::InvalidInput(_))));
+        assert_eq!(document.bytes(), source.as_bytes());
+    }
+}
+
+#[test]
+fn qa_text_edits_after_autolinks_remain_literal() {
+    let (document, _) = Document::open_file(
+        b"https://example.com tail\n".to_vec(),
+        Some("text.md"),
+        IdNamespace::from_halves(33, 1),
+    )
+    .unwrap();
+    let mut node = document.tree.materialize().children.remove(0).node;
+    node.payload["inline"][1]["value"] = serde_json::json!(" *oops*");
+    let (updated, _) = document
+        .rows_changed(vec![RowChange {
+            schema_key: NODE_SCHEMA_KEY.into(),
+            row_pk: vec![node.id],
+            row: Some(node_to_typed_row(&node).unwrap()),
+            effect: ChangeEffect::Content,
+        }])
+        .unwrap();
+    assert_eq!(updated.bytes(), b"https://example.com \\*oops\\*\n");
+    let (reopened, _) = Document::open_file(
+        updated.bytes(),
+        Some("text.md"),
+        IdNamespace::from_halves(33, 2),
+    )
+    .unwrap();
+    assert!(
+        !serde_json::to_string(&reopened.tree.materialize().children[0].node.payload)
+            .unwrap()
+            .contains("emphasis")
+    );
+}
+
+#[test]
+fn qa_table_inline_markers_preserve_cell_source_positions() {
+    let source = "| _a_ | __b__ |\n| - | - |\n| café \\| _c_ | __d__ |\n";
+    let (document, _) = Document::open_file(
+        source.as_bytes().to_vec(),
+        Some("table.md"),
+        IdNamespace::from_halves(34, 1),
+    )
+    .unwrap();
+    let tree = document.tree.materialize();
+    let table = &tree.children[0];
+    let mut markers = Vec::new();
+    for row in table
+        .children
+        .iter()
+        .filter(|child| child.node.kind == NodeKind::TableRow)
+    {
+        for cell in &row.children {
+            for inline in cell.node.payload["inline"].as_array().unwrap() {
+                if let Some(marker) = inline.get("format").and_then(|format| format.get("marker")) {
+                    markers.push(marker.as_str().unwrap().to_owned());
+                }
+            }
+        }
+    }
+    assert_eq!(markers, ["_", "__", "_", "__"]);
+    assert_eq!(document.bytes(), source.as_bytes());
+}
+
+#[test]
+fn qa_relaxed_autolink_spelling_survives_import_and_edit() {
+    for source in ["://b\n", "custom://host\n", "http://\n"] {
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("urls.md"),
+            IdNamespace::from_halves(35, 1),
+        )
+        .unwrap();
+        assert_eq!(document.bytes(), source.as_bytes());
+    }
+}
+
+#[test]
+fn qa_adding_titles_chooses_default_quote_style() {
+    for source in [
+        "[label](/url)\n",
+        "![alt](/url)\n",
+        "[label]: /url\n\n[label]\n",
+    ] {
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("title.md"),
+            IdNamespace::from_halves(35, 2),
+        )
+        .unwrap();
+        let mut node = document.tree.materialize().children.remove(0).node;
+        if node.kind == NodeKind::Definition {
+            node.payload["title"] = serde_json::json!("new title");
+        } else {
+            node.payload["inline"][0]["title"] = serde_json::json!("new title");
+        }
+        let (updated, _) = document
+            .rows_changed(vec![RowChange {
+                schema_key: NODE_SCHEMA_KEY.into(),
+                row_pk: vec![node.id],
+                row: Some(node_to_typed_row(&node).unwrap()),
+                effect: ChangeEffect::Content,
+            }])
+            .unwrap();
+        let (reopened, _) = Document::open_file(
+            updated.bytes(),
+            Some("title.md"),
+            IdNamespace::from_halves(35, 3),
+        )
+        .unwrap();
+        assert!(
+            serde_json::to_string(&reopened.tree.materialize().children[0].node.payload)
+                .unwrap()
+                .contains("new title")
+        );
+    }
+}
+
+#[test]
+fn qa_indented_code_edits_preserve_boundary_blank_lines() {
+    for value in ["\nnew\n\n", "\n", ""] {
+        let (document, _) = Document::open_file(
+            b"    old\n".to_vec(),
+            Some("code.md"),
+            IdNamespace::from_halves(36, 1),
+        )
+        .unwrap();
+        let mut node = document.tree.materialize().children.remove(0).node;
+        node.payload["value"] = serde_json::json!(value);
+        let (updated, _) = document
+            .rows_changed(vec![RowChange {
+                schema_key: NODE_SCHEMA_KEY.into(),
+                row_pk: vec![node.id],
+                row: Some(node_to_typed_row(&node).unwrap()),
+                effect: ChangeEffect::Content,
+            }])
+            .unwrap();
+        let (reopened, _) = Document::open_file(
+            updated.bytes(),
+            Some("code.md"),
+            IdNamespace::from_halves(36, 2),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.tree.materialize().children[0].node.payload["value"],
+            value
+        );
+    }
+}
+
+#[test]
+fn qa_unrepresentable_inline_code_edits_are_rejected() {
+    for value in ["", "a\nb", "a\rb"] {
+        let (document, _) = Document::open_file(
+            b"`old`\n".to_vec(),
+            Some("code.md"),
+            IdNamespace::from_halves(36, 3),
+        )
+        .unwrap();
+        let mut node = document.tree.materialize().children.remove(0).node;
+        node.payload["inline"][0]["value"] = serde_json::json!(value);
+        assert!(matches!(
+            document.rows_changed(vec![RowChange {
+                schema_key: NODE_SCHEMA_KEY.into(),
+                row_pk: vec![node.id],
+                row: Some(node_to_typed_row(&node).unwrap()),
+                effect: ChangeEffect::Content
+            }]),
+            Err(PluginError::InvalidInput(_))
+        ));
+    }
+}
+
+#[test]
+fn qa_emphasis_edits_preserve_boundary_whitespace() {
+    for source in ["*old*\n", "**old**\n", "_old_\n", "__old__\n"] {
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("emphasis.md"),
+            IdNamespace::from_halves(37, 1),
+        )
+        .unwrap();
+        let mut node = document.tree.materialize().children.remove(0).node;
+        let expected_kind = node.payload["inline"][0]["type"].clone();
+        node.payload["inline"][0]["children"][0]["value"] = serde_json::json!(" new ");
+        let (updated, _) = document
+            .rows_changed(vec![RowChange {
+                schema_key: NODE_SCHEMA_KEY.into(),
+                row_pk: vec![node.id],
+                row: Some(node_to_typed_row(&node).unwrap()),
+                effect: ChangeEffect::Content,
+            }])
+            .unwrap();
+        let (reopened, _) = Document::open_file(
+            updated.bytes(),
+            Some("emphasis.md"),
+            IdNamespace::from_halves(37, 2),
+        )
+        .unwrap();
+        let tree = reopened.tree.materialize();
+        assert_eq!(tree.children[0].node.kind, NodeKind::Paragraph);
+        assert_eq!(
+            tree.children[0].node.payload["inline"][0]["type"],
+            expected_kind
+        );
+        let text = tree.children[0].node.payload["inline"][0]["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|inline| inline["value"].as_str())
+            .collect::<String>();
+        assert_eq!(text, " new ");
+    }
+}
+
+#[test]
+fn qa_ambiguous_emphasis_with_escaped_table_pipe_imports() {
+    let source = "| a | b |\n| - | - |\n| _\\|__!_ |\n";
+    let (document, _) = Document::open_file(
+        source.as_bytes().to_vec(),
+        Some("pipes.md"),
+        IdNamespace::from_halves(37, 3),
+    )
+    .unwrap();
+    assert_eq!(document.bytes(), source.as_bytes());
+    let tree = document.tree.materialize();
+    let row = tree.children[0]
+        .children
+        .iter()
+        .filter(|child| child.node.kind == NodeKind::TableRow)
+        .nth(1)
+        .unwrap();
+    assert_eq!(
+        row.children[0].node.payload["inline"][0]["type"],
+        "emphasis"
+    );
+}
+
+#[test]
+fn qa_excessive_block_nesting_returns_an_error() {
+    let source = format!("{}a\n", "> ".repeat(1_000));
+    assert!(matches!(
+        Document::open_file(
+            source.into_bytes(),
+            Some("depth.md"),
+            IdNamespace::from_halves(38, 1)
+        ),
+        Err(PluginError::InvalidInput(_))
+    ));
+    let source = format!("{}a\n", "> ".repeat(32));
+    assert!(
+        Document::open_file(
+            source.into_bytes(),
+            Some("depth.md"),
+            IdNamespace::from_halves(38, 2)
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn qa_many_unmatched_emphasis_openers_import_losslessly() {
+    let source = format!("{}a\n", "*a ".repeat(10_000));
+    let (document, _) = Document::open_file(
+        source.as_bytes().to_vec(),
+        Some("openers.md"),
+        IdNamespace::from_halves(38, 3),
+    )
+    .unwrap();
+    assert_eq!(document.bytes(), source.as_bytes());
+}
+
+#[test]
+fn qa_many_unmatched_link_openers_import_losslessly() {
+    for suffix in ["a\n", "a]\n"] {
+        let source = format!("{}{suffix}", "[".repeat(10_000));
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("brackets.md"),
+            IdNamespace::from_halves(39, 1),
+        )
+        .unwrap();
+        assert_eq!(document.bytes(), source.as_bytes());
+    }
+}
+
+#[test]
+fn qa_table_pipes_adjacent_to_ambiguous_emphasis_import() {
+    for cell in [r"\|***1*:*", r"*:*1***\|"] {
+        let source = format!("| a | b |\n| - | - |\n| {cell} |\n");
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("pipes.md"),
+            IdNamespace::from_halves(40, 1),
+        )
+        .unwrap();
+        assert_eq!(document.bytes(), source.as_bytes());
+    }
+}
+
+#[test]
+fn qa_balanced_nonlink_brackets_do_not_speculatively_reparse() {
+    for depth in [24, 1_000] {
+        let source = format!("{}a{}\n", "[".repeat(depth), "]".repeat(depth));
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("balanced.md"),
+            IdNamespace::from_halves(40, 2),
+        )
+        .unwrap();
+        assert_eq!(document.bytes(), source.as_bytes());
+    }
+}
+
+#[test]
+fn qa_mixed_punctuation_prefixes_stabilize() {
+    for source in [
+        "&amp;>>>>>>>>",
+        "&\t>`>|*>-://&",
+        "&amp;>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>",
+    ] {
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("mixed.md"),
+            IdNamespace::from_halves(41, 1),
+        )
+        .unwrap();
+        assert_eq!(document.bytes(), source.as_bytes());
+    }
+}
+
+#[test]
+fn qa_unrepresentable_single_item_loose_list_is_rejected() {
+    let (document, _) = Document::open_file(
+        b"- x\n".to_vec(),
+        Some("list.md"),
+        IdNamespace::from_halves(41, 2),
+    )
+    .unwrap();
+    let mut node = document.tree.materialize().children.remove(0).node;
+    node.payload["tight"] = serde_json::json!(false);
+    assert!(matches!(
+        document.rows_changed(vec![RowChange {
+            schema_key: NODE_SCHEMA_KEY.into(),
+            row_pk: vec![node.id],
+            row: Some(node_to_typed_row(&node).unwrap()),
+            effect: ChangeEffect::Content
+        }]),
+        Err(PluginError::InvalidInput(_))
+    ));
+    assert_eq!(document.bytes(), b"- x\n");
+}
+
+#[test]
+fn qa_frontmatter_edits_preserve_value_or_reject_delimiter_lines() {
+    for value in [
+        "\nkey: value\n",
+        "key: value\n---\nother: value",
+        "key: value\n---  \nother: value",
+    ] {
+        let (document, _) = Document::open_file(
+            b"---\nkey: old\n---\n".to_vec(),
+            Some("frontmatter.md"),
+            IdNamespace::from_halves(42, 1),
+        )
+        .unwrap();
+        let mut node = document.tree.materialize().children.remove(0).node;
+        node.payload["value"] = serde_json::json!(value);
+        let result = document.rows_changed(vec![RowChange {
+            schema_key: NODE_SCHEMA_KEY.into(),
+            row_pk: vec![node.id],
+            row: Some(node_to_typed_row(&node).unwrap()),
+            effect: ChangeEffect::Content,
+        }]);
+        if value.contains("---") {
+            assert!(matches!(result, Err(PluginError::InvalidInput(_))));
+        } else {
+            let (updated, _) = result.unwrap();
+            let (reopened, _) = Document::open_file(
+                updated.bytes(),
+                Some("frontmatter.md"),
+                IdNamespace::from_halves(42, 2),
+            )
+            .unwrap();
+            assert_eq!(
+                reopened.tree.materialize().children[0].node.payload["value"],
+                value
+            );
+        }
+    }
+}
+
+#[test]
+fn qa_code_block_edits_reject_implicit_line_ending_changes() {
+    let (document, _) = Document::open_file(
+        b"```\nold\n```\n".to_vec(),
+        Some("code.md"),
+        IdNamespace::from_halves(42, 3),
+    )
+    .unwrap();
+    for value in ["abc", "abc\r\n"] {
+        let mut node = document.tree.materialize().children[0].node.clone();
+        node.payload["value"] = serde_json::json!(value);
+        assert!(matches!(
+            document.rows_changed(vec![RowChange {
+                schema_key: NODE_SCHEMA_KEY.into(),
+                row_pk: vec![node.id],
+                row: Some(node_to_typed_row(&node).unwrap()),
+                effect: ChangeEffect::Content
+            }]),
+            Err(PluginError::InvalidInput(_))
+        ));
+    }
+}
+
+#[test]
+fn qa_semantic_guard_rejects_html_type_and_table_role_loss() {
+    for (source, kind, field, value) in [
+        (
+            "<div>old</div>\n",
+            NodeKind::HtmlBlock,
+            "value",
+            "plain text\n",
+        ),
+        ("| a |\n| - |\n", NodeKind::TableRow, "role", "garbage"),
+    ] {
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("guard.md"),
+            IdNamespace::from_halves(43, 1),
+        )
+        .unwrap();
+        let mut target = None;
+        document.tree.materialize().visit_mut(&mut |node| {
+            if node.kind == kind {
+                target = Some(node.clone());
+            }
+        });
+        let mut node = target.unwrap();
+        node.payload[field] = serde_json::json!(value);
+        assert!(matches!(
+            document.rows_changed(vec![RowChange {
+                schema_key: NODE_SCHEMA_KEY.into(),
+                row_pk: vec![node.id],
+                row: Some(node_to_typed_row(&node).unwrap()),
+                effect: ChangeEffect::Content
+            }]),
+            Err(PluginError::InvalidInput(_))
+        ));
+        assert_eq!(document.bytes(), source.as_bytes());
+    }
+}
+
+#[test]
+fn qa_nested_link_candidates_reuse_speculative_results() {
+    let mut source = "a".to_owned();
+    for _ in 0..24 {
+        source = format!("[{source}](u)");
+    }
+    source.push('\n');
+    for _ in 0..3 {
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("links.md"),
+            IdNamespace::from_halves(44, 1),
+        )
+        .unwrap();
+        assert_eq!(document.bytes(), source.as_bytes());
+    }
+}
+
+#[test]
+fn qa_excessive_nested_link_candidates_stop_at_the_nesting_budget() {
+    let mut source = "a".to_owned();
+    for _ in 0..400 {
+        source = format!("[{source}](u)");
+    }
+    assert!(matches!(
+        Document::open_file(
+            source.into_bytes(),
+            Some("nested-links.md"),
+            IdNamespace::from_halves(44, 2)
+        ),
+        Err(PluginError::InvalidInput(_))
+    ));
+    assert!(
+        Document::open_file(
+            b"[a](u)\n".to_vec(),
+            Some("next.md"),
+            IdNamespace::from_halves(44, 3)
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn qa_terminal_indented_code_without_newline_survives_restore_and_edit() {
+    let source = b"    code".to_vec();
+    let (_, changes) = Document::open_file(
+        source.clone(),
+        Some("code.md"),
+        IdNamespace::from_halves(44, 1),
+    )
+    .unwrap();
+    let records: Vec<RowRecord> = changes
+        .into_iter()
+        .filter_map(|change| {
+            change.row.map(|row| RowRecord {
+                schema_key: change.schema_key,
+                row_pk: change.row_pk,
+                row,
+            })
+        })
+        .collect();
+    for accepted in [None, Some(source.clone())] {
+        let (document, _) = Document::open_rows(records.clone(), accepted).unwrap();
+        assert_eq!(document.bytes(), source);
+        let mut node = document.tree.materialize().children[0].node.clone();
+        node.payload["value"] = serde_json::json!("edited");
+        let (updated, _) = document
+            .rows_changed(vec![RowChange {
+                schema_key: NODE_SCHEMA_KEY.into(),
+                row_pk: vec![node.id],
+                row: Some(node_to_typed_row(&node).unwrap()),
+                effect: ChangeEffect::Content,
+            }])
+            .unwrap();
+        assert_eq!(updated.bytes(), b"    edited");
+    }
+}
+
+#[test]
+fn qa_indented_code_without_newline_rejects_incompatible_document_context() {
+    for source in ["    code\n", "    code\n\nafter"] {
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("code.md"),
+            IdNamespace::from_halves(44, 2),
+        )
+        .unwrap();
+        let mut node = document.tree.materialize().children[0].node.clone();
+        node.payload["value"] = serde_json::json!("edited");
+        assert!(matches!(
+            document.rows_changed(vec![RowChange {
+                schema_key: NODE_SCHEMA_KEY.into(),
+                row_pk: vec![node.id],
+                row: Some(node_to_typed_row(&node).unwrap()),
+                effect: ChangeEffect::Content,
+            }]),
+            Err(PluginError::InvalidInput(_))
+        ));
+    }
 }

@@ -86,6 +86,6 @@ export type {
 
 export { createLix, deleteLix } from "./hosted-lix.js";
 
-export { convertReplicaToPartial, type ConvertReplicaToPartialOptions } from "./open-lix.js";
 
-export { retryReplicaMigrationCleanup, type RetryReplicaMigrationCleanupOptions } from "./open-lix.js";
+
+export { networkFetch, HttpTransportError } from "./http-transport.js";

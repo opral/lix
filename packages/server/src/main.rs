@@ -5,15 +5,116 @@ use tokio::net::TcpListener;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    if !arguments.is_empty() && !(arguments.len() == 2 && arguments[0] == "upgrade-authority") {
-        anyhow::bail!("usage: lix-server [upgrade-authority <repository-id>]");
+    if !arguments.is_empty()
+        && arguments != ["inventory-authorities"]
+        && arguments != ["migrate-authorities"]
+        && !(arguments.len() == 2
+            && matches!(
+                arguments[0].as_str(),
+                "upgrade-authority"
+                    | "inspect-physical"
+                    | "adopt-staged-repository"
+                    | "retain-tombstone"
+            ))
+    {
+        anyhow::bail!(
+            "usage: lix-server [inventory-authorities | migrate-authorities | upgrade-authority <repository-id> | inspect-physical <storage-id> | adopt-staged-repository <manifest.json> | retain-tombstone <manifest.json>]"
+        );
     }
     let telemetry = telemetry::init();
 
     let config = Config::from_env()?;
-    if let [_, lix_id] = arguments.as_slice() {
+    if arguments == ["inventory-authorities"] {
         let manager = LixRuntimeManager::new(&config, telemetry.lix_sink)?;
-        return manager.upgrade_authority(lix_id).await;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&manager.inventory_authorities().await?)?
+        );
+        return Ok(());
+    }
+    if arguments == ["migrate-authorities"] {
+        #[cfg(feature = "offline-migration")]
+        {
+            let manager = LixRuntimeManager::new(&config, telemetry.lix_sink)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&manager.migrate_authority_fleet().await?)?
+            );
+            return Ok(());
+        }
+        #[cfg(not(feature = "offline-migration"))]
+        anyhow::bail!(
+            "Fleet migration requires the detached offline-migration tool build and stopped serving hosts."
+        );
+    }
+    if arguments
+        .first()
+        .is_some_and(|command| command == "inspect-physical")
+    {
+        #[cfg(feature = "offline-migration")]
+        {
+            let manager = LixRuntimeManager::new(&config, telemetry.lix_sink)?;
+            let inspection = manager.inspect_physical_offline(&arguments[1]).await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "physicalStorageId": arguments[1], "inspection": inspection,
+                    "hostedIdentityResolved": false,
+                }))?
+            );
+            return Ok(());
+        }
+        #[cfg(not(feature = "offline-migration"))]
+        anyhow::bail!(
+            "Physical inspection requires the detached offline-migration build and stopped writers or an isolated copy; opening SlateDB may write physical metadata."
+        );
+    }
+    if arguments
+        .first()
+        .is_some_and(|command| command == "adopt-staged-repository")
+    {
+        #[cfg(feature = "offline-migration")]
+        {
+            let manager = LixRuntimeManager::new(&config, telemetry.lix_sink)?;
+            let report = manager
+                .adopt_staged_repository_offline(std::path::Path::new(&arguments[1]))
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            return Ok(());
+        }
+        #[cfg(not(feature = "offline-migration"))]
+        anyhow::bail!(
+            "Adoption requires the detached offline-migration build and stopped serving hosts."
+        );
+    }
+    if arguments
+        .first()
+        .is_some_and(|command| command == "retain-tombstone")
+    {
+        #[cfg(feature = "offline-migration")]
+        {
+            let manager = LixRuntimeManager::new(&config, telemetry.lix_sink)?;
+            let report = manager
+                .retain_tombstone_offline(std::path::Path::new(&arguments[1]))
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            return Ok(());
+        }
+        #[cfg(not(feature = "offline-migration"))]
+        anyhow::bail!(
+            "Retained tombstones require the detached offline-migration build and stopped writers."
+        );
+    }
+    if let [_, lix_id] = arguments.as_slice() {
+        #[cfg(feature = "offline-migration")]
+        {
+            let manager = LixRuntimeManager::new(&config, telemetry.lix_sink)?;
+            return manager.upgrade_authority(lix_id).await;
+        }
+        #[cfg(not(feature = "offline-migration"))]
+        anyhow::bail!(
+            "Repository {lix_id} must be migrated using the offline-migration tool build, with serving hosts stopped."
+        );
     }
     let listener = TcpListener::bind(&config.bind_addr)
         .await

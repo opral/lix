@@ -312,7 +312,7 @@ fn canonical_literal_paragraph_layout(document: &md::Document, source: &str) -> 
     false
 }
 
-fn literal_paragraph_source_is_safe(raw: &str) -> bool {
+pub(crate) fn literal_paragraph_source_is_safe(raw: &str) -> bool {
     let Some(first) = raw.chars().next() else {
         return false;
     };
@@ -969,6 +969,7 @@ pub(crate) fn render_tree(root: &NodeTree) -> Result<Vec<u8>, PluginError> {
             "Markdown state must contain a document node".to_string(),
         ));
     }
+    validate_child_kinds(root)?;
     let mut document = md::Document {
         meta: md::NodeMeta::default(),
         children: root
@@ -999,6 +1000,44 @@ pub(crate) fn render_tree(root: &NodeTree) -> Result<Vec<u8>, PluginError> {
         remove_line_containing(&mut rendered, &sentinel);
     }
     Ok(rendered.into_bytes())
+}
+
+fn validate_child_kinds(tree: &NodeTree) -> Result<(), PluginError> {
+    for child in &tree.children {
+        let valid = match tree.node.kind {
+            NodeKind::Document
+            | NodeKind::BlockQuote
+            | NodeKind::ListItem
+            | NodeKind::FootnoteDefinition => matches!(
+                child.node.kind,
+                NodeKind::Frontmatter
+                    | NodeKind::Paragraph
+                    | NodeKind::Heading
+                    | NodeKind::ThematicBreak
+                    | NodeKind::BlockQuote
+                    | NodeKind::List
+                    | NodeKind::CodeBlock
+                    | NodeKind::HtmlBlock
+                    | NodeKind::Definition
+                    | NodeKind::FootnoteDefinition
+                    | NodeKind::Table
+            ),
+            NodeKind::List => child.node.kind == NodeKind::ListItem,
+            NodeKind::Table => {
+                matches!(child.node.kind, NodeKind::TableColumn | NodeKind::TableRow)
+            }
+            NodeKind::TableRow => child.node.kind == NodeKind::TableCell,
+            _ => false,
+        };
+        if !valid {
+            return Err(PluginError::InvalidInput(format!(
+                "Markdown {:?} node '{}' cannot contain {:?} child '{}'",
+                tree.node.kind, tree.node.id, child.node.kind, child.node.id,
+            )));
+        }
+        validate_child_kinds(child)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1376,7 +1415,27 @@ fn block_from_tree(tree: &NodeTree) -> Result<md::Block, PluginError> {
         NodeKind::CodeBlock => {
             let style = string_field(&tree.node.format, "style")?;
             let kind = match style {
-                "indented" => md::CodeBlockKind::Indented,
+                "indented" => {
+                    let value = string_field(&tree.node.payload, "value")?;
+                    let loses_blank_lines = value
+                        .lines()
+                        .next()
+                        .is_none_or(|line| line.trim().is_empty())
+                        || value
+                            .lines()
+                            .last()
+                            .is_some_and(|line| line.trim().is_empty());
+                    if loses_blank_lines
+                        || optional_string_field(&tree.node.payload, "info")?.is_some()
+                    {
+                        md::CodeBlockKind::Fenced {
+                            marker: md::FenceMarker::Backtick,
+                            length: 3,
+                        }
+                    } else {
+                        md::CodeBlockKind::Indented
+                    }
+                }
                 "fenced" => md::CodeBlockKind::Fenced {
                     marker: match string_field(&tree.node.format, "marker")? {
                         "backtick" => md::FenceMarker::Backtick,
@@ -1400,7 +1459,10 @@ fn block_from_tree(tree: &NodeTree) -> Result<md::Block, PluginError> {
         })),
         NodeKind::Definition => Ok(md::Block::Definition(md::Definition {
             meta: authored_meta(),
-            label: owned_string_field(&tree.node.format, "label")?,
+            label: effective_reference_label(
+                string_field(&tree.node.payload, "identifier")?,
+                string_field(&tree.node.format, "label")?,
+            ),
             identifier: owned_string_field(&tree.node.payload, "identifier")?,
             destination: owned_string_field(&tree.node.payload, "destination")?,
             destination_kind: parse_link_destination(
@@ -1411,11 +1473,21 @@ fn block_from_tree(tree: &NodeTree) -> Result<md::Block, PluginError> {
             title_kind: optional_string_field(&tree.node.format, "title")?
                 .as_deref()
                 .map(|value| parse_link_title(value, &tree.node))
-                .transpose()?,
+                .transpose()?
+                .or_else(|| {
+                    tree.node
+                        .payload
+                        .get("title")
+                        .is_some_and(Value::is_string)
+                        .then_some(md::LinkTitleKind::DoubleQuote)
+                }),
         })),
         NodeKind::FootnoteDefinition => Ok(md::Block::FootnoteDefinition(md::FootnoteDefinition {
             meta: authored_meta(),
-            label: owned_string_field(&tree.node.format, "label")?,
+            label: effective_reference_label(
+                string_field(&tree.node.payload, "identifier")?,
+                string_field(&tree.node.format, "label")?,
+            ),
             identifier: owned_string_field(&tree.node.payload, "identifier")?,
             children: child_blocks(tree)?,
         })),
@@ -1539,6 +1611,7 @@ fn inlines_to_ast(nodes: &[InlineNode]) -> Result<Vec<md::Inline>, PluginError> 
             if let Some((source, delimiter)) =
                 nodes.get(index + 1).and_then(ambiguous_delimited_source)
                 && value.ends_with(delimiter)
+                && !value.contains('|')
             {
                 output.push(raw_inline(&format!("{value}{source}")));
                 index += 2;
@@ -1561,14 +1634,10 @@ fn inlines_to_ast(nodes: &[InlineNode]) -> Result<Vec<md::Inline>, PluginError> 
                 body = &body[..body.len() - 1];
             }
             if !body.is_empty() {
-                if follows_autolink {
-                    output.push(raw_inline(body));
-                } else {
-                    output.push(md::Inline::Text(md::Text {
-                        meta: md::NodeMeta::default(),
-                        value: body.to_string(),
-                    }));
-                }
+                output.push(md::Inline::Text(md::Text {
+                    meta: md::NodeMeta::default(),
+                    value: body.to_string(),
+                }));
             }
             if trailing_bracket {
                 output.push(raw_inline("["));
@@ -1582,6 +1651,7 @@ fn inlines_to_ast(nodes: &[InlineNode]) -> Result<Vec<md::Inline>, PluginError> 
                 ..
             }) = nodes.get(index + 1)
                 && value.starts_with(delimiter)
+                && !value.contains('|')
             {
                 source.push_str(value);
                 index += 1;
@@ -1603,7 +1673,35 @@ fn raw_inline(value: &str) -> md::Inline {
     })
 }
 
+fn effective_reference_label(identifier: &str, label: &str) -> String {
+    if crate::parse::normalize_label(label) == identifier {
+        label.to_owned()
+    } else {
+        identifier.to_owned()
+    }
+}
+
+fn effective_character_reference(value: &str, reference: &str) -> String {
+    if crate::parse::parse_character_reference(reference, 0)
+        .is_some_and(|(end, decoded)| end == reference.len() && decoded == value)
+    {
+        reference.to_owned()
+    } else {
+        value
+            .chars()
+            .map(|character| format!("&#x{:X};", u32::from(character)))
+            .collect()
+    }
+}
+
 fn inline_to_ast(node: &InlineNode, output: &mut Vec<md::Inline>) -> Result<(), PluginError> {
+    if let InlineContent::Code { value, .. } = &node.content
+        && (value.is_empty() || value.contains(['\r', '\n']))
+    {
+        return Err(PluginError::InvalidInput(
+            "inline code value must be nonempty and contain no line endings; Markdown code spans normalize them".into(),
+        ));
+    }
     let meta = md::NodeMeta::default();
     match &node.content {
         InlineContent::Text { value } => output.push(md::Inline::Text(md::Text {
@@ -1617,7 +1715,7 @@ fn inline_to_ast(node: &InlineNode, output: &mut Vec<md::Inline>) -> Result<(), 
         InlineContent::CharacterReference { value, format } => {
             output.push(md::Inline::CharacterReference(md::CharacterReference {
                 meta,
-                reference: format.reference.clone(),
+                reference: effective_character_reference(value, &format.reference),
                 value: value.clone(),
             }));
         }
@@ -1658,7 +1756,16 @@ fn inline_to_ast(node: &InlineNode, output: &mut Vec<md::Inline>) -> Result<(), 
         InlineContent::Code { value, format } => output.push(md::Inline::Code(md::CodeInline {
             meta,
             value: value.clone(),
-            raw: format.raw.clone(),
+            raw: if crate::parse::normalize_code_span(&format.raw) == *value
+                && format.fence_length > 0
+                && !format
+                    .raw
+                    .contains(&"`".repeat(format.fence_length.min(format.raw.len() + 1)))
+            {
+                format.raw.clone()
+            } else {
+                String::new()
+            },
             fence_length: format.fence_length,
         })),
         InlineContent::Link {
@@ -1675,7 +1782,8 @@ fn inline_to_ast(node: &InlineNode, output: &mut Vec<md::Inline>) -> Result<(), 
                 .title
                 .as_deref()
                 .map(|value| parse_link_title_inline(value, node))
-                .transpose()?,
+                .transpose()?
+                .or_else(|| title.as_ref().map(|_| md::LinkTitleKind::DoubleQuote)),
             children: inlines_to_ast(children)?,
         })),
         InlineContent::Image {
@@ -1692,7 +1800,8 @@ fn inline_to_ast(node: &InlineNode, output: &mut Vec<md::Inline>) -> Result<(), 
                 .title
                 .as_deref()
                 .map(|value| parse_link_title_inline(value, node))
-                .transpose()?,
+                .transpose()?
+                .or_else(|| title.as_ref().map(|_| md::LinkTitleKind::DoubleQuote)),
             alt: inlines_to_ast(alt)?,
         })),
         InlineContent::LinkReference {
@@ -1702,7 +1811,7 @@ fn inline_to_ast(node: &InlineNode, output: &mut Vec<md::Inline>) -> Result<(), 
         } => output.push(md::Inline::LinkReference(md::LinkReference {
             meta: authored_meta(),
             identifier: identifier.clone(),
-            label: format.label.clone(),
+            label: effective_reference_label(identifier, &format.label),
             kind: parse_reference_kind(&format.kind, node)?,
             children: inlines_to_ast(children)?,
         })),
@@ -1713,7 +1822,7 @@ fn inline_to_ast(node: &InlineNode, output: &mut Vec<md::Inline>) -> Result<(), 
         } => output.push(md::Inline::ImageReference(md::ImageReference {
             meta: authored_meta(),
             identifier: identifier.clone(),
-            label: format.label.clone(),
+            label: effective_reference_label(identifier, &format.label),
             kind: parse_reference_kind(&format.kind, node)?,
             alt: inlines_to_ast(alt)?,
         })),
@@ -1725,13 +1834,26 @@ fn inline_to_ast(node: &InlineNode, output: &mut Vec<md::Inline>) -> Result<(), 
             destination: destination.clone(),
             kind: match format.kind.as_str() {
                 "angle" => md::AutolinkKind::Angle,
-                "literal" => md::AutolinkKind::GfmLiteral {
-                    original: format.original.clone().ok_or_else(|| {
-                        PluginError::InvalidInput(
-                            "literal autolink format must contain original spelling".to_string(),
-                        )
-                    })?,
-                },
+                "literal" => {
+                    let original = format.original.as_deref().unwrap_or(destination);
+                    let spelling = if crate::parse::parse_literal_autolink(original, 0, true, true)
+                        .is_some_and(|(end, parsed)| {
+                            end == original.len() && parsed == *destination
+                        }) {
+                        original
+                    } else {
+                        destination.strip_prefix("mailto:").unwrap_or(destination)
+                    };
+                    if crate::parse::parse_literal_autolink(spelling, 0, true, true).is_some_and(
+                        |(end, parsed)| end == spelling.len() && parsed == *destination,
+                    ) {
+                        md::AutolinkKind::GfmLiteral {
+                            original: spelling.to_owned(),
+                        }
+                    } else {
+                        md::AutolinkKind::Angle
+                    }
+                }
                 value => return Err(invalid_inline_field(node, "kind", value)),
             },
         })),
@@ -1753,7 +1875,7 @@ fn inline_to_ast(node: &InlineNode, output: &mut Vec<md::Inline>) -> Result<(), 
         InlineContent::FootnoteReference { identifier, format } => {
             output.push(md::Inline::FootnoteReference(md::FootnoteReference {
                 meta: authored_meta(),
-                label: format.label.clone(),
+                label: effective_reference_label(identifier, &format.label),
                 identifier: identifier.clone(),
             }));
         }
@@ -1775,12 +1897,55 @@ fn push_delimited_inlines(
         meta: md::NodeMeta::default(),
         value: marker.to_string(),
     }));
-    output.extend(inlines_to_ast(children)?);
+    let mut children = inlines_to_ast(children)?;
+    protect_delimited_whitespace(&mut children);
+    output.extend(children);
     output.push(md::Inline::Html(md::HtmlInline {
         meta: md::NodeMeta::default(),
         value: marker.to_string(),
     }));
     Ok(())
+}
+
+fn protect_delimited_whitespace(children: &mut Vec<md::Inline>) {
+    let last = children.len().saturating_sub(1);
+    let mut protected = Vec::with_capacity(children.len());
+    for (index, node) in children.drain(..).enumerate() {
+        let md::Inline::Text(text) = &node else {
+            protected.push(node);
+            continue;
+        };
+        let start = if index == 0 {
+            text.value.len() - text.value.trim_start().len()
+        } else {
+            0
+        };
+        let end = if index == last {
+            text.value.trim_end().len().max(start)
+        } else {
+            text.value.len()
+        };
+        let reference = |value: &str| {
+            md::Inline::CharacterReference(md::CharacterReference {
+                meta: md::NodeMeta::default(),
+                reference: value
+                    .chars()
+                    .map(|character| format!("&#x{:X};", u32::from(character)))
+                    .collect(),
+                value: value.to_owned(),
+            })
+        };
+        if start > 0 {
+            protected.push(reference(&text.value[..start]));
+        }
+        if start < end {
+            protected.push(md::Inline::Text(md::Text::new(&text.value[start..end])));
+        }
+        if end < text.value.len() {
+            protected.push(reference(&text.value[end..]));
+        }
+    }
+    *children = protected;
 }
 
 fn validate_delimiter(marker: &str, strong: bool) -> Result<(), PluginError> {
@@ -1817,6 +1982,11 @@ fn ambiguous_delimited_source(node: &InlineNode) -> Option<(String, char)> {
         source.push_str(&simple_inline_source(child)?);
     }
     source.push_str(marker);
+    // Raw inline spelling cannot carry a literal table pipe. Let the typed
+    // serializer escape those children with the surrounding table context.
+    if source.contains('|') {
+        return None;
+    }
     Some((source, marker.chars().next()?))
 }
 

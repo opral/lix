@@ -11,8 +11,8 @@ use std::ops::Bound;
 use crate::branch::BranchHeadControlContext;
 use crate::changelog::{CommitId, CommitRecord};
 use crate::storage_adapter::{
-    Storage, StorageAdapter, StorageBeginScanOptions,
-    StorageCoreProjection, StorageKeyRange, StorageProjectedValue,
+    Storage, StorageAdapter, StorageBeginScanOptions, StorageCoreProjection, StorageKeyRange,
+    StorageProjectedValue,
 };
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateFilter, TrackedStateReadColumns, TrackedStateScanRequest,
@@ -389,7 +389,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let records = records(&read, MigrationOptions::automatic()).await.unwrap();
+        let records = records(&read, MigrationOptions::default()).await.unwrap();
         let before = records
             .iter()
             .map(|(id, (_, record))| (*id, record.clone()))
@@ -630,10 +630,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            super::super::api::inspect_lix_with_adapter(&adapter)
+            crate::migration::inspect_lix_with_adapter(&adapter)
                 .await
                 .unwrap(),
-            super::super::api::MigrationStatus::Required {
+            crate::migration::MigrationStatus::Required {
                 from_version: 78,
                 to_version: crate::init::CURRENT_FORMAT_VERSION
             }

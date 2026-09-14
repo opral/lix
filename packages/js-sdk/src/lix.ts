@@ -1,3 +1,4 @@
+import { fetchTransport } from "./http-transport.js";
 import { invalidArgument } from "./errors.js";
 import type {
 	BindingObserveEvent,
@@ -244,7 +245,7 @@ export class Lix {
             url: new URL(server.url).toString(),
             headers: typeof server.headers === "function" ? [] : entries(server.headers),
             headerProvider: typeof server.headers === "function" ? async () => entries(await (server.headers as () => Promise<HeadersInit>)()) : undefined,
-            fetch: server.fetch as typeof fetch | undefined,
+            transport: server.fetch ? fetchTransport(server.fetch) : undefined,
         }));
     }
 

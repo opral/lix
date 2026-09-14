@@ -1,7 +1,7 @@
 import {expect,test,vi} from "vitest";
 const cleanup=vi.hoisted(()=>vi.fn<(...args:unknown[])=>Promise<number>>());
 vi.mock("./worker/client.js",()=>({retryReplicaMigrationCleanupWorkerOperation:cleanup}));
-import {retryReplicaMigrationCleanup,convertReplicaToPartial} from "./open-lix.js";
+import {retryReplicaMigrationCleanup,convertReplicaToPartial} from "./migration.js";
 function fixture(){return {storage:{lixStorage:{version:3 as const,moduleUrl:"https://example.test/provider.js",options:{name:"retained"}}},server:{url:"https://example.test/lix/id",headers:async()=>({authorization:"Bearer fresh"}),fetch:vi.fn()}};}
 test("cleanup forwards dynamic authentication and returns completed count",async()=>{
  const options=fixture();cleanup.mockResolvedValueOnce(2);

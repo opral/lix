@@ -1450,29 +1450,10 @@ where
 
         let paths = BTreeSet::from([path]);
         let _operation_guard = self.begin_waitable_session_operation().await?;
-        let mut expired_read_retries = ExpiredReadRetryState::default();
-        let mut read_quiescence_guard = None;
-        loop {
-            let read_scope = match self.storage.begin_read(StorageReadOptions::default()).await {
-                Ok(read_scope) => read_scope,
-                Err(error) => {
-                    let error: LixError = error.into();
-                    if retry_expired_read_with_write_quiescence(
-                        &mut expired_read_retries,
-                        &error,
-                        &self.collaboration_write_gate,
-                        &mut read_quiescence_guard,
-                        false,
-                    )
-                    .await
-                    {
-                        continue;
-                    }
-                    return Err(error);
-                }
-            };
-            let attempt = with_static_session_sql_read::<StorageImpl, _, _, _>(
-                read_scope,
+        let (content, file_view_mutations, captured_interests) =
+            execute_coherent_session_read::<StorageImpl, _, _, _>(
+                &self.storage,
+                true,
                 |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| {
                     let paths = paths.clone();
                     let requested_range = requested_range.clone();
@@ -1513,7 +1494,7 @@ where
                         .await?;
                         let content =
                             native_file_read_from_exact_result(result, &paths, requested_range)?;
-                        if let Some((_, capture)) = capture {
+                        if let Some((_, capture)) = &capture {
                             let reader = self.hot_state.reader(read_store.clone());
                             let executable_rows = reader
                                 .prepare_captured_read_interests(
@@ -1537,33 +1518,27 @@ where
                             )
                             .await?;
                         }
-                        Ok((content, file_view_collector.plugin_file_mutations()))
+                        Ok((
+                            content,
+                            file_view_collector.plugin_file_mutations(),
+                            capture
+                                .map(|(_, capture)| capture)
+                                .into_iter()
+                                .collect::<Vec<_>>(),
+                        ))
                     }
                 },
             )
-            .await;
-            match attempt {
-                Ok((content, file_view_mutations)) => {
-                    self.file_views.apply_mutations(file_view_mutations);
-                    self.flush_partial_read_interests().await?;
-                    return Ok(content);
-                }
-                Err(error) => {
-                    if retry_expired_read_with_write_quiescence(
-                        &mut expired_read_retries,
-                        &error,
-                        &self.collaboration_write_gate,
-                        &mut read_quiescence_guard,
-                        false,
-                    )
-                    .await
-                    {
-                        continue;
-                    }
-                    return Err(error);
-                }
-            }
+            .await?;
+        if let Some(content) = &content {
+            crate::common::ReadResultBudget::default().charge(content.content().len(), 1)?;
         }
+        for capture in captured_interests {
+            capture.publish_capture()?;
+        }
+        self.file_views.apply_mutations(file_view_mutations);
+        self.flush_partial_read_interests().await?;
+        Ok(content)
     }
 
     pub(crate) async fn execute_for_observe(
@@ -1816,30 +1791,10 @@ where
         } else {
             None
         };
-        let mut expired_read_retries = ExpiredReadRetryState::default();
-        let mut read_quiescence_guard = None;
-        let reads_already_quiesced = runtime_write_access.is_some();
-        let (mut read_result, file_view_mutations, _provider_rows_examined) = loop {
-            let read_scope = match self.storage.begin_read(StorageReadOptions::default()).await {
-                Ok(read_scope) => read_scope,
-                Err(error) => {
-                    let error: LixError = error.into();
-                    if retry_expired_read_with_write_quiescence(
-                        &mut expired_read_retries,
-                        &error,
-                        &self.collaboration_write_gate,
-                        &mut read_quiescence_guard,
-                        reads_already_quiesced,
-                    )
-                    .await
-                    {
-                        continue;
-                    }
-                    return Err(normalize_sql_surface_error(error, sql));
-                }
-            };
-            let read_result = with_static_session_sql_read::<StorageImpl, _, _, _>(
-                read_scope,
+        let (mut read_result, file_view_mutations, _provider_rows_examined, captured_interests) =
+            execute_coherent_session_read::<StorageImpl, _, _, _>(
+                &self.storage,
+                !has_durable_runtime_function,
                 |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| {
                     let statement = statement.clone();
                     let read_plan = read_plan.clone();
@@ -1857,26 +1812,11 @@ where
                     }
                 },
             )
-            .await;
-            match read_result {
-                Ok(result) => break result,
-                Err(error) => {
-                    let error = normalize_sql_surface_error(error, sql);
-                    if retry_expired_read_with_write_quiescence(
-                        &mut expired_read_retries,
-                        &error,
-                        &self.collaboration_write_gate,
-                        &mut read_quiescence_guard,
-                        reads_already_quiesced,
-                    )
-                    .await
-                    {
-                        continue;
-                    }
-                    return Err(error);
-                }
-            }
-        };
+            .await
+            .map_err(|error| normalize_sql_surface_error(error, sql))?;
+        if let Some(capture) = captured_interests {
+            capture.publish_capture()?;
+        }
         let runtime_storage_stats = match read_result.runtime_functions.take() {
             Some(runtime_functions) => {
                 self.persist_runtime_functions_if_needed(
@@ -2677,29 +2617,10 @@ where
                 || late_materialized_lix_file_content_read(parsed).is_some()
         });
         let _operation_guard = self.begin_waitable_session_operation().await?;
-        let mut expired_read_retries = ExpiredReadRetryState::default();
-        let mut read_quiescence_guard = None;
-        loop {
-            let read_scope = match self.storage.begin_read(StorageReadOptions::default()).await {
-                Ok(read_scope) => read_scope,
-                Err(error) => {
-                    let error: LixError = error.into();
-                    if retry_expired_read_with_write_quiescence(
-                        &mut expired_read_retries,
-                        &error,
-                        &self.collaboration_write_gate,
-                        &mut read_quiescence_guard,
-                        false,
-                    )
-                    .await
-                    {
-                        continue;
-                    }
-                    return Err(error);
-                }
-            };
-            let attempt = with_static_session_sql_read::<StorageImpl, _, _, _>(
-                read_scope,
+        let (results, file_view_mutations, captured_interests) =
+            execute_coherent_session_read::<StorageImpl, _, _, _>(
+                &self.storage,
+                true,
                 |read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>| {
                     let parsed = parsed.clone();
                     async move {
@@ -2746,6 +2667,7 @@ where
                                     snapshot,
                                 },
                                 Vec::new(),
+                                Vec::<Arc<crate::hot_state::ReadInterestRegistry>>::new(),
                             ));
                         }
                         let ctx = SessionSqlExecutionContext {
@@ -2767,8 +2689,10 @@ where
                             }
                             None => sql2::prepare_read_session(&ctx, &parsed).await?,
                         };
+                        let mut result_budget = crate::common::ReadResultBudget::default();
                         let mut results = Vec::with_capacity(statements.len());
                         let mut file_view_mutations = Vec::new();
+                        let mut captured_interests = Vec::new();
                         for (statement_index, ((sql, params), parsed)) in
                             statements.iter().zip(parsed).enumerate()
                         {
@@ -2793,7 +2717,7 @@ where
                                     // Resolve filters and LIMIT on file metadata first. A
                                     // provider scan may render files absent from the result;
                                     // only hydrate (and acknowledge) returned paths.
-                                    let (result, mutations, _) = self
+                                    let (result, mutations, _, captured) = self
                                         .execute_read_statement_with_store(
                                             read_store.clone(),
                                             sql,
@@ -2812,6 +2736,7 @@ where
                                             kind.normalize_error(error, sql, statement_index)
                                         })?;
                                     file_view_mutations.extend(mutations);
+                                    captured_interests.extend(captured);
                                     return Ok(ExecuteResult::from_session_read_result(result));
                                 }
                                 sql2::execute_read_statement_in_session_from_parsed(
@@ -2831,7 +2756,9 @@ where
                             if let Some(telemetry) = telemetry {
                                 telemetry.finish(&result);
                             }
-                            results.push(result?);
+                            let result = result?;
+                            charge_execute_result(&mut result_budget, &result)?;
+                            results.push(result);
                             if acknowledge_statement {
                                 if let Some(collector) = &file_view_collector {
                                     file_view_mutations.extend(collector.plugin_file_mutations());
@@ -2840,7 +2767,7 @@ where
                         }
                         drop(read_session);
                         drop(ctx);
-                        if let Some((_, capture)) = capture {
+                        if let Some((_, capture)) = &capture {
                             let reader = self.hot_state.reader(read_store.clone());
                             let executable_rows = reader
                                 .prepare_captured_read_interests(
@@ -2864,33 +2791,22 @@ where
                             )
                             .await?;
                         }
-                        Ok((ReadBatchResult { results, snapshot }, file_view_mutations))
+                        captured_interests.extend(capture.map(|(_, capture)| capture));
+                        Ok((
+                            ReadBatchResult { results, snapshot },
+                            file_view_mutations,
+                            captured_interests,
+                        ))
                     }
                 },
             )
-            .await;
-            match attempt {
-                Ok((results, file_view_mutations)) => {
-                    self.file_views.apply_mutations(file_view_mutations);
-                    self.flush_partial_read_interests().await?;
-                    return Ok(results);
-                }
-                Err(error) => {
-                    if retry_expired_read_with_write_quiescence(
-                        &mut expired_read_retries,
-                        &error,
-                        &self.collaboration_write_gate,
-                        &mut read_quiescence_guard,
-                        false,
-                    )
-                    .await
-                    {
-                        continue;
-                    }
-                    return Err(error);
-                }
-            }
+            .await?;
+        for capture in captured_interests {
+            capture.publish_capture()?;
         }
+        self.file_views.apply_mutations(file_view_mutations);
+        self.flush_partial_read_interests().await?;
+        Ok(results)
     }
 
     #[doc(hidden)]
@@ -3066,6 +2982,7 @@ where
             sql2::SessionReadSqlResult,
             Vec<sql2::SessionFileViewMutation>,
             usize,
+            Option<Arc<crate::hot_state::ReadInterestRegistry>>,
         ),
         LixError,
     > {
@@ -3085,7 +3002,7 @@ where
             has_durable_runtime_function,
         ))
         .await?;
-        if let Some((_, capture)) = capture {
+        if let Some((_, capture)) = &capture {
             let reader = self.hot_state.reader(read_store.clone());
             let executable_rows = reader
                 .prepare_captured_read_interests(&capture.snapshot()?, self.active_account_id())
@@ -3106,7 +3023,13 @@ where
             )
             .await?;
         }
-        Ok(result)
+        validate_session_read_result(&result.0.query)?;
+        Ok((
+            result.0,
+            result.1,
+            result.2,
+            capture.map(|(_, capture)| capture),
+        ))
     }
 
     async fn execute_read_statement_with_scoped_hot(
@@ -3618,6 +3541,146 @@ fn profile_checksum_bytes(mut checksum: u64, bytes: &[u8]) -> u64 {
         checksum = checksum.wrapping_mul(0x0000_0100_0000_01b3);
     }
     checksum
+}
+
+fn validate_session_read_result(result: &sql2::SessionReadResult) -> Result<(), LixError> {
+    let mut budget = crate::common::ReadResultBudget::default();
+    match result {
+        sql2::SessionReadResult::Rows(result) => {
+            budget.charge(result.columns.iter().map(|name| name.len()).sum(), 0)?;
+            for notice in &result.notices {
+                budget.charge(
+                    notice
+                        .code
+                        .len()
+                        .saturating_add(notice.message.len())
+                        .saturating_add(notice.hint.as_ref().map_or(0, String::len)),
+                    0,
+                )?;
+            }
+            for row in &result.rows {
+                budget.charge_values(row)?;
+            }
+        }
+        sql2::SessionReadResult::Columnar {
+            fields,
+            batches,
+            notices,
+        } => {
+            budget.charge(fields.iter().map(|field| field.name().len()).sum(), 0)?;
+            for notice in notices {
+                budget.charge(
+                    notice
+                        .code
+                        .len()
+                        .saturating_add(notice.message.len())
+                        .saturating_add(notice.hint.as_ref().map_or(0, String::len)),
+                    0,
+                )?;
+            }
+            for batch in batches.iter() {
+                budget.charge(batch.get_array_memory_size(), batch.num_rows())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn charge_execute_result(
+    budget: &mut crate::common::ReadResultBudget,
+    result: &ExecuteResult,
+) -> Result<(), LixError> {
+    if let Some(backing) = &result.backing {
+        budget.charge(backing.columns.iter().map(|name| name.len()).sum(), 0)?;
+        for notice in &backing.notices {
+            budget.charge(
+                notice
+                    .code
+                    .len()
+                    .saturating_add(notice.message.len())
+                    .saturating_add(notice.hint.as_ref().map_or(0, String::len)),
+                0,
+            )?;
+        }
+        let columnar = backing
+            .columnar
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(columnar) = columnar.as_ref() {
+            for batch in columnar.batches.iter() {
+                budget.charge(batch.get_array_memory_size(), batch.num_rows())?;
+            }
+        } else if let Some(rows) = backing.rows.get() {
+            for row in rows {
+                budget.charge_values(row.values())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Owns an entire buffered, replayable read operation. Each attempt gets a fresh
+/// read scope; its caches, staged observations and result are discarded together
+/// on expiry. Publication and hydration writes belong after this returns.
+///
+/// This executor deliberately takes no engine write gate: a scope can call read
+/// providers/plugins, and holding that gate across their awaits can deadlock the
+/// hydration or interest flush that makes progress possible. Adapter snapshot
+/// retention supplies the read window without blocking writers.
+async fn execute_coherent_session_read<StorageImpl, F, Fut, T>(
+    storage: &StorageAdapter<StorageImpl>,
+    replayable: bool,
+    mut attempt: F,
+) -> Result<T, LixError>
+where
+    StorageImpl: Storage + 'static,
+    F: FnMut(SharedStorageAdapterRead<StorageImpl::Read<'static>>) -> Fut,
+    Fut: Future<Output = Result<T, LixError>>,
+{
+    let operation = Box::pin(async {
+        let mut retries = ExpiredReadRetryState::default();
+        loop {
+            let result = match storage.begin_read(StorageReadOptions::default()).await {
+                Ok(read) => {
+                    with_static_session_sql_read::<StorageImpl, _, _, _>(read, &mut attempt)
+                        .await
+                }
+                Err(error) => Err(error.into()),
+            };
+            match result {
+                Ok(buffered) => return Ok(buffered),
+                Err(error) => {
+                    if !replayable {
+                        return Err(error);
+                    }
+                    let Some(delay) = retries.next_delay(&error) else {
+                        if error.code == LixError::CODE_STORAGE_READ_EXPIRED
+                            && !error.automatic_retry_is_forbidden()
+                        {
+                            return Err(LixError::new(
+                                "LIX_READ_PROGRESS_EXHAUSTED",
+                                "coherent read could not complete within its retry budget",
+                            )
+                            .with_details(serde_json::json!({
+                                "causeCode": error.code,
+                                "retryBudgetMs": 3000,
+                            })));
+                        }
+                        return Err(error);
+                    };
+                    tokio::task::yield_now().await;
+                    if !delay.is_zero() {
+                        crate::sync::sleep(delay).await;
+                    }
+                }
+            }
+        }
+    });
+    if replayable {
+        crate::common::with_read_deadline(operation).await
+    } else {
+        operation.await
+    }
 }
 
 /// Runs one session SQL read using a widened storage-read lifetime.
@@ -4460,37 +4523,6 @@ fn normalize_sql_surface_error(error: LixError, sql: &str) -> LixError {
     error
 }
 
-/// A storage such as browser OPFS may preserve coherent reads by expiring a
-/// multi-call snapshot when a commit lands between calls. Retry once on the
-/// optimistic path, then hold the same collaboration gate used by every Lix
-/// writer. Repeated expiry can come from another browser context, whose writer
-/// does not share that in-process gate, so an elapsed-time budget with bounded
-/// backoff gives an ownership handoff time to finish without allowing a broken
-/// storage implementation to retry forever.
-async fn retry_expired_read_with_write_quiescence(
-    state: &mut ExpiredReadRetryState,
-    error: &LixError,
-    write_gate: &Arc<tokio::sync::Mutex<()>>,
-    guard: &mut Option<tokio::sync::OwnedMutexGuard<()>>,
-    already_quiesced: bool,
-) -> bool {
-    let Some(delay) = state.next_delay(error) else {
-        return false;
-    };
-    // Cross-context stores such as OPFS can invalidate a read while another
-    // tab is committing or transferring ownership. Yield before reopening so
-    // that handoff can finish; otherwise all bounded retries can run in one
-    // event-loop turn against the same transient generation.
-    tokio::task::yield_now().await;
-    if !already_quiesced && guard.is_none() {
-        *guard = Some(Arc::clone(write_gate).lock_owned().await);
-    }
-    if !delay.is_zero() {
-        crate::sync::sleep(delay).await;
-    }
-    true
-}
-
 async fn retry_auto_commit(
     conflict_retries: &mut usize,
     expired_read_retries: &mut ExpiredReadRetryState,
@@ -4545,6 +4577,88 @@ mod tests {
         Memory,
         engine::{Engine, EngineOptions},
     };
+
+    #[tokio::test]
+    async fn read_result_byte_budget_rejects_oversize_and_releases_session() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone()).await.unwrap();
+        let engine = Engine::new(storage).await.unwrap();
+        let session = engine.open_session().await.unwrap();
+        let value = Value::Text("x".repeat(crate::common::MAX_READ_RESULT_BYTES + 1));
+        let error = session
+            .execute("SELECT $1 AS value", &[value])
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "LIX_READ_RESOURCE_EXHAUSTED");
+        assert_eq!(
+            session
+                .execute("SELECT 1 AS value", &[])
+                .await
+                .unwrap()
+                .rows()[0]
+                .get::<i64>("value"),
+            Ok(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn coherent_read_executor_discards_failed_attempt_results_and_handles() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone()).await.unwrap();
+        let engine = Engine::new(storage).await.unwrap();
+        let session = engine.open_session().await.unwrap();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result =
+            execute_coherent_session_read::<Memory, _, _, _>(&session.storage, true, |read| {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    let buffered = vec![attempt];
+                    drop(read);
+                    if attempt == 0 {
+                        Err(LixError::from(StorageError::ReadExpired))
+                    } else {
+                        Ok(buffered)
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(result, vec![1]);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn coherent_read_executor_never_replays_effectful_or_completed_operations() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone()).await.unwrap();
+        let engine = Engine::new(storage).await.unwrap();
+        let session = engine.open_session().await.unwrap();
+        for (replayable, marker) in [
+            (false, None),
+            (true, Some("nonRetryableAfterCommit")),
+            (true, Some("nonRetryableAfterExecution")),
+        ] {
+            let attempts = std::sync::atomic::AtomicUsize::new(0);
+            let result = execute_coherent_session_read::<Memory, _, _, ()>(
+                &session.storage,
+                replayable,
+                |read| {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        drop(read);
+                        let mut error = LixError::from(StorageError::ReadExpired);
+                        if let Some(marker) = marker {
+                            error = error.with_details(serde_json::json!({marker: true}));
+                        }
+                        Err(error)
+                    }
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        }
+    }
 
     #[tokio::test]
     async fn auto_commit_retry_policy_preserves_completion_boundaries() {

@@ -329,8 +329,7 @@ test("browser sync custom fetch crosses the worker boundary", async () => {
 			method: "GET",
 			headers: [["authorization", "Bearer fresh"]],
 			credentials: "include",
-			responseMode: "buffered",
-			responseLimit: 1024,
+			response: {mode: "buffered", maxBytes: 1024},
 		},
 	});
 	await new Promise((resolve) => setTimeout(resolve, 0));
@@ -386,7 +385,7 @@ test("browser authority streams cross the worker boundary with pull backpressure
 			url: "https://example.test/lix/v1/repository/observe",
 			method: "POST",
 			headers: [],
-			responseMode: "stream",
+			response: {mode: "streaming"},
 		},
 	});
 	await new Promise((resolve) => setTimeout(resolve, 0));
@@ -457,8 +456,7 @@ test("browser sync cancels a streamed response at the Rust byte limit", async ()
 			url: "https://example.test/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/sync/pull",
 			method: "GET",
 			headers: [],
-			responseMode: "buffered",
-			responseLimit: 4,
+			response: {mode: "buffered", maxBytes: 4},
 		},
 	});
 	await new Promise((resolve) => setTimeout(resolve, 0));
@@ -477,8 +475,8 @@ test("browser sync cancels a streamed response at the Rust byte limit", async ()
 		result: {
 			ok: false,
 			error: {
-				code: "LIX_ERROR_SYNC_RESPONSE_TOO_LARGE",
-				message: "sync fetch response exceeds 4 bytes",
+				code: "LIX_TRANSPORT_RESPONSE_LIMIT",
+				message: "HTTP response exceeds its declared resource budget",
 			},
 		},
 	});
@@ -510,8 +508,7 @@ test("browser sync cancellation aborts the bridged fetch", async () => {
 			url: "https://example.test/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/sync/pull",
 			method: "GET",
 			headers: [],
-			responseMode: "buffered",
-			responseLimit: 1024,
+			response: {mode: "buffered", maxBytes: 1024},
 		},
 	});
 	await Promise.resolve();
@@ -546,7 +543,7 @@ test("browser sync ignores a fetch that resolves after cancellation", async () =
 			url: "https://example.test/lix/v1/repository/observe",
 			method: "POST",
 			headers: [],
-			responseMode: "stream",
+			response: {mode: "streaming"},
 		},
 	});
 	await Promise.resolve();
@@ -588,7 +585,7 @@ test("browser sync does not revive a bodyless stream after cancellation", async 
 			url: "https://example.test/lix/v1/repository/observe",
 			method: "POST",
 			headers: [],
-			responseMode: "stream",
+			response: {mode: "streaming"},
 		},
 	});
 	await new Promise((resolve) => setTimeout(resolve, 0));
