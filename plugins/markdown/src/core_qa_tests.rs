@@ -956,3 +956,21 @@ fn qa_semantic_guard_rejects_html_type_and_table_role_loss() {
         assert_eq!(document.bytes(), source.as_bytes());
     }
 }
+
+#[test]
+fn qa_nested_link_candidates_reuse_speculative_results() {
+    let mut source = "a".to_owned();
+    for _ in 0..24 {
+        source = format!("[{source}](u)");
+    }
+    source.push('\n');
+    for _ in 0..3 {
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("links.md"),
+            IdNamespace::from_halves(44, 1),
+        )
+        .unwrap();
+        assert_eq!(document.bytes(), source.as_bytes());
+    }
+}

@@ -24,6 +24,37 @@ std::thread_local! {
     static PARSE_NESTING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[derive(Default)]
+struct InlineScanCache {
+    depth: usize,
+    labels: std::collections::HashMap<(usize, usize, usize), bool>,
+}
+
+std::thread_local! {
+    static INLINE_SCAN_CACHE: std::cell::RefCell<InlineScanCache> = std::cell::RefCell::new(InlineScanCache::default());
+}
+
+struct InlineScanGuard;
+impl InlineScanGuard {
+    fn enter() -> Self {
+        INLINE_SCAN_CACHE.with(|cache| cache.borrow_mut().depth += 1);
+        Self
+    }
+}
+impl Drop for InlineScanGuard {
+    fn drop(&mut self) {
+        INLINE_SCAN_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.depth -= 1;
+            if cache.depth == 0 {
+                // Keys refer only to immutable slices borrowed during this
+                // outer scan. Never reuse them for another source or dialect.
+                cache.labels = std::collections::HashMap::new();
+            }
+        });
+    }
+}
+
 struct NestingGuard;
 impl NestingGuard {
     fn enter(diagnostics: &mut Vec<Diagnostic>) -> Option<Self> {
@@ -4247,6 +4278,7 @@ fn parse_inlines_with_context(
     let Some(_nesting) = NestingGuard::enter(diagnostics) else {
         return Vec::new();
     };
+    let _scan = InlineScanGuard::enter();
     let label_ends = link_label_ends(input);
     let bytes = input.as_bytes();
     let mut nodes = Vec::new();
@@ -5356,6 +5388,14 @@ fn label_contains_link(
     options: &SyntaxOptions,
     definitions: &[String],
 ) -> bool {
+    let key = (
+        label_source.as_ptr().addr(),
+        label_source.len(),
+        PARSE_NESTING.with(std::cell::Cell::get),
+    );
+    if let Some(cached) = INLINE_SCAN_CACHE.with(|cache| cache.borrow().labels.get(&key).copied()) {
+        return cached;
+    }
     let mut diagnostics = Vec::new();
     let inlines = parse_inlines_with_context(
         label_source,
@@ -5365,7 +5405,14 @@ fn label_contains_link(
         &mut diagnostics,
         InlineContext::default(),
     );
-    contains_link_inline(&inlines)
+    let contains = contains_link_inline(&inlines);
+    INLINE_SCAN_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.depth > 0 {
+            cache.labels.insert(key, contains);
+        }
+    });
+    contains
 }
 
 fn contains_link_inline(inlines: &[Inline]) -> bool {
