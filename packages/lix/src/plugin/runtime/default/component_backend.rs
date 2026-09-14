@@ -15,9 +15,7 @@ pub(super) type HostStore = Store<WasiHostState>;
 pub(super) use super::{TimeoutTickerLease, reset_store_limits, wasm_runtime_error};
 pub(super) type HostState = WasiHostState;
 use super::WasiHostState;
-use super::{
-    CompileProfile, CompiledComponentKey, WasmtimePluginRuntime, add_to_linker_sync, create_store,
-};
+use super::{CompileProfile, CompiledComponentKey, WasmtimePluginRuntime, create_store};
 use wasmtime::Store;
 use wasmtime::component::{Component, Linker};
 pub(super) mod bindings {
@@ -25,6 +23,7 @@ pub(super) mod bindings {
         wasmtime::component::bindgen!({
             path: "wit",
             world: "plugin",
+            exports: { default: async },
             with: {
                 "lix:plugin-v2/host.snapshot": super::super::SnapshotResource,
                 "lix:plugin-v2/host.transition": super::super::TransitionResource,
@@ -50,6 +49,7 @@ pub(super) mod file_projection_bindings {
         wasmtime::component::bindgen!({
             path: "wit",
             world: "file-projection-plugin",
+            exports: { default: async },
             with: {
                 "lix:plugin-v2/host": super::super::bindings::lix::plugin::host,
                 "lix:plugin-v2/types": super::super::bindings::lix::plugin::types,
@@ -69,6 +69,7 @@ pub(super) mod column_merger_bindings {
         wasmtime::component::bindgen!({
             path: "wit",
             world: "column-merger-plugin",
+            exports: { default: async },
             with: {
                 "lix:plugin-v2/host": super::super::bindings::lix::plugin::host,
                 "lix:plugin-v2/types": super::super::bindings::lix::plugin::types,
@@ -88,6 +89,7 @@ pub(super) mod legacy_bindings {
     wasmtime::component::bindgen!({
         path: "wit-legacy-v2",
         world: "plugin",
+        exports: { default: async },
         with: {
             "lix:plugin/types": super::bindings::lix::plugin::types,
             "lix:plugin/host.snapshot": super::SnapshotResource,
@@ -103,6 +105,7 @@ pub(super) mod legacy_file_projection_bindings {
     wasmtime::component::bindgen!({
         path: "wit-legacy-v2",
         world: "file-projection-plugin",
+        exports: { default: async },
         with: {
             "lix:plugin/host": super::legacy_bindings::lix::plugin::host,
             "lix:plugin/types": super::bindings::lix::plugin::types,
@@ -114,6 +117,7 @@ pub(super) mod legacy_column_merger_bindings {
     wasmtime::component::bindgen!({
         path: "wit-legacy-v2",
         world: "column-merger-plugin",
+        exports: { default: async },
         with: {
             "lix:plugin/host": super::legacy_bindings::lix::plugin::host,
             "lix:plugin/types": super::bindings::lix::plugin::types,
@@ -137,6 +141,12 @@ enum ComponentLinker {
     Combined(Arc<Linker<WasiHostState>>),
     FileProjection(Arc<Linker<WasiHostState>>),
     ColumnMerger(Arc<Linker<WasiHostState>>),
+}
+
+fn configure_wasi_linker(linker: &mut Linker<WasiHostState>) -> wasmtime::Result<()> {
+    // Guest diagnostics and abort paths may flush WASI streams. Their sync
+    // adapters call block_on, which cannot run inside our async actor methods.
+    wasmtime_wasi::p2::add_to_linker_async(linker)
 }
 
 pub(super) async fn compile_component(
@@ -166,7 +176,7 @@ pub(super) async fn compile_component(
         })
         .await?;
     let mut linker = Linker::<WasiHostState>::new(engine);
-    add_to_linker_sync(&mut linker)
+    configure_wasi_linker(&mut linker)
         .map_err(|error| wasm_runtime_error("failed to configure component WASI linker", error))?;
     let legacy = component.component_type().exports(engine).any(|(name, _)| {
         matches!(
@@ -276,7 +286,8 @@ impl WasmComponentFactory for ComponentFactory {
         let (file_projection, column_merger) = match &self.linker {
             ComponentLinker::LegacyCombined(linker) => {
                 let instance =
-                    legacy_bindings::Plugin::instantiate(&mut store, &self.component, linker)
+                    legacy_bindings::Plugin::instantiate_async(&mut store, &self.component, linker)
+                        .await
                         .map_err(|error| {
                             wasm_runtime_error("failed to instantiate combined plugin actor", error)
                         })?;
@@ -290,14 +301,16 @@ impl WasmComponentFactory for ComponentFactory {
                 )
             }
             ComponentLinker::LegacyFileProjection(linker) => {
-                let instance = legacy_file_projection_bindings::FileProjectionPlugin::instantiate(
-                    &mut store,
-                    &self.component,
-                    linker,
-                )
-                .map_err(|error| {
-                    wasm_runtime_error("failed to instantiate file projection actor", error)
-                })?;
+                let instance =
+                    legacy_file_projection_bindings::FileProjectionPlugin::instantiate_async(
+                        &mut store,
+                        &self.component,
+                        linker,
+                    )
+                    .await
+                    .map_err(|error| {
+                        wasm_runtime_error("failed to instantiate file projection actor", error)
+                    })?;
                 (
                     Some(FileProjectionGuest::LegacyNarrow(
                         instance.lix_plugin_file_projection().clone(),
@@ -306,14 +319,16 @@ impl WasmComponentFactory for ComponentFactory {
                 )
             }
             ComponentLinker::LegacyColumnMerger(linker) => {
-                let instance = legacy_column_merger_bindings::ColumnMergerPlugin::instantiate(
-                    &mut store,
-                    &self.component,
-                    linker,
-                )
-                .map_err(|error| {
-                    wasm_runtime_error("failed to instantiate column merger actor", error)
-                })?;
+                let instance =
+                    legacy_column_merger_bindings::ColumnMergerPlugin::instantiate_async(
+                        &mut store,
+                        &self.component,
+                        linker,
+                    )
+                    .await
+                    .map_err(|error| {
+                        wasm_runtime_error("failed to instantiate column merger actor", error)
+                    })?;
                 (
                     None,
                     Some(ColumnMergerGuest::LegacyNarrow(
@@ -322,10 +337,12 @@ impl WasmComponentFactory for ComponentFactory {
                 )
             }
             ComponentLinker::Combined(linker) => {
-                let instance = bindings::Plugin::instantiate(&mut store, &self.component, linker)
-                    .map_err(|error| {
-                    wasm_runtime_error("failed to instantiate combined plugin actor", error)
-                })?;
+                let instance =
+                    bindings::Plugin::instantiate_async(&mut store, &self.component, linker)
+                        .await
+                        .map_err(|error| {
+                            wasm_runtime_error("failed to instantiate combined plugin actor", error)
+                        })?;
                 (
                     Some(FileProjectionGuest::Combined(
                         instance.lix_plugin_v2_file_projection().clone(),
@@ -336,11 +353,12 @@ impl WasmComponentFactory for ComponentFactory {
                 )
             }
             ComponentLinker::FileProjection(linker) => {
-                let instance = file_projection_bindings::FileProjectionPlugin::instantiate(
+                let instance = file_projection_bindings::FileProjectionPlugin::instantiate_async(
                     &mut store,
                     &self.component,
                     linker,
                 )
+                .await
                 .map_err(|error| {
                     wasm_runtime_error("failed to instantiate file projection actor", error)
                 })?;
@@ -352,11 +370,12 @@ impl WasmComponentFactory for ComponentFactory {
                 )
             }
             ComponentLinker::ColumnMerger(linker) => {
-                let instance = column_merger_bindings::ColumnMergerPlugin::instantiate(
+                let instance = column_merger_bindings::ColumnMergerPlugin::instantiate_async(
                     &mut store,
                     &self.component,
                     linker,
                 )
+                .await
                 .map_err(|error| {
                     wasm_runtime_error("failed to instantiate column merger actor", error)
                 })?;
@@ -417,10 +436,10 @@ impl FileProjectionGuest {
         output: Resource<TransitionResource>,
     ) -> wasmtime::Result<Result<(), bindings::lix::plugin::types::PluginError>> {
         match self {
-            Self::LegacyCombined(guest) => guest.call_parse(store, input, output),
-            Self::LegacyNarrow(guest) => guest.call_parse(store, input, output),
-            Self::Combined(guest) => guest.call_parse(store, input, output),
-            Self::Narrow(guest) => guest.call_parse(store, input, output),
+            Self::LegacyCombined(guest) => guest.call_parse(store, input, output).await,
+            Self::LegacyNarrow(guest) => guest.call_parse(store, input, output).await,
+            Self::Combined(guest) => guest.call_parse(store, input, output).await,
+            Self::Narrow(guest) => guest.call_parse(store, input, output).await,
         }
     }
 
@@ -431,10 +450,10 @@ impl FileProjectionGuest {
         output: Resource<TransitionResource>,
     ) -> wasmtime::Result<Result<(), bindings::lix::plugin::types::PluginError>> {
         match self {
-            Self::LegacyCombined(guest) => guest.call_parse_changes(store, input, output),
-            Self::LegacyNarrow(guest) => guest.call_parse_changes(store, input, output),
-            Self::Combined(guest) => guest.call_parse_changes(store, input, output),
-            Self::Narrow(guest) => guest.call_parse_changes(store, input, output),
+            Self::LegacyCombined(guest) => guest.call_parse_changes(store, input, output).await,
+            Self::LegacyNarrow(guest) => guest.call_parse_changes(store, input, output).await,
+            Self::Combined(guest) => guest.call_parse_changes(store, input, output).await,
+            Self::Narrow(guest) => guest.call_parse_changes(store, input, output).await,
         }
     }
 
@@ -445,10 +464,10 @@ impl FileProjectionGuest {
         output: Resource<TransitionResource>,
     ) -> wasmtime::Result<Result<(), bindings::lix::plugin::types::PluginError>> {
         match self {
-            Self::LegacyCombined(guest) => guest.call_serialize(store, input, output),
-            Self::LegacyNarrow(guest) => guest.call_serialize(store, input, output),
-            Self::Combined(guest) => guest.call_serialize(store, input, output),
-            Self::Narrow(guest) => guest.call_serialize(store, input, output),
+            Self::LegacyCombined(guest) => guest.call_serialize(store, input, output).await,
+            Self::LegacyNarrow(guest) => guest.call_serialize(store, input, output).await,
+            Self::Combined(guest) => guest.call_serialize(store, input, output).await,
+            Self::Narrow(guest) => guest.call_serialize(store, input, output).await,
         }
     }
 
@@ -459,10 +478,10 @@ impl FileProjectionGuest {
         output: Resource<TransitionResource>,
     ) -> wasmtime::Result<Result<(), bindings::lix::plugin::types::PluginError>> {
         match self {
-            Self::LegacyCombined(guest) => guest.call_serialize_changes(store, input, output),
-            Self::LegacyNarrow(guest) => guest.call_serialize_changes(store, input, output),
-            Self::Combined(guest) => guest.call_serialize_changes(store, input, output),
-            Self::Narrow(guest) => guest.call_serialize_changes(store, input, output),
+            Self::LegacyCombined(guest) => guest.call_serialize_changes(store, input, output).await,
+            Self::LegacyNarrow(guest) => guest.call_serialize_changes(store, input, output).await,
+            Self::Combined(guest) => guest.call_serialize_changes(store, input, output).await,
+            Self::Narrow(guest) => guest.call_serialize_changes(store, input, output).await,
         }
     }
 }
@@ -475,10 +494,10 @@ impl ColumnMergerGuest {
         output: Resource<ResolutionSinkResource>,
     ) -> wasmtime::Result<Result<(), bindings::lix::plugin::types::PluginError>> {
         match self {
-            Self::LegacyCombined(guest) => guest.call_merge(store, input, output),
-            Self::LegacyNarrow(guest) => guest.call_merge(store, input, output),
-            Self::Combined(guest) => guest.call_merge(store, input, output),
-            Self::Narrow(guest) => guest.call_merge(store, input, output),
+            Self::LegacyCombined(guest) => guest.call_merge(store, input, output).await,
+            Self::LegacyNarrow(guest) => guest.call_merge(store, input, output).await,
+            Self::Combined(guest) => guest.call_merge(store, input, output).await,
+            Self::Narrow(guest) => guest.call_merge(store, input, output).await,
         }
     }
 }
@@ -869,6 +888,41 @@ impl From<legacy_bindings::lix::plugin::host::MergeSide>
 mod tests {
     use wasmtime::component::{Component, Linker};
     use wasmtime::{Engine, Store};
+
+    async fn flushing_guest_trap_is_an_error() {
+        let engine = Engine::default();
+        let component = Component::new(
+            &engine,
+            include_bytes!(
+                "../../../../tests/fixtures/plugin-api/diagnostics/flush-then-trap.wasm"
+            ),
+        )
+        .unwrap();
+        let mut linker = Linker::<super::WasiHostState>::new(&engine);
+        super::configure_wasi_linker(&mut linker).unwrap();
+        // A guest trap must leave the Tokio caller able to create and run
+        // another component. No real OOM is needed to exercise stderr flushing.
+        for _ in 0..2 {
+            let mut store =
+                super::create_store(&engine, crate::wasm::WasmLimits::default()).unwrap();
+            let guest = wasmtime_wasi::p2::bindings::Command::instantiate_async(
+                &mut store, &component, &linker,
+            )
+            .await
+            .unwrap();
+            assert!(guest.wasi_cli_run().call_run(&mut store).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn wasi_diagnostic_flush_returns_guest_error_on_current_thread() {
+        flushing_guest_trap_is_an_error().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wasi_diagnostic_flush_returns_guest_error_on_multiple_threads() {
+        flushing_guest_trap_is_an_error().await;
+    }
 
     #[test]
     fn major_only_host_can_add_functions_without_rebuilding_existing_components() {
