@@ -69,7 +69,13 @@ fn native_projection_lifecycle_resolves_ids_and_preserves_cold_edits() {
     };
     let next_creates = CreateContext::from_namespace_bytes([2; 12]);
     let warm = harness
-        .parse_changes(&edited, &edited.path, &[edit.clone()], None, next_creates)
+        .parse_changes(
+            &edited,
+            &edited.path,
+            std::slice::from_ref(&edit),
+            None,
+            next_creates,
+        )
         .unwrap();
     let reopened = harness
         .parse_changes(&cold, &cold.path, &[edit], Some(&rows), next_creates)

@@ -125,11 +125,13 @@ fn profile_sparse_sql(count: usize) {
             .retain(|key, _| !key.starts_with(BLOCK_IDS_STATE));
         let started = std::time::Instant::now();
         let baseline = harness
-            .serialize_changes(&fallback, &[change.clone()])
+            .serialize_changes(&fallback, std::slice::from_ref(&change))
             .unwrap();
         let baseline_time = started.elapsed();
         let started = std::time::Instant::now();
-        let sparse = harness.serialize_changes(&file, &[change.clone()]).unwrap();
+        let sparse = harness
+            .serialize_changes(&file, std::slice::from_ref(&change))
+            .unwrap();
         let sparse_time = started.elapsed();
         assert_eq!(sparse.snapshot().bytes, baseline.snapshot().bytes);
         if replacement.contains('[') {
