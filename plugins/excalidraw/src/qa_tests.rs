@@ -927,3 +927,37 @@ fn qa_long_ids_use_bounded_index_pages_under_default_limits() {
         .unwrap();
     assert_eq!(changed.row_changes.len(), 1);
 }
+
+#[test]
+fn qa_default_order_ties_sort_by_id_and_accept_file_insertion_between_ties() {
+    let (h, file, mut rows) = initial();
+    for row in &mut rows {
+        if row.schema_key.as_ref() == core::ELEMENT_SCHEMA_KEY {
+            row.row
+                .insert("order_key", sdk::TypedValue::Text("80".into()));
+        }
+    }
+    let out = h.serialize(&file.file_id, &file.path, &rows, None).unwrap();
+    assert_eq!(json(&out.snapshot().bytes)["elements"][0]["id"], "a");
+    let mut successor = json(&out.snapshot().bytes);
+    successor["elements"]
+        .as_array_mut()
+        .unwrap()
+        .insert(1, json!({"id":"middle","type":"ellipse"}));
+    let edit = sdk::FileEdit {
+        offset: 0,
+        delete_len: out.snapshot().bytes.len() as u64,
+        insert: serde_json::to_vec(&successor).unwrap(),
+    };
+    let changed = h
+        .parse_changes(out.snapshot(), &file.path, &[edit], None, ctx(2))
+        .unwrap();
+    accept(&mut rows, &changed.row_changes);
+    assert_eq!(
+        h.serialize(&file.file_id, &file.path, &rows, None)
+            .unwrap()
+            .snapshot()
+            .bytes,
+        changed.snapshot().bytes
+    );
+}

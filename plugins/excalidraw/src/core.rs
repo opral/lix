@@ -1737,18 +1737,11 @@ fn sort_and_validate_files(files: &mut [FileRow]) -> Result<(), String> {
 
 fn sort_and_validate_ordered<T: OrderedRow>(rows: &mut [T], kind: &str) -> Result<(), String> {
     let mut ids = HashSet::with_capacity(rows.len());
-    let mut keys = HashSet::with_capacity(rows.len());
     for row in rows.iter() {
         if !ids.insert(row.id().to_owned()) {
             return Err(format!("duplicate Excalidraw {kind} id {:?}", row.id()));
         }
         validate_order_key(row.order_key())?;
-        if !keys.insert(row.order_key().to_owned()) {
-            return Err(format!(
-                "duplicate Excalidraw {kind} order key {:?}",
-                row.order_key()
-            ));
-        }
     }
     rows.sort_unstable_by(|left, right| {
         (left.order_key(), left.id()).cmp(&(right.order_key(), right.id()))
@@ -1804,7 +1797,10 @@ fn reconcile_order_keys<T: OrderedRow>(before: &[T], after: &mut [T]) -> Result<
             .checked_sub(1)
             .and_then(|index| old_keys.get(after[index].id()));
         let next = after.get(cursor).and_then(|row| old_keys.get(row.id()));
-        let allocated = OrderKey::evenly_between(previous, next, cursor - start)?;
+        let allocated = match OrderKey::evenly_between(previous, next, cursor - start) {
+            Ok(keys) => keys,
+            Err(_) => return assign_even_order_keys(after),
+        };
         for (row, key) in after[start..cursor].iter_mut().zip(allocated) {
             row.set_order_key(key.to_snapshot_string());
         }
