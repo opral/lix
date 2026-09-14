@@ -1,4 +1,6 @@
 #[cfg(feature = "offline-migration")]
+mod adoption;
+#[cfg(feature = "offline-migration")]
 mod maintenance;
 #[cfg(feature = "offline-migration")]
 pub use maintenance::AuthorityMigrationReport;

@@ -11,11 +11,11 @@ async fn main() -> anyhow::Result<()> {
         && !(arguments.len() == 2
             && matches!(
                 arguments[0].as_str(),
-                "upgrade-authority" | "inspect-physical"
+                "upgrade-authority" | "inspect-physical" | "adopt-staged-repository"
             ))
     {
         anyhow::bail!(
-            "usage: lix-server [inventory-authorities | migrate-authorities | upgrade-authority <repository-id> | inspect-physical <storage-id>]"
+            "usage: lix-server [inventory-authorities | migrate-authorities | upgrade-authority <repository-id> | inspect-physical <storage-id> | adopt-staged-repository <manifest.json>]"
         );
     }
     let telemetry = telemetry::init();
@@ -64,6 +64,24 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(not(feature = "offline-migration"))]
         anyhow::bail!(
             "Physical inspection requires the detached offline-migration build and stopped writers or an isolated copy; opening SlateDB may write physical metadata."
+        );
+    }
+    if arguments
+        .first()
+        .is_some_and(|command| command == "adopt-staged-repository")
+    {
+        #[cfg(feature = "offline-migration")]
+        {
+            let manager = LixRuntimeManager::new(&config, telemetry.lix_sink)?;
+            let report = manager
+                .adopt_staged_repository_offline(std::path::Path::new(&arguments[1]))
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            return Ok(());
+        }
+        #[cfg(not(feature = "offline-migration"))]
+        anyhow::bail!(
+            "Adoption requires the detached offline-migration build and stopped serving hosts."
         );
     }
     if let [_, lix_id] = arguments.as_slice() {
