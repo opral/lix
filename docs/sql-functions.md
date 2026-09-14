@@ -14,6 +14,7 @@ operators; there are no public `lix_json_*` functions.
 | `lix_active_branch_commit_id()` | text | Active branch head pinned for the statement. |
 | `lix_root_commit_id()` | text | Repository bootstrap root. |
 | `lix_row_ref(relation, primary_key...)` | row_ref | Opaque address of one relation row, including composite keys. |
+| `lix_order_between(previous, next)` | text | Allocate a plugin row order key between exclusive bounds; NULL means an open end. |
 | `uuidv7()` | uuid | Generate a UUIDv7 value. |
 | `CURRENT_TIMESTAMP` | timestamptz | Transaction-start instant at microsecond precision. |
 
@@ -25,6 +26,14 @@ SELECT lix_row_ref('json_object_member', $1, $2, $3) AS row_ref;
 
 For `json_object_member`, the components are `parent_id`, decoded `key`, and
 `occurrence` (zero for an ordinary unique key).
+
+## Row ordering
+
+Use `lix_order_between($1, NULL)` to append after the last key, or pass both
+neighbors to insert between them. Two NULL bounds allocate the first key.
+Read rows with `ORDER BY order_key, id`: concurrent allocations may tie, and
+UUID identity supplies deterministic tie ordering. See [Plugin ordering](./plugin-ordering.md)
+for batch allocation, validation, and concurrency behavior.
 
 ## JSONB
 

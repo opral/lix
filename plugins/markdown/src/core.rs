@@ -2431,6 +2431,45 @@ impl Document {
         self.clone()
     }
 
+    pub fn arena_block_id(block_json: &[u8]) -> Result<Uuid, PluginError> {
+        let block: NodeTree = serde_json::from_slice(block_json).map_err(|error| {
+            PluginError::InvalidInput(format!("invalid Markdown arena block: {error}"))
+        })?;
+        Ok(block.node.id)
+    }
+
+    /// Apply the existing literal-prose fast path to one addressable block.
+    /// Other edits still require the complete document's semantic guard.
+    pub fn rows_changed_from_arena_block(
+        before: Vec<u8>,
+        root_json: &[u8],
+        block_json: &[u8],
+        change: RowChange,
+    ) -> Result<Option<(Vec<ByteEdit>, Vec<u8>)>, PluginError> {
+        if root_json.first() != Some(&0) || before.is_empty() {
+            return Ok(None);
+        }
+        let length = before.len() as u64;
+        let document = Self::open_arena(
+            before,
+            root_json,
+            vec![ArenaMarkdownBlock {
+                start: 0,
+                end: length,
+                tree_json: block_json.to_vec(),
+            }],
+        )?;
+        let detected = row_change_to_detected(change)?;
+        let Some((_, _, edits, tree)) = document.try_paragraph_row_change(&[detected])? else {
+            return Ok(None);
+        };
+        let block = serde_json::to_vec(tree.top_level_tree(0).ok_or_else(|| {
+            PluginError::Internal("Markdown sparse successor lost its block".into())
+        })?)
+        .map_err(|error| PluginError::Internal(format!("serialize Markdown block: {error}")))?;
+        Ok(Some((edits, block)))
+    }
+
     pub fn arena_state(&self) -> Result<(Vec<u8>, Vec<ArenaMarkdownBlock>), PluginError> {
         let mut root = self.tree.root_node().clone();
         let format = root.format.as_object_mut().ok_or_else(|| {

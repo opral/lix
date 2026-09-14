@@ -491,8 +491,12 @@ async fn sql_line_edits_survive_file_edits_reopen_and_history() {
     .unwrap();
     assert_eq!(read_file(&lix, path).await.unwrap(), b"edited\nlast\n");
     lix.execute(
-        "INSERT INTO text_line (content, order_key, lixcol_file_id) VALUES ('middle', '60', $1)",
-        &[Value::Text(file_id.clone())],
+        "INSERT INTO text_line (content, order_key, lixcol_file_id) VALUES ('middle', lix_order_between($1, $2), $3)",
+        &[
+            Value::Text(rows[0].order_key.clone()),
+            Value::Text(rows[1].order_key.clone()),
+            Value::Text(file_id.clone()),
+        ],
     )
     .await
     .unwrap();
@@ -512,8 +516,14 @@ async fn sql_line_edits_survive_file_edits_reopen_and_history() {
         read_file(&lix, path).await.unwrap(),
         b"middle\nedited\nlast\n"
     );
+    let before_rejection = git_text_rows(&lix, &file_id).await;
     assert!(lix.execute("UPDATE text_line SET line_ending = '' WHERE content = 'middle' AND lixcol_file_id = $1",
         &[Value::Text(file_id.clone())]).await.is_err());
+    assert_eq!(git_text_rows(&lix, &file_id).await, before_rejection);
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        b"middle\nedited\nlast\n"
+    );
     lix.execute(
         "DELETE FROM text_line WHERE content = 'middle' AND lixcol_file_id = $1",
         &[Value::Text(file_id.clone())],

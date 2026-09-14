@@ -12,6 +12,7 @@
 #[doc(hidden)]
 pub mod api;
 
+pub mod ordering;
 pub(crate) mod wire;
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
