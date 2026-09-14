@@ -1,0 +1,4 @@
+n,bytes,open_ms,open_rows_ms,local_file_ms,sql_ms,duplicates_ms,sparse_delete_ms,sparse_insert_bytes,sparse_edit_count
+1000,36000,0.056,0.229,0.068,0.097,0.082,0.115,0,2
+10000,360000,0.485,3.172,0.661,1.013,0.783,1.221,0,2
+100000,3600000,4.928,41.390,7.414,13.667,8.171,17.777,0,2

@@ -11,9 +11,9 @@ Each `text_line` row has:
 | Column | Meaning |
 | --- | --- |
 | `id` | Stable UUID, generated on insert. |
-| `content` | Readable UTF-8 line body, excluding LF. |
-| `content_base64` | Unpadded base64url body for invalid UTF-8 only; otherwise NULL. |
-| `line_ending` | LF (`'\n'`) or the empty string for an unterminated final line. |
+| `content` | Readable NUL-free UTF-8 line body, excluding LF. |
+| `content_base64` | Unpadded base64url body for invalid UTF-8 or NUL-bearing lines; otherwise NULL. |
+| `line_ending` | LF (`'\n'`, default) or the empty string for an unterminated final line. |
 | `order_key` | Lowercase hexadecimal fractional position. Sort by `order_key, id`. |
 
 Exactly one of `content` and `content_base64` is non-NULL. CR remains in the
@@ -29,14 +29,14 @@ FROM text_line WHERE lixcol_file_id = $1 ORDER BY order_key, id;
 UPDATE text_line SET content = 'new text'
 WHERE lixcol_file_id = $1 AND id = $2;
 
--- Explicit position between '40' and '80'; bind $2 to LF. id defaults automatically.
-INSERT INTO text_line (content, order_key, line_ending, lixcol_file_id)
-VALUES ('inserted line', '60', $2, $1);
+-- Explicit position between '40' and '80'; id and LF default automatically.
+INSERT INTO text_line (content, order_key, lixcol_file_id)
+VALUES ('inserted line', '60', $1);
 
 DELETE FROM text_line WHERE lixcol_file_id = $1 AND id = $2;
 ```
 
-When changing from invalid UTF-8 to text, set `content_base64 = NULL` in the
+When changing from a byte fallback to text, set `content_base64 = NULL` in the
 same update. To change the other way, set `content = NULL` and provide canonical
 base64url. An encoding switch wins over a concurrent edit in the old encoding;
 conflicting edits in the same representation use Lix's default resolution.
@@ -62,3 +62,5 @@ cargo build --release -p plugin_text --target wasm32-wasip2
 Package `manifest.json`, `schema/text_line.json`, and `plugin.wasm` in a stored
 `.lixplugin` ZIP and install it at `/.lix/plugins/plugin_text.lixplugin`.
 The schema change is intentional and does not provide backward compatibility.
+
+See [qualification and scaling](QA.md) and the separate [plugin API proposals](PLUGIN_API_IMPROVEMENTS.md).
