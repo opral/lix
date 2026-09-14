@@ -19,9 +19,7 @@ use wasmtime::component::Linker;
 use wasmtime::{
     Cache, CacheConfig, Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder,
 };
-use wasmtime_wasi::{
-    ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView, p2::add_to_linker_sync,
-};
+use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 mod component_backend;
 mod component_runtime;
