@@ -4244,6 +4244,7 @@ fn parse_inlines_with_context(
     let Some(_nesting) = NestingGuard::enter(diagnostics) else {
         return Vec::new();
     };
+    let label_ends = link_label_ends(input);
     let bytes = input.as_bytes();
     let mut nodes = Vec::new();
     let mut text_start = 0;
@@ -4731,9 +4732,15 @@ fn parse_inlines_with_context(
         }
 
         if bytes[index] == b'!' && index + 1 < bytes.len() && bytes[index + 1] == b'[' {
-            if let Some((end, image)) =
-                parse_image(input, index, base_offset, options, definitions, diagnostics)
-            {
+            if let Some((end, image)) = parse_image(
+                input,
+                index,
+                base_offset,
+                options,
+                definitions,
+                diagnostics,
+                label_ends.get(&(index + 1)).copied(),
+            ) {
                 flush_text(&mut nodes, &mut text, text_start, base_offset + index);
                 nodes.push(image);
                 index = end;
@@ -4758,6 +4765,7 @@ fn parse_inlines_with_context(
                 definitions,
                 diagnostics,
                 context,
+                label_ends.get(&index).copied(),
             ) {
                 flush_text(&mut nodes, &mut text, text_start, base_offset + index);
                 nodes.push(link);
@@ -5110,9 +5118,10 @@ fn parse_image(
     options: &SyntaxOptions,
     definitions: &[String],
     diagnostics: &mut Vec<Diagnostic>,
+    label_end: Option<usize>,
 ) -> Option<(usize, Inline)> {
     let label_start = index + 2;
-    let label_end = find_link_label_end(input, index + 1)?;
+    let label_end = label_end?;
     let alt_source = &input[label_start..label_end];
     let after_label = label_end + 1;
     if input.as_bytes().get(after_label) == Some(&b'(') {
@@ -5202,11 +5211,12 @@ fn parse_link(
     definitions: &[String],
     diagnostics: &mut Vec<Diagnostic>,
     context: InlineContext,
+    label_end: Option<usize>,
 ) -> Option<(usize, Inline)> {
     if !context.allow_links {
         return None;
     }
-    let label_end = find_link_label_end(input, index)?;
+    let label_end = label_end?;
     let label_source = &input[index + 1..label_end];
     if label_contains_link(label_source, base_offset + index + 1, options, definitions) {
         return None;
@@ -5358,6 +5368,51 @@ fn contains_link_inline(inlines: &[Inline]) -> bool {
         Inline::TextDirective(node) => contains_link_inline(&node.label),
         _ => false,
     })
+}
+
+fn link_label_ends(input: &str) -> std::collections::HashMap<usize, usize> {
+    let mut ends = std::collections::HashMap::new();
+    if !input.contains('[') {
+        return ends;
+    }
+    let mut opens = Vec::new();
+    let mut cursor = 0;
+    while cursor < input.len() {
+        let (next, character) = next_char(input, cursor).expect("UTF-8 cursor");
+        match character {
+            '\\' => {
+                cursor = next_char(input, next).map_or(next, |(end, _)| end);
+                continue;
+            }
+            '`' => {
+                if let Some((end, _)) = parse_code_span(input, cursor) {
+                    cursor = end;
+                    continue;
+                }
+            }
+            '<' => {
+                if let Some(end) = parse_autolink_end(input, cursor)
+                    && is_autolink(&input[cursor..end])
+                {
+                    cursor = end;
+                    continue;
+                }
+                if let Some((end, _)) = parse_html_inline(input, cursor) {
+                    cursor = end;
+                    continue;
+                }
+            }
+            '[' => opens.push(cursor),
+            ']' => {
+                if let Some(open) = opens.pop() {
+                    ends.insert(open, cursor);
+                }
+            }
+            _ => {}
+        }
+        cursor = next;
+    }
+    ends
 }
 
 fn find_link_label_end(input: &str, open: usize) -> Option<usize> {

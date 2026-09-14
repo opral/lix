@@ -777,3 +777,17 @@ fn qa_many_unmatched_emphasis_openers_import_losslessly() {
     .unwrap();
     assert_eq!(document.bytes(), source.as_bytes());
 }
+
+#[test]
+fn qa_many_unmatched_link_openers_import_losslessly() {
+    for suffix in ["a\n", "a]\n"] {
+        let source = format!("{}{suffix}", "[".repeat(10_000));
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("brackets.md"),
+            IdNamespace::from_halves(39, 1),
+        )
+        .unwrap();
+        assert_eq!(document.bytes(), source.as_bytes());
+    }
+}
