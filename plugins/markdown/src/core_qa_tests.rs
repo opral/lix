@@ -582,3 +582,44 @@ fn qa_relaxed_autolink_spelling_survives_import_and_edit() {
         assert_eq!(document.bytes(), source.as_bytes());
     }
 }
+
+#[test]
+fn qa_adding_titles_chooses_default_quote_style() {
+    for source in [
+        "[label](/url)\n",
+        "![alt](/url)\n",
+        "[label]: /url\n\n[label]\n",
+    ] {
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("title.md"),
+            IdNamespace::from_halves(35, 2),
+        )
+        .unwrap();
+        let mut node = document.tree.materialize().children.remove(0).node;
+        if node.kind == NodeKind::Definition {
+            node.payload["title"] = serde_json::json!("new title");
+        } else {
+            node.payload["inline"][0]["title"] = serde_json::json!("new title");
+        }
+        let (updated, _) = document
+            .rows_changed(vec![RowChange {
+                schema_key: NODE_SCHEMA_KEY.into(),
+                row_pk: vec![node.id],
+                row: Some(node_to_typed_row(&node).unwrap()),
+                effect: ChangeEffect::Content,
+            }])
+            .unwrap();
+        let (reopened, _) = Document::open_file(
+            updated.bytes(),
+            Some("title.md"),
+            IdNamespace::from_halves(35, 3),
+        )
+        .unwrap();
+        assert!(
+            serde_json::to_string(&reopened.tree.materialize().children[0].node.payload)
+                .unwrap()
+                .contains("new title")
+        );
+    }
+}

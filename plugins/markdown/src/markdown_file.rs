@@ -1453,7 +1453,14 @@ fn block_from_tree(tree: &NodeTree) -> Result<md::Block, PluginError> {
             title_kind: optional_string_field(&tree.node.format, "title")?
                 .as_deref()
                 .map(|value| parse_link_title(value, &tree.node))
-                .transpose()?,
+                .transpose()?
+                .or_else(|| {
+                    tree.node
+                        .payload
+                        .get("title")
+                        .is_some_and(Value::is_string)
+                        .then_some(md::LinkTitleKind::DoubleQuote)
+                }),
         })),
         NodeKind::FootnoteDefinition => Ok(md::Block::FootnoteDefinition(md::FootnoteDefinition {
             meta: authored_meta(),
@@ -1741,7 +1748,8 @@ fn inline_to_ast(node: &InlineNode, output: &mut Vec<md::Inline>) -> Result<(), 
                 .title
                 .as_deref()
                 .map(|value| parse_link_title_inline(value, node))
-                .transpose()?,
+                .transpose()?
+                .or_else(|| title.as_ref().map(|_| md::LinkTitleKind::DoubleQuote)),
             children: inlines_to_ast(children)?,
         })),
         InlineContent::Image {
@@ -1758,7 +1766,8 @@ fn inline_to_ast(node: &InlineNode, output: &mut Vec<md::Inline>) -> Result<(), 
                 .title
                 .as_deref()
                 .map(|value| parse_link_title_inline(value, node))
-                .transpose()?,
+                .transpose()?
+                .or_else(|| title.as_ref().map(|_| md::LinkTitleKind::DoubleQuote)),
             alt: inlines_to_ast(alt)?,
         })),
         InlineContent::LinkReference {
