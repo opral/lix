@@ -341,10 +341,6 @@ fn merge_typed_csv_cells(
     let b_cells = cells(b)?;
     if base.get("id") != a.get("id")
         || base.get("id") != b.get("id")
-        || base.get("order_key") != a.get("order_key")
-        || base.get("order_key") != b.get("order_key")
-        || base.get("layout") != a.get("layout")
-        || base.get("layout") != b.get("layout")
         || base_cells.len() != a_cells.len()
         || base_cells.len() != b_cells.len()
     {
@@ -1350,3 +1346,7 @@ mod adapter_qa_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "qa_merge_tests.rs"]
+mod qa_merge_tests;
