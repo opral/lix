@@ -2153,6 +2153,7 @@ fn bound_expr_requires_datafusion(expr: &BoundExpr) -> bool {
                     | "__lix_json_contains"
                     | "__lix_json_exists"
                     | "__lix_jsonb"
+                    | "lix_order_between"
             ) || args.iter().any(bound_expr_requires_datafusion)
         }
         BoundExpr::Column(_)

@@ -40,6 +40,7 @@ struct MarkdownPlugin;
 const ROOT_STATE: &[u8] = b"markdown/root";
 const BLOCKS_STATE: &[u8] = b"markdown/blocks";
 const BLOCK_SHIFTS_STATE: &[u8] = b"markdown/block-shifts";
+const BLOCK_IDS_STATE: &[u8] = b"markdown/block-ids/";
 const LEXICAL_FALLBACK_FIELD: &str = "lexical_fallback_base64";
 const LEXICAL_SOURCE_REQUIRED_FIELD: &str = "lexical_source_required";
 const BLOCK_INDEX_MAGIC: &[u8; 4] = b"MDB2";
@@ -96,7 +97,6 @@ impl sdk::FileProjection for MarkdownPlugin {
         mut update: sdk::SerializeChangesInput<'_>,
         sink: &mut sdk::FileEditOutput<'_, '_>,
     ) -> sdk::Result<()> {
-        let before = update.before.read_all()?;
         let mut changes = Vec::new();
         while let Some(change) = update.typed_row_changes.next()? {
             changes.push(RowChange {
@@ -109,6 +109,10 @@ impl sdk::FileProjection for MarkdownPlugin {
                 },
             });
         }
+        if sparse_row_change(&update.before, &changes, sink)? {
+            return Ok(());
+        }
+        let before = update.before.read_all()?;
         let document = load_markdown_document(&update.before, before.clone())?;
         let (successor, edits) = document.rows_changed(changes).map_err(core_error)?;
         for edit in edits {
@@ -230,6 +234,12 @@ impl sdk::ColumnMerger for MarkdownPlugin {
 
 fn store_markdown_state(sink: &mut impl StateOutput, document: &Document) -> sdk::Result<()> {
     let (root, blocks) = document.arena_state().map_err(core_error)?;
+    let ids = blocks
+        .iter()
+        .map(|block| Document::arena_block_id(&block.tree_json))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(core_error)?;
+    sdk::UuidIndex::build(sink, BLOCK_IDS_STATE, ids)?;
     sink.put_state(ROOT_STATE, &root)?;
     sink.delete_state_prefix(b"markdown/block-index-page/")?;
     sink.delete_state_prefix(b"markdown/block-page/")?;
@@ -247,6 +257,81 @@ fn store_markdown_state(sink: &mut impl StateOutput, document: &Document) -> sdk
 }
 
 type SparseBlockResult = (Vec<RowChange>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+
+fn sparse_row_change(
+    before: &sdk::Snapshot<'_>,
+    changes: &[RowChange],
+    sink: &mut sdk::FileEditOutput<'_, '_>,
+) -> sdk::Result<bool> {
+    let [change] = changes else {
+        return Ok(false);
+    };
+    if change.schema_key.as_ref() != NODE_SCHEMA_KEY || change.row.is_none() {
+        return Ok(false);
+    }
+    let [id] = change.row_pk.as_slice() else {
+        return Ok(false);
+    };
+    let Some(ordinal) = sdk::UuidIndex::lookup(before, BLOCK_IDS_STATE, *id)? else {
+        return Ok(false);
+    };
+    let ordinal = u32::try_from(ordinal)
+        .map_err(|_| sdk::Error::invalid_input("Markdown block ordinal exceeds u32"))?;
+    let Some(root) = before.get_state(ROOT_STATE)? else {
+        return Ok(false);
+    };
+    if root.first() != Some(&0) {
+        return Ok(false);
+    }
+    let mut shifts = decode_block_shifts(
+        before
+            .get_state(BLOCK_SHIFTS_STATE)?
+            .as_deref()
+            .unwrap_or_default(),
+    )?;
+    let entry = read_block_entry(before, ordinal)?;
+    let start = effective_block_position(entry.start, ordinal, &shifts)?;
+    let end = effective_block_position(entry.end, ordinal + 1, &shifts)?;
+    if end <= start || end - start > BLOCK_PAGE_BYTES as u64 {
+        return Ok(false);
+    }
+    let key = block_overlay_key(ordinal);
+    let block = match before.get_state(&key)? {
+        Some(block) => block,
+        None => read_block_blob(before, entry)?,
+    };
+    if block.len() > BLOCK_PAGE_BYTES {
+        return Ok(false);
+    }
+    let bytes = before.read_range(start, end - start)?;
+    let Some((edits, block)) =
+        Document::rows_changed_from_arena_block(bytes, &root, &block, change.clone())
+            .map_err(core_error)?
+    else {
+        return Ok(false);
+    };
+    if block.len() > BLOCK_PAGE_BYTES {
+        return Ok(false);
+    }
+    let delta = edits.iter().try_fold(0_i64, |delta, edit| {
+        let insert = i64::try_from(edit.insert.len())
+            .map_err(|_| sdk::Error::limit_exceeded("Markdown insert exceeds i64"))?;
+        let delete = i64::try_from(edit.delete_len)
+            .map_err(|_| sdk::Error::limit_exceeded("Markdown delete exceeds i64"))?;
+        delta
+            .checked_add(insert - delete)
+            .ok_or_else(|| sdk::Error::limit_exceeded("Markdown shift exceeds i64"))
+    })?;
+    if !add_block_shift(&mut shifts, ordinal, delta)? {
+        return Ok(false);
+    }
+    for edit in edits {
+        sink.replace(start + edit.offset, edit.delete_len, &edit.insert)?;
+    }
+    sink.put_state(&key, &block)?;
+    sink.put_state(BLOCK_SHIFTS_STATE, &encode_block_shifts(&shifts))?;
+    Ok(true)
+}
 
 fn sparse_block_change(
     update: &sdk::ParseChangesInput<'_>,

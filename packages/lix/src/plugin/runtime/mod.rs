@@ -14,6 +14,7 @@ mod api;
 pub mod component_host;
 mod contract;
 
+pub(crate) use super::ordering::order_between;
 pub use api::*;
 pub use contract::*;
 

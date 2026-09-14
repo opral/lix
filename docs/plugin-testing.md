@@ -47,6 +47,28 @@ separator in your namespace to avoid unintentionally matching similarly named
 keys. This is a cleanup operation for rebuilds, not a replacement for sparse
 updates on every edit.
 
+## UUID lookup in private state
+
+`UuidIndex` provides a rebuildable, paged UUID-to-ordinal lookup used by text and
+Markdown. Build it from identities in document order; lookup returns that input
+ordinal even though the stored index is sorted by UUID.
+
+```rust,ignore
+use lix::plugin::UuidIndex;
+
+UuidIndex::build(output, b"my-plugin/row-ids/", ids_in_document_order)?;
+let ordinal = UuidIndex::lookup(&input.before, b"my-plugin/row-ids/", row_id)?;
+```
+
+The prefix must end in `/` and belong exclusively to this index. Building replaces
+all state beneath it and rejects duplicate UUIDs. Rebuild after inserts, deletes,
+or reorders; content-only edits leave this mapping unchanged. Builds materialize
+and sort all UUIDs, while point lookups use logarithmically many small state range
+reads. This helper does not maintain byte offsets or update itself after row
+changes. Missing indexes/IDs return `None`; malformed records return errors.
+Semantic rows and accepted bytes remain authoritative, so plugins must be able to
+rebuild the index when private state is absent.
+
 ## Conformance expectations
 
 For a plugin that promises lossless editing, test these properties:
@@ -88,6 +110,8 @@ let file = Snapshot {
 };
 let parsed = driver.parse(&file, creates)?;
 assert!(!parsed.row_changes.is_empty());
+let mut rows = Vec::new();
+parsed.apply_to_rows(&mut rows, creates, |_| Some("id"))?;
 let file = parsed.into_snapshot(); // Explicitly accept the staged result.
 let edit = FileEdit { offset: 0, delete_len: 5, insert: b"World".to_vec() };
 let changed = driver.parse_changes(
@@ -106,12 +130,47 @@ snapshot unchanged, including state writes emitted before the error.
 
 For a cold incremental call, clear the snapshot's disposable `state` and pass
 complete accepted rows in `parse_changes`'s `cold_rows` argument. The driver
-intentionally does not maintain a database: tests apply emitted row changes to
-their own fixture rows. A create's `local_ref` resolves to `creates.id(local_ref)`;
-the fixture must supply generated columns and primary keys when turning creates
-into complete durable rows. Use a new deterministic create namespace for each
-transition. See the Markdown plugin's `src/adapter_qa_tests.rs` for a complete
-parse, sparse-edit, row-edit, and cold-reopen lifecycle.
+intentionally does not maintain a database. `Transition::apply_to_rows` applies
+creates, upserts, deletes, and row replacement atomically to a small fixture vector.
+Supply a mapping from schema key to generated UUID primary-key column (or `None`
+for schemas without generated keys). It resolves creates using
+`creates.id(local_ref)`, fills the row's generated column, and rejects conflicting
+or duplicate create identities. It does not validate schemas, defaults, foreign
+keys, or the engine's identity authority. Use a new deterministic create namespace
+for each transition. The helper scans a small fixture vector; do not include it
+in large-document performance measurements.
+
+See `plugins/text/src/tests.rs`'s
+`native_projection_lifecycle_resolves_ids_and_preserves_cold_edits` for import,
+exact restoration, row edit, warm/cold equivalence, identity stability, and rollback
+using these helpers. Its real SQL/Wasm companion is
+`packages/e2e/tests/git_text_plugin.rs`'s
+`sql_line_edits_survive_file_edits_reopen_and_history`, which also exercises
+insertion, deletion, schema defaults, history, and persisted reopen.
+
+### Restoration and new rendering
+
+Test `serialize(..., Some(&accepted))` with the rows corresponding to that
+accepted snapshot for exact restoration. Test `serialize(..., None)` separately
+as rendering a new file: a plugin may canonicalize formatting or reject rows that
+lack necessary information. Equal semantic values do not prove byte preservation,
+and equal output bytes do not prove that semantic edits were honored. Change a
+semantic value, render it, and reparse it to check that stale lexical hints cannot
+restore the old value. Keep each plugin's documented formatting policy explicit;
+the driver does not impose one canonical spelling on every format.
+
+### Structural performance assertions
+
+Each successful transition exposes `metrics`: actual file/state bytes read,
+state bytes written, file payload bytes written, emitted row-page bytes, and
+corresponding call counts. Missing state reads count as calls with zero bytes;
+state deletion counts as a write call with zero payload bytes. Counts exclude
+fixture setup, snapshot cloning, output decoding, and state keys. Row bytes
+include encoded pages and attachments, including in-page metadata. These counts
+measure native guest-facing I/O, not total host allocations or
+Wasm memory. Assert these counts for repeated point edits so regressions do not
+depend on machine speed, and profile latency and peak memory through the compiled
+SQL/Wasm harness as well.
 
 Additional examples live in `plugins/json/src/adapter_qa_tests.rs` and
 `plugins/excalidraw/src/qa_tests.rs`. They exercise composite and native primary

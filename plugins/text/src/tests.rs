@@ -6,6 +6,98 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use crate::core::{Document, FileEdit, LINE_SCHEMA_KEY, Line};
 use crate::{STATE_PAGE_BYTES, decode_identities, decode_identity_manifest, encode_identities};
 
+#[test]
+fn native_projection_lifecycle_resolves_ids_and_preserves_cold_edits() {
+    use ::lix::plugin::testing::{Harness, Snapshot};
+    use ::lix::plugin::{ChangeEffect, CreateContext, TypedRowChange};
+
+    let harness = Harness::<crate::TextPlugin>::default();
+    let creates = CreateContext::from_namespace_bytes([1; 12]);
+    let source = Snapshot {
+        file_id: "test-file".into(),
+        path: "test.txt".into(),
+        bytes: b"first\nlast\n".to_vec(),
+        ..Snapshot::default()
+    };
+    let imported = harness.parse(&source, creates).unwrap();
+    assert_eq!(imported.metrics.file_bytes_read, source.bytes.len() as u64);
+    assert!(imported.metrics.row_pages_emitted > 0);
+    let mut rows = Vec::new();
+    imported
+        .apply_to_rows(&mut rows, creates, |_| Some("id"))
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].primary_key, vec![TypedValue::Uuid(creates.id(0))]);
+    let accepted = imported.into_snapshot();
+    let restored = harness
+        .serialize(&accepted.file_id, &accepted.path, &rows, Some(&accepted))
+        .unwrap();
+    assert_eq!(restored.snapshot().bytes, source.bytes);
+    let rendered = harness
+        .serialize(&accepted.file_id, &accepted.path, &rows, None)
+        .unwrap();
+    assert_eq!(rendered.snapshot().bytes, source.bytes);
+
+    let mut replacement = rows[0].clone();
+    replacement
+        .row
+        .insert("content", TypedValue::Text("edited".into()));
+    let changes = [TypedRowChange {
+        schema_key: replacement.schema_key.clone(),
+        schema_fingerprint: replacement.schema_fingerprint,
+        primary_key: replacement.primary_key.clone(),
+        row: Some(replacement.row.clone()),
+        local_ref: None,
+        effect: ChangeEffect::Content,
+    }];
+    let edited = harness
+        .serialize_changes(&accepted, &changes)
+        .unwrap()
+        .into_snapshot();
+    assert_eq!(edited.bytes, b"edited\nlast\n");
+    rows[0] = replacement;
+
+    // A cold actor receives durable rows with identities, not fresh creates.
+    let cold = Snapshot {
+        state: Default::default(),
+        ..edited.clone()
+    };
+    let edit = ::lix::plugin::FileEdit {
+        offset: 7,
+        delete_len: 4,
+        insert: b"FINAL".to_vec(),
+    };
+    let next_creates = CreateContext::from_namespace_bytes([2; 12]);
+    let warm = harness
+        .parse_changes(&edited, &edited.path, &[edit.clone()], None, next_creates)
+        .unwrap();
+    let reopened = harness
+        .parse_changes(&cold, &cold.path, &[edit], Some(&rows), next_creates)
+        .unwrap();
+    let mut warm_rows = rows.clone();
+    warm.apply_to_rows(&mut warm_rows, next_creates, |_| Some("id"))
+        .unwrap();
+    reopened
+        .apply_to_rows(&mut rows, next_creates, |_| Some("id"))
+        .unwrap();
+    assert_eq!(rows, warm_rows);
+    assert_eq!(reopened.snapshot().bytes, b"edited\nFINAL\n");
+    assert_eq!(rows[0].primary_key, vec![TypedValue::Uuid(creates.id(0))]);
+
+    let saved = reopened.into_snapshot();
+    let mut invalid = rows[0].clone();
+    invalid
+        .row
+        .insert("line_ending", TypedValue::Text(String::new()));
+    let invalid = [TypedRowChange {
+        row: Some(invalid.row),
+        ..changes[0].clone()
+    }];
+    let before_failure = saved.clone();
+    assert!(harness.serialize_changes(&saved, &invalid).is_err());
+    assert_eq!(saved, before_failure);
+}
+
 fn open(bytes: &[u8]) -> (Document, Vec<lix::RowChange>) {
     let (document, changes) = Document::open_file(bytes.to_vec(), |ordinal| test_id(1, ordinal))
         .expect("Text document should open");
@@ -576,6 +668,9 @@ fn content_edits_write_no_identity_state_and_deletions_retire_old_pages() {
         fn delete_state(&mut self, _: &[u8]) -> ::lix::plugin::Result<()> {
             self.deletes += 1;
             Ok(())
+        }
+        fn delete_state_prefix(&mut self, _: &[u8]) -> ::lix::plugin::Result<()> {
+            panic!("identity page replacement must not delete a prefix")
         }
     }
     let (document, _) = open(&b"line\n".repeat(50_000));

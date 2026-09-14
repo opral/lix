@@ -3459,8 +3459,8 @@ fn returning_expr_column_type(
         {
             "lixcol_metadata" => Some(crate::ResultColumnType::Jsonb),
             "lixcol_global" | "lixcol_untracked" => Some(crate::ResultColumnType::Boolean),
-            "lixcol_file_id" | "lixcol_created_at" | "lixcol_updated_at"
-            | "lixcol_change_id" | "lixcol_commit_id" => Some(crate::ResultColumnType::Text),
+            "lixcol_file_id" | "lixcol_created_at" | "lixcol_updated_at" | "lixcol_change_id"
+            | "lixcol_commit_id" => Some(crate::ResultColumnType::Text),
             _ => None,
         },
         BoundExpr::Literal(BoundLiteral::Null) => Some(crate::ResultColumnType::Null),
@@ -3485,6 +3485,7 @@ fn returning_expr_column_type(
                     | "lix_active_branch_commit_id"
                     | "__lix_json_get_text"
                     | "__lix_json_path_get_text"
+                    | "lix_order_between"
             ) =>
         {
             Some(crate::ResultColumnType::Text)
@@ -5840,6 +5841,26 @@ fn eval_expr_value(
         BoundExpr::Function { name, args } if name == "uuidv7" && args.is_empty() => Ok(
             RowEvalValue::SqlText(ctx.functions().call_uuid_v7().to_string()),
         ),
+        BoundExpr::Function { name, args } if name == "lix_order_between" && args.len() == 2 => {
+            let mut bounds = Vec::with_capacity(2);
+            for arg in args {
+                bounds.push(order_key_bound(eval_expr_value(
+                    arg,
+                    context,
+                    ctx,
+                    params,
+                    active_branch_commit_id,
+                )?)?);
+            }
+            crate::plugin::runtime::order_between(bounds[0].as_deref(), bounds[1].as_deref())
+                .map(RowEvalValue::SqlText)
+                .map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!("lix_order_between: {error}"),
+                    )
+                })
+        }
         BoundExpr::Function { name, args }
             if name == "__lix_current_timestamp" && args.is_empty() =>
         {
@@ -6438,6 +6459,39 @@ fn bound_expr_is_json(expr: &BoundExpr, spec: &SchemaSurfaceSpec) -> bool {
     }
 }
 
+fn order_key_bound(value: RowEvalValue) -> Result<Option<String>, LixError> {
+    match value {
+        // Match scalar conversion for both typed and JSON-backed row images.
+        RowEvalValue::SqlNull | RowEvalValue::Json(JsonValue::Null) => Ok(None),
+        RowEvalValue::SqlText(value) => Ok(Some(value)),
+        _ => Err(LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            "lix_order_between requires text bounds or NULL",
+        )),
+    }
+}
+
+#[cfg(test)]
+mod order_key_bound_tests {
+    use super::*;
+
+    #[test]
+    fn nullable_text_bounds_match_across_row_images() {
+        let typed =
+            typed_column_eval_value(&lix_schema::Value::Null, Some(SchemaColumnType::String))
+                .unwrap();
+        let json = visible_column_eval_value(None, &JsonValue::Null);
+        for value in [typed, json] {
+            let bound = order_key_bound(value).unwrap();
+            assert_eq!(
+                crate::plugin::runtime::order_between(bound.as_deref(), None).unwrap(),
+                "80"
+            );
+        }
+        assert!(order_key_bound(RowEvalValue::Json(JsonValue::Bool(false))).is_err());
+    }
+}
+
 fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
     match expr {
         BoundExpr::Column(_)
@@ -6462,6 +6516,7 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
                 | "__lix_json_path_get_text"
                 | "__lix_json_contains"
                 | "__lix_json_exists"
+                | "lix_order_between"
                     if args.len() == 2 => {}
                 "__lix_jsonb" if args.len() == 1 => {}
                 _ => {
