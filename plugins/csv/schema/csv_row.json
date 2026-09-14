@@ -6,7 +6,8 @@
     {
       "name": "cells",
       "type": "jsonb",
-      "nullable": false
+      "nullable": false,
+      "description": "Positional CSV fields as strings, including the first record. No header or number inference."
     },
     {
       "name": "id",
@@ -23,7 +24,8 @@
     {
       "name": "order_key",
       "type": "text",
-      "nullable": false
+      "nullable": false,
+      "description": "File order: sort by order_key, then id. Nonempty lowercase hexadecimal, even length, not ending in 00."
     }
   ],
   "primary_key": [

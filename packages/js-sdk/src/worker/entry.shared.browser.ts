@@ -40,10 +40,12 @@ scope.onconnect = (event) => {
       const readHeaders = async () =>
         raw.headerProvider ? await raw.headerProvider() : raw.headers;
       let verifiedKey: string | undefined;
+      let verifiedGeneration: number | undefined;
       let candidateIdentity: AdmissionIdentity | undefined;
       let candidateHeaders: [string, string][] | undefined;
       let candidateOnline = false;
       let candidateGeneration = 0;
+      let candidateCredentialGeneration = 0;
       const providerOptions = storage.kind === "jsStorage" ? storage.options : undefined;
       const physicalScope = providerOptions && typeof providerOptions === "object" &&
         "sharedEngineKey" in providerOptions && typeof providerOptions.sharedEngineKey === "string"
@@ -52,6 +54,7 @@ scope.onconnect = (event) => {
       const localAdmission = new DurableLocalAdmission(physicalScope, raw.url);
       const transport = raw.transport ?? fetchTransport();
       const authenticate = async (headers: [string, string][], allowOffline: boolean) => {
+        const credentialGeneration = admitted.generation(raw.url, headers);
         let result: { identity: AdmissionIdentity; online: boolean };
         try {
           result = await admitted.verify(raw.url, headers, rootIdentity,
@@ -74,7 +77,14 @@ scope.onconnect = (event) => {
           }
           result = { identity: local, online: false };
         }
-        if (result.online) verifiedKey = sharedCredentialKey(raw.url, headers);
+        if (admitted.generation(raw.url, headers) !== credentialGeneration) {
+          throw new HttpTransportError("LIX_ADMISSION_AUTH_REJECTED", "Credentials were rejected while local admission was in flight");
+        }
+        if (result.online) {
+          verifiedKey = sharedCredentialKey(raw.url, headers);
+          verifiedGeneration = credentialGeneration;
+        }
+        candidateCredentialGeneration = credentialGeneration;
         candidateGeneration++;
         candidateIdentity = result.identity;
         candidateHeaders = headers.map(([name, value]) => [name, value]);
@@ -94,7 +104,7 @@ scope.onconnect = (event) => {
         },
         headerProvider: async () => {
           const headers = await readHeaders();
-          if (sharedCredentialKey(raw.url, headers) !== verifiedKey) {
+          if (sharedCredentialKey(raw.url, headers) !== verifiedKey || admitted.generation(raw.url, headers) !== verifiedGeneration) {
             // Failure only suspends this remote lease; local sessions survive.
             verifiedKey = undefined;
             await authenticate(headers, false);
@@ -131,7 +141,10 @@ scope.onconnect = (event) => {
             // Failure to cache only disables later offline reopening.
             const generation = candidateGeneration;
             const headers = candidateHeaders;
-            await localAdmission.record(headers, candidateIdentity).catch(() => undefined);
+            const identity = candidateIdentity;
+            await admitted.persistLocal(raw.url, headers, candidateCredentialGeneration,
+              () => localAdmission.record(headers, identity),
+              () => localAdmission.remove(headers)).catch(() => undefined);
             // A rejection during the asynchronous write must not resurrect its proof.
             if (generation !== candidateGeneration) await localAdmission.remove(headers).catch(() => undefined);
           }

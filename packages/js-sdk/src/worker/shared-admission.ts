@@ -55,6 +55,7 @@ export async function requestAdmission(url: string, credentials: [string, string
 
 /** Memory-only proofs grant cached local attachment, never remote authorization. */
 export class SharedAdmissionCache {
+  private readonly revocations = new Map<string, number>();
   private readonly proofs = new Map<string, AdmissionIdentity>();
   record(url: string, headers: [string, string][], identity: AdmissionIdentity): void {
     // Invisible cookies/custom-fetch identity cannot be a credential proof.
@@ -62,11 +63,23 @@ export class SharedAdmissionCache {
     if (this.proofs.size >= 64) this.proofs.delete(this.proofs.keys().next().value!);
     this.proofs.set(sharedCredentialKey(url, headers), { ...identity });
   }
+  generation(url: string, headers: [string, string][]): number {
+    return this.revocations.get(sharedCredentialKey(url, headers)) ?? 0;
+  }
   remove(url: string, headers: [string, string][]): void {
-    this.proofs.delete(sharedCredentialKey(url, headers));
+    const key = sharedCredentialKey(url, headers);
+    this.revocations.set(key, this.generation(url, headers) + 1);
+    this.proofs.delete(key);
+  }
+  async persistLocal(url: string, headers: [string, string][], generation: number,
+    write: () => Promise<void>, remove: () => Promise<void>): Promise<void> {
+    if (this.generation(url, headers) !== generation) return;
+    await write();
+    if (this.generation(url, headers) !== generation) await remove();
   }
   async verify(url: string, headers: [string, string][], expected: AdmissionIdentity | undefined,
     probe: () => Promise<AdmissionIdentity>, allowOffline = true): Promise<{ identity: AdmissionIdentity; online: boolean }> {
+    const generation = this.generation(url, headers);
     let identity: AdmissionIdentity;
     let online = true;
     try { identity = await probe(); }
@@ -78,6 +91,9 @@ export class SharedAdmissionCache {
       }
       identity = known;
       online = false;
+    }
+    if (this.generation(url, headers) !== generation) {
+      throw new HttpTransportError("LIX_ADMISSION_AUTH_REJECTED", "Credentials were rejected while admission was in flight");
     }
     if (expected && !sameAdmission(identity, expected)) {
       throw new HttpTransportError("LIX_SHARED_ENGINE_IDENTITY_MISMATCH", "Shared engine repository/account does not match this client");

@@ -559,7 +559,9 @@ impl IdentityStore {
             let end = start + usize::try_from(range.len).expect("u32 fits usize");
             let id = uuid::Uuid::from_slice(&bytes[start..end])
                 .map_err(|_| "CSV import contains an invalid UUID identity".to_owned())?;
-            if let Some((namespace, ordinal)) = decode_generated_id(id) {
+            if let Some((namespace, ordinal)) = decode_generated_id(id).filter(|(namespace, _)| {
+                namespace_lookup.contains_key(namespace) || namespaces.len() <= u16::MAX as usize
+            }) {
                 let namespace_index = if let Some(index) = namespace_lookup.get(&namespace) {
                     usize::from(*index)
                 } else {
@@ -704,8 +706,11 @@ impl IdentityStore {
         {
             u16::try_from(index).map_err(|_| "too many ID namespaces".to_owned())?
         } else {
-            let index = u16::try_from(self.namespaces.len())
-                .map_err(|_| "too many ID namespaces".to_owned())?;
+            let Ok(index) = u16::try_from(self.namespaces.len()) else {
+                let slot = self.len_u32()?;
+                self.append_identity(StoredIdentity::NonCompact(namespace.encode(ordinal)))?;
+                return Ok(slot);
+            };
             Arc::make_mut(&mut self.namespaces).push(namespace.0);
             Arc::make_mut(&mut self.dense_slot_bases).push(None);
             index
@@ -734,8 +739,10 @@ impl IdentityStore {
             {
                 u16::try_from(index).map_err(|_| "too many ID namespaces".to_owned())?
             } else {
-                let index = u16::try_from(self.namespaces.len())
-                    .map_err(|_| "too many ID namespaces".to_owned())?;
+                let Ok(index) = u16::try_from(self.namespaces.len()) else {
+                    self.append_identity(StoredIdentity::NonCompact(id))?;
+                    return Ok(slot);
+                };
                 Arc::make_mut(&mut self.namespaces).push(namespace);
                 Arc::make_mut(&mut self.dense_slot_bases).push(None);
                 index
@@ -1442,6 +1449,7 @@ struct DocumentInner {
 #[derive(Clone, Debug, Default)]
 struct OrderKeyStore {
     base: Arc<HashMap<u32, Arc<str>>>,
+    compact: Arc<Vec<u64>>,
     overlay: Option<Arc<OrderKeyOverlay>>,
 }
 
@@ -1456,19 +1464,28 @@ impl OrderKeyStore {
     fn from_base(base: HashMap<u32, Arc<str>>) -> Self {
         Self {
             base: Arc::new(base),
+            compact: Arc::new(Vec::new()),
             overlay: None,
         }
     }
 
-    fn get(&self, slot: u32) -> Option<&str> {
+    fn get(&self, slot: u32, rank: u64) -> Option<std::borrow::Cow<'_, str>> {
         let mut overlay = self.overlay.as_deref();
         while let Some(value) = overlay {
             if value.slot == slot {
-                return value.value.as_deref();
+                return value.value.as_deref().map(std::borrow::Cow::Borrowed);
             }
             overlay = value.previous.as_deref();
         }
-        self.base.get(&slot).map(AsRef::as_ref)
+        self.base
+            .get(&slot)
+            .map(|value| std::borrow::Cow::Borrowed(value.as_ref()))
+            .or_else(|| {
+                self.compact
+                    .get(slot as usize)
+                    .filter(|value| **value != rank)
+                    .map(|value| std::borrow::Cow::Owned(format!("{value:016x}")))
+            })
     }
 
     fn with_key(&self, slot: u32, order_key: &str, order_rank: u64) -> Self {
@@ -1476,6 +1493,7 @@ impl OrderKeyStore {
         let value = (order_key != canonical).then(|| Arc::from(order_key));
         Self {
             base: Arc::clone(&self.base),
+            compact: Arc::clone(&self.compact),
             overlay: Some(Arc::new(OrderKeyOverlay {
                 previous: self.overlay.clone(),
                 slot,
@@ -1490,6 +1508,7 @@ impl OrderKeyStore {
             .values()
             .map(|value| value.len() + size_of::<(u32, Arc<str>)>())
             .sum::<usize>();
+        bytes += self.compact.len() * size_of::<u64>();
         let mut overlay = self.overlay.as_deref();
         while let Some(value) = overlay {
             bytes +=
@@ -1645,7 +1664,6 @@ impl RowImportBuilder {
             .iter()
             .map(|value| ((value.id.start, value.id.len), value.layout.clone()))
             .collect::<HashMap<_, _>>();
-        let mut moved_unterminated_ending = false;
         for (index, row) in self.rows.iter().enumerate() {
             let ending = layouts
                 .get(&(row.id.start, row.id.len))
@@ -1657,46 +1675,64 @@ impl RowImportBuilder {
                     .get_mut(&(row.id.start, row.id.len))
                     .expect("an unterminated row has a layout override")
                     .terminator = None;
-                moved_unterminated_ending = true;
             }
-        }
-        if moved_unterminated_ending {
-            let last = self.rows.last().expect("a moved final ending has rows");
-            layouts
-                .entry((last.id.start, last.id.len))
-                .or_default()
-                .terminator = Some(None);
         }
 
-        let prefix_len = if self.dialect.bom { UTF8_BOM.len() } else { 0 };
-        let rendered_len = self.rows.iter().try_fold(prefix_len, |total, row| {
-            let layout = layouts.get(&(row.id.start, row.id.len));
-            let ending = layout.map_or(Some(self.dialect.terminator), |layout| {
-                layout.ending(self.dialect)
-            });
-            let mut row_len = ending.map_or(0, |ending| ending.bytes().len());
-            let mut cursor = usize::try_from(row.cell_start).expect("u32 fits usize");
-            for index in 0..usize::from(row.cell_count) {
-                let cell = read_import_cell(&self.cell_bytes, &mut cursor)?;
-                if index > 0 {
-                    row_len = row_len
-                        .checked_add(1)
-                        .ok_or_else(|| "CSV rendered length overflowed".to_owned())?;
-                }
-                row_len = row_len
-                    .checked_add(rendered_cell_len(
-                        cell,
-                        self.dialect,
-                        layout.is_some_and(|layout| layout.force_quotes(index))
-                            || (row.cell_count == 1 && ending.is_none() && cell.is_empty()),
-                        layout.is_some_and(|layout| layout.leaves_quotes_unquoted(index)),
-                    )?)
-                    .ok_or_else(|| "CSV rendered length overflowed".to_owned())?;
+        // A bare LF empty record after CR would be consumed as CRLF.
+        let boundary_quote = |index: usize| {
+            if index == 0 {
+                return false;
             }
-            total
-                .checked_add(row_len)
-                .ok_or_else(|| "CSV rendered length overflowed".to_owned())
-        })?;
+            let previous = &self.rows[index - 1];
+            let current = &self.rows[index];
+            let ending = |row: &ImportedRow| {
+                layouts
+                    .get(&(row.id.start, row.id.len))
+                    .map_or(Some(self.dialect.terminator), |layout| {
+                        layout.ending(self.dialect)
+                    })
+            };
+            ending(previous) == Some(Terminator::Cr) && ending(current) == Some(Terminator::Lf)
+        };
+        let prefix_len = if self.dialect.bom { UTF8_BOM.len() } else { 0 };
+        let rendered_len =
+            self.rows
+                .iter()
+                .enumerate()
+                .try_fold(prefix_len, |total, (row_index, row)| {
+                    let layout = layouts.get(&(row.id.start, row.id.len));
+                    let ending = layout.map_or(Some(self.dialect.terminator), |layout| {
+                        layout.ending(self.dialect)
+                    });
+                    let mut row_len = ending.map_or(0, |ending| ending.bytes().len());
+                    let mut cursor = usize::try_from(row.cell_start).expect("u32 fits usize");
+                    for index in 0..usize::from(row.cell_count) {
+                        let cell = read_import_cell(&self.cell_bytes, &mut cursor)?;
+                        if index > 0 {
+                            row_len = row_len
+                                .checked_add(1)
+                                .ok_or_else(|| "CSV rendered length overflowed".to_owned())?;
+                        }
+                        row_len = row_len
+                            .checked_add(rendered_cell_len(
+                                cell,
+                                self.dialect,
+                                layout.is_some_and(|layout| layout.force_quotes(index))
+                                    || (row.cell_count == 1
+                                        && cell.is_empty()
+                                        && (ending.is_none() || boundary_quote(row_index)))
+                                    || (row_index == 0
+                                        && index == 0
+                                        && !self.dialect.bom
+                                        && cell.starts_with(UTF8_BOM)),
+                                layout.is_some_and(|layout| layout.leaves_quotes_unquoted(index)),
+                            )?)
+                            .ok_or_else(|| "CSV rendered length overflowed".to_owned())?;
+                    }
+                    total
+                        .checked_add(row_len)
+                        .ok_or_else(|| "CSV rendered length overflowed".to_owned())
+                })?;
         if rendered_len > u32::MAX as usize {
             return Err("CSV supports files smaller than 4GiB".to_owned());
         }
@@ -1749,8 +1785,14 @@ impl RowImportBuilder {
                     self.dialect,
                     layout.is_some_and(|layout| layout.force_quotes(cell_index))
                         || (row.cell_count == 1
-                            && layout.is_some_and(|layout| layout.ending(self.dialect).is_none())
-                            && cell.is_empty()),
+                            && cell.is_empty()
+                            && (layout
+                                .is_some_and(|layout| layout.ending(self.dialect).is_none())
+                                || boundary_quote(index)))
+                        || (index == 0
+                            && cell_index == 0
+                            && !self.dialect.bom
+                            && cell.starts_with(UTF8_BOM)),
                     layout.is_some_and(|layout| layout.leaves_quotes_unquoted(cell_index)),
                 )?;
                 let field_len = blob.len()
@@ -1991,17 +2033,64 @@ impl Document {
         } else if dialect.bom != bytes.starts_with(UTF8_BOM) {
             return Err("CSV stored BOM metadata does not match accepted bytes".to_owned());
         }
-        let prefix_len = if dialect.bom { UTF8_BOM.len() } else { 0 };
-        let mut drafts = scan_rows(&bytes, prefix_len, bytes.len(), dialect)?;
+        let (drafts, fields) = scan_cold_rows(&bytes, dialect)?;
         if infer_terminator {
             dialect.terminator =
                 preferred_terminator(drafts.iter().map(|row| row.ending), Terminator::Lf);
         }
-        let identities = IdentityStore::initial(namespace, drafts.len())?;
-        assign_initial_rows(&mut drafts);
+        let row_count = u32::try_from(drafts.len()).map_err(|_| "CSV has too many rows")?;
+        let field_count = u32::try_from(fields.len()).map_err(|_| "CSV has too many fields")?;
+        let mut chunks = Vec::with_capacity(drafts.len().div_ceil(ROWS_PER_CHUNK));
+        let mut next_key = 0;
+        for (chunk_ordinal, group) in drafts.chunks(ROWS_PER_CHUNK).enumerate() {
+            let start = group[0].start;
+            let first_field = group[0].first_field;
+            let last = group.last().expect("nonempty chunk");
+            let end_field = last.first_field as usize + last.field_count as usize;
+            let rows = group
+                .iter()
+                .enumerate()
+                .map(|(offset, row)| {
+                    let ordinal = (chunk_ordinal * ROWS_PER_CHUNK + offset) as u32;
+                    CompactRow {
+                        relative_start: row.start - start,
+                        byte_len: row.byte_len,
+                        first_field: row.first_field - first_field,
+                        field_count: row.field_count,
+                        ending: match row.ending {
+                            None => 0,
+                            Some(Terminator::Lf) => 1,
+                            Some(Terminator::CrLf) => 2,
+                            Some(Terminator::Cr) => 3,
+                        },
+                        id_slot: ordinal,
+                        order_rank: (((u128::from(ordinal) + 1) * u128::from(u64::MAX)
+                            / (u128::from(row_count) + 1))
+                            as u64)
+                            | 1,
+                    }
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            chunks.push(ChunkRef {
+                key: next_chunk_key(&mut next_key)?,
+                byte_start: start,
+                data: Arc::new(RowChunk {
+                    rows,
+                    fields: fields[first_field as usize..end_field]
+                        .to_vec()
+                        .into_boxed_slice(),
+                }),
+            });
+        }
+        // Avoid retaining per-row Vec allocations and both identity sets while
+        // opening a large structural successor in bounded Wasm memory.
+        drop(drafts);
+        drop(fields);
+        let identities = IdentityStore::initial(namespace, row_count as usize)?;
         let document = Self(Arc::new(DocumentInner {
             blob: PersistentBlob::from_vec(bytes)?,
-            index: RowIndex::from_drafts(drafts)?,
+            index: RowIndex::from_initial_chunks(chunks, row_count, field_count, next_key)?,
             identities,
             order_overrides: OrderKeyStore::default(),
             dialect,
@@ -2021,22 +2110,71 @@ impl Document {
         namespace: IdNamespace,
         identities: &[RowIdentity],
     ) -> Result<Self, String> {
+        let mut identities_iter = identities.iter();
+        Self::open_file_with_identity_reader(bytes, dialect, namespace, identities.len(), || {
+            identities_iter
+                .next()
+                .cloned()
+                .ok_or_else(|| "CSV checkpoint truncated".to_owned())
+        })
+    }
+
+    pub fn open_file_with_identity_reader(
+        bytes: Vec<u8>,
+        dialect: Dialect,
+        namespace: IdNamespace,
+        count: usize,
+        mut next: impl FnMut() -> Result<RowIdentity, String>,
+    ) -> Result<Self, String> {
         let document = Self::open_file_with_stored_dialect(bytes, dialect, namespace)?.0;
-        let mut records = document.row_records()?;
-        if records.len() != identities.len() + 1 {
+        if document.row_count() != count {
             return Err("CSV identity checkpoint row count does not match the file".to_owned());
         }
-        for (record, identity) in records.iter_mut().skip(1).zip(identities) {
-            record.row_pk = vec![TypedValue::Uuid(identity.id)];
-            record
-                .row
-                .insert("id".to_owned(), TypedValue::Uuid(identity.id));
-            record.row.insert(
-                "order_key".to_owned(),
-                TypedValue::Text(identity.order_key.clone()),
-            );
+        let mut inner = Arc::try_unwrap(document.0).expect("fresh document has one owner");
+        // Release the provisional dense identities before restoring durable IDs.
+        inner.identities = IdentityStore::initial(namespace, 0)?;
+        let mut id_bytes = Vec::with_capacity(count * 16);
+        let mut ranges = Vec::with_capacity(count);
+        let mut overrides = HashMap::new();
+        let mut compact = Vec::with_capacity(count);
+        let mut previous: Option<RowIdentity> = None;
+        for ordinal in 0..count {
+            let identity = next()?;
+            if !valid_order_key(&identity.order_key) {
+                return Err("CSV identity checkpoint order key is invalid".to_owned());
+            }
+            if previous.as_ref().is_some_and(|previous| {
+                (&previous.order_key, previous.id) >= (&identity.order_key, identity.id)
+            }) {
+                return Err("CSV identity checkpoint rows are not in order".to_owned());
+            }
+            ranges.push(IdentityRange {
+                start: u32::try_from(id_bytes.len())
+                    .map_err(|_| "CSV identity bytes exceed 4GiB")?,
+                len: 16,
+            });
+            id_bytes.extend_from_slice(identity.id.as_bytes());
+            let location = inner
+                .index
+                .ordinal_location(ordinal)
+                .expect("validated row count");
+            let row = inner.index.row(location).1;
+            if identity.order_key.len() == 16 {
+                compact
+                    .push(u64::from_str_radix(&identity.order_key, 16).expect("validated hex key"));
+            } else {
+                compact.push(row.order_rank);
+                overrides.insert(row.id_slot, Arc::from(identity.order_key.as_str()));
+            }
+            previous = Some(identity);
         }
-        Self::open_rows(records).map(|(document, _)| document)
+        inner.identities = IdentityStore::from_noncompact(id_bytes, ranges)?;
+        inner.order_overrides = OrderKeyStore {
+            base: Arc::new(overrides),
+            compact: Arc::new(compact),
+            overlay: None,
+        };
+        Ok(Self(Arc::new(inner)))
     }
 
     pub fn fork(&self) -> Self {
@@ -2078,7 +2216,13 @@ impl Document {
         for (ordinal, location) in self.0.index.locations().enumerate() {
             let ordinal_u32 = u32::try_from(ordinal).ok()?;
             let (chunk, row) = self.0.index.row(location);
-            if row.id_slot != ordinal_u32 || self.0.order_overrides.get(row.id_slot).is_some() {
+            if row.id_slot != ordinal_u32
+                || self
+                    .0
+                    .order_overrides
+                    .get(row.id_slot, row.order_rank)
+                    .is_some()
+            {
                 return None;
             }
             let (row_namespace, identity_ordinal) =
@@ -2375,35 +2519,204 @@ impl Document {
             };
             let slot = self.0.identities.slot_for_id(id);
             let existing = slot.and_then(|slot| self.0.index.location_for_identity_slot(slot));
-            match (&change.row, existing) {
-                (None, Some(location)) => return self.delete_sparse_row(location),
+            let candidate = match (&change.row, existing) {
+                (None, Some(location)) => Some(self.delete_sparse_row(location)?),
                 (None, None) => return Ok((self.clone(), Vec::new())),
                 (Some(row), Some(location)) => {
                     let semantic = parse_csv_row(row)?;
                     if semantic.id != id {
                         return Err("CSV row id does not match row key".to_owned());
                     }
-                    if let Some(result) = self.update_or_reorder_sparse_row(location, &semantic)? {
-                        return Ok(result);
-                    }
+                    self.update_or_reorder_sparse_row(location, &semantic)?
                 }
                 (Some(row), None) => {
                     let semantic = parse_csv_row(row)?;
                     if semantic.id != id {
                         return Err("CSV row id does not match row key".to_owned());
                     }
-                    return self.insert_sparse_row(slot, &semantic);
+                    Some(self.insert_sparse_row(slot, &semantic)?)
+                }
+            };
+            if let Some((document, edits)) = candidate {
+                let old_ordinal = existing.map(|location| self.0.index.ordinal_of(location));
+                let new_ordinal = document
+                    .0
+                    .identities
+                    .slot_for_id(id)
+                    .and_then(|slot| document.0.index.location_for_identity_slot(slot))
+                    .map(|location| document.0.index.ordinal_of(location));
+                let mut safe = document.boundary_is_unambiguous(0)?;
+                for ordinal in old_ordinal.into_iter().chain(new_ordinal) {
+                    safe &= document.boundary_is_unambiguous(ordinal)?;
+                    safe &= document.boundary_is_unambiguous(ordinal + 1)?;
+                }
+                if safe {
+                    return Ok((document, edits));
                 }
             }
         }
 
-        // Multi-row sparse sets and dialect mutation use the exact cold
-        // renderer. Every single-row content/delete/insert/reorder case above
-        // stays local except an unterminated-EOF reorder.
+        if changes.len() > 1 {
+            if let Some(result) = self.update_sparse_batch(changes)? {
+                return Ok(result);
+            }
+        }
+        // Structural batches, dialect mutations, and ambiguous row boundaries
+        // use the exact cold renderer.
         let records = apply_row_changes(self.row_records()?, changes)?;
         let (document, mut edit) = Self::open_rows(records)?;
         edit.delete_len = u64::try_from(self.0.blob.len()).expect("file length fits u64");
         Ok((document, vec![edit]))
+    }
+
+    fn update_sparse_batch(
+        &self,
+        changes: &[RowChange],
+    ) -> Result<Option<(Self, Vec<ByteEdit>)>, String> {
+        let mut updates = std::collections::BTreeMap::new();
+        for change in changes {
+            if change.schema_key.as_ref() != ROW_SCHEMA_KEY {
+                return Ok(None);
+            }
+            let Some(row) = &change.row else {
+                return Ok(None);
+            };
+            let semantic = parse_csv_row(row)?;
+            if change.row_pk != [TypedValue::Uuid(semantic.id)] {
+                return Err("CSV row id does not match row key".to_owned());
+            }
+            let Some(location) = self
+                .0
+                .identities
+                .slot_for_id(semantic.id)
+                .and_then(|slot| self.0.index.location_for_identity_slot(slot))
+            else {
+                return Ok(None);
+            };
+            let source = self.0.index.row(location).1;
+            if semantic.order_key != self.order_key(source) {
+                return Ok(None);
+            }
+            updates.insert(self.0.index.ordinal_of(location), (location, semantic));
+        }
+        let ordered = updates.iter().collect::<Vec<_>>();
+        let mut index = self.0.index.clone();
+        let mut edits = Vec::new();
+        let mut delta_before = 0i64;
+        let mut rows_touched = 0;
+        let mut cursor = 0;
+        while cursor < ordered.len() {
+            let first = cursor;
+            cursor += 1;
+            while cursor < ordered.len()
+                && *ordered[cursor].0 - *ordered[cursor - 1].0
+                    <= if updates.len() > 4096 {
+                        ROWS_PER_CHUNK
+                    } else {
+                        1
+                    }
+                && *ordered[cursor].0 - *ordered[first].0 < ROWS_PER_CHUNK
+            {
+                cursor += 1;
+            }
+            let first_ordinal = *ordered[first].0;
+            let last_ordinal = *ordered[cursor - 1].0;
+            let start = self.0.index.row_start(ordered[first].1.0);
+            let end = self.0.index.row_end(ordered[cursor - 1].1.0);
+            let shifted_start = shift_u32(start, delta_before)?;
+            let mut insert = Vec::new();
+            let mut drafts = Vec::with_capacity(cursor - first);
+            for ordinal in first_ordinal..=last_ordinal {
+                let location = self.0.index.ordinal_location(ordinal).expect("group row");
+                let row = self.0.index.row(location).1;
+                let bytes = if let Some((_, semantic)) = updates.get(&ordinal) {
+                    let ending = semantic.layout.ending(self.0.dialect).or_else(|| {
+                        (ordinal + 1 != self.row_count()).then_some(self.0.dialect.terminator)
+                    });
+                    render_row_with_layout(
+                        &semantic.cells,
+                        self.0.dialect,
+                        ending,
+                        &semantic.layout.force_quote,
+                        &semantic.layout.unquoted_quote,
+                        ordinal == 0 && !self.0.dialect.bom,
+                    )?
+                } else {
+                    self.0.blob.range(
+                        self.0.index.row_start(location) as usize,
+                        self.0.index.row_end(location) as usize,
+                    )?
+                };
+                let row_start = shifted_start
+                    .checked_add(u32::try_from(insert.len()).map_err(|_| "CSV batch too large")?)
+                    .ok_or_else(|| "CSV row offset overflow".to_owned())?;
+                drafts.push(row_draft_from_rendered(
+                    &bytes,
+                    row_start,
+                    row.id_slot,
+                    row.order_rank,
+                    self.0.dialect,
+                )?);
+                insert.extend_from_slice(&bytes);
+            }
+            let mut next_key = index.next_chunk_key;
+            let chunks = build_chunks(drafts, &mut next_key)?;
+            let delta = insert.len() as i64 - i64::from(end - start);
+            let (successor, touched) =
+                replace_index_range(&index, first_ordinal, last_ordinal + 1, chunks, delta)?;
+            index = successor;
+            rows_touched += touched;
+            delta_before += delta;
+            edits.push(ByteEdit {
+                offset: u64::from(start),
+                delete_len: u64::from(end - start),
+                insert: Arc::new(insert),
+            });
+        }
+        let splices = edits
+            .iter()
+            .map(|edit| FileEdit {
+                offset: edit.offset,
+                delete_len: edit.delete_len,
+                insert: edit.insert.as_slice(),
+            })
+            .collect::<Vec<_>>();
+        let document = Self(Arc::new(DocumentInner {
+            blob: self.0.blob.splice(&splices)?,
+            index,
+            identities: self.0.identities.clone(),
+            order_overrides: self.0.order_overrides.clone(),
+            dialect: self.0.dialect,
+            sparse_rows_touched: rows_touched,
+        }));
+        for ordinal in updates.keys() {
+            if !document.boundary_is_unambiguous(*ordinal)?
+                || !document.boundary_is_unambiguous(ordinal + 1)?
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some((document, edits)))
+    }
+
+    fn boundary_is_unambiguous(&self, ordinal: usize) -> Result<bool, String> {
+        let Some(location) = self.0.index.ordinal_location(ordinal) else {
+            return Ok(true);
+        };
+        let start = self.0.index.row_start(location) as usize;
+        let prefix = self.0.blob.range(start, (start + 3).min(self.byte_len()))?;
+        if ordinal == 0 {
+            return Ok(self.0.dialect.bom || !prefix.starts_with(UTF8_BOM));
+        }
+        let previous = self
+            .0
+            .index
+            .ordinal_location(ordinal - 1)
+            .expect("previous row");
+        Ok(
+            !(self.0.index.row(previous).1.ending() == Some(Terminator::Cr)
+                && prefix.starts_with(b"\n")),
+        )
     }
 
     pub fn row_records(&self) -> Result<Vec<RowRecord>, String> {
@@ -2423,23 +2736,18 @@ impl Document {
         Ok(records)
     }
 
+    pub fn row_identities(&self) -> impl Iterator<Item = RowIdentity> + '_ {
+        self.0.index.locations().map(|location| {
+            let (_, row) = self.0.index.row(location);
+            RowIdentity {
+                id: self.row_id(location),
+                order_key: self.order_key(row),
+            }
+        })
+    }
+
     pub fn identity_checkpoint(&self) -> (Dialect, Vec<RowIdentity>) {
-        let mut locations = self.0.index.locations().collect::<Vec<_>>();
-        locations.sort_unstable_by_key(|&location| {
-            let (chunk, row) = self.0.index.row(location);
-            chunk.byte_start + row.relative_start
-        });
-        let identities = locations
-            .into_iter()
-            .map(|location| {
-                let (_, row) = self.0.index.row(location);
-                RowIdentity {
-                    id: self.row_id(location),
-                    order_key: self.order_key(row),
-                }
-            })
-            .collect();
-        (self.0.dialect, identities)
+        (self.0.dialect, self.row_identities().collect())
     }
 
     fn typed_row(&self, location: RowLocation) -> Result<TypedRow, String> {
@@ -2452,8 +2760,11 @@ impl Document {
     fn order_key(&self, row: &CompactRow) -> String {
         self.0
             .order_overrides
-            .get(row.id_slot)
-            .map_or_else(|| format!("{:016x}", row.order_rank), ToOwned::to_owned)
+            .get(row.id_slot, row.order_rank)
+            .map_or_else(
+                || format!("{:016x}", row.order_rank),
+                |key| key.into_owned(),
+            )
     }
 
     fn row_id(&self, location: RowLocation) -> uuid::Uuid {
@@ -2548,6 +2859,7 @@ impl Document {
             desired_ending,
             &semantic.layout.force_quote,
             &semantic.layout.unquoted_quote,
+            target_ordinal == 0 && !self.0.dialect.bom,
         )?;
         let source_start = source_chunk.byte_start + source_row.relative_start;
         let source_len = source_row.byte_len;
@@ -2650,16 +2962,17 @@ impl Document {
         let ordinal = self.0.index.ordinal_of(location);
         let (chunk, row) = self.0.index.row(location);
         let start = chunk.byte_start + row.relative_start;
-        let ending = semantic.layout.ending(self.0.dialect);
-        if ending.is_none() && ordinal + 1 != self.row_count() {
-            return Err("only the final CSV row may be unterminated".to_owned());
-        }
+        let ending = semantic
+            .layout
+            .ending(self.0.dialect)
+            .or_else(|| (ordinal + 1 != self.row_count()).then_some(self.0.dialect.terminator));
         let insert = render_row_with_layout(
             &semantic.cells,
             self.0.dialect,
             ending,
             &semantic.layout.force_quote,
             &semantic.layout.unquoted_quote,
+            ordinal == 0 && !self.0.dialect.bom,
         )?;
         let splice = FileEdit {
             offset: u64::from(start),
@@ -2711,16 +3024,17 @@ impl Document {
         } else {
             identities.append_id(semantic.id)?
         };
-        let ending = semantic.layout.ending(self.0.dialect);
-        if ending.is_none() && target_ordinal != self.row_count() {
-            return Err("only the final CSV row may be unterminated".to_owned());
-        }
+        let ending = semantic
+            .layout
+            .ending(self.0.dialect)
+            .or_else(|| (target_ordinal != self.row_count()).then_some(self.0.dialect.terminator));
         let mut insert = render_row_with_layout(
             &semantic.cells,
             self.0.dialect,
             ending,
             &semantic.layout.force_quote,
             &semantic.layout.unquoted_quote,
+            target_ordinal == 0 && !self.0.dialect.bom,
         )?;
         let mut replacement_drafts = Vec::with_capacity(2);
         let offset = if target_ordinal < self.row_count() {
@@ -2742,6 +3056,16 @@ impl Document {
                 .expect("nonempty CSV has a last row");
             let (_, last_row) = self.0.index.row(last);
             if last_row.ending().is_none() {
+                if self.0.dialect.terminator == Terminator::Cr && insert == b"\n" {
+                    insert = render_row_with_layout(
+                        &semantic.cells,
+                        self.0.dialect,
+                        ending,
+                        &[1],
+                        &semantic.layout.unquoted_quote,
+                        false,
+                    )?;
+                }
                 let mut prefixed = self.0.dialect.terminator.bytes().to_vec();
                 prefixed.append(&mut insert);
                 insert = prefixed;
@@ -3049,6 +3373,57 @@ pub struct ArenaRowIndex {
 
 #[allow(dead_code)]
 impl ArenaRowIndex {
+    pub fn row_count(&self) -> u32 {
+        self.row_count
+    }
+    pub fn file_len(&self) -> u64 {
+        self.file_len
+    }
+
+    /// Dense imports retain the generated UUID ordinal and initial order key.
+    /// Updates with different identities/order or structural changes use the
+    /// general document path instead.
+    pub fn update_ordinal(&self, change: &RowChange) -> Result<Option<u32>, String> {
+        if change.schema_key.as_ref() != ROW_SCHEMA_KEY {
+            return Ok(None);
+        }
+        let Some(row) = &change.row else {
+            return Ok(None);
+        };
+        let semantic = parse_csv_row(row)?;
+        if change.row_pk != [TypedValue::Uuid(semantic.id)] {
+            return Err("CSV row id does not match row key".to_owned());
+        }
+        let bytes = semantic.id.as_bytes();
+        if bytes[..12] != self.namespace {
+            return Ok(None);
+        }
+        let ordinal = u32::from_be_bytes(bytes[12..].try_into().expect("UUID ordinal"));
+        if ordinal >= self.row_count {
+            return Ok(None);
+        }
+        let rank = ((u128::from(ordinal) + 1) * u128::from(u64::MAX)
+            / (u128::from(self.row_count) + 1)) as u64
+            | 1;
+        Ok((semantic.order_key == format!("{rank:016x}")).then_some(ordinal))
+    }
+
+    pub fn render_update(&self, ordinal: u32, row: &TypedRow) -> Result<Vec<u8>, String> {
+        let semantic = parse_csv_row(row)?;
+        let ending = semantic
+            .layout
+            .ending(self.dialect)
+            .or_else(|| (ordinal + 1 != self.row_count).then_some(self.dialect.terminator));
+        render_row_with_layout(
+            &semantic.cells,
+            self.dialect,
+            ending,
+            &semantic.layout.force_quote,
+            &semantic.layout.unquoted_quote,
+            ordinal == 0 && !self.dialect.bom,
+        )
+    }
+
     pub fn dialect(&self) -> Dialect {
         self.dialect
     }
@@ -4976,6 +5351,12 @@ pub fn parse_csv_row(row: &TypedRow) -> Result<CsvRow, String> {
     if cells.is_empty() {
         return Err("CSV rows require at least one cell".to_owned());
     }
+    if cells.len() > u16::MAX as usize {
+        return Err("CSV row has more than 65535 fields".to_owned());
+    }
+    for cell in &cells {
+        validate_csv_text(cell.as_bytes())?;
+    }
     let layout = match row.get("layout") {
         Some(TypedValue::Null) => RowLayout::default(),
         Some(TypedValue::Jsonb(value)) => parse_row_layout(value, cells.len())?,
@@ -5094,7 +5475,7 @@ pub fn render_row(
     dialect: Dialect,
     ending: Option<Terminator>,
 ) -> Result<Vec<u8>, String> {
-    render_row_with_layout(cells, dialect, ending, &[], &[])
+    render_row_with_layout(cells, dialect, ending, &[], &[], false)
 }
 
 fn render_row_with_layout(
@@ -5103,6 +5484,7 @@ fn render_row_with_layout(
     ending: Option<Terminator>,
     force_quote: &[u8],
     unquoted_quote: &[u8],
+    file_start: bool,
 ) -> Result<Vec<u8>, String> {
     if cells.is_empty() {
         return Err("CSV rows require at least one cell".to_owned());
@@ -5115,7 +5497,8 @@ fn render_row_with_layout(
         let force_quote = force_quote
             .get(index / 8)
             .is_some_and(|byte| byte & (1 << (index % 8)) != 0)
-            || (cells.len() == 1 && ending.is_none() && cell.is_empty());
+            || (cells.len() == 1 && ending.is_none() && cell.is_empty())
+            || (file_start && index == 0 && cell.as_bytes().starts_with(UTF8_BOM));
         let unquoted_quote = unquoted_quote
             .get(index / 8)
             .is_some_and(|byte| byte & (1 << (index % 8)) != 0);
@@ -5160,3 +5543,7 @@ pub fn describe_memory(document: &Document) -> String {
 #[cfg(test)]
 #[path = "core_qa_tests.rs"]
 mod core_qa_tests;
+
+#[cfg(test)]
+#[path = "qa_sql_tests.rs"]
+mod qa_sql_tests;
