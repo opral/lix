@@ -1000,3 +1000,63 @@ fn qa_multi_field_and_multi_element_file_edits_stay_sparse() {
     assert!(noop.metrics.file_bytes_read < 500);
     assert_eq!(noop.metrics.state_bytes_written, 0);
 }
+
+#[test]
+fn qa_shift_limit_fallback_restores_all_rows_and_file_offsets() {
+    let h = Harness::<ExcalidrawPlugin>::default();
+    let source = json!({"elements":(0..4100).map(|i|json!({"id":format!("e{i:04}"),"type":"rectangle","x":1})).collect::<Vec<_>>(),"files":{"img":{"dataURL":"abc"}}});
+    let file = Snapshot {
+        path: "shifts.excalidraw".into(),
+        bytes: serde_json::to_vec(&source).unwrap(),
+        ..Snapshot::default()
+    };
+    let parsed = h.parse(&file, ctx(1)).unwrap();
+    let mut rows: Vec<_> = parsed
+        .row_changes
+        .iter()
+        .map(|c| sdk::TypedRowRecord {
+            schema_key: c.schema_key.clone(),
+            schema_fingerprint: c.schema_fingerprint,
+            primary_key: c.primary_key.clone(),
+            row: c.row.clone().unwrap(),
+        })
+        .collect();
+    let mut changes = Vec::new();
+    for row in rows
+        .iter_mut()
+        .filter(|r| r.schema_key.as_ref() == core::ELEMENT_SCHEMA_KEY)
+        .take(4096)
+    {
+        let mut value = payload(row, "element_json");
+        value["x"] = json!(12345);
+        set_payload(row, "element_json", value);
+        changes.push(change(row));
+    }
+    let file = h
+        .serialize_changes(parsed.snapshot(), &changes)
+        .unwrap()
+        .into_snapshot();
+    assert_eq!(
+        decode_shifts(file.state.get(ELEMENT_SHIFTS_KEY).unwrap())
+            .unwrap()
+            .len(),
+        4096
+    );
+    let row = rows
+        .iter_mut()
+        .find(|r| r.primary_key == [sdk::TypedValue::Text("e4099".into())])
+        .unwrap();
+    let mut value = payload(row, "element_json");
+    value["x"] = json!(99);
+    set_payload(row, "element_json", value);
+    let out = h.serialize_changes(&file, &[change(row)]).unwrap();
+    assert!(!out.snapshot().state.contains_key(ELEMENT_SHIFTS_KEY));
+    assert_eq!(
+        h.serialize(&file.file_id, &file.path, &rows, None)
+            .unwrap()
+            .snapshot()
+            .bytes,
+        out.snapshot().bytes
+    );
+    assert_eq!(json(&out.snapshot().bytes)["files"], source["files"]);
+}

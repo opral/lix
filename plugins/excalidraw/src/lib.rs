@@ -270,24 +270,40 @@ fn restore_document_layout(before: &sdk::Snapshot<'_>, document: &mut Document) 
     let mut layout: core::ProjectionLayout =
         serde_json::from_slice(&bytes).map_err(|e| sdk::Error::invalid_input(e.to_string()))?;
     let shifts = decode_shifts(&before.get_state(ELEMENT_SHIFTS_KEY)?.unwrap_or_default())?;
+    let mut shift_cursor = 0;
+    let mut file_delta = 0_i64;
     for file in &mut layout.files {
-        let mut delta = 0_i64;
-        for (ordinal, shift) in &shifts {
+        while let Some((ordinal, shift)) = shifts.get(shift_cursor) {
             let element = layout
                 .elements
                 .get(*ordinal as usize)
                 .ok_or_else(|| sdk::Error::invalid_input("invalid layout shift"))?;
-            if element.offset < file.offset {
-                delta = delta
-                    .checked_add(*shift)
-                    .ok_or_else(|| sdk::Error::invalid_input("layout shift overflow"))?;
+            if element.offset >= file.offset {
+                break;
             }
+            file_delta = file_delta
+                .checked_add(*shift)
+                .ok_or_else(|| sdk::Error::invalid_input("layout shift overflow"))?;
+            shift_cursor += 1;
         }
-        file.offset = apply_shift(file.offset, delta)?;
+        file.offset = apply_shift(file.offset, file_delta)?;
     }
+    let mut shift_cursor = 0;
+    let mut element_delta = 0_i64;
     for (ordinal, row) in layout.elements.iter_mut().enumerate() {
-        row.offset = effective_offset(row.offset, ordinal as u32, &shifts)?;
-        row.length = effective_length(row.length, ordinal as u32, &shifts)?;
+        row.offset = apply_shift(row.offset, element_delta)?;
+        if let Some((changed, shift)) = shifts.get(shift_cursor)
+            && *changed as usize == ordinal
+        {
+            row.length = apply_shift(row.length, *shift)?;
+            element_delta = element_delta
+                .checked_add(*shift)
+                .ok_or_else(|| sdk::Error::invalid_input("layout shift overflow"))?;
+            shift_cursor += 1;
+        }
+    }
+    if shift_cursor != shifts.len() {
+        return Err(sdk::Error::invalid_input("invalid layout shift ordinal"));
     }
     document
         .restore_layout(layout)
