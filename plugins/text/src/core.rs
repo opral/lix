@@ -1,5 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -108,7 +107,7 @@ impl Document {
         validate_text(&bytes)?;
         let bytes = Arc::new(bytes);
         let chunks = split_lines(Arc::clone(&bytes));
-        let order_keys = OrderKey::evenly_between(None, None, chunks.len())?;
+        let order_keys = allocate_order_keys(None, None, chunks.len())?;
         let mut lines = Vec::with_capacity(chunks.len());
         for (ordinal, (bytes, order_key)) in chunks.into_iter().zip(order_keys).enumerate() {
             lines.push(Arc::new(Line {
@@ -153,11 +152,22 @@ impl Document {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let document = Self::from_lines(lines)?;
-        if document.bytes() != bytes.as_slice() {
+        let mut ids = std::collections::HashSet::with_capacity(lines.len());
+        for line in &lines {
+            if !ids.insert(line.id) {
+                return Err(format!("duplicate line row ID '{}'", line.id));
+            }
+        }
+        if lines
+            .windows(2)
+            .any(|pair| (&pair[0].order_key, pair[0].id) >= (&pair[1].order_key, pair[1].id))
+        {
             return Err("Text identity order does not match accepted bytes".to_owned());
         }
-        Ok(document)
+        Ok(Self(Arc::new(DocumentInner {
+            bytes,
+            lines: lines.into_iter().map(Arc::new).collect(),
+        })))
     }
 
     pub(crate) fn identities(&self) -> Vec<LineIdentity> {
@@ -203,6 +213,9 @@ impl Document {
     ) -> Result<(Self, Vec<lix::RowChange>), String> {
         let bytes = Arc::new(apply_splices(self.bytes(), splices)?);
         validate_text(&bytes)?;
+        if bytes.as_slice() == self.bytes() {
+            return Ok((self.clone(), Vec::new()));
+        }
         let chunks = split_lines(Arc::clone(&bytes));
 
         // Preserve the overwhelmingly common unchanged prefix and suffix
@@ -239,36 +252,21 @@ impl Document {
         // identity even across a reorder. Remaining old/new positions are
         // paired in order, preserving an edited line's ID without inventing a
         // parser-specific identity rule for arbitrary text.
-        let mut exact =
-            Vec::with_capacity(self.lines().len().saturating_sub(prefix_len + suffix_len));
-        for (old_index, line) in self.lines()[prefix_len..self.lines().len() - suffix_len]
-            .iter()
-            .enumerate()
-            .map(|(index, line)| (prefix_len + index, line))
-        {
-            exact.push((line_hash(line.bytes.as_slice()), old_index));
+        let mut exact: HashMap<&[u8], VecDeque<usize>> = HashMap::new();
+        for old_index in prefix_len..self.lines().len() - suffix_len {
+            exact
+                .entry(self.lines()[old_index].bytes.as_slice())
+                .or_default()
+                .push_back(old_index);
         }
-        exact.sort_unstable();
-        for (new_index, bytes) in chunks[prefix_len..chunks.len() - suffix_len]
-            .iter()
-            .enumerate()
-            .map(|(index, bytes)| (prefix_len + index, bytes))
-        {
-            let hash = line_hash(bytes.as_slice());
-            let start = exact.partition_point(|(candidate, _)| *candidate < hash);
-            let end = exact.partition_point(|(candidate, _)| *candidate <= hash);
-            let Some(old_index) = exact[start..end]
-                .iter()
-                .map(|(_, old_index)| *old_index)
-                .find(|old_index| {
-                    !old_used[*old_index]
-                        && self.lines()[*old_index].bytes.as_slice() == bytes.as_slice()
-                })
-            else {
-                continue;
-            };
-            old_for_new[new_index] = Some(old_index);
-            old_used[old_index] = true;
+        for new_index in prefix_len..chunks.len() - suffix_len {
+            if let Some(old_index) = exact
+                .get_mut(chunks[new_index].as_slice())
+                .and_then(VecDeque::pop_front)
+            {
+                old_for_new[new_index] = Some(old_index);
+                old_used[old_index] = true;
+            }
         }
 
         let unmatched_old = old_used
@@ -317,7 +315,7 @@ impl Document {
                 lines.push(Arc::new(Line {
                     id,
                     order_key,
-                    bytes,
+                    bytes: LineBytes::owned(bytes.as_slice().to_vec()),
                 }));
             }
         }
@@ -381,17 +379,10 @@ impl Document {
 
     fn from_lines(mut lines: Vec<Line>) -> Result<Self, String> {
         let mut ids = BTreeSet::new();
-        let mut order_keys = BTreeSet::new();
         for line in &lines {
             validate_line_bytes(line.bytes.as_slice())?;
             if !ids.insert(line.id.clone()) {
                 return Err(format!("duplicate line row ID '{}'", line.id));
-            }
-            if !order_keys.insert(line.order_key.clone()) {
-                return Err(format!(
-                    "duplicate line order key '{}'",
-                    line.order_key.to_snapshot_string()
-                ));
             }
         }
         lines.sort_by(|left, right| {
@@ -399,6 +390,11 @@ impl Document {
                 .cmp(&right.order_key)
                 .then_with(|| left.id.cmp(&right.id))
         });
+        for line in lines.iter().take(lines.len().saturating_sub(1)) {
+            if !line.bytes.as_slice().ends_with(b"\n") {
+                return Err("every nonfinal text line must end with LF".to_owned());
+            }
+        }
         let bytes = Arc::new(render_lines(&lines)?);
         validate_text(&bytes)?;
         let mut offset = 0usize;
@@ -477,7 +473,7 @@ impl Document {
         &self,
         old_for_new: &[Option<usize>],
     ) -> Result<Vec<OrderKey>, String> {
-        let anchors = longest_increasing_old_indexes(old_for_new);
+        let anchors = longest_increasing_by(old_for_new, |index| &self.lines()[index].order_key);
         let mut order_keys = vec![None; old_for_new.len()];
         for &position in &anchors {
             let old_index =
@@ -492,8 +488,7 @@ impl Document {
                 .as_ref()
                 .expect("an order anchor key was assigned")
                 .clone();
-            let allocated =
-                OrderKey::evenly_between(previous.as_ref(), Some(&next), anchor - cursor)?;
+            let allocated = allocate_order_keys(previous.as_ref(), Some(&next), anchor - cursor)?;
             for (position, key) in (cursor..anchor).zip(allocated) {
                 order_keys[position] = Some(key);
             }
@@ -502,8 +497,7 @@ impl Document {
                 .checked_add(1)
                 .ok_or_else(|| "line order cursor overflow".to_owned())?;
         }
-        let allocated =
-            OrderKey::evenly_between(previous.as_ref(), None, old_for_new.len() - cursor)?;
+        let allocated = allocate_order_keys(previous.as_ref(), None, old_for_new.len() - cursor)?;
         for (position, key) in (cursor..old_for_new.len()).zip(allocated) {
             order_keys[position] = Some(key);
         }
@@ -545,23 +539,61 @@ impl Document {
             return Ok(edits);
         }
 
-        let (prefix, suffix) = common_prefix_and_suffix(self.bytes(), after.bytes());
-        let delete_len = self
-            .bytes()
-            .len()
-            .checked_sub(prefix)
-            .and_then(|length| length.checked_sub(suffix))
-            .ok_or_else(|| "invalid common byte range".to_owned())?;
-        let insert_end = after
-            .bytes()
-            .len()
-            .checked_sub(suffix)
-            .ok_or_else(|| "invalid common byte suffix".to_owned())?;
-        Ok(vec![lix::ByteEdit::new(
-            usize_to_u64(prefix, "render edit offset")?,
-            usize_to_u64(delete_len, "render edit delete length")?,
-            after.bytes()[prefix..insert_end].to_vec(),
-        )])
+        let before_indexes: HashMap<_, _> = self
+            .lines()
+            .iter()
+            .enumerate()
+            .map(|(index, line)| (line.id, index))
+            .collect();
+        let matches = after
+            .lines()
+            .iter()
+            .map(|line| {
+                before_indexes
+                    .get(&line.id)
+                    .copied()
+                    .filter(|&index| self.lines()[index].bytes == line.bytes)
+            })
+            .collect::<Vec<_>>();
+        let anchors = longest_increasing_by(&matches, |index| index);
+        let mut before_offsets = vec![0usize];
+        let mut after_offsets = vec![0usize];
+        for line in self.lines() {
+            before_offsets.push(before_offsets.last().unwrap() + line.bytes.len());
+        }
+        for line in after.lines() {
+            after_offsets.push(after_offsets.last().unwrap() + line.bytes.len());
+        }
+        let mut before_cursor = 0;
+        let mut after_cursor = 0;
+        let mut edits = Vec::new();
+        for position in anchors
+            .into_iter()
+            .chain(std::iter::once(after.lines().len()))
+        {
+            let old_index = if position == after.lines().len() {
+                self.lines().len()
+            } else {
+                matches[position].unwrap()
+            };
+            let old_end = before_offsets[old_index];
+            let new_end = after_offsets[position];
+            let old = &self.bytes()[before_cursor..old_end];
+            let new = &after.bytes()[after_cursor..new_end];
+            let (prefix, suffix) = common_prefix_and_suffix(old, new);
+            if prefix != old.len() || prefix != new.len() {
+                edits.push(lix::ByteEdit::new(
+                    usize_to_u64(before_cursor + prefix, "render offset")?,
+                    usize_to_u64(old.len() - prefix - suffix, "render delete length")?,
+                    new[prefix..new.len() - suffix].to_vec(),
+                ));
+            }
+            if position < after.lines().len() {
+                before_cursor = before_offsets[old_index + 1];
+                after_cursor = after_offsets[position + 1];
+            }
+        }
+        Ok(edits)
     }
 }
 
@@ -583,9 +615,20 @@ impl Line {
 
     pub(crate) fn typed_row(&self) -> Result<TypedRow, String> {
         let mut row = TypedRow::new();
+        let raw = self.bytes.as_slice();
+        let body = raw.strip_suffix(b"\n").unwrap_or(raw);
+        let (content, fallback) = match std::str::from_utf8(body) {
+            Ok(text) if !body.contains(&0) => (TypedValue::Text(text.to_owned()), TypedValue::Null),
+            _ => (
+                TypedValue::Null,
+                TypedValue::Text(URL_SAFE_NO_PAD.encode(body)),
+            ),
+        };
+        row.insert("content", content);
+        row.insert("content_base64", fallback);
         row.insert(
-            "content_base64".to_owned(),
-            TypedValue::Text(URL_SAFE_NO_PAD.encode(self.bytes.as_slice())),
+            "line_ending",
+            TypedValue::Text(if raw.ends_with(b"\n") { "\n" } else { "" }.to_owned()),
         );
         row.insert("id".to_owned(), TypedValue::Uuid(self.id));
         row.insert(
@@ -596,10 +639,12 @@ impl Line {
     }
 
     fn from_typed_row(row: &TypedRow) -> Result<Self, String> {
-        if let Some(field) = row
-            .keys()
-            .find(|field| !matches!(*field, "content_base64" | "id" | "order_key"))
-        {
+        if let Some(field) = row.keys().find(|field| {
+            !matches!(
+                *field,
+                "content" | "content_base64" | "id" | "line_ending" | "order_key"
+            )
+        }) {
             return Err(format!(
                 "line typed row contains unsupported field '{field}'"
             ));
@@ -613,13 +658,38 @@ impl Line {
                 .map_err(|error| format!("invalid line order key: {error}"))?,
             _ => return Err("line typed row order_key must be text".to_owned()),
         };
-        let content_base64 = match row.get("content_base64") {
-            Some(TypedValue::Text(value)) => value,
-            _ => return Err("line typed row content_base64 must be text".to_owned()),
+        let mut bytes = match (row.get("content"), row.get("content_base64")) {
+            (Some(TypedValue::Text(text)), None | Some(TypedValue::Null)) => {
+                if text.contains('\0') {
+                    return Err("NUL-bearing lines must use content_base64".to_owned());
+                }
+                text.as_bytes().to_vec()
+            }
+            (None | Some(TypedValue::Null), Some(TypedValue::Text(encoded))) => {
+                let bytes = URL_SAFE_NO_PAD
+                    .decode(encoded)
+                    .map_err(|error| format!("invalid line content_base64: {error}"))?;
+                if std::str::from_utf8(&bytes).is_ok() && !bytes.contains(&0) {
+                    return Err(
+                        "NUL-free UTF-8 must use content instead of content_base64".to_owned()
+                    );
+                }
+                bytes
+            }
+            _ => {
+                return Err(
+                    "exactly one of content and content_base64 must be non-NULL text".to_owned(),
+                );
+            }
         };
-        let bytes = URL_SAFE_NO_PAD
-            .decode(content_base64)
-            .map_err(|error| format!("invalid line content_base64: {error}"))?;
+        if bytes.contains(&b'\n') {
+            return Err("line content cannot contain embedded LF bytes".to_owned());
+        }
+        match row.get("line_ending") {
+            Some(TypedValue::Text(ending)) if ending == "\n" => bytes.push(b'\n'),
+            Some(TypedValue::Text(ending)) if ending.is_empty() => {}
+            _ => return Err("line_ending must be LF or an empty string".to_owned()),
+        }
         validate_line_bytes(&bytes)?;
         Ok(Self {
             id,
@@ -635,12 +705,6 @@ impl Line {
             self.typed_row()?,
         ))
     }
-}
-
-fn line_hash(bytes: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
 }
 
 fn split_lines(bytes: Arc<Vec<u8>>) -> Vec<LineBytes> {
@@ -723,12 +787,26 @@ fn validate_row_key(schema_key: &str, row_pk: &[TypedValue]) -> Result<(), Strin
 
 fn validate_text(bytes: &[u8]) -> Result<(), String> {
     if bytes[..bytes.len().min(TEXT_PREFIX_SCAN_BYTES)].contains(&0) {
-        return Err("Text documents cannot contain NUL in their first 8 KiB".to_owned());
+        return Err("Text documents cannot contain NUL in their first 8,000 bytes".to_owned());
     }
     Ok(())
 }
 
-fn longest_increasing_old_indexes(old_for_new: &[Option<usize>]) -> Vec<usize> {
+fn longest_increasing_by<K: Ord>(
+    old_for_new: &[Option<usize>],
+    key: impl Fn(usize) -> K,
+) -> Vec<usize> {
+    let matched = old_for_new
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, old)| old.map(|old| (pos, old)))
+        .collect::<Vec<_>>();
+    if matched
+        .windows(2)
+        .all(|pair| key(pair[0].1) < key(pair[1].1))
+    {
+        return matched.into_iter().map(|(pos, _)| pos).collect();
+    }
     let mut tails = Vec::<usize>::new();
     let mut predecessors = vec![None; old_for_new.len()];
 
@@ -737,8 +815,8 @@ fn longest_increasing_old_indexes(old_for_new: &[Option<usize>]) -> Vec<usize> {
             continue;
         };
         let insertion = tails.partition_point(|tail_position| {
-            old_for_new[*tail_position].expect("LIS tails only contain matched positions")
-                < *old_index
+            key(old_for_new[*tail_position].expect("LIS tails only contain matched positions"))
+                < key(*old_index)
         });
         if insertion != 0 {
             predecessors[position] = Some(tails[insertion - 1]);
@@ -777,4 +855,61 @@ fn common_prefix_and_suffix(before: &[u8], after: &[u8]) -> (usize, usize) {
 
 fn usize_to_u64(value: usize, context: &str) -> Result<u64, String> {
     u64::try_from(value).map_err(|_| format!("{context} exceeds u64"))
+}
+
+// Reserve a wide integer stride at open ends. Repeated midpoint allocation
+// otherwise adds a byte every eight appends/prepends and grows total key
+// storage quadratically. Interior fractional allocation remains unchanged.
+pub(crate) fn allocate_order_keys(
+    previous: Option<&OrderKey>,
+    next: Option<&OrderKey>,
+    count: usize,
+) -> Result<Vec<OrderKey>, String> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if previous.is_some() != next.is_some() {
+        let bound = previous.or(next).unwrap();
+        let raw = bound.to_snapshot_string();
+        let prefix = &raw[..raw.len().min(32)];
+        let padded = format!("{prefix:0<32}");
+        let value = u128::from_str_radix(&padded, 16).expect("hex order key");
+        let distance = (count as u128).checked_mul(1u128 << 64);
+        let start = distance.and_then(|distance| {
+            if previous.is_some() {
+                value.checked_add(distance).map(|_| value)
+            } else {
+                value.checked_sub(distance)
+            }
+        });
+        if let Some(start) = start {
+            let keys = (0..count)
+                .map(|i| {
+                    let step = if previous.is_some() { i + 1 } else { i };
+                    OrderKey::from_snapshot_string(&format!(
+                        "{:032x}01",
+                        start + ((step as u128) << 64)
+                    ))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if previous.is_none_or(|bound| bound < &keys[0])
+                && next.is_none_or(|bound| &keys[keys.len() - 1] < bound)
+            {
+                return Ok(keys);
+            }
+        }
+    }
+    OrderKey::evenly_between(previous, next, count)
+}
+
+#[cfg(test)]
+impl Document {
+    pub(crate) fn retained_backing_bytes(&self) -> usize {
+        let mut buffers = HashMap::new();
+        buffers.insert(Arc::as_ptr(&self.0.bytes), self.0.bytes.len());
+        for line in self.lines() {
+            buffers.insert(Arc::as_ptr(&line.bytes.backing), line.bytes.backing.len());
+        }
+        buffers.into_values().sum()
+    }
 }

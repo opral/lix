@@ -1,18 +1,29 @@
 {
   "$schema": "https://lix.dev/schema-v1.json",
   "key": "text_line",
-  "description": "One byte-exact byte-exact text line. Newline bytes remain part of content_base64.",
+  "description": "One lossless LF-delimited text line. Content excludes its LF terminator; CR bytes remain in content.",
   "columns": [
+    {
+      "name": "content",
+      "type": "text",
+      "nullable": true
+    },
     {
       "name": "content_base64",
       "type": "text",
-      "nullable": false
+      "nullable": true
     },
     {
       "name": "id",
       "type": "uuid",
       "nullable": false,
       "default_expression": "uuidv7()"
+    },
+    {
+      "name": "line_ending",
+      "type": "text",
+      "nullable": false,
+      "default_value": "\n"
     },
     {
       "name": "order_key",

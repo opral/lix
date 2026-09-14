@@ -47,9 +47,19 @@ fn records(changes: &[lix::RowChange]) -> Vec<lix::RowRecord> {
 
 fn row_with_bytes(line: &Line, bytes: &[u8]) -> ::lix::plugin::TypedRow {
     let mut row = line.typed_row().expect("test line should have a UUID id");
+    let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let (content, fallback) = match std::str::from_utf8(body) {
+        Ok(text) if !body.contains(&0) => (TypedValue::Text(text.to_owned()), TypedValue::Null),
+        _ => (
+            TypedValue::Null,
+            TypedValue::Text(URL_SAFE_NO_PAD.encode(body)),
+        ),
+    };
+    row.insert("content", content);
+    row.insert("content_base64", fallback);
     row.insert(
-        "content_base64".to_owned(),
-        TypedValue::Text(URL_SAFE_NO_PAD.encode(bytes)),
+        "line_ending",
+        TypedValue::Text(if bytes.ends_with(b"\n") { "\n" } else { "" }.to_owned()),
     );
     row
 }
@@ -347,4 +357,386 @@ fn text_row_keys_require_native_uuid_values() {
         )])
         .expect_err("a textual UUID primary key must not cross the typed boundary");
     assert!(error.contains("UUID primary-key component"));
+}
+
+#[test]
+fn nonfinal_unterminated_rows_are_rejected_before_identity_state_can_drift() {
+    let (document, _) = open(b"a\nb\n");
+    let first = &document.lines()[0];
+    let change = lix::RowChange::upsert(
+        LINE_SCHEMA_KEY,
+        row_pk(first.id()).to_vec(),
+        row_with_bytes(first, b"a"),
+    );
+    assert!(
+        document
+            .rows_changed([change.clone()])
+            .unwrap_err()
+            .contains("nonfinal")
+    );
+    let mut rows = records(&open(b"a\nb\n").1);
+    rows[0].row = change.row.unwrap();
+    assert!(Document::open_rows(rows).unwrap_err().contains("nonfinal"));
+    assert_eq!(document.bytes(), b"a\nb\n");
+
+    let last = &document.lines()[1];
+    let (after, _) = document
+        .rows_changed([lix::RowChange::upsert(
+            LINE_SCHEMA_KEY,
+            row_pk(last.id()).to_vec(),
+            row_with_bytes(last, b"b"),
+        )])
+        .unwrap();
+    assert_eq!(after.bytes(), b"a\nb");
+    assert_eq!(
+        Document::open_file_with_identities(after.bytes().to_vec(), after.identities()).unwrap(),
+        after
+    );
+}
+
+#[test]
+fn duplicate_middle_matching_consumes_each_identity_once() {
+    let mut before = b"head\n".to_vec();
+    before.extend(b"same\n".repeat(20_000));
+    before.extend(b"tail\n");
+    let (document, _) = open(&before);
+    let mut after = before.clone();
+    after[..4].copy_from_slice(b"HEAD");
+    let end = after.len();
+    after[end - 5..end - 1].copy_from_slice(b"TAIL");
+    let (updated, changes) = document
+        .file_changed(
+            &[FileEdit {
+                offset: 0,
+                delete_len: before.len() as u64,
+                insert: after.clone(),
+            }],
+            |n| test_id(2, n),
+        )
+        .unwrap();
+    assert_eq!(updated.bytes(), after);
+    assert_eq!(ids(&updated), ids(&document));
+    assert_eq!(changes.len(), 2);
+}
+
+#[test]
+fn sequential_end_allocations_keep_order_storage_linear() {
+    use crate::core::allocate_order_keys;
+    for append in [false, true] {
+        let mut key = allocate_order_keys(None, None, 1).unwrap().remove(0);
+        let mut total = 0;
+        for _ in 0..20_000 {
+            let next = if append {
+                allocate_order_keys(Some(&key), None, 1)
+            } else {
+                allocate_order_keys(None, Some(&key), 1)
+            }
+            .unwrap()
+            .remove(0);
+            assert!(if append { next > key } else { next < key });
+            total += next.to_snapshot_string().len();
+            key = next;
+        }
+        assert!(total <= 34 * 20_000, "end keys must have bounded storage");
+    }
+}
+
+#[test]
+fn concurrent_order_ties_render_deterministically_and_accept_followup_edits() {
+    let (document, changes) = open(b"a\nb\n");
+    let mut rows = records(&changes);
+    let first_order = rows[0].row["order_key"].clone();
+    rows[1].row.insert("order_key", first_order);
+    let tied = Document::open_rows(rows.clone()).unwrap();
+    rows.reverse();
+    assert_eq!(Document::open_rows(rows).unwrap(), tied);
+    assert_eq!(tied.bytes(), document.bytes());
+    let hydrated =
+        Document::open_file_with_identities(tied.bytes().to_vec(), tied.identities()).unwrap();
+    assert_eq!(hydrated, tied);
+    let (_, noop) = tied.file_changed(&[], |n| test_id(2, n)).unwrap();
+    assert!(noop.is_empty());
+    let (after, mutations) = tied
+        .file_changed(
+            &[FileEdit {
+                offset: 0,
+                delete_len: 1,
+                insert: b"A".to_vec(),
+            }],
+            |n| test_id(2, n),
+        )
+        .unwrap();
+    let (replayed, _) = tied.rows_changed(mutations).unwrap();
+    assert_eq!(replayed, after);
+    assert_eq!(after.bytes(), b"A\nb\n");
+}
+
+#[test]
+fn sql_content_is_readable_and_edits_preserve_line_endings() {
+    let (document, _) = open(b"hello\r\nworld");
+    let first = &document.lines()[0];
+    let mut row = first.typed_row().unwrap();
+    assert_eq!(row["content"], TypedValue::Text("hello\r".to_owned()));
+    assert_eq!(row["line_ending"], TypedValue::Text("\n".to_owned()));
+    assert_eq!(row["content_base64"], TypedValue::Null);
+    row.insert("content", TypedValue::Text("updated\r".to_owned()));
+    let (after, edits) = document
+        .rows_changed([lix::RowChange::upsert(
+            LINE_SCHEMA_KEY,
+            row_pk(first.id()).to_vec(),
+            row,
+        )])
+        .unwrap();
+    assert_eq!(after.bytes(), b"updated\r\nworld");
+    assert_eq!(apply_edits(document.bytes(), &edits), after.bytes());
+}
+
+#[test]
+fn sql_payload_representation_is_canonical() {
+    let (document, _) = open(b"hello\n");
+    let first = &document.lines()[0];
+    for (content, fallback) in [
+        (TypedValue::Null, TypedValue::Null),
+        (
+            TypedValue::Text("hello".into()),
+            TypedValue::Text("_w".into()),
+        ),
+        (
+            TypedValue::Null,
+            TypedValue::Text(URL_SAFE_NO_PAD.encode(b"hello")),
+        ),
+    ] {
+        let mut row = first.typed_row().unwrap();
+        row.insert("content", content);
+        row.insert("content_base64", fallback);
+        assert!(
+            document
+                .rows_changed([lix::RowChange::upsert(
+                    LINE_SCHEMA_KEY,
+                    row_pk(first.id()).to_vec(),
+                    row,
+                )])
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn distant_structural_sql_edits_do_not_resend_unchanged_lines() {
+    let mut source = b"first\n".to_vec();
+    source.extend(b"unchanged\n".repeat(10_000));
+    source.extend(b"last\n");
+    let (document, _) = open(&source);
+    let (after, edits) = document
+        .rows_changed([
+            lix::RowChange::delete(LINE_SCHEMA_KEY, row_pk(document.lines()[1].id()).to_vec()),
+            lix::RowChange::delete(
+                LINE_SCHEMA_KEY,
+                row_pk(document.lines()[10_000].id()).to_vec(),
+            ),
+        ])
+        .unwrap();
+    assert_eq!(edits.len(), 2);
+    assert!(edits.iter().all(|edit| edit.insert.is_empty()));
+    assert_eq!(apply_edits(&source, &edits), after.bytes());
+}
+
+#[test]
+fn repeated_edits_do_not_retain_one_document_buffer_per_changed_line() {
+    let source = b"unchanged line\n".repeat(1_000);
+    let (mut document, _) = open(&source);
+    for index in 0..100 {
+        document = document
+            .file_changed(
+                &[FileEdit {
+                    offset: (index * 15) as u64,
+                    delete_len: 1,
+                    insert: b"U".to_vec(),
+                }],
+                |n| test_id(2, n),
+            )
+            .unwrap()
+            .0;
+    }
+    assert!(document.retained_backing_bytes() <= 3 * source.len());
+}
+
+#[test]
+fn content_edits_write_no_identity_state_and_deletions_retire_old_pages() {
+    #[derive(Default)]
+    struct Sink {
+        puts: usize,
+        deletes: usize,
+    }
+    impl crate::StateOutput for Sink {
+        fn put_state(&mut self, _: &[u8], _: &[u8]) -> ::lix::plugin::Result<()> {
+            self.puts += 1;
+            Ok(())
+        }
+        fn delete_state(&mut self, _: &[u8]) -> ::lix::plugin::Result<()> {
+            self.deletes += 1;
+            Ok(())
+        }
+    }
+    let (document, _) = open(&b"line\n".repeat(50_000));
+    let (manifest, pages) = encode_identities(&document.identities()).unwrap();
+    assert!(pages.len() > 1);
+    let (after, _) = document
+        .file_changed(
+            &[FileEdit {
+                offset: 0,
+                delete_len: 1,
+                insert: b"L".to_vec(),
+            }],
+            |n| test_id(2, n),
+        )
+        .unwrap();
+    let mut sink = Sink::default();
+    crate::replace_identity_pages(
+        Some(manifest.clone()),
+        |i| Ok(pages.get(i as usize).cloned()),
+        &mut sink,
+        &after,
+    )
+    .unwrap();
+    assert_eq!((sink.puts, sink.deletes), (0, 0));
+    let (empty, _) = open(b"");
+    crate::replace_identity_pages(
+        Some(manifest),
+        |i| Ok(pages.get(i as usize).cloned()),
+        &mut sink,
+        &empty,
+    )
+    .unwrap();
+    assert_eq!((sink.puts, sink.deletes), (1, pages.len()));
+}
+
+#[test]
+fn randomized_byte_edits_replay_rows_render_and_hydrate_losslessly() {
+    let mut seed = 0x5eed_u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed as usize
+    };
+    let alphabet = [b'a', b'b', b'\r', b'\n', 0xff, 0xfe];
+    for _ in 0..10_000 {
+        let source = (0..next() % 80)
+            .map(|_| alphabet[next() % alphabet.len()])
+            .collect::<Vec<_>>();
+        let (before, _) = open(&source);
+        let start = next() % (source.len() + 1);
+        let delete = next() % (source.len() - start + 1);
+        let insert = (0..next() % 20)
+            .map(|_| alphabet[next() % alphabet.len()])
+            .collect::<Vec<_>>();
+        let mut expected = source.clone();
+        expected.splice(start..start + delete, insert.clone());
+        let (after, changes) = before
+            .file_changed(
+                &[FileEdit {
+                    offset: start as u64,
+                    delete_len: delete as u64,
+                    insert,
+                }],
+                |n| test_id(2, n),
+            )
+            .unwrap();
+        assert_eq!(after.bytes(), expected);
+        let (replayed, edits) = before.rows_changed(changes).unwrap();
+        assert_eq!(replayed, after);
+        assert_eq!(apply_edits(&source, &edits), expected);
+        assert_eq!(
+            Document::open_file_with_identities(expected, after.identities()).unwrap(),
+            after
+        );
+    }
+}
+
+#[test]
+#[ignore = "manual scaling probe; run with plugin_text opt-level=3 and --nocapture"]
+fn text_core_scaling_probe() {
+    use std::time::Instant;
+    fn median(mut run: impl FnMut()) -> f64 {
+        let mut samples = (0..5)
+            .map(|_| {
+                let start = Instant::now();
+                run();
+                start.elapsed().as_secs_f64() * 1000.0
+            })
+            .collect::<Vec<_>>();
+        samples.sort_by(f64::total_cmp);
+        samples[2]
+    }
+    println!(
+        "lines,bytes,open_ms,file_edit_ms,row_edit_ms,duplicate_ms,sparse_ms,sparse_insert_bytes"
+    );
+    for count in [1_000, 10_000, 100_000] {
+        let source = (0..count)
+            .map(|n| format!("line {n:08} with example content\n"))
+            .collect::<String>()
+            .into_bytes();
+        let (document, _) = open(&source);
+        let open_ms = median(|| {
+            std::hint::black_box(open(&source));
+        });
+        let splice = FileEdit {
+            offset: (source.len() / 2) as u64,
+            delete_len: 1,
+            insert: b"X".to_vec(),
+        };
+        let file_ms = median(|| {
+            std::hint::black_box(
+                document
+                    .file_changed(std::slice::from_ref(&splice), |n| test_id(2, n))
+                    .unwrap(),
+            );
+        });
+        let line = &document.lines()[count / 2];
+        let change = lix::RowChange::upsert(
+            LINE_SCHEMA_KEY,
+            row_pk(line.id()).to_vec(),
+            row_with_bytes(line, b"changed\n"),
+        );
+        let row_ms = median(|| {
+            std::hint::black_box(document.rows_changed([change.clone()]).unwrap());
+        });
+        let mut duplicate = b"head\n".to_vec();
+        duplicate.extend(b"same\n".repeat(count));
+        duplicate.extend(b"tail\n");
+        let (dup_document, _) = open(&duplicate);
+        duplicate[..4].copy_from_slice(b"HEAD");
+        let len = duplicate.len();
+        duplicate[len - 5..len - 1].copy_from_slice(b"TAIL");
+        let dup_splice = FileEdit {
+            offset: 0,
+            delete_len: duplicate.len() as u64,
+            insert: duplicate,
+        };
+        let duplicate_ms = median(|| {
+            std::hint::black_box(
+                dup_document
+                    .file_changed(std::slice::from_ref(&dup_splice), |n| test_id(2, n))
+                    .unwrap(),
+            );
+        });
+        let deletes = [
+            lix::RowChange::delete(LINE_SCHEMA_KEY, row_pk(document.lines()[1].id()).to_vec()),
+            lix::RowChange::delete(
+                LINE_SCHEMA_KEY,
+                row_pk(document.lines()[count - 2].id()).to_vec(),
+            ),
+        ];
+        let mut inserted = 0;
+        let sparse_ms = median(|| {
+            let (_, edits) = document.rows_changed(deletes.clone()).unwrap();
+            inserted = edits.iter().map(|edit| edit.insert.len()).sum::<usize>();
+            assert_eq!(edits.len(), 2);
+        });
+        println!(
+            "{count},{},{open_ms:.3},{file_ms:.3},{row_ms:.3},{duplicate_ms:.3},{sparse_ms:.3},{inserted}",
+            source.len()
+        );
+    }
 }

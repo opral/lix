@@ -450,7 +450,7 @@ required-features = ["sdk-tests", "storage-benches", "slatedb"]
 [[test]]
 name = "git_text_plugin"
 path = "tests/git_text_plugin.rs"
-required-features = ["sdk-tests", "storage-benches", "slatedb"]
+required-features = ["sdk-tests"]
 
 [[test]]
 name = "history_scaling_probe"
