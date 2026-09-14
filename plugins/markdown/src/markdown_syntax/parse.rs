@@ -18,6 +18,37 @@ use crate::{
     validate::is_directive_name,
 };
 
+pub(crate) const MAX_NESTING: usize = 64;
+
+std::thread_local! {
+    static PARSE_NESTING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct NestingGuard;
+impl NestingGuard {
+    fn enter(diagnostics: &mut Vec<Diagnostic>) -> Option<Self> {
+        PARSE_NESTING.with(|depth| {
+            if depth.get() >= MAX_NESTING {
+                diagnostics.push(Diagnostic::new(
+                    DiagnosticSeverity::Error,
+                    DiagnosticCode::InvalidDocument,
+                    Span::new(0, 0),
+                    format!("Markdown nesting exceeds the supported limit of {MAX_NESTING}"),
+                ));
+                None
+            } else {
+                depth.set(depth.get() + 1);
+                Some(Self)
+            }
+        })
+    }
+}
+impl Drop for NestingGuard {
+    fn drop(&mut self) {
+        PARSE_NESTING.with(|depth| depth.set(depth.get() - 1));
+    }
+}
+
 /// The result of a tolerant parse: the document plus any diagnostics gathered
 /// along the way (empty on a clean parse).
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -195,6 +226,9 @@ fn parse_blocks_from_lines(
     definitions: &[String],
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<Block> {
+    let Some(_nesting) = NestingGuard::enter(diagnostics) else {
+        return Vec::new();
+    };
     let mut blocks = Vec::new();
     let mut index = 0;
 
@@ -4207,6 +4241,9 @@ fn parse_inlines_with_context(
     diagnostics: &mut Vec<Diagnostic>,
     context: InlineContext,
 ) -> Vec<Inline> {
+    let Some(_nesting) = NestingGuard::enter(diagnostics) else {
+        return Vec::new();
+    };
     let bytes = input.as_bytes();
     let mut nodes = Vec::new();
     let mut text_start = 0;

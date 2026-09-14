@@ -743,3 +743,25 @@ fn qa_ambiguous_emphasis_with_escaped_table_pipe_imports() {
         "emphasis"
     );
 }
+
+#[test]
+fn qa_excessive_block_nesting_returns_an_error() {
+    let source = format!("{}a\n", "> ".repeat(1_000));
+    assert!(matches!(
+        Document::open_file(
+            source.into_bytes(),
+            Some("depth.md"),
+            IdNamespace::from_halves(38, 1)
+        ),
+        Err(PluginError::InvalidInput(_))
+    ));
+    let source = format!("{}a\n", "> ".repeat(32));
+    assert!(
+        Document::open_file(
+            source.into_bytes(),
+            Some("depth.md"),
+            IdNamespace::from_halves(38, 2)
+        )
+        .is_ok()
+    );
+}

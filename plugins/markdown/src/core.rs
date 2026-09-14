@@ -1515,6 +1515,12 @@ fn build_tree(
     visiting: &mut BTreeSet<Uuid>,
     visited: &mut BTreeSet<Uuid>,
 ) -> Result<NodeTree, PluginError> {
+    if visiting.len() >= crate::parse::MAX_NESTING {
+        return Err(PluginError::InvalidInput(format!(
+            "Markdown row graph nesting exceeds the supported limit of {}",
+            crate::parse::MAX_NESTING,
+        )));
+    }
     if !visiting.insert(node.id) {
         return Err(PluginError::InvalidInput(format!(
             "Markdown graph contains a cycle at node '{}'",
