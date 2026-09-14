@@ -8,10 +8,14 @@ async fn main() -> anyhow::Result<()> {
     if !arguments.is_empty()
         && arguments != ["inventory-authorities"]
         && arguments != ["migrate-authorities"]
-        && !(arguments.len() == 2 && arguments[0] == "upgrade-authority")
+        && !(arguments.len() == 2
+            && matches!(
+                arguments[0].as_str(),
+                "upgrade-authority" | "inspect-physical"
+            ))
     {
         anyhow::bail!(
-            "usage: lix-server [inventory-authorities | migrate-authorities | upgrade-authority <repository-id>]"
+            "usage: lix-server [inventory-authorities | migrate-authorities | upgrade-authority <repository-id> | inspect-physical <storage-id>]"
         );
     }
     let telemetry = telemetry::init();
@@ -38,6 +42,28 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(not(feature = "offline-migration"))]
         anyhow::bail!(
             "Fleet migration requires the detached offline-migration tool build and stopped serving hosts."
+        );
+    }
+    if arguments
+        .first()
+        .is_some_and(|command| command == "inspect-physical")
+    {
+        #[cfg(feature = "offline-migration")]
+        {
+            let manager = LixRuntimeManager::new(&config, telemetry.lix_sink)?;
+            let inspection = manager.inspect_physical_offline(&arguments[1]).await?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "physicalStorageId": arguments[1], "inspection": inspection,
+                    "hostedIdentityResolved": false,
+                }))?
+            );
+            return Ok(());
+        }
+        #[cfg(not(feature = "offline-migration"))]
+        anyhow::bail!(
+            "Physical inspection requires the detached offline-migration build and stopped writers or an isolated copy; opening SlateDB may write physical metadata."
         );
     }
     if let [_, lix_id] = arguments.as_slice() {

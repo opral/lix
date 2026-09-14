@@ -13,6 +13,33 @@ pub struct AuthorityMigrationReport {
 }
 
 impl LixRuntimeManager {
+    /// Offline physical-format inspection only, never proof of hosted identity.
+    /// SlateDB opening can update physical metadata/compact: use an isolated copy
+    /// or hold the external serving/restart barrier. This is not a production
+    /// read-only inventory command and never creates a missing physical store.
+    pub async fn inspect_physical_offline(
+        self: Arc<Self>,
+        id: &str,
+    ) -> Result<lix_sdk::migration::RepositoryInspection> {
+        let manager = Arc::try_unwrap(self)
+            .map_err(|_| anyhow::anyhow!("physical inspection requires an offline manager"))?;
+        if !valid_lix_id(id) {
+            anyhow::bail!("invalid physical storage identifier");
+        }
+        if !manager.state.lock().await.entries.is_empty() {
+            anyhow::bail!("close repository runtimes before physical inspection");
+        }
+        if !manager.legacy_storage_present(id).await? {
+            anyhow::bail!("physical storage is missing; inspection never initializes it");
+        }
+        let storage = manager.open_storage(id, SlateDBIoCounters::default())?;
+        let result = lix_sdk::migration::inspect_repository(storage.clone()).await;
+        // SlateDBWorkerInner::drop joins its worker and drains close; keep this
+        // explicit for both successful inspection and decoder/format failures.
+        drop(storage);
+        Ok(result?)
+    }
+
     /// Copies physical objects before migration and records exact source versions.
     /// This does not open an engine or drop any source/receipt data.
     async fn backup_authority(&self, id: &str, storage_id: &str) -> Result<String> {
@@ -314,6 +341,15 @@ mod tests {
             .await
             .unwrap();
     }
+    #[tokio::test]
+    async fn missing_physical_inspection_never_initializes_storage() {
+        let manager = LixRuntimeManager::new_in_memory(1);
+        let (objects, _) = manager.catalog_store();
+        let error = manager.inspect_physical_offline(ID).await.unwrap_err();
+        assert!(error.to_string().contains("physical storage is missing"));
+        assert!(objects.list(None).try_next().await.unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn missing_physical_source_never_publishes_backup() {
         let manager = LixRuntimeManager::new_in_memory(1);
