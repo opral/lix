@@ -76,6 +76,7 @@ where
             ctx.changelog_query_source(),
             Arc::clone(&catalog),
             ctx.read_interest_registry(),
+            ctx.blob_reader(),
         );
     }
     if catalog
@@ -547,7 +548,12 @@ where
             .surface(name)
             .is_some_and(|surface| scope.includes(surface) && selection.includes(surface))
     }) {
-        mainline::register_functions(session, ctx.changelog_query_source(), Arc::clone(catalog));
+        mainline::register_functions(
+            session,
+            ctx.changelog_query_source(),
+            Arc::clone(catalog),
+            ctx.blob_reader(),
+        );
     }
 
     Ok(())
@@ -594,6 +600,7 @@ where
             read_ctx.changelog_query_source(),
             Arc::clone(&catalog),
             read_ctx.read_interest_registry(),
+            read_ctx.blob_reader(),
         );
     }
     if catalog

@@ -20,7 +20,7 @@ import { openLix } from "@lix-js/sdk";
 
 const lix = await openLix();
 const changedFiles = await lix.execute(
-  `SELECT row_ref, id, diff_type, from_path, to_path, row_count
+  `SELECT row_ref, id, diff_type, from_path, to_path
    FROM lix_diff('lix_file')
    ORDER BY coalesce(to_path, from_path)`,
 );
@@ -52,26 +52,36 @@ working changes.
 ## Diff rows
 
 Every relation diff exposes `row_ref`, the relation's typed primary-key
-columns, `diff_type`, `row_count`, and a
+columns, `diff_type`, and a
 `from_<column>` / `to_<column>` pair for each non-primary-key column of the compared relation.
 `diff_type` is `added`, `modified`, or `removed`. Added rows have empty `from_`
 values; removed rows have empty `to_` values. Use
 `coalesce(to_path, from_path)` when displaying a path that also covers removed
 or renamed files.
 
-Projecting `from_content` or `to_content` for `lix_file` is unsupported because
-reconstructing historical file bytes would turn lightweight diff reads into blob
-materialization. Query `lix_as_of('lix_file', commit_id)` when file bytes are
-required.
-
-`row_count` is `1` for a changed schema row. For a file it counts the underlying
-descriptor and content rows contributing to the aggregate:
+Project `from_content` and `to_content` to reconstruct historical file bytes.
+Absent sides are SQL `NULL`; an existing empty file is an empty `BYTEA`.
+Content is only materialized when projected or used by a predicate. File
+metadata predicates, including `id`, `from_path`, and `to_path`, select rows
+before content materialization. A content predicate itself requires reading
+bytes. Projecting content, including in a working diff, can require fetching
+deferred historical state or blob chunks on partial replicas. Metadata-only
+working diffs retain their existing HOT read contract. Missing inputs produce
+typed hydration demands, never a null value for an existing file.
 
 ```sql
-SELECT count(*) AS changed_files, sum(row_count) AS changed_rows
-FROM lix_diff(
-  'lix_file'
-);
+SELECT id, diff_type, from_content, to_content
+FROM lix_diff('lix_file', $1, $2)
+WHERE id = $3;
+```
+
+Count the relation being displayed. `row_count` is no longer an engine diff
+column: internal descriptor/content records do not describe a user-facing edit
+count. For example, count file diff rows for changed files, or query a plugin
+relation and count its diff rows for changed entities.
+
+```sql
+SELECT count(*) AS changed_files FROM lix_diff('lix_file');
 ```
 
 `lix_diff('lix_directory', ...)` supports changes to directory descriptors,

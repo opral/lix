@@ -31,7 +31,7 @@ simulation_test!(
             select_rows(
                 &session,
                 &format!(
-                    "SELECT key, diff_type, from_value, to_value, row_count \
+                    "SELECT key, diff_type, from_value, to_value \
                  FROM lix_diff('lix_key_value', '{baseline}', '{inserted}')"
                 ),
             )
@@ -41,7 +41,6 @@ simulation_test!(
                 Value::Text("added".to_string()),
                 Value::Null,
                 Value::Jsonb(json!("first").into()),
-                Value::Integer(1),
             ]]
         );
 
@@ -102,7 +101,7 @@ simulation_test!(
             select_rows(
                 &session,
                 &format!(
-                    "SELECT diff_type, from_value, to_value, row_count \
+                    "SELECT diff_type, from_value, to_value \
                  FROM lix_diff('lix_key_value', '{inserted}', '{updated}') \
                  WHERE key = 'note'"
                 ),
@@ -112,7 +111,6 @@ simulation_test!(
                 Value::Text("modified".to_string()),
                 Value::Jsonb(json!("first").into()),
                 Value::Jsonb(json!("second").into()),
-                Value::Integer(1),
             ]]
         );
     }
@@ -277,7 +275,7 @@ simulation_test!(
         let added = select_rows(
             &session,
             &format!(
-                "SELECT id, diff_type, from_path, to_path, row_count \
+                "SELECT id, diff_type, from_path, to_path \
              FROM lix_diff('lix_file', '{baseline}', '{inserted}')"
             ),
         )
@@ -286,12 +284,11 @@ simulation_test!(
         assert_eq!(added[0][1], Value::Text("added".to_string()));
         assert_eq!(added[0][2], Value::Null);
         assert_eq!(added[0][3], Value::Text("/note.txt".to_string()));
-        assert!(matches!(added[0][4], Value::Integer(count) if count >= 2));
         assert_eq!(
             select_rows(
                 &session,
                 &format!(
-                    "SELECT diff_type, from_path, to_path, row_count \
+                    "SELECT diff_type, from_path, to_path \
                  FROM lix_diff('lix_file', '{inserted}', '{baseline}')"
                 ),
             )
@@ -300,7 +297,6 @@ simulation_test!(
                 Value::Text("removed".to_string()),
                 Value::Text("/note.txt".to_string()),
                 Value::Null,
-                added[0][4].clone(),
             ]],
             "reversing a file addition swaps sides and inverts its classification",
         );
@@ -324,13 +320,13 @@ simulation_test!(
             select_rows(
                 &session,
                 &format!(
-                    "SELECT count(*), sum(row_count) \
+                    "SELECT count(*) \
                  FROM lix_diff('lix_file', '{baseline}', '{inserted}')"
                 ),
             )
             .await,
-            vec![vec![Value::Integer(1), added[0][4].clone()]],
-            "counts operate on aggregated file rows and retain underlying atom counts",
+            vec![vec![Value::Integer(1)]],
+            "counts operate on logical file rows",
         );
 
         session
@@ -432,18 +428,16 @@ simulation_test!(
             assert_eq!(rows[index][1], Value::Text("added".to_string()));
         }
 
-        let error = session
-            .execute(
-                "SELECT from_content, to_content FROM lix_diff('lix_file')",
-                &[],
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT from_content, to_content FROM lix_diff('lix_file') ORDER BY to_path"
             )
-            .await
-            .expect_err("the existing diff schema must keep file content unsupported");
-        assert!(
-            error
-                .message
-                .contains("does not support content projection"),
-            "unexpected error: {error:?}"
+            .await,
+            vec![
+                vec![Value::Null, Value::Blob(b"one".to_vec().into())],
+                vec![Value::Null, Value::Blob(b"two".to_vec().into())]
+            ]
         );
     }
 );
@@ -506,7 +500,7 @@ simulation_test!(
             select_rows(
                 &session,
                 &format!(
-                    "SELECT diff_type, from_path, to_path, row_count \
+                    "SELECT diff_type, from_path, to_path \
                  FROM lix_diff('lix_directory', '{baseline}', '{inserted}')"
                 ),
             )
@@ -515,7 +509,6 @@ simulation_test!(
                 Value::Text("added".to_string()),
                 Value::Null,
                 Value::Text("/docs".to_string()),
-                Value::Integer(1),
             ]]
         );
 
@@ -601,21 +594,10 @@ simulation_test!(
             .expect_err("unknown relations must be rejected");
         assert!(unsupported.message.contains("does not support relation"));
 
-        let file_content = session
-            .execute(
-                "SELECT from_content, to_content FROM lix_diff(\
-                 'lix_file', lix_root_commit_id(), lix_active_branch_commit_id()\
-             )",
-                &[],
-            )
-            .await
-            .expect_err("aggregate file bytes are deliberately unsupported");
-        assert!(
-            file_content
-                .message
-                .contains("does not support content projection")
-        );
-        assert!(file_content.message.contains("lix_as_of"));
+        let file_content = session.execute(
+            "SELECT from_content, to_content FROM lix_diff('lix_file', lix_root_commit_id(), lix_active_branch_commit_id())", &[])
+            .await.expect("empty file diffs support content projection");
+        assert_eq!(file_content.columns(), ["from_content", "to_content"]);
     }
 );
 
@@ -672,7 +654,7 @@ simulation_test!(
             select_rows(
                 &session,
                 &format!(
-                    "SELECT id, diff_type, row_count, \
+                    "SELECT id, diff_type, \
                  from_diff_type, to_diff_type, from_row_count, to_row_count, \
                  from_depth, to_depth, from_from_path, to_from_path \
                  FROM lix_diff('diff_name_collision', '{baseline}', '{head}')"
@@ -682,7 +664,6 @@ simulation_test!(
             vec![vec![
                 Value::Text("row-1".to_string()),
                 Value::Text("added".to_string()),
-                Value::Integer(1),
                 Value::Null,
                 Value::Text("user-kind".to_string()),
                 Value::Null,
@@ -694,7 +675,7 @@ simulation_test!(
             ]]
         );
 
-        for retired in ["lixcol_diff_type", "lixcol_row_count"] {
+        for retired in ["lixcol_diff_type", "lixcol_row_count", "row_count"] {
             let error = session
             .execute(
                 &format!(
@@ -710,7 +691,7 @@ simulation_test!(
                 error.message
             );
             assert!(
-                error.message.contains("Did you mean"),
+                retired == "row_count" || error.message.contains("Did you mean"),
                 "renamed diff columns should preserve DataFusion's near-match guidance: {}",
                 error.message
             );
@@ -924,6 +905,68 @@ simulation_test!(
                 expected,
                 "working and explicit ranges must reconstruct paths through unchanged parents: {arguments}",
             );
+        }
+    }
+);
+
+simulation_test!(
+    file_diff_content_preserves_absent_empty_and_renamed_sides,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        let id = "0193182b-2a72-7ed5-9015-76bf271af333";
+        let steps = [
+            (
+                "INSERT INTO lix_file(id,path,content) VALUES ($1, '/empty', CAST('' AS BYTEA))",
+                "added",
+                Value::Null,
+                Value::Blob(Vec::new().into()),
+            ),
+            (
+                "UPDATE lix_file SET path='/renamed' WHERE id=$1",
+                "modified",
+                Value::Blob(Vec::new().into()),
+                Value::Blob(Vec::new().into()),
+            ),
+            (
+                "UPDATE lix_file SET content=CAST('next' AS BYTEA) WHERE id=$1",
+                "modified",
+                Value::Blob(Vec::new().into()),
+                Value::Blob(b"next".to_vec().into()),
+            ),
+            (
+                "DELETE FROM lix_file WHERE id=$1",
+                "removed",
+                Value::Blob(b"next".to_vec().into()),
+                Value::Null,
+            ),
+        ];
+        for (sql, kind, old, new) in steps {
+            let before = engine
+                .load_branch_head_commit_id(sim.main_branch_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .to_string();
+            session
+                .execute(sql, &[Value::Text(id.into())])
+                .await
+                .unwrap();
+            let after = engine
+                .load_branch_head_commit_id(sim.main_branch_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .to_string();
+            for source in [
+                format!("lix_diff('lix_file', '{before}', '{after}')"),
+                format!("lix_history('lix_file', '{after}')"),
+            ] {
+                assert_eq!(select_rows(&session, &format!("SELECT diff_type, from_content, to_content FROM {source} WHERE id='{id}' AND lixcol_to_commit_id='{after}'")).await,
+                vec![vec![Value::Text(kind.into()), old.clone(), new.clone()]]);
+            }
+            assert_eq!(select_rows(&session, &format!("SELECT from_content, to_content FROM lix_diff('lix_file', '{after}', '{before}') WHERE id='{id}'")).await,
+            vec![vec![new, old]]);
         }
     }
 );
