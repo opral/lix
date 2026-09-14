@@ -139,7 +139,6 @@ simulation_test!(
         assert_eq!(no_op.rows_affected(), 0);
         assert_eq!(no_op.columns(), ["id", "title"]);
         assert!(no_op.rows().is_empty());
-
     }
 );
 
@@ -311,7 +310,6 @@ simulation_test!(
                 Value::Boolean(false),
             ]],
         );
-
     }
 );
 
@@ -548,3 +546,254 @@ simulation_test!(
             .expect("transaction should commit the successful statement");
     }
 );
+
+simulation_test!(
+    returning_old_new_global_and_untracked_rows,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let global = sim.wrap_session(
+            engine.open_session_at(lix::GLOBAL_BRANCH_ID).await.unwrap(),
+            &engine,
+        );
+        global.execute("INSERT INTO lix_key_value (key, value, lixcol_global) VALUES ('image-inherited', 'global-before', true)", &[]).await.unwrap();
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        let inherited = global.execute("INSERT INTO lix_key_value (key, value, lixcol_global) VALUES ('image-inherited', 'local-after', true) ON CONFLICT(key) DO UPDATE SET value = excluded.value RETURNING OLD.value, NEW.value", &[]).await.unwrap();
+        assert_rows_eq(
+            inherited,
+            vec![vec![
+                Value::Jsonb(serde_json::json!("global-before").into()),
+                Value::Jsonb(serde_json::json!("local-after").into()),
+            ]],
+        );
+        session.execute("INSERT INTO lix_key_value (key, value, lixcol_untracked) VALUES ('image-untracked', 'before', true)", &[]).await.unwrap();
+        let updated = session.execute("UPDATE lix_key_value SET value = 'after' WHERE key = 'image-untracked' RETURNING OLD.value, NEW.value, OLD.lixcol_untracked, NEW.lixcol_untracked", &[]).await.unwrap();
+        assert_rows_eq(
+            updated,
+            vec![vec![
+                Value::Jsonb(serde_json::json!("before").into()),
+                Value::Jsonb(serde_json::json!("after").into()),
+                Value::Boolean(true),
+                Value::Boolean(true),
+            ]],
+        );
+        let deleted = session.execute("DELETE FROM lix_key_value WHERE key = 'image-untracked' RETURNING OLD.value, NEW.value", &[]).await.unwrap();
+        assert_rows_eq(
+            deleted,
+            vec![vec![
+                Value::Jsonb(serde_json::json!("after").into()),
+                Value::Null,
+            ]],
+        );
+    }
+);
+
+simulation_test!(returning_old_new_transaction_images, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    session
+        .execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/cycle.txt', CAST('A' AS BYTEA))",
+            &[],
+        )
+        .await
+        .unwrap();
+    let before = session
+        .execute("SELECT lix_active_branch_commit_id()", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .values()[0]
+        .clone();
+    let mut transaction = session.begin_transaction().await.unwrap();
+    for (old, new) in [("A", "B"), ("B", "A")] {
+        let result = transaction.execute("UPDATE lix_file SET content = $1 WHERE path = '/cycle.txt' RETURNING OLD.content, NEW.content", &[Value::Blob(new.as_bytes().to_vec().into())]).await.unwrap();
+        assert_rows_eq(
+            result,
+            vec![vec![
+                Value::Blob(old.as_bytes().to_vec().into()),
+                Value::Blob(new.as_bytes().to_vec().into()),
+            ]],
+        );
+    }
+    // Failure in an image expression restores this statement and retains both
+    // successful statements that preceded it in the transaction.
+    let error = transaction.execute("UPDATE lix_file SET path = '/invalid' WHERE path = '/cycle.txt' RETURNING OLD.path, CAST(NEW.name AS BIGINT)", &[]).await.unwrap_err();
+    assert_eq!(error.code, "LIX_TYPE_MISMATCH");
+    transaction.commit().await.unwrap();
+    let after = session
+        .execute("SELECT lix_active_branch_commit_id()", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .values()[0]
+        .clone();
+    let diff = session
+        .execute(
+            "SELECT id FROM lix_diff('lix_file', $1, $2)",
+            &[before, after],
+        )
+        .await
+        .unwrap();
+    assert!(
+        diff.rows().is_empty(),
+        "statement transitions can have an empty net file diff"
+    );
+    assert_rows_eq(
+        session
+            .execute(
+                "SELECT path, content FROM lix_file WHERE path = '/cycle.txt'",
+                &[],
+            )
+            .await
+            .unwrap(),
+        vec![vec![
+            Value::Text("/cycle.txt".into()),
+            Value::Blob(b"A".to_vec().into()),
+        ]],
+    );
+});
+
+simulation_test!(returning_old_new_file_images, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    let inserted = session.execute("INSERT INTO lix_file (path, content) VALUES ('/images.txt', CAST('' AS BYTEA)) RETURNING OLD.content AS before, NEW.content AS after", &[]).await.unwrap();
+    assert_rows_eq(
+        inserted,
+        vec![vec![Value::Null, Value::Blob(vec![].into())]],
+    );
+    let upsert = session.execute("INSERT INTO lix_file (path, content) VALUES ('/images.txt', CAST('updated' AS BYTEA)), ('/inserted.txt', CAST('new' AS BYTEA)) ON CONFLICT (path) DO UPDATE SET content = excluded.content RETURNING path, OLD.content AS before, NEW.content AS after", &[]).await.unwrap();
+    assert_rows_eq(
+        upsert,
+        vec![
+            vec![
+                Value::Text("/images.txt".into()),
+                Value::Blob(vec![].into()),
+                Value::Blob(b"updated".to_vec().into()),
+            ],
+            vec![
+                Value::Text("/inserted.txt".into()),
+                Value::Null,
+                Value::Blob(b"new".to_vec().into()),
+            ],
+        ],
+    );
+    let renamed = session.execute("UPDATE lix_file SET path = '/renamed.txt', content = CAST('final' AS BYTEA) WHERE path = '/images.txt' RETURNING OLD.path AS before_path, NEW.path AS after_path, OLD.content AS before, NEW.content AS after", &[]).await.unwrap();
+    assert_rows_eq(
+        renamed,
+        vec![vec![
+            Value::Text("/images.txt".into()),
+            Value::Text("/renamed.txt".into()),
+            Value::Blob(b"updated".to_vec().into()),
+            Value::Blob(b"final".to_vec().into()),
+        ]],
+    );
+    let deleted = session.execute("DELETE FROM lix_file WHERE path = '/renamed.txt' RETURNING OLD.content AS before, NEW.content AS after, path", &[]).await.unwrap();
+    assert_rows_eq(
+        deleted,
+        vec![vec![
+            Value::Blob(b"final".to_vec().into()),
+            Value::Null,
+            Value::Text("/renamed.txt".into()),
+        ]],
+    );
+    let empty = session.execute("DELETE FROM lix_file WHERE path = '/absent.txt' RETURNING OLD.content AS before, NEW.content AS after", &[]).await.unwrap();
+    assert!(empty.rows().is_empty());
+    assert_eq!(
+        empty.column_types(),
+        &[lix::ResultColumnType::Blob, lix::ResultColumnType::Blob]
+    );
+});
+
+simulation_test!(
+    returning_old_new_native_rows_and_expressions,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        session.execute(r#"INSERT INTO lix_registered_schema (value) VALUES (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"image_counter","columns":[{"name":"id","type":"text","nullable":false},{"name":"n","type":"int8","nullable":false}],"primary_key":["id"]}' AS JSONB))"#, &[]).await.unwrap();
+        let inserted = session.execute("INSERT INTO image_counter (id,n) VALUES ('a',10) RETURNING OLD.n AS before, NEW.n AS after", &[]).await.unwrap();
+        assert_rows_eq(inserted, vec![vec![Value::Null, Value::Integer(10)]]);
+        let upsert = session.execute("INSERT INTO image_counter (id,n) VALUES ('a',20),('b',30) ON CONFLICT (id) DO UPDATE SET n = excluded.n RETURNING id, OLD.n AS before, NEW.n AS after", &[]).await.unwrap();
+        assert_rows_eq(
+            upsert,
+            vec![
+                vec![
+                    Value::Text("a".into()),
+                    Value::Integer(10),
+                    Value::Integer(20),
+                ],
+                vec![Value::Text("b".into()), Value::Null, Value::Integer(30)],
+            ],
+        );
+        let updated = session.execute("UPDATE image_counter SET n = n+1 WHERE id = 'a' RETURNING OLD.n AS before, NEW.n AS after, OLD.lixcol_change_id AS old_change, NEW.lixcol_change_id AS new_change", &[]).await.unwrap();
+        assert_eq!(
+            &updated.rows()[0].values()[0..2],
+            &[Value::Integer(20), Value::Integer(21)]
+        );
+        assert_ne!(updated.rows()[0].values()[2], updated.rows()[0].values()[3]);
+        let wildcard = session
+            .execute(
+                "UPDATE image_counter SET n = n WHERE id = 'a' RETURNING OLD.*, NEW.*",
+                &[],
+            )
+            .await
+            .unwrap();
+        let width = wildcard.columns().len() / 2;
+        assert_eq!(wildcard.columns()[..width], wildcard.columns()[width..]);
+        assert_eq!(wildcard.rows_affected(), 1);
+        let deleted = session.execute("DELETE FROM image_counter WHERE id = 'a' RETURNING OLD.n AS before, NEW.n AS after, n", &[]).await.unwrap();
+        assert_rows_eq(
+            deleted,
+            vec![vec![Value::Integer(21), Value::Null, Value::Integer(21)]],
+        );
+        assert!(
+            session
+                .execute("UPDATE image_counter SET n = OLD.n", &[])
+                .await
+                .is_err(),
+            "image qualifiers are scoped to RETURNING"
+        );
+    }
+);
+
+simulation_test!(returning_old_new_directory_and_branch, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    let inserted = session.execute("INSERT INTO lix_directory (path) VALUES ('/old-images') RETURNING OLD.path AS before, NEW.path AS after", &[]).await.unwrap();
+    assert_rows_eq(
+        inserted,
+        vec![vec![Value::Null, Value::Text("/old-images".into())]],
+    );
+    let updated = session.execute("UPDATE lix_directory SET path = '/new-images' WHERE path = '/old-images' RETURNING OLD.path AS before, NEW.path AS after", &[]).await.unwrap();
+    assert_rows_eq(
+        updated,
+        vec![vec![
+            Value::Text("/old-images".into()),
+            Value::Text("/new-images".into()),
+        ]],
+    );
+    let branch = session.execute("INSERT INTO lix_branch (id, name) VALUES ('72657475-726e-896e-872d-6272616e6302', 'old-images') RETURNING NEW.id AS id, OLD.name AS before, NEW.name AS after", &[]).await.unwrap();
+    assert_eq!(
+        &branch.rows()[0].values()[1..],
+        &[Value::Null, Value::Text("old-images".into())]
+    );
+    let id = branch.rows()[0].values()[0].clone();
+    let renamed = session.execute("UPDATE lix_branch SET name = 'new-images' WHERE id = $1 RETURNING OLD.name AS before, NEW.name AS after", &[id.clone()]).await.unwrap();
+    assert_rows_eq(
+        renamed,
+        vec![vec![
+            Value::Text("old-images".into()),
+            Value::Text("new-images".into()),
+        ]],
+    );
+    let deleted = session
+        .execute(
+            "DELETE FROM lix_branch WHERE id = $1 RETURNING OLD.name AS before, NEW.name AS after",
+            &[id],
+        )
+        .await
+        .unwrap();
+    assert_rows_eq(
+        deleted,
+        vec![vec![Value::Text("new-images".into()), Value::Null]],
+    );
+});

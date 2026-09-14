@@ -29,6 +29,7 @@
     { "path": "./surfaces.md", "label": "SQL Surfaces" },
     { "path": "./js-api-reference.md", "label": "JavaScript API" },
     { "path": "./sql-functions.md", "label": "SQL Functions" },
+    { "path": "./sql-returning.md", "label": "SQL RETURNING" },
     { "path": "./server-protocol.md", "label": "Server Protocol" }
   ]
 }

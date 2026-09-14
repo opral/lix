@@ -1046,6 +1046,7 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
             table_schema.as_ref(),
             plan.bound.returning.as_ref(),
             params,
+            matches!(plan.bound.op, BoundWriteOp::Delete),
         )?
     };
 
@@ -1554,12 +1555,22 @@ fn datafusion_dml_returning(
     table_schema: &Schema,
     returning: Option<&BoundReturning>,
     params: &[Value],
+    delete: bool,
 ) -> Result<Option<crate::sql2::providers::DmlReturning>, LixError> {
     let Some(returning) = returning else {
         return Ok(None);
     };
-    let df_schema =
-        DFSchema::try_from(table_schema.clone()).map_err(datafusion_error_to_lix_error)?;
+    let mut input_fields = Vec::new();
+    for qualifier in ["current", "old", "new"] {
+        for field in table_schema.fields() {
+            input_fields.push((
+                Some(datafusion::common::TableReference::bare(qualifier)),
+                std::sync::Arc::new(field.as_ref().clone().with_nullable(true)),
+            ));
+        }
+    }
+    let df_schema = DFSchema::new_with_metadata(input_fields, Default::default())
+        .map_err(datafusion_error_to_lix_error)?;
     let props = session.state_ref().read().execution_props().clone();
     let mut fields = Vec::with_capacity(returning.items.len());
     let mut expressions = Vec::with_capacity(returning.items.len());
@@ -1569,7 +1580,19 @@ fn datafusion_dml_returning(
         let expr = prepare_write_expr(
             session,
             &df_schema,
-            datafusion_expr_from_bound_expr(session, &item.expr, params)?,
+            datafusion_expr_from_bound_expr(session, &item.expr, params)?
+                .transform_up(|expr| {
+                    Ok(match expr {
+                        Expr::Column(mut column) if column.relation.is_none() => {
+                            column.relation =
+                                Some(datafusion::common::TableReference::bare("current"));
+                            Transformed::yes(Expr::Column(column))
+                        }
+                        expr => Transformed::no(expr),
+                    })
+                })
+                .map_err(datafusion_error_to_lix_error)?
+                .data,
         )?;
         let (_, inferred_field) = expr
             .to_field(&df_schema)
@@ -1593,7 +1616,64 @@ fn datafusion_dml_returning(
         std::sync::Arc::new(Schema::new(fields)),
         expressions,
         required_columns,
+        std::sync::Arc::new(table_schema.clone()),
+        delete,
+        returning_image_columns(
+            returning,
+            delete,
+            crate::sql2::bind::expr::ReturningImage::Old,
+        ),
+        returning_image_columns(
+            returning,
+            delete,
+            crate::sql2::bind::expr::ReturningImage::New,
+        ),
     )))
+}
+
+fn returning_image_columns(
+    returning: &BoundReturning,
+    delete: bool,
+    image: crate::sql2::bind::expr::ReturningImage,
+) -> BTreeSet<String> {
+    use crate::sql2::bind::expr::ReturningImage;
+    fn visit(
+        expr: &BoundExpr,
+        default: ReturningImage,
+        image: ReturningImage,
+        columns: &mut BTreeSet<String>,
+    ) {
+        match expr {
+            BoundExpr::Column(column) if column.image.unwrap_or(default) == image => {
+                columns.insert(column.name.clone());
+            }
+            BoundExpr::Cast { expr, .. } => visit(expr, default, image, columns),
+            BoundExpr::Function { args, .. } => {
+                for expr in args {
+                    visit(expr, default, image, columns);
+                }
+            }
+            BoundExpr::Binary { left, right, .. } => {
+                visit(left, default, image, columns);
+                visit(right, default, image, columns);
+            }
+            _ => {}
+        }
+    }
+    let mut columns = BTreeSet::new();
+    for item in &returning.items {
+        visit(
+            &item.expr,
+            if delete {
+                ReturningImage::Old
+            } else {
+                ReturningImage::New
+            },
+            image,
+            &mut columns,
+        );
+    }
+    columns
 }
 
 fn bound_expr_column_names(expr: &BoundExpr, columns: &mut BTreeSet<String>) {
@@ -1983,7 +2063,10 @@ fn datafusion_expr_from_bound_expr(
     params: &[Value],
 ) -> Result<Expr, LixError> {
     match expr {
-        BoundExpr::Column(column) => Ok(Expr::Column(Column::from_name(column.name.clone()))),
+        BoundExpr::Column(column) => Ok(Expr::Column(match column.image {
+            Some(image) => Column::new(Some(image.qualifier()), column.name.clone()),
+            None => Column::from_name(column.name.clone()),
+        })),
         // `excluded.<col>` resolves to the proposed row's value, carried in the
         // augmented conflict batch as an `excluded.<col>` column.
         BoundExpr::ExcludedColumn(column) => Ok(Expr::Column(Column::from_name(

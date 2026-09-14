@@ -488,11 +488,14 @@ async fn run_pending_native_conversion(
         thread.join().unwrap();
         return;
     }
-    let first = crate::convert_replica_to_partial(
+    // Conversion contains several migration phases. Keep that future on the
+    // heap so this end-to-end fixture leaves room for ordinary SQL execution
+    // on the default test-thread stack.
+    let first = Box::pin(crate::convert_replica_to_partial(
         local_storage.clone(),
         options.clone(),
         Some(&requested_branch),
-    )
+    ))
     .await;
     assert!(first.is_err());
     assert!(lost.load(Ordering::SeqCst));
@@ -524,11 +527,11 @@ async fn run_pending_native_conversion(
     drop(owned);
     let mut completed = false;
     for _ in 0..3 {
-        let result = crate::convert_replica_to_partial(
+        let result = Box::pin(crate::convert_replica_to_partial(
             local_storage.clone(),
             options.clone(),
             Some(&requested_branch),
-        )
+        ))
         .await;
         if result.is_ok() {
             completed = true;
