@@ -21,7 +21,8 @@ const ID_NAMESPACE_STATE: &[u8] = b"excalidraw/id-namespace";
 const ELEMENT_INDEX_MAGIC: &[u8; 4] = b"EXS2";
 const ELEMENT_INDEX_HEADER_BYTES: u32 = 16;
 const ELEMENT_INDEX_ENTRY_BYTES: u32 = 32;
-const ELEMENT_INDEX_PAGE_BYTES: usize = 1024 * 1024;
+// Leave room for the state key and protocol overhead under the default 1 MiB limit.
+const ELEMENT_INDEX_PAGE_BYTES: usize = 512 * 1024;
 const MAX_ELEMENT_SHIFT_RECORDS: usize = 4096;
 const SCENE_SCHEMA_JSON: &str = include_str!("../schema/excalidraw_scene.json");
 const ELEMENT_SCHEMA_JSON: &str = include_str!("../schema/excalidraw_element.json");

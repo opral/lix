@@ -903,3 +903,27 @@ fn qa_first_file_insert_delete_and_reordered_whitespace_restore_exactly() {
         );
     }
 }
+
+#[test]
+fn qa_long_ids_use_bounded_index_pages_under_default_limits() {
+    let h = Harness::<ExcalidrawPlugin>::default();
+    let value = json!({"elements":(0..1100).map(|i|json!({"id":format!("{i:04}{}","x".repeat(2000)),"type":"rectangle"})).collect::<Vec<_>>()});
+    let file = Snapshot {
+        path: "long-ids.excalidraw".into(),
+        bytes: serde_json::to_vec(&value).unwrap(),
+        ..Snapshot::default()
+    };
+    let out = h.parse(&file, ctx(1)).unwrap();
+    assert!(out.snapshot().state.len() > 8);
+    assert!(
+        out.snapshot()
+            .state
+            .values()
+            .all(|value| value.len() <= 512 * 1024)
+    );
+    let edit = replace(out.snapshot(), "\"rectangle\"", "\"ellipse\"");
+    let changed = h
+        .parse_changes(out.snapshot(), &file.path, &[edit], None, ctx(2))
+        .unwrap();
+    assert_eq!(changed.row_changes.len(), 1);
+}
