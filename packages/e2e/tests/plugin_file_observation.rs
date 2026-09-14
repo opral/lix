@@ -517,3 +517,69 @@ async fn fresh_import_and_plugin_reselection_preserve_rows_across_rollback() {
 }
 
 mod json_row_mapping_qa;
+
+#[tokio::test]
+async fn markdown_sql_edits_and_documented_insert_survive_reopen() {
+    let storage = Memory::new();
+    let lix = open_lix().with_storage(storage.clone()).await.unwrap();
+    install_markdown(&lix).await;
+    lix.execute(
+        "INSERT INTO lix_file(path,content) VALUES('/sql-edit.md',$1)",
+        &[Value::Blob(b"`old`\n".to_vec().into())],
+    )
+    .await
+    .unwrap();
+    let rows = lix.execute("SELECT id, parent_id, lixcol_file_id, payload_json FROM markdown_node WHERE kind='paragraph'", &[]).await.unwrap();
+    let row = &rows.rows()[0];
+    let id: String = row.get("id").unwrap();
+    let root: String = row.get("parent_id").unwrap();
+    let file: String = row.get("lixcol_file_id").unwrap();
+    let Value::Jsonb(payload) = row.get::<Value>("payload_json").unwrap() else {
+        panic!("native JSONB payload")
+    };
+    let mut payload = payload.to_value();
+    payload["inline"][0]["value"] = serde_json::json!("new");
+    lix.execute(
+        "UPDATE markdown_node SET payload_json=$1 WHERE id=$2 AND lixcol_file_id=$3",
+        &[
+            Value::Text(payload.to_string()),
+            Value::Text(id.clone()),
+            Value::Text(file.clone()),
+        ],
+    )
+    .await
+    .unwrap();
+    lix.execute(
+        "UPDATE markdown_node SET order_key='40' WHERE id=$1",
+        &[Value::Text(id.clone())],
+    )
+    .await
+    .unwrap();
+    lix.execute("INSERT INTO markdown_node (kind,parent_id,order_key,payload_json,format_json,lixcol_file_id) VALUES ('paragraph',$1,'60','{\"inline\":[{\"type\":\"text\",\"value\":\"New paragraph.\"}]}','{}',$2)", &[Value::Text(root), Value::Text(file.clone())]).await.unwrap();
+    lix.close().await.unwrap();
+    let reopened = open_lix().with_storage(storage).await.unwrap();
+    let bytes = reopened
+        .execute(
+            "SELECT content FROM lix_file WHERE path='/sql-edit.md'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<Vec<u8>>("content")
+        .unwrap();
+    assert_eq!(bytes, b"`new`\n\nNew paragraph.\n");
+    let rows = reopened
+        .execute(
+            "SELECT payload_json FROM markdown_node WHERE id=$1 AND lixcol_file_id=$2",
+            &[Value::Text(id), Value::Text(file)],
+        )
+        .await
+        .unwrap();
+    let Value::Jsonb(payload) = rows.rows()[0].get::<Value>("payload_json").unwrap() else {
+        panic!("native JSONB payload")
+    };
+    let payload = payload.to_value();
+    assert_eq!(payload["inline"][0]["value"], "new");
+    reopened.close().await.unwrap();
+}
