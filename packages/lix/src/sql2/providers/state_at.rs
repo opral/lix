@@ -244,6 +244,70 @@ struct StateAtSpec<S> {
     blob_reader: Arc<dyn BlobDataReader>,
 }
 
+/// Materialize historical bytes only for the identities selected by a file diff.
+/// Reuse the historical relation so plugin reconstruction and replica demands
+/// have the same semantics as `lix_as_of`.
+pub(super) async fn diff_file_content<S>(
+    store: S,
+    blob_reader: Arc<dyn BlobDataReader>,
+    commit_id: &str,
+    active_branch_id: &str,
+    ids: &[String],
+) -> Result<std::collections::HashMap<String, Vec<u8>>>
+where
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    use datafusion::arrow::array::{Array, LargeBinaryArray, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::logical_expr::{col, lit};
+    use futures_util::TryStreamExt;
+    if ids.is_empty() {
+        return Ok(Default::default());
+    }
+    let spec = StateAtSpec {
+        store,
+        relation_name: "lix_file".into(),
+        kind: StateRelationKind::File,
+        schema: Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("content", DataType::LargeBinary, true),
+        ])),
+        commit_id: commit_id.into(),
+        root_commit_id: None,
+        active_branch_id: active_branch_id.into(),
+        blob_reader,
+    };
+    let filter = col("id").in_list(ids.iter().map(|id| lit(id.clone())).collect(), false);
+    let plan = spec
+        .plan_scan(None, &[filter], None, &ExecutionProps::new())
+        .await?;
+    let mut stream = plan
+        .source
+        .open(0, Arc::new(datafusion::execution::TaskContext::default()))?;
+    let mut content = std::collections::HashMap::new();
+    while let Some(batch) = stream.try_next().await? {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let bytes = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            if bytes.is_null(i) {
+                return Err(DataFusionError::Execution(
+                    "existing historical file has null content".into(),
+                ));
+            }
+            content.insert(ids.value(i).into(), bytes.value(i).to_vec());
+        }
+    }
+    Ok(content)
+}
+
 #[async_trait]
 impl<S> TableSpec for StateAtSpec<S>
 where

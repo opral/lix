@@ -333,7 +333,7 @@ impl<H: ProtocolHttp> ClientCore<H> {
         &self,
         statements: &[ExecuteBatchStatement],
         options: Option<ProtocolExecuteOptions>,
-    ) -> Result<Vec<ExecuteResult>, LixError> {
+    ) -> Result<crate::ExecuteBatchResult, LixError> {
         self.enqueue(|| async {
             self.with_session_recovery(|| self.execute_batch_raw(statements, options.clone()))
                 .await
@@ -409,7 +409,7 @@ impl<H: ProtocolHttp> ClientCore<H> {
         &self,
         statements: &[ExecuteBatchStatement],
         options: Option<ProtocolExecuteOptions>,
-    ) -> Result<Vec<ExecuteResult>, LixError> {
+    ) -> Result<crate::ExecuteBatchResult, LixError> {
         let prepared: Vec<(String, Option<String>, PreparedRequestParams)> = {
             let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             statements
@@ -463,7 +463,7 @@ impl<H: ProtocolHttp> ClientCore<H> {
                 options: request_options.clone(),
                 cache_blobs,
             };
-            self.request_json::<Vec<ExecuteResponseBody>, _>(
+            self.request_json::<wire::ExecuteBatchResponseBody, _>(
                 "POST",
                 url.clone(),
                 true,
@@ -488,10 +488,14 @@ impl<H: ProtocolHttp> ClientCore<H> {
                     .flat_map(|(_, _, item)| item.cache_updates.clone())
                     .collect::<Vec<_>>(),
             );
-        value
-            .into_iter()
-            .map(ExecuteResponseBody::into_execute_result)
-            .collect()
+        Ok(crate::ExecuteBatchResult {
+            results: value
+                .results
+                .into_iter()
+                .map(ExecuteResponseBody::into_execute_result)
+                .collect::<Result<_, _>>()?,
+            commit: value.commit,
+        })
     }
 
     async fn request_with_blob_fallback<F, Fut>(
@@ -1008,13 +1012,14 @@ impl<H: ProtocolHttp> ProtocolTransaction<H> {
             .await
     }
 
-    pub async fn commit(&self) -> Result<(), LixError> {
+    pub async fn commit(&self) -> Result<crate::CommitReceipt, LixError> {
         self.assert_active()?;
         self.core
             .enqueue(|| async {
                 self.assert_active()?;
-                self.core
-                    .request_json::<(), EmptyBody>(
+                let receipt = self
+                    .core
+                    .request_json::<crate::CommitReceipt, EmptyBody>(
                         "POST",
                         self.core.join_path("transaction/commit")?,
                         true,
@@ -1023,11 +1028,11 @@ impl<H: ProtocolHttp> ProtocolTransaction<H> {
                             self.transaction_id.clone(),
                         )]),
                         Some(EmptyBody {}),
-                        "empty",
+                        "json",
                     )
                     .await?;
                 self.active.store(false, Ordering::SeqCst);
-                Ok(())
+                Ok(receipt)
             })
             .await
     }

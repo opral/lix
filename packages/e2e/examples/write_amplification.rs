@@ -195,6 +195,7 @@ async fn seed<S: BenchStorage>(storage: S, rows: usize, seed_width: usize) {
             .execute_batch(&statements)
             .await
             .expect("insert seed chunk")
+            .results
             .iter()
             .map(lix::ExecuteResult::rows_affected)
             .sum::<u64>();

@@ -435,7 +435,9 @@ impl TableSpec for BranchSpec {
                             .map_err(lix_error_to_datafusion_error)?;
                     }
 
-                    returning.capture(returning.project(&post_image)?);
+                    returning.capture(
+                        returning.project_images(Some(&matched_batch), Some(&post_image))?,
+                    );
                     Ok(count)
                 }
                 .boxed()

@@ -9,3 +9,8 @@ path = "junit.xml"
 
 [profile.ci-e2e]
 inherits = "ci"
+
+# The optimized latency job runs separately from other E2E workloads.
+[profile.ci-latency]
+inherits = "ci"
+test-threads = 1

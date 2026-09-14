@@ -42,6 +42,7 @@ pub struct SessionTransaction<StorageImpl: Storage + 'static = Memory> {
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
     pub(super) sync_mode: SyncModeState,
     pub(super) has_started_statement: bool,
+    pub(super) has_written_statement: bool,
     /// Reusable storage only for SQL literals containing doubled quote
     /// escapes. Ordinary warm literals continue to borrow the SQL text.
     pub(super) prepared_literal_escape_scratch: SmallVec<[String; 4]>,
@@ -106,6 +107,9 @@ where
             replica_remote_id,
             self.sync_mode.partial_admission(),
         );
+        // An explicit SQL commit returns its own exact span; combining it
+        // with another transaction would include unrelated changes.
+        opened.transaction.require_individual_commit_span();
         opened
             .transaction
             .attach_commit_boundary(self.transaction_commit_boundary());
@@ -124,6 +128,7 @@ where
             telemetry: self.telemetry.clone(),
             sync_mode: self.sync_mode.clone(),
             has_started_statement: false,
+            has_written_statement: false,
             prepared_literal_escape_scratch: SmallVec::new(),
             prepared_literal_shape: crate::sql2::CachedUpdateLiteralShape::default(),
         })
@@ -160,7 +165,7 @@ where
             .ok_or_else(|| transaction_state_error("Lix transaction is closed"))
     }
 
-    pub async fn commit(mut self) -> Result<(), LixError> {
+    pub async fn commit(mut self) -> Result<crate::CommitReceipt, LixError> {
         // Explicit transactions may remain open across application awaits, so
         // they do not hold the collaboration gate while planning. Serialize
         // their commit-time revalidation and persistence with bounded writes.
@@ -218,11 +223,18 @@ where
                 .schedule_checkpoint_gc_after_commit(checkpoint_sequence)
                 .await;
         }
+        let receipt = crate::CommitReceipt {
+            commit: self
+                .has_written_statement
+                .then_some(outcome.active_branch_commit_span)
+                .flatten()
+                .map(crate::CommitSpan::from_commit_ids),
+        };
         self.session
             .flush_partial_read_interests()
             .await
-            .map_err(super::context::non_retryable_after_commit)?;
-        Ok(())
+            .map_err(|error| receipt.annotate_completion_error(error))?;
+        Ok(receipt)
     }
 
     pub async fn rollback(mut self) -> Result<(), LixError> {

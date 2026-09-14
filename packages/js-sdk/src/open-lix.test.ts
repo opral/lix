@@ -896,7 +896,7 @@ test("execute and executeBatch expose registered-row RETURNING postimages", asyn
 	expect(get(updated, "id")).toBe(taskId);
 	expect(get(updated, "title")).toBe("Updated through SDK RETURNING");
 
-	const [batched] = await lix.executeBatch([
+	const { results: [batched] } = await lix.executeBatch([
 		{
 			sql: "INSERT INTO crm_task (id, title, done) VALUES ($1, $2, $3) RETURNING id, title",
 			params: ["batched-returning-task", "Batched SDK RETURNING", true],
@@ -1198,7 +1198,7 @@ test("executeBatch propagates originKey to every write", async () => {
 		{ originKey: "batch-origin" },
 	);
 
-	expect(results.map((result) => result.rowsAffected)).toEqual([1, 1]);
+	expect(results.results.map((result) => result.rowsAffected)).toEqual([1, 1]);
 	expect(get(await currentFileChange(lix, firstFileId), "origin_key")).toBe(
 		"batch-origin",
 	);

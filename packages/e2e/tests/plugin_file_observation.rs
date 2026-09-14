@@ -259,6 +259,7 @@ async fn mixed_read_batches_only_acknowledge_returned_file_bytes() {
                         )
                         .await
                         .unwrap()
+                        .results
                 };
                 let result = &results[usize::from(!files_first)];
                 assert_eq!(result.len(), 1);

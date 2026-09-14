@@ -1,12 +1,12 @@
+use lix::session::CreateCheckpointReceipt;
 use lix::storage::Memory;
 use lix::{
-    CreateBranchOptions, CreateBranchReceipt, ExecuteResult,
-    MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
-    SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt,
+    CreateBranchOptions, CreateBranchReceipt, ExecuteResult, MergeBranchOptions,
+    MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt, SessionTransaction,
+    SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt,
 };
 use lix::{LixError, Value};
 use lix::{engine::Engine, init::InitReceipt, session::SessionContext};
-use lix::session::CreateCheckpointReceipt;
 
 use super::expect_same::SimulationAssertions;
 use super::mode::{SimulationMode, SimulationOptions};
@@ -433,7 +433,7 @@ impl SimTransaction {
         if result.is_ok() && self.saw_write {
             self.sim.rebuild_tracked_state.after_successful_write();
         }
-        result
+        result.map(|_| ())
     }
 
     pub async fn rollback(self) -> Result<(), LixError> {

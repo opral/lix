@@ -928,7 +928,9 @@ impl TableSpec for LixDirectorySpec {
                     let post_image = returning_spec
                         .returning_post_image(&write_ctx, &keys)
                         .await?;
-                    returning.capture(returning.project(&post_image)?);
+                    returning.capture(
+                        returning.project_images(Some(&matched_batch), Some(&post_image))?,
+                    );
                     Ok(count)
                 }
                 .boxed()

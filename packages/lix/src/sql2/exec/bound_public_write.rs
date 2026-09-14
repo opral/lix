@@ -2137,6 +2137,7 @@ mod active_branch_commit_id_reference_tests {
         let plan = update_plan(
             BoundPredicate::Eq(
                 BoundExpr::Column(BoundColumnRef {
+                    image: None,
                     table: "json_pointer".to_string(),
                     column_id: 0,
                     name: "value".to_string(),
@@ -2179,6 +2180,7 @@ mod active_branch_commit_id_reference_tests {
                 predicate,
                 assignments: vec![BoundAssignment {
                     column: BoundColumnRef {
+                        image: None,
                         table: "json_pointer".to_string(),
                         column_id: 1,
                         name: "value".to_string(),
@@ -3000,6 +3002,28 @@ async fn stage_rows_with_postimage_returning(
     mode: TransactionWriteMode,
     write_rows: RawWriteBatch,
 ) -> Result<SqlWriteResult, LixError> {
+    let needs_old = plan.bound.returning.as_ref().is_some_and(|r| {
+        r.items.iter().any(|item| {
+            item.expr
+                .references_image(crate::sql2::bind::expr::ReturningImage::Old)
+        })
+    });
+    let before = if needs_old
+        && !write_rows.is_empty()
+        && (plan.bound.op == BoundWriteOp::Update || plan.bound.conflict.is_some())
+    {
+        Some(scan_row_conflict_candidates(ctx, spec, &write_rows).await?)
+    } else {
+        None
+    };
+    let before_by_identity = before
+        .as_ref()
+        .map(|rows| {
+            rows.iter()
+                .map(|row| (row_live_returning_identity(row), row))
+                .collect::<std::collections::HashMap<_, _>>()
+        })
+        .unwrap_or_default();
     let returning_requires_staged_postimage =
         plan.bound.returning.as_ref().is_some_and(|returning| {
             returning
@@ -3017,6 +3041,7 @@ async fn stage_rows_with_postimage_returning(
             params,
             active_branch_commit_id,
             &write_rows,
+            &before_by_identity,
         )?
     };
     // Transaction staging materializes audit fields such as the change and
@@ -3034,6 +3059,7 @@ async fn stage_rows_with_postimage_returning(
                 params,
                 active_branch_commit_id,
                 &write_rows,
+                &before_by_identity,
             )
             .await?
         }
@@ -3055,6 +3081,7 @@ fn row_postimage_returning_rows(
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
     write_rows: &RawWriteBatch,
+    before: &std::collections::HashMap<RowReturningIdentity, MaterializedHotStateRowRef<'_>>,
 ) -> Result<Option<Vec<Vec<Value>>>, LixError> {
     let Some(returning) = plan.bound.returning.as_ref() else {
         return Ok(None);
@@ -3065,13 +3092,17 @@ fn row_postimage_returning_rows(
         // bytes. Decoding through `TransactionJson::value()` would panic for
         // those rows, so materialize the normalized representation here.
         let image = staged_row_image(row, "row post-image")?;
-        let context = RowEvalContext::staged(
+        let mut context = RowEvalContext::staged(
             image
                 .as_ref()
                 .map_or(RowImageRef::Empty, CandidateRowImage::as_ref),
             row,
             spec,
         );
+        context.returning_old = before
+            .get(&row_staged_returning_identity(row, spec)?)
+            .copied()
+            .map(Into::into);
         rows.push(row_returning_row(
             returning,
             &context,
@@ -3103,6 +3134,7 @@ async fn row_staged_postimage_returning_rows(
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
     write_rows: &RawWriteBatch,
+    before: &std::collections::HashMap<RowReturningIdentity, MaterializedHotStateRowRef<'_>>,
 ) -> Result<Option<Vec<Vec<Value>>>, LixError> {
     let Some(returning) = plan.bound.returning.as_ref() else {
         return Ok(None);
@@ -3150,7 +3182,8 @@ async fn row_staged_postimage_returning_rows(
                 ),
             )
         })?;
-        let context = RowEvalContext::live(image.as_ref(), candidate, spec);
+        let mut context = RowEvalContext::live(image.as_ref(), candidate, spec);
+        context.returning_old = before.get(&identity).copied().map(Into::into);
         rows.push(row_returning_row(
             returning,
             &context,
@@ -3340,7 +3373,9 @@ async fn row_delete(
         let Some(image) = candidate_row_image(candidate)? else {
             continue;
         };
-        let context = RowEvalContext::live(image.as_ref(), candidate, spec);
+        let mut context = RowEvalContext::live(image.as_ref(), candidate, spec);
+        context.returning_old = Some(candidate.into());
+        context.returning_new_absent = true;
         if predicate_matches(
             &plan.bound.predicate,
             &context,
@@ -3459,8 +3494,8 @@ fn returning_expr_column_type(
         {
             "lixcol_metadata" => Some(crate::ResultColumnType::Jsonb),
             "lixcol_global" | "lixcol_untracked" => Some(crate::ResultColumnType::Boolean),
-            "lixcol_file_id" | "lixcol_created_at" | "lixcol_updated_at"
-            | "lixcol_change_id" | "lixcol_commit_id" => Some(crate::ResultColumnType::Text),
+            "lixcol_file_id" | "lixcol_created_at" | "lixcol_updated_at" | "lixcol_change_id"
+            | "lixcol_commit_id" => Some(crate::ResultColumnType::Text),
             _ => None,
         },
         BoundExpr::Literal(BoundLiteral::Null) => Some(crate::ResultColumnType::Null),
@@ -5522,6 +5557,8 @@ fn inherited_metadata<'a>(
 }
 
 struct RowEvalContext<'a> {
+    returning_old: Option<RowLiveRowRef<'a>>,
+    returning_new_absent: bool,
     image: RowImageRef<'a>,
     row: Option<RowEvalRowRef<'a>>,
     excluded_image: Option<RowImageRef<'a>>,
@@ -5602,6 +5639,8 @@ impl<'a> RowEvalRowRef<'a> {
 impl<'a> RowEvalContext<'a> {
     fn insert(visible_columns: &'a [SchemaSurfaceColumn]) -> Self {
         Self {
+            returning_old: None,
+            returning_new_absent: false,
             image: RowImageRef::Empty,
             row: None,
             excluded_image: None,
@@ -5616,6 +5655,8 @@ impl<'a> RowEvalContext<'a> {
         spec: &'a SchemaSurfaceSpec,
     ) -> Self {
         Self {
+            returning_old: None,
+            returning_new_absent: false,
             image,
             row: Some(RowEvalRowRef::Live(row.into())),
             excluded_image: None,
@@ -5630,6 +5671,8 @@ impl<'a> RowEvalContext<'a> {
         spec: &'a SchemaSurfaceSpec,
     ) -> Self {
         Self {
+            returning_old: None,
+            returning_new_absent: false,
             image,
             row: Some(RowEvalRowRef::Staged(row)),
             excluded_image: None,
@@ -5646,6 +5689,8 @@ impl<'a> RowEvalContext<'a> {
         spec: &'a SchemaSurfaceSpec,
     ) -> Self {
         Self {
+            returning_old: None,
+            returning_new_absent: false,
             image,
             row: Some(RowEvalRowRef::Live(row.into())),
             excluded_image: Some(excluded_image),
@@ -5831,7 +5876,30 @@ fn eval_expr_value(
                     format!("missing SQL parameter ${}", param.index),
                 )
             }),
-        BoundExpr::Column(column) => column_eval_value(context, &column.name),
+        BoundExpr::Column(column) => match column.image {
+            Some(crate::sql2::bind::expr::ReturningImage::Old) => {
+                let Some(row) = context.returning_old else {
+                    return Ok(RowEvalValue::SqlNull);
+                };
+                let Some(image) = candidate_row_image(row)? else {
+                    return Ok(RowEvalValue::SqlNull);
+                };
+                let old = RowEvalContext {
+                    image: image.as_ref(),
+                    row: Some(RowEvalRowRef::Live(row)),
+                    excluded_image: None,
+                    excluded_row: None,
+                    returning_old: None,
+                    returning_new_absent: false,
+                    visible_columns: context.visible_columns,
+                };
+                column_eval_value(&old, &column.name)
+            }
+            Some(crate::sql2::bind::expr::ReturningImage::New) if context.returning_new_absent => {
+                Ok(RowEvalValue::SqlNull)
+            }
+            _ => column_eval_value(context, &column.name),
+        },
         BoundExpr::ExcludedColumn(column) => excluded_column_eval_value(context, &column.name),
         BoundExpr::Cast { expr, data_type } => {
             let value = eval_expr_value(expr, context, ctx, params, active_branch_commit_id)?;
@@ -7609,6 +7677,7 @@ mod primary_key_route_tests {
 
     fn column(name: &str) -> BoundExpr {
         BoundExpr::Column(BoundColumnRef {
+            image: None,
             table: "row".to_string(),
             column_id: 0,
             name: name.to_string(),

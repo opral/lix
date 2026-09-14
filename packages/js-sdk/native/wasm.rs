@@ -1065,17 +1065,18 @@ impl WasmLixTransaction {
     }
 
     #[wasm_bindgen(js_name = commit)]
-    pub async fn commit(&mut self) -> Result<(), JsValue> {
+    pub async fn commit(&mut self) -> Result<JsValue, JsValue> {
         let telemetry_parent = self
             .telemetry_parent
             .as_ref()
             .and_then(|parent| parent.borrow_mut().take());
-        instrument_remote_parent(
+        let receipt = instrument_remote_parent(
             telemetry_parent,
             crate::session::TransactionOperations::commit(&mut self.inner),
         )
         .await
-        .map_err(lix_error_to_js)
+        .map_err(lix_error_to_js)?;
+        to_js(&receipt)
     }
 
     #[wasm_bindgen(js_name = rollback)]
@@ -1848,4 +1849,10 @@ pub async fn migrate_js_storage_repository(
     .await
     .map_err(lix_error_to_js)?;
     to_js(&report)
+}
+
+#[derive(Serialize)]
+pub(super) struct ExecuteBatchResultDto {
+    pub(super) results: Vec<ExecuteResultDto>,
+    pub(super) commit: Option<lix::CommitSpan>,
 }

@@ -163,7 +163,7 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
     }
     for primary_key in &parsed.primary_key {
         let collides_with_envelope =
-            matches!(primary_key.as_str(), "row_ref" | "diff_type" | "row_count");
+            matches!(primary_key.as_str(), "row_ref" | "diff_type");
         let collides_with_side_column = ["from_", "to_"].iter().any(|prefix| {
             primary_key.strip_prefix(prefix).is_some_and(|unprefixed| {
                 parsed.columns.iter().any(|column| {
@@ -555,7 +555,7 @@ mod tests {
 
     #[test]
     fn rejects_primary_keys_that_collide_with_diff_columns() {
-        for primary_key in ["row_ref", "diff_type", "row_count"] {
+        for primary_key in ["row_ref", "diff_type"] {
             let schema = json!({
                 "$schema": "https://lix.dev/schema-v1.json",
                 "key": format!("reserved_{primary_key}"),

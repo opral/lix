@@ -266,13 +266,43 @@ fn bind_returning(
                     });
                 }
             }
-            SelectItem::QualifiedWildcard(_, _) => {
-                return Err(super::error::unsupported(format!(
-                    "qualified wildcards in {action} RETURNING are not supported"
-                )));
+            SelectItem::QualifiedWildcard(name, options) => {
+                reject_returning_wildcard_options(options, action)?;
+                let datafusion::sql::sqlparser::ast::SelectItemQualifiedWildcardKind::ObjectName(
+                    name,
+                ) = name
+                else {
+                    return Err(super::error::unsupported(
+                        "expression wildcards in RETURNING are not supported",
+                    ));
+                };
+                let qualifier = super::table::bind_exact_table_name(name)?;
+                let image = match qualifier.as_str() {
+                    "old" => Some(super::expr::ReturningImage::Old),
+                    "new" => Some(super::expr::ReturningImage::New),
+                    name if name == table.name => None,
+                    _ => {
+                        return Err(super::error::unsupported(format!(
+                            "unknown SQL table qualifier '{qualifier}'"
+                        )));
+                    }
+                };
+                for column in table
+                    .surface
+                    .columns
+                    .iter()
+                    .filter(|column| column.is_public())
+                {
+                    let mut reference = bind_public_column_ref(table, &column.name)?;
+                    reference.image = image;
+                    items.push(BoundReturningItem {
+                        expr: BoundExpr::Column(reference),
+                        output_name: column.name.clone(),
+                    });
+                }
             }
             SelectItem::UnnamedExpr(sql_expr) => {
-                let expr = bind_expr(table, sql_expr, params)?;
+                let expr = bind_expr_context(table, sql_expr, params, true)?;
                 let output_name = match &expr {
                     BoundExpr::Column(column) => column.name.clone(),
                     _ => sql_expr.to_string(),
@@ -281,7 +311,7 @@ fn bind_returning(
             }
             SelectItem::ExprWithAlias { expr, alias } => {
                 items.push(BoundReturningItem {
-                    expr: bind_expr(table, expr, params)?,
+                    expr: bind_expr_context(table, expr, params, true)?,
                     output_name: normalize_identifier(alias),
                 });
             }
@@ -909,6 +939,15 @@ fn bind_expr(
     expr: &Expr,
     params: &mut ParamBinder,
 ) -> Result<BoundExpr, LixError> {
+    bind_expr_context(table, expr, params, false)
+}
+
+fn bind_expr_context(
+    table: &BoundTable,
+    expr: &Expr,
+    params: &mut ParamBinder,
+    returning: bool,
+) -> Result<BoundExpr, LixError> {
     match expr {
         Expr::Identifier(ident) => {
             let column_name = normalize_identifier(ident);
@@ -919,6 +958,15 @@ fn bind_expr(
         }
         Expr::CompoundIdentifier(idents) if idents.len() == 2 => {
             let table_name = normalize_identifier(&idents[0]);
+            if returning && matches!(table_name.as_str(), "old" | "new") {
+                let mut column = bind_public_column_ref(table, &normalize_identifier(&idents[1]))?;
+                column.image = Some(if table_name == "old" {
+                    super::expr::ReturningImage::Old
+                } else {
+                    super::expr::ReturningImage::New
+                });
+                return Ok(BoundExpr::Column(column));
+            }
             if table_name != table.name {
                 return Err(super::error::unsupported(format!(
                     "unknown SQL table qualifier '{table_name}'"
@@ -931,7 +979,7 @@ fn bind_expr(
             )?))
         }
         Expr::Value(value) => bind_value(&value.value, params),
-        Expr::Nested(expr) => bind_expr(table, expr, params),
+        Expr::Nested(expr) => bind_expr_context(table, expr, params, returning),
         Expr::Cast {
             kind,
             expr,
@@ -945,13 +993,15 @@ fn bind_expr(
             *array,
             format.is_some(),
             params,
-            |expr, params| bind_expr(table, expr, params),
+            |expr, params| bind_expr_context(table, expr, params, returning),
         ),
         Expr::UnaryOp {
             op: UnaryOperator::Minus,
             expr,
         } => bind_negative_number_expr(expr),
-        Expr::Function(function) => bind_function_expr(table, function, params),
+        Expr::Function(function) => bind_function(function, params, |expr, params| {
+            bind_expr_context(table, expr, params, returning)
+        }),
         Expr::BinaryOp { left, op, right }
             if matches!(op, BinaryOperator::Arrow | BinaryOperator::LongArrow) =>
         {
@@ -963,15 +1013,15 @@ fn bind_expr(
                 }
                 .to_string(),
                 args: vec![
-                    bind_expr(table, left, params)?,
-                    bind_expr(table, right, params)?,
+                    bind_expr_context(table, left, params, returning)?,
+                    bind_expr_context(table, right, params, returning)?,
                 ],
             })
         }
         Expr::BinaryOp { left, op, right } => Ok(BoundExpr::Binary {
-            left: Box::new(bind_expr(table, left, params)?),
+            left: Box::new(bind_expr_context(table, left, params, returning)?),
             op: bind_arithmetic_operator(op)?,
-            right: Box::new(bind_expr(table, right, params)?),
+            right: Box::new(bind_expr_context(table, right, params, returning)?),
         }),
         _ => Err(super::error::unsupported(format!(
             "unsupported SQL expression '{expr}'"
@@ -1145,16 +1195,6 @@ fn bind_insert_value_function(
 ) -> Result<BoundExpr, LixError> {
     bind_function(function, params, |expr, params| {
         bind_insert_value_expr(expr, params)
-    })
-}
-
-fn bind_function_expr(
-    table: &BoundTable,
-    function: &Function,
-    params: &mut ParamBinder,
-) -> Result<BoundExpr, LixError> {
-    bind_function(function, params, |expr, params| {
-        bind_expr(table, expr, params)
     })
 }
 

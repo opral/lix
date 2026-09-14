@@ -184,9 +184,15 @@ export function registerMemoryStorageContract({
 				expect((await wait(fresh.next(), "fresh observer external commit"))?.result.rows).toEqual([
 					{ key: params[0], value: "committed" },
 				]);
-				await tx.commit();
-				tx = undefined;
-				const expected = [
+                // The transaction read a snapshot that the other writer advanced.
+                // Retry the whole operation, including its reads, on a fresh snapshot.
+                await expect(tx.commit()).rejects.toMatchObject({ code: "LIX_TRANSACTION_CONFLICT" });
+                tx = await lix.beginTransaction();
+                expect((await tx.execute(sql, params)).rows).toEqual([{ key: params[0], value: "committed" }]);
+                await tx.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [params[1], "pending"]);
+                await tx.commit();
+                tx = undefined;
+                const expected = [
 					{ key: params[0], value: "committed" },
 					{ key: params[1], value: "pending" },
 				];
@@ -219,10 +225,10 @@ export function registerMemoryStorageContract({
 				const oneStatement = await lix.executeBatch([
 					{ sql: "SELECT $1 AS value", params: ["one statement"] },
 				]);
-				expect(oneStatement).toHaveLength(1);
-				expect(oneStatement[0]?.statementIndex).toBe(0);
-				expect(oneStatement[0]?.label).toBeUndefined();
-				expect(oneStatement[0]?.rows[0]?.value).toBe(
+				expect(oneStatement.results).toHaveLength(1);
+				expect(oneStatement.results[0]?.statementIndex).toBe(0);
+				expect(oneStatement.results[0]?.label).toBeUndefined();
+				expect(oneStatement.results[0]?.rows[0]?.value).toBe(
 					"one statement",
 				);
 
@@ -242,15 +248,15 @@ export function registerMemoryStorageContract({
 						params: ["batch-a", "batch-b"],
 					},
 				]);
-				expect(results).toHaveLength(3);
-				expect(results.map((result) => result.statementIndex)).toEqual([0, 1, 2]);
-				expect(results[0]?.label).toBe("first");
-				expect(results[1]?.label).toBe("first");
-				expect(results[2]?.label).toBeUndefined();
-				expect(results[0]?.rowsAffected).toBe(1);
-				expect(results[1]?.rowsAffected).toBe(1);
+				expect(results.results).toHaveLength(3);
+				expect(results.results.map((result) => result.statementIndex)).toEqual([0, 1, 2]);
+				expect(results.results[0]?.label).toBe("first");
+				expect(results.results[1]?.label).toBe("first");
+				expect(results.results[2]?.label).toBeUndefined();
+				expect(results.results[0]?.rowsAffected).toBe(1);
+				expect(results.results[1]?.rowsAffected).toBe(1);
 				expect(
-					results[2]?.rows.map((row) => row),
+					results.results[2]?.rows.map((row) => row),
 				).toEqual([
 					{ key: "batch-a", value: "first" },
 					{ key: "batch-b", value: "second" },
@@ -263,10 +269,10 @@ export function registerMemoryStorageContract({
 						params: [`batch-eighteen-${index}`, String(index)],
 					})),
 				);
-				expect(eighteen.map((result) => result.statementIndex)).toEqual(
+				expect(eighteen.results.map((result) => result.statementIndex)).toEqual(
 					Array.from({ length: 18 }, (_, index) => index),
 				);
-				expect(eighteen.map((result) => result.label)).toEqual(
+				expect(eighteen.results.map((result) => result.label)).toEqual(
 					Array.from({ length: 18 }, (_, index) => `file-${index}`),
 				);
 
@@ -282,11 +288,11 @@ export function registerMemoryStorageContract({
 						params: ["batch-omitted-c", "c"],
 					},
 				]);
-				expect(omitted.map((result) => result.label)).toEqual([
+				expect(omitted.results.map((result) => result.label)).toEqual([
 					"intended-a",
 					"intended-c",
 				]);
-				expect(omitted.map((result) => result.statementIndex)).toEqual([0, 1]);
+				expect(omitted.results.map((result) => result.statementIndex)).toEqual([0, 1]);
 
 				const returning = await lix.executeBatch([
 					{
@@ -295,9 +301,9 @@ export function registerMemoryStorageContract({
 						params: ["updated", "batch-a"],
 					},
 				]);
-				expect(returning[0]?.statementIndex).toBe(0);
-				expect(returning[0]?.rowsAffected).toBe(1);
-				expect(returning[0]?.rows[0]).toEqual({
+				expect(returning.results[0]?.statementIndex).toBe(0);
+				expect(returning.results[0]?.rowsAffected).toBe(1);
+				expect(returning.results[0]?.rows[0]).toEqual({
 					key: "batch-a",
 					value: "updated",
 				});

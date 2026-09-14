@@ -94,6 +94,7 @@ pub(crate) fn require_writable_column(
         )));
     }
     Ok(BoundColumnRef {
+        image: None,
         table: table.name.clone(),
         column_id: column.id,
         name: column.name.clone(),
@@ -106,6 +107,7 @@ pub(crate) fn bind_public_column_ref(
 ) -> Result<BoundColumnRef, LixError> {
     let column = require_public_column(table, column_name)?;
     Ok(BoundColumnRef {
+        image: None,
         table: table.name.clone(),
         column_id: column.id,
         name: column.name.clone(),

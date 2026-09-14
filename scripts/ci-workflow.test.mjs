@@ -249,9 +249,15 @@ test("server publishing and SDK package tests use appropriately sized Ubicloud r
 
 test("nextest compiles test targets without building unused examples", () => {
 	const commands = workflow.match(/^\s*run: cargo nextest run .+$/gm) ?? [];
-	assert.equal(commands.length, 3);
+	assert.equal(commands.length, 4);
 	for (const command of commands) {
-		assert.match(command, /--tests/);
+		if (command.includes("--profile ci-latency")) {
+			assert.match(command, /--cargo-profile release/);
+			assert.match(command, /--test crdt_benchmarks_baseline\b/);
+			assert.match(command, /test\(=crdt_benchmarks_b3_1_json_concurrent_map_sets\)/);
+		} else {
+			assert.match(command, /--tests/);
+		}
 		if (command.includes("-p lix_e2e")) {
 			assert.doesNotMatch(command, /--lib\b/);
 		} else {

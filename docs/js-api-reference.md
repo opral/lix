@@ -203,11 +203,11 @@ Result:
 type ExecuteResult<TRow = Record<string, unknown>> = {
   statementIndex?: number;
   label?: string;
-  columns: { name: string; type: "null" | "boolean" | "integer" | "real" | "text" | "jsonb" | "timestamptz" | "blob" }[];
+  columns: { name: string; type: "null" | "boolean" | "integer" | "real" | "text" | "jsonb" | "row_ref" | "timestamptz" | "blob" }[];
   rows: TRow[];
   rowsAffected: number;
   notices: { code: string; message: string; hint?: string }[];
-  commit?: { before: string; after: string };
+  commit: { before: string; after: string } | null;
 };
 ```
 
@@ -217,7 +217,7 @@ type ExecuteResult<TRow = Record<string, unknown>> = {
 | `rows`         | Enumerable plain objects by default. Property access, destructuring, spread, and JSON serialization work directly. |
 | `rowsAffected` | Number of rows affected by write statements.                                |
 | `notices`      | Non-fatal engine notices with `{ code, message, hint? }`.                   |
-| `commit`       | The active-branch commits a write moved between: `before` is the branch head before the write, `after` the head it published, so `lix_diff('lix_file', before, after)` is exactly what it changed. Present for every auto-committed write statement, including `RETURNING` writes and restores, and for every statement of a written batch (all share the batch's span, read statements included); a write that published no commit on the active branch reports both ids equal. Absent for read statements outside a written batch, read-only batches, statements inside an explicit transaction, and the first commit on a branch that had no head yet. |
+| `commit` | Exact active-branch transition `{ before, after }` for an auto-committed write; `null` for reads. Equal endpoints mean no active-branch movement. Explicit transaction statements omit this field; batch and transaction receipts return it once. |
 
 Example:
 
@@ -234,10 +234,10 @@ const content = result.rows[0]?.content as Uint8Array | undefined;
 ### executeBatch()
 
 ```ts
-const results = await lix.executeBatch(statements, options?);
+const { results, commit } = await lix.executeBatch(statements, options?);
 ```
 
-Executes multiple statements atomically in one call. `statements` is a non-empty
+Executes multiple statements atomically in one call. Returns `{ results, commit }`: one statement-result array and one commit span for the whole transaction. Read-only batches return `commit: null`; individual results have no `commit` field. `statements` is a non-empty
 array of `{ sql, params?, label? }` objects — one statement per entry, already
 split by the caller. Lix does not parse a multi-statement script. `options`
 accepts the same `originKey` and `idempotencyKey` as `execute()`. Results
@@ -246,7 +246,7 @@ is echoed unchanged; labels are opaque and may repeat. If a label is omitted,
 the result has no `label` property.
 
 ```ts
-const results = await lix.executeBatch([
+const { results, commit } = await lix.executeBatch([
   {
     label: "create",
     sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
@@ -258,7 +258,7 @@ const results = await lix.executeBatch([
 console.log(results[0].statementIndex, results[0].label); // 0, "create"
 console.log(results[1].statementIndex, results[1].label); // 1, undefined
 
-const returning = await lix.executeBatch([
+const { results: returning } = await lix.executeBatch([
   {
     label: "update",
     sql: "UPDATE task SET done = true WHERE id = $1 RETURNING id, done",
@@ -308,9 +308,11 @@ Commit or roll back the transaction before closing the original handle. Closing
 with an opening or active transaction still fails with
 `LIX_INVALID_TRANSACTION_STATE`.
 
-SQL `UPDATE` and `DELETE` decisions are protected until commit. If another
-transaction changes active-branch or shared/global state after this transaction
-opens, committing these statements fails with `LIX_TRANSACTION_CONFLICT`. Start
+SQL `UPDATE` and `DELETE` decisions, and successful explicit SQL reads used to
+decide later writes, are protected until commit. If another transaction changes
+active-branch or shared/global state after this transaction opens, committing
+its writes fails with `LIX_TRANSACTION_CONFLICT`. Read-only transactions can
+still commit successfully and return `{ commit: null }`. Start
 a new transaction and rerun its statements against current state. This is a conservative branch
 check, including untracked rows: even changes to unrelated rows can require a
 retry. A successfully planned update or delete retains this check if it matches
@@ -538,12 +540,16 @@ Closes the Lix handle and its storage resources.
 
 ## Transaction
 
+Transaction `execute()` returns `StatementResult<TRow>`, defined as
+`Omit<ExecuteResult<TRow>, "commit">`. The durable receipt arrives only from
+`commit()`, which returns `CommitReceipt = { commit: CommitSpan | null }`.
+
 Transactions expose:
 
 | Method                            | Description                                                                   |
 | --------------------------------- | ----------------------------------------------------------------------------- |
 | `execute(sql, params?, options?)` | Execute SQL inside the transaction. Same `ExecuteOptions` as `lix.execute()`. |
-| `commit()`                        | Commit the transaction and close the transaction handle.                      |
+| `commit()`                        | Commit and close the transaction, returning `{ commit }` with its durable span or `null` for a read-only transaction.                      |
 | `rollback()`                      | Roll back the transaction and close the transaction handle.                   |
 
 ## Result rows

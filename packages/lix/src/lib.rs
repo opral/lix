@@ -32,7 +32,7 @@
     )
 )]
 
-pub const SERVER_PROTOCOL_VERSION: u32 = 9;
+pub const SERVER_PROTOCOL_VERSION: u32 = 10;
 /// Current persisted repository format. Old stores require explicit migration.
 #[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
 pub const CURRENT_STORAGE_FORMAT_VERSION: u32 = init::CURRENT_FORMAT_VERSION;
@@ -202,7 +202,7 @@ pub use session::{
     RedoReceipt, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt,
 };
 pub use session::{
-    CommitSpan, ExecuteBatchStatement, ExecuteResult, ObserveEvent, ResultRowRef, Row,
+    CommitReceipt, CommitSpan, ExecuteBatchResult, ExecuteBatchStatement, ExecuteResult, ObserveEvent, ResultRowRef, Row,
     TryFromValue,
 };
 #[doc(hidden)]

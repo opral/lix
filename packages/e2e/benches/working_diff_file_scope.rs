@@ -208,23 +208,23 @@ async fn run<StorageImpl>(
         .get::<String>("commit_id")
         .expect("benchmark checkpoint ID");
     let file_sql = format!(
-        "SELECT row_ref, id, diff_type, row_count \
+        "SELECT row_ref, id, diff_type \
          FROM lix_diff('lix_file', '{checkpoint}', lix_active_branch_commit_id()) \
          WHERE id = $1"
     );
     let full_sql = format!(
-        "SELECT row_ref, id, diff_type, row_count \
+        "SELECT row_ref, id, diff_type \
          FROM lix_diff('lix_file', '{checkpoint}', lix_active_branch_commit_id())"
     );
     let file_schema_sql = format!(
-        "SELECT row_ref, id, diff_type, row_count \
+        "SELECT row_ref, id, diff_type \
          FROM lix_diff('{SCHEMA_KEY}', '{checkpoint}', lix_active_branch_commit_id()) \
          WHERE to_lixcol_file_id = $1"
     );
     // Finite identity + file id: takes the existing bypass and resolves as a
     // point read. This is the floor a seekable file-scoped read aims at.
     let point_sql = format!(
-        "SELECT row_ref, id, diff_type, row_count \
+        "SELECT row_ref, id, diff_type \
          FROM lix_diff('{SCHEMA_KEY}', '{checkpoint}', lix_active_branch_commit_id()) \
          WHERE id = $1"
     );
@@ -467,7 +467,8 @@ where
     let results = session
         .execute_batch(pending)
         .await
-        .expect("dirty working-diff rows");
+        .expect("dirty working-diff rows")
+        .results;
     assert!(
         results.iter().all(|result| result.rows_affected() == 1),
         "every dirtying update must affect exactly one row"

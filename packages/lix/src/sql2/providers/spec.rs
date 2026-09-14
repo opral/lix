@@ -244,6 +244,11 @@ pub(crate) struct DmlReturning {
     expressions: Vec<Arc<dyn PhysicalExpr>>,
     required_columns: BTreeSet<String>,
     captured: Arc<Mutex<Option<RecordBatch>>>,
+    input_schema: SchemaRef,
+    old: Arc<Mutex<Option<RecordBatch>>>,
+    old_columns: BTreeSet<String>,
+    new_columns: BTreeSet<String>,
+    delete: bool,
 }
 
 impl DmlReturning {
@@ -251,9 +256,18 @@ impl DmlReturning {
         schema: SchemaRef,
         expressions: Vec<Arc<dyn PhysicalExpr>>,
         required_columns: BTreeSet<String>,
+        input_schema: SchemaRef,
+        delete: bool,
+        old_columns: BTreeSet<String>,
+        new_columns: BTreeSet<String>,
     ) -> Self {
         Self {
             schema,
+            input_schema,
+            old: Arc::new(Mutex::new(None)),
+            old_columns,
+            new_columns,
+            delete,
             expressions,
             required_columns,
             captured: Arc::new(Mutex::new(None)),
@@ -269,16 +283,118 @@ impl DmlReturning {
     }
 
     pub(super) fn project(&self, batch: &RecordBatch) -> Result<RecordBatch> {
+        let old = self.old.lock().expect("RETURNING preimage mutex poisoned");
+        self.project_images(old.as_ref(), Some(batch))
+    }
+
+    pub(super) fn project_images(
+        &self,
+        old: Option<&RecordBatch>,
+        new: Option<&RecordBatch>,
+    ) -> Result<RecordBatch> {
+        let count = old.or(new).map_or(0, RecordBatch::num_rows);
+        if old.is_some_and(|batch| batch.num_rows() != count)
+            || new.is_some_and(|batch| batch.num_rows() != count)
+        {
+            return Err(DataFusionError::Execution(
+                "RETURNING row images have different cardinalities".into(),
+            ));
+        }
+        let mut fields = Vec::new();
+        let mut arrays = Vec::new();
+        for image in [if self.delete { old } else { new }, old, new] {
+            for field in self.input_schema.fields() {
+                fields.push(field.as_ref().clone().with_nullable(true));
+                arrays.push(match image {
+                    Some(batch) => batch
+                        .column_by_name(field.name())
+                        .ok_or_else(|| {
+                            DataFusionError::Execution(format!(
+                                "RETURNING image missing column {}",
+                                field.name()
+                            ))
+                        })?
+                        .clone(),
+                    None => datafusion::arrow::array::new_null_array(field.data_type(), count),
+                });
+            }
+        }
+        let batch = RecordBatch::try_new_with_options(
+            Arc::new(Schema::new(fields)),
+            arrays,
+            &datafusion::arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(count)),
+        )?;
         let columns = self
             .expressions
             .iter()
             .map(|expression| {
                 expression
-                    .evaluate(batch)
+                    .evaluate(&batch)
                     .and_then(|value| value.into_array(batch.num_rows()))
             })
             .collect::<Result<Vec<_>>>()?;
         RecordBatch::try_new(Arc::clone(&self.schema), columns).map_err(DataFusionError::from)
+    }
+
+    pub(super) fn old_columns(&self) -> &BTreeSet<String> {
+        &self.old_columns
+    }
+    pub(super) fn new_columns(&self) -> &BTreeSet<String> {
+        &self.new_columns
+    }
+
+    pub(super) fn capture_upsert_old(&self, rows: &[upsert::UpsertReturningRow]) -> Result<()> {
+        if self.old_columns.is_empty() {
+            return Ok(());
+        }
+        let columns = self
+            .input_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if !self.old_columns.contains(field.name()) {
+                    return Ok(datafusion::arrow::array::new_null_array(
+                        field.data_type(),
+                        rows.len(),
+                    ));
+                }
+                let parts = rows
+                    .iter()
+                    .map(|row| match row.old_batch() {
+                        Some(batch) => batch
+                            .column_by_name(field.name())
+                            .map(|array| array.slice(row.row_index(), 1))
+                            .ok_or_else(|| {
+                                DataFusionError::Execution(format!(
+                                    "RETURNING old image missing column {}",
+                                    field.name()
+                                ))
+                            }),
+                        None => Ok(datafusion::arrow::array::new_null_array(
+                            field.data_type(),
+                            1,
+                        )),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                if parts.is_empty() {
+                    return Ok(datafusion::arrow::array::new_empty_array(field.data_type()));
+                }
+                datafusion::arrow::compute::concat(
+                    &parts.iter().map(|a| a.as_ref()).collect::<Vec<_>>(),
+                )
+                .map_err(DataFusionError::from)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let schema = Arc::new(Schema::new(
+            self.input_schema
+                .fields()
+                .iter()
+                .map(|f| f.as_ref().clone().with_nullable(true))
+                .collect::<Vec<_>>(),
+        ));
+        *self.old.lock().expect("RETURNING preimage mutex poisoned") =
+            Some(RecordBatch::try_new(schema, columns)?);
+        Ok(())
     }
 
     pub(super) fn capture(&self, batch: RecordBatch) {
@@ -314,7 +430,13 @@ impl DmlPlanOptions {
     fn from_returning(returning: Option<&DmlReturning>) -> Self {
         Self {
             returning_columns: returning
-                .map(|returning| returning.required_columns().clone())
+                .map(|returning| {
+                    if returning.delete {
+                        returning.old_columns().clone()
+                    } else {
+                        returning.required_columns().clone()
+                    }
+                })
                 .unwrap_or_default(),
         }
     }
@@ -1657,7 +1779,7 @@ impl ExecutionPlan for SpecDmlExec {
             let matched_batch = filter_batch(source_batch, &filters, &table)?;
             let returned_batch = returning
                 .as_ref()
-                .map(|returning| returning.project(&matched_batch))
+                .map(|returning| returning.project_images(Some(&matched_batch), None))
                 .transpose()?;
             let count = apply(matched_batch).await?;
             if let (Some(returning), Some(returned_batch)) = (returning, returned_batch) {

@@ -123,7 +123,8 @@ async fn assert_format_scales(
     let results = lix
         .execute_batch(&[statement])
         .await
-        .expect("an atomic import must not be bounded by the live actor working set");
+        .expect("an atomic import must not be bounded by the live actor working set")
+        .results;
     let elapsed = started.elapsed();
     eprintln!(
         "plugin_document_scale format={extension} documents={expected_count} input_bytes={input_bytes} elapsed_ms={:.3} per_document_us={:.3}",

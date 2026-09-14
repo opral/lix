@@ -77,7 +77,7 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_rows_eq(session.execute("SELECT from_path, to_path, row_count FROM lix_history('lix_file') WHERE diff_type = 'modified'", &[]).await.unwrap(), vec![vec![Value::Text("/outer/inner/file".into()), Value::Text("/moved/inner/file".into()), Value::Integer(0)]]);
+        assert_rows_eq(session.execute("SELECT from_path, to_path FROM lix_history('lix_file') WHERE diff_type = 'modified'", &[]).await.unwrap(), vec![vec![Value::Text("/outer/inner/file".into()), Value::Text("/moved/inner/file".into())]]);
     }
 );
 
