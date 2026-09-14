@@ -1669,34 +1669,42 @@ impl RowImportBuilder {
         }
 
         let prefix_len = if self.dialect.bom { UTF8_BOM.len() } else { 0 };
-        let rendered_len = self.rows.iter().try_fold(prefix_len, |total, row| {
-            let layout = layouts.get(&(row.id.start, row.id.len));
-            let ending = layout.map_or(Some(self.dialect.terminator), |layout| {
-                layout.ending(self.dialect)
-            });
-            let mut row_len = ending.map_or(0, |ending| ending.bytes().len());
-            let mut cursor = usize::try_from(row.cell_start).expect("u32 fits usize");
-            for index in 0..usize::from(row.cell_count) {
-                let cell = read_import_cell(&self.cell_bytes, &mut cursor)?;
-                if index > 0 {
-                    row_len = row_len
-                        .checked_add(1)
-                        .ok_or_else(|| "CSV rendered length overflowed".to_owned())?;
-                }
-                row_len = row_len
-                    .checked_add(rendered_cell_len(
-                        cell,
-                        self.dialect,
-                        layout.is_some_and(|layout| layout.force_quotes(index))
-                            || (row.cell_count == 1 && ending.is_none() && cell.is_empty()),
-                        layout.is_some_and(|layout| layout.leaves_quotes_unquoted(index)),
-                    )?)
-                    .ok_or_else(|| "CSV rendered length overflowed".to_owned())?;
-            }
-            total
-                .checked_add(row_len)
-                .ok_or_else(|| "CSV rendered length overflowed".to_owned())
-        })?;
+        let rendered_len =
+            self.rows
+                .iter()
+                .enumerate()
+                .try_fold(prefix_len, |total, (row_index, row)| {
+                    let layout = layouts.get(&(row.id.start, row.id.len));
+                    let ending = layout.map_or(Some(self.dialect.terminator), |layout| {
+                        layout.ending(self.dialect)
+                    });
+                    let mut row_len = ending.map_or(0, |ending| ending.bytes().len());
+                    let mut cursor = usize::try_from(row.cell_start).expect("u32 fits usize");
+                    for index in 0..usize::from(row.cell_count) {
+                        let cell = read_import_cell(&self.cell_bytes, &mut cursor)?;
+                        if index > 0 {
+                            row_len = row_len
+                                .checked_add(1)
+                                .ok_or_else(|| "CSV rendered length overflowed".to_owned())?;
+                        }
+                        row_len = row_len
+                            .checked_add(rendered_cell_len(
+                                cell,
+                                self.dialect,
+                                layout.is_some_and(|layout| layout.force_quotes(index))
+                                    || (row.cell_count == 1 && ending.is_none() && cell.is_empty())
+                                    || (row_index == 0
+                                        && index == 0
+                                        && !self.dialect.bom
+                                        && cell.starts_with(UTF8_BOM)),
+                                layout.is_some_and(|layout| layout.leaves_quotes_unquoted(index)),
+                            )?)
+                            .ok_or_else(|| "CSV rendered length overflowed".to_owned())?;
+                    }
+                    total
+                        .checked_add(row_len)
+                        .ok_or_else(|| "CSV rendered length overflowed".to_owned())
+                })?;
         if rendered_len > u32::MAX as usize {
             return Err("CSV supports files smaller than 4GiB".to_owned());
         }
@@ -1750,7 +1758,11 @@ impl RowImportBuilder {
                     layout.is_some_and(|layout| layout.force_quotes(cell_index))
                         || (row.cell_count == 1
                             && layout.is_some_and(|layout| layout.ending(self.dialect).is_none())
-                            && cell.is_empty()),
+                            && cell.is_empty())
+                        || (index == 0
+                            && cell_index == 0
+                            && !self.dialect.bom
+                            && cell.starts_with(UTF8_BOM)),
                     layout.is_some_and(|layout| layout.leaves_quotes_unquoted(cell_index)),
                 )?;
                 let field_len = blob.len()
@@ -2368,7 +2380,15 @@ impl Document {
         {
             return Err("CSV table root cannot be deleted".to_owned());
         }
-        if changes.len() == 1 && changes[0].schema_key.as_ref() == ROW_SCHEMA_KEY {
+        let exposes_bom = !self.0.dialect.bom && self.row_count() > 1 && {
+            let second = self.0.index.ordinal_location(1).expect("second row");
+            let start = self.0.index.row_start(second) as usize;
+            self.0
+                .blob
+                .range(start, (start + 3).min(self.byte_len()))?
+                .starts_with(UTF8_BOM)
+        };
+        if !exposes_bom && changes.len() == 1 && changes[0].schema_key.as_ref() == ROW_SCHEMA_KEY {
             let change = &changes[0];
             let PrimaryKey::Row(id) = primary_key(&change.schema_key, &change.row_pk)? else {
                 unreachable!("CSV row schema has a UUID primary key")
@@ -2548,6 +2568,7 @@ impl Document {
             desired_ending,
             &semantic.layout.force_quote,
             &semantic.layout.unquoted_quote,
+            target_ordinal == 0 && !self.0.dialect.bom,
         )?;
         let source_start = source_chunk.byte_start + source_row.relative_start;
         let source_len = source_row.byte_len;
@@ -2660,6 +2681,7 @@ impl Document {
             ending,
             &semantic.layout.force_quote,
             &semantic.layout.unquoted_quote,
+            ordinal == 0 && !self.0.dialect.bom,
         )?;
         let splice = FileEdit {
             offset: u64::from(start),
@@ -2721,6 +2743,7 @@ impl Document {
             ending,
             &semantic.layout.force_quote,
             &semantic.layout.unquoted_quote,
+            target_ordinal == 0 && !self.0.dialect.bom,
         )?;
         let mut replacement_drafts = Vec::with_capacity(2);
         let offset = if target_ordinal < self.row_count() {
@@ -5094,7 +5117,7 @@ pub fn render_row(
     dialect: Dialect,
     ending: Option<Terminator>,
 ) -> Result<Vec<u8>, String> {
-    render_row_with_layout(cells, dialect, ending, &[], &[])
+    render_row_with_layout(cells, dialect, ending, &[], &[], false)
 }
 
 fn render_row_with_layout(
@@ -5103,6 +5126,7 @@ fn render_row_with_layout(
     ending: Option<Terminator>,
     force_quote: &[u8],
     unquoted_quote: &[u8],
+    file_start: bool,
 ) -> Result<Vec<u8>, String> {
     if cells.is_empty() {
         return Err("CSV rows require at least one cell".to_owned());
@@ -5115,7 +5139,8 @@ fn render_row_with_layout(
         let force_quote = force_quote
             .get(index / 8)
             .is_some_and(|byte| byte & (1 << (index % 8)) != 0)
-            || (cells.len() == 1 && ending.is_none() && cell.is_empty());
+            || (cells.len() == 1 && ending.is_none() && cell.is_empty())
+            || (file_start && index == 0 && cell.as_bytes().starts_with(UTF8_BOM));
         let unquoted_quote = unquoted_quote
             .get(index / 8)
             .is_some_and(|byte| byte & (1 << (index % 8)) != 0);
