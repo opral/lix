@@ -1,13 +1,15 @@
 import { fromNativeValue, type NativeLixValue, Value } from "./value.js";
 import type {
-	ExecuteBatchResult,
+	ExecuteBatchStatementResult,
+	CommitSpan,
 	ExecuteResult,
 	ResultArrayRow,
 	ResultObjectRow,
 	ResultRow,
 } from "./types.js";
 
-type NativeExecuteResult = Omit<ExecuteResult, "rows"> & {
+type NativeExecuteResult = Omit<ExecuteResult, "rows" | "commit"> & {
+	commit?: CommitSpan | null;
 	rows: NativeLixValue[][];
 };
 
@@ -30,6 +32,7 @@ export function wrapExecuteResult(
 ): ExecuteResult<ResultRow> {
 	return {
 		...result,
+		commit: result.commit ?? null,
 		rows: result.rows.map((row) => {
 			const values = row.map((value) =>
 				Value._fromNative(fromNativeValue(value)).toJS(),
@@ -45,7 +48,7 @@ export function wrapExecuteResult(
 export function wrapExecuteBatchResult(
 	result: NativeExecuteResult,
 	rowMode: "object" | "array" = "object",
-): ExecuteBatchResult<ResultRow> {
+): ExecuteBatchStatementResult<ResultRow> {
 	const statementIndex = result.statementIndex;
 	if (
 		typeof statementIndex !== "number" ||
@@ -54,10 +57,8 @@ export function wrapExecuteBatchResult(
 	) {
 		throw new Error("executeBatch result is missing a valid statementIndex");
 	}
-	return {
-		...wrapExecuteResult(result, rowMode),
-		statementIndex,
-	};
+	const { commit: _commit, ...statement } = wrapExecuteResult(result, rowMode);
+	return { ...statement, statementIndex };
 }
 
 export function normalizeOptionals<T>(value: T): T {

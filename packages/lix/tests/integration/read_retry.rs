@@ -392,7 +392,8 @@ async fn working_review_batch_retries_expired_hot_epoch_read() {
     let result = lix
         .execute_batch(&statements)
         .await
-        .expect("review must retry the whole coherent batch after HOT epoch expiration");
+        .expect("review must retry the whole coherent batch after HOT epoch expiration")
+        .results;
     assert_eq!(
         storage.expired_calls(),
         1,
@@ -676,7 +677,8 @@ async fn read_only_batch_restarts_as_one_coherent_unit_after_expiry() {
     let results = lix
         .execute_batch(&statements)
         .await
-        .expect("the complete read batch should restart");
+        .expect("the complete read batch should restart")
+        .results;
 
     assert_eq!(results[0].rows()[0].get::<i64>("value").unwrap(), 1);
     assert_eq!(results[1].rows()[0].get::<i64>("value").unwrap(), 2);

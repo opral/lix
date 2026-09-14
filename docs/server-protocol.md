@@ -96,6 +96,29 @@ The protocol has no default request-body byte ceiling. Hosts can set
 explicit budgets still return `413` for oversized bodies. Proxy limits and the
 separate sync-chunk limits still apply.
 
+## SQL transaction receipts
+
+Server protocol 10 changes `POST /execute-batch` to return
+`{ results: [...], commit: { before, after } | null }`. Statement entries retain
+`statementIndex`, labels, rows, counts, and notices, but carry no commit field.
+The receipt describes the entire committed batch, including statements with
+`RETURNING`; it is null for a read-only batch. Clients using protocol 8 must upgrade.
+
+`POST /transaction/commit` returns HTTP 200 with
+`{ commit: { before, after } | null }`. Repeating the same transaction capability
+returns the same receipt. Rollback continues to return HTTP 204. Explicit
+transaction statements carry no durable receipt until commit succeeds. Single
+`/execute` responses include `commit` for writes and omit it for reads; the
+JavaScript SDK normalizes that omitted field to `null`.
+
+Explicit SQL reads used to decide later writes are fenced against concurrent
+branch changes when the transaction commits. A concurrent change can cause
+`LIX_TRANSACTION_CONFLICT`, including changes to unrelated files. Retry the
+entire transaction and its checks; do not replay arbitrary application side
+effects. A read-only transaction does not require this write fence. Never
+retry unknown commit outcomes or errors marked `nonRetryableAfterCommit` or
+`nonRetryableAfterExecution`.
+
 ## Sync
 
 Sync is Lix-scoped: the immutable ID in the path selects the Lix. Connected

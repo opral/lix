@@ -7469,7 +7469,8 @@ where
             },
         ])
         .await
-        .expect("execute_batch write semantics");
+        .expect("execute_batch write semantics")
+        .results;
     assert_eq!(batch.len(), 2);
     assert_eq!(batch[0].statement_index(), Some(0));
     assert_eq!(batch[0].label(), Some("write"));

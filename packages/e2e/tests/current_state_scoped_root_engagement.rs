@@ -86,7 +86,8 @@ async fn bulk_typed_insert_bootstraps_and_sustains_a_scoped_current_state_root()
     let results = lix
         .execute_batch(&statements)
         .await
-        .expect("bulk typed INSERT batch");
+        .expect("bulk typed INSERT batch")
+        .results;
     assert_eq!(
         results.len(),
         BULK_ROWS,

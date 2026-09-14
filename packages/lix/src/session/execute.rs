@@ -79,10 +79,46 @@ impl LiteralParameterBuilder {
 /// it published, so `lix_diff('lix_file', before, after)` is exactly what the
 /// write changed. A write that published no commit on the active branch
 /// reports both ids equal; a restore reports the commit it moved the head to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommitSpan {
     before: String,
     after: String,
+}
+
+/// The durable result of committing one transaction.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CommitReceipt {
+    pub commit: Option<CommitSpan>,
+}
+
+/// Statement results and the single durable transition published by their batch.
+#[derive(Debug, Clone)]
+pub struct ExecuteBatchResult {
+    pub results: Vec<ExecuteResult>,
+    pub commit: Option<CommitSpan>,
+}
+
+impl ExecuteBatchResult {
+    pub(crate) fn from_results(mut results: Vec<ExecuteResult>) -> Self {
+        let commit = results.iter_mut().find_map(|result| result.commit.take());
+        for result in &mut results {
+            result.commit = None;
+        }
+        Self { results, commit }
+    }
+}
+
+impl CommitReceipt {
+    pub(crate) fn annotate_completion_error(&self, error: LixError) -> LixError {
+        let mut error = super::context::non_retryable_after_commit(error);
+        error
+            .details
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("completion error has object details")
+            .insert("commit".into(), serde_json::json!(self.commit));
+        error
+    }
 }
 
 impl CommitSpan {
@@ -221,13 +257,11 @@ impl ExecuteResult {
 
     /// The commits a write moved the active branch between.
     ///
-    /// `Some` for every auto-committed write statement, including `RETURNING`
-    /// writes, and for every statement of a written batch (all carry the
-    /// batch's one span, read statements included). A write that published
-    /// no commit on the active branch reports both ids equal. `None` for read
-    /// statements outside a written batch, read-only batches, statements
-    /// inside an explicit transaction (whose commit is the write), and the
-    /// first commit on a branch that had no head yet.
+    /// `Some` for every auto-committed write, including `RETURNING` and
+    /// no-op writes (whose endpoints are equal). Batch statement results and
+    /// explicit transaction statements have no receipt: their containing
+    /// `ExecuteBatchResult` or `CommitReceipt` carries the durable span once.
+    /// Reads and the first commit on a branch without a prior head return `None`.
     pub fn commit(&self) -> Option<&CommitSpan> {
         self.commit.as_ref()
     }
@@ -2210,8 +2244,10 @@ where
     pub async fn execute_batch(
         &self,
         statements: &[ExecuteBatchStatement],
-    ) -> Result<Vec<ExecuteResult>, LixError> {
-        Box::pin(self.execute_batch_with_options(statements, ExecuteOptions::default())).await
+    ) -> Result<ExecuteBatchResult, LixError> {
+        Box::pin(self.execute_batch_with_options(statements, ExecuteOptions::default()))
+            .await
+            .map(ExecuteBatchResult::from_results)
     }
 
     pub(crate) async fn execute_batch_with_options(
@@ -3832,6 +3868,7 @@ where
                     }
                     match result {
                         Ok(Some(result)) => {
+                            self.has_written_statement = true;
                             return Ok(ExecuteResult::from_sql_write_result(result));
                         }
                         Ok(None) => {}
@@ -3875,6 +3912,7 @@ where
                 transaction.replace_origin_key(previous_origin_key);
                 match result {
                     Ok(Some(result)) => {
+                        self.has_written_statement = true;
                         return Ok(ExecuteResult::from_sql_write_result(result));
                     }
                     Ok(None) => {}
@@ -3936,6 +3974,13 @@ where
                     transaction
                         .functions()
                         .restore_statement_checkpoint(function_checkpoint);
+                }
+            }
+            if result.is_ok() {
+                if is_read {
+                    transaction.protect_sql_read_snapshot();
+                } else {
+                    self.has_written_statement = true;
                 }
             }
             result
@@ -4578,6 +4623,22 @@ mod tests {
         engine::{Engine, EngineOptions},
     };
 
+    #[test]
+    fn durable_completion_errors_preserve_the_receipt_and_forbid_retry() {
+        let receipt = CommitReceipt {
+            commit: Some(CommitSpan::new("before".into(), "after".into())),
+        };
+        let error = receipt.annotate_completion_error(LixError::new(
+            LixError::CODE_TRANSACTION_CONFLICT,
+            "derived preview failed",
+        ));
+        assert!(error.automatic_retry_is_forbidden());
+        assert_eq!(
+            error.details.as_ref().unwrap()["commit"],
+            serde_json::json!({"before": "before", "after": "after"})
+        );
+    }
+
     #[tokio::test]
     async fn read_result_byte_budget_rejects_oversize_and_releases_session() {
         let storage = Memory::new();
@@ -4837,14 +4898,11 @@ mod tests {
             ])
             .await
             .expect("batch should commit");
-        let spans = batch
-            .iter()
-            .map(|result| result.commit().expect("batch statements carry the span"))
-            .collect::<Vec<_>>();
-        assert_eq!(spans[0], spans[1]);
-        assert_eq!(spans[0].before(), head_before_batch);
-        assert_eq!(spans[0].after(), active_head(&session).await);
-        assert_ne!(spans[0].before(), spans[0].after());
+        let span = batch.commit.as_ref().expect("batch carries one span");
+        assert!(batch.results.iter().all(|result| result.commit().is_none()));
+        assert_eq!(span.before(), head_before_batch);
+        assert_eq!(span.after(), active_head(&session).await);
+        assert_ne!(span.before(), span.after());
     }
 
     #[tokio::test]
@@ -4895,7 +4953,8 @@ mod tests {
                 params: Vec::new(),
             }])
             .await
-            .expect("nondeterministic read batch should run");
+            .expect("nondeterministic read batch should run")
+            .results;
         assert!(
             nondeterministic
                 .iter()
@@ -4915,7 +4974,8 @@ mod tests {
                 },
             ])
             .await
-            .expect("read batch should run");
+            .expect("read batch should run")
+            .results;
         assert!(reads.iter().all(|result| result.commit().is_none()));
 
         // Inside an explicit transaction the commit is the write, so its
@@ -6180,7 +6240,8 @@ mod tests {
                 },
             ])
             .await
-            .unwrap();
+            .unwrap()
+            .results;
 
         assert_eq!(results[0].rows()[0].get::<i64>("value").unwrap(), 11);
         assert_eq!(results[1].rows()[0].get::<i64>("value").unwrap(), 22);
@@ -6207,7 +6268,7 @@ mod tests {
                 },
             ])
             .await
-            .unwrap();
+            .unwrap().results;
 
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].statement_index(), Some(0));
@@ -6313,7 +6374,8 @@ mod tests {
                 },
             ])
             .await
-            .unwrap();
+            .unwrap()
+            .results;
 
         assert_eq!(
             sql2::take_certified_row_insert_parameter_batch_executions(),
@@ -6475,6 +6537,7 @@ mod tests {
             .execute_batch(&statements)
             .await
             .unwrap()
+            .results
             .iter()
             .map(ExecuteResult::rows_affected)
             .sum::<u64>();
@@ -6552,6 +6615,7 @@ mod tests {
             .execute_batch(&inserts)
             .await
             .expect("large certified parameter batch should insert")
+            .results
             .iter()
             .map(ExecuteResult::rows_affected)
             .sum::<u64>();
@@ -6774,6 +6838,7 @@ mod tests {
             .execute_batch(&reinserts)
             .await
             .expect("a second large ordered insert should start a bounded interval")
+            .results
             .iter()
             .map(ExecuteResult::rows_affected)
             .sum::<u64>();
@@ -6957,6 +7022,7 @@ mod tests {
                 .execute_batch(&inserts)
                 .await
                 .expect("each ordered insert generation should commit")
+                .results
                 .iter()
                 .map(ExecuteResult::rows_affected)
                 .sum::<u64>();
@@ -7039,6 +7105,7 @@ mod tests {
             .execute_batch(&inserts)
             .await
             .expect("ordered typed batch should insert")
+            .results
             .iter()
             .map(ExecuteResult::rows_affected)
             .sum::<u64>();
@@ -7408,6 +7475,7 @@ mod tests {
                 .execute_batch(&update_statements)
                 .await
                 .unwrap()
+                .results
                 .iter()
                 .map(ExecuteResult::rows_affected)
                 .sum::<u64>();
@@ -7470,6 +7538,7 @@ mod tests {
             .execute_batch(&partial_update_statements)
             .await
             .unwrap()
+            .results
             .iter()
             .map(ExecuteResult::rows_affected)
             .sum::<u64>();
@@ -8347,7 +8416,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             sql2::take_certified_row_insert_parameter_batch_executions();
-            let results = batch.execute_batch(&statements).await.unwrap();
+            let results = batch.execute_batch(&statements).await.unwrap().results;
             let executions = sql2::take_certified_row_insert_parameter_batch_executions();
             if case_index == 0 {
                 assert_eq!(
@@ -8754,7 +8823,8 @@ mod tests {
                 },
             ])
             .await
-            .unwrap();
+            .unwrap()
+            .results;
 
         assert_eq!(sql2::take_row_update_parameter_batch_executions(), 1);
         assert_eq!(
@@ -8814,7 +8884,8 @@ mod tests {
                 ),
             ])
             .await
-            .unwrap();
+            .unwrap()
+            .results;
 
         assert_eq!(sql2::take_row_update_parameter_batch_executions(), 1);
         assert_eq!(
@@ -9019,7 +9090,8 @@ mod tests {
                 },
             ])
             .await
-            .expect("missing rows must not evaluate their replacement expression");
+            .expect("missing rows must not evaluate their replacement expression")
+            .results;
         assert_eq!(
             missing_results
                 .iter()
@@ -9119,7 +9191,8 @@ mod tests {
                 },
             ])
             .await
-            .unwrap();
+            .unwrap()
+            .results;
 
         assert_eq!(
             sql2::take_certified_replacement_parameter_batch_executions(),
@@ -9294,6 +9367,7 @@ mod tests {
             .execute_batch(&updates)
             .await
             .unwrap()
+            .results
             .iter()
             .map(ExecuteResult::rows_affected)
             .sum::<u64>();
@@ -10118,7 +10192,8 @@ mod tests {
                 ),
             ])
             .await
-            .unwrap();
+            .unwrap()
+            .results;
 
         assert_eq!(results.len(), 2);
         assert_eq!(

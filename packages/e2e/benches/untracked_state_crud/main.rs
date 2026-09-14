@@ -248,9 +248,7 @@ where
     where
         Self: 'a;
 
-    async fn acquire_session(
-        &self,
-    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+    async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
         self.inner.acquire_session().await
     }
 
@@ -290,9 +288,7 @@ where
     where
         Self: 'a;
 
-    async fn acquire_session(
-        &self,
-    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+    async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
         self.inner.acquire_session().await
     }
     async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
@@ -1166,7 +1162,8 @@ async fn insert_untracked_json_pointer_rows_homogeneous<StorageImpl>(
     let results = session
         .execute_batch(&statements)
         .await
-        .expect("batch insert untracked json_pointer rows");
+        .expect("batch insert untracked json_pointer rows")
+        .results;
     assert_eq!(results.len(), rows.len());
     assert!(results.iter().all(|result| result.rows_affected() == 1));
 }

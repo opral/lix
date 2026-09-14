@@ -190,9 +190,7 @@ impl<S: Storage> Storage for CountingStorage<S> {
     where
         Self: 'a;
 
-    async fn acquire_session(
-        &self,
-    ) -> Result<lix::storage::StorageSessionToken, StorageError> {
+    async fn acquire_session(&self) -> Result<lix::storage::StorageSessionToken, StorageError> {
         self.inner.acquire_session().await
     }
 
@@ -571,7 +569,8 @@ where
     let results = session
         .execute_batch(&statements)
         .await
-        .expect("stage sparse undo benchmark transition");
+        .expect("stage sparse undo benchmark transition")
+        .results;
     assert_eq!(results.len(), width);
     assert!(results.iter().all(|result| result.rows_affected() == 1));
 }

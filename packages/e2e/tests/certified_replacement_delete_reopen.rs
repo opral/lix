@@ -73,7 +73,8 @@ async fn replacement_delete_checkpoint_reopens<S: ReopenStorage>() {
         let inserted = lix
             .execute_batch(&inserts)
             .await
-            .expect("insert complete collection");
+            .expect("insert complete collection")
+            .results;
         assert_eq!(
             inserted
                 .iter()
@@ -95,7 +96,8 @@ async fn replacement_delete_checkpoint_reopens<S: ReopenStorage>() {
         let replaced = lix
             .execute_batch(&replacements)
             .await
-            .expect("replace complete collection");
+            .expect("replace complete collection")
+            .results;
         assert_eq!(
             replaced
                 .iter()

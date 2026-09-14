@@ -87,13 +87,13 @@ async fn same_base_server_protocol_plugin_updates_conflict_then_retry() {
     assert_eq!(
         responses
             .iter()
-            .filter(|response| response.status() == StatusCode::NO_CONTENT)
+            .filter(|response| response.status() == StatusCode::OK)
             .count(),
         1,
         "only one same-base SQL update may publish"
     );
     for (index, response) in responses.into_iter().enumerate() {
-        if response.status() == StatusCode::NO_CONTENT {
+        if response.status() == StatusCode::OK {
             continue;
         }
         assert_eq!(response.status(), StatusCode::CONFLICT);
@@ -123,7 +123,7 @@ async fn same_base_server_protocol_plugin_updates_conflict_then_retry() {
             commit(&protocol, &sessions[index], &transaction)
                 .await
                 .status(),
-            StatusCode::NO_CONTENT
+            StatusCode::OK
         );
     }
 

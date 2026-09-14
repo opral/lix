@@ -127,7 +127,9 @@ where
             label: None,
         })
         .collect::<Vec<_>>();
-    lix.execute_batch(&statements).await
+    lix.execute_batch(&statements)
+        .await
+        .map(|batch| batch.results)
 }
 
 async fn active_branch_commit_id<S>(lix: &Lix<S>) -> String

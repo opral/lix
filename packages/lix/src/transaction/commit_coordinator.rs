@@ -17,8 +17,8 @@ use crate::functions::FunctionContext;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::storage_adapter::Storage;
 use crate::telemetry::{
-    ActiveTelemetrySpan, SpanContext, TelemetryAttribute, TelemetryContext, TelemetrySink,
-    Status, TRANSACTION_NOTIFY, TRANSACTION_STORAGE, TRANSACTION_WAIT,
+    ActiveTelemetrySpan, SpanContext, Status, TRANSACTION_NOTIFY, TRANSACTION_STORAGE,
+    TRANSACTION_WAIT, TelemetryAttribute, TelemetryContext, TelemetrySink,
     current_telemetry_context, next_commit_cohort_id,
 };
 
@@ -367,7 +367,16 @@ where
             }
             let commit_and_notify = async {
                 let outcomes = Box::pin(commit_transaction_cohort(inputs)).await;
-                if let Some(outcome) = outcomes.iter().find_map(|result| result.as_ref().ok()) {
+                // A grouped wave may publish individually. Its first successful
+                // member can be a no-op; inspect every result before notifying.
+                if let Some(outcome) = outcomes
+                    .iter()
+                    .filter_map(|result| result.as_ref().ok())
+                    .find(|outcome| {
+                        outcome.storage_stats.staged_puts > 0
+                            || outcome.storage_stats.staged_deletes > 0
+                    })
+                {
                     let notify = ActiveTelemetrySpan::start_current(
                         &TRANSACTION_NOTIFY,
                         vec![TelemetryAttribute::i64(
@@ -399,13 +408,10 @@ where
                 outcomes.iter_mut().zip(checkpoint_gc_sequences)
             {
                 if let Ok(outcome) = outcome {
-                    // Cohort commits serve explicit transactions, whose
-                    // statements carry no commit span by design; the span
-                    // is deliberately left unset here.
-                    *outcome = TransactionCommitOutcome {
-                        checkpoint_gc_sequence,
-                        ..TransactionCommitOutcome::default()
-                    };
+                    // Invalidation has already been published by the coordinator.
+                    // Preserve the exact durable span for the caller's receipt.
+                    outcome.storage_stats = Default::default();
+                    outcome.checkpoint_gc_sequence = checkpoint_gc_sequence;
                 }
             }
             debug_assert_eq!(outcomes.len(), senders.len());
@@ -470,7 +476,11 @@ fn cohort_telemetry_context<StorageImpl>(
 where
     StorageImpl: Storage + 'static,
 {
-    attach_cohort_parent_contexts(cohort.iter().filter_map(|request| request.telemetry_context.clone()))
+    attach_cohort_parent_contexts(
+        cohort
+            .iter()
+            .filter_map(|request| request.telemetry_context.clone()),
+    )
 }
 
 fn attach_cohort_parent_contexts(
@@ -517,17 +527,14 @@ mod tests {
             TelemetryContext::for_test(Arc::clone(&sink), parent_b.clone()),
         ])
         .expect("cohort context");
-        futures_lite::future::block_on(TelemetryContext::instrument(
-            &context,
-            async {
-                let span = ActiveTelemetrySpan::start_current(
-                    &TRANSACTION_STORAGE,
-                    vec![TelemetryAttribute::i64("lix.transaction.count", 2)],
-                )
-                .expect("storage enabled");
-                span.finish(Status::Unset, Vec::new());
-            },
-        ));
+        futures_lite::future::block_on(TelemetryContext::instrument(&context, async {
+            let span = ActiveTelemetrySpan::start_current(
+                &TRANSACTION_STORAGE,
+                vec![TelemetryAttribute::i64("lix.transaction.count", 2)],
+            )
+            .expect("storage enabled");
+            span.finish(Status::Unset, Vec::new());
+        }));
         let spans = captured.lock().expect("spans");
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].start.name, "lix.transaction.storage");

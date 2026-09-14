@@ -255,7 +255,8 @@ type NativeResult<T> = std::result::Result<T, LixError>;
 type NativeResolver<T> = Box<dyn FnOnce(Env) -> Result<T> + Send>;
 type NativeDeferred<T> = JsDeferred<T, NativeResolver<T>>;
 type NativeExecuteDeferred = NativeDeferred<ExecuteResult>;
-type NativeExecuteBatchDeferred = NativeDeferred<Vec<ExecuteResult>>;
+type NativeExecuteBatchDeferred = NativeDeferred<ExecuteBatchResult>;
+type NativeCommitDeferred = NativeDeferred<CommitReceipt>;
 type NativeTransactionDeferred = NativeDeferred<NativeLixTransaction>;
 type NativeLixDeferred = NativeDeferred<NativeLix>;
 type NativeStringDeferred = NativeDeferred<String>;
@@ -353,7 +354,7 @@ enum LixCommand {
     },
     TransactionCommit {
         transaction_id: u64,
-        deferred: NativeUnitDeferred,
+        deferred: NativeCommitDeferred,
     },
     TransactionRollback {
         transaction_id: u64,
@@ -953,9 +954,11 @@ fn reject_pending_lix_commands(receiver: mpsc::Receiver<QueuedLixCommand>, error
             LixCommand::SyncDiskToLix(deferred)
             | LixCommand::Close(deferred)
             | LixCommand::ImportFilesystemPaths { deferred, .. }
-            | LixCommand::TransactionCommit { deferred, .. }
             | LixCommand::TransactionRollback { deferred, .. } => {
                 deferred.reject(to_napi_error(&error));
+            }
+            LixCommand::TransactionCommit { deferred, .. } => {
+                deferred.reject(to_napi_error(&error))
             }
             LixCommand::Observe { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::TransactionExecute { deferred, .. } => {
@@ -1004,13 +1007,8 @@ fn handle_lix_command(
             options,
             deferred,
         } => {
-            let result =
-                block_on!(state.lix.execute_batch(&statements, options)).and_then(|results| {
-                    results
-                        .into_iter()
-                        .map(ExecuteResult::try_from)
-                        .collect::<std::result::Result<Vec<_>, _>>()
-                });
+            let result = block_on!(state.lix.execute_batch(&statements, options))
+                .and_then(ExecuteBatchResult::try_from);
             settle_deferred(deferred, result);
             None
         }
@@ -1195,7 +1193,7 @@ fn handle_lix_command(
         } => {
             let result = state.transactions.remove(&transaction_id).map_or_else(
                 || Err(transaction_closed_error()),
-                |transaction| block_on!(transaction.commit()),
+                |transaction| block_on!(transaction.commit()).map(CommitReceipt::from),
             );
             settle_deferred(deferred, result);
             None
@@ -1344,8 +1342,10 @@ fn settle_command_after_close(command: LixCommand) {
         }
         LixCommand::ImportFilesystemPaths { deferred, .. }
         | LixCommand::SyncDiskToLix(deferred)
-        | LixCommand::TransactionCommit { deferred, .. }
         | LixCommand::TransactionRollback { deferred, .. } => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
+        LixCommand::TransactionCommit { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
         LixCommand::TransactionAbandon { .. } => {}
@@ -1465,7 +1465,7 @@ impl NativeLixInner {
         &self,
         statements: &[RsExecuteBatchStatement],
         options: Option<String>,
-    ) -> std::result::Result<Vec<RsExecuteResult>, LixError> {
+    ) -> std::result::Result<lix::ExecuteBatchResult, LixError> {
         let options = crate::session::ExecuteOptions {
             origin_key: options,
             ..Default::default()
@@ -1687,7 +1687,7 @@ impl NativeLixTransactionInner {
         }
     }
 
-    async fn commit(self) -> std::result::Result<(), LixError> {
+    async fn commit(self) -> std::result::Result<lix::CommitReceipt, LixError> {
         match self {
             Self::Memory(mut transaction) => {
                 crate::session::TransactionOperations::commit(&mut transaction).await
@@ -2779,7 +2779,7 @@ impl NativeLixTransaction {
 
     #[napi]
     pub fn commit<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
-        let (deferred, promise): (NativeUnitDeferred, Object<'env>) = env.create_deferred()?;
+        let (deferred, promise): (NativeCommitDeferred, Object<'env>) = env.create_deferred()?;
         if self.closed.swap(true, Ordering::SeqCst) {
             settle_deferred(deferred, Err(transaction_closed_error()));
             return Ok(promise);
@@ -3578,4 +3578,46 @@ pub fn retry_filesystem_replica_migration_cleanup(
         sync_all_files,
         server: ServerOptions::new(url).with_headers(parse_server_headers(headers)?),
     }))
+}
+
+#[napi(object)]
+pub struct ExecuteBatchResult {
+    pub results: Vec<ExecuteResult>,
+    pub commit: Option<CommitSpan>,
+}
+
+impl TryFrom<lix::ExecuteBatchResult> for ExecuteBatchResult {
+    type Error = LixError;
+    fn try_from(batch: lix::ExecuteBatchResult) -> std::result::Result<Self, Self::Error> {
+        Ok(Self {
+            results: batch
+                .results
+                .into_iter()
+                .map(ExecuteResult::try_from)
+                .collect::<std::result::Result<_, _>>()?,
+            commit: batch.commit.map(CommitSpan::from),
+        })
+    }
+}
+
+#[napi(object)]
+pub struct CommitReceipt {
+    pub commit: Option<CommitSpan>,
+}
+
+impl From<lix::CommitReceipt> for CommitReceipt {
+    fn from(receipt: lix::CommitReceipt) -> Self {
+        Self {
+            commit: receipt.commit.map(CommitSpan::from),
+        }
+    }
+}
+
+impl From<lix::CommitSpan> for CommitSpan {
+    fn from(span: lix::CommitSpan) -> Self {
+        Self {
+            before: span.before().to_owned(),
+            after: span.after().to_owned(),
+        }
+    }
 }

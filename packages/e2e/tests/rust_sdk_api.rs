@@ -368,7 +368,8 @@ async fn execute_batch_is_atomic_and_returns_ordered_results() {
             },
         ])
         .await
-        .unwrap();
+        .unwrap()
+        .results;
     assert_eq!(results.len(), 3);
     assert_eq!(
         results
@@ -456,7 +457,7 @@ async fn execute_batch_indexes_all_eighteen_writes_and_echoes_labels() {
         })
         .collect::<Vec<_>>();
 
-    let results = lix.execute_batch(&statements).await.unwrap();
+    let results = lix.execute_batch(&statements).await.unwrap().results;
     assert_eq!(results.len(), 18);
     assert_eq!(
         results
@@ -640,7 +641,31 @@ async fn transaction_keeps_same_handle_reads_and_writes_outside_its_snapshot() {
         "tx-only-task"
     );
 
-    tx.commit().await.unwrap();
+    let error = tx
+        .commit()
+        .await
+        .expect_err("the explicit read guards the opening snapshot");
+    assert_eq!(error.code, "LIX_TRANSACTION_CONFLICT");
+    // Retry the complete read/write operation against the fresh snapshot.
+    let mut retry = lix.begin_transaction().await.unwrap();
+    let fresh = retry
+        .execute("SELECT id FROM crm_task ORDER BY id", &[])
+        .await
+        .unwrap();
+    assert_eq!(fresh.rows().len(), 1);
+    retry
+        .execute(
+            "INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, CAST($4 AS JSONB))",
+            &[
+                Value::Text("tx-only-task".to_string()),
+                Value::Text("Inside tx".to_string()),
+                Value::Boolean(false),
+                Value::Text(r#"{"batch":1}"#.to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(retry.commit().await.unwrap().commit.is_some());
 
     let committed = lix
         .execute(
