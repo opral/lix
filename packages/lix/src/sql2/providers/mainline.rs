@@ -33,6 +33,7 @@ pub(super) fn register_functions<S>(
     session: &datafusion::prelude::SessionContext,
     source: SqlChangelogQuerySource<S>,
     catalog: Arc<PublicCatalog>,
+    blob_reader: Arc<dyn crate::binary_cas::BlobDataReader>,
 ) where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
@@ -44,12 +45,14 @@ pub(super) fn register_functions<S>(
                 catalog: catalog.clone(),
                 slots: execution_slots(session),
                 history,
+                blob_reader: Arc::clone(&blob_reader),
             }),
         );
     }
 }
 
 struct MainlineFunction<S> {
+    blob_reader: Arc<dyn crate::binary_cas::BlobDataReader>,
     store: S,
     catalog: Arc<PublicCatalog>,
     slots: Arc<ExecutionSlots>,
@@ -115,6 +118,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableFunctionImpl
         let anchor = CommitId::parse_lix(&anchor, "mainline anchor")
             .map_err(lix_error_to_datafusion_error)?;
         Ok(Arc::new(SpecTableProvider::new(Arc::new(MainlineSpec {
+            blob_reader: Arc::clone(&self.blob_reader),
             store: self.store.clone(),
             relation,
             anchor,
@@ -257,6 +261,7 @@ fn record_work(_diff: bool) {
 }
 
 struct MainlineSpec<S> {
+    blob_reader: Arc<dyn crate::binary_cas::BlobDataReader>,
     store: S,
     relation: Option<DiffRelation>,
     anchor: CommitId,
@@ -355,6 +360,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
         let anchor = self.anchor;
         let active_branch_id = self.active_branch_id.clone();
         let output_schema = schema.clone();
+        let blob_reader = Arc::clone(&self.blob_reader);
         let ordering = Some(
             if relation.is_some() {
                 "lixcol_position"
@@ -373,6 +379,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                 active_branch_id.clone(),
             );
             let mut remaining_ids = selected_ids.clone();
+            let blob_reader = Arc::clone(&blob_reader);
             let stream_schema = schema.clone();
             let stream = async_stream::try_stream! {
                 let mut graph = CommitGraphContext::new().reader(store.clone());
@@ -394,7 +401,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                         let Some(parent) = next else { continue; }; // root is a baseline, not a synthetic change
                         let diff_projection = schema.fields().iter().filter_map(|field| relation.schema.index_of(field.name()).ok()).collect::<Vec<_>>();
                         record_work(true);
-                        let diff = DiffSpec { store: store.clone(), read_interests: None, interest_endpoints: None, relation: relation.clone(), from_commit_id: parent.to_string(),
+                        let diff = DiffSpec { blob_reader: Arc::clone(&blob_reader), store: store.clone(), read_interests: None, interest_endpoints: None, relation: relation.clone(), from_commit_id: parent.to_string(),
                             to_commit_id: id.to_string(), active_branch_id: active_branch_id.clone(), mode: DiffMode::General };
                         let plan = diff.plan_scan(Some(&diff_projection), &row_filters, None, &ExecutionProps::new()).await?;
                         let mut batches = plan.source.open(0, context.clone())?;

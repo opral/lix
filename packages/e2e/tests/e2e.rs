@@ -6384,9 +6384,9 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
     .unwrap();
     let selected_diff_count = lix
         .execute(
-            "SELECT coalesce(sum(row_count), 0) AS count \
-             FROM lix_diff('lix_file', $2, lix_active_branch_commit_id()) \
-             WHERE id = $1",
+            "SELECT count(*) AS count \
+             FROM lix_diff('csv_row', $2, lix_active_branch_commit_id()) \
+             WHERE to_lixcol_file_id = $1",
             &[
                 Value::Text(selected_file_id.clone()),
                 Value::Text(baseline_checkpoint),

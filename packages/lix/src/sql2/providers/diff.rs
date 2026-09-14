@@ -7,17 +7,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int64Array, LargeBinaryArray, StringArray,
+    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, LargeBinaryArray, StringArray,
     TimestampMicrosecondArray,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::{TableFunctionImpl, TableProvider};
-use datafusion::common::{DataFusionError, Result};
+use datafusion::common::{DFSchema, DataFusionError, Result};
 use datafusion::datasource::TableType;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::Operator;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::physical_expr::create_physical_expr;
 use serde_json::Value as JsonValue;
 
 use crate::NullableKeyFilter;
@@ -54,6 +55,7 @@ pub(super) fn register_diff_function<S>(
     query_source: SqlChangelogQuerySource<S>,
     catalog: Arc<PublicCatalog>,
     read_interests: Option<Arc<crate::hot_state::ReadInterestRegistry>>,
+    blob_reader: Arc<dyn crate::binary_cas::BlobDataReader>,
 ) where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
@@ -64,6 +66,7 @@ pub(super) fn register_diff_function<S>(
             read_interests,
             catalog,
             slots: execution_slots(session),
+            blob_reader,
         }),
     );
 }
@@ -79,6 +82,7 @@ struct DiffFunction<S> {
     read_interests: Option<Arc<crate::hot_state::ReadInterestRegistry>>,
     catalog: Arc<PublicCatalog>,
     slots: Arc<ExecutionSlots>,
+    blob_reader: Arc<dyn crate::binary_cas::BlobDataReader>,
 }
 
 impl<S> fmt::Debug for DiffFunction<S> {
@@ -149,6 +153,7 @@ where
         let relation_name = text_argument(relation, 1, "relation name", None)?;
         let relation = DiffRelation::from_catalog(&self.catalog, &relation_name)?;
         Ok(Arc::new(SpecTableProvider::new(Arc::new(DiffSpec {
+            blob_reader: Arc::clone(&self.blob_reader),
             store: self.store.clone(),
             read_interests: self.read_interests.clone(),
             interest_endpoints: Some(interest_endpoints),
@@ -290,7 +295,6 @@ impl DiffRelation {
                 );
             }
         }
-        fields.push(Field::new("row_count", DataType::Int64, false));
         fields.push(Field::new("lixcol_from_commit_id", DataType::Utf8, false));
         fields.push(Field::new("lixcol_to_commit_id", DataType::Utf8, false));
         Ok(Self {
@@ -304,6 +308,7 @@ impl DiffRelation {
 }
 
 pub(super) struct DiffSpec<S> {
+    pub(super) blob_reader: Arc<dyn crate::binary_cas::BlobDataReader>,
     pub(super) store: S,
     pub(super) read_interests: Option<Arc<crate::hot_state::ReadInterestRegistry>>,
     pub(super) interest_endpoints: Option<(
@@ -335,6 +340,11 @@ where
     }
 
     fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
+        if self.relation.kind == DiffRelationKind::File
+            && file_metadata_filter(filter, &self.relation.schema)
+        {
+            return TableProviderFilterPushDown::Inexact;
+        }
         if filter.column_refs().iter().any(|column| {
             column.name == "row_ref"
                 || self.relation.primary_key_columns.contains(&column.name)
@@ -354,21 +364,39 @@ where
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
-        _props: &ExecutionProps,
+        props: &ExecutionProps,
     ) -> Result<PlannedScan> {
         let schema = projected_schema(&self.relation.schema, projection);
-        if self.relation.kind == DiffRelationKind::File
-            && schema
-                .fields()
-                .iter()
-                .any(|field| matches!(field.name().as_str(), "from_content" | "to_content"))
-        {
-            return Err(DataFusionError::NotImplemented(
-                "lix_diff('lix_file', ...) does not support content projection; query lix_as_of('lix_file', commit_id) for file bytes"
-                    .to_string(),
-            ));
+        // Evaluate pushed metadata predicates on descriptor rows before opening any
+        // historical file bytes. Content predicates necessarily remain residual.
+        let metadata_filters = if self.relation.kind == DiffRelationKind::File {
+            filter_conjuncts(filters)
+                .into_iter()
+                .filter(|filter| file_metadata_filter(filter, &self.relation.schema))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let mut filter_fields = schema.fields().to_vec();
+        for filter in &metadata_filters {
+            for column in filter.column_refs() {
+                if !filter_fields
+                    .iter()
+                    .any(|field| field.name() == &column.name)
+                {
+                    filter_fields.push(Arc::new(
+                        self.relation.schema.field_with_name(&column.name)?.clone(),
+                    ));
+                }
+            }
         }
-        let route = DiffRoute::from_filters(filters, &self.relation, &schema);
+        let filter_schema = Arc::new(Schema::new(filter_fields));
+        let df_schema = DFSchema::try_from(filter_schema.as_ref().clone())?;
+        let metadata_filters = metadata_filters
+            .iter()
+            .map(|filter| create_physical_expr(filter, &df_schema, props))
+            .collect::<Result<Vec<_>>>()?;
+        let route = DiffRoute::from_filters(filters, &self.relation, &filter_schema);
         if let (Some(registry), Some((from, to))) = (&self.read_interests, &self.interest_endpoints)
         {
             registry
@@ -379,7 +407,7 @@ where
                     to: to.clone(),
                     filter: route.request.filter.clone(),
                     retain_payloads: route.request.retain_payloads,
-                    projected_columns: schema
+                    projected_columns: filter_schema
                         .fields()
                         .iter()
                         .map(|field| field.name().clone())
@@ -402,6 +430,9 @@ where
                     self.to_commit_id.clone(),
                     self.active_branch_id.clone(),
                     self.mode,
+                    self.blob_reader.clone(),
+                    filter_schema,
+                    metadata_filters,
                 ),
                 move |(
                     store,
@@ -412,6 +443,9 @@ where
                     to_commit_id,
                     active_branch_id,
                     mode,
+                    blob_reader,
+                    filter_schema,
+                    metadata_filters,
                 )| async move {
                     if limit == Some(0) || route.contradictory || from_commit_id == to_commit_id {
                         return diff_record_batch(
@@ -428,14 +462,14 @@ where
                     // checkpoint-to-head case, retain HOT_DIFF as the sparse
                     // candidate index and still resolve the final winners
                     // through the composite overlay below.
-                    let needs_global_provenance = schema.fields().iter().any(|field| {
+                    let needs_global_provenance = filter_schema.fields().iter().any(|field| {
                         matches!(
                             field.name().as_str(),
                             "from_lixcol_global" | "to_lixcol_global"
                         )
                     });
                     let working_needs_endpoint_descriptors = match &relation.kind {
-                        DiffRelationKind::File => schema
+                        DiffRelationKind::File => filter_schema
                             .fields()
                             .iter()
                             .any(|field| side_column(field.name()).is_some()),
@@ -609,15 +643,18 @@ where
                         (HashSet::new(), HashSet::new())
                     };
                     let mut rows = match &relation.kind {
-                        DiffRelationKind::Schema { .. } => {
-                            schema_diff_rows(diff, &schema, &from_global_rows, &to_global_rows)?
-                        }
+                        DiffRelationKind::Schema { .. } => schema_diff_rows(
+                            diff,
+                            &filter_schema,
+                            &from_global_rows,
+                            &to_global_rows,
+                        )?,
                         DiffRelationKind::File => {
                             let result = file_diff_rows(
                                 &mut tracked,
                                 diff,
                                 &route.request.filter.file_ids,
-                                &schema,
+                                &filter_schema,
                                 &from_commit_id,
                                 &to_commit_id,
                                 &from_descriptor,
@@ -635,7 +672,7 @@ where
                                 &mut tracked,
                                 diff,
                                 &route.request.filter.row_pks,
-                                &schema,
+                                &filter_schema,
                                 &from_commit_id,
                                 &to_commit_id,
                                 &from_descriptor,
@@ -651,14 +688,115 @@ where
                             }
                         }
                     };
+                    if !metadata_filters.is_empty() {
+                        let metadata = diff_record_batch(
+                            filter_schema,
+                            &rows,
+                            &relation,
+                            &from_commit_id,
+                            &to_commit_id,
+                        )?;
+                        let mut selected = vec![true; rows.len()];
+                        for filter in &metadata_filters {
+                            let values = filter.evaluate(&metadata)?.into_array(rows.len())?;
+                            let mask = values.as_any().downcast_ref::<BooleanArray>().ok_or_else(
+                                || {
+                                    DataFusionError::Internal(
+                                        "file metadata filter must be boolean".into(),
+                                    )
+                                },
+                            )?;
+                            for (index, keep) in selected.iter_mut().enumerate() {
+                                *keep &= !mask.is_null(index) && mask.value(index);
+                            }
+                        }
+                        let mut index = 0;
+                        rows.retain(|_| {
+                            let keep = selected[index];
+                            index += 1;
+                            keep
+                        });
+                    }
                     if let Some(limit) = limit {
                         rows.truncate(limit);
                     }
-                    diff_record_batch(schema, &rows, &relation, &from_commit_id, &to_commit_id)
+                    let batch = diff_record_batch(
+                        schema.clone(),
+                        &rows,
+                        &relation,
+                        &from_commit_id,
+                        &to_commit_id,
+                    )?;
+                    if relation.kind != DiffRelationKind::File
+                        || !schema.fields().iter().any(|field| {
+                            matches!(field.name().as_str(), "from_content" | "to_content")
+                        })
+                    {
+                        return Ok(batch);
+                    }
+                    let mut columns = batch.columns().to_vec();
+                    for (name, commit, after) in [
+                        ("from_content", &from_commit_id, false),
+                        ("to_content", &to_commit_id, true),
+                    ] {
+                        let Ok(index) = schema.index_of(name) else {
+                            continue;
+                        };
+                        let ids = rows
+                            .iter()
+                            .filter_map(|row| {
+                                let side = if after { &row.to } else { &row.from };
+                                side.as_ref().and_then(|side| side.id.clone())
+                            })
+                            .collect::<Vec<_>>();
+                        let content = super::state_at::diff_file_content(
+                            store.clone(),
+                            blob_reader.clone(),
+                            commit,
+                            active_branch_id
+                                .as_deref()
+                                .unwrap_or(crate::GLOBAL_BRANCH_ID),
+                            &ids,
+                        )
+                        .await?;
+                        let values = rows
+                            .iter()
+                            .map(|row| {
+                                let side = if after { &row.to } else { &row.from };
+                                let Some(side) = side else {
+                                    return Ok(None);
+                                };
+                                let id = side.id.as_ref().ok_or_else(|| {
+                                    DataFusionError::Execution(
+                                        "file diff side lacks identity".into(),
+                                    )
+                                })?;
+                                content
+                                    .get(id)
+                                    .map(|bytes| Some(bytes.as_slice()))
+                                    .ok_or_else(|| {
+                                        DataFusionError::Execution(format!(
+                                            "historical content missing for file {id}"
+                                        ))
+                                    })
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        columns[index] = Arc::new(LargeBinaryArray::from(values));
+                    }
+                    Ok(RecordBatch::try_new(schema, columns)?)
                 },
             ),
         })
     }
+}
+
+/// Only columns whose values are available without materializing file bytes.
+fn file_metadata_filter(filter: &Expr, schema: &SchemaRef) -> bool {
+    !filter.is_volatile()
+        && filter.column_refs().iter().all(|column| {
+            !matches!(column.name.as_str(), "from_content" | "to_content")
+                && schema.index_of(&column.name).is_ok()
+        })
 }
 
 fn filter_conjuncts(filters: &[Expr]) -> Vec<Expr> {
@@ -771,8 +909,7 @@ impl DiffRoute {
                 .any(|(_, column)| {
                     !matches!(
                         column,
-                        "id"
-                            | "lixcol_file_id"
+                        "id" | "lixcol_file_id"
                             | "lixcol_created_at"
                             | "lixcol_updated_at"
                             | "lixcol_change_id"
@@ -837,7 +974,7 @@ fn hot_only_diff_error(error: DataFusionError) -> DataFusionError {
 struct DiffSqlRow {
     row_pk: RowPk,
     diff_type: &'static str,
-    row_count: i64,
+
     from: Option<DiffSide>,
     to: Option<DiffSide>,
 }
@@ -1207,7 +1344,7 @@ fn schema_diff_rows(
             Ok(DiffSqlRow {
                 row_pk: entry.identity.row_pk().clone(),
                 diff_type: diff_type(entry.kind),
-                row_count: 1,
+
                 from: if needs_side {
                     diff_side(entry, entry.visible_before(), &diff, from_global_rows)?
                 } else {
@@ -1289,7 +1426,6 @@ fn single_row_pk_string(row_pk: &RowPk) -> Option<String> {
 }
 
 struct FileDiffGroup<'a> {
-    row_count: usize,
     descriptor: Option<&'a TrackedStateDiffEntry>,
 }
 
@@ -1452,15 +1588,13 @@ where
         let group = if let Some(group) = groups.get_mut(file_id.as_ref()) {
             group
         } else {
-            groups.entry(file_id.into_owned()).or_insert(FileDiffGroup {
-                row_count: 0,
-                descriptor: None,
-            })
+            groups
+                .entry(file_id.into_owned())
+                .or_insert(FileDiffGroup { descriptor: None })
         };
         if entry.identity.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY {
             group.descriptor = Some(entry);
         }
-        group.row_count += 1;
     }
 
     if diff
@@ -1487,10 +1621,9 @@ where
         )
         .await?;
         for (id, _, _) in path_changes {
-            groups.entry(id).or_insert(FileDiffGroup {
-                row_count: 0,
-                descriptor: None,
-            });
+            groups
+                .entry(id)
+                .or_insert(FileDiffGroup { descriptor: None });
         }
     }
 
@@ -1513,8 +1646,7 @@ where
         .any(|(_, column)| {
             !matches!(
                 column,
-                "id"
-                    | "lixcol_file_id"
+                "id" | "lixcol_file_id"
                     | "lixcol_created_at"
                     | "lixcol_updated_at"
                     | "lixcol_change_id"
@@ -1656,9 +1788,6 @@ where
         rows.push(DiffSqlRow {
             row_pk,
             diff_type: diff_type(kind),
-            row_count: i64::try_from(group.row_count).map_err(|_| {
-                DataFusionError::Execution("lix_diff row_count exceeds INT8".to_string())
-            })?,
             from,
             to,
         });
@@ -1711,7 +1840,7 @@ where
             rows.push(DiffSqlRow {
                 row_pk: uuid_row_pk(&id)?,
                 diff_type: "modified",
-                row_count: 0,
+
                 from: Some(from),
                 to: Some(to),
             });
@@ -1951,9 +2080,6 @@ fn diff_column_array(
         "diff_type" => Ok(Arc::new(StringArray::from_iter_values(
             rows.iter().map(|row| row.diff_type),
         ))),
-        "row_count" => Ok(Arc::new(Int64Array::from_iter_values(
-            rows.iter().map(|row| row.row_count),
-        ))),
         name if relation
             .primary_key_columns
             .iter()
@@ -2165,6 +2291,252 @@ mod tests {
     use super::*;
     use datafusion::logical_expr::{col, lit};
 
+    #[derive(Clone)]
+    struct ContentReadProbe<S> {
+        inner: S,
+        chunks: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl<S: StorageAdapterRead> StorageAdapterRead for ContentReadProbe<S> {
+        async fn get_many(
+            &self,
+            requests: &[crate::storage::GetManyRequest<'_>],
+        ) -> std::result::Result<crate::storage::GetManyResult, crate::storage::StorageError>
+        {
+            for request in requests {
+                if request.space.name == "binary_cas.chunk" {
+                    self.chunks
+                        .lock()
+                        .unwrap()
+                        .extend(request.keys.iter().map(|key| key.0.to_vec()));
+                }
+            }
+            self.inner.get_many(requests).await
+        }
+
+        async fn begin_scan(
+            &self,
+            space: crate::storage::StorageSpace,
+            range: crate::storage::KeyRange,
+            opts: crate::storage::BeginScanOptions,
+        ) -> std::result::Result<crate::storage::ScanCursor<'_>, crate::storage::StorageError>
+        {
+            assert_ne!(
+                space.name, "binary_cas.chunk",
+                "file content must use exact chunk reads"
+            );
+            self.inner.begin_scan(space, range, opts).await
+        }
+    }
+
+    #[tokio::test]
+    async fn file_content_filters_precede_storage_reads_for_diff_and_history() {
+        use crate::storage_adapter::SharedStorageAdapterRead;
+        use crate::{Value, open_lix};
+        let lix = open_lix()
+            .with_storage(crate::storage::Memory::new())
+            .await
+            .unwrap();
+        let id = "0193182b-2a72-7ed5-9015-76bf271af333";
+        lix.execute(
+            "INSERT INTO lix_file (id, path, content) VALUES ($1, '/selected', $2)",
+            &[
+                Value::Text(id.into()),
+                Value::Blob(b"before".to_vec().into()),
+            ],
+        )
+        .await
+        .unwrap();
+        let before = lix
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("commit_id")
+            .unwrap();
+        // The compared range changes the small selected file and an unrelated
+        // 40 MiB asset. The test records physical chunk requests, not elapsed time.
+        let large = vec![0xab; 40 * 1024 * 1024];
+        lix.execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/unrelated.asset', $1)",
+            &[Value::Blob(large.into())],
+        )
+        .await
+        .unwrap();
+        lix.execute(
+            "UPDATE lix_file SET path = '/renamed', content = $1 WHERE id = $2",
+            &[
+                Value::Blob(b"after".to_vec().into()),
+                Value::Text(id.into()),
+            ],
+        )
+        .await
+        .unwrap();
+        let after = lix
+            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("id")
+            .unwrap();
+        let adapter = lix.storage_adapter();
+        let chunks = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store = ContentReadProbe {
+            inner: SharedStorageAdapterRead::new(
+                adapter.begin_read(Default::default()).await.unwrap(),
+            ),
+            chunks: chunks.clone(),
+        };
+        let blob_reader =
+            Arc::new(crate::binary_cas::BinaryCasContext::new().reader(store.clone()));
+        let context = datafusion::prelude::SessionContext::new_with_config(
+            datafusion::prelude::SessionConfig::new()
+                .with_extension(Arc::new(ExecutionSlots::default())),
+        );
+        let relation =
+            DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_file").unwrap();
+        context
+            .register_table(
+                "changes",
+                Arc::new(SpecTableProvider::new(Arc::new(DiffSpec {
+                    store: store.clone(),
+                    blob_reader: blob_reader.clone(),
+                    read_interests: None,
+                    interest_endpoints: None,
+                    relation,
+                    from_commit_id: before,
+                    to_commit_id: after.clone(),
+                    active_branch_id: None,
+                    mode: DiffMode::General,
+                }))),
+            )
+            .unwrap();
+        super::super::mainline::register_functions(
+            &context,
+            SqlChangelogQuerySource { store },
+            Arc::new(PublicCatalog::fixed_system().clone()),
+            blob_reader,
+        );
+        let allowed = [b"before".as_slice(), b"after".as_slice()].map(|bytes| {
+            crate::binary_cas::ChunkHash::from_content(bytes)
+                .into_bytes()
+                .to_vec()
+        });
+        for source in [
+            "changes".to_string(),
+            format!("lix_history('lix_file', '{after}')"),
+        ] {
+            for predicate in [
+                format!("id = '{id}'"),
+                "from_path = '/selected'".into(),
+                "to_path = '/renamed'".into(),
+                "coalesce(to_path, from_path) = '/renamed'".into(),
+                format!("id IN ('{id}') AND diff_type = 'modified'"),
+            ] {
+                chunks.lock().unwrap().clear();
+                let batches = context
+                    .sql(&format!(
+                        "SELECT from_content, to_content FROM {source} WHERE {predicate}"
+                    ))
+                    .await
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                assert!(batches.iter().map(RecordBatch::num_rows).sum::<usize>() >= 1);
+                let reads = chunks.lock().unwrap();
+                assert!(
+                    !reads.is_empty(),
+                    "selected file content must reach storage"
+                );
+                assert!(
+                    reads.iter().all(|key| allowed.contains(key)),
+                    "unrelated asset chunk read for {predicate}: {reads:?}"
+                );
+            }
+            chunks.lock().unwrap().clear();
+            context
+                .sql(&format!("SELECT id FROM {source}"))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert!(
+                chunks.lock().unwrap().is_empty(),
+                "metadata projection must not open blob bytes"
+            );
+            context
+                .sql(&format!(
+                    "SELECT from_content, to_content FROM {source} WHERE to_path = '/missing'"
+                ))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert!(
+                chunks.lock().unwrap().is_empty(),
+                "empty selection must not open blob bytes"
+            );
+        }
+        chunks.lock().unwrap().clear();
+        context
+            .sql(&format!(
+                "SELECT to_content FROM changes WHERE id = '{id}' LIMIT 1"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert!(
+            chunks.lock().unwrap().iter().all(|key| key == &allowed[1]),
+            "projecting only the after side must not open before bytes"
+        );
+        let mixed = context.sql(&format!(
+            "SELECT id FROM changes WHERE id = '{id}' OR to_content = CAST('not a file' AS BYTEA)"
+        )).await.unwrap().collect().await.unwrap();
+        assert_eq!(
+            mixed.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            1,
+            "mixed content OR must stay intact as a residual predicate"
+        );
+        chunks.lock().unwrap().clear();
+        let volatile = context
+            .sql(&format!(
+                "SELECT to_content FROM changes WHERE id = '{id}' AND random() > 1 LIMIT 1"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(volatile.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+        assert!(
+            chunks.lock().unwrap().iter().all(|key| key == &allowed[1]),
+            "metadata conjunct remains bounded beside a volatile residual"
+        );
+        let large = context
+            .sql("SELECT to_content FROM changes WHERE to_path = '/unrelated.asset'")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(large.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let bytes = large
+            .iter()
+            .find(|batch| batch.num_rows() > 0)
+            .unwrap()
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        assert_eq!(bytes.value(0).len(), 40 * 1024 * 1024);
+        assert!(bytes.value(0).iter().all(|byte| *byte == 0xab));
+        lix.close().await.unwrap();
+    }
     #[tokio::test]
     async fn ancestor_moves_are_file_and_directory_changes_for_working_history_and_filtered_counts()
     {
@@ -2209,25 +2581,24 @@ mod tests {
         .await
         .expect("move ancestor");
         for query in [
-            "SELECT count(*) AS n, sum(row_count) AS atoms FROM lix_diff('lix_file')".to_owned(),
-            format!(
-                "SELECT count(*) AS n, sum(row_count) AS atoms FROM lix_diff('lix_file') WHERE id = '{file_id}'"
-            ),
+            "SELECT count(*) AS n FROM lix_diff('lix_file')".to_owned(),
+            format!("SELECT count(*) AS n FROM lix_diff('lix_file') WHERE id = '{file_id}'"),
         ] {
             let result = lix.execute(&query, &[]).await.expect("path-only count");
             assert_eq!(result.rows()[0].get::<i64>("n").unwrap(), 1);
-            assert_eq!(result.rows()[0].get::<i64>("atoms").unwrap(), 0);
         }
-        for (filter, expected_rows, expected_atoms) in [
-            (String::new(), 2, 1),
-            (format!(" WHERE id = '{directory_id}'"), 1, 0),
+        for (filter, expected_rows) in [
+            (String::new(), 2),
+            (format!(" WHERE id = '{directory_id}'"), 1),
         ] {
-            let result = lix.execute(&format!("SELECT count(*) AS n, sum(row_count) AS atoms FROM lix_diff('lix_directory'){filter}"), &[]).await.unwrap();
+            let result = lix
+                .execute(
+                    &format!("SELECT count(*) AS n FROM lix_diff('lix_directory'){filter}"),
+                    &[],
+                )
+                .await
+                .unwrap();
             assert_eq!(result.rows()[0].get::<i64>("n").unwrap(), expected_rows);
-            assert_eq!(
-                result.rows()[0].get::<i64>("atoms").unwrap(),
-                expected_atoms
-            );
         }
         let target = lix
             .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
@@ -2239,16 +2610,16 @@ mod tests {
             format!("lix_history('lix_file', '{target}')"),
         ] {
             let count_query = format!(
-                "SELECT count(*) AS n, sum(row_count) AS atoms FROM {source} WHERE lixcol_to_commit_id = '{target}'"
+                "SELECT count(*) AS n FROM {source} WHERE lixcol_to_commit_id = '{target}'"
             );
             let count = lix
                 .execute(&count_query, &[])
                 .await
                 .expect("projection-independent historical count");
             assert_eq!(count.rows()[0].get::<i64>("n").unwrap(), 1);
-            assert_eq!(count.rows()[0].get::<i64>("atoms").unwrap(), 0);
+
             let query = format!(
-                "SELECT id, diff_type, row_count, from_path, to_path FROM {source} WHERE id = '{file_id}' AND lixcol_to_commit_id = '{target}'"
+                "SELECT id, diff_type, from_path, to_path FROM {source} WHERE id = '{file_id}' AND lixcol_to_commit_id = '{target}'"
             );
             let result = lix
                 .execute(&query, &[])
@@ -2257,7 +2628,7 @@ mod tests {
             assert_eq!(result.rows().len(), 1);
             let rows = result.rows();
             assert_eq!(rows[0].get::<String>("diff_type").unwrap(), "modified");
-            assert_eq!(rows[0].get::<i64>("row_count").unwrap(), 0);
+
             assert_eq!(
                 rows[0].get::<String>("from_path").unwrap(),
                 "/docs/nested/a.txt"
@@ -2271,14 +2642,22 @@ mod tests {
             format!("lix_diff('lix_directory', '{baseline}', '{target}')"),
             format!("lix_history('lix_directory', '{target}')"),
         ] {
-            let count = lix.execute(&format!("SELECT count(*) AS n, sum(row_count) AS atoms FROM {source} WHERE lixcol_to_commit_id = '{target}'"), &[]).await.unwrap();
+            let count = lix
+                .execute(
+                    &format!(
+                        "SELECT count(*) AS n FROM {source} WHERE lixcol_to_commit_id = '{target}'"
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap();
             assert_eq!(count.rows()[0].get::<i64>("n").unwrap(), 2);
-            assert_eq!(count.rows()[0].get::<i64>("atoms").unwrap(), 1);
-            let result = lix.execute(&format!("SELECT diff_type, row_count, from_path, to_path FROM {source} WHERE id = '{directory_id}' AND lixcol_to_commit_id = '{target}'"), &[]).await.unwrap();
+
+            let result = lix.execute(&format!("SELECT diff_type, from_path, to_path FROM {source} WHERE id = '{directory_id}' AND lixcol_to_commit_id = '{target}'"), &[]).await.unwrap();
             assert_eq!(result.rows().len(), 1);
             let rows = result.rows();
             assert_eq!(rows[0].get::<String>("diff_type").unwrap(), "modified");
-            assert_eq!(rows[0].get::<i64>("row_count").unwrap(), 0);
+
             assert_eq!(rows[0].get::<String>("from_path").unwrap(), "/docs/nested");
             assert_eq!(rows[0].get::<String>("to_path").unwrap(), "/renamed/nested");
         }
@@ -2305,11 +2684,12 @@ mod tests {
         assert!(!names.contains(&"from_key"));
         assert!(!names.contains(&"to_key"));
         assert_eq!(
-            &names[names.len() - 3..],
-            &["row_count", "lixcol_from_commit_id", "lixcol_to_commit_id"]
+            &names[names.len() - 2..],
+            &["lixcol_from_commit_id", "lixcol_to_commit_id"]
         );
         assert!(!names.contains(&"lixcol_diff_type"));
         assert!(!names.contains(&"lixcol_row_count"));
+        assert!(!names.contains(&"row_count"));
         assert!(!names.contains(&"diff_id"));
         assert!(!names.contains(&"before_change_id"));
         assert!(!names.contains(&"after_change_id"));
@@ -2393,7 +2773,7 @@ mod tests {
     fn relation_diff_pushes_schema_identity_without_loading_payloads() {
         let relation = DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_key_value")
             .expect("key/value relation is registered");
-        let projection = Schema::new(vec![Field::new("row_count", DataType::Int64, false)]);
+        let projection = Schema::empty();
         let route = DiffRoute::from_filters(&[], &relation, &projection);
 
         assert_eq!(route.request.filter.schema_keys, vec!["lix_key_value"]);

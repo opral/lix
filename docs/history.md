@@ -58,7 +58,7 @@ includes changes received relative to its first parent; commits on merged side
 branches are not separately enumerated.
 
 History shares diff's typed primary keys, opaque `row_ref`, `diff_type` (`added`,
-`modified`, `removed`), `row_count`, and paired `from_<column>` / `to_<column>`
+`modified`, `removed`), and paired `from_<column>` / `to_<column>`
 columns. Absent sides are null. The endpoint metadata identifies the compared
 states; the checkpoint flag, time, and position describe the destination.
 Repeated edits compact to one net row difference; net-zero differences produce
@@ -97,9 +97,12 @@ viewport previews without one diff query for every checkpoint.
 
 File and directory events describe their logical before/after projections.
 Moving an ancestor directory changes descendant paths even if their own records
-did not change. A path-only descendant file event has `row_count = 0` directly
-changed file-owned records. Counts of changed files and sums of `row_count`
-measure different things; neither is a count of user edits.
+did not change. `COUNT(*)` counts the logical rows in the relation being
+displayed, including descendants whose paths changed. There is no aggregate
+count of internal descriptor or content records.
+
+Project `from_content` / `to_content` directly from file history for byte
+previews. Filter by file identity or path to select files before loading bytes.
 
 Load file bytes lazily from the endpoint snapshot:
 
@@ -109,8 +112,9 @@ FROM lix_as_of('lix_file', $1)
 WHERE id = $2;
 ```
 
-File history/diff does not project `from_content` or `to_content`. Select the
-needed metadata columns explicitly. Snapshot reads use live relation columns
+Select only metadata columns when bytes are unnecessary. Content projections
+can demand deferred historical state and blob chunks on partial replicas,
+including in working diffs. Snapshot reads use live relation columns
 and include complete tracked state, with its pinned global state, but exclude
 untracked rows. Collection-generation expansion restrictions remain explicit
 errors where row-level expansion is unsupported.

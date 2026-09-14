@@ -32,7 +32,7 @@ simulation_test!(row_ref_constructor_and_default_diff_are_typed_and_canonical, |
 
     let diff = session
         .execute(
-            "SELECT row_ref, id, diff_type, from_path, to_path, row_count \
+            "SELECT row_ref, id, diff_type, from_path, to_path \
              FROM lix_diff('lix_file') WHERE id = $1",
             &[Value::Text(id.into())],
         )
@@ -40,7 +40,7 @@ simulation_test!(row_ref_constructor_and_default_diff_are_typed_and_canonical, |
         .expect("one-argument diff should default from checkpoint (or root) to head");
     assert_eq!(
         diff.columns(),
-        ["row_ref", "id", "diff_type", "from_path", "to_path", "row_count"]
+        ["row_ref", "id", "diff_type", "from_path", "to_path"]
     );
     assert_eq!(diff.column_types()[0], ResultColumnType::RowRef);
     assert_eq!(diff.rows().len(), 1);

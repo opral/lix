@@ -42,7 +42,7 @@ case-fold, or Unicode-normalize paths. Filesystem adapters diagnose names that
 the target host cannot represent.
 
 The checkpoint and diff relations are read-only. `lix_diff()` exposes
-`row_ref`, the relation's typed primary-key columns, `diff_type`, `row_count`,
+`row_ref`, the relation's typed primary-key columns, `diff_type`,
 and paired `from_<column>` / `to_<column>` relation columns. Pass `row_ref` to
 the `lix_revert` and `lix_apply` command sinks or to the
 `lix_create_checkpoint()` function. See [Checkpoints](./checkpoints.md) and
@@ -54,7 +54,7 @@ checkpoint after a fork or restore.
 
 The rule is: `lixcol_` prefixes only engine-owned system metadata, while
 relation-specific payload always uses ordinary names such as `diff_type`,
-`row_count`, `from_path`, and `to_path`. Registered user schemas reject column
+`from_path` and `to_path`. Registered user schemas reject column
 names beginning with `lixcol_` or containing `_lixcol_`; this keeps system
 metadata mechanically distinguishable even after `from_`/`to_` side prefixing.
 

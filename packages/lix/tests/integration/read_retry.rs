@@ -382,7 +382,7 @@ async fn working_review_batch_retries_expired_hot_epoch_read() {
         },
         ExecuteBatchStatement {
             label: None,
-            sql: "SELECT id, row_count, from_path, to_path FROM lix_diff('lix_file')".to_string(),
+            sql: "SELECT id, from_path, to_path FROM lix_diff('lix_file')".to_string(),
             params: vec![],
         },
     ];

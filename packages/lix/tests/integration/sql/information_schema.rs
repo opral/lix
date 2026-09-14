@@ -223,13 +223,6 @@ simulation_test!(
                     Value::Null,
                 ],
                 vec![
-                    Value::Text("lix_file".to_string()),
-                    Value::Text("row_count".to_string()),
-                    Value::Text("BIGINT".to_string()),
-                    Value::Text("NO".to_string()),
-                    Value::Null,
-                ],
-                vec![
                     Value::Text("lix_key_value".to_string()),
                     Value::Text("row_ref".to_string()),
                     Value::Text("TEXT".to_string()),
@@ -263,13 +256,6 @@ simulation_test!(
                     Value::Text("TEXT".to_string()),
                     Value::Text("YES".to_string()),
                     Value::Text("JSONB".to_string()),
-                ],
-                vec![
-                    Value::Text("lix_key_value".to_string()),
-                    Value::Text("row_count".to_string()),
-                    Value::Text("BIGINT".to_string()),
-                    Value::Text("NO".to_string()),
-                    Value::Null,
                 ],
             ],
         );
