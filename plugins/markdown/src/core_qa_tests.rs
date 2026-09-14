@@ -791,3 +791,17 @@ fn qa_many_unmatched_link_openers_import_losslessly() {
         assert_eq!(document.bytes(), source.as_bytes());
     }
 }
+
+#[test]
+fn qa_table_pipes_adjacent_to_ambiguous_emphasis_import() {
+    for cell in [r"\|***1*:*", r"*:*1***\|"] {
+        let source = format!("| a | b |\n| - | - |\n| {cell} |\n");
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("pipes.md"),
+            IdNamespace::from_halves(40, 1),
+        )
+        .unwrap();
+        assert_eq!(document.bytes(), source.as_bytes());
+    }
+}

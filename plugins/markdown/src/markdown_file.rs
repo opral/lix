@@ -1611,6 +1611,7 @@ fn inlines_to_ast(nodes: &[InlineNode]) -> Result<Vec<md::Inline>, PluginError> 
             if let Some((source, delimiter)) =
                 nodes.get(index + 1).and_then(ambiguous_delimited_source)
                 && value.ends_with(delimiter)
+                && !value.contains('|')
             {
                 output.push(raw_inline(&format!("{value}{source}")));
                 index += 2;
@@ -1650,6 +1651,7 @@ fn inlines_to_ast(nodes: &[InlineNode]) -> Result<Vec<md::Inline>, PluginError> 
                 ..
             }) = nodes.get(index + 1)
                 && value.starts_with(delimiter)
+                && !value.contains('|')
             {
                 source.push_str(value);
                 index += 1;
