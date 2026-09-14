@@ -583,3 +583,61 @@ async fn markdown_sql_edits_and_documented_insert_survive_reopen() {
     assert_eq!(payload["inline"][0]["value"], "new");
     reopened.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn markdown_rejected_semantic_edit_preserves_durable_rows_and_bytes() {
+    let storage = Memory::new();
+    let lix = open_lix().with_storage(storage.clone()).await.unwrap();
+    install_markdown(&lix).await;
+    let original = b"<div>keep</div>\n".to_vec();
+    lix.execute(
+        "INSERT INTO lix_file(path,content) VALUES('/guard.md',$1)",
+        &[Value::Blob(original.clone().into())],
+    )
+    .await
+    .unwrap();
+    let before = lix
+        .execute(
+            "SELECT id,payload_json FROM markdown_node WHERE kind='html_block'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let id: String = before.rows()[0].get("id").unwrap();
+    let payload: Value = before.rows()[0].get("payload_json").unwrap();
+    let result = lix
+        .execute(
+            "UPDATE markdown_node SET payload_json=$1 WHERE id=$2",
+            &[
+                Value::Text(serde_json::json!({"value":"ordinary paragraph\n"}).to_string()),
+                Value::Text(id.clone()),
+            ],
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "HTML row edit must not silently become a paragraph"
+    );
+    lix.close().await.unwrap();
+    let reopened = open_lix().with_storage(storage).await.unwrap();
+    let bytes = reopened
+        .execute("SELECT content FROM lix_file WHERE path='/guard.md'", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<Vec<u8>>("content")
+        .unwrap();
+    assert_eq!(bytes, original);
+    let after = reopened
+        .execute(
+            "SELECT payload_json FROM markdown_node WHERE id=$1",
+            &[Value::Text(id)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        after.rows()[0].get::<Value>("payload_json").unwrap(),
+        payload
+    );
+    reopened.close().await.unwrap();
+}
