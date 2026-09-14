@@ -1090,7 +1090,9 @@ where
                                 validate_admission(&storage, &state, &connected).await?;
                                 transport = Some(connected);
                             }
-                            let recovery = async {
+                            // Keep the cold recovery future out of the worker's
+                            // inline layout for downstream storage adapters.
+                            let recovery = Box::pin(async {
                                 let connected = transport.as_ref().expect("connected");
                                 // Expiration is a reconnect condition. Request a fresh
                                 // authority pin immediately, even when its cursor has
@@ -1120,7 +1122,7 @@ where
                                     .await?;
                                 }
                                 Ok::<_, LixError>(())
-                            }.await;
+                            }).await;
                             let current = engine.sync_mode().partial_admission();
                             let admission_changed = current.as_deref() != Some(state.as_ref());
                             if let Err(error) = recovery {
