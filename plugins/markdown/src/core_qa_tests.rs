@@ -569,3 +569,16 @@ fn qa_table_inline_markers_preserve_cell_source_positions() {
     assert_eq!(markers, ["_", "__", "_", "__"]);
     assert_eq!(document.bytes(), source.as_bytes());
 }
+
+#[test]
+fn qa_relaxed_autolink_spelling_survives_import_and_edit() {
+    for source in ["://b\n", "custom://host\n", "http://\n"] {
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("urls.md"),
+            IdNamespace::from_halves(35, 1),
+        )
+        .unwrap();
+        assert_eq!(document.bytes(), source.as_bytes());
+    }
+}

@@ -1793,7 +1793,7 @@ fn inline_to_ast(node: &InlineNode, output: &mut Vec<md::Inline>) -> Result<(), 
                 "angle" => md::AutolinkKind::Angle,
                 "literal" => {
                     let original = format.original.as_deref().unwrap_or(destination);
-                    let spelling = if crate::parse::parse_literal_autolink(original, 0, true, false)
+                    let spelling = if crate::parse::parse_literal_autolink(original, 0, true, true)
                         .is_some_and(|(end, parsed)| {
                             end == original.len() && parsed == *destination
                         }) {
@@ -1801,7 +1801,7 @@ fn inline_to_ast(node: &InlineNode, output: &mut Vec<md::Inline>) -> Result<(), 
                     } else {
                         destination.strip_prefix("mailto:").unwrap_or(destination)
                     };
-                    if crate::parse::parse_literal_autolink(spelling, 0, true, false).is_some_and(
+                    if crate::parse::parse_literal_autolink(spelling, 0, true, true).is_some_and(
                         |(end, parsed)| end == spelling.len() && parsed == *destination,
                     ) {
                         md::AutolinkKind::GfmLiteral {
