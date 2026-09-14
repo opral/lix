@@ -86,7 +86,7 @@ export type LixBinding = {
 	executeBatch(
 		statements: BindingBatchStatement[],
 		options?: LixBatchOptions,
-	): Promise<BindingExecuteResult[]>;
+	): Promise<{ results: BindingExecuteResult[]; commit?: CommitSpan | null }>;
 	observe(sql: string, params: BindingParam[]): Promise<ObserveEventsBinding>;
 	beginTransaction(): Promise<LixTransactionBinding>;
 	replicaRecoverySources(): Promise<ReplicaRecoverySource[]>;
@@ -113,7 +113,7 @@ export type LixTransactionBinding = {
 		params: BindingParam[],
 		options?: ExecuteOptions,
 	): Promise<BindingExecuteResult>;
-	commit(): Promise<void>;
+	commit(): Promise<{ commit?: CommitSpan | null }>;
 	rollback(): Promise<void>;
 };
 

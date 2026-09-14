@@ -916,7 +916,7 @@ impl SessionActivity {
 #[derive(Clone)]
 struct CompletedRemoteTransaction {
     id: String,
-    result: Result<RemoteTransactionOutcome, LixError>,
+    result: Result<(RemoteTransactionOutcome, crate::CommitReceipt), LixError>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1369,7 +1369,7 @@ where
                     _ = &mut cancelled => {
                         let rollback = active.transaction.rollback().await;
                         let completed = rollback
-                            .map(|()| RemoteTransactionOutcome::RolledBack);
+                            .map(|()| (RemoteTransactionOutcome::RolledBack, crate::CommitReceipt::default()));
                         transactions.completed.push_back(CompletedRemoteTransaction {
                             id: transaction_id,
                             result: completed.clone(),
@@ -1398,7 +1398,10 @@ where
         result
     }
 
-    async fn commit_transaction(&self, transaction_id: String) -> Result<(), LixError> {
+    async fn commit_transaction(
+        &self,
+        transaction_id: String,
+    ) -> Result<crate::CommitReceipt, LixError> {
         self.finish_transaction(transaction_id, RemoteTransactionOutcome::Committed)
             .await
     }
@@ -1406,13 +1409,14 @@ where
     async fn rollback_transaction(&self, transaction_id: String) -> Result<(), LixError> {
         self.finish_transaction(transaction_id, RemoteTransactionOutcome::RolledBack)
             .await
+            .map(|_| ())
     }
 
     async fn finish_transaction(
         &self,
         transaction_id: String,
         requested: RemoteTransactionOutcome,
-    ) -> Result<(), LixError> {
+    ) -> Result<crate::CommitReceipt, LixError> {
         let record = Arc::clone(&self.record);
         self.run_detached(
             async move {
@@ -1431,12 +1435,15 @@ where
                         .transaction
                         .commit()
                         .await
-                        .map(|()| RemoteTransactionOutcome::Committed),
-                    RemoteTransactionOutcome::RolledBack => active
-                        .transaction
-                        .rollback()
-                        .await
-                        .map(|()| RemoteTransactionOutcome::RolledBack),
+                        .map(|receipt| (RemoteTransactionOutcome::Committed, receipt)),
+                    RemoteTransactionOutcome::RolledBack => {
+                        active.transaction.rollback().await.map(|()| {
+                            (
+                                RemoteTransactionOutcome::RolledBack,
+                                crate::CommitReceipt::default(),
+                            )
+                        })
+                    }
                 };
                 transactions
                     .completed
@@ -1447,7 +1454,7 @@ where
                 while transactions.completed.len() > MAX_COMPLETED_REMOTE_TRANSACTIONS {
                     transactions.completed.pop_front();
                 }
-                result.map(|_| ())
+                result.map(|(_, receipt)| receipt)
             },
             "join Lix server transaction finalization",
         )
@@ -1501,7 +1508,7 @@ fn completed_transaction_result<S>(
     transactions: &RemoteTransactionRegistry<S>,
     transaction_id: &str,
     requested: RemoteTransactionOutcome,
-) -> Result<(), LixError>
+) -> Result<crate::CommitReceipt, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -1511,7 +1518,7 @@ where
         .find(|completed| completed.id == transaction_id)
         .ok_or_else(|| remote_transaction_state_error("Lix session has no such transaction"))?;
     match &completed.result {
-        Ok(actual) if *actual == requested => Ok(()),
+        Ok((actual, receipt)) if *actual == requested => Ok(receipt.clone()),
         Ok(_) => Err(remote_transaction_state_error(
             "Lix transaction already completed with a different outcome",
         )),
@@ -2933,7 +2940,7 @@ fn execute_batch<S>(
     scope: Option<String>,
     headers: HeaderMap,
     Json(request): Json<ExecuteBatchRequest>,
-) -> SqlHandlerFuture<Json<Vec<ExecuteResponse>>>
+) -> SqlHandlerFuture<Json<ExecuteBatchResponse>>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -2979,12 +2986,15 @@ where
             .execute_batch(statements, options, statement_metadata, idempotency)
             .await?;
         lease.record.cache_request_blobs(cache_candidates);
-        Ok(Json(
-            results
+        let batch = crate::ExecuteBatchResult::from_results(results);
+        Ok(Json(ExecuteBatchResponse {
+            commit: batch.commit,
+            results: batch
+                .results
                 .into_iter()
                 .map(ExecuteResponse::try_from)
                 .collect::<Result<Vec<_>, _>>()?,
-        ))
+        }))
     })
 }
 
@@ -3518,15 +3528,19 @@ where
     })
 }
 
-fn commit_transaction<S>(lease: SessionLease<S>, headers: HeaderMap) -> SqlHandlerFuture<StatusCode>
+fn commit_transaction<S>(
+    lease: SessionLease<S>,
+    headers: HeaderMap,
+) -> SqlHandlerFuture<Json<crate::CommitReceipt>>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     Box::pin(async move {
-        lease
-            .commit_transaction(required_transaction_id(&headers)?)
-            .await?;
-        Ok(StatusCode::NO_CONTENT)
+        Ok(Json(
+            lease
+                .commit_transaction(required_transaction_id(&headers)?)
+                .await?,
+        ))
     })
 }
 
@@ -5203,6 +5217,12 @@ fn require_octet_stream_content_type(headers: &HeaderMap) -> Result<(), ApiError
             "raw sync chunk requests require Content-Type application/octet-stream",
         ))
     }
+}
+
+#[derive(Debug, Serialize)]
+struct ExecuteBatchResponse {
+    results: Vec<ExecuteResponse>,
+    commit: Option<crate::CommitSpan>,
 }
 
 #[derive(Debug, Serialize)]
@@ -7986,7 +8006,8 @@ mod tests {
         let results = replica
             .execute_batch(&statements)
             .await
-            .expect("history hydration retries the atomic batch before its local commit");
+            .expect("history hydration retries the atomic batch before its local commit")
+            .results;
         assert_eq!(results.len(), 2);
         assert_eq!(
             results[1].rows()[0].get::<serde_json::Value>("value"),
@@ -11752,9 +11773,15 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
-        assert_eq!(body.as_array().map(Vec::len), Some(2));
-        assert_eq!(body[0]["rows"][0][0], json!({ "kind": "int", "value": 1 }));
-        assert_eq!(body[1]["rows"][0][0], json!({ "kind": "int", "value": 2 }));
+        assert_eq!(body["results"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            body["results"][0]["rows"][0][0],
+            json!({ "kind": "int", "value": 1 })
+        );
+        assert_eq!(
+            body["results"][1]["rows"][0][0],
+            json!({ "kind": "int", "value": 2 })
+        );
     }
 
     #[tokio::test]
@@ -11805,8 +11832,14 @@ mod tests {
         .await;
         assert_eq!(batch.status(), StatusCode::OK);
         let batch = response_json(batch).await;
-        assert_eq!(batch[0]["commit"]["before"], json!(after));
-        assert_eq!(batch[1]["commit"], batch[0]["commit"], "one span per batch");
+        assert_eq!(batch["commit"]["before"], json!(after));
+        assert!(
+            batch["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|result| result.get("commit").is_none())
+        );
     }
 
     #[tokio::test]
@@ -11847,23 +11880,23 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
-        assert_eq!(body[0]["statementIndex"], 0);
-        assert_eq!(body[1]["statementIndex"], 1);
-        assert_eq!(body[2]["statementIndex"], 2);
-        assert_eq!(body[0]["label"], "same-label");
-        assert_eq!(body[1]["label"], "same-label");
-        assert!(body[2].get("label").is_none());
-        assert_eq!(body[0]["rowsAffected"], 1);
+        assert_eq!(body["results"][0]["statementIndex"], 0);
+        assert_eq!(body["results"][1]["statementIndex"], 1);
+        assert_eq!(body["results"][2]["statementIndex"], 2);
+        assert_eq!(body["results"][0]["label"], "same-label");
+        assert_eq!(body["results"][1]["label"], "same-label");
+        assert!(body["results"][2].get("label").is_none());
+        assert_eq!(body["results"][0]["rowsAffected"], 1);
         assert_eq!(
-            body[0]["rows"][0][1],
+            body["results"][0]["rows"][0][1],
             json!({ "kind": "jsonb", "value": "one" })
         );
         assert_eq!(
-            body[1]["rows"][0][1],
+            body["results"][1]["rows"][0][1],
             json!({ "kind": "jsonb", "value": "two" })
         );
         assert_eq!(
-            body[2]["rows"][0][0],
+            body["results"][2]["rows"][0][0],
             json!({ "kind": "jsonb", "value": "two" })
         );
 
@@ -11995,7 +12028,9 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(committed.status(), StatusCode::NO_CONTENT);
+        assert_eq!(committed.status(), StatusCode::OK);
+        let committed_receipt = response_json(committed).await;
+        assert!(committed_receipt["commit"]["after"].is_string());
         for body in [&mut existing, &mut during] {
             assert_eq!(
                 body.next().await["result"]["rows"][0][0],
@@ -12011,7 +12046,8 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(replayed_commit.status(), StatusCode::NO_CONTENT);
+        assert_eq!(replayed_commit.status(), StatusCode::OK);
+        assert_eq!(response_json(replayed_commit).await, committed_receipt);
 
         let transaction_id = begin_remote_transaction(&app.router, &session_id).await;
         let staged = remote_transaction_request(
@@ -12101,7 +12137,7 @@ mod tests {
                 None,
             )
             .await;
-            assert_eq!(committed.status(), StatusCode::NO_CONTENT);
+            assert_eq!(committed.status(), StatusCode::OK);
         }
 
         let visible = request(
@@ -12158,7 +12194,7 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(first_commit.status(), StatusCode::NO_CONTENT);
+        assert_eq!(first_commit.status(), StatusCode::OK);
         let second_commit = remote_transaction_request(
             &app.router,
             "POST",
@@ -12168,7 +12204,7 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(second_commit.status(), StatusCode::NO_CONTENT);
+        assert_eq!(second_commit.status(), StatusCode::OK);
 
         // Ordinary rows no longer surface a stale same-key INSERT as a
         // uniqueness error. The stale transaction is reconciled against the
@@ -12365,8 +12401,11 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_json(response).await;
-        assert_eq!(body[0]["rows"][0][0], wire_blob_json(&result));
-        assert_eq!(body[1]["rows"][0][0], json!({ "kind": "int", "value": 2 }));
+        assert_eq!(body["results"][0]["rows"][0][0], wire_blob_json(&result));
+        assert_eq!(
+            body["results"][1]["rows"][0][0],
+            json!({ "kind": "int", "value": 2 })
+        );
     }
 
     #[tokio::test]
@@ -13876,7 +13915,7 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(committed.status(), StatusCode::NO_CONTENT);
+        assert_eq!(committed.status(), StatusCode::OK);
 
         let spans = spans.lock().expect("capture spans");
         assert_info_plane(&spans);

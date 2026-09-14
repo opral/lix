@@ -545,7 +545,7 @@ impl RemoteLixTransaction {
             options: ProtocolExecuteOptions::default(),
         }
     }
-    pub async fn commit(mut self) -> Result<(), LixError> {
+    pub async fn commit(mut self) -> Result<crate::CommitReceipt, LixError> {
         let result = self
             .transaction
             .as_ref()
@@ -559,8 +559,9 @@ impl RemoteLixTransaction {
             .close()
             .await;
         self.client.take();
-        result?;
-        close_result
+        let receipt = result?;
+        close_result.map_err(|error| receipt.annotate_completion_error(error))?;
+        Ok(receipt)
     }
     pub async fn rollback(mut self) -> Result<(), LixError> {
         let result = self
@@ -703,8 +704,8 @@ impl RemoteExecuteBatchBuilder<'_> {
     }
 }
 impl<'a> IntoFuture for RemoteExecuteBatchBuilder<'a> {
-    type Output = Result<Vec<ExecuteResult>, LixError>;
-    type IntoFuture = crate::sync::SyncTransportFuture<'a, Vec<ExecuteResult>>;
+    type Output = Result<crate::ExecuteBatchResult, LixError>;
+    type IntoFuture = crate::sync::SyncTransportFuture<'a, crate::ExecuteBatchResult>;
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
             self.lix
@@ -984,7 +985,7 @@ impl<'a, StorageImpl> IntoFuture for ExecuteBatchBuilder<'a, StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    type Output = Result<Vec<ExecuteResult>, LixError>;
+    type Output = Result<crate::ExecuteBatchResult, LixError>;
     type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
 
     fn into_future(self) -> Self::IntoFuture {
@@ -1000,6 +1001,7 @@ where
                         .session
                         .execute_batch_with_options(&self.statements, self.options)
                         .await
+                        .map(crate::ExecuteBatchResult::from_results)
                 })
             });
         }
@@ -1018,6 +1020,7 @@ where
                         })
                     })
                     .await
+                    .map(crate::ExecuteBatchResult::from_results)
             })
         })
     }
@@ -2354,7 +2357,7 @@ where
             .await
     }
 
-    pub async fn commit(mut self) -> Result<(), LixError> {
+    pub async fn commit(mut self) -> Result<crate::CommitReceipt, LixError> {
         self.inner
             .take()
             .ok_or_else(closed_transaction_error)?
@@ -2802,7 +2805,7 @@ mod tests {
                 );
                 assert_ne!(child.session_id(), lix.client.session_id());
                 let result = if commit {
-                    transaction.commit().await
+                    transaction.commit().await.map(|_| ())
                 } else {
                     transaction.rollback().await
                 };

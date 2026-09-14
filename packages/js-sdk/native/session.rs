@@ -43,7 +43,7 @@ pub(crate) trait SessionOperations: Sized {
         &self,
         statements: &[ExecuteBatchStatement],
         options: ExecuteOptions,
-    ) -> Result<Vec<ExecuteResult>, LixError>;
+    ) -> Result<lix::ExecuteBatchResult, LixError>;
     async fn active_branch_id(&self) -> Result<String, LixError>;
     async fn active_account_id(&self) -> Result<String, LixError>;
     async fn create_branch(
@@ -120,7 +120,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> SessionOperations for Lix<S> {
         &self,
         statements: &[ExecuteBatchStatement],
         options: ExecuteOptions,
-    ) -> Result<Vec<ExecuteResult>, LixError> {
+    ) -> Result<lix::ExecuteBatchResult, LixError> {
         let execution = Lix::execute_batch(self, statements);
         match options.origin_key {
             Some(origin_key) => execution.with_origin_key(origin_key).await,
@@ -182,7 +182,7 @@ pub(crate) trait TransactionOperations {
         params: &[Value],
         options: ExecuteOptions,
     ) -> Result<ExecuteResult, LixError>;
-    async fn commit(&mut self) -> Result<(), LixError>;
+    async fn commit(&mut self) -> Result<lix::CommitReceipt, LixError>;
     async fn rollback(&mut self) -> Result<(), LixError>;
 }
 
@@ -207,7 +207,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> TransactionOperations
         }
     }
 
-    async fn commit(&mut self) -> Result<(), LixError> {
+    async fn commit(&mut self) -> Result<lix::CommitReceipt, LixError> {
         self.take()
             .ok_or_else(transaction_closed_error)?
             .commit()
@@ -253,13 +253,14 @@ mod remote {
                 .await
         }
 
-        async fn commit(&mut self) -> Result<(), LixError> {
-            self.as_ref()
+        async fn commit(&mut self) -> Result<lix::CommitReceipt, LixError> {
+            let receipt = self
+                .as_ref()
                 .ok_or_else(transaction_closed_error)?
                 .commit()
                 .await?;
             *self = None;
-            Ok(())
+            Ok(receipt)
         }
 
         async fn rollback(&mut self) -> Result<(), LixError> {
@@ -318,7 +319,7 @@ mod remote {
             &self,
             statements: &[ExecuteBatchStatement],
             options: ExecuteOptions,
-        ) -> Result<Vec<ExecuteResult>, LixError> {
+        ) -> Result<lix::ExecuteBatchResult, LixError> {
             ClientCore::execute_batch(self, statements, Some(options.into())).await
         }
 

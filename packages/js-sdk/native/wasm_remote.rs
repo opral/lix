@@ -306,10 +306,11 @@ impl WasmRemoteLixTransaction {
     }
 
     #[wasm_bindgen(js_name = commit)]
-    pub async fn commit(&mut self) -> Result<(), JsValue> {
-        crate::session::TransactionOperations::commit(&mut self.inner)
+    pub async fn commit(&mut self) -> Result<JsValue, JsValue> {
+        let receipt = crate::session::TransactionOperations::commit(&mut self.inner)
             .await
-            .map_err(lix_error_to_js)
+            .map_err(lix_error_to_js)?;
+        crate::wasm::to_js(&receipt)
     }
 
     #[wasm_bindgen(js_name = rollback)]

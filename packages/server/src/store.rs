@@ -4266,7 +4266,10 @@ mod host_provisioning_tests {
             .handle(
                 Request::builder()
                     .uri(format!("/lix/v1/{ID}"))
-                    .header("lix-server-protocol-version", "8")
+                    .header(
+                        "lix-server-protocol-version",
+                        lix_sdk::server_protocol::PROTOCOL_VERSION,
+                    )
                     .body(ServerProtocolBody::empty())
                     .unwrap(),
                 ServerProtocolContext::anonymous(),

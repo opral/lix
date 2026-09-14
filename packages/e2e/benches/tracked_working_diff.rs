@@ -936,7 +936,8 @@ async fn update_commit<StorageImpl>(
     let results = session
         .execute_batch(&statements)
         .await
-        .expect("update tracked-working-diff commit");
+        .expect("update tracked-working-diff commit")
+        .results;
     assert!(
         results.iter().all(|result| result.rows_affected() == 1),
         "every working-diff update must affect exactly one row"
@@ -968,7 +969,8 @@ async fn update_commit_range<StorageImpl>(
     let results = session
         .execute_batch(&statements)
         .await
-        .expect("update merge-preview rows");
+        .expect("update merge-preview rows")
+        .results;
     assert!(
         results.iter().all(|result| result.rows_affected() == 1),
         "every merge-preview update must affect exactly one row"

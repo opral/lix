@@ -151,3 +151,23 @@ test("disconnect drains active work but rejects queued writes and closes late ob
  expect(responses).toContainEqual(expect.objectContaining({id:4,ok:false}));
  expect(observationClose).toHaveBeenCalledTimes(1);expect(closed).toHaveBeenCalledTimes(1);
 });
+
+test("worker forwards the durable transaction commit receipt", async () => {
+	const responses: WorkerResponse[] = [];
+	let receive!: (message: WorkerInput) => void;
+	const span = { before: "before", after: "after" };
+	const binding = {
+		setTelemetryParent() {},
+		beginTransaction: async () => ({ commit: async () => ({ commit: span }) }),
+	} as unknown as LixBinding;
+	startWorkerHost({
+		postMessage: (message) => responses.push(message),
+		onMessage: (listener) => { receive = listener; },
+	}, async () => binding);
+	receive({ id: 1, sessionId: 0, operation: { kind: "open", storage: { kind: "memory" } } });
+	await vi.waitFor(() => expect(responses.some((response) => response.id === 1)).toBe(true));
+	receive({ id: 2, sessionId: 0, operation: { kind: "beginTransaction" } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 2, ok: true, value: 1 }));
+	receive({ id: 3, sessionId: 0, operation: { kind: "transaction.commit", transactionId: 1 } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 3, ok: true, value: { commit: span } }));
+});

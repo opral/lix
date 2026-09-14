@@ -42,12 +42,14 @@ macro_rules! wasm_session_methods {
                     ))
                     .await
                     .map_err(crate::wasm::lix_error_to_js)?;
+                let commit = results.commit;
                 let results = results
+                    .results
                     .into_iter()
                     .map(crate::wasm::ExecuteResultDto::try_from)
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(crate::wasm::lix_error_to_js)?;
-                crate::wasm::to_js(&results)
+                crate::wasm::to_js(&crate::wasm::ExecuteBatchResultDto { results, commit })
             }
 
             #[wasm_bindgen(js_name = activeBranchId)]

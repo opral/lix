@@ -467,7 +467,8 @@ where
     let results = session
         .execute_batch(pending)
         .await
-        .expect("dirty working-diff rows");
+        .expect("dirty working-diff rows")
+        .results;
     assert!(
         results.iter().all(|result| result.rows_affected() == 1),
         "every dirtying update must affect exactly one row"

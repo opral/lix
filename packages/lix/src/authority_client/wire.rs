@@ -685,3 +685,9 @@ mod commit_span_tests {
         }
     }
 }
+
+#[derive(Debug, Deserialize)]
+pub struct ExecuteBatchResponseBody {
+    pub results: Vec<ExecuteResponseBody>,
+    pub commit: Option<CommitSpan>,
+}

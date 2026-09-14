@@ -78,7 +78,9 @@ where
             params: params.clone(),
         })
         .collect::<Vec<_>>();
-    lix.execute_batch(&statements).await
+    lix.execute_batch(&statements)
+        .await
+        .map(|batch| batch.results)
 }
 
 /// Folds one public cell into an accumulator, reading the whole payload.
@@ -1104,6 +1106,7 @@ where
                 )
                 .await
                 .expect("execute tracked-state CRUD scalar SQL batch")
+                .results
                 .into_iter()
                 .map(|result| result.rows_affected())
                 .sum(),
@@ -1112,6 +1115,7 @@ where
                 .execute_batch(statements)
                 .await
                 .expect("execute tracked-state CRUD SQL batch")
+                .results
                 .into_iter()
                 .map(|result| result.rows_affected())
                 .sum(),

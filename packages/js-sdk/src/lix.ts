@@ -18,6 +18,8 @@ import type {
 	ExecuteOptions,
 	ExecuteResult,
 	ExecuteBatchResult,
+	CommitReceipt,
+	StatementResult,
 	LixBatchOptions,
 	LixBatchStatement,
 	MergeBranchOptions,
@@ -159,19 +161,19 @@ export class Lix {
 	executeBatch(
 		statements: readonly LixBatchStatement[],
 		options: LixBatchOptions & { rowMode: "array" },
-	): Promise<readonly ExecuteBatchResult<ResultArrayRow>[]>;
+	): Promise<ExecuteBatchResult<ResultArrayRow>>;
 	executeBatch(
 		statements: readonly LixBatchStatement[],
 		options?: LixBatchOptions & { rowMode?: "object" },
-	): Promise<readonly ExecuteBatchResult<ResultObjectRow>[]>;
+	): Promise<ExecuteBatchResult<ResultObjectRow>>;
 	executeBatch(
 		statements: readonly LixBatchStatement[],
 		options?: LixBatchOptions,
-	): Promise<readonly ExecuteBatchResult<ResultRow>[]>;
+	): Promise<ExecuteBatchResult<ResultRow>>;
 	async executeBatch(
 		statements: readonly LixBatchStatement[],
 		options?: LixBatchOptions,
-	): Promise<readonly ExecuteBatchResult<ResultRow>[]> {
+	): Promise<ExecuteBatchResult<ResultRow>> {
 		const normalizedStatements = normalizeBatchStatements(statements, options);
 		const { rowMode = "object", ...bindingOptions } = options ?? {};
 		return this.#runOperation(async () => {
@@ -179,7 +181,10 @@ export class Lix {
 				normalizedStatements,
 				bindingOptions,
 			);
-			return results.map((result) => wrapExecuteBatchResult(result, rowMode));
+			return {
+				results: results.results.map((result) => wrapExecuteBatchResult(result, rowMode)),
+				commit: results.commit ?? null,
+			};
 		});
 	}
 
@@ -551,26 +556,26 @@ export class LixTransaction {
 		sql: string,
 		params: SqlParam[] | undefined,
 		options: ExecuteOptions & { rowMode: "array" },
-	): Promise<ExecuteResult<ResultArrayRow>>;
+	): Promise<StatementResult<ResultArrayRow>>;
 	execute<TRow extends object = ResultObjectRow>(
 		sql: string,
 		params?: SqlParam[],
 		options?: ExecuteOptions & { rowMode?: "object" },
-	): Promise<ExecuteResult<TRow>>;
+	): Promise<StatementResult<TRow>>;
 	execute(
 		sql: string,
 		params: SqlParam[] | undefined,
 		options?: ExecuteOptions,
-	): Promise<ExecuteResult<ResultRow>>;
+	): Promise<StatementResult<ResultRow>>;
 	async execute(
 		sql: string,
 		params: SqlParam[] = [],
 		options?: ExecuteOptions,
-	): Promise<ExecuteResult<ResultRow>> {
+	): Promise<StatementResult<ResultRow>> {
 		if (this.finished) throw transactionClosedError();
 		assertExecuteArgs("lixTransaction", sql, params, options);
 		const { rowMode = "object", ...bindingOptions } = options ?? {};
-		return wrapExecuteResult(
+		const { commit: _commit, ...statement } = wrapExecuteResult(
 			await this.binding.execute(
 				sql,
 				params.map((param, index) =>
@@ -580,26 +585,30 @@ export class LixTransaction {
 			),
 			rowMode,
 		);
+		return statement;
 	}
 
-	async commit(): Promise<void> {
-		return this.finish("transaction.commit");
+	async commit(): Promise<CommitReceipt> {
+		return (await this.finish("transaction.commit"))!;
 	}
 
 	async rollback(): Promise<void> {
-		return this.finish("transaction.rollback");
+		await this.finish("transaction.rollback");
 	}
 
 	private async finish(
 		kind: "transaction.commit" | "transaction.rollback",
-	): Promise<void> {
+	): Promise<CommitReceipt | undefined> {
 		if (this.finished) throw transactionClosedError();
 		// The first terminal call owns the handle immediately. In particular,
 		// a concurrent rollback must never report a pending commit's success.
 		this.finished = true;
 		try {
-			if (kind === "transaction.commit") await this.binding.commit();
-			else await this.binding.rollback();
+			if (kind === "transaction.commit") {
+				const receipt = await this.binding.commit();
+				return { commit: receipt.commit ?? null };
+			}
+			await this.binding.rollback();
 		} finally {
 			// Keep the parent transaction lease until the binding settles. A
 			// terminal call consumes the handle even when it reports an error.

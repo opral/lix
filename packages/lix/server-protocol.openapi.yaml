@@ -116,12 +116,10 @@ paths:
                 cacheBlobs: { type: boolean }
       responses:
         "200":
-          description: Ordered statement results.
+          description: Ordered statement results and one transaction commit receipt.
           content:
             application/json:
-              schema:
-                type: array
-                items: { $ref: "#/components/schemas/ExecuteResponse" }
+              schema: { $ref: "#/components/schemas/ExecuteBatchResponse" }
         default: { $ref: "#/components/responses/Error" }
   /lix/v1/{lix_id}/sync/push:
     parameters:
@@ -662,7 +660,11 @@ paths:
         content:
           application/json: { schema: { $ref: "#/components/schemas/ExecuteRequest" } }
       responses:
-        "200": { $ref: "#/components/responses/Execute" }
+        "200":
+          description: Provisional statement result without a commit receipt.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatementResponse" }
         default: { $ref: "#/components/responses/Error" }
   /lix/v1/{lix_id}/transaction/commit:
     parameters:
@@ -674,7 +676,11 @@ paths:
         - $ref: "#/components/parameters/RequiredSessionId"
         - $ref: "#/components/parameters/TransactionId"
       responses:
-        "204": { description: Transaction committed. }
+        "200":
+          description: Transaction committed, including its exact commit receipt.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommitReceipt" }
         default: { $ref: "#/components/responses/Error" }
   /lix/v1/{lix_id}/transaction/rollback:
     parameters:
@@ -1004,7 +1010,7 @@ components:
       type: object
       required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
-        protocolVersion: { type: integer, const: 8 }
+        protocolVersion: { type: integer, const: 9 }
         syncProtocolVersion: { type: integer, const: 14 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
@@ -1040,14 +1046,70 @@ components:
         sql: { type: string, minLength: 1 }
         params: { type: array, items: {} }
         label: { type: string }
-    ExecuteResponse:
+    CommitSpan:
       type: object
+      required: [before, after]
+      properties:
+        before: { type: string }
+        after: { type: string }
+    CommitReceipt:
+      type: object
+      required: [commit]
+      properties:
+        commit:
+          oneOf:
+            - { $ref: "#/components/schemas/CommitSpan" }
+            - { type: "null" }
+    ExecuteBatchResponse:
+      type: object
+      required: [results, commit]
+      properties:
+        results:
+          type: array
+          items:
+            allOf:
+              - { $ref: "#/components/schemas/StatementResponse" }
+              - required: [statementIndex]
+        commit:
+          oneOf:
+            - { $ref: "#/components/schemas/CommitSpan" }
+            - { type: "null" }
+    StatementResponse:
+      type: object
+      description: One statement's rows, count, notices, and optional batch metadata. Used without a commit receipt in batches and explicit transactions.
       required: [columns, rows, rowsAffected, notices]
       properties:
-        columns: { type: array, items: { type: string } }
+        statementIndex: { type: integer, minimum: 0 }
+        label: { type: string }
+        columns:
+          type: array
+          items:
+            type: object
+            required: [name, type]
+            properties:
+              name: { type: string }
+              type:
+                type: string
+                enum: ["null", boolean, integer, real, text, jsonb, row_ref, timestamptz, blob]
         rows: { type: array, items: { type: array, items: {} } }
         rowsAffected: { type: integer, minimum: 0 }
-        notices: { type: array, items: { type: object } }
+        notices:
+          type: array
+          items:
+            type: object
+            required: [code, message]
+            properties:
+              code: { type: string }
+              message: { type: string }
+              hint: { type: string }
+    ExecuteResponse:
+      allOf:
+        - { $ref: "#/components/schemas/StatementResponse" }
+        - type: object
+          properties:
+            commit:
+              description: Present for auto-committed writes with a prior branch head; omitted for reads. The JavaScript SDK normalizes omission to null.
+              $ref: "#/components/schemas/CommitSpan"
     SyncRowPkPart:
       oneOf:
         - type: object

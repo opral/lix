@@ -179,6 +179,7 @@ mod tests {
             Ok(_) => transaction
                 .commit()
                 .await
+                .map(|_| ())
                 .expect("successful differential case should commit"),
             Err(_) => transaction
                 .rollback()
@@ -438,5 +439,4 @@ mod tests {
             }
         }
     }
-
 }

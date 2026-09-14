@@ -76,7 +76,7 @@ test("an active-transaction close preflight preserves the Lix and observations",
 		})),
 		beginTransaction: vi.fn(async () => ({
 			execute: vi.fn(),
-			commit: vi.fn(async () => undefined),
+			commit: vi.fn(async () => ({ commit: null })),
 			rollback: vi.fn(async () => undefined),
 		})),
 		activeBranchId: vi.fn(async () => "main"),
@@ -151,7 +151,7 @@ test.each(["commit", "rollback"] as const)(
 		const completion = deferred<void>();
 		const transactionBinding = {
 			execute: vi.fn(),
-			commit: vi.fn(async () => completion.promise),
+			commit: vi.fn(async () => { await completion.promise; return { commit: null }; }),
 			rollback: vi.fn(async () => completion.promise),
 		};
 		const binding = {
@@ -207,3 +207,27 @@ test.each(["commit", "rollback"] as const)(
 		await lix.close();
 	},
 );
+
+test("batch and explicit transaction receipts survive the public boundary", async () => {
+	const span = { before: "before", after: "after" };
+	const statement = { columns: [], rows: [], rowsAffected: 1, notices: [] };
+	const binding = {
+		executeBatch: vi.fn(async () => ({
+			results: [{ ...statement, statementIndex: 0, commit: span }], commit: span,
+		})),
+		beginTransaction: vi.fn(async () => ({
+			execute: vi.fn(async () => statement),
+			commit: vi.fn(async () => ({ commit: span })),
+		})),
+		close: vi.fn(async () => undefined),
+	} as unknown as LixBinding;
+	const lix = new Lix(binding);
+	const batch = await lix.executeBatch([{ sql: "INSERT INTO example VALUES (1)" }]);
+	expect(batch.commit).toEqual(span);
+	expect(batch.results).toHaveLength(1);
+	expect(batch.results[0]).not.toHaveProperty("commit");
+	const tx = await lix.beginTransaction();
+	expect(await tx.execute("INSERT INTO example VALUES (2)")).not.toHaveProperty("commit");
+	expect(await tx.commit()).toEqual({ commit: span });
+	await lix.close();
+});

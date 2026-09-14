@@ -266,7 +266,7 @@ export type CommitSpan = {
 	after: string;
 };
 
-export type ExecuteResult<TRow extends object = ResultObjectRow> = {
+export type StatementResult<TRow extends object = ResultObjectRow> = {
 	statementIndex?: number;
 	label?: string;
 	columns: ResultColumn[];
@@ -277,21 +277,23 @@ export type ExecuteResult<TRow extends object = ResultObjectRow> = {
 		message: string;
 		hint?: string;
 	}>;
-	/**
-	 * Present on every auto-committed write statement, including `RETURNING`
-	 * writes, and on every statement of a written batch (all carry the
-	 * batch's one span, read statements included). Absent for read
-	 * statements outside a written batch, read-only batches, statements
-	 * inside an explicit transaction (whose commit is the write), and the
-	 * first commit on a branch that had no head yet.
-	 */
-	commit?: CommitSpan;
 };
 
-export type ExecuteBatchResult<TRow extends object = ResultObjectRow> =
-	ExecuteResult<TRow> & {
-		statementIndex: number;
-	};
+export type ExecuteResult<TRow extends object = ResultObjectRow> =
+	StatementResult<TRow> & CommitReceipt;
+
+export type CommitReceipt = {
+	/** Exact durable transition for a committed write; null for reads. */
+	commit: CommitSpan | null;
+};
+
+export type ExecuteBatchStatementResult<TRow extends object = ResultObjectRow> =
+	StatementResult<TRow> & { statementIndex: number };
+
+export type ExecuteBatchResult<TRow extends object = ResultObjectRow> = {
+	results: readonly ExecuteBatchStatementResult<TRow>[];
+	commit: CommitSpan | null;
+};
 
 export type ObserveEvent = {
 	sequence: number;

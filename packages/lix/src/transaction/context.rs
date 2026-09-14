@@ -735,7 +735,7 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// overlapping semantic write without creating a temporary branch.
     opening_active_branch_head: Option<CommitId>,
     opening_global_branch_head: Option<CommitId>,
-    /// SQL UPDATE/DELETE predicates and computed values are decisions against
+    /// Explicit SQL reads and UPDATE/DELETE predicates are decisions against
     /// the opening snapshot, not edits that may be silently reconciled later.
     protect_sql_write_snapshot: bool,
     commit_boundary: Option<TransactionCommitBoundary>,
@@ -762,6 +762,7 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     sync_replica_remote_id: Option<Arc<str>>,
     partial_replica_admission: Option<Arc<crate::sync::PartialReplicaState>>,
     await_durable_commit: bool,
+    requires_individual_commit_span: bool,
     session_file_views: SessionFileViews,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
     pending_plugin_actor_publications: Vec<PendingPluginActorPublication>,
@@ -1512,6 +1513,10 @@ where
         Ok(true)
     }
 
+    pub(crate) fn protect_sql_read_snapshot(&mut self) {
+        self.protect_sql_write_snapshot = true;
+    }
+
     async fn fence_sql_write_snapshot<S>(&mut self, read: &S) -> Result<(), LixError>
     where
         S: StorageAdapterRead,
@@ -1533,7 +1538,7 @@ where
             if opening.raw_token != current.raw_token {
                 return Err(LixError::new(
                     LixError::CODE_TRANSACTION_CONFLICT,
-                    "SQL update or delete snapshot is stale because branch state changed",
+                    "SQL transaction snapshot is stale because branch state changed",
                 )
                 .with_hint("Retry the transaction against the latest committed state."));
             }
@@ -2228,6 +2233,7 @@ where
             sync_replica_remote_id: None,
             partial_replica_admission: None,
             await_durable_commit: false,
+            requires_individual_commit_span: false,
             session_file_views,
             pending_file_view_mutations: BTreeMap::new(),
             pending_plugin_actor_publications: Vec::new(),
@@ -2510,7 +2516,9 @@ where
                 let mut read = SharedStorageAdapterRead::new(commit_read);
                 // Preserve the original statement snapshot until its SQL decisions
                 // have been fenced; reconciliation below uses the current read.
-                transaction.fence_sql_write_snapshot(&read).await?;
+                if requires_tracked_snapshot_fence {
+                    transaction.fence_sql_write_snapshot(&read).await?;
+                }
                 // Commit-time reconciliation and validation must all observe this
                 // current coherent snapshot, while user statements above observed the
                 // snapshot retained from transaction open.
@@ -2764,6 +2772,10 @@ where
 
         }).await
         })
+    }
+
+    pub(crate) fn require_individual_commit_span(&mut self) {
+        self.requires_individual_commit_span = true;
     }
 
     /// The active-branch commit span this transaction is set to publish: the

@@ -334,8 +334,7 @@ export function startWorkerHost(
 			case "transaction.commit": {
 				const transaction = requiredTransaction(operation.transactionId);
 				transactions.delete(operation.transactionId);
-				await transaction.commit();
-				return undefined;
+				return await transaction.commit();
 			}
 			case "transaction.rollback": {
 				const transaction = requiredTransaction(operation.transactionId);

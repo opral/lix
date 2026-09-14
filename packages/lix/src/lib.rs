@@ -32,7 +32,7 @@
     )
 )]
 
-pub(crate) const SERVER_PROTOCOL_VERSION: u32 = 8;
+pub(crate) const SERVER_PROTOCOL_VERSION: u32 = 9;
 
 // Hosts can parse SQL with the same dialect and parameter rules as execution.
 #[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
@@ -197,7 +197,7 @@ pub use session::{
     RedoReceipt, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt,
 };
 pub use session::{
-    CommitSpan, ExecuteBatchStatement, ExecuteResult, ObserveEvent, ResultRowRef, Row,
+    CommitReceipt, CommitSpan, ExecuteBatchResult, ExecuteBatchStatement, ExecuteResult, ObserveEvent, ResultRowRef, Row,
     TryFromValue,
 };
 #[doc(hidden)]

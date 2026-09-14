@@ -392,7 +392,8 @@ async fn working_review_batch_retries_expired_hot_epoch_read() {
     let result = lix
         .execute_batch(&statements)
         .await
-        .expect("review must retry the whole coherent batch after HOT epoch expiration");
+        .expect("review must retry the whole coherent batch after HOT epoch expiration")
+        .results;
     assert_eq!(
         storage.expired_calls(),
         1,
@@ -557,9 +558,7 @@ async fn auto_commit_mutation_restarts_after_its_planning_snapshot_expires() {
 /// them, discovery included, must restart the statement rather than surface.
 #[tokio::test]
 async fn path_update_restarts_wherever_its_snapshot_expires() {
-    async fn open_with_file(
-        storage: &ExpiringReadStorage,
-    ) -> lix::Lix<ExpiringReadStorage> {
+    async fn open_with_file(storage: &ExpiringReadStorage) -> lix::Lix<ExpiringReadStorage> {
         let lix = crate::open_lix()
             .with_storage(storage.clone())
             .await
@@ -686,7 +685,8 @@ async fn read_only_batch_restarts_as_one_coherent_unit_after_expiry() {
     let results = lix
         .execute_batch(&statements)
         .await
-        .expect("the complete read batch should restart");
+        .expect("the complete read batch should restart")
+        .results;
 
     assert_eq!(results[0].rows()[0].get::<i64>("value").unwrap(), 1);
     assert_eq!(results[1].rows()[0].get::<i64>("value").unwrap(), 2);

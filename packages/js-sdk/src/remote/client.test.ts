@@ -26,7 +26,7 @@ test.each([
 ])("remote mode permits loopback HTTP locator %s", async (url) => {
 	const fetch = vi.fn(async () =>
 		Response.json({
-			protocolVersion: 8,
+			protocolVersion: 9,
 			activeBranchId: "01920000-0000-7000-8000-000000000601",
 			activeAccountId: "01920000-0000-7000-8000-000000000602",
 			sessionId: "session-1",
@@ -98,7 +98,7 @@ test("remote snapshots remain available on child and grandchild sessions", async
 					return new Response(null, { status: 204 });
 				if (!new URL(request.url).pathname.endsWith("/snapshot")) {
 					return Response.json({
-						protocolVersion: 8,
+						protocolVersion: 9,
 						activeBranchId: "main-id",
 						activeAccountId: "00000000-0000-7000-8000-000000000002",
 						sessionId: `session-${++handshakes}`,
@@ -224,7 +224,7 @@ test("Lix Server Protocol handshake requests a restored initial active branch", 
 					return new Response(null, { status: 204 });
 				}
 				return Response.json({
-					protocolVersion: 8,
+					protocolVersion: 9,
 					activeBranchId: "draft / one",
 					activeAccountId: accountId,
 					sessionId: "session-1",
@@ -261,7 +261,7 @@ test("openAnotherSession creates an independent remote protocol session", async 
 					return new Response(null, { status: 204 });
 				handshakes.push(request);
 				return Response.json({
-					protocolVersion: 8,
+					protocolVersion: 9,
 					activeBranchId:
 						new URL(request.url).searchParams.get("activeBranchId") ??
 						"main-id",
@@ -304,7 +304,7 @@ test("openAnotherSession rejects and closes a remote identity mismatch", async (
 				}
 				handshake += 1;
 				return Response.json({
-					protocolVersion: 8,
+					protocolVersion: 9,
 					activeBranchId: "main-id",
 					activeAccountId: handshake === 1 ? "account-a" : "account-b",
 					sessionId: `session-${handshake}`,
@@ -339,7 +339,7 @@ test("remote mode uses the repository protocol without loading a local engine", 
 			requests.push(request);
 			if (new URL(request.url).pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 				return Response.json({
-					protocolVersion: 8,
+					protocolVersion: 9,
 					activeBranchId: "main-id",
 					activeAccountId: "00000000-0000-7000-8000-000000000002",
 					sessionId: "session-1",
@@ -446,7 +446,7 @@ test("remote mode compresses only large compressible JSON requests", async () =>
 				const pathname = new URL(request.url).pathname;
 				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					return Response.json({
-						protocolVersion: 8,
+						protocolVersion: 9,
 						activeBranchId: "main-id",
 						activeAccountId: "00000000-0000-7000-8000-000000000002",
 						sessionId: "session-1",
@@ -512,12 +512,12 @@ test("remote executeBatch uses the first-class atomic batch endpoint", async () 
 				requests.push(request.clone());
 				return new URL(request.url).pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")
 					? Response.json({
-							protocolVersion: 8,
+							protocolVersion: 9,
 							activeBranchId: "main-id",
 							activeAccountId: "00000000-0000-7000-8000-000000000002",
 							sessionId: "session-1",
 						})
-					: Response.json([
+					: Response.json({ commit: null, results: [
 							{
 								statementIndex: 0,
 								label: "first",
@@ -533,7 +533,7 @@ test("remote executeBatch uses the first-class atomic batch endpoint", async () 
 								rowsAffected: 0,
 								notices: [],
 							},
-						]);
+						] });
 			},
 		},
 	});
@@ -545,11 +545,11 @@ test("remote executeBatch uses the first-class atomic batch endpoint", async () 
 		],
 		{ originKey: "batch-test" },
 	);
-	expect(results.map((result) => result.rows[0]?.value)).toEqual([
+	expect(results.results.map((result) => result.rows[0]?.value)).toEqual([
 		1,
 		"two",
 	]);
-	expect(results.map((result) => [result.statementIndex, result.label])).toEqual([
+	expect(results.results.map((result) => [result.statementIndex, result.label])).toEqual([
 		[0, "first"],
 		[1, undefined],
 	]);
@@ -802,7 +802,7 @@ test("Lix Server Protocol v3 uses blob splices without capability negotiation", 
 				const pathname = new URL(request.url).pathname;
 				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					return Response.json({
-						protocolVersion: 8,
+						protocolVersion: 9,
 						activeBranchId: "main-id",
 						activeAccountId: "00000000-0000-7000-8000-000000000002",
 						sessionId: "session-1",
@@ -848,7 +848,7 @@ test("remote executeBatch uses blob splices for stable statement slots", async (
 					return new Response(null, { status: 204 });
 				}
 				bodies.push((await requestJson(request)) as Record<string, unknown>);
-				return Response.json([{ ...emptyExecuteResponse(), statementIndex: 0 }]);
+				return Response.json({ commit: null, results: [{ ...emptyExecuteResponse(), statementIndex: 0 }] });
 			},
 		},
 	});
@@ -887,7 +887,7 @@ test("remote branches preserve local Lix branch semantics", async () => {
 				const pathname = new URL(request.url).pathname;
 				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					return Response.json({
-						protocolVersion: 8,
+						protocolVersion: 9,
 						activeBranchId,
 						activeAccountId: "00000000-0000-7000-8000-000000000002",
 						sessionId: "session-1",
@@ -942,7 +942,7 @@ test("remote lix_restore uses the existing execute endpoint", async () => {
 				const pathname = new URL(request.url).pathname;
 				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					return Response.json({
-						protocolVersion: 8,
+						protocolVersion: 9,
 						activeBranchId: "main-id",
 						activeAccountId: "00000000-0000-7000-8000-000000000002",
 						sessionId: "session-1",
@@ -992,7 +992,7 @@ test("remote undo and redo decode branch-history receipts", async () => {
 				const pathname = new URL(request.url).pathname;
 				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					return Response.json({
-						protocolVersion: 8,
+						protocolVersion: 9,
 						activeBranchId: "main-id",
 						activeAccountId: "00000000-0000-7000-8000-000000000002",
 						sessionId: "session-1",
@@ -1047,7 +1047,7 @@ test("a failed remote branch switch leaves the active branch unchanged", async (
 				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					handshakeCalls += 1;
 					return Response.json({
-						protocolVersion: 8,
+						protocolVersion: 9,
 						activeBranchId: "main-id",
 						activeAccountId: "00000000-0000-7000-8000-000000000002",
 						sessionId: "session-1",
@@ -1099,7 +1099,7 @@ test("an ambiguous remote branch switch is reconciled by the next branch read", 
 				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					handshakeCalls += 1;
 					return Response.json({
-						protocolVersion: 8,
+						protocolVersion: 9,
 						activeBranchId,
 						activeAccountId: "00000000-0000-7000-8000-000000000002",
 						sessionId: "session-1",
@@ -1140,7 +1140,7 @@ test("branch reconciliation rejects and never caches a replacement session", asy
 				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					handshakeCalls += 1;
 					return Response.json({
-						protocolVersion: 8,
+						protocolVersion: 9,
 						activeBranchId: "draft-id",
 						activeAccountId: "00000000-0000-7000-8000-000000000002",
 						sessionId: handshakeCalls === 1 ? "session-1" : "session-2",
@@ -1185,7 +1185,7 @@ test("remote clients retain independent active branches", async () => {
 				activeBranches.set(sessionId, "main-id");
 			}
 			return Response.json({
-				protocolVersion: 8,
+				protocolVersion: 9,
 				activeBranchId: activeBranches.get(sessionId),
 				activeAccountId: "00000000-0000-7000-8000-000000000002",
 				sessionId,
@@ -1235,7 +1235,7 @@ test("remote operations preserve normal Lix call ordering", async () => {
 				const pathname = new URL(request.url).pathname;
 				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					return Response.json({
-						protocolVersion: 8,
+						protocolVersion: 9,
 						activeBranchId: "main-id",
 						activeAccountId: "00000000-0000-7000-8000-000000000002",
 						sessionId: "session-1",
@@ -1293,7 +1293,7 @@ test("remote responses reject malformed rows and non-JSON HTTP errors", async ()
 				const pathname = new URL(request.url).pathname;
 				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					return Response.json({
-						protocolVersion: 8,
+						protocolVersion: 9,
 						activeBranchId: "main-id",
 						activeAccountId: "00000000-0000-7000-8000-000000000002",
 						sessionId: "session-1",
@@ -1357,11 +1357,14 @@ test("remote beginTransaction uses one capability-bound server lifecycle", async
 				});
 				if (path.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					return Response.json({
-						protocolVersion: 8,
+						protocolVersion: 9,
 						activeBranchId: "main-id",
 						activeAccountId: "00000000-0000-7000-8000-000000000002",
 						sessionId: "session-1",
 					});
+				}
+				if (path.endsWith("/transaction/commit")) {
+					return Response.json({ commit: { before: "before", after: "after" } });
 				}
 				if (path.endsWith("/transaction/begin")) {
 					return Response.json({ transactionId: "transaction-1" });
@@ -1384,7 +1387,7 @@ test("remote beginTransaction uses one capability-bound server lifecycle", async
 		originKey: "remote-transaction-test",
 	});
 	expect(result.rows[0]?.value).toBe(7);
-	await transaction.commit();
+	expect(await transaction.commit()).toEqual({ commit: { before: "before", after: "after" } });
 	await expect(transaction.execute("SELECT 1")).rejects.toMatchObject({
 		code: "LIX_INVALID_TRANSACTION_STATE",
 	});
@@ -1516,7 +1519,7 @@ test.each([undefined, "", " contains-space", "contains\nnewline", 42])(
 					url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
 					fetch: (async () =>
 						Response.json({
-							protocolVersion: 8,
+							protocolVersion: 9,
 							activeBranchId: "main-id",
 							activeAccountId: "00000000-0000-7000-8000-000000000002",
 							sessionId,
@@ -1539,7 +1542,7 @@ test("active branch reads reuse the initial handshake without another GET", asyn
 				}
 				handshakeCalls += 1;
 				return Response.json({
-					protocolVersion: 8,
+					protocolVersion: 9,
 					activeBranchId: "main-id",
 					activeAccountId: "00000000-0000-7000-8000-000000000002",
 					sessionId: "session-1",
@@ -1572,7 +1575,7 @@ test("execute recovers a gone protocol session once by opening a new handshake",
 					}
 					nextSession += 1;
 					return Response.json({
-						protocolVersion: 8,
+						protocolVersion: 9,
 						activeBranchId: "main-id",
 						activeAccountId: "00000000-0000-7000-8000-000000000002",
 						sessionId: `session-${nextSession}`,
@@ -1640,7 +1643,7 @@ test("execute recovers a closed protocol server once then retries with the new s
 				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					sessionIds.push(request.headers.get("lix-session-id"));
 					return Response.json({
-						protocolVersion: 8,
+						protocolVersion: 9,
 						activeBranchId: "main-id",
 						activeAccountId: "00000000-0000-7000-8000-000000000002",
 						sessionId:
@@ -1682,7 +1685,7 @@ test("a second gone protocol session after recovery is not retried", async () =>
 					handshakeCalls += 1;
 					expect(request.headers.has("lix-session-id")).toBe(false);
 					return Response.json({
-						protocolVersion: 8,
+						protocolVersion: 9,
 						activeBranchId: "main-id",
 						activeAccountId: "00000000-0000-7000-8000-000000000002",
 						sessionId: `session-${handshakeCalls}`,
@@ -1730,7 +1733,7 @@ test("an active branch read adopts a new session after protocol session gone", a
 						handshakes.length === 0 ? "session-1" : "session-2";
 					handshakes.push({ sessionId: null, issuedSessionId });
 					return Response.json({
-						protocolVersion: 8,
+						protocolVersion: 9,
 						activeBranchId:
 							issuedSessionId === "session-1" ? "main-id" : "draft-id",
 						activeAccountId: "00000000-0000-7000-8000-000000000002",
@@ -1771,7 +1774,7 @@ test("an expired session mutation is propagated without a new handshake or retry
 				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					handshakeCalls += 1;
 					return Response.json({
-						protocolVersion: 8,
+						protocolVersion: 9,
 						activeBranchId: "main-id",
 						activeAccountId: "00000000-0000-7000-8000-000000000002",
 						sessionId: "session-1",
@@ -1817,7 +1820,7 @@ test("close waits for queued operations before deleting the remote session", asy
 				const pathname = new URL(request.url).pathname;
 				if (pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")) {
 					return Response.json({
-						protocolVersion: 8,
+						protocolVersion: 9,
 						activeBranchId: "main-id",
 						activeAccountId: "00000000-0000-7000-8000-000000000002",
 						sessionId: "session-1",
@@ -1854,7 +1857,7 @@ test("close waits for queued operations before deleting the remote session", asy
 
 function handshakeResponse() {
 	return Response.json({
-		protocolVersion: 8,
+		protocolVersion: 9,
 		activeBranchId: "main-id",
 		activeAccountId: "00000000-0000-7000-8000-000000000002",
 		sessionId: "session-1",
