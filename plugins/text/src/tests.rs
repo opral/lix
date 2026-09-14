@@ -348,3 +348,38 @@ fn text_row_keys_require_native_uuid_values() {
         .expect_err("a textual UUID primary key must not cross the typed boundary");
     assert!(error.contains("UUID primary-key component"));
 }
+
+#[test]
+fn nonfinal_unterminated_rows_are_rejected_before_identity_state_can_drift() {
+    let (document, _) = open(b"a\nb\n");
+    let first = &document.lines()[0];
+    let change = lix::RowChange::upsert(
+        LINE_SCHEMA_KEY,
+        row_pk(first.id()).to_vec(),
+        row_with_bytes(first, b"a"),
+    );
+    assert!(
+        document
+            .rows_changed([change.clone()])
+            .unwrap_err()
+            .contains("nonfinal")
+    );
+    let mut rows = records(&open(b"a\nb\n").1);
+    rows[0].row = change.row.unwrap();
+    assert!(Document::open_rows(rows).unwrap_err().contains("nonfinal"));
+    assert_eq!(document.bytes(), b"a\nb\n");
+
+    let last = &document.lines()[1];
+    let (after, _) = document
+        .rows_changed([lix::RowChange::upsert(
+            LINE_SCHEMA_KEY,
+            row_pk(last.id()).to_vec(),
+            row_with_bytes(last, b"b"),
+        )])
+        .unwrap();
+    assert_eq!(after.bytes(), b"a\nb");
+    assert_eq!(
+        Document::open_file_with_identities(after.bytes().to_vec(), after.identities()).unwrap(),
+        after
+    );
+}

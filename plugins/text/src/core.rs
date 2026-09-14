@@ -399,6 +399,11 @@ impl Document {
                 .cmp(&right.order_key)
                 .then_with(|| left.id.cmp(&right.id))
         });
+        for line in lines.iter().take(lines.len().saturating_sub(1)) {
+            if !line.bytes.as_slice().ends_with(b"\n") {
+                return Err("every nonfinal text line must end with LF".to_owned());
+            }
+        }
         let bytes = Arc::new(render_lines(&lines)?);
         validate_text(&bytes)?;
         let mut offset = 0usize;
