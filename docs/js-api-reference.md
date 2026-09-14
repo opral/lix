@@ -168,6 +168,13 @@ on hover, then execute the same SELECT when opening it. Resident inputs stay loc
 Use ordinary `execute()` for writes; a read does not promise that all later write
 validation or commit dependencies are resident.
 
+Cancellable buffered local and partial-replica reads have a 30-second deadline including
+input hydration, and return at most 64 MiB or 1,000,000 rows per operation.
+`executeBatch()` shares the result budget across its read statements. Narrow
+large queries or request file ranges. Exceeding these bounds reports
+`LIX_READ_DEADLINE_EXCEEDED` or `LIX_READ_RESOURCE_EXHAUSTED`; accepted writes
+are never canceled or replayed by the read deadline.
+
 Parameters:
 
 | Parameter | Type             | Description                                                        |

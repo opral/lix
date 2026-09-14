@@ -1313,7 +1313,7 @@ async fn existing_branch_admission_publishes_matching_native_controls_and_retain
 }
 
 #[tokio::test]
-async fn owned_offline_open_upgrades_v1_receipt_without_changing_pending_data() {
+async fn detached_receipt_upgrade_preserves_pending_data_before_current_open() {
     let authority = open_lix().await.unwrap();
     authority
         .execute(
@@ -1529,10 +1529,10 @@ async fn owned_offline_open_upgrades_v1_receipt_without_changing_pending_data() 
     drop(read);
     drop(session);
     drop(engine);
+    // No transport exists in this route. Only the detached operator upgrades v1.
+    crate::sync::upgrade_owned_partial_receipt(&storage).await.unwrap();
     drop(storage);
     authority.close().await.unwrap();
-    // No transport exists in this route. Normal runtime readers must not decode
-    // v1; only owned epoch admission performs the one-way bounded rewrite.
     let admitted = crate::migration::admit_partial_epoch(&backing)
         .await
         .unwrap();

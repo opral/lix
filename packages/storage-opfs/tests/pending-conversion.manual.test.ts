@@ -1,4 +1,5 @@
-import { convertReplicaToPartial, openLix, type Lix } from "@lix-js/sdk";
+import { openLix, type Lix } from "@lix-js/sdk";
+import { convertReplicaToPartial } from "@lix-js/sdk/migration";
 import { OpfsStorage } from "@lix-js/storage-opfs";
 import { expect, test } from "vitest";
 import { OpfsStorageClient } from "../js/client.js";

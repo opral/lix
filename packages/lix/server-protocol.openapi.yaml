@@ -920,7 +920,7 @@ components:
       in: header
       required: true
       description: Exact SQL protocol version. Missing or incompatible versions are rejected before session creation or writes; upgrade the client.
-      schema: { type: integer, const: 8 }
+      schema: { type: integer, const: 9 }
     SessionId:
       name: Lix-Session-Id
       in: header
@@ -947,7 +947,7 @@ components:
       in: header
       required: true
       description: Exact sync wire-protocol version advertised by the handshake.
-      schema: { type: integer, const: 14 }
+      schema: { type: integer, const: 15 }
     TransactionId:
       name: Lix-Transaction-Id
       in: header
@@ -1004,8 +1004,8 @@ components:
       type: object
       required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
-        protocolVersion: { type: integer, const: 8 }
-        syncProtocolVersion: { type: integer, const: 14 }
+        protocolVersion: { type: integer, const: 9 }
+        syncProtocolVersion: { type: integer, const: 15 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }

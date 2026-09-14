@@ -2,7 +2,7 @@ import { openLix } from "@lix-js/sdk";
 import { OpfsStorage } from "@lix-js/storage-opfs";
 import { expect, test } from "vitest";
 
-test("snapshot migration survives a real OPFS heartbeat during candidate verification", async () => {
+test("current snapshot restore survives a real OPFS heartbeat during candidate verification", async () => {
 	const name = `slow-snapshot-migration-${crypto.randomUUID()}`;
 	const storage = new OpfsStorage({ name });
 	const original = storage.lixStorage;
@@ -18,14 +18,16 @@ test("snapshot migration survives a real OPFS heartbeat during candidate verific
 			},
 		},
 	};
-	const response = await fetch(new URL(
-		"../../lix/tests/fixtures/v75_released_repository.lixsnap",
-		import.meta.url,
-	));
-	expect(response.ok).toBe(true);
-	const bytes = new Uint8Array(await response.arrayBuffer());
-	// Compare against an independently migrated copy of the frozen released
-	// fixture; reopening an empty replacement must never satisfy this test.
+	// Ordinary opening accepts current-format snapshots. Historical formats
+	// are qualified through the detached migration composition suite.
+	const source = await openLix();
+	let bytes: Uint8Array;
+	try {
+		for (let i = 0; i < 3; i++) await source.execute(
+			"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [`heartbeat-${i}`, `preserved-${i}`],
+		);
+		bytes = new Uint8Array(await new Response(source.exportSnapshot()).arrayBuffer());
+	} finally { await source.close(); }
 	const expectedLix = await openLix.fromSnapshot(bytes);
 	const query = "SELECT key, value FROM lix_key_value ORDER BY key";
 	let expected;

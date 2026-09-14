@@ -10,8 +10,8 @@ mod component_shared;
 #[cfg(feature = "default_wasm_runtime")]
 pub(crate) mod default;
 
-pub mod component_host;
 mod api;
+pub mod component_host;
 mod contract;
 
 pub use api::*;
@@ -121,4 +121,6 @@ pub(crate) struct InstalledPluginMetadata {
 pub(crate) use install::recovery_test_plugin_archive;
 
 mod read_dependencies;
-pub(crate) use read_dependencies::{prepare_executable_blobs, prepare_returned_row_executables, prepare_file_content_state};
+pub(crate) use read_dependencies::{
+    prepare_executable_blobs, prepare_file_content_state, prepare_returned_row_executables,
+};

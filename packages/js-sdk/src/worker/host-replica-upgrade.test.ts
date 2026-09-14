@@ -27,7 +27,7 @@ for (const kind of ["replica.convert", "replica.cleanup"] as const) {
 		const storage = { kind: "memory" as const };
 		receive({ id: 1, sessionId: 0, operation: {
 			kind, storage,
-			server: { dynamicHeaders: false, customFetch: false, url: "https://example.com/lix/test", headers: [] },
+			server: { dynamicHeaders: false, url: "https://example.com/lix/test", headers: [] },
 		} });
 		await vi.waitFor(() => expect(responses).toContainEqual(
 			kind === "replica.convert" ? { id: 1, ok: true } : { id: 1, ok: true, value: 2 },
@@ -46,7 +46,7 @@ for (const kind of ["replica.convert", "replica.cleanup"] as const) {
 		}, async () => ({ setTelemetryParent() {}, async close() {} }) as unknown as LixBinding);
 		receive({ id: 1, sessionId: 0, operation: { kind: "open", storage: { kind: "memory" }, telemetryEnabled: false, progressEnabled: false } });
 		await vi.waitFor(() => expect(responses).toContainEqual({ id: 1, ok: true }));
-		receive({ id: 2, sessionId: 0, operation: { kind, storage: { kind: "memory" }, server: { dynamicHeaders: false, customFetch: false, url: "https://example.com/lix/test", headers: [] } } });
+		receive({ id: 2, sessionId: 0, operation: { kind, storage: { kind: "memory" }, server: { dynamicHeaders: false, url: "https://example.com/lix/test", headers: [] } } });
 		await vi.waitFor(() => expect(responses).toContainEqual(expect.objectContaining({ id: 2, ok: false, error: expect.objectContaining({ message: expect.stringContaining("requires closed storage") }) })));
 		expect(bindings.convert).not.toHaveBeenCalled();
 		expect(bindings.cleanup).not.toHaveBeenCalled();

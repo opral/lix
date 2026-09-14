@@ -913,7 +913,8 @@ fn is_retryable_sync_transport_error(error: &LixError) -> bool {
         return false;
     }
 
-    if error.code == super::http::SYNC_TRANSPORT_ERROR_CODE {
+    if error.code == super::http::SYNC_TRANSPORT_ERROR_CODE
+        || matches!(error.code.as_str(), "LIX_TRANSPORT_NETWORK" | "LIX_TRANSPORT_UNAVAILABLE" | "LIX_IDENTITY_UNVERIFIED_OFFLINE") {
         return true;
     }
     let status = error
@@ -2836,6 +2837,9 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(default_branch_id))
             .await
             .expect("replica initializes");
+        // The low-level initializer deliberately creates an unbanked fixture;
+        // explicit test migration establishes the current runtime envelope.
+        crate::migration::admit_repository(&storage, None).await.expect("adopt test fixture epoch");
         let replica = open_lix()
             .with_storage(storage)
             .await
@@ -4480,6 +4484,20 @@ mod metadata_batch_demand_tests {
                     .unwrap()
                     .is_none()
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod browser_transport_error_tests {
+    use super::*;
+    #[test]
+    fn transient_browser_leases_retry_but_contracts_and_auth_denials_do_not() {
+        for code in ["LIX_TRANSPORT_NETWORK", "LIX_TRANSPORT_UNAVAILABLE", "LIX_IDENTITY_UNVERIFIED_OFFLINE"] {
+            assert!(is_retryable_sync_transport_error(&LixError::new(code, "transient")));
+        }
+        for code in ["LIX_TRANSPORT_CALLBACK", "LIX_TRANSPORT_CONTRACT", "LIX_TRANSPORT_ABORTED", "LIX_ADMISSION_AUTH_REJECTED", "LIX_TRANSPORT_RESPONSE_LIMIT"] {
+            assert!(!is_retryable_sync_transport_error(&LixError::new(code, "stop")));
         }
     }
 }

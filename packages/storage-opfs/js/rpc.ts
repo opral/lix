@@ -9,7 +9,7 @@ import type {
 import type { OpfsWritePayload } from "./buffered-write.js";
 
 /** Internal protocol shared by the package-owned owner worker and its clients. */
-export const OPFS_RPC_PROTOCOL_VERSION = 3 as const;
+export const OPFS_RPC_PROTOCOL_VERSION = 4 as const;
 export const OPFS_RPC_CHANNEL =
 	`lix-js:storage-opfs:rpc:v${OPFS_RPC_PROTOCOL_VERSION}`;
 

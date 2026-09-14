@@ -82,6 +82,34 @@ impl PublicationPlan {
         Ok(())
     }
 
+    /// Consume the already validated bounded plan into a source projection for
+    /// exact post-migration verification. No source values are discarded unless
+    /// a canonical derived-space replacement explicitly declares that scope.
+    pub(super) fn into_preservation_overlay(
+        self,
+    ) -> (
+        std::collections::BTreeMap<u32, std::collections::BTreeMap<Bytes, Bytes>>,
+        std::collections::BTreeSet<u32>,
+    ) {
+        let mut replacements =
+            std::collections::BTreeMap::<u32, std::collections::BTreeMap<Bytes, Bytes>>::new();
+        for (space, batch) in self.replacements.into_iter().chain(self.mutable_puts) {
+            for entry in batch.entries {
+                replacements
+                    .entry(space.id.0)
+                    .or_default()
+                    .insert(entry.key.0, entry.value.bytes);
+            }
+        }
+        (
+            replacements,
+            self.cleared_spaces
+                .into_iter()
+                .map(|space| space.id.0)
+                .collect(),
+        )
+    }
+
     fn account(&mut self, batch: &PutBatch) -> Result<(), LixError> {
         let entries = batch.entries.len();
         let bytes = batch

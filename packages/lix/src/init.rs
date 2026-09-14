@@ -113,13 +113,17 @@ pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
 /// v78 stores checkpoint membership in canonical v7 commit metadata.
 /// v79 requires native deterministic-setting identity witnesses for bounded absence checks.
 /// v80 records complete checkpoint incorporation independently of commit membership.
-pub(crate) const CURRENT_FORMAT_VERSION: u32 = 80;
+/// v81 separates explicit migration from current-format opening and fences old runtimes.
+pub(crate) const CURRENT_FORMAT_VERSION: u32 = 81;
 const REPOSITORY_PROTOCOL_PREFIX: &[u8] = b"tracked-default-branch.v";
-pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v80";
+pub(crate) const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-default-branch.v81";
+pub(crate) const REPOSITORY_PROTOCOL_V80: &[u8] = b"tracked-default-branch.v80";
 pub(crate) const REPOSITORY_PROTOCOL_V79: &[u8] = b"tracked-default-branch.v79";
 pub(crate) const REPOSITORY_PROTOCOL_V78: &[u8] = b"tracked-default-branch.v78";
 // Older full-layout parsers reject the nonnumeric suffix before reading rows.
 pub(crate) const PARTIAL_REPOSITORY_PROTOCOL_VALUE: &[u8] =
+    b"tracked-default-branch.v81-partial-replica.v1";
+pub(crate) const PARTIAL_REPOSITORY_PROTOCOL_V80: &[u8] =
     b"tracked-default-branch.v80-partial-replica.v1";
 pub(crate) const PARTIAL_REPOSITORY_PROTOCOL_V79: &[u8] =
     b"tracked-default-branch.v79-partial-replica.v1";
@@ -260,7 +264,7 @@ pub(crate) fn migration_required_error(found_version: u32) -> LixError {
     LixError::new(
         "LIX_ERROR_REPOSITORY_MIGRATION_REQUIRED",
         format!(
-            "repository format v{found_version} must be upgraded to v{CURRENT_FORMAT_VERSION} by opening it with this Lix version"
+            "repository format v{found_version} must be upgraded to v{CURRENT_FORMAT_VERSION} using the detached migration tool before opening it"
         ),
     )
 }
@@ -590,7 +594,7 @@ where
     // Candidate initialization runs while the migration lease heartbeat writes
     // epoch control. Keep seed planning coherent at the logical bank revision
     // without retaining a physical read across the entire seed construction.
-    let mut read = crate::migration::MigrationPlanningRead::new(&storage).await?;
+    let mut read = crate::migration::MigrationPlanningRead::for_initialization(&storage).await?;
     let expected_revision =
         crate::storage_adapter::load_repository_mutation_revision(&read).await?;
     assert_empty_repository_for_initialize(&read).await?;
@@ -1607,11 +1611,15 @@ mod tests {
         );
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v80"),
-            RepositoryProtocolStatus::Current
+            RepositoryProtocolStatus::MigrationRequired { found_version: 80 }
         );
         assert_eq!(
             parse_repository_protocol(b"tracked-default-branch.v81"),
-            RepositoryProtocolStatus::TooNew { found_version: 81 }
+            RepositoryProtocolStatus::Current
+        );
+        assert_eq!(
+            parse_repository_protocol(b"tracked-default-branch.v82"),
+            RepositoryProtocolStatus::TooNew { found_version: 82 }
         );
         assert_eq!(
             parse_repository_protocol(b"not-a-lix-format"),

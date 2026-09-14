@@ -216,7 +216,8 @@ impl ReadInterestRegistry {
         })
     }
     /// Capture every scope used by one foreground operation, including scopes
-    /// already retained by the parent. The operation keeps the parent's gate.
+    /// already retained by the parent. Publication is explicit after the whole
+    /// coherent operation succeeds; failed attempts do not retain interests.
     pub(crate) fn capture(parent: Arc<Self>) -> Arc<Self> {
         Arc::new(Self {
             gate: Arc::new(RwLock::new(())),
@@ -227,6 +228,15 @@ impl ReadInterestRegistry {
             parent: Some(parent),
         })
     }
+    pub(crate) fn publish_capture(&self) -> Result<(), LixError> {
+        if let Some(parent) = &self.parent {
+            for interest in self.snapshot()?.interests {
+                parent.register((*interest).clone())?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn capture_parent(&self) -> Option<Arc<Self>> {
         self.parent.clone()
     }
@@ -376,10 +386,6 @@ impl ReadInterestRegistry {
     /// Call before predicate lowering or physical loading, including reads
     /// returning zero rows. A duplicate leaves the revision unchanged.
     pub(crate) fn register(&self, interest: LogicalReadInterest) -> Result<(), LixError> {
-        if let Some(parent) = &self.parent {
-            parent.register(interest.clone())?;
-        }
-
         let mut encoding = BoundedEncoding {
             bytes: Vec::new(),
             limit: self.max_bytes,
@@ -437,7 +443,7 @@ mod tests {
         )
     }
     #[test]
-    fn operation_capture_retains_repeated_parent_scope_and_forwards_new_scope() {
+    fn operation_capture_publishes_new_scope_only_after_success() {
         let parent = ReadInterestRegistry::new(8, 8192);
         let existing = negative_recipe();
         parent.register(existing.clone()).unwrap();
@@ -454,6 +460,8 @@ mod tests {
             schema_key: "example".into(),
         };
         capture.register(additional).unwrap();
+        assert_eq!(parent.snapshot().unwrap().interests.len(), 1);
+        capture.publish_capture().unwrap();
         assert_eq!(parent.snapshot().unwrap().interests.len(), 2);
         assert_eq!(capture.snapshot().unwrap().interests.len(), 2);
     }

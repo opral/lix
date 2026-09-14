@@ -10,8 +10,10 @@ const repoRoot = join(packageDir, "..", "..");
 const profile = process.env.LIX_WASM_PROFILE ?? "release";
 const cargoProfile = profile === "release" ? "release" : "dev";
 const artifactProfile = cargoProfile === "release" ? "release" : "debug";
-const outDir = join(packageDir, "dist", "wasm");
-const sourceOutDir = join(packageDir, "src", "wasm");
+const migrationArtifact = process.env.LIX_OFFLINE_MIGRATION === "1";
+const artifactDirectory = migrationArtifact ? "migration-wasm" : "wasm";
+const outDir = join(packageDir, "dist", artifactDirectory);
+const sourceOutDir = join(packageDir, "src", artifactDirectory);
 
 function run(command, args, options = {}) {
 	return new Promise((resolve, reject) => {
@@ -83,6 +85,7 @@ const cargoArgs = [
 	"--profile",
 	cargoProfile,
 ];
+if (migrationArtifact) cargoArgs.push("--features", "offline-migration");
 if (process.env.LIX_WASM_STORAGE_BENCH === "1") {
 	cargoArgs.push("--features", "storage-bridge-bench");
 }

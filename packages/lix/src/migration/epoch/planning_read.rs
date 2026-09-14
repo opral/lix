@@ -13,6 +13,7 @@ pub(crate) struct MigrationPlanningRead<S> {
 struct MigrationReadState<S> {
     source: StorageAdapter<S>,
     revision: Option<Bytes>,
+    initialization: bool,
 }
 
 impl<S> Clone for MigrationPlanningRead<S> {
@@ -25,11 +26,28 @@ impl<S> Clone for MigrationPlanningRead<S> {
 
 impl<S: Storage + Clone + Send + Sync + 'static> MigrationPlanningRead<S> {
     pub(crate) async fn new(source: &StorageAdapter<S>) -> Result<Self, StorageError> {
+        Self::capture(source, false).await
+    }
+
+    /// A competing cold opener may publish its seed while this read-only seed
+    /// plan is being built. That changes the transaction revision, not storage
+    /// ownership. The opener can validate the winner without replaying writes.
+    pub(crate) async fn for_initialization(
+        source: &StorageAdapter<S>,
+    ) -> Result<Self, StorageError> {
+        Self::capture(source, true).await
+    }
+
+    async fn capture(
+        source: &StorageAdapter<S>,
+        initialization: bool,
+    ) -> Result<Self, StorageError> {
         let revision = retry_read(|| source.load_mutation_revision()).await?;
         Ok(Self {
             inner: Arc::new(MigrationReadState {
                 source: source.clone(),
                 revision,
+                initialization,
             }),
         })
     }
@@ -51,7 +69,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> MigrationPlanningRead<S> {
         if StorageAdapter::<S>::load_mutation_revision_from_read(&read).await?
             != self.inner.revision
         {
-            return Err(StorageError::Fenced);
+            return Err(if self.inner.initialization {
+                StorageError::WriteConflict
+            } else {
+                StorageError::Fenced
+            });
         }
         Ok(read)
     }
@@ -209,6 +231,41 @@ mod tests {
         let source =
             StorageAdapter::for_epoch_migration(storage.clone(), EpochBank::A, claim.clone());
         (storage, source, claim)
+    }
+
+    #[tokio::test]
+    async fn initialization_revision_conflict_does_not_relax_epoch_fencing() {
+        for revision_change in [true, false] {
+            let (storage, source, claim) = fixture().await;
+            let read = MigrationPlanningRead::for_initialization(&source)
+                .await
+                .unwrap();
+            if revision_change {
+                let mut writes = source.new_write_set();
+                writes.put(SPACE, vec![2], vec![99]);
+                source
+                    .commit_write_set(writes, Default::default())
+                    .await
+                    .unwrap();
+            } else {
+                let active = encode_pointer(PointerState::Active {
+                    bank: EpochBank::B,
+                    generation: 1,
+                    format: crate::init::CURRENT_FORMAT_VERSION,
+                    publication: None,
+                });
+                replace_pointer(&storage, &claim, &active).await.unwrap();
+            }
+            let error = read.get_many(&[]).await.unwrap_err();
+            assert_eq!(
+                error,
+                if revision_change {
+                    StorageError::WriteConflict
+                } else {
+                    StorageError::Fenced
+                }
+            );
+        }
     }
 
     #[tokio::test]

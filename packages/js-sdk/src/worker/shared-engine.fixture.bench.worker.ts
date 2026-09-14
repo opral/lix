@@ -63,7 +63,7 @@ scope.onconnect = (event) => {
   let receive!: (message: WorkerInput) => void;
   const client: SharedEngineClient = {
     server: { url: "https://example.test", headers: [] },
-    verifyIdentity: async () => ({ authorityUrl: "https://example.test", accountId: "account" }),
+    verifyIdentity: async () => ({ authorityUrl: "https://example.test", accountId: "account", headers: [] }),
   };
   const host = startWorkerHost(
     {

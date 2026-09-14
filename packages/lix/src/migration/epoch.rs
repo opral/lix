@@ -5,7 +5,9 @@ mod pending_conversion_journal;
 pub(crate) use pending_conversion_journal::{
     PendingConversionJournal, retry_published_conversion_cleanup,
 };
+#[cfg(any(feature = "offline-migration", test))]
 mod partial_conversion;
+#[cfg(any(feature = "offline-migration", test))]
 pub(crate) use partial_conversion::convert_clean_replica_to_partial;
 mod partial;
 pub(crate) use partial::{
@@ -356,6 +358,22 @@ enum PointerState {
     },
 }
 
+pub(super) async fn inspect_layout<S: Storage>(
+    storage: &S,
+) -> Result<(super::public_api::RepositoryLayout, Option<u32>), LixError> {
+    use super::public_api::RepositoryLayout;
+    Ok(match load_pointer(storage).await? {
+        Some((PointerState::Active { format, .. }, _)) => (RepositoryLayout::Active, Some(format)),
+        Some((PointerState::Migrating { source_format, .. }, _)) => {
+            (RepositoryLayout::Interrupted, Some(source_format))
+        }
+        None => match super::inspect_lix(storage).await? {
+            super::MigrationStatus::Missing => (RepositoryLayout::Empty, None),
+            _ => (RepositoryLayout::Legacy, None),
+        },
+    })
+}
+
 /// Inspect the existing source without admitting or migrating it. Operator
 /// upgrades use this to reject an ineligible authority before changing storage.
 pub(super) async fn inspect_existing_epoch_adapter<S>(
@@ -381,7 +399,7 @@ where
     }
 }
 
-/// Adoption may migrate existing banks but must never claim a fresh bank.
+/// Current-format existing-storage admission never initializes or migrates.
 pub(crate) async fn admit_existing_repository<S>(storage: &S) -> Result<StorageAdapter<S>, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -410,9 +428,115 @@ where
         }
         _ => {}
     }
-    Ok(admit_repository(storage, None).await?.adapter)
+    Ok(admit_current_repository(storage, false).await?.adapter)
 }
 
+/// Steady-state admission. Legacy, interrupted, and unsupported epochs are read-only
+/// failures. Only genuinely empty storage may publish a fresh current epoch.
+pub(crate) async fn admit_current_repository<S>(
+    storage: &S,
+    create: bool,
+) -> Result<EpochAdmission<S>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    match load_pointer(storage).await? {
+        Some((PointerState::Active { bank, format, .. }, bytes)) => {
+            if format != crate::init::CURRENT_FORMAT_VERSION {
+                return Err(crate::init::migration_required_error(format));
+            }
+            Ok(EpochAdmission {
+                adapter: StorageAdapter::for_epoch(storage.clone(), bank, bytes),
+                report: OpenReport {
+                    format,
+                    initialized: false,
+                    migration: None,
+                },
+            })
+        }
+        Some((PointerState::Migrating { source_format, .. }, _)) => Err(LixError::new(
+            "LIX_ERROR_REPOSITORY_MIGRATION_REQUIRED",
+            format!(
+                "interrupted repository operation from v{source_format} requires explicit migration/recovery"
+            ),
+        )),
+        None => {
+            match super::inspect_lix(storage).await? {
+                super::MigrationStatus::Missing if create => {}
+                super::MigrationStatus::Missing => {
+                    return Err(LixError::new("LIX_NOT_FOUND", "repository does not exist"));
+                }
+                super::MigrationStatus::Current { version }
+                | super::MigrationStatus::Required {
+                    from_version: version,
+                    ..
+                } => return Err(crate::init::migration_required_error(version)),
+                _ => return Err(crate::init::unsupported_repository_protocol_error()),
+            }
+            let bytes = encode_pointer(PointerState::Active {
+                bank: EpochBank::A,
+                generation: 1,
+                format: crate::init::CURRENT_FORMAT_VERSION,
+                publication: None,
+            });
+            // One durable create with empty-range preconditions; no migration claim,
+            // heartbeat, legacy retirement, or source reconstruction is involved.
+            let mut preconditions = vec![Precondition::RangeEmpty {
+                space: REPOSITORY_EPOCH_SPACE,
+                range: KeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+            }];
+            preconditions.extend(
+                crate::storage_spaces::SNAPSHOT_STORAGE_SPACES
+                    .iter()
+                    .chain(
+                        crate::storage_spaces::RETIRED_STORAGE_SPACES
+                            .iter()
+                            .map(|entry| &entry.space),
+                    )
+                    .copied()
+                    .flat_map(|space| {
+                        [EpochBank::Legacy, EpochBank::A, EpochBank::B]
+                            .into_iter()
+                            .map(move |bank| Precondition::RangeEmpty {
+                                space: bank.map_space(space),
+                                range: KeyRange {
+                                    lower: Bound::Unbounded,
+                                    upper: Bound::Unbounded,
+                                },
+                            })
+                    }),
+            );
+            let mut write = storage
+                .begin_write(WriteOptions {
+                    await_durable: true,
+                    preconditions,
+                    ..Default::default()
+                })
+                .await?;
+            put_pointer(&mut write, bytes.clone()).await?;
+            match resolve_exact_pointer_commit(storage, write.commit().await, &bytes).await {
+                Ok(()) => {}
+                Err(error) if is_admission_race(&error) => {
+                    return Box::pin(admit_current_repository(storage, create)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+            Ok(EpochAdmission {
+                adapter: StorageAdapter::for_epoch(storage.clone(), EpochBank::A, bytes),
+                report: OpenReport {
+                    format: crate::init::CURRENT_FORMAT_VERSION,
+                    initialized: true,
+                    migration: None,
+                },
+            })
+        }
+    }
+}
+
+#[cfg(any(feature = "offline-migration", test))]
 pub(crate) async fn admit_repository<S>(
     storage: &S,
     progress: Option<&Arc<dyn OpenProgressSink>>,
@@ -423,10 +547,30 @@ where
     admit_repository_with_server(storage, progress, None).await
 }
 
+#[cfg(any(feature = "offline-migration", test))]
 pub(crate) async fn admit_repository_with_server<S>(
     storage: &S,
     progress: Option<&Arc<dyn OpenProgressSink>>,
     server: Option<&crate::ServerOptions>,
+) -> Result<EpochAdmission<S>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    admit_repository_with_options(
+        storage,
+        progress,
+        server,
+        super::MigrationOptions::default(),
+    )
+    .await
+}
+
+#[cfg(any(feature = "offline-migration", test))]
+pub(crate) async fn admit_repository_with_options<S>(
+    storage: &S,
+    progress: Option<&Arc<dyn OpenProgressSink>>,
+    server: Option<&crate::ServerOptions>,
+    options: super::MigrationOptions,
 ) -> Result<EpochAdmission<S>, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -452,13 +596,11 @@ where
                     // Keep cold migration/bootstrap state off the ordinary
                     // open future's stack, including for filesystem adapters.
                     return Box::pin(migrate_active(
-                        storage, bank, generation, format, bytes, progress, server,
+                        storage, bank, generation, format, bytes, progress, server, options,
                     ))
                     .await;
                 }
-                if generation >= 2 {
-                    let _ = schedule_legacy_retirement(storage.clone(), bytes.clone());
-                }
+
                 return Ok(EpochAdmission {
                     adapter: StorageAdapter::for_epoch(storage.clone(), bank, bytes),
                     report: OpenReport {
@@ -520,7 +662,7 @@ where
                 }
             }
             None => {
-                return Box::pin(admit_legacy(storage, progress, server)).await;
+                return Box::pin(admit_legacy(storage, progress, server, options)).await;
             }
         }
     }
@@ -721,10 +863,12 @@ where
     delete_pointer_resolving_outcome(storage, &recovery_bytes).await
 }
 
+#[cfg(any(feature = "offline-migration", test))]
 async fn admit_legacy<S>(
     storage: &S,
     progress: Option<&Arc<dyn OpenProgressSink>>,
     server: Option<&crate::ServerOptions>,
+    options: super::MigrationOptions,
 ) -> Result<EpochAdmission<S>, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -750,7 +894,10 @@ where
         });
         if let Err(error) = publish_migration_claim_absent(storage, &migrating_bytes).await {
             if is_admission_race(&error) {
-                return Box::pin(admit_repository_with_server(storage, progress, server)).await;
+                return Box::pin(admit_repository_with_options(
+                    storage, progress, server, options,
+                ))
+                .await;
             }
             return Err(storage_error(error));
         }
@@ -847,7 +994,10 @@ where
     let source_revision = match source.load_mutation_revision().await {
         Ok(revision) => revision,
         Err(error) if is_admission_race(&error) => {
-            return Box::pin(admit_repository_with_server(storage, progress, server)).await;
+            return Box::pin(admit_repository_with_options(
+                storage, progress, server, options,
+            ))
+            .await;
         }
         Err(error) => return Err(storage_error(error)),
     };
@@ -863,7 +1013,10 @@ where
         claim_legacy(storage, source_revision, &original_marker, &migrating_bytes).await
     {
         if is_admission_race(&error) {
-            return Box::pin(admit_repository_with_server(storage, progress, server)).await;
+            return Box::pin(admit_repository_with_options(
+                storage, progress, server, options,
+            ))
+            .await;
         }
         return Err(storage_error(error));
     }
@@ -896,6 +1049,7 @@ where
                 &migration_source,
                 &target,
                 from_format,
+                options,
             ))
             .await?
             {
@@ -942,7 +1096,7 @@ where
                 Box::pin(super::migrate_lix_with_adapter(
                     storage.clone(),
                     target.clone(),
-                    super::MigrationOptions::automatic(),
+                    options,
                 ))
                 .await?;
             }
@@ -997,6 +1151,7 @@ where
     finish_after_heartbeat(heartbeat, result).await
 }
 
+#[cfg(any(feature = "offline-migration", test))]
 async fn migrate_active<S>(
     storage: &S,
     source_bank: EpochBank,
@@ -1005,6 +1160,7 @@ async fn migrate_active<S>(
     active_source_bytes: Bytes,
     progress: Option<&Arc<dyn OpenProgressSink>>,
     server: Option<&crate::ServerOptions>,
+    options: super::MigrationOptions,
 ) -> Result<EpochAdmission<S>, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -1035,7 +1191,10 @@ where
     let source_revision = match source.load_mutation_revision().await {
         Ok(revision) => revision,
         Err(error) if is_admission_race(&error) => {
-            return Box::pin(admit_repository_with_server(storage, progress, server)).await;
+            return Box::pin(admit_repository_with_options(
+                storage, progress, server, options,
+            ))
+            .await;
         }
         Err(error) => return Err(storage_error(error)),
     };
@@ -1059,7 +1218,10 @@ where
     {
         Ok(claim) => claim,
         Err(error) if is_admission_race(&error) => {
-            return Box::pin(admit_repository_with_server(storage, progress, server)).await;
+            return Box::pin(admit_repository_with_options(
+                storage, progress, server, options,
+            ))
+            .await;
         }
         Err(error) => return Err(storage_error(error)),
     };
@@ -1073,7 +1235,10 @@ where
         resolve_exact_pointer_commit(storage, claim.commit().await, &migrating_bytes).await
     {
         if is_admission_race(&error) {
-            return Box::pin(admit_repository_with_server(storage, progress, server)).await;
+            return Box::pin(admit_repository_with_options(
+                storage, progress, server, options,
+            ))
+            .await;
         }
         return Err(storage_error(error));
     }
@@ -1102,6 +1267,7 @@ where
                 &migration_source,
                 &target,
                 from_format,
+                options,
             ))
             .await?
             {
@@ -1138,7 +1304,7 @@ where
                 Box::pin(super::migrate_lix_with_adapter(
                     storage.clone(),
                     target.clone(),
-                    super::MigrationOptions::automatic(),
+                    options,
                 ))
                 .await?;
             }
@@ -1164,7 +1330,7 @@ where
         // Standalone repositories retain the existing rollback window. A
         // retained replica source is excluded from legacy retirement forever;
         // later replacements also never reuse its numbered physical bank.
-        let _ = schedule_legacy_retirement(storage.clone(), active_bytes.clone());
+
         Ok(EpochAdmission {
             adapter: StorageAdapter::for_epoch(storage.clone(), target_bank, active_bytes),
             report: OpenReport {
@@ -1181,20 +1347,46 @@ where
     finish_after_heartbeat(heartbeat, result).await
 }
 
+#[cfg(any(feature = "offline-migration", test))]
 async fn migrate_sparse_candidate<S>(
     source: &StorageAdapter<S>,
     target: &StorageAdapter<S>,
     from_format: u32,
+    options: super::MigrationOptions,
 ) -> Result<bool, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    if from_format != 79 || !super::incorporation::is_legacy_partial(source).await? {
+    if !matches!(from_format, 79 | 80) {
         return Ok(false);
     }
+    let read = source.begin_read(ReadOptions::default()).await?;
+    let values = crate::storage_adapter::PointReadPlan::new(
+        crate::init::REPOSITORY_PROTOCOL_SPACE,
+        &[Key(Bytes::from_static(
+            crate::init::REPOSITORY_PROTOCOL_KEY,
+        ))],
+    )
+    .materialize(&read, Default::default())
+    .await?
+    .value;
+    let expected = if from_format == 79 {
+        crate::init::PARTIAL_REPOSITORY_PROTOCOL_V79
+    } else {
+        crate::init::PARTIAL_REPOSITORY_PROTOCOL_V80
+    };
+    if !matches!(values.first(), Some(Some(ProjectedValue::FullValue(value))) if value.as_ref() == expected)
+    {
+        return Ok(false);
+    }
+    drop(read);
     clear_bank(target).await?;
     let _ = copy_repository(source, target).await?;
-    super::incorporation::migrate(target, super::MigrationOptions::automatic(), true).await?;
+    if from_format == 79 {
+        super::incorporation::migrate(target, options, true).await?;
+    }
+    super::runtime_epoch::migrate(target, true).await?;
+    crate::sync::upgrade_owned_partial_receipt(target).await?;
     let state = crate::handle::retry_expired_read(|| async {
         let read = target.begin_read(ReadOptions::default()).await?;
         Ok(crate::sync::load_partial_replica_state(&read)
@@ -1210,15 +1402,7 @@ where
     Ok(true)
 }
 
-fn schedule_legacy_retirement<S>(storage: S, active_pointer: Bytes) -> Result<(), LixError>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    crate::background_task::spawn("lix-retire-legacy-repository-layout", move || async move {
-        let _ = retire_legacy_layout(&storage, &active_pointer).await;
-    })
-}
-
+#[cfg(test)]
 async fn retire_legacy_layout<S>(storage: &S, active_pointer: &Bytes) -> Result<(), LixError>
 where
     S: Storage + Clone,
@@ -1445,10 +1629,9 @@ async fn inspect_replica_rebuild<'a, S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    // A current-format repository in the legacy physical layout only needs an
-    // epoch copy. It must retain its existing offline replica admission; there
-    // is no historical format migration to replace with a server rebuild.
-    if source_format == crate::init::CURRENT_FORMAT_VERSION {
+    // v80 -> v81 is a marker-only cut. A full replica retains every local
+    // admission/pending record and needs no authority rebuild or network.
+    if source_format >= 80 {
         return Ok(None);
     }
     // The exact migration claim already fences ordinary writers. Identify the
@@ -3652,9 +3835,18 @@ pub(super) mod tests {
             .await
             .unwrap();
 
-        let admitted = migrate_active(&storage, EpochBank::A, 7, 75, stale_active, None, None)
-            .await
-            .expect("a losing opener should join the winner's active epoch");
+        let admitted = migrate_active(
+            &storage,
+            EpochBank::A,
+            7,
+            75,
+            stale_active,
+            None,
+            None,
+            super::super::MigrationOptions::default(),
+        )
+        .await
+        .expect("a losing opener should join the winner's active epoch");
 
         assert_eq!(admitted.adapter.epoch_bank(), EpochBank::B);
         assert_eq!(admitted.report.migration, None);
@@ -3784,4 +3976,67 @@ pub(crate) fn stage_legacy_partial_epoch_for_test(
         REPOSITORY_EPOCH_KEY,
         pointer.as_ref(),
     );
+}
+
+#[cfg(test)]
+pub(super) async fn stage_v80_repository_for_test<S>(
+    storage: &S,
+    partial: bool,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    stage_repository_format_for_test(storage, partial, 80).await
+}
+
+#[cfg(test)]
+pub(super) async fn stage_repository_format_for_test<S>(
+    storage: &S,
+    partial: bool,
+    format: u32,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let (
+        PointerState::Active {
+            bank,
+            generation,
+            publication,
+            ..
+        },
+        pointer,
+    ) = load_pointer(storage)
+        .await?
+        .expect("active test repository")
+    else {
+        panic!("active source required")
+    };
+    let adapter = StorageAdapter::for_epoch_migration(storage.clone(), bank, pointer.clone());
+    write_candidate_page(
+        &adapter,
+        crate::init::REPOSITORY_PROTOCOL_SPACE,
+        single_put(
+            crate::init::REPOSITORY_PROTOCOL_KEY,
+            Bytes::from_static(match (format, partial) {
+                (79, true) => crate::init::PARTIAL_REPOSITORY_PROTOCOL_V79,
+                (79, false) => crate::init::REPOSITORY_PROTOCOL_V79,
+                (80, true) => crate::init::PARTIAL_REPOSITORY_PROTOCOL_V80,
+                (80, false) => crate::init::REPOSITORY_PROTOCOL_V80,
+                _ => panic!("unsupported fixture format"),
+            }),
+        ),
+    )
+    .await?;
+    replace_pointer(
+        storage,
+        &pointer,
+        &encode_pointer(PointerState::Active {
+            bank,
+            generation,
+            publication,
+            format,
+        }),
+    )
+    .await
 }

@@ -112,20 +112,24 @@ async fn assert_draft_state(lix: &Lix<Memory>) {
 }
 
 #[tokio::test]
-async fn released_v75_repository_auto_upgrades_with_semantics_intact() {
+async fn released_v75_repository_explicitly_migrates_with_semantics_intact() {
+    let storage = Memory::new();
+    let migration = lix::migration::restore_and_migrate_repository(
+        storage.clone(),
+        Cursor::new(V75_RELEASED_SNAPSHOT),
+    )
+    .await
+    .expect("explicit v75 migration");
+    assert_eq!(migration.before.format, Some(75));
+    assert_eq!(
+        migration.after.format,
+        Some(lix::CURRENT_STORAGE_FORMAT_VERSION)
+    );
     let lix = open_lix()
-        .from_snapshot(Cursor::new(V75_RELEASED_SNAPSHOT))
+        .with_storage(storage)
         .await
-        .expect("released v75 repository should auto-upgrade");
-
-    assert_eq!(lix.open_report().format, 80);
-    assert!(!lix.open_report().initialized);
-    let migration = lix
-        .open_report()
-        .migration
-        .expect("v75 open should report its automatic upgrade");
-    assert_eq!(migration.from_format, 75);
-    assert_eq!(migration.to_format, 80);
+        .expect("open migrated current repository");
+    assert!(lix.open_report().migration.is_none());
 
     let main_branch_id = lix
         .active_branch_id()
@@ -175,7 +179,10 @@ async fn released_v75_repository_auto_upgrades_with_semantics_intact() {
         .from_snapshot(Cursor::new(migrated))
         .await
         .expect("migrated repository should cold-open");
-    assert_eq!(reopened.open_report().format, 80);
+    assert_eq!(
+        reopened.open_report().format,
+        lix::CURRENT_STORAGE_FORMAT_VERSION
+    );
     assert!(!reopened.open_report().initialized);
     assert_eq!(reopened.open_report().migration, None);
 

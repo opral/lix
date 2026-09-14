@@ -14,6 +14,8 @@ import type {
 	WorkerResponse,
 } from "./protocol.js";
 
+import { deserializeWorkerError } from "./protocol.js";
+
 // Browser/Wasm execution stays off the main thread.
 export const openDirectLixBinding: undefined | ((
 	storage: LixStorageConfig,
@@ -39,7 +41,7 @@ export function createWorkerConnection(): WorkerConnection {
 		},
 		onFatal(listener) {
 			worker.onerror = (event) =>
-				listener(event.error ?? new Error(event.message ?? "Lix worker failed"));
+				listener(workerFailure(event));
 		},
 		ref() {},
 		unref() {},
@@ -71,11 +73,39 @@ export function createSharedWorkerConnection(key: string): WorkerConnection {
  void acquired.then(() => port.postMessage({kind:"shared.clientLease",name:leaseName}));
  port.start();
  let closed = false;
+ let termination: Promise<void> | undefined;
+ let disconnected!: (error?: Error) => void;
+ const detached = new Promise<void>((resolve, reject) => { disconnected = error => error ? reject(error) : resolve(); });
  return {
   postMessage(message) {if (closed) throw new Error("Shared engine connection closed"); port.postMessage(message);},
-  onMessage(listener) {port.onmessage = event => listener(event.data);},
-  onFatal(listener) {failure=listener; worker.onerror=event => listener(new Error(event.message || "Shared engine failed"));},
+  onMessage(listener) {port.onmessage = event => {
+   if (event.data?.kind === "shared.disconnected") {
+    const error = event.data.error;
+    disconnected(error ? deserializeWorkerError(error) : undefined);
+   } else listener(event.data);
+  };},
+  onFatal(listener) {failure=listener; worker.onerror=event => listener(workerFailure(event));},
   ref() {}, unref() {},
-  async terminate() {if(closed)return;closed=true;port.postMessage({kind:"shared.disconnect"});release();port.close();},
+  terminate() {
+   if(termination)return termination;
+   termination = (async () => {
+   closed=true;
+   port.postMessage({kind:"shared.disconnect"});
+   release();
+   let timeout: ReturnType<typeof setTimeout> | undefined;
+   try {
+    await Promise.race([detached, new Promise<never>((_, reject) => {
+     timeout = setTimeout(() => reject(Object.assign(new Error("Shared engine close was not acknowledged"), {code:"LIX_SHARED_ENGINE_CLOSE_UNCONFIRMED"})), 10000);
+    })]);
+   } finally {if(timeout !== undefined)clearTimeout(timeout);port.close();}
+   })();
+   return termination;
+  },
  };
+}
+
+function workerFailure(event: ErrorEvent): Error {
+    if (event.error instanceof Error) return event.error;
+    const location = event.filename ? ` (${event.filename}:${event.lineno ?? 0}:${event.colno ?? 0})` : "";
+    return Object.assign(new Error(`${event.message || "Lix worker failed to load or execute"}${location}`), {code: "LIX_WORKER_FAILED"});
 }

@@ -1,3 +1,4 @@
+import type { HttpTransport } from "./http-transport.js";
 import type {
 	CommitSpan,
 	CreateBranchOptions,
@@ -28,7 +29,7 @@ export type SyncServerBindingOptions = {
 	url: string;
 	headers: [string, string][];
 	headerProvider?: () => Promise<[string, string][]>;
-	fetch?: typeof fetch;
+	transport?: HttpTransport;
 };
 
 export type BindingExecuteResult = {

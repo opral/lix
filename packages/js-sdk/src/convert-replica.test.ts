@@ -1,7 +1,7 @@
 import { expect,test,vi } from "vitest";
 const worker=vi.hoisted(()=>vi.fn(async()=>{}));
 vi.mock("./worker/client.js",()=>({convertReplicaWorkerOperation:worker}));
-import { convertReplicaToPartial } from "./open-lix.js";
+import { convertReplicaToPartial } from "./migration.js";
 
 test("conversion forwards provider configuration without opening full storage",async()=>{
  const options={name:"closed-provider"};

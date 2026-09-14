@@ -32,7 +32,13 @@
     )
 )]
 
-pub(crate) const SERVER_PROTOCOL_VERSION: u32 = 8;
+pub const SERVER_PROTOCOL_VERSION: u32 = 9;
+/// Current persisted repository format. Old stores require explicit migration.
+#[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
+pub const CURRENT_STORAGE_FORMAT_VERSION: u32 = init::CURRENT_FORMAT_VERSION;
+/// Current sync wire epoch; obsolete clients are rejected before mutation.
+#[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
+pub const SYNC_PROTOCOL_VERSION: u32 = sync::SYNC_PROTOCOL_VERSION;
 
 // Hosts can parse SQL with the same dialect and parameter rules as execution.
 #[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
@@ -92,7 +98,7 @@ mod hot_row_tombstone_probe;
 mod json_predicate_pushdown_probe;
 pub(crate) mod hot_state;
 pub(crate) mod init;
-mod migration;
+pub mod migration;
 mod open_types;
 /// The declared module layer order and the test that enforces it. Test-only:
 /// it contains no engine code, just the layering artifact and its guard.
@@ -155,7 +161,6 @@ pub use plugin::runtime::default::runtime as default_wasm_runtime;
 mod lifecycle;
 pub use lifecycle::{create_lix, delete_lix, CreateLixBuilder, DeleteLixBuilder, HostedLix};
 pub use handle::{
-    convert_replica_to_partial, retry_replica_migration_cleanup,
     CallbackOpenProgressSink, ExecuteBatchBuilder, ExecuteBuilder, Lix, LixTransaction,
     ObserveEvents, OpenAnotherSessionBuilder, OpenLixBuilder, OpenLixFromSnapshotBuilder,
     ServerOptions, TransactionExecuteBuilder, UnconfiguredOpenLixBuilder, RemoteOpenLixBuilder,
@@ -210,7 +215,10 @@ pub(crate) use session::{
 pub(crate) use session::VerifiedRequestBlob;
 #[cfg(feature = "storage-benches")]
 pub(crate) use sql_profile::SqlReadProfile;
+#[cfg(any(feature = "offline-migration", test))]
 pub use migration::upgrade_authority_for_partial_sync;
+#[cfg(any(feature = "offline-migration", test))]
+pub use handle::{convert_replica_to_partial, retry_replica_migration_cleanup};
 pub use storage::Memory;
 pub use sync::{
     ReplicaRecoveryBlob, ReplicaRecoveryBranch, ReplicaRecoveryExport, ReplicaRecoveryFile,

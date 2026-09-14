@@ -406,7 +406,7 @@ async fn working_review_batch_retries_expired_hot_epoch_read() {
 }
 
 #[tokio::test]
-async fn expired_read_waits_for_one_write_quiescent_retry() {
+async fn expired_read_progress_does_not_hold_or_wait_for_writer_gate() {
     let storage = ExpiringReadStorage::new();
     let lix = crate::open_lix()
         .with_storage(storage.clone())
@@ -422,22 +422,14 @@ async fn expired_read_waits_for_one_write_quiescent_retry() {
     let writer = lix.lock_collaboration_writes().await;
     storage.expire_next_read_call();
     let params = [Value::Text("read-quiescence".into())];
-    let mut read = Box::pin(async {
+    let result = tokio::time::timeout(Duration::from_secs(1), async {
         lix.execute("SELECT value FROM lix_key_value WHERE key = $1", &params)
             .await
-    });
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), read.as_mut())
-            .await
-            .is_err(),
-        "the expired read must wait until the in-flight writer releases the gate",
-    );
-
+    })
+    .await
+    .expect("a coherent snapshot retry must progress while the writer gate is held")
+    .expect("read retry should succeed");
     drop(writer);
-    let result = tokio::time::timeout(Duration::from_secs(1), read)
-        .await
-        .expect("quiescent retry should make forward progress")
-        .expect("quiescent retry should succeed");
     assert_eq!(
         result.rows()[0].get::<serde_json::Value>("value").unwrap(),
         serde_json::json!(42)
@@ -512,7 +504,7 @@ async fn perpetually_expired_read_remains_bounded() {
     .expect("retry policy must remain bounded")
     .expect_err("perpetual invalidation must eventually surface");
 
-    assert_eq!(error.code, "LIX_STORAGE_READ_EXPIRED");
+    assert_eq!(error.code, "LIX_READ_PROGRESS_EXHAUSTED");
     assert!(
         storage.expired_calls() > 1,
         "the bounded path must cover repeated invalidation",
@@ -557,9 +549,7 @@ async fn auto_commit_mutation_restarts_after_its_planning_snapshot_expires() {
 /// them, discovery included, must restart the statement rather than surface.
 #[tokio::test]
 async fn path_update_restarts_wherever_its_snapshot_expires() {
-    async fn open_with_file(
-        storage: &ExpiringReadStorage,
-    ) -> lix::Lix<ExpiringReadStorage> {
+    async fn open_with_file(storage: &ExpiringReadStorage) -> lix::Lix<ExpiringReadStorage> {
         let lix = crate::open_lix()
             .with_storage(storage.clone())
             .await

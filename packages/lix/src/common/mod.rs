@@ -6,6 +6,10 @@ pub(crate) mod json_pointer;
 pub(crate) mod lix_path;
 pub(crate) mod metadata;
 pub(crate) mod read_retry;
+mod read_budget;
+pub(crate) use read_budget::{ReadResultBudget, with_read_deadline};
+#[cfg(test)]
+pub(crate) use read_budget::{MAX_READ_RESULT_BYTES, MAX_READ_RESULT_ROWS};
 pub(crate) mod string_dictionary;
 pub(crate) mod timestamp;
 pub(crate) mod types;

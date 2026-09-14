@@ -8,6 +8,7 @@
 		"url": "https://github.com/opral/lix"
 	},
 	"exports": {
+		"./migration": { "types": "./dist/migration.d.ts", "default": "./dist/migration.js" },
 		".": {
 			"types": "./dist/index.d.ts",
 			"default": "./dist/index.js"
@@ -27,10 +28,12 @@
 		"dist"
 	],
 	"scripts": {
-		"build": "npm run clean && npm run build:native && npm run build:wasm && npm run build:ts && npm run build:plugins",
-		"build:browser": "npm run clean && npm run build:wasm && npm run build:ts && npm run build:plugins",
+		"build": "npm run clean && npm run build:native && npm run build:migration:native && npm run build:wasm && npm run build:migration:wasm && npm run build:ts && npm run build:plugins",
+		"build:browser": "npm run clean && npm run build:wasm && npm run build:migration:wasm && npm run build:ts && npm run build:plugins",
 		"build:native": "node ./scripts/build-native.js",
 		"build:wasm": "node ./scripts/build-wasm.js",
+		"build:migration:wasm": "LIX_OFFLINE_MIGRATION=1 node ./scripts/build-wasm.js",
+		"build:migration:native": "LIX_OFFLINE_MIGRATION=1 node ./scripts/build-native.js",
 		"build:wasm:dev": "LIX_WASM_PROFILE=dev node ./scripts/build-wasm.js",
 		"build:plugins": "node ./scripts/build-bundled-plugins.js",
 		"benchmark:plugin-reopen": "node ./scripts/benchmark-plugin-reopen.mjs",

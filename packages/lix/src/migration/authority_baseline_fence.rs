@@ -39,7 +39,7 @@ where
     drop(source);
     // Reuse the ordinary registered, resumable epoch migration rather than
     // rewriting the old source in place or constructing an engine.
-    let adapter = super::admit_existing_repository(storage).await?;
+    let adapter = super::epoch::admit_repository(storage, None).await?.adapter;
     let read = adapter.begin_read(Default::default()).await?;
     let marker = supported_authority_marker(&read).await?;
     if marker != original_marker {

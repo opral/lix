@@ -39,7 +39,10 @@ async fn fresh_open_reports_initialization_without_migration() {
         .await
         .expect("fresh repository should initialize and open");
 
-    assert_eq!(lix.open_report().format, 80);
+    assert_eq!(
+        lix.open_report().format,
+        lix::CURRENT_STORAGE_FORMAT_VERSION
+    );
     assert!(lix.open_report().initialized);
     assert_eq!(lix.open_report().migration, None);
     assert_eq!(
@@ -66,42 +69,26 @@ async fn fresh_open_reports_initialization_without_migration() {
 #[tokio::test]
 async fn migrates_profile_uri_and_persists_updates_across_cold_reopen() {
     let progress = Arc::new(RecordingProgress::default());
+    let storage = lix::Memory::new();
+    let report = lix::migration::restore_and_migrate_repository(
+        storage.clone(),
+        Cursor::new(V72_ACCOUNT_SNAPSHOT),
+    )
+    .await
+    .expect("explicit historical migration");
+    assert_eq!(report.before.format, Some(72));
+    assert!(report.after.current);
     let lix = open_lix()
+        .with_storage(storage)
         .with_open_progress_sink(progress.clone())
-        .from_snapshot(Cursor::new(V72_ACCOUNT_SNAPSHOT))
         .await
-        .expect("opening a v72 repository should migrate it automatically");
-    assert_eq!(lix.open_report().format, 80);
-    assert!(!lix.open_report().initialized);
-    let migration = lix
-        .open_report()
-        .migration
-        .expect("the open report should record the automatic migration");
-    assert_eq!(migration.from_format, 72);
-    assert_eq!(migration.to_format, 80);
-
-    let events = progress.events();
-    assert_eq!(
-        events.iter().map(|event| event.phase).collect::<Vec<_>>(),
-        vec![
-            OpenPhase::Inspecting,
-            OpenPhase::Migrating,
-            OpenPhase::Validating,
-            OpenPhase::Opening,
-            OpenPhase::Complete,
-        ],
-        "automatic migration progress should be deterministic and ordered",
-    );
-    assert_eq!(events[1].from_format, Some(72));
-    assert_eq!(events[1].to_format, 80);
-    assert_eq!(events[1].completed, Some(0));
-    assert_eq!(events[1].total, None);
+        .unwrap();
+    assert!(lix.open_report().migration.is_none());
     assert!(
-        events
+        progress
+            .events()
             .iter()
-            .skip(1)
-            .all(|event| event.from_format == Some(72)),
-        "every phase after inspection should retain the migration source format",
+            .all(|event| !matches!(event.phase, OpenPhase::Migrating | OpenPhase::Validating))
     );
     let accounts = lix
         .execute("SELECT id, profile_uri FROM lix_account ORDER BY id", &[])
@@ -138,7 +125,10 @@ async fn migrates_profile_uri_and_persists_updates_across_cold_reopen() {
         .from_snapshot(Cursor::new(migrated))
         .await
         .expect("migrated repository should cold-open");
-    assert_eq!(lix.open_report().format, 80);
+    assert_eq!(
+        lix.open_report().format,
+        lix::CURRENT_STORAGE_FORMAT_VERSION
+    );
     assert_eq!(lix.open_report().migration, None);
     assert!(!lix.open_report().initialized);
     let result = lix
