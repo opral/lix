@@ -1918,14 +1918,26 @@ fn node_from_typed_row(row: &TypedRow) -> Result<NodeSnapshot, PluginError> {
             ));
         }
     };
-    Ok(NodeSnapshot {
+    let node = NodeSnapshot {
         id: uuid("id")?,
         kind,
         parent_id: optional_uuid("parent_id")?,
         order_key: optional_text("order_key")?,
         payload: json_object("payload_json")?,
         format: json_object("format_json")?,
-    })
+    };
+    if node.kind == NodeKind::CodeBlock
+        && let Some(value) = node
+            .payload
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+        && ((!value.is_empty() && !value.ends_with('\n')) || value.contains('\r'))
+    {
+        return Err(PluginError::InvalidInput(
+            "code block values must use LF line endings and end with LF unless empty".into(),
+        ));
+    }
+    Ok(node)
 }
 
 fn fresh_tree_to_row_changes(root: &NodeTree) -> Result<Vec<RowChange>, PluginError> {

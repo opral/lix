@@ -897,3 +897,26 @@ fn qa_frontmatter_edits_preserve_value_or_reject_delimiter_lines() {
         }
     }
 }
+
+#[test]
+fn qa_code_block_edits_reject_implicit_line_ending_changes() {
+    let (document, _) = Document::open_file(
+        b"```\nold\n```\n".to_vec(),
+        Some("code.md"),
+        IdNamespace::from_halves(42, 3),
+    )
+    .unwrap();
+    for value in ["abc", "abc\r\n"] {
+        let mut node = document.tree.materialize().children[0].node.clone();
+        node.payload["value"] = serde_json::json!(value);
+        assert!(matches!(
+            document.rows_changed(vec![RowChange {
+                schema_key: NODE_SCHEMA_KEY.into(),
+                row_pk: vec![node.id],
+                row: Some(node_to_typed_row(&node).unwrap()),
+                effect: ChangeEffect::Content
+            }]),
+            Err(PluginError::InvalidInput(_))
+        ));
+    }
+}
