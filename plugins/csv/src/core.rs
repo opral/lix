@@ -1645,7 +1645,6 @@ impl RowImportBuilder {
             .iter()
             .map(|value| ((value.id.start, value.id.len), value.layout.clone()))
             .collect::<HashMap<_, _>>();
-        let mut moved_unterminated_ending = false;
         for (index, row) in self.rows.iter().enumerate() {
             let ending = layouts
                 .get(&(row.id.start, row.id.len))
@@ -1657,15 +1656,7 @@ impl RowImportBuilder {
                     .get_mut(&(row.id.start, row.id.len))
                     .expect("an unterminated row has a layout override")
                     .terminator = None;
-                moved_unterminated_ending = true;
             }
-        }
-        if moved_unterminated_ending {
-            let last = self.rows.last().expect("a moved final ending has rows");
-            layouts
-                .entry((last.id.start, last.id.len))
-                .or_default()
-                .terminator = Some(None);
         }
 
         let prefix_len = if self.dialect.bom { UTF8_BOM.len() } else { 0 };
@@ -2671,10 +2662,10 @@ impl Document {
         let ordinal = self.0.index.ordinal_of(location);
         let (chunk, row) = self.0.index.row(location);
         let start = chunk.byte_start + row.relative_start;
-        let ending = semantic.layout.ending(self.0.dialect);
-        if ending.is_none() && ordinal + 1 != self.row_count() {
-            return Err("only the final CSV row may be unterminated".to_owned());
-        }
+        let ending = semantic
+            .layout
+            .ending(self.0.dialect)
+            .or_else(|| (ordinal + 1 != self.row_count()).then_some(self.0.dialect.terminator));
         let insert = render_row_with_layout(
             &semantic.cells,
             self.0.dialect,
@@ -2733,10 +2724,10 @@ impl Document {
         } else {
             identities.append_id(semantic.id)?
         };
-        let ending = semantic.layout.ending(self.0.dialect);
-        if ending.is_none() && target_ordinal != self.row_count() {
-            return Err("only the final CSV row may be unterminated".to_owned());
-        }
+        let ending = semantic
+            .layout
+            .ending(self.0.dialect)
+            .or_else(|| (target_ordinal != self.row_count()).then_some(self.0.dialect.terminator));
         let mut insert = render_row_with_layout(
             &semantic.cells,
             self.0.dialect,

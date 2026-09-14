@@ -418,7 +418,7 @@ fn qa_reorder_unterminated_final_row_preserves_contents() {
     .unwrap()
     .0;
     let after = before.rows_changed(&[change]).unwrap().0;
-    assert_eq!(after.bytes(), b"last\nfirst");
+    assert_eq!(after.bytes(), b"last\nfirst\n");
     assert_eq!(cold.bytes(), after.bytes());
     assert_reconstructs(&after);
 }
@@ -552,4 +552,30 @@ fn qa_repeated_edits_replay_after_identity_checkpoint_reopen() {
             after.row_records().unwrap()
         );
     }
+}
+
+#[test]
+fn qa_append_unterminated_file_matches_cold_render() {
+    let before = open(b"a");
+    let mut records = before.row_records().unwrap();
+    let mut row = parse_csv_row(&records[1].row).unwrap();
+    row.id = uuid::Uuid::from_bytes([2; 16]);
+    row.order_key = "ff".into();
+    row.cells = vec!["b".into()];
+    row.layout = RowLayout::default();
+    let typed = csv_typed_row(row.clone()).unwrap();
+    let change = RowChange {
+        schema_key: ROW_SCHEMA_KEY.into(),
+        row_pk: vec![TypedValue::Uuid(row.id)],
+        row: Some(typed.clone()),
+        effect: ChangeEffect::Content,
+    };
+    records.push(RowRecord {
+        schema_key: change.schema_key.clone(),
+        row_pk: change.row_pk.clone(),
+        row: typed,
+    });
+    let warm = before.rows_changed(&[change]).unwrap().0;
+    let cold = Document::open_rows(records).unwrap().0;
+    assert_eq!(warm.bytes(), cold.bytes());
 }
