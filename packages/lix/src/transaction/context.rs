@@ -1680,12 +1680,14 @@ where
                 (plan, count, "generation_write_set")
             }
             None => {
+                // Classification consumes identities only. The diff still
+                // loads payloads needed for live/live equality internally.
+                let request = TrackedStateDiffRequest {
+                    retain_payloads: false,
+                    ..TrackedStateDiffRequest::default()
+                };
                 let concurrent = tracked
-                    .diff_commits(
-                        &opening_head_text,
-                        &current_head_text,
-                        &TrackedStateDiffRequest::default(),
-                    )
+                    .diff_commits(&opening_head_text, &current_head_text, &request)
                     .instrument(tracing::debug_span!(
                         target: "lix_transaction",
                         "lix.transaction.stale.general_diff"
@@ -1781,8 +1783,9 @@ where
                 &ChangeRecordProjection::full(),
             )
             .await?;
-        let opening_registry =
-            load_plugin_registry_at_commit(&mut tracked, &opening_head.to_string()).await?;
+        // The opening registry was authenticated on this exact transaction
+        // snapshot at begin; decoding it again cannot add information.
+        let opening_registry = &self.opening_plugin_registry;
         let current_registry =
             load_plugin_registry_at_commit(&mut tracked, &current_head.to_string()).await?;
         let mut merge_inputs = Vec::with_capacity(candidate_indices.len());
@@ -1830,7 +1833,7 @@ where
                 typed: current_registry.owns_schema(source.schema_key.as_str()),
                 plugin: common_registry_column_merger(
                     source.schema_key.as_str(),
-                    &opening_registry,
+                    opening_registry,
                     &current_registry,
                 )?,
             });
@@ -2472,6 +2475,20 @@ where
         result
     }
 
+    fn reset_drained_content_path_index(&mut self, prepared_writes: &PreparedWriteSet) {
+        if !prepared_writes_require_filesystem_index_rebuild(prepared_writes)
+            && !prepared_writes.state_rows.iter().any(|row| {
+                row.global || row.untracked || matches!(
+                    row.schema_key.as_str(),
+                    "lix_file_descriptor" | "lix_directory_descriptor"
+                )
+            })
+        {
+            self.filesystem_path_index_cache.clear();
+            self.filesystem_path_index_epoch.store(0, Ordering::SeqCst);
+        }
+    }
+
     /// Native commit materialization boundary. Returns prospective storage
     /// mutations only; durable publication remains exclusively in commit_prepared.
     fn prepare_storage_commit<'a>(
@@ -2523,6 +2540,11 @@ where
                 // current coherent snapshot, while user statements above observed the
                 // snapshot retained from transaction open.
                 transaction.opening_read = read.clone();
+                // The statement overlay has been drained into prepared_writes. For
+                // content-only commits, path lookup can now use the coherent shared
+                // snapshot index. Keep descriptor-changing commits on their existing
+                // path: their prepared paths may still be needed during replay.
+                transaction.reset_drained_content_path_index(&prepared_writes);
                 // Plain engines sharing replica storage remain fenced. An admitted
                 // sync engine may commit its durable pending suffix locally.
                 if !transaction.sync_role.is_replica()
@@ -17102,6 +17124,80 @@ fallback={large_fallback} decoded={large_decoded}"
             0,
             "a deleted file must not be resurrected by the pinned probe"
         );
+    }
+
+    #[tokio::test]
+    async fn drained_content_path_index_reuses_shared_snapshot_and_commit_resets_epoch() {
+        let storage = Memory::new();
+        let (_, _, _, runtime, mut transaction) = open_test_transaction(&storage).await;
+        let request = FilesystemPathIndexRequest::new(vec![GLOBAL_BRANCH_ID.to_owned()]);
+        let shared = transaction.filesystem_path_index(&request).await.unwrap();
+        transaction.filesystem_path_index_epoch.store(1, Ordering::SeqCst);
+        let private = transaction.filesystem_path_index(&request).await.unwrap();
+        assert!(!Arc::ptr_eq(&shared, &private));
+        let drained = transaction.staged_writes.drain().unwrap();
+        transaction.reset_drained_content_path_index(&drained);
+        reset_transaction_path_index_build_stats();
+        let reused = transaction.filesystem_path_index(&request).await.unwrap();
+        assert!(Arc::ptr_eq(&shared, &reused));
+        assert_eq!(transaction_path_index_build_stats().builds, 0);
+        // Replay can reuse epoch one. Its private index must not alias the
+        // pre-drain overlay retained under that same revision/epoch key.
+        transaction.filesystem_path_index_epoch.store(1, Ordering::SeqCst);
+        let replay_private = transaction.filesystem_path_index(&request).await.unwrap();
+        assert!(!Arc::ptr_eq(&private, &replay_private));
+        assert_eq!(transaction_path_index_build_stats().builds, 1);
+        // Exercise the consumed commit boundary too, rather than only its helper.
+        let epoch = transaction.filesystem_path_index_epoch.clone();
+        epoch.store(1, Ordering::SeqCst);
+        transaction.commit(&runtime).await.unwrap();
+        assert_eq!(epoch.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn drained_descriptor_rows_keep_private_path_epoch() {
+        for schema in ["lix_file_descriptor", "lix_directory_descriptor"] {
+            let storage = Memory::new();
+            let (_, _, _, _, mut transaction) = open_test_transaction(&storage).await;
+            let mut drained = transaction.staged_writes.drain().unwrap();
+            let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
+            drained.state_rows.push_parts_with_change_addressability(
+                SchemaPlanId::for_test(0), PreparedRowFacts::default(),
+                RowPk::single("file-a"), schema.into(), Some("file-a".into()),
+                None, None, None, None, timestamp, timestamp, false,
+                Some(ChangeId::for_test_label("provisional")), true,
+                Some(CommitId::for_test_label("commit")), false, "main".into(),
+            );
+            transaction.filesystem_path_index_epoch.store(3, Ordering::SeqCst);
+            transaction.reset_drained_content_path_index(&drained);
+            assert_eq!(transaction.filesystem_path_index_epoch.load(Ordering::SeqCst), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn drained_global_rows_and_branch_heads_keep_private_path_epoch() {
+        for untracked in [false, true] {
+            let storage = Memory::new();
+            let (_, _, _, _, mut transaction) = open_test_transaction(&storage).await;
+            transaction.stage_rows(raw_write_rows(vec![
+                key_value_stage_row("epoch-guard", "value", untracked),
+            ])).await.unwrap();
+            let drained = transaction.staged_writes.drain().unwrap();
+            transaction.filesystem_path_index_epoch.store(3, Ordering::SeqCst);
+            transaction.reset_drained_content_path_index(&drained);
+            assert_eq!(transaction.filesystem_path_index_epoch.load(Ordering::SeqCst), 3);
+        }
+        let storage = Memory::new();
+        let (_, _, _, _, mut transaction) = open_test_transaction(&storage).await;
+        transaction.advance_branch_ref(
+            "01960000-0000-7000-8000-0000000000c1",
+            CommitId::for_test_label("epoch-head"),
+        ).await.unwrap();
+        let drained = transaction.staged_writes.drain().unwrap();
+        let epoch = transaction.filesystem_path_index_epoch.load(Ordering::SeqCst);
+        assert!(epoch > 0);
+        transaction.reset_drained_content_path_index(&drained);
+        assert_eq!(transaction.filesystem_path_index_epoch.load(Ordering::SeqCst), epoch);
     }
 
     #[tokio::test]

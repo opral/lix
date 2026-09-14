@@ -10,8 +10,7 @@ path = "junit.xml"
 [profile.ci-e2e]
 inherits = "ci"
 
-[[profile.ci-e2e.overrides]]
-# This test measures a fixed commit-latency budget. Reserve the runner's
-# test capacity so unrelated E2E workloads do not consume its CPU budget.
-filter = "test(=crdt_benchmarks_b3_1_json_concurrent_map_sets)"
-threads-required = "num-cpus"
+# The optimized latency job runs separately from other E2E workloads.
+[profile.ci-latency]
+inherits = "ci"
+test-threads = 1

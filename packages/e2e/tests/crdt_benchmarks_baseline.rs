@@ -79,13 +79,18 @@ async fn crdt_benchmarks_b2_1_markdown_concurrent_prefix_inserts() {
 
 /// dmonad/crdt-benchmarks B3.1 durable Lix baseline.
 ///
-/// Runs in CI rather than as a manual profiling workload: it is the only
-/// coverage for a hundred-writer same-base wave, it completes in about a
-/// second, and its convergence assertions no longer depend on how the
-/// coordinator batched that wave. `LIX_CRDT_B3_CLIENTS` and `LIX_CRDT_SAMPLES`
+/// Runs the hundred-writer correctness workload in ordinary CI and enforces
+/// the latency budget in a separate optimized CI job. Distinct commit receipts
+/// require distinct durable transitions; unoptimized code generation is not
+/// the production latency contract. `LIX_CRDT_B3_CLIENTS` and `LIX_CRDT_SAMPLES`
 /// scale it up for profiling runs.
 #[tokio::test]
 async fn crdt_benchmarks_b3_1_json_concurrent_map_sets() {
+    assert!(
+        std::env::var_os("LIX_REQUIRE_OPTIMIZED_LATENCY").is_none()
+            || !cfg!(debug_assertions),
+        "the latency CI job must use the release profile",
+    );
     let clients = std::env::var("LIX_CRDT_B3_CLIENTS")
         .ok()
         .map(|value| {
@@ -190,11 +195,13 @@ async fn crdt_benchmarks_b3_1_json_concurrent_map_sets() {
             .map(|elapsed| elapsed.as_secs_f64() * 1_000.0)
             .collect::<Vec<_>>(),
     );
-    assert!(
-        p95 < Duration::from_millis(100),
-        "same-base durable commit service p95 was {:.3} ms",
-        p95.as_secs_f64() * 1_000.0
-    );
+    if !cfg!(debug_assertions) {
+        assert!(
+            p95 < Duration::from_millis(100),
+            "same-base durable commit service p95 was {:.3} ms",
+            p95.as_secs_f64() * 1_000.0
+        );
+    }
 }
 
 #[tokio::test]
