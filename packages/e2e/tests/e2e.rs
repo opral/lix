@@ -5523,7 +5523,7 @@ async fn v2_excalidraw_roundtrips_and_renders_local_element_edits() {
 
     let elements = lix
         .execute(
-            "SELECT id, element_type FROM excalidraw_element ORDER BY id",
+            "SELECT id, element_json->>'type' AS element_type FROM excalidraw_element ORDER BY id",
             &[],
         )
         .await
@@ -5555,9 +5555,9 @@ async fn v2_excalidraw_roundtrips_and_renders_local_element_edits() {
     element_json["isDeleted"] = serde_json::Value::Bool(true);
     lix.execute(
         "UPDATE excalidraw_element \
-         SET element_json = $1, is_deleted = $2 \
+         SET element_json = $1 \
          WHERE id = 'b'",
-        &[Value::Jsonb(element_json.into()), Value::Boolean(true)],
+        &[Value::Jsonb(element_json.into())],
     )
     .await
     .unwrap();
@@ -5699,7 +5699,7 @@ async fn excalidraw_element_boundary_insert_adds_element_through_full_reconcilia
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(successor));
     let elements = lix
         .execute(
-            "SELECT id, element_type FROM excalidraw_element ORDER BY id",
+            "SELECT id, element_json->>'type' AS element_type FROM excalidraw_element ORDER BY id",
             &[],
         )
         .await
@@ -8648,5 +8648,119 @@ async fn json_decimal_spelling_survives_structural_rebuild_and_reopen() {
         read_file(&reopened, path).await.unwrap(),
         Some(br#"{"one":1.0,"hundred":7,"array":[1.0,-0.0]}"#.to_vec())
     );
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn excalidraw_sql_defaults_metadata_ordering_and_cold_edits() {
+    let storage = lix::Memory::new();
+    let lix = open_lix().with_storage(storage.clone()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_excalidraw",
+        &build_excalidraw_plugin_archive(),
+        &["excalidraw_scene", "excalidraw_element", "excalidraw_file"],
+    )
+    .await;
+    let path = "/sql-excalidraw.excalidraw";
+    let original = br#"{ "elements": [{"id":"a","type":"rectangle","x":1}  ,{"id":"b","type":"text"} ], "appState": {"zoom":1.0} }"#.to_vec();
+    write_file(&lix, path, original).await.unwrap();
+    let file_id = file_id_at_path(&lix, path).await;
+    // Both default-order inserts must succeed without formatting fields.
+    for id in ["c", "d"] {
+        lix.execute(
+            "INSERT INTO excalidraw_element (id,element_json,lixcol_file_id) VALUES ($1,$2,$3)",
+            &[
+                Value::Text(id.into()),
+                Value::Jsonb(serde_json::json!({"id":id,"type":"ellipse"}).into()),
+                Value::Text(file_id.clone()),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+    lix.execute(
+        "UPDATE excalidraw_element SET order_key='f0' WHERE id='a' AND lixcol_file_id=$1",
+        &[Value::Text(file_id.clone())],
+    )
+    .await
+    .unwrap();
+    let before_image = read_file(&lix, path).await.unwrap().unwrap();
+    lix.execute(
+        "INSERT INTO excalidraw_file (id,file_json,lixcol_file_id) VALUES ('img',$1,$2)",
+        &[
+            Value::Jsonb(serde_json::json!({"dataURL":"data:image/png;base64,AAAA"}).into()),
+            Value::Text(file_id.clone()),
+        ],
+    )
+    .await
+    .unwrap();
+    lix.execute(
+        "DELETE FROM excalidraw_file WHERE id='img' AND lixcol_file_id=$1",
+        &[Value::Text(file_id.clone())],
+    )
+    .await
+    .unwrap();
+    assert_eq!(read_file(&lix, path).await.unwrap().unwrap(), before_image);
+    let metadata =
+        serde_json::json!({"appState":{"zoom":2,"theme":"dark"},"unknown":{"keep":[null,true]}});
+    lix.execute(
+        "UPDATE excalidraw_scene SET scene_json=$1 WHERE lixcol_file_id=$2",
+        &[Value::Jsonb(metadata.into()), Value::Text(file_id.clone())],
+    )
+    .await
+    .unwrap();
+    let accepted = read_file(&lix, path).await.unwrap().unwrap();
+    let mut expected: serde_json::Value = serde_json::from_slice(&accepted).unwrap();
+    assert_eq!(
+        expected["elements"].as_array().unwrap().last().unwrap()["id"],
+        "a"
+    );
+    assert_eq!(expected["appState"]["theme"], "dark");
+    // Evict the file actor before a SQL edit with custom order and layout.
+    for index in 0..12 {
+        write_file(
+            &lix,
+            &format!("/evict-{index}.excalidraw"),
+            br#"{"elements":[]}"#.to_vec(),
+        )
+        .await
+        .unwrap();
+    }
+    let a = expected["elements"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|e| e["id"] == "a")
+        .unwrap();
+    a["x"] = serde_json::json!(12345);
+    a["isDeleted"] = serde_json::json!(true);
+    lix.execute(
+        "UPDATE excalidraw_element SET element_json=$1 WHERE id='a' AND lixcol_file_id=$2",
+        &[Value::Jsonb(a.clone().into()), Value::Text(file_id.clone())],
+    )
+    .await
+    .unwrap();
+    let accepted = read_file(&lix, path).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&accepted).unwrap(),
+        expected
+    );
+    let error = lix
+        .execute(
+            "UPDATE excalidraw_element SET element_json=$1 WHERE id='a' AND lixcol_file_id=$2",
+            &[
+                Value::Jsonb(serde_json::json!({"id":"wrong","type":"text"}).into()),
+                Value::Text(file_id.clone()),
+            ],
+        )
+        .await;
+    assert!(error.is_err());
+    assert_eq!(read_file(&lix, path).await.unwrap().unwrap(), accepted);
+    lix.close().await.unwrap();
+    let reopened = open_lix().with_storage(storage).await.unwrap();
+    assert_eq!(read_file(&reopened, path).await.unwrap().unwrap(), accepted);
+    reopened.execute("UPDATE excalidraw_element SET element_json=element_json WHERE id='a' AND lixcol_file_id=$1",&[Value::Text(file_id)]).await.unwrap();
+    assert_eq!(read_file(&reopened, path).await.unwrap().unwrap(), accepted);
     reopened.close().await.unwrap();
 }

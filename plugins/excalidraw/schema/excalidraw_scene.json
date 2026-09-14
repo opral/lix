@@ -1,36 +1,40 @@
 {
   "$schema": "https://lix.dev/schema-v1.json",
   "key": "excalidraw_scene",
-  "description": "The stable root of an Excalidraw scene. The exact source layout outside elements and files is retained as typed text.",
+  "description": "One scene metadata object, excluding elements and files which have their own rows. Optional source layout preserves exact roundtrips.",
   "columns": [
     {
       "name": "elements_tail_json",
       "type": "text",
       "nullable": false,
-      "description": "Exact whitespace between the last element and the closing array bracket."
-    },
-    {
-      "name": "files_present",
-      "type": "boolean",
-      "nullable": false,
-      "description": "Whether the source contains a top-level files object."
+      "description": "Exact whitespace between the last element and the closing array bracket.",
+      "default_value": ""
     },
     {
       "name": "files_tail_json",
       "type": "text",
       "nullable": false,
-      "description": "Exact whitespace between the last file and the closing object brace."
+      "description": "Exact whitespace between the last file and the closing object brace.",
+      "default_value": ""
     },
     {
       "name": "id",
       "type": "text",
-      "nullable": false
+      "nullable": false,
+      "default_value": "scene"
+    },
+    {
+      "name": "scene_json",
+      "type": "jsonb",
+      "nullable": false,
+      "default_value": {},
+      "description": "All root properties other than elements and files, including appState and unknown metadata. Authoritative over template_json."
     },
     {
       "name": "template_json",
       "type": "text",
-      "nullable": false,
-      "description": "Exact UTF-8 source with reserved internal markers in place of the elements and files container contents."
+      "nullable": true,
+      "description": "Optional exact root layout hint with collection placeholders. Omit for new scenes; scene_json remains authoritative."
     }
   ],
   "primary_key": [

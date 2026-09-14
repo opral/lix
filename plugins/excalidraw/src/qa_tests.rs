@@ -489,7 +489,6 @@ fn qa_soft_delete_then_remove_all_children_retains_scene_metadata() {
     let mut p = payload(&b, "element_json");
     p["isDeleted"] = json!(true);
     set_payload(&mut b, "element_json", p);
-    b.row.insert("is_deleted", sdk::TypedValue::Boolean(true));
     let changes = [change(&b)];
     let out = h.serialize_changes(&file, &changes).unwrap();
     accept(&mut rows, &changes);
@@ -523,4 +522,558 @@ fn qa_unrepresentable_jsonb_is_rejected_without_panicking_or_mutation() {
     let before = file.clone();
     assert!(h.parse(&file, ctx(1)).is_err());
     assert_eq!(file, before);
+}
+
+#[test]
+fn qa_marker_text_in_metadata_roundtrips_and_marker_relocation_rejects() {
+    let harness = Harness::<ExcalidrawPlugin>::default();
+    let file = Snapshot {
+        path: "markers.excalidraw".into(),
+        bytes: br#"{"elements":[],"appState":{"name":"__LIX_EXCALIDRAW_ELEMENTS_9A7E__","other":"__LIX_EXCALIDRAW_FILES_4C2B__"}}"#.to_vec(),
+        ..Snapshot::default()
+    };
+    let parsed = harness.parse(&file, ctx(1)).unwrap();
+    let mut rows = Vec::new();
+    accept(&mut rows, &parsed.row_changes);
+    let rendered = harness
+        .serialize(&file.file_id, &file.path, &rows, None)
+        .unwrap();
+    assert_eq!(rendered.snapshot().bytes, file.bytes);
+
+    let (harness, file, rows) = initial();
+    for template in [
+        r#"{"elements":[{"id":"a","type":"rectangle","x":999},{"id":"b","type":"text"}],"other":[__LIX_EXCALIDRAW_ELEMENTS_9A7E__],"files":{__LIX_EXCALIDRAW_FILES_4C2B__}}"#,
+        r#"{"elements":[__LIX_EXCALIDRAW_ELEMENTS_9A7E__],"files":{__LIX_EXCALIDRAW_FILES_4C2B__},"appState":{},"appState":{}}"#,
+        r#"{"elements":[__LIX_EXCALIDRAW_ELEMENTS_9A7E__],"files":{"image":{}},"other":{__LIX_EXCALIDRAW_FILES_4C2B__}}"#,
+    ] {
+        let mut scene = rows
+            .iter()
+            .find(|r| r.schema_key.as_ref() == core::SCENE_SCHEMA_KEY)
+            .unwrap()
+            .clone();
+        scene
+            .row
+            .insert("template_json", sdk::TypedValue::Text(template.into()));
+        assert!(harness.serialize_changes(&file, &[change(&scene)]).is_err());
+    }
+}
+
+#[test]
+fn qa_structural_file_edits_then_sql_edits_preserve_durable_order() {
+    let (h, file, mut rows) = initial();
+    let edit = replace(
+        &file,
+        "\"elements\": [",
+        "\"elements\": [{\"id\":\"c\",\"type\":\"ellipse\"},",
+    );
+    let out = h
+        .parse_changes(&file, &file.path, &[edit], None, ctx(2))
+        .unwrap();
+    accept(&mut rows, &out.row_changes);
+    let mut file = out.into_snapshot();
+    for id in ["a", "b", "c", "a"] {
+        let mut row = element(&rows, id);
+        let mut value = payload(&row, "element_json");
+        value["x"] = json!(12345);
+        set_payload(&mut row, "element_json", value);
+        let update = change(&row);
+        let out = h
+            .serialize_changes(&file, std::slice::from_ref(&update))
+            .unwrap();
+        accept(&mut rows, &[update]);
+        file = out.into_snapshot();
+        assert_eq!(
+            json(&file.bytes)["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["c", "a", "b"]
+        );
+    }
+    // A structural fallback must compare against the same durable order keys.
+    let edit = replace(&file, "\"theme\":\"dark\"", "\"theme\":\"light\"");
+    let warm = h
+        .parse_changes(&file, &file.path, std::slice::from_ref(&edit), None, ctx(3))
+        .unwrap();
+    let mut cold = file.clone();
+    cold.state.clear();
+    let cold = h
+        .parse_changes(&cold, &cold.path, &[edit], Some(&rows), ctx(3))
+        .unwrap();
+    let mut warm_rows = rows.clone();
+    let mut cold_rows = rows;
+    accept(&mut warm_rows, &warm.row_changes);
+    accept(&mut cold_rows, &cold.row_changes);
+    assert_eq!(canonical_rows(&warm_rows), canonical_rows(&cold_rows));
+    assert_eq!(
+        h.serialize(&file.file_id, &file.path, &warm_rows, None)
+            .unwrap()
+            .snapshot()
+            .bytes,
+        warm.snapshot().bytes
+    );
+}
+
+#[test]
+fn qa_sql_point_edits_read_only_changed_elements_at_scale() {
+    for count in [100, 1_000, 10_000] {
+        let mut h = Harness::<ExcalidrawPlugin>::default();
+        h.max_batch_bytes = 2 * 1024 * 1024;
+        let source = json!({"elements": (0..count).map(|i| json!({"id":format!("e{i}"),"type":"rectangle","x":1})).collect::<Vec<_>>(), "files":{"image":{"dataURL":"A".repeat(1_000_000)}}});
+        let file = Snapshot {
+            path: "scale.excalidraw".into(),
+            bytes: serde_json::to_vec(&source).unwrap(),
+            ..Snapshot::default()
+        };
+        let parsed = h.parse(&file, ctx(1)).unwrap();
+        let rows: Vec<_> = parsed
+            .row_changes
+            .iter()
+            .map(|c| sdk::TypedRowRecord {
+                schema_key: c.schema_key.clone(),
+                schema_fingerprint: c.schema_fingerprint,
+                primary_key: c.primary_key.clone(),
+                row: c.row.clone().unwrap(),
+            })
+            .collect();
+        let mut file = parsed.into_snapshot();
+        let mut expected = source;
+        for (i, x) in [(0, 12345), (count / 2, 12345), (count - 1, 12345), (0, 1)] {
+            let mut row = element(&rows, &format!("e{i}"));
+            let mut value = payload(&row, "element_json");
+            value["x"] = json!(x);
+            set_payload(&mut row, "element_json", value);
+            let out = h.serialize_changes(&file, &[change(&row)]).unwrap();
+            assert!(
+                out.metrics.file_bytes_read < 128,
+                "{count}: {:?}",
+                out.metrics
+            );
+            assert!(
+                out.metrics.state_bytes_read < 16_384,
+                "{count}: {:?}",
+                out.metrics
+            );
+            assert!(
+                out.metrics.state_bytes_written <= 36,
+                "{count}: {:?}",
+                out.metrics
+            );
+            expected["elements"][i]["x"] = json!(x);
+            assert_eq!(out.snapshot().bytes, serde_json::to_vec(&expected).unwrap());
+            file = out.into_snapshot();
+            let noop = h.serialize_changes(&file, &[change(&row)]).unwrap();
+            assert!(noop.file_edits.is_empty());
+            assert_eq!(noop.metrics.state_bytes_written, 0);
+            assert!(noop.metrics.file_bytes_read < 128);
+        }
+    }
+}
+
+#[test]
+fn qa_scene_metadata_and_new_file_rows_need_no_template_edits() {
+    let (h, file, mut rows) = initial();
+    let mut scene = rows
+        .iter()
+        .find(|r| r.schema_key.as_ref() == core::SCENE_SCHEMA_KEY)
+        .unwrap()
+        .clone();
+    let mut metadata = payload(&scene, "scene_json");
+    metadata["appState"]["theme"] = json!("light");
+    metadata["future"]["new"] = json!([null, "hello"]);
+    set_payload(&mut scene, "scene_json", metadata.clone());
+    let out = h.serialize_changes(&file, &[change(&scene)]).unwrap();
+    let value = json(&out.snapshot().bytes);
+    assert_eq!(value["appState"], metadata["appState"]);
+    assert_eq!(value["future"], metadata["future"]);
+    assert_eq!(value["elements"], json(&file.bytes)["elements"]);
+    accept(&mut rows, &[change(&scene)]);
+    assert_eq!(
+        h.serialize(&file.file_id, &file.path, &rows, None)
+            .unwrap()
+            .snapshot()
+            .bytes,
+        out.snapshot().bytes
+    );
+
+    // Files can be introduced into a document that originally omitted files.
+    let source = Snapshot {
+        path: "new.excalidraw".into(),
+        bytes: br#"{"elements":[],"appState":{"keep":1}}"#.to_vec(),
+        ..Snapshot::default()
+    };
+    let parsed = h.parse(&source, ctx(2)).unwrap();
+    let source = parsed.into_snapshot();
+    let mut image = rows
+        .iter()
+        .find(|r| r.schema_key.as_ref() == core::FILE_SCHEMA_KEY)
+        .unwrap()
+        .clone();
+    image.primary_key = vec![sdk::TypedValue::Text("new-image".into())];
+    image
+        .row
+        .insert("id", sdk::TypedValue::Text("new-image".into()));
+    // An old key spelling is a hint; a rename does not require editing it.
+    let out = h.serialize_changes(&source, &[change(&image)]).unwrap();
+    assert_eq!(
+        json(&out.snapshot().bytes)["files"]["new-image"],
+        payload(&image, "file_json")
+    );
+    assert_eq!(json(&out.snapshot().bytes)["appState"], json!({"keep":1}));
+    image.row.remove("prefix_json");
+    assert_eq!(
+        h.serialize_changes(&source, &[change(&image)])
+            .unwrap()
+            .snapshot()
+            .bytes,
+        out.snapshot().bytes
+    );
+    scene.row.remove("template_json");
+    rows.retain(|r| r.schema_key.as_ref() != core::SCENE_SCHEMA_KEY);
+    rows.push(scene);
+    assert_eq!(
+        json(
+            &h.serialize(&file.file_id, &file.path, &rows, None)
+                .unwrap()
+                .snapshot()
+                .bytes
+        )["appState"],
+        metadata["appState"]
+    );
+}
+
+#[test]
+fn qa_layout_changes_are_format_only_and_metadata_changes_are_content() {
+    for (needle, insert) in [
+        ("[\r\n    {", "[\r\n     {"),
+        (" }\r\n  ]", " }\r\n   ]"),
+        ("\"files\": { \"image\" :", "\"files\": {  \"image\"  :"),
+        ("{\r\n  \"type\"", "{\r\n   \"type\""),
+    ] {
+        let (h, file, _) = initial();
+        let out = h
+            .parse_changes(
+                &file,
+                &file.path,
+                &[replace(&file, needle, insert)],
+                None,
+                ctx(2),
+            )
+            .unwrap();
+        assert!(!out.row_changes.is_empty());
+        assert!(
+            out.row_changes
+                .iter()
+                .all(|c| c.effect == sdk::ChangeEffect::FormatOnly),
+            "{needle:?}: {:?}",
+            out.row_changes
+        );
+        assert_eq!(json(&out.snapshot().bytes), json(&file.bytes));
+    }
+    let (h, file, _) = initial();
+    let out = h
+        .parse_changes(
+            &file,
+            &file.path,
+            &[replace(&file, "\"theme\":\"dark\"", "\"theme\":\"light\"")],
+            None,
+            ctx(2),
+        )
+        .unwrap();
+    assert_eq!(out.row_changes.len(), 1);
+    assert_eq!(out.row_changes[0].effect, sdk::ChangeEffect::Content);
+}
+
+#[test]
+fn qa_integral_float_scene_metadata_keeps_exact_spelling() {
+    let h = Harness::<ExcalidrawPlugin>::default();
+    let file = Snapshot {
+        path: "numeric.excalidraw".into(),
+        bytes: br#"{ "elements": [], "appState": {"zoom":1.0,"n":4e0,"zero":-0.0} }"#.to_vec(),
+        ..Snapshot::default()
+    };
+    let parsed = h.parse(&file, ctx(1)).unwrap();
+    let mut rows = Vec::new();
+    accept(&mut rows, &parsed.row_changes);
+    assert_eq!(
+        h.serialize(&file.file_id, &file.path, &rows, None)
+            .unwrap()
+            .snapshot()
+            .bytes,
+        file.bytes
+    );
+    assert_eq!(
+        h.serialize_changes(
+            parsed.snapshot(),
+            &rows.iter().map(change).collect::<Vec<_>>()
+        )
+        .unwrap()
+        .snapshot()
+        .bytes,
+        file.bytes
+    );
+}
+
+#[test]
+fn qa_first_file_insert_delete_and_reordered_whitespace_restore_exactly() {
+    let (h, _, fixtures) = initial();
+    let source = Snapshot {
+        path: "new.excalidraw".into(),
+        bytes: br#"{ "elements": [] }"#.to_vec(),
+        ..Snapshot::default()
+    };
+    let parsed = h.parse(&source, ctx(1)).unwrap();
+    let mut rows = Vec::new();
+    accept(&mut rows, &parsed.row_changes);
+    let file = parsed.into_snapshot();
+    let image = fixtures
+        .iter()
+        .find(|r| r.schema_key.as_ref() == core::FILE_SCHEMA_KEY)
+        .unwrap();
+    let add = change(image);
+    let added = h
+        .serialize_changes(&file, std::slice::from_ref(&add))
+        .unwrap();
+    accept(&mut rows, &[add]);
+    assert_eq!(
+        h.serialize(&file.file_id, &file.path, &rows, None)
+            .unwrap()
+            .snapshot()
+            .bytes,
+        added.snapshot().bytes
+    );
+    let mut delete = change(image);
+    delete.row = None;
+    let deleted = h
+        .serialize_changes(added.snapshot(), std::slice::from_ref(&delete))
+        .unwrap();
+    accept(&mut rows, &[delete]);
+    assert_eq!(deleted.snapshot().bytes, source.bytes);
+    assert_eq!(
+        h.serialize(&file.file_id, &file.path, &rows, None)
+            .unwrap()
+            .snapshot()
+            .bytes,
+        deleted.snapshot().bytes
+    );
+
+    let source = Snapshot {
+        path: "space.excalidraw".into(),
+        bytes:
+            br#"{"elements":[{"id":"a","type":"text"}  ,{"id":"b","type":"text"} ],"appState":{}}"#
+                .to_vec(),
+        ..Snapshot::default()
+    };
+    let parsed = h.parse(&source, ctx(2)).unwrap();
+    let mut rows = Vec::new();
+    accept(&mut rows, &parsed.row_changes);
+    let mut file = parsed.into_snapshot();
+    let mut a = element(&rows, "a");
+    a.row
+        .insert("order_key", sdk::TypedValue::Text("f0".into()));
+    let update = change(&a);
+    let out = h
+        .serialize_changes(&file, std::slice::from_ref(&update))
+        .unwrap();
+    accept(&mut rows, &[update]);
+    file = out.into_snapshot();
+    for n in 1..4 {
+        let mut scene = rows
+            .iter()
+            .find(|r| r.schema_key.as_ref() == core::SCENE_SCHEMA_KEY)
+            .unwrap()
+            .clone();
+        let mut metadata = payload(&scene, "scene_json");
+        metadata["appState"]["n"] = json!(n);
+        set_payload(&mut scene, "scene_json", metadata);
+        let update = change(&scene);
+        let out = h
+            .serialize_changes(&file, std::slice::from_ref(&update))
+            .unwrap();
+        accept(&mut rows, &[update]);
+        file = out.into_snapshot();
+        assert_eq!(
+            h.serialize(&file.file_id, &file.path, &rows, None)
+                .unwrap()
+                .snapshot()
+                .bytes,
+            file.bytes
+        );
+    }
+}
+
+#[test]
+fn qa_long_ids_use_bounded_index_pages_under_default_limits() {
+    let h = Harness::<ExcalidrawPlugin>::default();
+    let value = json!({"elements":(0..1100).map(|i|json!({"id":format!("{i:04}{}","x".repeat(2000)),"type":"rectangle"})).collect::<Vec<_>>()});
+    let file = Snapshot {
+        path: "long-ids.excalidraw".into(),
+        bytes: serde_json::to_vec(&value).unwrap(),
+        ..Snapshot::default()
+    };
+    let out = h.parse(&file, ctx(1)).unwrap();
+    assert!(out.snapshot().state.len() > 8);
+    assert!(
+        out.snapshot()
+            .state
+            .values()
+            .all(|value| value.len() <= 512 * 1024)
+    );
+    let edit = replace(out.snapshot(), "\"rectangle\"", "\"ellipse\"");
+    let changed = h
+        .parse_changes(out.snapshot(), &file.path, &[edit], None, ctx(2))
+        .unwrap();
+    assert_eq!(changed.row_changes.len(), 1);
+}
+
+#[test]
+fn qa_default_order_ties_sort_by_id_and_accept_file_insertion_between_ties() {
+    let (h, file, mut rows) = initial();
+    for row in &mut rows {
+        if row.schema_key.as_ref() == core::ELEMENT_SCHEMA_KEY {
+            row.row
+                .insert("order_key", sdk::TypedValue::Text("80".into()));
+        }
+    }
+    let out = h.serialize(&file.file_id, &file.path, &rows, None).unwrap();
+    assert_eq!(json(&out.snapshot().bytes)["elements"][0]["id"], "a");
+    let mut successor = json(&out.snapshot().bytes);
+    successor["elements"]
+        .as_array_mut()
+        .unwrap()
+        .insert(1, json!({"id":"middle","type":"ellipse"}));
+    let edit = sdk::FileEdit {
+        offset: 0,
+        delete_len: out.snapshot().bytes.len() as u64,
+        insert: serde_json::to_vec(&successor).unwrap(),
+    };
+    let changed = h
+        .parse_changes(out.snapshot(), &file.path, &[edit], None, ctx(2))
+        .unwrap();
+    accept(&mut rows, &changed.row_changes);
+    assert_eq!(
+        h.serialize(&file.file_id, &file.path, &rows, None)
+            .unwrap()
+            .snapshot()
+            .bytes,
+        changed.snapshot().bytes
+    );
+}
+
+#[test]
+fn qa_multi_field_and_multi_element_file_edits_stay_sparse() {
+    let (h, file, rows) = initial();
+    let edits = vec![
+        replace(&file, "\"x\": 1", "\"x\": 123"),
+        replace(&file, "\"n\":4e0", "\"n\":5e0"),
+        replace(&file, "untouched", "changed"),
+    ];
+    let warm = h
+        .parse_changes(&file, &file.path, &edits, None, ctx(2))
+        .unwrap();
+    assert_eq!(warm.row_changes.len(), 2);
+    assert!(warm.metrics.file_bytes_read < 500);
+    assert!(warm.metrics.state_bytes_written <= 24);
+    let mut cold = file.clone();
+    cold.state.clear();
+    let cold = h
+        .parse_changes(&cold, &cold.path, &edits, Some(&rows), ctx(2))
+        .unwrap();
+    let mut warm_rows = rows.clone();
+    let mut cold_rows = rows;
+    accept(&mut warm_rows, &warm.row_changes);
+    accept(&mut cold_rows, &cold.row_changes);
+    assert_eq!(canonical_rows(&warm_rows), canonical_rows(&cold_rows));
+    assert_eq!(warm.snapshot().bytes, cold.snapshot().bytes);
+    let file = warm.into_snapshot();
+    let edits = vec![
+        replace(&file, "\"x\": 123", "\"x\": 123"),
+        replace(&file, "\"n\":5e0", "\"n\":5e0"),
+        replace(&file, "changed", "changed"),
+    ];
+    let noop = h
+        .parse_changes(&file, &file.path, &edits, None, ctx(3))
+        .unwrap();
+    assert!(noop.row_changes.is_empty());
+    assert!(noop.metrics.file_bytes_read < 500);
+    assert_eq!(noop.metrics.state_bytes_written, 0);
+}
+
+#[test]
+fn qa_shift_limit_fallback_restores_all_rows_and_file_offsets() {
+    let h = Harness::<ExcalidrawPlugin>::default();
+    let source = json!({"elements":(0..4100).map(|i|json!({"id":format!("e{i:04}"),"type":"rectangle","x":1})).collect::<Vec<_>>(),"files":{"img":{"dataURL":"abc"}}});
+    let file = Snapshot {
+        path: "shifts.excalidraw".into(),
+        bytes: serde_json::to_vec(&source).unwrap(),
+        ..Snapshot::default()
+    };
+    let parsed = h.parse(&file, ctx(1)).unwrap();
+    let mut rows: Vec<_> = parsed
+        .row_changes
+        .iter()
+        .map(|c| sdk::TypedRowRecord {
+            schema_key: c.schema_key.clone(),
+            schema_fingerprint: c.schema_fingerprint,
+            primary_key: c.primary_key.clone(),
+            row: c.row.clone().unwrap(),
+        })
+        .collect();
+    let mut changes = Vec::new();
+    for row in rows
+        .iter_mut()
+        .filter(|r| r.schema_key.as_ref() == core::ELEMENT_SCHEMA_KEY)
+        .take(4096)
+    {
+        let mut value = payload(row, "element_json");
+        value["x"] = json!(12345);
+        set_payload(row, "element_json", value);
+        changes.push(change(row));
+    }
+    let file = h
+        .serialize_changes(parsed.snapshot(), &changes)
+        .unwrap()
+        .into_snapshot();
+    assert_eq!(
+        decode_shifts(file.state.get(ELEMENT_SHIFTS_KEY).unwrap())
+            .unwrap()
+            .len(),
+        4096
+    );
+    let row = rows
+        .iter_mut()
+        .find(|r| r.primary_key == [sdk::TypedValue::Text("e4099".into())])
+        .unwrap();
+    let mut value = payload(row, "element_json");
+    value["x"] = json!(99);
+    set_payload(row, "element_json", value);
+    let out = h.serialize_changes(&file, &[change(row)]).unwrap();
+    assert!(!out.snapshot().state.contains_key(ELEMENT_SHIFTS_KEY));
+    assert_eq!(
+        h.serialize(&file.file_id, &file.path, &rows, None)
+            .unwrap()
+            .snapshot()
+            .bytes,
+        out.snapshot().bytes
+    );
+    assert_eq!(json(&out.snapshot().bytes)["files"], source["files"]);
+}
+
+#[test]
+fn qa_missing_incremental_layout_requires_durable_row_restore() {
+    let (h, mut file, rows) = initial();
+    file.state.clear();
+    let mut a = element(&rows, "a");
+    a.row
+        .insert("order_key", sdk::TypedValue::Text("f0".into()));
+    assert!(h.serialize_changes(&file, &[change(&a)]).is_err());
+    let restored = h
+        .serialize(&file.file_id, &file.path, &rows, Some(&file))
+        .unwrap();
+    assert!(
+        h.serialize_changes(restored.snapshot(), &[change(&a)])
+            .is_ok()
+    );
 }

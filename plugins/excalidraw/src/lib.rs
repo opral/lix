@@ -21,7 +21,8 @@ const ID_NAMESPACE_STATE: &[u8] = b"excalidraw/id-namespace";
 const ELEMENT_INDEX_MAGIC: &[u8; 4] = b"EXS2";
 const ELEMENT_INDEX_HEADER_BYTES: u32 = 16;
 const ELEMENT_INDEX_ENTRY_BYTES: u32 = 32;
-const ELEMENT_INDEX_PAGE_BYTES: usize = 1024 * 1024;
+// Leave room for the state key and protocol overhead under the default 1 MiB limit.
+const ELEMENT_INDEX_PAGE_BYTES: usize = 512 * 1024;
 const MAX_ELEMENT_SHIFT_RECORDS: usize = 4096;
 const SCENE_SCHEMA_JSON: &str = include_str!("../schema/excalidraw_scene.json");
 const ELEMENT_SCHEMA_JSON: &str = include_str!("../schema/excalidraw_element.json");
@@ -82,11 +83,8 @@ fn cold_parse_changes(
         .file_changed(&splices, create_namespace)
         .map_err(sdk::Error::invalid_input)?;
     sink.put_state(ID_NAMESPACE_STATE, &accepted_namespace.0[..12])?;
-    store_element_index(
-        sink,
-        &encode_element_index(&successor.arena_element_spans())?,
-    )?;
-    emit_changes(changes.into_iter().map(Ok), sink)
+    store_document_indexes(sink, &successor)?;
+    emit_changes(changes, sink)
 }
 
 impl sdk::FileProjection for ExcalidrawPlugin {
@@ -94,7 +92,6 @@ impl sdk::FileProjection for ExcalidrawPlugin {
         mut update: sdk::SerializeChangesInput<'_>,
         sink: &mut sdk::FileEditOutput<'_, '_>,
     ) -> sdk::Result<()> {
-        let before = update.before.read_all()?;
         let mut changes = Vec::new();
         while let Some(change) = update.typed_row_changes.next()? {
             changes.push(RowChange {
@@ -107,21 +104,23 @@ impl sdk::FileProjection for ExcalidrawPlugin {
                 },
             });
         }
+        if sparse_serialize_changes(&update.before, &changes, sink)? {
+            return Ok(());
+        }
+        let before = update.before.read_all()?;
         let namespace = read_namespace(&update.before)?
             .or_else(|| namespace_from_changes(&changes))
             .unwrap_or_else(|| IdNamespace::from_halves(0, 0));
-        let (document, _) = Document::open_file(before.clone(), Some(update.path), namespace)
+        let (mut document, _) = Document::open_file(before.clone(), Some(update.path), namespace)
             .map_err(sdk::Error::invalid_input)?;
+        restore_document_layout(&update.before, &mut document)?;
         let (successor, edits) = document
             .rows_changed(&changes)
             .map_err(sdk::Error::invalid_input)?;
         for edit in edits {
             sink.replace(edit.offset, edit.delete_len, &edit.insert)?;
         }
-        store_element_index(
-            sink,
-            &encode_element_index(&successor.arena_element_spans())?,
-        )?;
+        store_document_indexes(sink, &successor)?;
         sink.delete_state(ELEMENT_SHIFTS_KEY)?;
         Ok(())
     }
@@ -130,38 +129,30 @@ impl sdk::FileProjection for ExcalidrawPlugin {
         mut input: sdk::SerializeInput<'_>,
         sink: &mut sdk::FileOutput<'_, '_>,
     ) -> sdk::Result<()> {
-        let mut records = Vec::new();
+        let mut builder = RowImportBuilder::new();
         while let Some(row) = input.typed_rows.next()? {
-            records.push(RowRecord {
-                schema_key: row.schema_key,
-                row_pk: row.primary_key,
-                row: row.row,
-            });
+            builder
+                .push(RowRecord {
+                    schema_key: row.schema_key,
+                    row_pk: row.primary_key,
+                    row: row.row,
+                })
+                .map_err(sdk::Error::invalid_input)?;
         }
-        let (rendered, _) = Document::open_rows(records).map_err(sdk::Error::invalid_input)?;
-        let document = if let Some(before) = input.before.as_ref() {
-            let namespace =
-                read_namespace(before)?.unwrap_or_else(|| IdNamespace::from_halves(0, 0));
-            let (accepted, _) =
-                Document::open_file(before.read_all()?, Some(input.path), namespace)
-                    .map_err(sdk::Error::invalid_input)?;
-            if accepted
-                .semantically_equal(&rendered)
-                .map_err(sdk::Error::invalid_input)?
-            {
-                accepted
-            } else {
-                sink.write(&rendered.bytes())?;
-                rendered
-            }
-        } else {
-            sink.write(&rendered.bytes())?;
-            rendered
-        };
-        store_element_index(
-            sink,
-            &encode_element_index(&document.arena_element_spans())?,
-        )?;
+        let (rendered, _) = builder.finish().map_err(sdk::Error::invalid_input)?;
+        let document = rendered;
+        let bytes = document.bytes();
+        if input
+            .before
+            .as_ref()
+            .map(|before| before.read_all())
+            .transpose()?
+            .as_deref()
+            != Some(bytes.as_slice())
+        {
+            sink.write(&bytes)?;
+        }
+        store_document_indexes(sink, &document)?;
         Ok(())
     }
 
@@ -171,10 +162,7 @@ impl sdk::FileProjection for ExcalidrawPlugin {
             Document::open_file(input.file.read_all()?, Some(input.path), namespace)
                 .map_err(sdk::Error::invalid_input)?;
         sink.put_state(ID_NAMESPACE_STATE, &input.creates.namespace_bytes())?;
-        store_element_index(
-            sink,
-            &encode_element_index(&document.arena_element_spans())?,
-        )?;
+        store_document_indexes(sink, &document)?;
         emit_changes(changes, sink)?;
         Ok(())
     }
@@ -203,34 +191,268 @@ impl sdk::FileProjection for ExcalidrawPlugin {
                 insert,
             })
             .collect::<Vec<_>>();
+        update.file_edits.validated(update.before.len())?;
         if update.before_path == update.after_path
-            && update.file_edits.iter().len() == 1
-            && let Some(edit) = update.file_edits.iter().next()
-            && let Some((change, successor_shifts)) =
-                sparse_element_change(&update, edit, &inserts[0])?
+            && let Some((changes, shifts)) = sparse_file_changes(&update)?
         {
-            sink.put_state(ELEMENT_SHIFTS_KEY, &successor_shifts)?;
-            emit_changes([Ok(change)], sink)?;
+            if update
+                .before
+                .get_state(ELEMENT_SHIFTS_KEY)?
+                .unwrap_or_default()
+                != shifts
+            {
+                sink.put_state(ELEMENT_SHIFTS_KEY, &shifts)?;
+            }
+            emit_changes(changes.into_iter().map(Ok), sink)?;
             return Ok(());
         }
 
-        let (document, _) = Document::open_file(
+        let (mut document, _) = Document::open_file(
             update.before.read_all()?,
             Some(update.before_path),
             accepted_namespace,
         )
         .map_err(sdk::Error::invalid_input)?;
+        restore_document_layout(&update.before, &mut document)?;
         let (document, changes) = document
             .file_changed(&splices, create_namespace)
             .map_err(sdk::Error::invalid_input)?;
-        store_element_index(
-            sink,
-            &encode_element_index(&document.arena_element_spans())?,
-        )?;
+        store_document_indexes(sink, &document)?;
         sink.delete_state(ELEMENT_SHIFTS_KEY)?;
-        emit_changes(changes.into_iter().map(Ok), sink)?;
+        emit_changes(changes, sink)?;
         Ok(())
     }
+}
+
+const ORDER_PREFIX: &[u8] = b"excalidraw/order/";
+const ORDER_ROOT: &[u8] = b"excalidraw/order/root";
+
+fn store_document_indexes(sink: &mut impl StateOutput, document: &Document) -> sdk::Result<()> {
+    let spans = document.arena_element_spans();
+    store_element_index(sink, &encode_element_index(&spans)?)?;
+    let mut ids: Vec<_> = spans.iter().enumerate().collect();
+    ids.sort_unstable_by(|a, b| a.1.id.cmp(&b.1.id));
+    sink.delete_state_prefix(b"excalidraw/id-page/")?;
+    for (page, ids) in ids.chunks(ELEMENT_INDEX_PAGE_BYTES / 4).enumerate() {
+        let bytes: Vec<_> = ids
+            .iter()
+            .flat_map(|(ordinal, _)| (*ordinal as u32).to_le_bytes())
+            .collect();
+        sink.put_state(&id_page_key(page as u32), &bytes)?;
+    }
+    drop(ids);
+    drop(spans);
+    sink.delete_state_prefix(ORDER_PREFIX)?;
+    let bytes =
+        serde_json::to_vec(&document.layout()).map_err(|e| sdk::Error::internal(e.to_string()))?;
+    let pages = bytes.len().div_ceil(ELEMENT_INDEX_PAGE_BYTES);
+    sink.put_state(ORDER_ROOT, &(pages as u64).to_le_bytes())?;
+    for (page, bytes) in bytes.chunks(ELEMENT_INDEX_PAGE_BYTES).enumerate() {
+        let key = format!("excalidraw/order/{page}");
+        sink.put_state(key.as_bytes(), bytes)?;
+    }
+    Ok(())
+}
+
+fn restore_document_layout(before: &sdk::Snapshot<'_>, document: &mut Document) -> sdk::Result<()> {
+    let Some(root) = before.get_state(ORDER_ROOT)? else {
+        return Err(sdk::Error::invalid_input(
+            "Excalidraw incremental layout is missing; restore from complete durable rows",
+        ));
+    };
+    let pages = u64::from_le_bytes(
+        root.try_into()
+            .map_err(|_| sdk::Error::invalid_input("invalid layout index"))?,
+    );
+    let mut bytes = Vec::new();
+    for page in 0..pages {
+        let key = format!("excalidraw/order/{page}");
+        bytes.extend(
+            before
+                .get_state(key.as_bytes())?
+                .ok_or_else(|| sdk::Error::invalid_input("missing layout page"))?,
+        );
+    }
+    let mut layout: core::ProjectionLayout =
+        serde_json::from_slice(&bytes).map_err(|e| sdk::Error::invalid_input(e.to_string()))?;
+    let shifts = decode_shifts(&before.get_state(ELEMENT_SHIFTS_KEY)?.unwrap_or_default())?;
+    let mut shift_cursor = 0;
+    let mut file_delta = 0_i64;
+    for file in &mut layout.files {
+        while let Some((ordinal, shift)) = shifts.get(shift_cursor) {
+            let element = layout
+                .elements
+                .get(*ordinal as usize)
+                .ok_or_else(|| sdk::Error::invalid_input("invalid layout shift"))?;
+            if element.offset >= file.offset {
+                break;
+            }
+            file_delta = file_delta
+                .checked_add(*shift)
+                .ok_or_else(|| sdk::Error::invalid_input("layout shift overflow"))?;
+            shift_cursor += 1;
+        }
+        file.offset = apply_shift(file.offset, file_delta)?;
+    }
+    let mut shift_cursor = 0;
+    let mut element_delta = 0_i64;
+    for (ordinal, row) in layout.elements.iter_mut().enumerate() {
+        row.offset = apply_shift(row.offset, element_delta)?;
+        if let Some((changed, shift)) = shifts.get(shift_cursor)
+            && *changed as usize == ordinal
+        {
+            row.length = apply_shift(row.length, *shift)?;
+            element_delta = element_delta
+                .checked_add(*shift)
+                .ok_or_else(|| sdk::Error::invalid_input("layout shift overflow"))?;
+            shift_cursor += 1;
+        }
+    }
+    if shift_cursor != shifts.len() {
+        return Err(sdk::Error::invalid_input("invalid layout shift ordinal"));
+    }
+    document
+        .restore_layout(layout)
+        .map_err(sdk::Error::invalid_input)
+}
+
+fn id_page_key(page: u32) -> Vec<u8> {
+    format!("excalidraw/id-page/{page}").into_bytes()
+}
+
+fn index_count(before: &sdk::Snapshot<'_>) -> sdk::Result<Option<u32>> {
+    let Some(header) = before.get_state(ELEMENT_INDEX_KEY)? else {
+        return Ok(None);
+    };
+    if header.len() != ELEMENT_INDEX_HEADER_BYTES as usize || &header[..4] != ELEMENT_INDEX_MAGIC {
+        return Err(sdk::Error::invalid_input("invalid Excalidraw index header"));
+    }
+    Ok(Some(u32::from_le_bytes(header[4..8].try_into().unwrap())))
+}
+
+fn index_metadata(
+    before: &sdk::Snapshot<'_>,
+    entry: IndexEntry,
+    count: u32,
+) -> sdk::Result<(String, String, String)> {
+    let length = entry
+        .id_len
+        .checked_add(entry.order_key_len)
+        .and_then(|n| n.checked_add(entry.leading_json_len))
+        .ok_or_else(|| sdk::Error::invalid_input("Excalidraw metadata overflow"))?;
+    let offset =
+        u64::from(count) * u64::from(ELEMENT_INDEX_ENTRY_BYTES) + u64::from(entry.metadata_offset);
+    let bytes = read_element_index_range(before, offset, length)?
+        .ok_or_else(|| sdk::Error::invalid_input("missing Excalidraw metadata"))?;
+    if bytes.len() != length as usize {
+        return Err(sdk::Error::invalid_input("truncated Excalidraw metadata"));
+    }
+    let id_end = entry.id_len as usize;
+    let order_end = id_end + entry.order_key_len as usize;
+    Ok((
+        state_text(&bytes[..id_end])?,
+        state_text(&bytes[id_end..order_end])?,
+        state_text(&bytes[order_end..])?,
+    ))
+}
+
+fn find_element(
+    before: &sdk::Snapshot<'_>,
+    id: &str,
+    count: u32,
+) -> sdk::Result<Option<(u32, IndexEntry, String, String)>> {
+    let mut low = 0;
+    let mut high = count;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let byte = u64::from(middle) * 4;
+        let Some(bytes) = before.read_state_range(
+            &id_page_key((byte / ELEMENT_INDEX_PAGE_BYTES as u64) as u32),
+            byte % ELEMENT_INDEX_PAGE_BYTES as u64,
+            4,
+        )?
+        else {
+            return Ok(None);
+        };
+        let ordinal = u32::from_le_bytes(
+            bytes
+                .try_into()
+                .map_err(|_| sdk::Error::invalid_input("invalid element lookup"))?,
+        );
+        if ordinal >= count {
+            return Err(sdk::Error::invalid_input("invalid element ordinal"));
+        }
+        let entry = read_index_entry(before, ordinal)?;
+        let (candidate, order, leading) = index_metadata(before, entry, count)?;
+        match candidate.as_str().cmp(id) {
+            std::cmp::Ordering::Less => low = middle + 1,
+            std::cmp::Ordering::Greater => high = middle,
+            std::cmp::Ordering::Equal => return Ok(Some((ordinal, entry, order, leading))),
+        }
+    }
+    Ok(None)
+}
+
+fn sparse_serialize_changes(
+    before: &sdk::Snapshot<'_>,
+    changes: &[RowChange],
+    sink: &mut sdk::FileEditOutput<'_, '_>,
+) -> sdk::Result<bool> {
+    if changes.is_empty() {
+        return Ok(true);
+    }
+    let Some(count) = index_count(before)? else {
+        return Ok(false);
+    };
+    let accepted_shifts = before.get_state(ELEMENT_SHIFTS_KEY)?.unwrap_or_default();
+    let shifts = decode_shifts(&accepted_shifts)?;
+    let mut successor_shifts = shifts.clone();
+    let mut edits = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for change in changes {
+        let Some((id, order, leading, source)) =
+            Document::element_row_source(change).map_err(sdk::Error::invalid_input)?
+        else {
+            return Ok(false);
+        };
+        if !seen.insert(id.clone()) {
+            return Ok(false);
+        }
+        let Some((ordinal, entry, accepted_order, accepted_leading)) =
+            find_element(before, &id, count)?
+        else {
+            return Ok(false);
+        };
+        if order != accepted_order || leading != accepted_leading {
+            return Ok(false);
+        }
+        let offset = effective_offset(entry.offset, ordinal, &shifts)?;
+        let length = effective_length(entry.length, ordinal, &shifts)?;
+        let accepted = before.read_range(offset, length)?;
+        if accepted == source.as_bytes() {
+            continue;
+        }
+        let delta = i64::try_from(source.len())
+            .ok()
+            .and_then(|n| {
+                i64::try_from(length)
+                    .ok()
+                    .and_then(|old| n.checked_sub(old))
+            })
+            .ok_or_else(|| sdk::Error::limit_exceeded("element length exceeds i64"))?;
+        if !add_element_shift(&mut successor_shifts, ordinal, delta)? {
+            return Ok(false);
+        }
+        edits.push((offset, length, source));
+    }
+    edits.sort_unstable_by_key(|edit| edit.0);
+    for (offset, length, source) in edits {
+        sink.replace(offset, length, source.as_bytes())?;
+    }
+    if shifts != successor_shifts {
+        sink.put_state(ELEMENT_SHIFTS_KEY, &encode_shifts(&successor_shifts))?;
+    }
+    Ok(true)
 }
 
 fn read_namespace(root: &sdk::Snapshot<'_>) -> sdk::Result<Option<IdNamespace>> {
@@ -293,11 +515,100 @@ fn apply_edits(mut bytes: Vec<u8>, edits: &[core::ByteEdit]) -> sdk::Result<Vec<
     Ok(bytes)
 }
 
+fn sparse_file_changes(
+    update: &sdk::ParseChangesInput<'_>,
+) -> sdk::Result<Option<(Vec<RowChange>, Vec<u8>)>> {
+    let Some(count) = index_count(&update.before)? else {
+        return Ok(None);
+    };
+    let shifts = decode_shifts(
+        &update
+            .before
+            .get_state(ELEMENT_SHIFTS_KEY)?
+            .unwrap_or_default(),
+    )?;
+    let mut successor = shifts.clone();
+    let edits: Vec<_> = update.file_edits.iter().collect();
+    let mut cursor = 0;
+    let mut changes = Vec::new();
+    while cursor < edits.len() {
+        let first = edits[cursor];
+        let mut low = 0;
+        let mut high = count;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let entry = read_index_entry(&update.before, middle)?;
+            if effective_offset(entry.offset, middle, &shifts)? <= first.offset {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        if low == 0 {
+            return Ok(None);
+        }
+        let ordinal = low - 1;
+        let entry = read_index_entry(&update.before, ordinal)?;
+        let start = effective_offset(entry.offset, ordinal, &shifts)?;
+        let end = start
+            .checked_add(effective_length(entry.length, ordinal, &shifts)?)
+            .ok_or_else(|| sdk::Error::invalid_input("element span overflow"))?;
+        if first.offset + first.delete_len > end {
+            return Ok(None);
+        }
+        let group_start = cursor;
+        cursor += 1;
+        while cursor < edits.len() && edits[cursor].offset <= end {
+            if edits[cursor].offset + edits[cursor].delete_len > end {
+                return Ok(None);
+            }
+            cursor += 1;
+        }
+        let last = edits[cursor - 1];
+        let delete_len = last.offset + last.delete_len - first.offset;
+        let mut insert = if cursor - group_start == 1 {
+            first.insert.clone()
+        } else {
+            update.before.read_range(first.offset, delete_len)?
+        };
+        if cursor - group_start > 1 {
+            for edit in edits[group_start..cursor].iter().rev() {
+                let from = (edit.offset - first.offset) as usize;
+                let to = from + edit.delete_len as usize;
+                insert.splice(from..to, edit.insert.iter().copied());
+            }
+        }
+        let combined = sdk::FileEdit {
+            offset: first.offset,
+            delete_len,
+            insert,
+        };
+        let Some((change, _)) = sparse_element_change(update, &combined, &combined.insert)? else {
+            return Ok(None);
+        };
+        if let Some(change) = change {
+            changes.push(change);
+        }
+        let delta = i64::try_from(combined.insert.len())
+            .ok()
+            .and_then(|n| {
+                i64::try_from(delete_len)
+                    .ok()
+                    .and_then(|old| n.checked_sub(old))
+            })
+            .ok_or_else(|| sdk::Error::limit_exceeded("element edit length exceeds i64"))?;
+        if !add_element_shift(&mut successor, ordinal, delta)? {
+            return Ok(None);
+        }
+    }
+    Ok(Some((changes, encode_shifts(&successor))))
+}
+
 fn sparse_element_change(
     update: &sdk::ParseChangesInput<'_>,
     edit: &sdk::FileEdit,
     insert: &[u8],
-) -> sdk::Result<Option<(RowChange, Vec<u8>)>> {
+) -> sdk::Result<Option<(Option<RowChange>, Vec<u8>)>> {
     match update.before.state_len(ELEMENT_INDEX_KEY)? {
         Some(_) => {}
         None => return Ok(None),
@@ -346,7 +657,7 @@ fn sparse_element_change(
     let mut high = count;
     while low < high {
         let middle = low + (high - low) / 2;
-        let entry = read_index_entry(update, middle)?;
+        let entry = read_index_entry(&update.before, middle)?;
         if effective_offset(entry.offset, middle, &shifts)? <= edit.offset {
             low = middle + 1;
         } else {
@@ -357,7 +668,7 @@ fn sparse_element_change(
         return Ok(None);
     }
     let ordinal = low - 1;
-    let entry = read_index_entry(update, ordinal)?;
+    let entry = read_index_entry(&update.before, ordinal)?;
     let span_offset = effective_offset(entry.offset, ordinal, &shifts)?;
     let span_length = effective_length(entry.length, ordinal, &shifts)?;
     if edit.offset < span_offset
@@ -398,7 +709,7 @@ fn sparse_element_change(
     let element_json = String::from_utf8(element)
         .map_err(|error| sdk::Error::invalid_input(format!("invalid Excalidraw UTF-8: {error}")))?;
     if element_json.as_bytes() == previous {
-        return Ok(None);
+        return Ok(Some((None, encode_shifts(&shifts))));
     }
     let Some(mut change) =
         Document::element_change_from_source(&id, order_key, leading_json, element_json)
@@ -428,7 +739,7 @@ fn sparse_element_change(
     if !add_element_shift(&mut shifts, ordinal, delta)? {
         return Ok(None);
     }
-    Ok(Some((change, encode_shifts(&shifts))))
+    Ok(Some((Some(change), encode_shifts(&shifts))))
 }
 
 struct EncodedElementIndex {
@@ -542,11 +853,11 @@ struct IndexEntry {
     leading_json_len: u32,
 }
 
-fn read_index_entry(update: &sdk::ParseChangesInput<'_>, ordinal: u32) -> sdk::Result<IndexEntry> {
+fn read_index_entry(before: &sdk::Snapshot<'_>, ordinal: u32) -> sdk::Result<IndexEntry> {
     let offset = u64::from(ordinal)
         .checked_mul(u64::from(ELEMENT_INDEX_ENTRY_BYTES))
         .ok_or_else(|| sdk::Error::invalid_input("Excalidraw index offset overflowed"))?;
-    let bytes = read_element_index_range(&update.before, offset, ELEMENT_INDEX_ENTRY_BYTES)?
+    let bytes = read_element_index_range(before, offset, ELEMENT_INDEX_ENTRY_BYTES)?
         .ok_or_else(|| sdk::Error::invalid_input("Excalidraw element index disappeared"))?;
     Ok(IndexEntry {
         offset: u64::from_le_bytes(bytes[0..8].try_into().expect("fixed index entry")),

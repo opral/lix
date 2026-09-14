@@ -4214,6 +4214,7 @@ name = "plugin_excalidraw"
 version = "0.16.1"
 dependencies = [
  "lix",
+ "serde",
  "serde_json",
  "uuid",
 ]

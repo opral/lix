@@ -1,7 +1,7 @@
 use crate::order_key::OrderKey;
 use lix::plugin::{TypedRow, TypedValue};
 use serde_json::{Map, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub const SCENE_SCHEMA_KEY: &str = "excalidraw_scene";
@@ -82,7 +82,7 @@ pub struct ByteEdit {
 
 type RowKey = (Arc<str>, String);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct SceneRow {
     template_json: String,
     elements_tail_json: String,
@@ -123,6 +123,22 @@ pub struct ArenaElementSpan {
     pub length: u64,
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ProjectionLayout {
+    scene: SceneRow,
+    pub elements: Vec<LayoutRow>,
+    pub files: Vec<LayoutRow>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct LayoutRow {
+    id: String,
+    order_key: String,
+    prefix: String,
+    pub offset: u64,
+    pub length: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Document(Arc<DocumentInner>);
 
@@ -138,14 +154,26 @@ struct DocumentInner {
 
 #[derive(Clone, Debug)]
 pub struct InitialChanges {
-    changes: VecDeque<RowChange>,
+    document: Document,
+    ordinal: usize,
 }
 
 impl Iterator for InitialChanges {
     type Item = Result<RowChange, String>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.changes.pop_front().map(Ok)
+        let inner = &self.document.0;
+        let record = if self.ordinal == 0 {
+            inner.scene.record()
+        } else if let Some(element) = inner.elements.get(self.ordinal - 1) {
+            element.record()
+        } else if let Some(file) = inner.files.get(self.ordinal - 1 - inner.elements.len()) {
+            file.record()
+        } else {
+            return None;
+        };
+        self.ordinal += 1;
+        Some(record.map(RowChange::upsert))
     }
 }
 
@@ -185,10 +213,7 @@ impl SceneRow {
             "files_tail_json".to_owned(),
             TypedValue::Text(self.files_tail_json.clone()),
         );
-        row.insert(
-            "files_present".to_owned(),
-            TypedValue::Boolean(self.files_present),
-        );
+        row.insert("scene_json", TypedValue::Jsonb(self.metadata()?.into()));
         Ok(RowRecord {
             schema_key: SCENE_SCHEMA_KEY.into(),
             row_pk: vec![TypedValue::Text(SCENE_ID.to_owned())],
@@ -203,36 +228,58 @@ impl SceneRow {
         }
         require_fields(
             &record.row,
-            &[
-                "id",
-                "template_json",
-                "elements_tail_json",
-                "files_tail_json",
-                "files_present",
-            ],
+            &["id", "elements_tail_json", "files_tail_json", "scene_json"],
         )?;
         if required_text(&record.row, "id")? != SCENE_ID {
             return Err("excalidraw_scene row id must be \"scene\"".to_owned());
         }
-        let files_present = required_typed_bool(&record.row, "files_present")?;
-        let scene = Self {
-            template_json: required_text(&record.row, "template_json")?.to_owned(),
+        let metadata = required_jsonb(&record.row, "scene_json")?;
+        let object = metadata.as_object().ok_or("scene_json must be an object")?;
+        if object.contains_key("elements") || object.contains_key("files") {
+            return Err("scene_json excludes elements and files; edit their rows instead".into());
+        }
+        let template = match record.row.get("template_json") {
+            Some(TypedValue::Text(value)) => Some(value.clone()),
+            None | Some(TypedValue::Null) => None,
+            _ => return Err("template_json must be text or null".into()),
+        };
+        let mut scene = Self {
+            template_json: template.unwrap_or_else(|| canonical_scene_template(metadata, true)),
             elements_tail_json: required_text(&record.row, "elements_tail_json")?.to_owned(),
             files_tail_json: required_text(&record.row, "files_tail_json")?.to_owned(),
-            files_present,
+            files_present: false,
         };
+        scene.files_present = template_has_files(&scene.template_json)?;
+        scene.validate_template()?;
+        if TypedValue::Jsonb(scene.metadata()?.into())
+            != *record
+                .row
+                .get("scene_json")
+                .expect("validated scene metadata")
+        {
+            scene.template_json = canonical_scene_template(metadata, scene.files_present);
+        }
         scene.validate_template()?;
         Ok(scene)
     }
 
+    fn metadata(&self) -> Result<Value, String> {
+        let markers = template_markers(&self.template_json, self.files_present)?;
+        let mut source = self.template_json.clone();
+        for (offset, marker) in markers.into_iter().rev() {
+            source.replace_range(offset..offset + marker.bytes().len(), "");
+        }
+        let mut value: Value = serde_json::from_str(&source).map_err(|e| e.to_string())?;
+        let object = value
+            .as_object_mut()
+            .ok_or("scene template must be an object")?;
+        object.remove("elements");
+        object.remove("files");
+        Ok(value)
+    }
+
     fn validate_template(&self) -> Result<(), String> {
-        require_marker_count(&self.template_json, ELEMENTS_MARKER, 1, "elements")?;
-        require_marker_count(
-            &self.template_json,
-            FILES_MARKER,
-            usize::from(self.files_present),
-            "files",
-        )?;
+        template_markers(&self.template_json, self.files_present)?;
         if !is_json_whitespace(&self.elements_tail_json) {
             return Err("elements_tail_json must contain only JSON whitespace".to_owned());
         }
@@ -303,14 +350,6 @@ impl ElementRow {
             "leading_json".to_owned(),
             TypedValue::Text(self.leading_json.clone()),
         );
-        row.insert(
-            "element_type".to_owned(),
-            TypedValue::Text(self.element_type.clone()),
-        );
-        row.insert(
-            "is_deleted".to_owned(),
-            TypedValue::Boolean(self.is_deleted),
-        );
         row.insert("element_json".to_owned(), TypedValue::Jsonb(element_json));
         row.insert(
             "source_json".to_owned(),
@@ -328,20 +367,11 @@ impl ElementRow {
         let id = text_primary_key(record)?;
         require_fields(
             &record.row,
-            &[
-                "id",
-                "order_key",
-                "leading_json",
-                "element_type",
-                "is_deleted",
-                "element_json",
-            ],
+            &["id", "order_key", "leading_json", "element_json"],
         )?;
         if required_text(&record.row, "id")? != id {
             return Err("excalidraw_element row id does not match its key".to_owned());
         }
-        let declared_type = required_text(&record.row, "element_type")?;
-        let declared_deleted = required_typed_bool(&record.row, "is_deleted")?;
         let element_json = render_payload(&record.row, "element_json")?;
         let row = Self::from_source(
             required_text(&record.row, "order_key")?.to_owned(),
@@ -350,12 +380,6 @@ impl ElementRow {
         )?;
         if row.id != id {
             return Err("element_json id does not match the row key".to_owned());
-        }
-        if row.element_type != declared_type {
-            return Err("element_type does not match element_json".to_owned());
-        }
-        if row.is_deleted != declared_deleted {
-            return Err("is_deleted does not match element_json".to_owned());
         }
         Ok(row)
     }
@@ -417,10 +441,7 @@ impl FileRow {
     fn parse(record: &RowRecord) -> Result<Self, String> {
         require_key(record, FILE_SCHEMA_KEY)?;
         let id = text_primary_key(record)?;
-        require_fields(
-            &record.row,
-            &["id", "order_key", "prefix_json", "file_json"],
-        )?;
+        require_fields(&record.row, &["id", "order_key", "file_json"])?;
         if required_text(&record.row, "id")? != id {
             return Err("excalidraw_file row id does not match its key".to_owned());
         }
@@ -428,7 +449,17 @@ impl FileRow {
         Self::from_source(
             id.to_owned(),
             required_text(&record.row, "order_key")?.to_owned(),
-            required_text(&record.row, "prefix_json")?.to_owned(),
+            match record.row.get("prefix_json") {
+                Some(TypedValue::Text(prefix))
+                    if parse_file_prefix(prefix).ok().as_deref() == Some(id) =>
+                {
+                    prefix.clone()
+                }
+                None | Some(TypedValue::Null) | Some(TypedValue::Text(_)) => {
+                    format!("{}:", serde_json::to_string(id).map_err(|e| e.to_string())?)
+                }
+                _ => return Err("prefix_json must be text or null".into()),
+            },
             file_json,
         )
     }
@@ -470,11 +501,18 @@ impl Document {
         scene.validate_template()?;
         sort_and_validate_elements(&mut elements)?;
         sort_and_validate_files(&mut files)?;
-        if !scene.files_present && !files.is_empty() {
-            return Err("file rows require a files marker in the scene".to_owned());
+        let mut rendering_scene = scene.clone();
+        if !rendering_scene.files_present && !files.is_empty() {
+            rendering_scene.template_json = canonical_scene_template(&scene.metadata()?, true);
+            rendering_scene.files_present = true;
         }
-        let rendered = render_document(&scene, &elements, &files)?;
-        validate_rendered_graph(&rendered.bytes, &elements, &files, scene.files_present)?;
+        let rendered = render_document(&rendering_scene, &elements, &files)?;
+        validate_rendered_graph(
+            &rendered.bytes,
+            &elements,
+            &files,
+            rendering_scene.files_present,
+        )?;
         Ok(Self(Arc::new(DocumentInner {
             bytes: Arc::new(rendered.bytes),
             scene,
@@ -483,6 +521,100 @@ impl Document {
             element_spans: Arc::new(rendered.element_spans),
             file_spans: Arc::new(rendered.file_spans),
         })))
+    }
+
+    pub fn layout(&self) -> ProjectionLayout {
+        ProjectionLayout {
+            scene: self.0.scene.clone(),
+            elements: self
+                .0
+                .elements
+                .iter()
+                .map(|row| {
+                    let span = self.0.element_spans[&row.id];
+                    LayoutRow {
+                        id: row.id.clone(),
+                        order_key: row.order_key.clone(),
+                        prefix: row.leading_json.clone(),
+                        offset: span.offset,
+                        length: span.length,
+                    }
+                })
+                .collect(),
+            files: self
+                .0
+                .files
+                .iter()
+                .map(|row| {
+                    let span = self.0.file_spans[&row.id];
+                    LayoutRow {
+                        id: row.id.clone(),
+                        order_key: row.order_key.clone(),
+                        prefix: row.prefix_json.clone(),
+                        offset: span.offset,
+                        length: span.length,
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    pub fn restore_layout(&mut self, layout: ProjectionLayout) -> Result<(), String> {
+        let inner = Arc::get_mut(&mut self.0).ok_or("cannot restore shared document layout")?;
+        let source = |row: &LayoutRow| -> Result<String, String> {
+            let end = row
+                .offset
+                .checked_add(row.length)
+                .ok_or("layout span overflow")?;
+            let start = usize::try_from(row.offset).map_err(|_| "layout offset exceeds memory")?;
+            let end = usize::try_from(end).map_err(|_| "layout end exceeds memory")?;
+            let bytes = inner
+                .bytes
+                .get(start..end)
+                .ok_or("layout span outside file")?;
+            bytes_to_string(bytes)
+        };
+        let mut elements = Vec::with_capacity(layout.elements.len());
+        let mut element_spans = HashMap::new();
+        for row in layout.elements {
+            let element =
+                ElementRow::from_source(row.order_key.clone(), row.prefix.clone(), source(&row)?)?;
+            if element.id != row.id {
+                return Err("element layout identity mismatch".into());
+            }
+            element_spans.insert(
+                row.id,
+                Span {
+                    offset: row.offset,
+                    length: row.length,
+                },
+            );
+            elements.push(element);
+        }
+        let mut files = Vec::with_capacity(layout.files.len());
+        let mut file_spans = HashMap::new();
+        for row in layout.files {
+            let file = FileRow::from_source(
+                row.id.clone(),
+                row.order_key.clone(),
+                row.prefix.clone(),
+                source(&row)?,
+            )?;
+            file_spans.insert(
+                row.id,
+                Span {
+                    offset: row.offset,
+                    length: row.length,
+                },
+            );
+            files.push(file);
+        }
+        inner.scene = layout.scene;
+        inner.elements = Arc::new(elements);
+        inner.files = Arc::new(files);
+        inner.element_spans = Arc::new(element_spans);
+        inner.file_spans = Arc::new(file_spans);
+        Ok(())
     }
 
     pub fn fork(&self) -> Self {
@@ -494,21 +626,10 @@ impl Document {
     }
 
     pub fn initial_changes(&self) -> InitialChanges {
-        let mut changes = VecDeque::with_capacity(1 + self.0.elements.len() + self.0.files.len());
-        changes.push_back(RowChange::upsert(
-            self.0.scene.record().expect("validated scene serializes"),
-        ));
-        for element in self.0.elements.iter() {
-            changes.push_back(RowChange::upsert(
-                element.record().expect("validated element serializes"),
-            ));
+        InitialChanges {
+            document: self.clone(),
+            ordinal: 0,
         }
-        for file in self.0.files.iter() {
-            changes.push_back(RowChange::upsert(
-                file.record().expect("validated file serializes"),
-            ));
-        }
-        InitialChanges { changes }
     }
 
     pub fn arena_element_spans(&self) -> Vec<ArenaElementSpan> {
@@ -535,6 +656,28 @@ impl Document {
         spans
     }
 
+    pub fn element_row_source(
+        change: &RowChange,
+    ) -> Result<Option<(String, String, String, String)>, String> {
+        if change.schema_key.as_ref() != ELEMENT_SCHEMA_KEY {
+            return Ok(None);
+        }
+        let Some(row) = &change.row else {
+            return Ok(None);
+        };
+        let row = ElementRow::parse(&RowRecord {
+            schema_key: change.schema_key.clone(),
+            row_pk: change.row_pk.clone(),
+            row: row.clone(),
+        })?;
+        Ok(Some((
+            row.id,
+            row.order_key,
+            row.leading_json,
+            row.element_json,
+        )))
+    }
+
     pub fn element_change_from_source(
         id: &str,
         order_key: String,
@@ -559,16 +702,16 @@ impl Document {
         &self,
         splices: &[FileEdit<'_>],
         _namespace: IdNamespace,
-    ) -> Result<(Self, Vec<RowChange>), String> {
+    ) -> Result<(Self, DocumentChanges), String> {
         if splices.is_empty() {
-            return Ok((self.clone(), Vec::new()));
+            return Ok((self.clone(), DocumentChanges::empty(self.clone())));
         }
         let bytes = apply_splices(&self.0.bytes, splices)?;
         let mut parsed = parse_file(&bytes)?;
         reconcile_order_keys(&self.0.elements, &mut parsed.elements)?;
         reconcile_order_keys(&self.0.files, &mut parsed.files)?;
         let after = Self::from_parsed_source(bytes, parsed);
-        let changes = diff_records(self.records()?, after.records()?)?;
+        let changes = DocumentChanges::new(self.clone(), after.clone());
         Ok((after, changes))
     }
 
@@ -582,28 +725,53 @@ impl Document {
             return Ok(result);
         }
 
-        let mut records = self
-            .records()?
-            .into_iter()
-            .map(|record| Ok((record_key(&record)?, record)))
-            .collect::<Result<HashMap<_, _>, String>>()?;
+        let mut scene = Some(self.0.scene.clone());
+        let mut elements: HashMap<_, _> = self
+            .0
+            .elements
+            .iter()
+            .map(|row| (row.id.clone(), row.clone()))
+            .collect();
+        let mut files: HashMap<_, _> = self
+            .0
+            .files
+            .iter()
+            .map(|row| (row.id.clone(), row.clone()))
+            .collect();
         for change in changes {
             validate_change_key(change)?;
-            let key = change_key(change)?;
-            if let Some(row) = &change.row {
-                records.insert(
-                    key,
-                    RowRecord {
-                        schema_key: change.schema_key.clone(),
-                        row_pk: change.row_pk.clone(),
-                        row: row.clone(),
-                    },
-                );
-            } else {
-                records.remove(&key);
+            let id = text_key_component(&change.row_pk)?;
+            let record = change.row.as_ref().map(|row| RowRecord {
+                schema_key: change.schema_key.clone(),
+                row_pk: change.row_pk.clone(),
+                row: row.clone(),
+            });
+            match change.schema_key.as_ref() {
+                SCENE_SCHEMA_KEY => scene = record.as_ref().map(SceneRow::parse).transpose()?,
+                ELEMENT_SCHEMA_KEY => match record {
+                    Some(record) => {
+                        elements.insert(id.to_owned(), ElementRow::parse(&record)?);
+                    }
+                    None => {
+                        elements.remove(id);
+                    }
+                },
+                FILE_SCHEMA_KEY => match record {
+                    Some(record) => {
+                        files.insert(id.to_owned(), FileRow::parse(&record)?);
+                    }
+                    None => {
+                        files.remove(id);
+                    }
+                },
+                _ => unreachable!("validated schema key"),
             }
         }
-        let (after, _) = Self::open_rows(records.into_values().collect())?;
+        let after = Self::from_rows(
+            scene.ok_or("Excalidraw requires a scene row")?,
+            elements.into_values().collect(),
+            files.into_values().collect(),
+        )?;
         if after.0.bytes == self.0.bytes {
             return Ok((after, Vec::new()));
         }
@@ -871,6 +1039,7 @@ fn parse_file(bytes: &[u8]) -> Result<ParsedFile, String> {
     if !value.is_object() {
         return Err("Excalidraw document root must be a JSON object".to_owned());
     }
+    drop(value);
     let fields = scan_root_fields(bytes)?;
     let elements_field = unique_field(&fields, "elements")?
         .ok_or_else(|| "Excalidraw document requires a top-level elements array".to_owned())?;
@@ -1358,17 +1527,7 @@ fn render_document(
     files: &[FileRow],
 ) -> Result<RenderedDocument, String> {
     let template = scene.template_json.as_bytes();
-    let mut markers = vec![(
-        find_unique(template, ELEMENTS_MARKER.as_bytes(), "elements")?,
-        Marker::Elements,
-    )];
-    if scene.files_present {
-        markers.push((
-            find_unique(template, FILES_MARKER.as_bytes(), "files")?,
-            Marker::Files,
-        ));
-    }
-    markers.sort_unstable_by_key(|marker| marker.0);
+    let markers = template_markers(&scene.template_json, scene.files_present)?;
     let mut bytes = Vec::with_capacity(scene.template_json.len());
     let mut element_spans = HashMap::with_capacity(elements.len());
     let mut file_spans = HashMap::with_capacity(files.len());
@@ -1462,21 +1621,103 @@ fn render_files(
     Ok(())
 }
 
-fn find_unique(haystack: &[u8], needle: &[u8], name: &str) -> Result<usize, String> {
-    let positions = haystack
-        .windows(needle.len())
-        .enumerate()
-        .filter_map(|(offset, window)| (window == needle).then_some(offset))
-        .collect::<Vec<_>>();
-    match positions.as_slice() {
-        [offset] => Ok(*offset),
-        [] => Err(format!(
-            "Excalidraw scene template is missing its {name} marker"
-        )),
-        _ => Err(format!(
-            "Excalidraw scene template contains multiple {name} markers"
-        )),
+fn canonical_scene_template(metadata: &Value, files_present: bool) -> String {
+    let mut source = serde_json::to_string(metadata).expect("validated JSON metadata");
+    source.pop();
+    if source.len() > 1 {
+        source.push(',');
     }
+    source.push_str("\"elements\":[");
+    source.push_str(ELEMENTS_MARKER);
+    source.push(']');
+    if files_present {
+        source.push_str(",\"files\":{");
+        source.push_str(FILES_MARKER);
+        source.push('}');
+    }
+    source.push('}');
+    source
+}
+
+fn template_has_files(source: &str) -> Result<bool, String> {
+    // Validate both possible layouts rather than searching marker-like text in metadata.
+    if template_markers(source, false).is_ok() {
+        Ok(false)
+    } else {
+        template_markers(source, true).map(|_| true)
+    }
+}
+
+// Markers are syntax, never text within JSON strings. Blanking them preserves
+// byte coordinates while allowing the normal scanner to validate their placement.
+fn template_markers(source: &str, files_present: bool) -> Result<Vec<(usize, Marker)>, String> {
+    let mut blanked = source.as_bytes().to_vec();
+    let mut markers = Vec::new();
+    let mut cursor = 0;
+    while cursor < blanked.len() {
+        if blanked[cursor] == b'"' {
+            cursor += 1;
+            while cursor < blanked.len() {
+                match blanked[cursor] {
+                    b'\\' => cursor += 2,
+                    b'"' => {
+                        cursor += 1;
+                        break;
+                    }
+                    _ => cursor += 1,
+                }
+            }
+            continue;
+        }
+        let marker = if blanked[cursor..].starts_with(ELEMENTS_MARKER.as_bytes()) {
+            Some(Marker::Elements)
+        } else if blanked[cursor..].starts_with(FILES_MARKER.as_bytes()) {
+            Some(Marker::Files)
+        } else {
+            None
+        };
+        if let Some(marker) = marker {
+            let end = cursor + marker.bytes().len();
+            blanked[cursor..end].fill(b' ');
+            markers.push((cursor, marker));
+            cursor = end;
+        } else {
+            cursor += 1;
+        }
+    }
+    let fields = scan_root_fields(&blanked)?;
+    for (name, token, present, opening, closing) in [
+        ("elements", ELEMENTS_MARKER, true, b'[', b']'),
+        ("files", FILES_MARKER, files_present, b'{', b'}'),
+    ] {
+        let field = unique_field(&fields, name)?;
+        if !present {
+            if field.is_some()
+                || markers
+                    .iter()
+                    .any(|(_, marker)| marker.bytes() == token.as_bytes())
+            {
+                return Err(format!("unexpected Excalidraw {name} collection or marker"));
+            }
+            continue;
+        }
+        let field = field.ok_or_else(|| format!("missing Excalidraw {name} collection"))?;
+        let raw = &source.as_bytes()[field.value_start..field.value_end];
+        if raw.first() != Some(&opening)
+            || raw.last() != Some(&closing)
+            || raw.get(1..raw.len().saturating_sub(1)) != Some(token.as_bytes())
+            || markers
+                .iter()
+                .filter(|(_, marker)| marker.bytes() == token.as_bytes())
+                .count()
+                != 1
+        {
+            return Err(format!(
+                "Excalidraw {name} marker must fill its top-level collection"
+            ));
+        }
+    }
+    Ok(markers)
 }
 
 trait OrderedRow {
@@ -1523,18 +1764,11 @@ fn sort_and_validate_files(files: &mut [FileRow]) -> Result<(), String> {
 
 fn sort_and_validate_ordered<T: OrderedRow>(rows: &mut [T], kind: &str) -> Result<(), String> {
     let mut ids = HashSet::with_capacity(rows.len());
-    let mut keys = HashSet::with_capacity(rows.len());
     for row in rows.iter() {
         if !ids.insert(row.id().to_owned()) {
             return Err(format!("duplicate Excalidraw {kind} id {:?}", row.id()));
         }
         validate_order_key(row.order_key())?;
-        if !keys.insert(row.order_key().to_owned()) {
-            return Err(format!(
-                "duplicate Excalidraw {kind} order key {:?}",
-                row.order_key()
-            ));
-        }
     }
     rows.sort_unstable_by(|left, right| {
         (left.order_key(), left.id()).cmp(&(right.order_key(), right.id()))
@@ -1590,7 +1824,10 @@ fn reconcile_order_keys<T: OrderedRow>(before: &[T], after: &mut [T]) -> Result<
             .checked_sub(1)
             .and_then(|index| old_keys.get(after[index].id()));
         let next = after.get(cursor).and_then(|row| old_keys.get(row.id()));
-        let allocated = OrderKey::evenly_between(previous, next, cursor - start)?;
+        let allocated = match OrderKey::evenly_between(previous, next, cursor - start) {
+            Ok(keys) => keys,
+            Err(_) => return assign_even_order_keys(after),
+        };
         for (row, key) in after[start..cursor].iter_mut().zip(allocated) {
             row.set_order_key(key.to_snapshot_string());
         }
@@ -1666,43 +1903,171 @@ fn validate_rendered_graph(
     Ok(())
 }
 
-fn diff_records(before: Vec<RowRecord>, after: Vec<RowRecord>) -> Result<Vec<RowChange>, String> {
-    let before = before
-        .into_iter()
-        .map(|record| Ok((record_key(&record)?, record.row)))
-        .collect::<Result<HashMap<_, _>, String>>()?;
-    let after = after
-        .into_iter()
-        .map(|record| Ok((record_key(&record)?, record)))
-        .collect::<Result<HashMap<_, _>, String>>()?;
-    let mut changes = Vec::new();
-    for (schema_key, row_id) in before.keys() {
-        if !after.contains_key(&(schema_key.clone(), row_id.clone())) {
-            changes.push(RowChange::delete(schema_key, row_id));
+#[derive(Debug)]
+pub struct DocumentChanges {
+    before: Document,
+    after: Document,
+    elements: HashMap<String, usize>,
+    files: HashMap<String, usize>,
+    phase: u8,
+    ordinal: usize,
+}
+
+impl DocumentChanges {
+    fn empty(document: Document) -> Self {
+        Self {
+            before: document.clone(),
+            after: document,
+            elements: HashMap::new(),
+            files: HashMap::new(),
+            phase: 5,
+            ordinal: 0,
         }
     }
-    for (key, record) in after {
-        if before.get(&key) != Some(&record.row) {
-            let format_only = before.get(&key).is_some_and(|before| {
-                let mut before = before.clone();
-                let mut after = record.row.clone();
-                before.remove("source_json");
-                after.remove("source_json");
-                before == after
-            });
-            let mut change = RowChange::upsert(record);
-            if format_only {
-                change.effect = ChangeEffect::FormatOnly;
-            }
-            changes.push(change);
+
+    fn new(before: Document, after: Document) -> Self {
+        let elements = before
+            .0
+            .elements
+            .iter()
+            .enumerate()
+            .map(|(i, row)| (row.id.clone(), i))
+            .collect();
+        let files = before
+            .0
+            .files
+            .iter()
+            .enumerate()
+            .map(|(i, row)| (row.id.clone(), i))
+            .collect();
+        Self {
+            before,
+            after,
+            elements,
+            files,
+            phase: 0,
+            ordinal: 0,
         }
     }
-    changes.sort_unstable_by(|left, right| {
-        change_key(left)
-            .expect("validated Excalidraw change")
-            .cmp(&change_key(right).expect("validated Excalidraw change"))
+}
+
+fn changed_record(before: Option<RowRecord>, after: RowRecord) -> Option<RowChange> {
+    if before
+        .as_ref()
+        .is_some_and(|before| before.row == after.row)
+    {
+        return None;
+    }
+    let formatting = |field: &str| {
+        matches!(
+            field,
+            "source_json"
+                | "leading_json"
+                | "prefix_json"
+                | "template_json"
+                | "elements_tail_json"
+                | "files_tail_json"
+        )
+    };
+    let format_only = before.as_ref().is_some_and(|before| {
+        before
+            .row
+            .iter()
+            .filter(|(key, _)| !formatting(key))
+            .eq(after.row.iter().filter(|(key, _)| !formatting(key)))
     });
-    Ok(changes)
+    let mut change = RowChange::upsert(after);
+    if format_only {
+        change.effect = ChangeEffect::FormatOnly;
+    }
+    Some(change)
+}
+
+impl Iterator for DocumentChanges {
+    type Item = Result<RowChange, String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let ordinal = self.ordinal;
+            self.ordinal += 1;
+            let candidate: Result<Option<RowChange>, String> = match self.phase {
+                0 => {
+                    self.phase = 1;
+                    self.ordinal = 0;
+                    if self.before.0.scene == self.after.0.scene {
+                        continue;
+                    }
+                    self.before.0.scene.record().and_then(|before| {
+                        self.after
+                            .0
+                            .scene
+                            .record()
+                            .map(|after| changed_record(Some(before), after))
+                    })
+                }
+                1 => {
+                    let Some(row) = self.before.0.elements.get(ordinal) else {
+                        self.phase = 2;
+                        self.ordinal = 0;
+                        continue;
+                    };
+                    if self.after.0.element_spans.contains_key(&row.id) {
+                        continue;
+                    }
+                    Ok(Some(RowChange::delete(ELEMENT_SCHEMA_KEY, &row.id)))
+                }
+                2 => {
+                    let Some(row) = self.before.0.files.get(ordinal) else {
+                        self.phase = 3;
+                        self.ordinal = 0;
+                        continue;
+                    };
+                    if self.after.0.file_spans.contains_key(&row.id) {
+                        continue;
+                    }
+                    Ok(Some(RowChange::delete(FILE_SCHEMA_KEY, &row.id)))
+                }
+                3 => {
+                    let Some(row) = self.after.0.elements.get(ordinal) else {
+                        self.phase = 4;
+                        self.ordinal = 0;
+                        continue;
+                    };
+                    let before = self
+                        .elements
+                        .get(&row.id)
+                        .map(|i| &self.before.0.elements[*i]);
+                    if before == Some(row) {
+                        continue;
+                    }
+                    before
+                        .map(ElementRow::record)
+                        .transpose()
+                        .and_then(|before| row.record().map(|after| changed_record(before, after)))
+                }
+                4 => {
+                    let Some(row) = self.after.0.files.get(ordinal) else {
+                        self.phase = 5;
+                        return None;
+                    };
+                    let before = self.files.get(&row.id).map(|i| &self.before.0.files[*i]);
+                    if before == Some(row) {
+                        continue;
+                    }
+                    before
+                        .map(FileRow::record)
+                        .transpose()
+                        .and_then(|before| row.record().map(|after| changed_record(before, after)))
+                }
+                _ => return None,
+            };
+            match candidate {
+                Ok(Some(change)) => return Some(Ok(change)),
+                Ok(None) => {}
+                Err(error) => return Some(Err(error)),
+            }
+        }
+    }
 }
 
 fn apply_splices(before: &[u8], splices: &[FileEdit<'_>]) -> Result<Vec<u8>, String> {
@@ -1776,6 +2141,8 @@ fn require_fields(row: &TypedRow, required: &[&str]) -> Result<(), String> {
     }
     for field in row.keys() {
         if !expected.contains(field)
+            && !(field == "template_json" && expected.contains("scene_json"))
+            && !(field == "prefix_json" && expected.contains("file_json"))
             && !(field == "source_json"
                 && (expected.contains("element_json") || expected.contains("file_json")))
         {

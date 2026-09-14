@@ -19,13 +19,14 @@
       "name": "order_key",
       "type": "text",
       "nullable": false,
-      "description": "A stable fractional key preserving the source object's deterministic order."
+      "description": "A stable fractional key preserving the source object's deterministic order.",
+      "default_value": "80"
     },
     {
       "name": "prefix_json",
       "type": "text",
-      "nullable": false,
-      "description": "Exact whitespace, encoded map key, and colon immediately preceding file_json; commas are supplied by the renderer."
+      "nullable": true,
+      "description": "Optional exact file key and colon spelling. Omit when inserting; stale key hints are regenerated from id."
     },
     {
       "name": "source_json",

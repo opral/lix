@@ -195,3 +195,7 @@ The harness uses a conservative 1 MiB batch limit by default. Set
 budget when testing large state pages or embedded files. Cold-file admission can
 raise the real host's budget further. The native driver checks per-operation
 limits, while compiled-component tests cover the complete host budget.
+
+For the Excalidraw SQL row contract, formatting hints, and compiled large-scene
+qualification, see [Excalidraw rows and editing](plugin-excalidraw.md) and
+[Excalidraw performance](performance/excalidraw.md).
