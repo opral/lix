@@ -7,7 +7,8 @@ export type SharedEngineClient = {
   telemetry?: TelemetryDispatch;
   parent?: TelemetryParentContext;
   progress?: OpenProgressDispatch;
-  commitIdentity?(): void;
+  commitIdentity?(): void | Promise<void>;
+  rejectCredentials?(headers: [string, string][]): void | Promise<void>;
   verifyIdentity(): Promise<{ authorityUrl: string; accountId: string; headers: [string, string][]; online?: boolean }>;
 };
 
@@ -51,7 +52,6 @@ export class SharedEngineOwner {
           const principal = await this.root.activeAccountId();
           if (principal !== identity.accountId) throw new HttpTransportError("LIX_SHARED_ENGINE_IDENTITY_MISMATCH", "Stored replica account does not match admission");
           this.principalId = principal;
-          client.commitIdentity?.();
           this.state = "ready";
         } catch (error) {
           this.clients.delete(client);
@@ -78,6 +78,7 @@ export class SharedEngineOwner {
             { code: "LIX_SHARED_ENGINE_IDENTITY_MISMATCH" },
           );
         }
+        await client.commitIdentity?.();
         this.clients.add(client);
         const report = opensRoot ? root.openReport?.() : undefined;
         const child = await root.openAnotherSession({}, client.telemetry ?? (() => {}));
@@ -174,12 +175,14 @@ export class SharedEngineOwner {
           if (client.isDisconnected?.()) continue;
           const server = client.server;
           let supplied: [string, string][];
-          try { supplied = server.headerProvider ? await server.headerProvider() : server.headers; }
+          try { supplied = (server.headerProvider ? await server.headerProvider() : server.headers).map(([name, value]) => [name, value]); }
           catch (error) { unavailable = error; continue; }
           if (!this.clients.has(client) || client.isDisconnected?.()) continue;
           const headers = new Headers(request.init.headers);
           for (const [name, value] of supplied) headers.set(name, value);
-          return (server.transport ?? fetchTransport())({ ...request, init: { ...request.init, headers, credentials: "omit" } });
+          const response = await (server.transport ?? fetchTransport())({ ...request, init: { ...request.init, headers, credentials: "omit" } });
+          if (response.status === 401 || response.status === 403) await client.rejectCredentials?.(supplied);
+          return response;
         }
         throw unavailable ?? new HttpTransportError("LIX_TRANSPORT_UNAVAILABLE", "No verified live shared-engine transport");
       },

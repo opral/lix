@@ -377,3 +377,38 @@ test("failed initial root validation never commits a provisional owner identity"
   expect(valid.commitIdentity).toHaveBeenCalledOnce();
   expect(f.open).toHaveBeenCalledTimes(2);
 });
+
+
+test("existing-root attachment awaits local proof commit only after principal validation", async () => {
+  const f = fixture();
+  await f.owner.attach(f.client());
+  let release!: () => void;
+  const committed = new Promise<void>(resolve => { release = resolve; });
+  const commitIdentity = vi.fn(() => committed);
+  const attaching = f.owner.attach({...f.client(), commitIdentity});
+  await vi.waitFor(() => expect(commitIdentity).toHaveBeenCalledOnce());
+  expect(f.sessions).toHaveLength(1);
+  release();
+  await attaching;
+  expect(f.sessions).toHaveLength(2);
+  const wrong = {...f.client("account-b"), commitIdentity: vi.fn()};
+  await expect(f.owner.attach(wrong)).rejects.toMatchObject({code:"LIX_SHARED_ENGINE_IDENTITY_MISMATCH"});
+  expect(wrong.commitIdentity).not.toHaveBeenCalled();
+});
+
+test("authorization rejection revokes the exact request credentials despite later refresh", async () => {
+  const f = fixture();
+  const client = f.client();
+  const oldHeaders: [string, string][] = [["authorization", "old-token"]];
+  client.server.headerProvider = async () => oldHeaders;
+  let respond!: (response: Response) => void;
+  client.server.transport = vi.fn(() => new Promise<Response>(resolve => { respond = resolve; }));
+  client.rejectCredentials = vi.fn();
+  await f.owner.attach(client);
+  const pending = f.transport().transport!({url:client.server.url,init:{},response:{mode:"buffered",maxBytes:16}});
+  await vi.waitFor(() => expect(client.server.transport).toHaveBeenCalledOnce());
+  oldHeaders[0]![1] = "new-token";
+  respond(new Response(null,{status:401}));
+  await pending;
+  expect(client.rejectCredentials).toHaveBeenCalledWith([["authorization","old-token"]]);
+});
