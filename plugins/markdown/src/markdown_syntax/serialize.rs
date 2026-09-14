@@ -247,10 +247,16 @@ fn serialize_block(
                 FrontmatterKind::Yaml => "---",
                 FrontmatterKind::Toml => "+++",
             };
-            Ok(format!(
-                "{fence}\n{}\n{fence}",
-                trim_trailing_newline(&node.value)
-            ))
+            if node
+                .value
+                .lines()
+                .any(|line| line.trim_end_matches([' ', '\t']) == fence)
+            {
+                return Err(SerializeError::UnsupportedNode(
+                    "frontmatter value contains its closing delimiter line",
+                ));
+            }
+            Ok(format!("{fence}\n{}\n{fence}", node.value))
         }
         Block::MdxEsm(node) => Ok(node.value.clone()),
         Block::MdxExpression(node) => Ok(format!("{{{}}}", node.value)),
@@ -466,10 +472,9 @@ fn serialize_list_with_marker_spacing(
             && matches!(item.children.as_slice(), [Block::Paragraph(_)])
             && !inner.is_empty()
         {
-            output.push_str(marker.trim_end());
-            output.push_str("\n\n");
-            output.push_str(&prefix_lines(&inner, &" ".repeat(marker.len())));
-            continue;
+            return Err(SerializeError::UnsupportedNode(
+                "a loose single-item list needs multiple block children; one paragraph cannot encode looseness",
+            ));
         }
         output.push_str(&marker);
         output.push_str(&indent_after_first_line(&inner, marker.len()));
@@ -818,6 +823,7 @@ fn serialize_inlines_with_context(
                         && output_line_len(&output) == 0,
                     trailing_ws.is_empty() && text_is_at_line_end(inlines, index),
                     context,
+                    after_literal_autolink,
                 ));
                 output.push_str(trailing_ws);
             }
@@ -1217,11 +1223,30 @@ fn escape_text_with_context(
     preserve_leading: bool,
     preserve_trailing: bool,
     context: InlineSerializeContext,
+    after_literal_autolink: bool,
 ) -> String {
     // This function encodes source line endings as entities below, so its
     // output never contains a literal newline. `output.len()` is therefore
     // the current line length and avoids rescanning the growing string with
     // `rsplit_once` for every input character.
+    let leading_pipe_end = input.len() - input.trim_start_matches('|').len();
+    let last_closers = [
+        ("*", false),
+        ("_", true),
+        ("++", false),
+        ("==", false),
+        ("~~", false),
+    ]
+    .map(|(marker, underscore)| {
+        input
+            .match_indices(marker)
+            .filter(|(offset, _)| {
+                !input[offset + marker.len()..].starts_with(marker)
+                    && text_delimiter_can_close(input, *offset, marker.len(), underscore)
+            })
+            .map(|(offset, _)| offset)
+            .last()
+    });
     let avoid_star_edges = context.avoid_star_edges;
     let mut output = String::new();
     let mut line_digit_prefix = 0usize;
@@ -1301,7 +1326,8 @@ fn escape_text_with_context(
             line_digit_prefix = usize::MAX;
             continue;
         }
-        if output.is_empty()
+        if preserve_leading
+            && output.is_empty()
             && matches!(char, '-' | '+')
             && chars
                 .peek()
@@ -1313,7 +1339,8 @@ fn escape_text_with_context(
             line_digit_prefix = usize::MAX;
             continue;
         }
-        if output.is_empty()
+        if preserve_leading
+            && output.is_empty()
             && ((char == '-' && chars.peek().is_some_and(|(_, next)| *next == '-')) || char == '=')
         {
             output.push('\\');
@@ -1325,7 +1352,7 @@ fn escape_text_with_context(
         match char {
             '*' if avoid_star_edges => output.push_str("&#x2A;"),
             '|' if context.table_cell => output.push_str("&#x7C;"),
-            '|' if output.is_empty() => {
+            '|' if offset < leading_pipe_end => {
                 output.push('\\');
                 output.push(char);
             }
@@ -1333,11 +1360,25 @@ fn escape_text_with_context(
                 output.push('\\');
                 output.push(char);
             }
-            '*' if text_attention_delimiter_can_start(input, offset, "*", false) => {
+            '*' if text_attention_delimiter_can_start(
+                input,
+                offset,
+                "*",
+                false,
+                last_closers[0],
+            ) =>
+            {
                 output.push('\\');
                 output.push(char);
             }
-            '_' if text_attention_delimiter_can_start(input, offset, "_", true) => {
+            '_' if text_attention_delimiter_can_start(
+                input,
+                offset,
+                "_",
+                true,
+                last_closers[1],
+            ) =>
+            {
                 output.push('\\');
                 output.push(char);
             }
@@ -1345,7 +1386,7 @@ fn escape_text_with_context(
                 output.push('\\');
                 output.push(char);
             }
-            '>' if output.is_empty() => {
+            '>' if (preserve_leading || after_literal_autolink) && output.is_empty() => {
                 output.push('\\');
                 output.push(char);
             }
@@ -1366,7 +1407,7 @@ fn escape_text_with_context(
                 output.push('\\');
                 output.push(char);
             }
-            '~' if text_tilde_can_start(input, offset) => {
+            '~' if text_tilde_can_start(input, offset, last_closers[4]) => {
                 output.push('\\');
                 output.push(char);
             }
@@ -1374,11 +1415,25 @@ fn escape_text_with_context(
                 output.push('\\');
                 output.push(char);
             }
-            '+' if text_attention_delimiter_can_start(input, offset, "++", false) => {
+            '+' if text_attention_delimiter_can_start(
+                input,
+                offset,
+                "++",
+                false,
+                last_closers[2],
+            ) =>
+            {
                 output.push('\\');
                 output.push(char);
             }
-            '=' if text_attention_delimiter_can_start(input, offset, "==", false) => {
+            '=' if text_attention_delimiter_can_start(
+                input,
+                offset,
+                "==",
+                false,
+                last_closers[3],
+            ) =>
+            {
                 output.push('\\');
                 output.push(char);
             }
@@ -1409,6 +1464,7 @@ fn text_attention_delimiter_can_start(
     offset: usize,
     marker: &str,
     underscore: bool,
+    last_closer: Option<usize>,
 ) -> bool {
     if !input[offset..].starts_with(marker) {
         return false;
@@ -1422,16 +1478,7 @@ fn text_attention_delimiter_can_start(
         return false;
     }
 
-    let mut cursor = offset + marker.len();
-    while let Some(candidate) = input[cursor..].find(marker).map(|index| cursor + index) {
-        if !input[candidate + marker.len()..].starts_with(marker)
-            && text_delimiter_can_close(input, candidate, marker.len(), underscore)
-        {
-            return true;
-        }
-        cursor = candidate + marker.len();
-    }
-    false
+    last_closer.is_some_and(|closer| closer >= offset + marker.len())
 }
 
 fn text_delimiter_can_open(
@@ -1546,9 +1593,9 @@ fn text_math_can_start(input: &str, offset: usize) -> bool {
     find_same_char_run(input, after_open, '$', marker_len).is_some()
 }
 
-fn text_tilde_can_start(input: &str, offset: usize) -> bool {
+fn text_tilde_can_start(input: &str, offset: usize, last_closer: Option<usize>) -> bool {
     if input[offset..].starts_with("~~") {
-        return text_attention_delimiter_can_start(input, offset, "~~", false)
+        return text_attention_delimiter_can_start(input, offset, "~~", false, last_closer)
             || text_simple_delimiter_can_start(input, offset, '~');
     }
     text_simple_delimiter_can_start(input, offset, '~')
@@ -1705,9 +1752,8 @@ fn normalize_reference_label(input: &str) -> String {
 /// matching label, so it is only whole if those children fold back to the
 /// definition identifier. Under RAW label matching the children can re-escape
 /// in a fold-breaking way (e.g. a leading `^` becomes `\^`), so when the
-/// children no longer reproduce the identifier we substitute the escaped raw
-/// label as the bracket body — keeping the Shortcut/Collapsed kind (and its
-/// re-parse) intact instead of degrading it into a Full reference.
+/// children no longer reproduce the identifier, use an explicit Full reference
+/// so the display text and target both survive the next parse.
 fn push_reference_body(
     output: &mut String,
     kind: ReferenceKind,
@@ -1715,16 +1761,14 @@ fn push_reference_body(
     children_match_identifier: bool,
     escaped_label: &str,
 ) {
-    // For a Shortcut/Collapsed reference the bracket body must fold back to the
-    // identifier on its own. Substitute the escaped raw label when the rendered
-    // children would not (keeping the reference kind), but a Full reference
-    // always keeps its rendered text since its explicit label does the matching.
-    let use_label_body = !children_match_identifier && !matches!(kind, ReferenceKind::Full);
-    let body = if use_label_body {
-        escaped_label
+    // An explicit reference preserves edited display text when it no longer
+    // spells the target identifier. Never replace semantic children with a label.
+    let kind = if children_match_identifier {
+        kind
     } else {
-        rendered
+        ReferenceKind::Full
     };
+    let body = rendered;
 
     output.push('[');
     output.push_str(body);

@@ -60,13 +60,16 @@ pub(crate) struct NodeTree {
 
 impl NodeTree {
     pub(crate) fn subtree_signature(&self) -> String {
-        let children = self
-            .children
-            .iter()
-            .map(Self::subtree_signature)
-            .collect::<Vec<_>>();
-        serde_json::to_string(&(self.node.content_signature(), children))
-            .expect("markdown subtree signature must serialize")
+        // Child counts make this preorder representation unambiguous without
+        // repeatedly JSON-escaping an already serialized descendant signature.
+        // In particular, nested blockquotes must use linear signature space.
+        let mut entries = Vec::new();
+        let mut pending = vec![self];
+        while let Some(tree) = pending.pop() {
+            entries.push((tree.node.content_signature(), tree.children.len()));
+            pending.extend(tree.children.iter().rev());
+        }
+        serde_json::to_string(&entries).expect("markdown subtree signature must serialize")
     }
 
     pub(crate) fn visit_mut(&mut self, visitor: &mut impl FnMut(&mut NodeSnapshot)) {
