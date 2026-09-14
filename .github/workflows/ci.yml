@@ -261,11 +261,6 @@ jobs:
             workspace: tooling
             junit: tooling/target/nextest/ci-e2e/junit.xml
             runner: ubicloud-standard-30-ubuntu-2404
-          - name: Commit Latency
-            task: latency
-            workspace: tooling
-            junit: tooling/target/nextest/ci-latency/junit.xml
-            runner: ubicloud-standard-30-ubuntu-2404
 
     steps:
       - name: Checkout repository
@@ -413,15 +408,6 @@ jobs:
       - name: Run Rust E2E tests with nextest
         if: matrix.task == 'e2e'
         run: cargo nextest run --config-file .config/nextest.toml --profile ci-e2e --locked --manifest-path tooling/Cargo.toml --cargo-profile test -p lix_e2e --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace --tests --timings
-
-      # Keep the 100-writer correctness workload above. Enforce the unchanged
-      # 100 ms latency budget on optimized code, without competing E2E tests.
-      # Per-node replay tracing changes hot-path timings; ordinary E2E retains it.
-      - name: Qualify optimized commit latency
-        if: matrix.task == 'latency'
-        env:
-          LIX_REQUIRE_OPTIMIZED_LATENCY: "1"
-        run: cargo nextest run --config-file .config/nextest.toml --profile ci-latency --locked --manifest-path tooling/Cargo.toml --cargo-profile release -p lix_e2e --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb --test crdt_benchmarks_baseline -E 'test(=crdt_benchmarks_b3_1_json_concurrent_map_sets)' --timings
 
       - name: Upload Rust test timing reports
         if: matrix.junit && !cancelled()

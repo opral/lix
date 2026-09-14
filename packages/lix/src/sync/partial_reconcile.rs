@@ -33,6 +33,25 @@ where
             "lease recovery source changed",
         ));
     }
+    if recovery == super::partial_publication::PartialRecoveryPolicy::ExpiredBaseline {
+        // A cold read can register interests and then fail for missing inputs,
+        // before the session's successful-read flush. Recovery must durably
+        // retain those interests (and restore a reopened registry) itself.
+        // This journal write uses its own admission/epoch CAS guards; it does
+        // not acquire session write admission or weaken publication's checks.
+        let registry = engine.sync_mode().read_interests().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_TRANSACTION_CONFLICT,
+                "lease recovery has no retained interests",
+            )
+        })?;
+        super::partial_interest_journal::flush_partial_read_interests(
+            &engine.storage(),
+            &previous,
+            &registry,
+        )
+        .await?;
+    }
     if recovery == super::partial_publication::PartialRecoveryPolicy::ExpiredBaseline
         && super::partial_publication::same_serving_basis(
             previous.descriptor(),

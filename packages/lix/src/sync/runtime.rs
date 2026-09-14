@@ -20,6 +20,7 @@ const SYNC_RESPONSE_TOO_LARGE_CODE: &str = "LIX_ERROR_SYNC_RESPONSE_TOO_LARGE";
 const SYNC_REQUEST_TOO_LARGE_CODE: &str = "LIX_ERROR_REQUEST_BODY_TOO_LARGE";
 const SYNC_ITEM_TOO_LARGE_CODE: &str = "LIX_ERROR_SYNC_ITEM_TOO_LARGE";
 const SYNC_SNAPSHOT_TOO_LARGE_CODE: &str = "LIX_ERROR_SYNC_SNAPSHOT_TOO_LARGE";
+pub(super) const PARTIAL_ADMISSION_CHANGED_CODE: &str = "LIX_PARTIAL_ADMISSION_CHANGED";
 const SYNC_DEMAND_STALLED_CODE: &str = "LIX_ERROR_SYNC_DEMAND_STALLED";
 const SYNC_DEMAND_MAX_BOUNDARIES_PER_PAGE: usize = 16;
 /// Independent sparse heads are safe to fetch concurrently. Keeping the cap
@@ -431,6 +432,7 @@ fn is_sparse_commit_graph_miss(error: &LixError) -> bool {
 #[derive(Debug, Default)]
 pub(crate) struct SyncDemandRetry {
     seen: BTreeSet<String>,
+    restarted_partial_admission: bool,
 }
 
 impl SyncDemandRetry {
@@ -464,7 +466,22 @@ impl SyncDemandRetry {
             return Err(error);
         };
         let request = self.admit(error)?;
-        send_sync_demand(demand_tx, request).await
+        match send_sync_demand(demand_tx, request).await {
+            Err(error)
+                if error.code == PARTIAL_ADMISSION_CHANGED_CODE
+                    && !error.automatic_retry_is_forbidden()
+                    && !self.restarted_partial_admission =>
+            {
+                // The worker published a fresh serving basis, rather than
+                // hydrating the old immutable address. Restart the enclosing
+                // SQL operation so it derives its inputs from that new basis.
+                // Bound this separately from ordinary hydration progress.
+                self.restarted_partial_admission = true;
+                self.seen.clear();
+                Ok(())
+            }
+            result => result,
+        }
     }
 }
 
@@ -3289,6 +3306,76 @@ mod tests {
             .expect_err("a repeated demand proves hydration made no progress");
         assert_eq!(error.code, SYNC_DEMAND_STALLED_CODE);
         assert!(is_terminal_sync_error(&error));
+    }
+
+    #[tokio::test]
+    async fn partial_admission_restart_is_bounded_and_resets_hydration_progress() {
+        let missing = || {
+            crate::tracked_state::NativeObjectRef::TrackedStateTreeChunk([29; 32])
+                .annotate_missing(LixError::unknown("missing input"))
+        };
+        let mut retry = SyncDemandRetry::default();
+        for restart in 0..2 {
+            let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
+            // Repeating the exact address after restart must reach the worker:
+            // the new serving basis may still need this shared immutable input.
+            let hydrate = retry.hydrate_for_retry(Some(&demand_tx), missing());
+            let serve = async {
+                let demand = demand_rx.recv().await.expect("native demand arrives");
+                demand.response.send(Err(LixError::new(
+                    PARTIAL_ADMISSION_CHANGED_CODE,
+                    "fresh serving basis",
+                ))).expect("waiter remains live");
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::join!(hydrate, serve)
+            })
+            .await
+            .expect("demand restart completes");
+            if restart == 0 {
+                result.expect("first admission change restarts SQL");
+            } else {
+                assert_eq!(result.unwrap_err().code, PARTIAL_ADMISSION_CHANGED_CODE);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_admission_restart_never_replays_completed_execution() {
+        for marker in ["nonRetryableAfterExecution", "nonRetryableAfterCommit"] {
+            let mut missing =
+                crate::tracked_state::NativeObjectRef::TrackedStateTreeChunk([29; 32])
+                    .annotate_missing(LixError::unknown("missing input"));
+            missing.details.as_mut().unwrap()[marker] = serde_json::json!(true);
+            let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
+            let error = SyncDemandRetry::default()
+                .hydrate_for_retry(Some(&demand_tx), missing.clone())
+                .await
+                .expect_err("completed operation must never reach the worker");
+            assert_eq!(error.code, missing.code);
+            assert_eq!(error.details, missing.details);
+            assert!(matches!(demand_rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
+
+            let missing = crate::tracked_state::NativeObjectRef::TrackedStateTreeChunk([29; 32])
+                .annotate_missing(LixError::unknown("missing input"));
+            let mut retry = SyncDemandRetry::default();
+            let hydrate = retry.hydrate_for_retry(Some(&demand_tx), missing);
+            let serve = async {
+                let demand = demand_rx.recv().await.expect("native demand arrives");
+                let mut outcome = LixError::new(PARTIAL_ADMISSION_CHANGED_CODE, "completed outcome")
+                    .with_details(serde_json::json!({}));
+                outcome.details.as_mut().unwrap()[marker] = serde_json::json!(true);
+                demand.response.send(Err(outcome)).expect("waiter remains live");
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::join!(hydrate, serve)
+            })
+            .await
+            .expect("demand restart completes");
+            let error = result.expect_err("completed worker outcome must not restart SQL");
+            assert_eq!(error.code, PARTIAL_ADMISSION_CHANGED_CODE);
+            assert!(error.automatic_retry_is_forbidden());
+        }
     }
 
     #[tokio::test]

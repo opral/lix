@@ -644,3 +644,385 @@ async fn engine_worker_preempts_watch_then_publishes_retained_negative_scope() {
     .await
     .expect("live partial worker publication timed out");
 }
+
+#[derive(Clone)]
+struct ExpiredAuthorityClient {
+    inner: WatchingAuthorityClient,
+    expired_lease: String,
+    descriptors: Arc<AtomicUsize>,
+    expirations: Arc<AtomicUsize>,
+}
+impl RawHttpClient for ExpiredAuthorityClient {
+    fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
+        Box::pin(async move {
+            let url = url::Url::parse(&request.url).unwrap();
+            // Foreground tests stop at the demand result; keep subsequent
+            // background reconciliation pending so the caller can assert it.
+            if url.path().ends_with("/sync/update") && self.descriptors.load(Ordering::SeqCst) > 0 {
+                futures_util::future::pending::<()>().await;
+            }
+            if url.path().ends_with("/sync/baseline-lease/renew") {
+                self.expirations.fetch_add(1, Ordering::SeqCst);
+                return Err(LixError::new(
+                    "LIX_PARTIAL_BASELINE_EXPIRED",
+                    "test renewal expired",
+                ));
+            }
+            if url.path().ends_with("/sync/descriptor") {
+                assert!(!url.query_pairs().any(|(key, _)| key == "after"));
+                self.descriptors.fetch_add(1, Ordering::SeqCst);
+                let branch = url
+                    .query_pairs()
+                    .find(|(key, _)| key == "branchId")
+                    .unwrap()
+                    .1
+                    .into_owned();
+                let descriptor = self
+                    .inner
+                    .base
+                    .authority
+                    .leased_partial_replica_descriptor(Some(&branch))
+                    .await?;
+                return Ok(RawHttpResponse {
+                    status: 200,
+                    status_text: "OK".into(),
+                    body: serde_json::to_vec(&descriptor).unwrap(),
+                });
+            }
+            if url.path().contains("/sync/native-")
+                && request.headers.iter().any(|(name, value)| {
+                    name == "lix-native-baseline-lease" && value == &self.expired_lease
+                })
+            {
+                self.expirations.fetch_add(1, Ordering::SeqCst);
+                return Err(LixError::new(
+                    "LIX_PARTIAL_BASELINE_EXPIRED",
+                    "test authority expired the old baseline",
+                ));
+            }
+            self.inner.send(request).await
+        })
+    }
+}
+
+async fn expired_foreground_read_recovers(advance_authority: bool, dirty: bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let authority = Arc::new(open_lix().await.unwrap());
+        authority
+            .set_sync_role(crate::sync::SyncRole::Authority)
+            .unwrap();
+        authority
+            .execute(
+                "INSERT INTO lix_key_value (key,value) VALUES ('lease-read','before')",
+                &[],
+            )
+            .await
+            .unwrap();
+        let leased = authority
+            .leased_partial_replica_descriptor(None)
+            .await
+            .unwrap();
+        let old = Arc::new(
+            PartialReplicaState::from_leased(
+                format!("https://example.test/lix/{}", authority.lix_id()),
+                authority.active_account_id().into(),
+                uuid::Uuid::now_v7().to_string(),
+                leased,
+            )
+            .unwrap(),
+        );
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let mut writes = storage.new_write_set();
+        let preconditions = stage_partial_bootstrap(&read, &mut writes, &old).unwrap();
+        crate::init::stage_partial_repository_protocol(&mut writes);
+        drop(read);
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    await_durable: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (engine, session) =
+            Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &old)
+                .await
+                .unwrap();
+        let engine = Arc::new(engine);
+        engine
+            .sync_mode()
+            .admit_partial_replica(old.clone(), crate::sync::partial_replica_write_capability());
+        storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
+        if dirty {
+            execute_hydrating(
+                &session,
+                &storage,
+                &old,
+                &authority,
+                "UPDATE lix_key_value SET value='local-pending' WHERE key='lease-read'",
+                &[],
+                &mut Fetches::default(),
+            )
+            .await
+            .unwrap();
+        }
+        if advance_authority || dirty {
+            authority
+                .execute(
+                    "UPDATE lix_key_value SET value='after' WHERE key='lease-read'",
+                    &[],
+                )
+                .await
+                .unwrap();
+        }
+        let client = ExpiredAuthorityClient {
+            inner: WatchingAuthorityClient {
+                base: AuthorityClient::new(authority.clone(), false),
+                watches: Arc::default(),
+                native_reads: Arc::default(),
+                blocked: Arc::default(),
+                changed: Arc::default(),
+            },
+            expired_lease: old.baseline_lease().lease_id.clone(),
+            descriptors: Arc::default(),
+            expirations: Arc::default(),
+        };
+        let transport = HttpSyncTransport::connect_with(client.clone(), old.remote_id())
+            .await
+            .unwrap();
+        transport
+            .bind_native_baseline_lease(old.baseline_lease())
+            .unwrap();
+        let (shutdown, shutdown_rx) =
+            tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        let sql = "SELECT value FROM lix_key_value WHERE key='lease-read'";
+        // Queue the first real SQL hydration demand before the worker can watch.
+        let request = if dirty {
+            let latest = authority.partial_replica_descriptor(None).await.unwrap();
+            crate::sync::runtime::SyncDemandRequest::NativeMetadata(
+                NativeMetadataRef::CommitStateHeader(latest.selected_branch.head.commit_id),
+                LixError::unknown("nonresident history with local edits"),
+            )
+        } else {
+            let error = session.execute(sql, &[]).await.unwrap_err();
+            crate::sync::runtime::native_sync_demand_request_for_error(&error)
+                .unwrap()
+                .expect("cold SQL requires hydration")
+        };
+        let (response, done) = tokio::sync::oneshot::channel();
+        sender
+            .send(crate::sync::runtime::SyncDemand { request, response })
+            .await
+            .unwrap();
+        let worker = crate::sync::partial_runtime::run_partial_worker_with_engine(
+            storage.clone(),
+            old.clone(),
+            Some(transport),
+            || Box::pin(async { Err(LixError::unknown("unexpected reconnect")) }),
+            shutdown_rx,
+            receiver,
+            None,
+            Some(engine.clone()),
+        );
+        let caller = async {
+            let result = done.await.unwrap();
+            if dirty {
+                let error = result.expect_err("pending local edits must block clean recovery");
+                assert_eq!(error.code, "LIX_PARTIAL_REPLICA_BASELINE_RECOVERY_PENDING");
+                assert_eq!(
+                    engine.sync_mode().partial_admission().as_deref(),
+                    Some(old.as_ref())
+                );
+                assert!(value(session.execute(sql, &[]).await.unwrap()).contains("local-pending"));
+                assert_eq!(client.descriptors.load(Ordering::SeqCst), 1);
+                shutdown.send_replace(crate::sync::runtime::SyncShutdown::Stop);
+                return;
+            }
+            if advance_authority {
+                assert_eq!(
+                    result
+                        .expect_err("changed basis restarts SQL against new roots")
+                        .code,
+                    "LIX_PARTIAL_ADMISSION_CHANGED"
+                );
+            } else {
+                result.expect("original demand must recover without exposing expiration");
+            }
+            assert_eq!(client.descriptors.load(Ordering::SeqCst), 1);
+            assert_eq!(client.expirations.load(Ordering::SeqCst), 1);
+            assert_ne!(
+                engine
+                    .sync_mode()
+                    .partial_admission()
+                    .unwrap()
+                    .baseline_lease()
+                    .lease_id,
+                old.baseline_lease().lease_id
+            );
+            loop {
+                match session.execute(sql, &[]).await {
+                    Ok(result) => {
+                        assert!(value(result).contains(if advance_authority {
+                            "after"
+                        } else {
+                            "before"
+                        }));
+                        break;
+                    }
+                    Err(error) => {
+                        let request =
+                            crate::sync::runtime::native_sync_demand_request_for_error(&error)
+                                .unwrap()
+                                .unwrap_or_else(|| panic!("unexpected SQL error: {error:?}"));
+                        let (response, done) = tokio::sync::oneshot::channel();
+                        sender
+                            .send(crate::sync::runtime::SyncDemand { request, response })
+                            .await
+                            .unwrap();
+                        done.await.unwrap().unwrap();
+                    }
+                }
+            }
+            assert!(
+                client.inner.native_reads.load(Ordering::SeqCst) > 0,
+                "recovery must hydrate the original demand, not merely acknowledge publication"
+            );
+            shutdown.send_replace(crate::sync::runtime::SyncShutdown::Stop);
+        };
+        let (result, ()) = futures_util::join!(worker, caller);
+        result.unwrap();
+    })
+    .await
+    .expect("expired foreground recovery timed out");
+}
+
+#[tokio::test]
+async fn expired_foreground_read_reacquires_unchanged_authority() {
+    expired_foreground_read_recovers(false, false).await;
+}
+
+#[tokio::test]
+async fn expired_foreground_read_adopts_advanced_authority() {
+    expired_foreground_read_recovers(true, false).await;
+}
+
+#[tokio::test]
+async fn expired_foreground_read_preserves_pending_local_edit() {
+    expired_foreground_read_recovers(false, true).await;
+}
+
+#[tokio::test]
+async fn expired_background_renewal_refreshes_unchanged_authority_without_long_poll() {
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let authority = Arc::new(open_lix().await.unwrap());
+        authority
+            .set_sync_role(crate::sync::SyncRole::Authority)
+            .unwrap();
+        authority
+            .execute(
+                "INSERT INTO lix_key_value (key,value) VALUES ('lease-read','before')",
+                &[],
+            )
+            .await
+            .unwrap();
+        let mut leased = authority
+            .leased_partial_replica_descriptor(None)
+            .await
+            .unwrap();
+        leased.lease.expires_at_ms = 1;
+        let old = Arc::new(
+            PartialReplicaState::from_leased(
+                format!("https://example.test/lix/{}", authority.lix_id()),
+                authority.active_account_id().into(),
+                uuid::Uuid::now_v7().to_string(),
+                leased,
+            )
+            .unwrap(),
+        );
+        let storage = StorageAdapter::new(Memory::new());
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let mut writes = storage.new_write_set();
+        let preconditions = stage_partial_bootstrap(&read, &mut writes, &old).unwrap();
+        crate::init::stage_partial_repository_protocol(&mut writes);
+        drop(read);
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    await_durable: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let (engine, session) =
+            Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &old)
+                .await
+                .unwrap();
+        let engine = Arc::new(engine);
+        engine
+            .sync_mode()
+            .admit_partial_replica(old.clone(), crate::sync::partial_replica_write_capability());
+        storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
+        let client = ExpiredAuthorityClient {
+            inner: WatchingAuthorityClient {
+                base: AuthorityClient::new(authority.clone(), false),
+                watches: Arc::default(),
+                native_reads: Arc::default(),
+                blocked: Arc::default(),
+                changed: Arc::default(),
+            },
+            expired_lease: old.baseline_lease().lease_id.clone(),
+            descriptors: Arc::default(),
+            expirations: Arc::default(),
+        };
+
+        let transport = HttpSyncTransport::connect_with(client.clone(), old.remote_id())
+            .await
+            .unwrap();
+        transport
+            .bind_native_baseline_lease(old.baseline_lease())
+            .unwrap();
+        let (shutdown, shutdown_rx) =
+            tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
+        let (_sender, receiver) = tokio::sync::mpsc::channel(4);
+        let worker = crate::sync::partial_runtime::run_partial_worker_with_engine(
+            storage.clone(),
+            old.clone(),
+            Some(transport),
+            || Box::pin(async { Err(LixError::unknown("unexpected reconnect")) }),
+            shutdown_rx,
+            receiver,
+            Some(engine.sync_mode().change_watcher()),
+            Some(engine.clone()),
+        );
+        let caller = async {
+            while engine.sync_mode().partial_admission().as_deref() == Some(old.as_ref()) {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(client.expirations.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                client.descriptors.load(Ordering::SeqCst),
+                0,
+                "background recovery uses the update endpoint"
+            );
+            assert!(client.inner.watches.load(Ordering::SeqCst) >= 1);
+            assert_eq!(
+                engine.sync_mode().partial_admission().unwrap().descriptor(),
+                old.descriptor()
+            );
+            shutdown.send_replace(crate::sync::runtime::SyncShutdown::Stop);
+        };
+        let (result, ()) = futures_util::join!(worker, caller);
+        result.unwrap();
+        session.close().await.unwrap();
+    })
+    .await
+    .expect("unchanged authority must not long-poll after lease expiration");
+}
