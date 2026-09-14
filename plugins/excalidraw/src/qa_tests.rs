@@ -1060,3 +1060,20 @@ fn qa_shift_limit_fallback_restores_all_rows_and_file_offsets() {
     );
     assert_eq!(json(&out.snapshot().bytes)["files"], source["files"]);
 }
+
+#[test]
+fn qa_missing_incremental_layout_requires_durable_row_restore() {
+    let (h, mut file, rows) = initial();
+    file.state.clear();
+    let mut a = element(&rows, "a");
+    a.row
+        .insert("order_key", sdk::TypedValue::Text("f0".into()));
+    assert!(h.serialize_changes(&file, &[change(&a)]).is_err());
+    let restored = h
+        .serialize(&file.file_id, &file.path, &rows, Some(&file))
+        .unwrap();
+    assert!(
+        h.serialize_changes(restored.snapshot(), &[change(&a)])
+            .is_ok()
+    );
+}

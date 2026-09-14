@@ -252,7 +252,9 @@ fn store_document_indexes(sink: &mut impl StateOutput, document: &Document) -> s
 
 fn restore_document_layout(before: &sdk::Snapshot<'_>, document: &mut Document) -> sdk::Result<()> {
     let Some(root) = before.get_state(ORDER_ROOT)? else {
-        return Ok(());
+        return Err(sdk::Error::invalid_input(
+            "Excalidraw incremental layout is missing; restore from complete durable rows",
+        ));
     };
     let pages = u64::from_le_bytes(
         root.try_into()
