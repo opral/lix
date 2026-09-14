@@ -479,6 +479,54 @@ impl Document {
         })))
     }
 
+    pub fn order_keys(&self) -> Vec<(String, String, String)> {
+        self.0
+            .elements
+            .iter()
+            .map(|row| {
+                (
+                    ELEMENT_SCHEMA_KEY.to_owned(),
+                    row.id.clone(),
+                    row.order_key.clone(),
+                )
+            })
+            .chain(self.0.files.iter().map(|row| {
+                (
+                    FILE_SCHEMA_KEY.to_owned(),
+                    row.id.clone(),
+                    row.order_key.clone(),
+                )
+            }))
+            .collect()
+    }
+
+    pub fn restore_order_keys(
+        &mut self,
+        keys: Vec<(String, String, String)>,
+    ) -> Result<(), String> {
+        let mut keys = keys
+            .into_iter()
+            .map(|(schema, id, key)| ((schema, id), key))
+            .collect::<HashMap<_, _>>();
+        let inner = Arc::get_mut(&mut self.0).ok_or("cannot restore shared document order")?;
+        for row in Arc::make_mut(&mut inner.elements) {
+            row.order_key = keys
+                .remove(&(ELEMENT_SCHEMA_KEY.to_owned(), row.id.clone()))
+                .ok_or("missing element order key")?;
+            validate_order_key(&row.order_key)?;
+        }
+        for row in Arc::make_mut(&mut inner.files) {
+            row.order_key = keys
+                .remove(&(FILE_SCHEMA_KEY.to_owned(), row.id.clone()))
+                .ok_or("missing file order key")?;
+            validate_order_key(&row.order_key)?;
+        }
+        if !keys.is_empty() {
+            return Err("order index contains unknown rows".into());
+        }
+        Ok(())
+    }
+
     pub fn fork(&self) -> Self {
         self.clone()
     }

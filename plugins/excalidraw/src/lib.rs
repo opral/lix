@@ -82,10 +82,7 @@ fn cold_parse_changes(
         .file_changed(&splices, create_namespace)
         .map_err(sdk::Error::invalid_input)?;
     sink.put_state(ID_NAMESPACE_STATE, &accepted_namespace.0[..12])?;
-    store_element_index(
-        sink,
-        &encode_element_index(&successor.arena_element_spans())?,
-    )?;
+    store_document_indexes(sink, &successor)?;
     emit_changes(changes.into_iter().map(Ok), sink)
 }
 
@@ -110,18 +107,16 @@ impl sdk::FileProjection for ExcalidrawPlugin {
         let namespace = read_namespace(&update.before)?
             .or_else(|| namespace_from_changes(&changes))
             .unwrap_or_else(|| IdNamespace::from_halves(0, 0));
-        let (document, _) = Document::open_file(before.clone(), Some(update.path), namespace)
+        let (mut document, _) = Document::open_file(before.clone(), Some(update.path), namespace)
             .map_err(sdk::Error::invalid_input)?;
+        restore_document_order(&update.before, &mut document)?;
         let (successor, edits) = document
             .rows_changed(&changes)
             .map_err(sdk::Error::invalid_input)?;
         for edit in edits {
             sink.replace(edit.offset, edit.delete_len, &edit.insert)?;
         }
-        store_element_index(
-            sink,
-            &encode_element_index(&successor.arena_element_spans())?,
-        )?;
+        store_document_indexes(sink, &successor)?;
         sink.delete_state(ELEMENT_SHIFTS_KEY)?;
         Ok(())
     }
@@ -139,29 +134,19 @@ impl sdk::FileProjection for ExcalidrawPlugin {
             });
         }
         let (rendered, _) = Document::open_rows(records).map_err(sdk::Error::invalid_input)?;
-        let document = if let Some(before) = input.before.as_ref() {
-            let namespace =
-                read_namespace(before)?.unwrap_or_else(|| IdNamespace::from_halves(0, 0));
-            let (accepted, _) =
-                Document::open_file(before.read_all()?, Some(input.path), namespace)
-                    .map_err(sdk::Error::invalid_input)?;
-            if accepted
-                .semantically_equal(&rendered)
-                .map_err(sdk::Error::invalid_input)?
-            {
-                accepted
-            } else {
-                sink.write(&rendered.bytes())?;
-                rendered
-            }
-        } else {
-            sink.write(&rendered.bytes())?;
-            rendered
-        };
-        store_element_index(
-            sink,
-            &encode_element_index(&document.arena_element_spans())?,
-        )?;
+        let document = rendered;
+        let bytes = document.bytes();
+        if input
+            .before
+            .as_ref()
+            .map(|before| before.read_all())
+            .transpose()?
+            .as_deref()
+            != Some(bytes.as_slice())
+        {
+            sink.write(&bytes)?;
+        }
+        store_document_indexes(sink, &document)?;
         Ok(())
     }
 
@@ -171,10 +156,7 @@ impl sdk::FileProjection for ExcalidrawPlugin {
             Document::open_file(input.file.read_all()?, Some(input.path), namespace)
                 .map_err(sdk::Error::invalid_input)?;
         sink.put_state(ID_NAMESPACE_STATE, &input.creates.namespace_bytes())?;
-        store_element_index(
-            sink,
-            &encode_element_index(&document.arena_element_spans())?,
-        )?;
+        store_document_indexes(sink, &document)?;
         emit_changes(changes, sink)?;
         Ok(())
     }
@@ -214,23 +196,64 @@ impl sdk::FileProjection for ExcalidrawPlugin {
             return Ok(());
         }
 
-        let (document, _) = Document::open_file(
+        let (mut document, _) = Document::open_file(
             update.before.read_all()?,
             Some(update.before_path),
             accepted_namespace,
         )
         .map_err(sdk::Error::invalid_input)?;
+        restore_document_order(&update.before, &mut document)?;
         let (document, changes) = document
             .file_changed(&splices, create_namespace)
             .map_err(sdk::Error::invalid_input)?;
-        store_element_index(
-            sink,
-            &encode_element_index(&document.arena_element_spans())?,
-        )?;
+        store_document_indexes(sink, &document)?;
         sink.delete_state(ELEMENT_SHIFTS_KEY)?;
         emit_changes(changes.into_iter().map(Ok), sink)?;
         Ok(())
     }
+}
+
+const ORDER_PREFIX: &[u8] = b"excalidraw/order/";
+const ORDER_ROOT: &[u8] = b"excalidraw/order/root";
+
+fn store_document_indexes(sink: &mut impl StateOutput, document: &Document) -> sdk::Result<()> {
+    store_element_index(
+        sink,
+        &encode_element_index(&document.arena_element_spans())?,
+    )?;
+    sink.delete_state_prefix(ORDER_PREFIX)?;
+    let keys = document.order_keys();
+    let pages = keys.len().div_ceil(1024);
+    sink.put_state(ORDER_ROOT, &(pages as u64).to_le_bytes())?;
+    for (page, keys) in keys.chunks(1024).enumerate() {
+        let key = format!("excalidraw/order/{page}");
+        let bytes = serde_json::to_vec(keys).map_err(|e| sdk::Error::internal(e.to_string()))?;
+        sink.put_state(key.as_bytes(), &bytes)?;
+    }
+    Ok(())
+}
+
+fn restore_document_order(before: &sdk::Snapshot<'_>, document: &mut Document) -> sdk::Result<()> {
+    let Some(root) = before.get_state(ORDER_ROOT)? else {
+        return Ok(());
+    };
+    let pages = u64::from_le_bytes(
+        root.try_into()
+            .map_err(|_| sdk::Error::invalid_input("invalid order index"))?,
+    );
+    let mut keys = Vec::new();
+    for page in 0..pages {
+        let key = format!("excalidraw/order/{page}");
+        let bytes = before
+            .get_state(key.as_bytes())?
+            .ok_or_else(|| sdk::Error::invalid_input("missing order page"))?;
+        let page: Vec<(String, String, String)> =
+            serde_json::from_slice(&bytes).map_err(|e| sdk::Error::invalid_input(e.to_string()))?;
+        keys.extend(page);
+    }
+    document
+        .restore_order_keys(keys)
+        .map_err(sdk::Error::invalid_input)
 }
 
 fn read_namespace(root: &sdk::Snapshot<'_>) -> sdk::Result<Option<IdNamespace>> {

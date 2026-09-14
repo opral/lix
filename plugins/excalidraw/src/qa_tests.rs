@@ -536,7 +536,9 @@ fn qa_marker_text_in_metadata_roundtrips_and_marker_relocation_rejects() {
     let parsed = harness.parse(&file, ctx(1)).unwrap();
     let mut rows = Vec::new();
     accept(&mut rows, &parsed.row_changes);
-    let rendered = harness.serialize(&file.file_id, &file.path, &rows, None).unwrap();
+    let rendered = harness
+        .serialize(&file.file_id, &file.path, &rows, None)
+        .unwrap();
     assert_eq!(rendered.snapshot().bytes, file.bytes);
 
     let (harness, file, rows) = initial();
@@ -555,4 +557,62 @@ fn qa_marker_text_in_metadata_roundtrips_and_marker_relocation_rejects() {
             .insert("template_json", sdk::TypedValue::Text(template.into()));
         assert!(harness.serialize_changes(&file, &[change(&scene)]).is_err());
     }
+}
+
+#[test]
+fn qa_structural_file_edits_then_sql_edits_preserve_durable_order() {
+    let (h, file, mut rows) = initial();
+    let edit = replace(
+        &file,
+        "\"elements\": [",
+        "\"elements\": [{\"id\":\"c\",\"type\":\"ellipse\"},",
+    );
+    let out = h
+        .parse_changes(&file, &file.path, &[edit], None, ctx(2))
+        .unwrap();
+    accept(&mut rows, &out.row_changes);
+    let mut file = out.into_snapshot();
+    for id in ["a", "b", "c", "a"] {
+        let mut row = element(&rows, id);
+        let mut value = payload(&row, "element_json");
+        value["x"] = json!(12345);
+        set_payload(&mut row, "element_json", value);
+        let update = change(&row);
+        let out = h
+            .serialize_changes(&file, std::slice::from_ref(&update))
+            .unwrap();
+        accept(&mut rows, &[update]);
+        file = out.into_snapshot();
+        assert_eq!(
+            json(&file.bytes)["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["c", "a", "b"]
+        );
+    }
+    // A structural fallback must compare against the same durable order keys.
+    let edit = replace(&file, "\"theme\":\"dark\"", "\"theme\":\"light\"");
+    let warm = h
+        .parse_changes(&file, &file.path, std::slice::from_ref(&edit), None, ctx(3))
+        .unwrap();
+    let mut cold = file.clone();
+    cold.state.clear();
+    let cold = h
+        .parse_changes(&cold, &cold.path, &[edit], Some(&rows), ctx(3))
+        .unwrap();
+    let mut warm_rows = rows.clone();
+    let mut cold_rows = rows;
+    accept(&mut warm_rows, &warm.row_changes);
+    accept(&mut cold_rows, &cold.row_changes);
+    assert_eq!(canonical_rows(&warm_rows), canonical_rows(&cold_rows));
+    assert_eq!(
+        h.serialize(&file.file_id, &file.path, &warm_rows, None)
+            .unwrap()
+            .snapshot()
+            .bytes,
+        warm.snapshot().bytes
+    );
 }
