@@ -1,5 +1,9 @@
 # CRDT benchmark baseline
 
+This document records historical measurements. The B3.1 JSON latency benchmark
+and its CI job have been removed. The remaining profiling and correctness tests
+are listed in the reproduction section.
+
 Measured 2026-08-01 against the latest
 [`dmonad/crdt-benchmarks`](https://github.com/dmonad/crdt-benchmarks) `main`
 workloads, with `N = 6000`. Every external package was upgraded to its npm
@@ -99,14 +103,7 @@ cargo test -p lix_e2e --test crdt_benchmarks_baseline --release \
   crdt_benchmarks_b2_1_markdown_concurrent_prefix_inserts \
   -- --ignored --exact --nocapture
 
-LIX_CRDT_SAMPLES=1 cargo test -p lix_e2e \
-  --test crdt_benchmarks_baseline --release \
-  crdt_benchmarks_b3_1_json_concurrent_map_sets \
-  -- --ignored --exact --nocapture
 ```
-
-`LIX_CRDT_B3_CLIENTS` overrides the default 100-client cardinality and
-`LIX_CRDT_SAMPLES` controls independent workspace samples.
 
 The separate [`REALTIME_COLLABORATION_CAPACITY.md`](REALTIME_COLLABORATION_CAPACITY.md)
 defines the realistic 50-100 collaborator, gradual-arrival, client-observed
