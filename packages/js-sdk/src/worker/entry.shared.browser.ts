@@ -1,12 +1,14 @@
 /// <reference lib="webworker" />
 import { openLixBinding, convertReplicaBinding } from "#binding";
-import { fetchTransport } from "../http-transport.js";
+import { fetchTransport, HttpTransportError } from "../http-transport.js";
 import {
   SharedAdmissionCache,
   requestAdmission,
   type AdmissionIdentity,
   sharedCredentialKey,
+  sameAdmission,
 } from "./shared-admission.js";
+import { DurableLocalAdmission } from "./durable-local-admission.js";
 import { startWorkerHost } from "./host.js";
 import { SharedEngineOwner, type SharedEngineClient } from "./shared-engine.js";
 import type { SyncServerBindingOptions } from "../binding-types.js";
@@ -15,9 +17,9 @@ import { serializeWorkerError, type WorkerInput, type WorkerResponse } from "./p
 const scope = globalThis as unknown as SharedWorkerGlobalScope;
 let owner: SharedEngineOwner | undefined;
 let configuration: string | undefined;
-// Same-origin callers already control this physical store. Exact credentials
-// previously admitted in this worker may attach offline; new credentials need
-// an authenticated probe. Never persist these credentials.
+// Same-origin callers own the local store. Durable routing proofs can reopen
+// its cached data after worker shutdown, but never authorize remote requests.
+// Raw credentials remain in memory only.
 const admitted = new SharedAdmissionCache();
 let rootIdentity: AdmissionIdentity | undefined;
 
@@ -38,13 +40,55 @@ scope.onconnect = (event) => {
       const readHeaders = async () =>
         raw.headerProvider ? await raw.headerProvider() : raw.headers;
       let verifiedKey: string | undefined;
+      let verifiedGeneration: number | undefined;
       let candidateIdentity: AdmissionIdentity | undefined;
+      let candidateHeaders: [string, string][] | undefined;
+      let candidateOnline = false;
+      let candidateGeneration = 0;
+      let candidateCredentialGeneration = 0;
+      const providerOptions = storage.kind === "jsStorage" ? storage.options : undefined;
+      const physicalScope = providerOptions && typeof providerOptions === "object" &&
+        "sharedEngineKey" in providerOptions && typeof providerOptions.sharedEngineKey === "string"
+        ? providerOptions.sharedEngineKey : undefined;
+      if (!physicalScope?.startsWith("lix:opfs:")) throw new Error("Missing physical shared storage identity");
+      const localAdmission = new DurableLocalAdmission(physicalScope, raw.url);
       const transport = raw.transport ?? fetchTransport();
       const authenticate = async (headers: [string, string][], allowOffline: boolean) => {
-        const result = await admitted.verify(raw.url, headers, rootIdentity,
-          () => requestAdmission(raw.url, headers, transport), allowOffline);
-        if (result.online) verifiedKey = sharedCredentialKey(raw.url, headers);
+        const credentialGeneration = admitted.generation(raw.url, headers);
+        let result: { identity: AdmissionIdentity; online: boolean };
+        try {
+          result = await admitted.verify(raw.url, headers, rootIdentity,
+            () => requestAdmission(raw.url, headers, transport), allowOffline);
+        } catch (error) {
+          const code = (error as {code?: string})?.code;
+          if (code === "LIX_ADMISSION_AUTH_REJECTED") {
+            if (candidateHeaders && sharedCredentialKey(raw.url, candidateHeaders) === sharedCredentialKey(raw.url, headers)) {
+              candidateOnline = false;
+              candidateGeneration++;
+            }
+            admitted.remove(raw.url, headers);
+            await localAdmission.remove(headers).catch(() => undefined);
+          }
+          if (!allowOffline || code !== "LIX_IDENTITY_UNVERIFIED_OFFLINE") throw error;
+          const local = await localAdmission.read(headers).catch(() => undefined);
+          if (!local) throw error;
+          if (rootIdentity && !sameAdmission(local, rootIdentity)) {
+            throw new HttpTransportError("LIX_SHARED_ENGINE_IDENTITY_MISMATCH", "Cached local repository/account does not match this owner");
+          }
+          result = { identity: local, online: false };
+        }
+        if (admitted.generation(raw.url, headers) !== credentialGeneration) {
+          throw new HttpTransportError("LIX_ADMISSION_AUTH_REJECTED", "Credentials were rejected while local admission was in flight");
+        }
+        if (result.online) {
+          verifiedKey = sharedCredentialKey(raw.url, headers);
+          verifiedGeneration = credentialGeneration;
+        }
+        candidateCredentialGeneration = credentialGeneration;
+        candidateGeneration++;
         candidateIdentity = result.identity;
+        candidateHeaders = headers.map(([name, value]) => [name, value]);
+        candidateOnline = result.online;
         return result;
       };
       const routed: SyncServerBindingOptions = {
@@ -52,7 +96,6 @@ scope.onconnect = (event) => {
         transport: async (request) => {
           try {
             const response = await transport(request);
-            if (response.status === 401 || response.status === 403) verifiedKey = undefined;
             return response;
           } catch (error) {
             verifiedKey = undefined;
@@ -61,7 +104,7 @@ scope.onconnect = (event) => {
         },
         headerProvider: async () => {
           const headers = await readHeaders();
-          if (sharedCredentialKey(raw.url, headers) !== verifiedKey) {
+          if (sharedCredentialKey(raw.url, headers) !== verifiedKey || admitted.generation(raw.url, headers) !== verifiedGeneration) {
             // Failure only suspends this remote lease; local sessions survive.
             verifiedKey = undefined;
             await authenticate(headers, false);
@@ -80,9 +123,31 @@ scope.onconnect = (event) => {
         telemetry,
         parent,
         progress,
-        commitIdentity: () => {
+        rejectCredentials: async (headers) => {
+          const rejectedKey = sharedCredentialKey(raw.url, headers);
+          if (verifiedKey === rejectedKey) verifiedKey = undefined;
+          if (candidateHeaders && sharedCredentialKey(raw.url, candidateHeaders) === rejectedKey) {
+            candidateOnline = false;
+            candidateGeneration++;
+          }
+          admitted.remove(raw.url, headers);
+          await localAdmission.remove(headers).catch(() => undefined);
+        },
+        commitIdentity: async () => {
           if (!candidateIdentity) throw new Error("Missing verified owner identity");
           rootIdentity ??= candidateIdentity;
+          if (candidateOnline && candidateHeaders) {
+            // The owner has checked the actual stored account before this call.
+            // Failure to cache only disables later offline reopening.
+            const generation = candidateGeneration;
+            const headers = candidateHeaders;
+            const identity = candidateIdentity;
+            await admitted.persistLocal(raw.url, headers, candidateCredentialGeneration,
+              () => localAdmission.record(headers, identity),
+              () => localAdmission.remove(headers)).catch(() => undefined);
+            // A rejection during the asynchronous write must not resurrect its proof.
+            if (generation !== candidateGeneration) await localAdmission.remove(headers).catch(() => undefined);
+          }
         },
         verifyIdentity: async () => {
           const headers = await readHeaders();
