@@ -489,7 +489,6 @@ fn qa_soft_delete_then_remove_all_children_retains_scene_metadata() {
     let mut p = payload(&b, "element_json");
     p["isDeleted"] = json!(true);
     set_payload(&mut b, "element_json", p);
-    b.row.insert("is_deleted", sdk::TypedValue::Boolean(true));
     let changes = [change(&b)];
     let out = h.serialize_changes(&file, &changes).unwrap();
     accept(&mut rows, &changes);

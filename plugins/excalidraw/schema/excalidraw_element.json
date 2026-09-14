@@ -10,22 +10,10 @@
       "description": "The complete JSON object, including numeric geometry and forward-compatible fields."
     },
     {
-      "name": "element_type",
-      "type": "text",
-      "nullable": false,
-      "description": "The element type derived from element_json for convenient queries."
-    },
-    {
       "name": "id",
       "type": "text",
       "nullable": false,
       "description": "The native Excalidraw element ID."
-    },
-    {
-      "name": "is_deleted",
-      "type": "boolean",
-      "nullable": false,
-      "description": "The deletion state derived from element_json."
     },
     {
       "name": "leading_json",

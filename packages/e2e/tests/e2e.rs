@@ -5523,7 +5523,7 @@ async fn v2_excalidraw_roundtrips_and_renders_local_element_edits() {
 
     let elements = lix
         .execute(
-            "SELECT id, element_type FROM excalidraw_element ORDER BY id",
+            "SELECT id, element_json->>'type' AS element_type FROM excalidraw_element ORDER BY id",
             &[],
         )
         .await
@@ -5555,9 +5555,9 @@ async fn v2_excalidraw_roundtrips_and_renders_local_element_edits() {
     element_json["isDeleted"] = serde_json::Value::Bool(true);
     lix.execute(
         "UPDATE excalidraw_element \
-         SET element_json = $1, is_deleted = $2 \
+         SET element_json = $1 \
          WHERE id = 'b'",
-        &[Value::Jsonb(element_json.into()), Value::Boolean(true)],
+        &[Value::Jsonb(element_json.into())],
     )
     .await
     .unwrap();
@@ -5699,7 +5699,7 @@ async fn excalidraw_element_boundary_insert_adds_element_through_full_reconcilia
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(successor));
     let elements = lix
         .execute(
-            "SELECT id, element_type FROM excalidraw_element ORDER BY id",
+            "SELECT id, element_json->>'type' AS element_type FROM excalidraw_element ORDER BY id",
             &[],
         )
         .await

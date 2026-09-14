@@ -297,14 +297,6 @@ impl ElementRow {
             "leading_json".to_owned(),
             TypedValue::Text(self.leading_json.clone()),
         );
-        row.insert(
-            "element_type".to_owned(),
-            TypedValue::Text(self.element_type.clone()),
-        );
-        row.insert(
-            "is_deleted".to_owned(),
-            TypedValue::Boolean(self.is_deleted),
-        );
         row.insert("element_json".to_owned(), TypedValue::Jsonb(element_json));
         row.insert(
             "source_json".to_owned(),
@@ -322,20 +314,11 @@ impl ElementRow {
         let id = text_primary_key(record)?;
         require_fields(
             &record.row,
-            &[
-                "id",
-                "order_key",
-                "leading_json",
-                "element_type",
-                "is_deleted",
-                "element_json",
-            ],
+            &["id", "order_key", "leading_json", "element_json"],
         )?;
         if required_text(&record.row, "id")? != id {
             return Err("excalidraw_element row id does not match its key".to_owned());
         }
-        let declared_type = required_text(&record.row, "element_type")?;
-        let declared_deleted = required_typed_bool(&record.row, "is_deleted")?;
         let element_json = render_payload(&record.row, "element_json")?;
         let row = Self::from_source(
             required_text(&record.row, "order_key")?.to_owned(),
@@ -344,12 +327,6 @@ impl ElementRow {
         )?;
         if row.id != id {
             return Err("element_json id does not match the row key".to_owned());
-        }
-        if row.element_type != declared_type {
-            return Err("element_type does not match element_json".to_owned());
-        }
-        if row.is_deleted != declared_deleted {
-            return Err("is_deleted does not match element_json".to_owned());
         }
         Ok(row)
     }
