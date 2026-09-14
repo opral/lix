@@ -1931,10 +1931,13 @@ fn node_from_typed_row(row: &TypedRow) -> Result<NodeSnapshot, PluginError> {
             .payload
             .get("value")
             .and_then(serde_json::Value::as_str)
-        && ((!value.is_empty() && !value.ends_with('\n')) || value.contains('\r'))
+        && ((node.format.get("style").and_then(serde_json::Value::as_str) != Some("indented")
+            && !value.is_empty()
+            && !value.ends_with('\n'))
+            || value.contains('\r'))
     {
         return Err(PluginError::InvalidInput(
-            "code block values must use LF line endings and end with LF unless empty".into(),
+            "code block values must use LF line endings; fenced values must end with LF unless empty".into(),
         ));
     }
     Ok(node)

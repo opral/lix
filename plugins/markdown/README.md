@@ -150,9 +150,10 @@ and should not be authored through SQL.
 Rendered row edits are reparsed and compared semantically before acceptance.
 Unrepresentable structures, HTML block values that become ordinary paragraphs,
 and inconsistent table roles return an error. A loose single-item list needs
-multiple block children to express its loose layout. Code block values use LF
-and end in LF unless empty. Frontmatter values exclude the newline separating
-the value from its closing fence; additional boundary blank lines are content.
+multiple block children to express its loose layout. Code block values use LF.
+Nonempty fenced code values end in LF; terminal indented code may omit it when
+the document has no final newline. Frontmatter values exclude the newline
+separating the value from its closing fence; additional boundary blank lines are content.
 
 The parser and row graph enforce a nesting budget of 64 to return an error before
 exhausting the host stack. Inline code values must be nonempty and cannot contain

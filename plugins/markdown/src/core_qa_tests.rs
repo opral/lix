@@ -998,3 +998,62 @@ fn qa_excessive_nested_link_candidates_stop_at_the_nesting_budget() {
         .is_ok()
     );
 }
+
+#[test]
+fn qa_terminal_indented_code_without_newline_survives_restore_and_edit() {
+    let source = b"    code".to_vec();
+    let (_, changes) = Document::open_file(
+        source.clone(),
+        Some("code.md"),
+        IdNamespace::from_halves(44, 1),
+    )
+    .unwrap();
+    let records: Vec<RowRecord> = changes
+        .into_iter()
+        .filter_map(|change| {
+            change.row.map(|row| RowRecord {
+                schema_key: change.schema_key,
+                row_pk: change.row_pk,
+                row,
+            })
+        })
+        .collect();
+    for accepted in [None, Some(source.clone())] {
+        let (document, _) = Document::open_rows(records.clone(), accepted).unwrap();
+        assert_eq!(document.bytes(), source);
+        let mut node = document.tree.materialize().children[0].node.clone();
+        node.payload["value"] = serde_json::json!("edited");
+        let (updated, _) = document
+            .rows_changed(vec![RowChange {
+                schema_key: NODE_SCHEMA_KEY.into(),
+                row_pk: vec![node.id],
+                row: Some(node_to_typed_row(&node).unwrap()),
+                effect: ChangeEffect::Content,
+            }])
+            .unwrap();
+        assert_eq!(updated.bytes(), b"    edited");
+    }
+}
+
+#[test]
+fn qa_indented_code_without_newline_rejects_incompatible_document_context() {
+    for source in ["    code\n", "    code\n\nafter"] {
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("code.md"),
+            IdNamespace::from_halves(44, 2),
+        )
+        .unwrap();
+        let mut node = document.tree.materialize().children[0].node.clone();
+        node.payload["value"] = serde_json::json!("edited");
+        assert!(matches!(
+            document.rows_changed(vec![RowChange {
+                schema_key: NODE_SCHEMA_KEY.into(),
+                row_pk: vec![node.id],
+                row: Some(node_to_typed_row(&node).unwrap()),
+                effect: ChangeEffect::Content,
+            }]),
+            Err(PluginError::InvalidInput(_))
+        ));
+    }
+}
