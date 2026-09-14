@@ -51,12 +51,14 @@ The examples show payload and format shapes; UUIDs and inline arrays are abbrevi
 A table has explicit column rows so changing column order moves all its cells
 without rewriting their content. Each cell references a column UUID, and each row
 must contain exactly one cell per column. The first table row in sibling order is
-the header. Reorder rows and their header/body roles together. Add or remove a
+the header. Its role must be `header`, and subsequent rows must use `body`.
+Reorder rows and their header/body roles together. Add or remove a
 column and its cells in one transaction.
 
 Unordered list delimiters are `dash`, `plus`, and `asterisk`. Ordered lists use
 `period` or `paren` and an integer `start`. Code fences use `backtick` or `tilde`.
 Reference identifiers use the parser's whitespace-collapsed, case-folded label.
+Rename definitions and their referencing inlines in the same transaction.
 The `label` format field preserves original spelling while it identifies the same
 reference. Link destinations use `bare` or `angle`; title styles are `double_quote`,
 `single_quote`, or `paren`.
@@ -142,6 +144,13 @@ Some noncanonical spellings require the accepted file bytes in addition to rows.
 Keep Lix's file snapshot when reopening; exported semantic rows alone are not a
 standalone archive of every lexical detail. Root lexical cache fields are internal
 and should not be authored through SQL.
+
+Rendered row edits are reparsed and compared semantically before acceptance.
+Unrepresentable structures, HTML block values that become ordinary paragraphs,
+and inconsistent table roles return an error. A loose single-item list needs more
+than one paragraph block to express its loose layout. Code block values use LF
+and end in LF unless empty. Frontmatter values exclude the newline separating
+the value from its closing fence; additional boundary blank lines are content.
 
 The parser and row graph enforce a nesting budget of 64 to return an error before
 exhausting the host stack. Inline code values must be nonempty and cannot contain

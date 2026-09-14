@@ -2009,6 +2009,107 @@ fn minimal_byte_edit(before: &[u8], after: Vec<u8>) -> Vec<ByteEdit> {
     }]
 }
 
+fn semantic_tree_value(tree: &NodeTree) -> serde_json::Value {
+    fn normalize_inlines(nodes: &mut Vec<serde_json::Value>) {
+        let mut normalized: Vec<serde_json::Value> = Vec::with_capacity(nodes.len());
+        for mut node in nodes.drain(..) {
+            for key in ["children", "alt"] {
+                if let Some(children) = node.get_mut(key).and_then(serde_json::Value::as_array_mut)
+                {
+                    normalize_inlines(children);
+                }
+            }
+            if matches!(
+                node.get("type").and_then(serde_json::Value::as_str),
+                Some("text" | "escape" | "character_reference")
+            ) {
+                let value = node
+                    .get("value")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                if value.is_empty() {
+                    continue;
+                }
+                if let Some(previous) = normalized.last_mut()
+                    && previous["type"] == "text"
+                {
+                    if let serde_json::Value::String(text) = &mut previous["value"] {
+                        text.push_str(&value);
+                    }
+                } else {
+                    normalized.push(serde_json::json!({"type":"text", "value":value}));
+                }
+            } else {
+                normalized.push(node);
+            }
+        }
+        *nodes = normalized;
+    }
+    fn visit(tree: &NodeTree, columns: Option<&[Uuid]>) -> serde_json::Value {
+        let mut payload = semantic_payload(&tree.node.payload);
+        if let Some(inline) = payload
+            .get_mut("inline")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            normalize_inlines(inline);
+        }
+        if tree.node.kind == NodeKind::TableCell {
+            payload.as_object_mut().unwrap().remove("column_id");
+        }
+        let children = if tree.node.kind == NodeKind::Table {
+            let columns = tree
+                .children
+                .iter()
+                .filter(|child| child.node.kind == NodeKind::TableColumn)
+                .map(|child| child.node.id)
+                .collect::<Vec<_>>();
+            tree.children
+                .iter()
+                .filter(|child| child.node.kind == NodeKind::TableColumn)
+                .chain(
+                    tree.children
+                        .iter()
+                        .filter(|child| child.node.kind == NodeKind::TableRow),
+                )
+                .map(|child| visit(child, Some(&columns)))
+                .collect::<Vec<_>>()
+        } else if tree.node.kind == NodeKind::TableRow {
+            let cells = tree
+                .children
+                .iter()
+                .map(|cell| (cell.node.payload["column_id"].as_str().unwrap_or(""), cell))
+                .collect::<HashMap<_, _>>();
+            columns
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|id| cells.get(id.to_string().as_str()))
+                .map(|child| visit(child, None))
+                .collect()
+        } else {
+            tree.children
+                .iter()
+                .map(|child| visit(child, None))
+                .collect()
+        };
+        serde_json::json!({"kind":tree.node.kind,"payload":payload,"children":children})
+    }
+    visit(tree, None)
+}
+
+fn validate_rendered_semantics(root: &NodeTree, bytes: &[u8]) -> Result<(), PluginError> {
+    let parsed = parse_file(&File {
+        filename: None,
+        content: bytes.to_vec(),
+    })?;
+    if semantic_tree_value(root) != semantic_tree_value(&parsed.root) {
+        return Err(PluginError::InvalidInput(
+            "Markdown row edits cannot be represented without changing semantic content; check node kinds, table header roles, references, and block boundaries".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn simple_top_level_ranges(root: &NodeTree, bytes: &[u8]) -> Vec<Range<usize>> {
     if root.node.format.get(LEXICAL_FALLBACK_FIELD).is_some() {
         return Vec::new();
@@ -2246,7 +2347,9 @@ impl Document {
                             .into(),
                     ));
                 }
-                (render_tree_with_lexical_fallback(&root)?, false)
+                let bytes = render_tree_with_lexical_fallback(&root)?;
+                validate_rendered_semantics(&root, &bytes)?;
+                (bytes, false)
             }
         };
         let top_level_ranges = simple_top_level_ranges(&root, &bytes);
@@ -2509,6 +2612,7 @@ impl Document {
                 &self.bytes.materialize(),
             )?,
         };
+        validate_rendered_semantics(&root, &bytes)?;
         if render_tree(&root)? != bytes {
             root.node.format[LEXICAL_FALLBACK_FIELD] =
                 serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(&bytes));
@@ -2696,6 +2800,15 @@ impl Document {
             || new.id != old.id
             || new.parent_id != old.parent_id
             || new.order_key != old.order_key
+        {
+            return Ok(None);
+        }
+
+        // Only literal prose can bypass full-document semantic validation.
+        // References, delimiters, and structural edits need the surrounding file.
+        let inlines = parse_inline_payload(&new.payload).map_err(PluginError::InvalidInput)?;
+        if !matches!(inlines.as_slice(), [InlineNode { content: InlineContent::Text { value }, .. }]
+            if crate::markdown_file::literal_paragraph_source_is_safe(value))
         {
             return Ok(None);
         }

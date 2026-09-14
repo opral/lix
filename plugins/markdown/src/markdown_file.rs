@@ -312,7 +312,7 @@ fn canonical_literal_paragraph_layout(document: &md::Document, source: &str) -> 
     false
 }
 
-fn literal_paragraph_source_is_safe(raw: &str) -> bool {
+pub(crate) fn literal_paragraph_source_is_safe(raw: &str) -> bool {
     let Some(first) = raw.chars().next() else {
         return false;
     };

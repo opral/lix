@@ -431,23 +431,21 @@ fn qa_reference_identifier_edits_override_stale_labels() {
             IdNamespace::from_halves(31, 3),
         )
         .unwrap();
-        let mut node = document
-            .tree
-            .materialize()
-            .children
-            .into_iter()
-            .find(|node| node.node.payload.get("identifier").is_some())
-            .unwrap()
-            .node;
-        node.payload["identifier"] = serde_json::json!("new");
-        let (updated, _) = document
-            .rows_changed(vec![RowChange {
-                schema_key: NODE_SCHEMA_KEY.into(),
-                row_pk: vec![node.id],
-                row: Some(node_to_typed_row(&node).unwrap()),
-                effect: ChangeEffect::Content,
-            }])
-            .unwrap();
+        let mut changes = Vec::new();
+        document.tree.materialize().visit_mut(&mut |node| {
+            let payload = serde_json::to_string(&node.payload).unwrap();
+            let updated = payload.replace("\"identifier\":\"old\"", "\"identifier\":\"new\"");
+            if updated != payload {
+                node.payload = serde_json::from_str(&updated).unwrap();
+                changes.push(RowChange {
+                    schema_key: NODE_SCHEMA_KEY.into(),
+                    row_pk: vec![node.id],
+                    row: Some(node_to_typed_row(node).unwrap()),
+                    effect: ChangeEffect::Content,
+                });
+            }
+        });
+        let (updated, _) = document.rows_changed(changes).unwrap();
         let (reopened, _) = Document::open_file(
             updated.bytes(),
             Some("edit.md"),
@@ -918,5 +916,43 @@ fn qa_code_block_edits_reject_implicit_line_ending_changes() {
             }]),
             Err(PluginError::InvalidInput(_))
         ));
+    }
+}
+
+#[test]
+fn qa_semantic_guard_rejects_html_type_and_table_role_loss() {
+    for (source, kind, field, value) in [
+        (
+            "<div>old</div>\n",
+            NodeKind::HtmlBlock,
+            "value",
+            "plain text\n",
+        ),
+        ("| a |\n| - |\n", NodeKind::TableRow, "role", "garbage"),
+    ] {
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("guard.md"),
+            IdNamespace::from_halves(43, 1),
+        )
+        .unwrap();
+        let mut target = None;
+        document.tree.materialize().visit_mut(&mut |node| {
+            if node.kind == kind {
+                target = Some(node.clone());
+            }
+        });
+        let mut node = target.unwrap();
+        node.payload[field] = serde_json::json!(value);
+        assert!(matches!(
+            document.rows_changed(vec![RowChange {
+                schema_key: NODE_SCHEMA_KEY.into(),
+                row_pk: vec![node.id],
+                row: Some(node_to_typed_row(&node).unwrap()),
+                effect: ChangeEffect::Content
+            }]),
+            Err(PluginError::InvalidInput(_))
+        ));
+        assert_eq!(document.bytes(), source.as_bytes());
     }
 }
