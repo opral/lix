@@ -4,7 +4,7 @@ The browser runtime has one internal HTTP request ABI: `{url, init, response}`. 
 
 A public `server.fetch` callback remains an ordinary network/telemetry adapter. It must preserve explicit credential headers. Delegate actual I/O to exported `networkFetch`: it validates request arguments before native fetch and classifies native rejection at the I/O boundary. An arbitrary callback's `TypeError` is a callback failure, not evidence of network unavailability. Neither opaque cookies nor invisible identity substitution are an admission mechanism. Shared-owner requests omit ambient cookies.
 
-Finite remote SQL protocol responses have a 16 MiB response budget; observations and snapshots use streaming. Admission uses a 16 KiB budget and ten-second cancellation deadline. Response limits cancel the body; worker disposal also aborts active fetches. Contract, network, callback, response-budget, HTTP authorization, protocol/epoch, cancellation and owner-loss failures remain distinct. Worker serialization retains at most three nested causes with bounded, credential-redacted diagnostics.
+Finite remote SQL protocol responses have a 16 MiB response budget; observations and snapshots use streaming. Each admission request uses a 16 KiB budget and ten-second cancellation deadline. The SDK polls an explicit `503 LIX_REPOSITORY_MIGRATING` response while the server owns the upgrade; the application continues awaiting open. Response limits cancel the body; worker disposal also aborts active fetches. Contract, network, callback, response-budget, HTTP authorization, protocol/epoch, cancellation and owner-loss failures remain distinct. Worker serialization retains at most three nested causes with bounded, credential-redacted diagnostics.
 
 ## Metadata operation
 
@@ -14,7 +14,7 @@ Finite remote SQL protocol responses have a 16 MiB response budget; observations
 { repositoryId, principalId, protocolEpoch: 16, storageEpoch: 81 }
 ```
 
-The gateway authenticates and authorizes the request. The reference host reads validated durable catalog metadata; this operation never opens an engine, creates a SQL session, starts synchronization or migrates storage. Principal IDs follow the host's bounded opaque-account contract (1–255 visible ASCII characters), rather than imposing a new UUID requirement. The stable repository ID must match the requested repository. Unsupported/missing epoch metadata requires explicit migration.
+The gateway authenticates and authorizes the request. For current storage, the reference host reads durable catalog metadata without opening an engine or scanning repository contents. An older saved transport epoch does not require a storage migration: the running server supplies the current protocol epoch. Older storage or missing admission metadata starts the server's shared, owned repository opener. That opener inspects the existing authority, migrates supported older storage with retained source banks and storage fencing, and publishes current admission metadata without changing repository identity or physical storage mapping. Requests wait briefly, then return a typed in-progress response if migration is still running. No SQL session is created by admission. Unsupported newer formats and failed preservation checks remain errors. Principal IDs follow the host's bounded opaque-account contract (1–255 visible ASCII characters). The stable repository ID must match the requested repository.
 
 ## Ownership and credentials
 

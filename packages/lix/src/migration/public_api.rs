@@ -148,7 +148,8 @@ pub struct RepositoryMigrationReport {
 
 /// Explicit, resumable copy-and-activate migration. Close all repository handles
 /// and hold the physical owner fence before calling. Source banks are retained.
-/// The current-format runtime never invokes this function, even in this build.
+/// The reference server invokes this before constructing its serving runtime;
+/// the low-level current-format engine does not run historical migrations.
 #[cfg(feature = "offline-migration")]
 pub async fn migrate_repository<S>(storage: S) -> Result<RepositoryMigrationReport, LixError>
 where

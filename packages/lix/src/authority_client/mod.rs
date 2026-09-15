@@ -265,16 +265,27 @@ impl<H: ProtocolHttp> ClientCore<H> {
         url: String,
         include_session: bool,
     ) -> Result<HandshakeResponse, LixError> {
-        let value = self
-            .request_json::<HandshakeResponse, EmptyBody>(
-                "GET",
-                url,
-                include_session,
-                None,
-                None,
-                "json",
-            )
-            .await?;
+        // Migration responses prove that the authority has not opened the
+        // requested session yet. Wait here, never replay arbitrary SQL writes.
+        let value = loop {
+            match self
+                .request_json::<HandshakeResponse, EmptyBody>(
+                    "GET",
+                    url.clone(),
+                    include_session,
+                    None,
+                    None,
+                    "json",
+                )
+                .await
+            {
+                Ok(value) => break value,
+                Err(error) => match opening_migration_retry_delay(&error) {
+                    Some(delay) => self.http.sleep(delay).await,
+                    None => return Err(error),
+                },
+            }
+        };
         if value.protocol_version != SERVER_PROTOCOL_VERSION {
             return Err(protocol_error(format!(
                 "unsupported Lix Server Protocol version: {}",
@@ -1244,3 +1255,15 @@ fn error_clears_cached_branch(error: &LixError) -> bool {
 }
 
 use wire::RequestWireValue;
+
+/// Only an explicit HTTP migration response permits waiting for admission.
+/// Keep each request/backoff bounded, but do not impose a total migration
+/// deadline: dropping the caller's opening future cancels this wait.
+pub(crate) fn opening_migration_retry_delay(error: &LixError) -> Option<std::time::Duration> {
+    (error_http_status(error) == Some(503)
+        && matches!(
+            error.code.as_str(),
+            "LIX_REPOSITORY_MIGRATING" | "LIX_ERROR_MIGRATING"
+        ))
+    .then_some(std::time::Duration::from_secs(1))
+}

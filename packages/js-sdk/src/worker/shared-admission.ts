@@ -20,7 +20,7 @@ export function sameAdmission(a: AdmissionIdentity, b: AdmissionIdentity): boole
     a.protocolEpoch === b.protocolEpoch && a.storageEpoch === b.storageEpoch;
 }
 
-/** Metadata authorization only: never create a remote SQL session or open storage. */
+/** Authorize attachment, awaiting any server-owned repository upgrade. */
 export async function requestAdmission(url: string, credentials: [string, string][], transport: HttpTransport): Promise<AdmissionIdentity> {
   const locator = new URL(url);
   const repositoryId = locator.pathname.match(/\/lix\/([0-9a-f-]{36})\/?$/i)?.[1];
@@ -30,14 +30,23 @@ export async function requestAdmission(url: string, credentials: [string, string
   const headers = new Headers(credentials);
   headers.set("lix-sync-protocol-version", String(ADMISSION_PROTOCOL_EPOCH));
   locator.pathname = `/lix/v1/${repositoryId}/admission`;
-  const response = await transport({ url: locator.toString(),
-    init: { method: "GET", headers, signal: AbortSignal.timeout(10_000), cache: "no-store", redirect: "error", credentials: "omit" },
-    response: { mode: "buffered", maxBytes: 16 * 1024 } });
+  let response: Response;
+  for (;;) {
+    response = await transport({ url: locator.toString(),
+      init: { method: "GET", headers, signal: AbortSignal.timeout(10_000), cache: "no-store", redirect: "error", credentials: "omit" },
+      response: { mode: "buffered", maxBytes: 16 * 1024 } });
+    if (response.status !== 503) break;
+    const body = await response.clone().json().catch(() => null);
+    if (body?.error?.code !== "LIX_REPOSITORY_MIGRATING") break;
+    // The authority owns the migration independently of this request. Poll only
+    // its explicit in-progress response; other failures retain their semantics.
+    await new Promise(resolve => setTimeout(resolve, 1_000));
+  }
   if (response.status === 401 || response.status === 403) {
     throw new HttpTransportError("LIX_ADMISSION_AUTH_REJECTED", "Authority rejected repository admission");
   }
   if (response.status === 409 || response.status === 426) {
-    throw new HttpTransportError("LIX_ADMISSION_EPOCH", "Repository requires explicit migration or a matching client version");
+    throw new HttpTransportError("LIX_ADMISSION_EPOCH", "Repository is incompatible with this client version");
   }
   if (!response.ok) throw new HttpTransportError("LIX_ADMISSION_HTTP", `Authority admission returned HTTP ${response.status}`);
   let result: AdmissionIdentity;
@@ -48,7 +57,7 @@ export async function requestAdmission(url: string, credentials: [string, string
     throw new HttpTransportError("LIX_ADMISSION_PROTOCOL", "Authority admission identity does not match the repository");
   }
   if (result.protocolEpoch !== ADMISSION_PROTOCOL_EPOCH || result.storageEpoch !== ADMISSION_STORAGE_EPOCH) {
-    throw new HttpTransportError("LIX_ADMISSION_EPOCH", "Repository requires explicit migration or a matching client version");
+    throw new HttpTransportError("LIX_ADMISSION_EPOCH", "Repository is incompatible with this client version");
   }
   return result;
 }

@@ -139,14 +139,24 @@ where
     pub(super) async fn connect_with(client: Client, lix_url: &str) -> Result<Self, LixError> {
         let normalized = normalize_sync_locator(lix_url)?;
         let protocol_url = normalized.protocol_url;
-        let response = client
-            .send(raw_request(
-                Method::GET,
-                protocol_url.clone(),
-                "open sync session",
-            ))
-            .await?;
-        let handshake: HandshakeResponse = decode_response(response, "open sync session")?;
+        let handshake: HandshakeResponse = loop {
+            let response = client
+                .send(raw_request(
+                    Method::GET,
+                    protocol_url.clone(),
+                    "open sync session",
+                ))
+                .await?;
+            match decode_response(response, "open sync session") {
+                Ok(handshake) => break handshake,
+                Err(error) => {
+                    match crate::authority_client::opening_migration_retry_delay(&error) {
+                        Some(delay) => super::platform::sleep(delay).await,
+                        None => return Err(error),
+                    }
+                }
+            }
+        };
         let lix_id = validate_handshake(&handshake)?.to_owned();
         Ok(Self {
             client,
@@ -1336,6 +1346,63 @@ mod tests {
         .await
         .expect("matching handshake should connect");
         assert_eq!(transport.lix_id(), "01936f4e-7b6c-7c3d-8f9a-123456789abc");
+    }
+
+    #[derive(Debug)]
+    struct MigratingOpenClient {
+        outcomes: Arc<Mutex<std::collections::VecDeque<(u16, &'static str)>>>,
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl RawHttpClient for MigratingOpenClient {
+        fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
+            Box::pin(async move {
+                assert_eq!(request.method, http::Method::GET);
+                self.requests
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let outcome = self.outcomes.lock().unwrap().pop_front();
+                if let Some((status, code)) = outcome {
+                    return Ok(RawHttpResponse {
+                        status,
+                        status_text: "migration fixture".into(),
+                        body: serde_json::to_vec(&serde_json::json!({"error":{"code":code,"message":"migration fixture"}})).unwrap(),
+                    });
+                }
+                MatchingClient.send(request).await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_open_awaits_migration_and_stops_on_terminal_admission() {
+        for terminal in [false, true] {
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let outcomes = if terminal {
+                vec![
+                    (503, "LIX_REPOSITORY_MIGRATING"),
+                    (401, "LIX_ERROR_UNAUTHORIZED"),
+                ]
+            } else {
+                vec![
+                    (503, "LIX_ERROR_MIGRATING"),
+                    (503, "LIX_REPOSITORY_MIGRATING"),
+                ]
+            };
+            let result = HttpSyncTransport::connect_with(
+                MigratingOpenClient {
+                    outcomes: Arc::new(Mutex::new(outcomes.into())),
+                    requests: requests.clone(),
+                },
+                "https://sync.example/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+            )
+            .await;
+            if terminal {
+                assert_eq!(result.unwrap_err().code, "LIX_ERROR_UNAUTHORIZED");
+                assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+            } else {
+                result.unwrap();
+                assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 3);
+            }
+        }
     }
 
     #[derive(Debug)]

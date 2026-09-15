@@ -249,8 +249,9 @@ async fn healthz(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
-/// Authentication and durable catalog metadata only. In particular, this route
-/// cannot create SQL sessions or trigger repository opening/migration.
+/// Authenticated repository admission. Current-storage catalogs need no engine
+/// open; older authorities use the shared owned opener and report retryable
+/// migration progress without creating a client SQL session.
 async fn repository_admission(
     State(state): State<AppState>,
     Path(id): Path<String>,

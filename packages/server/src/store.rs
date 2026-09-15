@@ -6,6 +6,7 @@ mod maintenance;
 mod retained_tombstone;
 #[cfg(feature = "offline-migration")]
 pub use maintenance::AuthorityMigrationReport;
+mod auto_migration;
 mod inventory;
 pub use inventory::{AuthorityInventory, AuthorityInventoryEntry};
 
@@ -39,7 +40,7 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 #[cfg(test)]
 use tokio::sync::Notify;
-use tokio::sync::{Mutex, OnceCell, RwLock, watch};
+use tokio::sync::{Mutex, OnceCell, OwnedRwLockReadGuard, RwLock, watch};
 use tokio::task::JoinSet;
 use tracing::{Instrument, info, info_span};
 
@@ -314,6 +315,7 @@ fn is_repository_upgrade_failure(error: &anyhow::Error) -> bool {
 }
 
 struct PendingRuntimeOpen {
+    lifecycle: OwnedRwLockReadGuard<()>,
     lix_id: String,
     runtime: Arc<OnceCell<Arc<LixRuntime>>>,
     done: watch::Sender<RuntimeOpenState>,
@@ -466,6 +468,19 @@ impl LixRuntimeManager {
             "22222222-2222-4222-8222-222222222222",
             "33333333-3333-4333-8333-333333333333",
         ] {
+            // A catalog row is never permission to initialize missing data.
+            // Create the fixture's physical authority before publishing it.
+            let storage = self
+                .open_storage(id, SlateDBIoCounters::default())
+                .expect("open fixture storage");
+            let authority = lix_sdk::open_lix()
+                .with_storage(storage)
+                .serve()
+                .with_lix_id(id)
+                .await
+                .expect("initialize fixture authority");
+            authority.close().await.expect("close fixture authority");
+            drop(authority);
             self.write_record(id, "live", Some(empty_create_fingerprint()), true)
                 .await
                 .expect("provision fixture repository");
@@ -514,7 +529,7 @@ impl LixRuntimeManager {
         }
 
         let lifecycle = self.lifecycle_lock(lix_id).await;
-        let _lifecycle = lifecycle.read().await;
+        let mut lifecycle_guard = Some(lifecycle.read_owned().await);
         if !self
             .repository_exists(lix_id)
             .await
@@ -598,6 +613,7 @@ impl LixRuntimeManager {
                     // `get` callers may be cancelled without leaving an
                     // empty entry or detaching a second same-ID opener.
                     self.spawn_runtime_open(PendingRuntimeOpen {
+                        lifecycle: lifecycle_guard.take().expect("opener owns lifecycle guard"),
                         lix_id: lix_id.to_string(),
                         runtime: Arc::clone(&runtime),
                         done,
@@ -689,6 +705,7 @@ impl LixRuntimeManager {
         );
         tokio::spawn(
             async move {
+                let _lifecycle = opener.lifecycle;
                 let opened = manager
                     .open_lix_for_handler(opener.lix_id.clone(), opener.done.clone())
                     .await;
@@ -852,8 +869,15 @@ impl LixRuntimeManager {
         let record = self
             .repository_record(lix_id)
             .await?
-            .context("repository catalog entry is missing")?;
-        self.open_storage_runtime(lix_id, &record.storage_id, opened)
+            .filter(|record| record.state == "live")
+            .context("live repository catalog entry is missing")?;
+        if !valid_lix_id(&record.storage_id) {
+            anyhow::bail!("catalogued physical storage identifier is invalid");
+        }
+        if !self.legacy_storage_present(&record.storage_id).await? {
+            anyhow::bail!("catalogued repository physical storage is missing");
+        }
+        self.open_storage_runtime(lix_id, &record.storage_id, opened, Some(&record))
             .await
     }
 
@@ -862,12 +886,17 @@ impl LixRuntimeManager {
         lix_id: &str,
         storage_id: &str,
         opened: &watch::Sender<RuntimeOpenState>,
+        existing: Option<&RepositoryRecord>,
     ) -> Result<Arc<LixRuntime>> {
         let started = Instant::now();
         let io = SlateDBIoCounters::default();
         let storage_started = Instant::now();
         let storage = self.open_storage(&storage_id, io.clone())?;
         let storage_open_ms = elapsed_millis(storage_started);
+        if let Some(record) = existing {
+            self.prepare_existing_authority(lix_id, record, &storage, opened)
+                .await?;
+        }
 
         let engine_started = Instant::now();
         // The canonical protocol owns the repository engine directly. Server
@@ -3544,8 +3573,8 @@ mod tests {
 // SlateDB prefix, so cache eviction and storage open can never create a resource.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RepositoryRecord {
-    /// Written only after explicit creation/migration validates the authority.
-    /// Missing metadata is a migration requirement, never inferred from this binary.
+    /// Written after creation or an owned open validates the authority.
+    /// Missing metadata requires storage inspection before admission.
     #[serde(default)]
     admission: Option<AuthorityAdmission>,
     state: String,
@@ -3622,9 +3651,10 @@ impl LixRuntimeManager {
             Err(error) => Err(error.into()),
         }
     }
-    /// Catalog-only admission: never obtains a runtime or opens storage.
+    /// Current-storage admission remains catalog-only. Older authorities are
+    /// prepared by the same owned opener used by ordinary SQL sessions.
     pub(crate) async fn authority_admission(
-        &self,
+        self: &Arc<Self>,
         id: &str,
     ) -> Result<Option<AuthorityAdmission>, lix_sdk::server_protocol::LifecycleError> {
         use lix_sdk::server_protocol::LifecycleError;
@@ -3638,12 +3668,34 @@ impl LixRuntimeManager {
         let Some(record) = record.filter(|record| record.state == "live") else {
             return Ok(None);
         };
-        match record.admission {
-            Some(admission) if admission == AuthorityAdmission::current() => Ok(Some(admission)),
-            _ => Err(LifecycleError::new(
-                http::StatusCode::CONFLICT,
-                "LIX_MIGRATION_REQUIRED",
-                "The authority requires explicit migration before admission.",
+        if let Some(admission) = &record.admission {
+            if admission.storage_epoch > lix_sdk::CURRENT_STORAGE_FORMAT_VERSION
+                || admission.protocol_epoch > lix_sdk::SYNC_PROTOCOL_VERSION
+            {
+                return Err(LifecycleError::new(
+                    http::StatusCode::CONFLICT,
+                    "LIX_PROTOCOL_VERSION_MISMATCH",
+                    "The repository requires a newer Lix server.",
+                ));
+            }
+            if admission.storage_epoch == lix_sdk::CURRENT_STORAGE_FORMAT_VERSION {
+                return Ok(Some(AuthorityAdmission::current()));
+            }
+        }
+        match tokio::time::timeout(Duration::from_secs(1), self.get(id)).await {
+            Ok(Ok(_)) => Ok(Some(AuthorityAdmission::current())),
+            Err(_) | Ok(Err(LixRuntimeError::Migrating { .. } | LixRuntimeError::Recovering)) => {
+                Err(LifecycleError::new(
+                    http::StatusCode::SERVICE_UNAVAILABLE,
+                    "LIX_REPOSITORY_MIGRATING",
+                    "The repository is being upgraded. Retry this request.",
+                ))
+            }
+            Ok(Err(LixRuntimeError::NotFound)) => Ok(None),
+            Ok(Err(_)) => Err(LifecycleError::new(
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                "LIX_REPOSITORY_OPEN_FAILED",
+                "The repository could not be opened. Its existing data is retained.",
             )),
         }
     }
@@ -3979,6 +4031,7 @@ impl LixRuntimeManager {
                     if explicit_id { &id } else { &storage_id },
                     &storage_id,
                     &opened,
+                    None,
                 )
                 .await?;
             let service = runtime
@@ -4626,7 +4679,7 @@ mod admission_tests {
     }
 
     #[tokio::test]
-    async fn admission_rejects_unmigrated_catalog_without_opening_or_mutating() {
+    async fn admission_rejects_missing_physical_storage_without_initializing() {
         let manager = LixRuntimeManager::new_in_memory(1);
         let (store, prefix) = manager.catalog_store();
         let path = ObjectPath::from(format!("{prefix}.lix-repositories/{ID}.json"));
@@ -4635,7 +4688,7 @@ mod admission_tests {
                 .to_string();
         store.put(&path, original.clone().into()).await.unwrap();
         let error = manager.authority_admission(ID).await.unwrap_err();
-        assert_eq!(error.code, "LIX_MIGRATION_REQUIRED");
+        assert_eq!(error.code, "LIX_REPOSITORY_OPEN_FAILED");
         assert_eq!(
             store
                 .get(&path)
@@ -4647,7 +4700,7 @@ mod admission_tests {
                 .as_ref(),
             original.as_bytes()
         );
-        assert!(manager.state.lock().await.entries.is_empty());
+        assert!(!manager.legacy_storage_present(ID).await.unwrap());
     }
 
     #[tokio::test]
