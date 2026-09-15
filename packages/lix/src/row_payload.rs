@@ -627,6 +627,66 @@ impl TypedRow {
         Ok(())
     }
 
+    /// A durable custom row can outlive a compatible registered-schema
+    /// amendment. A different fingerprint revokes the fast validation
+    /// certificate; it does not make otherwise valid historical values unreadable.
+    /// Revalidate every value and the storage identity before rebinding.
+    pub(crate) fn revalidate_resolved_schema(
+        &self,
+        stored_schema_key: &str,
+        stored_row_pk: &RowPk,
+        schema: &lix_schema::Schema,
+        compiled: &lix_schema::CompiledSchema,
+        fingerprint: [u8; 32],
+    ) -> Result<Self, LixError> {
+        if stored_schema_key != schema.key
+            || crate::catalog::CatalogSnapshot::builtin()
+                .plan_for_key(stored_schema_key)
+                .is_some()
+        {
+            self.validate_resolved_schema_binding(stored_schema_key, &schema.key, &fingerprint)?;
+        }
+        self.validate_durable_envelope(stored_schema_key, stored_row_pk)?;
+        let mut row = self.row.clone();
+        if schema
+            .columns
+            .iter()
+            .any(|column| column.default_expression.is_some() && !row.contains_key(&column.name))
+        {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                "a missing expression default requires durable schema-amendment materialization",
+            ));
+        }
+        compiled
+            .apply_defaults(
+                &mut row,
+                || unreachable!("expression defaults checked"),
+                || unreachable!("expression defaults checked"),
+            )
+            .map_err(|error| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    format!("invalid amended row for schema '{}': {error}", schema.key),
+                )
+            })?;
+        compiled.materialize_missing_nullable_columns(&mut row);
+        compiled.validate_complete_row(&row).map_err(|error| {
+            LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!("invalid amended row for schema '{}': {error}", schema.key),
+            )
+        })?;
+        Self::from_compiled_row(
+            &schema.key,
+            compiled,
+            fingerprint,
+            Some(stored_row_pk),
+            row,
+            false,
+        )
+    }
+
     pub(crate) fn invalidate_durable_payload(&mut self) {
         self.native_payload.take();
     }

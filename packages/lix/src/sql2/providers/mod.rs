@@ -47,7 +47,10 @@ pub(crate) use file::{
     execute_fast_lix_file_content_update_by_id_with_metadata, execute_fast_lix_file_id_path_writes,
     execute_fast_lix_file_path_writes, execute_fast_lix_file_prepared_path_write,
 };
-pub(crate) use schema::{execute_exact_schema_batch_read, execute_exact_schema_point_read};
+pub(crate) use schema::{
+    execute_exact_schema_batch_read, execute_exact_schema_point_read,
+    revalidate_schema_amended_rows,
+};
 pub(crate) use spec::{DmlReturning, SpecWriteTarget, WriteTargetRegistry};
 pub(crate) use upsert::{UpsertAction, excluded_field_name};
 

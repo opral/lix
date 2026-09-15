@@ -70,7 +70,8 @@ from the schema document.
 ```
 
 `default_value` and `default_expression` are mutually exclusive. Schema v1
-currently accepts only `uuidv7()` on `uuid` columns. This deliberately small
+currently accepts `uuidv7()` on `uuid` columns and `CURRENT_TIMESTAMP` on
+`timestamptz` columns. This deliberately small
 PostgreSQL expression dialect can be extended in later schema versions.
 
 ## JSONB

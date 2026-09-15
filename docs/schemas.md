@@ -120,6 +120,23 @@ retyping a column, changing a column's nullability or default, and changing a
 primary key, unique constraint, or foreign key. Use a new
 schema key for an incompatible model until an explicit migration API exists.
 
+When an amendment adds a literal or expression default (`uuidv7()` or
+`CURRENT_TIMESTAMP`), Lix materializes the default once for each existing row
+in the affected schema scope, in the same transaction as the amendment.
+Explicit values remain unchanged. Materialized values survive repeated reads,
+updates, and reopening; rolling back the amendment also rolls back its row
+changes. Historical commits retain their original snapshots.
+
+Older repositories may contain an accepted generated-default amendment whose
+values were never stored. Reapply the affected definition to materialize the
+missing values atomically; reads do not generate replacement values:
+
+```sql
+UPDATE lix_registered_schema
+SET value = value
+WHERE schema_key = 'acme_task';
+```
+
 ## Naming
 
 Use an owner prefix such as `acme_task` or `xlsx_cell`. The `lix` and `lix_*`

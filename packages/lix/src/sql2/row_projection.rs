@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use datafusion::arrow::array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampMicrosecondArray,
@@ -35,6 +35,8 @@ use crate::{LixError, ResultColumnType};
 pub(crate) struct RowProjectionDecoder {
     schema_key: String,
     schema_fingerprint: [u8; 32],
+    compatibility_document: Option<Arc<JsonValue>>,
+    compatibility_schema: OnceLock<(lix_schema::Schema, lix_schema::CompiledSchema)>,
     fields: Vec<RowProjectionField>,
     slots_by_name: HashMap<String, Vec<usize>>,
     expected_fields: SmallVec<[ExpectedNativeField; 8]>,
@@ -94,6 +96,59 @@ fn visit_projection_native_payload<'a>(
 }
 
 impl RowProjectionDecoder {
+    /// SQL reads may revalidate a custom row after a compatible schema
+    /// amendment. Built-ins and callers of `new` retain exact fingerprint checks.
+    pub(crate) fn with_schema_amendments<'a>(
+        spec: &SchemaSurfaceSpec,
+        columns: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Self, LixError> {
+        let mut decoder = Self::new(spec, columns)?;
+        if crate::catalog::CatalogSnapshot::builtin()
+            .plan_for_key(&spec.schema_key)
+            .is_none()
+        {
+            decoder.compatibility_document = Some(Arc::clone(&spec.schema_document));
+        }
+        Ok(decoder)
+    }
+
+    pub(crate) fn bind_typed_row<'a>(
+        &self,
+        typed: &'a crate::row_payload::TypedRow,
+        stored_schema_key: &str,
+        stored_row_pk: &RowPk,
+    ) -> Result<Cow<'a, crate::row_payload::TypedRow>, LixError> {
+        if typed.schema_fingerprint == self.schema_fingerprint
+            || self.compatibility_document.is_none()
+        {
+            typed.validate_resolved_schema_binding(
+                stored_schema_key,
+                &self.schema_key,
+                &self.schema_fingerprint,
+            )?;
+            typed.validate_durable_envelope(stored_schema_key, stored_row_pk)?;
+            return Ok(Cow::Borrowed(typed));
+        }
+        if self.compatibility_schema.get().is_none() {
+            let schema =
+                crate::schema::parse_lix_schema(self.compatibility_document.as_ref().unwrap())?;
+            let compiled = lix_schema::CompiledSchema::compile(&schema).map_err(|error| {
+                LixError::new(LixError::CODE_SCHEMA_DEFINITION, error.to_string())
+            })?;
+            let _ = self.compatibility_schema.set((schema, compiled));
+        }
+        let (schema, compiled) = self.compatibility_schema.get().unwrap();
+        typed
+            .revalidate_resolved_schema(
+                stored_schema_key,
+                stored_row_pk,
+                schema,
+                compiled,
+                self.schema_fingerprint,
+            )
+            .map(Cow::Owned)
+    }
+
     /// Builds a decoder for visible row columns in output order.
     pub(crate) fn new<'a>(
         spec: &SchemaSurfaceSpec,
@@ -177,6 +232,8 @@ impl RowProjectionDecoder {
         Ok(Self {
             schema_key: spec.schema_key.clone(),
             schema_fingerprint: spec.schema_fingerprint,
+            compatibility_document: None,
+            compatibility_schema: OnceLock::new(),
             fields,
             slots_by_name,
             expected_fields,
@@ -663,6 +720,32 @@ impl RowProjectionDecoder {
         row_pk: &RowPk,
         sink: &mut ArrowProjectionSink,
     ) -> Result<(), LixError> {
+        let bytes = match &payload {
+            NativeProjectionPayload::Raw(bytes) => *bytes,
+            NativeProjectionPayload::Validated(payload) => payload.as_bytes(),
+        };
+        // The fixed header only selects the slow path. Decoding and rebinding
+        // below still validates the complete payload and its outer identity.
+        if self.compatibility_document.is_some()
+            && bytes
+                .get(1..33)
+                .is_some_and(|fingerprint| fingerprint != self.schema_fingerprint)
+        {
+            let typed = crate::row_payload::TypedRow::decode_durable_payload(
+                Arc::from(bytes),
+                &self.schema_key,
+                row_pk,
+            )?;
+            let typed = self.bind_typed_row(&typed, &self.schema_key, row_pk)?;
+            for (index, field) in self.fields.iter().enumerate() {
+                sink.columns[index].replace_last_from_typed(
+                    typed.row.get(&field.name),
+                    field,
+                    &self.schema_key,
+                )?;
+            }
+            return Ok(());
+        }
         let mut key_matches = true;
         let mut key_components = 0usize;
         let mut field_key_matches = true;
@@ -1394,6 +1477,21 @@ impl RowProjectionColumn {
             | (Self::Jsonb(values), crate::Value::Null) => {
                 values.replace_last(None)?;
             }
+            (Self::Integer(values) | Self::Timestamptz(values), crate::Value::Null) => {
+                *values
+                    .last_mut()
+                    .expect("projection sink must start the row first") = None;
+            }
+            (Self::Number(values), crate::Value::Null) => {
+                *values
+                    .last_mut()
+                    .expect("projection sink must start the row first") = None;
+            }
+            (Self::Boolean(values), crate::Value::Null) => {
+                *values
+                    .last_mut()
+                    .expect("projection sink must start the row first") = None;
+            }
             (Self::String(values), crate::Value::Text(value)) => {
                 values.replace_last(Some(&value))?;
             }
@@ -1886,6 +1984,45 @@ mod tests {
                 BorrowedNativeValue::Null,
             ],
         );
+    }
+
+    #[test]
+    fn typed_projection_accepts_null_and_missing_for_every_sql_type() {
+        use crate::sql2::catalog::SchemaColumnType;
+        for (column_type, non_null) in [
+            (
+                SchemaColumnType::String,
+                lix_schema::Value::Text("value".into()),
+            ),
+            (
+                SchemaColumnType::Jsonb,
+                lix_schema::Value::Jsonb(lix_schema::Jsonb::from_value(json!({"v": 1}))),
+            ),
+            (SchemaColumnType::Integer, lix_schema::Value::Int8(7)),
+            (SchemaColumnType::Number, lix_schema::Value::Float8(4.5)),
+            (SchemaColumnType::Boolean, lix_schema::Value::Boolean(true)),
+            (
+                SchemaColumnType::Timestamptz,
+                lix_schema::Value::Timestamptz(123456),
+            ),
+        ] {
+            let field = RowProjectionField {
+                name: "value".into(),
+                column_type,
+            };
+            let mut column = RowProjectionColumn::new(column_type, 3);
+            for value in [Some(&non_null), Some(&lix_schema::Value::Null), None] {
+                column.push_null();
+                column
+                    .replace_last_from_typed(value, &field, "projection_test")
+                    .expect("typed nullable projection should succeed");
+            }
+            let array = column.into_array();
+            assert_eq!(array.len(), 3);
+            assert!(!array.is_null(0));
+            assert!(array.is_null(1));
+            assert!(array.is_null(2));
+        }
     }
 
     #[test]

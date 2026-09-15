@@ -57,6 +57,7 @@ pub(crate) struct SchemaSurfaceSpec {
     /// SQL readers bind durable rows to this resolved schema before exposing
     /// any typed value.
     pub(crate) schema_fingerprint: [u8; 32],
+    pub(crate) schema_document: Arc<JsonValue>,
     pub(crate) primary_key_paths: Vec<Vec<String>>,
     pub(crate) primary_key_component_types: Vec<RowPkComponentType>,
     pub(crate) columns: Vec<SchemaSurfaceColumn>,
@@ -162,8 +163,7 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
         ));
     }
     for primary_key in &parsed.primary_key {
-        let collides_with_envelope =
-            matches!(primary_key.as_str(), "row_ref" | "diff_type");
+        let collides_with_envelope = matches!(primary_key.as_str(), "row_ref" | "diff_type");
         let collides_with_side_column = ["from_", "to_"].iter().any(|prefix| {
             primary_key.strip_prefix(prefix).is_some_and(|unprefixed| {
                 parsed.columns.iter().any(|column| {
@@ -271,13 +271,15 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
                 SchemaColumnType::String | SchemaColumnType::Integer | SchemaColumnType::Boolean
             )
     });
-    let description = parsed.description.clone().or_else(|| {
-        crate::schema::seed_schema_description(&schema_key, None).map(str::to_string)
-    });
+    let description = parsed
+        .description
+        .clone()
+        .or_else(|| crate::schema::seed_schema_description(&schema_key, None).map(str::to_string));
     Ok(SchemaSurfaceSpec {
         schema_key,
         description,
         schema_fingerprint,
+        schema_document: Arc::new(schema.clone()),
         primary_key_paths,
         primary_key_component_types,
         indexed_columns,

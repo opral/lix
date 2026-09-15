@@ -12945,9 +12945,12 @@ fn decode_hot_row_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIden
 }
 
 /// Distinguishes the two record kinds sharing [`INDEX_SPACE`]: entries and
-/// the per-collection completeness witness. Entries sort after the witness for
-/// a given schema, so a witness probe is a point read and never scans entries.
-const HOT_INDEX_WITNESS_TAG: u8 = 0x00;
+/// the per-collection completeness witness. Each witness probe is a point
+/// read; entry scans use their distinct tag and never include witnesses.
+// Legacy tag 0x00 could certify an index missing packed or untracked rows.
+// A distinct key keeps reads and incremental writes from trusting that claim.
+// Existing collections use canonical scans until completeness is reestablished.
+const HOT_INDEX_WITNESS_TAG: u8 = 0x02;
 const HOT_INDEX_ENTRY_TAG: u8 = 0x01;
 const HOT_INDEX_CANDIDATE_PAGE: usize = 256;
 /// Distinct values one indexed-column probe may resolve.
@@ -13215,7 +13218,8 @@ fn hot_index_key_successor(prefix: &[u8]) -> Option<Vec<u8>> {
 /// can never be retired. Without the witness a generation whose rows predate
 /// this plane would look like an empty index and silently return no rows,
 /// which is the one failure mode this design must not have. A repository
-/// upgrades by publishing its next generation, not by rebuilding at open.
+/// falls back to canonical collection scans when its generation predates
+/// the current completeness-witness format; opening does not rebuild indexes.
 pub(crate) fn encode_hot_index_witness_key(
     branch_id: &str,
     generation: CommitId,
@@ -17487,6 +17491,136 @@ mod tests {
         // the index rather than guessing a budget.
         assert_eq!(decode_hot_index_witness(&[]), None);
         assert_eq!(decode_hot_index_witness(&[0, 1, 2]), None);
+    }
+
+    #[tokio::test]
+    async fn legacy_incomplete_index_is_not_trusted_or_blessed_by_new_writes() {
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = CommitId::for_test_label("legacy-index-generation");
+        // Exact legacy bytes: registration published an empty witness, then
+        // the packed-write bug omitted the later rows' index entries.
+        let mut legacy_key = hot_scope_prefix("branch", generation);
+        write_key_string(&mut legacy_key, "schema", KEY_PART_FINAL);
+        legacy_key.push(0x00);
+        legacy_key.extend_from_slice(&0_u16.to_be_bytes());
+        let mut writes = StorageWriteSet::new();
+        writes.put(
+            INDEX_SPACE,
+            StorageKey(Bytes::from(legacy_key)),
+            StorageValue {
+                bytes: Bytes::copy_from_slice(&0_u64.to_be_bytes()),
+            },
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let value = HotIndexValue::String("missing".into());
+        for append in [false, true] {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .unwrap();
+            if append {
+                let mut writes = StorageWriteSet::new();
+                stage_hot_index_entries(
+                    &read,
+                    &mut writes,
+                    "branch",
+                    generation,
+                    &[HotIndexEntry {
+                        schema_key: "schema".into(),
+                        ordinal: 0,
+                        value: HotIndexValue::String("fresh".into()),
+                        row_pk: RowPk::single("fresh"),
+                    }],
+                    &BTreeSet::new(),
+                )
+                .await
+                .unwrap();
+                storage
+                    .commit_write_set(writes, StorageWriteOptions::default())
+                    .await
+                    .unwrap();
+            }
+            let reader = HotStateStoreReader {
+                store: storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .unwrap(),
+                transaction_cache: None,
+                root_base_cache: None,
+            };
+            assert_eq!(
+                reader
+                    .scan_hot_index_candidates(
+                        "branch",
+                        generation,
+                        "schema",
+                        0,
+                        std::slice::from_ref(&value)
+                    )
+                    .await
+                    .unwrap(),
+                None,
+                "legacy equality index must fall back, append={append}"
+            );
+            assert_eq!(
+                reader
+                    .scan_hot_index_range_candidates(
+                        "branch",
+                        generation,
+                        "schema",
+                        0,
+                        Some((&value, true)),
+                        None
+                    )
+                    .await
+                    .unwrap(),
+                None,
+                "legacy range index must fall back, append={append}"
+            );
+        }
+        // A separately established complete collection still uses the index.
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let mut writes = StorageWriteSet::new();
+        stage_hot_index_entries(
+            &read,
+            &mut writes,
+            "branch",
+            generation,
+            &[HotIndexEntry {
+                schema_key: "new_schema".into(),
+                ordinal: 0,
+                value: value.clone(),
+                row_pk: RowPk::single("present"),
+            }],
+            &BTreeSet::from([("new_schema".into(), 0)]),
+        )
+        .await
+        .unwrap();
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let reader = HotStateStoreReader {
+            store: storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .unwrap(),
+            transaction_cache: None,
+            root_base_cache: None,
+        };
+        assert_eq!(
+            reader
+                .scan_hot_index_candidates("branch", generation, "new_schema", 0, &[value])
+                .await
+                .unwrap(),
+            Some(vec![RowPk::single("present")])
+        );
     }
 
     #[tokio::test]

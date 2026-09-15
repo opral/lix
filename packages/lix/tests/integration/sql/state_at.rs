@@ -999,3 +999,87 @@ simulation_test!(
         assert!(hidden_base_diff.rows().is_empty());
     }
 );
+
+simulation_test!(
+    state_at_preserves_absent_columns_before_schema_amendment,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        let mut schema = json!({
+            "$schema":"https://lix.dev/schema-v1.json", "key":"historical_amendment",
+            "columns":[{"name":"id","type":"text","nullable":false},
+                       {"name":"body","type":"text","nullable":false}],
+            "primary_key":["id"]
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema(value) VALUES ($1)",
+                &[Value::Jsonb(schema.clone().into())],
+            )
+            .await
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO historical_amendment(id,body) VALUES ('old','before')",
+                &[],
+            )
+            .await
+            .unwrap();
+        let before = session
+            .execute("SELECT lix_active_branch_commit_id()", &[])
+            .await
+            .unwrap();
+        let [Value::Text(before)] = before.rows()[0].values() else {
+            panic!("commit")
+        };
+        schema["columns"].as_array_mut().unwrap().extend([
+            json!({"name":"literal","type":"text","nullable":false,"default_value":"added"}),
+            json!({"name":"optional","type":"int8","nullable":true}),
+            json!({"name":"generated_id","type":"uuid","nullable":false,"default_expression":"uuidv7()"}),
+            json!({"name":"generated_at","type":"timestamptz","nullable":false,"default_expression":"CURRENT_TIMESTAMP"}),
+        ]);
+        session
+            .execute(
+                "UPDATE lix_registered_schema SET value=$1 WHERE schema_key='historical_amendment'",
+                &[Value::Jsonb(schema.into())],
+            )
+            .await
+            .unwrap();
+        for predicate in ["", " WHERE id='old'", " WHERE literal IS NULL"] {
+            let rows = session.execute(&format!(
+                "SELECT id, body, literal, optional, generated_id, generated_at FROM lix_as_of('historical_amendment', $1){predicate}"),
+                &[Value::Text(before.clone())]).await.unwrap();
+            assert_eq!(
+                rows.rows()[0].values(),
+                &[
+                    Value::Text("old".into()),
+                    Value::Text("before".into()),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null
+                ]
+            );
+            assert_eq!(rows.len(), 1);
+        }
+        let current = session
+            .execute(
+                "SELECT literal, optional FROM historical_amendment WHERE id='old'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            current.rows()[0].values(),
+            &[Value::Text("added".into()), Value::Null]
+        );
+        let count = session
+            .execute(
+                "SELECT count(*) FROM lix_as_of('historical_amendment',$1)",
+                &[Value::Text(before.clone())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(count.rows()[0].values(), &[Value::Integer(1)]);
+    }
+);
