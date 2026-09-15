@@ -13,6 +13,7 @@ const DEFAULT_METADATA_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 // across this cap, so raising it does not raise the configured aggregate block,
 // metadata, or disk-cache budgets. Larger deployments can still override it.
 const DEFAULT_MAX_OPEN_LIXS: u64 = 32;
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_PROTOCOL_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_RECOVERY_CLOSE_TIMEOUT_SECS: u64 = 30;
 
@@ -23,6 +24,7 @@ pub struct Config {
     pub public_url: String,
     pub internal_token: Option<String>,
     pub max_open_lixes: usize,
+    pub idle_timeout: Duration,
     pub protocol_timeout: Duration,
     pub recovery_close_timeout: Duration,
     pub(crate) storage: S3StorageConfig,
@@ -60,6 +62,10 @@ impl Config {
             DEFAULT_MAX_OPEN_LIXS,
         )?)
         .context("LIX_SERVER_MAX_OPEN_LIXS does not fit this platform")?;
+        let idle_timeout = Duration::from_secs(positive_u64_env(
+            "LIX_SERVER_IDLE_TIMEOUT_SECS",
+            DEFAULT_IDLE_TIMEOUT_SECS,
+        )?);
         let protocol_timeout = Duration::from_secs(positive_u64_env(
             "LIX_SERVER_PROTOCOL_TIMEOUT_SECS",
             DEFAULT_PROTOCOL_TIMEOUT_SECS,
@@ -85,6 +91,7 @@ impl Config {
             public_url: required_env("LIX_SERVER_PUBLIC_URL")?,
             internal_token,
             max_open_lixes,
+            idle_timeout,
             protocol_timeout,
             recovery_close_timeout,
             storage,
@@ -212,6 +219,7 @@ mod tests {
         let config = Config::from_env().unwrap();
 
         assert_eq!(config.max_open_lixes, 32);
+        assert_eq!(config.idle_timeout, Duration::from_secs(60));
         assert_eq!(config.bind_addr, "0.0.0.0:8080");
         assert_eq!(config.internal_token.as_deref(), Some("test-token"));
         assert_eq!(config.storage.endpoint, "https://s3.example");
@@ -270,6 +278,26 @@ mod tests {
         let config = Config::from_env().unwrap();
 
         assert_eq!(config.max_open_lixes, 7);
+        clear_server_env();
+    }
+
+    #[test]
+    fn from_env_configures_and_validates_idle_timeout() {
+        let _guard = env_lock().lock().unwrap();
+        clear_server_env();
+        set_s3_env();
+        set_env("LIX_SERVER_IDLE_TIMEOUT_SECS", "300");
+        assert_eq!(
+            Config::from_env().unwrap().idle_timeout,
+            Duration::from_secs(300)
+        );
+        for value in ["0", "-1", "invalid"] {
+            set_env("LIX_SERVER_IDLE_TIMEOUT_SECS", value);
+            assert!(
+                format!("{:#}", Config::from_env().unwrap_err())
+                    .contains("LIX_SERVER_IDLE_TIMEOUT_SECS")
+            );
+        }
         clear_server_env();
     }
 
@@ -387,6 +415,7 @@ mod tests {
             "LIX_SERVER_INTERNAL_TOKEN",
             "LIX_SERVER_PUBLIC_URL",
             "LIX_SERVER_MAX_OPEN_LIXS",
+            "LIX_SERVER_IDLE_TIMEOUT_SECS",
             "LIX_SERVER_PROTOCOL_TIMEOUT_SECS",
             "LIX_SERVER_RECOVERY_CLOSE_TIMEOUT_SECS",
             "S3_ENDPOINT",

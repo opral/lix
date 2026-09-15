@@ -69,6 +69,7 @@ and will remain red until that one-time setting is complete.
 | `PORT` | `8080` | Port used when `BIND_ADDR` is absent |
 | `LIX_SERVER_INTERNAL_TOKEN` | required | Protect protocol routes and enable trusted identity headers |
 | `LIX_SERVER_PUBLIC_URL` | required | External host origin used for canonical `https://host/lix/{id}` locators; no path |
+| `LIX_SERVER_IDLE_TIMEOUT_SECS` | `60` | Close unused runtimes after this idle period (positive seconds); active requests and protocol sessions are retained |
 | `LIX_SERVER_MAX_OPEN_LIXS` | `32` | Maximum retained Lix runtimes |
 | `LIX_SERVER_PROTOCOL_TIMEOUT_SECS` | `60` | Admission and request deadline |
 | `LIX_SERVER_RECOVERY_CLOSE_TIMEOUT_SECS` | `30` | Runtime recovery close deadline |
@@ -147,3 +148,5 @@ successful publication, replay, and deletion. Retired IDs remain recorded so a
 late or crashed writer cannot leave unreachable data. An operation is limited to
 1024 retired attempts; exceeding this limit requires operator reconciliation of
 its staging catalog. Uploads are streamed with a 16 GiB limit.
+
+Idle runtimes are checked every five seconds (or the configured idle timeout, if shorter). The idle interval starts when a sweep first observes no request leases or live protocol sessions, and requests reset it. Live protocol sessions retain their existing session lifetime (including the protocol’s 30-minute idle-session timeout), so the runtime idle period begins only after those sessions end or expire. Expiry closes the protocol and SlateDB workers even below the runtime capacity limit, stopping their background object-store polling. Reopening waits for close and cache cleanup to finish. Shutdown also waits for expiry cleanup; the recovery close deadline applies to eviction closes.

@@ -236,6 +236,7 @@ struct RuntimeEntry {
     runtime: Arc<OnceCell<Arc<LixRuntime>>>,
     opened: watch::Receiver<RuntimeOpenState>,
     last_used: u64,
+    idle_since: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -457,6 +458,7 @@ impl LixRuntimeManager {
             &manager.public_url,
         )
         .map_err(|error| anyhow::anyhow!("Invalid LIX_SERVER_PUBLIC_URL: {}", error.message))?;
+        manager.spawn_idle_reaper(config.idle_timeout);
         Ok(manager)
     }
 
@@ -554,6 +556,7 @@ impl LixRuntimeManager {
                         .get_mut(lix_id)
                         .expect("entry was present when updating Lix recency");
                     entry.last_used = now;
+                    entry.idle_since = None;
                     GetRuntimeAction::WaitForOpen {
                         runtime: Arc::clone(&entry.runtime),
                         opened: entry.opened.clone(),
@@ -607,6 +610,7 @@ impl LixRuntimeManager {
                             runtime: Arc::clone(&runtime),
                             opened: opened.clone(),
                             last_used: now,
+                            idle_since: None,
                         },
                     );
                     // The manager, rather than this request, owns opening.
@@ -944,6 +948,68 @@ impl LixRuntimeManager {
         Ok(Arc::new(LixRuntime::new(LixService { protocol })))
     }
 
+    /// The task holds only a weak reference while sleeping, so it cannot keep
+    /// the manager (or its cache-root lease) alive after the host drops it.
+    fn spawn_idle_reaper(self: &Arc<Self>, timeout: Duration) {
+        let manager = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let interval = timeout.min(Duration::from_secs(5));
+            loop {
+                tokio::time::sleep(interval).await;
+                let Some(manager) = manager.upgrade() else {
+                    break;
+                };
+                if !manager.expire_idle_runtimes(Instant::now(), timeout).await {
+                    break;
+                }
+            }
+        });
+    }
+
+    async fn expire_idle_runtimes(self: &Arc<Self>, now: Instant, timeout: Duration) -> bool {
+        let mut state = self.state.lock().await;
+        if state.shutting_down {
+            return false;
+        }
+        let mut expired = Vec::new();
+        for (id, entry) in &mut state.entries {
+            // Match the LRU's lease checks, including callers still waiting for
+            // an open and protocol sessions that live between HTTP requests.
+            let idle = Arc::strong_count(&entry.runtime) == 1
+                && entry
+                    .runtime
+                    .get()
+                    .is_some_and(|runtime| Arc::strong_count(runtime) == 1 && runtime.is_idle());
+            if !idle {
+                entry.idle_since = None;
+                continue;
+            }
+            let since = *entry.idle_since.get_or_insert(now);
+            if now.saturating_duration_since(since) >= timeout {
+                expired.push(id.clone());
+            }
+        }
+        for lix_id in expired {
+            let runtime = state.entries[&lix_id].runtime.get().unwrap().clone();
+            let Some(service) = runtime.try_begin_eviction() else {
+                continue;
+            };
+            state.entries.remove(&lix_id);
+            let (sequence, done) = start_cleanup(&mut state, lix_id.clone())
+                .expect("an active runtime cannot already be cleaning");
+            info!(lix_id, "expired idle lix runtime");
+            // Publish the tombstone and start its owner without an await gap.
+            self.spawn_eviction_cleanup(EvictedRuntime {
+                lix_id,
+                runtime,
+                service,
+                sequence,
+                done,
+            });
+        }
+        true
+    }
+
     fn spawn_eviction_cleanup(self: &Arc<Self>, evicted: EvictedRuntime) {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
@@ -956,7 +1022,16 @@ impl LixRuntimeManager {
             } = evicted;
             let started = Instant::now();
 
-            match close_lix_service(service).await {
+            let Some(closed) = await_recovery_close(
+                &manager.recovery_watchdog,
+                &lix_id,
+                close_lix_service(service),
+            )
+            .await
+            else {
+                return;
+            };
+            match closed {
                 Ok(()) => info!(
                     lix_id,
                     elapsed_ms = elapsed_millis(started),
@@ -1208,10 +1283,15 @@ impl LixRuntimeManager {
     /// Prevents new opens and closes protocol servers so their live streams
     /// cannot keep HTTP graceful shutdown from reaching the storage owners.
     pub async fn shutdown(&self) -> Result<()> {
-        let runtimes = {
+        let (runtimes, cleanups) = {
             let mut state = self.state.lock().await;
             state.shutting_down = true;
-            state
+            let cleanups = state
+                .cleaning
+                .values()
+                .map(|cleanup| cleanup.done.clone())
+                .collect::<Vec<_>>();
+            let runtimes = state
                 .entries
                 .iter()
                 .map(|(lix_id, entry)| {
@@ -1221,7 +1301,8 @@ impl LixRuntimeManager {
                         entry.opened.clone(),
                     )
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (runtimes, cleanups)
         };
 
         let mut closers = JoinSet::new();
@@ -1252,6 +1333,13 @@ impl LixRuntimeManager {
             }
         }
 
+        for mut cleanup in cleanups {
+            if let Err(error) = self.wait_for_cleanup(&mut cleanup).await {
+                first_error.get_or_insert_with(|| {
+                    anyhow::anyhow!("wait for runtime cleanup during shutdown: {error}")
+                });
+            }
+        }
         first_error.map_or(Ok(()), Err)
     }
 
@@ -2252,6 +2340,7 @@ mod tests {
                 runtime,
                 opened,
                 last_used: 1,
+                idle_since: None,
             },
         );
 
@@ -2335,6 +2424,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idle_expiry_closes_below_capacity_and_reopens() {
+        let manager = memory_manager(4).await;
+        let service = manager.get(LIX_A).await.unwrap();
+        let old = Arc::downgrade(&service);
+        drop(service);
+        let now = Instant::now();
+        let timeout = Duration::from_secs(60);
+        manager.expire_idle_runtimes(now, timeout).await;
+        manager
+            .expire_idle_runtimes(now + timeout - Duration::from_secs(1), timeout)
+            .await;
+        assert_eq!(manager.cached_lix_count().await, 1);
+        manager.expire_idle_runtimes(now + timeout, timeout).await;
+        assert_eq!(manager.cached_lix_count().await, 0);
+        // Same-ID get must wait until the old protocol and cache have closed.
+        let reopened = manager.get(LIX_A).await.unwrap();
+        assert!(old.upgrade().is_none());
+        assert_eq!(manager.cached_lix_count().await, 1);
+        drop(reopened);
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_expiry_resets_after_active_lease_and_new_request() {
+        let manager = memory_manager(4).await;
+        let service = manager.get(LIX_A).await.unwrap();
+        let now = Instant::now();
+        let timeout = Duration::from_secs(60);
+        manager.expire_idle_runtimes(now, timeout).await;
+        manager.expire_idle_runtimes(now + timeout, timeout).await;
+        assert_eq!(manager.cached_lix_count().await, 1);
+        drop(service);
+        manager.expire_idle_runtimes(now + timeout, timeout).await;
+        // Even a request entirely between sweeps resets the idle interval.
+        drop(manager.get(LIX_A).await.unwrap());
+        manager
+            .expire_idle_runtimes(now + timeout * 2, timeout)
+            .await;
+        assert_eq!(manager.cached_lix_count().await, 1);
+        manager
+            .expire_idle_runtimes(now + timeout * 3, timeout)
+            .await;
+        manager.shutdown().await.unwrap();
+        assert!(manager.state.lock().await.cleaning.is_empty());
+        assert!(
+            !manager
+                .expire_idle_runtimes(now + timeout * 4, timeout)
+                .await
+        );
+        assert!(matches!(
+            manager.get(LIX_A).await,
+            Err(LixRuntimeError::ShuttingDown)
+        ));
+    }
+
+    #[tokio::test]
+    async fn idle_expiry_stops_background_storage_operations() {
+        let manager = LixRuntimeManager::new_in_memory(4);
+        let counters = SlateDBIoCounters::default();
+        let storage = manager.open_storage(LIX_A, counters.clone()).unwrap();
+        let protocol = lix_sdk::open_lix()
+            .with_storage(storage)
+            .serve()
+            .with_lix_id(LIX_A)
+            .await
+            .unwrap();
+        let runtime = Arc::new(OnceCell::new());
+        runtime
+            .set(Arc::new(LixRuntime::new(LixService { protocol })))
+            .ok()
+            .unwrap();
+        let (_done, opened) = watch::channel(RuntimeOpenState::Ready);
+        manager.state.lock().await.entries.insert(
+            LIX_A.to_owned(),
+            RuntimeEntry {
+                runtime,
+                opened,
+                last_used: 1,
+                idle_since: None,
+            },
+        );
+        manager
+            .write_record(LIX_A, "live", Some(empty_create_fingerprint()), true)
+            .await
+            .unwrap();
+        let before = counters.snapshot();
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        assert!(
+            counters.snapshot().list_operations > before.list_operations,
+            "retained idle storage should demonstrate the background polling being fixed"
+        );
+        let now = Instant::now();
+        manager
+            .expire_idle_runtimes(now, Duration::from_secs(60))
+            .await;
+        manager
+            .expire_idle_runtimes(now + Duration::from_secs(60), Duration::from_secs(60))
+            .await;
+        assert_eq!(manager.cached_lix_count().await, 0);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if manager.state.lock().await.cleaning.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("idle expiry must finish storage cleanup without shutdown");
+        let closed = counters.snapshot();
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        let after = counters.snapshot();
+        assert_eq!(after.list_operations, closed.list_operations);
+        assert_eq!(after.read_objects, closed.read_objects);
+        assert_eq!(after.write_objects, closed.write_objects);
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_in_progress_idle_cleanup() {
+        let manager = LixRuntimeManager::new_in_memory(4);
+        let (sequence, done) = {
+            let mut state = manager.state.lock().await;
+            start_cleanup(&mut state, LIX_A.to_owned()).unwrap()
+        };
+        let shutdown_manager = manager.clone();
+        let mut shutdown = tokio::spawn(async move { shutdown_manager.shutdown().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut shutdown)
+                .await
+                .is_err()
+        );
+        assert!(manager.state.lock().await.shutting_down);
+        manager.finish_cleanup(LIX_A, sequence, done, Ok(())).await;
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_reaper_runs_without_requests_and_releases_manager() {
+        let manager = memory_manager(4).await;
+        drop(manager.get(LIX_A).await.unwrap());
+        manager.spawn_idle_reaper(Duration::from_millis(10));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let state = manager.state.lock().await;
+                if state.entries.is_empty() && state.cleaning.is_empty() {
+                    break;
+                }
+                drop(state);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reaper closes idle storage without capacity pressure");
+        let weak = Arc::downgrade(&manager);
+        drop(manager);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
     async fn evicts_the_least_recently_used_idle_runtime() {
         let manager = memory_manager(1).await;
         let first = manager.get(LIX_A).await.expect("open first runtime");
@@ -2390,6 +2643,14 @@ mod tests {
         drop(handshake);
         drop(service);
 
+        let now = Instant::now();
+        manager
+            .expire_idle_runtimes(now, Duration::from_secs(60))
+            .await;
+        manager
+            .expire_idle_runtimes(now + Duration::from_secs(120), Duration::from_secs(60))
+            .await;
+        assert_eq!(manager.cached_lix_count().await, 1);
         assert!(matches!(
             manager.get(LIX_B).await,
             Err(LixRuntimeError::AtCapacity { max: 1 })
@@ -3453,6 +3714,7 @@ mod tests {
             public_url: "https://server.test".into(),
             internal_token: None,
             max_open_lixes: 1,
+            idle_timeout: Duration::from_secs(60),
             protocol_timeout: Duration::from_secs(10),
             recovery_close_timeout: Duration::from_secs(10),
             storage: crate::config::S3StorageConfig {
