@@ -12745,7 +12745,7 @@ where
         &self,
         domain: &Domain,
         schema_key: &str,
-    ) -> Option<&crate::catalog::SchemaPlan> {
+    ) -> Option<&SchemaPlan> {
         self.schema_resolver.cached_schema_plan(domain, schema_key)
     }
 

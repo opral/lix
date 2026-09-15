@@ -8181,7 +8181,7 @@ mod tests {
             }
             let context = transaction.transaction_mut().unwrap();
             let branch_id = context.active_branch_id().to_owned();
-            let rows = crate::sql2::SqlWriteExecutionContext::scan_hot_state_batch(
+            let rows = SqlWriteExecutionContext::scan_hot_state_batch(
                 context,
                 &crate::hot_state::HotStateScanRequest {
                     filter: crate::hot_state::HotStateFilter {

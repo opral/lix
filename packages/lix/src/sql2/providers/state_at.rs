@@ -1193,8 +1193,8 @@ mod historical_projection_tests {
                 ("id".to_owned(), lix_schema::Value::Text("row".into())),
                 ("body".to_owned(), lix_schema::Value::Text("before".into())),
             ]),
-            native_payload: std::sync::OnceLock::new(),
-            boundary_create_validation: std::sync::OnceLock::new(),
+            native_payload: OnceLock::new(),
+            boundary_create_validation: OnceLock::new(),
         };
         let pk = RowPk::single("row");
         validate_historical_schema_row(&spec, &compiled, &spec.schema_key, &pk, &valid).unwrap();
