@@ -323,7 +323,7 @@ mod tests {
         catalog(&manager, &physical, None).await;
         use tower::ServiceExt as _;
         let app = crate::router(manager.clone(), None, Duration::from_secs(1), Default::default());
-        let response = app.oneshot(axum::http::Request::builder()
+        let response = app.oneshot(Request::builder()
             .uri(format!("/lix/v1/{ID}/admission"))
             .header("lix-sync-protocol-version", lix_sdk::SYNC_PROTOCOL_VERSION)
             .body(Body::empty()).unwrap()).await.unwrap();
