@@ -724,12 +724,8 @@ async fn try_execute_row_update_batch(
             affected_by_statement.push(affected);
         }
     }
-    if let Some(catalog) = ctx.schema_catalog_snapshot() {
-        if let Some((_, schema_plan)) = catalog.plan_for_key(&spec.schema_key) {
-            write_rows.convert_json_snapshots_to_typed(schema_plan)?;
-            certify_fileless_typed_sql_rows(ctx, &spec, &mut write_rows)?;
-        }
-    }
+    convert_sql_row_snapshots_to_typed(ctx, &spec, &mut write_rows)?;
+    certify_fileless_typed_sql_rows(ctx, &spec, &mut write_rows)?;
     stage_rows(ctx, TransactionWriteMode::Replace, write_rows).await?;
     #[cfg(test)]
     {
@@ -880,6 +876,12 @@ async fn try_execute_direct_path_value_replacement_batch(
         0,
     );
     let active_branch_id = ctx.active_branch_id().to_owned();
+    let validation_domain = crate::domain::Domain::schema_catalog(&active_branch_id, false);
+    let preserve_amended_row = ctx
+        .staged_schema_document(&validation_domain, &spec.schema_key)
+        .await?
+        .is_some_and(|document| document.as_ref() != spec.schema_document.as_ref());
+
     let scope = crate::collection_generation::CollectionScopeRef {
         schema_key: &spec.schema_key,
         file_id: None,
@@ -892,6 +894,7 @@ async fn try_execute_direct_path_value_replacement_batch(
         .load_collection_generation(&active_branch_id, scope)
         .await?;
     let certified_ordered_generation = primary_keys_strictly_ordered
+        && !preserve_amended_row
         && !has_staged_collection_rows
         && collection_generation.is_some_and(|generation| {
             generation.live_count == row_count as u64
@@ -1013,7 +1016,8 @@ async fn try_execute_direct_path_value_replacement_batch(
     let unique_row_count = unique_row_pks.len();
     let ordered_identity_digest =
         crate::collection_generation::ordered_single_string_identity_digest(unique_row_pks.iter());
-    let certified_generation_identity = !has_staged_collection_rows
+    let certified_generation_identity = !preserve_amended_row
+        && !has_staged_collection_rows
         && collection_generation.is_some_and(|generation| {
             generation.live_count == unique_row_count as u64
                 && generation.ordered_identity_digest.is_some()
@@ -1028,15 +1032,20 @@ async fn try_execute_direct_path_value_replacement_batch(
     let candidates = if certified_generation_identity {
         MaterializedHotStateBatch::default()
     } else {
-        let candidates =
-            scan_row_candidates_for_pks(ctx, plan, &spec, unique_row_pks.to_vec(), true)
-                .instrument(tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.row_update_value_batch.candidate_scan",
-                    row_count,
-                    unique_row_count
-                ))
-                .await?;
+        let candidates = scan_row_candidates_for_pks(
+            ctx,
+            plan,
+            &spec,
+            unique_row_pks.to_vec(),
+            !preserve_amended_row,
+        )
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.row_update_value_batch.candidate_scan",
+            row_count,
+            unique_row_count
+        ))
+        .await?;
         if candidates.iter().any(|candidate| {
             candidate.untracked()
                 || candidate.global()
@@ -1163,13 +1172,50 @@ async fn try_execute_direct_path_value_replacement_batch(
             });
 
         let start = snapshots.len();
-        append_certified_path_value_parameter_payload(
-            &mut snapshots,
-            schema_plan,
-            row_pk.as_single_string()?,
-            parameter_batch.value(replacement.value_param_index, statement_index),
-        )
-        .map_err(|error| with_parameter_batch_statement_index(error, statement_index))?;
+        if preserve_amended_row {
+            // The opening SQL layout cannot see newly appended columns.
+            // Retain their already-materialized values rather than generating
+            // defaults again when the replacement reaches canonical staging.
+            let candidate = candidates.row(candidate_index);
+            let mut typed = candidate
+                .materialize_decoded_snapshot()?
+                .ok_or_else(|| {
+                    LixError::unknown("amended replacement candidate has no typed payload")
+                })?
+                .as_ref()
+                .clone();
+            let value = match parameter_batch.value(replacement.value_param_index, statement_index)
+            {
+                DirectParameterValue::Null => JsonValue::Null,
+                DirectParameterValue::String(raw) => crate::sql2::udfs::common::parse_jsonb(raw)
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_TYPE_MISMATCH,
+                            format!("invalid JSONB value: {error}"),
+                        )
+                    })?,
+                DirectParameterValue::Boolean(_) => unreachable!("replacement value is text"),
+            };
+            typed.invalidate_durable_payload();
+            typed
+                .row
+                .insert("value", lix_schema::Value::Jsonb(value.into()));
+            let (_, typed) = finalize_typed_row(ctx, &validation_domain, &spec.schema_key, typed)?;
+            snapshots.extend_from_slice(&typed.durable_payload().map_err(|error| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    format!("amended row encoding failed: {error:?}"),
+                )
+            })?);
+        } else {
+            append_certified_path_value_parameter_payload(
+                &mut snapshots,
+                schema_plan,
+                row_pk.as_single_string()?,
+                parameter_batch.value(replacement.value_param_index, statement_index),
+            )
+            .map_err(|error| with_parameter_batch_statement_index(error, statement_index))?;
+        }
         snapshot_offsets.push((start, snapshots.len()));
         replacement_row_pks.push(row_pk.clone());
         replacement_predecessors.push(
@@ -2788,6 +2834,10 @@ pub(crate) fn prepare_path_value_replacement_program(
     plan: &LogicalWritePlan,
     spec: &SchemaSurfaceSpec,
 ) -> Option<PreparedPathValueReplacementProgram> {
+    // The fixed path/value image cannot retain fields appended after SQL binding.
+    if ctx.has_staged_schema_changes().ok()? {
+        return None;
+    }
     if spec.has_inter_row_constraints
         || !matches!(plan.bound.input, BoundWriteInput::None)
         || plan.bound.conflict.is_some()
@@ -3763,7 +3813,12 @@ fn certify_fileless_typed_sql_rows(
     spec: &SchemaSurfaceSpec,
     rows: &mut RawWriteBatch,
 ) -> Result<(), LixError> {
-    if rows.is_empty() || spec.schema_key == "lix_registered_schema" {
+    // Opening catalog plan IDs cannot certify images governed by a staged
+    // amendment. The ordinary staging path resolves and validates each domain.
+    if rows.is_empty()
+        || spec.schema_key == "lix_registered_schema"
+        || ctx.has_staged_schema_changes()?
+    {
         return Ok(());
     }
     let Some(first) = rows.iter().next() else {
@@ -3809,6 +3864,14 @@ fn convert_sql_row_snapshots_to_typed(
     spec: &SchemaSurfaceSpec,
     rows: &mut RawWriteBatch,
 ) -> Result<(), LixError> {
+    // SQL output columns stay bound at transaction open, but the complete
+    // post-image may contain fields backfilled by a later schema amendment.
+    // Preserve that image for canonical normalization against the effective
+    // staged catalog; converting against the opening plan would reject or
+    // discard those fields.
+    if ctx.has_staged_schema_changes()? {
+        return Ok(());
+    }
     let Some(catalog) = ctx.schema_catalog_snapshot() else {
         return Ok(());
     };
@@ -3935,18 +3998,20 @@ async fn scan_row_conflict_candidates(
     // of SQL conflict identity. A tracked INSERT therefore conflicts with an
     // existing untracked row (and vice versa); `DO UPDATE` then preserves the
     // existing row's retention through `append_row_replace_row_from_live`.
-    ctx.scan_hot_state_batch(&HotStateScanRequest {
-        filter: HotStateFilter {
-            schema_keys: vec![spec.schema_key.clone()],
-            row_pks: row_pks.into_iter().collect(),
-            branch_ids: branch_ids.into_iter().map(Into::into).collect(),
-            file_ids,
-            include_tombstones: false,
-            ..HotStateFilter::default()
-        },
-        ..HotStateScanRequest::default()
-    })
-    .await
+    let rows = ctx
+        .scan_hot_state_batch(&HotStateScanRequest {
+            filter: HotStateFilter {
+                schema_keys: vec![spec.schema_key.clone()],
+                row_pks: row_pks.into_iter().collect(),
+                branch_ids: branch_ids.into_iter().map(Into::into).collect(),
+                file_ids,
+                include_tombstones: false,
+                ..HotStateFilter::default()
+            },
+            ..HotStateScanRequest::default()
+        })
+        .await?;
+    revalidate_row_candidates(ctx, spec, rows).await
 }
 
 async fn scan_row_candidates(
@@ -3976,7 +4041,8 @@ async fn scan_row_candidates(
         }
         request.filter.row_pks = row_pks;
     }
-    ctx.scan_hot_state_batch(&request).await
+    let rows = ctx.scan_hot_state_batch(&request).await?;
+    revalidate_row_candidates(ctx, spec, rows).await
 }
 
 async fn scan_row_candidates_for_pks(
@@ -3989,24 +4055,77 @@ async fn scan_row_candidates_for_pks(
     #[cfg(feature = "storage-benches")]
     let _phase =
         crate::storage_bench::enter_crud_phase(crate::storage_bench::CRUD_PHASE_WRITE_READ);
-    ctx.scan_hot_state_batch(&HotStateScanRequest {
-        filter: HotStateFilter {
-            schema_keys: vec![spec.schema_key.clone()],
-            row_pks,
-            branch_ids: scan_branch_ids(&plan.bound.branch_scope)?,
-            include_tombstones: false,
-            ..HotStateFilter::default()
-        },
-        projection: if metadata_only {
-            HotStateProjection {
-                columns: vec!["metadata".to_string()],
-            }
+    let rows = ctx
+        .scan_hot_state_batch(&HotStateScanRequest {
+            filter: HotStateFilter {
+                schema_keys: vec![spec.schema_key.clone()],
+                row_pks,
+                branch_ids: scan_branch_ids(&plan.bound.branch_scope)?,
+                include_tombstones: false,
+                ..HotStateFilter::default()
+            },
+            projection: if metadata_only {
+                HotStateProjection {
+                    columns: vec!["metadata".to_string()],
+                }
+            } else {
+                HotStateProjection::default()
+            },
+            ..HotStateScanRequest::default()
+        })
+        .await?;
+    revalidate_row_candidates(ctx, spec, rows).await
+}
+
+/// Persisted repositories can contain rows written before a schema amendment
+/// by older engines. Predicates, assignments and conflict updates must see
+/// the same fully revalidated current-schema values as SELECT.
+async fn revalidate_row_candidates(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    spec: &SchemaSurfaceSpec,
+    rows: MaterializedHotStateBatch,
+) -> Result<MaterializedHotStateBatch, LixError> {
+    if !ctx.has_staged_schema_changes()? {
+        let rebound = crate::sql2::providers::revalidate_schema_amended_rows(spec, &rows)
+            .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+        return Ok(rebound.unwrap_or(rows));
+    }
+    let mut domains = std::collections::BTreeMap::new();
+    for row in rows.iter() {
+        domains
+            .entry(crate::domain::Domain::for_live_row_ref(row).schema_catalog_domain())
+            .or_insert(None);
+    }
+    for (domain, effective) in &mut domains {
+        if let Some(document) = ctx.staged_schema_document(domain, &spec.schema_key).await? {
+            *effective =
+                Some(crate::sql2::catalog::derive_schema_surface_spec_from_schema(&document)?);
+        }
+    }
+    if domains.values().all(Option::is_none) {
+        let rebound = crate::sql2::providers::revalidate_schema_amended_rows(spec, &rows)
+            .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+        return Ok(rebound.unwrap_or(rows));
+    }
+    let mut builder = crate::hot_state::MaterializedHotStateBatchBuilder::with_capacity(rows.len());
+    for row in rows.iter() {
+        let domain = crate::domain::Domain::for_live_row_ref(row).schema_catalog_domain();
+        let validation = domains
+            .get(&domain)
+            .and_then(Option::as_ref)
+            .unwrap_or(spec);
+        let mut single = crate::hot_state::MaterializedHotStateBatchBuilder::with_capacity(1);
+        single.push_ref(row, None);
+        let single = single.finish();
+        let rebound = crate::sql2::providers::revalidate_schema_amended_rows(validation, &single)
+            .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+        if let Some(rebound) = rebound {
+            builder.push_ref(rebound.iter().next().expect("one candidate"), None);
         } else {
-            HotStateProjection::default()
-        },
-        ..HotStateScanRequest::default()
-    })
-    .await
+            builder.push_ref(row, None);
+        }
+    }
+    Ok(builder.finish())
 }
 
 fn bound_row_pks_from_primary_key_predicate(
@@ -5466,7 +5585,12 @@ fn append_row_replace_row_from_live<'a>(
     };
     match image {
         Some(OwnedRowImage::Typed(typed)) => {
-            let (row_pk, typed) = finalize_typed_row(ctx, &spec.schema_key, typed)?;
+            let (row_pk, typed) = finalize_typed_row(
+                ctx,
+                &crate::domain::Domain::schema_catalog(row.branch_id(), row.untracked()),
+                &spec.schema_key,
+                typed,
+            )?;
             if &row_pk != row.row_pk() {
                 return Err(LixError::new(
                     LixError::CODE_SCHEMA_VALIDATION,
@@ -6800,9 +6924,13 @@ fn typed_value_from_eval(
 
 fn finalize_typed_row(
     ctx: &dyn SqlWriteExecutionContext,
+    domain: &crate::domain::Domain,
     schema_key: &str,
     typed: crate::row_payload::TypedRow,
 ) -> Result<(RowPk, crate::row_payload::TypedRow), LixError> {
+    if let Some(plan) = ctx.staged_schema_plan(domain, schema_key) {
+        return finalize_typed_row_with_plan(schema_key, plan, typed);
+    }
     let catalog = ctx.schema_catalog_snapshot().ok_or_else(|| {
         LixError::new(
             LixError::CODE_SCHEMA_DEFINITION,
@@ -6823,6 +6951,21 @@ fn finalize_typed_row_with_plan(
     plan: &crate::catalog::SchemaPlan,
     mut typed: crate::row_payload::TypedRow,
 ) -> Result<(RowPk, crate::row_payload::TypedRow), LixError> {
+    if typed.schema_fingerprint != plan.fingerprint().bytes() {
+        // UPDATE can select a durable row written before a compatible schema
+        // amendment. Rebind its complete owned image before certification,
+        // including appended nullable and literal-defaulted columns.
+        let schema = crate::schema::parse_lix_schema(&plan.schema)?;
+        let stored_row_pk = RowPk::from_schema_values(&typed.row_pk)
+            .map_err(|error| LixError::new(LixError::CODE_SCHEMA_VALIDATION, error.to_string()))?;
+        typed = typed.revalidate_resolved_schema(
+            schema_key,
+            &stored_row_pk,
+            &schema,
+            &plan.compiled_schema,
+            plan.fingerprint().bytes(),
+        )?;
+    }
     plan.compiled_schema
         .validate_complete_row(&typed.row)
         .map_err(|error| {

@@ -8125,6 +8125,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn certified_replacement_preserves_generated_defaults_after_staged_amendment() {
+        let session = open_session().await;
+        let mut schema = serde_json::json!({
+            "$schema":"https://lix.dev/schema-v1.json", "key":"generated_replacement_probe",
+            "columns":[{"name":"path","type":"text","nullable":false},{"name":"value","type":"jsonb","nullable":false}],
+            "primary_key":["path"]
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES ($1)",
+                &[Value::Jsonb(schema.clone().into())],
+            )
+            .await
+            .unwrap();
+        session.execute("INSERT INTO generated_replacement_probe (path,value) VALUES ('a',CAST('1' AS JSONB)),('b',CAST('2' AS JSONB))", &[]).await.unwrap();
+        schema["columns"].as_array_mut().unwrap().push(serde_json::json!({"name":"generated_id","type":"uuid","nullable":false,"default_expression":"uuidv7()"}));
+        let mut transaction = session.begin_transaction().await.unwrap();
+        transaction.execute("UPDATE lix_registered_schema SET value=$1 WHERE schema_key='generated_replacement_probe'", &[Value::Jsonb(schema.into())]).await.unwrap();
+        let mut snapshots = Vec::new();
+        for stage in 0..3 {
+            if stage == 1 {
+                let sql =
+                    "UPDATE generated_replacement_probe SET value=CAST($1 AS JSONB) WHERE path=$2";
+                let statements = ["a", "b"].map(|path| ExecuteBatchStatement {
+                    label: None,
+                    sql: sql.into(),
+                    params: vec![Value::Text("3".into()), Value::Text(path.into())],
+                });
+                let parsed = TransactionBatchStatements::Shared {
+                    statement: sql2::parse_statement(sql).unwrap(),
+                    len: statements.len(),
+                };
+                let result = try_execute_transaction_parameter_batch(
+                    transaction.transaction_mut().unwrap(),
+                    &statements,
+                    &parsed,
+                    &ExecuteOptions::default(),
+                    &vec![ExecuteStatementMetadata::default(); statements.len()],
+                    &AtomicBool::new(false),
+                )
+                .await
+                .unwrap();
+                if result.is_none() {
+                    // A staged amendment may safely decline the fixed-layout
+                    // optimization while preserving normal SQL behavior.
+                    for statement in &statements {
+                        transaction.execute(&statement.sql, &statement.params).await.unwrap();
+                    }
+                }
+            }
+            if stage == 2 {
+                let returned = transaction.execute("UPDATE generated_replacement_probe SET value=CAST('4' AS JSONB) RETURNING path", &[]).await.unwrap();
+                assert_eq!(returned.len(), 2);
+            }
+            let context = transaction.transaction_mut().unwrap();
+            let branch_id = context.active_branch_id().to_owned();
+            let rows = crate::sql2::SqlWriteExecutionContext::scan_hot_state_batch(
+                context,
+                &crate::hot_state::HotStateScanRequest {
+                    filter: crate::hot_state::HotStateFilter {
+                        schema_keys: vec!["generated_replacement_probe".into()],
+                        branch_ids: vec![branch_id],
+                        ..Default::default()
+                    },
+                    projection: crate::hot_state::HotStateProjection {
+                        columns: vec!["snapshot_content".into()],
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let mut generated = rows
+                .iter()
+                .map(|row| {
+                    let typed = row.materialize_decoded_snapshot().unwrap().unwrap();
+                    let Some(lix_schema::Value::Uuid(value)) = typed.row.get("generated_id") else {
+                        panic!("amendment must materialize UUID before the UPDATE")
+                    };
+                    (
+                        row.row_pk().as_single_string().unwrap().to_owned(),
+                        value.to_string(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            generated.sort();
+            assert_eq!(generated.len(), 2);
+            snapshots.push(generated);
+        }
+        assert_eq!(
+            snapshots[0], snapshots[1],
+            "updating an opening-schema field must retain already-materialized generated values"
+        );
+        assert_eq!(snapshots[0], snapshots[2], "generic UPDATE RETURNING must retain generated values too");
+        transaction.commit().await.unwrap();
+        let rows = session
+            .execute(
+                "SELECT path,generated_id,value FROM generated_replacement_probe ORDER BY path",
+                &[],
+            )
+            .await
+            .unwrap();
+        for (row, (path, generated)) in rows.rows().iter().zip(&snapshots[0]) {
+            assert_eq!(row.get::<String>("path").unwrap(), *path);
+            assert_eq!(row.get::<String>("generated_id").unwrap(), *generated);
+            assert_eq!(
+                row.get::<serde_json::Value>("value").unwrap(),
+                serde_json::json!(4)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn certified_batch_reconciles_concurrent_insert_at_commit_snapshot() {
         let storage = Memory::default();
         Engine::initialize(storage.clone())

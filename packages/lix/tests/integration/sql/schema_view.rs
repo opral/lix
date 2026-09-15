@@ -854,3 +854,71 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    indexed_range_projects_nullable_typed_primitives,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        let schema = serde_json::json!({
+            "$schema":"https://lix.dev/schema-v1.json", "key":"nullable_range_note",
+            "columns":[
+                {"name":"id","type":"text","nullable":false},
+                {"name":"count","type":"int8","nullable":true},
+                {"name":"ratio","type":"float8","nullable":true},
+                {"name":"active","type":"boolean","nullable":true},
+                {"name":"time","type":"timestamptz","nullable":true}
+            ],
+            "primary_key":["id"]
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+        // A selective key range over a larger table uses the typed-row projection.
+        let values = (0..255)
+            .map(|i| {
+                if i == 68 {
+                    format!("('n{i:03}',NULL,NULL,NULL,NULL)")
+                } else {
+                    format!("('n{i:03}',7,4.5,TRUE,'2026-09-15T01:02:03.123456Z')")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO nullable_range_note (id,count,ratio,active,time) VALUES {values}"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        for stage in 0..3 {
+            if stage == 1 {
+                session.execute("UPDATE nullable_range_note SET count=NULL,ratio=NULL,active=NULL,time=NULL WHERE id='n067'", &[]).await.unwrap();
+            } else if stage == 2 {
+                session
+                    .execute("DELETE FROM nullable_range_note WHERE id='n066'", &[])
+                    .await
+                    .unwrap();
+            }
+            let full = session
+                .execute(
+                    "SELECT id,count,ratio,active,time FROM nullable_range_note ORDER BY id",
+                    &[],
+                )
+                .await
+                .unwrap();
+            let expected = full.rows().iter().filter(|row| matches!(&row.values()[0], Value::Text(id) if id.as_str() >= "n060" && id.as_str() < "n070")).map(|row| row.values().to_vec()).collect::<Vec<_>>();
+            for _ in 0..2 {
+                let range = session.execute("SELECT id,count,ratio,active,time FROM nullable_range_note WHERE id >= 'n060' AND id < 'n070' ORDER BY id", &[]).await.expect("key range must project nullable typed values");
+                assert_rows_eq(range, expected.clone());
+            }
+        }
+    }
+);

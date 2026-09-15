@@ -97,6 +97,7 @@ mod diff_relation;
 mod errors;
 mod history_conformance;
 mod information_schema;
+mod index_lifecycle;
 mod lix_branch;
 mod lix_change;
 mod lix_commit;
@@ -112,6 +113,7 @@ mod metadata;
 mod read_only;
 mod row_ref;
 mod schema_history;
+mod schema_expression_amendment;
 mod schema_view;
 mod state_at;
 mod temporal_arguments;
@@ -147,3 +149,5 @@ fn rows_from_result(result: ExecuteResult) -> Vec<Vec<Value>> {
         .map(|row| row.values().to_vec())
         .collect()
 }
+
+mod index_schema_amendment;

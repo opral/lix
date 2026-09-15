@@ -3219,8 +3219,9 @@ pub(crate) struct StagedIndexRow {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct StagedIndexValues {
     pub(crate) rows: Vec<StagedIndexRow>,
-    /// `(schema_key, ordinal)` pairs whose collection provably begins at this
-    /// commit because the commit registers the schema itself.
+    /// `(schema_key, ordinal)` pairs nominated by registration snapshots.
+    /// Publication must also prove prior collection absence: these snapshots
+    /// can amend an existing schema whose index is incomplete.
     pub(crate) registered_collections: std::collections::BTreeSet<(String, u16)>,
 }
 

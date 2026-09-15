@@ -71,6 +71,18 @@ impl TransactionSchemaResolver {
             .expect("catalog cache should contain requested branch"))
     }
 
+    pub(crate) fn cached_schema_plan(
+        &self,
+        domain: &Domain,
+        schema_key: &str,
+    ) -> Option<&crate::catalog::SchemaPlan> {
+        self.catalogs_by_domain
+            .get(&domain.schema_catalog_domain())?
+            .snapshot()
+            .plan_for_key(schema_key)
+            .map(|(_, plan)| plan)
+    }
+
     pub(crate) async fn catalog_for_validation(
         &mut self,
         hot_state: &dyn HotStateReader,
@@ -180,8 +192,8 @@ where
 mod tests {
     use super::*;
     use crate::common::LixTimestamp;
-    use crate::row_pk::RowPk;
     use crate::hot_state::{HotStateFilter, MaterializedHotStateRow};
+    use crate::row_pk::RowPk;
 
     struct SplitCurrentAndTrackedReader {
         canonical: MaterializedHotStateRow,

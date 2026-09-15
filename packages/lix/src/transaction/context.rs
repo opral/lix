@@ -151,6 +151,7 @@ use crate::{LixError, NullableKeyFilter, SqlQueryResult, Value};
 
 mod cohort;
 mod native_application;
+mod schema_amendment;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct TransactionCommitOutcome {
@@ -2478,10 +2479,12 @@ where
     fn reset_drained_content_path_index(&mut self, prepared_writes: &PreparedWriteSet) {
         if !prepared_writes_require_filesystem_index_rebuild(prepared_writes)
             && !prepared_writes.state_rows.iter().any(|row| {
-                row.global || row.untracked || matches!(
-                    row.schema_key.as_str(),
-                    "lix_file_descriptor" | "lix_directory_descriptor"
-                )
+                row.global
+                    || row.untracked
+                    || matches!(
+                        row.schema_key.as_str(),
+                        "lix_file_descriptor" | "lix_directory_descriptor"
+                    )
             })
         {
             self.filesystem_path_index_cache.clear();
@@ -3092,7 +3095,41 @@ where
         Ok(())
     }
 
-    pub(crate) async fn stage_write(
+    pub(crate) fn stage_write(
+        &mut self,
+        write: TransactionWrite,
+    ) -> futures_util::future::BoxFuture<'_, Result<TransactionWriteOutcome, LixError>> {
+        // Dispatch before polling: an async wrapper would reserve its schema
+        // checkpoint/rollback frame even for ordinary writes, on top of the
+        // already deep SQL/plugin/storage poll chain.
+        match schema_amendment::schemas_with_defaults(&write) {
+            Err(error) => Box::pin(async move { Err(error) }),
+            Ok(schemas) if schemas.is_empty() => {
+                Box::pin(self.stage_write_without_schema_default_backfill(write))
+            }
+            Ok(schemas) => Box::pin(self.stage_write_with_schema_default_backfill(write, schemas)),
+        }
+    }
+
+    async fn stage_write_with_schema_default_backfill(
+        &mut self,
+        write: TransactionWrite,
+        schemas: Vec<(String, JsonValue)>,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        let checkpoint = self.begin_sql_statement_checkpoint()?;
+        let result = async {
+            let outcome = Box::pin(self.stage_write_without_schema_default_backfill(write)).await?;
+            Box::pin(self.materialize_schema_defaults(&schemas)).await?;
+            Ok(outcome)
+        }
+        .await;
+        if result.is_err() {
+            Box::pin(self.rollback_sql_statement_checkpoint(checkpoint)).await?;
+        }
+        result
+    }
+
+    async fn stage_write_without_schema_default_backfill(
         &mut self,
         mut write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError> {
@@ -12671,6 +12708,47 @@ where
         Some(Arc::clone(&self.sql_schema_snapshot))
     }
 
+    fn has_staged_schema_changes(&self) -> Result<bool, LixError> {
+        self.staged_writes.has_staged_schema_changes()
+    }
+
+    async fn staged_schema_document(
+        &mut self,
+        domain: &Domain,
+        schema_key: &str,
+    ) -> Result<Option<Arc<JsonValue>>, LixError> {
+        if !self
+            .staged_writes
+            .has_staged_schema_catalog_change(domain)?
+        {
+            return Ok(None);
+        }
+        let staged = self.staged_writes.staging_overlay()?;
+        let read = self.opening_read();
+        let hot_state = self
+            .hot_state
+            .transaction_reader(read, Arc::clone(&self.branch_head_control_cache));
+        let catalog = self
+            .schema_resolver
+            .catalog_for_row_normalization(&hot_state, &staged, domain)
+            .await?;
+        let (_, plan) = catalog.snapshot().plan_for_key(schema_key).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_SCHEMA_DEFINITION,
+                format!("typed row schema '{schema_key}' is not available"),
+            )
+        })?;
+        Ok(Some(Arc::clone(&plan.schema)))
+    }
+
+    fn staged_schema_plan(
+        &self,
+        domain: &Domain,
+        schema_key: &str,
+    ) -> Option<&crate::catalog::SchemaPlan> {
+        self.schema_resolver.cached_schema_plan(domain, schema_key)
+    }
+
     fn tracked_schema_catalog_snapshot(&self) -> Option<Arc<CatalogSnapshot>> {
         Some(Arc::clone(&self.tracked_schema_snapshot))
     }
@@ -17152,7 +17230,9 @@ fallback={large_fallback} decoded={large_decoded}"
         let (_, _, _, runtime, mut transaction) = open_test_transaction(&storage).await;
         let request = FilesystemPathIndexRequest::new(vec![GLOBAL_BRANCH_ID.to_owned()]);
         let shared = transaction.filesystem_path_index(&request).await.unwrap();
-        transaction.filesystem_path_index_epoch.store(1, Ordering::SeqCst);
+        transaction
+            .filesystem_path_index_epoch
+            .store(1, Ordering::SeqCst);
         let private = transaction.filesystem_path_index(&request).await.unwrap();
         assert!(!Arc::ptr_eq(&shared, &private));
         let drained = transaction.staged_writes.drain().unwrap();
@@ -17163,7 +17243,9 @@ fallback={large_fallback} decoded={large_decoded}"
         assert_eq!(transaction_path_index_build_stats().builds, 0);
         // Replay can reuse epoch one. Its private index must not alias the
         // pre-drain overlay retained under that same revision/epoch key.
-        transaction.filesystem_path_index_epoch.store(1, Ordering::SeqCst);
+        transaction
+            .filesystem_path_index_epoch
+            .store(1, Ordering::SeqCst);
         let replay_private = transaction.filesystem_path_index(&request).await.unwrap();
         assert!(!Arc::ptr_eq(&private, &replay_private));
         assert_eq!(transaction_path_index_build_stats().builds, 1);
@@ -17182,15 +17264,34 @@ fallback={large_fallback} decoded={large_decoded}"
             let mut drained = transaction.staged_writes.drain().unwrap();
             let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
             drained.state_rows.push_parts_with_change_addressability(
-                SchemaPlanId::for_test(0), PreparedRowFacts::default(),
-                RowPk::single("file-a"), schema.into(), Some("file-a".into()),
-                None, None, None, None, timestamp, timestamp, false,
-                Some(ChangeId::for_test_label("provisional")), true,
-                Some(CommitId::for_test_label("commit")), false, "main".into(),
+                SchemaPlanId::for_test(0),
+                PreparedRowFacts::default(),
+                RowPk::single("file-a"),
+                schema.into(),
+                Some("file-a".into()),
+                None,
+                None,
+                None,
+                None,
+                timestamp,
+                timestamp,
+                false,
+                Some(ChangeId::for_test_label("provisional")),
+                true,
+                Some(CommitId::for_test_label("commit")),
+                false,
+                "main".into(),
             );
-            transaction.filesystem_path_index_epoch.store(3, Ordering::SeqCst);
+            transaction
+                .filesystem_path_index_epoch
+                .store(3, Ordering::SeqCst);
             transaction.reset_drained_content_path_index(&drained);
-            assert_eq!(transaction.filesystem_path_index_epoch.load(Ordering::SeqCst), 3);
+            assert_eq!(
+                transaction
+                    .filesystem_path_index_epoch
+                    .load(Ordering::SeqCst),
+                3
+            );
         }
     }
 
@@ -17199,25 +17300,47 @@ fallback={large_fallback} decoded={large_decoded}"
         for untracked in [false, true] {
             let storage = Memory::new();
             let (_, _, _, _, mut transaction) = open_test_transaction(&storage).await;
-            transaction.stage_rows(raw_write_rows(vec![
-                key_value_stage_row("epoch-guard", "value", untracked),
-            ])).await.unwrap();
+            transaction
+                .stage_rows(raw_write_rows(vec![key_value_stage_row(
+                    "epoch-guard",
+                    "value",
+                    untracked,
+                )]))
+                .await
+                .unwrap();
             let drained = transaction.staged_writes.drain().unwrap();
-            transaction.filesystem_path_index_epoch.store(3, Ordering::SeqCst);
+            transaction
+                .filesystem_path_index_epoch
+                .store(3, Ordering::SeqCst);
             transaction.reset_drained_content_path_index(&drained);
-            assert_eq!(transaction.filesystem_path_index_epoch.load(Ordering::SeqCst), 3);
+            assert_eq!(
+                transaction
+                    .filesystem_path_index_epoch
+                    .load(Ordering::SeqCst),
+                3
+            );
         }
         let storage = Memory::new();
         let (_, _, _, _, mut transaction) = open_test_transaction(&storage).await;
-        transaction.advance_branch_ref(
-            "01960000-0000-7000-8000-0000000000c1",
-            CommitId::for_test_label("epoch-head"),
-        ).await.unwrap();
+        transaction
+            .advance_branch_ref(
+                "01960000-0000-7000-8000-0000000000c1",
+                CommitId::for_test_label("epoch-head"),
+            )
+            .await
+            .unwrap();
         let drained = transaction.staged_writes.drain().unwrap();
-        let epoch = transaction.filesystem_path_index_epoch.load(Ordering::SeqCst);
+        let epoch = transaction
+            .filesystem_path_index_epoch
+            .load(Ordering::SeqCst);
         assert!(epoch > 0);
         transaction.reset_drained_content_path_index(&drained);
-        assert_eq!(transaction.filesystem_path_index_epoch.load(Ordering::SeqCst), epoch);
+        assert_eq!(
+            transaction
+                .filesystem_path_index_epoch
+                .load(Ordering::SeqCst),
+            epoch
+        );
     }
 
     #[tokio::test]

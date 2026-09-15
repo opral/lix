@@ -2325,6 +2325,25 @@ impl TransactionWriteBuffer {
         Ok(())
     }
 
+    pub(crate) fn has_staged_schema_changes(&self) -> Result<bool, LixError> {
+        let rows = self.rows.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        let key = crate::transaction::normalization::REGISTERED_SCHEMA_KEY;
+        Ok(match &*rows {
+            StagedPreparedRows::AppendOnly { rows, .. } => {
+                !ordered_schema_row_range(rows, key).is_empty()
+            }
+            StagedPreparedRows::Indexed { by_candidate, .. } => by_candidate
+                .slots_by_schema
+                .get(key)
+                .is_some_and(|slots| !slots.is_empty()),
+        })
+    }
+
     /// Returns whether this transaction has changed the schema catalog used
     /// by `domain` without promoting the append-only staging journal.
     ///

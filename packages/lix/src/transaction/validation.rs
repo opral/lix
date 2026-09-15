@@ -570,11 +570,11 @@ impl<'a> StagedIndexExtractor<'a> {
 
     fn observe(&mut self, row: PreparedValidationRow<'_>, snapshot: &JsonValue) {
         if row.schema_key() == REGISTERED_SCHEMA_KEY {
-            // A schema registration is the moment a collection's index is
-            // complete for free: no row can exist for a schema that is not
-            // registered yet, so an empty index is a correct index and the
-            // witness costs one key per declared column. The registration
-            // row's `value` column carries the schema document itself.
+            // Registration snapshots nominate columns for a completeness
+            // witness. They also include amendments of existing schemas, so
+            // commit publication must additionally prove the collection was
+            // absent before this transaction. The registration row's `value`
+            // column carries the schema document itself.
             let registered = snapshot.get("value").unwrap_or(snapshot);
             if let Ok(spec) = crate::sql2::derive_schema_surface_spec_from_schema(registered) {
                 for column in &spec.indexed_columns {

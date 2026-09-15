@@ -182,6 +182,24 @@ pub(crate) trait SqlWriteExecutionContext: Send {
     fn schema_catalog_snapshot(&self) -> Option<Arc<crate::catalog::CatalogSnapshot>> {
         None
     }
+    fn has_staged_schema_changes(&self) -> Result<bool, LixError> {
+        Ok(false)
+    }
+    /// Current payload-validation authority, separate from opening SQL binding.
+    async fn staged_schema_document(
+        &mut self,
+        _domain: &crate::domain::Domain,
+        _schema_key: &str,
+    ) -> Result<Option<Arc<JsonValue>>, LixError> {
+        Ok(None)
+    }
+    fn staged_schema_plan(
+        &self,
+        _domain: &crate::domain::Domain,
+        _schema_key: &str,
+    ) -> Option<&crate::catalog::SchemaPlan> {
+        None
+    }
     /// Catalog visible to tracked writes in the active branch.
     ///
     /// SQL binding may also see untracked schema registrations. Certified
@@ -549,6 +567,24 @@ impl SqlWriteContext {
 
     pub(crate) fn session_file_views(&self) -> Option<SessionFileViews> {
         self.shared.session_file_views.clone()
+    }
+
+    pub(crate) async fn staged_schema_document(
+        &self,
+        domain: &crate::domain::Domain,
+        schema_key: &str,
+    ) -> Result<Option<Arc<JsonValue>>, LixError> {
+        let _guard = self.gate.lock().await;
+        self.ensure_context_live("staged_schema_document")?;
+        unsafe {
+            self.ptr
+                .0
+                .as_ptr()
+                .as_mut()
+                .unwrap()
+                .staged_schema_document(domain, schema_key)
+                .await
+        }
     }
 
     pub(crate) async fn scan_hot_state_batch(

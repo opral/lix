@@ -1661,7 +1661,17 @@ fn hot_index_writes_for_commit(
 ) {
     let staged = state_rows.staged_index_values();
     let mut entries = Vec::new();
-    let mut witnesses = staged.registered_collections.clone();
+    // Registration snapshots include amendments and replayed registrations,
+    // which do not prove an empty collection. The parent visibility summary
+    // must also prove absence before we authorize an index for that schema.
+    let mut witnesses = staged
+        .registered_collections
+        .iter()
+        .filter(|(schema_key, _)| {
+            parent_control.is_none_or(|control| !control.may_have_schema(schema_key))
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
     for row in &staged.rows {
         if row.branch_id.as_str() != branch_id {
             continue;

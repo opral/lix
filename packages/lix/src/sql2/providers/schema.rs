@@ -89,17 +89,16 @@ pub(crate) async fn execute_exact_schema_point_read(
         ..Default::default()
     };
     let batch = reader.scan_batch(&request).await?;
-    let decoder = RowProjectionDecoder::new(spec, projected_columns.iter().map(String::as_str))?;
+    let decoder = RowProjectionDecoder::with_schema_amendments(
+        spec,
+        projected_columns.iter().map(String::as_str),
+    )?;
     let column_types = decoder.column_types();
     let rows = batch
         .iter()
         .map(|row| {
             if let Some(typed) = row.decoded_snapshot() {
-                typed.validate_resolved_schema_binding(
-                    row.schema_key(),
-                    &spec.schema_key,
-                    &spec.schema_fingerprint,
-                )?;
+                let typed = decoder.bind_typed_row(typed, row.schema_key(), row.row_pk())?;
                 decoder.decode_typed_public_values(&typed.row)
             } else {
                 decoder.decode_public_values(
@@ -145,7 +144,10 @@ pub(crate) async fn execute_exact_schema_batch_read(
         include_tombstones: false,
     };
     let exact = reader.load_exact_batch(&request).await?;
-    let decoder = RowProjectionDecoder::new(spec, projected_columns.iter().map(String::as_str))?;
+    let decoder = RowProjectionDecoder::with_schema_amendments(
+        spec,
+        projected_columns.iter().map(String::as_str),
+    )?;
     let column_types = decoder.column_types();
     let mut rows = Vec::with_capacity(exact.len());
     for slot in 0..exact.len() {
@@ -153,11 +155,7 @@ pub(crate) async fn execute_exact_schema_batch_read(
             continue;
         };
         rows.push(if let Some(typed) = row.decoded_snapshot() {
-            typed.validate_resolved_schema_binding(
-                row.schema_key(),
-                &spec.schema_key,
-                &spec.schema_fingerprint,
-            )?;
+            let typed = decoder.bind_typed_row(typed, row.schema_key(), row.row_pk())?;
             decoder.decode_typed_public_values(&typed.row)?
         } else {
             decoder
@@ -266,6 +264,7 @@ struct SchemaSpec {
     spec: Arc<SchemaSurfaceSpec>,
     hot_state: Arc<dyn HotStateReader>,
     row_snapshot_reader: Option<Arc<dyn RowSnapshotReader>>,
+    write_ctx: Option<SqlWriteContext>,
     branch_ref: Arc<dyn BranchRefReader>,
     schema: SchemaRef,
     branch_binding: BranchBinding,
@@ -285,6 +284,7 @@ impl SchemaSpec {
             spec,
             hot_state,
             row_snapshot_reader,
+            write_ctx: None,
             branch_ref,
             branch_binding: BranchBinding::active(active_branch_id),
         }
@@ -296,8 +296,10 @@ impl SchemaSpec {
         branch_ref: Arc<dyn BranchRefReader>,
     ) -> Self {
         let active_branch_id = write_ctx.active_branch_id();
-        let hot_state = Arc::new(WriteContextHotStateReader::new(write_ctx));
-        Self::active(spec, hot_state, branch_ref, active_branch_id, None)
+        let hot_state = Arc::new(WriteContextHotStateReader::new(write_ctx.clone()));
+        let mut provider = Self::active(spec, hot_state, branch_ref, active_branch_id, None);
+        provider.write_ctx = Some(write_ctx);
+        provider
     }
 
     /// Plan-time scan derivation shared by `plan_scan` and the unit tests:
@@ -395,12 +397,15 @@ impl SchemaSpec {
             .scan_batch(&request)
             .await
             .map_err(lix_error_to_datafusion_error)?;
-        let batch = row_record_batch(
+        let batch = Box::pin(row_record_batch_with_staged_schemas(
+            Some(write_ctx),
             &self.spec,
             Arc::clone(&self.schema),
-            &rows,
+            rows,
+            &[],
             RowBatchProjection::for_request(&request),
-        )?;
+        ))
+        .await?;
         let mut post_rows = BTreeMap::new();
         for row_index in 0..batch.num_rows() {
             let key = self.returning_key_from_batch(&batch, row_index)?;
@@ -680,6 +685,7 @@ impl TableSpec for SchemaSpec {
         let (schema, request, row_filters) =
             self.plan_scan_parts(projection, filters, limit).await?;
         let batch_projection = RowBatchProjection::for_request(&request);
+        let staged_read_context = self.write_ctx.clone();
         let direct_primary_key_projection =
             direct_primary_key_projection_eligible(&self.spec, &schema, &request, &row_filters);
         let direct_primary_key_reader = direct_primary_key_projection
@@ -691,7 +697,7 @@ impl TableSpec for SchemaSpec {
         let direct_snapshot_decoder = direct_snapshot_reader
             .as_ref()
             .map(|_| {
-                RowProjectionDecoder::new(
+                RowProjectionDecoder::with_schema_amendments(
                     &self.spec,
                     schema.fields().iter().map(|field| field.name().as_str()),
                 )
@@ -744,6 +750,7 @@ impl TableSpec for SchemaSpec {
                     direct_snapshot_reader,
                     direct_snapshot_decoder,
                     direct_primary_key_projection,
+                    staged_read_context,
                 ),
                 |(
                     spec,
@@ -756,6 +763,7 @@ impl TableSpec for SchemaSpec {
                     direct_snapshot_reader,
                     direct_snapshot_decoder,
                     direct_primary_key_projection,
+                    staged_read_context,
                 )| async move {
                     if direct_primary_key_projection
                         && let Some(direct_primary_key_reader) = direct_primary_key_reader.as_ref()
@@ -775,6 +783,17 @@ impl TableSpec for SchemaSpec {
                             .scan_row_snapshots(request.clone())
                             .await
                             .map_err(lix_error_to_datafusion_error)?;
+                        // A certified segment binds its layout to the old
+                        // schema. Re-enter materialization on amendment so
+                        // every row is fully validated under the new schema.
+                        let direct_rows = direct_rows.filter(|rows| match rows {
+                            crate::tracked_state::ExclusiveRowSnapshotBatch::CertifiedNative(
+                                rows,
+                            ) => rows.segments().all(|segment| {
+                                segment.projection().schema_fingerprint() == spec.schema_fingerprint
+                            }),
+                            _ => true,
+                        });
                         if let Some(rows) = direct_rows {
                             record_rows_examined(rows.len());
                             let columns = match rows {
@@ -815,8 +834,15 @@ impl TableSpec for SchemaSpec {
                     // Before `row_filters` run: this is the row count a
                     // predicate without an indexed access path pays for.
                     record_rows_examined(rows.len());
-                    let filtered = apply_row_batch_filters(&spec, rows, &row_filters)?;
-                    row_record_batch(&spec, schema, &filtered.rows, batch_projection)
+                    Box::pin(row_record_batch_with_staged_schemas(
+                        staged_read_context.as_ref(),
+                        &spec,
+                        schema,
+                        rows,
+                        &row_filters,
+                        batch_projection,
+                    ))
+                    .await
                 },
             ),
         })
@@ -1393,8 +1419,43 @@ fn row_columnar_overlay_batches(
     rows: &[crate::hot_state::RowColumnarOverlayRow],
     row_filters: &[RowFilter],
 ) -> Result<Vec<RecordBatch>> {
+    let decoder = RowProjectionDecoder::with_schema_amendments(
+        spec,
+        schema.fields().iter().map(|field| field.name().as_str()),
+    )
+    .map_err(row_projection_error_to_datafusion_error)?;
+    let bound_rows = rows
+        .iter()
+        .map(|row| {
+            if row.deleted {
+                return Ok(None);
+            }
+            if let Some(typed) = row.decoded_snapshot.as_deref() {
+                return decoder
+                    .bind_typed_row(typed, &spec.schema_key, &row.row_pk)
+                    .map(Some)
+                    .map_err(lix_error_to_datafusion_error);
+            }
+            if !row_filters.is_empty()
+                && let Some(payload) = row.raw_snapshot.as_deref()
+            {
+                let typed = WasmTypedRow::decode_durable_payload(
+                    Arc::from(payload),
+                    &spec.schema_key,
+                    &row.row_pk,
+                )
+                .map_err(lix_error_to_datafusion_error)?;
+                let bound = decoder
+                    .bind_typed_row(&typed, &spec.schema_key, &row.row_pk)
+                    .map_err(lix_error_to_datafusion_error)?
+                    .into_owned();
+                return Ok(Some(std::borrow::Cow::Owned(bound)));
+            }
+            Ok(None)
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut snapshots = Vec::new();
-    for row in rows {
+    for (row, bound) in rows.iter().zip(&bound_rows) {
         if row.deleted {
             continue;
         }
@@ -1407,20 +1468,7 @@ fn row_columnar_overlay_batches(
             ));
         }
         if !row_filters.is_empty() {
-            let decoded_raw;
-            let typed = if let Some(typed) = row.decoded_snapshot.as_deref() {
-                Some(typed)
-            } else if let Some(payload) = row.raw_snapshot.as_deref() {
-                decoded_raw = WasmTypedRow::decode_durable_payload(
-                    Arc::from(payload),
-                    &spec.schema_key,
-                    &row.row_pk,
-                )
-                .map_err(lix_error_to_datafusion_error)?;
-                Some(&decoded_raw)
-            } else {
-                None
-            };
+            let typed = bound.as_deref();
             let matches = if let Some(typed) = typed {
                 row_filters.iter().try_fold(true, |matches, filter| {
                     Ok::<_, DataFusionError>(
@@ -1451,16 +1499,15 @@ fn row_columnar_overlay_batches(
         }
         snapshots.push((
             row.snapshot_content.as_deref(),
-            row.decoded_snapshot.as_deref().map(|typed| &typed.row),
-            row.raw_snapshot.as_deref(),
+            bound.as_deref().map(|typed| &typed.row),
+            if bound.is_some() {
+                None
+            } else {
+                row.raw_snapshot.as_deref()
+            },
             &row.row_pk,
         ));
     }
-    let decoder = RowProjectionDecoder::new(
-        spec,
-        schema.fields().iter().map(|field| field.name().as_str()),
-    )
-    .map_err(row_projection_error_to_datafusion_error)?;
     snapshots
         .chunks(crate::columnar_row_group::ROW_GROUP_MAX_ROWS)
         .map(|snapshots| {
@@ -1471,7 +1518,9 @@ fn row_columnar_overlay_batches(
                         .map(|row| (row.2.expect("raw payload checked above"), row.3)),
                 )
             } else {
-                decoder.decode_mixed_arrow_columns(snapshots.iter().map(|row| (row.0, row.1)))
+                decoder.decode_mixed_durable_arrow_columns(
+                    snapshots.iter().map(|row| (row.2, row.0, row.1, row.3)),
+                )
             }
             .map_err(row_projection_error_to_datafusion_error)?;
             RecordBatch::try_new(Arc::clone(&schema), columns).map_err(DataFusionError::from)
@@ -3251,6 +3300,118 @@ fn apply_row_filters(rows: &mut Vec<MaterializedHotStateRow>, filters: &[RowFilt
     Ok(())
 }
 
+/// Rebind only rows whose custom schema certificate was revoked. The
+/// common matching-fingerprint path retains its original compact batch.
+pub(crate) fn revalidate_schema_amended_rows(
+    spec: &SchemaSurfaceSpec,
+    rows: &MaterializedHotStateBatch,
+) -> Result<Option<MaterializedHotStateBatch>> {
+    if crate::catalog::CatalogSnapshot::builtin()
+        .plan_for_key(&spec.schema_key)
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let needs_revalidation = |row: crate::hot_state::MaterializedHotStateRowRef<'_>| {
+        if row.deleted() {
+            return false;
+        }
+        if let Some(typed) = row.decoded_snapshot() {
+            return typed.schema_fingerprint != spec.schema_fingerprint;
+        }
+        row.raw_snapshot().is_some_and(|bytes| {
+            matches!(
+                bytes.first().copied(),
+                Some(
+                    crate::plugin::wire::typed::NATIVE_ROW_PAYLOAD_VERSION
+                        | crate::plugin::wire::typed::STORAGE_ROW_PAYLOAD_VERSION
+                )
+            ) && bytes
+                .get(1..33)
+                .is_some_and(|fingerprint| fingerprint != spec.schema_fingerprint)
+        })
+    };
+    if !rows.iter().any(needs_revalidation) {
+        return Ok(None);
+    }
+    let decoder = RowProjectionDecoder::with_schema_amendments(spec, std::iter::empty())
+        .map_err(lix_error_to_datafusion_error)?;
+    let mut builder = crate::hot_state::MaterializedHotStateBatchBuilder::with_capacity(rows.len());
+    for row in rows.iter() {
+        let slot = builder.push_ref(row, None);
+        if needs_revalidation(row) {
+            let typed = row
+                .materialize_decoded_snapshot()
+                .map_err(lix_error_to_datafusion_error)?
+                .expect("typed payload was checked");
+            let bound = decoder
+                .bind_typed_row(&typed, row.schema_key(), row.row_pk())
+                .map_err(lix_error_to_datafusion_error)?;
+            builder.set_decoded_snapshot(slot, Some(Arc::new(bound.into_owned())));
+            builder.set_raw_snapshot(slot, None);
+        }
+    }
+    Ok(Some(builder.finish()))
+}
+
+/// SQL binds column names at transaction open, while staged amendments govern
+/// validation of newer row images. Retain the opening output schema, but use
+/// each row domain's authoritative staged schema before filtering/projecting.
+async fn row_record_batch_with_staged_schemas(
+    write_ctx: Option<&SqlWriteContext>,
+    opening_spec: &SchemaSurfaceSpec,
+    output_schema: SchemaRef,
+    rows: MaterializedHotStateBatch,
+    filters: &[RowFilter],
+    projection: RowBatchProjection,
+) -> Result<RecordBatch> {
+    let differs_from_opening = write_ctx.is_some()
+        && rows.iter().any(|row| {
+            row.decoded_snapshot()
+                .is_some_and(|typed| typed.schema_fingerprint != opening_spec.schema_fingerprint)
+                || row.raw_snapshot().is_some_and(|bytes| {
+                    bytes
+                        .get(1..33)
+                        .is_some_and(|fingerprint| fingerprint != opening_spec.schema_fingerprint)
+                })
+        });
+    let Some(write_ctx) = write_ctx.filter(|_| differs_from_opening) else {
+        let filtered = apply_row_batch_filters(opening_spec, rows, filters)?;
+        return row_record_batch(opening_spec, output_schema, &filtered.rows, projection);
+    };
+    let mut groups =
+        BTreeMap::<crate::domain::Domain, crate::hot_state::MaterializedHotStateBatchBuilder>::new(
+        );
+    for row in rows.iter() {
+        groups
+            .entry(crate::domain::Domain::for_live_row_ref(row).schema_catalog_domain())
+            .or_insert_with(|| crate::hot_state::MaterializedHotStateBatchBuilder::with_capacity(0))
+            .push_ref(row, None);
+    }
+    let mut batches = Vec::with_capacity(groups.len());
+    for (domain, builder) in groups {
+        let document = write_ctx
+            .staged_schema_document(&domain, &opening_spec.schema_key)
+            .await
+            .map_err(lix_error_to_datafusion_error)?;
+        let validation_spec = document
+            .as_deref()
+            .map(crate::sql2::derive_schema_surface_spec_from_schema)
+            .transpose()
+            .map_err(lix_error_to_datafusion_error)?;
+        let validation_spec = validation_spec.as_ref().unwrap_or(opening_spec);
+        let filtered = apply_row_batch_filters(validation_spec, builder.finish(), filters)?;
+        batches.push(row_record_batch(
+            validation_spec,
+            Arc::clone(&output_schema),
+            &filtered.rows,
+            projection,
+        )?);
+    }
+    datafusion::arrow::compute::concat_batches(&output_schema, &batches)
+        .map_err(DataFusionError::from)
+}
+
 fn validate_typed_row_schema_binding(
     spec: &SchemaSurfaceSpec,
     stored_schema_key: &str,
@@ -3286,6 +3447,7 @@ fn apply_row_batch_filters(
     // a deletion slot so later layers can reconcile it; compact those slots
     // before Arrow projection even when the SQL query has no predicate.
     let rows = rows.filter(|row| !row.deleted(), None);
+    let rows = revalidate_schema_amended_rows(spec, &rows)?.unwrap_or(rows);
     if filters.is_empty() {
         validate_typed_row_schema_bindings(spec, &rows)?;
         return Ok(FilteredRowBatch { rows });
@@ -3541,6 +3703,8 @@ pub(super) fn row_record_batch(
     rows: &MaterializedHotStateBatch,
     projection: RowBatchProjection,
 ) -> Result<RecordBatch> {
+    let rebound = revalidate_schema_amended_rows(spec, rows)?;
+    let rows = rebound.as_ref().unwrap_or(rows);
     validate_typed_row_schema_bindings(spec, rows)?;
     if schema.fields().is_empty() {
         let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
@@ -3581,7 +3745,7 @@ fn row_record_batch_from_native_payloads(
     schema: SchemaRef,
     rows: &MaterializedHotStateBatch,
 ) -> Result<RecordBatch> {
-    let decoder = RowProjectionDecoder::new(
+    let decoder = RowProjectionDecoder::with_schema_amendments(
         spec,
         schema.fields().iter().filter_map(|field| {
             (!field.name().starts_with("lixcol_")).then_some(field.name().as_str())
@@ -3624,7 +3788,7 @@ fn row_record_batch_from_mixed_payloads(
     schema: SchemaRef,
     rows: &MaterializedHotStateBatch,
 ) -> Result<RecordBatch> {
-    let decoder = RowProjectionDecoder::new(
+    let decoder = RowProjectionDecoder::with_schema_amendments(
         spec,
         schema.fields().iter().filter_map(|field| {
             (!field.name().starts_with("lixcol_")).then_some(field.name().as_str())
@@ -3726,7 +3890,7 @@ fn row_record_batch_from_snapshots(
                 }
             }
         }
-        let decoder = RowProjectionDecoder::new(
+        let decoder = RowProjectionDecoder::with_schema_amendments(
             spec,
             schema.fields().iter().filter_map(|field| {
                 (!field.name().starts_with("lixcol_")).then_some(field.name().as_str())
@@ -3791,7 +3955,7 @@ fn row_record_batch_from_raw_projection(
     schema: SchemaRef,
     rows: &MaterializedHotStateBatch,
 ) -> Result<RecordBatch> {
-    let decoder = RowProjectionDecoder::new(
+    let decoder = RowProjectionDecoder::with_schema_amendments(
         spec,
         schema.fields().iter().filter_map(|field| {
             (!field.name().starts_with("lixcol_")).then_some(field.name().as_str())
@@ -3918,7 +4082,7 @@ fn row_timestamptz_value(
 /// Identity dictionaries and payload arenas remain owned by the live-state
 /// batch until Arrow has copied the selected values into its output buffers;
 /// no terminal row DTOs are manufactured on this path.
-fn row_system_column_array(
+pub(super) fn row_system_column_array(
     column_name: &str,
     rows: &MaterializedHotStateBatch,
 ) -> Result<ArrayRef> {
@@ -4852,47 +5016,151 @@ mod tests {
     }
 
     #[test]
-    fn raw_typed_row_filters_reject_stale_schema_fingerprint() {
+    fn custom_row_fingerprint_mismatch_revalidates_before_filter_and_projection() {
         let spec = typed_binding_test_spec();
         let mut stale = spec.schema_fingerprint;
         stale[0] ^= 0xff;
-        let rows = raw_typed_binding_test_batch(stale);
-        let filter = super::RowFilter::ColumnEq {
-            column: "body".to_owned(),
-            column_type: SchemaColumnType::String,
-            value: super::RowFilterValue::String("other".to_owned()),
-        };
-        let result = super::apply_row_batch_filters(&spec, rows, &[filter]);
-        let error = result
-            .err()
-            .expect("invalid binding must fail even for a nonmatching row");
-        assert!(
-            error
-                .to_string()
-                .contains("does not match the resolved schema")
-        );
+        for raw in [false, true] {
+            let rows = if raw {
+                raw_typed_binding_test_batch(stale)
+            } else {
+                typed_binding_test_batch(&spec.schema_key, stale)
+            };
+            let filtered = super::apply_row_batch_filters(
+                &spec,
+                rows,
+                &[super::RowFilter::ColumnEq {
+                    column: "body".to_owned(),
+                    column_type: SchemaColumnType::String,
+                    value: super::RowFilterValue::String("hello".to_owned()),
+                }],
+            )
+            .expect("a stale certificate takes full row validation");
+            assert_eq!(filtered.rows.len(), 1);
+            let projected = row_record_batch(
+                &spec,
+                schema_surface_schema(&spec, SchemaSurfaceShape::Active),
+                &filtered.rows,
+                super::RowBatchProjection::ParsedSnapshots,
+            )
+            .expect("fully revalidated custom row projects");
+            assert_eq!(projected.num_rows(), 1);
+        }
     }
 
     #[test]
-    fn sql_projection_rejects_stale_durable_typed_fingerprint() {
+    fn amended_schema_fallback_rejects_invalid_values_fields_and_identity() {
         let spec = typed_binding_test_spec();
         let mut stale = spec.schema_fingerprint;
         stale[0] ^= 0xff;
-        let rows = typed_binding_test_batch(&spec.schema_key, stale);
+        for corruption in ["type", "unknown", "field_pk", "envelope_pk", "schema"] {
+            let source = typed_binding_test_batch(&spec.schema_key, stale);
+            let mut typed = source.row(0).decoded_snapshot().unwrap().as_ref().clone();
+            match corruption {
+                "type" => {
+                    typed.row.insert("body", lix_schema::Value::Int8(1));
+                }
+                "unknown" => {
+                    typed
+                        .row
+                        .insert("extra", lix_schema::Value::Text("bad".into()));
+                }
+                "field_pk" => {
+                    typed
+                        .row
+                        .insert("id", lix_schema::Value::Text("other".into()));
+                }
+                "envelope_pk" => {
+                    typed.row_pk = vec![lix_schema::Value::Text("other".into())].into();
+                }
+                "schema" => {}
+                _ => unreachable!(),
+            }
+            let mut builder = crate::hot_state::MaterializedHotStateBatchBuilder::with_capacity(1);
+            if corruption == "schema" {
+                let mut owned = source.row(0).to_owned();
+                owned.schema_key = "other_schema".into();
+                builder.push_owned(owned);
+            } else {
+                builder.push_ref(source.row(0), None);
+            }
+            builder.set_decoded_snapshot(0, Some(Arc::new(typed)));
+            let error = super::apply_row_batch_filters(
+                &spec,
+                builder.finish(),
+                &[super::RowFilter::ColumnEq {
+                    column: "body".to_owned(),
+                    column_type: SchemaColumnType::String,
+                    value: super::RowFilterValue::String("nonmatching".to_owned()),
+                }],
+            )
+            .err()
+            .expect("corruption must fail before a filter can hide it");
+            assert!(!error.to_string().is_empty(), "{corruption}");
+        }
+    }
 
-        let error = row_record_batch(
-            &spec,
-            schema_surface_schema(&spec, SchemaSurfaceShape::Active),
-            &rows,
-            super::RowBatchProjection::ParsedSnapshots,
-        )
-        .expect_err("stale durable fingerprint must fail before SQL projection");
-
-        assert!(
-            error
-                .to_string()
-                .contains("does not match the resolved schema")
-        );
+    #[test]
+    fn columnar_overlay_preserves_mixed_native_payloads_after_amendment() {
+        use datafusion::arrow::array::Array;
+        let spec = typed_binding_test_spec();
+        for amended in [false, true] {
+            let mut fingerprint = spec.schema_fingerprint;
+            if amended {
+                fingerprint[0] ^= 0xff;
+            }
+            let source = typed_binding_test_batch(&spec.schema_key, fingerprint);
+            let typed = source.row(0).decoded_snapshot().unwrap();
+            let mut raw = typed.as_ref().clone();
+            raw.row_pk = vec![lix_schema::Value::Text("row-2".into())].into();
+            raw.row
+                .insert("id", lix_schema::Value::Text("row-2".into()));
+            raw.invalidate_durable_payload();
+            let overlays = [
+                crate::hot_state::RowColumnarOverlayRow {
+                    row_pk: TestRowPk::single("row-1"),
+                    snapshot_content: None,
+                    decoded_snapshot: Some(Arc::clone(typed)),
+                    raw_snapshot: None,
+                    deleted: false,
+                    columnar_base_coordinate: None,
+                },
+                crate::hot_state::RowColumnarOverlayRow {
+                    row_pk: TestRowPk::single("row-2"),
+                    snapshot_content: None,
+                    decoded_snapshot: None,
+                    raw_snapshot: Some(Bytes::copy_from_slice(&raw.durable_payload().unwrap())),
+                    deleted: false,
+                    columnar_base_coordinate: None,
+                },
+            ];
+            let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, false)]));
+            for filters in [
+                vec![],
+                vec![super::RowFilter::ColumnEq {
+                    column: "body".into(),
+                    column_type: SchemaColumnType::String,
+                    value: super::RowFilterValue::String("hello".into()),
+                }],
+            ] {
+                let batches = super::row_columnar_overlay_batches(
+                    &spec,
+                    Arc::clone(&schema),
+                    &overlays,
+                    &filters,
+                )
+                .unwrap();
+                let body = batches[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                assert_eq!(body.len(), 2);
+                assert_eq!(body.null_count(), 0);
+                assert_eq!(body.value(0), "hello");
+                assert_eq!(body.value(1), "hello");
+            }
+        }
     }
 
     #[test]
