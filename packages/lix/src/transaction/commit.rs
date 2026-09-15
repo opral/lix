@@ -4495,6 +4495,19 @@ async fn stage_tracked_head(
             None
         };
         if let Some((generation, schemas)) = packed_publication {
+            // Packed publication keeps the current generation's completeness
+            // witnesses. Publish its indexed values before this early return,
+            // just as the row-by-row route does below; otherwise readers trust
+            // an index that silently omits the newly published rows.
+            stage_hot_index_writes_for_commit(
+                read,
+                writes,
+                state_rows,
+                &root.branch_id,
+                generation,
+                parent_control.as_ref(),
+            )
+            .await?;
             if let Some(epoch) = working_diff_epoch {
                 let next_epoch = TrackedWorkingDiffEpoch {
                     checkpoint_commit_id: epoch.checkpoint_commit_id,

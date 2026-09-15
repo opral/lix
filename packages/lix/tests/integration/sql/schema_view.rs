@@ -627,3 +627,230 @@ fn explain_plan_text(result: &ExecuteResult) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+// https://github.com/opral/inlang/issues/4417
+// Deterministic mode adds an untracked sequence write, which prevents the
+// tracked-only packed publication route this regression needs to exercise.
+simulation_test!(
+    small_import_preserves_foreign_key_filters_and_nested_joins,
+    options = crate::support::simulation_test::engine::SimulationOptions {
+        deterministic: false
+    },
+    |sim| async move { assert_import_indexes(&sim, 34).await }
+);
+
+simulation_test!(
+    packed_import_preserves_foreign_key_filters_and_nested_joins,
+    options = crate::support::simulation_test::engine::SimulationOptions {
+        deterministic: false
+    },
+    |sim| async move { assert_import_indexes(&sim, 35).await }
+);
+
+async fn assert_import_indexes(
+    sim: &crate::support::simulation_test::engine::Simulation,
+    bundle_count: usize,
+) {
+    // 34 * (1 + 7 + 7) = 510 rows; 35 * 15 = 525 crosses the
+    // packed-current-base publication threshold in a single commit.
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    for (key, columns, foreign_keys) in [
+        (
+            "bundle",
+            serde_json::json!([
+                {"name":"id","type":"text","nullable":false}
+            ]),
+            serde_json::json!([]),
+        ),
+        (
+            "message",
+            serde_json::json!([
+                {"name":"id","type":"text","nullable":false},
+                {"name":"bundle_id","type":"text","nullable":false}
+            ]),
+            serde_json::json!([
+                {"columns":["bundle_id"],"references":{"schema_key":"bundle","columns":["id"]}}
+            ]),
+        ),
+        (
+            "variant",
+            serde_json::json!([
+                {"name":"id","type":"text","nullable":false},
+                {"name":"message_id","type":"text","nullable":false},
+                {"name":"pattern","type":"text","nullable":false}
+            ]),
+            serde_json::json!([
+                {"columns":["message_id"],"references":{"schema_key":"message","columns":["id"]}}
+            ]),
+        ),
+    ] {
+        let schema = serde_json::json!({
+            "$schema":"https://lix.dev/schema-v1.json",
+            "key":key,"columns":columns,"primary_key":["id"],"foreign_keys":foreign_keys
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+    }
+    let mut bundles = Vec::new();
+    let mut messages = Vec::new();
+    let mut variants = Vec::new();
+    let mut expected = Vec::new();
+    for bundle in 0..bundle_count {
+        let bundle_id = format!("b{bundle:02}");
+        bundles.push(format!("('{bundle_id}')"));
+        for locale in 0..7 {
+            let message_id = format!("{bundle_id}_m{locale}");
+            let variant_id = format!("{message_id}_v");
+            messages.push(format!("('{message_id}','{bundle_id}')"));
+            variants.push(format!(
+                "('{variant_id}','{message_id}','Translated {message_id}')"
+            ));
+            expected.push(vec![
+                Value::Text(bundle_id.clone()),
+                Value::Text(message_id.clone()),
+                Value::Text(variant_id),
+                Value::Text(format!("Translated {message_id}")),
+            ]);
+        }
+    }
+    let mut tx = session.begin_transaction().await.unwrap();
+    for (table, columns, values) in [
+        ("bundle", "id", bundles),
+        ("message", "id,bundle_id", messages),
+        ("variant", "id,message_id,pattern", variants),
+    ] {
+        tx.execute(
+            &format!(
+                "INSERT INTO {table} ({columns}) VALUES {}",
+                values.join(",")
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    let scan = session
+        .execute(
+            "SELECT id FROM message WHERE concat(bundle_id, '') = 'b00' ORDER BY id",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(scan.len(), 7);
+    let indexed = session
+        .execute(
+            "SELECT id FROM message WHERE bundle_id = 'b00' ORDER BY id",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_rows_eq(
+        indexed,
+        scan.rows().iter().map(|r| r.values().to_vec()).collect(),
+    );
+    let nested = session
+        .execute(
+            "SELECT b.id, m.id, v.id, v.pattern FROM bundle b \
+         LEFT JOIN message m ON m.bundle_id = b.id \
+         LEFT JOIN variant v ON v.message_id = m.id ORDER BY b.id, m.id, v.id",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_rows_eq(nested, expected);
+}
+
+simulation_test!(
+    packed_writes_preserve_unique_column_index,
+    options = crate::support::simulation_test::engine::SimulationOptions {
+        deterministic: false
+    },
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        let schema = serde_json::json!({
+            "$schema":"https://lix.dev/schema-v1.json", "key":"indexed_note",
+            "columns":[
+                {"name":"id","type":"text","nullable":false},
+                {"name":"label","type":"text","nullable":false}
+            ],
+            "primary_key":["id"], "unique":[["label"]]
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+        // Seed the same generation's index before the packed append.
+        session
+            .execute(
+                "INSERT INTO indexed_note (id, label) VALUES ('seed', 'seed')",
+                &[],
+            )
+            .await
+            .unwrap();
+        let values = (0..512)
+            .map(|i| format!("('n{i:03}', 'label{i:03}')"))
+            .collect::<Vec<_>>();
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO indexed_note (id, label) VALUES {}",
+                    values.join(",")
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        for label in ["seed", "label000", "label511"] {
+            let result = session
+                .execute(
+                    "SELECT id FROM indexed_note WHERE label = $1",
+                    &[Value::Text(label.into())],
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.len(), 1, "packed append must index {label}");
+        }
+        let duplicate = session
+            .execute(
+                "INSERT INTO indexed_note (id, label) VALUES ('duplicate', 'label000')",
+                &[],
+            )
+            .await
+            .expect_err("packed rows must still enforce unique constraints");
+        assert_eq!(duplicate.code, lix::LixError::CODE_UNIQUE);
+        session
+            .execute("UPDATE indexed_note SET label = concat('new_', label)", &[])
+            .await
+            .unwrap();
+        for label in ["new_seed", "new_label000", "new_label511"] {
+            let result = session
+                .execute(
+                    "SELECT id FROM indexed_note WHERE label = $1",
+                    &[Value::Text(label.into())],
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.len(), 1, "packed replacement must index {label}");
+        }
+        assert_eq!(
+            session
+                .execute("SELECT id FROM indexed_note WHERE label = 'label000'", &[])
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+);
