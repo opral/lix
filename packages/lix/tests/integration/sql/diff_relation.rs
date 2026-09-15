@@ -958,6 +958,26 @@ simulation_test!(
                 .unwrap()
                 .unwrap()
                 .to_string();
+            // Snapshot absence is no row, while a present empty file retains its
+            // zero-length bytes. Each diff side must agree with that same read.
+            for (commit, content) in [(&before, &old), (&after, &new)] {
+                let expected = if *content == Value::Null {
+                    Vec::new()
+                } else {
+                    vec![vec![content.clone()]]
+                };
+                assert_eq!(
+                    select_rows(
+                        &session,
+                        &format!(
+                            "SELECT content FROM lix_as_of('lix_file', '{commit}') WHERE id='{id}'"
+                        ),
+                    )
+                    .await,
+                    expected,
+                    "snapshot and diff content must agree at {commit}",
+                );
+            }
             for source in [
                 format!("lix_diff('lix_file', '{before}', '{after}')"),
                 format!("lix_history('lix_file', '{after}')"),

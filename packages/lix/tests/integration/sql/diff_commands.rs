@@ -610,3 +610,46 @@ simulation_test!(
         );
     }
 );
+
+
+simulation_test!(
+    diff_commands_apply_resolves_scalar_subquery_endpoints_once,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
+            &engine,
+        );
+        session.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('subquery-apply', 'original')",
+            &[],
+        ).await.expect("insert should succeed");
+        let source_head = engine.load_branch_head_commit_id(sim.main_branch_id())
+            .await.expect("head loads").expect("head exists").to_string();
+        session.execute(
+            "INSERT INTO lix_revert (row_ref) SELECT row_ref FROM lix_diff('lix_key_value') WHERE key = 'subquery-apply'",
+            &[],
+        ).await.expect("revert removes the selected value");
+
+        let applied = session.execute(
+            "INSERT INTO lix_apply (row_ref) \
+             WITH endpoint AS (SELECT $1::text AS commit_id) \
+             SELECT row_ref FROM lix_diff('lix_key_value', \
+               (SELECT lix_root_commit_id()), (SELECT commit_id FROM endpoint)) \
+             WHERE key = 'subquery-apply'",
+            &[Value::Text(source_head.clone())],
+        ).await.expect("apply uses the endpoints resolved for the selected rows");
+        assert_eq!(applied.rows_affected(), 1);
+        assert_eq!(select_rows(&session,
+            "SELECT value FROM lix_key_value WHERE key = 'subquery-apply'").await,
+            vec![vec![Value::Jsonb(serde_json::json!("original").into())]]);
+
+        let empty = session.execute(
+            "INSERT INTO lix_apply (row_ref) SELECT row_ref \
+             FROM lix_diff('lix_key_value', (SELECT lix_root_commit_id()), (SELECT $1::text)) \
+             WHERE key = 'absent-subquery-apply'",
+            &[Value::Text(source_head)],
+        ).await.expect("empty selection with resolved endpoints remains a no-op");
+        assert_eq!(empty.rows_affected(), 0);
+    }
+);

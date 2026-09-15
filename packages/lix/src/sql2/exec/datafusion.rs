@@ -447,7 +447,7 @@ async fn create_logical_plan_in_session_from_parsed(
         }));
     }
     bind_table_function_parameters(&mut statement, params)?;
-    let plan = create_logical_plan_from_statement(session.context(), statement).await?;
+    let plan = create_logical_plan_from_statement(session.context(), statement, params).await?;
     validate_supported_logical_plan(&plan)?;
     validate_json_predicates_in_logical_plan(&plan)?;
     let json_predicate_params = json_predicate_params_in_logical_plan(&plan);
@@ -637,12 +637,12 @@ pub(crate) async fn execute_transaction_read_statement_from_parsed(
     sql: &str,
     statement: DataFusionStatement,
     params: &[Value],
-) -> Result<SqlQueryResult, LixError> {
+) -> Result<(SqlQueryResult, DataFusionStatement), LixError> {
     write_ctx.ensure_statement_allowed_after_restore()?;
     // Same fence as session reads, with the transaction overlay available
     // during planning/execution but not returned to the caller.
     let planning_environment = read_ctx.sql_planning_environment().await?;
-    let (plan, session) = create_transaction_read_logical_plan_from_parsed(
+    let (plan, session, resolved_statement) = create_transaction_read_logical_plan_from_parsed(
         read_ctx, write_ctx, sql, statement, params,
     )
     .await?;
@@ -652,7 +652,7 @@ pub(crate) async fn execute_transaction_read_statement_from_parsed(
     if let Some((cache, _)) = planning_environment {
         cache.recycle_datafusion_read_session(session);
     }
-    result
+    result.map(|result| (result, resolved_statement))
 }
 
 async fn create_transaction_read_logical_plan_from_parsed(
@@ -661,14 +661,21 @@ async fn create_transaction_read_logical_plan_from_parsed(
     sql: &str,
     mut statement: DataFusionStatement,
     params: &[Value],
-) -> Result<(SqlLogicalPlan, PooledReadSession), LixError> {
+) -> Result<(SqlLogicalPlan, PooledReadSession, DataFusionStatement), LixError> {
     crate::sql2::bind_read_statement(sql, &statement)?;
     let parameter_names = statement_parameter_names(&statement)?;
     let expected_parameter_count = expected_positional_parameter_count(&parameter_names)?;
     validate_parameter_count_values(expected_parameter_count, &parameter_names, params.len())?;
     bind_table_function_parameters(&mut statement, params)?;
     let session = build_transaction_read_session(read_ctx, write_ctx, &statement).await?;
-    let plan = create_logical_plan_from_statement(session.context(), statement).await?;
+    Box::pin(resolve_temporal_subquery_arguments(
+        session.context(),
+        &mut statement,
+        params,
+    ))
+    .await?;
+    let plan =
+        create_logical_plan_from_statement(session.context(), statement.clone(), params).await?;
     validate_supported_logical_plan(&plan)?;
     validate_json_predicates_in_logical_plan(&plan)?;
     let json_predicate_params = json_predicate_params_in_logical_plan(&plan);
@@ -683,18 +690,235 @@ async fn create_transaction_read_logical_plan_from_parsed(
             physical_planning_cache: None,
         }),
         session,
+        statement,
     ))
 }
 
 async fn create_logical_plan_from_statement(
     session: &SessionContext,
-    statement: DataFusionStatement,
+    mut statement: DataFusionStatement,
+    params: &[Value],
 ) -> Result<LogicalPlan, LixError> {
+    // Endpoint evaluation includes a complete read execution. Keep that future
+    // off the enclosing read/write futures' stacks, including ordinary queries
+    // that do not contain temporal arguments.
+    Box::pin(resolve_temporal_subquery_arguments(
+        session,
+        &mut statement,
+        params,
+    ))
+    .await?;
     session
         .state()
         .statement_to_plan(statement)
         .await
         .map_err(datafusion_error_to_lix_error)
+}
+
+/// Table providers need concrete endpoints while planning their schemas. Resolve
+/// scalar-subquery arguments against the statement's existing read session before
+/// invoking DataFusion's synchronous table-function registry. Never cache these
+/// resolved values: table-function statements already bypass the plan cache.
+async fn resolve_temporal_subquery_arguments(
+    session: &SessionContext,
+    statement: &mut DataFusionStatement,
+    params: &[Value],
+) -> Result<(), LixError> {
+    use datafusion::sql::sqlparser::ast::{Query, With};
+
+    struct SubqueryFinder;
+    impl Visitor for SubqueryFinder {
+        type Break = ();
+        fn pre_visit_expr(&mut self, expr: &SqlExpr) -> ControlFlow<()> {
+            if matches!(expr, SqlExpr::Subquery(_)) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+    }
+
+    // Each scope remembers CTE query addresses to distinguish a definition from
+    // the query body: a nonrecursive CTE can see earlier siblings, not itself or
+    // later siblings. Nested WITH scopes retain the normal SQL planner behavior.
+    struct Scope {
+        with: Option<With>,
+        cte_queries: Vec<usize>,
+        visible: Vec<With>,
+    }
+    struct ArgumentVisitor {
+        scopes: Vec<Scope>,
+        replacement: Option<SqlExpr>,
+    }
+    impl VisitorMut for ArgumentVisitor {
+        type Break = Box<(SqlExpr, Vec<With>)>;
+        fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+            let mut visible = self
+                .scopes
+                .last()
+                .map(|s| s.visible.clone())
+                .unwrap_or_default();
+            if let Some(parent) = self.scopes.last()
+                && let Some(with) = &parent.with
+                && let Some(index) = parent
+                    .cte_queries
+                    .iter()
+                    .position(|address| *address == std::ptr::from_ref(&*query).addr())
+            {
+                visible.pop();
+                let mut preceding = with.clone();
+                preceding.cte_tables.truncate(index);
+                if !preceding.cte_tables.is_empty() {
+                    visible.push(preceding);
+                }
+            }
+            if let Some(with) = &query.with {
+                visible.push(with.clone());
+            }
+            self.scopes.push(Scope {
+                with: query.with.clone(),
+                cte_queries: query
+                    .with
+                    .as_ref()
+                    .map(|with| {
+                        with.cte_tables
+                            .iter()
+                            .map(|cte| std::ptr::from_ref(cte.query.as_ref()).addr())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                visible,
+            });
+            ControlFlow::Continue(())
+        }
+        fn post_visit_query(&mut self, _: &mut Query) -> ControlFlow<Self::Break> {
+            self.scopes.pop();
+            ControlFlow::Continue(())
+        }
+        fn post_visit_table_factor(
+            &mut self,
+            factor: &mut TableFactor,
+        ) -> ControlFlow<Self::Break> {
+            let TableFactor::Table {
+                name,
+                args: Some(args),
+                ..
+            } = factor
+            else {
+                return ControlFlow::Continue(());
+            };
+            let endpoint_count =
+                if crate::sql2::parse::object_name_is_public_function(name, "lix_as_of") {
+                    1
+                } else if crate::sql2::parse::object_name_is_public_function(name, "lix_diff") {
+                    2
+                } else {
+                    return ControlFlow::Continue(());
+                };
+            for argument in args.args.iter_mut().skip(1).take(endpoint_count) {
+                let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = argument else {
+                    continue;
+                };
+                if Visit::visit(&*expr, &mut SubqueryFinder).is_break() {
+                    let found = expr.clone();
+                    if let Some(replacement) = self.replacement.take() {
+                        *expr = replacement;
+                    }
+                    return ControlFlow::Break(Box::new((
+                        found,
+                        self.scopes
+                            .last()
+                            .map(|s| s.visible.clone())
+                            .unwrap_or_default(),
+                    )));
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    fn visit(
+        statement: &mut DataFusionStatement,
+        visitor: &mut ArgumentVisitor,
+    ) -> ControlFlow<Box<(SqlExpr, Vec<With>)>> {
+        match statement {
+            DataFusionStatement::Statement(statement) => statement.visit(visitor),
+            DataFusionStatement::Explain(explain) => visit(&mut explain.statement, visitor),
+            _ => ControlFlow::Continue(()),
+        }
+    }
+
+    loop {
+        let ControlFlow::Break(argument) = visit(
+            statement,
+            &mut ArgumentVisitor {
+                scopes: Vec::new(),
+                replacement: None,
+            },
+        ) else {
+            return Ok(());
+        };
+        let (expression, scopes) = *argument;
+        let mut sql = format!("SELECT {expression}");
+        for scope in scopes.into_iter().rev() {
+            sql = format!("{scope} SELECT ({sql})");
+        }
+        let mut argument_statement = crate::sql2::parse::parse_statement(&sql)?;
+        // Preserve Lix's read-only and expression restrictions even though the
+        // scalar query is executed during endpoint resolution.
+        crate::sql2::bind_read_statement(&sql, &argument_statement)?;
+        bind_table_function_parameters(&mut argument_statement, params)?;
+        let plan = Box::pin(create_logical_plan_from_statement(
+            session,
+            argument_statement,
+            params,
+        ))
+        .await?;
+        validate_supported_logical_plan(&plan)?;
+        validate_json_predicates_in_logical_plan(&plan)?;
+        validate_json_predicate_params(&json_predicate_params_in_logical_plan(&plan), params)?;
+        let plan = bind_plan_param_values(plan, params)?;
+        let batches = crate::sql2::runtime::collect_plan(
+            &session.state(),
+            crate::sql2::runtime::RuntimeReadPlan::Bound(plan),
+            None,
+        )
+        .await
+        .map_err(datafusion_error_to_lix_error)?;
+        if batches.iter().map(RecordBatch::num_rows).sum::<usize>() != 1
+            || batches.iter().any(|batch| batch.num_columns() != 1)
+        {
+            return Err(LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                "temporal commit argument must return exactly one column and one row",
+            ));
+        }
+        let batch = batches
+            .iter()
+            .find(|batch| batch.num_rows() != 0)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    "temporal commit argument must be non-null text",
+                )
+            })?;
+        let value = ScalarValue::try_from_array(batch.column(0), 0)
+            .map_err(datafusion_error_to_lix_error)?;
+        let text = value.try_as_str().flatten().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                "temporal commit argument must be non-null text",
+            )
+        })?;
+        let _ = visit(
+            statement,
+            &mut ArgumentVisitor {
+                scopes: Vec::new(),
+                replacement: Some(SqlExpr::value(SqlValue::SingleQuotedString(
+                    text.to_string(),
+                ))),
+            },
+        );
+    }
 }
 
 fn validate_json_predicates_in_logical_plan(plan: &LogicalPlan) -> Result<(), LixError> {
@@ -1310,17 +1534,17 @@ async fn insert_query_input_plan(
     columns: &[crate::sql2::bind::expr::BoundColumnRef],
     params: &[Value],
 ) -> Result<std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>, LixError> {
-    let input = session
-        .state()
-        .statement_to_plan(DataFusionStatement::Statement(Box::new(
-            datafusion::sql::sqlparser::ast::Statement::Query(query.query.clone()),
-        )))
-        .await
-        .map_err(datafusion_error_to_lix_error)?;
+    let mut statement = DataFusionStatement::Statement(Box::new(
+        datafusion::sql::sqlparser::ast::Statement::Query(query.query.clone()),
+    ));
+    let parameter_names = statement_parameter_names(&statement)?;
+    let expected = expected_positional_parameter_count(&parameter_names)?;
+    validate_parameter_count_values(expected, &parameter_names, params.len())?;
+    bind_table_function_parameters(&mut statement, params)?;
+    let input = create_logical_plan_from_statement(session, statement, params).await?;
     validate_supported_logical_plan(&input)?;
     validate_json_predicates_in_logical_plan(&input)?;
     let json_predicate_params = json_predicate_params_in_logical_plan(&input);
-    validate_parameter_count(&input, params.len())?;
     validate_json_predicate_params(&json_predicate_params, params)?;
     if input.schema().fields().len() != columns.len() {
         return Err(LixError::new(
@@ -2324,14 +2548,6 @@ fn validate_json_predicate_params(
         }
     }
     Ok(())
-}
-
-fn validate_parameter_count(plan: &LogicalPlan, param_count: usize) -> Result<(), LixError> {
-    let parameter_names = plan
-        .get_parameter_names()
-        .map_err(datafusion_error_to_lix_error)?;
-    let expected_count = expected_positional_parameter_count(&parameter_names)?;
-    validate_parameter_count_values(expected_count, &parameter_names, param_count)
 }
 
 fn validate_parameter_count_values(

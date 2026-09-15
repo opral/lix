@@ -6,7 +6,8 @@ description: Compare typed Lix relations across commits and select rows atomical
 
 `lix_diff(relation, from_commit_id, to_commit_id)` compares one relation across
 two explicitly selected commits. With only the relation argument it defaults
-to latest checkpoint → active head. A write's own span is on its result:
+to the active branch's working baseline → current head, pinned for the statement.
+A write's own span is on its result:
 `execute` returns `commit: { before, after }`, and `lix_diff('lix_file',
 before, after)` is exactly what that write changed. A file is one row of `lix_file`; a
 registered schema row is one row of its schema relation. Commands consume the
@@ -54,13 +55,18 @@ working changes.
 Every relation diff exposes `row_ref`, the relation's typed primary-key
 columns, `diff_type`, and a
 `from_<column>` / `to_<column>` pair for each non-primary-key column of the compared relation.
-`diff_type` is `added`, `modified`, or `removed`. Added rows have empty `from_`
-values; removed rows have empty `to_` values. Use
+`diff_type` is `added`, `modified`, or `removed`. Added rows have SQL `NULL`
+`from_` values; removed rows have SQL `NULL` `to_` values. A present row can also
+have nullable columns, so use `diff_type` to identify an absent side. Use
 `coalesce(to_path, from_path)` when displaying a path that also covers removed
 or renamed files.
 
 Project `from_content` and `to_content` to reconstruct historical file bytes.
-Absent sides are SQL `NULL`; an existing empty file is an empty `BYTEA`.
+For each present side, these bytes equal `content` from
+`lix_as_of('lix_file', endpoint_commit_id)` for the same file. Absent sides are
+SQL `NULL`; an existing empty file is an empty `BYTEA`. A snapshot of an absent
+file returns no row. Read or reconstruction failures are errors, not absent
+rows or empty bytes.
 Content is only materialized when projected or used by a predicate. File
 metadata predicates, including `id`, `from_path`, and `to_path`, select rows
 before content materialization. A content predicate itself requires reading

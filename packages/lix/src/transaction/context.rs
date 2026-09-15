@@ -9040,6 +9040,20 @@ where
         statement: DataFusionStatement,
         params: Vec<Value>,
     ) -> Result<SqlQueryResult, LixError> {
+        // The shared reader owns a complete planning/execution future. Keep it
+        // boxed so adding resolved endpoints does not grow every write future
+        // that performs a transaction read.
+        Box::pin(self.execute_read_sql_statement_with_resolved_statement(sql, statement, params))
+            .await
+            .map(|(result, _)| result)
+    }
+
+    async fn execute_read_sql_statement_with_resolved_statement(
+        &mut self,
+        sql: String,
+        statement: DataFusionStatement,
+        params: Vec<Value>,
+    ) -> Result<(SqlQueryResult, DataFusionStatement), LixError> {
         let read_store = self.opening_read();
         let active_branch_id = self.active_branch_id.clone();
         let hot_state = Arc::clone(&self.hot_state);
@@ -10738,8 +10752,17 @@ where
             ));
         }
         let statement = crate::sql2::parse_statement(&query_sql)?;
+        // Use the exact endpoints resolved while planning the selection query.
+        // Evaluating scalar subqueries again could select a different source range.
+        let (result, resolved_statement) =
+            Box::pin(self.execute_read_sql_statement_with_resolved_statement(
+                query_sql,
+                statement,
+                params.clone(),
+            ))
+            .await?;
         let source_commits = if command == DiffCommand::Apply {
-            let source = diff_command_source_commits(&statement, &params)?;
+            let source = diff_command_source_commits(&resolved_statement, &params)?;
             match source {
                 Some((from, to)) => Some(self.resolve_diff_command_source_commits(from, to).await?),
                 None => None,
@@ -10747,9 +10770,6 @@ where
         } else {
             None
         };
-        let result = self
-            .execute_read_sql_statement(query_sql, statement, params)
-            .await?;
         if result.columns.len() != 1 {
             return Err(LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
