@@ -178,7 +178,14 @@ where
             .ok_or_else(|| transaction_state_error("Lix transaction is closed"))
     }
 
-    pub async fn commit(mut self) -> Result<crate::CommitReceipt, LixError> {
+    pub fn commit(self) -> impl Future<Output = Result<crate::CommitReceipt, LixError>> {
+        // Callers can join independent commits. Return only the pinned owner,
+        // so each caller does not retain another complete adapter-specific
+        // preparation/publication state machine on its thread stack.
+        Box::pin(self.commit_inner())
+    }
+
+    async fn commit_inner(mut self) -> Result<crate::CommitReceipt, LixError> {
         // Explicit transactions may remain open across application awaits, so
         // they do not hold the collaboration gate while planning. Serialize
         // their commit-time revalidation and persistence with bounded writes.

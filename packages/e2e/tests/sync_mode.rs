@@ -888,7 +888,13 @@ async fn connected_api_routes_local_work_and_hot_reads_need_no_round_trip() {
         .write_to(&mut offline_snapshot)
         .await
         .expect("persisted partial cache exports without a server");
+    let restored_dir = TempDir::new().expect("restored replica tempdir");
     let restored = open_lix()
+        .with_storage(
+            FilesystemStorage::new(restored_dir.path())
+                .open()
+                .expect("open durable restored replica storage"),
+        )
         .from_snapshot(Cursor::new(offline_snapshot))
         .await
         .expect("restore local partial snapshot without an authority");

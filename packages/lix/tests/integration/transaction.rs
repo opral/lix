@@ -330,10 +330,18 @@ async fn assert_conditional_publication_has_one_committed_winner(
     assert_eq!(alice_update.rows().len(), 1);
     assert_eq!(bob_update.rows().len(), 1);
 
+    let alice_commit = alice.commit();
+    let bob_commit = bob.commit();
+    // These public futures can be joined by callers on a default thread stack.
+    // Keep their resident state bounded even when workspace feature unification
+    // adds instrumentation to internal commit preparation.
+    let maximum_commit_future_bytes = 2 * size_of::<usize>();
+    assert!(size_of_val(&alice_commit) <= maximum_commit_future_bytes);
+    assert!(size_of_val(&bob_commit) <= maximum_commit_future_bytes);
     let (alice_commit, bob_commit) = if commit_together {
-        tokio::join!(alice.commit(), bob.commit())
+        tokio::join!(alice_commit, bob_commit)
     } else {
-        (alice.commit().await, bob.commit().await)
+        (alice_commit.await, bob_commit.await)
     };
     let published = alice_session
         .execute(

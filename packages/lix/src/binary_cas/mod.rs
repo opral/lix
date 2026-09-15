@@ -169,6 +169,7 @@ pub(crate) async fn hydrated_manifest_input_keys(
     for chunk in chunks {
         let key = Key(bytes::Bytes::copy_from_slice(&chunk));
         keys.push((BINARY_CAS_CHUNK_SPACE, key.clone()));
+        keys.push((BINARY_CAS_CHUNK_PRESENCE_SPACE, key.clone()));
         keys.push((BINARY_CAS_CHUNK_DEMAND_SPACE, key));
     }
     Ok(keys)

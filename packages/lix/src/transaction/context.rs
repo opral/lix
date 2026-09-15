@@ -1534,10 +1534,12 @@ where
                     LixError::new(LixError::CODE_INVALID_PARAM, "chunk demand ID is not text")
                 })?;
                 let hash = crate::binary_cas::ChunkHash::from_hex(id)?;
-                keys.push((
-                    crate::binary_cas::BINARY_CAS_CHUNK_SPACE,
-                    crate::storage_adapter::StorageKey(Bytes::copy_from_slice(hash.as_bytes())),
-                ));
+                let key =
+                    crate::storage_adapter::StorageKey(Bytes::copy_from_slice(hash.as_bytes()));
+                keys.push((crate::binary_cas::BINARY_CAS_CHUNK_SPACE, key.clone()));
+                // The availability marker and immutable payload are published
+                // atomically. Referenced-content preparation reads the marker.
+                keys.push((crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE, key));
             }
         }
         if keys.is_empty() && blob.is_none() {
@@ -18277,6 +18279,117 @@ fallback={large_fallback} decoded={large_decoded}"
             crate::binary_cas::BlobManifestRequired::from_error(&error).unwrap(),
             Some(crate::binary_cas::BlobManifestRequired(hash)),
         );
+    }
+
+    #[tokio::test]
+    async fn pinned_blob_hydration_preserves_referenced_content_readiness_through_commit() {
+        for inline in [false, true] {
+            let storage = Memory::new();
+            let (hot_state, binary_cas, _, functions, mut transaction) =
+                open_test_transaction(&storage).await;
+            binary_cas.enable_referenced_manifest_demands();
+            let adapter = StorageAdapter::new(storage);
+            let bytes = b"cold executable dependency";
+            let manifest = crate::binary_cas::CanonicalBlobManifest::from_bytes(bytes);
+            let reader = binary_cas.reader(transaction.opening_read());
+            let manifest_demand =
+                crate::plugin::runtime::prepare_executable_blobs(&reader, [manifest.blob_id])
+                    .await
+                    .unwrap_err();
+            assert_eq!(
+                crate::binary_cas::BlobManifestRequired::from_error(&manifest_demand).unwrap(),
+                Some(crate::binary_cas::BlobManifestRequired(manifest.blob_id)),
+            );
+            drop(reader);
+
+            let read = adapter.begin_read(Default::default()).await.unwrap();
+            let mut writes = adapter.new_write_set();
+            if inline {
+                crate::binary_cas::stage_verified_inline_canonical_blob(
+                    &mut writes, &manifest, bytes,
+                )
+                .unwrap();
+            } else {
+                crate::binary_cas::stage_deferred_canonical_manifest(&read, &mut writes, &manifest)
+                    .await
+                    .unwrap();
+            }
+            drop(read);
+            adapter
+                .commit_write_set(writes, Default::default())
+                .await
+                .unwrap();
+            transaction
+                .refresh_hydrated_native_inputs(&manifest_demand)
+                .await
+                .unwrap();
+
+            if !inline {
+                let reader = binary_cas.reader(transaction.opening_read());
+                let demand =
+                    crate::plugin::runtime::prepare_executable_blobs(&reader, [manifest.blob_id])
+                        .await
+                        .unwrap_err();
+                assert_eq!(demand.code, "LIX_SYNC_CHUNKS_REQUIRED");
+                drop(reader);
+                let mut writes = adapter.new_write_set();
+                crate::binary_cas::stage_verified_raw_chunk(
+                    &mut writes,
+                    manifest.chunks[0].hash,
+                    bytes,
+                )
+                .unwrap();
+                adapter
+                    .commit_write_set(writes, Default::default())
+                    .await
+                    .unwrap();
+                transaction
+                    .refresh_hydrated_native_inputs(&demand)
+                    .await
+                    .unwrap();
+            }
+
+            let reader = binary_cas.reader(transaction.opening_read());
+            for _ in 0..2 {
+                crate::plugin::runtime::prepare_executable_blobs(&reader, [manifest.blob_id])
+                    .await
+                    .expect("hydrated payload and presence marker remain coherent");
+            }
+            assert_eq!(
+                BlobDataReader::load_bytes_many(&reader, &[manifest.blob_id])
+                    .await
+                    .unwrap()
+                    .into_vec(),
+                vec![Some(bytes.to_vec())]
+            );
+            drop(reader);
+            transaction
+                .stage_rows(raw_write_rows(vec![key_value_stage_row(
+                    "hydrated-dependency",
+                    "prepared",
+                    false,
+                )]))
+                .await
+                .unwrap();
+            transaction
+                .commit(&functions)
+                .await
+                .expect("prepared transaction commits once");
+            let row = hot_state
+                .reader(adapter.begin_read(Default::default()).await.unwrap())
+                .load_row(&HotStateRowRequest {
+                    schema_key: "lix_key_value".to_owned(),
+                    branch_id: GLOBAL_BRANCH_ID.to_owned(),
+                    row_pk: RowPk::single("hydrated-dependency"),
+                    file_id: NullableKeyFilter::Null,
+                })
+                .await
+                .unwrap()
+                .expect("prepared mutation is persisted");
+            let snapshot: serde_json::Value =
+                serde_json::from_str(row.snapshot_content.as_deref().unwrap()).unwrap();
+            assert_eq!(snapshot["value"], "prepared");
+        }
     }
 
     #[tokio::test]
