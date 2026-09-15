@@ -57,6 +57,10 @@ where
     R: StorageRead,
 {
     read: Arc<StorageAdapterReadScope<R>>,
+    hydrated: Option<Arc<StorageAdapterReadScope<R>>>,
+    hydrated_previous: Option<Arc<SharedStorageAdapterRead<R>>>,
+    hydrated_keys: Option<Arc<std::collections::BTreeSet<(StorageSpace, crate::storage::Key)>>>,
+    hydrated_prefixes: Option<Arc<Vec<(StorageSpace, bytes::Bytes)>>>,
 }
 
 impl<R> SharedStorageAdapterRead<R>
@@ -66,10 +70,50 @@ where
     pub(crate) fn new(read: StorageAdapterReadScope<R>) -> Self {
         Self {
             read: Arc::new(read),
+            hydrated: None,
+            hydrated_previous: None,
+            hydrated_keys: None,
+            hydrated_prefixes: None,
         }
     }
 
+    /// Add only exact immutable inputs already selected by the pinned SQL
+    /// snapshot. Mutable coordinates and all scans stay on the original read.
+    pub(crate) fn with_hydrated_keys(
+        &self,
+        read: StorageAdapterReadScope<R>,
+        keys: impl IntoIterator<Item = (StorageSpace, crate::storage::Key)>,
+    ) -> Self {
+        let mut hydrated_keys = self
+            .hydrated_keys
+            .as_ref()
+            .map(|keys| keys.as_ref().clone())
+            .unwrap_or_default();
+        hydrated_keys.extend(keys);
+        Self {
+            read: self.read.clone(),
+            hydrated: Some(Arc::new(read)),
+            hydrated_previous: self.hydrated.as_ref().map(|_| Arc::new(self.clone())),
+            hydrated_keys: Some(Arc::new(hydrated_keys)),
+            hydrated_prefixes: self.hydrated_prefixes.clone(),
+        }
+    }
+
+    pub(crate) fn with_hydrated_prefix(
+        mut self,
+        space: StorageSpace,
+        prefix: bytes::Bytes,
+    ) -> Self {
+        Arc::make_mut(self.hydrated_prefixes.get_or_insert_with(Default::default))
+            .push((space, prefix));
+        self
+    }
+
     pub(crate) fn finish(self) -> Result<(), StorageError> {
+        // Prior hydrated scopes retain the opening read for exact-key fallback.
+        // Release our own chain before checking for external borrowers.
+        drop(self.hydrated_previous);
+        drop(self.hydrated);
         let read = Arc::try_unwrap(self.read).map_err(|read| {
             StorageError::Io(format!(
                 "shared storage read still has {} active handles",
@@ -88,6 +132,10 @@ where
     fn clone(&self) -> Self {
         Self {
             read: Arc::clone(&self.read),
+            hydrated: self.hydrated.clone(),
+            hydrated_previous: self.hydrated_previous.clone(),
+            hydrated_keys: self.hydrated_keys.clone(),
+            hydrated_prefixes: self.hydrated_prefixes.clone(),
         }
     }
 }
@@ -185,14 +233,70 @@ where
     R: StorageRead,
 {
     fn snapshot_cache_key(&self) -> Option<u128> {
-        StorageAdapterRead::snapshot_cache_key(self.read.as_ref())
+        // A mixed read must never share caches with the fresh mutable
+        // snapshot used to fetch its immutable inputs.
+        if self.hydrated.is_some() {
+            None
+        } else {
+            StorageAdapterRead::snapshot_cache_key(self.read.as_ref())
+        }
     }
 
     fn get_many(
         &self,
         requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
-        StorageAdapterRead::get_many(self.read.as_ref(), requests)
+        if self.hydrated.is_none() {
+            return futures_util::future::Either::Left(
+                StorageAdapterRead::get_many(self.read.as_ref(), requests));
+        }
+        // Keep the ordinary read future small and allocation-free. The larger
+        // pinned-hydration state machine must not inflate every SQL/commit poll.
+        futures_util::future::Either::Right(Box::pin(async move {
+            let mut result = StorageAdapterRead::get_many(self.read.as_ref(), requests).await?;
+            let Some(hydrated) = &self.hydrated else {
+                return Ok(result);
+            };
+            let mut indices = Vec::new();
+            let mut missing = Vec::new();
+            let mut offset = 0;
+            for request in requests {
+                for (index, key) in request.keys.iter().enumerate() {
+                    if result.values[offset + index].is_none()
+                        && self
+                            .hydrated_keys
+                            .as_ref()
+                            .is_some_and(|keys| keys.contains(&(request.space, key.clone())))
+                    {
+                        indices.push(offset + index);
+                        missing.push(GetManyRequest {
+                            space: request.space,
+                            keys: std::slice::from_ref(key),
+                            opts: request.opts,
+                        });
+                    }
+                }
+                offset += request.keys.len();
+            }
+            if !missing.is_empty() {
+                let fetched = StorageAdapterRead::get_many(hydrated.as_ref(), &missing).await?;
+                let prior = if let Some(previous) = &self.hydrated_previous {
+                    Some(Box::pin(StorageAdapterRead::get_many(previous.as_ref(), &missing)).await?)
+                } else {
+                    None
+                };
+                for (position, (index, value)) in
+                    indices.into_iter().zip(fetched.values).enumerate()
+                {
+                    result.values[index] = value.or_else(|| {
+                        prior
+                            .as_ref()
+                            .and_then(|prior| prior.values[position].clone())
+                    });
+                }
+            }
+            Ok(result)
+        }))
     }
 
     fn begin_scan(
@@ -201,8 +305,73 @@ where
         range: KeyRange,
         opts: BeginScanOptions,
     ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
-        StorageAdapterRead::begin_scan(self.read.as_ref(), space, range, opts)
+        if self.hydrated.is_none() {
+            return futures_util::future::Either::Left(
+                StorageAdapterRead::begin_scan(self.read.as_ref(), space, range, opts));
+        }
+        futures_util::future::Either::Right(Box::pin(async move {
+            // A prior manifest scan keeps its original immutable rows even if
+            // a later hydration snapshot observes local cache reclamation.
+            if let Some(previous) = &self.hydrated_previous {
+                if previous
+                    .hydrated_prefixes
+                    .iter()
+                    .flat_map(|prefixes| prefixes.iter())
+                    .any(|(allowed_space, prefix)| {
+                        space == *allowed_space && range_within_prefix(&range, prefix)
+                    })
+                {
+                    return Box::pin(StorageAdapterRead::begin_scan(
+                        previous.as_ref(),
+                        space,
+                        range,
+                        opts,
+                    ))
+                    .await;
+                }
+            }
+            if let Some(hydrated) = &self.hydrated {
+                for (allowed_space, prefix) in self
+                    .hydrated_prefixes
+                    .iter()
+                    .flat_map(|prefixes| prefixes.iter())
+                {
+                    if space == *allowed_space && range_within_prefix(&range, prefix) {
+                        return StorageAdapterRead::begin_scan(
+                            hydrated.as_ref(),
+                            space,
+                            range,
+                            opts,
+                        )
+                        .await;
+                    }
+                }
+            }
+            StorageAdapterRead::begin_scan(self.read.as_ref(), space, range, opts).await
+        }))
     }
+}
+
+fn range_within_prefix(range: &KeyRange, prefix: &bytes::Bytes) -> bool {
+    use std::ops::Bound;
+    let lower = match &range.lower {
+        Bound::Included(key) | Bound::Excluded(key) => key.0.starts_with(prefix),
+        Bound::Unbounded => false,
+    };
+    let upper = match &range.upper {
+        Bound::Included(key) => key.0.starts_with(prefix),
+        Bound::Excluded(key) => {
+            key.0.starts_with(prefix)
+                || crate::storage::Prefix {
+                    bytes: prefix.clone(),
+                }
+                .to_range()
+                .ok()
+                .is_some_and(|allowed| allowed.upper == range.upper)
+        }
+        Bound::Unbounded => false,
+    };
+    lower && upper
 }
 
 impl<T> StorageAdapterRead for &T
@@ -252,5 +421,80 @@ where
         opts: BeginScanOptions,
     ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
         (**self).begin_scan(space, range, opts)
+    }
+}
+
+#[cfg(test)]
+mod hydration_tests {
+    use super::*;
+    use crate::storage::{Key, ProjectedValue};
+    use crate::storage_adapter::{Memory, StorageAdapter, StorageWriteOptions};
+    use bytes::Bytes;
+
+    #[tokio::test]
+    async fn hydrated_keys_preserve_existing_values_and_hide_unrequested_additions() {
+        let storage = StorageAdapter::new(Memory::new());
+        let space = crate::changelog::COMMIT_SPACE;
+        let keys = ["existing", "requested", "unrequested"].map(|key| Key(Bytes::from(key)));
+        let mut writes = storage.new_write_set();
+        writes.put(space, keys[0].clone(), b"old".as_slice());
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let pinned =
+            SharedStorageAdapterRead::new(storage.begin_read(Default::default()).await.unwrap());
+        let mut writes = storage.new_write_set();
+        for key in &keys {
+            writes.put(space, key.clone(), b"new".as_slice());
+        }
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let hydrated = pinned.with_hydrated_keys(
+            storage.begin_read(Default::default()).await.unwrap(),
+            [(space, keys[0].clone()), (space, keys[1].clone())],
+        );
+        let result = hydrated
+            .get_many(&[GetManyRequest {
+                space,
+                keys: &keys,
+                opts: Default::default(),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(
+            result.values,
+            vec![
+                Some(ProjectedValue::FullValue(Bytes::from_static(b"old"))),
+                Some(ProjectedValue::FullValue(Bytes::from_static(b"new"))),
+                None,
+            ]
+        );
+        assert_eq!(
+            hydrated.snapshot_cache_key(),
+            None,
+            "mixed reads cannot poison a fresh snapshot's cache"
+        );
+        assert!(
+            pinned
+                .get_many(&[GetManyRequest {
+                    space,
+                    keys: &keys[1..2],
+                    opts: Default::default()
+                }])
+                .await
+                .unwrap()
+                .values[0]
+                .is_none()
+        );
+        let refreshed =
+            hydrated.with_hydrated_keys(storage.begin_read(Default::default()).await.unwrap(), []);
+        drop(hydrated);
+        drop(pinned);
+        refreshed
+            .finish()
+            .expect("owned hydration history is not an external read borrower");
     }
 }

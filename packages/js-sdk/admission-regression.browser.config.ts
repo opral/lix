@@ -16,7 +16,7 @@ export default defineConfig({
       if (match[2] === 'probe') {res.end(token);return;}
       if (req.headers['lix-sync-protocol-version'] !== '15') {res.statusCode=426;res.end();return;}
       res.setHeader('content-type','application/json');
-      res.end(JSON.stringify({repositoryId:match[1],principalId: token.includes('other') ? '00000000-0000-7000-8000-000000000005' : '00000000-0000-7000-8000-000000000003',protocolEpoch:15,storageEpoch:81}));
+      res.end(JSON.stringify({repositoryId:match[1],principalId: token.includes('other') ? '00000000-0000-7000-8000-000000000005' : '00000000-0000-7000-8000-000000000003',protocolEpoch:16,storageEpoch:81}));
     });
   }}],
   test: {include: ['src/worker/shared-admission.browser.test.ts'], browser: {enabled:true,headless:true,provider:playwright(),instances:[{browser:'chromium'}]}},

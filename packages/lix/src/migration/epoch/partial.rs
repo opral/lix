@@ -1,5 +1,5 @@
-//! Current-format partial admission is bounded and read-only. Legacy epochs
-//! require the detached migrator before admission.
+//! Current-format partial admission is bounded and read-only. Older replica
+//! caches can be replaced with authenticated opening coordinates in a new bank.
 
 use super::*;
 use crate::storage_adapter::{StorageReadDurability, StorageWriteSetError};
@@ -14,7 +14,7 @@ fn migration_required(message: &str) -> LixError {
     LixError::new("LIX_PARTIAL_REPLICA_MIGRATION_REQUIRED", message)
 }
 
-async fn durable_pointer<S: Storage>(
+pub(super) async fn durable_pointer<S: Storage>(
     storage: &S,
 ) -> Result<Option<(PointerState, Bytes)>, LixError> {
     let read = storage

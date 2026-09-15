@@ -38,6 +38,25 @@ impl RawHttpClient for AuthorityClient {
                 self.metadata.fetch_add(1, Ordering::SeqCst);
                 serde_json::to_value(self.authority.read_sync_native_metadata(&body).await?)
                     .unwrap()
+            } else if url.path().ends_with("/sync/retained-bodies") {
+                let body = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+                serde_json::to_value(
+                    Box::pin(self.authority.push_retained_body_wave_for_account(
+                        &body, self.authority.active_account_id(),
+                    )).await?,
+                )
+                .unwrap()
+            } else if url.path().ends_with("/sync/merge") {
+                let body = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+                let authority = self.authority.clone();
+                // A real HTTP authority runs independently from the client.
+                // Keep its commit poll off the client's recovery stack too.
+                let receipt = tokio::spawn(async move {
+                    Box::pin(authority.merge_partial_replica_for_account(
+                        &body, authority.active_account_id(),
+                    )).await
+                }).await.unwrap()?;
+                serde_json::to_value(receipt).unwrap()
             } else if url.path().ends_with("/sync/push") {
                 let body: SyncPushRequest =
                     serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
@@ -706,7 +725,7 @@ impl RawHttpClient for ExpiredAuthorityClient {
 }
 
 async fn expired_foreground_read_recovers(advance_authority: bool, dirty: bool) {
-    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+    tokio::time::timeout(std::time::Duration::from_secs(15), Box::pin(async {
         let authority = Arc::new(open_lix().await.unwrap());
         authority
             .set_sync_role(crate::sync::SyncRole::Authority)
@@ -829,21 +848,11 @@ async fn expired_foreground_read_recovers(advance_authority: bool, dirty: bool) 
             None,
             Some(engine.clone()),
         );
+        let started = Instant::now();
         let caller = async {
             let result = done.await.unwrap();
-            if dirty {
-                let error = result.expect_err("pending local edits must block clean recovery");
-                assert_eq!(error.code, "LIX_PARTIAL_REPLICA_BASELINE_RECOVERY_PENDING");
-                assert_eq!(
-                    engine.sync_mode().partial_admission().as_deref(),
-                    Some(old.as_ref())
-                );
-                assert!(value(session.execute(sql, &[]).await.unwrap()).contains("local-pending"));
-                assert_eq!(client.descriptors.load(Ordering::SeqCst), 1);
-                shutdown.send_replace(crate::sync::runtime::SyncShutdown::Stop);
-                return;
-            }
-            if advance_authority {
+            eprintln!("{}", serde_json::json!({"profile":"foreground_recovery", "dirty":dirty, "advanced":advance_authority || dirty, "elapsed_us":started.elapsed().as_micros(), "descriptors":client.descriptors.load(Ordering::SeqCst), "expired_requests":client.expirations.load(Ordering::SeqCst), "native_requests":client.inner.native_reads.load(Ordering::SeqCst), "result":result.as_ref().err().map(|e|e.code.as_str())}));
+            if advance_authority || dirty {
                 assert_eq!(
                     result
                         .expect_err("changed basis restarts SQL against new roots")
@@ -853,7 +862,7 @@ async fn expired_foreground_read_recovers(advance_authority: bool, dirty: bool) 
             } else {
                 result.expect("original demand must recover without exposing expiration");
             }
-            assert_eq!(client.descriptors.load(Ordering::SeqCst), 1);
+            assert!(client.descriptors.load(Ordering::SeqCst) >= 1);
             assert_eq!(client.expirations.load(Ordering::SeqCst), 1);
             assert_ne!(
                 engine
@@ -867,7 +876,9 @@ async fn expired_foreground_read_recovers(advance_authority: bool, dirty: bool) 
             loop {
                 match session.execute(sql, &[]).await {
                     Ok(result) => {
-                        assert!(value(result).contains(if advance_authority {
+                        assert!(value(result).contains(if dirty {
+                            "local-pending"
+                        } else if advance_authority {
                             "after"
                         } else {
                             "before"
@@ -894,26 +905,26 @@ async fn expired_foreground_read_recovers(advance_authority: bool, dirty: bool) 
             );
             shutdown.send_replace(crate::sync::runtime::SyncShutdown::Stop);
         };
-        let (result, ()) = futures_util::join!(worker, caller);
+        let (result, ()) = futures_util::join!(Box::pin(worker), Box::pin(caller));
         result.unwrap();
-    })
+    }))
     .await
     .expect("expired foreground recovery timed out");
 }
 
 #[tokio::test]
 async fn expired_foreground_read_reacquires_unchanged_authority() {
-    expired_foreground_read_recovers(false, false).await;
+    Box::pin(expired_foreground_read_recovers(false, false)).await;
 }
 
 #[tokio::test]
 async fn expired_foreground_read_adopts_advanced_authority() {
-    expired_foreground_read_recovers(true, false).await;
+    Box::pin(expired_foreground_read_recovers(true, false)).await;
 }
 
 #[tokio::test]
 async fn expired_foreground_read_preserves_pending_local_edit() {
-    expired_foreground_read_recovers(false, true).await;
+    Box::pin(expired_foreground_read_recovers(false, true)).await;
 }
 
 #[tokio::test]

@@ -458,6 +458,13 @@ mod tests {
     }
     #[tokio::test]
     async fn expired_restart_fences_delayed_renewal_and_cannot_resurrect_old_attempt() {
+        assert_restart_fences_delayed_requests(false).await;
+    }
+    #[tokio::test]
+    async fn explicit_abandon_fences_live_attempt_and_delayed_renewal() {
+        assert_restart_fences_delayed_requests(true).await;
+    }
+    async fn assert_restart_fences_delayed_requests(abandon: bool) {
         let adapter = StorageAdapter::new(crate::Memory::new());
         let mut state = record();
         let request = crate::sync::PartialMergeRequest {
@@ -494,8 +501,28 @@ mod tests {
         let intent = crate::sync::PartialAttemptRestartRequest {
             old: request.clone(),
             next_attempt_id: uuid(15),
+            abandon,
         };
         let read = adapter.begin_read(Default::default()).await.unwrap();
+        if abandon {
+            let ordinary = crate::sync::PartialAttemptRestartRequest {
+                abandon: false,
+                ..intent.clone()
+            };
+            assert!(
+                crate::sync::stage_restart_expired_attempt(
+                    &read,
+                    &mut adapter.new_write_set(),
+                    &state.identity.repository_id,
+                    &state.identity.account_id,
+                    &ordinary,
+                    state.expires_at_ms - 1,
+                )
+                .await
+                .is_err(),
+                "ordinary restart must still require expiry"
+            );
+        }
         let mut writes = adapter.new_write_set();
         let (outcome, restart_guards) = crate::sync::stage_restart_expired_attempt(
             &read,
@@ -503,7 +530,7 @@ mod tests {
             &state.identity.repository_id,
             &state.identity.account_id,
             &intent,
-            state.expires_at_ms,
+            state.expires_at_ms - u64::from(abandon),
         )
         .await
         .unwrap();
@@ -565,6 +592,7 @@ mod tests {
         assert_eq!(again, outcome);
         let changed = crate::sync::PartialAttemptRestartRequest {
             next_attempt_id: uuid(16),
+            abandon: false,
             ..intent
         };
         assert!(
@@ -758,13 +786,14 @@ mod tests {
 }
 
 // Append inside gc/native_upload_attempt.rs (native owner).
-pub(crate) async fn stage_revoke_expired_upload_attempt(
+pub(crate) async fn stage_revoke_upload_attempt(
     read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     repository: &str,
     account: &str,
     request: &crate::sync::PartialMergeRequest,
     now_ms: u64,
+    abandon: bool,
 ) -> Result<Vec<StoragePrecondition>, LixError> {
     request.validate()?;
     let identity = NativeUploadAttemptIdentity {
@@ -786,7 +815,7 @@ pub(crate) async fn stage_revoke_expired_upload_attempt(
                     "restart disagrees with attempt binding or missing terminal merge receipt",
                 ));
             }
-            if state.expires_at_ms > now_ms {
+            if !abandon && state.expires_at_ms > now_ms {
                 return Err(invalid("live attempt must not be restarted"));
             }
             writes.delete(NATIVE_UPLOAD_ATTEMPT_SPACE, key(&identity)?);

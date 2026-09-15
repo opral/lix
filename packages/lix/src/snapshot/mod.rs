@@ -48,6 +48,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn partial_snapshot_flag_cannot_relabel_complete_repository() {
+        let source = open_lix().await.unwrap();
+        let mut snapshot = Vec::new();
+        source
+            .export_snapshot()
+            .write_to(&mut snapshot)
+            .await
+            .unwrap();
+        snapshot[11] = 1;
+        let error = open_lix()
+            .from_snapshot(Cursor::new(snapshot))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "LIX_INVALID_SNAPSHOT");
+        assert!(error.message.contains("partial snapshot"));
+    }
+
+    #[tokio::test]
     async fn complete_lix_roundtrip_is_byte_identical() {
         let source = open_lix().await.expect("open source Lix");
         source

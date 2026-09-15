@@ -3678,8 +3678,7 @@ where
         loop {
             let result = match storage.begin_read(StorageReadOptions::default()).await {
                 Ok(read) => {
-                    with_static_session_sql_read::<StorageImpl, _, _, _>(read, &mut attempt)
-                        .await
+                    with_static_session_sql_read::<StorageImpl, _, _, _>(read, &mut attempt).await
                 }
                 Err(error) => Err(error.into()),
             };
@@ -3787,7 +3786,90 @@ where
         Box::pin(self.execute_with_options_inner(sql, params, ExecuteOptions::default())).await
     }
 
+    pub(super) async fn flush_prepared_mutations_with_sync(&mut self) -> Result<(), LixError> {
+        let sender = self
+            .sync_demand_tx
+            .clone()
+            .filter(|_| self.sync_mode.role() == crate::sync::SyncRole::PartialReplica);
+        let mut retry = crate::sync::SyncDemandRetry::default();
+        loop {
+            match Box::pin(self.transaction_mut()?.flush_prepared_mutations()).await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    let Some(sender) = &sender else {
+                        return Err(error);
+                    };
+                    retry.hydrate_pinned_for_retry(Some(sender), error.clone()).await.map_err(|error| {
+                        if error.code == "LIX_ERROR_SYNC_DEMAND_STALLED" {
+                            LixError::new(LixError::CODE_TRANSACTION_CONFLICT, "transaction could not preserve its staged snapshot while loading inputs")
+                        } else { error }
+                    })?;
+                    if !self
+                        .transaction_mut()?
+                        .refresh_hydrated_native_inputs(&error)
+                        .await?
+                    {
+                        return Err(LixError::new(
+                            LixError::CODE_TRANSACTION_CONFLICT,
+                            "transaction snapshot requires inputs outside its retained authority",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     async fn execute_with_options_inner(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+        options: ExecuteOptions,
+    ) -> Result<ExecuteResult, LixError> {
+        let Some(sender) = self
+            .sync_demand_tx
+            .clone()
+            .filter(|_| self.sync_mode.role() == crate::sync::SyncRole::PartialReplica)
+        else {
+            return Box::pin(self.execute_with_options_once(sql, params, options)).await;
+        };
+        let mut retry = crate::sync::SyncDemandRetry::default();
+        loop {
+            // Seal earlier successful statements before the checkpoint. A
+            // failed cold statement can then be retried without replaying them.
+            self.flush_prepared_mutations_with_sync().await?;
+            let checkpoint = self.transaction_mut()?.begin_sql_statement_checkpoint()?;
+            let error = match Box::pin(self.execute_with_options_once(sql, params, options.clone()))
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(error) => error,
+            };
+            self.transaction_mut()?
+                .rollback_sql_statement_checkpoint(checkpoint)
+                .await?;
+            if error.automatic_retry_is_forbidden() {
+                return Err(error);
+            }
+            // Only immutable object/metadata misses can extend this pinned
+            // read. A changed authority cannot rewrite values already returned.
+            let native = crate::tracked_state::NativeObjectRef::from_missing_error(&error)?
+                .is_some()
+                || crate::tracked_state::NativeMetadataRef::from_missing_error(&error)?.is_some()
+                || crate::binary_cas::BlobManifestRequired::from_error(&error)?.is_some()
+                || error.code == "LIX_SYNC_CHUNKS_REQUIRED";
+            if !native {
+                return Err(error);
+            }
+            retry
+                .hydrate_pinned_for_retry(Some(&sender), error.clone())
+                .await?;
+            self.transaction_mut()?
+                .refresh_hydrated_native_inputs(&error)
+                .await?;
+        }
+    }
+
+    async fn execute_with_options_once(
         &mut self,
         sql: &str,
         params: &[Value],
@@ -8171,7 +8253,10 @@ mod tests {
                     // A staged amendment may safely decline the fixed-layout
                     // optimization while preserving normal SQL behavior.
                     for statement in &statements {
-                        transaction.execute(&statement.sql, &statement.params).await.unwrap();
+                        transaction
+                            .execute(&statement.sql, &statement.params)
+                            .await
+                            .unwrap();
                     }
                 }
             }
@@ -8218,7 +8303,10 @@ mod tests {
             snapshots[0], snapshots[1],
             "updating an opening-schema field must retain already-materialized generated values"
         );
-        assert_eq!(snapshots[0], snapshots[2], "generic UPDATE RETURNING must retain generated values too");
+        assert_eq!(
+            snapshots[0], snapshots[2],
+            "generic UPDATE RETURNING must retain generated values too"
+        );
         transaction.commit().await.unwrap();
         let rows = session
             .execute(

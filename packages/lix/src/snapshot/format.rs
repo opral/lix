@@ -34,6 +34,7 @@ pub(crate) struct SnapshotEntry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SnapshotHeader {
     pub(crate) lix_format_version: u32,
+    pub(crate) partial_replica: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,11 +44,11 @@ pub(crate) struct SnapshotTrailer {
     pub(crate) digest: [u8; 32],
 }
 
-pub(crate) fn decode_streamed_snapshot_header(
-    header: &[u8],
-) -> Result<SnapshotHeader, LixError> {
+pub(crate) fn decode_streamed_snapshot_header(header: &[u8]) -> Result<SnapshotHeader, LixError> {
     if header.len() != HEADER_BYTES {
-        return Err(invalid_snapshot("authority snapshot has an invalid header length"));
+        return Err(invalid_snapshot(
+            "authority snapshot has an invalid header length",
+        ));
     }
     if &header[..MAGIC.len()] != MAGIC {
         return Err(invalid_snapshot("unsupported snapshot magic"));
@@ -69,7 +70,7 @@ pub(crate) fn decode_streamed_snapshot_header(
     }
     let flags = header[offset];
     offset += 1;
-    if flags != 0 {
+    if flags & !1 != 0 {
         return Err(invalid_snapshot(format!(
             "unsupported snapshot flags 0x{flags:02x}"
         )));
@@ -79,7 +80,10 @@ pub(crate) fn decode_streamed_snapshot_header(
             .try_into()
             .expect("snapshot format version has a fixed width"),
     );
-    Ok(SnapshotHeader { lix_format_version })
+    Ok(SnapshotHeader {
+        lix_format_version,
+        partial_replica: flags & 1 != 0,
+    })
 }
 
 pub(crate) fn decode_streamed_snapshot_trailer(
@@ -91,21 +95,25 @@ pub(crate) fn decode_streamed_snapshot_trailer(
         || trailer[0] != TRAILER_TAG
         || trailer[49..] != *TRAILER_MAGIC
     {
-        return Err(invalid_snapshot("authority snapshot has an invalid trailer"));
+        return Err(invalid_snapshot(
+            "authority snapshot has an invalid trailer",
+        ));
     }
     let entry_count = u64::from_be_bytes(trailer[1..9].try_into().expect("fixed trailer count"));
     let payload_bytes =
         u64::from_be_bytes(trailer[9..17].try_into().expect("fixed trailer byte count"));
-    let expected_digest: [u8; 32] = trailer[17..49]
-        .try_into()
-        .expect("fixed trailer digest");
-    let framing = u64::try_from(HEADER_BYTES + TRAILER_BYTES)
-        .expect("snapshot framing length fits u64");
+    let expected_digest: [u8; 32] = trailer[17..49].try_into().expect("fixed trailer digest");
+    let framing =
+        u64::try_from(HEADER_BYTES + TRAILER_BYTES).expect("snapshot framing length fits u64");
     if total_bytes.checked_sub(framing) != Some(payload_bytes) {
-        return Err(invalid_snapshot("authority snapshot payload length is invalid"));
+        return Err(invalid_snapshot(
+            "authority snapshot payload length is invalid",
+        ));
     }
     if digest != expected_digest {
-        return Err(invalid_snapshot("authority snapshot digest does not match its payload"));
+        return Err(invalid_snapshot(
+            "authority snapshot digest does not match its payload",
+        ));
     }
     Ok(SnapshotTrailer {
         entry_count,
@@ -127,6 +135,14 @@ where
     W: AsyncWrite + Unpin + ?Sized,
 {
     pub(crate) async fn new(writer: &'a mut W, lix_format_version: u32) -> Result<Self, LixError> {
+        Self::new_with_partial(writer, lix_format_version, false).await
+    }
+
+    pub(crate) async fn new_with_partial(
+        writer: &'a mut W,
+        lix_format_version: u32,
+        partial_replica: bool,
+    ) -> Result<Self, LixError> {
         let mut header = [0_u8; HEADER_BYTES];
         header[..MAGIC.len()].copy_from_slice(MAGIC);
         let mut offset = MAGIC.len();
@@ -134,7 +150,7 @@ where
         offset += 2;
         header[offset] = CHECKSUM_BLAKE3;
         offset += 1;
-        header[offset] = 0;
+        header[offset] = u8::from(partial_replica);
         offset += 1;
         header[offset..offset + 4].copy_from_slice(&lix_format_version.to_be_bytes());
         writer.write_all(&header).await.map_err(snapshot_io_error)?;
@@ -646,7 +662,12 @@ mod tests {
             key: Bytes::from_static(b"key"),
             value: Bytes::from(vec![0x5a; READ_ALLOCATION_CHUNK_BYTES * 3 + 17]),
         };
-        assert_eq!(decode(&encode(std::slice::from_ref(&entry)).await).await.unwrap(), vec![entry]);
+        assert_eq!(
+            decode(&encode(std::slice::from_ref(&entry)).await)
+                .await
+                .unwrap(),
+            vec![entry]
+        );
     }
 
     #[tokio::test]
@@ -716,7 +737,7 @@ mod tests {
         );
 
         let mut bad_flags = EMPTY_V1_GOLDEN.to_vec();
-        bad_flags[MAGIC.len() + 3] = 1;
+        bad_flags[MAGIC.len() + 3] = 2;
         assert!(SnapshotDecoder::new(bad_flags.as_slice()).await.is_err());
 
         // The v1 checksum contract covers the canonical entry payload, not
@@ -802,7 +823,7 @@ mod tests {
         assert!(decode(&bad_algorithm).await.is_err());
 
         let mut bad_flags = valid.clone();
-        bad_flags[MAGIC.len() + 3] = 1;
+        bad_flags[MAGIC.len() + 3] = 2;
         assert!(decode(&bad_flags).await.is_err());
 
         let mut unknown_tag = valid.clone();

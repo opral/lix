@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- Partial replicas now recover expired baselines and reconcile pending changes inside awaited SQL operations. Unsupported local changes can yield to the authoritative server after outstanding merge attempts are fenced.
+
+### Upgrade notes
+
+- Upgrade the SDK and server together to sync protocol 16. It adds active-attempt abandonment for automatic recovery; older peers fail protocol negotiation. The repository storage format remains 81.
+
 ## 0.16.1 - 2026-09-11
 
 ### Improvements

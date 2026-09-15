@@ -1326,8 +1326,7 @@ where
             total: None,
         },
     );
-    let admission =
-        crate::migration::admit_current_repository(storage, true).await?;
+    let admission = crate::migration::admit_current_repository(storage, true).await?;
     Ok(RepositoryAdmission {
         adapter: admission.adapter,
         report: admission.report,
@@ -1341,7 +1340,11 @@ where
     /// Configures a deterministic, stream-first snapshot export.
     pub fn export_snapshot(&self) -> crate::snapshot::SnapshotExportBuilder<StorageImpl> {
         let export = crate::snapshot::SnapshotExportBuilder::new(self.engine.storage());
-        if let Some(server) = &self.server {
+        if self.engine.sync_mode().role() == crate::sync::SyncRole::PartialReplica {
+            // A local export must preserve the state the caller is diagnosing,
+            // including unpublished edits and its exact resident working set.
+            export.from_local_partial_replica()
+        } else if let Some(server) = &self.server {
             export.from_sync_server(server.clone(), self.active_account_id().to_owned())
         } else if self.engine.sync_mode().role().is_replica() {
             export.reject_connected_replica()
@@ -1871,19 +1874,22 @@ where
                     ));
                 }
                 crate::common::with_read_deadline(async {
-                let mut retry = crate::sync::SyncDemandRetry::default();
-                loop {
-                    let result = retry_expired_read(|| {
-                        Arc::clone(&session)
-                            .execute_coherent_read_batch_owned(Arc::clone(&statements))
-                    })
-                    .await;
-                    match result {
-                        Ok(result) => return Ok(result),
-                        Err(error) => retry.hydrate_for_retry(demand_tx.as_ref(), error).await?,
+                    let mut retry = crate::sync::SyncDemandRetry::default();
+                    loop {
+                        let result = retry_expired_read(|| {
+                            Arc::clone(&session)
+                                .execute_coherent_read_batch_owned(Arc::clone(&statements))
+                        })
+                        .await;
+                        match result {
+                            Ok(result) => return Ok(result),
+                            Err(error) => {
+                                retry.hydrate_for_retry(demand_tx.as_ref(), error).await?
+                            }
+                        }
                     }
-                }
-                }).await
+                })
+                .await
             })
         }
     }
@@ -1971,9 +1977,10 @@ where
     /// do not retarget it. Finish or drop the transaction before closing this
     /// handle (or one of its clones).
     ///
-    /// On a sync replica, fetch any required cold history before opening the
-    /// transaction. Its pinned snapshot cannot be hydrated while it is active;
-    /// an uncached historical read returns a structured sync-demand error.
+    /// Partial replicas fetch missing immutable inputs while each SQL call
+    /// awaits, without advancing this transaction's snapshot. If the authority
+    /// no longer retains that snapshot, the operation returns a transaction
+    /// conflict; previously returned reads are never silently rebased.
     pub async fn begin_transaction(&self) -> Result<LixTransaction<StorageImpl>, LixError> {
         // Reserve before awaiting admission so close also notices an opening
         // transaction. The mutex coordinates only begin/close, never SQL work.
@@ -1981,16 +1988,27 @@ where
         let _admission = self.transaction_lifecycle.admission.lock().await;
         self.session.ensure_open()?;
 
-        let branch_id = Arc::clone(&self.session).active_branch_id_owned().await?;
-        let session = Arc::new(
-            self.engine
-                .open_session_at_with_account(branch_id, self.active_account_id().to_owned())
-                .await?
-                .with_file_views_from(&self.session),
-        );
+        let inner = self
+            .retry_sync_demands(|| async {
+                let branch_id = Arc::clone(&self.session).active_branch_id_owned().await?;
+                let session = Arc::new(
+                    self.engine
+                        .open_session_at_with_account(
+                            branch_id,
+                            self.active_account_id().to_owned(),
+                        )
+                        .await?
+                        .with_file_views_from(&self.session),
+                );
+                Ok(session
+                    .begin_transaction()
+                    .await?
+                    .with_sync_demand_sender(self.sync_demand_tx.clone()))
+            })
+            .await?;
         Ok(LixTransaction {
             _lifecycle: lifecycle,
-            inner: Some(session.begin_transaction().await?),
+            inner: Some(inner),
         })
     }
 
@@ -2117,6 +2135,7 @@ where
                             self.engine.clone(),
                             server,
                             completion,
+                            self.sync_demand_tx.clone(),
                         )
                         .await?;
                         return Ok(SwitchBranchReceipt { branch_id: target });
@@ -2164,11 +2183,16 @@ where
         // Includes typed input preparation/hydration between complete local
         // attempts. The deadline never wraps a durable operation.
         crate::common::with_read_deadline(async {
-            if matches!(self.engine.sync_mode().role(),
-                crate::sync::SyncRole::Replica | crate::sync::SyncRole::PartialReplica) {
+            if matches!(
+                self.engine.sync_mode().role(),
+                crate::sync::SyncRole::Replica | crate::sync::SyncRole::PartialReplica
+            ) {
                 retry_expired_read(operation).await
-            } else { operation().await }
-        }).await
+            } else {
+                operation().await
+            }
+        })
+        .await
     }
 
     pub async fn close(&self) -> Result<(), LixError> {
@@ -3948,3 +3972,18 @@ where
 #[cfg(test)]
 #[path = "handle/session_open_retry_tests.rs"]
 mod session_open_retry_tests;
+
+#[cfg(all(test, feature = "server-protocol"))]
+impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
+    pub(crate) fn from_partial_engine_for_test(
+        engine: Arc<Engine<StorageSession<S>>>,
+        session: SessionContext<StorageSession<S>>,
+        sender: tokio::sync::mpsc::Sender<crate::sync::SyncDemand>,
+    ) -> Self {
+        let lix = Self { engine, session: Arc::new(session), transaction_lifecycle: Arc::default(),
+            primary_switch_gate: Some(Arc::default()), sync_lease: None, sync_demand_tx: Some(sender), server: None,
+            open_report: Arc::new(OpenReport { format: crate::init::CURRENT_FORMAT_VERSION, initialized: false, migration: None }) };
+        lix.bind_session();
+        lix
+    }
+}

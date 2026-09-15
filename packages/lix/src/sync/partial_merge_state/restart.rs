@@ -119,6 +119,9 @@ pub(in crate::sync) async fn stage_capture_restarted_partial_merge(
         .restart
         .as_ref()
         .ok_or_else(|| conflict("restart capture has no durable terminal receipt"))?;
+    if restart.request.abandon {
+        return Err(conflict("an abandoned attempt cannot capture a successor"));
+    }
     let receipt = restart
         .receipt
         .as_ref()

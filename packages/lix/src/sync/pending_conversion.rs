@@ -187,6 +187,7 @@ async fn restart<C: http::RawHttpClient + Clone + 'static>(
         .unwrap_or_else(|| PartialAttemptRestartRequest {
             old: current.request.clone(),
             next_attempt_id: uuid::Uuid::now_v7().to_string(),
+            abandon: false,
         });
     if current.restart.is_none() {
         let mut next = current.clone();

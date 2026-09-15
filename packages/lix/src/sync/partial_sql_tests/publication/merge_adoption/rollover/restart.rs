@@ -26,6 +26,7 @@ async fn restarting() -> (
     let intent = PartialAttemptRestartRequest {
         old: request,
         next_attempt_id: uuid::Uuid::now_v7().to_string(),
+        abandon: false,
     };
     (authority, engine, session, state, intent)
 }
@@ -86,6 +87,7 @@ async fn lost_restart_reply_reuses_durable_uuid_and_terminal_restart_rejects_old
     assert!(retry.is_empty());
     let different = PartialAttemptRestartRequest {
         next_attempt_id: uuid::Uuid::now_v7().to_string(),
+        abandon: false,
         ..intent.clone()
     };
     assert!(

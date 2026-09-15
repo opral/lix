@@ -244,6 +244,54 @@ async fn persist<S: Storage + Clone + Send + Sync + 'static>(
     Ok(())
 }
 
+/// Obtain an exact terminal outcome before discarding unsupported GLOBAL work.
+/// The existing authenticated GLOBAL restart endpoint already fences live pins.
+pub(super) async fn abandon_global_merge<S, C>(
+    storage: &StorageAdapter<S>,
+    state: Arc<PartialReplicaState>,
+    transport: &HttpSyncTransport<C>,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+    C: RawHttpClient + Clone + 'static,
+{
+    let read = storage.begin_read(Default::default()).await?;
+    let (record, _, _) = load_partial_global_merge_state(&read, &state).await?;
+    drop(read);
+    let Some(record) = record else {
+        return Ok(());
+    };
+    if record.receipt.is_some() || record.restart_receipt.is_some() {
+        return Ok(());
+    }
+    let mut owner = RuntimeGlobalOwner {
+        storage: storage.clone(),
+        state,
+        record,
+    };
+    if owner.record.restart_intent.is_none() {
+        owner
+            .publish(
+                owner
+                    .record
+                    .prepare_restart(uuid::Uuid::now_v7().to_string())?,
+            )
+            .await?;
+    }
+    let outcome = transport
+        .restart_native_global_migration(
+            owner
+                .record
+                .restart_intent
+                .as_ref()
+                .expect("durable intent"),
+        )
+        .await?;
+    owner
+        .publish(owner.record.acknowledge_restart(outcome)?)
+        .await
+}
+
 async fn resume_restart<S, C>(
     owner: &mut RuntimeGlobalOwner<S>,
     transport: &HttpSyncTransport<C>,

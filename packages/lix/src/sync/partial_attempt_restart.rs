@@ -1,4 +1,4 @@
-//! Authority-owned terminal restart fencing for one exact expired KV attempt.
+//! Authority-owned terminal fencing for one exact expired or abandoned KV attempt.
 //! Compact immutable restart records are retained: UUID-only old requests have
 //! no finite replay horizon, so deleting this fence would permit resurrection.
 use super::{PartialMergeReceipt, PartialMergeRequest};
@@ -21,6 +21,10 @@ pub(crate) const PARTIAL_ATTEMPT_RESTART_SPACE: StorageSpace = StorageSpace::dec
 pub(crate) struct PartialAttemptRestartRequest {
     pub old: PartialMergeRequest,
     pub next_attempt_id: String,
+    /// Explicitly fence an active attempt when automatic recovery adopts the
+    /// authority. Omitted for ordinary expired-attempt restart compatibility.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub abandon: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -47,6 +51,10 @@ pub(crate) enum PartialAttemptRestartOutcome {
         receipt: PartialAttemptRestartReceipt,
     },
 }
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 impl PartialAttemptRestartRequest {
     pub(crate) fn validate(&self) -> Result<(), LixError> {
         validate_request(self)
@@ -253,18 +261,20 @@ pub(crate) async fn stage_restart_expired_attempt(
     guards.push(
         super::partial_authority_merge_receipt::absent_receipt_guard(repo, account, &request.old)?,
     );
-    // GC owner checks exact binding digest if record remains, requires expiration,
+    // GC owner checks exact binding digest if record remains, requires expiration
+    // unless the authenticated caller explicitly abandons this exact attempt,
     // stages deletion under exact record CAS (or KeyAbsent if already collected),
     // and adds repository mutation revision guard. No closure transfer: new
     // attempt starts at B and reuploads its captured locally retained bodies.
     guards.extend(
-        crate::gc::stage_revoke_expired_upload_attempt(
+        crate::gc::stage_revoke_upload_attempt(
             read,
             writes,
             repo,
             account,
             &request.old,
             now_ms,
+            request.abandon,
         )
         .await?,
     );
@@ -309,7 +319,25 @@ mod tests {
                 global_checkpoint_commit_id: id(),
             },
             next_attempt_id: id(),
+            abandon: false,
         }
+    }
+    #[test]
+    fn ordinary_restart_keeps_wire_shape_and_explicit_abandon_round_trips() {
+        let mut request = request();
+        let wire = serde_json::to_value(&request).unwrap();
+        assert!(wire.get("abandon").is_none());
+        assert_eq!(
+            serde_json::from_value::<PartialAttemptRestartRequest>(wire).unwrap(),
+            request
+        );
+        request.abandon = true;
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["abandon"], true);
+        assert_eq!(
+            serde_json::from_value::<PartialAttemptRestartRequest>(wire).unwrap(),
+            request
+        );
     }
     #[test]
     fn restart_outcomes_bind_identity_and_exact_successor() {

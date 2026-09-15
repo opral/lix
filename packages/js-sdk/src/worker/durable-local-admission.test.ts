@@ -5,7 +5,7 @@ import type { AdmissionIdentity } from "./shared-admission.js";
 const id = "00000000-0000-7000-8000-000000000004";
 const url = `https://example.test/lix/${id}`;
 const headers: [string, string][] = [["Authorization", "Bearer secret-token"]];
-const identity: AdmissionIdentity = { repositoryId: id, principalId: "user-A", protocolEpoch: 15, storageEpoch: 81 };
+const identity: AdmissionIdentity = { repositoryId: id, principalId: "user-A", protocolEpoch: 16, storageEpoch: 81 };
 function memory() {
   const values = new Map<string, unknown>();
   const store: DurableLocalAdmissionStore = {
@@ -39,7 +39,7 @@ test.each([
   (v: any) => { v.schemaVersion = 2; },
   (v: any) => { v.key = "wrong"; },
   (v: any) => { v.identity.storageEpoch = 80; },
-  (v: any) => { v.identity.protocolEpoch = 14; },
+  (v: any) => { v.identity.protocolEpoch = 15; },
   (v: any) => { v.identity.repositoryId = "other"; },
   (v: any) => { v.identity.principalId = "bad\nidentity"; },
   (v: any) => { v.identity.unrecognized = true; },

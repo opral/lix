@@ -8,10 +8,10 @@ Finite remote SQL protocol responses have a 16 MiB response budget; observations
 
 ## Metadata operation
 
-`GET /lix/v1/{repository UUID}/admission` (normalized from the public `/lix/{UUID}` locator), with `lix-sync-protocol-version: 15`, returns authenticated metadata:
+`GET /lix/v1/{repository UUID}/admission` (normalized from the public `/lix/{UUID}` locator), with `lix-sync-protocol-version: 16`, returns authenticated metadata:
 
 ```
-{ repositoryId, principalId, protocolEpoch: 15, storageEpoch: 81 }
+{ repositoryId, principalId, protocolEpoch: 16, storageEpoch: 81 }
 ```
 
 The gateway authenticates and authorizes the request. The reference host reads validated durable catalog metadata; this operation never opens an engine, creates a SQL session, starts synchronization or migrates storage. Principal IDs follow the host's bounded opaque-account contract (1–255 visible ASCII characters), rather than imposing a new UUID requirement. The stable repository ID must match the requested repository. Unsupported/missing epoch metadata requires explicit migration.

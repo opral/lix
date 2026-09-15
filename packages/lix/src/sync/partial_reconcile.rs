@@ -33,7 +33,11 @@ where
             "lease recovery source changed",
         ));
     }
-    if recovery == super::partial_publication::PartialRecoveryPolicy::ExpiredBaseline {
+    if matches!(
+        recovery,
+        super::partial_publication::PartialRecoveryPolicy::ExpiredBaseline
+            | super::partial_publication::PartialRecoveryPolicy::AuthorityWins
+    ) {
         // A cold read can register interests and then fail for missing inputs,
         // before the session's successful-read flush. Recovery must durably
         // retain those interests (and restore a reopened registry) itself.
@@ -58,7 +62,7 @@ where
             &wrapper.wire.descriptor,
         )
     {
-        return super::partial_publication::prepare_clean_lease_reacquisition(
+        return super::partial_publication::prepare_lease_reacquisition(
             &engine,
             &wrapper.wire,
             deadline,
@@ -70,7 +74,7 @@ where
     let candidate = transport.fork_native_baseline_lease(next.baseline_lease())?;
     let storage = engine.storage();
     let mut demands = std::collections::BTreeSet::new();
-    for _ in 0..4096 {
+    loop {
         deadline.check(&next.baseline_lease().lease_id)?;
         engine.sync_mode().ensure_partial_admission_healthy()?;
         if engine.sync_mode().partial_admission().as_deref() != Some(previous.as_ref()) {
@@ -125,8 +129,4 @@ where
         }
         deadline.check(&next.baseline_lease().lease_id)?;
     }
-    Err(LixError::new(
-        "LIX_PARTIAL_SCOPE_PREPARATION_LIMIT",
-        "candidate preparation exceeded bounded dependency count",
-    ))
 }
