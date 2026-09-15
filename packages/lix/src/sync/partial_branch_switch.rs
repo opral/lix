@@ -1,5 +1,5 @@
-//! Explicit, online admission of an existing authority branch. No pending lane
-//! is settled here and no local branch is discarded to manufacture cleanliness.
+//! Online admission of an existing authority branch. Pending source work is
+//! reconciled by the sync worker before publishing the new branch admission.
 use super::SyncTransport;
 use super::http::{HttpSyncTransport, RawHttpClient};
 use super::partial_state::PartialReplicaState;
@@ -30,6 +30,7 @@ pub(crate) async fn switch_existing_branch<S>(
     engine: Arc<Engine<S>>,
     server: ServerOptions,
     completion: PartialBranchSwitchCompletion,
+    demand_tx: Option<tokio::sync::mpsc::Sender<super::runtime::SyncDemand>>,
 ) -> Result<(), LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -47,15 +48,21 @@ where
             "branch switch authority differs from admitted repository",
         ));
     }
-    super::partial_publication::require_clean_switch_source(&engine, &previous).await?;
     let owner = engine.partial_owner();
     let owner_guard = if owner.is_installed() {
         Some(owner.retain_for_owned_work()?)
     } else {
         None
     };
+    let completion = Arc::new(completion);
     let (mut sender, receiver) = tokio::sync::oneshot::channel();
-    let task = super::platform::spawn_sync_task(async move {
+    // Erase the owner task so consumer crates do not instantiate the entire
+    // branch preparation state machine inside their public operation future.
+    #[cfg(not(target_family = "wasm"))]
+    type OwnedTask = futures_util::future::BoxFuture<'static, ()>;
+    #[cfg(target_family = "wasm")]
+    type OwnedTask = futures_util::future::LocalBoxFuture<'static, ()>;
+    let owned: OwnedTask = Box::pin(async move {
         let _owner_guard = owner_guard;
         let connect = super::platform::HttpSyncTransport::connect(&server.url, &server.headers);
         futures_util::pin_mut!(connect);
@@ -81,22 +88,44 @@ where
                 ));
             }
             let target = completion.target.clone();
-            let prepare = prepare_existing_branch(engine.clone(), previous, &transport, &target);
-            futures_util::pin_mut!(prepare);
-            let prepared =
-                match futures_util::future::select(prepare, Box::pin(sender.closed())).await {
-                    futures_util::future::Either::Left((result, _)) => result?,
-                    futures_util::future::Either::Right(_) => {
-                        return Err(conflict("branch switch cancelled before publication"));
+            loop {
+                let prepare: super::SyncTransportFuture<'_, super::partial_publication::PreparedPartialPublication> =
+                    Box::pin(prepare_existing_branch_with_retry(
+                        engine.clone(),
+                        &transport,
+                        &target,
+                        demand_tx.as_ref(),
+                    ));
+                futures_util::pin_mut!(prepare);
+                let prepared =
+                    match futures_util::future::select(prepare, Box::pin(sender.closed())).await {
+                        futures_util::future::Either::Left((result, _)) => result?,
+                        futures_util::future::Either::Right(_) => {
+                            return Err(conflict("branch switch cancelled before publication"));
+                        }
+                    };
+                // Keep selector guards across failed preparations/publications.
+                // Once durable work starts its owned task must finish, even if
+                // the public future is cancelled.
+                match super::partial_publication::publish_prepared_partial(
+                    engine.clone(),
+                    prepared.with_branch_switch_completion(completion.clone()),
+                )
+                .await
+                {
+                    Err(error)
+                        if retryable_branch_preparation(&error)
+                            && engine
+                                .sync_mode()
+                                .ensure_partial_admission_healthy()
+                                .is_ok()
+                            && completion.branch.get()? != target =>
+                    {
+                        super::platform::sleep(std::time::Duration::from_millis(10)).await;
                     }
-                };
-            // Publication owns its task and both selector guards. Do not race
-            // this await against cancellation once durable work can begin.
-            super::partial_publication::publish_prepared_partial(
-                engine,
-                prepared.with_branch_switch_completion(completion),
-            )
-            .await
+                    result => return result,
+                }
+            }
         }
         .await;
         let close = transport.close_session();
@@ -108,7 +137,8 @@ where
             tracing::warn!(code = %error.code, "branch admission session cleanup failed");
         }
         let _ = sender.send(result);
-    })?;
+    });
+    let task = super::platform::spawn_sync_task(owned)?;
     let result = receiver
         .await
         .map_err(|_| conflict("branch switch stopped without an outcome"))?;
@@ -140,7 +170,7 @@ where
     let candidate = transport.fork_native_baseline_lease(next.baseline_lease())?;
     let storage = engine.storage();
     let mut demands = std::collections::BTreeSet::new();
-    for _ in 0..4096 {
+    loop {
         deadline.check(&next.baseline_lease().lease_id)?;
         if engine.sync_mode().partial_admission().as_deref() != Some(previous.as_ref()) {
             return Err(conflict(
@@ -184,8 +214,53 @@ where
             }
         }
     }
-    Err(LixError::new(
-        "LIX_PARTIAL_SCOPE_PREPARATION_LIMIT",
-        "branch switch exceeded native dependency bound",
-    ))
+}
+
+fn retryable_branch_preparation(error: &LixError) -> bool {
+    !error.automatic_retry_is_forbidden()
+        && matches!(
+            error.code.as_str(),
+            "LIX_PARTIAL_CANDIDATE_EXPIRED"
+                | "LIX_PARTIAL_READ_INTEREST_CHANGED"
+                | "LIX_PARTIAL_BASELINE_EXPIRED"
+                | LixError::CODE_TRANSACTION_CONFLICT
+        )
+}
+
+pub(super) async fn prepare_existing_branch_with_retry<S, C>(
+    engine: Arc<Engine<S>>,
+    transport: &HttpSyncTransport<C>,
+    target: &str,
+    demand_tx: Option<&tokio::sync::mpsc::Sender<super::runtime::SyncDemand>>,
+) -> Result<super::partial_publication::PreparedPartialPublication, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+    C: RawHttpClient + Clone + 'static,
+{
+    loop {
+        let previous = engine
+            .sync_mode()
+            .partial_admission()
+            .ok_or_else(|| conflict("branch switch lost its partial admission"))?;
+        match prepare_existing_branch(engine.clone(), previous, transport, target).await {
+            Ok(prepared) => return Ok(prepared),
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "LIX_PARTIAL_BRANCH_SWITCH_PENDING" | "LIX_PARTIAL_REPLICA_MERGE_PENDING"
+                ) =>
+            {
+                let Some(demand_tx) = demand_tx else {
+                    return Err(error);
+                };
+                super::runtime::reconcile_partial_before_branch_switch(demand_tx).await?;
+            }
+            Err(error) if retryable_branch_preparation(&error) => {
+                // Preparation has not published the selector. Fetch a fresh
+                // descriptor after lease expiry or concurrent publication.
+                super::platform::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }

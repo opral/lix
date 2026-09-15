@@ -1,7 +1,7 @@
 use super::*;
 use crate::sync::http::CandidateBaselineDeadline;
 use crate::sync::partial_publication::{
-    PartialRecoveryPolicy, prepare_clean_lease_reacquisition, prepare_partial_publication,
+    PartialRecoveryPolicy, prepare_lease_reacquisition, prepare_partial_publication,
 };
 fn deadline(wire: &crate::sync::LeasedPartialReplicaDescriptor) -> CandidateBaselineDeadline {
     CandidateBaselineDeadline::for_test(&wire.lease.lease_id, std::time::Duration::from_secs(60))
@@ -14,7 +14,7 @@ async fn lease_only(
         .leased_partial_replica_descriptor(None)
         .await
         .unwrap();
-    prepare_clean_lease_reacquisition(engine, &wire, deadline(&wire))
+    prepare_lease_reacquisition(engine, &wire, deadline(&wire))
         .await
         .unwrap()
 }
@@ -22,6 +22,20 @@ async fn recovery_candidate(
     engine: &Engine<Memory>,
     old: &PartialReplicaState,
     authority: &Lix<Memory>,
+) -> (Arc<PartialReplicaState>, PreparedPartialPublication) {
+    recovery_candidate_with_policy(
+        engine,
+        old,
+        authority,
+        PartialRecoveryPolicy::ExpiredBaseline,
+    )
+    .await
+}
+async fn recovery_candidate_with_policy(
+    engine: &Engine<Memory>,
+    old: &PartialReplicaState,
+    authority: &Lix<Memory>,
+    policy: PartialRecoveryPolicy,
 ) -> (Arc<PartialReplicaState>, PreparedPartialPublication) {
     let wire = authority
         .leased_partial_replica_descriptor(None)
@@ -35,18 +49,12 @@ async fn recovery_candidate(
     let storage = engine.storage();
     let mut seen = BTreeSet::new();
     for _ in 0..256 {
-        let error = match prepare_partial_publication(
-            engine,
-            next.clone(),
-            budget.clone(),
-            PartialRecoveryPolicy::ExpiredBaseline,
-        )
-        .await
-        {
-            Ok(Some(prepared)) => return (next, prepared),
-            Ok(None) => panic!("expiry recovery must rebuild different serving basis"),
-            Err(error) => error,
-        };
+        let error =
+            match prepare_partial_publication(engine, next.clone(), budget.clone(), policy).await {
+                Ok(Some(prepared)) => return (next, prepared),
+                Ok(None) => panic!("expiry recovery must rebuild different serving basis"),
+                Err(error) => error,
+            };
         if let Some(address) = NativeObjectRef::from_missing_error(&error).unwrap() {
             assert!(seen.insert(format!("{address:?}")));
             hydrate_native_object(
@@ -189,7 +197,7 @@ async fn own_ack_recovery_rebuilds_old_serving_basis_even_when_confirmed_matches
         .is_none()
     );
     assert!(
-        prepare_clean_lease_reacquisition(&engine, &wire, deadline(&wire))
+        prepare_lease_reacquisition(&engine, &wire, deadline(&wire))
             .await
             .is_err()
     );
@@ -244,7 +252,7 @@ async fn changed_basis_recovery_prepares_previously_negative_scope() {
     assert!(value(session.execute(sql, &[]).await.unwrap()).contains("arrived"));
 }
 #[tokio::test]
-async fn pending_suffix_blocks_recovery_without_losing_local_edit() {
+async fn same_basis_recovery_preserves_pending_suffix_and_frozen_upload() {
     let (authority, engine, session, old) = fixture().await;
     let storage = engine.storage();
     execute_hydrating(
@@ -259,6 +267,7 @@ async fn pending_suffix_blocks_recovery_without_losing_local_edit() {
     .await
     .unwrap();
     let before = admitted_controls(&storage, &old).await.unwrap();
+    let before_capture = lease_only(&engine, &authority).await;
     let branch = &old.descriptor().selected_branch.branch_id;
     let read = storage.begin_read(Default::default()).await.unwrap();
     let (push, _, _) =
@@ -299,23 +308,37 @@ async fn pending_suffix_blocks_recovery_without_losing_local_edit() {
         )
         .await
         .unwrap();
+    // Capturing an upload does not move branch controls. Its own bookkeeping
+    // guard must still invalidate a lease publication prepared before capture.
+    assert!(
+        publish_prepared_partial(engine.clone(), before_capture)
+            .await
+            .is_err()
+    );
     let wire = authority
         .leased_partial_replica_descriptor(None)
         .await
         .unwrap();
-    let error = match prepare_clean_lease_reacquisition(&engine, &wire, deadline(&wire)).await {
-        Err(error) => error,
-        Ok(_) => panic!("pending suffix was overwritten"),
-    };
-    assert_eq!(error.code, "LIX_PARTIAL_REPLICA_BASELINE_RECOVERY_PENDING");
+    let prepared = prepare_lease_reacquisition(&engine, &wire, deadline(&wire))
+        .await
+        .expect("same-basis lease recovery retains pending writes");
+    publish_prepared_partial(engine.clone(), prepared)
+        .await
+        .unwrap();
+    let next = engine.sync_mode().partial_admission().unwrap();
+    assert_ne!(
+        next.baseline_lease().lease_id,
+        old.baseline_lease().lease_id
+    );
+    assert_eq!(next.descriptor(), old.descriptor());
     let read = storage.begin_read(Default::default()).await.unwrap();
     let (retained, _, _) =
-        crate::sync::partial_push_state::load_partial_push_state(&read, &old, branch)
+        crate::sync::partial_push_state::load_partial_push_state(&read, &next, branch)
             .await
             .unwrap();
     assert_eq!(retained.prepared, Some(upload));
     drop(read);
-    assert_eq!(admitted_controls(&storage, &old).await.unwrap(), before);
+    assert_eq!(admitted_controls(&storage, &next).await.unwrap(), before);
     assert!(
         value(
             session
@@ -386,7 +409,7 @@ async fn lease_recovery_rejects_racing_write_and_elapsed_candidate_budget() {
         .await
         .unwrap();
     assert!(
-        prepare_clean_lease_reacquisition(
+        prepare_lease_reacquisition(
             &engine,
             &wire,
             CandidateBaselineDeadline::for_test(&wire.lease.lease_id, std::time::Duration::ZERO)
@@ -394,7 +417,7 @@ async fn lease_recovery_rejects_racing_write_and_elapsed_candidate_budget() {
         .await
         .is_err()
     );
-    let prepared = prepare_clean_lease_reacquisition(&engine, &wire, deadline(&wire))
+    let prepared = prepare_lease_reacquisition(&engine, &wire, deadline(&wire))
         .await
         .unwrap();
     execute_hydrating(
@@ -425,5 +448,141 @@ async fn lease_recovery_rejects_racing_write_and_elapsed_candidate_budget() {
                 .unwrap()
         )
         .contains("raced")
+    );
+}
+
+#[tokio::test]
+async fn authority_recovery_replaces_conflicting_suffix_and_accepts_new_writes() {
+    let (authority, engine, session, old) = fixture().await;
+    let storage = engine.storage();
+    execute_hydrating(
+        &session,
+        &storage,
+        &old,
+        &authority,
+        "UPDATE lix_key_value SET value='local-suffix' WHERE key='resident'",
+        &[],
+        &mut Fetches::default(),
+    )
+    .await
+    .unwrap();
+    let branch = &old.descriptor().selected_branch.branch_id;
+    let controls = admitted_controls(&storage, &old).await.unwrap();
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let (push, _, _) =
+        crate::sync::partial_push_state::load_partial_push_state(&read, &old, branch)
+            .await
+            .unwrap();
+    let upload = crate::sync::partial_push_state::PreparedPartialUpload {
+        created_refs: Vec::new(),
+        attempt_id: uuid::Uuid::now_v7().to_string(),
+        expected: push.confirmed,
+        target: crate::sync::partial_push_state::PartialPushCoordinate {
+            head: controls[0].head_commit_id.to_string(),
+            checkpoint: controls[0]
+                .working_diff_checkpoint_commit_id
+                .unwrap()
+                .to_string(),
+        },
+    };
+    let mut writes = storage.new_write_set();
+    let preconditions = crate::sync::partial_push_state::stage_prepare_partial_upload(
+        &read,
+        &mut writes,
+        &old,
+        branch,
+        &upload,
+    )
+    .await
+    .unwrap();
+    drop(read);
+    storage
+        .commit_partial_replica_write_set(
+            crate::sync::partial_replica_write_capability(),
+            writes,
+            StorageWriteOptions {
+                preconditions,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let wire = authority
+        .leased_partial_replica_descriptor(None)
+        .await
+        .unwrap();
+    let candidate = Arc::new(
+        old.with_leased_descriptor_and_fresh_generations(wire.clone())
+            .unwrap(),
+    );
+    let error = match prepare_partial_publication(
+        &engine,
+        candidate,
+        deadline(&wire),
+        PartialRecoveryPolicy::AuthorityWins,
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("a still-publishable upload must not be forgotten"),
+    };
+    assert_eq!(error.code, LixError::CODE_TRANSACTION_CONFLICT);
+    authority
+        .execute(
+            "UPDATE lix_key_value SET value='authority-wins' WHERE key='resident'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let (next, prepared) = recovery_candidate_with_policy(
+        &engine,
+        &old,
+        &authority,
+        PartialRecoveryPolicy::AuthorityWins,
+    )
+    .await;
+    publish_prepared_partial(engine.clone(), prepared)
+        .await
+        .unwrap();
+    assert!(
+        value(
+            session
+                .execute("SELECT value FROM lix_key_value WHERE key='resident'", &[])
+                .await
+                .unwrap()
+        )
+        .contains("authority-wins")
+    );
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    for branch in [
+        &next.descriptor().selected_branch,
+        &next.descriptor().global_branch,
+    ] {
+        let (push, _, _) = crate::sync::partial_push_state::load_partial_push_state(
+            &read,
+            &next,
+            &branch.branch_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(push.confirmed.head, branch.head.commit_id);
+        assert!(push.prepared.is_none());
+    }
+    drop(read);
+    session
+        .execute(
+            "UPDATE lix_key_value SET value='after-recovery' WHERE key='resident'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(
+        value(
+            session
+                .execute("SELECT value FROM lix_key_value WHERE key='resident'", &[])
+                .await
+                .unwrap()
+        )
+        .contains("after-recovery")
     );
 }

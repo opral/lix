@@ -41,6 +41,7 @@ pub struct SessionTransaction<StorageImpl: Storage + 'static = Memory> {
     commit_coordinator: Arc<CommitCoordinator<StorageImpl>>,
     pub(super) telemetry: Option<Arc<dyn TelemetrySink>>,
     pub(super) sync_mode: SyncModeState,
+    pub(super) sync_demand_tx: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
     pub(super) has_started_statement: bool,
     pub(super) has_written_statement: bool,
     /// Reusable storage only for SQL literals containing doubled quote
@@ -127,6 +128,7 @@ where
             commit_coordinator: Arc::clone(&self.commit_coordinator),
             telemetry: self.telemetry.clone(),
             sync_mode: self.sync_mode.clone(),
+            sync_demand_tx: None,
             has_started_statement: false,
             has_written_statement: false,
             prepared_literal_escape_scratch: SmallVec::new(),
@@ -139,6 +141,17 @@ impl<StorageImpl> SessionTransaction<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    pub(crate) fn with_sync_demand_sender(
+        mut self,
+        sender: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
+    ) -> Self {
+        if let Some(transaction) = self.transaction.as_mut() {
+            transaction.set_sync_demand_sender(sender.clone());
+        }
+        self.sync_demand_tx = sender;
+        self
+    }
+
     pub(super) fn transaction_mut(&mut self) -> Result<&mut Transaction<StorageImpl>, LixError> {
         self.ensure_session_open()?;
         self.transaction
@@ -165,7 +178,14 @@ where
             .ok_or_else(|| transaction_state_error("Lix transaction is closed"))
     }
 
-    pub async fn commit(mut self) -> Result<crate::CommitReceipt, LixError> {
+    pub fn commit(self) -> impl Future<Output = Result<crate::CommitReceipt, LixError>> {
+        // Callers can join independent commits. Return only the pinned owner,
+        // so each caller does not retain another complete adapter-specific
+        // preparation/publication state machine on its thread stack.
+        Box::pin(self.commit_inner())
+    }
+
+    async fn commit_inner(mut self) -> Result<crate::CommitReceipt, LixError> {
         // Explicit transactions may remain open across application awaits, so
         // they do not hold the collaboration gate while planning. Serialize
         // their commit-time revalidation and persistence with bounded writes.
@@ -176,7 +196,10 @@ where
             .as_ref()
             .is_some_and(SessionWriteAccess::serializes_collaboration_writes);
         let operation_guard = self.begin_session_commit_operation()?;
-        self.transaction_mut()?.flush_prepared_mutations().await?;
+        // The hydration path retains adapter-specific read futures. Keep it
+        // outside the commit future, which callers may join for independent
+        // transactions on the default thread stack.
+        Box::pin(self.flush_prepared_mutations_with_sync()).await?;
         let transaction = self
             .transaction
             .take()

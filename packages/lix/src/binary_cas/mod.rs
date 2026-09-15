@@ -12,13 +12,13 @@ mod types;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(crate) use codec::decode_binary_cas_manifest;
+pub(crate) use chunking::CHUNK_ANCHOR_BYTES;
+pub(crate) use codec::{BinaryCasManifest, decode_binary_cas_manifest, decode_binary_cas_manifest_chunk};
 #[cfg(all(feature = "storage-benches", test))]
 pub(crate) use codec::encode_binary_cas_manifest;
 #[cfg(feature = "storage-benches")]
 pub(crate) use codec::{
-    BinaryCasManifest, StorageBinaryCasDeltaBaseLayout, decode_binary_cas_chunk,
-    decode_binary_cas_manifest_chunk,
+    StorageBinaryCasDeltaBaseLayout, decode_binary_cas_chunk,
 };
 pub(crate) use context::{BinaryCasContext, BlobDataReader};
 pub(crate) use kv::{
@@ -27,8 +27,9 @@ pub(crate) use kv::{
 };
 pub(crate) use kv::{load_bytes_many, load_metadata_many};
 pub(crate) use transfer::{
-    CanonicalBlobChunk, CanonicalBlobManifest, chunk_presence_many, load_canonical_blob_chunks,
-    load_verified_chunk, stage_deferred_canonical_manifest, stage_transfer_publication_fence,
+    CanonicalBlobChunk, CanonicalBlobManifest, chunk_presence_many, load_canonical_blob_anchor,
+    load_canonical_blob_chunks, load_streaming_canonical_manifest, load_verified_chunk,
+    stage_deferred_canonical_manifest, stage_transfer_publication_fence,
     stage_verified_canonical_manifest, stage_verified_inline_canonical_blob,
     stage_verified_raw_chunk, validate_manifest_receipts,
 };
@@ -107,4 +108,69 @@ pub(crate) async fn stage_cas_reclamation_fence(
     preconditions: &mut Vec<crate::storage_adapter::StoragePrecondition>,
 ) -> Result<(), crate::LixError> {
     kv::stage_reclamation_fence(store, writes, preconditions).await
+}
+
+/// Exact inputs behind one authenticated immutable blob identity. These are
+/// safe to add to a pinned transaction cache without admitting newer roots.
+pub(crate) async fn hydrated_manifest_input_keys(
+    read: &impl crate::storage_adapter::StorageAdapterRead,
+    blob: BlobId,
+) -> Result<Vec<(crate::storage_adapter::StorageSpace, crate::storage_adapter::StorageKey)>, crate::LixError> {
+    use crate::storage_adapter::{StorageGetManyRequest as GetManyRequest, StorageKey as Key, StorageProjectedValue as ProjectedValue};
+    let key = Key(bytes::Bytes::copy_from_slice(blob.as_bytes()));
+    let result = read
+        .get_many(&[GetManyRequest {
+            space: BINARY_CAS_MANIFEST_SPACE,
+            keys: std::slice::from_ref(&key),
+            opts: Default::default(),
+        }])
+        .await?;
+    let Some(Some(ProjectedValue::FullValue(value))) = result.values.first() else {
+        return Err(crate::LixError::new(
+            crate::LixError::CODE_TRANSACTION_CONFLICT,
+            "transaction blob manifest is no longer retained",
+        ));
+    };
+    let mut keys = vec![(BINARY_CAS_MANIFEST_SPACE, key)];
+    let mut chunks = Vec::new();
+    match decode_binary_cas_manifest(value)? {
+        BinaryCasManifest::SingleChunk { chunk_hash, .. } => chunks.push(chunk_hash),
+        BinaryCasManifest::Chunked { .. } => {
+            let range = crate::storage_adapter::StoragePrefix {
+                bytes: bytes::Bytes::copy_from_slice(blob.as_bytes()),
+            }
+            .to_range()?;
+            let mut scan = read
+                .begin_scan(BINARY_CAS_MANIFEST_CHUNK_SPACE, range, Default::default())
+                .await?;
+            loop {
+                let (page, more) = scan
+                    .next_page(crate::storage_adapter::MAX_SCAN_PAGE_ROWS)
+                    .await?
+                    .into_parts();
+                for entry in page {
+                    if let ProjectedValue::FullValue(value) = entry.value {
+                        chunks.push(decode_binary_cas_manifest_chunk(&value)?.0);
+                    }
+                }
+                if !more {
+                    break;
+                }
+            }
+        }
+        BinaryCasManifest::Empty { .. } => {}
+        BinaryCasManifest::Delta { .. } => {
+            return Err(crate::LixError::new(
+                crate::LixError::CODE_TRANSACTION_CONFLICT,
+                "transaction requires a canonical retained blob manifest",
+            ));
+        }
+    }
+    for chunk in chunks {
+        let key = Key(bytes::Bytes::copy_from_slice(&chunk));
+        keys.push((BINARY_CAS_CHUNK_SPACE, key.clone()));
+        keys.push((BINARY_CAS_CHUNK_PRESENCE_SPACE, key.clone()));
+        keys.push((BINARY_CAS_CHUNK_DEMAND_SPACE, key));
+    }
+    Ok(keys)
 }

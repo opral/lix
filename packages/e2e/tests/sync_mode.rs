@@ -861,7 +861,7 @@ async fn connected_api_routes_local_work_and_hot_reads_need_no_round_trip() {
         .export_snapshot()
         .write_to(&mut snapshot)
         .await
-        .expect("connected snapshot export streams from the authority");
+        .expect("connected snapshot export preserves the local replica");
     assert!(snapshot.starts_with(b"LIXSNAP\0"));
 
     replica.close().await.expect("close replica");
@@ -882,12 +882,35 @@ async fn connected_api_routes_local_work_and_hot_reads_need_no_round_trip() {
         .await
         .expect("a persisted certified HOT cache remains readable without a server");
     assert_eq!(offline_read.results[0].rows().len(), 1);
-    let persisted_export_error = reopened_without_server
+    let mut offline_snapshot = Vec::new();
+    reopened_without_server
         .export_snapshot()
-        .write_to(&mut Vec::new())
+        .write_to(&mut offline_snapshot)
         .await
-        .expect_err("persisted sparse cache must not export through a standalone handle");
-    assert_eq!(persisted_export_error.code, LixError::CODE_INVALID_PARAM);
+        .expect("persisted partial cache exports without a server");
+    let restored_dir = TempDir::new().expect("restored replica tempdir");
+    let restored = open_lix()
+        .with_storage(
+            FilesystemStorage::new(restored_dir.path())
+                .open()
+                .expect("open durable restored replica storage"),
+        )
+        .from_snapshot(Cursor::new(offline_snapshot))
+        .await
+        .expect("restore local partial snapshot without an authority");
+    assert_eq!(
+        restored
+            .execute("SELECT value FROM lix_key_value WHERE key = 'after-abandoned'", &[])
+            .await
+            .expect("restored cached row remains readable")
+            .rows()
+            .len(),
+        1,
+    );
+    restored
+        .close()
+        .await
+        .expect("close restored partial snapshot");
     reopened_without_server
         .close()
         .await
@@ -3297,7 +3320,7 @@ async fn existing_branch_admission_preserves_pending_work_and_restores_archived_
         })
         .await
         .unwrap_err();
-    assert_eq!(error.code, "LIX_PARTIAL_BRANCH_SWITCH_PENDING", "{error:?}");
+    assert_eq!(error.code, "LIX_SYNC_TEST_OFFLINE", "{error:?}");
     assert_eq!(replica.active_branch_id().await.unwrap(), target);
     assert_eq!(
         read_value(&replica, "branch-marker").await.as_deref(),
@@ -3315,28 +3338,15 @@ async fn existing_branch_admission_preserves_pending_work_and_restores_archived_
     remote
         .wait_for_value("branch-marker", "pending-target")
         .await;
-    tokio::time::timeout(WAIT_TIMEOUT, async {
-        loop {
-            match replica
-                .switch_branch(SwitchBranchOptions {
-                    branch_id: main.clone(),
-                })
-                .await
-            {
-                Ok(_) => break,
-                Err(error)
-                    if error.code == "LIX_PARTIAL_BRANCH_SWITCH_PENDING"
-                        || error.code == LixError::CODE_TRANSACTION_CONFLICT
-                        || error.code == "LIX_PARTIAL_READ_INTEREST_CHANGED" =>
-                {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                Err(error) => panic!("branch switch after exact upload acknowledgement: {error:?}"),
-            }
-        }
-    })
+    tokio::time::timeout(
+        WAIT_TIMEOUT,
+        replica.switch_branch(SwitchBranchOptions {
+            branch_id: main.clone(),
+        }),
+    )
     .await
-    .expect("branch switch after selected upload");
+    .expect("branch switch completes after selected upload")
+    .expect("branch switch settles internal reconciliation without caller retries");
     // The old exact recipe survived in the bounded archive and was prepared
     // before publication; this first returning read must already be local.
     probe.set_offline(true);

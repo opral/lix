@@ -459,7 +459,7 @@ paths:
       - $ref: "#/components/parameters/LixId"
     post:
       operationId: syncPartialUpdate
-      description: Waits for a leased descriptor and delivers a bounded bundle of immutable native inputs for retained read recipes. Opening remains metadata-only. The replica validates and prepares coverage locally; incomplete bundles use ordinary on-demand hydration. Requires SDK and server sync protocol 14 together.
+      description: Waits for a leased descriptor and delivers a bounded bundle of immutable native inputs for retained read recipes. Opening remains metadata-only. The replica validates and prepares coverage locally; incomplete bundles use ordinary on-demand hydration. Requires SDK and server sync protocol 16 together.
       parameters:
         - $ref: "#/components/parameters/RequiredSessionId"
         - $ref: "#/components/parameters/SyncProtocolVersion"
@@ -953,7 +953,7 @@ components:
       in: header
       required: true
       description: Exact sync wire-protocol version advertised by the handshake.
-      schema: { type: integer, const: 15 }
+      schema: { type: integer, const: 16 }
     TransactionId:
       name: Lix-Transaction-Id
       in: header
@@ -1011,7 +1011,7 @@ components:
       required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
         protocolVersion: { type: integer, const: 10 }
-        syncProtocolVersion: { type: integer, const: 15 }
+        syncProtocolVersion: { type: integer, const: 16 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }
@@ -1210,6 +1210,10 @@ components:
       properties:
         old: { $ref: "#/components/schemas/PartialMergeRequest" }
         nextAttemptId: { type: string, format: uuid }
+        abandon:
+          type: boolean
+          default: false
+          description: When true, terminally fences an active attempt for automatic authoritative recovery. An already committed receipt wins. Otherwise the attempt must have expired. Requires sync protocol 16.
     PartialAttemptRestartReceipt:
       type: object
       additionalProperties: false

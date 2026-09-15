@@ -27,6 +27,7 @@ mod contract;
 mod current_coverage;
 mod http;
 pub(crate) mod native_metadata;
+pub(crate) use native_metadata::{key as native_metadata_storage_key, space as native_metadata_storage_space};
 pub(crate) use native_metadata::{MAX_NATIVE_METADATA_RESPONSE_BYTES, NativeMetadataRequest};
 pub(crate) mod native_object;
 pub(crate) use native_object::MAX_NATIVE_OBJECT_RESPONSE_BYTES;
@@ -170,6 +171,7 @@ pub(crate) use repository::{
 };
 pub(crate) use repository::{
     ReplicaRebuildSource, inspect_replica_rebuild_source, replica_replacement_unavailable,
+    replica_repository_identity,
 };
 pub(crate) use runtime::{SyncDemand, SyncDemandRetry, SyncRuntime};
 pub(crate) use upload_plan::{
@@ -186,7 +188,8 @@ pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 // can differ from the head captured by the client's attempt.
 // SDK and server must upgrade together.
 // v15 requires format81 and explicit repository/principal admission.
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 15;
+// v16 fences active abandoned attempts before automatic authoritative recovery.
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 16;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str = "LIX_SYNC_REPOSITORY_ID_MISMATCH";
@@ -502,3 +505,6 @@ mod partial_branch_switch;
 pub(crate) use partial_branch_switch::{PartialBranchSwitchCompletion, switch_existing_branch};
 
 mod partial_created_refs;
+
+#[cfg(all(test, feature = "server-protocol"))]
+mod partial_public_api_tests;

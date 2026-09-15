@@ -278,7 +278,8 @@ export class Lix {
 		return this.#runOperation(() => this.binding.createBranch(options));
 	}
 
-	/** Streams a deterministic snapshot of the complete Lix. */
+	/** Streams this handle's state. Local partial replicas include their cached
+	 * inputs and pending edits; remote handles export the complete authority. */
 	exportSnapshot(): ReadableStream<Uint8Array> {
 		let snapshot:
 			| {

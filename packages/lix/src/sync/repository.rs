@@ -926,41 +926,11 @@ pub(crate) fn replica_replacement_unavailable(reason: &str) -> LixError {
         .with_details(serde_json::json!({"reason": reason}))
 }
 
-pub(crate) async fn inspect_replica_rebuild_source(
+/// Read only the indexed repository identity. Replica cache replacement must
+/// never enumerate branches, outboxes, or history to open a repository.
+pub(crate) async fn replica_repository_identity(
     read: &(impl StorageAdapterRead + ?Sized),
-    _source_format: u32,
-) -> Result<Option<ReplicaRebuildSource>, LixError> {
-    let mut cursor = read
-        .begin_scan(
-            SYNC_REPLICA_STATE_SPACE,
-            StoragePrefix {
-                bytes: Bytes::new(),
-            }
-            .to_range()?,
-            StorageBeginScanOptions {
-                projection: StorageCoreProjection::FullValue,
-                ..Default::default()
-            },
-        )
-        .await?;
-    let (entries, has_more) = cursor.next_page(2).await?.into_parts();
-    if entries.is_empty() {
-        return Ok(None);
-    }
-    if entries.len() == 1 && entries[0].key.0.as_ref() == AUTHORITY_STATE_KEY {
-        return Ok(None);
-    }
-    if entries.len() != 1 || has_more {
-        return Err(replica_replacement_unavailable("unknown_state"));
-    }
-    let StorageProjectedValue::FullValue(raw) = &entries[0].value else {
-        return Err(replica_replacement_unavailable("unknown_state"));
-    };
-    let state: SyncReplicaState = serde_json::from_slice(raw)
-        .map_err(|_| replica_replacement_unavailable("unknown_state"))?;
-    if state.active_account_id.is_empty() {
-        return Err(replica_replacement_unavailable("unknown_state"));
-    }
+) -> Result<String, LixError> {
     let hot = crate::hot_state::HotStateContext::new(
         TrackedStateContext::new(),
         CommitGraphContext::new(),
@@ -1001,6 +971,45 @@ pub(crate) async fn inspect_replica_rebuild_source(
         .filter(|id| uuid::Uuid::parse_str(id).is_ok())
         .ok_or_else(|| replica_replacement_unavailable("unknown_state"))?
         .to_owned();
+    Ok(repository_id)
+}
+
+pub(crate) async fn inspect_replica_rebuild_source(
+    read: &(impl StorageAdapterRead + ?Sized),
+    _source_format: u32,
+) -> Result<Option<ReplicaRebuildSource>, LixError> {
+    let mut cursor = read
+        .begin_scan(
+            SYNC_REPLICA_STATE_SPACE,
+            StoragePrefix {
+                bytes: Bytes::new(),
+            }
+            .to_range()?,
+            StorageBeginScanOptions {
+                projection: StorageCoreProjection::FullValue,
+                ..Default::default()
+            },
+        )
+        .await?;
+    let (entries, has_more) = cursor.next_page(2).await?.into_parts();
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    if entries.len() == 1 && entries[0].key.0.as_ref() == AUTHORITY_STATE_KEY {
+        return Ok(None);
+    }
+    if entries.len() != 1 || has_more {
+        return Err(replica_replacement_unavailable("unknown_state"));
+    }
+    let StorageProjectedValue::FullValue(raw) = &entries[0].value else {
+        return Err(replica_replacement_unavailable("unknown_state"));
+    };
+    let state: SyncReplicaState = serde_json::from_slice(raw)
+        .map_err(|_| replica_replacement_unavailable("unknown_state"))?;
+    if state.active_account_id.is_empty() {
+        return Err(replica_replacement_unavailable("unknown_state"));
+    }
+    let repository_id = replica_repository_identity(read).await?;
     let controls = BranchHeadControlContext::new()
         .reader(read)
         .scan()
@@ -9022,7 +9031,9 @@ mod tests {
         let receipt = Engine::initialize(storage.clone())
             .await
             .expect("replica storage should initialize");
-        crate::migration::admit_repository(&storage, None).await.unwrap();
+        crate::migration::admit_repository(&storage, None)
+            .await
+            .unwrap();
         let replica = open_lix()
             .with_storage(storage.clone())
             .await
@@ -9090,7 +9101,9 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
             .await
             .expect("replica storage should initialize");
-        crate::migration::admit_repository(&storage, None).await.unwrap();
+        crate::migration::admit_repository(&storage, None)
+            .await
+            .unwrap();
         let replica = open_lix()
             .with_storage(storage.clone())
             .await
@@ -9205,7 +9218,9 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
             .await
             .unwrap();
-        crate::migration::admit_repository(&storage, None).await.unwrap();
+        crate::migration::admit_repository(&storage, None)
+            .await
+            .unwrap();
         let mut replica = open_lix().with_storage(storage.clone()).await.unwrap();
         replica
             .set_sync_role(super::super::SyncRole::Replica)
@@ -10473,7 +10488,9 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
             .await
             .expect("replica storage should initialize");
-        crate::migration::admit_repository(&storage, None).await.unwrap();
+        crate::migration::admit_repository(&storage, None)
+            .await
+            .unwrap();
         let mut replica = open_lix()
             .with_storage(storage)
             .await
@@ -10510,7 +10527,9 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
             .await
             .expect("replica storage should initialize");
-        crate::migration::admit_repository(&storage, None).await.unwrap();
+        crate::migration::admit_repository(&storage, None)
+            .await
+            .unwrap();
         let first = open_lix()
             .with_storage(storage.clone())
             .await
@@ -10668,7 +10687,9 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
             .await
             .expect("replica storage should initialize");
-        crate::migration::admit_repository(&storage, None).await.unwrap();
+        crate::migration::admit_repository(&storage, None)
+            .await
+            .unwrap();
         let mut replica = open_lix()
             .with_storage(storage)
             .await
@@ -12853,7 +12874,9 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&default_branch_id))
             .await
             .expect("replica storage should initialize");
-        crate::migration::admit_repository(&storage, None).await.unwrap();
+        crate::migration::admit_repository(&storage, None)
+            .await
+            .unwrap();
         let replica = open_lix()
             .with_storage(storage)
             .await
@@ -12905,7 +12928,9 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&secondary.id))
             .await
             .expect("replica storage should initialize");
-        crate::migration::admit_repository(&storage, None).await.unwrap();
+        crate::migration::admit_repository(&storage, None)
+            .await
+            .unwrap();
         let replica = open_lix()
             .with_storage(storage)
             .await
@@ -13154,7 +13179,9 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
             .await
             .expect("local storage should initialize with the same branch id");
-        crate::migration::admit_repository(&storage, None).await.unwrap();
+        crate::migration::admit_repository(&storage, None)
+            .await
+            .unwrap();
         let local = open_lix()
             .with_storage(storage)
             .await
@@ -13238,7 +13265,9 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
             .await
             .expect("replica storage should initialize");
-        crate::migration::admit_repository(&storage, None).await.unwrap();
+        crate::migration::admit_repository(&storage, None)
+            .await
+            .unwrap();
         let replica = open_lix()
             .with_storage(storage)
             .await
@@ -13299,7 +13328,9 @@ mod tests {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&branch_id))
             .await
             .expect("replica storage should initialize");
-        crate::migration::admit_repository(&storage, None).await.unwrap();
+        crate::migration::admit_repository(&storage, None)
+            .await
+            .unwrap();
         let replica = open_lix()
             .with_storage(storage)
             .await

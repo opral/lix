@@ -21,7 +21,7 @@ pub(crate) use native_baseline_lease::{
 pub(crate) use native_upload_attempt::{
     NATIVE_UPLOAD_ATTEMPT_SPACE, NativeUploadAttempt, NativeUploadAttemptIdentity,
     load_native_upload_attempt, require_native_upload_attempt, stage_accepted_native_upload_wave,
-    stage_finalize_native_upload_attempt, stage_revoke_expired_upload_attempt,
+    stage_finalize_native_upload_attempt, stage_revoke_upload_attempt,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

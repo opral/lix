@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 mod terminal_transport;
 
-async fn fixture() -> (
+pub(super) async fn fixture() -> (
     Lix<Memory>,
     Arc<Engine<Memory>>,
     SessionContext<Memory>,
@@ -84,7 +84,7 @@ async fn fixture_with_account(
     fixture_from_authority(authority, account).await
 }
 
-async fn fixture_from_authority(
+pub(super) async fn fixture_from_authority(
     authority: Lix<Memory>,
     account: Option<&str>,
 ) -> (
@@ -1530,7 +1530,9 @@ async fn detached_receipt_upgrade_preserves_pending_data_before_current_open() {
     drop(session);
     drop(engine);
     // No transport exists in this route. Only the detached operator upgrades v1.
-    crate::sync::upgrade_owned_partial_receipt(&storage).await.unwrap();
+    crate::sync::upgrade_owned_partial_receipt(&storage)
+        .await
+        .unwrap();
     drop(storage);
     authority.close().await.unwrap();
     let admitted = crate::migration::admit_partial_epoch(&backing)

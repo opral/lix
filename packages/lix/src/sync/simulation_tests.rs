@@ -246,7 +246,9 @@ impl Replica {
         Engine::initialize_with_main_branch_id(storage.clone(), Some(&default_branch_id))
             .await
             .expect("simulation replica should initialize");
-        crate::migration::admit_repository(&storage, None).await.unwrap();
+        crate::migration::admit_repository(&storage, None)
+            .await
+            .unwrap();
         let mut lix = open_lix()
             .with_storage(storage.clone())
             .await

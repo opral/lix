@@ -80,12 +80,33 @@ pub(crate) async fn prepare_partial_open<S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    loop {
+        match Box::pin(prepare_partial_open_once(storage.clone(), server.clone())).await {
+            Err(error)
+                if error.code == "LIX_PARTIAL_OPEN_RETRY"
+                    || error.code == LixError::CODE_STORAGE_FENCED =>
+            {
+                super::platform::sleep(Duration::from_millis(1)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+async fn prepare_partial_open_once<S>(
+    storage: S,
+    server: Option<ServerOptions>,
+) -> Result<PreparedPartialOpen<S>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
     let server = server
         .map(|mut server| {
             server.url = super::normalize_sync_locator(&server.url)?.locator;
             Ok::<_, LixError>(server)
         })
         .transpose()?;
+    let replacement;
     match crate::migration::admit_partial_epoch(&storage).await {
         Ok(admitted) => {
             if server
@@ -106,11 +127,14 @@ where
             });
         }
         Err(error) => {
-            if error.code != "LIX_PARTIAL_REPLICA_MIGRATION_REQUIRED"
-                || !crate::migration::partial_epoch_has_no_markers(&storage).await?
-            {
+            if error.code != "LIX_PARTIAL_REPLICA_MIGRATION_REQUIRED" {
                 return Err(error);
             }
+            replacement = if crate::migration::partial_epoch_has_no_markers(&storage).await? {
+                None
+            } else {
+                Some(crate::migration::inspect_partial_replacement(&storage).await?)
+            };
         }
     }
     let server = server.ok_or_else(|| {
@@ -128,7 +152,12 @@ where
             uuid::Uuid::now_v7().to_string(),
             descriptor,
         )?;
-        let admission = crate::migration::install_fresh_partial_epoch(storage, &state).await?;
+        let admission = match replacement {
+            Some(source) => {
+                crate::migration::install_replacement_partial_epoch(storage, source, &state).await?
+            }
+            None => crate::migration::install_fresh_partial_epoch(storage, &state).await?,
+        };
         Ok::<_, LixError>(admission)
     }
     .await;

@@ -198,8 +198,22 @@ pub(super) async fn hydrate_metadata_batch<
     request.objects = missing;
     // No local read or transaction remains open across network I/O.
     let response = transport.native_metadata(&request).await?;
-    for attempt in 0..4 {
+    loop {
         let read = storage.begin_read(Default::default()).await?;
+        // Retry local CAS contention only while these authenticated inputs
+        // still belong to the durable admission. Publication may win before
+        // the worker observes its new in-memory state.
+        if load_partial_replica_state(&read)
+            .await?
+            .as_ref()
+            .map(|(stored, _)| stored)
+            != Some(state)
+        {
+            return Err(LixError::new(
+                LixError::CODE_TRANSACTION_CONFLICT,
+                "native metadata hydration admission changed",
+            ));
+        }
         let mut writes = storage.new_write_set();
         let preconditions =
             stage_native_metadata(&read, &mut writes, state, &request, &response).await?;
@@ -218,13 +232,13 @@ pub(super) async fn hydrate_metadata_batch<
         {
             Err(crate::storage_adapter::StorageWriteSetError::Storage(
                 crate::storage_adapter::StorageError::PreconditionFailed(_),
-            )) if attempt < 3 => {
+            )) => {
+                sleep(Duration::from_millis(1)).await;
                 continue;
             }
             result => return result.map(|_| ()).map_err(Into::into),
         }
     }
-    unreachable!("bounded metadata CAS loop returns")
 }
 
 /// Resolve stale queued demands from durable local data before connecting.
@@ -300,6 +314,8 @@ async fn demand_is_resident<S: Storage + Clone + Send + Sync + 'static>(
             }
             Ok(resident)
         }
+        SyncDemandRequest::Pinned(request) => Box::pin(demand_is_resident(storage, state, request)).await,
+        SyncDemandRequest::ReconcilePartial => Ok(false),
         SyncDemandRequest::History(_) => Err(LixError::new(
             "LIX_PARTIAL_REPLICA_DEMAND_UNSUPPORTED",
             "partial replica requires a typed native address for history dependencies",
@@ -420,6 +436,10 @@ pub(super) fn hydrate_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: 
                 }
                 Ok(())
             }
+            SyncDemandRequest::Pinned(request) => hydrate_demand(storage, state, transport, *request).await,
+            SyncDemandRequest::ReconcilePartial => Err(LixError::unknown(
+                "reconciliation must run through the partial owner",
+            )),
             SyncDemandRequest::History(_) => Err(LixError::new(
                 "LIX_PARTIAL_REPLICA_DEMAND_UNSUPPORTED",
                 "partial replica requires a typed native address for this dependency",
@@ -475,6 +495,7 @@ where
     Connect: FnMut() -> super::SyncTransportFuture<'static, HttpSyncTransport<C>>,
 {
     let mut progress = false;
+    let mut deferred_error = None;
     let read = storage.begin_read(Default::default()).await?;
     let cleanup_pending =
         super::partial_global_merge_state::load_partial_global_merge_state(&read, state)
@@ -549,10 +570,196 @@ where
         match upload {
             Ok(changed) => progress |= changed,
             Err(error) if error.code == "LIX_PARTIAL_CREATED_REF_SOURCE_PENDING" => {}
-            Err(error) => return Err(error),
+            Err(error) if is_terminal_partial_transport_error(&error) => return Err(error),
+            Err(error) => { deferred_error.get_or_insert(error); },
         }
     }
+    // A divergent GLOBAL lane must not starve an independently publishable
+    // selected upload. Its acknowledgment can be the fence recovery needs.
+    if !progress {
+        if let Some(error) = deferred_error { return Err(error); }
+    }
     Ok(progress)
+}
+
+/// A recoverable owner transition, never an application retry instruction.
+fn reconciliation_can_retry(error: &LixError) -> bool {
+    matches!(
+        error.code.as_str(),
+        LixError::CODE_TRANSACTION_CONFLICT
+            | "LIX_PARTIAL_BASELINE_EXPIRED"
+            | "LIX_PARTIAL_CANDIDATE_EXPIRED"
+        | "LIX_PARTIAL_READ_INTEREST_CHANGED"
+            | "LIX_PARTIAL_REPLICA_REBASE_REQUIRED"
+            | "LIX_PARTIAL_REPLICA_BASELINE_RECOVERY_PENDING"
+            | "LIX_PARTIAL_REPLICA_MERGE_PENDING"
+            | "LIX_PARTIAL_ATTEMPT_RESTARTED"
+            | "LIX_NATIVE_UPLOAD_ATTEMPT_EXPIRED"
+    )
+}
+
+/// Shared by watch and demand recovery: semantic conflicts are resolved by the
+/// authority, while malformed proofs and transport/authentication failures stay
+/// real errors. The publication layer fences any still-publishable attempt.
+fn prepare_reconciled_descriptor<'a, S, C>(
+    engine: Arc<crate::engine::Engine<S>>,
+    state: Arc<PartialReplicaState>,
+    transport: &'a HttpSyncTransport<C>,
+    wrapper: super::http::TimedLeasedPartialDescriptor,
+    policy: super::partial_publication::PartialRecoveryPolicy,
+) -> super::SyncTransportFuture<'a, super::partial_reconcile::PreparedDescriptor>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+    C: RawHttpClient + Clone + 'static,
+{
+    Box::pin(async move {
+        match super::partial_global_merge_runtime::prepare_descriptor_with_global_merge(
+            engine.clone(),
+            state.clone(),
+            transport,
+            wrapper,
+            policy,
+        )
+        .await
+        {
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "LIX_PARTIAL_GLOBAL_SCOPE_UNSUPPORTED"
+                        | "LIX_PARTIAL_MERGE_SCOPE_UNSUPPORTED"
+                        | "LIX_PARTIAL_GLOBAL_MERGE_PENDING"
+                        | "LIX_PARTIAL_GLOBAL_SELECTED_RECONCILIATION_REQUIRED"
+                        | "LIX_PARTIAL_GLOBAL_NEWER_LOCAL_RECONCILIATION_REQUIRED"
+                        | "LIX_MIGRATION_GLOBAL_SCOPE_UNSUPPORTED"
+                        | "LIX_PARTIAL_MERGE_PROOF_UNAVAILABLE"
+                ) =>
+            {
+                let storage = engine.storage();
+                super::partial_global_merge_runtime::abandon_global_merge(
+                    &storage,
+                    state.clone(),
+                    transport,
+                )
+                .await?;
+                super::partial_merge_runtime::abandon_partial_merge(&storage, &state, transport)
+                    .await?;
+                let wrapper = transport
+                    .partial_replica_descriptor(Some(&state.descriptor().selected_branch.branch_id))
+                    .await?;
+                tracing::warn!(code=%error.code, "partial replica adopts authoritative state after unsupported reconciliation");
+                super::partial_reconcile::prepare_clean_descriptor(
+                    engine,
+                    state,
+                    transport,
+                    wrapper,
+                    super::partial_publication::PartialRecoveryPolicy::AuthorityWins,
+                )
+                .await
+            }
+            result => result,
+        }
+    })
+}
+
+/// The same owner drives foreground recovery and branch admission. Never wait
+/// for this worker's background loop from a demand: that would deadlock it.
+async fn reconcile_partial<S, C, Connect>(
+    engine: Arc<crate::engine::Engine<S>>,
+    transport: &mut Option<HttpSyncTransport<C>>,
+    connect: &mut Connect,
+    settle: bool,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+    C: RawHttpClient + Clone + 'static,
+    Connect: FnMut() -> super::SyncTransportFuture<'static, HttpSyncTransport<C>>,
+{
+    let storage = engine.storage();
+    loop {
+        engine.sync_mode().ensure_partial_admission_healthy()?;
+        let state = engine
+            .sync_mode()
+            .partial_admission()
+            .ok_or_else(|| LixError::unknown("partial recovery lost admission"))?;
+        if settle
+            && super::partial_publication::require_clean_switch_source(&engine, &state)
+                .await
+                .is_ok()
+        {
+            return Ok(());
+        }
+        if transport.is_none() {
+            let connected = connect().await?;
+            validate_admission(&storage, &state, &connected).await?;
+            *transport = Some(connected);
+        }
+        let connected = transport.as_ref().expect("connected");
+        let wrapper = connected
+            .partial_replica_descriptor(Some(&state.descriptor().selected_branch.branch_id))
+            .await?;
+        let candidate = connected.fork_native_baseline_lease(&wrapper.wire.lease)?;
+        let result = prepare_reconciled_descriptor(
+            engine.clone(),
+            state.clone(),
+            &candidate,
+            wrapper,
+            super::partial_publication::PartialRecoveryPolicy::ExpiredBaseline,
+        )
+        .await;
+        match result {
+            Ok(super::partial_reconcile::PreparedDescriptor::Ready(prepared)) => {
+                match super::partial_publication::publish_prepared_partial(engine.clone(), prepared)
+                    .await
+                {
+                    Ok(()) if !settle => return Ok(()),
+                    Ok(()) => {}
+                    Err(error) if reconciliation_can_retry(&error) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(super::partial_reconcile::PreparedDescriptor::LocalProgress) => {}
+            Ok(super::partial_reconcile::PreparedDescriptor::NoChange) => {
+                if !settle {
+                    return Ok(());
+                }
+            }
+            Err(error) if reconciliation_can_retry(&error) => {}
+            Err(error) => return Err(error),
+        }
+        let current = engine
+            .sync_mode()
+            .partial_admission()
+            .ok_or_else(|| LixError::unknown("partial recovery lost admission"))?;
+        // Ordinary pending work on an unchanged server head needs upload, not
+        // a divergent merge. Use the fresh lease for any missing upload inputs.
+        *transport = Some(if current.as_ref() == state.as_ref() { candidate } else {
+            candidate.fork_native_baseline_lease(current.baseline_lease())?
+        });
+        match upload_pending_once(&storage, &current, transport, connect).await {
+            Ok(_) => {}
+            Err(error) if reconciliation_can_retry(&error) => {}
+            Err(error) => {
+                if let Some(demand) = super::runtime::native_sync_demand_request_for_error(&error)?
+                {
+                    match hydrate_demand(
+                        &storage,
+                        &current,
+                        transport.as_ref().expect("connected"),
+                        demand,
+                    ).await {
+                        Ok(()) => {},
+                        Err(error) if reconciliation_can_retry(&error) => {},
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    return Err(error);
+                }
+            }
+        }
+        // Yield under active writers/authority churn; caller cancellation and
+        // owner shutdown continue to race the whole reconciliation future.
+        sleep(Duration::from_millis(1)).await;
+    }
 }
 
 async fn run_partial_worker_connecting<S, C, Connect>(
@@ -875,7 +1082,7 @@ where
                 }
 
                 let prepared =
-                    super::partial_global_merge_runtime::prepare_descriptor_with_global_merge(
+                    prepare_reconciled_descriptor(
                         engine.clone(),
                         state.clone(),
                         connected,
@@ -1022,144 +1229,61 @@ where
         }
         let result = {
             let hydrate = async {
-                let mut recovered_expired_baseline = false;
-                for attempt in 0..3 {
+                loop {
                     if let Some(engine) = &engine {
                         engine.sync_mode().ensure_partial_admission_healthy()?;
-                        let current = engine.sync_mode().partial_admission().ok_or_else(|| {
-                            LixError::new(
-                                "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH",
-                                "worker lost admission",
-                            )
-                        })?;
+                        let current = engine.sync_mode().partial_admission().ok_or_else(||
+                            LixError::unknown("worker lost admission"))?;
                         if current.as_ref() != state.as_ref() {
-                            let lease_changed = current.baseline_lease().lease_id
-                                != state.baseline_lease().lease_id;
-                            transport = transport
-                                .as_ref()
-                                .map(|value| {
-                                    value.fork_native_baseline_lease(current.baseline_lease())
-                                })
-                                .transpose()?;
+                            let lease_changed = current.baseline_lease().lease_id != state.baseline_lease().lease_id;
+                            transport = transport.as_ref().map(|value|
+                                value.fork_native_baseline_lease(current.baseline_lease())).transpose()?;
                             state = current;
                             watch_cursor = state.descriptor().cursor;
                             renewal_deadline = web_time::Instant::now()
                                 + lease_renewal_delay(state.baseline_lease().expires_at_ms);
-                            if lease_changed {
-                                baseline_expired = None;
-                            }
+                            if lease_changed { baseline_expired = None; }
                         }
                     }
+                    if matches!(demand.request, SyncDemandRequest::ReconcilePartial) {
+                        let engine = engine.as_ref().ok_or_else(|| LixError::unknown("reconciliation requires an engine"))?;
+                        return Box::pin(reconcile_partial(engine.clone(), &mut transport, &mut connect, true)).await;
+                    }
                     let result = async {
-                        if demand_is_resident(&storage, &state, &demand.request).await? {
-                            return Ok(());
-                        }
-                        if let Some(error) = &baseline_expired {
-                            return Err(error.clone());
-                        }
+                        if demand_is_resident(&storage, &state, &demand.request).await? { return Ok(()); }
+                        if let Some(error) = &baseline_expired { return Err(error.clone()); }
                         if transport.is_none() {
                             let connected = connect().await?;
                             validate_admission(&storage, &state, &connected).await?;
                             transport = Some(connected);
                         }
-                        hydrate_demand(
-                            &storage,
-                            &state,
-                            transport.as_ref().expect("connected"),
-                            demand.request.clone(),
-                        )
-                        .await
-                    }
-                    .await;
-                    if result.is_ok() {
-                        return result;
-                    }
-                    if result
-                        .as_ref()
-                        .is_err_and(|error| error.code == "LIX_PARTIAL_BASELINE_EXPIRED")
-                        && !recovered_expired_baseline
-                        && attempt < 2
-                    {
+                        hydrate_demand(&storage, &state, transport.as_ref().expect("connected"), demand.request.clone()).await
+                    }.await;
+                    if result.is_ok() { return result; }
+                    if result.as_ref().is_err_and(|error| error.code == "LIX_PARTIAL_BASELINE_EXPIRED") {
+                        if matches!(demand.request, SyncDemandRequest::Pinned(_)) {
+                            return Err(LixError::new(LixError::CODE_TRANSACTION_CONFLICT,
+                                "transaction snapshot expired before its missing inputs were fetched"));
+                        }
                         if let Some(engine) = &engine {
-                            recovered_expired_baseline = true;
                             baseline_expired = result.as_ref().err().cloned();
                             force_descriptor_refresh = true;
                             watch_after = web_time::Instant::now();
-                            if transport.is_none() {
-                                let connected = connect().await?;
-                                validate_admission(&storage, &state, &connected).await?;
-                                transport = Some(connected);
+                            Box::pin(reconcile_partial(engine.clone(), &mut transport, &mut connect, false)).await?;
+                            let current = engine.sync_mode().partial_admission().ok_or_else(|| LixError::unknown("recovery lost admission"))?;
+                            if !super::partial_publication::same_serving_basis(state.descriptor(), current.descriptor())
+                                || state.serving_generation(&state.descriptor().selected_branch.branch_id)? != current.serving_generation(&current.descriptor().selected_branch.branch_id)?
+                                || state.serving_generation(&state.descriptor().global_branch.branch_id)? != current.serving_generation(&current.descriptor().global_branch.branch_id)? {
+                                return Err(LixError::new(super::runtime::PARTIAL_ADMISSION_CHANGED_CODE,
+                                    "baseline recovery changed the serving basis; restart the local operation"));
                             }
-                            // Keep the cold recovery future out of the worker's
-                            // inline layout for downstream storage adapters.
-                            let recovery = Box::pin(async {
-                                let connected = transport.as_ref().expect("connected");
-                                // Expiration is a reconnect condition. Request a fresh
-                                // authority pin immediately, even when its cursor has
-                                // not advanced; a normal watch could long-poll here.
-                                let wrapper = connected
-                                    .partial_replica_descriptor(Some(
-                                        &state.descriptor().selected_branch.branch_id,
-                                    ))
-                                    .await?;
-                                let prepared = super::partial_reconcile::prepare_clean_descriptor(
-                                    engine.clone(),
-                                    state.clone(),
-                                    connected,
-                                    wrapper,
-                                    super::partial_publication::PartialRecoveryPolicy::ExpiredBaseline,
-                                )
-                                .await?;
-                                if let super::partial_reconcile::PreparedDescriptor::Ready(prepared) =
-                                    prepared
-                                {
-                                    // Publication owns the clean checks, CAS guards
-                                    // and cancellation-safe durable commit.
-                                    super::partial_publication::publish_prepared_partial(
-                                        engine.clone(),
-                                        prepared,
-                                    )
-                                    .await?;
-                                }
-                                Ok::<_, LixError>(())
-                            }).await;
-                            let current = engine.sync_mode().partial_admission();
-                            let admission_changed = current.as_deref() != Some(state.as_ref());
-                            if let Err(error) = recovery {
-                                // A concurrent owned publication can win the CAS.
-                                // Retry only if its admitted result actually changed.
-                                if error.code != LixError::CODE_TRANSACTION_CONFLICT
-                                    || !admission_changed
-                                {
-                                    return Err(error);
-                                }
-                            }
-                            if let Some(current) = current {
-                                if !super::partial_publication::same_serving_basis(
-                                    state.descriptor(), current.descriptor(),
-                                ) {
-                                    return Err(LixError::new(
-                                        super::runtime::PARTIAL_ADMISSION_CHANGED_CODE,
-                                        "baseline recovery changed the serving basis; restart the local operation",
-                                    ));
-                                }
-                            }
-                            if admission_changed {
-                                continue;
-                            }
+                            if current.as_ref() != state.as_ref() { continue; }
                         }
                     }
-                    let admission_changed = engine.as_ref().is_some_and(|engine| {
-                        engine.sync_mode().partial_admission().as_deref() != Some(state.as_ref())
-                    });
-                    if !admission_changed || attempt == 2 {
-                        return result;
-                    }
-                    // Retain the actual typed demand and retry installation
-                    // after refresh. Never report hydration success merely
-                    // because publication advanced the serving basis.
+                    let admission_changed = engine.as_ref().is_some_and(|engine|
+                        engine.sync_mode().partial_admission().as_deref() != Some(state.as_ref()));
+                    if !admission_changed { return result; }
                 }
-                unreachable!("bounded demand retry returns")
             }
             .fuse();
             let shutdown = shutdown_rx.changed().fuse();
@@ -1406,6 +1530,69 @@ mod tests {
                     .unwrap()
             );
         }
+    }
+
+    #[derive(Clone)]
+    struct ContendedMetadataStorage {
+        memory: Memory,
+        conflicts: Arc<AtomicUsize>,
+        writes: Arc<AtomicUsize>,
+    }
+
+    impl Storage for ContendedMetadataStorage {
+        type Read<'a> = crate::storage_adapter::MemoryRead;
+        type Write<'a> = crate::storage_adapter::MemoryWrite;
+
+        async fn acquire_session(
+            &self,
+        ) -> Result<crate::storage::StorageSessionToken, crate::storage::StorageError> {
+            self.memory.acquire_session().await
+        }
+
+        async fn begin_read(
+            &self,
+            opts: crate::storage::ReadOptions,
+        ) -> Result<Self::Read<'_>, crate::storage::StorageError> {
+            self.memory.begin_read(opts).await
+        }
+
+        async fn begin_write(
+            &self,
+            opts: crate::storage::WriteOptions,
+        ) -> Result<Self::Write<'_>, crate::storage::StorageError> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            if self.conflicts.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            }).is_ok() {
+                return Err(crate::storage::StorageError::PreconditionFailed(vec![
+                    crate::storage::PreconditionFailure { index: 0 },
+                ]));
+            }
+            self.memory.begin_write(opts).await
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_hydration_survives_repeated_local_cas_contention() {
+        let (storage, state, transport, client, address) = fixture(false).await;
+        let memory = storage.storage().clone();
+        drop(storage);
+        let conflicts = Arc::new(AtomicUsize::new(6));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let storage = StorageAdapter::new(ContendedMetadataStorage {
+            memory,
+            conflicts: conflicts.clone(),
+            writes: writes.clone(),
+        });
+        tokio::time::timeout(Duration::from_secs(5), hydrate_metadata(
+            &storage, &state, &transport, address.clone(),
+        )).await.expect("contention must settle").unwrap();
+        assert_eq!(conflicts.load(Ordering::SeqCst), 0);
+        assert!(writes.load(Ordering::SeqCst) >= 7);
+        assert_eq!(client.fetches.load(Ordering::SeqCst), 1,
+            "local contention must not refetch authenticated metadata");
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        assert!(native_metadata_is_resident(&read, &state, &address).await.unwrap());
     }
 
     #[tokio::test]

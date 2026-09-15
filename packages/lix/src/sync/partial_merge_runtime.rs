@@ -189,6 +189,59 @@ pub(super) async fn captured_wave(
     Ok(wave)
 }
 
+/// Fence an unsupported selected attempt before authoritative recovery drops
+/// its journal. Durable intent and exact replay survive cancellation or a lost
+/// reply; an already committed result wins on the server.
+pub(super) async fn abandon_partial_merge<S, C>(
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+    transport: &HttpSyncTransport<C>,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+    C: RawHttpClient + Clone + 'static,
+{
+    use super::partial_merge_state::{
+        stage_prepare_partial_merge_restart, stage_record_partial_merge_restart_outcome,
+    };
+    let read = storage.begin_read(Default::default()).await?;
+    let (record, _, _) =
+        load_partial_merge_state(&read, state, &state.descriptor().selected_branch.branch_id)
+            .await?;
+    let Some(record) = record else {
+        return Ok(());
+    };
+    if record.authority_receipt.is_some()
+        || record
+            .restart
+            .as_ref()
+            .is_some_and(|restart| restart.receipt.is_some())
+    {
+        return Ok(());
+    }
+    let intent = record
+        .restart
+        .as_ref()
+        .map(|restart| restart.request.clone())
+        .unwrap_or_else(|| super::PartialAttemptRestartRequest {
+            old: record.request.clone(),
+            next_attempt_id: uuid::Uuid::now_v7().to_string(),
+            abandon: true,
+        });
+    let mut writes = storage.new_write_set();
+    let guards = stage_prepare_partial_merge_restart(&read, &mut writes, state, &intent).await?;
+    drop(read);
+    persist(storage, writes, guards).await?;
+    let outcome = transport.restart_partial_attempt(&intent).await?;
+    let read = storage.begin_read(Default::default()).await?;
+    let mut writes = storage.new_write_set();
+    let guards =
+        stage_record_partial_merge_restart_outcome(&read, &mut writes, state, &intent, &outcome)
+            .await?;
+    drop(read);
+    persist(storage, writes, guards).await
+}
+
 /// Complete the durable restart lane before permitting any old/new body RPC.
 async fn recover_expired_attempt<S, C>(
     storage: &StorageAdapter<S>,
@@ -210,6 +263,18 @@ where
     if record.authority_receipt.is_some() {
         return Ok(());
     }
+    if record
+        .restart
+        .as_ref()
+        .is_some_and(|restart| restart.request.abandon)
+    {
+        drop(read);
+        abandon_partial_merge(storage, state, transport).await?;
+        return Err(LixError::new(
+            "LIX_PARTIAL_MERGE_SCOPE_UNSUPPORTED",
+            "abandoned merge awaits authoritative working-set adoption",
+        ));
+    }
     let intent = record
         .restart
         .as_ref()
@@ -217,6 +282,7 @@ where
         .unwrap_or_else(|| super::PartialAttemptRestartRequest {
             old: record.request.clone(),
             next_attempt_id: uuid::Uuid::now_v7().to_string(),
+            abandon: false,
         });
     let has_receipt = record
         .restart

@@ -4,8 +4,10 @@ description: Export and restore a complete Lix for reproduction, transfer, and r
 
 # Snapshots
 
-A Lix snapshot is a complete, point-in-time copy of a Lix. It is a binary
-artifact with the extension `.lixsnap`.
+A Lix snapshot is a point-in-time copy of the state held by a Lix handle. It is
+a binary artifact with the extension `.lixsnap`. A local partial replica exports
+its resident inputs and pending edits, explicitly marked as partial. A remote
+handle or standalone repository exports the complete repository.
 
 Use a snapshot to:
 
@@ -194,10 +196,15 @@ Accept: application/vnd.lix.snapshot
 The response is a backpressured `application/vnd.lix.snapshot` stream with
 `Cache-Control: no-store, no-transform`. Snapshot export requires an
 authenticated host principal even when selected files from the Lix are public.
-`lix.exportSnapshot()` on a remote or connected replica handle streams this
-authoritative snapshot. It includes the server's untracked rows, not any
-replica-local untracked rows. An offline partial replica cannot export a complete
-snapshot; reconnect it to the authority first.
+`lix.exportSnapshot()` on a remote handle streams this authoritative snapshot.
+On a local partial replica, the same call streams the local cache, pending edits,
+and replica receipts without contacting the server. This works offline and
+preserves differences between the local and remote views for reproduction.
+Partial exports do not contain inputs that have never been fetched, so they are
+not complete backups. Restore them into fresh durable storage to reopen the
+same partial replica offline; resident queries use the captured inputs, and
+missing inputs still require the authenticated authority. Export the remote
+handle separately when a complete repository snapshot is needed.
 
 Create a new hosted repository from a snapshot with `POST /lix/v1`, using
 `Content-Type: application/vnd.lix.snapshot` and an `Idempotency-Key` header.
@@ -214,7 +221,10 @@ and format version, export produces byte-identical artifacts.
 
 The binary `LIXSNAP` version 1 container records its container version, Lix
 format version, canonical entries, entry count, payload byte count, checksum
-algorithm identifier, and BLAKE3 digest. Restore rejects corruption,
+algorithm identifier, and BLAKE3 digest. Header flag bit 0 marks a partial replica;
+complete snapshots keep flags zero. Older readers reject the partial flag. Restore
+validates the flag against the repository marker and replica receipt, so a partial
+artifact cannot be admitted as a complete standalone repository. Restore rejects corruption,
 truncation, invalid lengths, duplicate or out-of-order entries, unknown
 versions or algorithms, and trailing data.
 

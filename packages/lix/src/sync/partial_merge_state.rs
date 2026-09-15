@@ -243,6 +243,32 @@ pub(super) async fn load_partial_merge_state(
         ],
     ))
 }
+/// Retire a selected attempt only after its terminal outcome is durable.
+/// Authority advancement is not a fence: selected merges may incorporate a
+/// newer server head while retaining the captured attempt's identity.
+pub(super) async fn stage_abandon_fenced_partial_merge(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    state: &PartialReplicaState,
+    remote: &super::partial_replica::PartialReplicaBranch,
+) -> Result<Vec<StoragePrecondition>, LixError> {
+    let (record, _, guards) = load_partial_merge_state(read, state, &remote.branch_id).await?;
+    if let Some(record) = record {
+        let terminal = record.authority_receipt.is_some()
+            || record
+                .restart
+                .as_ref()
+                .is_some_and(|restart| restart.receipt.is_some());
+        if !terminal {
+            return Err(conflict(
+                "authority recovery must first resolve a live merge attempt",
+            ));
+        }
+        writes.delete(PARTIAL_BRANCH_MERGE_SPACE, key(&remote.branch_id)?);
+    }
+    Ok(guards)
+}
+
 /// A bounded captured prefix may precede current local edits. Publication still
 /// guards the exact observed control, and settlement only adopts at exact L.
 pub(super) async fn require_captured_local_frontier(

@@ -528,6 +528,7 @@ mod tests {
         let intent = crate::sync::PartialAttemptRestartRequest {
             old: first.clone(),
             next_attempt_id: uuid::Uuid::now_v7().to_string(),
+            abandon: false,
         };
         let (outcome, guards) = crate::sync::stage_restart_expired_attempt(
             &read,
@@ -536,6 +537,24 @@ mod tests {
             authority.active_account_id(),
             &intent,
             u64::MAX,
+        )
+        .await
+        .unwrap();
+        assert!(guards.is_empty());
+        assert!(
+            matches!(outcome, crate::sync::PartialAttemptRestartOutcome::Committed { receipt: recovered, .. } if recovered == receipt)
+        );
+        let abandon = crate::sync::PartialAttemptRestartRequest {
+            abandon: true,
+            ..intent
+        };
+        let (outcome, guards) = crate::sync::stage_restart_expired_attempt(
+            &read,
+            &mut adapter.new_write_set(),
+            authority.lix_id(),
+            authority.active_account_id(),
+            &abandon,
+            0,
         )
         .await
         .unwrap();

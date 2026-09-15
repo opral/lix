@@ -84,6 +84,111 @@ pub(crate) async fn load_canonical_blob_manifest(
     Ok(Some(manifest))
 }
 
+/// One forced FastCDC anchor, bounded independently of the complete blob size.
+pub(crate) async fn load_canonical_blob_anchor(
+    store: &(impl StorageAdapterRead + ?Sized),
+    metadata: &crate::binary_cas::BlobMetadata,
+    offset: u64,
+) -> Result<Vec<CanonicalBlobChunk>, LixError> {
+    if offset >= metadata.size_bytes || offset % CHUNK_ANCHOR_BYTES as u64 != 0 {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "canonical transfer offset must begin a blob anchor",
+        ));
+    }
+    let end = offset
+        .saturating_add(CHUNK_ANCHOR_BYTES as u64)
+        .min(metadata.size_bytes);
+    let bytes = crate::binary_cas::kv::load_transfer_range(store, metadata, offset..end).await?;
+    Ok(chunk_ranges(&bytes)
+        .into_iter()
+        .map(|(start, end)| {
+            let bytes = bytes[start..end].to_vec();
+            CanonicalBlobChunk {
+                receipt: BlobChunkReceipt {
+                    hash: ChunkHash::from_content(&bytes),
+                    size_bytes: bytes.len() as u64,
+                },
+                bytes,
+            }
+        })
+        .collect())
+}
+
+/// Authenticate an already canonical physical layout using only its receipts.
+/// A different physical layout may be valid for the same content identity; in
+/// that case the caller reconstructs canonical anchors rather than trusting it.
+async fn load_stored_canonical_manifest(
+    store: &(impl StorageAdapterRead + ?Sized),
+    metadata: &crate::binary_cas::BlobMetadata,
+) -> Result<Option<CanonicalBlobManifest>, LixError> {
+    use crate::binary_cas::BlobLayout;
+    let chunks = match &metadata.layout {
+        BlobLayout::Empty => Vec::new(),
+        BlobLayout::SingleChunk { chunk_hash } => vec![BlobChunkReceipt {
+            hash: *chunk_hash,
+            size_bytes: metadata.size_bytes,
+        }],
+        BlobLayout::Chunked { chunk_count } => {
+            let rows = crate::binary_cas::kv::load_declared_manifest_chunks(
+                store,
+                metadata.hash,
+                metadata.size_bytes,
+            )
+            .await?;
+            if rows.len() != *chunk_count as usize {
+                return Err(LixError::new(
+                    LixError::CODE_STORAGE_ERROR,
+                    "canonical transfer manifest omitted declared chunk rows",
+                ));
+            }
+            rows.into_iter()
+                .map(|row| BlobChunkReceipt {
+                    hash: ChunkHash::from_bytes(row.chunk_hash),
+                    size_bytes: row.chunk_size,
+                })
+                .collect()
+        }
+        BlobLayout::Delta { .. } => return Ok(None),
+    };
+    let manifest = CanonicalBlobManifest {
+        blob_id: metadata.hash,
+        size_bytes: metadata.size_bytes,
+        chunks,
+    };
+    Ok(validate_manifest_receipts(&manifest)
+        .is_ok()
+        .then_some(manifest))
+}
+
+/// Build only receipts in memory, authenticating the final blob identity across
+/// independently decoded anchors. Delta bases never require full flattening.
+pub(crate) async fn load_streaming_canonical_manifest(
+    store: &(impl StorageAdapterRead + ?Sized),
+    metadata: &crate::binary_cas::BlobMetadata,
+) -> Result<CanonicalBlobManifest, LixError> {
+    if let Some(manifest) = load_stored_canonical_manifest(store, metadata).await? {
+        return Ok(manifest);
+    }
+    let mut chunks = Vec::new();
+    let mut offset = 0;
+    while offset < metadata.size_bytes {
+        let anchor = load_canonical_blob_anchor(store, metadata, offset).await?;
+        offset += anchor
+            .iter()
+            .map(|chunk| chunk.receipt.size_bytes)
+            .sum::<u64>();
+        chunks.extend(anchor.into_iter().map(|chunk| chunk.receipt));
+    }
+    let manifest = CanonicalBlobManifest {
+        blob_id: metadata.hash,
+        size_bytes: metadata.size_bytes,
+        chunks,
+    };
+    validate_manifest_receipts(&manifest)?;
+    Ok(manifest)
+}
+
 /// Loads all canonical chunks of a blob.
 ///
 /// This is the fallback needed for a delta-backed blob whose canonical flat
@@ -431,9 +536,7 @@ pub(crate) async fn stage_verified_canonical_manifest(
     Ok(receipt)
 }
 
-pub(crate) fn validate_manifest_receipts(
-    manifest: &CanonicalBlobManifest,
-) -> Result<(), LixError> {
+pub(crate) fn validate_manifest_receipts(manifest: &CanonicalBlobManifest) -> Result<(), LixError> {
     validate_manifest_shape(manifest)?;
     let observed_size = manifest.chunks.iter().try_fold(0u64, |total, chunk| {
         total.checked_add(chunk.size_bytes).ok_or_else(|| {
@@ -533,6 +636,82 @@ mod tests {
         BinaryCasManifest, StorageBinaryCasDeltaBaseLayout, StorageBinaryCasDeltaSegment,
     };
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
+
+    struct PayloadReadCounter<R> {
+        read: R,
+        payload_reads: std::sync::atomic::AtomicUsize,
+    }
+    impl<R: StorageAdapterRead> StorageAdapterRead for PayloadReadCounter<R> {
+        async fn get_many(
+            &self,
+            requests: &[crate::storage_adapter::StorageGetManyRequest<'_>],
+        ) -> Result<
+            crate::storage_adapter::StorageGetManyResult,
+            crate::storage_adapter::StorageError,
+        > {
+            for request in requests {
+                if request.space == BINARY_CAS_CHUNK_SPACE {
+                    self.payload_reads
+                        .fetch_add(request.keys.len(), std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            self.read.get_many(requests).await
+        }
+        async fn begin_scan(
+            &self,
+            space: crate::storage_adapter::StorageSpace,
+            range: crate::storage_adapter::StorageKeyRange,
+            opts: crate::storage_adapter::StorageBeginScanOptions,
+        ) -> Result<
+            crate::storage_adapter::StorageScanCursor<'_>,
+            crate::storage_adapter::StorageError,
+        > {
+            self.read.begin_scan(space, range, opts).await
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_flat_transfer_preparation_reads_receipts_without_payload() {
+        let storage = StorageAdapter::new(Memory::new());
+        let expected = CanonicalBlobManifest::from_bytes(&structured_bytes(5 * 1024 * 1024, 49));
+        assert!(expected.chunks.len() > 1);
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let mut writes = storage.new_write_set();
+        stage_deferred_canonical_manifest(&read, &mut writes, &expected)
+            .await
+            .unwrap();
+        drop(read);
+        storage
+            .commit_write_set(writes, Default::default())
+            .await
+            .unwrap();
+        // Payload is deliberately absent: remote cache reuse requires only its
+        // authenticated identity, not an unnecessary download and re-upload.
+        let read = PayloadReadCounter {
+            read: storage.begin_read(Default::default()).await.unwrap(),
+            payload_reads: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let metadata = crate::binary_cas::load_metadata_many(&read, &[expected.blob_id])
+            .await
+            .unwrap()
+            .into_vec()
+            .pop()
+            .flatten()
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                load_streaming_canonical_manifest(&read, &metadata)
+                    .await
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(
+                read.payload_reads
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                0
+            );
+        }
+    }
 
     fn structured_bytes(len: usize, seed: u64) -> Vec<u8> {
         let mut bytes = vec![0; len];
@@ -815,7 +994,7 @@ mod tests {
     #[tokio::test]
     async fn delta_backing_flattens_to_canonical_transfer_chunks() {
         let storage = StorageAdapter::new(Memory::new());
-        let base = structured_bytes(1024 * 1024, 17);
+        let base = structured_bytes(CHUNK_ANCHOR_BYTES + 1024 * 1024, 17);
         let base_manifest = CanonicalBlobManifest::from_bytes(&base);
         stage_chunks(&storage, &base, &base_manifest).await;
         let read = storage
@@ -833,7 +1012,7 @@ mod tests {
             .await
             .expect("base manifest should commit");
 
-        let offset = 32 * 1024;
+        let offset = CHUNK_ANCHOR_BYTES - 8;
         let replacement = b"sixteen-new-byte";
         assert_eq!(replacement.len(), 16);
         let mut result = base.clone();
@@ -884,6 +1063,45 @@ mod tests {
             .await
             .expect("read should reopen");
         let expected = CanonicalBlobManifest::from_bytes(&result);
+        let metadata = crate::binary_cas::load_metadata_many(&read, &[result_id])
+            .await
+            .unwrap()
+            .into_vec()
+            .pop()
+            .flatten()
+            .unwrap();
+        assert_eq!(
+            load_streaming_canonical_manifest(&read, &metadata)
+                .await
+                .unwrap(),
+            expected
+        );
+        let first = load_canonical_blob_anchor(&read, &metadata, 0)
+            .await
+            .unwrap();
+        let second = load_canonical_blob_anchor(&read, &metadata, CHUNK_ANCHOR_BYTES as u64)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.iter().map(|chunk| chunk.bytes.len()).sum::<usize>(),
+            CHUNK_ANCHOR_BYTES
+        );
+        assert_eq!(
+            first
+                .into_iter()
+                .chain(second)
+                .flat_map(|chunk| chunk.bytes)
+                .collect::<Vec<_>>(),
+            result
+        );
+        let mut wrong_identity = metadata.clone();
+        wrong_identity.hash = BlobId::from_content(b"wrong identity");
+        assert!(
+            load_streaming_canonical_manifest(&read, &wrong_identity)
+                .await
+                .is_err(),
+            "streamed delta output must authenticate the complete blob identity"
+        );
         assert_eq!(
             load_canonical_blob_manifest(&read, result_id)
                 .await

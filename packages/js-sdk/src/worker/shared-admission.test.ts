@@ -4,7 +4,7 @@ import { SharedAdmissionCache, requestAdmission, type AdmissionIdentity } from "
 const repositoryId = "00000000-0000-7000-8000-000000000004";
 const url = `https://example.test/lix/${repositoryId}`;
 const headers: [string, string][] = [["Authorization", "Bearer exact-token"]];
-const identity: AdmissionIdentity = {repositoryId, principalId: "00000000-0000-7000-8000-000000000003", protocolEpoch: 15, storageEpoch: 81};
+const identity: AdmissionIdentity = {repositoryId, principalId: "00000000-0000-7000-8000-000000000003", protocolEpoch: 16, storageEpoch: 81};
 const offline = async (): Promise<AdmissionIdentity> => {throw new HttpTransportError("LIX_TRANSPORT_NETWORK", "offline");};
 
 test("new ports verify principal even with previously admitted credentials", async () => {
@@ -37,13 +37,14 @@ test("metadata admission uses bounded GET and explicit credentials without SQL o
   expect(request.url).toBe(`https://example.test/lix/v1/${repositoryId}/admission`);
   expect(request.response).toEqual({mode: "buffered", maxBytes: 16384});
   expect(new Headers(request.init.headers).get("authorization")).toBe("Bearer exact-token");
-  expect(new Headers(request.init.headers).get("lix-sync-protocol-version")).toBe("15");
+  expect(new Headers(request.init.headers).get("lix-sync-protocol-version")).toBe("16");
   expect(request.init.credentials).toBe("omit");
 });
 test.each([401,403])("HTTP %s is authorization rejection", async status => {
   await expect(requestAdmission(url, headers, async () => new Response(null, {status}))).rejects.toMatchObject({code: "LIX_ADMISSION_AUTH_REJECTED"});
 });
 test("admission rejects mismatched epoch and repository", async () => {
+  await expect(requestAdmission(url, headers, async () => Response.json({...identity, protocolEpoch: 15}))).rejects.toMatchObject({code: "LIX_ADMISSION_EPOCH"});
   await expect(requestAdmission(url, headers, async () => Response.json({...identity, storageEpoch: 80}))).rejects.toMatchObject({code: "LIX_ADMISSION_EPOCH"});
   await expect(requestAdmission(url, headers, async () => Response.json({...identity, repositoryId: identity.principalId}))).rejects.toMatchObject({code: "LIX_ADMISSION_PROTOCOL"});
 });

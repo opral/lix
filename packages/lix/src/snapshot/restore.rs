@@ -6,14 +6,13 @@ use futures_lite::io::sink;
 use super::format::{
     SnapshotDecoder, SnapshotEncoder, SnapshotEntry, SnapshotTrailer, invalid_snapshot,
 };
+use crate::LixError;
 use crate::migration::{MigrationStatus, begin_fresh_epoch_import, inspect_lix_read};
 use crate::storage_adapter::{
-    MAX_SCAN_PAGE_ROWS, PutBatch, PutEntry, StorageAdapter, StorageAdapterRead as _,
+    MAX_SCAN_PAGE_ROWS, PutBatch, PutEntry, Storage, StorageAdapter, StorageAdapterRead as _,
     StorageBeginScanOptions, StorageCoreProjection, StorageKey, StorageKeyRange,
     StorageProjectedValue, StorageSession, StorageSpaceId, StorageValue,
-    Storage,
 };
-use crate::LixError;
 
 pub(crate) async fn restore_snapshot<S, R>(
     storage: StorageSession<S>,
@@ -111,7 +110,12 @@ where
         .trailer()
         .ok_or_else(|| invalid_snapshot("snapshot has no verified trailer"))?;
 
-    validate_protocol_version(import.candidate(), header.lix_format_version).await?;
+    validate_protocol_version(
+        import.candidate(),
+        header.lix_format_version,
+        header.partial_replica,
+    )
+    .await?;
     let actual = candidate_digest(import.candidate(), header.lix_format_version).await?;
     if actual != expected {
         return Err(invalid_snapshot(
@@ -143,20 +147,32 @@ where
 async fn validate_protocol_version<S>(
     candidate: &StorageAdapter<S>,
     expected: u32,
+    partial_replica: bool,
 ) -> Result<(), LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let read = crate::migration::MigrationPlanningRead::new(candidate).await?;
+    if partial_replica {
+        if expected != crate::init::CURRENT_FORMAT_VERSION
+            || !crate::init::is_partial_repository_protocol(&read).await?
+            || crate::sync::load_partial_replica_state(&read)
+                .await?
+                .is_none()
+        {
+            return Err(invalid_snapshot(
+                "partial snapshot header and replica receipt disagree",
+            ));
+        }
+        return Ok(());
+    }
     let observed = inspect_lix_read(&read).await?;
     let observed_version = match observed {
         MigrationStatus::Current { version } => version,
         MigrationStatus::Required { from_version, .. } => from_version,
         MigrationStatus::TooNew { found_version, .. } => found_version,
         MigrationStatus::Missing | MigrationStatus::Malformed => {
-            return Err(invalid_snapshot(
-                "snapshot has no valid Lix format marker",
-            ));
+            return Err(invalid_snapshot("snapshot has no valid Lix format marker"));
         }
     };
     if observed_version != expected {
@@ -238,14 +254,13 @@ mod tests {
     use futures_io::AsyncRead;
     use futures_lite::io::Cursor;
 
-    use crate::storage_adapter::{
-        Memory, MemoryRead, MemoryWrite, PutBatch, REPOSITORY_EPOCH_KEY,
-        REPOSITORY_EPOCH_SPACE, Storage, StorageCommitResult, StorageCoreProjection, StorageError,
-        StorageGetManyRequest, StorageGetOptions, StorageKey, StorageKeyRange,
-        StorageProjectedValue, StorageRead as _, StorageReadOptions, StorageSession,
-        StorageSessionToken, StorageSpace, StorageWriteOptions,
-    };
     use crate::open_lix;
+    use crate::storage_adapter::{
+        Memory, MemoryRead, MemoryWrite, PutBatch, REPOSITORY_EPOCH_KEY, REPOSITORY_EPOCH_SPACE,
+        Storage, StorageCommitResult, StorageCoreProjection, StorageError, StorageGetManyRequest,
+        StorageGetOptions, StorageKey, StorageKeyRange, StorageProjectedValue, StorageRead as _,
+        StorageReadOptions, StorageSession, StorageSessionToken, StorageSpace, StorageWriteOptions,
+    };
 
     #[tokio::test]
     async fn candidate_digest_retries_revoked_pages_without_changing_trailer() {
@@ -386,9 +401,9 @@ mod tests {
                 let _ = report.send(committed);
             })
             .map_err(|error| StorageError::Io(error.to_string()))?;
-            result.await.map_err(|_| {
-                StorageError::Io("delayed snapshot claim task stopped".to_string())
-            })?
+            result
+                .await
+                .map_err(|_| StorageError::Io("delayed snapshot claim task stopped".to_string()))?
         }
 
         async fn rollback(self) -> Result<(), StorageError> {

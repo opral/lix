@@ -843,7 +843,7 @@ pub(crate) async fn scan_manifest_chunks(
 /// different layout for the same content hash. Restricting reads to the
 /// declared byte extent keeps stale suffix rows harmless; the caller still
 /// rejects missing declared rows by comparing the resulting count.
-async fn load_declared_manifest_chunks(
+pub(in crate::binary_cas) async fn load_declared_manifest_chunks(
     store: &(impl StorageAdapterRead + ?Sized),
     blob_hash: BlobId,
     size_bytes: u64,
@@ -1514,6 +1514,88 @@ pub(crate) async fn load_ranges_many(
         });
     }
     Ok(BlobRangeBytesBatch::new(entries))
+}
+
+/// Bounded transfer-only range reconstruction. The transfer caller verifies
+/// the final canonical manifest identity after visiting every output anchor.
+/// Ordinary serving keeps its existing complete delta authentication path.
+pub(in crate::binary_cas) async fn load_transfer_range(
+    store: &(impl StorageAdapterRead + ?Sized),
+    metadata: &BlobMetadata,
+    range: Range<u64>,
+) -> Result<Vec<u8>, LixError> {
+    let BlobLayout::Delta {
+        base_blob_hash,
+        base_size_bytes,
+        base_layout,
+        segments,
+    } = &metadata.layout
+    else {
+        return Ok(load_blob_range(store, metadata.clone(), range).await?.bytes);
+    };
+    let base = BlobMetadata {
+        hash: *base_blob_hash,
+        size_bytes: *base_size_bytes,
+        layout: match base_layout {
+            BlobDeltaBaseLayout::SingleChunk { chunk_hash } => BlobLayout::SingleChunk {
+                chunk_hash: *chunk_hash,
+            },
+            BlobDeltaBaseLayout::Chunked { chunk_count } => BlobLayout::Chunked {
+                chunk_count: *chunk_count,
+            },
+        },
+    };
+    let capacity = persisted_size_to_usize(range.end - range.start, "transfer range")?;
+    let mut output = Vec::with_capacity(capacity);
+    let mut position = 0u64;
+    for segment in segments {
+        let length = match segment {
+            BlobDeltaSegment::Copy { length, .. } => *length,
+            BlobDeltaSegment::Insert { bytes } => bytes.len() as u64,
+        };
+        let end = position
+            .checked_add(length)
+            .ok_or_else(|| LixError::unknown("delta range overflow"))?;
+        let start = range.start.max(position);
+        let stop = range.end.min(end);
+        if start < stop {
+            let offset = start - position;
+            let length = stop - start;
+            match segment {
+                BlobDeltaSegment::Copy {
+                    offset: base_offset,
+                    ..
+                } => {
+                    let start = base_offset
+                        .checked_add(offset)
+                        .ok_or_else(|| LixError::unknown("delta base range overflow"))?;
+                    let end = start
+                        .checked_add(length)
+                        .ok_or_else(|| LixError::unknown("delta base range overflow"))?;
+                    output.extend(
+                        load_blob_range(store, base.clone(), start..end)
+                            .await?
+                            .bytes,
+                    );
+                }
+                BlobDeltaSegment::Insert { bytes } => {
+                    let start = persisted_size_to_usize(offset, "delta insert start")?;
+                    let end = persisted_size_to_usize(offset + length, "delta insert end")?;
+                    output.extend_from_slice(&bytes[start..end]);
+                }
+            }
+        }
+        position = end;
+        if position >= range.end {
+            break;
+        }
+    }
+    if output.len() != capacity {
+        return Err(LixError::unknown(
+            "delta transfer range did not reconstruct its declared size",
+        ));
+    }
+    Ok(output)
 }
 
 async fn load_blob_range(

@@ -1985,6 +1985,7 @@ mod tests {
                 global_checkpoint_commit_id: descriptor.global_branch.checkpoint.commit_id.clone(),
             },
             next_attempt_id: uuid::Uuid::now_v7().to_string(),
+            abandon: false,
         };
         let mut transport = descriptor_transport(&descriptor);
         let outcome = super::super::PartialAttemptRestartOutcome::Committed {

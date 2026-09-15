@@ -31,6 +31,7 @@ where
     preflight_error: Option<LixError>,
     remote: Option<(crate::ServerOptions, String)>,
     connected_remote: Option<RemoteSnapshotExport>,
+    local_partial_replica: bool,
 }
 
 #[derive(Clone)]
@@ -51,7 +52,13 @@ where
             preflight_error: None,
             remote: None,
             connected_remote: None,
+            local_partial_replica: false,
         }
+    }
+
+    pub(crate) fn from_local_partial_replica(mut self) -> Self {
+        self.local_partial_replica = true;
+        self
     }
 
     pub(crate) fn from_sync_server(
@@ -126,20 +133,42 @@ where
             close?;
             return Ok(report);
         }
-        let storage = self.storage.ok_or_else(|| LixError::new(LixError::CODE_INTERNAL_ERROR, "snapshot export has no source"))?;
+        let storage = self.storage.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "snapshot export has no source",
+            )
+        })?;
         let read = storage
             .begin_read(StorageReadOptions {
                 durability: self.durability,
                 ..StorageReadOptions::default()
             })
             .await?;
-        if crate::sync::has_any_sync_replica_state(&read).await? {
+        if !self.local_partial_replica && crate::sync::has_any_sync_replica_state(&read).await? {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PARAM,
                 "a persisted replica is a sparse cache and cannot export a canonical repository snapshot; export from the authority",
             ));
         }
-        let mut encoder = SnapshotEncoder::new(writer, crate::init::CURRENT_FORMAT_VERSION).await?;
+        if self.local_partial_replica {
+            if !crate::init::is_partial_repository_protocol(&read).await?
+                || crate::sync::load_partial_replica_state(&read)
+                    .await?
+                    .is_none()
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "local partial export requires a valid partial replica receipt",
+                ));
+            }
+        }
+        let mut encoder = SnapshotEncoder::new_with_partial(
+            writer,
+            crate::init::CURRENT_FORMAT_VERSION,
+            self.local_partial_replica,
+        )
+        .await?;
         for space in super::snapshot_spaces() {
             let mut cursor = read
                 .begin_scan(
@@ -220,7 +249,14 @@ impl SnapshotExportBuilder<crate::Memory> {
         session_id: Option<String>,
     ) -> Self {
         let (connected_remote, preflight_error) = match url {
-            Ok(url) => (Some(RemoteSnapshotExport { http, url, session_id }), None),
+            Ok(url) => (
+                Some(RemoteSnapshotExport {
+                    http,
+                    url,
+                    session_id,
+                }),
+                None,
+            ),
             Err(error) => (None, Some(error)),
         };
         Self {
@@ -229,6 +265,7 @@ impl SnapshotExportBuilder<crate::Memory> {
             preflight_error,
             remote: None,
             connected_remote,
+            local_partial_replica: false,
         }
     }
 }
@@ -322,7 +359,11 @@ where
             header_bytes += take;
             remaining = &remaining[take..];
             if header_bytes == header.len() {
-                super::format::decode_streamed_snapshot_header(&header)?;
+                if super::format::decode_streamed_snapshot_header(&header)?.partial_replica {
+                    return Err(super::format::invalid_snapshot(
+                        "authority returned a partial replica snapshot",
+                    ));
+                }
                 writer
                     .write_all(&header)
                     .await

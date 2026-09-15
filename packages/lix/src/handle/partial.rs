@@ -216,7 +216,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     #[tokio::test]
-    async fn partial_handle_rejects_full_cache_before_connecting() {
+    async fn partial_handle_rejects_local_only_repository_before_connecting() {
         let backing = crate::sync::durable_memory_for_test(Memory::new());
         let full = open_lix().with_storage(backing.clone()).await.unwrap();
         let repository_id = full.lix_id().to_owned();
@@ -233,7 +233,9 @@ mod tests {
         .await
         .err()
         .unwrap();
-        assert_eq!(error.code, "LIX_PARTIAL_REPLICA_MIGRATION_REQUIRED");
+        // No durable replica role exists: authenticated replacement may only
+        // discard a replica cache, never an ordinary local repository.
+        assert_eq!(error.code, "LIX_ERROR_REPLICA_REPLACEMENT_UNAVAILABLE");
     }
 
     #[tokio::test]
@@ -410,6 +412,12 @@ mod tests {
         assert!(warm > 2, "cold SQL must demand missing native inputs");
         assert_eq!(lix.execute(sql, &params).await.unwrap().rows().len(), 1);
         assert_eq!(requests.load(Ordering::SeqCst), warm);
+        let mut online_snapshot = Vec::new();
+        lix.export_snapshot().write_to(&mut online_snapshot).await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), warm,
+            "local partial export must not download the authority snapshot");
+        assert!(crate::snapshot::format::decode_streamed_snapshot_header(
+            &online_snapshot[..crate::snapshot::format::HEADER_BYTES]).unwrap().partial_replica);
         lix.close().await.unwrap();
         let contender = StorageSession::acquire(backing.clone()).await.unwrap();
         assert!(
@@ -448,17 +456,18 @@ mod tests {
         let offline = open_lix().with_storage(backing.clone()).await.unwrap();
         assert!(!offline.open_report().initialized);
         let mut snapshot = Vec::new();
-        assert!(
-            offline
-                .export_snapshot()
-                .write_to(&mut snapshot)
-                .await
-                .is_err()
-        );
-        assert!(
-            snapshot.is_empty(),
-            "partial storage must not emit a full snapshot header"
-        );
+        offline.export_snapshot().write_to(&mut snapshot).await.unwrap();
+        assert!(crate::snapshot::format::decode_streamed_snapshot_header(
+            &snapshot[..crate::snapshot::format::HEADER_BYTES]).unwrap().partial_replica);
+        let restored = open_lix()
+            .with_storage(crate::sync::durable_memory_for_test(Memory::new()))
+            .from_snapshot(futures_lite::io::Cursor::new(snapshot.clone()))
+            .await.unwrap();
+        let mut roundtrip = Vec::new();
+        restored.export_snapshot().write_to(&mut roundtrip).await.unwrap();
+        assert_eq!(roundtrip, snapshot, "partial restoration preserves exact local inputs and journals");
+        assert_eq!(restored.execute(sql, &params).await.unwrap().rows().len(), 1);
+        restored.close().await.unwrap();
         assert_eq!(offline.execute(sql, &params).await.unwrap().rows().len(), 1);
         assert_eq!(
             requests.load(Ordering::SeqCst),

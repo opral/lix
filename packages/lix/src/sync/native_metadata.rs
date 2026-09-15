@@ -53,7 +53,7 @@ fn canonical_id(value: &str) -> Result<CommitId, LixError> {
     }
     CommitId::parse(value).map_err(|_| invalid("native metadata ID must be a canonical UUID"))
 }
-fn space(address: &NativeMetadataRef) -> StorageSpace {
+pub(crate) fn space(address: &NativeMetadataRef) -> StorageSpace {
     match address {
         NativeMetadataRef::CommitStateHeader(_) => {
             crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
@@ -64,7 +64,7 @@ fn space(address: &NativeMetadataRef) -> StorageSpace {
         }
     }
 }
-fn key(address: &NativeMetadataRef) -> Result<StorageKey, LixError> {
+pub(crate) fn key(address: &NativeMetadataRef) -> Result<StorageKey, LixError> {
     let id = canonical_id(address.id())?;
     Ok(match address {
         NativeMetadataRef::CommitStateHeader(_) => {

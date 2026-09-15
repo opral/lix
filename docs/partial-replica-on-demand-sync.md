@@ -2,7 +2,7 @@
 
 **Decision: implement a partial replica with on-demand sync. Opening installs a bounded session descriptor; SQL loads missing native inputs on demand; covered reads and prepared writes execute locally; background synchronization maintains that coverage.** Server SQL fallback is an optional optimization for cold reads, with strict consistency checks. A result-cache wrapper alone does not meet the local-write requirement.
 
-This document records the reviewed design and target contract. The development worktree implements bounded opening, native SQL hydration, local commits, scoped publication and explicit migration. Validation status and current build measurements are recorded in [PR #1755](https://github.com/opral/lix/pull/1755); this document is not a production deployment record. Optional server SQL result fallback, broader preparation forms and cache-eviction policy below remain follow-up capabilities; current cold reads hydrate native inputs, and unsupported inventories fail explicitly. See [measured performance](partial-replica-performance.md) and [migration support and remaining boundaries](partial-replica-migration.md) for current evidence; planned capabilities below must not be read as already delivered. Three independent sub-agents reviewed correctness, engine integration and performance; their required changes are incorporated below.
+This document records the reviewed design and target contract. The implementation provides bounded opening, native SQL hydration, local commits, scoped publication, transparent recovery, and detached explicit migration. Validation status and current build measurements are recorded in [PR #1755](https://github.com/opral/lix/pull/1755); this document is not a production deployment record. Optional server SQL result fallback, broader preparation forms and cache-eviction policy below remain follow-up capabilities; current cold reads hydrate native inputs, and unsupported inventories fail explicitly. See [measured performance](partial-replica-performance.md) and [migration support and remaining boundaries](partial-replica-migration.md) for current evidence; planned capabilities below must not be read as already delivered. Three independent sub-agents reviewed correctness, engine integration and performance; their required changes are incorporated below.
 
 ## JavaScript opening configuration
 
@@ -25,23 +25,37 @@ server and storage must add the explicit opt-in. This selector describes the
 JavaScript API; Rust continues to select the topology through its typed builders.
 
 The existing `switchBranch()` operation admits an existing authority branch on
-demand. Switching to another branch requires an online connection and confirmed
-work on the current selected and global branches. If it reports
-`LIX_PARTIAL_BRANCH_SWITCH_PENDING`, keep the handle open so background sync can
-finish, then retry the switch. The operation does not discard pending edits.
-Creating a branch remains a separate operation: retry its switch rather than
-creating the branch again. Previously visited scopes are retained, but archived
-branch subscriptions are suspended until that branch is admitted again.
+demand. Switching requires an online connection. Lix settles pending work and
+refreshes expired admission internally while the caller awaits the operation;
+applications do not catch internal pending/rebase codes or implement sync retries.
+Previously visited scopes are retained, but archived branch subscriptions are
+suspended until that branch is admitted again.
 
-Background upload publishes supported new branch references together with their
-global descriptors. Concurrent disjoint branch creations use native GLOBAL
-reconciliation; unsupported semantic GLOBAL conflicts preserve local work and
-wait for a relevant state change. This does not implement automatic reconciliation
-for arbitrary account, schema, plugin or default-branch conflicts.
+The server is authoritative. Ordinary concurrent edits reconcile through the
+shared row/plugin merge pipeline in server acceptance order. When a pending
+local change cannot be reconciled under supported semantics, Lix may discard it
+and adopt the authoritative state. Before forgetting an upload, Lix must prove
+that it is settled or cannot later publish; ambiguous acceptance is never a new
+write. This fallback does not authorize ignoring authentication, corruption, or
+protocol failures.
+
+## Opening existing caches
+
+Online partial opening treats an incompatible local replica as a disposable cache.
+Lix authenticates the authority, verifies the repository identity, and atomically
+activates a fresh partial epoch. Previous cache banks remain detached; opening
+does not scan, copy, migrate, or replay their history or pending edits. Healthy
+current partial caches retain their existing admission and resident inputs.
+Authority and local-only repositories are not disposable replica caches.
+
+This keeps cache recovery inside `await openLix(...)`. Explicit offline migration
+remains available when preserving old local work is required. The format-78
+migration witness validates native checkpoint flags and inventory; retired
+`lix_checkpoint` rows are used only for older formats that owned those markers.
 
 ## Contract
 
-Protocol and storage changes may break compatibility. Migrate existing repositories to the new native format explicitly; do not maintain compatibility shims or run the old full-bootstrap path behind an on-demand request. Measure migration separately from ordinary opening. Migration must preserve repository identity, history, branch/checkpoint references, content and pending local edits, and support resumption after interruption.
+Protocol and storage changes may break compatibility. Migrate authoritative and local-only repositories to the new native format explicitly; do not maintain compatibility shims or run the old full-bootstrap path behind an on-demand request. Measure migration separately from ordinary opening. Migration must preserve repository identity, history, branch/checkpoint references, content and pending local edits, and support resumption after interruption.
 
 | Operation | Contract |
 |---|---|
@@ -122,13 +136,13 @@ Hydration does not hold a mutable storage transaction open across the network. I
 
 Mutation retries must distinguish pre-commit dependency misses from a commit that already became durable. Hydrate before mutation admission; after local commit, preserve the outcome and never replay the SQL merely because background publication or response delivery failed.
 
-The authority must retain or lease baseline objects that a partial replica may still demand. A clean read can restart after expiry; pending local commits cannot silently switch bases. Define an expired-base recovery state that preserves pending work when compatible inputs are no longer available. Expiry alone is not authorization to discard local commits. Prepare and pin the dependencies needed for promised offline operations, and test authority GC/lease expiry explicitly.
+The authority must retain or lease baseline objects that a partial replica may still demand. An unchanged baseline can be leased again without changing pending edits. When authority state advances, Lix reconciles pending work, publishes a coherent baseline, and restarts the awaiting operation internally. Unsupported reconciliation uses the fenced authoritative fallback described above; baseline expiry itself is not a caller-managed recovery state. Prepare and pin the dependencies needed for promised offline operations, and test authority GC/lease expiry explicitly.
 
 Keep `execute` behavior automatic: cold statements hydrate and retry, warm statements stay local. Applications prefetch by executing the intended SELECT on hover or ahead of interaction. Do not add a separate public preparation API. Current-row reads also hydrate supported native mutation dependencies; ordinary writes fetch any additional inputs they need while online. Offline operations with missing dependencies fail without publishing a partial mutation.
 
 Preparation readiness belongs to a dependency set and context. A new parameter that introduces an unseen uniqueness target, foreign key, plugin dependency or directory is a new cold demand. Do not advertise a generic “editable file” as covering every possible future mutation.
 
-Explicit transactions require preparation before opening their fixed snapshot. A missing dependency inside such a transaction returns a typed preparation error; callers can load the missing inputs with ordinary SQL and retry the whole transaction. Never replay arbitrary external side effects or partially publish a mutation while hydrating.
+Explicit transactions hydrate missing immutable inputs without changing their fixed snapshot or replaying earlier successful statements. Mutable reads remain pinned. If the authority no longer retains an input needed by that snapshot, return a normal transaction conflict; Lix cannot replace already-returned reads with a different snapshot. Never replay arbitrary external side effects or a durable mutation while recovering.
 
 ## 4. Prove partial native writes before broad implementation
 
@@ -147,7 +161,7 @@ Prototype this narrow lifecycle first:
 5. Reconnect and have the authority accept the commits through native sync.
 6. Compare the authority and a fresh full replica, including untouched rows.
 7. Exercise checkpoint, reopen, reset and GC without hydrating the full repository.
-8. Expire an authority baseline lease while local commits are pending; either retain compatible inputs or enter the defined recovery state without losing local work.
+8. Expire an authority baseline lease while local commits are pending; the awaiting operation completes after internal recovery. Verify unchanged-baseline preservation, authoritative convergence after remote changes, and safe fencing before any unsupported local work is discarded.
 
 Passing requires zero foreground requests for the prepared mutation, no hidden whole-base materialization, and preservation of canonical state and pending-work recovery. If current publication cannot achieve this, fix that engine path before presenting a result-cache prototype as fulfillment of the task.
 

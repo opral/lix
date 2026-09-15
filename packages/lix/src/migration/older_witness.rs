@@ -1,4 +1,4 @@
-//! Detached, bounded source qualification for the v74/v77 canonical chain.
+//! Detached, bounded source qualification for the v74/v77/v78 canonical chain.
 //! The planning copy predicts exact output; independent source invariants below
 //! reject destructive transformations even if both executions share a defect.
 use super::MigrationOptions;
@@ -257,6 +257,23 @@ async fn descriptors(
     use crate::tracked_state::{
         TrackedStateContext, TrackedStateFilter, TrackedStateReadColumns, TrackedStateScanRequest,
     };
+    let protocol = source
+        .get(&(
+            crate::init::REPOSITORY_PROTOCOL_SPACE.id.0,
+            Bytes::from_static(crate::init::REPOSITORY_PROTOCOL_KEY),
+        ))
+        .ok_or_else(|| failure("source repository protocol absent"))?;
+    let native_checkpoints = match crate::init::parse_repository_protocol(protocol) {
+        crate::init::RepositoryProtocolStatus::MigrationRequired { found_version: 78 } => true,
+        crate::init::RepositoryProtocolStatus::MigrationRequired {
+            found_version: 74 | 77,
+        } => false,
+        _ => {
+            return Err(failure(
+                "source witness requires repository format 74, 77, or 78",
+            ));
+        }
+    };
     let mut normalized = source.clone();
     let source_memory = copy(source).await?;
     let source_adapter = StorageAdapter::new(source_memory);
@@ -331,41 +348,51 @@ async fn descriptors(
     let normalized_memory = copy(&normalized).await?;
     let normalized_adapter = StorageAdapter::new(normalized_memory);
     let source_read = super::MigrationPlanningRead::new(&normalized_adapter).await?;
-    let mut reader = TrackedStateContext::new().reader(source_read.clone());
-    let checkpoints = reader
-        .scan_batch_at_commit(
-            &control.head_commit_id.to_string(),
-            &TrackedStateScanRequest {
-                filter: TrackedStateFilter {
-                    schema_keys: vec!["lix_checkpoint".to_owned()],
-                    ..Default::default()
-                },
-                read_columns: TrackedStateReadColumns {
-                    columns: vec!["row_pk".to_owned()],
-                },
-                limit: Some(options.max_changes.saturating_add(1)),
-            },
-        )
-        .await?
-        .into_rows();
-    if checkpoints.len() > options.max_changes {
-        return Err(failure("checkpoint witness exceeded bounds"));
-    }
     let mut checkpoint_ids = std::collections::BTreeSet::new();
-    for marker in checkpoints {
-        if marker.deleted {
-            continue;
-        }
-        let parts = marker.row_pk.into_parts();
-        let [id] = parts.as_slice() else {
-            return Err(failure("source checkpoint identity invalid"));
-        };
-        checkpoint_ids.insert(
-            id.parse::<crate::changelog::CommitId>()
-                .map_err(|_| failure("source checkpoint UUID invalid"))?,
+    if native_checkpoints {
+        // v78 retired lix_checkpoint markers. Its canonical commit flags are
+        // the source authority, independently corroborated by its inventory.
+        checkpoint_ids.extend(
+            commits
+                .values()
+                .filter_map(|(record, _)| record.is_checkpoint.then_some(record.commit_id)),
         );
+    } else {
+        let mut reader = TrackedStateContext::new().reader(source_read.clone());
+        let checkpoints = reader
+            .scan_batch_at_commit(
+                &control.head_commit_id.to_string(),
+                &TrackedStateScanRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec!["lix_checkpoint".to_owned()],
+                        ..Default::default()
+                    },
+                    read_columns: TrackedStateReadColumns {
+                        columns: vec!["row_pk".to_owned()],
+                    },
+                    limit: Some(options.max_changes.saturating_add(1)),
+                },
+            )
+            .await?
+            .into_rows();
+        if checkpoints.len() > options.max_changes {
+            return Err(failure("checkpoint witness exceeded bounds"));
+        }
+        for marker in checkpoints {
+            if marker.deleted {
+                continue;
+            }
+            let parts = marker.row_pk.into_parts();
+            let [id] = parts.as_slice() else {
+                return Err(failure("source checkpoint identity invalid"));
+            };
+            checkpoint_ids.insert(
+                id.parse::<crate::changelog::CommitId>()
+                    .map_err(|_| failure("source checkpoint UUID invalid"))?,
+            );
+        }
+        drop(reader);
     }
-    drop(reader);
     let expected_inventory = checkpoint_ids
         .iter()
         .map(|id| {
@@ -375,6 +402,18 @@ async fn descriptors(
             )
         })
         .collect::<BTreeMap<_, _>>();
+    if native_checkpoints {
+        let source_inventory = source
+            .iter()
+            .filter(|((space, _), _)| *space == crate::checkpoint::CHECKPOINT_INVENTORY_SPACE.id.0)
+            .map(|((_, key), value)| (key.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if source_inventory != expected_inventory {
+            return Err(failure(
+                "source checkpoint inventory differs from native commit flags",
+            ));
+        }
+    }
     let actual_inventory = target
         .iter()
         .filter(|((space, _), _)| *space == crate::checkpoint::CHECKPOINT_INVENTORY_SPACE.id.0)
@@ -382,7 +421,7 @@ async fn descriptors(
         .collect::<BTreeMap<_, _>>();
     if actual_inventory != expected_inventory {
         return Err(failure(
-            "checkpoint inventory differs from source marker identities",
+            "candidate checkpoint inventory differs from source checkpoint identities",
         ));
     }
     for (id, (mut expected, _)) in commits.clone() {
@@ -506,7 +545,9 @@ mod tests {
         .await
         .unwrap();
         lix.close().await.unwrap();
-        let mut records = capture(&session, MigrationOptions::default()).await.unwrap();
+        let mut records = capture(&session, MigrationOptions::default())
+            .await
+            .unwrap();
         records.insert(
             (
                 crate::init::REPOSITORY_PROTOCOL_SPACE.id.0,
@@ -541,6 +582,153 @@ mod tests {
             Bytes::from_static(b"certified-authority-v4"),
         );
         copy(&records).await.unwrap()
+    }
+
+    async fn v78_native_checkpoint_source() -> (Memory, crate::changelog::CommitId) {
+        let memory = Memory::default();
+        let session = StorageSession::acquire(memory).await.unwrap();
+        let lix = crate::open_lix()
+            .with_storage(session.clone())
+            .await
+            .unwrap();
+        lix.execute(
+            "INSERT INTO lix_key_value(key,value) VALUES('native-checkpoint','retained')",
+            &[],
+        )
+        .await
+        .unwrap();
+        let checkpoint = lix
+            .create_checkpoint()
+            .await
+            .unwrap()
+            .commit_id
+            .parse()
+            .unwrap();
+        lix.close().await.unwrap();
+        let mut records = capture(&session, MigrationOptions::default())
+            .await
+            .unwrap();
+        records.insert(
+            (
+                crate::init::REPOSITORY_PROTOCOL_SPACE.id.0,
+                Bytes::from_static(crate::init::REPOSITORY_PROTOCOL_KEY),
+            ),
+            Bytes::from_static(crate::init::REPOSITORY_PROTOCOL_V78),
+        );
+        let source = copy(&records).await.unwrap();
+        let adapter = StorageAdapter::new(source.clone());
+        let read = super::super::MigrationPlanningRead::new(&adapter)
+            .await
+            .unwrap();
+        let global = crate::branch::BranchHeadControlContext::new()
+            .reader(read.clone())
+            .load(crate::GLOBAL_BRANCH_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        let markers = crate::tracked_state::TrackedStateContext::new()
+            .reader(read.clone())
+            .scan_batch_at_commit(
+                &global.head_commit_id.to_string(),
+                &crate::tracked_state::TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec!["lix_checkpoint".into()],
+                        ..Default::default()
+                    },
+                    read_columns: crate::tracked_state::TrackedStateReadColumns {
+                        columns: vec!["row_pk".into()],
+                    },
+                    limit: Some(10),
+                },
+            )
+            .await
+            .unwrap()
+            .into_rows();
+        assert!(
+            markers.iter().all(|marker| marker.deleted),
+            "native fixture has no live retired checkpoint marker"
+        );
+        read.finish().unwrap();
+        (source, checkpoint)
+    }
+
+    #[tokio::test]
+    async fn v78_native_checkpoint_without_legacy_marker_migrates() {
+        let (source, checkpoint) = v78_native_checkpoint_source().await;
+        let report = super::super::public_api::migrate_repository(source.clone())
+            .await
+            .unwrap();
+        assert!(report.semantic_preservation_verified);
+        assert_eq!(report.before.format, Some(78));
+        // Migration acquires a physical storage fence. Inspect the result with
+        // a fresh session instead of the now-fenced bare adapter.
+        let source = StorageSession::acquire(source).await.unwrap();
+        let records = capture(&source, MigrationOptions::default()).await.unwrap();
+        let checkpoint_key = Bytes::copy_from_slice(checkpoint.as_uuid().as_bytes());
+        let (record, _) =
+            commit(&records[&(crate::changelog::COMMIT_SPACE.id.0, checkpoint_key.clone())])
+                .unwrap();
+        assert!(record.is_checkpoint);
+        assert_eq!(
+            records.get(&(
+                crate::checkpoint::CHECKPOINT_INVENTORY_SPACE.id.0,
+                checkpoint_key
+            )),
+            Some(&Bytes::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn v78_witness_rejects_tampered_checkpoint_inventory_and_flags() {
+        let (source, checkpoint) = v78_native_checkpoint_source().await;
+        let options = MigrationOptions::default();
+        let witness = plan(&source, options, false).await.unwrap();
+        let id = Bytes::copy_from_slice(checkpoint.as_uuid().as_bytes());
+        let inventory_key = (
+            crate::checkpoint::CHECKPOINT_INVENTORY_SPACE.id.0,
+            id.clone(),
+        );
+        let commit_key = (crate::changelog::COMMIT_SPACE.id.0, id);
+        for tamper_source in [true, false] {
+            for tamper_inventory in [true, false] {
+                let mut original = witness.source.clone();
+                let mut candidate = witness.expected.clone();
+                let records = if tamper_source {
+                    &mut original
+                } else {
+                    &mut candidate
+                };
+                if tamper_inventory {
+                    assert!(records.remove(&inventory_key).is_some());
+                } else {
+                    let (mut record, _) = commit(&records[&commit_key]).unwrap();
+                    assert!(record.is_checkpoint);
+                    record.is_checkpoint = false;
+                    records.insert(
+                        commit_key.clone(),
+                        Bytes::from(
+                            crate::storage_codec::encode("tampered checkpoint", &record).unwrap(),
+                        ),
+                    );
+                }
+                let error = descriptors(&original, &candidate, options)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code, "LIX_MIGRATION_PRESERVATION_FAILED");
+            }
+        }
+        // Membership alone is insufficient: the inventory's canonical empty
+        // values also have to survive qualification unchanged.
+        let mut broken = witness.source.clone();
+        broken.insert(
+            inventory_key,
+            Bytes::from_static(b"invalid inventory value"),
+        );
+        assert!(
+            descriptors(&broken, &witness.expected, options)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

@@ -51,7 +51,9 @@ async fn legacy_sparse_epoch_preserves_pending_sql_and_exact_merge_attempt_on_re
         .unwrap();
     crate::migration::downgrade_headers_for_test(&adapter, true).await;
     let durable = crate::sync::durable_memory_for_test(memory);
-    crate::migration::admit_repository(&durable, None).await.unwrap();
+    crate::migration::admit_repository(&durable, None)
+        .await
+        .unwrap();
     let migrated = crate::migration::admit_partial_epoch(&durable)
         .await
         .unwrap();

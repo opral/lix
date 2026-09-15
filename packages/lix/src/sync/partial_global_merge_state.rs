@@ -366,6 +366,31 @@ pub(super) async fn load_partial_global_merge_state(
         ],
     ))
 }
+/// A moved authority coordinate fences the immutable GLOBAL merge request.
+/// Native local objects remain retained; only its obsolete upload journal goes.
+pub(super) async fn stage_abandon_fenced_global_merge(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    state: &PartialReplicaState,
+    remote: &super::partial_replica::PartialReplicaBranch,
+) -> Result<Vec<StoragePrecondition>, LixError> {
+    let (record, _, guards) = load_partial_global_merge_state(read, state).await?;
+    if let Some(record) = record {
+        let terminal = record.receipt.is_some() || record.restart_receipt.is_some();
+        if !terminal
+            && record.request.expected_authority_head_commit_id == remote.head.commit_id
+            && record.request.checkpoint_commit_id == remote.checkpoint.commit_id
+        {
+            return Err(LixError::new(
+                LixError::CODE_TRANSACTION_CONFLICT,
+                "authority recovery must first resolve a live GLOBAL merge attempt",
+            ));
+        }
+        writes.delete(PARTIAL_GLOBAL_MERGE_SPACE, key());
+    }
+    Ok(guards)
+}
+
 #[must_use = "publish every returned guard with the complete outbox write"]
 pub(super) fn stage_global_record(
     writes: &mut StorageWriteSet,

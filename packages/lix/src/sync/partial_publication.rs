@@ -20,7 +20,8 @@ pub(super) struct PreparedPartialPublication {
     // Exact owning engine, not a serializable receipt that another backing
     // store could copy. Preparation and publication use this same write gate.
     origin_write_gate: Arc<tokio::sync::Mutex<()>>,
-    branch_switch_completion: Option<super::partial_branch_switch::PartialBranchSwitchCompletion>,
+    branch_switch_completion:
+        Option<Arc<super::partial_branch_switch::PartialBranchSwitchCompletion>>,
     previous: Arc<PartialReplicaState>,
     next: Arc<PartialReplicaState>,
     interests_revision: u64,
@@ -50,6 +51,8 @@ where
 pub(super) enum PartialRecoveryPolicy {
     Normal,
     ExpiredBaseline,
+    /// Rebuild from the authority after an unsupported local reconciliation.
+    AuthorityWins,
     NativeMerge,
     NativeGlobalMerge,
 }
@@ -110,6 +113,26 @@ where
     .await?;
     let mut writes = storage.new_write_set();
     let mut changed = false;
+    if policy == PartialRecoveryPolicy::AuthorityWins {
+        preconditions.extend(
+            super::partial_merge_state::stage_abandon_fenced_partial_merge(
+                &read,
+                &mut writes,
+                &previous,
+                &next.descriptor().selected_branch,
+            )
+            .await?,
+        );
+        preconditions.extend(
+            super::partial_global_merge_state::stage_abandon_fenced_global_merge(
+                &read,
+                &mut writes,
+                &previous,
+                &next.descriptor().global_branch,
+            )
+            .await?,
+        );
+    }
     for (index, branch) in [
         &next.descriptor().selected_branch,
         &next.descriptor().global_branch,
@@ -167,13 +190,14 @@ where
         let control = observed
             .control
             .ok_or_else(|| conflict("partial branch disappeared"))?;
-        if push.prepared.is_some()
-            || control.head_commit_id != push.confirmed.head
-            || control
-                .working_diff_checkpoint_commit_id
-                .map(|id| id.to_string())
-                .as_ref()
-                != Some(&push.confirmed.checkpoint)
+        if policy != PartialRecoveryPolicy::AuthorityWins
+            && (push.prepared.is_some()
+                || control.head_commit_id != push.confirmed.head
+                || control
+                    .working_diff_checkpoint_commit_id
+                    .map(|id| id.to_string())
+                    .as_ref()
+                    != Some(&push.confirmed.checkpoint))
         {
             return Err(LixError::new(
                 if policy == PartialRecoveryPolicy::ExpiredBaseline {
@@ -189,17 +213,30 @@ where
             checkpoint: branch.checkpoint.commit_id.clone(),
         };
         changed |= target != push.confirmed;
-        preconditions.extend(
-            stage_remote_partial_confirmation(
-                &read,
-                &mut writes,
-                &previous,
-                &branch.branch_id,
-                &push.confirmed,
-                target,
-            )
-            .await?,
-        );
+        if policy == PartialRecoveryPolicy::AuthorityWins {
+            preconditions.extend(
+                super::partial_push_state::stage_authoritative_partial_confirmation(
+                    &read,
+                    &mut writes,
+                    &previous,
+                    &branch.branch_id,
+                    target,
+                )
+                .await?,
+            );
+        } else {
+            preconditions.extend(
+                stage_remote_partial_confirmation(
+                    &read,
+                    &mut writes,
+                    &previous,
+                    &branch.branch_id,
+                    &push.confirmed,
+                    target,
+                )
+                .await?,
+            );
+        }
         preconditions.push(crate::branch::branch_head_control_precondition(
             &branch.branch_id,
             observed.raw_token,
@@ -231,7 +268,8 @@ where
     // Rotate in the same atomic publication so warm negative paths and counts
     // cannot keep serving the previous baseline after admission advances.
     crate::filesystem::stage_path_index_revision(&mut writes);
-    if next.descriptor().global_branch.head != previous.descriptor().global_branch.head
+    if policy == PartialRecoveryPolicy::AuthorityWins
+        || next.descriptor().global_branch.head != previous.descriptor().global_branch.head
         || next.descriptor().global_branch.checkpoint
             != previous.descriptor().global_branch.checkpoint
     {
@@ -377,7 +415,7 @@ where
 
 /// Same serving roots, new authority pin: publish only the receipt. The exact
 /// source/gate/deadline contracts are the same as root adoption.
-pub(super) async fn prepare_clean_lease_reacquisition<S>(
+pub(super) async fn prepare_lease_reacquisition<S>(
     engine: &Engine<S>,
     wire: &super::LeasedPartialReplicaDescriptor,
     deadline: CandidateBaselineDeadline,
@@ -426,47 +464,30 @@ where
         if index == 1 && branch.branch_id == previous.descriptor().selected_branch.branch_id {
             continue;
         }
-        let (push, _, _) = load_partial_push_state(&read, &previous, &branch.branch_id).await?;
+        // Reacquiring the same authority roots changes no local branch state.
+        // Pending edits and frozen upload identities remain valid and must not
+        // force the caller into a special recovery state.
+        guards.extend(
+            super::partial_push_state::partial_push_observation_guards(
+                &read,
+                &previous,
+                &branch.branch_id,
+            )
+            .await?,
+        );
         let observed = crate::branch::BranchHeadControlContext::new()
             .reader(&read)
             .load_observed(std::slice::from_ref(&branch.branch_id))
             .await?
             .pop()
             .ok_or_else(|| conflict("lease recovery control absent"))?;
-        let control = observed
-            .control
-            .ok_or_else(|| conflict("lease recovery control absent"))?;
-        if push.prepared.is_some()
-            || control.head_commit_id != push.confirmed.head
-            || control
-                .working_diff_checkpoint_commit_id
-                .map(|id| id.to_string())
-                .as_ref()
-                != Some(&push.confirmed.checkpoint)
-        {
-            return Err(LixError::new(
-                "LIX_PARTIAL_REPLICA_BASELINE_RECOVERY_PENDING",
-                "expired baseline recovery preserves the pending local suffix until native rebase",
-            ));
+        if observed.control.is_none() {
+            return Err(conflict("lease recovery control absent"));
         }
         guards.push(crate::branch::branch_head_control_precondition(
             &branch.branch_id,
             observed.raw_token,
         )?);
-        // Reuse the push owner's guarded observation; discard its identical
-        // staged bytes so lease-only publication writes no push state.
-        let mut unchanged_push = storage.new_write_set();
-        guards.extend(
-            stage_remote_partial_confirmation(
-                &read,
-                &mut unchanged_push,
-                &previous,
-                &branch.branch_id,
-                &push.confirmed,
-                push.confirmed.clone(),
-            )
-            .await?,
-        );
     }
     guards.push(stage_partial_replica_state(
         &mut writes,
@@ -621,9 +642,9 @@ where
 impl PreparedPartialPublication {
     pub(super) fn with_branch_switch_completion(
         mut self,
-        completion: super::partial_branch_switch::PartialBranchSwitchCompletion,
+        completion: impl Into<Arc<super::partial_branch_switch::PartialBranchSwitchCompletion>>,
     ) -> Self {
-        self.branch_switch_completion = Some(completion);
+        self.branch_switch_completion = Some(completion.into());
         self
     }
 }

@@ -51,7 +51,7 @@ pub(crate) use epoch::{
     FreshEpochImport, RetainedReplicaSource, admit_current_repository, admit_existing_repository,
     admit_partial_epoch, begin_fresh_epoch_import, has_partial_replica_marker,
     install_fresh_partial_epoch, list_retained_replica_sources, open_retained_replica_source,
-    partial_epoch_has_no_markers,
+    partial_epoch_has_no_markers, inspect_partial_replacement, install_replacement_partial_epoch,
 };
 pub(crate) use inspection::{
     MigrationStatus, inspect_lix, inspect_lix_read, inspect_lix_with_adapter,

@@ -368,6 +368,54 @@ pub(super) async fn stage_acknowledge_included_partial_upload(
         .map(Some)
 }
 
+/// Abandon a local suffix only when its frozen ordinary upload cannot still
+/// replace the observed server coordinate. The server's ref CAS is the fence.
+pub(super) async fn stage_authoritative_partial_confirmation(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    state: &PartialReplicaState,
+    branch_id: &str,
+    target: PartialPushCoordinate,
+) -> Result<Vec<StoragePrecondition>, LixError> {
+    target.validate()?;
+    let (mut record, previous, epoch_guard) =
+        load_partial_push_state(read, state, branch_id).await?;
+    if record
+        .prepared
+        .as_ref()
+        .is_some_and(|upload| upload.expected == target && upload.target != target)
+    {
+        return Err(LixError::new(
+            LixError::CODE_TRANSACTION_CONFLICT,
+            "authority recovery must first resolve an upload that can still publish",
+        ));
+    }
+    record.confirmed = target;
+    record.prepared = None;
+    record.bodies_acknowledged = false;
+    Ok(vec![
+        epoch_guard,
+        stage_record(writes, &record, Some(previous))?,
+    ])
+}
+
+/// Capture upload bookkeeping without changing it, including a frozen attempt.
+pub(super) async fn partial_push_observation_guards(
+    read: &(impl StorageAdapterRead + ?Sized),
+    state: &PartialReplicaState,
+    branch_id: &str,
+) -> Result<Vec<StoragePrecondition>, LixError> {
+    let (_, previous, epoch_guard) = load_partial_push_state(read, state, branch_id).await?;
+    Ok(vec![
+        epoch_guard,
+        StoragePrecondition::KeyValueEquals {
+            space: PARTIAL_BRANCH_PUSH_SPACE,
+            key: key(branch_id)?,
+            expected: previous,
+        },
+    ])
+}
+
 /// Publication of prepared remote state may advance a clean confirmed ref.
 /// Unlike an own ACK, this accompanies a new serving basis. The caller must
 /// also CAS the observed local control and prepare all retained read scopes.

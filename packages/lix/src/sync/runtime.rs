@@ -68,6 +68,10 @@ pub(super) enum SyncDemandRequest {
     NativeMetadataBatch(Vec<crate::tracked_state::NativeMetadataRef>, LixError),
     History(Vec<String>),
     Chunks(Vec<String>),
+    /// Wait for the partial owner to settle local work before changing branches.
+    ReconcilePartial,
+    /// Hydrate immutable inputs without moving an explicit transaction snapshot.
+    Pinned(Box<SyncDemandRequest>),
     #[cfg(test)]
     PublicationBarrier,
 }
@@ -420,6 +424,12 @@ async fn send_sync_demand(
     Ok(())
 }
 
+pub(crate) async fn reconcile_partial_before_branch_switch(
+    demand_tx: &tokio::sync::mpsc::Sender<SyncDemand>,
+) -> Result<(), LixError> {
+    send_sync_demand(demand_tx, SyncDemandRequest::ReconcilePartial).await
+}
+
 fn is_sparse_commit_graph_miss(error: &LixError) -> bool {
     error.code == LixError::CODE_COMMIT_NOT_FOUND
         && error.details.as_ref().is_some_and(|details| {
@@ -432,7 +442,6 @@ fn is_sparse_commit_graph_miss(error: &LixError) -> bool {
 #[derive(Debug, Default)]
 pub(crate) struct SyncDemandRetry {
     seen: BTreeSet<String>,
-    restarted_partial_admission: bool,
 }
 
 impl SyncDemandRetry {
@@ -457,6 +466,16 @@ impl SyncDemandRetry {
         Ok(request)
     }
 
+    pub(crate) async fn hydrate_pinned_for_retry(
+        &mut self,
+        demand_tx: Option<&tokio::sync::mpsc::Sender<SyncDemand>>,
+        error: LixError,
+    ) -> Result<(), LixError> {
+        let Some(demand_tx) = demand_tx else { return Err(error); };
+        let request = self.admit(error)?;
+        send_sync_demand(demand_tx, SyncDemandRequest::Pinned(Box::new(request))).await
+    }
+
     pub(crate) async fn hydrate_for_retry(
         &mut self,
         demand_tx: Option<&tokio::sync::mpsc::Sender<SyncDemand>>,
@@ -469,14 +488,14 @@ impl SyncDemandRetry {
         match send_sync_demand(demand_tx, request).await {
             Err(error)
                 if error.code == PARTIAL_ADMISSION_CHANGED_CODE
-                    && !error.automatic_retry_is_forbidden()
-                    && !self.restarted_partial_admission =>
+                    && !error.automatic_retry_is_forbidden() =>
             {
                 // The worker published a fresh serving basis, rather than
                 // hydrating the old immutable address. Restart the enclosing
                 // SQL operation so it derives its inputs from that new basis.
-                // Bound this separately from ordinary hydration progress.
-                self.restarted_partial_admission = true;
+                // Each signal follows an actual admitted basis change. A long
+                // operation may cross more than one publication; none of those
+                // internal transitions belongs in the application API.
                 self.seen.clear();
                 Ok(())
             }
@@ -931,7 +950,13 @@ fn is_retryable_sync_transport_error(error: &LixError) -> bool {
     }
 
     if error.code == super::http::SYNC_TRANSPORT_ERROR_CODE
-        || matches!(error.code.as_str(), "LIX_TRANSPORT_NETWORK" | "LIX_TRANSPORT_UNAVAILABLE" | "LIX_IDENTITY_UNVERIFIED_OFFLINE") {
+        || matches!(
+            error.code.as_str(),
+            "LIX_TRANSPORT_NETWORK"
+                | "LIX_TRANSPORT_UNAVAILABLE"
+                | "LIX_IDENTITY_UNVERIFIED_OFFLINE"
+        )
+    {
         return true;
     }
     let status = error
@@ -999,6 +1024,7 @@ where
             | SyncDemandRequest::NativeMetadata(_, _)
             | SyncDemandRequest::NativeMetadataBatch(_, _)
             | SyncDemandRequest::BlobManifest(_, _) => {}
+            SyncDemandRequest::ReconcilePartial | SyncDemandRequest::Pinned(_) => {}
             SyncDemandRequest::History(ids) => history_ids.extend(ids),
             SyncDemandRequest::Chunks(ids) => chunk_ids.extend(ids),
             #[cfg(test)]
@@ -1046,6 +1072,10 @@ fn resolve_sync_demand_results(
             | SyncDemandRequest::NativeMetadata(_, error)
             | SyncDemandRequest::NativeMetadataBatch(_, error)
             | SyncDemandRequest::BlobManifest(_, error) => Err(error.clone()),
+            SyncDemandRequest::ReconcilePartial | SyncDemandRequest::Pinned(_) => Err(LixError::new(
+                "LIX_SYNC_MODE_MISMATCH",
+                "partial reconciliation requires a partial owner",
+            )),
             SyncDemandRequest::History(_) => history_result.clone(),
             SyncDemandRequest::Chunks(_) => chunk_result.clone(),
             #[cfg(test)]
@@ -1624,6 +1654,9 @@ where
         | Some(SyncDemandRequest::NativeMetadata(_, original))
         | Some(SyncDemandRequest::NativeMetadataBatch(_, original))
         | Some(SyncDemandRequest::BlobManifest(_, original)) => Err(original),
+        Some(SyncDemandRequest::ReconcilePartial | SyncDemandRequest::Pinned(_)) => Err(LixError::unknown(
+            "partial reconciliation requires a partial owner",
+        )),
         Some(SyncDemandRequest::History(ids)) => {
             hydrate_history_ids(lix, transport, ids.into_iter().collect()).await
         }
@@ -2856,7 +2889,9 @@ mod tests {
             .expect("replica initializes");
         // The low-level initializer deliberately creates an unbanked fixture;
         // explicit test migration establishes the current runtime envelope.
-        crate::migration::admit_repository(&storage, None).await.expect("adopt test fixture epoch");
+        crate::migration::admit_repository(&storage, None)
+            .await
+            .expect("adopt test fixture epoch");
         let replica = open_lix()
             .with_storage(storage)
             .await
@@ -3309,34 +3344,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_admission_restart_is_bounded_and_resets_hydration_progress() {
+    async fn partial_admission_restart_repeats_and_resets_hydration_progress() {
         let missing = || {
             crate::tracked_state::NativeObjectRef::TrackedStateTreeChunk([29; 32])
                 .annotate_missing(LixError::unknown("missing input"))
         };
         let mut retry = SyncDemandRetry::default();
-        for restart in 0..2 {
+        for _ in 0..3 {
             let (demand_tx, mut demand_rx) = tokio::sync::mpsc::channel(1);
             // Repeating the exact address after restart must reach the worker:
             // the new serving basis may still need this shared immutable input.
             let hydrate = retry.hydrate_for_retry(Some(&demand_tx), missing());
             let serve = async {
                 let demand = demand_rx.recv().await.expect("native demand arrives");
-                demand.response.send(Err(LixError::new(
-                    PARTIAL_ADMISSION_CHANGED_CODE,
-                    "fresh serving basis",
-                ))).expect("waiter remains live");
+                demand
+                    .response
+                    .send(Err(LixError::new(
+                        PARTIAL_ADMISSION_CHANGED_CODE,
+                        "fresh serving basis",
+                    )))
+                    .expect("waiter remains live");
             };
             let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
                 tokio::join!(hydrate, serve)
             })
             .await
             .expect("demand restart completes");
-            if restart == 0 {
-                result.expect("first admission change restarts SQL");
-            } else {
-                assert_eq!(result.unwrap_err().code, PARTIAL_ADMISSION_CHANGED_CODE);
-            }
+            result.expect("every actual admission change restarts SQL");
         }
     }
 
@@ -3354,7 +3388,10 @@ mod tests {
                 .expect_err("completed operation must never reach the worker");
             assert_eq!(error.code, missing.code);
             assert_eq!(error.details, missing.details);
-            assert!(matches!(demand_rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
+            assert!(matches!(
+                demand_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
 
             let missing = crate::tracked_state::NativeObjectRef::TrackedStateTreeChunk([29; 32])
                 .annotate_missing(LixError::unknown("missing input"));
@@ -3362,10 +3399,14 @@ mod tests {
             let hydrate = retry.hydrate_for_retry(Some(&demand_tx), missing);
             let serve = async {
                 let demand = demand_rx.recv().await.expect("native demand arrives");
-                let mut outcome = LixError::new(PARTIAL_ADMISSION_CHANGED_CODE, "completed outcome")
-                    .with_details(serde_json::json!({}));
+                let mut outcome =
+                    LixError::new(PARTIAL_ADMISSION_CHANGED_CODE, "completed outcome")
+                        .with_details(serde_json::json!({}));
                 outcome.details.as_mut().unwrap()[marker] = serde_json::json!(true);
-                demand.response.send(Err(outcome)).expect("waiter remains live");
+                demand
+                    .response
+                    .send(Err(outcome))
+                    .expect("waiter remains live");
             };
             let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
                 tokio::join!(hydrate, serve)
@@ -4580,11 +4621,26 @@ mod browser_transport_error_tests {
     use super::*;
     #[test]
     fn transient_browser_leases_retry_but_contracts_and_auth_denials_do_not() {
-        for code in ["LIX_TRANSPORT_NETWORK", "LIX_TRANSPORT_UNAVAILABLE", "LIX_IDENTITY_UNVERIFIED_OFFLINE"] {
-            assert!(is_retryable_sync_transport_error(&LixError::new(code, "transient")));
+        for code in [
+            "LIX_TRANSPORT_NETWORK",
+            "LIX_TRANSPORT_UNAVAILABLE",
+            "LIX_IDENTITY_UNVERIFIED_OFFLINE",
+        ] {
+            assert!(is_retryable_sync_transport_error(&LixError::new(
+                code,
+                "transient"
+            )));
         }
-        for code in ["LIX_TRANSPORT_CALLBACK", "LIX_TRANSPORT_CONTRACT", "LIX_TRANSPORT_ABORTED", "LIX_ADMISSION_AUTH_REJECTED", "LIX_TRANSPORT_RESPONSE_LIMIT"] {
-            assert!(!is_retryable_sync_transport_error(&LixError::new(code, "stop")));
+        for code in [
+            "LIX_TRANSPORT_CALLBACK",
+            "LIX_TRANSPORT_CONTRACT",
+            "LIX_TRANSPORT_ABORTED",
+            "LIX_ADMISSION_AUTH_REJECTED",
+            "LIX_TRANSPORT_RESPONSE_LIMIT",
+        ] {
+            assert!(!is_retryable_sync_transport_error(&LixError::new(
+                code, "stop"
+            )));
         }
     }
 }

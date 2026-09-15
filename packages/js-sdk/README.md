@@ -27,6 +27,26 @@ For compiled plugin downloads, installation, updates, and uninstalling, see
 
 ## Hosted lifecycle
 
+### Compatibility metadata
+
+Raw HTTP integrations can obtain this SDK's protocol versions without loading
+the engine:
+
+```ts
+import { compatibility } from "@lix-js/sdk/compatibility";
+
+const headers = {
+  "Lix-Server-Protocol-Version": String(compatibility.serverProtocolVersion),
+  "Lix-Sync-Protocol-Version": String(compatibility.syncProtocolVersion),
+};
+```
+
+The object also includes `storageFormatVersion`. It is generated from the Rust
+engine constants during the SDK build. Source-checkout CI can use
+`node scripts/compatibility.mjs` before building the SDK.
+
+### Execution modes
+
 `openLix()` selects execution from storage and the explicit server mode:
 
 | Options | Behavior |

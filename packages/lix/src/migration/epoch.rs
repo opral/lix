@@ -10,6 +10,8 @@ mod partial_conversion;
 #[cfg(any(feature = "offline-migration", test))]
 pub(crate) use partial_conversion::convert_clean_replica_to_partial;
 mod partial;
+mod partial_replacement;
+pub(crate) use partial_replacement::{inspect_partial_replacement, install_replacement_partial_epoch};
 pub(crate) use partial::{
     PartialEpochAdmission, admit_partial_epoch, has_partial_replica_marker,
     install_fresh_partial_epoch, partial_epoch_has_no_markers,

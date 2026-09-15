@@ -12,6 +12,20 @@ Application developers should start with
 [Collaboration](./collaboration-and-sync.md). This page documents the
 server wire contract.
 
+## Compatibility metadata
+
+Applications and CI should read Lix's compatibility metadata instead of keeping
+their own protocol version pins. From a source checkout, run
+`node scripts/compatibility.mjs` to print JSON, or import `getCompatibility()`
+from that script. It reads the canonical Rust constants and needs neither
+installed dependencies nor a built SDK. The fields are `serverProtocolVersion`,
+`syncProtocolVersion`, and `storageFormatVersion`.
+
+Published SDK consumers can import the same fields as `compatibility` from
+`@lix-js/sdk/compatibility`. This entry point contains generated data only and
+does not load a native or WebAssembly binding. Metadata describes the checked-out
+or installed Lix version; HTTP admission still checks the actual server.
+
 ## Why it exists
 
 The protocol is the interop layer between clients and hosts.
@@ -154,7 +168,7 @@ executes on the authority.
   `PUT /lix/v1/{lix_id}/sync/chunk?chunkId=...` transfer raw chunks. Both identities are
   64-character lowercase BLAKE3 hex digests; chunks are at most 4 MiB.
 
-All sync routes require exactly one `lix-sync-protocol-version: 14` header.
+All sync routes require exactly one `lix-sync-protocol-version: 16` header.
 Missing, duplicate, malformed, or incompatible versions are rejected before
 reading or publishing sync data. The handshake advertises
 `syncCheckpointInventory: true`. Commit bodies and headers both carry immutable
@@ -174,10 +188,20 @@ again. There is no separate presence request.
 
 ### Partial replica with on-demand sync
 
-Sync protocol 14 defines the native transport for a partial replica with
+Sync protocol 16 defines the native transport for a partial replica with
 on-demand sync. SDK callers opt in with `server.mode: "partial_replica"` and
 local storage. The default server mode is `remote`. Client and server must
 upgrade together; this transport change does not alter the repository format.
+
+Protocol 16 adds `abandon: true` to the exact partial-attempt restart request.
+Lix uses this during automatic recovery to fence an unsupported active merge
+before adopting the server working set. An already committed merge receipt
+wins; otherwise the authority durably prevents delayed requests from reviving
+the abandoned attempt. Ordinary restarts omit this field and still require
+expiry. Upgrade server and SDK together: older servers reject the new field,
+and protocol negotiation rejects incompatible peers before synchronization.
+The storage format remains 81; cached admission proofs are reacquired for the
+new protocol epoch.
 
 Partial merge receipts use the authority head at admission as the first parent,
 which may differ from the head captured when the client prepared its attempt.

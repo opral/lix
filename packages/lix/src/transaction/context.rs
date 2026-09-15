@@ -760,6 +760,7 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     atomic_metadata_writes: Option<StorageWriteSet>,
     atomic_metadata_preconditions: Vec<StoragePrecondition>,
     sync_role: crate::sync::SyncRole,
+    sync_demand_tx: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
     sync_replica_remote_id: Option<Arc<str>>,
     partial_replica_admission: Option<Arc<crate::sync::PartialReplicaState>>,
     await_durable_commit: bool,
@@ -1480,6 +1481,105 @@ where
 
     fn opening_read(&self) -> SharedStorageAdapterRead<StorageImpl::Read<'static>> {
         self.opening_read.clone()
+    }
+
+    pub(crate) async fn refresh_hydrated_native_inputs(
+        &mut self,
+        error: &LixError,
+    ) -> Result<bool, LixError> {
+        let mut keys = Vec::new();
+        let objects = crate::tracked_state::NativeObjectRef::batch_from_missing_error(error)?
+            .or_else(|| {
+                crate::tracked_state::NativeObjectRef::from_missing_error(error)
+                    .ok()
+                    .flatten()
+                    .map(|address| vec![address])
+            });
+        if let Some(objects) = objects {
+            keys.extend(objects.into_iter().map(|address| {
+                (
+                    address.space(),
+                    crate::storage_adapter::StorageKey(Bytes::from(address.storage_key())),
+                )
+            }));
+        }
+        let metadata = crate::tracked_state::NativeMetadataRef::batch_from_missing_error(error)?
+            .or_else(|| {
+                crate::tracked_state::NativeMetadataRef::from_missing_error(error)
+                    .ok()
+                    .flatten()
+                    .map(|address| vec![address])
+            });
+        if let Some(metadata) = metadata {
+            for address in metadata {
+                keys.push((
+                    crate::sync::native_metadata_storage_space(&address),
+                    crate::sync::native_metadata_storage_key(&address)?,
+                ));
+            }
+        }
+        let blob =
+            crate::binary_cas::BlobManifestRequired::from_error(error)?.map(|required| required.0);
+        if error.code == "LIX_SYNC_CHUNKS_REQUIRED" {
+            let ids = error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("chunkIds"))
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    LixError::new(LixError::CODE_INVALID_PARAM, "chunk demand has no IDs")
+                })?;
+            for id in ids {
+                let id = id.as_str().ok_or_else(|| {
+                    LixError::new(LixError::CODE_INVALID_PARAM, "chunk demand ID is not text")
+                })?;
+                let hash = crate::binary_cas::ChunkHash::from_hex(id)?;
+                let key =
+                    crate::storage_adapter::StorageKey(Bytes::copy_from_slice(hash.as_bytes()));
+                keys.push((crate::binary_cas::BINARY_CAS_CHUNK_SPACE, key.clone()));
+                // The availability marker and immutable payload are published
+                // atomically. Referenced-content preparation reads the marker.
+                keys.push((crate::binary_cas::BINARY_CAS_CHUNK_PRESENCE_SPACE, key));
+            }
+        }
+        if keys.is_empty() && blob.is_none() {
+            return Ok(false);
+        }
+        let read = self
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await?;
+        for (space, key) in &keys {
+            let result = StorageAdapterRead::get_many(
+                &read,
+                &[crate::storage_adapter::StorageGetManyRequest {
+                    space: *space,
+                    keys: std::slice::from_ref(key),
+                    opts: Default::default(),
+                }],
+            )
+            .await?;
+            if result.values.first().is_none_or(Option::is_none) {
+                return Err(LixError::new(
+                    LixError::CODE_TRANSACTION_CONFLICT,
+                    "transaction snapshot inputs are no longer retained by the authority",
+                ));
+            }
+        }
+        if let Some(blob) = blob {
+            keys.extend(crate::binary_cas::hydrated_manifest_input_keys(&read, blob).await?);
+        }
+        // SAFETY: like opening_read, the fallback drops before the retained
+        // Arc storage. It only fills exact native input misses in that read.
+        let read = unsafe { assume_static_storage_read::<StorageImpl>(read) };
+        self.opening_read = self.opening_read.with_hydrated_keys(read, keys);
+        if let Some(blob) = blob {
+            self.opening_read = self.opening_read.clone().with_hydrated_prefix(
+                crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE,
+                Bytes::copy_from_slice(blob.as_bytes()),
+            );
+        }
+        Ok(true)
     }
 
     /// Stages an empty local commit only when this coherent transaction opened
@@ -2234,6 +2334,7 @@ where
             atomic_metadata_writes: None,
             atomic_metadata_preconditions: Vec::new(),
             sync_role: crate::sync::SyncRole::Disabled,
+            sync_demand_tx: None,
             sync_replica_remote_id: None,
             partial_replica_admission: None,
             await_durable_commit: false,
@@ -2494,7 +2595,62 @@ where
 
     /// Native commit materialization boundary. Returns prospective storage
     /// mutations only; durable publication remains exclusively in commit_prepared.
+    pub(crate) fn set_sync_demand_sender(
+        &mut self,
+        sender: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
+    ) {
+        self.sync_demand_tx = sender;
+        if self.sync_demand_tx.is_some() && self.sync_role == crate::sync::SyncRole::PartialReplica {
+            self.requires_individual_commit_span = true;
+        }
+    }
+
     fn prepare_storage_commit<'a>(
+        &'a mut self,
+        runtime_functions: &'a FunctionContext,
+        prepared_writes: PreparedWriteSet,
+        materialize_span: Option<ActiveTelemetrySpan>,
+    ) -> NativePreparationFuture<'a> {
+        let sender = self.sync_demand_tx.clone()
+            .filter(|_| self.sync_role == crate::sync::SyncRole::PartialReplica);
+        let Some(sender) = sender else {
+            return self.prepare_storage_commit_once(runtime_functions, prepared_writes, materialize_span);
+        };
+        Box::pin(async move {
+            let mut span = materialize_span;
+            let mut retry = crate::sync::SyncDemandRetry::default();
+            loop {
+                // Preparation produces prospective bytes only. Preserve the
+                // SQL snapshot and intents until those bytes can be completed;
+                // never retry the durable commit below this boundary.
+                let opening_read = self.opening_read.clone();
+                let opening_head = self.opening_active_branch_head;
+                let opening_revision = self.opening_tracked_mutation_revision.clone();
+                let restore_targets = self.pending_restore_targets.clone();
+                let checkpoint_replacements = self.pending_branch_checkpoint_replacements.clone();
+                let migration_bridges = self.native_migration_branch_bridges.clone();
+                let metadata_preconditions = self.atomic_metadata_preconditions.clone();
+                let result = self.prepare_storage_commit_once(
+                    runtime_functions, prepared_writes.clone(), span.take(),
+                ).await;
+                let error = match result {
+                    Ok(prepared) => return Ok(prepared),
+                    Err(error) => error,
+                };
+                self.opening_read = opening_read;
+                self.opening_active_branch_head = opening_head;
+                self.opening_tracked_mutation_revision = opening_revision;
+                self.pending_restore_targets = restore_targets;
+                self.pending_branch_checkpoint_replacements = checkpoint_replacements;
+                self.native_migration_branch_bridges = migration_bridges;
+                self.atomic_metadata_preconditions = metadata_preconditions;
+                retry.hydrate_pinned_for_retry(Some(&sender), error.clone()).await?;
+                self.refresh_hydrated_native_inputs(&error).await?;
+            }
+        })
+    }
+
+    fn prepare_storage_commit_once<'a>(
         &'a mut self,
         runtime_functions: &'a FunctionContext,
         mut prepared_writes: PreparedWriteSet,
@@ -12741,11 +12897,7 @@ where
         Ok(Some(Arc::clone(&plan.schema)))
     }
 
-    fn staged_schema_plan(
-        &self,
-        domain: &Domain,
-        schema_key: &str,
-    ) -> Option<&SchemaPlan> {
+    fn staged_schema_plan(&self, domain: &Domain, schema_key: &str) -> Option<&SchemaPlan> {
         self.schema_resolver.cached_schema_plan(domain, schema_key)
     }
 
@@ -18127,6 +18279,117 @@ fallback={large_fallback} decoded={large_decoded}"
             crate::binary_cas::BlobManifestRequired::from_error(&error).unwrap(),
             Some(crate::binary_cas::BlobManifestRequired(hash)),
         );
+    }
+
+    #[tokio::test]
+    async fn pinned_blob_hydration_preserves_referenced_content_readiness_through_commit() {
+        for inline in [false, true] {
+            let storage = Memory::new();
+            let (hot_state, binary_cas, _, functions, mut transaction) =
+                open_test_transaction(&storage).await;
+            binary_cas.enable_referenced_manifest_demands();
+            let adapter = StorageAdapter::new(storage);
+            let bytes = b"cold executable dependency";
+            let manifest = crate::binary_cas::CanonicalBlobManifest::from_bytes(bytes);
+            let reader = binary_cas.reader(transaction.opening_read());
+            let manifest_demand =
+                crate::plugin::runtime::prepare_executable_blobs(&reader, [manifest.blob_id])
+                    .await
+                    .unwrap_err();
+            assert_eq!(
+                crate::binary_cas::BlobManifestRequired::from_error(&manifest_demand).unwrap(),
+                Some(crate::binary_cas::BlobManifestRequired(manifest.blob_id)),
+            );
+            drop(reader);
+
+            let read = adapter.begin_read(Default::default()).await.unwrap();
+            let mut writes = adapter.new_write_set();
+            if inline {
+                crate::binary_cas::stage_verified_inline_canonical_blob(
+                    &mut writes, &manifest, bytes,
+                )
+                .unwrap();
+            } else {
+                crate::binary_cas::stage_deferred_canonical_manifest(&read, &mut writes, &manifest)
+                    .await
+                    .unwrap();
+            }
+            drop(read);
+            adapter
+                .commit_write_set(writes, Default::default())
+                .await
+                .unwrap();
+            transaction
+                .refresh_hydrated_native_inputs(&manifest_demand)
+                .await
+                .unwrap();
+
+            if !inline {
+                let reader = binary_cas.reader(transaction.opening_read());
+                let demand =
+                    crate::plugin::runtime::prepare_executable_blobs(&reader, [manifest.blob_id])
+                        .await
+                        .unwrap_err();
+                assert_eq!(demand.code, "LIX_SYNC_CHUNKS_REQUIRED");
+                drop(reader);
+                let mut writes = adapter.new_write_set();
+                crate::binary_cas::stage_verified_raw_chunk(
+                    &mut writes,
+                    manifest.chunks[0].hash,
+                    bytes,
+                )
+                .unwrap();
+                adapter
+                    .commit_write_set(writes, Default::default())
+                    .await
+                    .unwrap();
+                transaction
+                    .refresh_hydrated_native_inputs(&demand)
+                    .await
+                    .unwrap();
+            }
+
+            let reader = binary_cas.reader(transaction.opening_read());
+            for _ in 0..2 {
+                crate::plugin::runtime::prepare_executable_blobs(&reader, [manifest.blob_id])
+                    .await
+                    .expect("hydrated payload and presence marker remain coherent");
+            }
+            assert_eq!(
+                BlobDataReader::load_bytes_many(&reader, &[manifest.blob_id])
+                    .await
+                    .unwrap()
+                    .into_vec(),
+                vec![Some(bytes.to_vec())]
+            );
+            drop(reader);
+            transaction
+                .stage_rows(raw_write_rows(vec![key_value_stage_row(
+                    "hydrated-dependency",
+                    "prepared",
+                    false,
+                )]))
+                .await
+                .unwrap();
+            transaction
+                .commit(&functions)
+                .await
+                .expect("prepared transaction commits once");
+            let row = hot_state
+                .reader(adapter.begin_read(Default::default()).await.unwrap())
+                .load_row(&HotStateRowRequest {
+                    schema_key: "lix_key_value".to_owned(),
+                    branch_id: GLOBAL_BRANCH_ID.to_owned(),
+                    row_pk: RowPk::single("hydrated-dependency"),
+                    file_id: NullableKeyFilter::Null,
+                })
+                .await
+                .unwrap()
+                .expect("prepared mutation is persisted");
+            let snapshot: serde_json::Value =
+                serde_json::from_str(row.snapshot_content.as_deref().unwrap()).unwrap();
+            assert_eq!(snapshot["value"], "prepared");
+        }
     }
 
     #[tokio::test]
