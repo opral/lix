@@ -208,7 +208,7 @@ mod tests {
     async fn await_admission(manager: &Arc<LixRuntimeManager>) {
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                match manager.authority_admission(ID).await {
+                match manager.authority_admission(ID, tokio::time::Instant::now() + Duration::from_secs(30)).await {
                     Ok(Some(admission)) => {
                         assert_eq!(admission, AuthorityAdmission::current());
                         break;
@@ -303,7 +303,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            manager.authority_admission(ID).await.unwrap(),
+            manager.authority_admission(ID, tokio::time::Instant::now() + Duration::from_secs(30)).await.unwrap(),
             Some(AuthorityAdmission::current())
         );
         assert!(manager.state.lock().await.entries.is_empty());
@@ -321,8 +321,16 @@ mod tests {
         Arc::get_mut(&mut manager).unwrap().open_gate = Some(gate.clone());
         let physical = seeded_authority(&manager).await;
         catalog(&manager, &physical, None).await;
-        let error = manager.authority_admission(ID).await.unwrap_err();
-        assert_eq!(error.code, "LIX_REPOSITORY_MIGRATING");
+        use tower::ServiceExt as _;
+        let app = crate::router(manager.clone(), None, Duration::from_secs(1), Default::default());
+        let response = app.oneshot(axum::http::Request::builder()
+            .uri(format!("/lix/v1/{ID}/admission"))
+            .header("lix-sync-protocol-version", lix_sdk::SYNC_PROTOCOL_VERSION)
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"]["code"], "LIX_REPOSITORY_MIGRATING");
         let lifecycle = manager.lifecycle_lock(ID).await;
         assert!(
             lifecycle.try_write().is_err(),
@@ -354,7 +362,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            manager.authority_admission(ID).await.unwrap_err().code,
+            manager.authority_admission(ID, tokio::time::Instant::now() + Duration::from_secs(30)).await.unwrap_err().code,
             "LIX_PROTOCOL_VERSION_MISMATCH"
         );
         assert!(manager.state.lock().await.entries.is_empty());

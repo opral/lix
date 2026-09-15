@@ -309,9 +309,10 @@ async fn repository_admission(
             );
         }
     };
-    let admission = match tokio::time::timeout(
-        state.protocol_timeout,
-        state.manager.authority_admission(&id),
+    let deadline = tokio::time::Instant::now() + state.protocol_timeout;
+    let admission = match tokio::time::timeout_at(
+        deadline,
+        state.manager.authority_admission(&id, deadline),
     )
     .await
     {

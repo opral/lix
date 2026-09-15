@@ -3656,6 +3656,7 @@ impl LixRuntimeManager {
     pub(crate) async fn authority_admission(
         self: &Arc<Self>,
         id: &str,
+        deadline: tokio::time::Instant,
     ) -> Result<Option<AuthorityAdmission>, lix_sdk::server_protocol::LifecycleError> {
         use lix_sdk::server_protocol::LifecycleError;
         let record = self.repository_record(id).await.map_err(|_| {
@@ -3682,7 +3683,11 @@ impl LixRuntimeManager {
                 return Ok(Some(AuthorityAdmission::current()));
             }
         }
-        match tokio::time::timeout(Duration::from_secs(1), self.get(id)).await {
+        // Reserve time for the route to return progress, including when its
+        // configured deadline is only one second or catalog I/O used part of it.
+        let opening_wait = (deadline.saturating_duration_since(tokio::time::Instant::now()) / 2)
+            .min(Duration::from_secs(1));
+        match tokio::time::timeout(opening_wait, self.get(id)).await {
             Ok(Ok(_)) => Ok(Some(AuthorityAdmission::current())),
             Err(_) | Ok(Err(LixRuntimeError::Migrating { .. } | LixRuntimeError::Recovering)) => {
                 Err(LifecycleError::new(
@@ -4687,7 +4692,7 @@ mod admission_tests {
             serde_json::json!({"state":"live","fingerprint":null,"storage_id":ID,"retired":[]})
                 .to_string();
         store.put(&path, original.clone().into()).await.unwrap();
-        let error = manager.authority_admission(ID).await.unwrap_err();
+        let error = manager.authority_admission(ID, tokio::time::Instant::now() + Duration::from_secs(30)).await.unwrap_err();
         assert_eq!(error.code, "LIX_REPOSITORY_OPEN_FAILED");
         assert_eq!(
             store
