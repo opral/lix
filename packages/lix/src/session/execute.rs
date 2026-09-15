@@ -3836,7 +3836,7 @@ where
         loop {
             // Seal earlier successful statements before the checkpoint. A
             // failed cold statement can then be retried without replaying them.
-            self.flush_prepared_mutations_with_sync().await?;
+            Box::pin(self.flush_prepared_mutations_with_sync()).await?;
             let checkpoint = self.transaction_mut()?.begin_sql_statement_checkpoint()?;
             let error = match Box::pin(self.execute_with_options_once(sql, params, options.clone()))
                 .await

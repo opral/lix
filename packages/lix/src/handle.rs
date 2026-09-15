@@ -1988,22 +1988,27 @@ where
         let _admission = self.transaction_lifecycle.admission.lock().await;
         self.session.ensure_open()?;
 
+        // Each attempt opens an adapter-specific session and transaction. Keep
+        // that nested future on the heap so retry orchestration does not embed
+        // its full storage-read state in every caller's stack frame.
         let inner = self
-            .retry_sync_demands(|| async {
-                let branch_id = Arc::clone(&self.session).active_branch_id_owned().await?;
-                let session = Arc::new(
-                    self.engine
-                        .open_session_at_with_account(
-                            branch_id,
-                            self.active_account_id().to_owned(),
-                        )
+            .retry_sync_demands(|| {
+                Box::pin(async {
+                    let branch_id = Arc::clone(&self.session).active_branch_id_owned().await?;
+                    let session = Arc::new(
+                        self.engine
+                            .open_session_at_with_account(
+                                branch_id,
+                                self.active_account_id().to_owned(),
+                            )
+                            .await?
+                            .with_file_views_from(&self.session),
+                    );
+                    Ok(session
+                        .begin_transaction()
                         .await?
-                        .with_file_views_from(&self.session),
-                );
-                Ok(session
-                    .begin_transaction()
-                    .await?
-                    .with_sync_demand_sender(self.sync_demand_tx.clone()))
+                        .with_sync_demand_sender(self.sync_demand_tx.clone()))
+                })
             })
             .await?;
         Ok(LixTransaction {

@@ -30,3 +30,7 @@ explicit header flag and restore as partial replicas; older readers reject them.
 Deploy SDK and server together for sync protocol 16. Older peers fail version
 negotiation before attempting the new authenticated upload-abandonment fence.
 Repository storage format remains unchanged.
+
+Deployment probes and raw HTTP integrations can read Lix-owned compatibility
+metadata from the source checkout or `@lix-js/sdk/compatibility`; applications
+no longer need to maintain their own protocol version numbers.

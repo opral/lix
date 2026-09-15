@@ -1,24 +1,17 @@
 import { expect, test } from 'vitest';
 import { LixWorkerClient } from './client.js';
-import type { WorkerConnection } from './protocol.js';
+import { createSharedWorkerConnection } from './factory.browser.js';
 import { networkFetch } from '../http-transport.js';
 
 test.runIf(import.meta.env.LIX_ADMISSION_REGRESSION === true)('real SharedWorker and HTTP admission survive rotation, reject account drift and keep offline local work', async () => {
   const name = 'admission-regression-' + crypto.randomUUID();
+  const physicalScope = `lix:opfs:${name}`;
   const url = `${location.origin}/lix/00000000-0000-7000-8000-000000000004`;
   const clients: LixWorkerClient[] = [];
   let admissions = 0;
   async function attach(initial: string, drop = false) {
     let token = initial;
-    const worker = new SharedWorker(new URL('./entry.shared.browser.ts', import.meta.url), {type:'module',name});
-    const connection: WorkerConnection = {
-      postMessage: message => worker.port.postMessage(message),
-      onMessage: listener => {worker.port.onmessage = event => listener(event.data);},
-      onFatal: listener => {worker.onerror = event => listener(new Error(event.message));},
-      ref() {}, unref() {},
-      terminate: async () => {worker.port.postMessage({kind:'shared.disconnect'});worker.port.close();},
-    };
-    worker.port.start();
+    const connection = createSharedWorkerConnection(physicalScope);
     const client = new LixWorkerClient(connection,false);
     clients.push(client);
     client.beginLease(undefined,undefined,{url,headers:()=>[['Authorization',token]],fetch:async(input,init)=>{
@@ -27,7 +20,9 @@ test.runIf(import.meta.env.LIX_ADMISSION_REGRESSION === true)('real SharedWorker
       if(drop) headers.set("x-test-drop", "yes");
       return networkFetch(input,{...init,headers});
     }});
-    await client.request({kind:'open',storage:{kind:'memory'},telemetryEnabled:false,progressEnabled:false,
+    // The binding is stubbed, but the real shared host still requires the
+    // provider's physical identity for durable local admission proofs.
+    await client.request({kind:'open',storage:{kind:'jsStorage',moduleUrl:new URL('../../admission-regression-binding.ts', import.meta.url).href,options:{sharedEngineKey:physicalScope}},telemetryEnabled:false,progressEnabled:false,
       server:{url,headers:[],dynamicHeaders:true}});
     return {client, token(value:string) {token=value;}, execute(sql:string) {return client.request<any>({kind:'execute',sql,params:[]});}};
   }

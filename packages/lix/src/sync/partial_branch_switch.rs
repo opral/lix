@@ -58,7 +58,11 @@ where
     let (mut sender, receiver) = tokio::sync::oneshot::channel();
     // Erase the owner task so consumer crates do not instantiate the entire
     // branch preparation state machine inside their public operation future.
-    let owned: std::pin::Pin<Box<dyn Future<Output = ()> + Send>> = Box::pin(async move {
+    #[cfg(not(target_family = "wasm"))]
+    type OwnedTask = futures_util::future::BoxFuture<'static, ()>;
+    #[cfg(target_family = "wasm")]
+    type OwnedTask = futures_util::future::LocalBoxFuture<'static, ()>;
+    let owned: OwnedTask = Box::pin(async move {
         let _owner_guard = owner_guard;
         let connect = super::platform::HttpSyncTransport::connect(&server.url, &server.headers);
         futures_util::pin_mut!(connect);

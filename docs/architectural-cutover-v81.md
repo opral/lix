@@ -1,7 +1,7 @@
 # Current-format runtime and detached migration
 
-The target runtime accepts repository format **81**, sync protocol **15**, and
-remote SQL protocol **9**. Older protocol clients must be rejected before any
+The target runtime accepts repository format **81**, sync protocol **16**, and
+remote SQL protocol **10**. Older protocol clients must be rejected before any
 mutation. Opening does not migrate, recover interrupted migration claims,
 upgrade partial receipts, or retire old source banks.
 

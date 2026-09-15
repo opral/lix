@@ -12,6 +12,20 @@ Application developers should start with
 [Collaboration](./collaboration-and-sync.md). This page documents the
 server wire contract.
 
+## Compatibility metadata
+
+Applications and CI should read Lix's compatibility metadata instead of keeping
+their own protocol version pins. From a source checkout, run
+`node scripts/compatibility.mjs` to print JSON, or import `getCompatibility()`
+from that script. It reads the canonical Rust constants and needs neither
+installed dependencies nor a built SDK. The fields are `serverProtocolVersion`,
+`syncProtocolVersion`, and `storageFormatVersion`.
+
+Published SDK consumers can import the same fields as `compatibility` from
+`@lix-js/sdk/compatibility`. This entry point contains generated data only and
+does not load a native or WebAssembly binding. Metadata describes the checked-out
+or installed Lix version; HTTP admission still checks the actual server.
+
 ## Why it exists
 
 The protocol is the interop layer between clients and hosts.

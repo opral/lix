@@ -189,7 +189,10 @@ where
             .as_ref()
             .is_some_and(SessionWriteAccess::serializes_collaboration_writes);
         let operation_guard = self.begin_session_commit_operation()?;
-        self.flush_prepared_mutations_with_sync().await?;
+        // The hydration path retains adapter-specific read futures. Keep it
+        // outside the commit future, which callers may join for independent
+        // transactions on the default thread stack.
+        Box::pin(self.flush_prepared_mutations_with_sync()).await?;
         let transaction = self
             .transaction
             .take()
