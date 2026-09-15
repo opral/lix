@@ -60,6 +60,7 @@ struct ScriptHttp {
     requests: Arc<Mutex<Vec<ProtocolHttpRequest>>>,
     outcomes: Arc<Mutex<VecDeque<ScriptOutcome>>>,
     stream_cancellations: Arc<AtomicUsize>,
+    sleeps: Arc<Mutex<Vec<Duration>>>,
 }
 
 enum ScriptOutcome {
@@ -199,7 +200,9 @@ impl ProtocolHttp for ScriptHttp {
         }
     }
 
-    async fn sleep(&self, _duration: Duration) {}
+    async fn sleep(&self, duration: Duration) {
+        self.sleeps.lock().unwrap().push(duration);
+    }
 
     fn spawn(&self, fut: Pin<Box<dyn Future<Output = ()> + Send>>) {
         tokio::spawn(fut);
@@ -758,4 +761,84 @@ async fn observe_client_request_passes_server_version_gate_and_streams_initial_r
     );
     drop(body);
     server.close().await.expect("close server");
+}
+
+#[tokio::test]
+async fn opening_awaits_typed_migration_without_a_total_deadline() {
+    let http = ScriptHttp::default();
+    for index in 0..40 {
+        let code = if index % 2 == 0 {
+            "LIX_REPOSITORY_MIGRATING"
+        } else {
+            "LIX_ERROR_MIGRATING"
+        };
+        http.push_json(
+            503,
+            serde_json::json!({"error":{"code":code,"message":"migration in progress"}}),
+        );
+    }
+    http.push_json(200, handshake("ready", "main"));
+    let client = open_protocol_client(
+        http.clone(),
+        "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(http.requests().len(), 41);
+    assert!(
+        http.requests()
+            .iter()
+            .all(|request| request.method == "GET")
+    );
+    assert_eq!(
+        *http.sleeps.lock().unwrap(),
+        vec![Duration::from_secs(1); 40]
+    );
+    // The same response on SQL is not proof that replaying a write is safe.
+    http.push_json(503, serde_json::json!({"error":{"code":"LIX_REPOSITORY_MIGRATING","message":"migration in progress"}}));
+    let error = client
+        .execute("INSERT INTO example VALUES (1)", &[], None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "LIX_REPOSITORY_MIGRATING");
+    assert_eq!(http.requests().len(), 42);
+    assert_eq!(http.sleeps.lock().unwrap().len(), 40);
+}
+
+#[tokio::test]
+async fn opening_does_not_delay_healthy_admission_or_retry_terminal_errors() {
+    let http = ScriptHttp::default();
+    http.push_json(200, handshake("ready", "main"));
+    let _client = open_protocol_client(
+        http.clone(),
+        "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(http.requests().len(), 1);
+    assert!(http.sleeps.lock().unwrap().is_empty());
+    for (status, code) in [
+        (503, "LIX_ERROR_UNAVAILABLE"),
+        (401, "LIX_REPOSITORY_MIGRATING"),
+        (426, "LIX_SYNC_PROTOCOL_MISMATCH"),
+    ] {
+        let http = ScriptHttp::default();
+        http.push_json(503, serde_json::json!({"error":{"code":"LIX_REPOSITORY_MIGRATING","message":"migration in progress"}}));
+        http.push_json(
+            status,
+            serde_json::json!({"error":{"code":code,"message":"terminal"}}),
+        );
+        let error = open_protocol_client(
+            http.clone(),
+            "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, code);
+        assert_eq!(http.requests().len(), 2);
+        assert_eq!(*http.sleeps.lock().unwrap(), vec![Duration::from_secs(1)]);
+    }
 }

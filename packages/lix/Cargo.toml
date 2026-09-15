@@ -21,7 +21,8 @@ workspace = true
 [features]
 default = ["default_wasm_runtime"]
 all-simulations = []
-# Detached operator/browser migration artifact only; never enabled by the ordinary runtime.
+# Historical migration support for operator tools and the server-owned opener.
+# Ordinary client bindings keep this in a separate migration artifact.
 offline-migration = []
 storage-benches = []
 # Per-node cost attribution for commit-root replay (experiment AA). Kept out of

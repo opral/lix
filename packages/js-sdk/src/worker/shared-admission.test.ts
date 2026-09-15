@@ -85,3 +85,24 @@ test("another port's rejection removes a delayed durable write and invalidates t
   await cache.persistLocal(url, headers, generation, write, async () => {});
   expect(write).not.toHaveBeenCalled();
 });
+
+
+test("admission waits through server-owned migration and returns the upgraded identity", async () => {
+  vi.useFakeTimers();
+  try {
+    const transport = vi.fn()
+      .mockResolvedValueOnce(Response.json({error: {code: "LIX_REPOSITORY_MIGRATING"}}, {status: 503}))
+      .mockResolvedValueOnce(Response.json({error: {code: "LIX_REPOSITORY_MIGRATING"}}, {status: 503}))
+      .mockResolvedValueOnce(Response.json(identity));
+    const pending = requestAdmission(url, headers, transport);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(await pending).toEqual(identity);
+    expect(transport).toHaveBeenCalledTimes(3);
+  } finally { vi.useRealTimers(); }
+});
+
+test("admission does not retry unrelated service failures", async () => {
+  const transport = vi.fn(async () => Response.json({error: {code: "LIX_STORAGE_FAILURE"}}, {status: 503}));
+  await expect(requestAdmission(url, headers, transport)).rejects.toMatchObject({code: "LIX_ADMISSION_HTTP"});
+  expect(transport).toHaveBeenCalledTimes(1);
+});

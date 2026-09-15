@@ -42,7 +42,7 @@ test("no options opens memory; storage alone opens local", async () => {
 
 test("server defaults to remote; partial_replica explicitly opts into on-demand sync", async () => {
 	const remote = await openLix({ server });
-	expect(mocks.remote).toHaveBeenCalledWith(server);
+	expect(mocks.remote).toHaveBeenCalledWith(server, {onProgress: undefined});
 	expect(mocks.local).not.toHaveBeenCalled();
 	await remote.close();
 	const local = await openLix({
@@ -68,10 +68,7 @@ test.each(["sync", "replica", "unknown"])("unsupported mode %s fails before open
 test("remote execution rejects local-only options before opening", async () => {
 	await expect(
 		openLix({ server, telemetry: { onSpan() {} } } as never),
-	).rejects.toThrow("does not accept local telemetry or onProgress");
-	await expect(openLix({ server, onProgress() {} } as never)).rejects.toThrow(
-		"does not accept local telemetry or onProgress",
-	);
+	).rejects.toThrow("does not accept local telemetry");
 	expect(mocks.remote).not.toHaveBeenCalled();
 });
 
@@ -90,4 +87,11 @@ test("partial_replica requires storage before opening", async () => {
 	await expect(openLix({server: {...server, mode: "partial_replica"}} as never)).rejects.toThrow('requires storage');
 	expect(mocks.local).not.toHaveBeenCalled();
 	expect(mocks.remote).not.toHaveBeenCalled();
+});
+
+test("remote opening forwards observational progress", async () => {
+ const onProgress = vi.fn();
+ const lix = await openLix({server, onProgress});
+ expect(mocks.remote).toHaveBeenCalledWith(server, {onProgress});
+ await lix.close();
 });

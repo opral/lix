@@ -2,18 +2,24 @@
 
 The target runtime accepts repository format **81**, sync protocol **16**, and
 remote SQL protocol **10**. Older protocol clients must be rejected before any
-mutation. Opening does not migrate, recover interrupted migration claims,
-upgrade partial receipts, or retire old source banks.
+mutation. The reference server automatically migrates supported older authorities
+inside its owned repository opener before serving requests. Concurrent opens share
+the same migration. Compatible transport-only upgrades require no content scan.
+The browser SDK awaits server migration internally; applications keep awaiting open.
+The low-level current-format engine does not itself run historical migrations or
+retire old source banks.
 
 `lix::migration::inspect_repository(storage)` performs read-only inventory.
 `lix::migration::migrate_repository(storage)` is available only with the
-nondefault `offline-migration` Cargo feature. It resumes the registered
+`offline-migration` Cargo feature, which the reference server enables for
+automatic authority opening. It resumes the registered
 copy-and-activate chain (full repositories v72–80 and partial v79–80), retains
 source banks, and reports before/after format, role, and logical-content digests.
 Historical preflight defaults to 250,000 changes and 512 MiB.
 `migrate_repository_with_options` / `migrateStorageProvider(provider, limits)`
 accept explicit positive limits; limit exhaustion preserves the source and fails
-with `LIX_ERROR_MIGRATION_LIMIT_EXCEEDED`. No unbounded automatic policy remains.
+with `LIX_ERROR_MIGRATION_LIMIT_EXCEEDED`. Automatic authority opening uses these
+default limits and verifies semantic preservation before publishing admission.
 No migration chain exists for pre-v72 full repository record shapes; inventory
 must identify these repositories and preserve them for a version-specific
 export/import tool. Never silently reset them.

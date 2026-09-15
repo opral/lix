@@ -64,12 +64,12 @@ async function openLixInternal(
 			if (options.storage !== undefined) {
 				throw new TypeError('remote mode does not accept storage; set server.mode to "partial_replica" for on-demand sync');
 			}
-			if (options.telemetry !== undefined || options.onProgress !== undefined)
+			if (options.telemetry !== undefined)
 				throw new TypeError(
-					"remote execution does not accept local telemetry or onProgress",
+					"remote execution does not accept local telemetry",
 				);
 			const { openRemoteLixBinding } = await import("./remote/client.js");
-			return new Lix(await openRemoteLixBinding(options.server));
+			return new Lix(await openRemoteLixBinding(options.server, { onProgress: options.onProgress }));
 		}
 		if (options.storage === undefined) {
 			throw new TypeError('server.mode "partial_replica" requires storage');

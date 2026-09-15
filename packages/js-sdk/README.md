@@ -27,6 +27,19 @@ For compiled plugin downloads, installation, updates, and uninstalling, see
 
 ## Hosted lifecycle
 
+### Automatic upgrades and progress
+
+Opening a supported older hosted repository automatically upgrades it on the
+server. The SDK waits inside `openLix()`; applications do not implement migration
+or retry logic. Concurrent opens share the server's upgrade operation.
+
+Use `onProgress` to display status in either remote or partial-replica mode.
+Authority upgrades emit `scope: "authority"` and `phase: "migrating"`, followed
+by opening and completion. The source format and work totals may be unknown:
+show “Upgrading repository” with an indeterminate indicator instead of inventing
+a percentage. Progress callbacks are observational and cannot change the result
+of opening.
+
 ### Compatibility metadata
 
 Raw HTTP integrations can obtain this SDK's protocol versions without loading

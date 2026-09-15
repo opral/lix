@@ -67,7 +67,7 @@ export type LixTelemetryOptions = {
 	parentContext?(): LixTelemetryParentContext | undefined;
 };
 
-/** Stable phases emitted while a local repository is opened. */
+/** Stable phases emitted while a repository is opened. */
 export type LixOpenPhase =
 	| "inspecting"
 	| "migrating"
@@ -78,6 +78,9 @@ export type LixOpenPhase =
 /** One observational repository-open progress snapshot. */
 export type LixOpenProgress = {
 	phase: LixOpenPhase;
+	/** Present for an upgrade owned by the remote authority. */
+	scope?: "authority";
+	/** May be unknown while waiting for a remote authority upgrade. */
 	fromFormat?: number;
 	toFormat: number;
 	completed?: number;
@@ -160,7 +163,7 @@ export type ReplicaRecoveryReceipt = {
 };
 
 export type LixOpenProgressOptions = {
-	/** Observes local inspection, automatic migration, and opening. */
+	/** Observes local or authority inspection, automatic migration, and opening. */
 	onProgress?(progress: LixOpenProgress): void;
 };
 
@@ -179,12 +182,11 @@ export type OpenLixOptions =
 			server?: never;
 			telemetry?: LixTelemetryOptions;
 	  } & LixOpenProgressOptions)
-	| {
+	| ({
 			storage?: never;
 			server: RemoteLixServerOptions;
 			telemetry?: never;
-			onProgress?: never;
-	  }
+	  } & LixOpenProgressOptions)
 	| ({
 			storage: import("./storage-adapter.js").LixStorage;
 			server: PartialReplicaLixServerOptions;
