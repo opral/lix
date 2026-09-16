@@ -3967,7 +3967,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_json"
-version = "0.16.2"
+version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
