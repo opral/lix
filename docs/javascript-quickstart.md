@@ -4,8 +4,7 @@ description: Install the Lix JavaScript SDK, write a file, inspect its history, 
 
 # JavaScript quickstart
 
-This guide creates an in-memory Lix repository, writes a file, reads its
-history, and undoes the latest change.
+This guide creates an in-memory Lix repository, writes a file, reads its history, and undoes the latest change.
 
 ## Install
 
@@ -33,9 +32,7 @@ await lix.execute("UPDATE lix_file SET content = $1 WHERE path = $2", [
 
 Lix records both writes automatically. You do not need to create commits.
 
-`execute()` runs one statement. To run several statements atomically, pass an
-array of statements to `lix.executeBatch()`. Do not concatenate SQL into one
-script string.
+`execute()` runs one statement. To run several statements atomically, pass an array of statements to `lix.executeBatch()`. Do not concatenate SQL into one script string.
 
 ## Read history
 
@@ -53,8 +50,7 @@ for (const row of history.rows) {
 }
 ```
 
-Position `0` is the head commit. Higher positions walk back through the
-first-parent chain. Read file bytes with `lix_as_of` at an event endpoint.
+Position `0` is the head commit. Higher positions walk back through the first-parent chain. Read file bytes with `lix_as_of` at an event endpoint.
 
 ## Undo the update
 
@@ -63,9 +59,7 @@ await lix.undo();
 await lix.close();
 ```
 
-The repository is in memory and disappears when the process ends. Continue
-with [Storage](./persistence.md) to save it locally or connect
-to a server.
+The repository is in memory and disappears when the process ends. Continue with [Storage](./persistence.md) to save it locally or connect to a server.
 
 ## Next
 

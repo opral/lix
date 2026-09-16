@@ -1,72 +1,32 @@
 # Partial replica with on-demand sync: performance evidence
 
-The measurements below are historical, from before removal of the public
-preparation API and the current SQL-driven dependency changes. They establish
-earlier baselines; they do not validate the current revision. Current SQL-driven
-validation and profiling are recorded in [PR #1755](https://github.com/opral/lix/pull/1755).
-The updated benchmarks disconnect immediately after the first SELECT; compare
-results only when their source and installed artifact hashes match.
+The measurements below are historical, from before removal of the public preparation API and the current SQL-driven dependency changes. They establish earlier baselines; they do not validate the current revision. Current SQL-driven validation and profiling are recorded in [PR #1755](https://github.com/opral/lix/pull/1755). The updated benchmarks disconnect immediately after the first SELECT; compare results only when their source and installed artifact hashes match.
 
-The public opener with storage and `server.mode: "partial_replica"` creates a **partial replica with
-on-demand sync**. Optimized Chromium/WASM/OPFS measurements below show bounded
-opening transfers across independently varied rows, branches, history and
-unopened content: two repository requests and approximately 2.3 KiB. Total
-fresh-browser opening is typically about 280 ms in this environment, including
-worker/WASM/OPFS startup; the approximately 40 ms request-to-open phase is only a
-part of that total. These measurements do not reproduce the user's original
-23.5-second deployment baseline and should not be presented as a matched speedup.
+The public opener with storage and `server.mode: "partial_replica"` creates a **partial replica with on-demand sync**. Optimized Chromium/WASM/OPFS measurements below show bounded opening transfers across independently varied rows, branches, history and unopened content: two repository requests and approximately 2.3 KiB. Total fresh-browser opening is typically about 280 ms in this environment, including worker/WASM/OPFS startup; the approximately 40 ms request-to-open phase is only a part of that total. These measurements do not reproduce the user's original 23.5-second deployment baseline and should not be presented as a matched speedup.
 
-Covered reads and prepared writes pass disconnected browser tests, including
-OPFS reopen. Native, adapter, SDK and browser verification passes. See
-[migration support](partial-replica-migration.md) for explicit conversion and its
-remaining boundaries. Format and protocol changes are intentional, without an
-eager fallback or compatibility shim.
+Covered reads and prepared writes pass disconnected browser tests, including OPFS reopen. Native, adapter, SDK and browser verification passes. See [migration support](partial-replica-migration.md) for explicit conversion and its remaining boundaries. Format and protocol changes are intentional, without an eager fallback or compatibility shim.
 
 ## Historical verification (build 75 / release 5)
 
-Three independent fresh authority/browser processes per opening arm, with
-alternating small/large order. All eight sequential workflows passed; source,
-installed SDK JavaScript/generated glue/WASM and native authority artifacts were
-verified unchanged throughout the run.
+Three independent fresh authority/browser processes per opening arm, with alternating small/large order. All eight sequential workflows passed; source, installed SDK JavaScript/generated glue/WASM and native authority artifacts were verified unchanged throughout the run.
 
 | Repository | Fresh-browser opening samples (ms) | Median | Requests | Repository body bytes |
 |---|---|---:|---:|---|
 | 16 KV rows | 277.0, 276.4, 274.2 | 276.4 ms | 2 each | 2,327–2,330 |
 | Same rows plus 320 MiB unrelated content | 272.2, 292.4, 266.2 | 272.2 ms | 2 each | 2,311–2,324 |
 
-Every large fixture contains **335,547,662 physical CAS bytes in 286 chunks**.
-All six opening runs pass 30 disconnected read/write pairs and offline OPFS
-reopen with **zero native input-fetch attempts**. Total opening includes
-worker/WASM/OPFS startup. The request-to-open residual medians are 38.3/38.8 ms;
-they are not total opening or pure network time. Repository bytes exclude shared
-SDK resources, HTTP framing and the separate remote mutation session. The
-1,600-file case within the file workflow reuses its browser startup and must not
-be substituted for these fresh-browser opening measurements.
+Every large fixture contains **335,547,662 physical CAS bytes in 286 chunks**. All six opening runs pass 30 disconnected read/write pairs and offline OPFS reopen with **zero native input-fetch attempts**. Total opening includes worker/WASM/OPFS startup. The request-to-open residual medians are 38.3/38.8 ms; they are not total opening or pure network time. Repository bytes exclude shared SDK resources, HTTP framing and the separate remote mutation session. The 1,600-file case within the file workflow reuses its browser startup and must not be substituted for these fresh-browser opening measurements.
 
-Paired local SQL, using identical artifacts/providers/statements, five warmups
-and 30 measurements per case:
+Paired local SQL, using identical artifacts/providers/statements, five warmups and 30 measurements per case:
 
 | Rows | Complete SELECT | Partial SELECT | Complete UPDATE | Partial UPDATE |
 |---|---:|---:|---:|---:|
 | 16 | 0.8 ms | 1.0 ms | 6.65 ms | 8.6 ms |
 | 16,000 | 0.7 ms | 0.9 ms | 8.65 ms | 11.6 ms |
 
-These are paired-workflow medians; the independently seeded opening arms have
-approximately 1.1 ms warm point-read medians. The file workflow's 1,600-file
-case measures 1,124.8 ms for cold directory loading and **1,200.3 ms for remote
-insertion publication**. The earlier instrumented release 2 publication took
-15,462 ms; these individual diagnostic runs do not establish a population
-speedup. Bounded sibling batching and reuse of complete immutable projections
-remove repeated candidate work without weakening native validation.
+These are paired-workflow medians; the independently seeded opening arms have approximately 1.1 ms warm point-read medians. The file workflow's 1,600-file case measures 1,124.8 ms for cold directory loading and **1,200.3 ms for remote insertion publication**. The earlier instrumented release 2 publication took 15,462 ms; these individual diagnostic runs do not establish a population speedup. Bounded sibling batching and reuse of complete immutable projections remove repeated candidate work without weakening native validation.
 
-In this historical run, the now-removed SQL preparation API preceded 30 disconnected 96 KiB content edits, reads and
-counts pass with zero native input-fetch attempts. Warm content read/write
-medians are **4.7/19.75 ms**; offline OPFS reopen is 49.2 ms. Preparation itself
-takes 56.5 ms and leaves content unpublished. Changed dependencies can make a
-later operation cold; these figures do not promise that any SQL after one query
-is warm.
-Current applications prefetch SELECT inputs through `execute()`; these historical
-write-preparation timings do not describe a currently available API.
+In this historical run, the now-removed SQL preparation API preceded 30 disconnected 96 KiB content edits, reads and counts pass with zero native input-fetch attempts. Warm content read/write medians are **4.7/19.75 ms**; offline OPFS reopen is 49.2 ms. Preparation itself takes 56.5 ms and leaves content unpublished. Changed dependencies can make a later operation cold; these figures do not promise that any SQL after one query is warm. Current applications prefetch SELECT inputs through `execute()`; these historical write-preparation timings do not describe a currently available API.
 
 | Verification | Result |
 |---|---|
@@ -80,80 +40,41 @@ write-preparation timings do not describe a currently available API.
 | Native JavaScript preparation/read-your-writes smoke check | Passed |
 | Final browser profiling workflows | 8 passed |
 
-Independent sub-agent reviews covered conversion future safety, worker/input
-boundaries, tree batching, GC test coordination, profiling methodology and final
-raw results/provenance. The native consumer tests compile without increasing
-their recursion limits. The GC fixture replans only on genuine optimistic
-precondition conflicts; production GC already handles those conflicts.
+Independent sub-agent reviews covered conversion future safety, worker/input boundaries, tree batching, GC test coordination, profiling methodology and final raw results/provenance. The native consumer tests compile without increasing their recursion limits. The GC fixture replans only on genuine optimistic precondition conflicts; production GC already handles those conflicts.
 
-WASM SHA256: `e3ffe99c8c36887c1a329b77ffcd3c7f9ab5c93e824baafdba5f737c2f207326`
-(47,217,605 raw bytes). Native authority SHA256:
-`895789aca7b52f707c36202318feea89e6f156f75c6d5398b942e7638914d9a3`.
-Raw results, source/artifact manifests and verification logs are retained in
-`research/lazy-browser-sync/release-followup-5` in the parent workspace.
+WASM SHA256: `e3ffe99c8c36887c1a329b77ffcd3c7f9ab5c93e824baafdba5f737c2f207326` (47,217,605 raw bytes). Native authority SHA256: `895789aca7b52f707c36202318feea89e6f156f75c6d5398b942e7638914d9a3`. Raw results, source/artifact manifests and verification logs are retained in `research/lazy-browser-sync/release-followup-5` in the parent workspace.
 
-Reproduce with `packages/storage-opfs/tests/run-partial-release-profile.py`
-using an explicitly selected current native test binary after building the
-optimized browser SDK. The invocation below also applies to this final run.
-The authority is already open before timing starts. Three samples per arm do
-not establish tail latency, strict O(1) backend latency or a matched speedup over
-the reported 23.5-second deployment. Explicit old-repository migration remains
-separate; its supported cases and recovery boundaries are documented in
-[the migration guide](partial-replica-migration.md).
+Reproduce with `packages/storage-opfs/tests/run-partial-release-profile.py` using an explicitly selected current native test binary after building the optimized browser SDK. The invocation below also applies to this final run. The authority is already open before timing starts. Three samples per arm do not establish tail latency, strict O(1) backend latency or a matched speedup over the reported 23.5-second deployment. Explicit old-repository migration remains separate; its supported cases and recovery boundaries are documented in [the migration guide](partial-replica-migration.md).
 
 ## Earlier measurements
 
-The following sections preserve historical results. Their statements about work
-remaining describe those earlier builds; the final verification above is the
-current status.
+The following sections preserve historical results. Their statements about work remaining describe those earlier builds; the final verification above is the current status.
 
 ## Repeated optimized opening verification (build 57 / release 2)
 
-WASM SHA256: `6b0e87ad60c365c322b729785450b82143350f60d08b592d78fd44ab3d632ef3`.
-Raw module size: 47,036,224 bytes. Repository transfer counts exclude this shared
-SDK/WASM resource, HTTP framing and the separate remote mutation session.
+WASM SHA256: `6b0e87ad60c365c322b729785450b82143350f60d08b592d78fd44ab3d632ef3`. Raw module size: 47,036,224 bytes. Repository transfer counts exclude this shared SDK/WASM resource, HTTP framing and the separate remote mutation session.
 
-Three independent fresh authority/browser processes per arm, with alternating
-small/large order and a fixed source/artifact manifest:
+Three independent fresh authority/browser processes per arm, with alternating small/large order and a fixed source/artifact manifest:
 
 | Repository | Total opening samples (ms) | Median | Foreground requests | Repository bytes |
 |---|---|---:|---:|---|
 | 16 KV rows | 270.5, 277.5, 288.4 | 277.5 ms | 2 each | 2,319–2,323 |
 | 16 KV rows plus 320 MiB unrelated files | 271.3, 270.9, 290.0 | 271.3 ms | 2 each | 2,324–2,338 |
 
-The large fixture verifies **335,547,662 physical CAS bytes in 286 chunks** before
-opening is timed; it is not a repeated-content logical-size fixture. All six
-runs pass 30 disconnected read/write pairs and offline OPFS reopen with zero
-native input-fetch attempts. Request-to-open medians are 38.5 ms and 37.6 ms;
-total opening includes worker/WASM/OPFS initialization.
+The large fixture verifies **335,547,662 physical CAS bytes in 286 chunks** before opening is timed; it is not a repeated-content logical-size fixture. All six runs pass 30 disconnected read/write pairs and offline OPFS reopen with zero native input-fetch attempts. Request-to-open medians are 38.5 ms and 37.6 ms; total opening includes worker/WASM/OPFS initialization.
 
-These samples establish bounded transfer and no repository-wide opening work
-in this setup, not a statistical tail guarantee or strict O(1) storage latency.
-The authority is already open before the browser starts. Native indexed point
-lookups, backend/cache state, network latency and browser startup can vary.
+These samples establish bounded transfer and no repository-wide opening work in this setup, not a statistical tail guarantee or strict O(1) storage latency. The authority is already open before the browser starts. Native indexed point lookups, backend/cache state, network latency and browser startup can vary.
 
-Paired local SQL runs use the same artifact/provider/statements, five warmups
-and 30 samples per case, with reversed mode order at the second size:
+Paired local SQL runs use the same artifact/provider/statements, five warmups and 30 samples per case, with reversed mode order at the second size:
 
 | Rows | Complete SELECT median | Partial SELECT median | Complete UPDATE median | Partial UPDATE median |
 |---|---:|---:|---:|---:|
 | 16 | 0.9 ms | 1.0 ms | 7.0 ms | 8.4 ms |
 | 16,000 | 0.7 ms | 0.9 ms | 8.85 ms | 10.65 ms |
 
-This historical real-file workflow used the now-removed preparation API without publication, followed by 30 offline
-96 KiB content edits/reads/counts, and reopen. At 1,600 files, warm content reads
-have a 4.55 ms median and writes 19.55 ms. This release exposed a background
-publication bottleneck: a remote insertion into retained negative/directory scopes
-took 17.81 seconds and issued 137 native range requests. The batch endpoint
-was never used by that phase. The release 4 follow-up below addresses this
-bottleneck. Cold directory
-loading is 1.30 seconds. This historical run used the now-removed `Lix.prepare` API and is not
-directly comparable to earlier fixtures that performed an actual dummy write.
+This historical real-file workflow used the now-removed preparation API without publication, followed by 30 offline 96 KiB content edits/reads/counts, and reopen. At 1,600 files, warm content reads have a 4.55 ms median and writes 19.55 ms. This release exposed a background publication bottleneck: a remote insertion into retained negative/directory scopes took 17.81 seconds and issued 137 native range requests. The batch endpoint was never used by that phase. The release 4 follow-up below addresses this bottleneck. Cold directory loading is 1.30 seconds. This historical run used the now-removed `Lix.prepare` API and is not directly comparable to earlier fixtures that performed an actual dummy write.
 
-Native verification: 3,496 tests passed, 78 ignored, normal stack, no exclusions.
-The SDK TypeScript build/typecheck and 61 focused lifecycle/worker tests pass.
-Broader adapter/integration verification remains. The later build 59 unit run
-passes all 3,940 simulation tests, with 78 ignored and no exclusions.
+Native verification: 3,496 tests passed, 78 ignored, normal stack, no exclusions. The SDK TypeScript build/typecheck and 61 focused lifecycle/worker tests pass. Broader adapter/integration verification remains. The later build 59 unit run passes all 3,940 simulation tests, with 78 ignored and no exclusions.
 
 Reproduce after building optimized WASM/SDK and the native authority test binary:
 
@@ -163,39 +84,22 @@ python3 packages/storage-opfs/tests/run-partial-release-profile.py \
   --output /absolute/path/to/new-profile-directory
 ```
 
-The runner preserves raw measurements, physical-size manifests, artifact hashes
-and tracked/untracked source hashes. It rejects source/artifact changes during
-the run. The recorded run is in `research/lazy-browser-sync/release-followup-2`
-in the parent workspace.
+The runner preserves raw measurements, physical-size manifests, artifact hashes and tracked/untracked source hashes. It rejects source/artifact changes during the run. The recorded run is in `research/lazy-browser-sync/release-followup-2` in the parent workspace.
 
 ## Follow-up publication optimization (build 59 / release 4)
 
-The instrumented file workflow was repeated after two reviewed changes:
-completed immutable-root projection reuse across candidate retries, and bounded
-sibling-demand aggregation in exact-key and unlimited range traversals. The
-latter requests at most 32 already-required missing tree objects; limited reads
-retain sequential traversal and corruption remains an error.
+The instrumented file workflow was repeated after two reviewed changes: completed immutable-root projection reuse across candidate retries, and bounded sibling-demand aggregation in exact-key and unlimited range traversals. The latter requests at most 32 already-required missing tree objects; limited reads retain sequential traversal and corruption remains an error.
 
 | 1,600-file workflow | Before | Immutable cache reuse | Cache reuse + sibling batches |
 |---|---:|---:|---:|
 | Remote insertion publication | 15,462 ms | 11,949 ms | 1,331 ms |
 | Cold directory listing | 1,349 ms | 1,419 ms | 1,045 ms |
 
-These are individual diagnostic runs with newly seeded repositories, not a
-population latency guarantee. Request timestamps in the baseline measured only
-394 ms spent in HTTP and 14,788 ms between requests. Reducing repeated candidate
-work, rather than transport bandwidth, addresses that measured bottleneck.
+These are individual diagnostic runs with newly seeded repositories, not a population latency guarantee. Request timestamps in the baseline measured only 394 ms spent in HTTP and 14,788 ms between requests. Reducing repeated candidate work, rather than transport bandwidth, addresses that measured bottleneck.
 
-The final diagnostic retains two opening requests (2,329 bytes at 1,600 files),
-zero offline native input-fetch attempts, preparation through the now-removed API,
-30 content edits/reads/counts and offline reopen. Warm 96 KiB content read/write
-medians are 4.8/19.25 ms. Raw artifacts are in
-`research/lazy-browser-sync/file-demand-diagnostic-release4` in the parent
-workspace. Broad native simulation/adapter checks remain in progress; these
-measurements do not imply that the entire release verification is complete.
+The final diagnostic retains two opening requests (2,329 bytes at 1,600 files), zero offline native input-fetch attempts, preparation through the now-removed API, 30 content edits/reads/counts and offline reopen. Warm 96 KiB content read/write medians are 4.8/19.25 ms. Raw artifacts are in `research/lazy-browser-sync/file-demand-diagnostic-release4` in the parent workspace. Broad native simulation/adapter checks remain in progress; these measurements do not imply that the entire release verification is complete.
 
-The following sections retain historical diagnostic results and their original
-limitations; the latest evidence above supersedes their implementation status.
+The following sections retain historical diagnostic results and their original limitations; the latest evidence above supersedes their implementation status.
 
 ## Existing sync baseline
 
@@ -339,35 +243,16 @@ Six actual Chromium ownership tests pass, covering a competing owner, cancellati
 
 ## First-account schema scaling diagnostic (build43)
 
-The witness fix removed unrelated global-row enumeration but a separate custom
-schema fixture exposed full catalog preparation during account creation. At
-16/256/1,600 custom global schemas, admission scanned88/808/4,840 rows, returned
-47,160/249,393/1,354,442 local bytes, and took6.779/26.715/135.698ms. Existing
-account admission remained six point keys and zero scans. Fixture construction
-was excluded; this was a native debug run without another test or compiler
-competing for CPU.
+The witness fix removed unrelated global-row enumeration but a separate custom schema fixture exposed full catalog preparation during account creation. At 16/256/1,600 custom global schemas, admission scanned88/808/4,840 rows, returned 47,160/249,393/1,354,442 local bytes, and took6.779/26.715/135.698ms. Existing account admission remained six point keys and zero scans. Fixture construction was excluded; this was a native debug run without another test or compiler competing for CPU.
 
-Artifact: `/root/repos/research/lazy-browser-sync/partial-account-admission-profile-schemas.json`;
-log: `/tmp/partial-replica-account-profile4.log`. A sealed built-in account
-insertion path is now under validation. No improved schema-scaling result is
-claimed until the new path passes correctness checks and profiling.
+Artifact: `/root/repos/research/lazy-browser-sync/partial-account-admission-profile-schemas.json`; log: `/tmp/partial-replica-account-profile4.log`. A sealed built-in account insertion path is now under validation. No improved schema-scaling result is claimed until the new path passes correctness checks and profiling.
 
 
 ## Chromium / WASM / OPFS functional gate
 
-The public SQL worker passed all five fixtures with actual Chromium and OPFS.
-Each open made exactly two repository requests and consumed 2,318–2,355 decoded
-HTTP body bytes. Across the fixtures, 150 offline SELECT/UPDATE pairs retained
-read-your-writes and offline OPFS reopen preserved pending edits. The harness
-aborts in-flight responses before offline operations and rejects every native
-input fetch during those prepared operations, including background fetches.
+The public SQL worker passed all five fixtures with actual Chromium and OPFS. Each open made exactly two repository requests and consumed 2,318–2,355 decoded HTTP body bytes. Across the fixtures, 150 offline SELECT/UPDATE pairs retained read-your-writes and offline OPFS reopen preserved pending edits. The harness aborts in-flight responses before offline operations and rejects every native input fetch during those prepared operations, including background fetches.
 
-These are **unoptimized development-build diagnostics**, not production latency
-results. The first fixture includes cold worker/WASM startup; later fixtures
-reuse browser code/module caches. Do not interpret the faster large-repository
-fixture as a size-related improvement. Repository HTTP counts exclude the SDK
-and WASM download. The native authority was build46; the WASM artifact predates
-the pending-full-conversion integration.
+These are **unoptimized development-build diagnostics**, not production latency results. The first fixture includes cold worker/WASM startup; later fixtures reuse browser code/module caches. Do not interpret the faster large-repository fixture as a size-related improvement. Repository HTTP counts exclude the SDK and WASM download. The native authority was build46; the WASM artifact predates the pending-full-conversion integration.
 
 | Fixture | Open ms | Repository body bytes | Cold SQL ms | Warm SELECT median ms | Warm UPDATE median ms | Offline reopen ms |
 |---|---:|---:|---:|---:|---:|---:|
@@ -377,50 +262,23 @@ the pending-full-conversion integration.
 | history_256 | 31.1 | 2,323 | 102.8 | 1.90 | 19.85 | 7.7 |
 | blob_8mib | 32.0 | 2,327 | 112.0 | 1.80 | 19.00 | 7.4 |
 
-Artifact: `/root/repos/research/lazy-browser-sync/partial-browser-opfs-dev-functional.json`.
-The separate real Lix ownership lifecycle test also passed in Chromium.
+Artifact: `/root/repos/research/lazy-browser-sync/partial-browser-opfs-dev-functional.json`. The separate real Lix ownership lifecycle test also passed in Chromium.
 
-The first public file-tree run exposed a stale live path-index cache following
-remote publication: native hydration succeeded and the watcher advanced, but a
-previously empty path stayed empty locally. Atomic filesystem revision rotation
-and a native regression are under validation. This is an outstanding functional
-gate; key/value success does not establish complete file-tree correctness.
+The first public file-tree run exposed a stale live path-index cache following remote publication: native hydration succeeded and the watcher advanced, but a previously empty path stayed empty locally. Atomic filesystem revision rotation and a native regression are under validation. This is an outstanding functional gate; key/value success does not establish complete file-tree correctness.
 
 
 ## Bounded account preparation profile (build48)
 
-The sealed account INSERT now avoids custom catalog/plugin enumeration. At
-16/256/1,600 global custom schemas, first-account admission returned
-9,226/15,326/16,110 local bytes and took2.626/3.807/3.978ms, versus1,354,442bytes
-and135.698ms at1,600schemas before this fix. First-account cases scan one row
-in this authority fixture at all measured selected-row/global-row/account/schema
-widths; a branch-width fixture and per-space scan attribution remain to verify
-the last scan does not conceal branch enumeration. Ordinary indexed lookup
-work and returned bytes can vary with native tree height.
+The sealed account INSERT now avoids custom catalog/plugin enumeration. At 16/256/1,600 global custom schemas, first-account admission returned 9,226/15,326/16,110 local bytes and took2.626/3.807/3.978ms, versus1,354,442bytes and135.698ms at1,600schemas before this fix. First-account cases scan one row in this authority fixture at all measured selected-row/global-row/account/schema widths; a branch-width fixture and per-space scan attribution remain to verify the last scan does not conceal branch enumeration. Ordinary indexed lookup work and returned bytes can vary with native tree height.
 
-Across the measured dimensions, existing-account admission remains six point
-keys,427–428bytes, no scans/writes,125–198µs. Fixture construction was excluded
-and no compiler or other test workload ran concurrently with the profile.
-These are native debug authority timings, not HTTP or browser timings.
+Across the measured dimensions, existing-account admission remains six point keys,427–428bytes, no scans/writes,125–198µs. Fixture construction was excluded and no compiler or other test workload ran concurrently with the profile. These are native debug authority timings, not HTTP or browser timings.
 
-Artifact: `/root/repos/research/lazy-browser-sync/partial-account-admission-profile-bounded.json`;
-log: `/tmp/partial-replica-account-profile5.log`. The corresponding custom-schema
-visibility test needed correction: global-only schemas must be queried through
-a global session, as required by the existing catalog contract. Stronger tests
-now check both global and branch-local schemas before/after account creation
-and after reopen.
+Artifact: `/root/repos/research/lazy-browser-sync/partial-account-admission-profile-bounded.json`; log: `/tmp/partial-replica-account-profile5.log`. The corresponding custom-schema visibility test needed correction: global-only schemas must be queried through a global session, as required by the existing catalog contract. Stronger tests now check both global and branch-local schemas before/after account creation and after reopen.
 
 
 ## Optimized Chromium / WASM / OPFS measurements
 
-The release WASM artifact is 44 MiB raw, SHA-256
-`def0388469972fb29c8f955cce552cca11b6c0803795b156ddab00b4c41faf5d`.
-Fifteen samples used a fresh Chromium process for every opening, three independent
-repositories per dimension, with no concurrent compilation or test workload.
-Each opening made two repository requests and consumed 2,310–2,370 decoded
-response bytes. SDK/WASM download and HTTP framing are excluded from that byte
-count. All 450 offline SELECT/UPDATE pairs and offline OPFS reopens passed with
-zero native input read attempts.
+The release WASM artifact is 44 MiB raw, SHA-256 `def0388469972fb29c8f955cce552cca11b6c0803795b156ddab00b4c41faf5d`. Fifteen samples used a fresh Chromium process for every opening, three independent repositories per dimension, with no concurrent compilation or test workload. Each opening made two repository requests and consumed 2,310–2,370 decoded response bytes. SDK/WASM download and HTTP framing are excluded from that byte count. All 450 offline SELECT/UPDATE pairs and offline OPFS reopens passed with zero native input read attempts.
 
 | Dimension | Total open min / median / max ms | First authority request to open median ms | Warm SELECT median ms | Warm UPDATE median ms |
 |---|---:|---:|---:|---:|
@@ -430,49 +288,22 @@ zero native input read attempts.
 | 256 history commits | 274.8 / 277.2 / 513.5 | 38.5 | 1.3 | 15.55 |
 | Unrelated 8 MiB blob | 277.6 / 280.9 / 290.5 | 41.0 | 1.2 | 15.65 |
 
-The approximately 40 ms interval excludes preceding worker, WASM and OPFS
-initialization; it is not total browser opening time. Three openings per
-dimension support descriptive ranges, not a reliable tail-latency estimate.
-Artifact: `/root/repos/research/lazy-browser-sync/partial-browser-opfs-release-profile.json`.
+The approximately 40 ms interval excludes preceding worker, WASM and OPFS initialization; it is not total browser opening time. Three openings per dimension support descriptive ranges, not a reliable tail-latency estimate. Artifact: `/root/repos/research/lazy-browser-sync/partial-browser-opfs-release-profile.json`.
 
-The optimized file workflow also passed remote insertion into a previously
-empty path, local counts, 30 offline 96 KiB content edits and offline reopening
-at 16 and 1,600 files. Atomic path revision rotation fixed the stale-path gate
-reported above. Opening consumed 2,331 / 2,327 repository bytes. This run reused
-one browser process, so its 276.9 / 30.8 ms opening times are not comparable
-cold-start samples.
+The optimized file workflow also passed remote insertion into a previously empty path, local counts, 30 offline 96 KiB content edits and offline reopening at 16 and 1,600 files. Atomic path revision rotation fixed the stale-path gate reported above. Opening consumed 2,331 / 2,327 repository bytes. This run reused one browser process, so its 276.9 / 30.8 ms opening times are not comparable cold-start samples.
 
-File profiling identified two follow-ups. The reported warm content read timer
-included Vitest deep byte-array equality; those figures are invalid as SQL-only
-latencies and require a corrected rerun. Remote publication took 266 / 16,930 ms,
-with 11 / 129 native object-range requests. Repeated candidate preparation and
-serial hydration need optimization. The functional pass alone does not establish
-acceptable update latency. Artifact:
-`/root/repos/research/lazy-browser-sync/partial-browser-file-opfs-release2.json`.
+File profiling identified two follow-ups. The reported warm content read timer included Vitest deep byte-array equality; those figures are invalid as SQL-only latencies and require a corrected rerun. Remote publication took 266 / 16,930 ms, with 11 / 129 native object-range requests. Repeated candidate preparation and serial hydration need optimization. The functional pass alone does not establish acceptable update latency. Artifact: `/root/repos/research/lazy-browser-sync/partial-browser-file-opfs-release2.json`.
 
 
 ### Corrected file timings and paired local comparison
 
-The corrected file timer stops immediately after SQL resolves, before deep
-byte-array validation. The release artifact remains unchanged. At 16 / 1,600
-files, warm 96 KiB SELECT medians were 7.90 / 7.25 ms; content UPDATE medians
-18.70 / 20.65 ms; COUNT medians 2.00 / 3.50 ms. Both workflows passed remote
-negative-path publication, 30 offline edits, and offline reopen with zero input
-read attempts. Publication remained slow at 266 / 15,413 ms before native
-missing-object batching. Artifact:
-`/root/repos/research/lazy-browser-sync/partial-browser-file-opfs-release3.json`.
+The corrected file timer stops immediately after SQL resolves, before deep byte-array validation. The release artifact remains unchanged. At 16 / 1,600 files, warm 96 KiB SELECT medians were 7.90 / 7.25 ms; content UPDATE medians 18.70 / 20.65 ms; COUNT medians 2.00 / 3.50 ms. Both workflows passed remote negative-path publication, 30 offline edits, and offline reopen with zero input read attempts. Publication remained slow at 266 / 15,413 ms before native missing-object batching. Artifact: `/root/repos/research/lazy-browser-sync/partial-browser-file-opfs-release3.json`.
 
-A separate same-artifact, same-provider comparison used identical SQL, keys,
-row counts and payloads, five excluded warmups, and 30 measured pairs per mode.
-Seeding was excluded; mode order reversed at the second scale. No compiler or
-other test workload ran concurrently.
+A separate same-artifact, same-provider comparison used identical SQL, keys, row counts and payloads, five excluded warmups, and 30 measured pairs per mode. Seeding was excluded; mode order reversed at the second scale. No compiler or other test workload ran concurrently.
 
 | Rows | Complete SELECT / UPDATE median ms | Partial SELECT / UPDATE median ms |
 |---|---:|---:|
 | 16 | 0.90 / 6.95 | 1.00 / 12.95 |
 | 16,000 | 0.70 / 9.00 | 0.90 / 14.70 |
 
-The approximately 6 ms partial write overhead is measurable and still needs
-attribution; it cannot be described as OPFS durability cost alone. All measured
-partial operations ran offline with zero native input reads. Artifact:
-`/root/repos/research/lazy-browser-sync/partial-browser-local-comparison-release1.json`.
+The approximately 6 ms partial write overhead is measurable and still needs attribution; it cannot be described as OPFS durability cost alone. All measured partial operations ran offline with zero native input reads. Artifact: `/root/repos/research/lazy-browser-sync/partial-browser-local-comparison-release1.json`.

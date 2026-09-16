@@ -4,15 +4,7 @@ description: Compare typed Lix relations across commits and select rows atomical
 
 # Diff commands
 
-`lix_diff(relation, from_commit_id, to_commit_id)` compares one relation across
-two explicitly selected commits. With only the relation argument it defaults
-to the active branch's working baseline → current head, pinned for the statement.
-A write's own span is on its result:
-`execute` returns `commit: { before, after }`, and `lix_diff('lix_file',
-before, after)` is exactly what that write changed. A file is one row of `lix_file`; a
-registered schema row is one row of its schema relation. Commands consume the
-diff's `row_ref` identity, so selecting a file also selects its underlying
-tracked content.
+`lix_diff(relation, from_commit_id, to_commit_id)` compares one relation across two explicitly selected commits. With only the relation argument it defaults to the active branch's working baseline → current head, pinned for the statement. A write's own span is on its result: `execute` returns `commit: { before, after }`, and `lix_diff('lix_file', before, after)` is exactly what that write changed. A file is one row of `lix_file`; a registered schema row is one row of its schema relation. Commands consume the diff's `row_ref` identity, so selecting a file also selects its underlying tracked content.
 
 ## Review changed files
 
@@ -46,34 +38,13 @@ if (reverted.rows.length > 0) {
 await lix.close();
 ```
 
-The working baseline is `lix_branch.working_base_commit_id`. It can be an
-ordinary commit after a fork or restore, so use the one-argument diff for
-working changes.
+The working baseline is `lix_branch.working_base_commit_id`. It can be an ordinary commit after a fork or restore, so use the one-argument diff for working changes.
 
 ## Diff rows
 
-Every relation diff exposes `row_ref`, the relation's typed primary-key
-columns, `diff_type`, and a
-`from_<column>` / `to_<column>` pair for each non-primary-key column of the compared relation.
-`diff_type` is `added`, `modified`, or `removed`. Added rows have SQL `NULL`
-`from_` values; removed rows have SQL `NULL` `to_` values. A present row can also
-have nullable columns, so use `diff_type` to identify an absent side. Use
-`coalesce(to_path, from_path)` when displaying a path that also covers removed
-or renamed files.
+Every relation diff exposes `row_ref`, the relation's typed primary-key columns, `diff_type`, and a `from_<column>` / `to_<column>` pair for each non-primary-key column of the compared relation. `diff_type` is `added`, `modified`, or `removed`. Added rows have SQL `NULL` `from_` values; removed rows have SQL `NULL` `to_` values. A present row can also have nullable columns, so use `diff_type` to identify an absent side. Use `coalesce(to_path, from_path)` when displaying a path that also covers removed or renamed files.
 
-Project `from_content` and `to_content` to reconstruct historical file bytes.
-For each present side, these bytes equal `content` from
-`lix_as_of('lix_file', endpoint_commit_id)` for the same file. Absent sides are
-SQL `NULL`; an existing empty file is an empty `BYTEA`. A snapshot of an absent
-file returns no row. Read or reconstruction failures are errors, not absent
-rows or empty bytes.
-Content is only materialized when projected or used by a predicate. File
-metadata predicates, including `id`, `from_path`, and `to_path`, select rows
-before content materialization. A content predicate itself requires reading
-bytes. Projecting content, including in a working diff, can require fetching
-deferred historical state or blob chunks on partial replicas. Metadata-only
-working diffs retain their existing HOT read contract. Missing inputs produce
-typed hydration demands, never a null value for an existing file.
+Project `from_content` and `to_content` to reconstruct historical file bytes. For each present side, these bytes equal `content` from `lix_as_of('lix_file', endpoint_commit_id)` for the same file. Absent sides are SQL `NULL`; an existing empty file is an empty `BYTEA`. A snapshot of an absent file returns no row. Read or reconstruction failures are errors, not absent rows or empty bytes. Content is only materialized when projected or used by a predicate. File metadata predicates, including `id`, `from_path`, and `to_path`, select rows before content materialization. A content predicate itself requires reading bytes. Projecting content, including in a working diff, can require fetching deferred historical state or blob chunks on partial replicas. Metadata-only working diffs retain their existing HOT read contract. Missing inputs produce typed hydration demands, never a null value for an existing file.
 
 ```sql
 SELECT id, diff_type, from_content, to_content
@@ -81,30 +52,17 @@ FROM lix_diff('lix_file', $1, $2)
 WHERE id = $3;
 ```
 
-Count the relation being displayed. `row_count` is no longer an engine diff
-column: internal descriptor/content records do not describe a user-facing edit
-count. For example, count file diff rows for changed files, or query a plugin
-relation and count its diff rows for changed entities.
+Count the relation being displayed. `row_count` is no longer an engine diff column: internal descriptor/content records do not describe a user-facing edit count. For example, count file diff rows for changed files, or query a plugin relation and count its diff rows for changed entities.
 
 ```sql
 SELECT count(*) AS changed_files FROM lix_diff('lix_file');
 ```
 
-`lix_diff('lix_directory', ...)` supports changes to directory descriptors,
-including directory creation, removal, and renaming. Rolling changed files or
-their content up into an otherwise unchanged parent directory is unsupported;
-query `lix_diff('lix_file', ...)` for file-level changes and aggregate those
-rows by path when directory summaries are needed.
+`lix_diff('lix_directory', ...)` supports changes to directory descriptors, including directory creation, removal, and renaming. Rolling changed files or their content up into an otherwise unchanged parent directory is unsupported; query `lix_diff('lix_file', ...)` for file-level changes and aggregate those rows by path when directory summaries are needed.
 
-Bulk deletion of an entire schema collection is represented by an internal
-collection-generation marker, not individual row changes. Expanding that marker
-into per-row `lix_diff` results is unsupported; delete selected rows individually
-when row-level history or diff visibility is required.
+Bulk deletion of an entire schema collection is represented by an internal collection-generation marker, not individual row changes. Expanding that marker into per-row `lix_diff` results is unsupported; delete selected rows individually when row-level history or diff visibility is required.
 
-`lix_root_commit_id()` returns the repository root; comparing it with another
-commit reports files present in that commit as added rows. Genesis comparisons
-of internal bootstrap schema rows are unsupported because those metadata rows
-already exist in the bootstrap root.
+`lix_root_commit_id()` returns the repository root; comparing it with another commit reports files present in that commit as added rows. Genesis comparisons of internal bootstrap schema rows are unsupported because those metadata rows already exist in the bootstrap root.
 
 ```sql
 SELECT row_ref, id, to_path
@@ -122,28 +80,15 @@ FROM lix_diff('acme_task', $after_commit_id, $before_commit_id)
 RETURNING commit_id;
 ```
 
-Use the `commit.before` and `commit.after` returned by the original write or
-transaction. Add a `WHERE` clause to undo only selected rows. The reversed diff
-removes rows the write added, restores rows it deleted, and restores the previous
-values of rows it modified. Undo creates a new commit; it does not erase history
-or move the branch back to the original commit.
+Use the `commit.before` and `commit.after` returned by the original write or transaction. Add a `WHERE` clause to undo only selected rows. The reversed diff removes rows the write added, restores rows it deleted, and restores the previous values of rows it modified. Undo creates a new commit; it does not erase history or move the branch back to the original commit.
 
-Later changes to unrelated rows are preserved. Each affected row must still have
-the version expected by the reversed diff (or be absent when absence is expected).
-A later edit to an affected row rejects the entire statement with
-`LIX_CONSTRAINT_VIOLATION`, even if that edit changed a different column. No subset
-of the undo is committed. Related rows required for a valid apply can also be
-included by dependency planning; constraints and their version checks still apply.
+Later changes to unrelated rows are preserved. Each affected row must still have the version expected by the reversed diff (or be absent when absence is expected). A later edit to an affected row rejects the entire statement with `LIX_CONSTRAINT_VIOLATION`, even if that edit changed a different column. No subset of the undo is committed. Related rows required for a valid apply can also be included by dependency planning; constraints and their version checks still apply.
 
-`lix_revert` serves a different purpose: it restores selected rows to the active
-branch's working baseline/checkpoint. A diff supplied to `lix_revert` selects row
-identities; its endpoints do not specify the versions to restore. Use reversed
-`lix_apply` for undoing a particular historical commit span.
+`lix_revert` serves a different purpose: it restores selected rows to the active branch's working baseline/checkpoint. A diff supplied to `lix_revert` selects row identities; its endpoints do not specify the versions to restore. Use reversed `lix_apply` for undoing a particular historical commit span.
 
 ## Commands
 
-The insert-only apply and revert command sinks consume queries selecting one
-`row_ref` column:
+The insert-only apply and revert command sinks consume queries selecting one `row_ref` column:
 
 ```sql
 INSERT INTO lix_revert (row_ref)
@@ -166,19 +111,8 @@ FROM lix_create_checkpoint(ARRAY(
 SELECT commit_id FROM lix_create_checkpoint();
 ```
 
-Selecting a file includes the tracked rows composing that file. Partial file
-checkpoints also include required ancestor directory descriptors. Directory
-rows and mixed-relation selections use the same dependency planner. A scope
-that cannot be closed into a valid checkpoint fails before commit.
+Selecting a file includes the tracked rows composing that file. Partial file checkpoints also include required ancestor directory descriptors. Directory rows and mixed-relation selections use the same dependency planner. A scope that cannot be closed into a valid checkpoint fails before commit.
 
-Each statement is atomic. An empty selection succeeds without creating a
-commit and duplicate selected identities are rejected. Apply and revert support
-`RETURNING commit_id`; `lix_create_checkpoint()` returns the commit ID as its
-one result row. For apply and revert, `rowsAffected` reports the number of
-selected identities. Full checkpoints structurally reuse the branch state
-without copying application rows.
+Each statement is atomic. An empty selection succeeds without creating a commit and duplicate selected identities are rejected. Apply and revert support `RETURNING commit_id`; `lix_create_checkpoint()` returns the commit ID as its one result row. For apply and revert, `rowsAffected` reports the number of selected identities. Full checkpoints structurally reuse the branch state without copying application rows.
 
-Rows written with `lixcol_untracked` are absent from every diff. Untracked
-state belongs to the local repository replica and is not transported through
-commit-based synchronization; use a separate service for state that needs
-synchronization without version history.
+Rows written with `lixcol_untracked` are absent from every diff. Untracked state belongs to the local repository replica and is not transported through commit-based synchronization; use a separate service for state that needs synchronization without version history.

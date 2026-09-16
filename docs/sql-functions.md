@@ -4,8 +4,7 @@ description: Built-in scalar SQL functions and PostgreSQL JSONB syntax supported
 
 # SQL Functions
 
-Lix exposes a small set of runtime functions. JSON uses PostgreSQL casts and
-operators; there are no public `lix_json_*` functions.
+Lix exposes a small set of runtime functions. JSON uses PostgreSQL casts and operators; there are no public `lix_json_*` functions.
 
 | Function | Returns | Purpose |
 | :-- | :-- | :-- |
@@ -24,21 +23,15 @@ operators; there are no public `lix_json_*` functions.
 SELECT lix_row_ref('json_object_member', $1, $2, $3) AS row_ref;
 ```
 
-For `json_object_member`, the components are `parent_id`, decoded `key`, and
-`occurrence` (zero for an ordinary unique key).
+For `json_object_member`, the components are `parent_id`, decoded `key`, and `occurrence` (zero for an ordinary unique key).
 
 ## Row ordering
 
-Use `lix_order_between($1, NULL)` to append after the last key, or pass both
-neighbors to insert between them. Two NULL bounds allocate the first key.
-Read rows with `ORDER BY order_key, id`: concurrent allocations may tie, and
-UUID identity supplies deterministic tie ordering. See [Plugin ordering](./plugin-ordering.md)
-for batch allocation, validation, and concurrency behavior.
+Use `lix_order_between($1, NULL)` to append after the last key, or pass both neighbors to insert between them. Two NULL bounds allocate the first key. Read rows with `ORDER BY order_key, id`: concurrent allocations may tie, and UUID identity supplies deterministic tie ordering. See [Plugin ordering](./plugin-ordering.md) for batch allocation, validation, and concurrency behavior.
 
 ## JSONB
 
-Cast JSON text or a bound JSON value with `::jsonb` and use PostgreSQL
-operators:
+Cast JSON text or a bound JSON value with `::jsonb` and use PostgreSQL operators:
 
 ```sql
 SELECT
@@ -48,13 +41,9 @@ FROM lix_registered_schema
 WHERE value @> '{"deprecated":false}'::jsonb;
 ```
 
-Supported syntax includes `->`, `->>`, `#>`, `#>>`, `@>`, `?`, equality, and
-`'…'::jsonb`. Missing paths return SQL `NULL`; `->` preserves JSONB `null`,
-while `->>` converts JSONB `null` to SQL `NULL`. Negative array indexes follow
-PostgreSQL behavior.
+Supported syntax includes `->`, `->>`, `#>`, `#>>`, `@>`, `?`, equality, and `'…'::jsonb`. Missing paths return SQL `NULL`; `->` preserves JSONB `null`, while `->>` converts JSONB `null` to SQL `NULL`. Negative array indexes follow PostgreSQL behavior.
 
-The SDK accepts structured JSON parameters directly. If a parameter contains
-JSON text, cast it explicitly:
+The SDK accepts structured JSON parameters directly. If a parameter contains JSON text, cast it explicitly:
 
 ```ts
 await lix.execute(
@@ -65,9 +54,7 @@ await lix.execute(
 
 ## Branch and history
 
-`lix_log([anchor])` lists retained first-parent commits. `lix_history(relation
-[, anchor])` describes each commit's changes against its actual first parent.
-Both default to the active head pinned for the statement.
+`lix_log([anchor])` lists retained first-parent commits. `lix_history(relation [, anchor])` describes each commit's changes against its actual first parent. Both default to the active head pinned for the statement.
 
 ```sql
 SELECT lixcol_position, diff_type, from_title, to_title
@@ -79,14 +66,9 @@ SELECT row_ref, id, diff_type
 FROM lix_diff('lix_file');
 ```
 
-The one-argument diff uses the branch working baseline. Read
-`working_base_commit_id` alongside `commit_id` from `lix_branch` when the
-comparison context is needed even for an empty diff. See [History](./history.md)
-for endpoint columns, global checkpoint metrics, and paged previews.
+The one-argument diff uses the branch working baseline. Read `working_base_commit_id` alongside `commit_id` from `lix_branch` when the comparison context is needed even for an empty diff. See [History](./history.md) for endpoint columns, global checkpoint metrics, and paged previews.
 
-`lix_as_of(relation, commit_id)` returns the complete tracked state of a
-relation at one commit. Its columns are identical to the live relation, and
-entities that did not exist at that commit produce no row:
+`lix_as_of(relation, commit_id)` returns the complete tracked state of a relation at one commit. Its columns are identical to the live relation, and entities that did not exist at that commit produce no row:
 
 ```sql
 SELECT id, path, content
@@ -94,33 +76,13 @@ FROM lix_as_of('lix_file', $1)
 WHERE id IN ($2, $3);
 ```
 
-The relation argument must be a text literal. The commit may be a text
-parameter or `lix_root_commit_id()` / `lix_active_branch_commit_id()`. Primary
-key `=` and `IN` predicates are pushed into the point-in-time read, so batched
-entity lookups do not scan unrelated tracked rows. Untracked rows are never
-included.
+The relation argument must be a text literal. The commit may be a text parameter or `lix_root_commit_id()` / `lix_active_branch_commit_id()`. Primary key `=` and `IN` predicates are pushed into the point-in-time read, so batched entity lookups do not scan unrelated tracked rows. Untracked rows are never included.
 
-The supplied commit is a closed snapshot. A local commit records its exact
-global dependency in `lix_commit.base_commit_id`; its physical state is an
-immutable local-overlay root plus that pinned immutable global root.
-`lix_as_of` composes both roots and returns inherited global rows plus local
-values and tombstones, with local intent winning. Global commits have a null
-base. The base is a state dependency, not ancestry, so it is deliberately
-absent from `parent_commit_ids` and `lix_commit_ancestry()`. History compares
-complete endpoint states, including their pinned bases, while traversing only
-first parents.
+The supplied commit is a closed snapshot. A local commit records its exact global dependency in `lix_commit.base_commit_id`; its physical state is an immutable local-overlay root plus that pinned immutable global root. `lix_as_of` composes both roots and returns inherited global rows plus local values and tombstones, with local intent winning. Global commits have a null base. The base is a state dependency, not ancestry, so it is deliberately absent from `parent_commit_ids` and `lix_commit_ancestry()`. History compares complete endpoint states, including their pinned bases, while traversing only first parents.
 
-When global advances, the next live access to a local branch lazily publishes
-one metadata-only local commit pinned to the latest global commit. An actual
-local write performs the same base advance in its own commit, so multiple
-global advances coalesce and global publication remains O(1) rather than
-fanning out over every branch. No global rows are copied into the local
-overlay. The active commit ID and every live row therefore always describe the
-same closed snapshot.
+When global advances, the next live access to a local branch lazily publishes one metadata-only local commit pinned to the latest global commit. An actual local write performs the same base advance in its own commit, so multiple global advances coalesce and global publication remains O(1) rather than fanning out over every branch. No global rows are copied into the local overlay. The active commit ID and every live row therefore always describe the same closed snapshot.
 
-`lix_commit_ancestry()` returns the active head at depth `0` and every
-reachable ancestor once at its shortest depth. Pass one commit ID to use an
-explicit graph anchor:
+`lix_commit_ancestry()` returns the active head at depth `0` and every reachable ancestor once at its shortest depth. Pass one commit ID to use an explicit graph anchor:
 
 ```sql
 SELECT commit_id, depth
@@ -136,17 +98,9 @@ VALUES ($1)
 RETURNING commit_id;
 ```
 
-The commit must exist and be an ancestor of the active branch head. The
-command returns the restored commit ID. It creates no commit, leaves other
-branches untouched, preserves branch-local untracked rows, and starts a fresh
-undo interval. A restore cannot be combined with another write in the same
-transaction and must be the final statement before commit or rollback.
-Orphaned commits may remain stored until ordinary
-reachability-based garbage collection reclaims them. Checkpoint commits remain
-stored even when they are no longer on the branch.
+The commit must exist and be an ancestor of the active branch head. The command returns the restored commit ID. It creates no commit, leaves other branches untouched, preserves branch-local untracked rows, and starts a fresh undo interval. A restore cannot be combined with another write in the same transaction and must be the final statement before commit or rollback. Orphaned commits may remain stored until ordinary reachability-based garbage collection reclaims them. Checkpoint commits remain stored even when they are no longer on the branch.
 
-Use `execute` for remote callers as well; restore does not add a server-protocol
-endpoint or a typed SDK method.
+Use `execute` for remote callers as well; restore does not add a server-protocol endpoint or a typed SDK method.
 
 ## IDs and time
 
@@ -155,5 +109,4 @@ INSERT INTO event (id, occurred_at)
 VALUES (uuidv7(), CURRENT_TIMESTAMP);
 ```
 
-Bound parameters may use `?` or `$1`, `$2`, and so on, but a statement cannot
-mix the two styles.
+Bound parameters may use `?` or `$1`, `$2`, and so on, but a statement cannot mix the two styles.

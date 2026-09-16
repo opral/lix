@@ -4,8 +4,7 @@ description: Give each agent an isolated branch, preview its changes, then merge
 
 # Lix for AI Agents
 
-Give each agent task a branch for review before merging into main.
-Agents can edit normal files or SQL rows, locally or through a hosted server.
+Give each agent task a branch for review before merging into main. Agents can edit normal files or SQL rows, locally or through a hosted server.
 
 ## The pattern
 
@@ -41,9 +40,7 @@ Use [`FilesystemStorage`](./persistence.md#local-filesystem) for files on disk.
 
 ## Hosted repository
 
-For SDK-only access, [query the server directly](./persistence.md#remote-mode).
-For files in a sandbox or mounted volume, [sync a filesystem replica](./persistence.md#filesystem-sync).
-A browser can share the repository through an [OPFS replica](./persistence.md#browser-opfs).
+For SDK-only access, [query the server directly](./persistence.md#remote-mode). For files in a sandbox or mounted volume, [sync a filesystem replica](./persistence.md#filesystem-sync). A browser can share the repository through an [OPFS replica](./persistence.md#browser-opfs).
 
 ## Why branches matter
 
@@ -63,18 +60,13 @@ const rows = await reviewLix.execute(
 await reviewLix.close();
 ```
 
-Use `lix_history('<schema>')` for commit-anchored history, not current rows;
-use `lix_diff('acme_task', from_commit_id, to_commit_id)` for changes between commits.
+Use `lix_history('<schema>')` for commit-anchored history, not current rows; use `lix_diff('acme_task', from_commit_id, to_commit_id)` for changes between commits.
 
-`lix_registered_schema` lists schemas. `lix_change` shows repository-wide
-activity across branches.
+`lix_registered_schema` lists schemas. `lix_change` shows repository-wide activity across branches.
 
 ## Automatic merging
 
-Lix combines different-column edits and resolves competing same-column edits
-using last-writer-wins by default. In a branch merge, the source is incoming;
-plugins can provide column mergers. Review the changes before merging. See
-[Branching](./branching.md#automatic-merging) for the merge rules.
+Lix combines different-column edits and resolves competing same-column edits using last-writer-wins by default. In a branch merge, the source is incoming; plugins can provide column mergers. Review the changes before merging. See [Branching](./branching.md#automatic-merging) for the merge rules.
 
 ## Next
 

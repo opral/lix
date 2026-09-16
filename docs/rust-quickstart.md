@@ -4,8 +4,7 @@ description: Install the Lix Rust SDK, write a file, inspect its history, and un
 
 # Rust quickstart
 
-This guide creates an in-memory Lix repository, writes a file, reads its
-history, and undoes the latest change.
+This guide creates an in-memory Lix repository, writes a file, reads its history, and undoes the latest change.
 
 ## Install
 
@@ -56,23 +55,15 @@ async fn main() -> Result<(), lix::LixError> {
 }
 ```
 
-Lix records both writes automatically. You do not need to create commits.
-Depth `0` is the state at the head. Higher numbers walk back through history.
+Lix records both writes automatically. You do not need to create commits. Depth `0` is the state at the head. Higher numbers walk back through history.
 
-`execute()` runs one statement. To run several statements atomically, pass an
-array of statements to `lix.execute_batch`. Do not concatenate SQL into one
-script string.
+`execute()` runs one statement. To run several statements atomically, pass an array of statements to `lix.execute_batch`. Do not concatenate SQL into one script string.
 
-The repository is in memory and disappears when the process ends. For native
-persistence, use `lix-storage-rocksdb` or `lix-storage-filesystem`. See
-[Storage](./persistence.md).
+The repository is in memory and disappears when the process ends. For native persistence, use `lix-storage-rocksdb` or `lix-storage-filesystem`. See [Storage](./persistence.md).
 
 ## Local, remote, and synchronized access
 
-Rust defines the lifecycle; JavaScript exposes bindings to it. Supply only a
-server for remote execution, or explicit storage and a server for a
-partial replica with on-demand sync. Reads and writes whose dependencies are resident execute
-locally; pending commits upload in the background:
+Rust defines the lifecycle; JavaScript exposes bindings to it. Supply only a server for remote execution, or explicit storage and a server for a partial replica with on-demand sync. Reads and writes whose dependencies are resident execute locally; pending commits upload in the background:
 
 ```rust
 use lix::{create_lix, delete_lix, open_lix, ServerOptions};
@@ -100,20 +91,9 @@ delete_lix()
     .await?;
 ```
 
-Omit `.from_lix(&local)` to create an empty hosted repository. Creation returns
-the same result on retries using `.with_idempotency_key(key)` and the same
-snapshot content. When omitted, a key is generated for each call.
-The result is
-`HostedLix { id, url }` and copies the source at one point in time; it does not
-connect the source. A copy preserves history and untracked rows. Configure
-credentials with `ServerOptions::with_headers`. To reconnect the original
-durable storage, pause writes, create the hosted copy, close the source, and
-reopen that same storage with the returned server URL. Diverged local history
-is rejected without replacement.
+Omit `.from_lix(&local)` to create an empty hosted repository. Creation returns the same result on retries using `.with_idempotency_key(key)` and the same snapshot content. When omitted, a key is generated for each call. The result is `HostedLix { id, url }` and copies the source at one point in time; it does not connect the source. A copy preserves history and untracked rows. Configure credentials with `ServerOptions::with_headers`. To reconnect the original durable storage, pause writes, create the hosted copy, close the source, and reopen that same storage with the returned server URL. Diverged local history is rejected without replacement.
 
-Opening a missing server repository returns an error. Deleting a hosted
-repository does not delete its local replicas, and reopening a replica cannot
-silently recreate a deleted hosted repository.
+Opening a missing server repository returns an error. Deleting a hosted repository does not delete its local replicas, and reopening a replica cannot silently recreate a deleted hosted repository.
 
 ## Next
 

@@ -6,9 +6,7 @@ This document records the reviewed design and target contract. The implementatio
 
 ## JavaScript opening configuration
 
-`server.mode` defaults to `"remote"`: SQL executes on the server and local storage
-is not accepted. A browser such as Lixray opts into a **partial replica with
-on-demand sync** by supplying both storage and `server.mode: "partial_replica"`:
+`server.mode` defaults to `"remote"`: SQL executes on the server and local storage is not accepted. A browser such as Lixray opts into a **partial replica with on-demand sync** by supplying both storage and `server.mode: "partial_replica"`:
 
 ```ts
 const lix = await openLix({
@@ -17,41 +15,17 @@ const lix = await openLix({
 });
 ```
 
-Partial-replica mode requires storage. Storage alone still opens a standalone
-local repository. The only supported server modes are `"remote"` and
-`"partial_replica"`; a future full `"replica"` mode is not implemented, and the
-former `"sync"` spelling is rejected. Existing JavaScript callers that combined
-server and storage must add the explicit opt-in. This selector describes the
-JavaScript API; Rust continues to select the topology through its typed builders.
+Partial-replica mode requires storage. Storage alone still opens a standalone local repository. The only supported server modes are `"remote"` and `"partial_replica"`; a future full `"replica"` mode is not implemented, and the former `"sync"` spelling is rejected. Existing JavaScript callers that combined server and storage must add the explicit opt-in. This selector describes the JavaScript API; Rust continues to select the topology through its typed builders.
 
-The existing `switchBranch()` operation admits an existing authority branch on
-demand. Switching requires an online connection. Lix settles pending work and
-refreshes expired admission internally while the caller awaits the operation;
-applications do not catch internal pending/rebase codes or implement sync retries.
-Previously visited scopes are retained, but archived branch subscriptions are
-suspended until that branch is admitted again.
+The existing `switchBranch()` operation admits an existing authority branch on demand. Switching requires an online connection. Lix settles pending work and refreshes expired admission internally while the caller awaits the operation; applications do not catch internal pending/rebase codes or implement sync retries. Previously visited scopes are retained, but archived branch subscriptions are suspended until that branch is admitted again.
 
-The server is authoritative. Ordinary concurrent edits reconcile through the
-shared row/plugin merge pipeline in server acceptance order. When a pending
-local change cannot be reconciled under supported semantics, Lix may discard it
-and adopt the authoritative state. Before forgetting an upload, Lix must prove
-that it is settled or cannot later publish; ambiguous acceptance is never a new
-write. This fallback does not authorize ignoring authentication, corruption, or
-protocol failures.
+The server is authoritative. Ordinary concurrent edits reconcile through the shared row/plugin merge pipeline in server acceptance order. When a pending local change cannot be reconciled under supported semantics, Lix may discard it and adopt the authoritative state. Before forgetting an upload, Lix must prove that it is settled or cannot later publish; ambiguous acceptance is never a new write. This fallback does not authorize ignoring authentication, corruption, or protocol failures.
 
 ## Opening existing caches
 
-Online partial opening treats an incompatible local replica as a disposable cache.
-Lix authenticates the authority, verifies the repository identity, and atomically
-activates a fresh partial epoch. Previous cache banks remain detached; opening
-does not scan, copy, migrate, or replay their history or pending edits. Healthy
-current partial caches retain their existing admission and resident inputs.
-Authority and local-only repositories are not disposable replica caches.
+Online partial opening treats an incompatible local replica as a disposable cache. Lix authenticates the authority, verifies the repository identity, and atomically activates a fresh partial epoch. Previous cache banks remain detached; opening does not scan, copy, migrate, or replay their history or pending edits. Healthy current partial caches retain their existing admission and resident inputs. Authority and local-only repositories are not disposable replica caches.
 
-This keeps cache recovery inside `await openLix(...)`. Explicit offline migration
-remains available when preserving old local work is required. The format-78
-migration witness validates native checkpoint flags and inventory; retired
-`lix_checkpoint` rows are used only for older formats that owned those markers.
+This keeps cache recovery inside `await openLix(...)`. Explicit offline migration remains available when preserving old local work is required. The format-78 migration witness validates native checkpoint flags and inventory; retired `lix_checkpoint` rows are used only for older formats that owned those markers.
 
 ## Contract
 
@@ -74,10 +48,7 @@ Opening independence means bounded request count, descriptor bytes and applicati
 
 **The local guarantee applies to prepared dependencies, not arbitrary future SQL.** Reading one file cannot make a later repository-wide update or a rename into an unseen directory warm. A cold read also does not automatically prepare every possible write on the returned rows. Applications can call `execute()` with a SELECT on hover to prefetch the intended read. Writes hydrate additional dependencies through ordinary execution.
 
-SELECT-only offline edit tests use `UPDATE` against fetched rows. An
-`INSERT ... ON CONFLICT` can require insertion/conflict-path metadata that the
-SELECT did not load, even if it ultimately updates an existing row. Treat that
-first UPSERT as potentially cold; there is no separate preparation API.
+SELECT-only offline edit tests use `UPDATE` against fetched rows. An `INSERT ... ON CONFLICT` can require insertion/conflict-path metadata that the SELECT did not load, even if it ultimately updates an existing row. Treat that first UPSERT as potentially cold; there is no separate preparation API.
 
 ## 1. Replace the opening boundary
 
@@ -169,15 +140,7 @@ Foreign-key, uniqueness, filesystem ancestry, delete restrictions, plugin extrac
 
 ## 5. Keep the working set warm through background sync
 
-The current implementation discovers leased descriptors independently of read
-recipes. The replica hydrates required native inputs and publishes the moving
-working set atomically. Fixed-to-fixed historical reads retain their recipes and
-immutable bytes without participating in moving-state publication. Dynamic reads,
-including negative scopes and diffs involving a moving head, remain publication
-requirements. This retained warm working set is not an observer-lifetime lease;
-explicit subscription disposal and cache eviction remain separate future work.
-Optional prefetch must remain independent of descriptor discovery and publication.
-It must never turn unavailable historical inputs into a synchronization barrier.
+The current implementation discovers leased descriptors independently of read recipes. The replica hydrates required native inputs and publishes the moving working set atomically. Fixed-to-fixed historical reads retain their recipes and immutable bytes without participating in moving-state publication. Dynamic reads, including negative scopes and diffs involving a moving head, remain publication requirements. This retained warm working set is not an observer-lifetime lease; explicit subscription disposal and cache eviction remain separate future work. Optional prefetch must remain independent of descriptor discovery and publication. It must never turn unavailable historical inputs into a synchronization barrier.
 
 A scope snapshot and its following changes need a race-free boundary. Apply cross-scope changes as a coherent transaction, with rows, provenance and coverage updates installed together. A move between two loaded directories must not transiently disappear from both or be counted twice in a combined query.
 
@@ -191,15 +154,7 @@ Pending commits and their base/validation/recovery dependencies are not evictabl
 
 ### Synchronization health
 
-Use Rust `lix.sync_health()` or JavaScript `await lix.syncHealth()` to inspect
-partial-replica background progress independently of local read availability. The snapshot reports
-`inactive`, `running`, `stalled`, `failed`, or `stopped`, the latest observed and
-locally applied cursors, and phase-specific failures. A successful local read does
-not clear a failed sync phase. Each phase clears its own failure only after it
-succeeds. `running` is not a promise of instant server freshness; new remote writes
-may not have been observed yet. Health is process-local and shared by handles of
-the same engine; a newly opened worker starts a new health lifecycle. Other modes
-report `inactive`. JavaScript sessions must still be open when reading health.
+Use Rust `lix.sync_health()` or JavaScript `await lix.syncHealth()` to inspect partial-replica background progress independently of local read availability. The snapshot reports `inactive`, `running`, `stalled`, `failed`, or `stopped`, the latest observed and locally applied cursors, and phase-specific failures. A successful local read does not clear a failed sync phase. Each phase clears its own failure only after it succeeds. `running` is not a promise of instant server freshness; new remote writes may not have been observed yet. Health is process-local and shared by handles of the same engine; a newly opened worker starts a new health lifecycle. Other modes report `inactive`. JavaScript sessions must still be open when reading health.
 
 ## 6. Permit server SQL fallback under a precise rule
 
