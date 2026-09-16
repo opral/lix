@@ -70,7 +70,7 @@ test("Rust scope gates only Rust jobs and keeps both SDK integration suites", ()
 	assert.match(sdk, /needs: merge-reuse/);
 	assert.doesNotMatch(sdk, /outputs\.rust/);
 	assert.match(workflow, /fetch-depth: 2/);
-	assert.match(workflow, /rust: \$\{\{ steps\.scope\.outputs\.rust \}\}/);
+	assert.match(workflow, /rust: \$\{\{ needs\.merge-reuse\.outputs\.content_only == 'true' && 'false' \|\| steps\.scope\.outputs\.rust \}\}/);
 	assert.match(workflow, /run: node scripts\/ci-rust-scope\.mjs/);
 });
 
