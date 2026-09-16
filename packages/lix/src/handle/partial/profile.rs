@@ -208,9 +208,15 @@ async fn partial_handle_http_opening_profile() {
             let before = samples.lock().unwrap().len();
             let storage = StorageSession::acquire(destination.clone()).await.unwrap();
             let started = Instant::now();
-            let lix = open_partial_lix(storage, None, None, Some(ServerOptions::new(&locator)))
-                .await
-                .unwrap();
+            let lix = open_partial_lix(
+                storage,
+                None,
+                None,
+                Some(ServerOptions::new(&locator)),
+                Durability::default(),
+            )
+            .await
+            .unwrap();
             let open_micros = started.elapsed().as_micros();
             let requests = samples.lock().unwrap()[before..].to_vec();
             let foreground = requests
@@ -249,7 +255,9 @@ async fn partial_handle_http_opening_profile() {
             let network_after_close = samples.lock().unwrap().len();
             let storage = StorageSession::acquire(destination).await.unwrap();
             let started = Instant::now();
-            let offline = open_partial_lix(storage, None, None, None).await.unwrap();
+            let offline = open_partial_lix(storage, None, None, None, Durability::default())
+                .await
+                .unwrap();
             let reopen_micros = started.elapsed().as_micros();
             assert_eq!(samples.lock().unwrap().len(), network_after_close);
             offline.close().await.unwrap();

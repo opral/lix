@@ -1728,6 +1728,7 @@ impl NativeObserveEventsInner {
 
 #[expect(missing_debug_implementations)]
 pub struct OpenFilesystemStorageTask {
+    durability: lix::Durability,
     component_runtime: Arc<dyn lix::plugin::runtime::WasmRuntime>,
     path: String,
     sync_all_files: bool,
@@ -1741,6 +1742,7 @@ pub struct OpenFilesystemStorageTask {
 
 #[expect(missing_debug_implementations)]
 pub struct OpenMemoryTask {
+    durability: lix::Durability,
     component_runtime: Arc<dyn lix::plugin::runtime::WasmRuntime>,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
     telemetry_parent: Option<SpanContext>,
@@ -1756,6 +1758,7 @@ impl Task for OpenFilesystemStorageTask {
 
     fn compute(&mut self) -> Result<Self::Output> {
         Ok(open_filesystem_storage_native(
+            self.durability,
             std::mem::take(&mut self.path),
             self.sync_all_files,
             self.telemetry_dispatch.take(),
@@ -1781,6 +1784,7 @@ impl Task for OpenMemoryTask {
 
     fn compute(&mut self) -> Result<Self::Output> {
         Ok(open_memory_native(
+            self.durability,
             self.telemetry_dispatch.take(),
             self.telemetry_parent.take(),
             self.open_progress_dispatch.take(),
@@ -1845,6 +1849,7 @@ fn parse_server_headers(headers: Option<Vec<Vec<String>>>) -> Result<Vec<(String
 }
 
 fn open_memory_native(
+    durability: lix::Durability,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
     telemetry_parent: Option<SpanContext>,
     open_progress_dispatch: Option<SharedJsOpenProgressDispatch>,
@@ -1862,6 +1867,7 @@ fn open_memory_native(
         .map_or((None, None), |(sink, parent)| (Some(sink), Some(parent)));
     let mut builder = open_lix()
         .with_storage(Memory::new())
+        .with_durability(durability)
         .with_wasm_runtime(component_runtime);
     if let Some(telemetry) = telemetry {
         builder = builder.with_telemetry(telemetry);
@@ -1883,6 +1889,7 @@ fn open_memory_native(
 }
 
 fn open_filesystem_storage_native(
+    durability: lix::Durability,
     path: String,
     sync_all_files: bool,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
@@ -1905,6 +1912,7 @@ fn open_filesystem_storage_native(
         .map_or((None, None), |(sink, parent)| (Some(sink), Some(parent)));
     let mut builder = open_lix()
         .with_storage(storage.clone())
+        .with_durability(durability)
         .with_wasm_runtime(component_runtime);
     if let Some(telemetry) = telemetry {
         builder = builder.with_telemetry(telemetry);
@@ -2041,12 +2049,15 @@ impl NativeLix {
         server_headers: Option<Vec<Vec<String>>>,
         open_progress_dispatch: Option<Function<'_, String, ()>>,
         component_dispatch: Option<JsDispatch<'_>>,
+        durability: Option<String>,
     ) -> Result<AsyncTask<OpenMemoryTask>> {
         let component_runtime = component_runtime::runtime(component_runtime::platform::create(
             component_dispatch
                 .ok_or_else(|| Error::from_reason("JavaScript component host is required"))?,
         )?);
         Ok(AsyncTask::new(OpenMemoryTask {
+            durability: crate::parse_durability(durability.as_deref())
+                .map_err(|error| Error::from_reason(error.to_string()))?,
             component_runtime,
             telemetry_dispatch: optional_telemetry_dispatch(telemetry_dispatch)?,
             telemetry_parent: crate::telemetry::parse_parent_context_json(telemetry_parent_json)
@@ -2064,6 +2075,7 @@ impl NativeLix {
         telemetry_parent_json: Option<String>,
         open_progress_dispatch: Option<Function<'_, String, ()>>,
         component_dispatch: Option<JsDispatch<'_>>,
+        durability: Option<String>,
     ) -> Result<NativeSnapshotRestore> {
         let component_runtime = component_runtime::runtime(component_runtime::platform::create(
             component_dispatch
@@ -2073,8 +2085,11 @@ impl NativeLix {
         let telemetry_parent = crate::telemetry::parse_parent_context_json(telemetry_parent_json)
             .map_err(Error::from_reason)?;
         let open_progress_dispatch = optional_open_progress_dispatch(open_progress_dispatch)?;
+        let durability = crate::parse_durability(durability.as_deref())
+            .map_err(|error| Error::from_reason(error.to_string()))?;
         start_native_snapshot_restore(move |snapshot| {
             open_memory_native(
+                durability,
                 telemetry_dispatch,
                 telemetry_parent,
                 open_progress_dispatch,
@@ -2096,12 +2111,15 @@ impl NativeLix {
         server_headers: Option<Vec<Vec<String>>>,
         open_progress_dispatch: Option<Function<'_, String, ()>>,
         component_dispatch: Option<JsDispatch<'_>>,
+        durability: Option<String>,
     ) -> Result<AsyncTask<OpenFilesystemStorageTask>> {
         let component_runtime = component_runtime::runtime(component_runtime::platform::create(
             component_dispatch
                 .ok_or_else(|| Error::from_reason("JavaScript component host is required"))?,
         )?);
         Ok(AsyncTask::new(OpenFilesystemStorageTask {
+            durability: crate::parse_durability(durability.as_deref())
+                .map_err(|error| Error::from_reason(error.to_string()))?,
             path,
             sync_all_files,
             component_runtime,
@@ -2123,6 +2141,7 @@ impl NativeLix {
         telemetry_parent_json: Option<String>,
         open_progress_dispatch: Option<Function<'_, String, ()>>,
         component_dispatch: Option<JsDispatch<'_>>,
+        durability: Option<String>,
     ) -> Result<NativeSnapshotRestore> {
         let component_runtime = component_runtime::runtime(component_runtime::platform::create(
             component_dispatch
@@ -2132,8 +2151,11 @@ impl NativeLix {
         let telemetry_parent = crate::telemetry::parse_parent_context_json(telemetry_parent_json)
             .map_err(Error::from_reason)?;
         let open_progress_dispatch = optional_open_progress_dispatch(open_progress_dispatch)?;
+        let durability = crate::parse_durability(durability.as_deref())
+            .map_err(|error| Error::from_reason(error.to_string()))?;
         start_native_snapshot_restore(move |snapshot| {
             open_filesystem_storage_native(
+                durability,
                 path,
                 sync_all_files,
                 telemetry_dispatch,

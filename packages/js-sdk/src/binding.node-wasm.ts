@@ -18,6 +18,7 @@ export async function openMemoryWasmBinding(
 	telemetryParent?: TelemetryParentContext,
 	openProgress?: OpenProgressDispatch,
 	snapshot?: ReadableStream<Uint8Array>,
+	durability?: import("./types.js").Durability,
 ): Promise<LixBinding> {
 	await initializeWasm();
 	const componentDispatch = createComponentDispatch();
@@ -29,6 +30,7 @@ export async function openMemoryWasmBinding(
 				telemetryParent,
 				openProgress,
 				componentDispatch,
+				durability,
 			) as SnapshotRestoreBinding<LixBinding>,
 		);
 	}
@@ -38,5 +40,6 @@ export async function openMemoryWasmBinding(
 		undefined,
 		openProgress,
 		componentDispatch,
+		durability,
 	) as Promise<LixBinding>;
 }

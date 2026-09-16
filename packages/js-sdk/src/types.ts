@@ -162,6 +162,9 @@ export type ReplicaRecoveryReceipt = {
 	unresolved: string[];
 };
 
+/** Local persistence policy. Buffered acknowledgement can lose saves on a crash. */
+export type Durability = "durable" | "buffered";
+
 export type LixOpenProgressOptions = {
 	/** Observes local or authority inspection, automatic migration, and opening. */
 	onProgress?(progress: LixOpenProgress): void;
@@ -179,16 +182,21 @@ export type PartialReplicaLixServerOptions = Omit<LixServerOptions, "mode"> & {
 export type OpenLixOptions =
 	| ({
 			storage?: import("./storage-adapter.js").LixStorage;
+			/** Defaults to durable; applies to all local sessions and transactions. */
+			durability?: Durability;
 			server?: never;
 			telemetry?: LixTelemetryOptions;
 	  } & LixOpenProgressOptions)
 	| ({
 			storage?: never;
+			/** Remote persistence is configured by the authority. */
+			durability?: never;
 			server: RemoteLixServerOptions;
 			telemetry?: never;
 	  } & LixOpenProgressOptions)
 	| ({
 			storage: import("./storage-adapter.js").LixStorage;
+			durability?: Durability;
 			server: PartialReplicaLixServerOptions;
 			telemetry?: LixTelemetryOptions;
 	  } & LixOpenProgressOptions);

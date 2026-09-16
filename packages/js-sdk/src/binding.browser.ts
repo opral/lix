@@ -45,6 +45,7 @@ export async function openLixBinding(
 								telemetryParent,
 								openProgress,
 								componentDispatch,
+								storage.durability,
 							) as SnapshotRestoreBinding<LixBinding>,
 						)
 					: openMemory(
@@ -53,6 +54,7 @@ export async function openLixBinding(
 						server,
 						openProgress,
 						componentDispatch,
+						storage.durability,
 					)
 			) as Promise<LixBinding>;
 		case "jsStorage": {
@@ -75,6 +77,7 @@ export async function openLixBinding(
 								telemetryParent,
 								openProgress,
 								componentDispatch,
+								storage.durability,
 							) as SnapshotRestoreBinding<LixBinding>,
 						)
 					: openJsStorage(
@@ -84,6 +87,7 @@ export async function openLixBinding(
 							server,
 							openProgress,
 							componentDispatch,
+							storage.durability,
 						))) as unknown as LixBinding;
 				return binding;
 			} catch (error) {

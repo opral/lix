@@ -8,7 +8,8 @@
 //!
 //! MVP boundary: session close can cancel queued or pre-boundary writes until
 //! the storage commit point-of-no-return. After that point, close waits for
-//! commit completion. Crash persistence is provider-defined.
+//! commit completion. Persistent writes await the backend durability boundary
+//! by default; repository handles can explicitly select buffered acknowledgement.
 
 use std::future::Future;
 use std::pin::Pin;

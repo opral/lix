@@ -57,6 +57,7 @@ export type {
 	MergeConflictSide,
 	ObserveEvent,
 	OpenLixOptions,
+	Durability,
 	OpenAnotherSessionOptions,
 	LixTelemetryOptions,
 	LixTelemetryParentContext,

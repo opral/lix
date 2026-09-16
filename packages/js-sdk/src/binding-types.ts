@@ -132,7 +132,7 @@ export type LixStorageProviderModule = {
 	createLixStorageProvider(options: unknown): Promise<LixStorageProvider>;
 };
 
-export type LixStorageConfig =
+export type LixStorageConfig = { durability?: import("./types.js").Durability } & (
 	| { kind: "memory" }
 	| {
 			kind: "jsStorage";
@@ -143,7 +143,7 @@ export type LixStorageConfig =
 			kind: "filesystem";
 			path: string;
 			syncAllFiles: boolean;
-	  };
+	  });
 
 export type HostedServerBindingOptions = {
 	idempotencyKey?: string;
