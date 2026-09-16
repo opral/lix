@@ -78,6 +78,7 @@ if (cargoProfile === "release") {
 }
 const cargoArgs = [
 	"build",
+	"--timings",
 	"-p",
 	"lix_js_sdk",
 	"--target",

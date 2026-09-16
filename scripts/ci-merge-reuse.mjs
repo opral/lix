@@ -12,7 +12,7 @@ export function matchesTestedSource(evidence, { revision, tree }) {
 		evidence.sourceTree === tree && evidence.testedTree === tree;
 }
 
-export async function findReusableRun({ github, repository, sha, tree, readEvidence }) {
+export async function findReusableRun({ github, repository, sha, tree, readEvidence, acceptBrowser = async () => true }) {
 	const [owner, repo] = repository.split("/");
 	const scope = { owner, repo };
 	const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({ ...scope, commit_sha: sha, per_page: 100 });
@@ -32,10 +32,26 @@ export async function findReusableRun({ github, repository, sha, tree, readEvide
 			const browser = artifacts.find(a => a.name === `lix-browser-sdk-${revision}` && !a.expired);
 			if (!evidenceArtifact || !browser) continue;
 			const evidence = await readEvidence(evidenceArtifact);
-			if (matchesTestedSource(evidence, { revision, tree })) return { runId: run.id, revision };
+			if (matchesTestedSource(evidence, { revision, tree }) &&
+				await acceptBrowser({ artifacts, revision, run })) return { runId: run.id, revision };
 		}
 	}
 	return null;
+}
+
+export async function readArtifactJson({ github, repo, artifact, filename }) {
+	if (artifact.size_in_bytes > 65536) throw new Error("Oversized CI provenance");
+	const response = await github.rest.actions.downloadArtifact({ ...repo, artifact_id: artifact.id, archive_format: "zip" });
+	const download = await fetch(response.url);
+	if (!download.ok) throw new Error(`Provenance download: ${download.status}`);
+	const zip = Buffer.from(await download.arrayBuffer());
+	if (artifact.digest && artifact.digest !== `sha256:${createHash("sha256").update(zip).digest("hex")}`) throw new Error("CI provenance digest mismatch");
+	const directory = mkdtempSync(join(tmpdir(), "ci-provenance-"));
+	try {
+		const archive = join(directory, "source.zip");
+		writeFileSync(archive, zip);
+		return JSON.parse(execFileSync("unzip", ["-p", archive, filename], { encoding: "utf8", maxBuffer: 65536 }));
+	} finally { rmSync(directory, { recursive: true, force: true }); }
 }
 
 export async function selectMergeReuse({ github, context, core }) {
@@ -45,20 +61,7 @@ export async function selectMergeReuse({ github, context, core }) {
 		const tree = execFileSync("git", ["rev-parse", "HEAD^{tree}"], { encoding: "utf8" }).trim();
 		const result = await findReusableRun({
 			github, repository: `${context.repo.owner}/${context.repo.repo}`, sha: context.sha, tree,
-			readEvidence: async artifact => {
-				if (artifact.size_in_bytes > 65536) throw new Error("Oversized CI provenance");
-				const response = await github.rest.actions.downloadArtifact({ ...context.repo, artifact_id: artifact.id, archive_format: "zip" });
-				const download = await fetch(response.url);
-				if (!download.ok) throw new Error(`Provenance download: ${download.status}`);
-				const zip = Buffer.from(await download.arrayBuffer());
-				if (artifact.digest && artifact.digest !== `sha256:${createHash("sha256").update(zip).digest("hex")}`) throw new Error("CI provenance digest mismatch");
-				const directory = mkdtempSync(join(tmpdir(), "ci-provenance-"));
-				try {
-					const archive = join(directory, "source.zip");
-					writeFileSync(archive, zip);
-					return JSON.parse(execFileSync("unzip", ["-p", archive, "tested-source.json"], { encoding: "utf8", maxBuffer: 65536 }));
-				} finally { rmSync(directory, { recursive: true, force: true }); }
-			},
+			readEvidence: artifact => readArtifactJson({ github, repo: context.repo, artifact, filename: "tested-source.json" }),
 		});
 		if (!result) { core.info("No successful PR run proves this exact tree; running full CI."); return; }
 		await core.summary.addRaw(`Reusing successful PR CI run ${result.runId}: both tested source trees match ${tree}. SDK artifacts are promoted to ${context.sha}; compilation and tests are not repeated.`).write();

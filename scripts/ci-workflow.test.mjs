@@ -349,3 +349,53 @@ test("explicit artifact mode reuses producers without emitting release readiness
     assert.match(selector, /inputs\.artifacts_only == true/);
     assert.match(selector, /echo 'server=true'/);
 });
+
+test("release assembly consumes browser artifacts and tests consume the matrix's two Linux binaries", () => {
+	const native = publishWorkflow.split("\n  build-js-sdk-native-packages:\n")[1].split("\n  build-js-sdk-browser:\n")[0];
+	assert.match(native, /run: npm run build:native/);
+	assert.match(native, /if: matrix\.suffix == 'linux-x64'[\s\S]*?run: npm run build:migration:native/);
+	assert.match(native, /name: js-sdk-linux-test-binaries/);
+	assert.match(native, /packages\/js-sdk\/lix_js_sdk_migration\.node/);
+	const assembly = publishWorkflow.split("\n  build-js-sdk:\n")[1].split("\n  test-js-sdk:\n")[0];
+	assert.match(assembly, /needs: \[release-version, build-js-sdk-browser\]/);
+	assert.match(assembly, /name: js-sdk-browser-binaries/);
+	assert.match(assembly, /run: npm run build:ts/);
+	assert.doesNotMatch(assembly, /build:native|build:migration:native|build:wasm|build:browser|\bcargo\b/);
+	for (const consumer of ["test-js-sdk", "publish-js-sdk"]) {
+		const job = publishWorkflow.split(`\n  ${consumer}:\n`)[1].split(/\n  [a-z-]+:\n/)[0];
+		assert.match(job, /name: js-sdk-package-build\n\s+path: packages\/js-sdk\/dist/);
+	}
+	const tests = publishWorkflow.split("\n  test-js-sdk:\n")[1].split("\n  publish-rust-crates:\n")[0];
+	assert.match(tests, /needs:[\s\S]*?- build-js-sdk-native-packages/);
+	assert.match(tests, /name: js-sdk-linux-test-binaries\n\s+path: packages\/js-sdk/);
+});
+
+test("release browser reuse validates provenance before skipping each expensive phase", () => {
+	assert.match(publishWorkflow, /selectReleaseBrowser\(\{ github, context, core, sha: process\.env\.RELEASE_SHA \}\)/);
+	const browser = publishWorkflow.split("\n  build-js-sdk-browser:\n")[1].split("\n  build-js-sdk:\n")[0];
+	assert.match(browser, /run-id: \$\{\{ needs\.release-version\.outputs\.browser_run \}\}/);
+	assert.match(browser, /node scripts\/release-browser-artifact\.mjs restore/);
+	for (const name of ["Activate repository Rust toolchain", "Restore Rust cache", "Restore compiler cache", "Build browser WASM", "Build migration WASM", "Build bundled plugins"]) {
+		const step = browser.split(`- name: ${name}\n`)[1].split("\n      - name:")[0];
+		assert.match(step, /if: steps\.browser\.outputs\.reuse != 'true'/);
+	}
+	assert.match(browser, /shared-key: ci-js-browser/);
+	assert.match(browser, /scope: sdk-browser/);
+	assert.ok(browser.indexOf("name: Setup Node.js") < browser.indexOf("name: Verify and restore browser binary payload"));
+	assert.ok(workflow.indexOf("name: Upload browser build provenance for release lookup") > workflow.indexOf("name: Run OPFS storage browser tests"));
+});
+
+test("CI and release share bounded disk compiler caches with separate native profiles", () => {
+	const cache = readFileSync(resolve(repositoryRoot, ".github/actions/compiler-cache/action.yml"), "utf8");
+	assert.match(cache, /SCCACHE_GHA_ENABLED=false/);
+	assert.match(cache, /SCCACHE_CACHE_SIZE=2G/);
+	assert.match(cache, /uses: actions\/cache@v4/);
+	assert.match(cache, /version: v0\.18\.0/);
+	assert.match(cache, /hashFiles\('rust-toolchain\.toml'\)/);
+	assert.match(workflow, /scope: sdk-\$\{\{ matrix\.runtime \}\}/);
+	assert.match(publishWorkflow, /scope: sdk-release-\$\{\{ matrix\.suffix \}\}/);
+	for (const profile of ["DEV", "TEST", "RELEASE", "BENCH"]) {
+		assert.ok(workflow.includes(`CARGO_PROFILE_${profile}_DEBUG=0`));
+		assert.ok(publishWorkflow.includes(`CARGO_PROFILE_${profile}_DEBUG: '0'`));
+	}
+});
