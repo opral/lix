@@ -7,8 +7,9 @@ already traversed on the consumer's behalf.
 
 E12 counts metadata-selected checkpoints visited, including empty diffs, and
 exposes that count as the lookahead budget only after the consumer resumes past a
-nonempty result. This preserves the zero-lookahead first-result behavior. It does
-not count excluded graph nodes and does not increase the 16-checkpoint cap.
+nonempty batch. This is a producer-side signal: residual SQL filters above the
+history scan may discard that batch. The LIMIT1 controls use an exact file ID.
+It does not count excluded graph nodes or increase the 16-checkpoint cap.
 Required/optional dependency handling, normal awaited SQL, and protocol/storage
 versions remain unchanged.
 
