@@ -28,8 +28,7 @@ Use names that fit your product, such as `"Marketing edit"`, `"Q3 pricing draft"
 
 ## Work with branches concurrently
 
-SQL relations always read and write the current session's active branch. Open
-another session to work with another branch without switching the primary one:
+SQL relations always read and write the current session's active branch. Open another session to work with another branch without switching the primary one:
 
 ```ts
 const draftLix = await lix.openAnotherSession({ branchId: draft.id });
@@ -42,10 +41,7 @@ const [mainRows, draftRows] = await Promise.all([
 await draftLix.close();
 ```
 
-Each session has independent branch selection, transactions, observations, and
-lifecycle. Use `lix_diff('acme_section', mainCommit, draftCommit)` when the
-desired result is a relation-specific commit-to-commit change set rather than
-two current-state result sets.
+Each session has independent branch selection, transactions, observations, and lifecycle. Use `lix_diff('acme_section', mainCommit, draftCommit)` when the desired result is a relation-specific commit-to-commit change set rather than two current-state result sets.
 
 ## Preview a merge
 
@@ -76,18 +72,11 @@ await lix.mergeBranch({ sourceBranchId: draft.id });
 
 ## Automatic merging
 
-Lix reconciles overlapping edits automatically. Changes to different columns of
-the same row combine. For competing changes to the same column, the incoming
-source value wins by default; a plugin can provide a column merger instead.
-Creation/deletion races use whole-row last-writer-wins (LWW).
+Lix reconciles overlapping edits automatically. Changes to different columns of the same row combine. For competing changes to the same column, the incoming source value wins by default; a plugin can provide a column merger instead. Creation/deletion races use whole-row last-writer-wins (LWW).
 
-“Last” follows acceptance order, not client timestamps. In a branch merge, the
-source branch is incoming. Overlapping edits do not require caller conflict
-resolution. Merges can still fail when plugin ownership or generations are
-incompatible, or when tracked changes collide with untracked rows.
+“Last” follows acceptance order, not client timestamps. In a branch merge, the source branch is incoming. Overlapping edits do not require caller conflict resolution. Merges can still fail when plugin ownership or generations are incompatible, or when tracked changes collide with untracked rows.
 
-Preview reports the merge outcome and change counts; it does not
-reserve the branch heads or approve a later merge against changing data.
+Preview reports the merge outcome and change counts; it does not reserve the branch heads or approve a later merge against changing data.
 
 ## Hide or delete a branch
 
@@ -100,8 +89,7 @@ await lix.execute("UPDATE lix_branch SET hidden = true WHERE id = $1", [
 await lix.execute("DELETE FROM lix_branch WHERE id = $1", [draft.id]);
 ```
 
-Lix creates a built-in branch named `global` when it opens a repository. You
-cannot delete that branch, and you cannot delete the active branch.
+Lix creates a built-in branch named `global` when it opens a repository. You cannot delete that branch, and you cannot delete the active branch.
 
 `hidden` only marks a branch for UIs. It does not change what SQL queries can see.
 
@@ -116,7 +104,4 @@ await lix.execute(
 );
 ```
 
-Metadata belongs to the tracked `lix_branch_descriptor` row, just as file and
-directory metadata belongs to their descriptors. Branch descriptors are global,
-so the metadata is visible from every branch. Renaming, hiding, or moving the
-branch head preserves it. Set `lixcol_metadata = NULL` to clear it.
+Metadata belongs to the tracked `lix_branch_descriptor` row, just as file and directory metadata belongs to their descriptors. Branch descriptors are global, so the metadata is visible from every branch. Renaming, hiding, or moving the branch head preserves it. Set `lixcol_metadata = NULL` to clear it.

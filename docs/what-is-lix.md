@@ -56,8 +56,7 @@ File plugins map parts of a file to rows. A row can represent a Markdown block, 
 
 <img src="../website/public/assets/file-to-rows.svg" alt="A plugin maps /orders.csv to SQL rows with row, field, and value columns" width="760" />
 
-Apps read and write these rows with SQL. Lix records their history. With
-`FilesystemStorage`, it also writes changes back to normal files on disk.
+Apps read and write these rows with SQL. Lix records their history. With `FilesystemStorage`, it also writes changes back to normal files on disk.
 
 Diffs are row-level: review the clause, cell, or row that changed, not lines of text. See [Diffs](./diffs.md).
 
@@ -69,14 +68,9 @@ Run Lix in memory, on the local filesystem, or against a server backed by S3. Se
 
 ## Local, remote, and sync
 
-Lix supports local repositories, direct remote clients, and synchronized local
-replicas with the same API. See [Storage](./persistence.md) for
-setup examples.
+Lix supports local repositories, direct remote clients, and synchronized local replicas with the same API. See [Storage](./persistence.md) for setup examples.
 
-Clients can execute directly on a server or use a synchronized local replica.
-Both modes use the same files, SQL, and branches. Clients on the same server
-see each other's changes through `lix.observe()`. See
-[Collaboration](./collaboration-and-sync.md).
+Clients can execute directly on a server or use a synchronized local replica. Both modes use the same files, SQL, and branches. Clients on the same server see each other's changes through `lix.observe()`. See [Collaboration](./collaboration-and-sync.md).
 
 ## Permissions (planned)
 

@@ -4,8 +4,7 @@ description: Store text, binary files, audio, video, and other large media in a 
 
 # Files and media
 
-Lix stores text and binary files in `lix_file`. This includes images, audio,
-video, archives, and application-specific formats.
+Lix stores text and binary files in `lix_file`. This includes images, audio, video, archives, and application-specific formats.
 
 You use normal file paths and bytes. Lix handles the storage details.
 
@@ -35,9 +34,7 @@ lix.execute(
 
 ## How large files are stored
 
-Lix stores file bytes in a content-addressed store. Lix splits large files into
-chunks. It stores equal chunks once, even when they appear in several files or
-branches.
+Lix stores file bytes in a content-addressed store. Lix splits large files into chunks. It stores equal chunks once, even when they appear in several files or branches.
 
 The chunk store gives Lix three properties:
 
@@ -45,18 +42,12 @@ The chunk store gives Lix three properties:
 - chunk-level deduplication;
 - garbage collection when content is no longer reachable.
 
-Applications never call the chunk store or the server's transfer protocol
-directly. Read and write `lix_file` with SQL.
+Applications never call the chunk store or the server's transfer protocol directly. Read and write `lix_file` with SQL.
 
 ## What belongs in the repository
 
-Store source files in Lix, along with the metadata needed to understand them. Derived
-data such as thumbnails, waveform caches, and temporary render files can stay
-outside the repository when your application can rebuild them.
+Store source files in Lix, along with the metadata needed to understand them. Derived data such as thumbnails, waveform caches, and temporary render files can stay outside the repository when your application can rebuild them.
 
 ## Storage
 
-Binary content uses the repository's selected storage adapter. Use RocksDB or
-the local filesystem for native applications. Use SlateDB with S3-compatible
-object storage for hosted repositories. See
-[Storage](./persistence.md).
+Binary content uses the repository's selected storage adapter. Use RocksDB or the local filesystem for native applications. Use SlateDB with S3-compatible object storage for hosted repositories. See [Storage](./persistence.md).

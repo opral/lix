@@ -4,8 +4,7 @@ description: Choose the JavaScript or Rust quickstart and make your first versio
 
 # Getting started
 
-Choose your SDK. Both quickstarts create a repository, write a file, inspect
-its history, and undo a change.
+Choose your SDK. Both quickstarts create a repository, write a file, inspect its history, and undo a change.
 
 ## JavaScript
 
@@ -27,5 +26,4 @@ cargo add lix
 
 [Start the Rust quickstart →](./rust-quickstart.md)
 
-After the quickstart, pick a local or hosted setup in
-[Storage](./persistence.md).
+After the quickstart, pick a local or hosted setup in [Storage](./persistence.md).

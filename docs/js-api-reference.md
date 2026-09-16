@@ -4,10 +4,7 @@ description: "Reference for opening local, remote, and synchronized Lix instance
 
 # JavaScript API Reference
 
-`@lix-js/sdk` exports `openLix()`, `createLix()`, `deleteLix()`, the generic JavaScript storage protocol,
-`Value` and `bundledPluginArchives`. `@lix-js/storage-opfs` and
-`@lix-js/storage-filesystem` provide concrete storage implementations.
-`openLix()` returns a local repository, a thin remote client, or a partial replica with on-demand sync.
+`@lix-js/sdk` exports `openLix()`, `createLix()`, `deleteLix()`, the generic JavaScript storage protocol, `Value` and `bundledPluginArchives`. `@lix-js/storage-opfs` and `@lix-js/storage-filesystem` provide concrete storage implementations. `openLix()` returns a local repository, a thin remote client, or a partial replica with on-demand sync.
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -17,8 +14,7 @@ const lix = await openLix();
 
 ## Hosted repository lifecycle
 
-`createLix()` provisions a hosted repository and returns `{ id, url }`. Its
-`server.url` is the host origin; opening and deleting use the repository URL.
+`createLix()` provisions a hosted repository and returns `{ id, url }`. Its `server.url` is the host origin; opening and deleting use the repository URL.
 
 ```ts
 import { createLix, openLix, deleteLix } from "@lix-js/sdk";
@@ -32,28 +28,13 @@ await remote.close();
 await deleteLix({ server: { url: repository.url, headers } });
 ```
 
-Supply `from: localLix` to copy an existing repository instead of creating an
-empty one. Creation takes one consistent snapshot, including files, branches,
-history, and untracked rows. It does not attach or change the source handle.
-Subsequent source edits are not part of that copy. To attach the original
-durable storage afterward, pause writes during creation, close the local handle,
-and follow the [explicit conversion guide](./partial-replica-migration.md) for
-supported existing replica storage. Opening with `server.mode: "partial_replica"`
-does not silently replace unrelated or locally diverged history.
+Supply `from: localLix` to copy an existing repository instead of creating an empty one. Creation takes one consistent snapshot, including files, branches, history, and untracked rows. It does not attach or change the source handle. Subsequent source edits are not part of that copy. To attach the original durable storage afterward, pause writes during creation, close the local handle, and follow the [explicit conversion guide](./partial-replica-migration.md) for supported existing replica storage. Opening with `server.mode: "partial_replica"` does not silently replace unrelated or locally diverged history.
 
-Supply `idempotencyKey` to recover a creation after a lost response. Retry with
-the same key and unchanged source snapshot; reusing a key for different content
-fails. When omitted, the SDK generates a key for that call. Lifecycle requests
-accept `url` and `headers`; custom `fetch` overrides are not supported.
+Supply `idempotencyKey` to recover a creation after a lost response. Retry with the same key and unchanged source snapshot; reusing a key for different content fails. When omitted, the SDK generates a key for that call. Lifecycle requests accept `url` and `headers`; custom `fetch` overrides are not supported.
 
-Browser creation from a local repository requires Fetch request streaming;
-browsers without it return `LIX_UNSUPPORTED_OPERATION`. Browser Fetch may also
-require HTTP/2 or HTTP/3 for these uploads. Lix does not buffer a complete
-repository as a fallback. Empty creation does not require request streaming.
+Browser creation from a local repository requires Fetch request streaming; browsers without it return `LIX_UNSUPPORTED_OPERATION`. Browser Fetch may also require HTTP/2 or HTTP/3 for these uploads. Lix does not buffer a complete repository as a fallback. Empty creation does not require request streaming.
 
-Opening a missing hosted repository fails; it never provisions one. Deletion
-removes the hosted resource without deleting local copies. Closing only releases
-a session. A disconnected replica never recreates a deleted server repository.
+Opening a missing hosted repository fails; it never provisions one. Deletion removes the hosted resource without deleting local copies. Closing only releases a session. A disconnected replica never recreates a deleted server repository.
 
 ## openLix()
 
@@ -82,8 +63,7 @@ const lix = await openLix({
 
 Remote file content, SQL rows, and branches live on the server. Use `headers` for authentication and `fetch` when you need a custom fetch implementation.
 
-Open a **partial replica with on-demand sync** by supplying `storage` and
-explicitly selecting `server.mode: "partial_replica"`:
+Open a **partial replica with on-demand sync** by supplying `storage` and explicitly selecting `server.mode: "partial_replica"`:
 
 ```ts
 import { OpfsStorage } from "@lix-js/storage-opfs";
@@ -98,15 +78,9 @@ const lix = await openLix({
 });
 ```
 
-Opening installs bounded metadata. SQL fetches missing native inputs on demand
-and retains them in local storage. Covered reads and writes with resident
-dependencies execute locally, including offline. Mutations commit locally and
-upload in the background; success does not wait for server acceptance.
+Opening installs bounded metadata. SQL fetches missing native inputs on demand and retains them in local storage. Covered reads and writes with resident dependencies execute locally, including offline. Mutations commit locally and upload in the background; success does not wait for server acceptance.
 
-`server.mode` defaults to `"remote"`, which rejects storage. Partial-replica mode
-requires storage. `"sync"` is not an alias and full `"replica"` mode is not yet
-supported. See
-[Collaboration](./collaboration-and-sync.md) for the complete behavior.
+`server.mode` defaults to `"remote"`, which rejects storage. Partial-replica mode requires storage. `"sync"` is not an alias and full `"replica"` mode is not yet supported. See [Collaboration](./collaboration-and-sync.md) for the complete behavior.
 
 Use `OpfsStorage` to persist a local browser Lix across reloads:
 
@@ -119,8 +93,7 @@ const lix = await openLix({
 });
 ```
 
-Use `FilesystemStorage` for a repository directory backed by RocksDB at
-`<repository>/.lix/.internal/rocksdb`:
+Use `FilesystemStorage` for a repository directory backed by RocksDB at `<repository>/.lix/.internal/rocksdb`:
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -142,9 +115,7 @@ const lix = await openLix({ storage });
 await storage.importPaths(["notes/today.md"]);
 ```
 
-Call `storage.syncDiskToLix()` to run one manual sync pass that imports pending
-disk changes into Lix. It returns `Promise<void>` and requires an open Lix
-instance.
+Call `storage.syncDiskToLix()` to run one manual sync pass that imports pending disk changes into Lix. It returns `Promise<void>` and requires an open Lix instance.
 
 ```ts
 await storage.syncDiskToLix();
@@ -159,15 +130,9 @@ const health = await lix.syncHealth();
 // { state, appliedCursor, observedCursor, failures, terminalError }
 ```
 
-Returns the local partial-replica worker's health without querying SQL or fetching
-remote data. `state` is `inactive`, `running`, `stalled`, `failed`, or `stopped`.
-`failures` holds independent `descriptor`, `publication`, `upload`, and `lease`
-errors, each with a `code` and `message`. `terminalError` describes a failed
-worker. Cursors and terminal errors are `null` when unavailable.
+Returns the local partial-replica worker's health without querying SQL or fetching remote data. `state` is `inactive`, `running`, `stalled`, `failed`, or `stopped`. `failures` holds independent `descriptor`, `publication`, `upload`, and `lease` errors, each with a `code` and `message`. `terminalError` describes a failed worker. Cursors and terminal errors are `null` when unavailable.
 
-Successful local reads do not clear sync failures. `running` means no known
-worker failure, not guaranteed server freshness. Other modes report `inactive`.
-Call this method before closing the JavaScript session.
+Successful local reads do not clear sync failures. `running` means no known worker failure, not guaranteed server freshness. Other modes report `inactive`. Call this method before closing the JavaScript session.
 
 ### execute()
 
@@ -175,22 +140,11 @@ Call this method before closing the JavaScript session.
 const result = await lix.execute(sql, params?, options?);
 ```
 
-Executes one PostgreSQL-dialect SQL statement against the active Lix session.
-Pass a single statement. To run several statements atomically, call
-`executeBatch()` with an array of `{ sql, params? }` objects. Do not concatenate
-statements into one SQL string or parse a script on the host.
+Executes one PostgreSQL-dialect SQL statement against the active Lix session. Pass a single statement. To run several statements atomically, call `executeBatch()` with an array of `{ sql, params? }` objects. Do not concatenate statements into one SQL string or parse a script on the host.
 
-For a partial replica with on-demand sync, prefetch a view by executing its SELECT
-on hover, then execute the same SELECT when opening it. Resident inputs stay local.
-Use ordinary `execute()` for writes; a read does not promise that all later write
-validation or commit dependencies are resident.
+For a partial replica with on-demand sync, prefetch a view by executing its SELECT on hover, then execute the same SELECT when opening it. Resident inputs stay local. Use ordinary `execute()` for writes; a read does not promise that all later write validation or commit dependencies are resident.
 
-Cancellable buffered local and partial-replica reads have a 30-second deadline including
-input hydration, and return at most 64 MiB or 1,000,000 rows per operation.
-`executeBatch()` shares the result budget across its read statements. Narrow
-large queries or request file ranges. Exceeding these bounds reports
-`LIX_READ_DEADLINE_EXCEEDED` or `LIX_READ_RESOURCE_EXHAUSTED`; accepted writes
-are never canceled or replayed by the read deadline.
+Cancellable buffered local and partial-replica reads have a 30-second deadline including input hydration, and return at most 64 MiB or 1,000,000 rows per operation. `executeBatch()` shares the result budget across its read statements. Narrow large queries or request file ranges. Exceeding these bounds reports `LIX_READ_DEADLINE_EXCEEDED` or `LIX_READ_RESOURCE_EXHAUSTED`; accepted writes are never canceled or replayed by the read deadline.
 
 Parameters:
 
@@ -255,13 +209,7 @@ const content = result.rows[0]?.content as Uint8Array | undefined;
 const { results, commit } = await lix.executeBatch(statements, options?);
 ```
 
-Executes multiple statements atomically in one call. Returns `{ results, commit }`: one statement-result array and one commit span for the whole transaction. Read-only batches return `commit: null`; individual results have no `commit` field. `statements` is a non-empty
-array of `{ sql, params?, label? }` objects — one statement per entry, already
-split by the caller. Lix does not parse a multi-statement script. `options`
-accepts the same `originKey`, `idempotencyKey`, and `maxAutoCommitRetries` as `execute()`. Results
-preserve input order and include a zero-based `statementIndex`. A supplied label
-is echoed unchanged; labels are opaque and may repeat. If a label is omitted,
-the result has no `label` property.
+Executes multiple statements atomically in one call. Returns `{ results, commit }`: one statement-result array and one commit span for the whole transaction. Read-only batches return `commit: null`; individual results have no `commit` field. `statements` is a non-empty array of `{ sql, params?, label? }` objects — one statement per entry, already split by the caller. Lix does not parse a multi-statement script. `options` accepts the same `originKey`, `idempotencyKey`, and `maxAutoCommitRetries` as `execute()`. Results preserve input order and include a zero-based `statementIndex`. A supplied label is echoed unchanged; labels are opaque and may repeat. If a label is omitted, the result has no `label` property.
 
 ```ts
 const { results, commit } = await lix.executeBatch([
@@ -292,10 +240,7 @@ console.log(returning[0].rows[0]?.done);
 const events = lix.observe(sql, params?);
 ```
 
-Observes a SQL query. Returns an `ObserveEvents` handle. Call `next()` to await
-the next result; it resolves with `{ sequence, mutationSequence, result }` for
-the initial result and after each change, or `undefined` after the observation
-is closed. Call `close()` to stop observing.
+Observes a SQL query. Returns an `ObserveEvents` handle. Call `next()` to await the next result; it resolves with `{ sequence, mutationSequence, result }` for the initial result and after each change, or `undefined` after the observation is closed. Call `close()` to stop observing.
 
 ```ts
 const events = lix.observe("SELECT path FROM lix_file");
@@ -310,73 +255,32 @@ events.close();
 const tx = await lix.beginTransaction();
 ```
 
-Starts an independent transaction context on this handle's current branch and
-account. Execute statements that belong to the transaction through `tx.execute()`;
-these reads see its staged writes. Ordinary `lix.execute()` reads and
-`lix.observe()` remain available on the original handle and see committed data.
-Observers publish relevant updates after commit; rolled-back writes are never
-published. Changing the original handle's branch does not retarget the transaction.
-Local transactions retain the caller's previously acknowledged plugin-file view,
-so plugins can merge stale content against the correct base.
+Starts an independent transaction context on this handle's current branch and account. Execute statements that belong to the transaction through `tx.execute()`; these reads see its staged writes. Ordinary `lix.execute()` reads and `lix.observe()` remain available on the original handle and see committed data. Observers publish relevant updates after commit; rolled-back writes are never published. Changing the original handle's branch does not retarget the transaction. Local transactions retain the caller's previously acknowledged plugin-file view, so plugins can merge stale content against the correct base.
 
-Each handle permits one opening or active explicit transaction at a time. Use
-`openAnotherSession()` for another independent handle when needed.
+Each handle permits one opening or active explicit transaction at a time. Use `openAnotherSession()` for another independent handle when needed.
 
-Commit or roll back the transaction before closing the original handle. Closing
-with an opening or active transaction still fails with
-`LIX_INVALID_TRANSACTION_STATE`.
+Commit or roll back the transaction before closing the original handle. Closing with an opening or active transaction still fails with `LIX_INVALID_TRANSACTION_STATE`.
 
-SQL `UPDATE` and `DELETE` decisions, and successful explicit SQL reads used to
-decide later writes, are protected until commit. If another transaction changes
-active-branch or shared/global state after this transaction opens, committing
-its writes fails with `LIX_TRANSACTION_CONFLICT`. Read-only transactions can
-still commit successfully and return `{ commit: null }`. Start
-a new transaction and rerun its statements against current state. This is a conservative branch
-check, including untracked rows: even changes to unrelated rows can require a
-retry. A successfully planned update or delete retains this check if it matches
-no rows or subsequently fails and the transaction continues with other writes.
+SQL `UPDATE` and `DELETE` decisions, and successful explicit SQL reads used to decide later writes, are protected until commit. If another transaction changes active-branch or shared/global state after this transaction opens, committing its writes fails with `LIX_TRANSACTION_CONFLICT`. Read-only transactions can still commit successfully and return `{ commit: null }`. Start a new transaction and rerun its statements against current state. This is a conservative branch check, including untracked rows: even changes to unrelated rows can require a retry. A successfully planned update or delete retains this check if it matches no rows or subsequently fails and the transaction continues with other writes.
 
-Rows returned by `RETURNING` inside a transaction are provisional. Report a
-publication as successful only after `commit()` succeeds. Automatic `execute()`
-and `executeBatch()` can rerun the whole statement or batch after a known failed
-transaction. Explicit transactions remain caller-controlled.
+Rows returned by `RETURNING` inside a transaction are provisional. Report a publication as successful only after `commit()` succeeds. Automatic `execute()` and `executeBatch()` can rerun the whole statement or batch after a known failed transaction. Explicit transactions remain caller-controlled.
 
-Set `maxAutoCommitRetries` to cap these replays across both transaction contention
-and expired transaction snapshots. The initial attempt does not count; `0`
-returns the first failure without re-executing the transaction. When omitted,
-Lix permits up to 16 contention retries and separately bounds expired-snapshot
-recovery by its existing time budget. An explicit cap cannot extend that expiry
-budget. This option does not control pure-read recovery, idempotency receipt
-lookups, or network retries.
+Set `maxAutoCommitRetries` to cap these replays across both transaction contention and expired transaction snapshots. The initial attempt does not count; `0` returns the first failure without re-executing the transaction. When omitted, Lix permits up to 16 contention retries and separately bounds expired-snapshot recovery by its existing time budget. An explicit cap cannot extend that expiry budget. This option does not control pure-read recovery, idempotency receipt lookups, or network retries.
 
 ```ts
 await lix.execute(sql, params, { maxAutoCommitRetries: 0 });
 await lix.executeBatch(statements, { maxAutoCommitRetries: 2 });
 ```
 
-Rust callers use `.with_max_auto_commit_retries(0)` on `lix.execute(...)` or
-`lix.execute_batch(...)`, including remote handles.
+Rust callers use `.with_max_auto_commit_retries(0)` on `lix.execute(...)` or `lix.execute_batch(...)`, including remote handles.
 
-Re-execution reevaluates predicates against current state. An update guarded by
-an expected revision may therefore succeed with **zero affected rows** after a
-retry; check `rowsAffected` as well as commit success. Retries do not provide
-general serializable isolation for arbitrary reads or cross-branch dependencies.
+Re-execution reevaluates predicates against current state. An update guarded by an expected revision may therefore succeed with **zero affected rows** after a retry; check `rowsAffected` as well as commit success. Retries do not provide general serializable isolation for arbitrary reads or cross-branch dependencies.
 
-Lix never automatically re-executes an unknown commit outcome or an operation
-marked as having completed execution/publication. Remote mutation recovery first
-looks up its idempotency receipt: a durable matching receipt replays the saved
-result; a known transaction conflict with no receipt may retry with the same
-identity. Absence after an unknown outcome is not proof that the write failed.
+Lix never automatically re-executes an unknown commit outcome or an operation marked as having completed execution/publication. Remote mutation recovery first looks up its idempotency receipt: a durable matching receipt replays the saved result; a known transaction conflict with no receipt may retry with the same identity. Absence after an unknown outcome is not proof that the write failed.
 
-Errors exiting the automatic transaction retry loop retain their code and details
-and add `autoCommitRetryCount` and `autoCommitRetryStopReason`; an explicit cap is
-included as `maxAutoCommitRetries`. Debug tracing records each replay and its
-error code. The count covers re-executions, not receipt lookups or transport work.
+Errors exiting the automatic transaction retry loop retain their code and details and add `autoCommitRetryCount` and `autoCommitRetryStopReason`; an explicit cap is included as `maxAutoCommitRetries`. Debug tracing records each replay and its error code. The count covers re-executions, not receipt lookups or transport work.
 
-Unconditional `INSERT ... ON CONFLICT DO UPDATE` file saves and explicit branch
-merges retain their collaboration semantics. Use `UPDATE ... WHERE` with an
-expected revision and require commit success when publication depends on that
-revision remaining current.
+Unconditional `INSERT ... ON CONFLICT DO UPDATE` file saves and explicit branch merges retain their collaboration semantics. Use `UPDATE ... WHERE` with an expected revision and require commit success when publication depends on that revision remaining current.
 
 ```ts
 const tx = await lix.beginTransaction();
@@ -414,13 +318,11 @@ Returns the id of the active account.
 const unsubscribe = lix.subscribeActiveBranch(listener);
 ```
 
-Subscribes to successful branch switches made through this Lix handle. The
-`listener` is a function with no arguments. Returns an unsubscribe function.
+Subscribes to successful branch switches made through this Lix handle. The `listener` is a function with no arguments. Returns an unsubscribe function.
 
 ### Checkpoints
 
-Checkpointing uses the canonical SQL surface rather than a separate typed SDK
-method:
+Checkpointing uses the canonical SQL surface rather than a separate typed SDK method:
 
 ```ts
 const result = await lix.execute(
@@ -438,8 +340,7 @@ const undone = await lix.undo();
 const redone = await lix.redo();
 ```
 
-`undo()` reverts the latest change on the active branch by committing an
-inverse commit. `redo()` replays the last undone change.
+`undo()` reverts the latest change on the active branch by committing an inverse commit. `redo()` replays the last undone change.
 
 Results:
 
@@ -569,9 +470,7 @@ Closes the Lix handle and its storage resources.
 
 ## Transaction
 
-Transaction `execute()` returns `StatementResult<TRow>`, defined as
-`Omit<ExecuteResult<TRow>, "commit">`. The durable receipt arrives only from
-`commit()`, which returns `CommitReceipt = { commit: CommitSpan | null }`.
+Transaction `execute()` returns `StatementResult<TRow>`, defined as `Omit<ExecuteResult<TRow>, "commit">`. The durable receipt arrives only from `commit()`, which returns `CommitReceipt = { commit: CommitSpan | null }`.
 
 Transactions expose:
 
@@ -589,16 +488,11 @@ Transactions expose:
 const row = result.rows[0]!;
 ```
 
-Use `row.column_name`, `row[dynamicColumn]`, destructuring, spread, or
-`JSON.stringify(row)` directly. Duplicate output names use the last value in
-object mode while every descriptor remains in `columns`; pass
-`{ rowMode: "array" }` to `execute()` or `executeBatch()` when positional
-duplicates are required.
+Use `row.column_name`, `row[dynamicColumn]`, destructuring, spread, or `JSON.stringify(row)` directly. Duplicate output names use the last value in object mode while every descriptor remains in `columns`; pass `{ rowMode: "array" }` to `execute()` or `executeBatch()` when positional duplicates are required.
 
 ## Value
 
-`Value` constructs explicitly typed SQL parameters. Returned values are native
-JavaScript values and their SQL types are described by `result.columns`.
+`Value` constructs explicitly typed SQL parameters. Returned values are native JavaScript values and their SQL types are described by `result.columns`.
 
 Accessors:
 

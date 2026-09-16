@@ -6,9 +6,7 @@ description: Lix diffs at the row level. Plugins parse files into rows, so a dif
 
 Lix diffs rows, not lines.
 
-Plugins parse a file into rows: a CSV record, a spreadsheet cell, a Markdown
-block. Lix stores every change as a row in `lix_change`. A diff is therefore a
-set of changed rows. It names the row that changed and gives its new value.
+Plugins parse a file into rows: a CSV record, a spreadsheet cell, a Markdown block. Lix stores every change as a row in `lix_change`. A diff is therefore a set of changed rows. It names the row that changed and gives its new value.
 
 That is the whole idea.
 
@@ -47,9 +45,7 @@ Lix sees a row:
 | --- | --- | --- |
 | `lix_row_ref:v1:…` | `csv_row` | `{"id": "0192f3a1-…-7b2c", "order_key": "…", "cells": ["1002", "Widget B", "shipped"]}` |
 
-The CSV plugin gives each record a stable `id`, so the row keeps its identity
-even when the file is reordered. `cells` holds the decoded record. One cell
-changed, and your app renders that:
+The CSV plugin gives each record a stable `id`, so the row keeps its identity even when the file is reordered. `cells` holds the decoded record. One cell changed, and your app renders that:
 
 ```diff
 order_id 1002 status:
@@ -60,15 +56,11 @@ order_id 1002 status:
 
 ## Granularity comes from plugins
 
-A plugin decides what a row is for its format. The Markdown plugin emits blocks,
-the CSV plugin emits records. Both ship with the JavaScript SDK. Other formats
-need a plugin you install yourself. Without one, Lix still tracks the file but
-does not split it into rows, so its diff is the whole file.
+A plugin decides what a row is for its format. The Markdown plugin emits blocks, the CSV plugin emits records. Both ship with the JavaScript SDK. Other formats need a plugin you install yourself. Without one, Lix still tracks the file but does not split it into rows, so its diff is the whole file.
 
 <img src="../website/public/assets/file-to-rows.svg" alt="A plugin maps /orders.csv to SQL rows with row, field, and value columns" width="760" />
 
-Application data that never touches a file works the same way. Register a
-[schema](./schemas.md) and its rows diff like any other row.
+Application data that never touches a file works the same way. Register a [schema](./schemas.md) and its rows diff like any other row.
 
 ## What this buys you
 

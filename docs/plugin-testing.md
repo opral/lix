@@ -1,36 +1,23 @@
 # Testing and maintaining file plugins
 
-The SDK provides helpers through `lix::plugin`. Plugins still implement the four
-`FileProjection` hooks explicitly. Incremental fallback remains a plugin decision:
-a full rebuild must preserve existing row identities, and warm calls intentionally
-avoid loading all accepted rows.
+The SDK provides helpers through `lix::plugin`. Plugins still implement the four `FileProjection` hooks explicitly. Incremental fallback remains a plugin decision: a full rebuild must preserve existing row identities, and warm calls intentionally avoid loading all accepted rows.
 
-For API evolution and frozen compiled compatibility fixtures, see
-[Plugin API compatibility](plugin-api-versioning.md).
+For API evolution and frozen compiled compatibility fixtures, see [Plugin API compatibility](plugin-api-versioning.md).
 
 ## Validated edits
 
-`EditSet` validates all edits against the length of the accepted file before any
-bytes are read or changed. Offsets refer to that original file, starts must be
-strictly increasing, and deletion ranges must not overlap. Adjacent edits are
-allowed; multiple insertions at the same offset must be combined by the caller.
+`EditSet` validates all edits against the length of the accepted file before any bytes are read or changed. Offsets refer to that original file, starts must be strictly increasing, and deletion ranges must not overlap. Adjacent edits are allowed; multiple insertions at the same offset must be combined by the caller.
 
 ```rust,ignore
 let edits = input.file_edits.validated(input.before.len())?;
 let first_bytes = edits.read_range(&input.before, 0, edits.len().min(128))?;
 ```
 
-`read_range` uses coordinates in the resulting file and reads only intersecting
-unchanged bytes from the snapshot. Inserted bytes come directly from the edits.
-`apply(&bytes)` materializes the complete resulting file when that is appropriate.
-The helper handles binary bytes; encoding, record boundaries, and syntax are
-still the plugin's responsibility. Use the same accepted snapshot used to
-validate the edit set; matching lengths alone cannot establish file identity.
+`read_range` uses coordinates in the resulting file and reads only intersecting unchanged bytes from the snapshot. Inserted bytes come directly from the edits. `apply(&bytes)` materializes the complete resulting file when that is appropriate. The helper handles binary bytes; encoding, record boundaries, and syntax are still the plugin's responsibility. Use the same accepted snapshot used to validate the edit set; matching lengths alone cannot establish file identity.
 
 ## Private state cleanup
 
-All four output types implement `StateOutput`. Shared helpers can accept
-`&mut impl StateOutput` without repeating an adapter trait in each plugin.
+All four output types implement `StateOutput`. Shared helpers can accept `&mut impl StateOutput` without repeating an adapter trait in each plugin.
 
 ```rust,ignore
 fn replace_index(output: &mut impl lix::plugin::StateOutput) -> lix::plugin::Result<()> {
@@ -39,19 +26,11 @@ fn replace_index(output: &mut impl lix::plugin::StateOutput) -> lix::plugin::Res
 }
 ```
 
-Prefix deletion includes accepted keys and writes staged earlier in the same
-transition. Later writes recreate keys. Like other state writes, deletion commits
-with the successful transition and rolls back on failure. Empty prefixes and
-prefixes overlapping the host's reserved state namespace are rejected. Include a
-separator in your namespace to avoid unintentionally matching similarly named
-keys. This is a cleanup operation for rebuilds, not a replacement for sparse
-updates on every edit.
+Prefix deletion includes accepted keys and writes staged earlier in the same transition. Later writes recreate keys. Like other state writes, deletion commits with the successful transition and rolls back on failure. Empty prefixes and prefixes overlapping the host's reserved state namespace are rejected. Include a separator in your namespace to avoid unintentionally matching similarly named keys. This is a cleanup operation for rebuilds, not a replacement for sparse updates on every edit.
 
 ## UUID lookup in private state
 
-`UuidIndex` provides a rebuildable, paged UUID-to-ordinal lookup used by text and
-Markdown. Build it from identities in document order; lookup returns that input
-ordinal even though the stored index is sorted by UUID.
+`UuidIndex` provides a rebuildable, paged UUID-to-ordinal lookup used by text and Markdown. Build it from identities in document order; lookup returns that input ordinal even though the stored index is sorted by UUID.
 
 ```rust,ignore
 use lix::plugin::UuidIndex;
@@ -60,14 +39,7 @@ UuidIndex::build(output, b"my-plugin/row-ids/", ids_in_document_order)?;
 let ordinal = UuidIndex::lookup(&input.before, b"my-plugin/row-ids/", row_id)?;
 ```
 
-The prefix must end in `/` and belong exclusively to this index. Building replaces
-all state beneath it and rejects duplicate UUIDs. Rebuild after inserts, deletes,
-or reorders; content-only edits leave this mapping unchanged. Builds materialize
-and sort all UUIDs, while point lookups use logarithmically many small state range
-reads. This helper does not maintain byte offsets or update itself after row
-changes. Missing indexes/IDs return `None`; malformed records return errors.
-Semantic rows and accepted bytes remain authoritative, so plugins must be able to
-rebuild the index when private state is absent.
+The prefix must end in `/` and belong exclusively to this index. Building replaces all state beneath it and rejects duplicate UUIDs. Rebuild after inserts, deletes, or reorders; content-only edits leave this mapping unchanged. Builds materialize and sort all UUIDs, while point lookups use logarithmically many small state range reads. This helper does not maintain byte offsets or update itself after row changes. Missing indexes/IDs return `None`; malformed records return errors. Semantic rows and accepted bytes remain authoritative, so plugins must be able to rebuild the index when private state is absent.
 
 ## Conformance expectations
 
@@ -81,20 +53,13 @@ For a plugin that promises lossless editing, test these properties:
 - Invalid or unrepresentable edits leave accepted bytes, rows, and state intact.
 - Repeated identical inputs produce identical outputs.
 
-Formatting hints can become stale after row edits. Normalize hints such as CSV
-quote flags against the new content before rendering. Preserve authoritative
-formatting information in durable rows or recover it from accepted bytes; do not
-depend on an index surviving cache eviction.
+Formatting hints can become stale after row edits. Normalize hints such as CSV quote flags against the new content before rendering. Preserve authoritative formatting information in durable rows or recover it from accepted bytes; do not depend on an index surviving cache eviction.
 
-Keep compiled-component integration tests as well: native tests do not verify
-the Wasm boundary, host schema validation, identity reconciliation, or SQL
-transactions.
+Keep compiled-component integration tests as well: native tests do not verify the Wasm boundary, host schema validation, identity reconciliation, or SQL transactions.
 
 ## Native projection driver
 
-`lix::plugin::testing::Harness<MyPlugin>` calls the four real `FileProjection`
-hooks with in-memory snapshots, typed row pages, and staged outputs. It is
-available on native targets without an additional feature flag.
+`lix::plugin::testing::Harness<MyPlugin>` calls the four real `FileProjection` hooks with in-memory snapshots, typed row pages, and staged outputs. It is available on native targets without an additional feature flag.
 
 ```rust,ignore
 use lix::plugin::{CreateContext, FileEdit};
@@ -121,81 +86,24 @@ let changed = driver.parse_changes(
 assert_eq!(changed.snapshot().bytes, b"World\n");
 ```
 
-`serialize` accepts complete `TypedRowRecord` values and an optional accepted
-snapshot. `serialize_changes` accepts sparse `TypedRowChange` values. Results
-expose decoded row changes, the row-replacement flag, emitted byte edits, and
-an optional complete file replacement. Inspect the staged successor with
-`snapshot()` and commit it with `into_snapshot()`. An error leaves the input
-snapshot unchanged, including state writes emitted before the error.
+`serialize` accepts complete `TypedRowRecord` values and an optional accepted snapshot. `serialize_changes` accepts sparse `TypedRowChange` values. Results expose decoded row changes, the row-replacement flag, emitted byte edits, and an optional complete file replacement. Inspect the staged successor with `snapshot()` and commit it with `into_snapshot()`. An error leaves the input snapshot unchanged, including state writes emitted before the error.
 
-For a cold incremental call, clear the snapshot's disposable `state` and pass
-complete accepted rows in `parse_changes`'s `cold_rows` argument. The driver
-intentionally does not maintain a database. `Transition::apply_to_rows` applies
-creates, upserts, deletes, and row replacement atomically to a small fixture vector.
-Supply a mapping from schema key to generated UUID primary-key column (or `None`
-for schemas without generated keys). It resolves creates using
-`creates.id(local_ref)`, fills the row's generated column, and rejects conflicting
-or duplicate create identities. It does not validate schemas, defaults, foreign
-keys, or the engine's identity authority. Use a new deterministic create namespace
-for each transition. The helper scans a small fixture vector; do not include it
-in large-document performance measurements.
+For a cold incremental call, clear the snapshot's disposable `state` and pass complete accepted rows in `parse_changes`'s `cold_rows` argument. The driver intentionally does not maintain a database. `Transition::apply_to_rows` applies creates, upserts, deletes, and row replacement atomically to a small fixture vector. Supply a mapping from schema key to generated UUID primary-key column (or `None` for schemas without generated keys). It resolves creates using `creates.id(local_ref)`, fills the row's generated column, and rejects conflicting or duplicate create identities. It does not validate schemas, defaults, foreign keys, or the engine's identity authority. Use a new deterministic create namespace for each transition. The helper scans a small fixture vector; do not include it in large-document performance measurements.
 
-See `plugins/text/src/tests.rs`'s
-`native_projection_lifecycle_resolves_ids_and_preserves_cold_edits` for import,
-exact restoration, row edit, warm/cold equivalence, identity stability, and rollback
-using these helpers. Its real SQL/Wasm companion is
-`packages/e2e/tests/git_text_plugin.rs`'s
-`sql_line_edits_survive_file_edits_reopen_and_history`, which also exercises
-insertion, deletion, schema defaults, history, and persisted reopen.
+See `plugins/text/src/tests.rs`'s `native_projection_lifecycle_resolves_ids_and_preserves_cold_edits` for import, exact restoration, row edit, warm/cold equivalence, identity stability, and rollback using these helpers. Its real SQL/Wasm companion is `packages/e2e/tests/git_text_plugin.rs`'s `sql_line_edits_survive_file_edits_reopen_and_history`, which also exercises insertion, deletion, schema defaults, history, and persisted reopen.
 
 ### Restoration and new rendering
 
-Test `serialize(..., Some(&accepted))` with the rows corresponding to that
-accepted snapshot for exact restoration. Test `serialize(..., None)` separately
-as rendering a new file: a plugin may canonicalize formatting or reject rows that
-lack necessary information. Equal semantic values do not prove byte preservation,
-and equal output bytes do not prove that semantic edits were honored. Change a
-semantic value, render it, and reparse it to check that stale lexical hints cannot
-restore the old value. Keep each plugin's documented formatting policy explicit;
-the driver does not impose one canonical spelling on every format.
+Test `serialize(..., Some(&accepted))` with the rows corresponding to that accepted snapshot for exact restoration. Test `serialize(..., None)` separately as rendering a new file: a plugin may canonicalize formatting or reject rows that lack necessary information. Equal semantic values do not prove byte preservation, and equal output bytes do not prove that semantic edits were honored. Change a semantic value, render it, and reparse it to check that stale lexical hints cannot restore the old value. Keep each plugin's documented formatting policy explicit; the driver does not impose one canonical spelling on every format.
 
 ### Structural performance assertions
 
-Each successful transition exposes `metrics`: actual file/state bytes read,
-state bytes written, file payload bytes written, emitted row-page bytes, and
-corresponding call counts. Missing state reads count as calls with zero bytes;
-state deletion counts as a write call with zero payload bytes. Counts exclude
-fixture setup, snapshot cloning, output decoding, and state keys. Row bytes
-include encoded pages and attachments, including in-page metadata. These counts
-measure native guest-facing I/O, not total host allocations or
-Wasm memory. Assert these counts for repeated point edits so regressions do not
-depend on machine speed, and profile latency and peak memory through the compiled
-SQL/Wasm harness as well.
+Each successful transition exposes `metrics`: actual file/state bytes read, state bytes written, file payload bytes written, emitted row-page bytes, and corresponding call counts. Missing state reads count as calls with zero bytes; state deletion counts as a write call with zero payload bytes. Counts exclude fixture setup, snapshot cloning, output decoding, and state keys. Row bytes include encoded pages and attachments, including in-page metadata. These counts measure native guest-facing I/O, not total host allocations or Wasm memory. Assert these counts for repeated point edits so regressions do not depend on machine speed, and profile latency and peak memory through the compiled SQL/Wasm harness as well.
 
-Additional examples live in `plugins/json/src/adapter_qa_tests.rs` and
-`plugins/excalidraw/src/qa_tests.rs`. They exercise composite and native primary
-keys, repeated edits, exact scalar/object spelling, and embedded files. JSON's
-row-edit contract supports scalar updates, insertion, deletion, reordering, moves,
-and scalar/container conversion. Scalar updates use small byte splices; structural
-batches rebuild the tree and stream a complete replacement, preserving unchanged
-scalar spelling and row identities. Invalid final trees reject the entire plugin
-call. Deleting a container requires deleting or moving its descendants in the same
-row batch; there is no implicit cascade.
+Additional examples live in `plugins/json/src/adapter_qa_tests.rs` and `plugins/excalidraw/src/qa_tests.rs`. They exercise composite and native primary keys, repeated edits, exact scalar/object spelling, and embedded files. JSON's row-edit contract supports scalar updates, insertion, deletion, reordering, moves, and scalar/container conversion. Scalar updates use small byte splices; structural batches rebuild the tree and stream a complete replacement, preserving unchanged scalar spelling and row identities. Invalid final trees reject the entire plugin call. Deleting a container requires deleting or moving its descendants in the same row batch; there is no implicit cascade.
 
-SQL projects each statement separately, including within `execute_batch`. Delete
-a subtree in one `DELETE` statement, and remove children before changing their
-parent's kind. Object keys are primary keys: rename them with a delete and insert.
-Valid existing key-layout hints adapt to the new key while preserving whitespace;
-empty-container whitespace hints are ignored after conversion to a scalar. Structural writes use normal
-row upsert semantics, so a later stale writer can recreate a deleted key. The
-plugin does not provide a separate deletion-wins concurrency policy.
+SQL projects each statement separately, including within `execute_batch`. Delete a subtree in one `DELETE` statement, and remove children before changing their parent's kind. Object keys are primary keys: rename them with a delete and insert. Valid existing key-layout hints adapt to the new key while preserving whitespace; empty-container whitespace hints are ignored after conversion to a scalar. Structural writes use normal row upsert semantics, so a later stale writer can recreate a deleted key. The plugin does not provide a separate deletion-wins concurrency policy.
 
-The harness uses a conservative 1 MiB batch limit by default. Set
-`driver.max_batch_bytes = 2 * 1024 * 1024` to match the standard runtime page
-budget when testing large state pages or embedded files. Cold-file admission can
-raise the real host's budget further. The native driver checks per-operation
-limits, while compiled-component tests cover the complete host budget.
+The harness uses a conservative 1 MiB batch limit by default. Set `driver.max_batch_bytes = 2 * 1024 * 1024` to match the standard runtime page budget when testing large state pages or embedded files. Cold-file admission can raise the real host's budget further. The native driver checks per-operation limits, while compiled-component tests cover the complete host budget.
 
-For the Excalidraw SQL row contract, formatting hints, and compiled large-scene
-qualification, see [Excalidraw rows and editing](plugin-excalidraw.md) and
-[Excalidraw performance](performance/excalidraw.md).
+For the Excalidraw SQL row contract, formatting hints, and compiled large-scene qualification, see [Excalidraw rows and editing](plugin-excalidraw.md) and [Excalidraw performance](performance/excalidraw.md).

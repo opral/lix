@@ -4,10 +4,7 @@ description: Export and restore a complete Lix for reproduction, transfer, and r
 
 # Snapshots
 
-A Lix snapshot is a point-in-time copy of the state held by a Lix handle. It is
-a binary artifact with the extension `.lixsnap`. A local partial replica exports
-its resident inputs and pending edits, explicitly marked as partial. A remote
-handle or standalone repository exports the complete repository.
+A Lix snapshot is a point-in-time copy of the state held by a Lix handle. It is a binary artifact with the extension `.lixsnap`. A local partial replica exports its resident inputs and pending edits, explicitly marked as partial. A remote handle or standalone repository exports the complete repository.
 
 Use a snapshot to:
 
@@ -19,8 +16,7 @@ Use a snapshot to:
 
 ## Snapshot versus checkpoint
 
-A [checkpoint](./checkpoints.md) is a meaningful version inside Lix history. A
-snapshot is a portable copy outside Lix.
+A [checkpoint](./checkpoints.md) is a meaningful version inside Lix history. A snapshot is a portable copy outside Lix.
 
 | | Checkpoint | Snapshot |
 | --- | --- | --- |
@@ -28,34 +24,21 @@ snapshot is a portable copy outside Lix.
 | Scope | One version on a branch | All branches, history, data, and blobs |
 | Use | Review, undo, and version history | Reproduction, transfer, and recovery |
 
-Creating a snapshot does not create a commit or checkpoint. Restoring one does
-not merge new history into an existing Lix.
+Creating a snapshot does not create a commit or checkpoint. Restoring one does not merge new history into an existing Lix.
 
 ## What a snapshot contains
 
-Lix opens one coherent read and exports every registered logical storage
-space. This includes files, application rows, schemas, branches, history,
-blobs, untracked rows, and engine-owned state.
+Lix opens one coherent read and exports every registered logical storage space. This includes files, application rows, schemas, branches, history, blobs, untracked rows, and engine-owned state.
 
-Creating a hosted repository from an existing Lix uses this same snapshot
-contract. Untracked rows are preserved in `.lixsnap` files and hosted copies.
-The host-local authority fence is excluded; active sessions are not transferred.
+Creating a hosted repository from an existing Lix uses this same snapshot contract. Untracked rows are preserved in `.lixsnap` files and hosted copies. The host-local authority fence is excluded; active sessions are not transferred.
 
-It does not contain inactive migration data, backend WALs or caches, active
-sessions or transactions, server configuration, or transport credentials.
-Application data stored in rows is included, even when marked untracked.
-The container adds no export timestamp, hostname, Lix name, random
-identifier, or exporter metadata, so equal logical states produce equal bytes.
+It does not contain inactive migration data, backend WALs or caches, active sessions or transactions, server configuration, or transport credentials. Application data stored in rows is included, even when marked untracked. The container adds no export timestamp, hostname, Lix name, random identifier, or exporter metadata, so equal logical states produce equal bytes.
 
-The artifact describes logical Lix data, not the physical layout of RocksDB,
-SlateDB, OPFS, or another adapter. Use backend-native tooling when physical
-storage itself needs forensic recovery.
+The artifact describes logical Lix data, not the physical layout of RocksDB, SlateDB, OPFS, or another adapter. Use backend-native tooling when physical storage itself needs forensic recovery.
 
 ## Exporting in Rust
 
-`export_snapshot()` returns a builder. Its only terminal operation streams the
-snapshot to an async writer. Publish backup files through a temporary sibling
-so an interrupted export never appears under the final `.lixsnap` name:
+`export_snapshot()` returns a builder. Its only terminal operation streams the snapshot to an async writer. Publish backup files through a temporary sibling so an interrupted export never appears under the final `.lixsnap` name:
 
 ```rust
 use futures_lite::io::AsyncWriteExt as _;
@@ -80,11 +63,7 @@ let parent = async_fs::File::open(final_path.parent().unwrap_or(Path::new(".")))
 parent.sync_all().await?;
 ```
 
-The temporary file must be in the same directory as the final file for the
-rename to be atomic. Give concurrent exports distinct temporary names, ignore
-`.part` files when discovering backups, and remove abandoned temporary files
-after a failed export. On platforms without directory fsync, use the platform's
-equivalent durable-publication primitive.
+The temporary file must be in the same directory as the final file for the rename to be atomic. Give concurrent exports distinct temporary names, ignore `.part` files when discovering backups, and remove abandoned temporary files after a failed export. On platforms without directory fsync, use the platform's equivalent durable-publication primitive.
 
 For a bounded test fixture, a `Vec<u8>` is also an async writer:
 
@@ -96,8 +75,7 @@ lix.export_snapshot()
     .await?;
 ```
 
-Visible committed state is the default. Backup tooling can require data that
-has crossed the adapter's durable-read boundary:
+Visible committed state is the default. Backup tooling can require data that has crossed the adapter's durable-read boundary:
 
 ```rust
 use lix::storage::ReadDurability;
@@ -108,11 +86,9 @@ lix.export_snapshot()
     .await?;
 ```
 
-An adapter that cannot provide the requested durability fails the export. Lix
-does not flush or mutate the source to manufacture durability.
+An adapter that cannot provide the requested durability fails the export. Lix does not flush or mutate the source to manufacture durability.
 
-`SnapshotExportReport` returns the entry count, canonical payload byte count,
-and BLAKE3 digest written into the snapshot trailer.
+`SnapshotExportReport` returns the entry count, canonical payload byte count, and BLAKE3 digest written into the snapshot trailer.
 
 ## Restoring and opening in Rust
 
@@ -140,21 +116,13 @@ let restored = lix::open_lix()
     .await?;
 ```
 
-The destination must be empty of every known Lix-owned logical space,
-including retired spaces. Lix verifies the complete stream, writes into an
-unpublished storage epoch, publishes it atomically, applies any supported
-format migration, and then opens it. It never merges a snapshot into or
-overwrites an existing Lix.
+The destination must be empty of every known Lix-owned logical space, including retired spaces. Lix verifies the complete stream, writes into an unpublished storage epoch, publishes it atomically, applies any supported format migration, and then opens it. It never merges a snapshot into or overwrites an existing Lix.
 
-There is deliberately no `lix.import_snapshot()`. Replacing storage under a
-live handle would invalidate active sessions, transactions, observers, and
-caches. To persist a restored in-memory Lix after changing it, export a new
-snapshot and restore that artifact into a fresh persistent destination.
+There is deliberately no `lix.import_snapshot()`. Replacing storage under a live handle would invalidate active sessions, transactions, observers, and caches. To persist a restored in-memory Lix after changing it, export a new snapshot and restore that artifact into a fresh persistent destination.
 
 ## JavaScript
 
-The JavaScript API uses standard web streams and keeps the same small public
-surface in browsers and Node.js:
+The JavaScript API uses standard web streams and keeps the same small public surface in browsers and Node.js:
 
 ```ts
 const snapshot = lix.exportSnapshot();
@@ -178,10 +146,7 @@ const restored = await openLix.fromSnapshot(snapshotStream, {
 });
 ```
 
-`openLix.fromSnapshot()` also accepts a `Uint8Array` for bounded fixtures. It
-rejects `server` and any destination that already contains
-a Lix. There is no separate byte-array export method; bounded callers can use
-standard APIs such as `new Response(lix.exportSnapshot()).arrayBuffer()`.
+`openLix.fromSnapshot()` also accepts a `Uint8Array` for bounded fixtures. It rejects `server` and any destination that already contains a Lix. There is no separate byte-array export method; bounded callers can use standard APIs such as `new Response(lix.exportSnapshot()).arrayBuffer()`.
 
 ## Remote export
 
@@ -193,68 +158,26 @@ Authorization: Bearer <access-token>
 Accept: application/vnd.lix.snapshot
 ```
 
-The response is a backpressured `application/vnd.lix.snapshot` stream with
-`Cache-Control: no-store, no-transform`. Snapshot export requires an
-authenticated host principal even when selected files from the Lix are public.
-`lix.exportSnapshot()` on a remote handle streams this authoritative snapshot.
-On a local partial replica, the same call streams the local cache, pending edits,
-and replica receipts without contacting the server. This works offline and
-preserves differences between the local and remote views for reproduction.
-Partial exports do not contain inputs that have never been fetched, so they are
-not complete backups. Restore them into fresh durable storage to reopen the
-same partial replica offline; resident queries use the captured inputs, and
-missing inputs still require the authenticated authority. Export the remote
-handle separately when a complete repository snapshot is needed.
+The response is a backpressured `application/vnd.lix.snapshot` stream with `Cache-Control: no-store, no-transform`. Snapshot export requires an authenticated host principal even when selected files from the Lix are public. `lix.exportSnapshot()` on a remote handle streams this authoritative snapshot. On a local partial replica, the same call streams the local cache, pending edits, and replica receipts without contacting the server. This works offline and preserves differences between the local and remote views for reproduction. Partial exports do not contain inputs that have never been fetched, so they are not complete backups. Restore them into fresh durable storage to reopen the same partial replica offline; resident queries use the captured inputs, and missing inputs still require the authenticated authority. Export the remote handle separately when a complete repository snapshot is needed.
 
-Create a new hosted repository from a snapshot with `POST /lix/v1`, using
-`Content-Type: application/vnd.lix.snapshot` and an `Idempotency-Key` header.
-The SDK's `createLix({ server, from: localLix })` streams the same payload;
-Rust also accepts a snapshot reader with `create_lix().from_snapshot(reader)`.
-Creation never overwrites an existing hosted repository. See the
-[server protocol](./server-protocol.md) for the lifecycle contract.
+Create a new hosted repository from a snapshot with `POST /lix/v1`, using `Content-Type: application/vnd.lix.snapshot` and an `Idempotency-Key` header. The SDK's `createLix({ server, from: localLix })` streams the same payload; Rust also accepts a snapshot reader with `create_lix().from_snapshot(reader)`. Creation never overwrites an existing hosted repository. See the [server protocol](./server-protocol.md) for the lifecycle contract.
 
 ## Consistency, integrity, and format
 
-One coherent read covers the full export. A concurrent commit is included
-completely or excluded completely. Given the same logical state, durability,
-and format version, export produces byte-identical artifacts.
+One coherent read covers the full export. A concurrent commit is included completely or excluded completely. Given the same logical state, durability, and format version, export produces byte-identical artifacts.
 
-The binary `LIXSNAP` version 1 container records its container version, Lix
-format version, canonical entries, entry count, payload byte count, checksum
-algorithm identifier, and BLAKE3 digest. Header flag bit 0 marks a partial replica;
-complete snapshots keep flags zero. Older readers reject the partial flag. Restore
-validates the flag against the repository marker and replica receipt, so a partial
-artifact cannot be admitted as a complete standalone repository. Restore rejects corruption,
-truncation, invalid lengths, duplicate or out-of-order entries, unknown
-versions or algorithms, and trailing data.
+The binary `LIXSNAP` version 1 container records its container version, Lix format version, canonical entries, entry count, payload byte count, checksum algorithm identifier, and BLAKE3 digest. Header flag bit 0 marks a partial replica; complete snapshots keep flags zero. Older readers reject the partial flag. Restore validates the flag against the repository marker and replica receipt, so a partial artifact cannot be admitted as a complete standalone repository. Restore rejects corruption, truncation, invalid lengths, duplicate or out-of-order entries, unknown versions or algorithms, and trailing data.
 
-Logical space identifiers and their storage semantics form an append-only wire
-registry. New identifiers may be added, but an identifier emitted by a
-snapshot is never removed or reused, even after its space is retired from the
-current layout. This lets a future engine decode the old bytes before applying
-the migration selected by the embedded Lix format version.
+Logical space identifiers and their storage semantics form an append-only wire registry. New identifiers may be added, but an identifier emitted by a snapshot is never removed or reused, even after its space is retired from the current layout. This lets a future engine decode the old bytes before applying the migration selected by the embedded Lix format version.
 
-The v1 decoder accepts at most 10 million entries and 64 GiB of canonical
-payload, with individual keys limited to 16 MiB and values to 256 MiB. These
-bounds make malformed or unexpectedly large inputs fail as
-`LIX_INVALID_SNAPSHOT` instead of exhausting memory. Larger Lixes need a future
-container version or a deliberately revised implementation limit.
+The v1 decoder accepts at most 10 million entries and 64 GiB of canonical payload, with individual keys limited to 16 MiB and values to 256 MiB. These bounds make malformed or unexpectedly large inputs fail as `LIX_INVALID_SNAPSHOT` instead of exhausting memory. Larger Lixes need a future container version or a deliberately revised implementation limit.
 
-The digest detects accidental corruption; it does not authenticate who made
-the artifact. A snapshot can contain current data and deleted content retained
-in history, so protect it like the source data.
+The digest detects accidental corruption; it does not authenticate who made the artifact. A snapshot can contain current data and deleted content retained in history, so protect it like the source data.
 
-`LIXSNAP` is the only supported snapshot family. The earlier Memory-specific
-`LIXMEM` test encoding is intentionally not accepted.
+`LIXSNAP` is the only supported snapshot family. The earlier Memory-specific `LIXMEM` test encoding is intentionally not accepted.
 
 ## Snapshots and backups
 
-A `.lixsnap` file can be a full backup artifact, but export alone is not a
-backup system. Production recovery also requires scheduling, retention,
-encryption, access control, independent storage, monitoring, and restore
-drills.
+A `.lixsnap` file can be a full backup artifact, but export alone is not a backup system. Production recovery also requires scheduling, retention, encryption, access control, independent storage, monitoring, and restore drills.
 
-Version 1 does not provide incremental backups, point-in-time log replay,
-compression, encryption, signing, automatic upload, or restore over a live
-Lix. Those features can be added around or alongside the stable full-snapshot
-format when operational demand justifies them.
+Version 1 does not provide incremental backups, point-in-time log replay, compression, encryption, signing, automatic upload, or restore over a live Lix. Those features can be added around or alongside the stable full-snapshot format when operational demand justifies them.

@@ -4,14 +4,9 @@ description: Run Lix against the official host at lixray.com, or host Lixes your
 
 # Hosting
 
-A hosted Lix lives on a server. The server owns its storage and
-authentication. Clients can execute directly on the server or keep a
-synchronized local replica.
+A hosted Lix lives on a server. The server owns its storage and authentication. Clients can execute directly on the server or keep a synchronized local replica.
 
-A service can access the repository through SDK calls, an agent sandbox can
-synchronize a filesystem directory, and a browser can keep a local replica in
-OPFS. All three connect to the same server. See the
-[setup examples](./persistence.md) for client configuration and storage adapters.
+A service can access the repository through SDK calls, an agent sandbox can synchronize a filesystem directory, and a browser can keep a local replica in OPFS. All three connect to the same server. See the [setup examples](./persistence.md) for client configuration and storage adapters.
 
 There are two ways to get a server:
 
@@ -24,22 +19,13 @@ Both speak the same protocol. Only the URL changes in client code.
 
 ## Create and delete repositories
 
-Use `createLix({ server: { url: hostOrigin, headers } })` to create a hosted
-repository programmatically. It returns `{ id, url }`; pass `url` to
-`openLix({ server: { url, headers } })`. Add `storage` and explicitly set `server.mode: "partial_replica"` to keep a
-partial replica with on-demand sync. Omitting the mode defaults to remote SQL
-and does not accept client storage.
+Use `createLix({ server: { url: hostOrigin, headers } })` to create a hosted repository programmatically. It returns `{ id, url }`; pass `url` to `openLix({ server: { url, headers } })`. Add `storage` and explicitly set `server.mode: "partial_replica"` to keep a partial replica with on-demand sync. Omitting the mode defaults to remote SQL and does not accept client storage.
 
-`createLix({ server, from: localLix })` creates a point-in-time copy including
-history and untracked rows. It does not connect the source handle. Use
-`deleteLix({ server: { url, headers } })` to delete the hosted repository;
-closing a session does not delete it. See the
-[API reference](./js-api-reference.md#hosted-repository-lifecycle).
+`createLix({ server, from: localLix })` creates a point-in-time copy including history and untracked rows. It does not connect the source handle. Use `deleteLix({ server: { url, headers } })` to delete the hosted repository; closing a session does not delete it. See the [API reference](./js-api-reference.md#hosted-repository-lifecycle).
 
 ## Official host: lixray.com
 
-[LixRay](https://lixray.com) is the official Lix host. Copy the immutable Lix
-connection URL and pass it to `openLix()`:
+[LixRay](https://lixray.com) is the official Lix host. Copy the immutable Lix connection URL and pass it to `openLix()`:
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -54,19 +40,13 @@ const lix = await openLix({
 });
 ```
 
-The connection URL is an absolute HTTPS URL whose path is exactly
-`/lix/{uuid}`. HTTP is accepted only for loopback development. It carries no
-query, fragment, credentials, or deployment-path prefix. Human-readable
-namespace and project URLs are separate web-page addresses, not Lix connection
-URLs.
+The connection URL is an absolute HTTPS URL whose path is exactly `/lix/{uuid}`. HTTP is accepted only for loopback development. It carries no query, fragment, credentials, or deployment-path prefix. Human-readable namespace and project URLs are separate web-page addresses, not Lix connection URLs.
 
-Files, SQL, branches, history, and `observe()` work the same way they do
-locally. See [Collaboration](./collaboration-and-sync.md).
+Files, SQL, branches, history, and `observe()` work the same way they do locally. See [Collaboration](./collaboration-and-sync.md).
 
 ## Host it yourself
 
-Companies that must keep repositories on their own infrastructure can run their
-own host. There are three interoperable approaches:
+Companies that must keep repositories on their own infrastructure can run their own host. There are three interoperable approaches:
 
 1. Deploy the ready-made [Lix reference server](https://github.com/opral/lix/tree/main/packages/server)
    behind your authentication gateway.
@@ -74,17 +54,11 @@ own host. There are three interoperable approaches:
 3. Implement the documented Lix Server Protocol independently in another
    language or architecture.
 
-The reference server is a supported example, not the protocol authority. Every
-compatible implementation exposes the same wire contract to clients.
+The reference server is a supported example, not the protocol authority. Every compatible implementation exposes the same wire contract to clients.
 
 ### Deploy the reference server
 
-The reference server uses SlateDB and S3-compatible object storage and is
-published as `ghcr.io/opral/lix-server`. It provides runtime pooling, caching,
-stream leases, timeouts, and graceful recovery. Authentication, authorization,
-and resource-existence policy remain the responsibility of a trusted gateway.
-See its [README](https://github.com/opral/lix/tree/main/packages/server) for configuration and security
-requirements.
+The reference server uses SlateDB and S3-compatible object storage and is published as `ghcr.io/opral/lix-server`. It provides runtime pooling, caching, stream leases, timeouts, and graceful recovery. Authentication, authorization, and resource-existence policy remain the responsibility of a trusted gateway. See its [README](https://github.com/opral/lix/tree/main/packages/server) for configuration and security requirements.
 
 ### Embed the Rust handler
 
@@ -120,49 +94,30 @@ let context = ServerProtocolContext {
 let response = protocol.handle(request, context).await;
 ```
 
-`with_lix_id` binds the host's stable resource UUID. It can differ from the
-portable identity stored inside a restored snapshot. The protocol validates
-that every request targets this bound UUID.
+`with_lix_id` binds the host's stable resource UUID. It can differ from the portable identity stored inside a restored snapshot. The protocol validates that every request targets this bound UUID.
 
-`request` is a `ServerProtocolRequest`, which is
-`http::Request<ServerProtocolBody>`. The response is
-`http::Response<ServerProtocolBody>`. Converting your framework's body type into
-`ServerProtocolBody` is the only adapter code you write.
+`request` is a `ServerProtocolRequest`, which is `http::Request<ServerProtocolBody>`. The response is `http::Response<ServerProtocolBody>`. Converting your framework's body type into `ServerProtocolBody` is the only adapter code you write.
 
 Your host is responsible for three things:
 
 1. **Authenticate the request** and choose a principal. The protocol does not
-   read tokens, cookies, or certificates. Never derive an `account_id` from an
-   unverified header.
+   read tokens, cookies, or certificates. Never derive an `account_id` from an unverified header.
 2. **Resolve the Lix** identified by `{lix_id}` without creating an unknown
-   target. Pass the complete root `/lix/v1/{lix_id}/...` request to the
-   protocol; it validates the immutable ID before dispatch. If your product is
-   mounted below a deployment prefix, strip that prefix at the reverse-proxy
-   boundary before dispatch. SDK connection locators themselves never contain
-   a deployment prefix.
+   target. Pass the complete root `/lix/v1/{lix_id}/...` request to the protocol; it validates the immutable ID before dispatch. If your product is mounted below a deployment prefix, strip that prefix at the reverse-proxy boundary before dispatch. SDK connection locators themselves never contain a deployment prefix.
 3. **Forward the request and the response.** Preserve protocol status codes,
-   headers, and body bytes. Keep the Lix runtime alive until every streaming
-   response body closes, including server-sent events (SSE) and snapshot
-   downloads.
+   headers, and body bytes. Keep the Lix runtime alive until every streaming response body closes, including server-sent events (SSE) and snapshot downloads.
 
-Use `ServerProtocolPrincipal::Anonymous` only where you deliberately allow
-anonymous access. Reject bad credentials with `401` before dispatch. Call
-`LixServerProtocol::close()` on shutdown.
+Use `ServerProtocolPrincipal::Anonymous` only where you deliberately allow anonymous access. Reject bad credentials with `401` before dispatch. Call `LixServerProtocol::close()` on shutdown.
 
 Clients connect exactly as they do to lixray.com. Only the URL changes.
 
-The SDK accepts `https://host/lix/{lix_id}`, derives the versioned API URL,
-opens a session, and reconnects observation streams on its own. HTTPS is
-required except for HTTP loopback addresses used in local development.
+The SDK accepts `https://host/lix/{lix_id}`, derives the versioned API URL, opens a session, and reconnects observation streams on its own. HTTPS is required except for HTTP loopback addresses used in local development.
 
-For the wire format, session behavior, and the OpenAPI document, see
-[Lix Server Protocol](./server-protocol.md).
+For the wire format, session behavior, and the OpenAPI document, see [Lix Server Protocol](./server-protocol.md).
 
 ### Storage on your own host
 
-The host chooses where bytes live. `SlateDB` stores a repository on
-S3-compatible object storage; `RocksDB` stores it on a local disk. Clients never
-configure this:
+The host chooses where bytes live. `SlateDB` stores a repository on S3-compatible object storage; `RocksDB` stores it on a local disk. Clients never configure this:
 
 ```text
 JS client ── HTTP ──▶ your Lix server ──▶ SlateDB ──▶ S3
