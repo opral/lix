@@ -45,3 +45,31 @@ storage.start_sync(&lix).await?;
 The storage owns synchronization until `storage.stop_sync().await?` or until
 the final storage/repository instance is dropped. Explicitly stopping is useful
 for tests and before immediately reopening the same path.
+
+## Mirror write guarantees
+
+File content updates are staged in the destination directory and atomically
+replace that file. A reader opening the destination sees either the complete old
+contents or the complete new contents, never an intermediate write. Replacement
+failure leaves the previous file in place. This guarantee is per file, not per
+transaction or directory, and relies on the filesystem's atomic rename support.
+Existing open readers may continue reading the old file.
+
+The mirror does not fsync file contents or directory entries. A successful mirror
+write is not a power-loss durability guarantee; the repository's durability
+policy applies to the database. Startup synchronization reads disk changes first,
+so after an interrupted synchronization an older complete mirror can be imported
+as a new repository change. Atomic replacement does not resolve that recovery
+ambiguity or provide a durable mirror checkpoint.
+
+Names matching `.lix-mirror-<16 ASCII letters or digits>.tmp` are reserved for
+staging and excluded from synchronization, including explicit imports. Normal
+failures clean them up immediately; directory scans remove abandoned regular
+staging files left by process termination on a best-effort basis. Selective
+synchronization does not scan unrelated directories for cleanup.
+
+Replacement preserves existing file permission bits and uses ordinary creation
+permissions for new files. It replaces the file identity: hard links and existing
+open handles retain the old file, and ownership, ACLs, and extended attributes are
+not copied. Filesystems or Windows handles that prevent replacement cause an
+error; there is no fallback to truncating the destination.
