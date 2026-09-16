@@ -49,6 +49,9 @@ substantive experiments against the latest accepted stack.
 | --- | --- | --- | ---: |
 | E00 | Known-dependency oracle, 64 checkpoints | Dense: 394 → 14 fetches, 12,359 → 64 diff plans. Sparse (1/8 checkpoints relevant): 226 → 8 fetches, 7,032 → 64 diff plans. Three runs, equal ordered rows and payload per pair. Diagnostic only: address discovery excluded. Not an accepted implementation. | 0 |
 | E01 | Preserve credential verification on canceled requests | Chromium SharedWorker, real HTTP/RPC with stub engine: initial attachment plus five canceled requests used 6 admissions before, 1 after (83.3% less). Rotation, identity drift, rejection and offline behavior remain covered. Accepted correctness + deterministic request reduction; no production-latency claim. | 0 |
-| E02 | Public awaited-history baseline and opening controls | In progress. Must include real sync worker, canonical authority protocol and fresh replicas; no oracle address list or caller hydration loop. | 0 |
+| E02 | Public awaited-history baseline and opening controls | Canonical HTTP authority + RocksDB replica: dense64 uses 381 native requests; sparse64 uses 213. Ordered results match the authority and warm reads work offline. Opening uses two requests and zero native reads, including 16,000 unrelated files and an unopened 8 MiB blob. Diagnostic unoptimized timing includes a retained 30-second deadline failure; optimized paired timing follows. See [benchmark method](public-history-benchmark.md). | 0 |
 
 PRs are drafts and stacked. Nothing is deployed or merged by this series.
+
+First accepted implementation: [Lix #1810](https://github.com/opral/lix/pull/1810).
+Related UI bug fix: [Atelier #174](https://github.com/opral/atelier/pull/174).

@@ -553,3 +553,9 @@ required-features = ["plugin-tests"]
 name = "plugin_file_observation"
 path = "tests/plugin_file_observation.rs"
 required-features = ["plugin-tests"]
+
+[[bench]]
+name = "partial_replica_history"
+path = "benches/partial_replica_history.rs"
+harness = false
+required-features = ["server-protocol", "rocksdb"]
