@@ -1,14 +1,37 @@
 # Changelog
 
-## Unreleased
+## 0.17.0 - 2026-09-16
+
+### Partial replicas with on-demand sync
+
+Open a repository without downloading it in full. Lix fetches the data your SQL queries need and keeps it locally. Reads and writes whose required data is already available run locally, including offline, while background sync uploads your edits and keeps loaded data up to date.
+
+Enable this with local storage and `server.mode: "partial_replica"`. Run a query ahead of an interaction to prefetch its data—there is no separate preparation API. Browser tabs share cached data and offline edits, and previously opened replicas can reopen offline.
+
+See [on-demand sync](docs/partial-replica-on-demand-sync.md) for usage and [replica migration](docs/partial-replica-migration.md) for converting existing replicas.
+
+### Improvements
+
+- File diffs and history return `from_content` and `to_content`. `lix_as_of` and `lix_diff` accept scalar subqueries for commit IDs, saving a separate lookup.
+- SQL `RETURNING` supports `OLD` and `NEW` row values. `UPDATE` supports expressions such as `replace`, `concat`, and `coalesce`.
+- Control automatic transaction retries with JavaScript's `maxAutoCommitRetries` or Rust's `with_max_auto_commit_retries`.
+- Faster localized JSON, Markdown, and text edits. JSON preserves duplicate object keys and handles deeply nested documents.
+- Inspect synchronization progress with JavaScript's `syncHealth()` or Rust's `sync_health()`.
 
 ### Fixes
 
-- Partial replicas now recover expired baselines and reconcile pending changes inside awaited SQL operations. Unsupported local changes can yield to the authoritative server after outstanding merge attempts are fenced.
+- Fixed missing query results after large bulk writes, including translation compilation falling back to message keys after large inlang imports.
+- Improved browser replica upgrades, reconnects, and concurrent-tab reliability.
+- Filesystem mirror updates replace each file atomically, so readers no longer see partially written contents.
 
 ### Upgrade notes
 
-- Upgrade the SDK and server together to sync protocol 16. It adds active-attempt abandonment for automatic recovery; older peers fail protocol negotiation. The repository storage format remains 81.
+- Upgrade the SDK and server together: this release uses sync protocol **17** and storage format **81**. Supported older server repositories upgrade during opening, with progress available through `onProgress`. For local repository migration and replica conversion, follow the [migration guide](docs/partial-replica-migration.md).
+- Replace `server.mode: "sync"` with `"partial_replica"` when using client storage. The default mode is `"remote"`, which rejects client storage.
+- `executeBatch()` now returns `{ results, commit }` instead of an array. Explicit transaction `commit()` returns `{ commit }`; individual statements carry no receipt. Retry the entire explicit transaction when concurrent branch changes invalidate its reads.
+- Diff and history no longer return `row_count`; use `COUNT(*)`. Merge previews no longer include the unused `conflicts` field.
+- JSON rows add an `occurrence` primary-key column for duplicate keys, defaulting to zero. Excalidraw uses `scene_json` for root metadata; edit element type and deletion state in `element_json` instead of the removed `element_type` and `is_deleted` columns.
+- Custom JavaScript HTTP transports must use the typed request/response contract. Server lifecycle error codes drop the redundant second `LIX`; unsupported storage formats use `LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT`. Update code that matches the old names.
 
 ## 0.16.1 - 2026-09-11
 
