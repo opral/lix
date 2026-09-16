@@ -411,4 +411,3 @@ export type SyncHealth = {
 	failures: Partial<Record<"descriptor" | "publication" | "upload" | "lease", { code: string; message: string }>>;
 	terminalError: { code: string; message: string } | null;
 };
-
