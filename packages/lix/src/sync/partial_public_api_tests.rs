@@ -16,12 +16,23 @@ struct ExpiringClient {
     server: LixServerProtocol<Memory>,
     lease: Arc<std::sync::Mutex<String>>,
     expire: Arc<AtomicBool>,
+    lose_session: Arc<AtomicBool>,
     fetches: Arc<AtomicUsize>,
     live_updates: Option<Arc<AtomicBool>>,
 }
 impl RawHttpClient for ExpiringClient {
     fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
         Box::pin(async move {
+            if self.lose_session.swap(false, Ordering::SeqCst) {
+                let session = request.headers.iter().find(|(k,_)| k == "lix-session-id").unwrap().1.clone();
+                let base = request.url.split("/sync/").next().unwrap();
+                let response = self.server.handle(http::Request::builder()
+                    .method("DELETE").uri(format!("{base}/session"))
+                    .header("lix-server-protocol-version", crate::SERVER_PROTOCOL_VERSION.to_string())
+                    .header("lix-session-id", session)
+                    .body(ServerProtocolBody::from(Vec::new())).unwrap(), ServerProtocolContext::anonymous()).await;
+                assert_eq!(response.status(), 204);
+            }
             if request.url.ends_with("/sync/update") {
                 match &self.live_updates {
                     Some(enabled) => while !enabled.load(Ordering::SeqCst) {
@@ -142,7 +153,7 @@ async fn recovery(dirty: bool, advanced: bool, transaction: usize) {
         authority.execute("INSERT INTO lix_key_value(key,value) VALUES('edit','before')", &[]).await.unwrap();
         authority.upsert_file_content("/cold.bin", if transaction == 2 { vec![42u8; 5 * 1024 * 1024] } else { b"cold contents".to_vec() }).await.unwrap();
         let server = open_lix().with_storage(backing).serve().with_embedded_lix_id().await.unwrap();
-        let client = ExpiringClient { server, lease: Arc::default(), expire: Arc::default(), fetches: Arc::default(), live_updates: None };
+        let client = ExpiringClient { server, lease: Arc::default(), expire: Arc::default(), lose_session: Arc::default(), fetches: Arc::default(), live_updates: None };
         let transport = HttpSyncTransport::connect_with(client.clone(), &format!("https://example.test/lix/{}", authority.lix_id())).await.unwrap();
         let wrapper = transport.partial_replica_descriptor(None).await.unwrap();
         let old = Arc::new(PartialReplicaState::from_leased(
@@ -170,6 +181,7 @@ async fn recovery(dirty: bool, advanced: bool, transaction: usize) {
             if dirty { lix.execute("UPDATE lix_key_value SET value='local' WHERE key='edit'", &[]).await.unwrap(); }
             if advanced { authority_sql(&client.server, authority.lix_id(), None, "UPDATE lix_key_value SET value='remote' WHERE key='edit'").await; }
             client.expire.store(transaction == 0, Ordering::SeqCst);
+            client.lose_session.store(transaction == 7, Ordering::SeqCst);
             if transaction == 6 {
                 let mut retry = crate::sync::SyncDemandRetry::default();
                 loop {
@@ -292,4 +304,9 @@ async fn public_transaction_hydrates_cold_file_write_and_commits() {
 #[tokio::test]
 async fn public_sql_settles_frozen_selected_upload_despite_global_divergence() {
     Box::pin(recovery(true, false, 6)).await;
+}
+
+#[tokio::test]
+async fn public_sql_recovers_lost_session_with_unsynced_local_edits() {
+    Box::pin(recovery(true, false, 7)).await;
 }

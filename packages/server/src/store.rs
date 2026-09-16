@@ -966,6 +966,46 @@ impl LixRuntimeManager {
         });
     }
 
+    /// Admit only a currently registered session. Keep the eviction lock until
+    /// validation and pinning finish; invalid requests never clone the runtime,
+    /// reset its idle clock, query the catalog, or start an opener.
+    pub(crate) async fn get_session_runtime(
+        &self,
+        lix_id: &str,
+        admission: &lix_sdk::server_protocol::ServerProtocolRuntimeAdmission,
+        principal: &lix_sdk::server_protocol::ServerProtocolPrincipal,
+    ) -> Result<Arc<LixService>, ServerProtocolResponse> {
+        let lifecycle = self.lifecycle_lock(lix_id).await;
+        let _lifecycle = lifecycle.read_owned().await;
+        let mut state = self.state.lock().await;
+        if state.shutting_down {
+            return Err(admission.missing_runtime_response());
+        }
+        let runtime = {
+            let Some(entry) = state.entries.get(lix_id) else {
+                return Err(admission.missing_runtime_response());
+            };
+            let Some(runtime) = entry.runtime.get() else {
+                return Err(admission.missing_runtime_response());
+            };
+            let runtime_state = runtime.state.lock().await;
+            let LixRuntimeState::Active(service) = &*runtime_state else {
+                return Err(admission.missing_runtime_response());
+            };
+            service
+                .protocol
+                .validate_runtime_admission(admission, principal)
+                .await?;
+            Arc::clone(service)
+        };
+        state.clock = state.clock.wrapping_add(1);
+        let now = state.clock;
+        let entry = state.entries.get_mut(lix_id).expect("validated under lock");
+        entry.last_used = now;
+        entry.idle_since = None;
+        Ok(runtime)
+    }
+
     async fn expire_idle_runtimes(self: &Arc<Self>, now: Instant, timeout: Duration) -> bool {
         let mut state = self.state.lock().await;
         if state.shutting_down {
@@ -2423,6 +2463,98 @@ mod tests {
         drop(service);
     }
 
+    fn stale_session_request(method: &str, path: &str, session: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(format!("/lix/v1/{LIX_A}/{path}"))
+            .header(
+                lix_sdk::server_protocol::SERVER_PROTOCOL_VERSION_HEADER,
+                lix_sdk::server_protocol::PROTOCOL_VERSION,
+            )
+            .header("lix-sync-protocol-version", lix_sdk::SYNC_PROTOCOL_VERSION)
+            .header("content-type", "application/json");
+        if let Some(session) = session {
+            builder = builder.header(lix_sdk::server_protocol::SESSION_ID_HEADER, session);
+        }
+        builder.body(Body::from("{}")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn stale_sessions_never_open_a_runtime() {
+        let manager = LixRuntimeManager::new_in_memory(4);
+        let app = crate::routes::router(
+            manager.clone(),
+            None,
+            Duration::from_secs(5),
+            Default::default(),
+        );
+        let id = "a".repeat(64);
+        // No catalog entry exists: old get() would issue a lookup and return404.
+        // Protocol session rejection must precede catalog/storage admission.
+        for (method, path, session, status) in [
+            ("POST", "sync/update", Some(id.as_str()), 410),
+            ("POST", "execute", Some(id.as_str()), 410),
+            ("GET", "", Some(id.as_str()), 410),
+            ("DELETE", "session", Some(id.as_str()), 204),
+            ("POST", "execute", None, 400),
+            ("POST", "execute", Some("invalid"), 400),
+            ("POST", "", None, 405),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(stale_session_request(method, path, session))
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), status, "{method} {path}");
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            assert_eq!(manager.cached_lix_count().await, 0);
+        }
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_sessions_do_not_reset_idle_expiry_or_reopen_after_eviction() {
+        let manager = memory_manager(4).await;
+        let app = crate::routes::router(
+            manager.clone(),
+            None,
+            Duration::from_secs(5),
+            Default::default(),
+        );
+        drop(manager.get(LIX_A).await.unwrap());
+        let now = Instant::now();
+        let timeout = Duration::from_secs(60);
+        manager.expire_idle_runtimes(now, timeout).await;
+        let id = "a".repeat(64);
+        for second in 1..=60 {
+            let response = app
+                .clone()
+                .oneshot(stale_session_request("POST", "sync/update", Some(&id)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 410);
+            manager
+                .expire_idle_runtimes(now + Duration::from_secs(second), timeout)
+                .await;
+        }
+        assert_eq!(manager.cached_lix_count().await, 0);
+        for _ in 0..10 {
+            assert_eq!(
+                app.clone()
+                    .oneshot(stale_session_request("POST", "sync/update", Some(&id)))
+                    .await
+                    .unwrap()
+                    .status(),
+                410
+            );
+        }
+        assert_eq!(manager.cached_lix_count().await, 0);
+        let session = open_protocol_session(&app, LIX_A).await;
+        assert_eq!(session.len(), 64, "fresh handshake still works");
+        assert_eq!(manager.cached_lix_count().await, 1);
+        manager.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn idle_expiry_closes_below_capacity_and_reopens() {
         let manager = memory_manager(4).await;
@@ -2515,10 +2647,15 @@ mod tests {
             counters.snapshot().list_operations > before.list_operations,
             "retained idle storage should demonstrate the background polling being fixed"
         );
+        let app = crate::routes::router(manager.clone(), None, Duration::from_secs(5), Default::default());
+        let invalid_session = "a".repeat(64);
         let now = Instant::now();
         manager
             .expire_idle_runtimes(now, Duration::from_secs(60))
             .await;
+        for _ in 0..20 {
+            assert_eq!(app.clone().oneshot(stale_session_request("POST","sync/update",Some(&invalid_session))).await.unwrap().status(),410);
+        }
         manager
             .expire_idle_runtimes(now + Duration::from_secs(60), Duration::from_secs(60))
             .await;
@@ -2534,6 +2671,9 @@ mod tests {
         .await
         .expect("idle expiry must finish storage cleanup without shutdown");
         let closed = counters.snapshot();
+        for _ in 0..20 {
+            assert_eq!(app.clone().oneshot(stale_session_request("POST","sync/update",Some(&invalid_session))).await.unwrap().status(),410);
+        }
         tokio::time::sleep(Duration::from_millis(2200)).await;
         let after = counters.snapshot();
         assert_eq!(after.list_operations, closed.list_operations);

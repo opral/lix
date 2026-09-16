@@ -642,8 +642,34 @@ async fn lix_protocol_inner(
             idempotency_scope: principal.idempotency_scope,
         }
     });
+    let admission = match server_protocol::server_protocol_runtime_admission(
+        request.method(),
+        &protocol_path,
+        request.headers(),
+        &principal,
+    ) {
+        Ok(admission) => admission,
+        Err(response) => {
+            let (parts, body) = (*response).into_parts();
+            return Response::from_parts(parts, Body::new(body));
+        }
+    };
     let protocol_started_at = Instant::now();
-    let runtime =
+    let runtime = if !admission.opens_runtime() {
+        match tokio::time::timeout(
+            state.protocol_timeout,
+            state.manager.get_session_runtime(&lix_id, &admission, &principal),
+        )
+        .await
+        {
+            Ok(Ok(runtime)) => runtime,
+            Ok(Err(response)) => {
+                let (parts, body) = response.into_parts();
+                return Response::from_parts(parts, Body::new(body));
+            }
+            Err(_) => return protocol_timeout_response(),
+        }
+    } else {
         match tokio::time::timeout(state.protocol_timeout, state.manager.get(&lix_id)).await {
             Ok(Ok(runtime)) => runtime,
             Ok(Err(error)) => return lix_error(error),
@@ -657,7 +683,8 @@ async fn lix_protocol_inner(
                     max: state.manager.max_open_lixes(),
                 });
             }
-        };
+        }
+    };
 
     let (notifier, signal) = server_protocol::durable_terminal_storage_signal();
     let context = ServerProtocolContext {
