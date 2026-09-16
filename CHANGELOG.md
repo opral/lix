@@ -1,23 +1,18 @@
 # Changelog
 
-## 0.18.0 - 2026-09-16
+## 0.17.1 - 2026-09-16
 
-### Minor
+### Faster partial replica history hydration
 
-- Partial replicas load file history with fewer network round trips and retain admission and pending update watches during foreground reads.
+Partial replicas load file history with fewer network round trips by batching dependencies and fetching ancestor metadata more efficiently. Queries that select files by ID fetch only those files and the parent directories needed to resolve their paths.
 
-  History hydration batches independent dependencies, fetches bounded ancestor metadata, and includes small owner metadata dependencies with native objects. This release advances the sync protocol to version 19; upgrade clients and servers together. Existing repository storage does not require a reset.
+This release uses sync protocol version 19. Upgrade clients and servers together; existing repository storage does not require a reset.
 
-  Long history queries discover dependencies across known checkpoints as results are consumed. Discovery respects checkpoint selection, while latest-event queries retain their bounded fetch behavior.
+### Fixes
 
-  Queries selecting files by ID load only the selected files and the parent directories needed to resolve their paths.
-
-### Patch
-
-- Filesystem synchronization preserves `.git` files stored in Lix during live disk reconciliation. These paths remain excluded from disk materialization; their intentional absence on disk no longer deletes the stored records during the session. Reopening still cleans up previously imported Git entries.
-- Fixed repeated row replacement within SQL batches and explicit transactions.
-
-  Repeated updates now retain the same transaction commit ID, so earlier `RETURNING lixcol_commit_id` results agree with the published commit after the transaction succeeds. Deleting and reinserting the same key within a transaction no longer reports a false duplicate-key error; live duplicate keys remain rejected.
+- Keep admission and pending update watches active during foreground reads.
+- Preserve stored `.git` files during live filesystem reconciliation, even though they are excluded from disk materialization. Reopening still cleans up previously imported Git entries.
+- Keep transaction commit IDs stable across repeated updates so `RETURNING lixcol_commit_id` matches the published commit. Deleting and reinserting a key in the same transaction no longer raises a false duplicate-key error.
 
 ## 0.17.0 - 2026-09-16
 
