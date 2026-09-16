@@ -502,11 +502,7 @@ where
     .await;
     let preview = preview_measure.value.expect("plugin preview");
     let preview_phases = collector.take_ms();
-    assert!(
-        preview.conflicts.is_empty(),
-        "plugin-owned conflicts must be resolver-owned: {:?}",
-        preview.conflicts
-    );
+
     assert_eq!(
         read_all_files(&lix, fixture_files.keys()).await,
         target_before_preview,
@@ -746,7 +742,6 @@ where
 
     let (base, target_ops, source_ops) = prepare_row_scenario(&lix, &source, &cfg).await;
     let expected = model_merge(&base, &target_ops, &source_ops);
-    let expected_clean = expected.is_ok();
     let target_before_preview = read_rows(&lix).await;
     let source_before_preview = read_rows(&source).await;
     let storage_bytes_before = directory_bytes(&db_path);
@@ -773,11 +768,7 @@ where
         source_before_preview,
         "preview mutated source state"
     );
-    assert_eq!(
-        preview.conflicts.is_empty(),
-        expected_clean,
-        "preview/model conflict disagreement"
-    );
+
     assert_eq!(
         branch_head(&lix, &main_branch_id).await,
         preview.target_head_commit_id
@@ -796,100 +787,69 @@ where
     })
     .await;
     let merge_phases = collector.take_ms();
-    let mut merge_outcome = "conflict".to_owned();
     let mut merge_parents = 0usize;
-    match expected {
-        Ok(expected_rows) => {
-            let receipt = merge_measure
-                .value
-                .expect("model-clean merge should succeed");
-            merge_outcome = outcome_name(receipt.outcome).to_owned();
-            assert_eq!(
-                preview.outcome, receipt.outcome,
-                "preview/commit outcome disagreement"
-            );
-            assert_eq!(
-                preview.change_stats, receipt.change_stats,
-                "preview/commit stats disagreement"
-            );
-            assert_eq!(preview.base_commit_id, receipt.base_commit_id);
-            assert_eq!(
-                read_rows(&lix).await,
-                expected_rows,
-                "merged rows differ from independent model"
-            );
-            assert_eq!(
-                read_rows(&source).await,
-                source_before_preview,
-                "merge mutated source branch"
-            );
-            assert_eq!(
-                receipt.target_head_before_commit_id,
-                preview.target_head_commit_id
-            );
-            assert_eq!(
-                receipt.source_head_before_commit_id,
-                preview.source_head_commit_id
-            );
-            assert_eq!(
-                branch_head(&lix, &main_branch_id).await,
-                receipt.target_head_after_commit_id
-            );
-            assert_eq!(
-                branch_head(&lix, SOURCE_BRANCH_ID).await,
-                receipt.source_head_before_commit_id
-            );
-            if receipt.outcome == MergeBranchOutcome::MergeCommitted {
-                merge_parents =
-                    commit_parent_count(&lix, &receipt.target_head_after_commit_id).await;
-                assert_eq!(merge_parents, 2, "merge commit must have two parents");
-            }
-            let repeat = lix
-                .merge_branch_preview(MergeBranchPreviewOptions {
-                    source_branch_id: SOURCE_BRANCH_ID.to_owned(),
-                })
-                .await
-                .expect("repeat preview");
-            assert_eq!(repeat.outcome, MergeBranchOutcome::AlreadyUpToDate);
-            let repeated_merge = lix
-                .merge_branch(MergeBranchOptions {
-                    source_branch_id: SOURCE_BRANCH_ID.to_owned(),
-                })
-                .await
-                .expect("repeated merge should be idempotent");
-            assert_eq!(repeated_merge.outcome, MergeBranchOutcome::AlreadyUpToDate);
-            assert!(repeated_merge.created_merge_commit_id.is_none());
-            assert_eq!(
-                repeated_merge.target_head_after_commit_id,
-                receipt.target_head_after_commit_id
-            );
-        }
-        Err(conflicting_ids) => {
-            assert_eq!(preview.conflicts.len(), conflicting_ids.len());
-            let error = merge_measure
-                .value
-                .expect_err("model conflict must reject merge");
-            assert_eq!(error.code, "LIX_MERGE_CONFLICT");
-            assert_eq!(
-                read_rows(&lix).await,
-                target_before_preview,
-                "failed merge partially mutated target"
-            );
-            assert_eq!(
-                read_rows(&source).await,
-                source_before_preview,
-                "failed merge mutated source"
-            );
-            assert_eq!(
-                branch_head(&lix, &main_branch_id).await,
-                preview.target_head_commit_id
-            );
-            assert_eq!(
-                branch_head(&lix, SOURCE_BRANCH_ID).await,
-                preview.source_head_commit_id
-            );
-        }
+    let expected_rows = expected;
+
+    let receipt = merge_measure.value.expect("LWW merge should succeed");
+    let merge_outcome = outcome_name(receipt.outcome).to_owned();
+    assert_eq!(
+        preview.outcome, receipt.outcome,
+        "preview/commit outcome disagreement"
+    );
+    assert_eq!(
+        preview.change_stats, receipt.change_stats,
+        "preview/commit stats disagreement"
+    );
+    assert_eq!(preview.base_commit_id, receipt.base_commit_id);
+    assert_eq!(
+        read_rows(&lix).await,
+        expected_rows,
+        "merged rows differ from independent model"
+    );
+    assert_eq!(
+        read_rows(&source).await,
+        source_before_preview,
+        "merge mutated source branch"
+    );
+    assert_eq!(
+        receipt.target_head_before_commit_id,
+        preview.target_head_commit_id
+    );
+    assert_eq!(
+        receipt.source_head_before_commit_id,
+        preview.source_head_commit_id
+    );
+    assert_eq!(
+        branch_head(&lix, &main_branch_id).await,
+        receipt.target_head_after_commit_id
+    );
+    assert_eq!(
+        branch_head(&lix, SOURCE_BRANCH_ID).await,
+        receipt.source_head_before_commit_id
+    );
+    if receipt.outcome == MergeBranchOutcome::MergeCommitted {
+        merge_parents = commit_parent_count(&lix, &receipt.target_head_after_commit_id).await;
+        assert_eq!(merge_parents, 2, "merge commit must have two parents");
     }
+    let repeat = lix
+        .merge_branch_preview(MergeBranchPreviewOptions {
+            source_branch_id: SOURCE_BRANCH_ID.to_owned(),
+        })
+        .await
+        .expect("repeat preview");
+    assert_eq!(repeat.outcome, MergeBranchOutcome::AlreadyUpToDate);
+    let repeated_merge = lix
+        .merge_branch(MergeBranchOptions {
+            source_branch_id: SOURCE_BRANCH_ID.to_owned(),
+        })
+        .await
+        .expect("repeated merge should be idempotent");
+    assert_eq!(repeated_merge.outcome, MergeBranchOutcome::AlreadyUpToDate);
+    assert!(repeated_merge.created_merge_commit_id.is_none());
+    assert_eq!(
+        repeated_merge.target_head_after_commit_id,
+        receipt.target_head_after_commit_id
+    );
 
     let expected_diff = map_diff_oracle(&base, &target_before_preview);
     let diff_measure = measure_async(|| async {
@@ -911,9 +871,7 @@ where
         .iter()
         .map(|row| {
             let id = row.get::<String>("id").expect("diff row identity");
-            let kind = row
-                .get::<String>("diff_type")
-                .expect("diff type");
+            let kind = row.get::<String>("diff_type").expect("diff type");
             assert!(!id.is_empty(), "diff row identities must be non-empty");
             (id, kind)
         })
@@ -1065,7 +1023,7 @@ where
             "independent_three_way_model": true,
             "preview_non_mutating": true,
             "preview_commit_agree": true,
-            "failed_merge_atomic": (!expected_clean).then_some(true),
+            "automatic_lww_merge": true,
             "source_branch_unchanged": true,
             "branch_isolation": true,
             "branch_deletion_durable": true,
@@ -1438,12 +1396,11 @@ fn model_merge(
     base: &BTreeMap<String, String>,
     target_ops: &BTreeMap<String, RowValue>,
     source_ops: &BTreeMap<String, RowValue>,
-) -> Result<BTreeMap<String, String>, BTreeSet<String>> {
+) -> BTreeMap<String, String> {
     let mut ids = base.keys().cloned().collect::<BTreeSet<_>>();
     ids.extend(target_ops.keys().cloned());
     ids.extend(source_ops.keys().cloned());
     let mut merged = BTreeMap::new();
-    let mut conflicts = BTreeSet::new();
     for id in ids {
         let base_value = base
             .get(&id)
@@ -1465,18 +1422,13 @@ fn model_merge(
         } else if source == base_value {
             Some(target)
         } else {
-            conflicts.insert(id.clone());
-            None
+            Some(source)
         };
         if let Some(RowValue::Present(value)) = selected {
             merged.insert(id, value);
         }
     }
-    if conflicts.is_empty() {
-        Ok(merged)
-    } else {
-        Err(conflicts)
-    }
+    merged
 }
 
 fn map_diff_oracle(
@@ -1528,11 +1480,11 @@ where
     .await
     .expect("query merge parents")
     .rows()[0]
-    .get::<serde_json::Value>("parent_commit_ids")
-    .expect("merge parents should decode as JSON")
-    .as_array()
-    .expect("merge parents should form an array")
-    .len()
+        .get::<serde_json::Value>("parent_commit_ids")
+        .expect("merge parents should decode as JSON")
+        .as_array()
+        .expect("merge parents should form an array")
+        .len()
 }
 
 async fn branch_head<StorageImpl>(lix: &Lix<StorageImpl>, branch_id: &str) -> String

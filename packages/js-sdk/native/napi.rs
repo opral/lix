@@ -4,11 +4,11 @@ use lix::{
     ExecuteBatchStatement as RsExecuteBatchStatement, ExecuteResult as RsExecuteResult,
     Lix as RsLix, LixError, LixTransaction as RsLixTransaction, Memory,
     MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
-    MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats, MergeConflict,
-    MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, ObserveEvent as RsObserveEvent,
-    ObserveEvents as RsObserveEvents, OpenPhase, OpenProgress, OpenProgressSink, OpenReport,
-    RedoReceipt, ServerOptions, SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt,
-    UndoReceipt, Value, open_lix,
+    MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats,
+    ObserveEvent as RsObserveEvent, ObserveEvents as RsObserveEvents, OpenPhase, OpenProgress,
+    OpenProgressSink, OpenReport, RedoReceipt, ServerOptions,
+    SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt, UndoReceipt, Value,
+    open_lix,
 };
 use lix_storage_filesystem::FilesystemStorage;
 use napi::JsDeferred;
@@ -3005,7 +3005,6 @@ pub struct MergeBranchPreviewDto {
     pub target_head_commit_id: String,
     pub source_head_commit_id: String,
     pub change_stats: MergeChangeStatsDto,
-    pub conflicts: Vec<MergeConflictDto>,
 }
 
 impl From<MergeBranchPreview> for MergeBranchPreviewDto {
@@ -3018,7 +3017,6 @@ impl From<MergeBranchPreview> for MergeBranchPreviewDto {
             target_head_commit_id: preview.target_head_commit_id,
             source_head_commit_id: preview.source_head_commit_id,
             change_stats: preview.change_stats.into(),
-            conflicts: preview.conflicts.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -3050,60 +3048,6 @@ impl From<MergeChangeStats> for MergeChangeStatsDto {
             removed: stats.removed as u32,
         }
     }
-}
-
-#[napi(object)]
-pub struct MergeConflictDto {
-    pub kind: String,
-    pub row_ref: String,
-    pub file_id: Option<String>,
-    pub target: MergeConflictSideDto,
-    pub source: MergeConflictSideDto,
-}
-
-impl From<MergeConflict> for MergeConflictDto {
-    fn from(conflict: MergeConflict) -> Self {
-        Self {
-            kind: merge_conflict_kind_to_string(conflict.kind),
-            row_ref: conflict.row_ref.to_string(),
-            file_id: conflict.file_id,
-            target: conflict.target.into(),
-            source: conflict.source.into(),
-        }
-    }
-}
-
-fn merge_conflict_kind_to_string(kind: MergeConflictKind) -> String {
-    match kind {
-        MergeConflictKind::SameRowChanged => "sameRowChanged",
-    }
-    .to_string()
-}
-
-#[napi(object)]
-pub struct MergeConflictSideDto {
-    pub kind: String,
-    pub before_change_id: Option<String>,
-    pub after_change_id: Option<String>,
-}
-
-impl From<MergeConflictSide> for MergeConflictSideDto {
-    fn from(side: MergeConflictSide) -> Self {
-        Self {
-            kind: merge_conflict_change_kind_to_string(side.kind),
-            before_change_id: side.before_change_id,
-            after_change_id: side.after_change_id,
-        }
-    }
-}
-
-fn merge_conflict_change_kind_to_string(kind: MergeConflictChangeKind) -> String {
-    match kind {
-        MergeConflictChangeKind::Added => "added",
-        MergeConflictChangeKind::Modified => "modified",
-        MergeConflictChangeKind::Removed => "removed",
-    }
-    .to_string()
 }
 
 #[expect(missing_debug_implementations)]

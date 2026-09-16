@@ -61,7 +61,6 @@ const preview = await lix.mergeBranchPreview({
 //   targetBranchId,
 //   sourceBranchId,
 //   changeStats: { total, added, modified, removed },
-//   conflicts: MergeConflict[],
 //   ...
 // }
 ```
@@ -72,26 +71,23 @@ const preview = await lix.mergeBranchPreview({
 await lix.switchBranch({ branchId: main });
 
 const preview = await lix.mergeBranchPreview({ sourceBranchId: draft.id });
-if (preview.conflicts.length === 0) {
-  await lix.mergeBranch({ sourceBranchId: draft.id });
-}
+await lix.mergeBranch({ sourceBranchId: draft.id });
 ```
 
-## Conflicts
+## Automatic merging
 
-If both branches changed the same row after their merge base, the preview includes a `sameRowChanged` conflict. `mergeBranch()` throws a `LixError` until the caller resolves it.
+Lix reconciles overlapping edits automatically. Changes to different columns of
+the same row combine. For competing changes to the same column, the incoming
+source value wins by default; a plugin can provide a column merger instead.
+Creation/deletion races use whole-row last-writer-wins (LWW).
 
-```ts
-{
-	kind: "sameRowChanged",
-	rowRef: "lix_row_ref:v1:…",
-	fileId: null,
-	target: { kind: "modified", beforeChangeId, afterChangeId },
-	source: { kind: "modified", beforeChangeId, afterChangeId },
-}
-```
+“Last” follows acceptance order, not client timestamps. In a branch merge, the
+source branch is incoming. Overlapping edits do not require caller conflict
+resolution. Merges can still fail when plugin ownership or generations are
+incompatible, or when tracked changes collide with untracked rows.
 
-Conflict detection is row-level today. Two branches that edit different fields of the same row still conflict. Design rows for how your app reads them, not around the current merge rule.
+Preview reports the merge outcome and change counts; it does not
+reserve the branch heads or approve a later merge against changing data.
 
 ## Hide or delete a branch
 

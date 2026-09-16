@@ -189,7 +189,9 @@ impl LixError {
     /// An operation is incompatible with the current session mode or state.
     pub const CODE_INVALID_SESSION_STATE: &'static str = "LIX_INVALID_SESSION_STATE";
 
-    /// A merge found incompatible changes to the same tracked-state identity.
+    /// Plugin ownership or generations are incompatible, or a tracked change
+    /// collides with an untracked row. Ordinary overlapping row edits reconcile
+    /// automatically.
     pub const CODE_MERGE_CONFLICT: &'static str = "LIX_MERGE_CONFLICT";
 
     /// A caller referenced a branch id that has no matching branch ref.

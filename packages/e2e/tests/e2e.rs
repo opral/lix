@@ -2318,11 +2318,7 @@ async fn v2_markdown_merges_unrelated_rows_and_regenerates_derived_bytes() {
         })
         .await
         .unwrap();
-    assert!(
-        preview.conflicts.is_empty(),
-        "the materialized blob is derived plugin state: {:?}",
-        preview.conflicts
-    );
+    assert_eq!(preview.outcome, lix::MergeBranchOutcome::MergeCommitted);
     lix.merge_branch(MergeBranchOptions {
         source_branch_id: source.id,
     })
@@ -2385,11 +2381,7 @@ async fn v2_markdown_same_paragraph_branch_merge_composes_word_edge_inserts() {
         })
         .await
         .expect("plugin-owned paragraph conflict should preview");
-    assert!(
-        preview.conflicts.is_empty(),
-        "the static Markdown resolver owns the paragraph conflict: {:?}",
-        preview.conflicts
-    );
+    assert_eq!(preview.outcome, lix::MergeBranchOutcome::MergeCommitted);
 
     lix.merge_branch(MergeBranchOptions {
         source_branch_id: source.id,
@@ -2453,7 +2445,7 @@ async fn v3_markdown_same_paragraph_branch_merge_composes_word_edge_inserts() {
         })
         .await
         .expect("v3 plugin-owned paragraph conflict should preview");
-    assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
+    assert_eq!(preview.outcome, lix::MergeBranchOutcome::MergeCommitted);
 
     lix.merge_branch(MergeBranchOptions {
         source_branch_id: source.id,
@@ -2517,11 +2509,7 @@ async fn v2_csv_same_row_branch_merge_composes_distinct_cells() {
         })
         .await
         .expect("plugin-owned row conflict should preview");
-    assert!(
-        preview.conflicts.is_empty(),
-        "the static CSV resolver owns the row conflict: {:?}",
-        preview.conflicts
-    );
+    assert_eq!(preview.outcome, lix::MergeBranchOutcome::MergeCommitted);
 
     lix.merge_branch(MergeBranchOptions {
         source_branch_id: source.id,
@@ -2604,7 +2592,7 @@ async fn v3_csv_same_row_branch_merge_composes_distinct_cells() {
         })
         .await
         .expect("v3 plugin-owned row conflict should preview");
-    assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
+    assert_eq!(preview.outcome, lix::MergeBranchOutcome::MergeCommitted);
 
     lix.merge_branch(MergeBranchOptions {
         source_branch_id: source.id,
@@ -2684,7 +2672,7 @@ async fn v2_json_unrelated_row_branch_merge_accepts_typed_rows() {
         })
         .await
         .expect("unrelated typed JSON rows should preview");
-    assert!(preview.conflicts.is_empty());
+    assert_eq!(preview.outcome, lix::MergeBranchOutcome::MergeCommitted);
     lix.merge_branch(MergeBranchOptions {
         source_branch_id: source.id,
     })
@@ -2938,7 +2926,7 @@ async fn v2_csv_same_cell_merge_uses_incoming_default() {
         })
         .await
         .expect("plugin-owned same-cell conflict should preview");
-    assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
+    assert_eq!(preview.outcome, lix::MergeBranchOutcome::MergeCommitted);
 
     lix.merge_branch(MergeBranchOptions {
         source_branch_id: source.id,
@@ -3012,7 +3000,7 @@ async fn v3_csv_same_cell_merge_uses_incoming_default() {
         })
         .await
         .expect("v3 plugin-owned same-cell conflict should preview");
-    assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
+    assert_eq!(preview.outcome, lix::MergeBranchOutcome::MergeCommitted);
 
     lix.merge_branch(MergeBranchOptions {
         source_branch_id: source.id,
@@ -3089,7 +3077,7 @@ async fn v2_csv_incoming_edit_restores_deleted_file_and_semantic_rows() {
         })
         .await
         .expect("delete-vs-edit should preview with host-native LWW");
-    assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
+    assert_eq!(preview.outcome, lix::MergeBranchOutcome::MergeCommitted);
 
     lix.merge_branch(MergeBranchOptions {
         source_branch_id: source.id,
@@ -4027,10 +4015,7 @@ async fn v2_json_ten_mib_unrelated_row_merge_benchmark() {
             .expect("unrelated JSON properties should produce a merge preview");
         let preview_measurement =
             BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
-        assert!(
-            preview.conflicts.is_empty(),
-            "unrelated JSON properties must remain conflict-free"
-        );
+        assert_eq!(preview.outcome, lix::MergeBranchOutcome::MergeCommitted);
         preview_elapsed_ms.push(preview_measurement.elapsed_ms);
         preview_measurements.push(preview_measurement);
         emit_sample(
@@ -6216,7 +6201,7 @@ async fn v2_excalidraw_same_element_branch_merge_uses_canonical_b() {
         })
         .await
         .expect("same-element Excalidraw conflict should preview");
-    assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
+    assert_eq!(preview.outcome, lix::MergeBranchOutcome::MergeCommitted);
 
     lix.merge_branch(MergeBranchOptions {
         source_branch_id: source.id,
@@ -6320,7 +6305,7 @@ async fn v3_excalidraw_same_element_branch_merge_uses_canonical_b() {
         })
         .await
         .expect("same-element v3 Excalidraw conflict should preview");
-    assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
+    assert_eq!(preview.outcome, lix::MergeBranchOutcome::MergeCommitted);
 
     lix.merge_branch(MergeBranchOptions {
         source_branch_id: source.id,

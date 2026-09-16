@@ -685,7 +685,6 @@ async fn measure_merge_preview<StorageImpl>(
         .expect("warm merge preview");
     assert_eq!(warm.outcome, MergeBranchOutcome::MergeCommitted);
     assert_eq!(warm.change_stats.total, changes_per_side);
-    assert!(warm.conflicts.is_empty());
 
     let mut latencies = Vec::with_capacity(repetitions);
     for _ in 0..repetitions {
@@ -697,7 +696,6 @@ async fn measure_merge_preview<StorageImpl>(
         latencies.push(start.elapsed());
         assert_eq!(preview.outcome, MergeBranchOutcome::MergeCommitted);
         assert_eq!(preview.change_stats.total, changes_per_side);
-        assert!(preview.conflicts.is_empty());
     }
     let mut sorted = latencies.clone();
     sorted.sort_unstable();

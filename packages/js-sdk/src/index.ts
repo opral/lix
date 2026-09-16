@@ -53,8 +53,6 @@ export type {
 	MergeBranchPreview,
 	MergeBranchReceipt,
 	MergeChangeStats,
-	MergeConflict,
-	MergeConflictSide,
 	ObserveEvent,
 	OpenLixOptions,
 	OpenAnotherSessionOptions,

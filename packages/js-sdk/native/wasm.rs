@@ -1276,7 +1276,6 @@ struct MergeBranchPreviewDto {
     target_head_commit_id: String,
     source_head_commit_id: String,
     change_stats: MergeChangeStatsDto,
-    conflicts: Vec<MergeConflictDto>,
 }
 
 impl From<lix::MergeBranchPreview> for MergeBranchPreviewDto {
@@ -1289,7 +1288,6 @@ impl From<lix::MergeBranchPreview> for MergeBranchPreviewDto {
             target_head_commit_id: preview.target_head_commit_id,
             source_head_commit_id: preview.source_head_commit_id,
             change_stats: preview.change_stats.into(),
-            conflicts: preview.conflicts.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -1317,51 +1315,6 @@ impl From<lix::MergeChangeStats> for MergeChangeStatsDto {
             added: stats.added,
             modified: stats.modified,
             removed: stats.removed,
-        }
-    }
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MergeConflictDto {
-    kind: &'static str,
-    row_ref: String,
-    file_id: Option<String>,
-    target: MergeConflictSideDto,
-    source: MergeConflictSideDto,
-}
-
-impl From<lix::MergeConflict> for MergeConflictDto {
-    fn from(conflict: lix::MergeConflict) -> Self {
-        Self {
-            kind: "sameRowChanged",
-            row_ref: conflict.row_ref.to_string(),
-            file_id: conflict.file_id,
-            target: conflict.target.into(),
-            source: conflict.source.into(),
-        }
-    }
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MergeConflictSideDto {
-    kind: &'static str,
-    before_change_id: Option<String>,
-    after_change_id: Option<String>,
-}
-
-impl From<lix::MergeConflictSide> for MergeConflictSideDto {
-    fn from(side: lix::MergeConflictSide) -> Self {
-        let kind = match side.kind {
-            lix::MergeConflictChangeKind::Added => "added",
-            lix::MergeConflictChangeKind::Modified => "modified",
-            lix::MergeConflictChangeKind::Removed => "removed",
-        };
-        Self {
-            kind,
-            before_change_id: side.before_change_id,
-            after_change_id: side.after_change_id,
         }
     }
 }
