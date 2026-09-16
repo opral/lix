@@ -9845,7 +9845,7 @@ mod tests {
         let preview = response_json(response).await;
         assert_eq!(preview["targetBranchId"], target_branch);
         assert_eq!(preview["sourceBranchId"], source_branch);
-        assert_eq!(preview["conflicts"], json!([]));
+        assert!(preview.get("conflicts").is_none());
         // Preview must not publish source changes; merge publishes source changes.
         for (merge, expected_count) in [(false, 0), (true, 1)] {
             if merge {
