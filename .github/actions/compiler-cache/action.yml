@@ -17,11 +17,15 @@ runs:
         echo 'SCCACHE_GHA_ENABLED=false' >> "$GITHUB_ENV"
         echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
         echo 'RUSTC_WRAPPER=sccache' >> "$GITHUB_ENV"
+    # Immutable snapshots are keyed by compilation inputs, not run IDs. A retry
+    # or CI-only edit can restore an exact key without uploading another copy.
+    # sccache itself validates each compiler invocation; this outer key only
+    # controls snapshot freshness, never whether a compilation is correct.
     - name: Restore compiler objects
       uses: actions/cache@v4
       with:
         path: ${{ runner.temp }}/lix-sccache
-        key: sccache-disk-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+        key: sccache-disk-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'tooling/Cargo.lock', 'tooling/Cargo.toml', '.cargo/**', 'packages/**/Cargo.toml', 'packages/**/*.rs', 'plugins/**', 'packages/js-sdk/scripts/**') }}
         restore-keys: |
           sccache-disk-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ hashFiles('rust-toolchain.toml') }}-
     - name: Install compiler cache

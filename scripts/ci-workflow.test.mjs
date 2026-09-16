@@ -412,3 +412,13 @@ test("content revisions preserve compatible consumer artifacts without compilati
   const gate = workflow.split("\n  release-ready:\n")[1].split("\n  merge-reuse:\n")[0];
   assert.match(gate, /needs: .*content-browser-sdk/);
 });
+
+test("merge promotion warms main browser binaries and retries do not duplicate compiler snapshots", () => {
+  const promotion = workflow.split("\n  promote-browser-sdk:\n")[1].split("\n  changelog:\n")[0];
+  assert.match(promotion, /prepare-merged-cache/);
+  assert.match(promotion, /lookup-only: true/);
+  assert.match(promotion, /uses: actions\/cache\/save@v4/);
+  const cache = readFileSync(resolve(repositoryRoot, ".github/actions/compiler-cache/action.yml"), "utf8");
+  assert.doesNotMatch(cache, /github\.(run_id|run_attempt|sha)/);
+  assert.match(cache, /hashFiles\('Cargo.lock'/);
+});

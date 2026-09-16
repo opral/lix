@@ -113,12 +113,41 @@ jobs:
     permissions:
       actions: read
       contents: read
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+      CARGO_PROFILE_BENCH_DEBUG: '0'
     steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
       - uses: actions/download-artifact@v4
         with:
           name: lix-browser-sdk-${{ needs.merge-reuse.outputs.revision }}
           run-id: ${{ needs.merge-reuse.outputs.run_id }}
           github-token: ${{ github.token }}
+      - name: Validate browser binaries for main cache
+        id: cache-payload
+        env:
+          SOURCE_REVISION: ${{ needs.merge-reuse.outputs.revision }}
+        run: node scripts/release-browser-artifact.mjs prepare-merged-cache
+      - name: Check main browser binary cache
+        if: steps.cache-payload.outputs.key != ''
+        id: cache-lookup
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-sdk-cache/browser
+          key: ${{ steps.cache-payload.outputs.key }}
+          lookup-only: true
+      - name: Seed main browser binary cache without recompilation
+        if: steps.cache-payload.outputs.key != '' && steps.cache-lookup.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .ci-sdk-cache/browser
+          key: ${{ steps.cache-payload.outputs.key }}
       - name: Record identical-tree artifact provenance
         env:
           SOURCE_REVISION: ${{ needs.merge-reuse.outputs.revision }}

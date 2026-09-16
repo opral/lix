@@ -4,8 +4,8 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, sym
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import { cacheKey } from "./ci-sdk-cache.mjs";
-import { describeBrowser, matchesBrowserBuild, restoreReleaseBrowser, selectReleaseBrowser } from "./release-browser-artifact.mjs";
+import { cacheKey, validCache } from "./ci-sdk-cache.mjs";
+import { describeBrowser, prepareMergedBrowserCache, matchesBrowserBuild, restoreReleaseBrowser, selectReleaseBrowser } from "./release-browser-artifact.mjs";
 
 function fixture(t) {
 	const root = mkdtempSync(join(tmpdir(), "release-browser-"));
@@ -116,4 +116,18 @@ test("legacy manifest is not release evidence and missing download falls back to
 	});
 	assert.equal(result.status, 0, result.stderr);
 	assert.equal(readFileSync(output, "utf8"), "reuse=false\n");
+});
+
+
+test("identical-tree promotion seeds validated binaries without compiling or copying TypeScript", t => {
+  const f = fixture(t);
+  f.git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--quiet", "--allow-empty", "-m", "merge");
+  f.write("packages/js-sdk/dist/index.js", "not cached");
+  const key = prepareMergedBrowserCache(f.root, f.revision, {});
+  assert.equal(validCache(join(f.root, ".ci-sdk-cache/browser"), "browser", key), true);
+  assert.throws(() => readFileSync(join(f.root, ".ci-sdk-cache/browser/dist/index.js")), /ENOENT/);
+  assert.throws(() => prepareMergedBrowserCache(f.root, "wrong-revision", {}), /does not match/);
+  assert.throws(() => prepareMergedBrowserCache(f.root, f.revision, { LIX_WASM_PROFILE: "dev" }), /does not match/);
+  f.write("packages/js-sdk/dist/migration-wasm/lix_js_sdk_bg.wasm", "corrupt");
+  assert.throws(() => prepareMergedBrowserCache(f.root, f.revision, {}), /checksum/);
 });
