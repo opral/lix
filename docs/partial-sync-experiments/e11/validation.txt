@@ -1,9 +1,0 @@
-Final engine source validation (before acceptance commit):
-cargo nextest run -p lix --features all-simulations,server-protocol
-Summary: 4323 passed, 84 skipped (57.843s test execution).
-cargo test -p lix --doc: 10 passed.
-cargo fmt -p lix -- --check: passed.
-Engine patch SHA256: 37fbf5bc48c25107c9a4a43561e50fdb35e7626df7228fcc8d8ec93b91653cea.
-Source worktree: /root/repos/lix-partial-sync-selected-frontier.
-Published worktree engine diff has the same patch hash.
-Timing used saved optimized executables with no concurrent compilation/tests.
