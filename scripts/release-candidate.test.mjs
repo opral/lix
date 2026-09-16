@@ -136,11 +136,12 @@ test("ready candidates freeze only their release target", async () => {
 test("content-only skips are explicit and never hide failures", () => {
   const input = validation();
   input.needs['merge-reuse'].outputs.content_only = 'true';
+  input.needs['content-browser-sdk'] = { result: 'success' };
   input.needs.changelog.outputs.rust = 'false';
   for (const name of ['cargo', 'cargo-config', 'js-sdk-test', 'preview-server-image']) input.needs[name].result = 'skipped';
   input.needs['preview-artifact-changes'].outputs.server = 'false';
   assert.doesNotThrow(() => assertReleaseReady(input));
-  for (const name of ['cargo', 'cargo-config', 'js-sdk-test', 'changelog', 'preview-server-image']) {
+  for (const name of ['cargo', 'cargo-config', 'js-sdk-test', 'changelog', 'preview-server-image', 'content-browser-sdk']) {
     const bad = structuredClone(input);
     bad.needs[name].result = 'failure';
     assert.throws(() => assertReleaseReady(bad));

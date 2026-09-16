@@ -45,6 +45,7 @@ export function assertReleaseReady({ needs, eventName, event, currentPr }) {
 	}
 	requireSuccess("changelog");
 	if (needs["merge-reuse"].outputs?.content_only === "true") {
+		requireSuccess("content-browser-sdk");
 		if (!["pull_request", "push"].includes(eventName)) throw new Error("Unexpected content scope event");
 		for (const name of ["cargo-config", "js-sdk-test"]) {
 			if (needs[name]?.result !== "skipped") throw new Error(`Unexpected content scope result: ${name}`);

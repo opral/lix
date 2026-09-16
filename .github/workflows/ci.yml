@@ -38,7 +38,7 @@ jobs:
     # Draft reruns must not overwrite the required ready-candidate check.
     name: ${{ inputs.artifacts_only && 'Artifacts only - not release validation' || github.event.pull_request.draft && 'Draft - full CI deferred' || 'Release ready' }}
     if: always() && inputs.artifacts_only != true && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
-    needs: [merge-reuse, promote-browser-sdk, changelog, cargo-config, cargo, js-sdk-test, preview-artifact-changes, preview-server-image]
+    needs: [merge-reuse, promote-browser-sdk, content-browser-sdk, changelog, cargo-config, cargo, js-sdk-test, preview-artifact-changes, preview-server-image]
     runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 5
     permissions:
@@ -197,7 +197,7 @@ jobs:
         run: node scripts/validate-server-protocol-docs.mjs
 
       - name: Validate CI workflow invariants
-        run: node --test scripts/compatibility.test.mjs scripts/native-build.test.mjs scripts/ci-workflow.test.mjs scripts/ci-merge-reuse.test.mjs scripts/ci-rust-scope.test.mjs scripts/ci-content-scope.test.mjs scripts/ci-sdk-cache.test.mjs scripts/release-browser-artifact.test.mjs scripts/ci-server-image.test.mjs scripts/release.test.mjs scripts/release-candidate.test.mjs scripts/publish-plugin.test.mjs
+        run: node --test scripts/compatibility.test.mjs scripts/native-build.test.mjs scripts/ci-workflow.test.mjs scripts/ci-merge-reuse.test.mjs scripts/ci-rust-scope.test.mjs scripts/ci-content-scope.test.mjs scripts/ci-content-artifact.test.mjs scripts/ci-sdk-cache.test.mjs scripts/release-browser-artifact.test.mjs scripts/ci-server-image.test.mjs scripts/release.test.mjs scripts/release-candidate.test.mjs scripts/publish-plugin.test.mjs
 
   cargo-config:
     name: Cargo config (${{ matrix.name }})
@@ -829,3 +829,65 @@ jobs:
         run: |
           df -h "$GITHUB_WORKSPACE"
           free -h
+
+  content-browser-sdk:
+    name: Reuse unchanged content SDK
+    needs: merge-reuse
+    if: needs.merge-reuse.outputs.content_only == 'true' && needs.merge-reuse.outputs.reuse != 'true'
+    runs-on: ubicloud-standard-2-ubuntu-2404
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    env:
+      TARGET_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+      CARGO_PROFILE_BENCH_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ env.TARGET_REVISION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Find tested SDK with identical code inputs
+        id: source
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { selectContentArtifact } = await import(`${process.env.GITHUB_WORKSPACE}/scripts/ci-content-artifact.mjs`);
+            await selectContentArtifact({ github, context, core });
+      - uses: actions/download-artifact@v4
+        if: steps.source.outputs.run_id != ''
+        with:
+          name: lix-browser-sdk-${{ steps.source.outputs.revision }}
+          run-id: ${{ steps.source.outputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify and promote unchanged SDK
+        if: steps.source.outputs.run_id != ''
+        env:
+          SOURCE_REVISION: ${{ steps.source.outputs.revision }}
+          SOURCE_RUN: ${{ steps.source.outputs.run_id }}
+        run: node scripts/ci-content-artifact.mjs
+      - uses: actions/upload-artifact@v4
+        if: steps.source.outputs.run_id != ''
+        with:
+          name: lix-browser-sdk-${{ env.TARGET_REVISION }}
+          path: |
+            packages/js-sdk/dist
+            packages/storage-opfs/dist
+            ci-artifact/browser.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+      - uses: actions/upload-artifact@v4
+        if: steps.source.outputs.run_id != ''
+        with:
+          name: ci-browser-build
+          path: ci-artifact/browser.json
+          retention-days: 90
+          if-no-files-found: error
