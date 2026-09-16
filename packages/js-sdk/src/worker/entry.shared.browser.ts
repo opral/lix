@@ -98,7 +98,12 @@ scope.onconnect = (event) => {
             const response = await transport(request);
             return response;
           } catch (error) {
-            verifiedKey = undefined;
+            // Foreground hydration routinely cancels the descriptor long poll.
+            // Cancellation says nothing about the verified account identity.
+            const cancelled = request.init.signal?.aborted ||
+              (error as {code?: string})?.code === "LIX_TRANSPORT_ABORTED" ||
+              (error as {name?: string})?.name === "AbortError";
+            if (!cancelled) verifiedKey = undefined;
             throw error;
           }
         },

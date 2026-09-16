@@ -477,6 +477,7 @@ where
                 .await?;
             }
             LogicalReadInterest::FilesystemPaths {
+                file_ids,
                 branch_ids,
                 include_blob_refs,
                 cache_small_blob_data,
@@ -487,6 +488,7 @@ where
                 hot.reader(read.clone())
                     .path_index(
                         &FilesystemPathIndexRequest::new(branch_ids.clone())
+                            .with_file_ids(file_ids.clone())
                             .with_blob_refs(*include_blob_refs)
                             .with_cached_blob_data(*cache_small_blob_data),
                     )
@@ -654,6 +656,7 @@ mod tests {
     #[test]
     fn only_explicit_archives_suspend_whole_recipes() {
         let recipe = |branches: &[&str]| LogicalReadInterest::FilesystemPaths {
+            file_ids: None,
             branch_ids: branches.iter().map(|branch| (*branch).to_owned()).collect(),
             include_blob_refs: false,
             cache_small_blob_data: false,

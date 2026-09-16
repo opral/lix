@@ -33,10 +33,13 @@ async fn explicit_transaction_hydration(commit: bool) {
                 "before"
             );
             if !commit {
-                let outside = engine.open_session_at_with_account(
-                    old.descriptor().selected_branch.branch_id.clone(),
-                    old.active_account_id().to_owned(),
-                ).await.unwrap();
+                let outside = engine
+                    .open_session_at_with_account(
+                        old.descriptor().selected_branch.branch_id.clone(),
+                        old.active_account_id().to_owned(),
+                    )
+                    .await
+                    .unwrap();
                 execute_hydrating(
                     &outside,
                     &storage,
@@ -93,21 +96,7 @@ async fn explicit_transaction_hydration(commit: bool) {
                 let objects = match request {
                     SyncDemandRequest::NativeObject(address, _) => vec![address],
                     SyncDemandRequest::NativeObjects(addresses, _) => addresses,
-                    SyncDemandRequest::NativeMetadata(address, _) => {
-                        hydrate_metadata(
-                            &storage,
-                            &old,
-                            &authority,
-                            address,
-                            &mut Fetches::default(),
-                        )
-                        .await
-                        .unwrap();
-                        count += 1;
-                        demand.response.send(Ok(())).unwrap();
-                        continue;
-                    }
-                    SyncDemandRequest::NativeMetadataBatch(addresses, _) => {
+                    SyncDemandRequest::NativeMetadata(addresses, _) => {
                         for address in addresses {
                             hydrate_metadata(
                                 &storage,

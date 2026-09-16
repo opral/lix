@@ -362,6 +362,24 @@ paths:
           description: Explicit native records bound to the repository and echoed caller epoch.
           content: { application/json: { schema: { $ref: "#/components/schemas/NativeMetadataResponse" } } }
         default: { $ref: "#/components/responses/Error" }
+  /lix/v1/{lix_id}/sync/native-metadata-walk:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
+    post:
+      operationId: syncNativeMetadataWalk
+      description: Reads a bounded first-parent prefix of at most 16 commits and their optional state headers, capped at 32 records and 256 KiB decoded payload. A short prefix is not a history-completeness claim. The client validates parent continuity and record identity before epoch-fenced installation. Requires a native baseline lease.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
+        - $ref: "#/components/parameters/NativeBaselineLease"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/NativeMetadataWalkRequest" } } }
+      responses:
+        "200":
+          description: Explicit native records bound to the repository and echoed caller epoch.
+          content: { application/json: { schema: { $ref: "#/components/schemas/NativeMetadataResponse" } } }
+        default: { $ref: "#/components/responses/Error" }
   /lix/v1/{lix_id}/sync/native-object-range:
     parameters:
       - $ref: "#/components/parameters/LixId"
@@ -908,7 +926,7 @@ components:
       in: header
       required: true
       description: Exact sync wire-protocol version advertised by the handshake.
-      schema: { type: integer, const: 17 }
+      schema: { type: integer, const: 19 }
     TransactionId:
       name: Lix-Transaction-Id
       in: header
@@ -966,7 +984,7 @@ components:
       required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
         protocolVersion: { type: integer, const: 11 }
-        syncProtocolVersion: { type: integer, const: 17 }
+        syncProtocolVersion: { type: integer, const: 19 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }
@@ -1178,7 +1196,7 @@ components:
         abandon:
           type: boolean
           default: false
-          description: When true, terminally fences an active attempt for automatic authoritative recovery. An already committed receipt wins. Otherwise the attempt must have expired. Requires sync protocol 17.
+          description: When true, terminally fences an active attempt for automatic authoritative recovery. An already committed receipt wins. Otherwise the attempt must have expired. Requires sync protocol 19.
     PartialAttemptRestartReceipt:
       type: object
       additionalProperties: false
@@ -1462,6 +1480,15 @@ components:
           maxItems: 32
           uniqueItems: true
           items: { $ref: "#/components/schemas/NativeMetadataRef" }
+    NativeMetadataWalkRequest:
+      type: object
+      additionalProperties: false
+      required: [epochId, anchor, maxCommits, includeStateHeaders]
+      properties:
+        epochId: { type: string, format: uuid }
+        anchor: { type: string, format: uuid }
+        maxCommits: { type: integer, minimum: 1, maximum: 16 }
+        includeStateHeaders: { type: boolean }
     NativeMetadataResponse:
       type: object
       required: [lixId, epochId, objects]
@@ -1478,6 +1505,30 @@ components:
             properties:
               address: { $ref: "#/components/schemas/NativeMetadataRef" }
               bytes: { type: string, format: byte }
+        dependencies:
+          type: object
+          additionalProperties: false
+          required: [metadata, objects]
+          description: Optional dependencies derived from returned change locators. The entire response is bounded to 32 records and 256 KiB decoded bytes. Dependencies prove no coverage or absence.
+          properties:
+            metadata:
+              type: array
+              maxItems: 32
+              items:
+                type: object
+                required: [address, bytes]
+                properties:
+                  address: { $ref: "#/components/schemas/NativeMetadataRef" }
+                  bytes: { type: string, format: byte }
+            objects:
+              type: array
+              maxItems: 32
+              items:
+                type: object
+                required: [address, bytes]
+                properties:
+                  address: { $ref: "#/components/schemas/NativeObjectRef" }
+                  bytes: { type: string, format: byte }
     NativeObjectRangeRequest:
       type: object
       additionalProperties: false

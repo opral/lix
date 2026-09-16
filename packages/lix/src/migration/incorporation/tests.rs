@@ -196,6 +196,7 @@ async fn full_and_sparse_migrations_produce_identical_headers_and_accept_native_
                 .collect(),
         };
         let response = NativeMetadataResponse {
+            dependencies: Default::default(),
             lix_id: state.repository_id().into(),
             epoch_id: state.epoch_id().into(),
             objects,

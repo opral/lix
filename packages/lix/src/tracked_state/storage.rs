@@ -5503,6 +5503,24 @@ pub(crate) fn decode_commit_state_authority_id(
     Ok(Some(stored.commit_id))
 }
 
+/// Derive a catalog address only from a validated immutable owner header.
+pub(crate) fn commit_state_catalog_address(
+    commit_id: CommitId,
+    bytes: &[u8],
+) -> Result<super::NativeObjectRef, LixError> {
+    let stored = decode_stored_commit_state_manifest(bytes)?;
+    if stored.commit_id != commit_id {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "catalog owner header identity mismatch",
+        ));
+    }
+    Ok(super::NativeObjectRef::MutationCatalog {
+        commit_id: *commit_id.as_uuid().as_bytes(),
+        expected_digest: stored.mutation_inventory_digest,
+    })
+}
+
 /// Loads authenticated mutation-directory roots without reading catalogs or
 /// directory nodes. GC uses this projection to mark shared content-addressed
 /// nodes from retained commit authorities.

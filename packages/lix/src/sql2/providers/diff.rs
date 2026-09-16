@@ -322,6 +322,65 @@ pub(super) struct DiffSpec<S> {
     pub(super) mode: DiffMode,
 }
 
+fn diff_filter_schema(
+    relation: &DiffRelation,
+    schema: &SchemaRef,
+    filters: &[Expr],
+) -> Result<SchemaRef> {
+    let mut fields = schema.fields().to_vec();
+    for filter in filters {
+        for column in filter.column_refs() {
+            if !fields.iter().any(|field| field.name() == &column.name) {
+                fields.push(Arc::new(
+                    relation.schema.field_with_name(&column.name)?.clone(),
+                ));
+            }
+        }
+    }
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> DiffSpec<S> {
+    /// Prepare only native inputs. Never evaluate SQL expressions or user functions
+    /// while looking ahead beyond the first required history miss.
+    pub(super) async fn prepare_history_inputs(
+        &self,
+        from: &str,
+        to: &str,
+        projection: &Vec<usize>,
+        filters: &[Expr],
+    ) -> Result<(), crate::LixError> {
+        let schema = projected_schema(&self.relation.schema, Some(projection));
+        let metadata_filters = if self.relation.kind == DiffRelationKind::File {
+            filter_conjuncts(filters)
+                .into_iter()
+                .filter(|filter| file_metadata_filter(filter, &self.relation.schema))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let schema = diff_filter_schema(&self.relation, &schema, &metadata_filters)
+            .map_err(datafusion_error_to_lix_error)?;
+        let route = DiffRoute::from_filters(filters, &self.relation, &schema);
+        if route.contradictory {
+            return Ok(());
+        }
+        prepare_native_diff_interest(
+            self.store.clone(),
+            &self.relation.name,
+            from,
+            to,
+            &route.request,
+            &schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>(),
+        )
+        .await
+    }
+}
+
 #[async_trait]
 impl<S> TableSpec for DiffSpec<S>
 where
@@ -377,20 +436,7 @@ where
         } else {
             Vec::new()
         };
-        let mut filter_fields = schema.fields().to_vec();
-        for filter in &metadata_filters {
-            for column in filter.column_refs() {
-                if !filter_fields
-                    .iter()
-                    .any(|field| field.name() == &column.name)
-                {
-                    filter_fields.push(Arc::new(
-                        self.relation.schema.field_with_name(&column.name)?.clone(),
-                    ));
-                }
-            }
-        }
-        let filter_schema = Arc::new(Schema::new(filter_fields));
+        let filter_schema = diff_filter_schema(&self.relation, &schema, &metadata_filters)?;
         let df_schema = DFSchema::try_from(filter_schema.as_ref().clone())?;
         let metadata_filters = metadata_filters
             .iter()
@@ -1005,36 +1051,40 @@ async fn commit_state_descriptor(
 ) -> Result<CommitStateDescriptor> {
     let commit_id = CommitId::parse_lix(commit_id, "lix_diff commit ID")
         .map_err(lix_error_to_datafusion_error)?;
-    let global_scope = crate::tracked_state::load_published_commit_state_topology(store, commit_id)
-        .await
-        .map_err(lix_error_to_datafusion_error)?
-        .map(|manifest| manifest.global_scope())
-        .ok_or_else(|| {
-            lix_error_to_datafusion_error(
-                crate::tracked_state::NativeMetadataRef::CommitStateHeader(commit_id.to_string())
-                    .annotate_missing(crate::tracked_state::sync_history_required_for_commits(&[
-                        commit_id,
-                    ])),
-            )
-        })?;
-    let node = crate::commit_graph::CommitGraphContext::new()
-        .reader(store)
-        .load_node(&commit_id)
-        .await
-        .map_err(lix_error_to_datafusion_error)?
-        .ok_or_else(|| {
-            lix_error_to_datafusion_error(
-                crate::tracked_state::NativeMetadataRef::CommitGraphRecord(commit_id.to_string())
-                    .annotate_missing(crate::LixError::new(
-                        crate::LixError::CODE_INTERNAL_ERROR,
-                        format!("commit '{commit_id}' does not exist"),
-                    )),
-            )
-        })?;
-    Ok(CommitStateDescriptor {
-        base_commit_id: node.base_commit_id,
-        global_scope,
-    })
+    // Both immutable addresses are known before either read. Discover their
+    // absence together so a partial replica can hydrate one bounded frontier.
+    let mut graph = crate::commit_graph::CommitGraphContext::new().reader(store);
+    let (topology, node) = futures_util::future::join(
+        crate::tracked_state::load_published_commit_state_topology(store, commit_id),
+        graph.load_node(&commit_id),
+    )
+    .await;
+    // Corruption and other read failures remain errors, even if the other
+    // input is absent. Missing data must never hide a damaged resident record.
+    let topology = topology.map_err(lix_error_to_datafusion_error)?;
+    let node = node.map_err(lix_error_to_datafusion_error)?;
+    match (topology, node) {
+        (Some(topology), Some(node)) => Ok(CommitStateDescriptor {
+            base_commit_id: node.base_commit_id,
+            global_scope: topology.global_scope(),
+        }),
+        (topology, node) => {
+            use crate::tracked_state::NativeMetadataRef;
+            let mut missing = Vec::with_capacity(2);
+            if topology.is_none() {
+                missing.push(NativeMetadataRef::CommitStateHeader(commit_id.to_string()));
+            }
+            if node.is_none() {
+                missing.push(NativeMetadataRef::CommitGraphRecord(commit_id.to_string()));
+            }
+            Err(lix_error_to_datafusion_error(
+                NativeMetadataRef::annotate_missing_batch(
+                    missing,
+                    crate::tracked_state::sync_history_required_for_commits(&[commit_id]),
+                ),
+            ))
+        }
+    }
 }
 
 async fn effective_diff<S: StorageAdapterRead>(
@@ -2290,6 +2340,86 @@ fn values_array(field: &Field, values: &[Option<lix_schema::Value>]) -> Result<A
 mod tests {
     use super::*;
     use datafusion::logical_expr::{col, lit};
+
+    #[tokio::test]
+    async fn descriptor_reports_independent_missing_inputs_together() {
+        use crate::storage_adapter::SharedStorageAdapterRead;
+        use crate::tracked_state::NativeMetadataRef;
+        let lix = crate::open_lix().await.unwrap();
+        let store = SharedStorageAdapterRead::new(
+            lix.storage_adapter()
+                .begin_read(Default::default())
+                .await
+                .unwrap(),
+        );
+        let id = "0193182b-2a72-7ed5-9015-76bf271af333";
+        let error = match commit_state_descriptor(&store, id).await {
+            Ok(_) => panic!("unknown commit must need inputs"),
+            Err(error) => datafusion_error_to_lix_error(error),
+        };
+        assert_eq!(
+            NativeMetadataRef::batch_from_missing_error(&error).unwrap(),
+            Some(vec![
+                NativeMetadataRef::CommitStateHeader(id.into()),
+                NativeMetadataRef::CommitGraphRecord(id.into()),
+            ])
+        );
+        lix.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn descriptor_does_not_hide_corruption_behind_another_missing_input() {
+        use crate::storage_adapter::{
+            SharedStorageAdapterRead, StorageAdapter, StorageKey, StorageValue,
+        };
+        use crate::tracked_state::NativeMetadataRef;
+        let id = CommitId::parse("0193182b-2a72-7ed5-9015-76bf271af333").unwrap();
+        for corrupt_graph in [false, true] {
+            let storage = StorageAdapter::new(crate::Memory::new());
+            let (space, key) = if corrupt_graph {
+                (
+                    crate::changelog::COMMIT_SPACE,
+                    StorageKey(bytes::Bytes::from(crate::changelog::commit_key(id))),
+                )
+            } else {
+                (
+                    crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
+                    crate::tracked_state::commit_state_authority_key(id),
+                )
+            };
+            let mut writes = storage.new_write_set();
+            writes.put(
+                space,
+                key,
+                StorageValue {
+                    bytes: bytes::Bytes::from_static(b"corrupt"),
+                },
+            );
+            storage
+                .commit_write_set(writes, Default::default())
+                .await
+                .unwrap();
+            let read = SharedStorageAdapterRead::new(
+                storage.begin_read(Default::default()).await.unwrap(),
+            );
+            let error = match commit_state_descriptor(&read, &id.to_string()).await {
+                Ok(_) => panic!("resident corruption must fail"),
+                Err(error) => datafusion_error_to_lix_error(error),
+            };
+            assert!(
+                NativeMetadataRef::from_missing_error(&error)
+                    .unwrap()
+                    .is_none(),
+                "{error}"
+            );
+            assert!(
+                NativeMetadataRef::batch_from_missing_error(&error)
+                    .unwrap()
+                    .is_none(),
+                "{error}"
+            );
+        }
+    }
 
     #[derive(Clone)]
     struct ContentReadProbe<S> {

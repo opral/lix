@@ -4,6 +4,12 @@ const session = (server: SyncServerBindingOptions) => ({
   activeAccountId: async () => '00000000-0000-7000-8000-000000000003',
   openAnotherSession: async () => session(server),
   execute: async (sql: string) => {
+    if (sql === 'cancel') {
+      const controller = new AbortController();
+      const pending = server.transport!({url: server.url + '/probe', init: {signal: controller.signal}, response: {mode: 'buffered', maxBytes: 4096}});
+      controller.abort();
+      await pending;
+    }
     if (sql === 'remote') {
       const response = await server.transport!({url: server.url + '/probe', init: {}, response: {mode: 'buffered', maxBytes: 4096}});
       return {columns: [], rows: [[await response.text()]], rowsAffected: 0, notices: []};

@@ -20,26 +20,49 @@ struct ExpiringClient {
     expire: Arc<AtomicBool>,
     lose_session: Arc<AtomicBool>,
     fetches: Arc<AtomicUsize>,
+    fresh_descriptors: Arc<AtomicUsize>,
     live_updates: Option<Arc<AtomicBool>>,
 }
 impl RawHttpClient for ExpiringClient {
     fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
         Box::pin(async move {
             if self.lose_session.swap(false, Ordering::SeqCst) {
-                let session = request.headers.iter().find(|(k,_)| k == "lix-session-id").unwrap().1.clone();
+                let session = request
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k == "lix-session-id")
+                    .unwrap()
+                    .1
+                    .clone();
                 let base = request.url.split("/sync/").next().unwrap();
-                let response = self.server.handle(http::Request::builder()
-                    .method("DELETE").uri(format!("{base}/session"))
-                    .header("lix-server-protocol-version", crate::SERVER_PROTOCOL_VERSION.to_string())
-                    .header("lix-session-id", session)
-                    .body(ServerProtocolBody::from(Vec::new())).unwrap(), ServerProtocolContext::anonymous()).await;
+                let response = self
+                    .server
+                    .handle(
+                        http::Request::builder()
+                            .method("DELETE")
+                            .uri(format!("{base}/session"))
+                            .header(
+                                "lix-server-protocol-version",
+                                crate::SERVER_PROTOCOL_VERSION.to_string(),
+                            )
+                            .header("lix-session-id", session)
+                            .body(ServerProtocolBody::from(Vec::new()))
+                            .unwrap(),
+                        ServerProtocolContext::anonymous(),
+                    )
+                    .await;
                 assert_eq!(response.status(), 204);
+            }
+            if request.url.contains("/sync/descriptor") && !request.url.contains("after=") {
+                self.fresh_descriptors.fetch_add(1, Ordering::SeqCst);
             }
             if request.url.contains("/sync/descriptor?") && request.url.contains("after=") {
                 match &self.live_updates {
-                    Some(enabled) => while !enabled.load(Ordering::SeqCst) {
-                        crate::sync::platform::sleep(std::time::Duration::from_millis(1)).await;
-                    },
+                    Some(enabled) => {
+                        while !enabled.load(Ordering::SeqCst) {
+                            crate::sync::platform::sleep(std::time::Duration::from_millis(1)).await;
+                        }
+                    }
                     None => futures_util::future::pending::<()>().await,
                 }
             }
@@ -155,7 +178,7 @@ async fn recovery(dirty: bool, advanced: bool, transaction: usize) {
         authority.execute("INSERT INTO lix_key_value(key,value) VALUES('edit','before')", &[]).await.unwrap();
         authority.upsert_file_content("/cold.bin", if transaction == 2 { vec![42u8; 5 * 1024 * 1024] } else { b"cold contents".to_vec() }).await.unwrap();
         let server = open_lix().with_storage(backing).serve().with_embedded_lix_id().await.unwrap();
-        let client = ExpiringClient { server, lease: Arc::default(), expire: Arc::default(), lose_session: Arc::default(), fetches: Arc::default(), live_updates: None };
+        let client = ExpiringClient { server, lease: Arc::default(), expire: Arc::default(), lose_session: Arc::default(), fetches: Arc::default(), fresh_descriptors: Arc::default(), live_updates: None };
         let transport = HttpSyncTransport::connect_with(client.clone(), &format!("https://example.test/lix/{}", authority.lix_id())).await.unwrap();
         let wrapper = transport.partial_replica_descriptor(None).await.unwrap();
         let old = Arc::new(PartialReplicaState::from_leased(
@@ -216,6 +239,7 @@ async fn recovery(dirty: bool, advanced: bool, transaction: usize) {
                 client.expire.store(true, Ordering::SeqCst);
             }
             let fetches_before = client.fetches.load(Ordering::SeqCst);
+            let descriptors_before = client.fresh_descriptors.load(Ordering::SeqCst);
             let started = std::time::Instant::now();
             let sql = "SELECT content FROM lix_file WHERE path='/cold.bin'";
             let result = if transaction == 1 || transaction == 2 || transaction == 5 {
@@ -236,6 +260,10 @@ async fn recovery(dirty: bool, advanced: bool, transaction: usize) {
                 }
             } else { lix.execute(sql, &[]).await.expect("normal awaited SQL recovers without application retries") };
             let elapsed_us = started.elapsed().as_micros();
+            if !dirty && !advanced && transaction == 0 {
+                assert_eq!(client.fresh_descriptors.load(Ordering::SeqCst) - descriptors_before, 1,
+                    "one completed recovery must not refetch descriptors for later hydration");
+            }
             assert_eq!(result.rows().len(), 1, "cold SQL returns the requested file");
             assert_eq!(result.rows()[0].get::<Vec<u8>>("content").unwrap(),
                 if transaction == 2 { vec![42u8; 5 * 1024 * 1024] } else if transaction == 5 { b"committed transaction contents".to_vec() } else { b"cold contents".to_vec() });

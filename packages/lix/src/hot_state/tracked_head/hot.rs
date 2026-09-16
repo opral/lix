@@ -2658,7 +2658,10 @@ async fn scan_root_current_base_rows(
             if cache.is_some() {
                 crate::storage_bench::record_root_base_batch_cache_miss();
             }
-            let mut reader = crate::tracked_state::TrackedStateContext::new().reader(store);
+            let context = cache
+                .map(|cache| cache.tracked_state.clone())
+                .unwrap_or_else(crate::tracked_state::TrackedStateContext::new);
+            let mut reader = context.reader(store);
             let produced = Arc::new(
                 Box::pin(reader.scan_batch_at_commit(&base_commit_id.to_string(), request)).await?,
             );
@@ -2977,7 +2980,10 @@ async fn load_cached_root_exact(
     if let Some(batch) = cache.and_then(|cache| cache.exact.get(base, keys, projection)) {
         return Ok(batch);
     }
-    let mut reader = crate::tracked_state::TrackedStateContext::new().reader(store);
+    let context = cache
+        .map(|cache| cache.tracked_state.clone())
+        .unwrap_or_else(crate::tracked_state::TrackedStateContext::new);
+    let mut reader = context.reader(store);
     let batch = Arc::new(
         Box::pin(reader.load_projected_batch_at_commit_refs(&base.to_string(), keys, &projection))
             .await?,
@@ -4084,8 +4090,11 @@ fn exclude_ordered_live_batch_identities(
 /// time. Branch creation therefore stays O(1) — nothing is materialized when a
 /// branch is created — and the first read of a rotated generation pays the
 /// materialization once instead of every read paying it forever.
-#[derive(Default)]
 pub(crate) struct RootBaseBatchCache {
+    // Content-addressed tree nodes remain valid across requests and generations.
+    // Reuse the caller's existing bounded node cache rather than constructing a
+    // fresh tracked-state context for every point or scoped scan cache miss.
+    tracked_state: crate::tracked_state::TrackedStateContext,
     exact: root_exact_cache::Cache,
     entries: std::sync::Mutex<RootBaseBatchCacheEntries>,
 }
@@ -4109,7 +4118,23 @@ struct RootBaseBatchCacheEntry {
 const ROOT_BASE_BATCH_CACHE_MAX_ENTRIES: usize = 16;
 const ROOT_BASE_BATCH_CACHE_MAX_ROWS: usize = 250_000;
 
+impl Default for RootBaseBatchCache {
+    fn default() -> Self {
+        Self::with_tracked_state(crate::tracked_state::TrackedStateContext::new())
+    }
+}
+
 impl RootBaseBatchCache {
+    pub(crate) fn with_tracked_state(
+        tracked_state: crate::tracked_state::TrackedStateContext,
+    ) -> Self {
+        Self {
+            tracked_state,
+            exact: root_exact_cache::Cache::default(),
+            entries: Default::default(),
+        }
+    }
+
     /// A poisoned cache lock degrades to a miss rather than an error. A serving
     /// cache must never be able to fail a read that would otherwise succeed.
     fn entries(&self) -> std::sync::MutexGuard<'_, RootBaseBatchCacheEntries> {

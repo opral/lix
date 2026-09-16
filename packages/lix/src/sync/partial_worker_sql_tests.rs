@@ -33,6 +33,11 @@ impl RawHttpClient for AuthorityClient {
             let url = url::Url::parse(&request.url).unwrap();
             let result = if request.method == http::Method::GET && !url.path().contains("/sync/") {
                 serde_json::json!({"protocolVersion":crate::SERVER_PROTOCOL_VERSION,"syncProtocolVersion":crate::sync::SYNC_PROTOCOL_VERSION,"lixId":self.authority.lix_id(),"sessionId":"partial-worker-authority","activeAccountId":self.authority.active_account_id()})
+            } else if url.path().ends_with("/sync/native-metadata-walk") {
+                let body = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+                self.metadata.fetch_add(1, Ordering::SeqCst);
+                serde_json::to_value(self.authority.read_sync_native_metadata_walk(&body).await?)
+                    .unwrap()
             } else if url.path().ends_with("/sync/native-metadata") {
                 let body = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
                 self.metadata.fetch_add(1, Ordering::SeqCst);
@@ -224,9 +229,9 @@ async fn partial_upload_worker_yields_to_demands_and_retries_ambiguous_acceptanc
             sender
                 .send(crate::sync::runtime::SyncDemand {
                     request: crate::sync::runtime::SyncDemandRequest::NativeMetadata(
-                        NativeMetadataRef::CommitGraphRecord(
+                        vec![NativeMetadataRef::CommitGraphRecord(
                             state.descriptor().selected_branch.head.commit_id.clone(),
-                        ),
+                        )],
                         LixError::unknown("queued resident demand"),
                     ),
                     response,
@@ -375,9 +380,9 @@ async fn production_frontier_preparation_supports_thirty_local_appends() {
         sender
             .send(crate::sync::runtime::SyncDemand {
                 request: crate::sync::runtime::SyncDemandRequest::NativeMetadata(
-                    NativeMetadataRef::CommitGraphRecord(
+                    vec![NativeMetadataRef::CommitGraphRecord(
                         state.descriptor().selected_branch.head.commit_id.clone(),
-                    ),
+                    )],
                     LixError::unknown("prepare baseline write frontier"),
                 ),
                 response,
@@ -452,6 +457,7 @@ impl RawHttpClient for WatchingAuthorityClient {
                 serde_json::to_value(descriptor).unwrap()
             } else if url.path().ends_with("/sync/native-object-range")
                 || url.path().ends_with("/sync/native-metadata")
+                || url.path().ends_with("/sync/native-metadata-walk")
                 || url.path().ends_with("/sync/native-objects")
             {
                 self.native_reads.fetch_add(1, Ordering::SeqCst);
@@ -474,6 +480,15 @@ impl RawHttpClient for WatchingAuthorityClient {
                         self.base
                             .authority
                             .read_sync_native_objects_leased(&body.objects, lease)
+                            .await?,
+                    )
+                    .unwrap()
+                } else if url.path().ends_with("/sync/native-metadata-walk") {
+                    let body = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+                    serde_json::to_value(
+                        self.base
+                            .authority
+                            .read_sync_native_metadata_walk_leased(&body, lease)
                             .await?,
                     )
                     .unwrap()
@@ -509,7 +524,7 @@ impl RawHttpClient for WatchingAuthorityClient {
 }
 
 #[tokio::test]
-async fn engine_worker_preempts_watch_then_publishes_retained_negative_scope() {
+async fn engine_worker_retains_watch_across_demands_then_publishes_negative_scope() {
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
         let authority = Arc::new(open_lix().await.unwrap());
         authority
@@ -605,25 +620,31 @@ async fn engine_worker_preempts_watch_then_publishes_retained_negative_scope() {
         );
         let caller = async {
             client.blocked.notified().await;
-            let (response, done) = tokio::sync::oneshot::channel();
-            sender
-                .send(crate::sync::runtime::SyncDemand {
-                    request: crate::sync::runtime::SyncDemandRequest::NativeMetadata(
-                        NativeMetadataRef::CommitStateHeader(
-                            old.descriptor().selected_branch.head.commit_id.clone(),
+            for _ in 0..8 {
+                let (response, done) = tokio::sync::oneshot::channel();
+                sender
+                    .send(crate::sync::runtime::SyncDemand {
+                        request: crate::sync::runtime::SyncDemandRequest::NativeMetadata(
+                            vec![NativeMetadataRef::CommitStateHeader(
+                                old.descriptor().selected_branch.head.commit_id.clone(),
+                            )],
+                            LixError::unknown("resident foreground demand"),
                         ),
-                        LixError::unknown("resident foreground demand"),
-                    ),
-                    response,
-                })
-                .await
-                .unwrap();
-            tokio::time::timeout(std::time::Duration::from_secs(1), done)
-                .await
-                .expect("foreground demand must cancel blocked watch")
-                .unwrap()
-                .unwrap();
-            client.blocked.notified().await;
+                        response,
+                    })
+                    .await
+                    .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(1), done)
+                    .await
+                    .expect("foreground demand must complete while the watch is blocked")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    client.watches.load(Ordering::SeqCst),
+                    1,
+                    "foreground work must retain the same descriptor request"
+                );
+            }
             authority
                 .execute(
                     "INSERT INTO lix_key_value (key,value) VALUES ('arrives-later','remote')",
@@ -653,6 +674,10 @@ async fn engine_worker_preempts_watch_then_publishes_retained_negative_scope() {
                 0,
                 "remote read publication creates no local pending edit"
             );
+            // Adoption changes the admission basis and must create a new watch.
+            while client.watches.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
             shutdown.send_replace(crate::sync::runtime::SyncShutdown::Stop);
         };
         let (result, ()) = futures_util::join!(worker, caller);
@@ -825,7 +850,7 @@ async fn expired_foreground_read_recovers(advance_authority: bool, dirty: bool) 
         let request = if dirty {
             let latest = authority.partial_replica_descriptor(None).await.unwrap();
             crate::sync::runtime::SyncDemandRequest::NativeMetadata(
-                NativeMetadataRef::CommitStateHeader(latest.selected_branch.head.commit_id),
+                vec![NativeMetadataRef::CommitStateHeader(latest.selected_branch.head.commit_id)],
                 LixError::unknown("nonresident history with local edits"),
             )
         } else {

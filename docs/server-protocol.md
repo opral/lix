@@ -49,7 +49,7 @@ contract in another language. See [Hosting](./hosting.md).
 | SQL         | `/lix/v1/{lix_id}/execute`, `/lix/v1/{lix_id}/execute-batch`                    |
 | Transaction | `/lix/v1/{lix_id}/transaction/{begin,execute,commit,rollback}`                  |
 | Files       | `/lix/v1/{lix_id}/file`, `/lix/v1/{lix_id}/file/upsert{,-batch}`               |
-| Sync        | `/lix/v1/{lix_id}/sync/{push,pull,history,checkpoints,descriptor,native-objects,native-object-range,native-metadata,baseline-lease/renew,blob,chunk,retained-bodies,merge,merge/restart,migration/merge,migration/cleanup,migration/global/restart,migration/global/cleanup,migration/global/merge,migration/global/bodies}`                          |
+| Sync        | `/lix/v1/{lix_id}/sync/{push,pull,history,checkpoints,descriptor,native-objects,native-object-range,native-metadata,native-metadata-walk,baseline-lease/renew,blob,chunk,retained-bodies,merge,merge/restart,migration/merge,migration/cleanup,migration/global/restart,migration/global/cleanup,migration/global/merge,migration/global/bodies}`                          |
 | Versioning  | `/lix/v1/{lix_id}/branch/{create,switch,merge,merge-preview}`, `/lix/v1/{lix_id}/{undo,redo}`       |
 | Observation | `/lix/v1/{lix_id}/observe`, `/lix/v1/{lix_id}/observe/multiplex`                |
 | Snapshot    | `/lix/v1/{lix_id}/snapshot`                                                     |
@@ -175,7 +175,7 @@ executes on the authority.
   `PUT /lix/v1/{lix_id}/sync/chunk?chunkId=...` transfer raw chunks. Both identities are
   64-character lowercase BLAKE3 hex digests; chunks are at most 4 MiB.
 
-All sync routes require exactly one `lix-sync-protocol-version: 17` header.
+All sync routes require exactly one `lix-sync-protocol-version: 19` header.
 Missing, duplicate, malformed, or incompatible versions are rejected before
 reading or publishing sync data. The handshake advertises
 `syncCheckpointInventory: true`. Commit bodies and headers both carry immutable
@@ -195,7 +195,7 @@ again. There is no separate presence request.
 
 ### Partial replica with on-demand sync
 
-Sync protocol 17 defines the native transport for a partial replica with
+Sync protocol 19 defines the native transport for a partial replica with
 on-demand sync. SDK callers opt in with `server.mode: "partial_replica"` and
 local storage. The default server mode is `remote`. Client and server must
 upgrade together; this transport change does not alter the repository format.
@@ -243,6 +243,16 @@ incompatible sync versions before sync work; upgrade SDK and server together.
   `lix-native-baseline-lease`, checked against the authenticated account in the
   same storage snapshot as the native read. Request JSON is capped at 16 KiB;
   object/range payloads are capped at 1 MiB and metadata payloads at 256 KiB.
+- `POST /sync/native-metadata-walk` fetches up to 16 first-parent commits
+  with optional headers under the same baseline lease. The response is bounded
+  to 32 records and 256 KiB of decoded metadata. Unavailable optional ancestors
+  truncate the walk; required inputs still fail normally.
+- Native metadata responses may include a bounded dependency bundle containing
+  the locator owner's header and catalog. Clients validate ownership, hashes,
+  and admission before atomically installing the bundle. Missing or corrupt
+  optional companions are omitted; required object failures remain errors.
+  Protocol 18 introduced metadata walks and protocol 19 adds these bundles;
+  clients and servers must upgrade together, without resetting local storage.
 - `POST /sync/baseline-lease/renew` accepts `{leaseId}` and extends an unexpired
   lease without changing its account or roots. Expired leases cannot be
   resurrected. Cold requests return `LIX_PARTIAL_BASELINE_EXPIRED` (HTTP 410);

@@ -10,9 +10,7 @@ use crate::storage_adapter::{Storage, StorageAdapter, StorageWriteOptions};
 use crate::{LixError, tracked_state::NativeMetadataRef};
 
 use super::http::{HttpSyncTransport, RawHttpClient};
-use super::native_metadata::{
-    NativeMetadataRequest, native_metadata_is_resident, stage_native_metadata,
-};
+use super::native_metadata::{NativeMetadataRequest, stage_native_metadata};
 use super::partial_hydration::{hydrate_native_object, native_object_is_resident};
 use super::partial_state::{PartialReplicaState, load_partial_replica_state};
 use super::platform::{sleep, spawn_sync_task};
@@ -202,6 +200,15 @@ pub(super) async fn hydrate_metadata_batch<
     request.objects = missing;
     // No local read or transaction remains open across network I/O.
     let response = transport.native_metadata(&request).await?;
+    install_metadata_response(storage, state, &request, &response).await
+}
+
+async fn install_metadata_response<S: Storage + Clone + Send + Sync + 'static>(
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+    request: &NativeMetadataRequest,
+    response: &super::native_metadata::NativeMetadataResponse,
+) -> Result<(), LixError> {
     loop {
         let read = storage.begin_read(Default::default()).await?;
         // Retry local CAS contention only while these authenticated inputs
@@ -220,7 +227,7 @@ pub(super) async fn hydrate_metadata_batch<
         }
         let mut writes = storage.new_write_set();
         let preconditions =
-            stage_native_metadata(&read, &mut writes, state, &request, &response).await?;
+            stage_native_metadata(&read, &mut writes, state, request, response).await?;
         drop(read);
         match storage
             .commit_partial_replica_write_set(
@@ -256,19 +263,19 @@ async fn demand_is_resident<S: Storage + Clone + Send + Sync + 'static>(
         SyncDemandRequest::NativeObject(address, _) => {
             native_object_is_resident(storage, state, *address).await
         }
-        SyncDemandRequest::NativeObjects(addresses, _) => {
+        SyncDemandRequest::NativeObjects(addresses, error) => {
+            let required =
+                crate::tracked_state::NativeHistoryFrontier::required_len(error, addresses.len())?;
             let mut complete = true;
-            for address in addresses {
+            for address in &addresses[..required] {
                 complete &= native_object_is_resident(storage, state, *address).await?;
             }
             Ok(complete)
         }
-        SyncDemandRequest::NativeMetadataBatch(addresses, _) => {
-            let request = NativeMetadataRequest {
-                epoch_id: state.epoch_id().to_owned(),
-                objects: addresses.clone(),
-            };
-            super::native_metadata::validate_native_metadata_request(&request)?;
+        SyncDemandRequest::NativeMetadata(addresses, error) => {
+            let required =
+                crate::tracked_state::NativeHistoryFrontier::required_len(error, addresses.len())?;
+            let addresses = &addresses[..required];
             let read = storage.begin_read(Default::default()).await?;
             let mut complete =
                 super::native_metadata::native_metadata_residency(&read, state, addresses)
@@ -288,24 +295,6 @@ async fn demand_is_resident<S: Storage + Clone + Send + Sync + 'static>(
                 .is_none();
             }
             Ok(complete)
-        }
-        SyncDemandRequest::NativeMetadata(address, _) => {
-            let read = storage.begin_read(Default::default()).await?;
-            let resident = native_metadata_is_resident(&read, state, address).await?;
-            drop(read);
-            if !resident {
-                return Ok(false);
-            }
-            if matches!(address, NativeMetadataRef::CommitGraphRecord(_)) {
-                return Ok(
-                    super::partial_write_frontier::next_missing_baseline_write_frontier(
-                        storage, state,
-                    )
-                    .await?
-                    .is_none(),
-                );
-            }
-            Ok(true)
         }
         SyncDemandRequest::BlobManifest(address, _) => {
             super::partial_blob::manifest_is_resident(storage, state, *address).await
@@ -334,7 +323,8 @@ async fn demand_is_resident<S: Storage + Clone + Send + Sync + 'static>(
     }
 }
 
-// Erase this child operation before composing the worker select loop.
+// Speculative history inputs share the exact batch path. If that attempt fails,
+// revalidate/fetch only the original required prefix before deciding query fate.
 pub(super) fn hydrate_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: RawHttpClient>(
     storage: &'a StorageAdapter<S>,
     state: &'a PartialReplicaState,
@@ -342,6 +332,81 @@ pub(super) fn hydrate_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: 
     request: SyncDemandRequest,
 ) -> super::SyncTransportFuture<'a, ()> {
     Box::pin(async move {
+        let required = match &request {
+            SyncDemandRequest::NativeObjects(addresses, error) => {
+                let n = crate::tracked_state::NativeHistoryFrontier::required_len(
+                    error,
+                    addresses.len(),
+                )?;
+                (n < addresses.len()).then(|| {
+                    SyncDemandRequest::NativeObjects(addresses[..n].to_vec(), error.clone())
+                })
+            }
+            SyncDemandRequest::NativeMetadata(addresses, error) => {
+                let n = crate::tracked_state::NativeHistoryFrontier::required_len(
+                    error,
+                    addresses.len(),
+                )?;
+                (n < addresses.len()).then(|| {
+                    SyncDemandRequest::NativeMetadata(addresses[..n].to_vec(), error.clone())
+                })
+            }
+            _ => None,
+        };
+        // Do not let an optional graph input launch another metadata prefetch.
+        let allow_metadata_walk = required.is_none();
+        match hydrate_exact_demand(storage, state, transport, request, allow_metadata_walk).await {
+            Ok(()) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "LIX_PARTIAL_BASELINE_EXPIRED"
+                        | super::SYNC_PROTOCOL_MISMATCH_CODE
+                        | super::SYNC_REPOSITORY_ID_MISMATCH_CODE
+                ) =>
+            {
+                Err(error)
+            }
+            Err(error) => match required {
+                Some(required) => hydrate_exact_demand(storage, state, transport, required, true).await,
+                None => Err(error),
+            },
+        }
+    })
+}
+
+// Erase this child operation before composing the worker select loop.
+fn hydrate_exact_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: RawHttpClient>(
+    storage: &'a StorageAdapter<S>,
+    state: &'a PartialReplicaState,
+    transport: &'a HttpSyncTransport<C>,
+    request: SyncDemandRequest,
+    allow_metadata_walk: bool,
+) -> super::SyncTransportFuture<'a, ()> {
+    Box::pin(async move {
+        let history_inputs = match &request {
+            SyncDemandRequest::NativeMetadata(addresses, error) if allow_metadata_walk => {
+                Some((addresses.as_slice(), error))
+            }
+            _ => None,
+        };
+        if let Some((addresses, error)) = history_inputs {
+            if let Some(walk) = super::native_metadata_walk::request_for_missing(
+                state.epoch_id(),
+                addresses,
+                error,
+            )? {
+                // Drop all local reads before network I/O. Install through the
+                // same immutable, epoch-fenced path used for exact metadata.
+                let response = transport.native_metadata_walk(&walk).await?;
+                let exact = super::native_metadata_walk::validate_response(
+                    state.repository_id(),
+                    &walk,
+                    &response,
+                )?;
+                install_metadata_response(storage, state, &exact, &response).await?;
+            }
+        }
         match request {
             SyncDemandRequest::BlobManifest(address, _) => {
                 if super::partial_blob::manifest_is_resident(storage, state, address).await? {
@@ -400,7 +465,7 @@ pub(super) fn hydrate_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: 
                 .await
                 .map(|_| ())
             }
-            SyncDemandRequest::NativeMetadataBatch(addresses, error) => {
+            SyncDemandRequest::NativeMetadata(addresses, error) => {
                 if super::partial_merge_analysis::ancestry::hydrate(
                     storage, state, transport, &error,
                 )
@@ -412,26 +477,6 @@ pub(super) fn hydrate_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: 
                     .iter()
                     .any(|address| matches!(address, NativeMetadataRef::CommitGraphRecord(_)));
                 hydrate_metadata_batch(storage, state, transport, addresses).await?;
-                if graph {
-                    super::partial_write_frontier::prepare_baseline_write_frontier(
-                        storage,
-                        state,
-                        |address| hydrate_metadata(storage, state, transport, address),
-                    )
-                    .await?;
-                }
-                Ok(())
-            }
-            SyncDemandRequest::NativeMetadata(address, error) => {
-                if super::partial_merge_analysis::ancestry::hydrate(
-                    storage, state, transport, &error,
-                )
-                .await?
-                {
-                    return Ok(());
-                }
-                let graph = matches!(address, NativeMetadataRef::CommitGraphRecord(_));
-                hydrate_metadata(storage, state, transport, address).await?;
                 if graph {
                     super::partial_write_frontier::prepare_baseline_write_frontier(
                         storage,
@@ -861,6 +906,13 @@ where
         .unwrap_or_default();
     health.started(state.descriptor().cursor);
     let mut publication: Option<super::SyncTransportFuture<'static, ()>> = None;
+    // Retain only network discovery across foreground demands. Reconciliation
+    // still cancels normally, so no local read or operation gate is parked.
+    let mut pending_descriptor: Option<(
+        Arc<PartialReplicaState>,
+        u64,
+        super::SyncTransportFuture<'static, super::http::TimedLeasedPartialDescriptor>,
+    )> = None;
     let mut watch_cursor = state.descriptor().cursor;
     let mut blocked_global_cursor: Option<u64> = None;
     let mut force_descriptor_refresh = false;
@@ -886,6 +938,7 @@ where
                 )
             })?;
             if current.as_ref() != state.as_ref() {
+                pending_descriptor = None;
                 let lease_changed =
                     current.baseline_lease().lease_id != state.baseline_lease().lease_id;
                 transport = transport
@@ -1081,9 +1134,26 @@ where
                 // evaluator below, under this descriptor's original lease.
                 let branch = &state.descriptor().selected_branch.branch_id;
                 let wrapper = if request_fresh {
+                    // Explicit refresh follows a known state/authority change.
+                    // Never reuse discovery across that invalidation boundary.
+                    pending_descriptor = None;
                     connected.partial_replica_descriptor(Some(branch)).await?
                 } else {
-                    connected.wait_partial_replica_descriptor(branch, after_cursor).await?
+                    if pending_descriptor.as_ref().is_some_and(|(basis, after, _)| {
+                        basis.as_ref() != state.as_ref() || *after != after_cursor
+                    }) {
+                        pending_descriptor = None;
+                    }
+                    if pending_descriptor.is_none() {
+                        let connected = connected.clone();
+                        let branch = branch.clone();
+                        pending_descriptor = Some((state.clone(), after_cursor, Box::pin(async move {
+                            connected.wait_partial_replica_descriptor(&branch, after_cursor).await
+                        })));
+                    }
+                    let response = pending_descriptor.as_mut().expect("descriptor request").2.as_mut().await;
+                    pending_descriptor = None;
+                    response?
                 };
                 wrapper.deadline.check(&wrapper.wire.lease.lease_id)?;
                 let cursor = wrapper.wire.descriptor.cursor;
@@ -1294,6 +1364,12 @@ where
                             watch_after = web_time::Instant::now();
                             Box::pin(reconcile_partial(engine.clone(), &mut transport, &mut connect, false)).await?;
                             let current = engine.sync_mode().partial_admission().ok_or_else(|| LixError::unknown("recovery lost admission"))?;
+                            if current.as_ref() != state.as_ref() {
+                                // Recovery already fetched and published fresh coordinates.
+                                // Resume watching their cursor instead of fetching the same
+                                // descriptor again for every subsequent missing input.
+                                force_descriptor_refresh = false;
+                            }
                             if !super::partial_publication::same_serving_basis(state.descriptor(), current.descriptor())
                                 || state.serving_generation(&state.descriptor().selected_branch.branch_id)? != current.serving_generation(&current.descriptor().selected_branch.branch_id)?
                                 || state.serving_generation(&state.descriptor().global_branch.branch_id)? != current.serving_generation(&current.descriptor().global_branch.branch_id)? {
@@ -1337,6 +1413,8 @@ where
             }
         }
     }
+    // Cancel outstanding discovery before closing its authenticated session.
+    drop(pending_descriptor);
     // Dropping a publication completion future cannot cancel its already
     // spawned commit owner. That owner keeps Engine and both gates alive and
     // does no network work. Shutdown therefore closes transport independently;
@@ -1386,6 +1464,7 @@ mod tests {
     use super::super::native_metadata::NativeMetadataResponse;
     use super::super::partial_state::stage_partial_replica_state;
     use super::*;
+    use crate::sync::native_metadata::native_metadata_is_resident;
     use crate::{Memory, open_lix};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1409,7 +1488,7 @@ mod tests {
         sender
             .send(SyncDemand {
                 request: SyncDemandRequest::NativeMetadata(
-                    address,
+                    vec![address],
                     LixError::unknown("stale demand"),
                 ),
                 response,
@@ -1459,7 +1538,7 @@ mod tests {
             sender
                 .send(SyncDemand {
                     request: SyncDemandRequest::NativeMetadata(
-                        address,
+                        vec![address],
                         LixError::unknown("missing"),
                     ),
                     response,
@@ -1525,6 +1604,148 @@ mod tests {
             })
         }
     }
+    #[tokio::test]
+    async fn speculative_native_failures_fall_back_without_hiding_required_failures() {
+        use super::super::native_metadata::NativeMetadata;
+        use super::super::native_object::{NativeObject, NativeObjectResponse};
+        use crate::tracked_state::{NativeHistoryFrontier, NativeObjectRef};
+        #[derive(Clone)]
+        struct FaultClient {
+            inner: Client,
+            corrupt_optional: bool,
+            missing_required: bool,
+        }
+        impl RawHttpClient for FaultClient {
+            fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
+                Box::pin(async move {
+                    assert!(!request.url.ends_with("/sync/native-metadata-walk"), "optional graph records must not launch nested metadata prefetch");
+                    let metadata = request.url.ends_with("/sync/native-metadata");
+                    if !metadata && !request.url.ends_with("/sync/native-objects") {
+                        return self.inner.send(request).await;
+                    }
+                    self.inner.fetches.fetch_add(1, Ordering::SeqCst);
+                    let body: serde_json::Value =
+                        serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+                    let objects = body["objects"].as_array().unwrap();
+                    if self.missing_required || (objects.len() > 1 && !self.corrupt_optional) {
+                        return Ok(RawHttpResponse { status: 404, status_text: "missing".into(), body: br#"{"error":{"code":"LIX_NATIVE_OBJECT_UNAVAILABLE","message":"requested input unavailable"}}"#.to_vec() });
+                    }
+                    let payload = if metadata {
+                        let mut response = self.inner.metadata.clone();
+                        if objects.len() > 1 {
+                            response.objects.push(NativeMetadata {
+                                address: serde_json::from_value(objects[1].clone()).unwrap(),
+                                bytes: b"corrupt optional header".to_vec(),
+                            });
+                        }
+                        serde_json::to_vec(&response).unwrap()
+                    } else {
+                        let values = objects
+                            .iter()
+                            .enumerate()
+                            .map(|(i, address)| NativeObject {
+                                address: serde_json::from_value(address.clone()).unwrap(),
+                                bytes: if i == 0 {
+                                    vec![7; 16]
+                                } else {
+                                    b"corrupt optional object".to_vec()
+                                },
+                            })
+                            .collect();
+                        serde_json::to_vec(&NativeObjectResponse {
+                            lix_id: self.inner.state.repository_id().into(),
+                            objects: values,
+                        })
+                        .unwrap()
+                    };
+                    Ok(RawHttpResponse {
+                        status: 200,
+                        status_text: "OK".into(),
+                        body: payload,
+                    })
+                })
+            }
+        }
+        for (objects, optional_graph) in [(false, false), (false, true), (true, false)] {
+            for (corrupt_optional, missing_required) in
+                [(false, false), (true, false), (false, true)]
+            {
+                let (storage, state, _, client, address) = fixture_metadata(false, false).await;
+                let transport = HttpSyncTransport::connect_with(
+                    FaultClient {
+                        inner: client.clone(),
+                        corrupt_optional,
+                        missing_required,
+                    },
+                    state.remote_id(),
+                )
+                .await
+                .unwrap();
+                transport
+                    .bind_native_baseline_lease(state.baseline_lease())
+                    .unwrap();
+                let request = if objects {
+                    let addresses = [vec![7; 16], vec![8; 16]].map(|bytes| {
+                        NativeObjectRef::TrackedStateTreeChunk(*blake3::hash(&bytes).as_bytes())
+                    });
+                    let error = NativeObjectRef::annotate_missing_batch(
+                        addresses,
+                        LixError::unknown("required object"),
+                    );
+                    SyncDemandRequest::NativeObjects(
+                        addresses.to_vec(),
+                        NativeHistoryFrontier::annotate_optional_suffix(error, 1),
+                    )
+                } else {
+                    let addresses = vec![
+                        address.clone(),
+                        if optional_graph {
+                            NativeMetadataRef::CommitGraphRecord("00000000-0000-7000-8000-000000000598".into())
+                        } else {
+                            NativeMetadataRef::CommitStateHeader("00000000-0000-7000-8000-000000000598".into())
+                        },
+                    ];
+                    let error = NativeMetadataRef::annotate_missing_batch(
+                        addresses.clone(),
+                        LixError::unknown("required header"),
+                    );
+                    SyncDemandRequest::NativeMetadata(
+                        addresses,
+                        NativeHistoryFrontier::annotate_optional_suffix(
+                            NativeMetadataRef::annotate_history_demand(error, true), 1),
+                    )
+                };
+                assert!(
+                    !demand_is_resident(&storage, &state, &request)
+                        .await
+                        .unwrap()
+                );
+                let result = hydrate_demand(&storage, &state, &transport, request.clone()).await;
+                if missing_required {
+                    assert_eq!(result.unwrap_err().code, "LIX_NATIVE_OBJECT_UNAVAILABLE");
+                    assert!(
+                        !demand_is_resident(&storage, &state, &request)
+                            .await
+                            .unwrap()
+                    );
+                } else {
+                    result.unwrap();
+                    assert!(
+                        demand_is_resident(&storage, &state, &request)
+                            .await
+                            .unwrap(),
+                        "optional absence cannot block a now-resident required input"
+                    );
+                }
+                assert_eq!(
+                    client.fetches.load(Ordering::SeqCst),
+                    2,
+                    "failed speculative batch gets one required-only fallback"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn metadata_batch_fetches_once_and_reuses_durable_residency() {
         let (storage, state, transport, client, _) = fixture_metadata(false, true).await;
@@ -1665,6 +1886,7 @@ mod tests {
                         })
                         .collect();
                     let response = NativeMetadataResponse {
+                        dependencies: Default::default(),
                         lix_id: self.handshake.state.repository_id().to_owned(),
                         epoch_id: request.epoch_id,
                         objects,
@@ -1910,7 +2132,7 @@ mod tests {
         sender
             .send(SyncDemand {
                 request: SyncDemandRequest::NativeMetadata(
-                    address.clone(),
+                    vec![address.clone()],
                     LixError::unknown("missing"),
                 ),
                 response,
@@ -1930,7 +2152,7 @@ mod tests {
             sender
                 .send(SyncDemand {
                     request: SyncDemandRequest::NativeMetadata(
-                        address.clone(),
+                        vec![address.clone()],
                         LixError::unknown("duplicate demand"),
                     ),
                     response,
@@ -1988,7 +2210,7 @@ mod tests {
             sender
                 .send(SyncDemand {
                     request: SyncDemandRequest::NativeMetadata(
-                        address.clone(),
+                        vec![address.clone()],
                         LixError::unknown("missing"),
                     ),
                     response,

@@ -7,6 +7,80 @@ use serde_json::json;
 use super::assert_rows_eq;
 
 simulation_test!(
+    finite_file_id_selection_preserves_paths_filters_and_noncanonical_literals,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        let first = "aaaaaaaa-0000-8000-8000-000000000001";
+        let second = "bbbbbbbb-0000-8000-8000-000000000002";
+        session.execute(
+                "INSERT INTO lix_file (id,path,content) VALUES              ('aaaaaaaa-0000-8000-8000-000000000001','/folder/nested/one.bin',CAST('one' AS BYTEA)),              ('bbbbbbbb-0000-8000-8000-000000000002','/other/two.bin',CAST('two' AS BYTEA))",
+                &[],
+            ).await.unwrap();
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT id,path FROM lix_file WHERE id IN ($1,$2) ORDER BY id",
+                    &[Value::Text(second.into()), Value::Text(first.into())],
+                )
+                .await
+                .unwrap(),
+            vec![
+                vec![
+                    Value::Text(first.into()),
+                    Value::Text("/folder/nested/one.bin".into()),
+                ],
+                vec![
+                    Value::Text(second.into()),
+                    Value::Text("/other/two.bin".into()),
+                ],
+            ],
+        );
+        session
+            .execute(
+                "UPDATE lix_directory SET path='/moved' WHERE path='/folder'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_rows_eq(
+                session.execute("SELECT id,path FROM lix_file WHERE id IN ($1,$2) AND path LIKE '/moved/%' ORDER BY id", &[Value::Text(first.into()),Value::Text(second.into())]).await.unwrap(),
+                vec![vec![Value::Text(first.into()),Value::Text("/moved/nested/one.bin".into())]],
+            );
+        for literal in [
+            "not-a-uuid",
+            "AAAAAAAA-0000-8000-8000-000000000001",
+            "00000000-0000-0000-0000-000000000000",
+        ] {
+            assert_rows_eq(
+                session
+                    .execute(
+                        "SELECT id,path FROM lix_file WHERE id=$1",
+                        &[Value::Text(literal.into())],
+                    )
+                    .await
+                    .unwrap(),
+                vec![],
+            );
+        }
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT id,path FROM lix_file WHERE id IN ($1,'not-a-uuid')",
+                    &[Value::Text(first.into())],
+                )
+                .await
+                .unwrap(),
+            vec![vec![
+                Value::Text(first.into()),
+                Value::Text("/moved/nested/one.bin".into()),
+            ]],
+        );
+    }
+);
+
+
+simulation_test!(
     bootstrap_lix_files_belong_to_initial_main_commit,
     |sim| async move {
         let engine = sim.boot_engine().await;

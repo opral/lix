@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 
 use crate::LixError;
-#[cfg(test)]
 use crate::hot_state::MaterializedHotStateBatchBuilder;
 use crate::hot_state::{HotStateExactBatchRequest, HotStateScanRequest};
 use crate::hot_state::{MaterializedHotStateBatch, MaterializedHotStateExactBatch};
@@ -104,6 +103,19 @@ pub(crate) trait HotStateReader: Send + Sync {
         request: &HotStateExactBatchRequest,
     ) -> Result<MaterializedHotStateExactBatch, LixError>;
 
+    /// Resolve a parent chain in the same visible domain as the initial rows.
+    /// The caller retains the semantic dependency recipe; point interests alone
+    /// cannot describe parents introduced by a later generation.
+    async fn load_exact_parent_closure(
+        &self,
+        request: &HotStateExactBatchRequest,
+        parent: ParentRowPk,
+    ) -> Result<MaterializedHotStateBatch, LixError> {
+        load_parent_closure_with(request, parent, |batch| async move {
+            self.load_exact_batch(&batch).await
+        }).await
+    }
+
     /// Loads collection control from this reader's coherent storage snapshot.
     ///
     /// Readers without a published tracked-head projection conservatively
@@ -143,4 +155,40 @@ where
         );
     }
     MaterializedHotStateExactBatch::new(rows.finish(), slots)
+}
+
+/// Pure identity extraction, never SQL expression evaluation.
+pub(crate) type ParentRowPk = fn(super::MaterializedHotStateRowRef<'_>) -> Result<Option<crate::row_pk::RowPk>, LixError>;
+
+pub(crate) async fn load_parent_closure_with<F, Fut>(
+    request: &HotStateExactBatchRequest,
+    parent: ParentRowPk,
+    mut load: F,
+) -> Result<MaterializedHotStateBatch, LixError>
+where
+    F: FnMut(HotStateExactBatchRequest) -> Fut + Send,
+    Fut: Future<Output = Result<MaterializedHotStateExactBatch, LixError>> + Send,
+{
+    let mut pending = request.rows.clone();
+    let mut visited = std::collections::BTreeSet::new();
+    let mut batches = Vec::new();
+    loop {
+        pending.retain(|row| visited.insert((row.branch_id.clone(), row.schema_key.clone(), row.file_id.clone(), row.row_pk.clone())));
+        if pending.is_empty() { break; }
+        let batch = load(HotStateExactBatchRequest { rows: std::mem::take(&mut pending), ..request.clone() }).await?.into_present_batch();
+        for row in batch.iter() {
+            if let Some(row_pk) = parent(row)? {
+                pending.push(super::HotStateExactRowRequest {
+                    branch_id: row.branch_id().to_owned(),
+                    schema_key: row.schema_key().to_owned(),
+                    file_id: row.file_id().map(str::to_owned),
+                    row_pk,
+                });
+            }
+        }
+        batches.push(batch);
+    }
+    let mut builder = MaterializedHotStateBatchBuilder::with_capacity(batches.iter().map(MaterializedHotStateBatch::len).sum());
+    for batch in &batches { for row in batch.iter() { builder.push_ref(row, None); } }
+    Ok(builder.finish())
 }

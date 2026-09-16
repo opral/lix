@@ -15,7 +15,7 @@ pub(crate) use diff::{arm_diff_commits_test_probe, take_diff_commits_test_probe}
 mod diff_id;
 mod merge;
 mod native_object;
-pub(crate) use native_object::{NativeMetadataRef, NativeObjectRef};
+pub(crate) use native_object::{NativeHistoryFrontier, NativeMetadataRef, NativeObjectRef};
 pub(crate) mod mutation_directory;
 pub(crate) mod replacement_part;
 mod row_materialization;
@@ -150,7 +150,9 @@ pub(crate) use storage::{
     TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE, TRACKED_STATE_COMMIT_MUTATION_INVENTORY_SPACE,
     TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE,
 };
-pub(crate) use storage::{commit_state_authority_key, decode_commit_state_authority_id};
+pub(crate) use storage::{
+    commit_state_authority_key, commit_state_catalog_address, decode_commit_state_authority_id,
+};
 #[cfg(test)]
 pub(crate) use storage::{
     load_commit_delta_change_ids, load_snapshot_commit_root,

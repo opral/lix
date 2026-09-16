@@ -20,9 +20,11 @@ use crate::changelog::CommitId;
 use crate::commit_graph::{CommitGraphContext, CommitGraphNode};
 use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::catalog::PublicCatalog;
-use crate::sql2::error::lix_error_to_datafusion_error;
+use crate::sql2::error::{datafusion_error_to_lix_error, lix_error_to_datafusion_error};
 use crate::sql2::udfs::{ExecutionSlots, execution_slots};
 use crate::storage_adapter::StorageAdapterRead;
+
+mod frontier;
 
 use super::diff::{DiffMode, DiffRelation, DiffSpec};
 use super::spec::{
@@ -350,6 +352,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
             Ok(super::file::FileIdConstraint::None) => Some(BTreeSet::new()),
             _ => None,
         };
+        let checkpoint_constraint = frontier::checkpoint_constraint(&metadata_filters);
         let df_meta_schema = DFSchema::try_from(meta_schema.as_ref().clone())?;
         let metadata_filters = metadata_filters
             .iter()
@@ -381,11 +384,13 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
             let mut remaining_ids = selected_ids.clone();
             let blob_reader = Arc::clone(&blob_reader);
             let stream_schema = schema.clone();
+            let include_state_headers = relation.is_some();
             let stream = async_stream::try_stream! {
                 let mut graph = CommitGraphContext::new().reader(store.clone());
                 let mut next = Some(anchor);
                 let mut position = 0i64;
                 let mut emitted = 0usize;
+                let mut completed_history_checkpoints = 0usize;
                 while let Some(id) = next {
                     if max_position.is_some_and(|ceiling| position > ceiling) { break; }
                     if limit.is_some_and(|n| emitted >= n) || remaining_ids.as_ref().is_some_and(|ids| ids.is_empty()) { break; }
@@ -405,7 +410,16 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                             to_commit_id: id.to_string(), active_branch_id: active_branch_id.clone(), mode: DiffMode::General };
                         let plan = diff.plan_scan(Some(&diff_projection), &row_filters, None, &ExecutionProps::new()).await?;
                         let mut batches = plan.source.open(0, context.clone())?;
-                        while let Some(batch) = batches.try_next().await? {
+                        while let Some(batch) = match batches.try_next().await {
+                            Ok(batch) => batch,
+                            Err(error) => {
+                                let error = frontier::discover(
+                                    &diff, parent, &diff_projection, &row_filters,
+                                    completed_history_checkpoints, checkpoint_constraint, datafusion_error_to_lix_error(error),
+                                ).await;
+                                Err(lix_error_to_datafusion_error(error))?
+                            }
+                        } {
                             let meta = metadata_batch(&node, current_position, true, batch.num_rows())?;
                             let columns = schema.fields().iter().map(|field| {
                                 batch.column_by_name(field.name()).or_else(|| meta.column_by_name(field.name())).cloned()
@@ -417,6 +431,9 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                             yield output;
                             if limit.is_some_and(|n| emitted >= n) { break; }
                         }
+                        // Reaching the next selected checkpoint means the consumer still
+                        // needs history, even when the completed diff produced no rows.
+                        completed_history_checkpoints = completed_history_checkpoints.saturating_add(1);
                     } else {
                         let batch = metadata_batch(&node, current_position, false, 1)?;
                         let indices = schema.fields().iter().map(|f| batch.schema().index_of(f.name())).collect::<std::result::Result<Vec<_>, _>>()?;
@@ -425,6 +442,14 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                     }
                 }
             };
+            let stream = stream.map_err(move |error| {
+                lix_error_to_datafusion_error(
+                    crate::tracked_state::NativeMetadataRef::annotate_history_demand(
+                        datafusion_error_to_lix_error(error),
+                        include_state_headers,
+                    ),
+                )
+            });
             Ok(Box::pin(RecordBatchStreamAdapter::new(
                 stream_schema,
                 stream,
