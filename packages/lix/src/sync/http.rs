@@ -20,7 +20,7 @@ pub(super) const HTTP_TIMEOUT: std::time::Duration =
 pub(super) const SYNC_TRANSPORT_ERROR_CODE: &str = "LIX_ERROR_SYNC_TRANSPORT";
 const SESSION_HEADER: &str = "lix-session-id";
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct RawHttpRequest {
     pub method: Method,
     pub url: String,
@@ -122,12 +122,44 @@ impl CandidateBaselineDeadline {
     }
 }
 
+/// Shared by transport clones; a rejected ID is never sent again. Reserve the
+/// retry deadline before awaiting the handshake so cancellation also backs off.
+#[derive(Debug)]
+struct SessionState {
+    id: String,
+    invalid: bool,
+    closed: bool,
+    terminal: bool,
+    retry_at: web_time::Instant,
+    retry_delay: std::time::Duration,
+    error: Option<LixError>,
+}
+impl SessionState {
+    fn new(id: String) -> Self {
+        Self {
+            id,
+            invalid: false,
+            closed: false,
+            terminal: false,
+            retry_at: web_time::Instant::now(),
+            retry_delay: std::time::Duration::from_secs(1),
+            error: None,
+        }
+    }
+}
+
+fn session_gone(response: &RawHttpResponse) -> bool {
+    response.status == 410
+        && serde_json::from_slice::<ErrorResponse>(&response.body)
+            .is_ok_and(|envelope| envelope.error.code == "LIX_ERROR_PROTOCOL_SESSION_GONE")
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct HttpSyncTransport<Client> {
     client: Client,
     protocol_url: String,
     lix_id: String,
-    session_id: String,
+    session: std::sync::Arc<tokio::sync::Mutex<SessionState>>,
     active_account_id: String,
     baseline_lease: std::sync::Arc<parking_lot::Mutex<Option<crate::gc::NativeBaselineLease>>>,
 }
@@ -162,10 +194,122 @@ where
             client,
             protocol_url,
             lix_id,
-            session_id: handshake.session_id,
+            session: std::sync::Arc::new(tokio::sync::Mutex::new(SessionState::new(
+                handshake.session_id,
+            ))),
             active_account_id: handshake.active_account_id,
             baseline_lease: Default::default(),
         })
+    }
+
+    async fn session_id(&self) -> Result<String, LixError> {
+        let mut session = self.session.lock().await;
+        if session.closed {
+            return Err(LixError::new(
+                LixError::CODE_CLOSED,
+                "sync session is closed",
+            ));
+        }
+        if session.terminal {
+            return Err(session.error.clone().expect("terminal recovery error"));
+        }
+        if !session.invalid {
+            return Ok(session.id.clone());
+        }
+        if web_time::Instant::now() < session.retry_at {
+            return Err(session.error.clone().unwrap_or_else(|| {
+                LixError::new(
+                    SYNC_TRANSPORT_ERROR_CODE,
+                    "sync session recovery is backing off",
+                )
+            }));
+        }
+        let delay = session.retry_delay;
+        session.retry_at = web_time::Instant::now() + delay;
+        session.retry_delay = (session.retry_delay * 2).min(std::time::Duration::from_secs(30));
+        let result = async {
+            let response = self.client.send(raw_request(
+                Method::GET, self.protocol_url.clone(), "recover sync session",
+            )).await?;
+            let handshake: HandshakeResponse = decode_response(response, "recover sync session")?;
+            let valid = validate_handshake(&handshake).and_then(|lix_id| {
+                if lix_id != self.lix_id || handshake.active_account_id != self.active_account_id {
+                    Err(LixError::new(super::SYNC_PROTOCOL_MISMATCH_CODE,
+                        "recovered sync session changed repository or account; local edits retained"))
+                } else { Ok(()) }
+            });
+            if let Err(error) = valid {
+                session.terminal = true;
+                session.error = Some(error.clone());
+                // A rejected handshake can still have allocated a session.
+                // Best-effort bounded cleanup must never start another one.
+                if !handshake.session_id.is_empty() && handshake.session_id.len() <= 4096 {
+                    use futures_util::FutureExt as _;
+                    let mut close = self.request(Method::DELETE, "/session", "close rejected sync session");
+                    close.headers.push((SESSION_HEADER.to_owned(), handshake.session_id));
+                    let close = self.client.send(close).fuse();
+                    let deadline = super::platform::sleep(std::time::Duration::from_secs(1)).fuse();
+                    futures_util::pin_mut!(close, deadline);
+                    futures_util::select! { _ = close => {}, _ = deadline => {} }
+                }
+                return Err(error);
+            }
+            Ok::<_, LixError>(handshake.session_id)
+        }.await;
+        match result {
+            Ok(id) => {
+                session.id = id.clone();
+                session.invalid = false;
+                session.error = None;
+                Ok(id)
+            }
+            Err(error) => {
+                session.retry_at = web_time::Instant::now() + delay;
+                session.error = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    async fn invalidate_session(&self, id: &str, response: &RawHttpResponse) {
+        let mut session = self.session.lock().await;
+        if session.id == id {
+            session.invalid = true;
+            session.error = Some(response_error(response, "sync session expired"));
+        }
+    }
+
+    async fn send(&self, mut request: RawHttpRequest) -> Result<RawHttpResponse, LixError> {
+        let id = self.session_id().await?;
+        request
+            .headers
+            .push((SESSION_HEADER.to_owned(), id.clone()));
+        // Only a canonical SESSION_GONE proves the server rejected the request
+        // before execution. Never replay writes on ambiguous transport failures.
+        let response = self.client.send(request.clone()).await?;
+        if !session_gone(&response) {
+            if (200..300).contains(&response.status) {
+                let mut session = self.session.lock().await;
+                if session.id == id && !session.invalid {
+                    session.retry_delay = std::time::Duration::from_secs(1);
+                    session.retry_at = web_time::Instant::now();
+                }
+            }
+            return Ok(response);
+        }
+        self.invalidate_session(&id, &response).await;
+        let replacement = self.session_id().await?;
+        request
+            .headers
+            .retain(|(name, _)| !name.eq_ignore_ascii_case(SESSION_HEADER));
+        request
+            .headers
+            .push((SESSION_HEADER.to_owned(), replacement.clone()));
+        let response = self.client.send(request).await?;
+        if session_gone(&response) {
+            self.invalidate_session(&replacement, &response).await;
+        }
+        Ok(response)
     }
 
     // Insert in inherent HttpSyncTransport<Client:RawHttpClient> impl.
@@ -183,7 +327,7 @@ where
             request.response_limit = 4096;
             request.headers.push(json_content_type());
             request.body = Some(json_body(value, "encode partial merge restart")?);
-            let response = self.client.send(request).await?;
+            let response = self.send(request).await?;
             if response.body.len() > 4096 {
                 return Err(response_too_large_limit(
                     "restart expired partial merge",
@@ -217,7 +361,7 @@ where
             request.response_limit = 2048;
             request.headers.push(json_content_type());
             request.body = Some(json_body(value, "encode retained body wave")?);
-            let response = self.client.send(request).await?;
+            let response = self.send(request).await?;
             if response.body.len() > 2048 {
                 return Err(response_too_large_limit("retain native upload wave", 2048));
             }
@@ -246,7 +390,7 @@ where
             request.response_limit = 4096;
             request.headers.push(json_content_type());
             request.body = Some(json_body(value, "encode partial merge")?);
-            let response = self.client.send(request).await?;
+            let response = self.send(request).await?;
             if response.body.len() > 4096 {
                 return Err(response_too_large_limit(
                     "merge partial replica commits",
@@ -272,7 +416,7 @@ where
             request.response_limit = 256 * 1024;
             request.headers.push(json_content_type());
             request.body = Some(json_body(value, "encode global restart")?);
-            let response = self.client.send(request).await?;
+            let response = self.send(request).await?;
             if response.body.len() > 256 * 1024 {
                 return Err(response_too_large_limit("global restart", 256 * 1024));
             }
@@ -296,7 +440,7 @@ where
             request.response_limit = 4096;
             request.headers.push(json_content_type());
             request.body = Some(json_body(value, "encode global cleanup")?);
-            let response = self.client.send(request).await?;
+            let response = self.send(request).await?;
             if response.body.len() > 4096 {
                 return Err(response_too_large_limit("global cleanup", 4096));
             }
@@ -317,7 +461,7 @@ where
             request.response_limit = 256 * 1024;
             request.headers.push(json_content_type());
             request.body = Some(json_body(value, "encode global migration")?);
-            let response = self.client.send(request).await?;
+            let response = self.send(request).await?;
             if response.body.len() > 256 * 1024 {
                 return Err(response_too_large_limit(
                     "global migration outcome",
@@ -350,7 +494,7 @@ where
             request.response_limit = 4096;
             request.headers.push(json_content_type());
             request.body = Some(json_body(value, "encode migration body wave")?);
-            let response = self.client.send(request).await?;
+            let response = self.send(request).await?;
             if response.body.len() > 4096 {
                 return Err(response_too_large_limit(
                     "migration body acknowledgement",
@@ -375,7 +519,7 @@ where
             request.response_limit = 4096;
             request.headers.push(json_content_type());
             request.body = Some(json_body(value, "encode partial merge")?);
-            let response = self.client.send(request).await?;
+            let response = self.send(request).await?;
             if response.body.len() > 4096 {
                 return Err(response_too_large_limit(
                     "merge partial replica commits",
@@ -399,7 +543,7 @@ where
             request.response_limit = 4096;
             request.headers.push(json_content_type());
             request.body = Some(json_body(value, "encode partial merge")?);
-            let response = self.client.send(request).await?;
+            let response = self.send(request).await?;
             if response.body.len() > 4096 {
                 return Err(response_too_large_limit(
                     "merge partial replica commits",
@@ -478,7 +622,7 @@ where
             "encode baseline renewal",
         )?);
         let request_started = web_time::Instant::now();
-        let response = self.client.send(request).await?;
+        let response = self.send(request).await?;
         if response.body.len() > 1024 {
             return Err(response_too_large_limit(
                 "renew native baseline lease",
@@ -513,10 +657,22 @@ where
     }
 
     pub(crate) async fn close_session(&self) -> Result<(), LixError> {
-        let response = self
-            .client
-            .send(self.request(Method::DELETE, "/session", "close sync session"))
-            .await?;
+        // Closing never creates a replacement session, including after a failed
+        // recovery. Serialize with recovery so a concurrent close cannot leak it.
+        let mut session = self.session.lock().await;
+        session.closed = true;
+        if session.invalid {
+            return Ok(());
+        }
+        session.invalid = true;
+        let mut request = self.request(Method::DELETE, "/session", "close sync session");
+        request
+            .headers
+            .push((SESSION_HEADER.to_owned(), session.id.clone()));
+        let response = self.client.send(request).await?;
+        if session_gone(&response) {
+            return Ok(());
+        }
         ensure_success(&response, "close sync session")
     }
 
@@ -573,7 +729,7 @@ where
             let mut request = self.request(Method::GET, &path, "load partial replica descriptor");
             request.response_limit = super::MAX_LEASED_DESCRIPTOR_BYTES;
             let request_started = web_time::Instant::now();
-            let response = self.client.send(request).await?;
+            let response = self.send(request).await?;
             if response.body.len() > super::MAX_LEASED_DESCRIPTOR_BYTES {
                 return Err(LixError::new(
                     super::SYNC_PROTOCOL_MISMATCH_CODE,
@@ -618,7 +774,7 @@ where
                 &serde_json::json!({"objects": objects}),
                 "encode native object request",
             )?);
-            let response = self.client.send(request).await?;
+            let response = self.send(request).await?;
             if response.body.len() > super::native_object::MAX_NATIVE_OBJECT_RESPONSE_BYTES {
                 return Err(response_too_large_limit(
                     "load native objects",
@@ -649,7 +805,7 @@ where
             request.response_limit = super::native_object::MAX_NATIVE_OBJECT_RESPONSE_BYTES;
             request.headers.push(json_content_type());
             request.body = Some(json_body(range, "encode native object range request")?);
-            let response = self.client.send(request).await?;
+            let response = self.send(request).await?;
             if response.body.len() > super::native_object::MAX_NATIVE_OBJECT_RESPONSE_BYTES {
                 return Err(response_too_large_limit(
                     "load native object range",
@@ -692,7 +848,7 @@ where
             request.response_limit = super::native_metadata::MAX_NATIVE_METADATA_RESPONSE_BYTES;
             request.headers.push(json_content_type());
             request.body = Some(json_body(metadata, "encode native metadata request")?);
-            let response = self.client.send(request).await?;
+            let response = self.send(request).await?;
             if response.body.len() > super::native_metadata::MAX_NATIVE_METADATA_RESPONSE_BYTES {
                 return Err(response_too_large_limit(
                     "load native metadata",
@@ -711,9 +867,6 @@ where
 
     fn request(&self, method: Method, path: &str, operation: &'static str) -> RawHttpRequest {
         let mut request = raw_request(method, format!("{}{path}", self.protocol_url), operation);
-        request
-            .headers
-            .push((SESSION_HEADER.to_owned(), self.session_id.clone()));
         request.headers.push((
             SYNC_PROTOCOL_VERSION_HEADER.to_owned(),
             SYNC_PROTOCOL_VERSION.to_string(),
@@ -731,7 +884,7 @@ where
         T: serde::de::DeserializeOwned,
     {
         let operation = request.operation;
-        decode_response(self.client.send(request).await?, operation)
+        decode_response(self.send(request).await?, operation)
     }
 }
 
@@ -981,7 +1134,7 @@ where
             );
             request.cache_immutable = true;
             request.response_limit = 4 * 1024 * 1024;
-            let response = self.client.send(request).await?;
+            let response = self.send(request).await?;
             if response.status == 404 {
                 return Ok(None);
             }
@@ -1000,7 +1153,7 @@ where
                 "application/octet-stream".to_owned(),
             ));
             request.body = Some(bytes.to_vec());
-            let response = self.client.send(request).await?;
+            let response = self.send(request).await?;
             ensure_success(&response, "store sync chunk")
         })
     }
@@ -1138,7 +1291,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        HandshakeResponse, HttpSyncTransport, RawHttpClient, RawHttpRequest, RawHttpResponse,
+        HandshakeResponse, HttpSyncTransport, RawHttpClient, RawHttpRequest, RawHttpResponse, SessionState,
         encode_query, normalize_sync_locator, response_error, validate_handshake,
     };
     use crate::sync::{SyncTransport, SyncTransportFuture};
@@ -1426,7 +1579,7 @@ mod tests {
             },
             protocol_url: "https://sync.example/lix/v1/repository".into(),
             lix_id: descriptor.lix_id.clone(),
-            session_id: "session".into(),
+            session: Arc::new(tokio::sync::Mutex::new(SessionState::new("session".into()))),
             active_account_id: crate::SYSTEM_ACCOUNT_ID.into(),
             baseline_lease: Arc::new(parking_lot::Mutex::new(Some(
                 crate::sync::LeasedPartialReplicaDescriptor::for_test(
@@ -2065,3 +2218,7 @@ mod tests {
         assert!(transport.merge_partial_replica(&request).await.is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "http/session_recovery_tests.rs"]
+mod session_recovery_tests;

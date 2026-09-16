@@ -374,6 +374,103 @@ pub const FILE_FOUND_HEADER: &str = "lix-file-found";
 pub const FILE_UPLOAD_ID_HEADER: &str = "lix-upload-id";
 /// Default maximum number of live remote sessions for one repository.
 pub const DEFAULT_MAX_SESSIONS: usize = 64;
+/// Storage admission decided from protocol headers before opening a runtime.
+/// Hosts must authenticate the principal first and still call `handle` after
+/// admission: this preflight does not replace canonical dispatch validation.
+#[derive(Debug)]
+pub struct ServerProtocolRuntimeAdmission {
+    session_id: Option<String>,
+    delete: bool,
+}
+impl ServerProtocolRuntimeAdmission {
+    /// Only a fresh handshake or snapshot can create a storage runtime.
+    pub fn opens_runtime(&self) -> bool {
+        self.session_id.is_none()
+    }
+
+    /// A prior process's sessions cannot survive a missing runtime. Session
+    /// deletion remains idempotent and never opens storage just to return 204.
+    pub fn missing_runtime_response(&self) -> ServerProtocolResponse {
+        admission_response(if self.delete {
+            StatusCode::NO_CONTENT.into_response()
+        } else {
+            ApiError::session_gone().into_response()
+        })
+    }
+}
+
+fn admission_response(mut response: ServerProtocolResponse) -> ServerProtocolResponse {
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, http::HeaderValue::from_static("no-store"));
+    response
+}
+
+/// Classify a protocol path relative to `/lix/v1/{lix_id}/` without storage I/O.
+pub fn server_protocol_runtime_admission(
+    method: &Method,
+    protocol_path: &str,
+    headers: &HeaderMap,
+    principal: &ServerProtocolPrincipal,
+) -> Result<ServerProtocolRuntimeAdmission, Box<ServerProtocolResponse>> {
+    let classify = || -> Result<ServerProtocolRuntimeAdmission, ApiError> {
+        if headers.contains_key(http::header::CONTENT_ENCODING) {
+            return Err(ApiError::unsupported_media_type(
+                "hosts must decode Content-Encoding before protocol dispatch",
+            ));
+        }
+        let path = if protocol_path.is_empty() {
+            PROTOCOL_PATH.to_owned()
+        } else {
+            format!("{PROTOCOL_PATH}/{protocol_path}")
+        };
+        let route = ProtocolRoute::ALL
+            .iter()
+            .find(|route| route.path() == path && route.method() == method.as_str())
+            .copied();
+        if route != Some(ProtocolRoute::Snapshot) {
+            require_server_protocol_version(headers)?;
+        }
+        if route.is_none()
+            && ProtocolRoute::ALL.iter().any(|route| route.path() == path)
+            && matches!(protocol_path, "" | "session" | "snapshot")
+        {
+            // These endpoints reject unsupported methods before session lookup.
+            return Err(ApiError::new(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "LIX_ERROR_METHOD_NOT_ALLOWED",
+                "the HTTP method is not defined for this Lix Server Protocol path",
+            ));
+        }
+        if protocol_path.starts_with("sync/") {
+            require_sync_protocol_version(headers)?;
+        }
+        if route == Some(ProtocolRoute::Snapshot) {
+            if matches!(principal, ServerProtocolPrincipal::Anonymous) {
+                return Err(ApiError::new(
+                    StatusCode::UNAUTHORIZED,
+                    "LIX_ERROR_UNAUTHENTICATED",
+                    "snapshot export requires an authenticated principal",
+                ));
+            }
+            return Ok(ServerProtocolRuntimeAdmission {
+                session_id: None,
+                delete: false,
+            });
+        }
+        let session_id = if route == Some(ProtocolRoute::Handshake) {
+            optional_session_id(headers)?
+        } else {
+            Some(required_session_id(headers)?)
+        };
+        Ok(ServerProtocolRuntimeAdmission {
+            session_id,
+            delete: route == Some(ProtocolRoute::DeleteSession),
+        })
+    };
+    classify().map_err(|error| Box::new(admission_response(error.into_response())))
+}
+
 /// Default idle lifetime for a remote session.
 pub const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_mins(30);
 /// No application-level request-body ceiling by default. Hosts that require a
@@ -1921,6 +2018,7 @@ where
         let lease = match self
             .lease(
                 &session_id,
+                &context.principal,
                 context.durable_terminal_storage_notifier.clone(),
             )
             .await
@@ -2343,6 +2441,35 @@ where
             .all(|record| record.is_idle_expired(now, self.inner.options.session_idle_timeout))
     }
 
+    /// Check a cached runtime's session without touching session activity or
+    /// storage. Hosts pin the runtime only after this succeeds, under their
+    /// eviction lock, so rejected traffic cannot extend its lifetime.
+    pub async fn validate_runtime_admission(
+        &self,
+        admission: &ServerProtocolRuntimeAdmission,
+        principal: &ServerProtocolPrincipal,
+    ) -> Result<(), ServerProtocolResponse> {
+        let Some(id) = &admission.session_id else {
+            return Ok(());
+        };
+        let registry = self.inner.registry.lock().await;
+        let Some(record) = registry.get(id) else {
+            return Err(admission.missing_runtime_response());
+        };
+        if record.principal != *principal {
+            return Err(admission_response(
+                ApiError::account_mismatch().into_response(),
+            ));
+        }
+        if record.is_idle_expired(Instant::now(), self.inner.options.session_idle_timeout) {
+            return Err(admission.missing_runtime_response());
+        }
+        self.inner
+            .session_open_gate
+            .ensure_open()
+            .map_err(|error| admission_response(error.into_response()))
+    }
+
     /// Closes every client session and rejects future handshakes.
     /// Repeated calls are safe.
     pub async fn close(&self) -> Result<(), LixError> {
@@ -2559,6 +2686,7 @@ where
     async fn lease(
         &self,
         session_id: &str,
+        principal: &ServerProtocolPrincipal,
         durable_terminal_storage_notifier: Option<DurableTerminalStorageNotifier>,
     ) -> Result<SessionLease<S>, ApiError> {
         let mut registry = self.inner.registry.lock().await;
@@ -2566,6 +2694,7 @@ where
         let Some(record) = registry.get(session_id).cloned() else {
             return Err(ApiError::session_gone());
         };
+        if record.principal != *principal { return Err(ApiError::account_mismatch()); }
         if record.is_idle_expired(Instant::now(), self.inner.options.session_idle_timeout) {
             let removed = registry.remove(session_id);
             drop(registry);
@@ -2784,7 +2913,7 @@ where
                 ));
             }
             let lease = server
-                .lease(&session_id, durable_terminal_storage_notifier.clone())
+                .lease(&session_id, &context.principal, durable_terminal_storage_notifier.clone())
                 .await?;
             validate_principal(&lease, &context.principal)?;
             lease
@@ -2849,7 +2978,7 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let session_id = required_session_id(&headers)?;
-    match server.lease(&session_id, None).await {
+    match server.lease(&session_id, &context.principal, None).await {
         Ok(lease) => {
             validate_principal(&lease, &context.principal)?;
             drop(lease);
@@ -7632,6 +7761,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_principal_does_not_refresh_session_activity() {
+        let app = app().await;
+        let (session, _) = new_session(&app.router).await;
+        let before = app.server.inner.registry.lock().await[&session].last_used();
+        let wrong = ServerProtocolPrincipal::Authenticated {
+            account_id: "22222222-2222-4222-8222-222222222222".into(),
+            idempotency_scope: "other".into(),
+        };
+        let admission = ServerProtocolRuntimeAdmission {
+            session_id: Some(session.clone()),
+            delete: false,
+        };
+        assert!(
+            app.server
+                .validate_runtime_admission(&admission, &wrong)
+                .await
+                .is_err()
+        );
+        assert!(app.server.lease(&session, &wrong, None).await.is_err());
+        assert_eq!(
+            app.server.inner.registry.lock().await[&session].last_used(),
+            before
+        );
+        app.server
+            .validate_runtime_admission(&admission, &ServerProtocolPrincipal::Anonymous)
+            .await
+            .unwrap();
+        let response = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session),
+            Some(json!({"sql":"SELECT 1", "params":[]})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn expired_session_admission_preserves_idempotent_delete() {
+        let app = app_with_options(ServerProtocolOptions {
+            session_idle_timeout: Duration::ZERO,
+            ..Default::default()
+        })
+        .await;
+        let (session, _) = new_session(&app.router).await;
+        let admission = ServerProtocolRuntimeAdmission {
+            session_id: Some(session.clone()),
+            delete: false,
+        };
+        let response = app
+            .server
+            .validate_runtime_admission(&admission, &ServerProtocolPrincipal::Anonymous)
+            .await
+            .unwrap_err();
+        assert_eq!(response.status(), StatusCode::GONE);
+        let admission = ServerProtocolRuntimeAdmission {
+            session_id: Some(session),
+            delete: true,
+        };
+        let response = app
+            .server
+            .validate_runtime_admission(&admission, &ServerProtocolPrincipal::Anonymous)
+            .await
+            .unwrap_err();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(app.server.is_idle());
+    }
+
+    #[tokio::test]
     async fn sql_mutations_require_an_idempotency_key() {
         let app = app().await;
         let (session_id, _) = new_session(&app.router).await;
@@ -8995,7 +9194,7 @@ mod tests {
     async fn descriptor_continuation_rejects_future_cursor_and_requires_selected_branch() {
         let app = app().await;
         let (session_id, _) = new_session(&app.router).await;
-        let lease = app.server.lease(&session_id, None).await.unwrap();
+        let lease = app.server.lease(&session_id, &ServerProtocolPrincipal::Anonymous, None).await.unwrap();
         let descriptor = lease
             .record
             .lix
@@ -9020,7 +9219,7 @@ mod tests {
             let response = request(&app.router, "GET", &path, Some(&session_id), None).await;
             assert_eq!(response.status(), status);
         }
-        let lease = app.server.lease(&session_id, None).await.unwrap();
+        let lease = app.server.lease(&session_id, &ServerProtocolPrincipal::Anonymous, None).await.unwrap();
         let response = descriptor_wait::wait_descriptor_until(
             lease,
             Some(branch.clone()),
@@ -9034,7 +9233,7 @@ mod tests {
             response_json(response).await["descriptor"]["cursor"],
             descriptor.cursor
         );
-        let lease = app.server.lease(&session_id, None).await.unwrap();
+        let lease = app.server.lease(&session_id, &ServerProtocolPrincipal::Anonymous, None).await.unwrap();
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(10),
@@ -9049,14 +9248,14 @@ mod tests {
             .await
             .is_err()
         );
-        assert!(app.server.lease(&session_id, None).await.is_ok());
+        assert!(app.server.lease(&session_id, &ServerProtocolPrincipal::Anonymous, None).await.is_ok());
     }
 
     #[tokio::test]
     async fn descriptor_wait_wakes_on_commit_and_cursor_neutral_wakes_keep_deadline() {
         let app = app().await;
         let (session_id, _) = new_session(&app.router).await;
-        let lease = app.server.lease(&session_id, None).await.unwrap();
+        let lease = app.server.lease(&session_id, &ServerProtocolPrincipal::Anonymous, None).await.unwrap();
         let descriptor = lease
             .record
             .lix
@@ -9083,8 +9282,8 @@ mod tests {
                 .expect("commit wakes descriptor waiter");
         let next = response_json(response.unwrap()).await["descriptor"].clone();
         assert!(next["cursor"].as_u64().unwrap() > descriptor.cursor);
-        let neutral_lease = app.server.lease(&session_id, None).await.unwrap();
-        let lease = app.server.lease(&session_id, None).await.unwrap();
+        let neutral_lease = app.server.lease(&session_id, &ServerProtocolPrincipal::Anonymous, None).await.unwrap();
+        let lease = app.server.lease(&session_id, &ServerProtocolPrincipal::Anonymous, None).await.unwrap();
         let wait = descriptor_wait::wait_descriptor_until(
             lease,
             Some(descriptor.selected_branch.branch_id),
@@ -15042,7 +15241,7 @@ mod tests {
 
         let (notifier, signal) = durable_terminal_storage_signal();
         let lease = server
-            .lease(&session_id, Some(notifier))
+            .lease(&session_id, &ServerProtocolPrincipal::Anonymous, Some(notifier))
             .await
             .expect("session lease");
         storage.block_next_branch_control_read();
@@ -15221,7 +15420,7 @@ mod tests {
             .unwrap();
         let router = handler(server.clone());
         let (session_id, _) = new_session(&router).await;
-        let lease = server.lease(&session_id, None).await.unwrap();
+        let lease = server.lease(&session_id, &ServerProtocolPrincipal::Anonymous, None).await.unwrap();
         let authority = &lease.record.lix;
         local
             .execute(

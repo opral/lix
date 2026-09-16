@@ -57,7 +57,7 @@ async fn repository_policy_covers_automatic_explicit_and_additional_sessions() {
                 .all(|value| *value == (policy == Durability::Durable))
         );
 
-        lix.execute_batch(&[crate::ExecuteBatchStatement {
+        lix.execute_batch(&[ExecuteBatchStatement {
             sql: "UPDATE lix_key_value SET value = 'batch' WHERE key = 'durability-test'"
                 .to_owned(),
             params: Vec::new(),

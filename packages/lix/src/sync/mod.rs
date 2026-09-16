@@ -31,11 +31,14 @@ mod contract;
 mod current_coverage;
 mod http;
 pub(crate) mod native_metadata;
-pub(crate) use native_metadata::{MAX_NATIVE_METADATA_RESPONSE_BYTES, NativeMetadataRequest};
+#[cfg(feature = "server-protocol")]
+pub(crate) use native_metadata::MAX_NATIVE_METADATA_RESPONSE_BYTES;
+pub(crate) use native_metadata::NativeMetadataRequest;
 pub(crate) use native_metadata::{
     key as native_metadata_storage_key, space as native_metadata_storage_space,
 };
 pub(crate) mod native_object;
+#[cfg(feature = "server-protocol")]
 pub(crate) use native_object::MAX_NATIVE_OBJECT_RESPONSE_BYTES;
 pub(crate) mod native_object_range;
 pub(crate) use native_object_range::NativeObjectRangeRequest;
@@ -99,10 +102,11 @@ pub(crate) use partial_state::{
     partial_replica_state_key,
 };
 mod platform;
-pub(crate) use partial_replica::{
-    MAX_PARTIAL_REPLICA_DESCRIPTOR_BYTES, PARTIAL_REPLICA_DESCRIPTOR_VERSION,
-    PartialReplicaDescriptor,
-};
+pub(crate) use partial_replica::PartialReplicaDescriptor;
+#[cfg(test)]
+pub(crate) use partial_replica::MAX_PARTIAL_REPLICA_DESCRIPTOR_BYTES;
+#[cfg(all(test, feature = "server-protocol"))]
+pub(crate) use partial_replica::PARTIAL_REPLICA_DESCRIPTOR_VERSION;
 mod protocol;
 mod recovery;
 mod repository;
@@ -128,9 +132,9 @@ use parking_lot::RwLock;
 
 #[cfg(feature = "server-protocol")]
 pub(crate) use blob::validate_sync_blob_manifest;
-pub(crate) use bootstrap::{
-    install_sync_bootstrap, prepare_sync_bootstrap, rebuild_replica_candidate,
-};
+pub(crate) use bootstrap::rebuild_replica_candidate;
+#[cfg(all(test, feature = "server-protocol", not(target_family = "wasm")))]
+pub(crate) use bootstrap::{install_sync_bootstrap, prepare_sync_bootstrap};
 pub(crate) use commit::{
     SYNC_CHECKPOINT_SOURCE_SPACE, SYNC_MATERIALIZED_STATE_ALIAS_SPACE,
     load_complete_state_alias_source, stage_delete_materialized_sync_state_alias,

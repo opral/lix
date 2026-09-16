@@ -14,6 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 pub(crate) const PARTIAL_REPLICA_DESCRIPTOR_VERSION: u32 = 1;
+#[cfg(test)]
 pub(crate) const MAX_PARTIAL_REPLICA_DESCRIPTOR_BYTES: usize = 4096;
 
 use crate::branch::BranchHeadControlContext;

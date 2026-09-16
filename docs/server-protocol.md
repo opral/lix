@@ -49,7 +49,7 @@ contract in another language. See [Hosting](./hosting.md).
 | SQL         | `/lix/v1/{lix_id}/execute`, `/lix/v1/{lix_id}/execute-batch`                    |
 | Transaction | `/lix/v1/{lix_id}/transaction/{begin,execute,commit,rollback}`                  |
 | Files       | `/lix/v1/{lix_id}/file`, `/lix/v1/{lix_id}/file/upsert{,-batch}`               |
-| Sync        | `/lix/v1/{lix_id}/sync/{push,pull,history,checkpoints,descriptor,update,native-objects,native-object-range,native-metadata,baseline-lease/renew,blob,chunk,retained-bodies,merge,merge/restart,migration/merge,migration/cleanup,migration/global/restart,migration/global/cleanup,migration/global/merge,migration/global/bodies}`                          |
+| Sync        | `/lix/v1/{lix_id}/sync/{push,pull,history,checkpoints,descriptor,native-objects,native-object-range,native-metadata,baseline-lease/renew,blob,chunk,retained-bodies,merge,merge/restart,migration/merge,migration/cleanup,migration/global/restart,migration/global/cleanup,migration/global/merge,migration/global/bodies}`                          |
 | Versioning  | `/lix/v1/{lix_id}/branch/{create,switch,merge,merge-preview}`, `/lix/v1/{lix_id}/{undo,redo}`       |
 | Observation | `/lix/v1/{lix_id}/observe`, `/lix/v1/{lix_id}/observe/multiplex`                |
 | Snapshot    | `/lix/v1/{lix_id}/snapshot`                                                     |

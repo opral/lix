@@ -163,3 +163,17 @@ push (up to 256 KiB per blob and a 1 MiB combined request); larger uploads retai
 the existing chunk path. Authoritative row/plugin merge semantics are unchanged.
 Sync protocol 17 removes `/sync/update` and requires SDK and server to upgrade
 together. Repository format remains 81; retained data and recipes remain readable.
+
+### Lost HTTP sessions
+
+A server restart or session expiry can invalidate a sync session without losing
+its durable repository or the replica's local edits. The HTTP transport replaces
+that session on the canonical `LIX_ERROR_PROTOCOL_SESSION_GONE` response and
+replays the rejected request at most once. This response is emitted before the
+server executes the operation; ambiguous network failures are never replayed by
+this mechanism. Concurrent transport clones share the replacement session.
+
+Failed recovery uses exponential backoff from one to thirty seconds. Recovery
+checks the repository and account identity, retains the existing baseline lease,
+and leaves expired-baseline reconciliation to the normal replica recovery path.
+Changing identity terminates recovery; closing a transport never opens a session.
