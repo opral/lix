@@ -54,6 +54,7 @@ substantive experiments against the latest accepted stack.
 | E04 | Group both diff endpoint descriptors | Rejected: unchanged native requests; paired history improves only 0.81% [0.19%, 1.43%] dense and 0.24% [-0.72%, 1.42%] sparse. More local bookkeeping, no removed component. Corrected prototype passes 4,074 simulation tests. [Evidence](e04/README.md). | 1 |
 | E05 | Normalize singleton and batch metadata demand | Accepted architecture simplification: metadata variants 2 → 1, residency/hydration branches 2 → 1 each. Requests unchanged; paired cold history -0.78% dense and -0.57% sparse. Disclosed small cost, no material regression. 4,074 tests and 10 doctests pass. [Evidence](e05/README.md). | 0 |
 | E06 | Bounded first-parent metadata selection | Accepted: dense64 native requests 320 → 262 and cold history 19.29% faster [18.55%, 19.67%]; sparse64 152 → 94 and 38.82% faster [38.07%, 40.00%]. Short-query overfetch disclosed. 4,315 tests pass; existing v17 replicas reopen with v18 without reset. [Evidence](e06/README.md). | 0 |
+| E07 | Retain pending descriptor watch; clear completed recovery refresh | Accepted: total history HTTP attempts 524 → 262 dense and 188 → 94 sparse, identical counts in ten pairs. Native requests unchanged; no substantial latency gain claimed. Expired-recovery descriptor reads 262/94 → 1. 4,315 tests and 10 doctests pass. [Evidence](e07/README.md). | 0 |
 
 PRs are drafts and stacked. Nothing is deployed or merged by this series.
 

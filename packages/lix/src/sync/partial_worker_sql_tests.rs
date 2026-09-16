@@ -524,7 +524,7 @@ impl RawHttpClient for WatchingAuthorityClient {
 }
 
 #[tokio::test]
-async fn engine_worker_preempts_watch_then_publishes_retained_negative_scope() {
+async fn engine_worker_retains_watch_across_demands_then_publishes_negative_scope() {
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
         let authority = Arc::new(open_lix().await.unwrap());
         authority
@@ -620,25 +620,31 @@ async fn engine_worker_preempts_watch_then_publishes_retained_negative_scope() {
         );
         let caller = async {
             client.blocked.notified().await;
-            let (response, done) = tokio::sync::oneshot::channel();
-            sender
-                .send(crate::sync::runtime::SyncDemand {
-                    request: crate::sync::runtime::SyncDemandRequest::NativeMetadata(
-                        vec![NativeMetadataRef::CommitStateHeader(
-                            old.descriptor().selected_branch.head.commit_id.clone(),
-                        )],
-                        LixError::unknown("resident foreground demand"),
-                    ),
-                    response,
-                })
-                .await
-                .unwrap();
-            tokio::time::timeout(std::time::Duration::from_secs(1), done)
-                .await
-                .expect("foreground demand must cancel blocked watch")
-                .unwrap()
-                .unwrap();
-            client.blocked.notified().await;
+            for _ in 0..8 {
+                let (response, done) = tokio::sync::oneshot::channel();
+                sender
+                    .send(crate::sync::runtime::SyncDemand {
+                        request: crate::sync::runtime::SyncDemandRequest::NativeMetadata(
+                            vec![NativeMetadataRef::CommitStateHeader(
+                                old.descriptor().selected_branch.head.commit_id.clone(),
+                            )],
+                            LixError::unknown("resident foreground demand"),
+                        ),
+                        response,
+                    })
+                    .await
+                    .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(1), done)
+                    .await
+                    .expect("foreground demand must complete while the watch is blocked")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    client.watches.load(Ordering::SeqCst),
+                    1,
+                    "foreground work must retain the same descriptor request"
+                );
+            }
             authority
                 .execute(
                     "INSERT INTO lix_key_value (key,value) VALUES ('arrives-later','remote')",
@@ -668,6 +674,10 @@ async fn engine_worker_preempts_watch_then_publishes_retained_negative_scope() {
                 0,
                 "remote read publication creates no local pending edit"
             );
+            // Adoption changes the admission basis and must create a new watch.
+            while client.watches.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
             shutdown.send_replace(crate::sync::runtime::SyncShutdown::Stop);
         };
         let (result, ()) = futures_util::join!(worker, caller);

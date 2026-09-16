@@ -18,6 +18,9 @@ with open(a.output,'w') as out:
             for line in run.stdout.splitlines():
                 row=json.loads(line); row.update(pair=pair,variant=label)
                 row['history_native_bytes']=sum(v['bytes'] for k,v in row['history'].items() if k.startswith('native-'))
+                row['history_total_requests']=sum(v['attempts'] for v in row['history'].values())
+                row['history_total_bytes']=sum(v['bytes'] for v in row['history'].values())
+                row['history_descriptor_requests']=sum(v['attempts'] for k,v in row['history'].items() if k in ('descriptor','descriptor-watch'))
                 records.append(row); out.write(json.dumps(row)+'\n'); out.flush()
             if run.returncode:
                 out.write(json.dumps({'pair':pair,'variant':label,'failed':True,'returncode':run.returncode,'stderr':run.stderr})+'\n'); out.flush()
@@ -31,7 +34,7 @@ for case in a.cases.split(','):
     for b,c in pairs:
         assert (b['snapshot_digest'],b['rows'],b['rtt_ms'],b.get('history_limit'))==(c['snapshot_digest'],c['rows'],c['rtt_ms'],c.get('history_limit'))
     metrics={}
-    for metric in ['open_us','file_open_us','history_us','warm_us','history_native_requests','history_native_bytes']:
+    for metric in ['open_us','file_open_us','history_us','warm_us','history_native_requests','history_native_bytes','history_total_requests','history_total_bytes','history_descriptor_requests']:
         improvements=[1-c[metric]/b[metric] for b,c in pairs]
         boots=sorted(statistics.median(rng.choices(improvements,k=len(improvements))) for _ in range(10000))
         metrics[metric]={'baseline_median':statistics.median(b[metric] for b,c in pairs),'candidate_median':statistics.median(c[metric] for b,c in pairs),'paired_improvement_median':statistics.median(improvements),'bootstrap_95_interval':[boots[249],boots[9749]],'latency_threshold_pass':boots[249]>.1,'baseline_range':[min(b[metric] for b,c in pairs),max(b[metric] for b,c in pairs)],'candidate_range':[min(c[metric] for b,c in pairs),max(c[metric] for b,c in pairs)]}

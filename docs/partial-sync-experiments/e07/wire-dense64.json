@@ -1,0 +1,16 @@
+{
+  "case": "dense64",
+  "file_native_requests": 17,
+  "history_native_requests": 262,
+  "history_endpoint_counts": {
+    "native-metadata": 130,
+    "native-object-range": 128,
+    "native-metadata-walk": 4
+  },
+  "history_requested_address_kinds": {
+    "commit_state_header": 66,
+    "tracked_state_tree_chunk": 64,
+    "change_locator": 64,
+    "mutation_catalog": 64
+  }
+}

@@ -848,6 +848,13 @@ where
         .unwrap_or_default();
     health.started(state.descriptor().cursor);
     let mut publication: Option<super::SyncTransportFuture<'static, ()>> = None;
+    // Retain only network discovery across foreground demands. Reconciliation
+    // still cancels normally, so no local read or operation gate is parked.
+    let mut pending_descriptor: Option<(
+        Arc<PartialReplicaState>,
+        u64,
+        super::SyncTransportFuture<'static, super::http::TimedLeasedPartialDescriptor>,
+    )> = None;
     let mut watch_cursor = state.descriptor().cursor;
     let mut blocked_global_cursor: Option<u64> = None;
     let mut force_descriptor_refresh = false;
@@ -873,6 +880,7 @@ where
                 )
             })?;
             if current.as_ref() != state.as_ref() {
+                pending_descriptor = None;
                 let lease_changed =
                     current.baseline_lease().lease_id != state.baseline_lease().lease_id;
                 transport = transport
@@ -1068,9 +1076,26 @@ where
                 // evaluator below, under this descriptor's original lease.
                 let branch = &state.descriptor().selected_branch.branch_id;
                 let wrapper = if request_fresh {
+                    // Explicit refresh follows a known state/authority change.
+                    // Never reuse discovery across that invalidation boundary.
+                    pending_descriptor = None;
                     connected.partial_replica_descriptor(Some(branch)).await?
                 } else {
-                    connected.wait_partial_replica_descriptor(branch, after_cursor).await?
+                    if pending_descriptor.as_ref().is_some_and(|(basis, after, _)| {
+                        basis.as_ref() != state.as_ref() || *after != after_cursor
+                    }) {
+                        pending_descriptor = None;
+                    }
+                    if pending_descriptor.is_none() {
+                        let connected = connected.clone();
+                        let branch = branch.clone();
+                        pending_descriptor = Some((state.clone(), after_cursor, Box::pin(async move {
+                            connected.wait_partial_replica_descriptor(&branch, after_cursor).await
+                        })));
+                    }
+                    let response = pending_descriptor.as_mut().expect("descriptor request").2.as_mut().await;
+                    pending_descriptor = None;
+                    response?
                 };
                 wrapper.deadline.check(&wrapper.wire.lease.lease_id)?;
                 let cursor = wrapper.wire.descriptor.cursor;
@@ -1281,6 +1306,12 @@ where
                             watch_after = web_time::Instant::now();
                             Box::pin(reconcile_partial(engine.clone(), &mut transport, &mut connect, false)).await?;
                             let current = engine.sync_mode().partial_admission().ok_or_else(|| LixError::unknown("recovery lost admission"))?;
+                            if current.as_ref() != state.as_ref() {
+                                // Recovery already fetched and published fresh coordinates.
+                                // Resume watching their cursor instead of fetching the same
+                                // descriptor again for every subsequent missing input.
+                                force_descriptor_refresh = false;
+                            }
                             if !super::partial_publication::same_serving_basis(state.descriptor(), current.descriptor())
                                 || state.serving_generation(&state.descriptor().selected_branch.branch_id)? != current.serving_generation(&current.descriptor().selected_branch.branch_id)?
                                 || state.serving_generation(&state.descriptor().global_branch.branch_id)? != current.serving_generation(&current.descriptor().global_branch.branch_id)? {
@@ -1324,6 +1355,8 @@ where
             }
         }
     }
+    // Cancel outstanding discovery before closing its authenticated session.
+    drop(pending_descriptor);
     // Dropping a publication completion future cannot cancel its already
     // spawned commit owner. That owner keeps Engine and both gates alive and
     // does no network work. Shutdown therefore closes transport independently;

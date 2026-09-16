@@ -1,0 +1,166 @@
+{
+  "dense4": {
+    "open_us": {
+      "baseline_median": 9202.5,
+      "candidate_median": 9127.5,
+      "paired_improvement_median": -0.00750928126941125,
+      "bootstrap_95_interval": [
+        -0.051801029159519674,
+        0.031921235025437755
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        8745,
+        9314
+      ],
+      "candidate_range": [
+        8801,
+        10384
+      ]
+    },
+    "file_open_us": {
+      "baseline_median": 37912.5,
+      "candidate_median": 35657.5,
+      "paired_improvement_median": 0.06169619384637631,
+      "bootstrap_95_interval": [
+        -0.0295731774214813,
+        0.1047027741083223
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        35836,
+        45795
+      ],
+      "candidate_range": [
+        33866,
+        42234
+      ]
+    },
+    "history_us": {
+      "baseline_median": 129709.5,
+      "candidate_median": 130138.5,
+      "paired_improvement_median": -0.006698115128772053,
+      "bootstrap_95_interval": [
+        -0.01882826100183177,
+        0.014587752414062405
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        127931,
+        137738
+      ],
+      "candidate_range": [
+        128594,
+        135494
+      ]
+    },
+    "warm_us": {
+      "baseline_median": 7879.0,
+      "candidate_median": 7771.5,
+      "paired_improvement_median": 0.015994942356885034,
+      "bootstrap_95_interval": [
+        0.001318543515179904,
+        0.03368351414897053
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        7735,
+        8738
+      ],
+      "candidate_range": [
+        7652,
+        8359
+      ]
+    },
+    "history_native_requests": {
+      "baseline_median": 19.0,
+      "candidate_median": 19.0,
+      "paired_improvement_median": 0.0,
+      "bootstrap_95_interval": [
+        0.0,
+        0.0
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        19,
+        19
+      ],
+      "candidate_range": [
+        19,
+        19
+      ]
+    },
+    "history_native_bytes": {
+      "baseline_median": 14689.0,
+      "candidate_median": 14689.0,
+      "paired_improvement_median": 0.0,
+      "bootstrap_95_interval": [
+        0.0,
+        0.0
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        14689,
+        14689
+      ],
+      "candidate_range": [
+        14689,
+        14689
+      ]
+    },
+    "history_total_requests": {
+      "baseline_median": 38.0,
+      "candidate_median": 19.0,
+      "paired_improvement_median": 0.5,
+      "bootstrap_95_interval": [
+        0.5,
+        0.5
+      ],
+      "latency_threshold_pass": true,
+      "baseline_range": [
+        38,
+        38
+      ],
+      "candidate_range": [
+        19,
+        19
+      ]
+    },
+    "history_total_bytes": {
+      "baseline_median": 14689.0,
+      "candidate_median": 14689.0,
+      "paired_improvement_median": 0.0,
+      "bootstrap_95_interval": [
+        0.0,
+        0.0
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        14689,
+        14689
+      ],
+      "candidate_range": [
+        14689,
+        14689
+      ]
+    },
+    "history_descriptor_requests": {
+      "baseline_median": 19.0,
+      "candidate_median": 0.0,
+      "paired_improvement_median": 1.0,
+      "bootstrap_95_interval": [
+        1.0,
+        1.0
+      ],
+      "latency_threshold_pass": true,
+      "baseline_range": [
+        19,
+        19
+      ],
+      "candidate_range": [
+        0,
+        0
+      ]
+    }
+  }
+}
