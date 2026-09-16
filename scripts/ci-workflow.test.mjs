@@ -421,6 +421,8 @@ test("merge promotion warms main browser binaries and retries do not duplicate c
   const cache = readFileSync(resolve(repositoryRoot, ".github/actions/compiler-cache/action.yml"), "utf8");
   assert.doesNotMatch(cache, /github\.(run_id|run_attempt|sha)/);
   assert.match(cache, /hashFiles\('Cargo.lock'/);
+  assert.ok(cache.includes("'packages/**'"));
+  assert.ok(cache.includes("'scripts/**'"));
 });
 
 

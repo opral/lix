@@ -18,7 +18,7 @@ runs:
         echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
         echo 'RUSTC_WRAPPER=sccache' >> "$GITHUB_ENV"
     # Immutable snapshots are keyed by compilation inputs, not run IDs. A retry
-    # or CI-only edit can restore an exact key without uploading another copy.
+    # with unchanged inputs can restore an exact key without another upload.
     # sccache itself validates each compiler invocation; this outer key only
     # controls snapshot freshness, never whether a compilation is correct.
     # PR-scoped snapshots compete with main's reusable caches and cannot be
@@ -28,7 +28,7 @@ runs:
       uses: actions/cache/restore@v4
       with:
         path: ${{ runner.temp }}/lix-sccache
-        key: sccache-disk-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'tooling/Cargo.lock', 'tooling/Cargo.toml', '.cargo/**', 'packages/**/Cargo.toml', 'packages/**/*.rs', 'plugins/**', 'packages/js-sdk/scripts/**') }}
+        key: sccache-disk-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'tooling/Cargo.lock', 'tooling/Cargo.toml', '.cargo/**', 'packages/**', 'plugins/**', 'scripts/**', '.github/workflows/**', '.github/actions/compiler-cache/**', '!packages/**/node_modules/**', '!packages/**/dist/**', '!packages/**/target/**') }}
         restore-keys: |
           sccache-disk-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ hashFiles('rust-toolchain.toml') }}-
     - name: Restore and retain main compiler objects
@@ -36,7 +36,7 @@ runs:
       uses: actions/cache@v4
       with:
         path: ${{ runner.temp }}/lix-sccache
-        key: sccache-disk-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'tooling/Cargo.lock', 'tooling/Cargo.toml', '.cargo/**', 'packages/**/Cargo.toml', 'packages/**/*.rs', 'plugins/**', 'packages/js-sdk/scripts/**') }}
+        key: sccache-disk-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'tooling/Cargo.lock', 'tooling/Cargo.toml', '.cargo/**', 'packages/**', 'plugins/**', 'scripts/**', '.github/workflows/**', '.github/actions/compiler-cache/**', '!packages/**/node_modules/**', '!packages/**/dist/**', '!packages/**/target/**') }}
         restore-keys: |
           sccache-disk-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ hashFiles('rust-toolchain.toml') }}-
     - name: Install compiler cache
