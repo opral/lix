@@ -247,7 +247,7 @@ incompatible sync versions before sync work; upgrade SDK and server together.
   with optional headers under the same baseline lease. The response is bounded
   to 32 records and 256 KiB of decoded metadata. Unavailable optional ancestors
   truncate the walk; required inputs still fail normally.
-- Native object responses may include a bounded dependency bundle containing
+- Native metadata responses may include a bounded dependency bundle containing
   the locator owner's header and catalog. Clients validate ownership, hashes,
   and admission before atomically installing the bundle. Missing or corrupt
   optional companions are omitted; required object failures remain errors.
