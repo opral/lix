@@ -55,8 +55,7 @@ pub(crate) use idempotency::{
 pub(crate) use media_upload::FileUploadProgress;
 pub use merge::{
     MergeBranchOptions, MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions,
-    MergeBranchReceipt, MergeChangeStats, MergeConflict, MergeConflictChangeKind,
-    MergeConflictKind, MergeConflictSide,
+    MergeBranchReceipt, MergeChangeStats,
 };
 pub use observe::ObserveEvent;
 pub(crate) use observe::ObserveEvents as SessionObserveEvents;

@@ -1,16 +1,11 @@
-use crate::changelog::ChangeId;
-use crate::row_pk::RowPk;
 #[cfg(test)]
 use crate::tracked_state::TrackedStateDiffIdentity;
-use crate::tracked_state::{
-    TrackedStateDiffEntry, TrackedStateDiffKind, TrackedStateMergeConflict, TrackedStateMergePlan,
-};
+use crate::tracked_state::{TrackedStateMergeConflict, TrackedStateMergePlan};
 
 /// Borrowed, typed view over a merge plan's conflict column.
 ///
 /// The merge plan remains the sole owner. Iterating this batch creates only
-/// pointer-sized row views, so analysis, plugin preflight, error construction,
-/// and public preview all inspect the same identity and side records.
+/// pointer-sized row views for plugin preflight.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MergeConflictBatch<'a> {
     rows: &'a [TrackedStateMergeConflict],
@@ -41,12 +36,9 @@ impl<'a> MergeConflictRow<'a> {
         Self { tracked }
     }
 
+    #[cfg(test)]
     pub(crate) fn tracked(self) -> &'a TrackedStateMergeConflict {
         self.tracked
-    }
-
-    pub(crate) fn kind(self) -> MergeConflictKind {
-        MergeConflictKind::SameRowChanged
     }
 
     #[cfg(test)]
@@ -54,65 +46,9 @@ impl<'a> MergeConflictRow<'a> {
         &self.tracked.identity
     }
 
-    pub(crate) fn schema_key(self) -> &'a str {
-        self.tracked.identity.schema_key()
-    }
-
-    pub(crate) fn row_pk(self) -> &'a RowPk {
-        self.tracked.identity.row_pk()
-    }
-
     pub(crate) fn file_id(self) -> Option<&'a str> {
         self.tracked.identity.file_id()
     }
-
-    pub(crate) fn target(self) -> MergeConflictSideRow<'a> {
-        MergeConflictSideRow {
-            entry: &self.tracked.target,
-        }
-    }
-
-    pub(crate) fn source(self) -> MergeConflictSideRow<'a> {
-        MergeConflictSideRow {
-            entry: &self.tracked.source,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MergeConflictKind {
-    SameRowChanged,
-}
-
-/// One side-column view in a conflict batch row.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct MergeConflictSideRow<'a> {
-    entry: &'a TrackedStateDiffEntry,
-}
-
-impl<'a> MergeConflictSideRow<'a> {
-    pub(crate) fn kind(self) -> MergeConflictChangeKind {
-        match self.entry.kind {
-            TrackedStateDiffKind::Added => MergeConflictChangeKind::Added,
-            TrackedStateDiffKind::Modified => MergeConflictChangeKind::Modified,
-            TrackedStateDiffKind::Removed => MergeConflictChangeKind::Removed,
-        }
-    }
-
-    pub(crate) fn before_change_id(self) -> Option<ChangeId> {
-        self.entry.before.as_ref().map(|row| row.change_id)
-    }
-
-    pub(crate) fn after_change_id(self) -> Option<ChangeId> {
-        self.entry.after.as_ref().map(|row| row.change_id)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MergeConflictChangeKind {
-    Added,
-    Modified,
-    Removed,
 }
 
 #[cfg(test)]
@@ -120,6 +56,8 @@ mod tests {
     use super::*;
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
+    use crate::row_pk::RowPk;
+    use crate::tracked_state::{TrackedStateDiffEntry, TrackedStateDiffKind};
     use crate::tracked_state::{TrackedStateDiffRow, TrackedStateKey};
 
     fn row(identity: TrackedStateDiffIdentity, label: &str) -> TrackedStateDiffRow {

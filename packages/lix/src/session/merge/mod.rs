@@ -10,8 +10,7 @@ pub(crate) use analysis::{
 
 pub use branch::{
     MergeBranchOptions, MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions,
-    MergeBranchReceipt, MergeChangeStats, MergeConflict, MergeConflictChangeKind,
-    MergeConflictKind, MergeConflictSide,
+    MergeBranchReceipt, MergeChangeStats,
 };
 
 pub(crate) use branch::{stage_merge_native_heads, stage_native_change_application};

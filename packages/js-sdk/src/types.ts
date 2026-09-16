@@ -374,7 +374,6 @@ export type MergeBranchPreview = {
 	targetHeadCommitId: string;
 	sourceHeadCommitId: string;
 	changeStats: MergeChangeStats;
-	conflicts: MergeConflict[];
 };
 
 export type MergeChangeStats = {
@@ -382,18 +381,4 @@ export type MergeChangeStats = {
 	added: number;
 	modified: number;
 	removed: number;
-};
-
-export type MergeConflict = {
-	kind: "sameRowChanged";
-	rowRef: string;
-	fileId: string | null;
-	target: MergeConflictSide;
-	source: MergeConflictSide;
-};
-
-export type MergeConflictSide = {
-	kind: "added" | "modified" | "removed";
-	beforeChangeId: string | null;
-	afterChangeId: string | null;
 };

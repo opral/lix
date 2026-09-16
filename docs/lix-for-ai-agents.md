@@ -32,9 +32,7 @@ await lix.switchBranch({ branchId: main });
 const preview = await lix.mergeBranchPreview({ sourceBranchId: task.id });
 // preview.changeStats is the one-line review summary:
 // { total, added, modified, removed }
-if (preview.conflicts.length === 0) {
-  await lix.mergeBranch({ sourceBranchId: task.id });
-}
+await lix.mergeBranch({ sourceBranchId: task.id });
 ```
 
 ## Local file repository
@@ -71,13 +69,15 @@ use `lix_diff('acme_task', from_commit_id, to_commit_id)` for changes between co
 `lix_registered_schema` lists schemas. `lix_change` shows repository-wide
 activity across branches.
 
-## Conflicts
+## Automatic merging
 
-Merges operate per row: different-row edits can merge cleanly; same-row edits
-produce `sameRowChanged`. See [Branching](./branching.md) for conflict handling.
+Lix combines different-column edits and resolves competing same-column edits
+using last-writer-wins by default. In a branch merge, the source is incoming;
+plugins can provide column mergers. Review the changes before merging. See
+[Branching](./branching.md#automatic-merging) for the merge rules.
 
 ## Next
 
 - [Getting Started](./getting-started.md): the basic setup.
-- [Branching](./branching.md): previews, conflicts, and side-by-side reads.
+- [Branching](./branching.md): previews, automatic merging, and side-by-side reads.
 - [History](./history.md): SQL for review and undo.

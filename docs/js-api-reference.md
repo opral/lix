@@ -471,7 +471,6 @@ type MergeBranchPreview = {
   targetHeadCommitId: string;
   sourceHeadCommitId: string;
   changeStats: MergeChangeStats;
-  conflicts: MergeConflict[];
 };
 ```
 
@@ -509,24 +508,6 @@ type MergeChangeStats = {
   added: number;
   modified: number;
   removed: number;
-};
-```
-
-`MergeConflict`:
-
-```ts
-type MergeConflict = {
-  kind: "sameRowChanged";
-  rowRef: string;
-  fileId: string | null;
-  target: MergeConflictSide;
-  source: MergeConflictSide;
-};
-
-type MergeConflictSide = {
-  kind: "added" | "modified" | "removed";
-  beforeChangeId: string | null;
-  afterChangeId: string | null;
 };
 ```
 

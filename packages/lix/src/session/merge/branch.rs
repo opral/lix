@@ -27,11 +27,6 @@ use crate::transaction_types::{
 };
 
 use super::analysis::{MergeCommits, MergeOutcome, analyze};
-use super::conflicts::{
-    MergeConflictChangeKind as AnalysisMergeConflictChangeKind,
-    MergeConflictKind as AnalysisMergeConflictKind, MergeConflictRow as AnalysisMergeConflict,
-    MergeConflictSideRow as AnalysisMergeConflictSide,
-};
 use super::stats::MergeStats;
 use crate::common::{SharedStr, compose_directory_path, compose_file_path};
 use crate::plugin::runtime::WasmRowKey;
@@ -86,35 +81,6 @@ pub struct MergeBranchPreview {
     pub target_head_commit_id: String,
     pub source_head_commit_id: String,
     pub change_stats: MergeChangeStats,
-    pub conflicts: Vec<MergeConflict>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MergeConflict {
-    pub kind: MergeConflictKind,
-    pub row_ref: crate::RowRef,
-    pub file_id: Option<String>,
-    pub target: MergeConflictSide,
-    pub source: MergeConflictSide,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MergeConflictKind {
-    SameRowChanged,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MergeConflictSide {
-    pub kind: MergeConflictChangeKind,
-    pub before_change_id: Option<String>,
-    pub after_change_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MergeConflictChangeKind {
-    Added,
-    Modified,
-    Removed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,7 +182,6 @@ where
                     &active_branch_id,
                     &source_branch_id,
                     &analysis,
-                    &derived_blob_files,
                     &plugin_resolution_stats,
                 )
         })
@@ -1766,28 +1731,8 @@ fn preview_from_analysis(
     target_branch_id: &str,
     source_branch_id: &str,
     analysis: &super::analysis::MergeAnalysis,
-    derived_blob_files: &DerivedPluginConflictIndex,
     plugin_resolution_stats: &MergeChangeStats,
 ) -> Result<MergeBranchPreview, LixError> {
-    let conflicts = match analysis.merge_plan() {
-        // Every same-row conflict has a deterministic host LWW result. An
-        // optional merger improves overlapping columns but is not required
-        // for the preview to be mergeable.
-        Some(_) => Vec::new(),
-        _ => analysis
-            .conflict_batch()
-            .map(|batch| {
-                batch
-                    .iter()
-                    .filter(|conflict| {
-                        !is_derived_blob_conflict(conflict.tracked(), derived_blob_files)
-                    })
-                    .map(merge_conflict_from_analysis)
-                    .collect::<Result<Vec<_>, LixError>>()
-            })
-            .transpose()?
-            .unwrap_or_default(),
-    };
     Ok(MergeBranchPreview {
         outcome: merge_branch_outcome_from_analysis(analysis.outcome),
         target_branch_id: target_branch_id.to_string(),
@@ -1799,7 +1744,6 @@ fn preview_from_analysis(
             &analysis.stats,
             plugin_resolution_stats,
         ),
-        conflicts,
     })
 }
 
@@ -1829,39 +1773,6 @@ fn merge_change_stats_with_plugin_resolutions(
         added: stats.added + plugin_resolution_stats.added,
         modified: stats.modified + plugin_resolution_stats.modified,
         removed: stats.removed + plugin_resolution_stats.removed,
-    }
-}
-
-fn merge_conflict_from_analysis(
-    conflict: AnalysisMergeConflict<'_>,
-) -> Result<MergeConflict, LixError> {
-    Ok(MergeConflict {
-        kind: match conflict.kind() {
-            AnalysisMergeConflictKind::SameRowChanged => MergeConflictKind::SameRowChanged,
-        },
-        row_ref: crate::row_ref::encode(
-            match conflict.schema_key() {
-                FILE_DESCRIPTOR_SCHEMA_KEY => "lix_file",
-                DIRECTORY_DESCRIPTOR_SCHEMA_KEY => "lix_directory",
-                relation => relation,
-            },
-            conflict.row_pk(),
-        )?,
-        file_id: conflict.file_id().map(str::to_owned),
-        target: merge_conflict_side_from_analysis(conflict.target()),
-        source: merge_conflict_side_from_analysis(conflict.source()),
-    })
-}
-
-fn merge_conflict_side_from_analysis(side: AnalysisMergeConflictSide<'_>) -> MergeConflictSide {
-    MergeConflictSide {
-        kind: match side.kind() {
-            AnalysisMergeConflictChangeKind::Added => MergeConflictChangeKind::Added,
-            AnalysisMergeConflictChangeKind::Modified => MergeConflictChangeKind::Modified,
-            AnalysisMergeConflictChangeKind::Removed => MergeConflictChangeKind::Removed,
-        },
-        before_change_id: side.before_change_id().map(|id| id.to_string()),
-        after_change_id: side.after_change_id().map(|id| id.to_string()),
     }
 }
 

@@ -1010,7 +1010,7 @@ components:
       type: object
       required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
-        protocolVersion: { type: integer, const: 10 }
+        protocolVersion: { type: integer, const: 11 }
         syncProtocolVersion: { type: integer, const: 16 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }

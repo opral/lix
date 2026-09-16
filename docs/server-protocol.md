@@ -85,7 +85,7 @@ receives an already-trusted principal in process and never derives identity from
 request headers.
 
 Protocol requests except snapshot download require exactly one
-`lix-server-protocol-version: 7` header. Missing, duplicate, malformed, or older
+`lix-server-protocol-version: 11` header. Missing, duplicate, malformed, or older
 versions return `426 LIX_PROTOCOL_VERSION_MISMATCH` before opening a session or
 executing SQL. Clients must upgrade together with the checkpoint metadata and
 SQL API changes.
@@ -109,6 +109,13 @@ The protocol has no default request-body byte ceiling. Hosts can set
 `ServerProtocolOptions::max_request_body_bytes` to enforce a byte budget;
 explicit budgets still return `413` for oversized bodies. Proxy limits and the
 separate sync-chunk limits still apply.
+
+## Merge previews
+
+Server protocol 11 removes the `conflicts` field from merge previews. Overlapping
+row edits reconcile automatically through LWW or plugin column merging. Preview
+returns the outcome, branch and commit IDs, and change counts. Upgrade clients
+and servers together; no persisted repository format changes are required.
 
 ## SQL transaction receipts
 
