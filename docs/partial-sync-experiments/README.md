@@ -66,7 +66,7 @@ substantive experiments against the latest accepted stack.
 | E16 | Scoped filesystem index and ancestor-read variants | Rejected: cold finite-ID gains up to 99.56%, but every follow-up variant regresses wide offline warm history by 22.65–25.85% after latency-injected hydration. Combined deep64 regression is below 10%; the warm-history failure remains. All four follow-up variants pass 4,331 tests and 10 doctests. [Evidence](e16/README.md). | 2 |
 | E17 | Attribute warm-history timing and complete E16 validation | Accepts E16 combined after CPU-state controls: identical measured query-work counts; matched-state first-read interval excludes a 10% regression, steady warm reads +1.54%. Cold finite-ID gains up to 99.56%, with deep64 −6.09% explicitly retained. Full integration engine gate and 32 query-form controls pass. [Evidence](e17/README.md). | 0 |
 
-Accepted E01–E08 and E11–E14 changes are consolidated in merge-ready [Lix #1817](https://github.com/opral/lix/pull/1817); the component drafts through E14 are closed. E09/E10 retain rejected prototypes as research only. Later experiments remain separate drafts. Nothing is deployed or merged by this series.
+Accepted E01–E08, E11–E14, and the combined E16 implementation validated by E17 are consolidated in [Lix #1817](https://github.com/opral/lix/pull/1817), the sole merge target. E09/E10/E15 and the original E16 decision retain their research evidence; E17 explicitly revises E16 after CPU-state attribution and completed controls. Research PRs preserve the experiment history. Nothing has been deployed or merged as part of this series.
 
 First accepted implementation: [Lix #1810](https://github.com/opral/lix/pull/1810).
 Related UI bug fix: [Atelier #174](https://github.com/opral/atelier/pull/174).
