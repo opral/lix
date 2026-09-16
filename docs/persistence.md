@@ -9,6 +9,44 @@ data across restarts. Files, SQL, and version control use the same API.
 
 <img src="../website/public/assets/local-only-storage.webp" alt="Lix runs on one device with a choice of memory, filesystem, or browser OPFS storage adapter. No server is required." width="760" decoding="async" />
 
+## Commit acknowledgement
+
+Persistent repositories wait for the storage backend's durable boundary before
+acknowledging writes by default. This applies to automatic statements, batches,
+explicit transaction commits, and additional sessions opened from the handle.
+RocksDB synchronizes its WAL; SlateDB waits for the WAL upload; OPFS uses SQLite
+`synchronous=FULL`. Memory remains ephemeral even with the default policy.
+
+Applications that accept losing acknowledged saves after a crash can opt into
+buffered acknowledgement when opening local storage:
+
+```ts
+import { openLix } from "@lix-js/sdk";
+import { FilesystemStorage } from "@lix-js/storage-filesystem";
+
+const lix = await openLix({
+  storage: new FilesystemStorage({ path: "./repository" }),
+  durability: "buffered", // default: "durable"
+});
+```
+
+In Rust, use `open_lix().with_storage(storage).with_durability(Durability::Buffered)`.
+The policy belongs to the open repository handle, not the stored repository
+format. Reopening without the option restores the durable default. It does not
+weaken internal durability requirements for publication, migration, or sync.
+Buffered acknowledgement differs by adapter: RocksDB can lose writes on power
+loss; SlateDB can also lose writes when its process exits before WAL upload.
+
+Durability covers repository storage, not completion of background filesystem
+exports or synchronization with a server. For remote execution the authority
+chooses its storage policy; remote clients cannot override it. Hardware and
+storage services must honor their synchronization guarantees. Tests verify the
+backend requests and acknowledgement boundaries, not physical power failures.
+Durable acknowledgement can increase write latency. Use a batch or explicit
+transaction to group related changes into one commit. The
+[`commit_durability` example](../packages/storage-rocksdb/examples/commit_durability.rs)
+measures a small sequential RocksDB workload under both policies.
+
 ## In-memory (default)
 
 <a id="local-only-storage"></a>

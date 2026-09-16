@@ -810,11 +810,9 @@ impl StorageWrite for RocksDBWrite {
             // so an acknowledged publication survives power loss, not merely
             // process death.
             //
-            // Deliberately conditional. Ordinary row commits do not request
-            // durability and must not pay an fsync for it; the engine sets the
-            // flag only for atomic content-addressed publications and media
-            // uploads, which is precisely where losing an acknowledged write
-            // would be visible as a missing file.
+            // Lix repository handles request this by default. An explicit
+            // buffered policy can omit it for ordinary writes, while internal
+            // publication and synchronization requirements still force it.
             let mut write_options = RocksDBWriteOptions::default();
             write_options.set_sync(self.await_durable);
             self.inner

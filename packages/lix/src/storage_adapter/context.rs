@@ -41,6 +41,7 @@ enum ReplicaWriteAdmission {
 
 #[derive(Clone, Debug)]
 pub struct StorageAdapter<StorageImpl = Memory> {
+    durability: crate::Durability,
     storage: StorageImpl,
     routing: EpochRouting,
     authority_writer: Arc<AtomicBool>,
@@ -60,9 +61,19 @@ impl<StorageImpl> StorageAdapter<StorageImpl>
 where
     StorageImpl: Storage,
 {
+    pub(crate) fn durability(&self) -> crate::Durability {
+        self.durability
+    }
+
+    pub(crate) fn with_durability(mut self, durability: crate::Durability) -> Self {
+        self.durability = durability;
+        self
+    }
+
     pub fn new(storage: StorageImpl) -> Self {
         Self {
             storage,
+            durability: crate::Durability::default(),
             routing: EpochRouting::legacy(),
             authority_writer: Arc::new(AtomicBool::new(false)),
             replica_writer: Arc::new(AtomicU8::new(ReplicaWriterMode::None as u8)),
@@ -76,6 +87,7 @@ where
     ) -> Result<StorageAdapter<crate::storage::StorageSession<StorageImpl>>, StorageError> {
         Ok(StorageAdapter {
             storage: crate::storage::StorageSession::acquire(self.storage).await?,
+            durability: self.durability,
             routing: self.routing,
             authority_writer: self.authority_writer,
             replica_writer: self.replica_writer,
@@ -92,6 +104,7 @@ where
     pub(crate) fn for_epoch_unfenced(storage: StorageImpl, bank: EpochBank) -> Self {
         Self {
             storage,
+            durability: crate::Durability::default(),
             routing: EpochRouting::unfenced(bank),
             authority_writer: Arc::new(AtomicBool::new(false)),
             replica_writer: Arc::new(AtomicU8::new(ReplicaWriterMode::None as u8)),
@@ -107,6 +120,7 @@ where
     ) -> Self {
         Self {
             storage,
+            durability: crate::Durability::default(),
             routing: EpochRouting::fenced(bank, expected_pointer),
             authority_writer: Arc::new(AtomicBool::new(false)),
             replica_writer: Arc::new(AtomicU8::new(ReplicaWriterMode::None as u8)),
@@ -121,6 +135,7 @@ where
     ) -> Self {
         Self {
             storage,
+            durability: crate::Durability::default(),
             routing: EpochRouting::retained(bank, expected_pointer),
             authority_writer: Arc::new(AtomicBool::new(false)),
             replica_writer: Arc::new(AtomicU8::new(ReplicaWriterMode::None as u8)),
@@ -137,6 +152,7 @@ where
     ) -> Self {
         Self {
             storage,
+            durability: crate::Durability::default(),
             routing: EpochRouting::migration(bank, expected_pointer),
             authority_writer: Arc::new(AtomicBool::new(false)),
             replica_writer: Arc::new(AtomicU8::new(ReplicaWriterMode::None as u8)),
@@ -197,6 +213,8 @@ where
         &self,
         opts: WriteOptions,
     ) -> Result<EpochStorageWrite<StorageImpl::Write<'_>>, StorageError> {
+        let mut opts = opts;
+        opts.await_durable |= self.durability == crate::Durability::Durable;
         let (opts, fence_precondition_index) = self.routing.route_write_options(opts)?;
         let write = self.storage.begin_write(opts).await?;
         Ok(EpochStorageWrite::new(
@@ -338,6 +356,10 @@ where
         opts.batch_capacity_hint_bytes = opts
             .batch_capacity_hint_bytes
             .max(write_set.backend_batch_capacity_hint_bytes());
+        // Apply policy after transaction grouping so durable acknowledgement
+        // does not disable commit cohorts. Buffered policy never clears an
+        // internal request for stronger publication or synchronization guarantees.
+        opts.await_durable |= self.durability == crate::Durability::Durable;
         let (opts, fence_precondition_index) = self.routing.route_write_options(opts)?;
         let write = self
             .storage
@@ -443,6 +465,8 @@ where
         range: KeyRange,
         opts: WriteOptions,
     ) -> Result<CommitResult, StorageError> {
+        let mut opts = opts;
+        opts.await_durable |= self.durability == crate::Durability::Durable;
         let (opts, fence_precondition_index) = self.routing.route_write_options(opts)?;
         let write = self.storage.begin_write(opts).await?;
         let mut write =

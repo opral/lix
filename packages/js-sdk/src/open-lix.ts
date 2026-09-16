@@ -26,6 +26,13 @@ async function openLixInternal(
 	if (!options || typeof options !== "object") {
 		throw new TypeError("openLix() options must be an object");
 	}
+	if (
+		options.durability !== undefined &&
+		options.durability !== "durable" &&
+		options.durability !== "buffered"
+	) {
+		throw new TypeError('openLix() durability must be "durable" or "buffered"');
+	}
 	if ("backend" in options) {
 		throw new TypeError(
 			"openLix() option 'backend' was removed; use 'storage' instead",
@@ -61,6 +68,11 @@ async function openLixInternal(
 			throw new TypeError("openLix.fromSnapshot() does not accept server mode");
 		}
 		if (mode === "remote") {
+			if (options.durability !== undefined) {
+				throw new TypeError(
+					"remote persistence is configured by the authority; durability requires local storage",
+				);
+			}
 			if (options.storage !== undefined) {
 				throw new TypeError('remote mode does not accept storage; set server.mode to "partial_replica" for on-demand sync');
 			}
@@ -99,7 +111,7 @@ async function openLixInternal(
 	const { openLixWorkerBinding } = await import("./worker/client.js");
 	if (options.storage === undefined) {
 		const binding = await openLixWorkerBinding(
-			{ kind: "memory" },
+			{ kind: "memory", durability: options.durability ?? "durable" },
 			undefined,
 			options.telemetry,
 			syncServer,
@@ -111,6 +123,7 @@ async function openLixInternal(
 	if (isJsProviderLixStorage(options.storage)) {
 		return openJsProviderStorage(
 			options.storage,
+			options.durability ?? "durable",
 			options.telemetry,
 			syncServer,
 			options.onProgress,
@@ -130,7 +143,7 @@ async function openLixInternal(
 		};
 		try {
 			binding = await openLixWorkerBinding(
-				storage.lixStorage.config,
+				{ ...storage.lixStorage.config, durability: options.durability ?? "durable" },
 				disconnect,
 				options.telemetry,
 				syncServer,
@@ -198,6 +211,7 @@ async function openJsProviderStorage(
 			readonly options: unknown;
 		};
 	},
+	durability: OpenLixOptions["durability"],
 	telemetry: OpenLixOptions["telemetry"],
 	syncServer: LixServerOptions | undefined,
 	onProgress: ((progress: LixOpenProgress) => void) | undefined,
@@ -211,6 +225,7 @@ async function openJsProviderStorage(
 		const opened = await openLixWorkerBinding(
 			{
 				kind: "jsStorage",
+				durability,
 				moduleUrl: storage.lixStorage.moduleUrl,
 				options: storage.lixStorage.options,
 			},

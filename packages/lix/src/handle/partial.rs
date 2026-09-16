@@ -7,6 +7,7 @@ pub(crate) async fn open_partial_lix<StorageImpl>(
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
     server: Option<ServerOptions>,
+    durability: Durability,
 ) -> Result<Lix<StorageImpl>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -16,6 +17,7 @@ where
         .await?;
     let owner = crate::engine::PartialOwnerLifetime::install(owner);
     let mut prepared = crate::sync::prepare_partial_open(storage, server.clone()).await?;
+    prepared.adapter = prepared.adapter.with_durability(durability);
     let result = async {
         #[cfg(feature = "default_wasm_runtime")]
         let wasm_runtime = match wasm_runtime {
@@ -97,8 +99,14 @@ where
     if let Some(telemetry) = source.engine.telemetry() {
         options = options.with_telemetry(telemetry.clone());
     }
-    let (mut engine, initial_session) =
-        Engine::new_partial_replica(admitted.adapter, options, &expected).await?;
+    let (mut engine, initial_session) = Engine::new_partial_replica(
+        admitted
+            .adapter
+            .with_durability(source.engine.storage().durability()),
+        options,
+        &expected,
+    )
+    .await?;
     engine.inherit_partial_storage_runtime(&source.engine);
     engine.inherit_sync_mode(source.engine.sync_mode());
     crate::sync::admit_partial_storage_session(&engine, &expected)?;
@@ -229,6 +237,7 @@ mod tests {
             Some(ServerOptions::new(format!(
                 "http://127.0.0.1:9/lix/{repository_id}"
             ))),
+            Durability::default(),
         )
         .await
         .err()

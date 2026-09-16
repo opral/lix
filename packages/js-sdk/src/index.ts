@@ -55,6 +55,7 @@ export type {
 	MergeChangeStats,
 	ObserveEvent,
 	OpenLixOptions,
+	Durability,
 	OpenAnotherSessionOptions,
 	LixTelemetryOptions,
 	LixTelemetryParentContext,

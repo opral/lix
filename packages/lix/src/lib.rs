@@ -162,6 +162,7 @@ pub use plugin::runtime::default::runtime as default_wasm_runtime;
 mod lifecycle;
 pub use lifecycle::{create_lix, delete_lix, CreateLixBuilder, DeleteLixBuilder, HostedLix};
 pub use handle::{
+    Durability,
     CallbackOpenProgressSink, ExecuteBatchBuilder, ExecuteBuilder, Lix, LixTransaction,
     ObserveEvents, OpenAnotherSessionBuilder, OpenLixBuilder, OpenLixFromSnapshotBuilder,
     ServerOptions, TransactionExecuteBuilder, UnconfiguredOpenLixBuilder, RemoteOpenLixBuilder,

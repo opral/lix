@@ -129,12 +129,24 @@ impl ServerOptions {
     }
 }
 
+/// Persistence boundary required before acknowledging repository writes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Durability {
+    /// Wait for the backend's persistent boundary. Memory storage remains ephemeral.
+    #[default]
+    Durable,
+    /// Acknowledge buffered writes. A crash or power loss may lose acknowledged writes.
+    /// Internal publication and synchronization requirements still force durability.
+    Buffered,
+}
+
 /// Configures a session after local storage has been explicitly selected.
 ///
 /// Start with [`open_lix`] and select storage with `with_storage`. Adding a
 /// server to this builder selects synchronization.
 #[expect(missing_debug_implementations)]
 pub struct OpenLixBuilder<StorageImpl = Memory> {
+    durability: Durability,
     storage: StorageImpl,
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
@@ -146,6 +158,7 @@ impl OpenLixBuilder<Memory> {
     fn memory() -> Self {
         Self {
             storage: Memory::new(),
+            durability: Durability::default(),
             wasm_runtime: None,
             telemetry: None,
             server: None,
@@ -155,12 +168,20 @@ impl OpenLixBuilder<Memory> {
 }
 
 impl<StorageImpl> OpenLixBuilder<StorageImpl> {
+    /// Sets acknowledgement policy for all writes and sessions opened by this handle.
+    /// This controls local persistence, not remote synchronization completion.
+    pub fn with_durability(mut self, durability: Durability) -> Self {
+        self.durability = durability;
+        self
+    }
+
     /// Replaces the default in-memory storage with `storage`.
     pub fn with_storage<NewStorageImpl>(
         self,
         storage: NewStorageImpl,
     ) -> OpenLixBuilder<NewStorageImpl> {
         OpenLixBuilder {
+            durability: self.durability,
             storage,
             wasm_runtime: self.wasm_runtime,
             telemetry: self.telemetry,
@@ -270,7 +291,7 @@ where
                     },
                 );
                 let (engine, _) = open_or_initialize_engine_with_adapter(
-                    admission.adapter,
+                    admission.adapter.with_durability(self.durability),
                     wasm_runtime,
                     telemetry,
                     None,
@@ -768,6 +789,7 @@ where
             open.telemetry.clone(),
             open.server.clone(),
             retained_progress.clone(),
+            open.durability,
         )
     })
     .await?;
@@ -1156,6 +1178,7 @@ async fn open_lix_inner<StorageImpl>(
     telemetry: Option<Arc<dyn TelemetrySink>>,
     server: Option<ServerOptions>,
     retained_progress: Arc<RetainingOpenProgressSink>,
+    durability: Durability,
 ) -> Result<Lix<StorageImpl>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -1182,7 +1205,8 @@ where
                 total: None,
             },
         );
-        let lix = partial::open_partial_lix(storage, wasm_runtime, telemetry, server).await?;
+        let lix =
+            partial::open_partial_lix(storage, wasm_runtime, telemetry, server, durability).await?;
         retained_progress.retain_initialized(lix.open_report.initialized);
         emit_open_progress(
             Some(&open_progress),
@@ -1212,7 +1236,7 @@ where
         },
     );
     let (engine, engine_initialized) = open_or_initialize_engine_with_adapter(
-        admission.adapter,
+        admission.adapter.with_durability(durability),
         wasm_runtime,
         telemetry,
         None,
@@ -1555,7 +1579,10 @@ where
         if self.engine.sync_mode().role() == crate::sync::SyncRole::PartialReplica {
             return partial::open_partial_storage_session(self, storage).await;
         }
-        let mut opened = open_lix().with_storage(storage).await?;
+        let mut opened = open_lix()
+            .with_storage(storage)
+            .with_durability(self.engine.storage().durability())
+            .await?;
         if opened.lix_id() != self.lix_id() {
             opened.close().await?;
             return Err(LixError::new(
@@ -3773,6 +3800,7 @@ mod assume_send_future_proofs {
             telemetry,
             None,
             Arc::new(RetainingOpenProgressSink::new(None)),
+            Durability::default(),
         ));
     }
 
@@ -4009,3 +4037,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
         lix
     }
 }
+
+#[cfg(test)]
+mod durability_tests;
