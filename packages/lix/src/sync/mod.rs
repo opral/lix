@@ -133,7 +133,7 @@ use parking_lot::RwLock;
 #[cfg(feature = "server-protocol")]
 pub(crate) use blob::validate_sync_blob_manifest;
 pub(crate) use bootstrap::rebuild_replica_candidate;
-#[cfg(all(test, feature = "server-protocol", not(target_family = "wasm")))]
+#[cfg(all(test, feature = "server-protocol"))]
 pub(crate) use bootstrap::{install_sync_bootstrap, prepare_sync_bootstrap};
 pub(crate) use commit::{
     SYNC_CHECKPOINT_SOURCE_SPACE, SYNC_MATERIALIZED_STATE_ALIAS_SPACE,

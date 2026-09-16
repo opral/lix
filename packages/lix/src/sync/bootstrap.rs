@@ -159,7 +159,7 @@ pub(crate) async fn prepare_sync_bootstrap(
     })
 }
 
-#[cfg(all(test, feature = "server-protocol", not(target_family = "wasm")))]
+#[cfg(all(test, feature = "server-protocol"))]
 pub(crate) async fn install_sync_bootstrap<StorageImpl>(
     lix: &mut Lix<StorageImpl>,
     server: &crate::ServerOptions,
