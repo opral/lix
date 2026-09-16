@@ -61,6 +61,7 @@ substantive experiments against the latest accepted stack.
 | E11 | Restrict discovery to selected checkpoints | Accepted: dense cold history improves 80.09% and sparse 55.68% with 25 ms injected delay; wide regression removed. First covered dense query is about 10.7 ms slower, explicitly accepted and not hidden by later warm queries. [Evidence](e11/README.md). | 0 |
 | E12 | Grow discovery with selected checkpoints traversed | Accepted: sparse full history improves 36.97% [36.33%, 37.68%] at zero injected delay; sparse LIMIT2/4 improve too. Small limited-query byte increases disclosed. [Evidence](e12/README.md). | 0 |
 | E13 | Schedule discovery with completed checkpoints | Accepted: one counter and a conditional branch removed; sparse limited history improves 20–26%, empty history 82%. Wide-sparse LIMIT1 improves 36.88% with 37.88% more bytes. Full engine gate and final latency controls pass. [Evidence](e13/README.md). | 0 |
+| E14 | Prune tree subtrees using query scope | Accepted: ordinary wide history 95.81% faster, wide-sparse 94.29% faster; requests 337 → 21 and 404 → 46. Wide-sparse LIMIT1 is 4.88% slower, explicitly disclosed. 4,325 tests and 10 doctests pass. [Evidence](e14/README.md). | 0 |
 
 Accepted E01–E08 changes are consolidated in merge-ready [Lix #1817](https://github.com/opral/lix/pull/1817); the older component drafts are closed. Later experiments remain separate drafts. Nothing is deployed or merged by this series.
 

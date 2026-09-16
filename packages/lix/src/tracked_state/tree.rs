@@ -23,7 +23,7 @@ use crate::changelog::{ChangeId, CommitId};
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use crate::tracked_state::codec::{
     ChildSummary, DecodedLeafNodeRef, DecodedNode, DecodedNodeRef, EncodedLeafEntry, PendingChunk,
-    PendingChunkBatch, TrackedStateKeyBatchBuilder, boundary_trigger, decode_key,
+    PendingChunkBatch, TrackedStateKeyBatchBuilder, boundary_trigger, decode_key, decode_key_borrowed,
     decode_key_shared, decode_key_with_trusted_prefix, decode_node, decode_node_ref, decode_value,
     decode_visible_value, encode_internal_node, encode_key, encode_key_ref_into, encode_leaf_node,
     encode_schema_file_prefix, encode_schema_key_prefix, encode_value_ref, encode_value_ref_into,
@@ -1184,6 +1184,7 @@ impl TrackedStateTree {
             return self.diff_decoded_leaves(left, right, request, out);
         }
 
+        let ranges = scan_ranges(request);
         let mut left = node_diff_frontier(left_hash, left)?;
         let mut right = node_diff_frontier(right_hash, right)?;
         let mut left_window = Vec::new();
@@ -1192,6 +1193,21 @@ impl TrackedStateTree {
         let mut right_loaded = None;
 
         loop {
+            // Excluded keys cannot contribute a diff on either side. Prune each
+            // ordered frontier independently, retaining the pending leaf windows
+            // so shifted boundaries still meet in the ordinary ordered merge.
+            while left.front().is_some_and(|child| {
+                !child_summary_overlaps_request(child, request, &ranges)
+            }) {
+                left.pop_front();
+                left_loaded = None;
+            }
+            while right.front().is_some_and(|child| {
+                !child_summary_overlaps_request(child, request, &ranges)
+            }) {
+                right.pop_front();
+                right_loaded = None;
+            }
             match (left.front().cloned(), right.front().cloned()) {
                 (Some(left_node), Some(right_node))
                     if left_node.child_hash == right_node.child_hash =>
@@ -1693,7 +1709,7 @@ impl TrackedStateTree {
                         if scan_limit_reached(request, out.len()) {
                             break;
                         }
-                        if child_summary_overlaps_scan_ranges(child, ranges) {
+                        if child_summary_overlaps_request(child, request, ranges) {
                             self.collect_root_diff_shared(
                                 store,
                                 child.child_hash,
@@ -1769,7 +1785,7 @@ impl TrackedStateTree {
                         if scan_limit_reached(request, rows.len()) {
                             break;
                         }
-                        if child_summary_overlaps_scan_ranges(child, ranges) {
+                        if child_summary_overlaps_request(child, request, ranges) {
                             let result = self
                                 .scan_node(
                                     store,
@@ -3075,6 +3091,45 @@ fn lexicographic_successor(bytes: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// File-scoped queries need not enumerate schemas to exclude a subtree whose
+/// authenticated bounds lie within one schema. Mixed-schema bounds conservatively
+/// descend; null owners remain eligible when directory changes are requested.
+fn child_summary_overlaps_request(
+    child: &ChildSummary,
+    request: &TrackedStateTreeScanRequest,
+    ranges: &[EncodedScanRange],
+) -> bool {
+    if !child_summary_overlaps_scan_ranges(child, ranges) {
+        return false;
+    }
+    if !request.schema_keys.is_empty()
+        || request.file_ids.is_empty()
+        || request.file_ids.iter().any(|owner| matches!(owner, NullableKeyFilter::Any))
+    {
+        return true;
+    }
+    let (Ok(first), Ok(last)) = (
+        decode_key_borrowed(&child.first_key),
+        decode_key_borrowed(&child.last_key),
+    ) else {
+        // Pruning is optional. Preserve normal traversal and its corruption
+        // handling when a boundary cannot prove exclusion.
+        return true;
+    };
+    if first.schema_key != last.schema_key {
+        return true;
+    }
+    request.file_ids.iter().any(|owner| {
+        let file_id = match owner {
+            NullableKeyFilter::Null => None,
+            NullableKeyFilter::Value(id) => Some(id.as_str()),
+            NullableKeyFilter::Any => return true,
+        };
+        let range = prefix_scan_range(encode_schema_file_prefix(first.schema_key.as_ref(), file_id));
+        child_summary_overlaps_scan_ranges(child, std::slice::from_ref(&range))
+    })
+}
+
 fn child_summary_overlaps_scan_ranges(child: &ChildSummary, ranges: &[EncodedScanRange]) -> bool {
     ranges.is_empty()
         || ranges.iter().any(|range| {
@@ -3954,6 +4009,215 @@ mod tests {
             );
             current = updated.root_id;
         }
+    }
+
+    #[tokio::test]
+    async fn file_scoped_tree_traversal_matches_ordered_maps_across_shifted_boundaries() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
+            target_chunk_bytes: 256,
+            min_chunk_bytes: 128,
+            max_chunk_bytes: 512,
+        });
+        let mut before = BTreeMap::new();
+        let mut after = BTreeMap::new();
+        for schema in ["alpha", "middle\0schema", "omega"] {
+            for owner in [None, Some("file-a"), Some("file-b"), Some("file-c")] {
+                for index in 0..32 {
+                    let identity = key(schema, owner, &format!("row-{:04}", index * 2));
+                    let original = value(&format!("base-{index}"), Some("{}"));
+                    before.insert(identity.clone(), original.clone());
+                    if index % 7 != 0 {
+                        after.insert(
+                            identity,
+                            if index % 3 == 0 {
+                                value("modified", Some("{}"))
+                            } else {
+                                original
+                            },
+                        );
+                    }
+                    if index % 5 == 0 {
+                        after.insert(
+                            key(schema, owner, &format!("row-{:04}", index * 2 + 1)),
+                            value("inserted", Some("{}")),
+                        );
+                    }
+                }
+            }
+        }
+        let left = apply_mutations_for_test(
+            &tree,
+            &storage,
+            None,
+            before.iter().map(|(k, v)| mutation(k, v)).collect(),
+            None,
+        )
+        .await
+        .unwrap();
+        let right = apply_mutations_for_test(
+            &tree,
+            &storage,
+            None,
+            after.iter().map(|(k, v)| mutation(k, v)).collect(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(left.tree_height >= 3 && right.tree_height >= 3);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let empty = BTreeMap::new();
+        for schemas in [vec![], vec!["middle\0schema".to_string()]] {
+            for owners in [
+                vec![],
+                vec![NullableKeyFilter::Any],
+                vec![NullableKeyFilter::Null],
+                vec![NullableKeyFilter::Value("file-b".into())],
+                vec![
+                    NullableKeyFilter::Null,
+                    NullableKeyFilter::Value("file-a".into()),
+                    NullableKeyFilter::Value("file-c".into()),
+                ],
+                vec![NullableKeyFilter::Value("absent".into())],
+            ] {
+                let request = TrackedStateTreeScanRequest {
+                    schema_keys: schemas.clone(),
+                    file_ids: owners,
+                    ..Default::default()
+                };
+                let selected = |k: &TrackedStateKey| {
+                    (request.schema_keys.is_empty() || request.schema_keys.contains(&k.schema_key))
+                        && (request.file_ids.is_empty()
+                            || request.file_ids.iter().any(|owner| match owner {
+                                NullableKeyFilter::Any => true,
+                                NullableKeyFilter::Null => k.file_id.is_none(),
+                                NullableKeyFilter::Value(id) => k.file_id.as_ref() == Some(id),
+                            }))
+                };
+                let scan = TrackedStateTree::with_options(tree.options.clone())
+                    .scan(&read, &right.root_id, &request)
+                    .await
+                    .unwrap();
+                let expected_scan = after
+                    .iter()
+                    .filter(|(k, _)| selected(k))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<Vec<_>>();
+                assert_eq!(scan, expected_scan);
+                for (left_root, right_root, left_rows, right_rows) in [
+                    (Some(&left.root_id), Some(&right.root_id), &before, &after),
+                    (Some(&right.root_id), Some(&left.root_id), &after, &before),
+                    (None, Some(&right.root_id), &empty, &after),
+                    (Some(&left.root_id), None, &before, &empty),
+                ] {
+                    let actual = TrackedStateTree::with_options(tree.options.clone())
+                        .diff(&read, left_root, right_root, &request)
+                        .await
+                        .unwrap()
+                        .into_rows_for_test();
+                    let expected = naive_tree_diff(left_rows, right_rows)
+                        .into_iter()
+                        .filter(|entry| selected(&entry.key))
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        actual, expected,
+                        "filtered hierarchical diff must preserve ordered-map semantics"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn file_scoped_tree_traversal_does_not_require_excluded_leaf_chunks() {
+        let adapter = StorageAdapter::new(Memory::new());
+        let identities = [
+            key("schema", Some("file-a"), "row"),
+            key("schema", Some("file-b"), "row"),
+            key("schema", Some("file-c"), "row"),
+        ];
+        let encoded = identities
+            .iter()
+            .map(encode_key)
+            .map(Bytes::from)
+            .collect::<Vec<_>>();
+        let leaves = encoded
+            .iter()
+            .map(|key| test_gc_leaf_chunk(key))
+            .collect::<Vec<_>>();
+        let mut summaries = encoded
+            .iter()
+            .zip(&leaves)
+            .map(|(key, (hash, _))| ChildSummary {
+                first_key: key.clone(),
+                last_key: key.clone(),
+                child_hash: *hash,
+                subtree_count: 1,
+            })
+            .collect::<Vec<_>>();
+        let left_bytes = Bytes::from(encode_internal_node(&summaries));
+        let left = TrackedStateRootId::new(hash_bytes(&left_bytes));
+        let changed_bytes = Bytes::from(encode_leaf_node(&[EncodedLeafEntry {
+            key: encoded[1].clone(),
+            value: Bytes::from(encode_value(&value("changed", Some("{}")))),
+        }]));
+        let changed_hash = hash_bytes(&changed_bytes);
+        summaries[1].child_hash = changed_hash;
+        let right_bytes = Bytes::from(encode_internal_node(&summaries));
+        let right = TrackedStateRootId::new(hash_bytes(&right_bytes));
+        let mut writes = adapter.new_write_set();
+        for (hash, bytes) in [
+            (left.as_bytes(), &left_bytes),
+            (right.as_bytes(), &right_bytes),
+            (&leaves[1].0, &leaves[1].1),
+            (&changed_hash, &changed_bytes),
+        ] {
+            writes.put(
+                storage::TRACKED_STATE_TREE_CHUNK_SPACE,
+                crate::storage_adapter::StorageKey(Bytes::copy_from_slice(hash)),
+                crate::storage_adapter::StorageValue {
+                    bytes: bytes.clone(),
+                },
+            );
+        }
+        adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let read = adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let request = TrackedStateTreeScanRequest {
+            file_ids: vec![NullableKeyFilter::Value("file-b".into())],
+            ..Default::default()
+        };
+        let tree = TrackedStateTree::new();
+        let rows = tree.scan(&read, &right, &request).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, identities[1]);
+        for (from, to) in [
+            (None, Some(&right)),
+            (Some(&left), None),
+            (Some(&left), Some(&right)),
+        ] {
+            let rows = tree
+                .diff(&read, from, to, &request)
+                .await
+                .unwrap()
+                .into_rows_for_test();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].key, identities[1]);
+        }
+        assert!(
+            tree.scan(&read, &right, &TrackedStateTreeScanRequest::default())
+                .await
+                .is_err(),
+            "unfiltered reads still require the absent chunks"
+        );
     }
 
     #[tokio::test]
