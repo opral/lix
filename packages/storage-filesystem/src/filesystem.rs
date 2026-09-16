@@ -898,9 +898,23 @@ impl FilesystemState {
         let lix = self
             .apply_local_snapshot_to_lix_with_filter(&local, previous.as_ref(), &path_filter)
             .await?;
-        let materialized =
-            self.materialize_snapshot_with_filter(&lix.snapshot, Some(&local), &path_filter)?;
-        self.remember_materialized(materialized, lix.revision, lix_file_paths(&lix.snapshot));
+        // Disk events can run before a pending Lix export. Include new Lix
+        // paths before remembering this revision, or a later export will no
+        // longer recognize those paths as new and leave them unmaterialized.
+        let (materialization_filter, final_filter) =
+            self.path_filters_for_lix_materialization(&path_filter, &lix.snapshot);
+        let disk = self.materialize_snapshot_with_filter(
+            &lix.snapshot,
+            Some(&local),
+            &materialization_filter,
+        )?;
+        let remembered_disk = if materialization_filter == final_filter {
+            disk
+        } else {
+            self.remembered_snapshot_for_filter(&lix.snapshot, &final_filter)?
+        };
+        self.replace_path_filter(final_filter);
+        self.remember_materialized(remembered_disk, lix.revision, lix_file_paths(&lix.snapshot));
         Ok(())
     }
 
@@ -2879,6 +2893,45 @@ mod tests {
         ];
 
         assert_eq!(lix_file_upsert_chunk_end(&files, 0, 10, 8), 1);
+    }
+
+    #[tokio::test]
+    async fn disk_sync_materializes_new_lix_files_before_remembering_them() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::write(tempdir.path().join("initial.md"), b"initial").unwrap();
+        let layout = prepare_filesystem_layout(tempdir.path()).unwrap();
+        let state = open_test_filesystem_state(
+            layout,
+            FilesystemPathFilter {
+                include_files: Some(BTreeSet::from(["/initial.md".to_string()])),
+            },
+        )
+        .await;
+        state.sync_disk_to_lix(false).await.unwrap();
+
+        lix_write_file(&state.lix, "/nested/new-file.md", b"new".to_vec())
+            .await
+            .unwrap();
+        // A queued disk event can run before the write's SyncFromLix event.
+        state.sync_disk_to_lix(true).await.unwrap();
+        state.sync_from_lix().await.unwrap();
+
+        let disk_path = tempdir.path().join("nested/new-file.md");
+        assert_eq!(std::fs::read(&disk_path).unwrap(), b"new");
+        assert!(
+            state
+                .path_filter()
+                .explicitly_includes_file("/nested/new-file.md")
+        );
+        std::fs::write(&disk_path, b"edited").unwrap();
+        state.sync_disk_to_lix(true).await.unwrap();
+        assert_eq!(
+            lix_read_file(&state.lix, "/nested/new-file.md")
+                .await
+                .unwrap(),
+            Some(b"edited".to_vec())
+        );
+        state.close().await.unwrap();
     }
 
     #[tokio::test]

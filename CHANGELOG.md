@@ -12,6 +12,7 @@ This release uses sync protocol version 19. Upgrade clients and servers together
 
 - Keep admission and pending update watches active during foreground reads.
 - Preserve stored `.git` files during live filesystem reconciliation, even though they are excluded from disk materialization. Reopening still cleans up previously imported Git entries.
+- Reliably write Lix-created files to disk in on-demand filesystem mode when disk synchronization runs before their export.
 - Keep transaction commit IDs stable across repeated updates so `RETURNING lixcol_commit_id` matches the published commit. Deleting and reinserting a key in the same transaction no longer raises a false duplicate-key error.
 
 ## 0.17.0 - 2026-09-16
