@@ -1,0 +1,44 @@
+{
+  "artifact": {
+    "reason": "compiler-artifact",
+    "package_id": "path+file:///root/repos/lix-partial-sync-history-frontier/packages/e2e#lix_e2e@0.11.0",
+    "manifest_path": "/root/repos/lix-partial-sync-history-frontier/packages/e2e/Cargo.toml",
+    "target": {
+      "kind": [
+        "bench"
+      ],
+      "crate_types": [
+        "bin"
+      ],
+      "name": "partial_replica_history",
+      "src_path": "/root/repos/lix-partial-sync-history-frontier/packages/e2e/benches/partial_replica_history.rs",
+      "edition": "2024",
+      "required-features": [
+        "server-protocol",
+        "rocksdb"
+      ],
+      "doc": false,
+      "doctest": false,
+      "test": false
+    },
+    "profile": {
+      "opt_level": "0",
+      "debuginfo": "line-tables-only",
+      "debug_assertions": true,
+      "overflow_checks": true,
+      "test": true
+    },
+    "features": [
+      "default",
+      "rocksdb",
+      "server-protocol"
+    ],
+    "filenames": [
+      "/tmp/lix-transparent-target/debug/deps/partial_replica_history-79c0fddf0c71b358"
+    ],
+    "executable": "/tmp/lix-transparent-target/debug/deps/partial_replica_history-79c0fddf0c71b358",
+    "fresh": false
+  },
+  "saved_binary_sha256": "6b0a0bf81b043725e1ca40fdca5176b9397124956a59d1e5892faf8e55163d6f",
+  "harness_sha256": "6b3637e5f2262f22285f70710e1f1d63e9d2c5d1431d42621bf8a30fafd9249f"
+}

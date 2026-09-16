@@ -57,7 +57,9 @@ substantive experiments against the latest accepted stack.
 | E07 | Retain pending descriptor watch; clear completed recovery refresh | Accepted: total history HTTP attempts 524 → 262 dense and 188 → 94 sparse, identical counts in ten pairs. Native requests unchanged; no substantial latency gain claimed. Expired-recovery descriptor reads 262/94 → 1. 4,315 tests and 10 doctests pass. [Evidence](e07/README.md). | 0 |
 | E08 | Bundle locator owner/header/catalog dependencies | Accepted: dense64 native requests 262 → 134 and cold history 48.05% faster [47.83%, 48.31%]; sparse64 94 → 78 and 15.37% faster [14.35%, 16.08%]. Short queries improve; warm costs disclosed. 4,318 tests pass; existing v18 replicas reopen v19 without reset. [Evidence](e08/README.md). | 0 |
 
-PRs are drafts and stacked. Nothing is deployed or merged by this series.
+| E09 | Cross-checkpoint native frontier | Rejected policy: full-history latency improves 82.82% dense / 84.95% sparse, but dense LIMIT1 is 162.45% slower and transfers 11.4× bytes. Promising discovery result, unacceptable unconditional lookahead. 4,322 tests and 10 doctests pass. [Evidence](e09/README.md). | 0 |
+
+Accepted E01–E08 changes are consolidated in merge-ready [Lix #1817](https://github.com/opral/lix/pull/1817); the older component drafts are closed. Later experiments remain separate drafts. Nothing is deployed or merged by this series.
 
 First accepted implementation: [Lix #1810](https://github.com/opral/lix/pull/1810).
 Related UI bug fix: [Atelier #174](https://github.com/opral/atelier/pull/174).

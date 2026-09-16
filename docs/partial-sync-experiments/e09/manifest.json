@@ -1,0 +1,19 @@
+{
+  "decision": "rejected: material dense LIMIT1 regression despite full-history improvements",
+  "baseline_revision": "e0d831a3037a92e8ced7bab8bd5f0b264de219af",
+  "candidate_base_revision": "e0d831a3037a92e8ced7bab8bd5f0b264de219af",
+  "candidate_patch_sha256": "38f3838e397f195a89dc04ef28d49bb7f1e78f248be3cf3b67c97525424bc5e2",
+  "baseline_binary_sha256": "616cc01bc8a21d9f26c9ad2d398842e1ec3ccf95fbd18e1c5235a93b8cd6592f",
+  "candidate_binary_sha256": "6b0a0bf81b043725e1ca40fdca5176b9397124956a59d1e5892faf8e55163d6f",
+  "harness_sha256": "6b3637e5f2262f22285f70710e1f1d63e9d2c5d1431d42621bf8a30fafd9249f",
+  "pairs_per_case": 10,
+  "rtt_ms": 0,
+  "build": "dev dependencies; lix opt-level=2; CARGO_INCREMENTAL=0",
+  "compiler": "rustc 1.97.0-nightly (b954122bb 2026-05-20)",
+  "tests": {
+    "engine_all_simulations_server_protocol": 4322,
+    "doctests": 10
+  },
+  "protocol": 19,
+  "storage_format": 81
+}
