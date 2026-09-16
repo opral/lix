@@ -1606,6 +1606,7 @@ fn collect_local_directory_shallow(
         let entry =
             entry.map_err(|error| io_error("read filesystem directory entry", directory, error))?;
         let path = entry.path();
+        crate::atomic_write::cleanup_abandoned(&path);
         if is_filesystem_sync_ignored_local_path(layout, &path) {
             continue;
         }
@@ -1962,7 +1963,7 @@ fn write_materialized_file(
     if path_contains_unmanaged_entry(layout, &local_path)? {
         return Err(unsupported_materialization_entry(path, &local_path));
     }
-    std::fs::write(&local_path, data)
+    crate::atomic_write::atomic_write(&local_path, data)
         .map_err(|error| io_error("write filesystem file", &local_path, error))
 }
 
@@ -2216,6 +2217,9 @@ fn is_filesystem_sync_ignored_local_path(layout: &FilesystemLayout, path: &Path)
             return true;
         };
         depth += 1;
+        if crate::atomic_write::is_staging_name(segment) {
+            return true;
+        }
         let segment = segment.to_str();
         if segment == Some(".git") {
             return true;
@@ -2232,6 +2236,9 @@ fn is_filesystem_sync_ignored_local_path(layout: &FilesystemLayout, path: &Path)
 
 fn is_materialization_ignored_path(path: &str) -> bool {
     is_filesystem_metadata_path(path)
+        || path
+            .split('/')
+            .any(|part| crate::atomic_write::is_staging_name(std::ffi::OsStr::new(part)))
 }
 
 fn is_filesystem_sync_ignored_lix_path(path: &str) -> bool {
@@ -2720,6 +2727,26 @@ mod tests {
             let error = lix_path_to_local_path(root, path).expect_err("path should fail");
             assert_eq!(error.code, expected_code);
         }
+    }
+
+    #[test]
+    fn staging_files_are_never_imported_or_materialized() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let layout = prepare_filesystem_layout(tempdir.path()).unwrap();
+        let staged_name = ".lix-mirror-0123456789abcdef.tmp";
+        let staged_path = format!("/{staged_name}");
+        std::fs::write(layout.root.join(staged_name), b"partial").unwrap();
+        let filtered = FilesystemPathFilter {
+            include_files: Some(BTreeSet::from([staged_path.clone()])),
+        };
+        let snapshot = collect_local_snapshot(&layout, &filtered).unwrap();
+        assert!(!snapshot.files.contains_key(&staged_path));
+        let unfiltered = FilesystemPathFilter { include_files: None };
+        let snapshot = collect_local_snapshot(&layout, &unfiltered).unwrap();
+        assert!(!snapshot.files.contains_key(&staged_path));
+        assert!(!layout.root.join(staged_name).exists());
+        write_materialized_file(&layout, &staged_path, b"reserved").unwrap();
+        assert!(!layout.root.join(staged_name).exists());
     }
 
     #[test]
