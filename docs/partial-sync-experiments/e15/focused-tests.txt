@@ -1,0 +1,69 @@
+   Compiling lix v0.16.1 (/root/repos/lix-partial-sync-finite-file-ids/packages/lix)
+   Compiling lix-schema v0.16.1 (/root/repos/lix-partial-sync-finite-file-ids/packages/lix-schema)
+   Compiling lix_collaboration_test_support v0.16.1 (/root/repos/lix-partial-sync-finite-file-ids/packages/collaboration-test-support)
+warning: method `unsupported` is never used
+   --> packages/lix/src/authority_client/mod.rs:820:12
+    |
+190 | impl<H: ProtocolHttp> ClientCore<H> {
+    | ----------------------------------- method in this implementation
+...
+820 |     pub fn unsupported(&self, operation: &str) -> LixError {
+    |            ^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `headers` is never read
+  --> packages/lix/src/authority_client/http.rs:37:9
+   |
+35 | pub struct ProtocolHttpResponse {
+   |            -------------------- field in this struct
+36 |     pub status: u16,
+37 |     pub headers: Vec<(String, String)>,
+   |         ^^^^^^^
+   |
+   = note: `ProtocolHttpResponse` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: method `header` is never used
+  --> packages/lix/src/authority_client/http.rs:42:12
+   |
+41 | impl ProtocolHttpResponse {
+   | ------------------------- method in this implementation
+42 |     pub fn header(&self, name: &str) -> Option<&str> {
+   |            ^^^^^^
+
+warning: function `unsupported_remote_operation` is never used
+   --> packages/lix/src/authority_client/wire.rs:519:8
+    |
+519 | pub fn unsupported_remote_operation(operation: &str) -> LixError {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `stage_v80_repository_for_test` is never used
+    --> packages/lix/src/migration/epoch.rs:3984:21
+     |
+3984 | pub(super) async fn stage_v80_repository_for_test<S>(
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `stage_repository_format_for_test` is never used
+    --> packages/lix/src/migration/epoch.rs:3995:21
+     |
+3995 | pub(super) async fn stage_repository_format_for_test<S>(
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `into_preservation_overlay` is never used
+  --> packages/lix/src/migration/publish.rs:88:19
+   |
+26 | impl PublicationPlan {
+   | -------------------- method in this implementation
+...
+88 |     pub(super) fn into_preservation_overlay(
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `lix` (lib test) generated 7 warnings
+    Finished `test` profile [unoptimized] target(s) in 6m 21s
+────────────
+ Nextest run ID 032c6f27-6ecd-44c8-90f5-5888ece6411a with nextest profile: default
+    Starting 2 tests across 12 binaries (4409 tests skipped)
+        PASS [   0.045s] (1/2) lix integration_tests::sql::lix_file::finite_file_id_selection_preserves_paths_filters_and_noncanonical_literals_base
+        PASS [   0.071s] (2/2) lix integration_tests::sql::lix_file::finite_file_id_selection_preserves_paths_filters_and_noncanonical_literals_tracked_state_rebuild
+────────────
+     Summary [   0.073s] 2 tests run: 2 passed, 4409 skipped
