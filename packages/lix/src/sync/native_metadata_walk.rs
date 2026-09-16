@@ -252,6 +252,7 @@ async fn read_walk(
         }
     }
     let response = NativeMetadataResponse {
+        dependencies: Default::default(),
         lix_id: repository_id.to_owned(),
         epoch_id: request.epoch_id.clone(),
         objects,

@@ -30,15 +30,16 @@ pub(crate) use commit::{
 mod contract;
 mod current_coverage;
 mod http;
+mod native_dependencies;
 pub(crate) mod native_metadata;
 mod native_metadata_walk;
-pub(crate) use native_metadata_walk::NativeMetadataWalkRequest;
 #[cfg(feature = "server-protocol")]
 pub(crate) use native_metadata::MAX_NATIVE_METADATA_RESPONSE_BYTES;
 pub(crate) use native_metadata::NativeMetadataRequest;
 pub(crate) use native_metadata::{
     key as native_metadata_storage_key, space as native_metadata_storage_space,
 };
+pub(crate) use native_metadata_walk::NativeMetadataWalkRequest;
 pub(crate) mod native_object;
 #[cfg(feature = "server-protocol")]
 pub(crate) use native_object::MAX_NATIVE_OBJECT_RESPONSE_BYTES;
@@ -104,11 +105,11 @@ pub(crate) use partial_state::{
     partial_replica_state_key,
 };
 mod platform;
-pub(crate) use partial_replica::PartialReplicaDescriptor;
 #[cfg(test)]
 pub(crate) use partial_replica::MAX_PARTIAL_REPLICA_DESCRIPTOR_BYTES;
 #[cfg(all(test, feature = "server-protocol"))]
 pub(crate) use partial_replica::PARTIAL_REPLICA_DESCRIPTOR_VERSION;
+pub(crate) use partial_replica::PartialReplicaDescriptor;
 mod protocol;
 mod recovery;
 mod repository;
@@ -196,7 +197,8 @@ pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 // v16 fences active abandoned attempts before automatic authoritative recovery.
 // v17 removes recipe-driven updates; progress discovery uses leased descriptors.
 // v18 adds bounded first-parent native metadata selection for demand hydration.
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 18;
+// v19 attaches bounded authenticated native dependencies to exact metadata.
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 19;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str = "LIX_SYNC_REPOSITORY_ID_MISMATCH";

@@ -1686,6 +1686,7 @@ mod tests {
                         })
                         .collect();
                     let response = NativeMetadataResponse {
+                        dependencies: Default::default(),
                         lix_id: self.handshake.state.repository_id().to_owned(),
                         epoch_id: request.epoch_id,
                         objects,

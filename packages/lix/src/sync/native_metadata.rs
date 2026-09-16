@@ -2,7 +2,8 @@
 //!
 //! UUID-addressed metadata is not content-addressed object data. Receipt epoch
 //! binding, native decoding, and byte-for-byte existing-value guards precede
-//! publication. Fetching these records never walks parents or inventories.
+//! publication. Exact locator responses may include bounded owner dependencies;
+//! they do not traverse history or certify coverage.
 
 use super::native_object::base64_bytes;
 use super::partial_state::{
@@ -37,6 +38,11 @@ pub(crate) struct NativeMetadataResponse {
     pub(crate) lix_id: String,
     pub(crate) epoch_id: String,
     pub(crate) objects: Vec<NativeMetadata>,
+    #[serde(
+        default,
+        skip_serializing_if = "super::native_dependencies::NativeDependencyBundle::is_empty"
+    )]
+    pub(crate) dependencies: super::native_dependencies::NativeDependencyBundle,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct NativeMetadata {
@@ -207,6 +213,7 @@ pub(crate) fn validate_native_metadata_response(
         }
         validate_bytes(expected, &object.bytes)?;
     }
+    super::native_dependencies::validate(response)?;
     Ok(())
 }
 impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
@@ -306,11 +313,16 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
                 bytes: bytes.to_vec(),
             });
         }
-        Ok(NativeMetadataResponse {
+        let mut response = NativeMetadataResponse {
             lix_id: self.lix_id().to_owned(),
             epoch_id: request.epoch_id.clone(),
             objects,
-        })
+            dependencies: Default::default(),
+        };
+        response.dependencies =
+            super::native_dependencies::select(&read, &response.objects).await?;
+        validate_native_metadata_response(self.lix_id(), request, &response)?;
+        Ok(response)
     }
 }
 
@@ -326,6 +338,67 @@ pub(crate) async fn stage_native_metadata(
     response: &NativeMetadataResponse,
 ) -> Result<Vec<StoragePrecondition>, LixError> {
     validate_native_metadata_response(state.repository_id(), request, response)?;
+    if response.dependencies.metadata.is_empty() && response.dependencies.objects.is_empty() {
+        return stage_exact_metadata(read, writes, state, request, response).await;
+    }
+    // Validate staged immutable conflicts before adding any metadata writes.
+    for object in &response.dependencies.objects {
+        if writes
+            .staged_value(object.address.space(), &object.address.storage_key())
+            .is_some_and(|bytes| bytes.as_ref() != object.bytes.as_slice())
+        {
+            return Err(invalid(
+                "native dependency conflicts with staged immutable bytes",
+            ));
+        }
+    }
+    let exact_request = NativeMetadataRequest {
+        epoch_id: request.epoch_id.clone(),
+        objects: response
+            .objects
+            .iter()
+            .chain(&response.dependencies.metadata)
+            .map(|v| v.address.clone())
+            .collect(),
+    };
+    let exact_response = NativeMetadataResponse {
+        lix_id: response.lix_id.clone(),
+        epoch_id: response.epoch_id.clone(),
+        objects: response
+            .objects
+            .iter()
+            .chain(&response.dependencies.metadata)
+            .cloned()
+            .collect(),
+        dependencies: Default::default(),
+    };
+    let guards = stage_exact_metadata(read, writes, state, &exact_request, &exact_response).await?;
+    if !response.dependencies.objects.is_empty() {
+        super::native_object::stage_native_objects(
+            state.repository_id(),
+            &response
+                .dependencies
+                .objects
+                .iter()
+                .map(|v| v.address)
+                .collect::<Vec<_>>(),
+            &super::native_object::NativeObjectResponse {
+                lix_id: response.lix_id.clone(),
+                objects: response.dependencies.objects.clone(),
+            },
+            writes,
+        )?;
+    }
+    Ok(guards)
+}
+
+async fn stage_exact_metadata(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    state: &PartialReplicaState,
+    request: &NativeMetadataRequest,
+    response: &NativeMetadataResponse,
+) -> Result<Vec<StoragePrecondition>, LixError> {
     if request.epoch_id != state.epoch_id() {
         return Err(invalid(
             "native metadata request belongs to another local epoch",

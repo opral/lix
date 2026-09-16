@@ -1,0 +1,18 @@
+{
+  "compiler": "rustc 1.97.0-nightly (e50aa6fba 2026-05-19)",
+  "platform": "Linux-6.17.0-23-generic-x86_64-with-glibc2.39",
+  "build": "dev dependencies; lix engine opt-level=2; CARGO_INCREMENTAL=0",
+  "baseline_revision": "51c6e10bb3131427948bd5062ec3990095392255",
+  "candidate_base_revision": "51c6e10bb3131427948bd5062ec3990095392255",
+  "candidate_patch_sha256": "d724dc295b2f18eba5a10dc7696c99bdd3c43404c93759d33a0425bbbc6428ef",
+  "binaries": {
+    "e07-candidate-opt2": "969a87c0dc29a837e12424d3409c7566a78bef0f625e34d8aad932b3888ea7ea",
+    "e08-candidate-opt2": "616cc01bc8a21d9f26c9ad2d398842e1ec3ccf95fbd18e1c5235a93b8cd6592f"
+  },
+  "harness_sha256": "6b3637e5f2262f22285f70710e1f1d63e9d2c5d1431d42621bf8a30fafd9249f",
+  "support_files_sha256": {
+    "packages/js-sdk/src/worker/shared-admission.ts": "8468854a229d6e38f5f919a536b3b27d5f2c53a7656854210ae28f0b808d12c4",
+    "packages/js-sdk/src/worker/shared-admission.test.ts": "578b15eea4c116acee3234301b4217c7c57dd1ea149876e7bd9fc2efd0d5bf54",
+    "packages/lix/server-protocol.openapi.yaml": "9c3e4a7509cd7ffb52ae0e0f406477af36f486b18a28fcfebaa0db0b237ac1b4"
+  }
+}
