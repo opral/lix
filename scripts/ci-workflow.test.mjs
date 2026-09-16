@@ -422,3 +422,10 @@ test("merge promotion warms main browser binaries and retries do not duplicate c
   assert.doesNotMatch(cache, /github\.(run_id|run_attempt|sha)/);
   assert.match(cache, /hashFiles\('Cargo.lock'/);
 });
+
+
+test("only main writes compiler snapshots; PRs restore without creating private copies", () => {
+  const cache = readFileSync(resolve(repositoryRoot, ".github/actions/compiler-cache/action.yml"), "utf8");
+  assert.match(cache, /if: github\.ref != 'refs\/heads\/main'\n\s+uses: actions\/cache\/restore@v4/);
+  assert.match(cache, /if: github\.ref == 'refs\/heads\/main'\n\s+uses: actions\/cache@v4/);
+});

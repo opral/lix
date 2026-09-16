@@ -21,7 +21,18 @@ runs:
     # or CI-only edit can restore an exact key without uploading another copy.
     # sccache itself validates each compiler invocation; this outer key only
     # controls snapshot freshness, never whether a compilation is correct.
-    - name: Restore compiler objects
+    # PR-scoped snapshots compete with main's reusable caches and cannot be
+    # read by sibling PRs. Keep PRs read-only to avoid evicting the shared seed.
+    - name: Restore compiler objects for pull requests
+      if: github.ref != 'refs/heads/main'
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/lix-sccache
+        key: sccache-disk-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'tooling/Cargo.lock', 'tooling/Cargo.toml', '.cargo/**', 'packages/**/Cargo.toml', 'packages/**/*.rs', 'plugins/**', 'packages/js-sdk/scripts/**') }}
+        restore-keys: |
+          sccache-disk-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ hashFiles('rust-toolchain.toml') }}-
+    - name: Restore and retain main compiler objects
+      if: github.ref == 'refs/heads/main'
       uses: actions/cache@v4
       with:
         path: ${{ runner.temp }}/lix-sccache
