@@ -266,12 +266,12 @@ fn compresses_metadata_but_not_immutable_payloads() {
 fn cross_process_open_reports_locked_database() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let path = temp_dir.path().join("storage.rocksdb");
-    let _storage = RocksDB::open(&path).expect("open parent storage");
+    let storage = RocksDB::open(&path).expect("open parent storage");
     let test_binary = env::current_exe().expect("current test binary path should resolve");
 
-    let output = Command::new(test_binary)
+    let output = Command::new(&test_binary)
         .arg("--exact")
-        .arg("cross_process_open_helper")
+        .arg("rocksdb_specific::cross_process_open_helper")
         .arg("--nocapture")
         .env("LIX_ROCKSDB_LOCK_HELPER_PATH", &path)
         .output()
@@ -284,6 +284,20 @@ fn cross_process_open_reports_locked_database() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("LOCK_HELPER_CHECKED"));
+    drop(storage);
+    let reopened = Command::new(test_binary)
+        .args([
+            "--exact",
+            "rocksdb_specific::cross_process_open_helper",
+            "--nocapture",
+        ])
+        .env("LIX_ROCKSDB_LOCK_HELPER_PATH", &path)
+        .env("LIX_ROCKSDB_LOCK_HELPER_REOPEN", "1")
+        .output()
+        .expect("spawn reopen helper");
+    assert!(reopened.status.success(), "{reopened:?}");
+    assert!(String::from_utf8_lossy(&reopened.stdout).contains("LOCK_HELPER_CHECKED"));
 }
 
 #[test]
@@ -292,16 +306,18 @@ fn cross_process_open_helper() {
         return;
     };
 
-    let Err(error) = RocksDB::open(path) else {
-        panic!("child process should not open RocksDB while parent holds the database lock");
-    };
-
-    assert!(
-        error
-            .to_string()
-            .contains("already open by another process"),
-        "lock error should be mapped clearly: {error}"
-    );
+    if env::var_os("LIX_ROCKSDB_LOCK_HELPER_REOPEN").is_some() {
+        let _storage = RocksDB::open(path).expect("open after owner releases storage");
+    } else {
+        let Err(error) = RocksDB::open(path) else {
+            panic!("child process should not open RocksDB while parent holds the database lock");
+        };
+        assert_eq!(error, lix::storage::StorageError::InUse);
+        let public_error = lix::LixError::from(error);
+        assert_eq!(public_error.code, "LIX_STORAGE_IN_USE");
+        assert!(!public_error.message.contains("partial replica"));
+    }
+    println!("LOCK_HELPER_CHECKED");
 }
 
 fn put_one(storage: &RocksDB, space: StorageSpace, key: Key, value: Bytes) {

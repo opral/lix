@@ -63,6 +63,7 @@ These are the named categories defined on [LixError](../packages/lix/src/common/
 | `LIX_UNSUPPORTED_SQL` | SQL syntax is valid, but the feature is intentionally outside the Lix SQL surface. |
 | `LIX_UNSUPPORTED_SQL_RUNTIME_PLAN` | SQL planning succeeded far enough to produce a physical runtime shape that the current engine target cannot execute safely. |
 | `LIX_STORAGE_ERROR` | Storage I/O failed. |
+| `LIX_STORAGE_IN_USE` | Another owner holds exclusive access to the repository. Use that owner or close it before reopening. |
 | `LIX_STORAGE_READ_EXPIRED` | A coherent storage read was invalidated by a concurrent commit. Auto-commit read surfaces consume this internally by reopening the complete read/query against a fresh snapshot. |
 | `LIX_STORAGE_DURABILITY_UNAVAILABLE` | The selected storage cannot prove the requested persistence boundary. |
 | `LIX_INVALID_SNAPSHOT` | A snapshot is malformed, unsupported, truncated, or fails integrity verification. |
