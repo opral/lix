@@ -101,6 +101,7 @@ fn validate_bytes(address: &NativeMetadataRef, bytes: &[u8]) -> Result<(), LixEr
 }
 /// Check one native record only after matching its exact local admission.
 /// An invalid resident record is corruption, never an invitation to refetch.
+#[cfg(test)]
 pub(super) async fn native_metadata_is_resident(
     read: &(impl StorageAdapterRead + ?Sized),
     state: &PartialReplicaState,

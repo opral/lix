@@ -224,9 +224,9 @@ async fn partial_upload_worker_yields_to_demands_and_retries_ambiguous_acceptanc
             sender
                 .send(crate::sync::runtime::SyncDemand {
                     request: crate::sync::runtime::SyncDemandRequest::NativeMetadata(
-                        NativeMetadataRef::CommitGraphRecord(
+                        vec![NativeMetadataRef::CommitGraphRecord(
                             state.descriptor().selected_branch.head.commit_id.clone(),
-                        ),
+                        )],
                         LixError::unknown("queued resident demand"),
                     ),
                     response,
@@ -375,9 +375,9 @@ async fn production_frontier_preparation_supports_thirty_local_appends() {
         sender
             .send(crate::sync::runtime::SyncDemand {
                 request: crate::sync::runtime::SyncDemandRequest::NativeMetadata(
-                    NativeMetadataRef::CommitGraphRecord(
+                    vec![NativeMetadataRef::CommitGraphRecord(
                         state.descriptor().selected_branch.head.commit_id.clone(),
-                    ),
+                    )],
                     LixError::unknown("prepare baseline write frontier"),
                 ),
                 response,
@@ -609,9 +609,9 @@ async fn engine_worker_preempts_watch_then_publishes_retained_negative_scope() {
             sender
                 .send(crate::sync::runtime::SyncDemand {
                     request: crate::sync::runtime::SyncDemandRequest::NativeMetadata(
-                        NativeMetadataRef::CommitStateHeader(
+                        vec![NativeMetadataRef::CommitStateHeader(
                             old.descriptor().selected_branch.head.commit_id.clone(),
-                        ),
+                        )],
                         LixError::unknown("resident foreground demand"),
                     ),
                     response,
@@ -825,7 +825,7 @@ async fn expired_foreground_read_recovers(advance_authority: bool, dirty: bool) 
         let request = if dirty {
             let latest = authority.partial_replica_descriptor(None).await.unwrap();
             crate::sync::runtime::SyncDemandRequest::NativeMetadata(
-                NativeMetadataRef::CommitStateHeader(latest.selected_branch.head.commit_id),
+                vec![NativeMetadataRef::CommitStateHeader(latest.selected_branch.head.commit_id)],
                 LixError::unknown("nonresident history with local edits"),
             )
         } else {

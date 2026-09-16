@@ -64,8 +64,7 @@ pub(super) enum SyncDemandRequest {
     BlobManifest(crate::binary_cas::BlobId, LixError),
     NativeObject(crate::tracked_state::NativeObjectRef, LixError),
     NativeObjects(Vec<crate::tracked_state::NativeObjectRef>, LixError),
-    NativeMetadata(crate::tracked_state::NativeMetadataRef, LixError),
-    NativeMetadataBatch(Vec<crate::tracked_state::NativeMetadataRef>, LixError),
+    NativeMetadata(Vec<crate::tracked_state::NativeMetadataRef>, LixError),
     History(Vec<String>),
     Chunks(Vec<String>),
     /// Wait for the partial owner to settle local work before changing branches.
@@ -384,14 +383,14 @@ pub(super) fn native_sync_demand_request_for_error(
     if let Some(addresses) =
         crate::tracked_state::NativeMetadataRef::batch_from_missing_error(error)?
     {
-        return Ok(Some(SyncDemandRequest::NativeMetadataBatch(
+        return Ok(Some(SyncDemandRequest::NativeMetadata(
             addresses,
             error.clone(),
         )));
     }
     if let Some(address) = crate::tracked_state::NativeMetadataRef::from_missing_error(error)? {
         return Ok(Some(SyncDemandRequest::NativeMetadata(
-            address,
+            vec![address],
             error.clone(),
         )));
     }
@@ -403,7 +402,6 @@ fn full_replica_demand(request: SyncDemandRequest) -> Result<SyncDemandRequest, 
         SyncDemandRequest::NativeObject(_, error)
         | SyncDemandRequest::NativeObjects(_, error)
         | SyncDemandRequest::NativeMetadata(_, error)
-        | SyncDemandRequest::NativeMetadataBatch(_, error)
         | SyncDemandRequest::BlobManifest(_, error) => {
             sync_demand_request_for_error(&error)?.ok_or(error)
         }
@@ -471,7 +469,9 @@ impl SyncDemandRetry {
         demand_tx: Option<&tokio::sync::mpsc::Sender<SyncDemand>>,
         error: LixError,
     ) -> Result<(), LixError> {
-        let Some(demand_tx) = demand_tx else { return Err(error); };
+        let Some(demand_tx) = demand_tx else {
+            return Err(error);
+        };
         let request = self.admit(error)?;
         send_sync_demand(demand_tx, SyncDemandRequest::Pinned(Box::new(request))).await
     }
@@ -1022,7 +1022,6 @@ where
             SyncDemandRequest::NativeObject(_, _)
             | SyncDemandRequest::NativeObjects(_, _)
             | SyncDemandRequest::NativeMetadata(_, _)
-            | SyncDemandRequest::NativeMetadataBatch(_, _)
             | SyncDemandRequest::BlobManifest(_, _) => {}
             SyncDemandRequest::ReconcilePartial | SyncDemandRequest::Pinned(_) => {}
             SyncDemandRequest::History(ids) => history_ids.extend(ids),
@@ -1070,12 +1069,13 @@ fn resolve_sync_demand_results(
             SyncDemandRequest::NativeObject(_, error)
             | SyncDemandRequest::NativeObjects(_, error)
             | SyncDemandRequest::NativeMetadata(_, error)
-            | SyncDemandRequest::NativeMetadataBatch(_, error)
             | SyncDemandRequest::BlobManifest(_, error) => Err(error.clone()),
-            SyncDemandRequest::ReconcilePartial | SyncDemandRequest::Pinned(_) => Err(LixError::new(
-                "LIX_SYNC_MODE_MISMATCH",
-                "partial reconciliation requires a partial owner",
-            )),
+            SyncDemandRequest::ReconcilePartial | SyncDemandRequest::Pinned(_) => {
+                Err(LixError::new(
+                    "LIX_SYNC_MODE_MISMATCH",
+                    "partial reconciliation requires a partial owner",
+                ))
+            }
             SyncDemandRequest::History(_) => history_result.clone(),
             SyncDemandRequest::Chunks(_) => chunk_result.clone(),
             #[cfg(test)]
@@ -1652,11 +1652,10 @@ where
         Some(SyncDemandRequest::NativeObject(_, original))
         | Some(SyncDemandRequest::NativeObjects(_, original))
         | Some(SyncDemandRequest::NativeMetadata(_, original))
-        | Some(SyncDemandRequest::NativeMetadataBatch(_, original))
         | Some(SyncDemandRequest::BlobManifest(_, original)) => Err(original),
-        Some(SyncDemandRequest::ReconcilePartial | SyncDemandRequest::Pinned(_)) => Err(LixError::unknown(
-            "partial reconciliation requires a partial owner",
-        )),
+        Some(SyncDemandRequest::ReconcilePartial | SyncDemandRequest::Pinned(_)) => Err(
+            LixError::unknown("partial reconciliation requires a partial owner"),
+        ),
         Some(SyncDemandRequest::History(ids)) => {
             hydrate_history_ids(lix, transport, ids.into_iter().collect()).await
         }
@@ -4578,6 +4577,30 @@ mod native_batch_demand_tests {
 mod metadata_batch_demand_tests {
     use super::*;
     #[test]
+    fn singleton_and_batch_diagnostics_normalize_to_one_metadata_demand() {
+        use crate::tracked_state::NativeMetadataRef;
+        let address =
+            NativeMetadataRef::ChangeLocator("00000000-0000-7000-8000-000000000001".into());
+        let single = address
+            .clone()
+            .annotate_missing(LixError::unknown("missing"));
+        let mut batch = single.clone();
+        batch.details.as_mut().unwrap()["missingNativeMetadataBatch"] = serde_json::json!({
+            "version": 1, "addresses": [address.clone()],
+        });
+        for original in [single, batch] {
+            let Some(SyncDemandRequest::NativeMetadata(addresses, error)) =
+                native_sync_demand_request_for_error(&original).unwrap()
+            else {
+                panic!("both diagnostics must use the canonical metadata demand");
+            };
+            assert_eq!(addresses, vec![address.clone()]);
+            assert_eq!(error.details, original.details);
+            assert_eq!(error.code, original.code);
+        }
+    }
+
+    #[test]
     fn metadata_frontier_preserves_full_replica_error_and_forbidden_retry() {
         let addresses = (1..=2)
             .map(|id| {
@@ -4594,7 +4617,7 @@ mod metadata_batch_demand_tests {
             .unwrap()
             .unwrap();
         match &demand {
-            SyncDemandRequest::NativeMetadataBatch(actual, error) => {
+            SyncDemandRequest::NativeMetadata(actual, error) => {
                 assert_eq!(actual, &addresses);
                 assert_eq!(error.message, original.message);
             }

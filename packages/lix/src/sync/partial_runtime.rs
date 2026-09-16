@@ -10,9 +10,7 @@ use crate::storage_adapter::{Storage, StorageAdapter, StorageWriteOptions};
 use crate::{LixError, tracked_state::NativeMetadataRef};
 
 use super::http::{HttpSyncTransport, RawHttpClient};
-use super::native_metadata::{
-    NativeMetadataRequest, native_metadata_is_resident, stage_native_metadata,
-};
+use super::native_metadata::{NativeMetadataRequest, stage_native_metadata};
 use super::partial_hydration::{hydrate_native_object, native_object_is_resident};
 use super::partial_state::{PartialReplicaState, load_partial_replica_state};
 use super::platform::{sleep, spawn_sync_task};
@@ -263,12 +261,7 @@ async fn demand_is_resident<S: Storage + Clone + Send + Sync + 'static>(
             }
             Ok(complete)
         }
-        SyncDemandRequest::NativeMetadataBatch(addresses, _) => {
-            let request = NativeMetadataRequest {
-                epoch_id: state.epoch_id().to_owned(),
-                objects: addresses.clone(),
-            };
-            super::native_metadata::validate_native_metadata_request(&request)?;
+        SyncDemandRequest::NativeMetadata(addresses, _) => {
             let read = storage.begin_read(Default::default()).await?;
             let mut complete =
                 super::native_metadata::native_metadata_residency(&read, state, addresses)
@@ -288,24 +281,6 @@ async fn demand_is_resident<S: Storage + Clone + Send + Sync + 'static>(
                 .is_none();
             }
             Ok(complete)
-        }
-        SyncDemandRequest::NativeMetadata(address, _) => {
-            let read = storage.begin_read(Default::default()).await?;
-            let resident = native_metadata_is_resident(&read, state, address).await?;
-            drop(read);
-            if !resident {
-                return Ok(false);
-            }
-            if matches!(address, NativeMetadataRef::CommitGraphRecord(_)) {
-                return Ok(
-                    super::partial_write_frontier::next_missing_baseline_write_frontier(
-                        storage, state,
-                    )
-                    .await?
-                    .is_none(),
-                );
-            }
-            Ok(true)
         }
         SyncDemandRequest::BlobManifest(address, _) => {
             super::partial_blob::manifest_is_resident(storage, state, *address).await
@@ -400,7 +375,7 @@ pub(super) fn hydrate_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: 
                 .await
                 .map(|_| ())
             }
-            SyncDemandRequest::NativeMetadataBatch(addresses, error) => {
+            SyncDemandRequest::NativeMetadata(addresses, error) => {
                 if super::partial_merge_analysis::ancestry::hydrate(
                     storage, state, transport, &error,
                 )
@@ -412,26 +387,6 @@ pub(super) fn hydrate_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: 
                     .iter()
                     .any(|address| matches!(address, NativeMetadataRef::CommitGraphRecord(_)));
                 hydrate_metadata_batch(storage, state, transport, addresses).await?;
-                if graph {
-                    super::partial_write_frontier::prepare_baseline_write_frontier(
-                        storage,
-                        state,
-                        |address| hydrate_metadata(storage, state, transport, address),
-                    )
-                    .await?;
-                }
-                Ok(())
-            }
-            SyncDemandRequest::NativeMetadata(address, error) => {
-                if super::partial_merge_analysis::ancestry::hydrate(
-                    storage, state, transport, &error,
-                )
-                .await?
-                {
-                    return Ok(());
-                }
-                let graph = matches!(address, NativeMetadataRef::CommitGraphRecord(_));
-                hydrate_metadata(storage, state, transport, address).await?;
                 if graph {
                     super::partial_write_frontier::prepare_baseline_write_frontier(
                         storage,
@@ -1386,6 +1341,7 @@ mod tests {
     use super::super::native_metadata::NativeMetadataResponse;
     use super::super::partial_state::stage_partial_replica_state;
     use super::*;
+    use crate::sync::native_metadata::native_metadata_is_resident;
     use crate::{Memory, open_lix};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1409,7 +1365,7 @@ mod tests {
         sender
             .send(SyncDemand {
                 request: SyncDemandRequest::NativeMetadata(
-                    address,
+                    vec![address],
                     LixError::unknown("stale demand"),
                 ),
                 response,
@@ -1459,7 +1415,7 @@ mod tests {
             sender
                 .send(SyncDemand {
                     request: SyncDemandRequest::NativeMetadata(
-                        address,
+                        vec![address],
                         LixError::unknown("missing"),
                     ),
                     response,
@@ -1910,7 +1866,7 @@ mod tests {
         sender
             .send(SyncDemand {
                 request: SyncDemandRequest::NativeMetadata(
-                    address.clone(),
+                    vec![address.clone()],
                     LixError::unknown("missing"),
                 ),
                 response,
@@ -1930,7 +1886,7 @@ mod tests {
             sender
                 .send(SyncDemand {
                     request: SyncDemandRequest::NativeMetadata(
-                        address.clone(),
+                        vec![address.clone()],
                         LixError::unknown("duplicate demand"),
                     ),
                     response,
@@ -1988,7 +1944,7 @@ mod tests {
             sender
                 .send(SyncDemand {
                     request: SyncDemandRequest::NativeMetadata(
-                        address.clone(),
+                        vec![address.clone()],
                         LixError::unknown("missing"),
                     ),
                     response,
