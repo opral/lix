@@ -191,7 +191,7 @@ jobs:
         run: node scripts/validate-server-protocol-docs.mjs
 
       - name: Validate CI workflow invariants
-        run: node --test scripts/compatibility.test.mjs scripts/native-build.test.mjs scripts/ci-workflow.test.mjs scripts/ci-merge-reuse.test.mjs scripts/ci-rust-scope.test.mjs scripts/ci-sdk-cache.test.mjs scripts/ci-server-image.test.mjs scripts/release.test.mjs scripts/release-candidate.test.mjs scripts/publish-plugin.test.mjs
+        run: node --test scripts/compatibility.test.mjs scripts/native-build.test.mjs scripts/ci-workflow.test.mjs scripts/ci-merge-reuse.test.mjs scripts/ci-rust-scope.test.mjs scripts/ci-sdk-cache.test.mjs scripts/release-browser-artifact.test.mjs scripts/ci-server-image.test.mjs scripts/release.test.mjs scripts/release-candidate.test.mjs scripts/publish-plugin.test.mjs
 
   cargo-config:
     name: Cargo config (${{ matrix.name }})
@@ -313,14 +313,9 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Restore compiler cache
-        uses: mozilla-actions/sccache-action@v0.0.10
-
-      - name: Enable compiler cache
-        run: |
-          grep -v "^#" << "EOF" >> "$GITHUB_ENV"
-          SCCACHE_GHA_ENABLED=true
-          RUSTC_WRAPPER=sccache
-          EOF
+        uses: ./.github/actions/compiler-cache
+        with:
+          scope: cargo-${{ matrix.task }}
 
       - name: Lint Rust workspace
         if: matrix.task == 'clippy'
@@ -514,6 +509,16 @@ jobs:
           BINSTALL_NO_CONFIRM=true
           EOF
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            packages/js-sdk/package-lock.json
+            packages/storage-filesystem/package-lock.json
+            packages/storage-opfs/package-lock.json
+
       - name: Fingerprint SDK binary build inputs
         id: binary-key
         run: node scripts/ci-sdk-cache.mjs key '${{ matrix.runtime }}'
@@ -556,15 +561,9 @@ jobs:
 
       - name: Restore compiler cache
         if: steps.binary-cache.outputs.reuse != 'true'
-        uses: mozilla-actions/sccache-action@v0.0.10
-
-      - name: Enable compiler cache
-        if: steps.binary-cache.outputs.reuse != 'true'
-        run: |
-          grep -v "^#" << "EOF" >> "$GITHUB_ENV"
-          SCCACHE_GHA_ENABLED=true
-          RUSTC_WRAPPER=sccache
-          EOF
+        uses: ./.github/actions/compiler-cache
+        with:
+          scope: sdk-${{ matrix.runtime }}
 
       - name: Install plugin build target
         if: steps.binary-cache.outputs.reuse != 'true'
@@ -579,16 +578,6 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: wasm-bindgen-cli@0.2.122
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: |
-            packages/js-sdk/package-lock.json
-            packages/storage-filesystem/package-lock.json
-            packages/storage-opfs/package-lock.json
 
       - name: Install JS SDK dependencies
         working-directory: packages/js-sdk
@@ -678,16 +667,16 @@ jobs:
 
       - name: Describe reusable browser SDK artifact
         if: matrix.runtime == 'browser'
-        run: |
-          mkdir -p ci-artifact
-          node --input-type=module - <<'EOF' > ci-artifact/browser.json
-          console.log(JSON.stringify({
-            schemaVersion: 1,
-            kind: "lix-browser-sdk",
-            sourceRevision: process.env.LIX_SOURCE_SHA,
-            target: "wasm32-unknown-unknown",
-          }, null, 2));
-          EOF
+        run: node scripts/release-browser-artifact.mjs describe
+
+      - name: Upload browser build provenance for release lookup
+        if: matrix.runtime == 'browser'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-browser-build
+          path: ci-artifact/browser.json
+          retention-days: 90
+          if-no-files-found: error
 
       - name: Upload tested browser SDK for submodule consumers
         if: matrix.runtime == 'browser'

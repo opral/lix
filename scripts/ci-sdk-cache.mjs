@@ -40,8 +40,9 @@ export function cacheKey(root, runtime, env = process.env) {
 	const hash = createHash("sha256");
 	const buildEnv = Object.fromEntries(
 		Object.entries(env)
+			.filter(([name]) => runtime !== "browser" || name !== "LIX_NATIVE_PROFILE")
 			.filter(([name]) =>
-				/^(CARGO_PROFILE_|CARGO_ENCODED_RUSTFLAGS$|CARGO_INCREMENTAL$|RUSTFLAGS$|LIX_.*PROFILE$|LIX_WASM_STORAGE_BENCH$|CC$|CXX$|CFLAGS$|CXXFLAGS$)/.test(
+				/^(CARGO_PROFILE_|CARGO_TARGET_.*_(RUSTFLAGS|LINKER)$|CARGO_ENCODED_RUSTFLAGS$|CARGO_INCREMENTAL$|RUSTFLAGS$|RUSTUP_TOOLCHAIN$|LIX_.*PROFILE$|LIX_WASM_STORAGE_BENCH$|CC$|CXX$|CFLAGS$|CXXFLAGS$)/.test(
 					name,
 				),
 			)
@@ -74,7 +75,7 @@ export function cacheKey(root, runtime, env = process.env) {
 		);
 		hash.update("\0");
 	}
-	return `sdk-binaries-v2-${runtime}-${hash.digest("hex")}`;
+	return `sdk-binaries-v3-${runtime}-${hash.digest("hex")}`;
 }
 
 function outputs(runtime) {
@@ -97,7 +98,7 @@ function files(root, relative) {
 		.flatMap((name) => files(root, `${relative}/${name}`));
 }
 
-function manifest(root, runtime, key) {
+export function binaryManifest(root, runtime, key) {
 	const entries = outputs(runtime).flatMap((path) => files(root, path));
 	for (const path of [
 		"dist/wasm/lix_js_sdk.js",
@@ -128,7 +129,7 @@ function manifest(root, runtime, key) {
 export function validCache(cache, runtime, key) {
 	try {
 		return (
-			JSON.stringify(manifest(cache, runtime, key)) ===
+			JSON.stringify(binaryManifest(cache, runtime, key)) ===
 			JSON.stringify(
 				JSON.parse(readFileSync(join(cache, "manifest.json"), "utf8")),
 			)
@@ -139,7 +140,7 @@ export function validCache(cache, runtime, key) {
 }
 
 export function saveBinaries(sdk, cache, runtime, key) {
-	const description = manifest(sdk, runtime, key);
+	const description = binaryManifest(sdk, runtime, key);
 	rmSync(cache, { recursive: true, force: true });
 	for (const path of outputs(runtime)) {
 		mkdirSync(dirname(join(cache, path)), { recursive: true });

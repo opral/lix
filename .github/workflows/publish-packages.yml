@@ -18,6 +18,14 @@ concurrency:
 permissions:
   contents: read
 
+# Match CI's build settings so browser provenance and compiler objects agree.
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  CARGO_PROFILE_RELEASE_DEBUG: '0'
+  CARGO_PROFILE_BENCH_DEBUG: '0'
+
 jobs:
   release-version:
     name: Validate release version
@@ -29,10 +37,13 @@ jobs:
       has_release: ${{ steps.version.outputs.has_release }}
       server_tag: ${{ steps.server.outputs.tag }}
       server_digest: ${{ steps.server.outputs.digest }}
+      browser_run: ${{ steps.browser.outputs.run_id }}
+      browser_revision: ${{ steps.browser.outputs.revision }}
 
     permissions:
       contents: write
       pull-requests: write
+      actions: read
 
     steps:
       - name: Checkout repository
@@ -128,6 +139,17 @@ jobs:
       - name: Look up server image before allocating a build runner
         id: server
         run: node scripts/ci-server-image.mjs
+
+      - name: Find tested browser artifacts for the release tree
+        if: steps.version.outputs.has_release == 'true'
+        id: browser
+        uses: actions/github-script@v8
+        env:
+          RELEASE_SHA: ${{ steps.version.outputs.release_sha }}
+        with:
+          script: |
+            const { selectReleaseBrowser } = await import(`${process.env.GITHUB_WORKSPACE}/scripts/release-browser-artifact.mjs`);
+            await selectReleaseBrowser({ github, context, core, sha: process.env.RELEASE_SHA });
 
   publish-lix-server:
     name: Publish Lix reference server
@@ -229,6 +251,7 @@ jobs:
   build-js-sdk-native-packages:
     name: Build @lix-js/sdk native package (${{ matrix.suffix }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     needs: release-version
     if: needs.release-version.outputs.has_release == 'true'
     strategy:
@@ -248,8 +271,8 @@ jobs:
         with:
           ref: ${{ needs.release-version.outputs.release_sha }}
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Activate repository Rust toolchain
+        run: rustup show active-toolchain
 
       - name: Install Linux native build dependencies
         if: startsWith(matrix.suffix, 'linux-')
@@ -270,6 +293,11 @@ jobs:
         with:
           shared-key: publish-js-sdk-${{ matrix.suffix }}
 
+      - name: Restore compiler cache
+        uses: ./.github/actions/compiler-cache
+        with:
+          scope: sdk-release-${{ matrix.suffix }}
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -285,6 +313,21 @@ jobs:
         working-directory: packages/js-sdk
         run: npm run build:native
 
+      - name: Build Linux migration binary for SDK integration tests
+        if: matrix.suffix == 'linux-x64'
+        working-directory: packages/js-sdk
+        run: npm run build:migration:native
+
+      - name: Upload Linux native binaries for SDK integration tests
+        if: matrix.suffix == 'linux-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: js-sdk-linux-test-binaries
+          path: |
+            packages/js-sdk/lix_js_sdk.node
+            packages/js-sdk/lix_js_sdk_migration.node
+          if-no-files-found: error
+
       - name: Prepare JS SDK native package
         working-directory: packages/js-sdk
         run: npm run prepare:native-package -- --suffix=${{ matrix.suffix }}
@@ -296,11 +339,23 @@ jobs:
           path: packages/js-sdk/native-packages/${{ matrix.suffix }}
           if-no-files-found: error
 
-  build-js-sdk:
-    name: Build @lix-js/sdk
+      - name: Upload native build timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-native-timings-${{ matrix.suffix }}
+          path: target/cargo-timings/*.html
+          if-no-files-found: ignore
+
+  build-js-sdk-browser:
+    name: Build or reuse browser SDK
     runs-on: ubicloud-standard-30-ubuntu-2404
+    timeout-minutes: 45
     needs: release-version
     if: needs.release-version.outputs.has_release == 'true'
+    permissions:
+      contents: read
+      actions: read
 
     steps:
       - name: Checkout repository
@@ -308,26 +363,107 @@ jobs:
         with:
           ref: ${{ needs.release-version.outputs.release_sha }}
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: packages/js-sdk/package-lock.json
 
-      - name: Install native and WebAssembly host build dependencies
+      - name: Download tested browser artifact
+        if: needs.release-version.outputs.browser_run != ''
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: lix-browser-sdk-${{ needs.release-version.outputs.browser_revision }}
+          run-id: ${{ needs.release-version.outputs.browser_run }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/tested-browser
+
+      - name: Verify and restore browser binary payload
+        id: browser
+        env:
+          BROWSER_REVISION: ${{ needs.release-version.outputs.browser_revision }}
+        run: node scripts/release-browser-artifact.mjs restore "$RUNNER_TEMP/tested-browser" "$BROWSER_REVISION"
+
+      - name: Activate repository Rust toolchain
+        if: steps.browser.outputs.reuse != 'true'
+        run: rustup show active-toolchain
+
+      - name: Install WebAssembly host build dependencies
+        if: steps.browser.outputs.reuse != 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y llvm-dev libclang-dev clang mold
+          sudo apt-get install -y mold
 
       - name: Restore Rust cache
+        if: steps.browser.outputs.reuse != 'true'
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: publish-js-sdk
+          shared-key: ci-js-browser
 
-      - name: Install WebAssembly build target
-        run: rustup target add wasm32-unknown-unknown
+      - name: Restore compiler cache
+        if: steps.browser.outputs.reuse != 'true'
+        uses: ./.github/actions/compiler-cache
+        with:
+          scope: sdk-browser
+
+      - name: Install WebAssembly build targets
+        if: steps.browser.outputs.reuse != 'true'
+        run: rustup target add wasm32-unknown-unknown wasm32-wasip2
 
       - name: Install wasm-bindgen CLI
+        if: steps.browser.outputs.reuse != 'true'
         uses: taiki-e/install-action@v2
         with:
           tool: wasm-bindgen-cli@0.2.122
+
+      - name: Install JS SDK dependencies
+        working-directory: packages/js-sdk
+        run: npm ci
+
+      - name: Build browser WASM
+        if: steps.browser.outputs.reuse != 'true'
+        working-directory: packages/js-sdk
+        run: npm run build:wasm
+
+      - name: Build migration WASM
+        if: steps.browser.outputs.reuse != 'true'
+        working-directory: packages/js-sdk
+        run: npm run build:migration:wasm
+
+      - name: Build bundled plugins
+        if: steps.browser.outputs.reuse != 'true'
+        working-directory: packages/js-sdk
+        run: npm run build:plugins
+
+      - name: Upload release browser binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: js-sdk-browser-binaries
+          path: packages/js-sdk/dist
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload browser build timings
+        if: always() && steps.browser.outputs.reuse != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-browser-timings
+          path: target/cargo-timings/*.html
+          if-no-files-found: ignore
+
+  build-js-sdk:
+    name: Assemble @lix-js/sdk
+    runs-on: ubicloud-standard-2-ubuntu-2404
+    timeout-minutes: 10
+    needs: [release-version, build-js-sdk-browser]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-version.outputs.release_sha }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -338,11 +474,10 @@ jobs:
             packages/js-sdk/package-lock.json
             packages/storage-filesystem/package-lock.json
             packages/storage-opfs/package-lock.json
-          registry-url: https://registry.npmjs.org
 
       - name: Install JS SDK dependencies
         working-directory: packages/js-sdk
-        run: npm install
+        run: npm ci
 
       - name: Install filesystem storage dependencies
         working-directory: packages/storage-filesystem
@@ -352,9 +487,20 @@ jobs:
         working-directory: packages/storage-opfs
         run: npm ci
 
-      - name: Build JS SDK package
+      - name: Download browser binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: js-sdk-browser-binaries
+          path: packages/js-sdk/dist
+
+      - name: Restore generated WASM source links
+        run: |
+          ln -s ../dist/wasm packages/js-sdk/src/wasm
+          ln -s ../dist/migration-wasm packages/js-sdk/src/migration-wasm
+
+      - name: Build JS SDK TypeScript
         working-directory: packages/js-sdk
-        run: npm run build
+        run: npm run build:ts
 
       - name: Build filesystem storage package
         working-directory: packages/storage-filesystem
@@ -368,10 +514,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: js-sdk-package-build
-          path: |
-            packages/js-sdk/dist
-            packages/js-sdk/lix_js_sdk.node
-            packages/js-sdk/lix_js_sdk_migration.node
+          path: packages/js-sdk/dist
           if-no-files-found: error
 
       - name: Upload filesystem storage package build
@@ -394,6 +537,7 @@ jobs:
     needs:
       - release-version
       - build-js-sdk
+      - build-js-sdk-native-packages
 
     steps:
       - name: Checkout repository
@@ -427,6 +571,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: js-sdk-package-build
+          path: packages/js-sdk/dist
+
+      - name: Download Linux native binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: js-sdk-linux-test-binaries
           path: packages/js-sdk
 
       - name: Download filesystem storage package build
@@ -568,7 +718,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: js-sdk-package-build
-          path: packages/js-sdk
+          path: packages/js-sdk/dist
 
       - name: Download filesystem storage package build
         uses: actions/download-artifact@v4
@@ -736,6 +886,7 @@ jobs:
       - build-js-sdk-native-packages
       - build-js-sdk-arm64
       - build-js-sdk
+      - build-js-sdk-browser
       - test-js-sdk
       - publish-rust-crates
       - publish-js-sdk
@@ -750,6 +901,7 @@ jobs:
           echo "build-js-sdk-arm64: ${{ needs.build-js-sdk-arm64.result }}"
           echo "build-js-sdk-native-packages: ${{ needs.build-js-sdk-native-packages.result }}"
           echo "build-js-sdk: ${{ needs.build-js-sdk.result }}"
+          echo "build-js-sdk-browser: ${{ needs.build-js-sdk-browser.result }}"
           echo "test-js-sdk: ${{ needs.test-js-sdk.result }}"
           echo "publish-rust-crates: ${{ needs.publish-rust-crates.result }}"
           echo "publish-js-sdk: ${{ needs.publish-js-sdk.result }}"
