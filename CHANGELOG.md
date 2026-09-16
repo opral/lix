@@ -2,141 +2,36 @@
 
 ## 0.17.0 - 2026-09-16
 
-### Minor
+### Partial replicas with on-demand sync
 
-- Automatic SQL transactions now accept a retry limit.
+Open a repository without downloading it in full. Lix fetches the data your SQL queries need and keeps it locally. Reads and writes whose required data is already available run locally, including offline, while background sync uploads your edits and keeps loaded data up to date.
 
-  Set `maxAutoCommitRetries` on JavaScript `execute()` and `executeBatch()`, or use Rust's `.with_max_auto_commit_retries(...)`, to cap whole-operation retries after transaction contention or an expired snapshot. Zero disables these retries. Without an override, Lix retains its default recovery budgets. Explicit transactions remain caller-controlled, and unknown commit outcomes are never automatically re-executed. Remote idempotent writes can now retry known transaction conflicts after checking for a committed receipt.
+Enable this with local storage and `server.mode: "partial_replica"`. Run a query ahead of an interaction to prefetch its data—there is no separate preparation API. Browser tabs share cached data and offline edits, and previously opened replicas can reopen offline.
 
-  Errors from the retry loop include the number of replays and why retrying stopped.
-- Excalidraw scenes now expose root metadata as `scene_json`. Element type and deletion state are edited directly in `element_json`; duplicate `element_type` and `is_deleted` columns are removed. Formatting hints are optional for SQL inserts, and rows with equal order keys sort by native ID.
+See [on-demand sync](docs/partial-replica-on-demand-sync.md) for usage and [replica migration](docs/partial-replica-migration.md) for converting existing replicas.
 
-  Excalidraw preserves durable ordering, numeric spelling, collection layout, and unknown data across file edits, SQL updates, and cold restoration. Scene templates cannot override row content. Warm element SQL edits and grouped file edits use sparse indexed reads; paged indexes and offset rebuilding have scaling regressions and compiled SQL/Wasm coverage.
-- Return `from_content` and `to_content` from `lix_diff('lix_file', ...)` and `lix_history('lix_file', ...)`. File metadata filters are applied before reading the selected historical bytes, including on partial replicas.
+### Improvements
 
-  Remove the public diff and history `row_count` column. Count the relation being displayed explicitly with `COUNT(*)`, naming the result `changed_files`, `changed_paragraphs`, or another description of that relation.
-- Improved JSON plugin lossless roundtrips, SQL row creation, and scalar edit performance.
-
-  JSON objects now preserve duplicate member names, distinguished by an `occurrence` primary-key column that defaults to zero. Rows provide defaults for root identities, top-level parents, and ordering, and nested containers can use caller-supplied identities for SQL creation and renaming. Deeply nested documents no longer overflow the parser or renderer stack, and numeric changes remain content changes even when their native numeric values round identically.
-
-  Scalar SQL edits locate their rows through a paged identity index and read only the affected values instead of loading the entire file or scanning every scalar for each changed row.
-- Removed the unused `conflicts` field and conflict types from branch merge previews.
-
-  Lix continues to combine independent column edits and resolve competing edits with last-writer-wins or a plugin merger. Applications should review the changes rather than use a conflict array as an approval gate. Server protocol version 11 marks the response change; clients and servers must use compatible versions.
-- Open partial replicas with on-demand sync instead of downloading a full repository.
-
-  JavaScript clients opt in with storage and `server.mode: "partial_replica"`. Opening transfers bounded metadata; SQL fetches missing native inputs and retains them locally. Covered reads and prepared writes execute locally, including offline, while background synchronization updates the working set and uploads commits. Execute the expected SQL query to prefetch its inputs before an interaction; no separate preparation API is required.
-
-  Server mode defaults to `"remote"` and rejects client storage. Existing synchronized callers must explicitly opt into `"partial_replica"`; the former `"sync"` spelling is not supported. Upgrade SDK and server together. Existing full replicas require explicit conversion that preserves their source and pending work; see the partial replica migration guide for supported formats and recovery boundaries.
-- Partial replicas continue syncing current data when retained historical data is unavailable on the server.
-
-  Historical retention no longer blocks current-state updates, and background progress discovery no longer depends on optional prefetch. Use `sync_health()` in Rust or `syncHealth()` in JavaScript to distinguish stalled synchronization from successful local reads and compare observed and applied cursors.
-
-  This release requires sync protocol 17. Upgrade SDK and server together; protocol 16 peers are rejected. Existing repository data remains in format 81.
-- Plugin API v2 now uses the major-only `lix:plugin-v2` identity independently of Lix and plugin release versions.
-
-  Existing compiled plugins using `lix:plugin@2.0.0` remain supported. Compatible API additions preserve existing plugin behavior; breaking changes require a new API major.
-- Plugins can use shared SDK order-key allocation and the SQL `lix_order_between` function instead of implementing fractional ordering themselves.
-
-  The native plugin testing harness now applies generated identities to small row fixtures and reports transition I/O counters. A reusable UUID-to-ordinal private-state index supports bounded lookup.
-
-  Text content updates and ordinary Markdown paragraph updates now use sparse accepted-file reads and state updates. Structural and formatting-sensitive changes retain the existing full-document fallback.
-- Separate repository migration from ordinary opening, and make browser replica reads and shared identity admission reliable during concurrent synchronization.
-
-  This is a coordinated breaking upgrade: migrate every authority and local repository with the detached migration tools before admitting it to the current runtime, and upgrade clients and servers together to sync protocol 9 and storage format 81. Migration preserves source repositories and pending local work; dormant browser repositories migrate when their device returns. Ordinary opening no longer performs legacy migrations or remote SQL identity probes.
-
-  Custom JavaScript HTTP transports must implement the typed request and response contract. Replica conversion now belongs to the detached migration API. Buffered foreground reads have a 30-second deadline and a combined 64 MiB / 1,000,000-row result limit; oversized results and exhausted read progress return structured errors. Browser storage close now waits for physical ownership release when the last client disconnects.
-- Support `OLD.column`, `NEW.column`, `OLD.*`, and `NEW.*` in SQL RETURNING for inserts, updates, deletes, and upserts. Returned row images describe each statement independently of the committed operation's endpoint diff, with typed NULLs for absent images and selective file content reads.
-- Resolve concurrent partial-replica edits through the same native row merge pipeline as branch merges.
-
-  Registered schema/plugin merge hooks remain active. The default for overlapping values is incoming-write precedence in server acceptance order, rather than change-ID ordering. Plugin-managed files serialize the resolved rows; opaque file content remains atomic. Accepted retries retain their original identity and cannot overwrite a later server edit by being treated as a new write.
-
-  Upgrade SDK and server together for sync protocol 14. The explicit local journal migration preserves pending edits and existing acknowledgment identities without resetting browser storage. Opening and resident SQL keep their on-demand and local execution behavior.
-
-  Pending edits are accepted against the server's current branch state even when other writers advance it during upload. Exact retries keep their original outcome, already included rows are not applied again, and newer local edits remain pending for their own acceptance.
-- Normalized reference-server error codes and documented the error catalog.
-
-  Server lifecycle errors now use `LIX_ERROR_MIGRATING`, `LIX_ERROR_MIGRATION_FAILED`, `LIX_ERROR_RECOVERING`, `LIX_ERROR_SHUTTING_DOWN`, `LIX_ERROR_CAPACITY`, `LIX_ERROR_CACHE_CLEANUP`, and `LIX_ERROR_TIMEOUT`, removing the redundant second `LIX`. Unsupported storage formats now consistently use `LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT`. This changes the wire codes without legacy aliases; update clients that match the previous spellings together with the server. HTTP statuses and retry semantics are unchanged.
-- Resolve historical read and diff commit arguments with scalar subqueries.
-
-  `lix_as_of` and `lix_diff` can now look up commit IDs within the same statement, including through parameters and common table expressions. This removes the separate query previously needed to resolve a branch before reading or comparing its state. The one-argument working diff continues to compare the active branch's working baseline with its current head.
-- Return one durable commit receipt per SQL transaction.
-
-  `executeBatch` now returns `{ results, commit }`, replacing the array of results with repeated commit spans. Explicit transaction `commit()` returns `{ commit }`; its statement results carry no receipt. Server protocol 10 carries these contracts through HTTP, native bindings, browser workers, and the JavaScript SDK.
-
-  Explicit SQL reads used to decide later writes now fence the transaction's opening branch snapshot. Concurrent branch changes require retrying the complete transaction, including application checks. Read-only transactions remain valid. Known durable completion errors preserve the receipt in `details.commit` and remain forbidden from automatic mutation retries.
-
-  Explicit SQL transactions publish individually to preserve exact receipts. They no longer combine multiple transactions into one merged commit; concurrent commits still use the coordinator and retain stale-write reconciliation.
-
-### Patch
-
-- Filesystem mirror updates now replace each file atomically, so readers no longer observe partially written contents. This does not add a power-loss durability guarantee for mirrored files or make multi-file updates atomic.
-- Automatically upgrade supported older server repositories when opening them.
-
-  Clients await server migration inside the normal open call. The SDK reports upgrade progress through `onProgress`, so applications can display status without owning migration or retry logic. Concurrent opens share one upgrade, which retains source storage and verifies preservation before serving the repository. Failed or unsupported migrations preserve the existing data and return an error.
-
-  Transport-only upgrades no longer reject repositories with compatible storage. Ordinary admission remains independent of repository size.
-- Fixed full-replica migration inspections failing when OPFS reads expire during migration heartbeat or candidate writes. Frozen source reads now resume bounded point batches and scan pages while checking the exact migration claim and source revision. Local edits and retained source banks remain protected.
-- Fixed browser replica upgrades failing with “Lix session is closed.”
-
-  Existing replicas can now run closed-storage conversion and retry migration cleanup through the SDK worker.
-- Fixed missing results from indexed filters and joins after large bulk writes.
-
-  Bulk inserts and replacements now publish index entries alongside their rows, preventing queries from treating existing records as absent. This fixes translation compilation falling back to message keys after larger inlang imports. Databases with older, potentially incomplete indexes use a scan when index completeness cannot be established.
-
-  Also fixed nullable primitive projections and compatible schema amendments: existing rows remain readable, inherited rows retain correct indexed results, and newly added literal and generated defaults are stored once in the amendment transaction. Historical queries preserve the original row values.
-- Keep legacy synced replica initialization and snapshot installation coherent while migration heartbeats commit. Preserve archived local edits as recovery exports without blocking conversion of the clean active replica to partial storage. Reject unsupported restoration before it can create pending work that prevents branch switching.
-- Fixed migration planning and snapshot verification failing when OPFS reads expire during heartbeat commits. Candidate scans now resume bounded read units under an unchanged bank revision and epoch fence; publication keeps its existing revision preconditions. This preserves stored rows and pending edits without restarting completed migration writes.
-
-  Explicit browser replica conversion now shares the same admission queue as repository opening. Concurrent tabs coordinate conversion, disconnected callers release ownership, and repeated conversion validates the published replica instead of reopening a competing engine. Existing sessions and retained recovery sources are preserved.
-
-  Opening an additional session outside an admitted partial replica scope now returns the scope error before attempting to read unprepared branch metadata.
-- Reopen previously admitted browser replicas after a cold offline reload without granting cached credentials a remote lease. Persist only a credential digest and verified local routing identity scoped to the physical store, authority and protocol epochs; remote access still requires fresh admission.
-
-  Handle bodyless HTTP responses (204, 205 and 304) without constructing an invalid response stream, fixing remote session cleanup through wrapped browser transports.
-- OPFS partial replicas now share loaded data and offline edits across browser tabs.
-
-  Tabs coordinate one engine automatically through a SharedWorker, keeping the same storage identity and `openLix()` API. Closing a tab leaves the other sessions operational. Checkpoint history also fetches missing commit metadata on demand and retains it for subsequent offline reads.
-
-  File checkpoints upload their blob dependencies before publishing, including after an offline checkpoint or a lost acknowledgment. Each browser session keeps its own telemetry callback and trace parent; shared background spans go to live subscribers.
-
-  Pending edits and checkpoint dependencies upload in bounded waves, including recovery after lost replies. SQL retries preserve the completion boundary: an error reported after execution or commit cannot replay the operation.
-
-  Read-interest journal flushing retries expired snapshots internally, so concurrent tab startup can complete without replaying the SQL that registered its inputs.
-
-  Opening an additional session retries transient read invalidation during branch and admission validation, so another tab or background synchronization can commit while the session opens. Real admission and storage errors still propagate.
-- Filesystem repository opens now report `LIX_STORAGE_IN_USE` when another process holds the repository lock. Applications can distinguish ownership contention from storage failures without matching diagnostic text.
-- SQL `UPDATE` statements now support scalar expressions such as `replace`, `concat`, `coalesce`, and string concatenation in file and row mutations.
-
-  Update assignments, filters, and returned expressions use the same scalar function rules as reads. Invalid expressions reject the mutation atomically. Partial replicas can use resident file content in an exact-path expression update while offline.
-
-  These additional scalar expressions, such as `upper` and `concat`, remain unsupported in registered-row `INSERT` values, upsert assignments, and insert `RETURNING`; those statements fail without changing rows.
-- Keep server S3 requests and response bodies on the server's long-lived Tokio runtime. Closing a repository's SlateDB runtime no longer invalidates shared HTTP connections used by later repository opens or catalog reads.
-- Recover partial replicas inside awaited operations.
-
-  Cold SQL renews expired baseline leases, reconciles pending changes, and retries against the recovered state without exposing internal recovery instructions. Unchanged baselines retain local edits and frozen upload identities. Branch switches await pending synchronization internally. Repeated coherent baseline changes can restart an uncommitted operation without replaying completed writes.
-
-  Unsupported local reconciliation adopts server-authoritative state only after pending publication identities are safely settled or fenced. Bounded opening and network-free reads with valid resident inputs remain unchanged.
-
-  Online opening replaces incompatible replica caches with an authenticated partial epoch without migrating their history. Old banks remain detached and intact. Format-78 offline migration validates native checkpoint identities rather than retired checkpoint marker rows.
-
-  Explicit transactions fetch missing immutable inputs while keeping mutable reads pinned. A snapshot whose required inputs are no longer retained fails with a normal transaction conflict instead of waiting for a publication it prevents.
-
-  Local partial snapshot exports now preserve the actual resident cache and pending edits instead of downloading the authority snapshot. Partial snapshots carry an explicit header flag and restore as partial replicas; older readers reject them.
-
-  Deploy SDK and server together for sync protocol 16. Older peers fail version negotiation before attempting the new authenticated upload-abandonment fence. Repository storage format remains unchanged.
-
-  Deployment probes and raw HTTP integrations can read Lix-owned compatibility metadata from the source checkout or `@lix-js/sdk/compatibility`; applications no longer need to maintain their own protocol version numbers.
-
-## Unreleased
+- File diffs and history return `from_content` and `to_content`. `lix_as_of` and `lix_diff` accept scalar subqueries for commit IDs, saving a separate lookup.
+- SQL `RETURNING` supports `OLD` and `NEW` row values. `UPDATE` supports expressions such as `replace`, `concat`, and `coalesce`.
+- Control automatic transaction retries with JavaScript's `maxAutoCommitRetries` or Rust's `with_max_auto_commit_retries`.
+- Faster localized JSON, Markdown, and text edits. JSON preserves duplicate object keys and handles deeply nested documents.
+- Inspect synchronization progress with JavaScript's `syncHealth()` or Rust's `sync_health()`.
 
 ### Fixes
 
-- Partial replicas now recover expired baselines and reconcile pending changes inside awaited SQL operations. Unsupported local changes can yield to the authoritative server after outstanding merge attempts are fenced.
+- Fixed missing query results after large bulk writes, including translation compilation falling back to message keys after large inlang imports.
+- Improved browser replica upgrades, reconnects, and concurrent-tab reliability.
+- Filesystem mirror updates replace each file atomically, so readers no longer see partially written contents.
 
 ### Upgrade notes
 
-- Upgrade the SDK and server together to sync protocol 16. It adds active-attempt abandonment for automatic recovery; older peers fail protocol negotiation. The repository storage format remains 81.
+- Upgrade the SDK and server together: this release uses sync protocol **17** and storage format **81**. Supported older server repositories upgrade during opening, with progress available through `onProgress`. For local repository migration and replica conversion, follow the [migration guide](docs/partial-replica-migration.md).
+- Replace `server.mode: "sync"` with `"partial_replica"` when using client storage. The default mode is `"remote"`, which rejects client storage.
+- `executeBatch()` now returns `{ results, commit }` instead of an array. Explicit transaction `commit()` returns `{ commit }`; individual statements carry no receipt. Retry the entire explicit transaction when concurrent branch changes invalidate its reads.
+- Diff and history no longer return `row_count`; use `COUNT(*)`. Merge previews no longer include the unused `conflicts` field.
+- JSON rows add an `occurrence` primary-key column for duplicate keys, defaulting to zero. Excalidraw uses `scene_json` for root metadata; edit element type and deletion state in `element_json` instead of the removed `element_type` and `is_deleted` columns.
+- Custom JavaScript HTTP transports must use the typed request/response contract. Server lifecycle error codes drop the redundant second `LIX`; unsupported storage formats use `LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT`. Update code that matches the old names.
 
 ## 0.16.1 - 2026-09-11
 
