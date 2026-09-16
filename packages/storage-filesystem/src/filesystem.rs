@@ -986,7 +986,7 @@ impl FilesystemState {
             if !local.files.contains_key(path)
                 && path_filter.includes_file(path)
                 && !is_plugin_storage_path(path)
-                && !is_materialization_ignored_path(path)
+                && !is_filesystem_sync_ignored_lix_path(path)
             {
                 if previous
                     .as_ref()
@@ -1014,7 +1014,7 @@ impl FilesystemState {
             for path in lix.snapshot.directories.difference(&local.directories) {
                 if path.as_str() == "/"
                     || is_plugin_storage_path(path)
-                    || is_materialization_ignored_path(path)
+                    || is_filesystem_sync_ignored_lix_path(path)
                 {
                     continue;
                 }
@@ -2496,7 +2496,10 @@ const LEGACY_FILESYSTEM_SQLITE_METADATA_NAMES: &[&str] = &[
 
 fn rocksdb_error(error: StorageError) -> LixError {
     let mut error = LixError::from(error);
-    error.message = format!("failed to open filesystem RocksDB storage: {}", error.message);
+    error.message = format!(
+        "failed to open filesystem RocksDB storage: {}",
+        error.message
+    );
     error
 }
 
@@ -2741,7 +2744,9 @@ mod tests {
         };
         let snapshot = collect_local_snapshot(&layout, &filtered).unwrap();
         assert!(!snapshot.files.contains_key(&staged_path));
-        let unfiltered = FilesystemPathFilter { include_files: None };
+        let unfiltered = FilesystemPathFilter {
+            include_files: None,
+        };
         let snapshot = collect_local_snapshot(&layout, &unfiltered).unwrap();
         assert!(!snapshot.files.contains_key(&staged_path));
         assert!(!layout.root.join(staged_name).exists());
@@ -2892,6 +2897,32 @@ mod tests {
             "an unchanged filesystem should be recognized as already materialized"
         );
 
+        state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disk_sync_preserves_lix_git_entries_that_are_not_materialized() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let layout = prepare_filesystem_layout(tempdir.path()).unwrap();
+        let state = open_test_filesystem_state(layout, FilesystemPathFilter::default()).await;
+        state.sync_disk_to_lix(false).await.unwrap();
+
+        for path in ["/.git/config", "/docs/.git", "/nested/.git/config"] {
+            lix_write_file(&state.lix, path, b"lix".to_vec())
+                .await
+                .unwrap();
+        }
+        state.sync_from_lix().await.unwrap();
+        // Force disk reconciliation after the ignored paths have been remembered.
+        // Their deliberate absence on disk must not delete files or parent dirs.
+        state.sync_disk_to_lix(true).await.unwrap();
+        for path in ["/.git/config", "/docs/.git", "/nested/.git/config"] {
+            assert_eq!(
+                lix_read_file(&state.lix, path).await.unwrap().as_deref(),
+                Some(b"lix".as_slice())
+            );
+            assert!(!tempdir.path().join(path.trim_start_matches('/')).exists());
+        }
         state.close().await.unwrap();
     }
 
