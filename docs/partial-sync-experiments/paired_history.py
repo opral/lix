@@ -7,6 +7,8 @@ p.add_argument('baseline'); p.add_argument('candidate'); p.add_argument('--pairs
 p.add_argument('--cases',default='dense64,sparse64'); p.add_argument('--rtt',type=int,default=0)
 p.add_argument('--output',required=True); p.add_argument('--fixtures',required=True)
 a=p.parse_args()
+assert not os.environ.get('LIX_PROFILE_PERSISTED_REPLICAS'), 'paired timings require fresh replicas'
+assert not os.environ.get('LIX_PROFILE_PREPARE_REPLICA'), 'preparation is a separate compatibility control'
 records=[]
 with open(a.output,'w') as out:
     for pair in range(a.pairs):
@@ -15,6 +17,7 @@ with open(a.output,'w') as out:
             run=subprocess.run([getattr(a,label)],env=env,capture_output=True,text=True)
             for line in run.stdout.splitlines():
                 row=json.loads(line); row.update(pair=pair,variant=label)
+                row['history_native_bytes']=sum(v['bytes'] for k,v in row['history'].items() if k.startswith('native-'))
                 records.append(row); out.write(json.dumps(row)+'\n'); out.flush()
             if run.returncode:
                 out.write(json.dumps({'pair':pair,'variant':label,'failed':True,'returncode':run.returncode,'stderr':run.stderr})+'\n'); out.flush()
@@ -26,9 +29,9 @@ for case in a.cases.split(','):
     rows={(r['pair'],r['variant']):r for r in records if r['case']==case}
     pairs=[(rows[i,'baseline'],rows[i,'candidate']) for i in range(a.pairs)]
     for b,c in pairs:
-        assert (b['snapshot_digest'],b['rows'],b['rtt_ms'])==(c['snapshot_digest'],c['rows'],c['rtt_ms'])
+        assert (b['snapshot_digest'],b['rows'],b['rtt_ms'],b.get('history_limit'))==(c['snapshot_digest'],c['rows'],c['rtt_ms'],c.get('history_limit'))
     metrics={}
-    for metric in ['open_us','file_open_us','history_us','warm_us','history_native_requests']:
+    for metric in ['open_us','file_open_us','history_us','warm_us','history_native_requests','history_native_bytes']:
         improvements=[1-c[metric]/b[metric] for b,c in pairs]
         boots=sorted(statistics.median(rng.choices(improvements,k=len(improvements))) for _ in range(10000))
         metrics[metric]={'baseline_median':statistics.median(b[metric] for b,c in pairs),'candidate_median':statistics.median(c[metric] for b,c in pairs),'paired_improvement_median':statistics.median(improvements),'bootstrap_95_interval':[boots[249],boots[9749]],'latency_threshold_pass':boots[249]>.1,'baseline_range':[min(b[metric] for b,c in pairs),max(b[metric] for b,c in pairs)],'candidate_range':[min(c[metric] for b,c in pairs),max(c[metric] for b,c in pairs)]}

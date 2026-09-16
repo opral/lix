@@ -20,7 +20,7 @@ use crate::changelog::CommitId;
 use crate::commit_graph::{CommitGraphContext, CommitGraphNode};
 use crate::sql2::SqlChangelogQuerySource;
 use crate::sql2::catalog::PublicCatalog;
-use crate::sql2::error::lix_error_to_datafusion_error;
+use crate::sql2::error::{datafusion_error_to_lix_error, lix_error_to_datafusion_error};
 use crate::sql2::udfs::{ExecutionSlots, execution_slots};
 use crate::storage_adapter::StorageAdapterRead;
 
@@ -381,6 +381,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
             let mut remaining_ids = selected_ids.clone();
             let blob_reader = Arc::clone(&blob_reader);
             let stream_schema = schema.clone();
+            let include_state_headers = relation.is_some();
             let stream = async_stream::try_stream! {
                 let mut graph = CommitGraphContext::new().reader(store.clone());
                 let mut next = Some(anchor);
@@ -425,6 +426,14 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                     }
                 }
             };
+            let stream = stream.map_err(move |error| {
+                lix_error_to_datafusion_error(
+                    crate::tracked_state::NativeMetadataRef::annotate_history_demand(
+                        datafusion_error_to_lix_error(error),
+                        include_state_headers,
+                    ),
+                )
+            });
             Ok(Box::pin(RecordBatchStreamAdapter::new(
                 stream_schema,
                 stream,

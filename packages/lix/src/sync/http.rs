@@ -865,6 +865,34 @@ where
         })
     }
 
+    pub(crate) fn native_metadata_walk<'a>(
+        &'a self,
+        walk: &'a super::native_metadata_walk::NativeMetadataWalkRequest,
+    ) -> SyncTransportFuture<'a, super::native_metadata::NativeMetadataResponse> {
+        Box::pin(async move {
+            super::native_metadata_walk::validate_request(walk)?;
+            self.require_bound_native_lease()?;
+            let mut request = self.request(
+                Method::POST,
+                "/sync/native-metadata-walk",
+                "load native metadata walk",
+            );
+            request.response_limit = super::native_metadata::MAX_NATIVE_METADATA_RESPONSE_BYTES;
+            request.headers.push(json_content_type());
+            request.body = Some(json_body(walk, "encode native metadata walk")?);
+            let response = self.send(request).await?;
+            if response.body.len() > super::native_metadata::MAX_NATIVE_METADATA_RESPONSE_BYTES {
+                return Err(response_too_large_limit(
+                    "load native metadata walk",
+                    super::native_metadata::MAX_NATIVE_METADATA_RESPONSE_BYTES,
+                ));
+            }
+            let response = decode_response(response, "load native metadata walk")?;
+            super::native_metadata_walk::validate_response(&self.lix_id, walk, &response)?;
+            Ok(response)
+        })
+    }
+
     fn request(&self, method: Method, path: &str, operation: &'static str) -> RawHttpRequest {
         let mut request = raw_request(method, format!("{}{path}", self.protocol_url), operation);
         request.headers.push((
@@ -1291,8 +1319,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        HandshakeResponse, HttpSyncTransport, RawHttpClient, RawHttpRequest, RawHttpResponse, SessionState,
-        encode_query, normalize_sync_locator, response_error, validate_handshake,
+        HandshakeResponse, HttpSyncTransport, RawHttpClient, RawHttpRequest, RawHttpResponse,
+        SessionState, encode_query, normalize_sync_locator, response_error, validate_handshake,
     };
     use crate::sync::{SyncTransport, SyncTransportFuture};
 

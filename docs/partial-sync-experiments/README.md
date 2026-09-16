@@ -53,6 +53,7 @@ substantive experiments against the latest accepted stack.
 | E03 | Discover independent commit metadata together | Accepted: dense64 requests 381 → 320; sparse64 213 → 152. Ten paired runs: cold history improves 16.45% [15.86%, 17.00%] and 29.11% [28.26%, 29.46%]. Full simulations and doctests pass; opening and offline warm controls preserved. [Evidence](e03/README.md). | 0 |
 | E04 | Group both diff endpoint descriptors | Rejected: unchanged native requests; paired history improves only 0.81% [0.19%, 1.43%] dense and 0.24% [-0.72%, 1.42%] sparse. More local bookkeeping, no removed component. Corrected prototype passes 4,074 simulation tests. [Evidence](e04/README.md). | 1 |
 | E05 | Normalize singleton and batch metadata demand | Accepted architecture simplification: metadata variants 2 → 1, residency/hydration branches 2 → 1 each. Requests unchanged; paired cold history -0.78% dense and -0.57% sparse. Disclosed small cost, no material regression. 4,074 tests and 10 doctests pass. [Evidence](e05/README.md). | 0 |
+| E06 | Bounded first-parent metadata selection | Accepted: dense64 native requests 320 → 262 and cold history 19.29% faster [18.55%, 19.67%]; sparse64 152 → 94 and 38.82% faster [38.07%, 40.00%]. Short-query overfetch disclosed. 4,315 tests pass; existing v17 replicas reopen with v18 without reset. [Evidence](e06/README.md). | 0 |
 
 PRs are drafts and stacked. Nothing is deployed or merged by this series.
 

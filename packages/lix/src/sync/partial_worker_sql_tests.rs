@@ -33,6 +33,11 @@ impl RawHttpClient for AuthorityClient {
             let url = url::Url::parse(&request.url).unwrap();
             let result = if request.method == http::Method::GET && !url.path().contains("/sync/") {
                 serde_json::json!({"protocolVersion":crate::SERVER_PROTOCOL_VERSION,"syncProtocolVersion":crate::sync::SYNC_PROTOCOL_VERSION,"lixId":self.authority.lix_id(),"sessionId":"partial-worker-authority","activeAccountId":self.authority.active_account_id()})
+            } else if url.path().ends_with("/sync/native-metadata-walk") {
+                let body = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+                self.metadata.fetch_add(1, Ordering::SeqCst);
+                serde_json::to_value(self.authority.read_sync_native_metadata_walk(&body).await?)
+                    .unwrap()
             } else if url.path().ends_with("/sync/native-metadata") {
                 let body = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
                 self.metadata.fetch_add(1, Ordering::SeqCst);
@@ -452,6 +457,7 @@ impl RawHttpClient for WatchingAuthorityClient {
                 serde_json::to_value(descriptor).unwrap()
             } else if url.path().ends_with("/sync/native-object-range")
                 || url.path().ends_with("/sync/native-metadata")
+                || url.path().ends_with("/sync/native-metadata-walk")
                 || url.path().ends_with("/sync/native-objects")
             {
                 self.native_reads.fetch_add(1, Ordering::SeqCst);
@@ -474,6 +480,15 @@ impl RawHttpClient for WatchingAuthorityClient {
                         self.base
                             .authority
                             .read_sync_native_objects_leased(&body.objects, lease)
+                            .await?,
+                    )
+                    .unwrap()
+                } else if url.path().ends_with("/sync/native-metadata-walk") {
+                    let body = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+                    serde_json::to_value(
+                        self.base
+                            .authority
+                            .read_sync_native_metadata_walk_leased(&body, lease)
                             .await?,
                     )
                     .unwrap()

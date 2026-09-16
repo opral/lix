@@ -315,6 +315,15 @@ mod tests {
                         authority.active_account_id(),
                     ))
                     .unwrap()
+                } else if path.ends_with("/sync/native-metadata-walk") {
+                    let request: crate::sync::NativeMetadataWalkRequest =
+                        serde_json::from_slice(&bytes).unwrap();
+                    serde_json::to_value(
+                        runtime
+                            .block_on(authority.read_sync_native_metadata_walk(&request))
+                            .unwrap(),
+                    )
+                    .unwrap()
                 } else if path.ends_with("/sync/native-metadata") {
                     let request: crate::sync::NativeMetadataRequest =
                         serde_json::from_slice(&bytes).unwrap();

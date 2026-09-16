@@ -31,6 +31,8 @@ mod contract;
 mod current_coverage;
 mod http;
 pub(crate) mod native_metadata;
+mod native_metadata_walk;
+pub(crate) use native_metadata_walk::NativeMetadataWalkRequest;
 #[cfg(feature = "server-protocol")]
 pub(crate) use native_metadata::MAX_NATIVE_METADATA_RESPONSE_BYTES;
 pub(crate) use native_metadata::NativeMetadataRequest;
@@ -193,7 +195,8 @@ pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 // v15 requires format81 and explicit repository/principal admission.
 // v16 fences active abandoned attempts before automatic authoritative recovery.
 // v17 removes recipe-driven updates; progress discovery uses leased descriptors.
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 17;
+// v18 adds bounded first-parent native metadata selection for demand hydration.
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 18;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str = "LIX_SYNC_REPOSITORY_ID_MISMATCH";

@@ -54,3 +54,20 @@ Eight dense-64 samples each used 381 native history requests; the ninth hit the
 run is retained and is not treated as a successful timing sample. Paired timing
 uses an optimized engine (`opt-level=2`) with identical dependency build settings
 on both revisions; this is still not a production browser latency claim.
+
+## Short-query and persisted-replica controls
+
+Set `LIX_PROFILE_HISTORY_LIMIT=1` to measure early stopping on the same ordered
+query. Both executables must use the same harness; the runner verifies the
+limit as well as snapshot identity and rows. Native HTTP body bytes are
+reported alongside requests, so speculative metadata overfetch stays visible.
+
+For the protocol-upgrade control only, use one sample and set
+`LIX_PROFILE_PERSISTED_REPLICAS` to an empty directory. Run the accepted
+baseline with `LIX_PROFILE_PREPARE_REPLICA=1`; it closes the real partial
+RocksDB store after file selection. Run the candidate with the same persistent
+directory and without the prepare flag. It restores the same authority seed
+at the saved loopback URL and reopens the existing partial replica before
+querying history. No local receipt or data reset is performed. Keep these
+controls separate from performance runs: the paired runner rejects persistent
+replica environment settings.

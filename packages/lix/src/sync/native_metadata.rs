@@ -78,7 +78,7 @@ pub(crate) fn key(address: &NativeMetadataRef) -> Result<StorageKey, LixError> {
         }
     })
 }
-fn validate_bytes(address: &NativeMetadataRef, bytes: &[u8]) -> Result<(), LixError> {
+pub(super) fn validate_bytes(address: &NativeMetadataRef, bytes: &[u8]) -> Result<(), LixError> {
     let id = canonical_id(address.id())?;
     match address {
         NativeMetadataRef::CommitStateHeader(_) => {

@@ -124,14 +124,20 @@ async fn handle(
     }
     Ok(Response::from_parts(parts, ServerProtocolBody::full(bytes)))
 }
-async fn serve(storage: RocksDB, rtt: u64) -> (String, Arc<Probe>, tokio::task::JoinHandle<()>) {
+async fn serve(
+    storage: RocksDB,
+    rtt: u64,
+    listen: Option<String>,
+) -> (String, Arc<Probe>, tokio::task::JoinHandle<()>) {
     let protocol = open_lix()
         .with_storage(storage)
         .serve()
         .with_embedded_lix_id()
         .await
         .unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = TcpListener::bind(listen.as_deref().unwrap_or("127.0.0.1:0"))
+        .await
+        .unwrap();
     let url = format!(
         "http://{}/lix/{}",
         listener.local_addr().unwrap(),
@@ -239,6 +245,32 @@ async fn fixture(case: Case, path: &PathBuf) {
 async fn run(case: Case, snapshot: &[u8], sample: usize, rtt: u64) {
     let authority_dir = tempfile::tempdir().unwrap();
     let replica_dir = tempfile::tempdir().unwrap();
+    // Optional cross-version control: the baseline leaves a real partial
+    // RocksDB replica after file selection; the candidate reopens it at the
+    // same authority URL, without resetting or rewriting its stored receipt.
+    let persisted = std::env::var("LIX_PROFILE_PERSISTED_REPLICAS")
+        .ok()
+        .map(|root| PathBuf::from(root).join(case.name));
+    if let Some(root) = &persisted {
+        std::fs::create_dir_all(root).unwrap();
+    }
+    let replica_path = persisted
+        .as_ref()
+        .map(|root| root.join("replica"))
+        .unwrap_or_else(|| replica_dir.path().to_owned());
+    let reopening = persisted.is_some() && replica_path.exists();
+    let listen = persisted
+        .as_ref()
+        .and_then(|root| std::fs::read_to_string(root.join("authority-address")).ok());
+    let prepare = std::env::var("LIX_PROFILE_PREPARE_REPLICA").as_deref() == Ok("1");
+    assert!(
+        !prepare || persisted.is_some(),
+        "preparing requires a persistent replica directory"
+    );
+    assert!(
+        !prepare || !reopening,
+        "preparation requires a fresh replica directory"
+    );
     let backing = RocksDB::open(authority_dir.path()).unwrap();
     let authority = open_lix()
         .with_storage(backing.clone())
@@ -252,14 +284,34 @@ async fn run(case: Case, snapshot: &[u8], sample: usize, rtt: u64) {
         .rows()[0]
         .get::<String>("id")
         .unwrap();
-    let sql = "SELECT lixcol_to_commit_id, diff_type, coalesce(to_path,from_path) AS path FROM lix_history('lix_file') WHERE id=$1 AND lixcol_commit_is_checkpoint=true ORDER BY lixcol_position ASC";
+    let history_limit = std::env::var("LIX_PROFILE_HISTORY_LIMIT")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("history limit must be an integer")
+        });
+    let mut sql = "SELECT lixcol_to_commit_id, diff_type, coalesce(to_path,from_path) AS path FROM lix_history('lix_file') WHERE id=$1 AND lixcol_commit_is_checkpoint=true ORDER BY lixcol_position ASC".to_owned();
+    if let Some(limit) = history_limit {
+        assert!(limit > 0, "history limit must be positive");
+        sql.push_str(&format!(" LIMIT {limit}"));
+    }
     let params = [Value::Text(file)];
-    let expected = authority.execute(sql, &params).await.unwrap();
+    let expected = authority.execute(&sql, &params).await.unwrap();
     authority.close().await.unwrap();
-    let (url, probe, task) = serve(backing, rtt).await;
+    let (url, probe, task) = serve(backing, rtt, listen).await;
+    if let Some(root) = &persisted {
+        let address = url
+            .strip_prefix("http://")
+            .unwrap()
+            .split('/')
+            .next()
+            .unwrap();
+        std::fs::write(root.join("authority-address"), address).unwrap();
+    }
     let start = Instant::now();
     let replica = open_lix()
-        .with_storage(RocksDB::open(replica_dir.path()).unwrap())
+        .with_storage(RocksDB::open(&replica_path).unwrap())
         .with_server(ServerOptions::new(url))
         .await
         .unwrap();
@@ -270,8 +322,17 @@ async fn run(case: Case, snapshot: &[u8], sample: usize, rtt: u64) {
         0,
         "opening must not hydrate native inputs"
     );
-    assert_eq!(open_counts.get("handshake").unwrap().attempts, 1);
-    assert_eq!(open_counts.get("descriptor").unwrap().attempts, 1);
+    for endpoint in ["handshake", "descriptor"] {
+        let attempts = open_counts.get(endpoint).map_or(0, |count| count.attempts);
+        if reopening {
+            assert!(attempts <= 1, "cached reopening must remain bounded");
+        } else {
+            assert_eq!(
+                attempts, 1,
+                "fresh opening requires its initial coordinates"
+            );
+        }
+    }
     let foreground_bytes = open_counts
         .iter()
         .filter(|(k, _)| k.as_str() != "descriptor-watch")
@@ -293,16 +354,28 @@ async fn run(case: Case, snapshot: &[u8], sample: usize, rtt: u64) {
         .unwrap();
     let file_open_us = started.elapsed().as_micros();
     let file_open = diff(&probe.snapshot(), &before);
+    if prepare {
+        replica.close().await.unwrap();
+        task.abort();
+        let _ = task.await;
+        println!(
+            "{}",
+            json!({"schema":"lix.partial-history.prepare.v1", "case":case.name,
+            "snapshot_digest":blake3::hash(snapshot).to_hex().to_string(), "opening":open_counts,
+            "file_open":file_open, "prepared":true})
+        );
+        return;
+    }
     let started = Instant::now();
     let before = probe.snapshot();
-    let actual = replica.execute(sql, &params).await.unwrap();
+    let actual = replica.execute(&sql, &params).await.unwrap();
     let history_us = started.elapsed().as_micros();
     let history = diff(&probe.snapshot(), &before);
     assert_eq!(actual.rows(), expected.rows());
     probe.offline.store(true, Ordering::Release);
     let before = probe.snapshot();
     let started = Instant::now();
-    let warm = replica.execute(sql, &params).await.unwrap();
+    let warm = replica.execute(&sql, &params).await.unwrap();
     let warm_us = started.elapsed().as_micros();
     assert_eq!(warm.rows(), expected.rows());
     assert_eq!(
@@ -316,7 +389,7 @@ async fn run(case: Case, snapshot: &[u8], sample: usize, rtt: u64) {
     let _ = task.await;
     println!(
         "{}",
-        json!({"schema":"lix.partial-history.v1","revision":std::env::var("LIX_PROFILE_REVISION").unwrap_or_default(),"case":case.name,"sample":sample,"rtt_ms":rtt,"depth":case.depth,"relevant_every":case.every,"width":case.width,"unopened_blob_bytes":case.blob,"snapshot_digest":blake3::hash(snapshot).to_hex().to_string(),"open_us":open_us,"opening":open_counts,"file_open_us":file_open_us,"file_open":file_open,"history_us":history_us,"history":history,"history_native_requests":native_requests(&history),"warm_us":warm_us,"rows":actual.rows().len()})
+        json!({"schema":"lix.partial-history.v1","revision":std::env::var("LIX_PROFILE_REVISION").unwrap_or_default(),"case":case.name,"sample":sample,"rtt_ms":rtt,"history_limit":history_limit,"persistent_replica":persisted.is_some(),"reopening":reopening,"depth":case.depth,"relevant_every":case.every,"width":case.width,"unopened_blob_bytes":case.blob,"snapshot_digest":blake3::hash(snapshot).to_hex().to_string(),"open_us":open_us,"opening":open_counts,"file_open_us":file_open_us,"file_open":file_open,"history_us":history_us,"history":history,"history_native_requests":native_requests(&history),"warm_us":warm_us,"rows":actual.rows().len()})
     );
 }
 fn main() {

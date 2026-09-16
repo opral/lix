@@ -354,6 +354,39 @@ impl From<NativeMetadataRef> for NativeMetadataWire {
 }
 
 impl NativeMetadataRef {
+    /// Attach semantic history demand to an existing typed metadata miss.
+    /// Fetch strategy and request bounds remain owned by the sync runtime.
+    pub(crate) fn annotate_history_demand(
+        mut error: LixError,
+        include_state_headers: bool,
+    ) -> LixError {
+        if error.automatic_retry_is_forbidden() {
+            return error;
+        }
+        let has_graph = match NativeMetadataRef::batch_from_missing_error(&error) {
+            Ok(Some(addresses)) => addresses
+                .iter()
+                .any(|address| matches!(address, NativeMetadataRef::CommitGraphRecord(_))),
+            Ok(None) => matches!(
+                NativeMetadataRef::from_missing_error(&error),
+                Ok(Some(NativeMetadataRef::CommitGraphRecord(_)))
+            ),
+            Err(_) => false,
+        };
+        if !has_graph {
+            return error;
+        }
+        let details = error.details.get_or_insert_with(|| serde_json::json!({}));
+        if let Some(details) = details.as_object_mut() {
+            details.insert(
+                "nativeHistoryDemand".into(),
+                serde_json::json!({
+                    "version": 1, "includeStateHeaders": include_state_headers,
+                }),
+            );
+        }
+        error
+    }
     pub(crate) const MAX_MISSING_BATCH: usize = 32;
 
     /// Report only addresses already selected by the native query's point-read

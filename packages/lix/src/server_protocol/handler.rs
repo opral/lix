@@ -329,6 +329,7 @@ protocol_routes! {
    SyncNativeMigrationMerge => ("POST", "/sync/migration/merge", NativeObjects),
    SyncNativeMigrationCleanup => ("POST", "/sync/migration/cleanup", NativeObjects),
    SyncNativeMetadata => ("POST", "/sync/native-metadata", NativeObjects),
+   SyncNativeMetadataWalk => ("POST", "/sync/native-metadata-walk", NativeObjects),
    SyncNativeObjectRange => ("POST", "/sync/native-object-range", NativeObjects),
    SyncNativeObjects => ("POST", "/sync/native-objects", NativeObjects),
    SyncRenewBaselineLease => ("POST", "/sync/baseline-lease/renew", NativeObjects),
@@ -2242,6 +2243,22 @@ where
                     .await,
                 )
             }
+            Some(ProtocolRoute::SyncNativeMetadataWalk) => {
+                if parts.uri.query().is_some() {
+                    return ApiError::bad_request(
+                        "native metadata reads do not accept query parameters",
+                    )
+                    .into_response();
+                }
+                result_response(
+                    sync_native_metadata_walk(
+                        lease,
+                        parts.headers,
+                        json_request!(crate::sync::NativeMetadataWalkRequest),
+                    )
+                    .await,
+                )
+            }
             Some(ProtocolRoute::SyncNativeObjectRange) => {
                 if parts.uri.query().is_some() {
                     return ApiError::bad_request(
@@ -2694,7 +2711,9 @@ where
         let Some(record) = registry.get(session_id).cloned() else {
             return Err(ApiError::session_gone());
         };
-        if record.principal != *principal { return Err(ApiError::account_mismatch()); }
+        if record.principal != *principal {
+            return Err(ApiError::account_mismatch());
+        }
         if record.is_idle_expired(Instant::now(), self.inner.options.session_idle_timeout) {
             let removed = registry.remove(session_id);
             drop(registry);
@@ -2913,7 +2932,11 @@ where
                 ));
             }
             let lease = server
-                .lease(&session_id, &context.principal, durable_terminal_storage_notifier.clone())
+                .lease(
+                    &session_id,
+                    &context.principal,
+                    durable_terminal_storage_notifier.clone(),
+                )
                 .await?;
             validate_principal(&lease, &context.principal)?;
             lease
@@ -3224,6 +3247,28 @@ where
     bounded_sync_json_response(
         response,
         "native metadata",
+        crate::sync::MAX_NATIVE_METADATA_RESPONSE_BYTES,
+    )
+}
+
+async fn sync_native_metadata_walk<S>(
+    lease: SessionLease<S>,
+    headers: HeaderMap,
+    Json(request): Json<crate::sync::NativeMetadataWalkRequest>,
+) -> Result<Response, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let baseline_id = required_native_baseline_header(&headers)?;
+    let response = lease
+        .run_cancellable_read(move |lix| async move {
+            lix.read_sync_native_metadata_walk_leased(&request, &baseline_id)
+                .await
+        })
+        .await?;
+    bounded_sync_json_response(
+        response,
+        "native metadata walk",
         crate::sync::MAX_NATIVE_METADATA_RESPONSE_BYTES,
     )
 }
@@ -5944,6 +5989,7 @@ mod tests {
                 ("POST", "/lix/v1/{lix_id}/sync/native-objects") => "syncNativeObjects",
                 ("POST", "/lix/v1/{lix_id}/sync/native-object-range") => "syncNativeObjectRange",
                 ("POST", "/lix/v1/{lix_id}/sync/native-metadata") => "syncNativeMetadata",
+                ("POST", "/lix/v1/{lix_id}/sync/native-metadata-walk") => "syncNativeMetadataWalk",
                 ("GET", "/lix/v1/{lix_id}/sync/history") => "syncHistory",
                 ("GET", "/lix/v1/{lix_id}/sync/checkpoints") => "syncCheckpointInventory",
                 ("GET", "/lix/v1/{lix_id}/sync/blob") => "syncGetBlobs",
@@ -5994,7 +6040,7 @@ mod tests {
             openapi
                 .matches("$ref: \"#/components/parameters/SyncProtocolVersion\"")
                 .count(),
-            22,
+            23,
             "every sync HTTP operation must declare the required version header",
         );
         for operation_id in [
@@ -6004,6 +6050,7 @@ mod tests {
             "syncNativeObjects",
             "syncNativeObjectRange",
             "syncNativeMetadata",
+            "syncNativeMetadataWalk",
             "syncPull",
             "syncHistory",
             "syncCheckpointInventory",
@@ -9194,7 +9241,11 @@ mod tests {
     async fn descriptor_continuation_rejects_future_cursor_and_requires_selected_branch() {
         let app = app().await;
         let (session_id, _) = new_session(&app.router).await;
-        let lease = app.server.lease(&session_id, &ServerProtocolPrincipal::Anonymous, None).await.unwrap();
+        let lease = app
+            .server
+            .lease(&session_id, &ServerProtocolPrincipal::Anonymous, None)
+            .await
+            .unwrap();
         let descriptor = lease
             .record
             .lix
@@ -9219,7 +9270,11 @@ mod tests {
             let response = request(&app.router, "GET", &path, Some(&session_id), None).await;
             assert_eq!(response.status(), status);
         }
-        let lease = app.server.lease(&session_id, &ServerProtocolPrincipal::Anonymous, None).await.unwrap();
+        let lease = app
+            .server
+            .lease(&session_id, &ServerProtocolPrincipal::Anonymous, None)
+            .await
+            .unwrap();
         let response = descriptor_wait::wait_descriptor_until(
             lease,
             Some(branch.clone()),
@@ -9233,7 +9288,11 @@ mod tests {
             response_json(response).await["descriptor"]["cursor"],
             descriptor.cursor
         );
-        let lease = app.server.lease(&session_id, &ServerProtocolPrincipal::Anonymous, None).await.unwrap();
+        let lease = app
+            .server
+            .lease(&session_id, &ServerProtocolPrincipal::Anonymous, None)
+            .await
+            .unwrap();
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(10),
@@ -9248,14 +9307,23 @@ mod tests {
             .await
             .is_err()
         );
-        assert!(app.server.lease(&session_id, &ServerProtocolPrincipal::Anonymous, None).await.is_ok());
+        assert!(
+            app.server
+                .lease(&session_id, &ServerProtocolPrincipal::Anonymous, None)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
     async fn descriptor_wait_wakes_on_commit_and_cursor_neutral_wakes_keep_deadline() {
         let app = app().await;
         let (session_id, _) = new_session(&app.router).await;
-        let lease = app.server.lease(&session_id, &ServerProtocolPrincipal::Anonymous, None).await.unwrap();
+        let lease = app
+            .server
+            .lease(&session_id, &ServerProtocolPrincipal::Anonymous, None)
+            .await
+            .unwrap();
         let descriptor = lease
             .record
             .lix
@@ -9282,8 +9350,16 @@ mod tests {
                 .expect("commit wakes descriptor waiter");
         let next = response_json(response.unwrap()).await["descriptor"].clone();
         assert!(next["cursor"].as_u64().unwrap() > descriptor.cursor);
-        let neutral_lease = app.server.lease(&session_id, &ServerProtocolPrincipal::Anonymous, None).await.unwrap();
-        let lease = app.server.lease(&session_id, &ServerProtocolPrincipal::Anonymous, None).await.unwrap();
+        let neutral_lease = app
+            .server
+            .lease(&session_id, &ServerProtocolPrincipal::Anonymous, None)
+            .await
+            .unwrap();
+        let lease = app
+            .server
+            .lease(&session_id, &ServerProtocolPrincipal::Anonymous, None)
+            .await
+            .unwrap();
         let wait = descriptor_wait::wait_descriptor_until(
             lease,
             Some(descriptor.selected_branch.branch_id),
@@ -9405,6 +9481,103 @@ mod tests {
             renewed["expiresAtMs"].as_u64().unwrap()
                 >= envelope["lease"]["expiresAtMs"].as_u64().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn native_metadata_walk_route_is_bounded_and_requires_its_lease() {
+        let app = app().await;
+        let (session, _) = new_session(&app.router).await;
+        let envelope = response_json(
+            request(
+                &app.router,
+                "GET",
+                "/lix/v1/sync/descriptor",
+                Some(&session),
+                None,
+            )
+            .await,
+        )
+        .await;
+        let lease = envelope["lease"]["leaseId"].as_str().unwrap();
+        let body = json!({
+            "epochId": uuid::Uuid::now_v7().to_string(),
+            "anchor": envelope["descriptor"]["selectedBranch"]["head"]["commitId"],
+            "maxCommits": 3,
+            "includeStateHeaders": false,
+        });
+        let path = "/lix/v1/sync/native-metadata-walk";
+        let missing = request_with_headers(
+            &app.router,
+            "POST",
+            path,
+            Some(&session),
+            &[],
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let unknown = uuid::Uuid::now_v7().to_string();
+        let expired = request_with_headers(
+            &app.router,
+            "POST",
+            path,
+            Some(&session),
+            &[("lix-native-baseline-lease", &unknown)],
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(expired.status(), StatusCode::GONE);
+        let response = request_with_headers(
+            &app.router,
+            "POST",
+            path,
+            Some(&session),
+            &[("lix-native-baseline-lease", lease)],
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = response_json(response).await;
+        let objects = response["objects"].as_array().unwrap();
+        assert!(!objects.is_empty() && objects.len() <= 3);
+        assert_eq!(objects[0]["address"]["commitId"], body["anchor"]);
+        assert!(
+            objects
+                .iter()
+                .all(|object| object["address"]["kind"] == "commit_graph_record")
+        );
+        assert_eq!(response["epochId"], body["epochId"]);
+        for (field, value) in [
+            ("maxCommits", json!(0)),
+            ("maxCommits", json!(17)),
+            ("epochId", json!("bad")),
+            ("anchor", json!("bad")),
+            ("includeStateHeaders", json!("bad")),
+            ("extra", json!(true)),
+        ] {
+            let mut invalid = body.clone();
+            invalid[field] = value;
+            let response = request_with_headers(
+                &app.router,
+                "POST",
+                path,
+                Some(&session),
+                &[("lix-native-baseline-lease", lease)],
+                Some(invalid),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "field {field}");
+        }
+        let anonymous = request_with_headers(
+            &app.router,
+            "POST",
+            path,
+            None,
+            &[("lix-native-baseline-lease", lease)],
+            Some(body),
+        )
+        .await;
+        assert!(!anonymous.status().is_success());
     }
 
     #[tokio::test]
@@ -9566,6 +9739,7 @@ mod tests {
                 "/lix/v1/sync/native-objects",
                 "/lix/v1/sync/native-object-range",
                 "/lix/v1/sync/native-metadata",
+                "/lix/v1/sync/native-metadata-walk",
             ] {
                 let effective_limit = configured_limit.min(16 * 1024);
                 for (length, expected_status) in [
@@ -15241,7 +15415,11 @@ mod tests {
 
         let (notifier, signal) = durable_terminal_storage_signal();
         let lease = server
-            .lease(&session_id, &ServerProtocolPrincipal::Anonymous, Some(notifier))
+            .lease(
+                &session_id,
+                &ServerProtocolPrincipal::Anonymous,
+                Some(notifier),
+            )
             .await
             .expect("session lease");
         storage.block_next_branch_control_read();
@@ -15420,7 +15598,10 @@ mod tests {
             .unwrap();
         let router = handler(server.clone());
         let (session_id, _) = new_session(&router).await;
-        let lease = server.lease(&session_id, &ServerProtocolPrincipal::Anonymous, None).await.unwrap();
+        let lease = server
+            .lease(&session_id, &ServerProtocolPrincipal::Anonymous, None)
+            .await
+            .unwrap();
         let authority = &lease.record.lix;
         local
             .execute(

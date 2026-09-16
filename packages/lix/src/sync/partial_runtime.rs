@@ -200,6 +200,15 @@ pub(super) async fn hydrate_metadata_batch<
     request.objects = missing;
     // No local read or transaction remains open across network I/O.
     let response = transport.native_metadata(&request).await?;
+    install_metadata_response(storage, state, &request, &response).await
+}
+
+async fn install_metadata_response<S: Storage + Clone + Send + Sync + 'static>(
+    storage: &StorageAdapter<S>,
+    state: &PartialReplicaState,
+    request: &NativeMetadataRequest,
+    response: &super::native_metadata::NativeMetadataResponse,
+) -> Result<(), LixError> {
     loop {
         let read = storage.begin_read(Default::default()).await?;
         // Retry local CAS contention only while these authenticated inputs
@@ -218,7 +227,7 @@ pub(super) async fn hydrate_metadata_batch<
         }
         let mut writes = storage.new_write_set();
         let preconditions =
-            stage_native_metadata(&read, &mut writes, state, &request, &response).await?;
+            stage_native_metadata(&read, &mut writes, state, request, response).await?;
         drop(read);
         match storage
             .commit_partial_replica_write_set(
@@ -317,6 +326,29 @@ pub(super) fn hydrate_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: 
     request: SyncDemandRequest,
 ) -> super::SyncTransportFuture<'a, ()> {
     Box::pin(async move {
+        let history_inputs = match &request {
+            SyncDemandRequest::NativeMetadata(addresses, error) => {
+                Some((addresses.as_slice(), error))
+            }
+            _ => None,
+        };
+        if let Some((addresses, error)) = history_inputs {
+            if let Some(walk) = super::native_metadata_walk::request_for_missing(
+                state.epoch_id(),
+                addresses,
+                error,
+            )? {
+                // Drop all local reads before network I/O. Install through the
+                // same immutable, epoch-fenced path used for exact metadata.
+                let response = transport.native_metadata_walk(&walk).await?;
+                let exact = super::native_metadata_walk::validate_response(
+                    state.repository_id(),
+                    &walk,
+                    &response,
+                )?;
+                install_metadata_response(storage, state, &exact, &response).await?;
+            }
+        }
         match request {
             SyncDemandRequest::BlobManifest(address, _) => {
                 if super::partial_blob::manifest_is_resident(storage, state, address).await? {

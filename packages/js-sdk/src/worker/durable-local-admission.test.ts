@@ -1,11 +1,11 @@
 import { expect, test } from "vitest";
 import { DurableLocalAdmission, type DurableLocalAdmissionStore } from "./durable-local-admission.js";
-import type { AdmissionIdentity } from "./shared-admission.js";
+import { ADMISSION_PROTOCOL_EPOCH, type AdmissionIdentity } from "./shared-admission.js";
 
 const id = "00000000-0000-7000-8000-000000000004";
 const url = `https://example.test/lix/${id}`;
 const headers: [string, string][] = [["Authorization", "Bearer secret-token"]];
-const identity: AdmissionIdentity = { repositoryId: id, principalId: "user-A", protocolEpoch: 17, storageEpoch: 81 };
+const identity: AdmissionIdentity = { repositoryId: id, principalId: "user-A", protocolEpoch: ADMISSION_PROTOCOL_EPOCH, storageEpoch: 81 };
 function memory() {
   const values = new Map<string, unknown>();
   const store: DurableLocalAdmissionStore = {
