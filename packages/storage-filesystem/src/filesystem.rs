@@ -982,11 +982,14 @@ impl FilesystemState {
         let lix = self.collect_lix_snapshot_read().await?;
         let mut needs_fresh_lix_read = false;
 
+        // With no previous snapshot, reopening still removes legacy imported Git
+        // entries. During live sync, ignored paths written through Lix must survive.
         for path in lix.snapshot.files.keys() {
             if !local.files.contains_key(path)
                 && path_filter.includes_file(path)
                 && !is_plugin_storage_path(path)
-                && !is_filesystem_sync_ignored_lix_path(path)
+                && !is_materialization_ignored_path(path)
+                && !(previous.is_some() && lix_path_contains_segment(path, ".git"))
             {
                 if previous
                     .as_ref()
@@ -1014,7 +1017,8 @@ impl FilesystemState {
             for path in lix.snapshot.directories.difference(&local.directories) {
                 if path.as_str() == "/"
                     || is_plugin_storage_path(path)
-                    || is_filesystem_sync_ignored_lix_path(path)
+                    || is_materialization_ignored_path(path)
+                    || (previous.is_some() && lix_path_contains_segment(path, ".git"))
                 {
                     continue;
                 }
@@ -2897,6 +2901,23 @@ mod tests {
             "an unchanged filesystem should be recognized as already materialized"
         );
 
+        state.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn initial_disk_reconciliation_removes_legacy_git_entries() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let layout = prepare_filesystem_layout(tempdir.path()).unwrap();
+        let state = open_test_filesystem_state(layout, FilesystemPathFilter::default()).await;
+        for path in ["/.git/config", "/docs/.git", "/nested/.git/config"] {
+            lix_write_file(&state.lix, path, b"old".to_vec())
+                .await
+                .unwrap();
+        }
+        state.sync_disk_to_lix(false).await.unwrap();
+        for path in ["/.git/config", "/docs/.git", "/nested/.git/config"] {
+            assert_eq!(lix_read_file(&state.lix, path).await.unwrap(), None);
+        }
         state.close().await.unwrap();
     }
 
