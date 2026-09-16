@@ -13,6 +13,7 @@ use lix::{
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ExecuteOptions {
     pub(crate) origin_key: Option<String>,
+    pub(crate) max_auto_commit_retries: Option<u32>,
     // Transport retry identity is only used by the remote protocol client.
     pub(crate) idempotency_key: Option<String>,
 }
@@ -111,6 +112,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> SessionOperations for Lix<S> {
     ) -> Result<ExecuteResult, LixError> {
         let _ = options.idempotency_key;
         let execution = Lix::execute(self, sql, params);
+        let execution = match options.max_auto_commit_retries {
+            Some(limit) => execution.with_max_auto_commit_retries(limit),
+            None => execution,
+        };
         match options.origin_key {
             Some(origin_key) => execution.with_origin_key(origin_key).await,
             None => execution.await,
@@ -123,6 +128,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> SessionOperations for Lix<S> {
         options: ExecuteOptions,
     ) -> Result<lix::ExecuteBatchResult, LixError> {
         let execution = Lix::execute_batch(self, statements);
+        let execution = match options.max_auto_commit_retries {
+            Some(limit) => execution.with_max_auto_commit_retries(limit),
+            None => execution,
+        };
         match options.origin_key {
             Some(origin_key) => execution.with_origin_key(origin_key).await,
             None => execution.await,
@@ -237,6 +246,7 @@ mod remote {
         fn from(options: ExecuteOptions) -> Self {
             Self {
                 origin_key: options.origin_key,
+                max_auto_commit_retries: options.max_auto_commit_retries,
                 idempotency_key: options.idempotency_key,
             }
         }

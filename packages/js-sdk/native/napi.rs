@@ -108,6 +108,8 @@ enum NativeObserveEventsInner {
 pub struct NativeExecuteOptions {
     #[napi(js_name = "originKey")]
     pub origin_key: Option<String>,
+    #[napi(js_name = "maxAutoCommitRetries")]
+    pub max_auto_commit_retries: Option<u32>,
 }
 
 #[napi(object)]
@@ -284,12 +286,12 @@ enum LixCommand {
     Execute {
         sql: String,
         params: Vec<Value>,
-        options: Option<String>,
+        options: crate::session::ExecuteOptions,
         deferred: NativeExecuteDeferred,
     },
     ExecuteBatch {
         statements: Vec<RsExecuteBatchStatement>,
-        options: Option<String>,
+        options: crate::session::ExecuteOptions,
         deferred: NativeExecuteBatchDeferred,
     },
     BeginTransaction {
@@ -350,7 +352,7 @@ enum LixCommand {
         transaction_id: u64,
         sql: String,
         params: Vec<Value>,
-        options: Option<String>,
+        options: crate::session::ExecuteOptions,
         deferred: NativeExecuteDeferred,
     },
     TransactionCommit {
@@ -1455,12 +1457,8 @@ impl NativeLixInner {
         &self,
         sql: &str,
         params: &[Value],
-        options: Option<String>,
+        options: crate::session::ExecuteOptions,
     ) -> std::result::Result<RsExecuteResult, LixError> {
-        let options = crate::session::ExecuteOptions {
-            origin_key: options,
-            ..Default::default()
-        };
         match self {
             Self::Memory(lix) => {
                 crate::session::SessionOperations::execute(lix, sql, params, options).await
@@ -1474,12 +1472,8 @@ impl NativeLixInner {
     async fn execute_batch(
         &self,
         statements: &[RsExecuteBatchStatement],
-        options: Option<String>,
+        options: crate::session::ExecuteOptions,
     ) -> std::result::Result<lix::ExecuteBatchResult, LixError> {
-        let options = crate::session::ExecuteOptions {
-            origin_key: options,
-            ..Default::default()
-        };
         match self {
             Self::Memory(lix) => {
                 crate::session::SessionOperations::execute_batch(lix, statements, options).await
@@ -1689,12 +1683,8 @@ impl NativeLixTransactionInner {
         &mut self,
         sql: &str,
         params: &[Value],
-        options: Option<String>,
+        options: crate::session::ExecuteOptions,
     ) -> std::result::Result<RsExecuteResult, LixError> {
-        let options = crate::session::ExecuteOptions {
-            origin_key: options,
-            ..Default::default()
-        };
         match self {
             Self::Memory(transaction) => {
                 crate::session::TransactionOperations::execute(transaction, sql, params, options)
@@ -2224,7 +2214,13 @@ impl NativeLix {
                 .map_err(|error| throw_lix_error(env, error))?,
             None => Vec::new(),
         };
-        let options = options.and_then(|options| options.origin_key);
+        let options = options
+            .map(|options| crate::session::ExecuteOptions {
+                origin_key: options.origin_key,
+                max_auto_commit_retries: options.max_auto_commit_retries,
+                ..Default::default()
+            })
+            .unwrap_or_default();
         let (deferred, promise): (NativeExecuteDeferred, Object<'env>) = env.create_deferred()?;
         self.actor
             .send_with_deferred(deferred, |deferred| LixCommand::Execute {
@@ -2260,7 +2256,13 @@ impl NativeLix {
             })
             .collect::<std::result::Result<Vec<_>, LixError>>()
             .map_err(|error| throw_lix_error(env, error))?;
-        let options = options.and_then(|options| options.origin_key);
+        let options = options
+            .map(|options| crate::session::ExecuteOptions {
+                origin_key: options.origin_key,
+                max_auto_commit_retries: options.max_auto_commit_retries,
+                ..Default::default()
+            })
+            .unwrap_or_default();
         let (deferred, promise): (NativeExecuteBatchDeferred, Object<'env>) =
             env.create_deferred()?;
         self.actor
@@ -2810,7 +2812,13 @@ impl NativeLixTransaction {
                 .map_err(|error| throw_lix_error(env, error))?,
             None => Vec::new(),
         };
-        let options = options.and_then(|options| options.origin_key);
+        let options = options
+            .map(|options| crate::session::ExecuteOptions {
+                origin_key: options.origin_key,
+                max_auto_commit_retries: options.max_auto_commit_retries,
+                ..Default::default()
+            })
+            .unwrap_or_default();
         let (deferred, promise): (NativeExecuteDeferred, Object<'env>) = env.create_deferred()?;
         if self.closed.load(Ordering::SeqCst) {
             settle_deferred(deferred, Err(transaction_closed_error()));

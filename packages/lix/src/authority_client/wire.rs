@@ -28,6 +28,8 @@ pub struct HandshakeResponse {
 pub struct ExecuteOptionsBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_auto_commit_retries: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

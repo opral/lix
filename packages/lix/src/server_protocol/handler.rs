@@ -5089,12 +5089,14 @@ struct BinaryFileReadRequest {
 #[serde(rename_all = "camelCase")]
 struct ExecuteOptionsRequest {
     origin_key: Option<String>,
+    max_auto_commit_retries: Option<u32>,
 }
 
 impl From<ExecuteOptionsRequest> for ExecuteOptions {
     fn from(value: ExecuteOptionsRequest) -> Self {
         Self {
             origin_key: value.origin_key,
+            max_auto_commit_retries: value.max_auto_commit_retries,
         }
     }
 }

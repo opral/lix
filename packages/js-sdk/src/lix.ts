@@ -654,6 +654,14 @@ function assertExecuteArgs(
 		);
 	}
 	if (
+		options.maxAutoCommitRetries !== undefined &&
+		(!Number.isInteger(options.maxAutoCommitRetries) ||
+			options.maxAutoCommitRetries < 0 || options.maxAutoCommitRetries > 0xffff_ffff)
+	) {
+		throw invalidArgument("execute", "options.maxAutoCommitRetries",
+			"integer between 0 and 4294967295", typeof options.maxAutoCommitRetries, receiver);
+	}
+	if (
 		options.originKey !== undefined &&
 		typeof options.originKey !== "string"
 	) {
@@ -792,6 +800,14 @@ function assertBatchOptions(options?: LixBatchOptions) {
 	if (options === undefined) return;
 	if (!options || typeof options !== "object" || Array.isArray(options)) {
 		throw invalidArgument("executeBatch", "options", "object", typeof options);
+	}
+	if (
+		options.maxAutoCommitRetries !== undefined &&
+		(!Number.isInteger(options.maxAutoCommitRetries) ||
+			options.maxAutoCommitRetries < 0 || options.maxAutoCommitRetries > 0xffff_ffff)
+	) {
+		throw invalidArgument("executeBatch", "options.maxAutoCommitRetries",
+			"integer between 0 and 4294967295", typeof options.maxAutoCommitRetries);
 	}
 	if (
 		options.originKey !== undefined &&
