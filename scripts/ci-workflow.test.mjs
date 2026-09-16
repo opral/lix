@@ -399,3 +399,16 @@ test("CI and release share bounded disk compiler caches with separate native pro
 		assert.ok(publishWorkflow.includes(`CARGO_PROFILE_${profile}_DEBUG: '0'`));
 	}
 });
+
+
+test("content revisions preserve compatible consumer artifacts without compilation", () => {
+  const job = workflow.split("\n  content-browser-sdk:\n")[1];
+  assert.match(job, /selectContentArtifact/);
+  assert.match(job, /node scripts\/ci-content-artifact\.mjs/);
+  assert.doesNotMatch(job, /npm |cargo |build:wasm/);
+  assert.match(job, /name: ci-browser-build/);
+  const promotion = workflow.split("\n  promote-browser-sdk:\n")[1].split("\n  changelog:\n")[0];
+  assert.match(promotion, /name: ci-browser-build/);
+  const gate = workflow.split("\n  release-ready:\n")[1].split("\n  merge-reuse:\n")[0];
+  assert.match(gate, /needs: .*content-browser-sdk/);
+});
