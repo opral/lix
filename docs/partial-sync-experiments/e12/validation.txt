@@ -1,0 +1,10 @@
+Exact engine patch SHA256: ad42e115378cb928e27d69422784e68c76481924412c9f49c5b96a6319333792
+Source worktree: /root/repos/lix-partial-sync-selected-density
+cargo nextest run -p lix --features all-simulations,server-protocol:
+4323 passed, 84 skipped; 58.484s test execution.
+cargo test -p lix --doc: 10 passed.
+cargo fmt -p lix -- --check and git diff --check passed.
+7 changenotes and 42 server protocol paths validated.
+All raw benchmark cases contain 10 complete alternating pairs and zero opening native reads.
+All tests/builds were terminal before paired timing. Source unchanged after benchmark build.
+Published worktree engine diff has the same hash as the tested source.
