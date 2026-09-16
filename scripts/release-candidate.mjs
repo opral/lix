@@ -43,7 +43,17 @@ export function assertReleaseReady({ needs, eventName, event, currentPr }) {
 		requireSuccess("promote-browser-sdk");
 		return;
 	}
-	for (const name of ["changelog", "cargo-config", "js-sdk-test"]) requireSuccess(name);
+	requireSuccess("changelog");
+	if (needs["merge-reuse"].outputs?.content_only === "true") {
+		requireSuccess("content-browser-sdk");
+		if (!["pull_request", "push"].includes(eventName)) throw new Error("Unexpected content scope event");
+		for (const name of ["cargo-config", "js-sdk-test"]) {
+			if (needs[name]?.result !== "skipped") throw new Error(`Unexpected content scope result: ${name}`);
+		}
+		if (needs.changelog.outputs?.rust !== "false") throw new Error("Unexpected content Rust scope");
+	} else {
+		for (const name of ["cargo-config", "js-sdk-test"]) requireSuccess(name);
+	}
 	// Retain the existing intentional Rust-only skip for SDK TypeScript changes.
 	if (needs.changelog.outputs?.rust === "false") {
 		if (needs.cargo?.result !== "skipped") throw new Error("Unexpected Rust scope result");

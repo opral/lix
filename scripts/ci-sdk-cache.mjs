@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { isContentPath } from "./ci-content-scope.mjs";
 
 function validateRuntime(runtime) {
 	if (!["native", "browser"].includes(runtime))
@@ -21,10 +22,11 @@ function validateRuntime(runtime) {
 }
 
 export function isBuildInput(path) {
-	// Only handwritten SDK TypeScript and release prose are proven independent
+	// Independent site/content trees, handwritten SDK TypeScript and release prose are independent
 	// of the binaries. Unknown paths, fixtures, build scripts and manifests all
 	// invalidate the cache. TypeScript is rebuilt and tested even on a hit.
 	return (
+		!isContentPath(path) &&
 		!(
 			/^packages\/js-sdk\/src\/.+\.ts$/.test(path) &&
 			!path.startsWith("packages/js-sdk/src/wasm/") &&
