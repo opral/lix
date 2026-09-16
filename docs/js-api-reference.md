@@ -152,6 +152,23 @@ await storage.syncDiskToLix();
 
 ## Lix instance
 
+### syncHealth()
+
+```ts
+const health = await lix.syncHealth();
+// { state, appliedCursor, observedCursor, failures, terminalError }
+```
+
+Returns the local partial-replica worker's health without querying SQL or fetching
+remote data. `state` is `inactive`, `running`, `stalled`, `failed`, or `stopped`.
+`failures` holds independent `descriptor`, `publication`, `upload`, and `lease`
+errors, each with a `code` and `message`. `terminalError` describes a failed
+worker. Cursors and terminal errors are `null` when unavailable.
+
+Successful local reads do not clear sync failures. `running` means no known
+worker failure, not guaranteed server freshness. Other modes report `inactive`.
+Call this method before closing the JavaScript session.
+
 ### execute()
 
 ```ts

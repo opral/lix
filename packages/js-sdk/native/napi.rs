@@ -309,6 +309,7 @@ enum LixCommand {
         server: Option<ServerOptions>,
         deferred: NativeDeferred<serde_json::Value>,
     },
+    SyncHealth(NativeDeferred<serde_json::Value>),
     ActiveBranchId(NativeStringDeferred),
     ActiveAccountId(NativeStringDeferred),
     CreateBranch {
@@ -935,6 +936,7 @@ fn reject_pending_lix_commands(receiver: mpsc::Receiver<QueuedLixCommand>, error
                 deferred.reject(to_napi_error(&error))
             }
             LixCommand::RecoverReplica { deferred, .. } => deferred.reject(to_napi_error(&error)),
+            LixCommand::SyncHealth(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::ActiveBranchId(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::ActiveAccountId(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::CreateBranch { deferred, .. } => deferred.reject(to_napi_error(&error)),
@@ -1047,6 +1049,11 @@ fn handle_lix_command(
             deferred,
         } => {
             settle_deferred(deferred, block_on!(state.lix.recover_replica(&id, server)));
+            None
+        }
+        LixCommand::SyncHealth(deferred) => {
+            let result = block_on!(state.lix.sync_health());
+            settle_deferred(deferred, result);
             None
         }
         LixCommand::ActiveBranchId(deferred) => {
@@ -1313,6 +1320,9 @@ fn settle_command_after_close(command: LixCommand) {
         LixCommand::RecoverReplica { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
+        LixCommand::SyncHealth(deferred) => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
         LixCommand::ActiveBranchId(deferred) => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
@@ -1504,6 +1514,16 @@ impl NativeLixInner {
                 crate::session::SessionOperations::observe(lix, sql, params).await?,
             )),
         }
+    }
+
+    async fn sync_health(&self) -> std::result::Result<serde_json::Value, LixError> {
+        let health = match self {
+            Self::Memory(lix) => crate::session::SessionOperations::sync_health(lix).await?,
+            Self::FilesystemStorage(lix, _, _) => {
+                crate::session::SessionOperations::sync_health(lix).await?
+            }
+        };
+        serde_json::to_value(health).map_err(|error| LixError::unknown(error.to_string()))
     }
 
     async fn active_branch_id(&self) -> std::result::Result<String, LixError> {
@@ -2269,6 +2289,15 @@ impl NativeLix {
                 actor,
                 deferred,
             });
+        Ok(promise)
+    }
+
+    #[napi(js_name = "syncHealth")]
+    pub fn sync_health<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeDeferred<serde_json::Value>, Object<'env>) =
+            env.create_deferred()?;
+        self.actor
+            .send_with_deferred(deferred, LixCommand::SyncHealth);
         Ok(promise)
     }
 

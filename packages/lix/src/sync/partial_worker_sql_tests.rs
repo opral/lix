@@ -42,8 +42,10 @@ impl RawHttpClient for AuthorityClient {
                 let body = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
                 serde_json::to_value(
                     Box::pin(self.authority.push_retained_body_wave_for_account(
-                        &body, self.authority.active_account_id(),
-                    )).await?,
+                        &body,
+                        self.authority.active_account_id(),
+                    ))
+                    .await?,
                 )
                 .unwrap()
             } else if url.path().ends_with("/sync/merge") {
@@ -51,11 +53,16 @@ impl RawHttpClient for AuthorityClient {
                 let authority = self.authority.clone();
                 // A real HTTP authority runs independently from the client.
                 // Keep its commit poll off the client's recovery stack too.
-                let receipt = tokio::spawn(async move {
-                    Box::pin(authority.merge_partial_replica_for_account(
-                        &body, authority.active_account_id(),
-                    )).await
-                }).await.unwrap()?;
+                let receipt =
+                    tokio::spawn(async move {
+                        Box::pin(authority.merge_partial_replica_for_account(
+                            &body,
+                            authority.active_account_id(),
+                        ))
+                        .await
+                    })
+                    .await
+                    .unwrap()?;
                 serde_json::to_value(receipt).unwrap()
             } else if url.path().ends_with("/sync/push") {
                 let body: SyncPushRequest =
@@ -418,12 +425,16 @@ impl RawHttpClient for WatchingAuthorityClient {
     fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
         Box::pin(async move {
             let url = url::Url::parse(&request.url).unwrap();
-            let response = if url.path().ends_with("/sync/update") {
+            let response = if url.path().ends_with("/sync/descriptor") {
                 self.watches.fetch_add(1, Ordering::SeqCst);
-                let update: crate::sync::partial_update::PartialUpdateRequest =
-                    serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
-                let branch = Some(update.branch_id.clone());
-                let after = update.after;
+                let branch = url
+                    .query_pairs()
+                    .find(|(key, _)| key == "branchId")
+                    .map(|(_, value)| value.into_owned());
+                let after = url
+                    .query_pairs()
+                    .find(|(key, _)| key == "after")
+                    .map(|(_, value)| value.parse::<u64>().unwrap());
                 let current = self
                     .base
                     .authority
@@ -438,19 +449,7 @@ impl RawHttpClient for WatchingAuthorityClient {
                     .authority
                     .leased_partial_replica_descriptor(branch.as_deref())
                     .await?;
-                let bundle = if descriptor.descriptor.cursor == update.known_cursor {
-                    Default::default()
-                } else {
-                    self.base
-                        .authority
-                        .collect_partial_working_set(&descriptor, &update.snapshot()?)
-                        .await?
-                };
-                serde_json::to_value(crate::sync::partial_update::PartialUpdateResponse {
-                    descriptor,
-                    bundle,
-                })
-                .unwrap()
+                serde_json::to_value(descriptor).unwrap()
             } else if url.path().ends_with("/sync/native-object-range")
                 || url.path().ends_with("/sync/native-metadata")
                 || url.path().ends_with("/sync/native-objects")
@@ -637,9 +636,9 @@ async fn engine_worker_preempts_watch_then_publishes_retained_negative_scope() {
                 tokio::task::yield_now().await;
             }
             let native_reads = client.native_reads.load(Ordering::SeqCst);
-            assert_eq!(
-                native_reads, 0,
-                "update carries the complete retained negative scope without hydration round trips"
+            assert!(
+                native_reads > 0,
+                "candidate preparation hydrates the changed scope on demand"
             );
             for _ in 0..10 {
                 assert!(value(session.execute(sql, &[]).await.unwrap()).contains("remote"));
@@ -677,7 +676,9 @@ impl RawHttpClient for ExpiredAuthorityClient {
             let url = url::Url::parse(&request.url).unwrap();
             // Foreground tests stop at the demand result; keep subsequent
             // background reconciliation pending so the caller can assert it.
-            if url.path().ends_with("/sync/update") && self.descriptors.load(Ordering::SeqCst) > 0 {
+            if url.path().ends_with("/sync/descriptor")
+                && url.query_pairs().any(|(key, _)| key == "after")
+            {
                 futures_util::future::pending::<()>().await;
             }
             if url.path().ends_with("/sync/baseline-lease/renew") {
@@ -1020,10 +1021,9 @@ async fn expired_background_renewal_refreshes_unchanged_authority_without_long_p
             assert_eq!(client.expirations.load(Ordering::SeqCst), 1);
             assert_eq!(
                 client.descriptors.load(Ordering::SeqCst),
-                0,
-                "background recovery uses the update endpoint"
+                1,
+                "expired lease recovery requests a fresh descriptor without long polling"
             );
-            assert!(client.inner.watches.load(Ordering::SeqCst) >= 1);
             assert_eq!(
                 engine.sync_mode().partial_admission().unwrap().descriptor(),
                 old.descriptor()

@@ -231,3 +231,11 @@ test("batch and explicit transaction receipts survive the public boundary", asyn
 	expect(await tx.commit()).toEqual({ commit: span });
 	await lix.close();
 });
+
+test("sync health reads the worker snapshot without issuing SQL", async () => {
+	const health = { state: "stalled", appliedCursor: 492, observedCursor: 543, failures: { descriptor: { code: "OFFLINE", message: "unavailable" } }, terminalError: null };
+	const binding = { syncHealth: vi.fn(async () => health), execute: vi.fn() } as unknown as LixBinding;
+	const lix = new Lix(binding);
+	await expect(lix.syncHealth()).resolves.toEqual(health);
+	expect(binding.execute).not.toHaveBeenCalled();
+});

@@ -44,6 +44,7 @@ pub(crate) trait SessionOperations: Sized {
         statements: &[ExecuteBatchStatement],
         options: ExecuteOptions,
     ) -> Result<lix::ExecuteBatchResult, LixError>;
+    async fn sync_health(&self) -> Result<lix::SyncHealth, LixError>;
     async fn active_branch_id(&self) -> Result<String, LixError>;
     async fn active_account_id(&self) -> Result<String, LixError>;
     async fn create_branch(
@@ -128,6 +129,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> SessionOperations for Lix<S> {
         }
     }
 
+    async fn sync_health(&self) -> Result<lix::SyncHealth, LixError> {
+        Ok(Lix::sync_health(self))
+    }
     async fn active_branch_id(&self) -> Result<String, LixError> {
         Lix::active_branch_id(self).await
     }
@@ -323,6 +327,10 @@ mod remote {
             ClientCore::execute_batch(self, statements, Some(options.into())).await
         }
 
+        async fn sync_health(&self) -> Result<lix::SyncHealth, LixError> {
+            // Remote SQL sessions have no local replica synchronization worker.
+            Ok(lix::SyncHealth::default())
+        }
         async fn active_branch_id(&self) -> Result<String, LixError> {
             ClientCore::active_branch_id(self).await
         }

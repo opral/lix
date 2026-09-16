@@ -145,16 +145,21 @@ canonically, preserving existing immutable request digests. The owned persisted
 journal migration upgrades older records without resetting pending edits. These
 endpoints require sync protocol 14/server protocol 8; upgrade SDK and server together.
 
-Partial replicas deliver retained working-set updates through `POST /sync/update`.
-The request contains native read recipes, and the response pairs a leased descriptor
-with bounded immutable inputs selected by the same candidate evaluator used locally.
-The server does not publish client coverage: the replica installs validated bytes,
-then runs its existing candidate preparation and atomic publication. Idle polls carry
-no working-set payload. Bundles exceeding the bounded delivery budget use existing
-on-demand hydration. Initial opening still requests only bounded metadata.
+Partial replicas discover progress through the leased `GET /sync/descriptor`
+long poll. Discovery carries no read recipes and performs no optional prefetch.
+The replica hydrates the native inputs required by its moving read interests,
+validates coverage locally, and atomically publishes the candidate. Fixed-to-fixed
+historical recipes and their immutable data remain retained locally, but are not
+moving publication requirements. The publication revision fence still covers the
+full read registry so concurrent reads cannot be lost.
 
-Small-file publication includes canonical content in the existing `inlineBlobs` push
-(up to 256 KiB per blob and a 1 MiB combined request); larger uploads retain the
-existing chunk path. Authoritative row/plugin merge semantics are unchanged.
-The new update route requires SDK and server to upgrade together. Repository storage
-format is unchanged; existing partial replicas retain their data and read interests.
+`Lix::sync_health()` exposes worker state, observed and applied cursors, and
+independent descriptor, publication, upload, and lease failures. Successful SQL
+reads do not clear synchronization failures. `running` means the worker has no
+known failure; it does not guarantee that there are no unseen remote writes.
+
+Small-file publication includes canonical content in the existing `inlineBlobs`
+push (up to 256 KiB per blob and a 1 MiB combined request); larger uploads retain
+the existing chunk path. Authoritative row/plugin merge semantics are unchanged.
+Sync protocol 17 removes `/sync/update` and requires SDK and server to upgrade
+together. Repository format remains 81; retained data and recipes remain readable.

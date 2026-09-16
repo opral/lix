@@ -67,6 +67,7 @@ export type {
 	LixOpenProgress,
 	LixOpenProgressOptions,
 	LixOpenReport,
+	SyncHealth,
 	ReplicaRecoverySource,
 	ReplicaRecoveryRow,
 	ReplicaRecoveryBranch,

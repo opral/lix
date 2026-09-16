@@ -5,7 +5,7 @@ import type { AdmissionIdentity } from "./shared-admission.js";
 const id = "00000000-0000-7000-8000-000000000004";
 const url = `https://example.test/lix/${id}`;
 const headers: [string, string][] = [["Authorization", "Bearer secret-token"]];
-const identity: AdmissionIdentity = { repositoryId: id, principalId: "user-A", protocolEpoch: 16, storageEpoch: 81 };
+const identity: AdmissionIdentity = { repositoryId: id, principalId: "user-A", protocolEpoch: 17, storageEpoch: 81 };
 function memory() {
   const values = new Map<string, unknown>();
   const store: DurableLocalAdmissionStore = {

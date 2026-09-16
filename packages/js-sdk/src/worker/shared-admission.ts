@@ -1,6 +1,6 @@
 import { HttpTransportError, type HttpTransport } from "../http-transport.js";
 
-export const ADMISSION_PROTOCOL_EPOCH = 16;
+export const ADMISSION_PROTOCOL_EPOCH = 17;
 export const ADMISSION_STORAGE_EPOCH = 81;
 export type AdmissionIdentity = {
   repositoryId: string;

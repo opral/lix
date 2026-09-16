@@ -254,6 +254,11 @@ export class Lix {
         }));
     }
 
+	/** Local worker health; independent of whether a warm SQL read succeeds. */
+	async syncHealth(): Promise<import("./types.js").SyncHealth> {
+		return this.binding.syncHealth();
+	}
+
 	async activeBranchId(): Promise<string> {
 		return this.#runOperation(() => this.binding.activeBranchId());
 	}

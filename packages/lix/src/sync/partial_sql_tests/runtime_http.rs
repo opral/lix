@@ -868,7 +868,6 @@ mod conflict_file;
 mod global_during_merge;
 mod included_upload;
 
-mod working_set;
 
 mod combined_body_limit;
 mod large_blob_upload;

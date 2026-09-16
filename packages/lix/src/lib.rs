@@ -123,6 +123,7 @@ mod server_protocol;
 mod session;
 #[doc(hidden)]
 mod sync;
+pub use sync::{SyncFailure, SyncHealth, SyncHealthState, SyncPhase};
 pub(crate) mod sql2;
 #[cfg(feature = "storage-benches")]
 mod sql_profile;

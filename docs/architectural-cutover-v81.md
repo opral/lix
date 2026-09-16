@@ -1,6 +1,6 @@
 # Current-format runtime and detached migration
 
-The target runtime accepts repository format **81**, sync protocol **16**, and
+The target runtime accepts repository format **81**, sync protocol **17**, and
 remote SQL protocol **10**. Older protocol clients must be rejected before any
 mutation. The reference server automatically migrates supported older authorities
 inside its owned repository opener before serving requests. Concurrent opens share

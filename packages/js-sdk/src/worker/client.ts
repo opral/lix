@@ -411,6 +411,7 @@ export function workerBinding(
 			request({ kind: "exportReplicaRecovery", id }),
 		recoverReplica: (id) => request({ kind: "recoverReplica", id }),
         recoverReplicaWithServer: (id, server) => client.withRecoveryServer(server, (transportScope, serialized) => request({kind:"recoverReplicaWithServer",id,server:serialized,transportScope})),
+		syncHealth: () => request({ kind: "syncHealth" }),
 		activeBranchId: () => request({ kind: "activeBranchId" }),
 		activeAccountId: () => request({ kind: "activeAccountId" }),
 		createBranch: (options) => request({ kind: "createBranch", options }),
