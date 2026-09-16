@@ -86,6 +86,11 @@ const cargoArgs = [
 	"--profile",
 	cargoProfile,
 ];
+// Parallelize LLVM only for the engine; keep a single unit for dependencies
+// and the final SDK, where global parallel codegen inflated compressed WASM.
+if (cargoProfile === "release") {
+	cargoArgs.push("--config", "profile.release.package.lix.codegen-units=4");
+}
 if (migrationArtifact) cargoArgs.push("--features", "offline-migration");
 if (process.env.LIX_WASM_STORAGE_BENCH === "1") {
 	cargoArgs.push("--features", "storage-bridge-bench");

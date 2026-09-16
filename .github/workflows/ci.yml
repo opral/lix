@@ -233,7 +233,7 @@ jobs:
         run: node scripts/validate-server-protocol-docs.mjs
 
       - name: Validate CI workflow invariants
-        run: node --test scripts/compatibility.test.mjs scripts/native-build.test.mjs scripts/ci-workflow.test.mjs scripts/ci-merge-reuse.test.mjs scripts/ci-rust-scope.test.mjs scripts/ci-content-scope.test.mjs scripts/ci-content-artifact.test.mjs scripts/ci-sdk-cache.test.mjs scripts/release-browser-artifact.test.mjs scripts/ci-server-image.test.mjs scripts/release.test.mjs scripts/release-candidate.test.mjs scripts/publish-plugin.test.mjs
+        run: node --test scripts/compatibility.test.mjs scripts/native-build.test.mjs scripts/ci-workflow.test.mjs scripts/ci-merge-reuse.test.mjs scripts/ci-rust-scope.test.mjs scripts/ci-content-scope.test.mjs scripts/ci-content-artifact.test.mjs scripts/ci-sdk-cache.test.mjs scripts/ci-build-sdk.test.mjs scripts/ci-test-browser.test.mjs scripts/release-browser-artifact.test.mjs scripts/ci-server-image.test.mjs scripts/release.test.mjs scripts/release-candidate.test.mjs scripts/publish-plugin.test.mjs
 
   cargo-config:
     name: Cargo config (${{ matrix.name }})
@@ -600,6 +600,8 @@ jobs:
           # Native uses test/dev profiles; Browser uses release Wasm. A single
           # immutable key lets the first writer seed only its own build modes.
           shared-key: ci-js-${{ matrix.runtime }}
+          key: parallel-sdk-v1
+          cache-targets: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Restore compiler cache
@@ -640,7 +642,7 @@ jobs:
         run: npm ci
 
       - name: Install Chromium
-        if: matrix.runtime == 'browser'
+        if: matrix.runtime == 'browser' && steps.binary-cache.outputs.reuse == 'true'
         working-directory: packages/js-sdk
         run: npx playwright install --with-deps chromium
 
@@ -654,16 +656,7 @@ jobs:
           if [ "$REUSE_BINARIES" = true ]; then
             node scripts/ci-sdk-cache.mjs restore "$SDK_RUNTIME" "$BINARY_KEY"
           else
-            if [ "$SDK_RUNTIME" = native ]; then
-              npm --prefix packages/js-sdk run build:native
-              npm --prefix packages/js-sdk run build:migration:native
-              npm --prefix packages/js-sdk run build:wasm:dev
-              LIX_WASM_PROFILE=dev npm --prefix packages/js-sdk run build:migration:wasm
-            else
-              npm --prefix packages/js-sdk run build:wasm
-              npm --prefix packages/js-sdk run build:migration:wasm
-            fi
-            npm --prefix packages/js-sdk run build:plugins
+            node scripts/ci-build-sdk.mjs "$SDK_RUNTIME"
             node scripts/ci-sdk-cache.mjs save "$SDK_RUNTIME" "$BINARY_KEY"
           fi
           npm --prefix packages/js-sdk run build:ts
@@ -694,19 +687,9 @@ jobs:
           npm run typecheck
           npm pack --dry-run --ignore-scripts
 
-      - name: Run browser JS SDK tests
+      - name: Run browser integration suites
         if: matrix.runtime == 'browser'
-        working-directory: packages/js-sdk
-        run: |
-          npm run test:browser:built
-          node ./scripts/test-packed-vite.js
-
-      - name: Run OPFS storage browser tests
-        if: matrix.runtime == 'browser'
-        working-directory: packages/storage-opfs
-        run: |
-          npm run test:browser:built
-          npm run test:browser:production
+        run: node scripts/ci-test-browser.mjs
 
       - name: Describe reusable browser SDK artifact
         if: matrix.runtime == 'browser'
@@ -733,6 +716,15 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 90
+
+      - name: Upload SDK build phase timings
+        if: always() && steps.binary-cache.outputs.reuse != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-build-timings-${{ matrix.runtime }}-${{ github.run_attempt }}
+          path: ci-sdk-timings/${{ matrix.runtime }}
+          retention-days: 14
+          if-no-files-found: warn
 
       - name: Cache successfully tested SDK binaries
         if: steps.binary-cache.outputs.reuse != 'true' && steps.binaries.outputs.cache-hit != 'true'
