@@ -233,7 +233,7 @@ jobs:
         run: node scripts/validate-server-protocol-docs.mjs
 
       - name: Validate CI workflow invariants
-        run: node --test scripts/compatibility.test.mjs scripts/native-build.test.mjs scripts/ci-workflow.test.mjs scripts/ci-merge-reuse.test.mjs scripts/ci-rust-scope.test.mjs scripts/ci-content-scope.test.mjs scripts/ci-content-artifact.test.mjs scripts/ci-sdk-cache.test.mjs scripts/ci-build-sdk.test.mjs scripts/release-browser-artifact.test.mjs scripts/ci-server-image.test.mjs scripts/release.test.mjs scripts/release-candidate.test.mjs scripts/publish-plugin.test.mjs
+        run: node --test scripts/compatibility.test.mjs scripts/native-build.test.mjs scripts/ci-workflow.test.mjs scripts/ci-merge-reuse.test.mjs scripts/ci-rust-scope.test.mjs scripts/ci-content-scope.test.mjs scripts/ci-content-artifact.test.mjs scripts/ci-sdk-cache.test.mjs scripts/ci-build-sdk.test.mjs scripts/ci-test-browser.test.mjs scripts/release-browser-artifact.test.mjs scripts/ci-server-image.test.mjs scripts/release.test.mjs scripts/release-candidate.test.mjs scripts/publish-plugin.test.mjs
 
   cargo-config:
     name: Cargo config (${{ matrix.name }})
@@ -642,7 +642,7 @@ jobs:
         run: npm ci
 
       - name: Install Chromium
-        if: matrix.runtime == 'browser'
+        if: matrix.runtime == 'browser' && steps.binary-cache.outputs.reuse == 'true'
         working-directory: packages/js-sdk
         run: npx playwright install --with-deps chromium
 
@@ -687,19 +687,9 @@ jobs:
           npm run typecheck
           npm pack --dry-run --ignore-scripts
 
-      - name: Run browser JS SDK tests
+      - name: Run browser integration suites
         if: matrix.runtime == 'browser'
-        working-directory: packages/js-sdk
-        run: |
-          npm run test:browser:built
-          node ./scripts/test-packed-vite.js
-
-      - name: Run OPFS storage browser tests
-        if: matrix.runtime == 'browser'
-        working-directory: packages/storage-opfs
-        run: |
-          npm run test:browser:built
-          npm run test:browser:production
+        run: node scripts/ci-test-browser.mjs
 
       - name: Describe reusable browser SDK artifact
         if: matrix.runtime == 'browser'
@@ -731,7 +721,7 @@ jobs:
         if: always() && steps.binary-cache.outputs.reuse != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: sdk-build-timings-${{ matrix.runtime }}
+          name: sdk-build-timings-${{ matrix.runtime }}-${{ github.run_attempt }}
           path: ci-sdk-timings/${{ matrix.runtime }}
           retention-days: 14
           if-no-files-found: warn

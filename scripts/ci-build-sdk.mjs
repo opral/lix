@@ -31,7 +31,7 @@ export async function executeBuildPlan(plan, run) {
     const start = performance.now();
     try {
       await run(phase);
-      return { name: phase.name, seconds: (performance.now() - start) / 1000, jobs: Number(phase.env.CARGO_BUILD_JOBS) };
+      return { name: phase.name, seconds: (performance.now() - start) / 1000, jobs: Number(phase.env.CARGO_BUILD_JOBS || 0) };
     } catch (error) {
       throw new Error(`${phase.name}: ${error.message}`);
     }
@@ -45,19 +45,22 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const runtime = process.argv[2];
   const root = process.cwd();
   const plan = sdkBuildPlan(runtime, root);
+  // Chromium is independent of compilation. Cache-hit jobs install it in the
+  // workflow; cold browser builds overlap installation with the Rust work.
+  if (runtime === "browser") plan.push({ name: "chromium", script: join(root, "packages/js-sdk/node_modules/playwright/cli.js"), args: ["install", "--with-deps", "chromium"], env: process.env });
   const report = resolve("ci-sdk-timings", runtime);
   mkdirSync(report, { recursive: true });
   const run = phase => new Promise((resolve, reject) => {
-    console.log(`Starting ${phase.name} (${phase.env.CARGO_BUILD_JOBS} Cargo jobs)`);
+    console.log(`Starting ${phase.name} (${phase.env.CARGO_BUILD_JOBS ? `${phase.env.CARGO_BUILD_JOBS} Cargo jobs` : 'prerequisite'})`);
     const start = performance.now();
-    const child = spawn(process.execPath, [phase.script], { cwd: root, env: phase.env, stdio: "inherit" });
+    const child = spawn(process.execPath, [phase.script, ...(phase.args ?? [])], { cwd: root, env: phase.env, stdio: "inherit" });
     child.on("error", reject);
     child.on("exit", (code, signal) => {
       const seconds = (performance.now() - start) / 1000;
       console.log(`Finished ${phase.name}: ${seconds.toFixed(1)}s, exit=${code}, signal=${signal}`);
-      writeFileSync(join(report, `${phase.name}.json`), JSON.stringify({ name: phase.name, seconds, code, signal, jobs: Number(phase.env.CARGO_BUILD_JOBS) }, null, 2));
-      const timings = join(phase.env.CARGO_TARGET_DIR, "cargo-timings");
-      if (existsSync(timings)) cpSync(timings, join(report, phase.name), { recursive: true });
+      writeFileSync(join(report, `${phase.name}.json`), JSON.stringify({ name: phase.name, seconds, code, signal, jobs: Number(phase.env.CARGO_BUILD_JOBS || 0) }, null, 2));
+      const timings = phase.env.CARGO_TARGET_DIR && join(phase.env.CARGO_TARGET_DIR, "cargo-timings");
+      if (timings && existsSync(timings)) cpSync(timings, join(report, phase.name), { recursive: true });
       if (code === 0) resolve(); else reject(new Error(`exited ${code ?? signal}`));
     });
   });

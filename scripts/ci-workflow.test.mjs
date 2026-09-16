@@ -157,7 +157,7 @@ test("browser artifacts publish after functional tests without OPFS benchmarks",
 	assert.match(upload, /retention-days: 90/);
 	assert.ok(
 		sdk.indexOf("name: Upload tested browser SDK for submodule consumers") >
-			sdk.indexOf("name: Run OPFS storage browser tests"),
+			sdk.indexOf("name: Run browser integration suites"),
 	);
 	for (const source of [workflow, publishWorkflow]) {
 		assert.doesNotMatch(
@@ -219,12 +219,12 @@ test("SDK binary reuse never skips TypeScript builds or integration tests", () =
 	assert.match(workflow, /fi\n\s+npm --prefix packages\/js-sdk run build:ts/);
 	assert.ok(
 		workflow.indexOf("name: Cache successfully tested SDK binaries") >
-			workflow.indexOf("name: Run OPFS storage browser tests"),
+			workflow.indexOf("name: Run browser integration suites"),
 	);
 	for (const name of [
 		"Run native JS SDK tests",
-		"Run browser JS SDK tests",
-		"Run OPFS storage browser tests",
+
+		"Run browser integration suites",
 	]) {
 		const step = workflow
 			.split(`name: ${name}\n`)[1]
@@ -382,7 +382,7 @@ test("release browser reuse validates provenance before skipping each expensive 
 	assert.match(browser, /shared-key: ci-js-browser/);
 	assert.match(browser, /scope: sdk-browser/);
 	assert.ok(browser.indexOf("name: Setup Node.js") < browser.indexOf("name: Verify and restore browser binary payload"));
-	assert.ok(workflow.indexOf("name: Upload browser build provenance for release lookup") > workflow.indexOf("name: Run OPFS storage browser tests"));
+	assert.ok(workflow.indexOf("name: Upload browser build provenance for release lookup") > workflow.indexOf("name: Run browser integration suites"));
 });
 
 test("CI and release share bounded disk compiler caches with separate native profiles", () => {
