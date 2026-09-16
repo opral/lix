@@ -111,6 +111,35 @@ SELECT row_ref, id, to_path
 FROM lix_diff('lix_file', lix_root_commit_id(), $commit_id);
 ```
 
+## Undo a selected change
+
+To undo a write, reverse its commit span and apply the resulting diff:
+
+```sql
+INSERT INTO lix_apply (row_ref)
+SELECT row_ref
+FROM lix_diff('acme_task', $after_commit_id, $before_commit_id)
+RETURNING commit_id;
+```
+
+Use the `commit.before` and `commit.after` returned by the original write or
+transaction. Add a `WHERE` clause to undo only selected rows. The reversed diff
+removes rows the write added, restores rows it deleted, and restores the previous
+values of rows it modified. Undo creates a new commit; it does not erase history
+or move the branch back to the original commit.
+
+Later changes to unrelated rows are preserved. Each affected row must still have
+the version expected by the reversed diff (or be absent when absence is expected).
+A later edit to an affected row rejects the entire statement with
+`LIX_CONSTRAINT_VIOLATION`, even if that edit changed a different column. No subset
+of the undo is committed. Related rows required for a valid apply can also be
+included by dependency planning; constraints and their version checks still apply.
+
+`lix_revert` serves a different purpose: it restores selected rows to the active
+branch's working baseline/checkpoint. A diff supplied to `lix_revert` selects row
+identities; its endpoints do not specify the versions to restore. Use reversed
+`lix_apply` for undoing a particular historical commit span.
+
 ## Commands
 
 The insert-only apply and revert command sinks consume queries selecting one
