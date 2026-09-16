@@ -35,6 +35,9 @@ test("handwritten SDK TypeScript and release prose do not invalidate binaries; u
 		"packages/js-sdk/src/foo.ts",
 		".changenotes/fix.md",
 		"CHANGELOG.md",
+        "blog/009/cover.png",
+        "docs/server-protocol.md",
+        "website/package-lock.json",
 	])
 		assert.equal(isBuildInput(path), false, path);
 	for (const path of [
@@ -42,6 +45,7 @@ test("handwritten SDK TypeScript and release prose do not invalidate binaries; u
 		"rust-toolchain.toml",
 		".cargo/config.toml",
 		"packages/lix/src/lib.rs",
+        "packages/lix/src/init_readme.md",
 		"packages/js-sdk/src/wasm/generated.d.ts",
 		"packages/js-sdk/build.rs",
 		"packages/js-sdk/scripts/build-wasm.js",
@@ -56,10 +60,12 @@ test("keys track actual tracked bytes, filenames, runtime and build settings wit
 	const { root, write } = fixture(t);
 	write("Cargo.lock", "one");
 	write("packages/js-sdk/src/foo.ts", "one");
+    write("blog/post.md", "one");
 	execFileSync("git", ["init", "--quiet", root]);
 	execFileSync("git", ["add", "."], { cwd: root });
 	const key = cacheKey(root, "native", {});
 	write("packages/js-sdk/src/foo.ts", "two");
+    write("blog/post.md", "two");
 	assert.equal(cacheKey(root, "native", {}), key);
 	assert.notEqual(cacheKey(root, "browser", {}), key);
 	assert.notEqual(

@@ -74,8 +74,14 @@ jobs:
       reuse: ${{ steps.reuse.outputs.reuse }}
       run_id: ${{ steps.reuse.outputs.run_id }}
       revision: ${{ steps.reuse.outputs.revision }}
+      content_only: ${{ steps.content.outputs.content_only }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Select content-only scope
+        id: content
+        run: node scripts/ci-content-scope.mjs
       - name: Validate explicit artifact source
         uses: actions/github-script@v7
         env:
@@ -148,7 +154,7 @@ jobs:
     if: inputs.artifacts_only != true && needs.merge-reuse.outputs.reuse != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     runs-on: ubicloud-standard-2-ubuntu-2404
     outputs:
-      rust: ${{ steps.scope.outputs.rust }}
+      rust: ${{ needs.merge-reuse.outputs.content_only == 'true' && 'false' || steps.scope.outputs.rust }}
 
     steps:
       - name: Checkout repository
@@ -191,12 +197,12 @@ jobs:
         run: node scripts/validate-server-protocol-docs.mjs
 
       - name: Validate CI workflow invariants
-        run: node --test scripts/compatibility.test.mjs scripts/native-build.test.mjs scripts/ci-workflow.test.mjs scripts/ci-merge-reuse.test.mjs scripts/ci-rust-scope.test.mjs scripts/ci-sdk-cache.test.mjs scripts/release-browser-artifact.test.mjs scripts/ci-server-image.test.mjs scripts/release.test.mjs scripts/release-candidate.test.mjs scripts/publish-plugin.test.mjs
+        run: node --test scripts/compatibility.test.mjs scripts/native-build.test.mjs scripts/ci-workflow.test.mjs scripts/ci-merge-reuse.test.mjs scripts/ci-rust-scope.test.mjs scripts/ci-content-scope.test.mjs scripts/ci-sdk-cache.test.mjs scripts/release-browser-artifact.test.mjs scripts/ci-server-image.test.mjs scripts/release.test.mjs scripts/release-candidate.test.mjs scripts/publish-plugin.test.mjs
 
   cargo-config:
     name: Cargo config (${{ matrix.name }})
     needs: merge-reuse
-    if: inputs.artifacts_only != true && needs.merge-reuse.outputs.reuse != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    if: inputs.artifacts_only != true && needs.merge-reuse.outputs.reuse != 'true' && needs.merge-reuse.outputs.content_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -469,7 +475,7 @@ jobs:
   js-sdk-test:
     name: JS SDK ${{ matrix.runtime == 'browser' && 'Browser' || 'Native' }} Test
     needs: merge-reuse
-    if: needs.merge-reuse.outputs.reuse != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    if: needs.merge-reuse.outputs.reuse != 'true' && needs.merge-reuse.outputs.content_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     runs-on: ubicloud-standard-30-ubuntu-2404
     timeout-minutes: 45
     env:
