@@ -1,0 +1,12 @@
+{
+  "compiler": "rustc 1.97.0-nightly (e50aa6fba 2026-05-19)",
+  "platform": "Linux-6.17.0-23-generic-x86_64-with-glibc2.39",
+  "build": "dev dependencies; lix engine opt-level=2; CARGO_INCREMENTAL=0",
+  "baseline_revision": "3d2ac63f75cff74875b918b7b4dcd67862a5327c",
+  "candidate_base_revision": "3d2ac63f75cff74875b918b7b4dcd67862a5327c",
+  "candidate_patch_sha256": "e7df481704e0dbc62142aee0270c6181714ac30a3c64481279bba147f3a99bd5",
+  "binaries": {
+    "e02-baseline-opt2": "60a411b6a6f14ae28f1d4b81e56dc0083e5f88864e1040830900707d87988f8f",
+    "e03-candidate-opt2": "a0b2bb08aff1fbf579714088a12c647f08d2a53f4e823a59d4ec190ce54aad85"
+  }
+}
