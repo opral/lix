@@ -28,6 +28,12 @@ test.runIf(import.meta.env.LIX_ADMISSION_REGRESSION === true)('real SharedWorker
   }
   try {
     const first = await attach('Bearer initial');
+    const admissionAtOpen = admissions;
+    for (let i = 0; i < 5; i++) {
+      await expect(first.execute('cancel')).rejects.toMatchObject({name:'AbortError'});
+      expect((await first.execute('remote')).rows).toEqual([['Bearer initial']]);
+    }
+    expect(admissions).toBe(admissionAtOpen);
     const same = await attach('Bearer initial');
     const rotated = await attach('Bearer rotated');
     expect(admissions).toBe(3);
