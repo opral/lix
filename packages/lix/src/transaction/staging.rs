@@ -3338,7 +3338,11 @@ impl TransactionWriteBuffer {
             let duplicate_staged = insert_order
                 .iter()
                 .copied()
-                .filter(|&row_index| by_identity.contains_key(&identities[row_index]))
+                .filter(|&row_index| {
+                    by_identity
+                        .get(&identities[row_index])
+                        .is_some_and(|&RowSlot::State(index)| staged_rows.row(index).has_payload())
+                })
                 .min();
             if let Some(row_index) = duplicate_in_batch.into_iter().chain(duplicate_staged).min() {
                 return Err(duplicate_insert_identity_error(rows.row(row_index)));
@@ -3400,8 +3404,11 @@ impl TransactionWriteBuffer {
         let mut new_candidate_destinations = Vec::new();
         for (source_index, identity) in identities.into_iter().enumerate() {
             let row = rows.row(source_index);
-            let is_insert = row_is_insert(mode, row);
             let existing_slot = by_identity.get(&identity).copied();
+            // Reinsertion after a staged deletion replaces an existing slot.
+            // Retain its original insertion check, if any: a row deleted from
+            // the opening snapshot must not be revalidated as a fresh insert.
+            let is_insert = row_is_insert(mode, row) && existing_slot.is_none();
             let mut requires_transaction_validation = row.facts.requires_transaction_validation;
             if let Some(RowSlot::State(index)) = existing_slot {
                 let previous = if let Some(previous_source) =
@@ -4429,9 +4436,9 @@ fn remove_row_from_commit_change_refs(
         return;
     };
     change_refs.remove_change_id(change_id);
-    if change_refs.is_empty() {
-        change_refs_by_branch.remove(row.branch_id.as_str());
-    }
+    // Replacement removes the old member before adding the new one. Keep the
+    // branch's reserved commit even when that temporarily leaves no members:
+    // its ID may already have escaped through SELECT or RETURNING.
 }
 
 fn append_matching_staged_rows(
@@ -6108,6 +6115,10 @@ mod tests {
                 ],
             })
             .expect("initial tracked row should stage");
+        let reserved_commit = staged_writes
+            .commit_id_for_branch(GLOBAL_BRANCH_ID)
+            .unwrap()
+            .expect("first tracked write reserves the transaction commit");
         staged_writes
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
@@ -6125,6 +6136,77 @@ mod tests {
             .get("ffffffff-ffff-7fff-bfff-ffffffffffff")
             .expect("global commit change_refs should exist");
         assert_eq!(change_refs.tracked_change_count, 1);
+        assert_eq!(change_refs.commit_id, reserved_commit);
+        assert_eq!(drained.state_rows.row(0).commit_id, Some(reserved_commit));
+    }
+
+    #[test]
+    fn staged_reinsertion_preserves_original_insert_validation_and_commit() {
+        for initial_mode in [TransactionWriteMode::Insert, TransactionWriteMode::Replace] {
+            let staged_writes = test_staged_writes();
+            staged_writes
+                .stage_write(PreparedTransactionWrite::Rows {
+                    mode: initial_mode,
+                    rows: prepared_rows![
+                        state_row("reinsert", "first")
+                            .with_tracked()
+                            .with_change_id("first")
+                    ],
+                })
+                .unwrap();
+            let reserved_commit = staged_writes
+                .commit_id_for_branch(GLOBAL_BRANCH_ID)
+                .unwrap()
+                .unwrap();
+            staged_writes
+                .stage_write(PreparedTransactionWrite::Rows {
+                    mode: TransactionWriteMode::Replace,
+                    rows: prepared_rows![
+                        tombstone_row("reinsert")
+                            .with_tracked()
+                            .with_change_id("deleted")
+                    ],
+                })
+                .unwrap();
+            staged_writes
+                .stage_write(PreparedTransactionWrite::Rows {
+                    mode: TransactionWriteMode::Insert,
+                    rows: prepared_rows![
+                        state_row("reinsert", "second")
+                            .with_tracked()
+                            .with_change_id("second")
+                    ],
+                })
+                .expect("a staged tombstone must not block reinsertion");
+            let duplicate = staged_writes
+                .stage_write(PreparedTransactionWrite::Rows {
+                    mode: TransactionWriteMode::Insert,
+                    rows: prepared_rows![
+                        state_row("reinsert", "duplicate")
+                            .with_tracked()
+                            .with_change_id("duplicate")
+                    ],
+                })
+                .expect_err("the reinserted live row must still reject duplicate inserts");
+            assert_eq!(duplicate.code, LixError::CODE_UNIQUE);
+            let drained = staged_writes.drain().unwrap();
+            assert_eq!(drained.state_rows.len(), 1);
+            assert_eq!(
+                drained.insert_selection.len(),
+                usize::from(initial_mode == TransactionWriteMode::Insert)
+            );
+            let refs = drained
+                .commit_change_refs_by_branch
+                .get(GLOBAL_BRANCH_ID)
+                .unwrap();
+            assert_eq!(refs.tracked_change_count, 1);
+            assert_eq!(refs.commit_id, reserved_commit);
+            assert_eq!(drained.state_rows.row(0).commit_id, Some(reserved_commit));
+            assert_eq!(
+                decoded_test_snapshot(drained.state_rows.row(0)).as_str(),
+                "{\"key\":\"reinsert\",\"value\":\"second\"}"
+            );
+        }
     }
 
     #[tokio::test]

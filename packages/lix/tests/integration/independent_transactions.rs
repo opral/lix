@@ -708,3 +708,246 @@ async fn concurrent_explicit_commit_receipts_contain_only_their_own_file() {
         assert_eq!(diff.rows()[0].get::<String>("to_path").unwrap(), path);
     }
 }
+
+#[tokio::test]
+async fn repeated_updates_return_the_published_transaction_commit_id() {
+    let assert_rows_eq = |result: lix::ExecuteResult, expected: Vec<Vec<Value>>| {
+        let actual = result
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    };
+    let session = open_lix().await.unwrap();
+    register_commit_counter(&session).await;
+
+    for explicit in [false, true] {
+        let inserted = session
+            .execute("INSERT INTO commit_counter (id, n) VALUES ('a', 0)", &[])
+            .await
+            .unwrap();
+        let previous_commit = inserted.commit().unwrap().after().to_string();
+        let sql = "UPDATE commit_counter SET n = n + 1 WHERE id = 'a' \
+                       RETURNING OLD.n AS before_n, NEW.n AS after_n, \
+                       OLD.lixcol_commit_id AS before_commit, \
+                       NEW.lixcol_commit_id AS after_commit, lixcol_commit_id";
+        let (results, commit) = if explicit {
+            let mut transaction = session.begin_transaction().await.unwrap();
+            let first = transaction.execute(sql, &[]).await.unwrap();
+            let second = transaction.execute(sql, &[]).await.unwrap();
+            let receipt = transaction.commit().await.unwrap();
+            (vec![first, second], receipt.commit.unwrap())
+        } else {
+            let statement = || lix::ExecuteBatchStatement {
+                sql: sql.into(),
+                params: vec![],
+                label: None,
+            };
+            let batch = session
+                .execute_batch(&[statement(), statement()])
+                .await
+                .unwrap();
+            (batch.results, batch.commit.unwrap())
+        };
+        assert_eq!(commit.before(), previous_commit);
+        assert_ne!(commit.after(), previous_commit);
+        for (index, result) in results.into_iter().enumerate() {
+            assert_rows_eq(
+                result,
+                vec![vec![
+                    Value::Integer(index as i64),
+                    Value::Integer(index as i64 + 1),
+                    Value::Text(if index == 0 {
+                        previous_commit.clone()
+                    } else {
+                        commit.after().into()
+                    }),
+                    Value::Text(commit.after().into()),
+                    Value::Text(commit.after().into()),
+                ]],
+            );
+        }
+        let head = session
+            .execute("SELECT lix_active_branch_commit_id()", &[])
+            .await
+            .unwrap();
+        assert_rows_eq(head, vec![vec![Value::Text(commit.after().into())]]);
+        let persisted = session
+            .execute(
+                "SELECT n, lixcol_commit_id FROM commit_counter WHERE id = 'a'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_rows_eq(
+            persisted,
+            vec![vec![Value::Integer(2), Value::Text(commit.after().into())]],
+        );
+
+        // A deletion returns the old row's provenance, not its own commit.
+        let deleted = session
+            .execute(
+                "DELETE FROM commit_counter WHERE id = 'a' \
+                 RETURNING OLD.lixcol_commit_id, NEW.lixcol_commit_id, lixcol_commit_id",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_ne!(deleted.commit().unwrap().after(), commit.after());
+        assert_rows_eq(
+            deleted,
+            vec![vec![
+                Value::Text(commit.after().into()),
+                Value::Null,
+                Value::Text(commit.after().into()),
+            ]],
+        );
+    }
+}
+
+async fn register_commit_counter(session: &lix::Lix) {
+    session.execute(
+        r#"INSERT INTO lix_registered_schema (value) VALUES (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"commit_counter","columns":[{"name":"id","type":"text","nullable":false},{"name":"n","type":"int8","nullable":false}],"primary_key":["id"]}' AS JSONB))"#,
+        &[],
+    ).await.unwrap();
+}
+
+#[tokio::test]
+async fn reserved_commit_survives_statement_rollback_and_row_replacement() {
+    for initially_present in [false, true] {
+        let session = open_lix().await.unwrap();
+        register_commit_counter(&session).await;
+        if initially_present {
+            session
+                .execute("INSERT INTO commit_counter (id, n) VALUES ('a', 0)", &[])
+                .await
+                .unwrap();
+        }
+        let mut tx = session.begin_transaction().await.unwrap();
+        let inserted_commit = if initially_present {
+            None
+        } else {
+            let inserted = tx
+                .execute(
+                    "INSERT INTO commit_counter (id, n) VALUES ('a', 0) RETURNING lixcol_commit_id",
+                    &[],
+                )
+                .await
+                .unwrap();
+            Some(
+                inserted.rows()[0]
+                    .get::<String>("lixcol_commit_id")
+                    .unwrap(),
+            )
+        };
+        let first = tx
+            .execute(
+                "UPDATE commit_counter SET n = 1 WHERE id = 'a' RETURNING lixcol_commit_id",
+                &[],
+            )
+            .await
+            .unwrap();
+        let reserved = first.rows()[0].get::<String>("lixcol_commit_id").unwrap();
+        if let Some(inserted_commit) = inserted_commit {
+            assert_eq!(inserted_commit, reserved);
+        }
+        let error = tx.execute("UPDATE commit_counter SET n = 100 WHERE id = 'a' RETURNING lixcol_commit_id, CAST(id AS BIGINT)", &[]).await.unwrap_err();
+        assert_eq!(error.code, "LIX_TYPE_MISMATCH");
+        let after_error = tx
+            .execute(
+                "SELECT n, lixcol_commit_id FROM commit_counter WHERE id = 'a'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_error.rows()[0].get::<i64>("n").unwrap(), 1);
+        assert_eq!(
+            after_error.rows()[0]
+                .get::<String>("lixcol_commit_id")
+                .unwrap(),
+            reserved
+        );
+        let deleted = tx
+            .execute(
+                "DELETE FROM commit_counter WHERE id = 'a' RETURNING lixcol_commit_id",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            deleted.rows()[0].get::<String>("lixcol_commit_id").unwrap(),
+            reserved
+        );
+        let inserted = tx
+            .execute(
+                "INSERT INTO commit_counter (id, n) VALUES ('a', 2) RETURNING lixcol_commit_id",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            inserted.rows()[0]
+                .get::<String>("lixcol_commit_id")
+                .unwrap(),
+            reserved
+        );
+        let receipt = tx.commit().await.unwrap();
+        assert_eq!(receipt.commit.unwrap().after(), reserved);
+        let persisted = session
+            .execute(
+                "SELECT n, lixcol_commit_id FROM commit_counter WHERE id = 'a'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(persisted.rows()[0].get::<i64>("n").unwrap(), 2);
+        assert_eq!(
+            persisted.rows()[0]
+                .get::<String>("lixcol_commit_id")
+                .unwrap(),
+            reserved
+        );
+    }
+}
+
+#[tokio::test]
+async fn reinserted_new_row_cannot_overwrite_a_concurrent_insert() {
+    for first_insert in [
+        "INSERT INTO commit_counter (id, n) VALUES ('a', 0)",
+        "INSERT INTO commit_counter (id, n) VALUES ('a', 0) ON CONFLICT (id) DO UPDATE SET n = excluded.n",
+    ] {
+        let session = open_lix().await.unwrap();
+        register_commit_counter(&session).await;
+        let mut tx = session.begin_transaction().await.unwrap();
+        tx.execute(first_insert, &[]).await.unwrap();
+        tx.execute("DELETE FROM commit_counter WHERE id = 'a'", &[])
+            .await
+            .unwrap();
+        tx.execute("INSERT INTO commit_counter (id, n) VALUES ('a', 1)", &[])
+            .await
+            .unwrap();
+        let concurrent = session
+            .execute("INSERT INTO commit_counter (id, n) VALUES ('a', 2)", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            tx.commit().await.unwrap_err().code,
+            lix::LixError::CODE_TRANSACTION_CONFLICT
+        );
+        let persisted = session
+            .execute(
+                "SELECT n, lixcol_commit_id FROM commit_counter WHERE id = 'a'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(persisted.rows()[0].get::<i64>("n").unwrap(), 2);
+        assert_eq!(
+            persisted.rows()[0]
+                .get::<String>("lixcol_commit_id")
+                .unwrap(),
+            concurrent.commit().unwrap().after()
+        );
+    }
+}
