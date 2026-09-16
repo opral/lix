@@ -1061,6 +1061,50 @@ mod tests {
         StorageSpace, StorageWrite, StoredValue, WriteOptions,
     };
 
+    #[test]
+    fn lock_contention_excludes_other_lock_file_failures() {
+        for message in [
+            "IO error: While lock file: /repo/LOCK: Resource temporarily unavailable",
+            "IO error: While lock file: /repo/LOCK: Permission denied",
+            "IO error: lock hold by current process, acquire time 123 acquiring thread 42: /repo/LOCK: No locks available",
+        ] {
+            assert!(super::is_repository_lock_contention(message), "{message}");
+        }
+        for message in [
+            "IO error: while open a file for lock: /repo/LOCK: Permission denied",
+            "IO error: While lock file: /repo/LOCK: No locks available",
+            "IO error: While lock file: /repo/LOCK: Input/output error",
+            "IO error: Failed to create lock file: C:\\repo\\LOCK: Access is denied.",
+            "IO error: /repo/lock/LOG: Resource temporarily unavailable",
+        ] {
+            assert!(!super::is_repository_lock_contention(message), "{message}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lock_probe_is_independent_of_diagnostic_language() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let owner = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .share_mode(0)
+            .open(directory.path().join("LOCK"))
+            .unwrap();
+        let localized = "IO error: Failed to create lock file: repository/LOCK: Zugriff durch einen anderen Prozess";
+        assert!(super::windows_repository_lock_contention(
+            localized,
+            directory.path()
+        ));
+        drop(owner);
+        assert!(!super::windows_repository_lock_contention(
+            localized,
+            directory.path()
+        ));
+    }
+
     #[tokio::test]
     async fn session_acquisition_serializes_with_commits_and_fences_prepared_tokenless_writes() {
         let directory = tempfile::tempdir().unwrap();
@@ -1268,17 +1312,49 @@ fn rocksdb_error(error: rocksdb::Error) -> StorageError {
 
 fn rocksdb_open_error(error: rocksdb::Error, path: &Path) -> StorageError {
     let message = error.to_string();
-    if message.to_ascii_lowercase().contains("lock") {
-        StorageError::Io(format!(
-            "rocksdb storage at {} is already open by another process: {message}",
-            path.display()
-        ))
+    if is_repository_lock_contention(&message) || windows_repository_lock_contention(&message, path)
+    {
+        StorageError::InUse
     } else {
         StorageError::Io(format!(
             "rocksdb storage failed to open {}: {message}",
             path.display()
         ))
     }
+}
+
+// rust-rocksdb's C API exposes only a formatted status, not errno/subcodes.
+// Match the lock operation and its contention diagnostic together. A path
+// containing "lock", an unreadable LOCK file, or a full disk is still an I/O error.
+fn is_repository_lock_contention(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    (message.starts_with("io error: while lock file:")
+        && (message.ends_with("resource temporarily unavailable")
+            || message.ends_with("resource deadlock avoided")
+            || message.ends_with("permission denied")))
+        || message.starts_with("io error: lock hold by current process, acquire time ")
+}
+
+// RocksDB formats Windows errors in the user's language and discards the
+// numeric status. Probe the existing lock with the same exclusive sharing
+// mode to recover a stable sharing/lock-violation code, without creating it.
+#[cfg(windows)]
+fn windows_repository_lock_contention(message: &str, path: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    if !message.starts_with("IO error: Failed to create lock file:") {
+        return false;
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .open(path.join("LOCK"))
+        .is_err_and(|error| matches!(error.raw_os_error(), Some(32 | 33)))
+}
+
+#[cfg(not(windows))]
+fn windows_repository_lock_contention(_message: &str, _path: &Path) -> bool {
+    false
 }
 
 #[derive(Clone, Default)]

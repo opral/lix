@@ -182,3 +182,44 @@ fn failed_initial_sync_does_not_record_materialization() {
         lix.close().await.unwrap();
     });
 }
+
+#[test]
+fn filesystem_open_preserves_repository_in_use_code() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = FilesystemStorage::new(root.path()).open().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "filesystem_lock_helper", "--nocapture"])
+        .env("LIX_FILESYSTEM_LOCK_TEST_PATH", root.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("FILESYSTEM_LOCK_CHECKED"));
+    drop(storage);
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "filesystem_lock_helper", "--nocapture"])
+        .env("LIX_FILESYSTEM_LOCK_TEST_PATH", root.path())
+        .env("LIX_FILESYSTEM_LOCK_TEST_REOPEN", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("FILESYSTEM_LOCK_CHECKED"));
+}
+
+#[test]
+fn filesystem_lock_helper() {
+    let Some(path) = std::env::var_os("LIX_FILESYSTEM_LOCK_TEST_PATH") else {
+        return;
+    };
+    let result = FilesystemStorage::new(path).open();
+    if std::env::var_os("LIX_FILESYSTEM_LOCK_TEST_REOPEN").is_some() {
+        result.expect("reopen after owner releases repository");
+    } else {
+        let error = match result {
+            Ok(_) => panic!("second process must not open repository"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "LIX_STORAGE_IN_USE");
+        assert!(error.hint.is_some());
+    }
+    println!("FILESYSTEM_LOCK_CHECKED");
+}

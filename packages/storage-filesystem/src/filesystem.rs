@@ -2488,10 +2488,9 @@ const LEGACY_FILESYSTEM_SQLITE_METADATA_NAMES: &[&str] = &[
 ];
 
 fn rocksdb_error(error: StorageError) -> LixError {
-    LixError::new(
-        LixError::CODE_STORAGE_ERROR,
-        format!("failed to open filesystem RocksDB storage: {error}"),
-    )
+    let mut error = LixError::from(error);
+    error.message = format!("failed to open filesystem RocksDB storage: {}", error.message);
+    error
 }
 
 #[cfg(test)]
