@@ -312,7 +312,7 @@ paths:
       - $ref: "#/components/parameters/LixId"
     post:
       operationId: syncNativeMigrationMerge
-      description: Explicit migration only: validates ordinary file/custom-schema native selections and plugin resolutions at captured heads. An isolated source branch pins uploaded native bodies. Selected/global coordinates and source pin are guarded with the native merge and immutable outcome atomically. Unchanged global/checkpoint scope; unsupported mutations preserve the original source. Metadata request limit is 16 KiB.
+      description: "Explicit migration only: validates ordinary file/custom-schema native selections and plugin resolutions at captured heads. An isolated source branch pins uploaded native bodies. Selected/global coordinates and source pin are guarded with the native merge and immutable outcome atomically. Unchanged global/checkpoint scope; unsupported mutations preserve the original source. Metadata request limit is 16 KiB."
       parameters:
         - $ref: "#/components/parameters/RequiredSessionId"
         - $ref: "#/components/parameters/SyncProtocolVersion"
@@ -453,51 +453,6 @@ paths:
         "409":
           description: Requested cursor is ahead of the authority; preserve pending edits and reconcile the admitted baseline.
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
-        default: { $ref: "#/components/responses/Error" }
-  /lix/v1/{lix_id}/sync/update:
-    parameters:
-      - $ref: "#/components/parameters/LixId"
-    post:
-      operationId: syncPartialUpdate
-      description: Waits for a leased descriptor and delivers a bounded bundle of immutable native inputs for retained read recipes. Opening remains metadata-only. The replica validates and prepares coverage locally; incomplete bundles use ordinary on-demand hydration. Requires SDK and server sync protocol 16 together.
-      parameters:
-        - $ref: "#/components/parameters/RequiredSessionId"
-        - $ref: "#/components/parameters/SyncProtocolVersion"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              additionalProperties: false
-              required: [branchId, knownCursor, interests]
-              properties:
-                branchId: { type: string, format: uuid }
-                after: { type: [integer, 'null'], minimum: 0 }
-                knownCursor: { type: integer, minimum: 0 }
-                interests:
-                  type: array
-                  maxItems: 4096
-                  description: Internal versioned native read recipes, bounded to 4 MiB. Never SQL text or local coverage claims.
-                  items: { type: object }
-      responses:
-        "200":
-          description: At most 2 MiB containing one leased descriptor and bounded native metadata, objects and inline content. Empty bundles accompany idle polls; no coverage is inferred from delivery.
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [descriptor, bundle]
-                properties:
-                  descriptor: { $ref: "#/components/schemas/LeasedPartialReplicaDescriptor" }
-                  bundle:
-                    type: object
-                    required: [objects, metadata, blobs, complete]
-                    properties:
-                      objects: { type: array, items: { type: object } }
-                      metadata: { type: array, items: { type: object } }
-                      blobs: { type: array, items: { $ref: "#/components/schemas/SyncBlobManifest" } }
-                      complete: { type: boolean }
         default: { $ref: "#/components/responses/Error" }
   /lix/v1/{lix_id}/sync/checkpoints:
     parameters:
@@ -953,7 +908,7 @@ components:
       in: header
       required: true
       description: Exact sync wire-protocol version advertised by the handshake.
-      schema: { type: integer, const: 16 }
+      schema: { type: integer, const: 17 }
     TransactionId:
       name: Lix-Transaction-Id
       in: header
@@ -1010,8 +965,8 @@ components:
       type: object
       required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
-        protocolVersion: { type: integer, const: 10 }
-        syncProtocolVersion: { type: integer, const: 16 }
+        protocolVersion: { type: integer, const: 11 }
+        syncProtocolVersion: { type: integer, const: 17 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }
@@ -1030,7 +985,17 @@ components:
             syncChunk: { type: boolean }
     ExecuteOptions:
       type: object
-      properties: { originKey: { type: string } }
+      properties:
+        originKey: { type: string }
+        maxAutoCommitRetries:
+          type: integer
+          minimum: 0
+          maximum: 4294967295
+          description: >-
+            Maximum whole automatic-transaction replays after conflict or snapshot
+            expiry, excluding the initial attempt. Zero disables replay. Omit to
+            retain default recovery budgets. Does not control explicit transactions,
+            pure-read recovery, receipt lookups, or transport retries.
     ExecuteRequest:
       type: object
       required: [sql]
@@ -1213,7 +1178,7 @@ components:
         abandon:
           type: boolean
           default: false
-          description: When true, terminally fences an active attempt for automatic authoritative recovery. An already committed receipt wins. Otherwise the attempt must have expired. Requires sync protocol 16.
+          description: When true, terminally fences an active attempt for automatic authoritative recovery. An already committed receipt wins. Otherwise the attempt must have expired. Requires sync protocol 17.
     PartialAttemptRestartReceipt:
       type: object
       additionalProperties: false

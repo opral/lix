@@ -856,6 +856,10 @@ impl ResultRowRef<'_> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExecuteOptions {
     pub origin_key: Option<String>,
+    /// Maximum whole-operation replays after a known failed automatic transaction.
+    /// Zero disables replay. None preserves the default conflict and expiry budgets.
+    /// Does not replay explicit transactions or ambiguous commit outcomes.
+    pub max_auto_commit_retries: Option<u32>,
 }
 
 /// Whether abandoning an in-flight SQL execution can discard its work.
@@ -1736,8 +1740,7 @@ where
             }
             let sql_for_error = sql.to_string();
             let params = params.to_vec();
-            let mut transaction_conflict_retries = 0;
-            let mut expired_read_retries = ExpiredReadRetryState::default();
+            let mut retries = AutoCommitRetries::new(options.max_auto_commit_retries);
             loop {
                 let write_access = self.begin_session_write_access().await?;
                 let sql_for_planning = sql_for_error.clone();
@@ -1776,16 +1779,10 @@ where
                 match result {
                     Ok((result, commit)) => return Ok(result.with_commit(commit)),
                     Err(error) => {
-                        if retry_auto_commit(
-                            &mut transaction_conflict_retries,
-                            &mut expired_read_retries,
-                            &error,
-                        )
-                        .await
-                        {
+                        if retries.retry(&error).await {
                             continue;
                         }
-                        return Err(error);
+                        return Err(retries.annotate(error));
                     }
                 }
             }
@@ -2026,6 +2023,7 @@ where
         self.execute_with_idempotency_recovery(
             &idempotency,
             ExecuteIdempotencyReceipt::into_single_result,
+            options.max_auto_commit_retries,
             || async {
                 let write_access = self.begin_session_write_access().await?;
                 let sql_for_planning = sql.to_owned();
@@ -2087,18 +2085,16 @@ where
         &self,
         idempotency: &ExecuteIdempotency,
         replay: fn(ExecuteIdempotencyReceipt) -> Result<T, LixError>,
+        max_auto_commit_retries: Option<u32>,
         mut execute: F,
     ) -> Result<T, LixError>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, LixError>>,
     {
-        let mut expired_read_retries = ExpiredReadRetryState::default();
+        let mut retries = AutoCommitRetries::new(max_auto_commit_retries);
         if let IdempotencyReceiptResolution::Replay(receipt) = self
-            .resolve_idempotency_receipt_with_expired_read_retry(
-                idempotency,
-                &mut expired_read_retries,
-            )
+            .resolve_idempotency_receipt_with_expired_read_retry(idempotency, &mut retries.expired)
             .await?
         {
             return replay(receipt);
@@ -2109,7 +2105,7 @@ where
                 Ok(result) => return Ok(result),
                 Err(error)
                     if error.code == LixError::CODE_STORAGE_READ_EXPIRED
-                        && retry_expired_auto_commit(&mut expired_read_retries, &error).await =>
+                        && retries.retry(&error).await =>
                 {
                     continue;
                 }
@@ -2120,10 +2116,10 @@ where
                             | LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
                     ) =>
                 {
-                    return match self
+                    match self
                         .resolve_idempotency_receipt_with_expired_read_retry(
                             idempotency,
-                            &mut expired_read_retries,
+                            &mut retries.expired,
                         )
                         .await
                     {
@@ -2138,13 +2134,20 @@ where
                             // rather than let a stale acknowledgement poison the
                             // next plugin-backed edit.
                             self.file_views.clear();
-                            replay(receipt)
+                            return replay(receipt);
                         }
-                        Ok(IdempotencyReceiptResolution::Absent) => Err(error),
-                        Err(recovery_error) => Err(recovery_error),
+                        Ok(IdempotencyReceiptResolution::Absent) => {
+                            // Only a known conflict permits re-execution. An absent
+                            // receipt after an unknown outcome is not proof of failure.
+                            if retries.retry(&error).await {
+                                continue;
+                            }
+                            return Err(retries.annotate(error));
+                        }
+                        Err(recovery_error) => return Err(retries.annotate(recovery_error)),
                     };
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(retries.annotate(error)),
             }
         }
     }
@@ -2415,6 +2418,7 @@ where
                 self.execute_with_idempotency_recovery(
                     &idempotency,
                     ExecuteIdempotencyReceipt::into_results,
+                    options.max_auto_commit_retries,
                     || {
                         self.execute_transaction_batch(
                             statements,
@@ -2437,8 +2441,7 @@ where
         options: ExecuteOptions,
         statement_metadata: Vec<ExecuteStatementMetadata>,
     ) -> Result<Vec<ExecuteResult>, LixError> {
-        let mut transaction_conflict_retries = 0;
-        let mut expired_read_retries = ExpiredReadRetryState::default();
+        let mut retries = AutoCommitRetries::new(options.max_auto_commit_retries);
         loop {
             let result = self
                 .execute_transaction_batch(
@@ -2452,16 +2455,10 @@ where
             match result {
                 Ok(results) => return Ok(results),
                 Err(error) => {
-                    if retry_auto_commit(
-                        &mut transaction_conflict_retries,
-                        &mut expired_read_retries,
-                        &error,
-                    )
-                    .await
-                    {
+                    if retries.retry(&error).await {
                         continue;
                     }
-                    return Err(error);
+                    return Err(retries.annotate(error));
                 }
             }
         }
@@ -4650,25 +4647,81 @@ fn normalize_sql_surface_error(error: LixError, sql: &str) -> LixError {
     error
 }
 
-async fn retry_auto_commit(
-    conflict_retries: &mut usize,
-    expired_read_retries: &mut ExpiredReadRetryState,
-    error: &LixError,
-) -> bool {
-    if error.automatic_retry_is_forbidden() {
-        return false;
-    }
-    if retry_expired_auto_commit(expired_read_retries, error).await {
-        return true;
+/// Tracks only whole automatic-transaction replays; receipt/read recovery is separate.
+struct AutoCommitRetries {
+    limit: Option<u32>,
+    attempts: u32,
+    conflicts: usize,
+    expired: ExpiredReadRetryState,
+}
+
+impl AutoCommitRetries {
+    fn new(limit: Option<u32>) -> Self {
+        Self {
+            limit,
+            attempts: 0,
+            conflicts: 0,
+            expired: ExpiredReadRetryState::default(),
+        }
     }
 
-    if error.code != LixError::CODE_TRANSACTION_CONFLICT
-        || *conflict_retries >= MAX_AUTO_COMMIT_RETRIES
-    {
-        return false;
+    async fn retry(&mut self, error: &LixError) -> bool {
+        if error.automatic_retry_is_forbidden()
+            || self.limit.is_some_and(|limit| self.attempts >= limit)
+        {
+            return false;
+        }
+        let retry = if error.code == LixError::CODE_TRANSACTION_CONFLICT {
+            if self.limit.is_none() && self.conflicts >= MAX_AUTO_COMMIT_RETRIES {
+                false
+            } else {
+                self.conflicts += 1;
+                true
+            }
+        } else {
+            retry_expired_auto_commit(&mut self.expired, error).await
+        };
+        if retry {
+            self.attempts += 1;
+            tracing::debug!(retry_count = self.attempts, error_code = %error.code,
+                "replaying automatic transaction after known failure");
+        }
+        retry
     }
-    *conflict_retries += 1;
-    true
+
+    fn annotate(&self, mut error: LixError) -> LixError {
+        let forbidden = error.automatic_retry_is_forbidden();
+        let mut details = match error.details.take() {
+            Some(JsonValue::Object(details)) => details,
+            Some(cause) => JsonMap::from_iter([("cause".to_owned(), cause)]),
+            None => JsonMap::new(),
+        };
+        details.insert("autoCommitRetryCount".into(), self.attempts.into());
+        details.insert(
+            "autoCommitRetryStopReason".into(),
+            JsonValue::from(if forbidden {
+                "replay-forbidden"
+            } else if !matches!(
+                error.code.as_str(),
+                LixError::CODE_TRANSACTION_CONFLICT | LixError::CODE_STORAGE_READ_EXPIRED
+            ) {
+                "non-retryable-error"
+            } else if self.limit.is_some_and(|limit| self.attempts >= limit) {
+                "retry-limit"
+            } else if error.code == LixError::CODE_TRANSACTION_CONFLICT {
+                "retry-limit"
+            } else if error.code == LixError::CODE_STORAGE_READ_EXPIRED {
+                "snapshot-recovery-deadline"
+            } else {
+                "non-retryable-error"
+            }),
+        );
+        if let Some(limit) = self.limit {
+            details.insert("maxAutoCommitRetries".into(), limit.into());
+        }
+        error.details = Some(JsonValue::Object(details));
+        error
+    }
 }
 
 async fn retry_expired_auto_commit(
@@ -4804,6 +4857,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_retry_limits_cover_conflicts_and_expiry() {
+        let conflict = LixError::new(LixError::CODE_TRANSACTION_CONFLICT, "conflict");
+        let expired = LixError::new(LixError::CODE_STORAGE_READ_EXPIRED, "expired");
+        let mut defaults = AutoCommitRetries::new(None);
+        for _ in 0..16 {
+            assert!(defaults.retry(&conflict).await);
+        }
+        assert!(!defaults.retry(&conflict).await);
+        // Default snapshot recovery has its own time budget.
+        assert!(defaults.retry(&expired).await);
+        for error in [&conflict, &expired] {
+            let mut fail_fast = AutoCommitRetries::new(Some(0));
+            assert!(!fail_fast.retry(error).await);
+            assert_eq!(fail_fast.attempts, 0);
+        }
+        let mut capped = AutoCommitRetries::new(Some(2));
+        assert!(capped.retry(&conflict).await);
+        assert!(capped.retry(&expired).await);
+        assert!(!capped.retry(&conflict).await);
+        assert!(!capped.retry(&expired).await);
+        let error =
+            capped.annotate(conflict.with_details(serde_json::json!({"statementIndex": 1})));
+        assert_eq!(error.details.as_ref().unwrap()["statementIndex"], 1);
+        assert_eq!(error.details.as_ref().unwrap()["autoCommitRetryCount"], 2);
+        assert_eq!(
+            error.details.as_ref().unwrap()["autoCommitRetryStopReason"],
+            "retry-limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_diagnostics_preserve_nonretryable_failure_reason_at_limit() {
+        for limit in [0, 1] {
+            let mut retries = AutoCommitRetries::new(Some(limit));
+            for _ in 0..limit {
+                assert!(
+                    retries
+                        .retry(&LixError::new(
+                            LixError::CODE_TRANSACTION_CONFLICT,
+                            "conflict"
+                        ))
+                        .await
+                );
+            }
+            let error = LixError::new(LixError::CODE_INVALID_PARAM, "invalid parameter");
+            assert!(!retries.retry(&error).await);
+            let error = retries.annotate(error);
+            assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+            assert_eq!(
+                error.details.as_ref().unwrap()["autoCommitRetryCount"],
+                limit
+            );
+            assert_eq!(
+                error.details.as_ref().unwrap()["autoCommitRetryStopReason"],
+                "non-retryable-error"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn idempotent_replay_policy_never_reexecutes_ambiguous_or_completed_writes() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone()).await.unwrap();
+        let engine = Engine::new(storage).await.unwrap();
+        let session = engine.open_session().await.unwrap();
+        let idempotency = ExecuteIdempotency::new(None, "retry-policy-test".into(), [4; 32])
+            .with_branch(session.active_branch_id().await.unwrap());
+        for (code, marker, limit, expected_attempts) in [
+            (LixError::CODE_TRANSACTION_CONFLICT, None, 1, 2),
+            (LixError::CODE_TRANSACTION_CONFLICT, None, 0, 1),
+            (LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN, None, 1, 1),
+            (
+                LixError::CODE_TRANSACTION_CONFLICT,
+                Some("nonRetryableAfterCommit"),
+                1,
+                1,
+            ),
+            (
+                LixError::CODE_STORAGE_READ_EXPIRED,
+                Some("nonRetryableAfterExecution"),
+                1,
+                1,
+            ),
+        ] {
+            let attempts = std::sync::atomic::AtomicUsize::new(0);
+            let result = session
+                .execute_with_idempotency_recovery(
+                    &idempotency,
+                    |_| Ok(99_usize),
+                    Some(limit),
+                    || async {
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                        if attempt > 0 {
+                            return Ok(attempt);
+                        }
+                        let mut error = LixError::new(code, "injected known failure");
+                        if let Some(marker) = marker {
+                            error = error.with_details(serde_json::json!({marker: true}));
+                        }
+                        Err(error)
+                    },
+                )
+                .await;
+            assert_eq!(attempts.load(Ordering::SeqCst), expected_attempts);
+            if expected_attempts == 2 {
+                assert_eq!(result.unwrap(), 1);
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, code);
+                assert_eq!(error.details.as_ref().unwrap()["autoCommitRetryCount"], 0);
+                if let Some(marker) = marker {
+                    assert_eq!(error.details.unwrap()[marker], true);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn statement_and_batch_retry_caps_leave_failed_writes_unpublished() {
+        for batch in [false, true] {
+            for limit in [0, 1] {
+                let storage = RepeatedExpiringStorage::new();
+                Engine::initialize(storage.clone()).await.unwrap();
+                let engine = Engine::new(storage.clone()).await.unwrap();
+                let session = engine.open_session().await.unwrap();
+                session
+                    .execute(
+                        "INSERT INTO lix_key_value (key, value) VALUES ('cap', 'keep')",
+                        &[],
+                    )
+                    .await
+                    .unwrap();
+                let sql = "INSERT INTO lix_revert (row_ref) SELECT row_ref FROM lix_diff('lix_key_value', lix_root_commit_id(), lix_active_branch_commit_id()) WHERE key = 'cap'";
+                storage.expire_after_each_transaction_open(3);
+                let options = ExecuteOptions {
+                    max_auto_commit_retries: Some(limit),
+                    ..Default::default()
+                };
+                let error = if batch {
+                    session
+                        .execute_batch_with_options(
+                            &[ExecuteBatchStatement {
+                                sql: sql.into(),
+                                params: vec![],
+                                label: None,
+                            }],
+                            options,
+                        )
+                        .await
+                        .unwrap_err()
+                } else {
+                    session
+                        .execute_with_options(sql, &[], options)
+                        .await
+                        .unwrap_err()
+                };
+                assert_eq!(error.code, LixError::CODE_STORAGE_READ_EXPIRED);
+                assert_eq!(
+                    error.details.as_ref().unwrap()["autoCommitRetryCount"],
+                    limit
+                );
+                *storage.schedule.lock().unwrap() = None;
+                let result = session
+                    .execute("SELECT value FROM lix_key_value WHERE key = 'cap'", &[])
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result.rows()[0].get::<serde_json::Value>("value").unwrap(),
+                    serde_json::json!("keep")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn auto_commit_retry_policy_preserves_completion_boundaries() {
         for code in [
             LixError::CODE_TRANSACTION_CONFLICT,
@@ -4819,14 +5047,13 @@ mod tests {
                 if let Some(marker) = marker {
                     error = error.with_details(serde_json::json!({marker: true}));
                 }
-                let mut conflicts = 0;
-                let mut expired = ExpiredReadRetryState::default();
+                let mut retries = AutoCommitRetries::new(None);
                 assert_eq!(
-                    retry_auto_commit(&mut conflicts, &mut expired, &error).await,
+                    retries.retry(&error).await,
                     marker.is_none() && code != LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
                 );
                 if marker.is_some() {
-                    assert_eq!(conflicts, 0);
+                    assert_eq!(retries.attempts, 0);
                 }
             }
         }
@@ -4882,10 +5109,9 @@ mod tests {
                 error.details.as_ref().unwrap()["nonRetryableAfterCommit"],
                 true
             );
-            let mut conflicts = 0;
-            let mut expired = ExpiredReadRetryState::default();
-            assert!(!retry_auto_commit(&mut conflicts, &mut expired, &error).await);
-            assert_eq!(conflicts, 0);
+            let mut retries = AutoCommitRetries::new(None);
+            assert!(!retries.retry(&error).await);
+            assert_eq!(retries.attempts, 0);
             drop(session);
             drop(engine);
             let reopened = Engine::new(storage).await.unwrap();
@@ -12944,7 +13170,7 @@ mod assume_send_future_proofs_borrowing {
 pub(crate) async fn prepare_partial_candidate_read_scope<StorageImpl>(
     read: StorageAdapterReadScope<StorageImpl::Read<'_>>,
     state: &crate::sync::PartialReplicaState,
-    interests: &crate::hot_state::ReadInterestSnapshot,
+    interests: &crate::hot_state::MovingReadInterestSnapshot,
     plugin_host: crate::plugin::runtime::PluginRuntimeHost,
     hot: crate::hot_state::HotStateContext,
     allow_missing_selected_control: bool,
@@ -12962,22 +13188,6 @@ where
             allow_missing_selected_control,
         )
         .await
-    })
-    .await
-}
-
-/// Keep the authority snapshot alive until all recorded candidate reads finish.
-pub(crate) async fn collect_partial_working_set_read_scope<StorageImpl>(
-    read: StorageAdapterReadScope<StorageImpl::Read<'_>>,
-    state: &crate::sync::PartialReplicaState,
-    interests: &crate::hot_state::ReadInterestSnapshot,
-    plugin_host: crate::plugin::runtime::PluginRuntimeHost,
-) -> Result<crate::sync::WorkingSetBundle, LixError>
-where
-    StorageImpl: Storage + 'static,
-{
-    with_static_session_sql_read::<StorageImpl, _, _, _>(read, |read| async move {
-        crate::sync::collect_working_set(read, state, interests, plugin_host).await
     })
     .await
 }

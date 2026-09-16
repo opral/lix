@@ -184,6 +184,96 @@ async fn prepare_hydrating_with_deadline<
 }
 
 #[tokio::test]
+async fn unavailable_historical_recipe_does_not_block_moving_negative_scope() {
+    let (authority, engine, session, old) = fixture().await;
+    let storage = engine.storage();
+    let sql = "SELECT value FROM lix_key_value WHERE key='future-history-independent'";
+    assert!(
+        execute_hydrating(
+            &session,
+            &storage,
+            &old,
+            &authority,
+            sql,
+            &[],
+            &mut Fetches::default()
+        )
+        .await
+        .unwrap()
+        .rows()
+        .is_empty()
+    );
+    let history_sql = format!(
+        "SELECT * FROM lix_diff('lix_key_value', '{}', '{}')",
+        old.descriptor().selected_branch.checkpoint.commit_id,
+        old.descriptor().selected_branch.head.commit_id,
+    );
+    let history = execute_hydrating(
+        &session,
+        &storage,
+        &old,
+        &authority,
+        &history_sql,
+        &[],
+        &mut Fetches::default(),
+    )
+    .await
+    .unwrap();
+    let registry = engine.sync_mode().read_interests().unwrap();
+    let historical = crate::hot_state::LogicalReadInterest::Diff {
+        branch_id: Some(old.descriptor().selected_branch.branch_id.clone()),
+        relation: "lix_key_value".into(),
+        from: crate::hot_state::DiffInterestEndpoint::Fixed(uuid::Uuid::now_v7().to_string()),
+        to: crate::hot_state::DiffInterestEndpoint::Fixed(uuid::Uuid::now_v7().to_string()),
+        filter: Default::default(),
+        retain_payloads: true,
+        projected_columns: vec!["value".into()],
+        limit: None,
+    };
+    // Model a successfully retained historical read whose endpoints no longer
+    // exist at the authority. Replaying it would request unavailable history.
+    registry.register(historical.clone()).unwrap();
+    crate::sync::partial_interest_journal::flush_partial_read_interests(&storage, &old, &registry)
+        .await
+        .unwrap();
+    authority
+        .execute(
+            "INSERT INTO lix_key_value (key,value) VALUES ('future-history-independent','arrived')",
+            &[],
+        )
+        .await
+        .unwrap();
+    let next = Arc::new(
+        old.with_descriptor_and_fresh_generations(
+            authority.partial_replica_descriptor(None).await.unwrap(),
+        )
+        .unwrap(),
+    );
+    let prepared = prepare_hydrating(&engine, &old, next.clone(), &authority).await;
+    publish_prepared_partial(engine.clone(), prepared)
+        .await
+        .unwrap();
+    assert!(value(session.execute(sql, &[]).await.unwrap()).contains("arrived"));
+    assert_eq!(
+        session.execute(&history_sql, &[]).await.unwrap().rows(),
+        history.rows(),
+        "immutable historical reads remain available without network after publication"
+    );
+    assert!(
+        registry
+            .snapshot()
+            .unwrap()
+            .interests
+            .iter()
+            .any(|recipe| recipe.as_ref() == &historical)
+    );
+    assert_eq!(
+        engine.sync_mode().partial_admission().as_deref(),
+        Some(next.as_ref())
+    );
+}
+
+#[tokio::test]
 async fn remote_publication_prepares_negative_scope_then_keeps_reads_local() {
     let (authority, engine, session, old) = fixture().await;
     let storage = engine.storage();

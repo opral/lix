@@ -761,7 +761,7 @@ test("openLix exposes the lix-sdk e2e flow", async () => {
 			modified: 1,
 			removed: 0,
 		},
-		conflicts: [],
+
 	});
 	expect(await taskDone(lix, "task-1")).toBe(false);
 
@@ -2060,7 +2060,7 @@ test("same-row merges use host column LWW without conflict details", async () =>
 	]);
 
 	const preview = await lix.mergeBranchPreview({ sourceBranchId: draft.id });
-	expect(preview.conflicts).toHaveLength(0);
+	expect(preview).not.toHaveProperty("conflicts");
 
 	await lix.mergeBranch({ sourceBranchId: draft.id });
 	const merged = await lix.execute(

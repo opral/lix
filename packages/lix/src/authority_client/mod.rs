@@ -56,6 +56,7 @@ const MAX_COMPRESSED_BODY_RATIO: f64 = 0.9;
 #[derive(Debug, Clone, Default)]
 pub struct ProtocolExecuteOptions {
     pub origin_key: Option<String>,
+    pub max_auto_commit_retries: Option<u32>,
     pub idempotency_key: Option<String>,
 }
 
@@ -372,14 +373,15 @@ impl<H: ProtocolHttp> ClientCore<H> {
                 cache_updates: Vec::new(),
             }
         };
-        let request_options = options.as_ref().and_then(|options| {
-            options
-                .origin_key
-                .as_ref()
-                .map(|origin_key| ExecuteOptionsBody {
-                    origin_key: Some(origin_key.clone()),
-                })
-        });
+        let request_options = options
+            .as_ref()
+            .filter(|options| {
+                options.origin_key.is_some() || options.max_auto_commit_retries.is_some()
+            })
+            .map(|options| ExecuteOptionsBody {
+                origin_key: options.origin_key.clone(),
+                max_auto_commit_retries: options.max_auto_commit_retries,
+            });
         let mut headers = extra_headers.unwrap_or_default();
         if cache_blobs {
             headers.push((
@@ -443,14 +445,15 @@ impl<H: ProtocolHttp> ClientCore<H> {
         let has_delta = prepared
             .iter()
             .any(|(_, _, item)| request_params_have_delta(&item.params));
-        let request_options = options.as_ref().and_then(|options| {
-            options
-                .origin_key
-                .as_ref()
-                .map(|origin_key| ExecuteOptionsBody {
-                    origin_key: Some(origin_key.clone()),
-                })
-        });
+        let request_options = options
+            .as_ref()
+            .filter(|options| {
+                options.origin_key.is_some() || options.max_auto_commit_retries.is_some()
+            })
+            .map(|options| ExecuteOptionsBody {
+                origin_key: options.origin_key.clone(),
+                max_auto_commit_retries: options.max_auto_commit_retries,
+            });
         let headers = vec![(
             IDEMPOTENCY_KEY_HEADER.to_owned(),
             idempotency_key(options.as_ref())?,
@@ -991,14 +994,15 @@ impl<H: ProtocolHttp> ProtocolTransaction<H> {
         self.core
             .enqueue(|| async {
                 self.assert_active()?;
-                let request_options = options.as_ref().and_then(|options| {
-                    options
-                        .origin_key
-                        .as_ref()
-                        .map(|origin_key| ExecuteOptionsBody {
-                            origin_key: Some(origin_key.clone()),
-                        })
-                });
+                let request_options = options
+                    .as_ref()
+                    .filter(|options| {
+                        options.origin_key.is_some() || options.max_auto_commit_retries.is_some()
+                    })
+                    .map(|options| ExecuteOptionsBody {
+                        origin_key: options.origin_key.clone(),
+                        max_auto_commit_retries: options.max_auto_commit_retries,
+                    });
                 let body = ExecuteRequestBody {
                     sql: sql.to_owned(),
                     params: encode_engine_values(params)?,

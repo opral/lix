@@ -8,7 +8,8 @@
 //!
 //! MVP boundary: session close can cancel queued or pre-boundary writes until
 //! the storage commit point-of-no-return. After that point, close waits for
-//! commit completion. Crash persistence is provider-defined.
+//! commit completion. Persistent writes await the backend durability boundary
+//! by default; repository handles can explicitly select buffered acknowledgement.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -55,8 +56,7 @@ pub(crate) use idempotency::{
 pub(crate) use media_upload::FileUploadProgress;
 pub use merge::{
     MergeBranchOptions, MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions,
-    MergeBranchReceipt, MergeChangeStats, MergeConflict, MergeConflictChangeKind,
-    MergeConflictKind, MergeConflictSide,
+    MergeBranchReceipt, MergeChangeStats,
 };
 pub use observe::ObserveEvent;
 pub(crate) use observe::ObserveEvents as SessionObserveEvents;
@@ -193,9 +193,7 @@ pub(crate) mod borrowing_proof_storage {
 
 pub(crate) use media_upload::{export_recoverable_uploads, has_recoverable_uploads};
 
-pub(crate) use execute::{
-    collect_partial_working_set_read_scope, prepare_partial_candidate_read_scope,
-};
+pub(crate) use execute::prepare_partial_candidate_read_scope;
 
 pub(crate) use merge::{
     MergeAnalysis, analyze_incoming_rows, stage_merge_native_heads, stage_native_change_application,

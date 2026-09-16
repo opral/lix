@@ -3,8 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::{CommitSpan, ExecuteResult, LixError, LixNotice, ResultColumnType, Value, WireValue};
 use crate::{
     MergeBranchOptions, MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions,
-    MergeBranchReceipt, MergeChangeStats, MergeConflict, MergeConflictChangeKind,
-    MergeConflictKind, MergeConflictSide, RowRef,
+    MergeBranchReceipt, MergeChangeStats,
 };
 
 pub const SERVER_PROTOCOL_VERSION: u32 = crate::SERVER_PROTOCOL_VERSION;
@@ -29,6 +28,8 @@ pub struct HandshakeResponse {
 pub struct ExecuteOptionsBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_auto_commit_retries: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -317,7 +318,6 @@ pub(crate) struct MergeBranchPreviewResponseBody {
     pub target_head_commit_id: String,
     pub source_head_commit_id: String,
     pub change_stats: MergeChangeStatsBody,
-    pub conflicts: Vec<MergeConflictBody>,
 }
 
 impl From<MergeBranchPreview> for MergeBranchPreviewResponseBody {
@@ -330,7 +330,6 @@ impl From<MergeBranchPreview> for MergeBranchPreviewResponseBody {
             target_head_commit_id: value.target_head_commit_id,
             source_head_commit_id: value.source_head_commit_id,
             change_stats: value.change_stats.into(),
-            conflicts: value.conflicts.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -345,7 +344,6 @@ impl From<MergeBranchPreviewResponseBody> for MergeBranchPreview {
             target_head_commit_id: value.target_head_commit_id,
             source_head_commit_id: value.source_head_commit_id,
             change_stats: value.change_stats.into(),
-            conflicts: value.conflicts.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -405,118 +403,6 @@ impl From<MergeChangeStatsBody> for MergeChangeStats {
             added: value.added,
             modified: value.modified,
             removed: value.removed,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct MergeConflictBody {
-    pub kind: MergeConflictKindBody,
-    pub row_ref: RowRef,
-    pub file_id: Option<String>,
-    pub target: MergeConflictSideBody,
-    pub source: MergeConflictSideBody,
-}
-
-impl From<MergeConflict> for MergeConflictBody {
-    fn from(value: MergeConflict) -> Self {
-        Self {
-            kind: value.kind.into(),
-            row_ref: value.row_ref,
-            file_id: value.file_id,
-            target: value.target.into(),
-            source: value.source.into(),
-        }
-    }
-}
-
-impl From<MergeConflictBody> for MergeConflict {
-    fn from(value: MergeConflictBody) -> Self {
-        Self {
-            kind: value.kind.into(),
-            row_ref: value.row_ref,
-            file_id: value.file_id,
-            target: value.target.into(),
-            source: value.source.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum MergeConflictKindBody {
-    SameRowChanged,
-}
-
-impl From<MergeConflictKind> for MergeConflictKindBody {
-    fn from(value: MergeConflictKind) -> Self {
-        match value {
-            MergeConflictKind::SameRowChanged => Self::SameRowChanged,
-        }
-    }
-}
-
-impl From<MergeConflictKindBody> for MergeConflictKind {
-    fn from(value: MergeConflictKindBody) -> Self {
-        match value {
-            MergeConflictKindBody::SameRowChanged => Self::SameRowChanged,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct MergeConflictSideBody {
-    pub kind: MergeConflictChangeKindBody,
-    pub before_change_id: Option<String>,
-    pub after_change_id: Option<String>,
-}
-
-impl From<MergeConflictSide> for MergeConflictSideBody {
-    fn from(value: MergeConflictSide) -> Self {
-        Self {
-            kind: value.kind.into(),
-            before_change_id: value.before_change_id,
-            after_change_id: value.after_change_id,
-        }
-    }
-}
-
-impl From<MergeConflictSideBody> for MergeConflictSide {
-    fn from(value: MergeConflictSideBody) -> Self {
-        Self {
-            kind: value.kind.into(),
-            before_change_id: value.before_change_id,
-            after_change_id: value.after_change_id,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum MergeConflictChangeKindBody {
-    Added,
-    Modified,
-    Removed,
-}
-
-impl From<MergeConflictChangeKind> for MergeConflictChangeKindBody {
-    fn from(value: MergeConflictChangeKind) -> Self {
-        match value {
-            MergeConflictChangeKind::Added => Self::Added,
-            MergeConflictChangeKind::Modified => Self::Modified,
-            MergeConflictChangeKind::Removed => Self::Removed,
-        }
-    }
-}
-
-impl From<MergeConflictChangeKindBody> for MergeConflictChangeKind {
-    fn from(value: MergeConflictChangeKindBody) -> Self {
-        match value {
-            MergeConflictChangeKindBody::Added => Self::Added,
-            MergeConflictChangeKindBody::Modified => Self::Modified,
-            MergeConflictChangeKindBody::Removed => Self::Removed,
         }
     }
 }

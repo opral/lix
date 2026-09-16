@@ -8,6 +8,10 @@
 //! Platform-specific code is limited to tasks, timers, HTTP, and
 //! cancellation.
 
+mod health;
+pub(crate) use health::SyncHealthTracker;
+pub use health::{SyncFailure, SyncHealth, SyncHealthState, SyncPhase};
+
 mod partial_attempt_restart;
 pub(crate) use partial_attempt_restart::{
     PARTIAL_ATTEMPT_RESTART_SPACE, PartialAttemptRestartOutcome, PartialAttemptRestartReceipt,
@@ -27,9 +31,14 @@ mod contract;
 mod current_coverage;
 mod http;
 pub(crate) mod native_metadata;
-pub(crate) use native_metadata::{key as native_metadata_storage_key, space as native_metadata_storage_space};
-pub(crate) use native_metadata::{MAX_NATIVE_METADATA_RESPONSE_BYTES, NativeMetadataRequest};
+#[cfg(feature = "server-protocol")]
+pub(crate) use native_metadata::MAX_NATIVE_METADATA_RESPONSE_BYTES;
+pub(crate) use native_metadata::NativeMetadataRequest;
+pub(crate) use native_metadata::{
+    key as native_metadata_storage_key, space as native_metadata_storage_space,
+};
 pub(crate) mod native_object;
+#[cfg(feature = "server-protocol")]
 pub(crate) use native_object::MAX_NATIVE_OBJECT_RESPONSE_BYTES;
 pub(crate) mod native_object_range;
 pub(crate) use native_object_range::NativeObjectRangeRequest;
@@ -67,16 +76,9 @@ pub(crate) use partial_merge_protocol::{
 };
 pub(crate) use partial_merge_state::PARTIAL_BRANCH_MERGE_SPACE;
 mod partial_reconcile;
-mod partial_update;
-mod partial_working_set;
 pub(crate) use partial_interest_journal::{
     PARTIAL_READ_INTEREST_SPACE, flush_partial_read_interests,
 };
-pub(crate) use partial_update::{
-    MAX_PARTIAL_UPDATE_REQUEST_BYTES, MAX_PARTIAL_UPDATE_RESPONSE_BYTES, PartialUpdateRequest,
-    PartialUpdateResponse,
-};
-pub(crate) use partial_working_set::{WorkingSetBundle, collect_working_set};
 mod leased_descriptor;
 mod partial_replica;
 pub(crate) use leased_descriptor::{LeasedPartialReplicaDescriptor, MAX_LEASED_DESCRIPTOR_BYTES};
@@ -100,10 +102,11 @@ pub(crate) use partial_state::{
     partial_replica_state_key,
 };
 mod platform;
-pub(crate) use partial_replica::{
-    MAX_PARTIAL_REPLICA_DESCRIPTOR_BYTES, PARTIAL_REPLICA_DESCRIPTOR_VERSION,
-    PartialReplicaDescriptor,
-};
+pub(crate) use partial_replica::PartialReplicaDescriptor;
+#[cfg(test)]
+pub(crate) use partial_replica::MAX_PARTIAL_REPLICA_DESCRIPTOR_BYTES;
+#[cfg(all(test, feature = "server-protocol"))]
+pub(crate) use partial_replica::PARTIAL_REPLICA_DESCRIPTOR_VERSION;
 mod protocol;
 mod recovery;
 mod repository;
@@ -129,9 +132,9 @@ use parking_lot::RwLock;
 
 #[cfg(feature = "server-protocol")]
 pub(crate) use blob::validate_sync_blob_manifest;
-pub(crate) use bootstrap::{
-    install_sync_bootstrap, prepare_sync_bootstrap, rebuild_replica_candidate,
-};
+pub(crate) use bootstrap::rebuild_replica_candidate;
+#[cfg(all(test, feature = "server-protocol"))]
+pub(crate) use bootstrap::{install_sync_bootstrap, prepare_sync_bootstrap};
 pub(crate) use commit::{
     SYNC_CHECKPOINT_SOURCE_SPACE, SYNC_MATERIALIZED_STATE_ALIAS_SPACE,
     load_complete_state_alias_source, stage_delete_materialized_sync_state_alias,
@@ -189,7 +192,8 @@ pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 // SDK and server must upgrade together.
 // v15 requires format81 and explicit repository/principal admission.
 // v16 fences active abandoned attempts before automatic authoritative recovery.
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 16;
+// v17 removes recipe-driven updates; progress discovery uses leased descriptors.
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 17;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str = "LIX_SYNC_REPOSITORY_ID_MISMATCH";
@@ -329,6 +333,7 @@ impl SyncRole {
 /// not a durable coverage receipt or permission to publish remote roots.
 #[derive(Clone, Debug)]
 pub(crate) struct SyncModeState {
+    health: SyncHealthTracker,
     role: Arc<AtomicU8>,
     replica_remote_id: Arc<RwLock<Option<Arc<str>>>>,
     partial_admission: Arc<RwLock<Option<Arc<PartialReplicaState>>>>,
@@ -340,6 +345,7 @@ pub(crate) struct SyncModeState {
 impl Default for SyncModeState {
     fn default() -> Self {
         Self {
+            health: SyncHealthTracker::default(),
             role: Arc::new(AtomicU8::new(SyncRole::Disabled as u8)),
             replica_remote_id: Arc::new(RwLock::new(None)),
             partial_admission: Arc::new(RwLock::new(None)),
@@ -351,6 +357,9 @@ impl Default for SyncModeState {
 }
 
 impl SyncModeState {
+    pub(crate) fn health(&self) -> SyncHealthTracker {
+        self.health.clone()
+    }
     pub(crate) fn read_interests(&self) -> Option<Arc<crate::hot_state::ReadInterestRegistry>> {
         self.read_interests.read().clone()
     }

@@ -63,6 +63,7 @@ These are the named categories defined on [LixError](../packages/lix/src/common/
 | `LIX_UNSUPPORTED_SQL` | SQL syntax is valid, but the feature is intentionally outside the Lix SQL surface. |
 | `LIX_UNSUPPORTED_SQL_RUNTIME_PLAN` | SQL planning succeeded far enough to produce a physical runtime shape that the current engine target cannot execute safely. |
 | `LIX_STORAGE_ERROR` | Storage I/O failed. |
+| `LIX_STORAGE_IN_USE` | Another owner holds exclusive access to the repository. Use that owner or close it before reopening. |
 | `LIX_STORAGE_READ_EXPIRED` | A coherent storage read was invalidated by a concurrent commit. Auto-commit read surfaces consume this internally by reopening the complete read/query against a fresh snapshot. |
 | `LIX_STORAGE_DURABILITY_UNAVAILABLE` | The selected storage cannot prove the requested persistence boundary. |
 | `LIX_INVALID_SNAPSHOT` | A snapshot is malformed, unsupported, truncated, or fails integrity verification. |
@@ -88,7 +89,7 @@ These are the named categories defined on [LixError](../packages/lix/src/common/
 | `LIX_RESERVED_SCHEMA_NAMESPACE` | A public runtime schema registration attempted to use the `lix_*` namespace reserved for schemas owned and bootstrapped by Lix. |
 | `LIX_ERROR_CLOSED` | The logical Lix handle/session has been closed and cannot run further operations. Close is a resource-release lifecycle boundary, not a durability boundary. |
 | `LIX_INVALID_SESSION_STATE` | An operation is incompatible with the current session mode or state. |
-| `LIX_MERGE_CONFLICT` | A merge found incompatible changes to the same tracked-state identity. |
+| `LIX_MERGE_CONFLICT` | Plugin ownership or generations are incompatible, or a tracked change collides with an untracked row. Ordinary overlapping row edits reconcile automatically. |
 | `LIX_BRANCH_NOT_FOUND` | A caller referenced a branch id that has no matching branch ref. |
 | `LIX_COMMIT_NOT_FOUND` | A caller referenced a commit id that has no matching commit record. |
 | `LIX_ERROR_INVALID_STORAGE_SCOPE` | A staged row's storage scope flags disagree, such as a global row not using the reserved global branch id. |

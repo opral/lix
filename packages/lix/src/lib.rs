@@ -32,7 +32,7 @@
     )
 )]
 
-pub const SERVER_PROTOCOL_VERSION: u32 = 10;
+pub const SERVER_PROTOCOL_VERSION: u32 = 11;
 /// Current persisted repository format. Old stores require explicit migration.
 #[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
 pub const CURRENT_STORAGE_FORMAT_VERSION: u32 = init::CURRENT_FORMAT_VERSION;
@@ -123,6 +123,7 @@ mod server_protocol;
 mod session;
 #[doc(hidden)]
 mod sync;
+pub use sync::{SyncFailure, SyncHealth, SyncHealthState, SyncPhase};
 pub(crate) mod sql2;
 #[cfg(feature = "storage-benches")]
 mod sql_profile;
@@ -161,6 +162,7 @@ pub use plugin::runtime::default::runtime as default_wasm_runtime;
 mod lifecycle;
 pub use lifecycle::{create_lix, delete_lix, CreateLixBuilder, DeleteLixBuilder, HostedLix};
 pub use handle::{
+    Durability,
     CallbackOpenProgressSink, ExecuteBatchBuilder, ExecuteBuilder, Lix, LixTransaction,
     ObserveEvents, OpenAnotherSessionBuilder, OpenLixBuilder, OpenLixFromSnapshotBuilder,
     ServerOptions, TransactionExecuteBuilder, UnconfiguredOpenLixBuilder, RemoteOpenLixBuilder,
@@ -198,8 +200,7 @@ pub(crate) use common::{parse_row_metadata_value, serialize_row_metadata};
 pub use session::{
     CreateBranchOptions, CreateBranchReceipt, MergeBranchOptions,
     MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
-    MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
-    RedoReceipt, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt,
+    MergeChangeStats, RedoReceipt, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt,
 };
 pub use session::{
     CommitReceipt, CommitSpan, ExecuteBatchResult, ExecuteBatchStatement, ExecuteResult, ObserveEvent, ResultRowRef, Row,

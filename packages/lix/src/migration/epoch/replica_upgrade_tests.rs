@@ -148,6 +148,9 @@ fn serve_request(
     runtime: &tokio::runtime::Handle,
     fail: &AtomicBool,
 ) -> std::io::Result<()> {
+    // Darwin inherits the listener's nonblocking flag on accepted sockets.
+    // This fixture uses blocking read_exact, including when bytes arrive later.
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let mut header = Vec::new();
     while !header.ends_with(b"\r\n\r\n") {

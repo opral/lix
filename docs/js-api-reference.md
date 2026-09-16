@@ -152,6 +152,23 @@ await storage.syncDiskToLix();
 
 ## Lix instance
 
+### syncHealth()
+
+```ts
+const health = await lix.syncHealth();
+// { state, appliedCursor, observedCursor, failures, terminalError }
+```
+
+Returns the local partial-replica worker's health without querying SQL or fetching
+remote data. `state` is `inactive`, `running`, `stalled`, `failed`, or `stopped`.
+`failures` holds independent `descriptor`, `publication`, `upload`, and `lease`
+errors, each with a `code` and `message`. `terminalError` describes a failed
+worker. Cursors and terminal errors are `null` when unavailable.
+
+Successful local reads do not clear sync failures. `running` means no known
+worker failure, not guaranteed server freshness. Other modes report `inactive`.
+Call this method before closing the JavaScript session.
+
 ### execute()
 
 ```ts
@@ -193,6 +210,7 @@ type SqlParam = JsonValue | Uint8Array | Value;
 
 | Option           | Type     | Description                                                                                                                                                                                                                                                                       |
 | ---------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `maxAutoCommitRetries` | `number` | Maximum automatic transaction replays after the initial attempt. `0` fails fast; omit to retain default recovery budgets. |
 | `originKey`      | `string` | Optional origin label for the mutation.                                                                                                                                                                                                                                           |
 | `idempotencyKey` | `string` | Stable identity for one logical remote SQL mutation. This is the retry story: supply the same key when retrying after a lost response, and the server applies the mutation only once. Remote Lix generates one per call when omitted. Sent as `Idempotency-Key`, not SQL options. |
 | `rowMode`        | `"object" \| "array"` | Return plain objects by default or positional arrays when duplicate column names must remain separately addressable. |
@@ -240,7 +258,7 @@ const { results, commit } = await lix.executeBatch(statements, options?);
 Executes multiple statements atomically in one call. Returns `{ results, commit }`: one statement-result array and one commit span for the whole transaction. Read-only batches return `commit: null`; individual results have no `commit` field. `statements` is a non-empty
 array of `{ sql, params?, label? }` objects — one statement per entry, already
 split by the caller. Lix does not parse a multi-statement script. `options`
-accepts the same `originKey` and `idempotencyKey` as `execute()`. Results
+accepts the same `originKey`, `idempotencyKey`, and `maxAutoCommitRetries` as `execute()`. Results
 preserve input order and include a zero-based `statementIndex`. A supplied label
 is echoed unchanged; labels are opaque and may repeat. If a label is omitted,
 the result has no `label` property.
@@ -319,11 +337,41 @@ retry. A successfully planned update or delete retains this check if it matches
 no rows or subsequently fails and the transaction continues with other writes.
 
 Rows returned by `RETURNING` inside a transaction are provisional. Report a
-publication as successful only after `commit()` succeeds. Ordinary local
-`execute()` and `executeBatch()` automatically retry transaction conflicts a
-bounded number of times by rerunning the statements; they can still return a
-conflict if contention persists. This check does not provide general serializable
-isolation for arbitrary reads or cross-branch dependencies.
+publication as successful only after `commit()` succeeds. Automatic `execute()`
+and `executeBatch()` can rerun the whole statement or batch after a known failed
+transaction. Explicit transactions remain caller-controlled.
+
+Set `maxAutoCommitRetries` to cap these replays across both transaction contention
+and expired transaction snapshots. The initial attempt does not count; `0`
+returns the first failure without re-executing the transaction. When omitted,
+Lix permits up to 16 contention retries and separately bounds expired-snapshot
+recovery by its existing time budget. An explicit cap cannot extend that expiry
+budget. This option does not control pure-read recovery, idempotency receipt
+lookups, or network retries.
+
+```ts
+await lix.execute(sql, params, { maxAutoCommitRetries: 0 });
+await lix.executeBatch(statements, { maxAutoCommitRetries: 2 });
+```
+
+Rust callers use `.with_max_auto_commit_retries(0)` on `lix.execute(...)` or
+`lix.execute_batch(...)`, including remote handles.
+
+Re-execution reevaluates predicates against current state. An update guarded by
+an expected revision may therefore succeed with **zero affected rows** after a
+retry; check `rowsAffected` as well as commit success. Retries do not provide
+general serializable isolation for arbitrary reads or cross-branch dependencies.
+
+Lix never automatically re-executes an unknown commit outcome or an operation
+marked as having completed execution/publication. Remote mutation recovery first
+looks up its idempotency receipt: a durable matching receipt replays the saved
+result; a known transaction conflict with no receipt may retry with the same
+identity. Absence after an unknown outcome is not proof that the write failed.
+
+Errors exiting the automatic transaction retry loop retain their code and details
+and add `autoCommitRetryCount` and `autoCommitRetryStopReason`; an explicit cap is
+included as `maxAutoCommitRetries`. Debug tracing records each replay and its
+error code. The count covers re-executions, not receipt lookups or transport work.
 
 Unconditional `INSERT ... ON CONFLICT DO UPDATE` file saves and explicit branch
 merges retain their collaboration semantics. Use `UPDATE ... WHERE` with an
@@ -471,7 +519,6 @@ type MergeBranchPreview = {
   targetHeadCommitId: string;
   sourceHeadCommitId: string;
   changeStats: MergeChangeStats;
-  conflicts: MergeConflict[];
 };
 ```
 
@@ -509,24 +556,6 @@ type MergeChangeStats = {
   added: number;
   modified: number;
   removed: number;
-};
-```
-
-`MergeConflict`:
-
-```ts
-type MergeConflict = {
-  kind: "sameRowChanged";
-  rowRef: string;
-  fileId: string | null;
-  target: MergeConflictSide;
-  source: MergeConflictSide;
-};
-
-type MergeConflictSide = {
-  kind: "added" | "modified" | "removed";
-  beforeChangeId: string | null;
-  afterChangeId: string | null;
 };
 ```
 

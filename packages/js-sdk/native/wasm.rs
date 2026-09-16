@@ -417,6 +417,7 @@ pub async fn open_memory(
     server: Option<JsValue>,
     open_progress_dispatch: Option<Function>,
     component_dispatch: Function,
+    durability: Option<String>,
 ) -> Result<WasmLix, JsValue> {
     open_browser_storage(
         BrowserStorage::Memory(Memory::new()),
@@ -426,6 +427,7 @@ pub async fn open_memory(
         server,
         open_progress_dispatch,
         component_dispatch,
+        durability,
     )
     .await
 }
@@ -436,6 +438,7 @@ pub fn open_memory_from_snapshot(
     telemetry_parent: Option<JsValue>,
     open_progress_dispatch: Option<Function>,
     component_dispatch: Function,
+    durability: Option<String>,
 ) -> WasmSnapshotRestore {
     let (input, receiver) = async_channel::bounded(1);
     let source = WasmSnapshotReader::new(receiver);
@@ -447,6 +450,7 @@ pub fn open_memory_from_snapshot(
         None,
         open_progress_dispatch,
         component_dispatch,
+        durability,
     );
     let (result_sender, result) = async_channel::bounded(1);
     let complete = Rc::new(Cell::new(false));
@@ -471,6 +475,7 @@ pub async fn open_js_storage(
     server: Option<JsValue>,
     open_progress_dispatch: Option<Function>,
     component_dispatch: Function,
+    durability: Option<String>,
 ) -> Result<WasmLix, JsValue> {
     let storage = JsStorage::new(provider);
     let browser_storage = BrowserStorage::Js(storage);
@@ -482,6 +487,7 @@ pub async fn open_js_storage(
         server,
         open_progress_dispatch,
         component_dispatch,
+        durability,
     )
     .await
     {
@@ -500,6 +506,7 @@ pub fn open_js_storage_from_snapshot(
     telemetry_parent: Option<JsValue>,
     open_progress_dispatch: Option<Function>,
     component_dispatch: Function,
+    durability: Option<String>,
 ) -> WasmSnapshotRestore {
     let storage = JsStorage::new(provider);
     let browser_storage = BrowserStorage::Js(storage);
@@ -515,6 +522,7 @@ pub fn open_js_storage_from_snapshot(
             None,
             open_progress_dispatch,
             component_dispatch,
+            durability,
         )
         .await
         {
@@ -548,7 +556,9 @@ async fn open_browser_storage(
     server: Option<JsValue>,
     open_progress_dispatch: Option<Function>,
     component_dispatch: Function,
+    durability: Option<String>,
 ) -> Result<WasmLix, JsValue> {
+    let durability = crate::parse_durability(durability.as_deref()).map_err(lix_error_to_js)?;
     console_error_panic_hook::set_once();
     let telemetry_parent = telemetry_parent
         .map(|value| {
@@ -610,11 +620,12 @@ async fn open_browser_storage(
         None => None,
     };
     let open = async {
-        let mut builder = open_lix().with_storage(storage.clone()).with_wasm_runtime(
-            crate::component_runtime::runtime(crate::component_runtime::platform::create(
-                component_dispatch,
-            )),
-        );
+        let mut builder = open_lix()
+            .with_storage(storage.clone())
+            .with_durability(durability)
+            .with_wasm_runtime(crate::component_runtime::runtime(
+                crate::component_runtime::platform::create(component_dispatch),
+            ));
         if let Some(telemetry) = telemetry {
             builder = builder.with_telemetry(telemetry);
         }
@@ -1276,7 +1287,6 @@ struct MergeBranchPreviewDto {
     target_head_commit_id: String,
     source_head_commit_id: String,
     change_stats: MergeChangeStatsDto,
-    conflicts: Vec<MergeConflictDto>,
 }
 
 impl From<lix::MergeBranchPreview> for MergeBranchPreviewDto {
@@ -1289,7 +1299,6 @@ impl From<lix::MergeBranchPreview> for MergeBranchPreviewDto {
             target_head_commit_id: preview.target_head_commit_id,
             source_head_commit_id: preview.source_head_commit_id,
             change_stats: preview.change_stats.into(),
-            conflicts: preview.conflicts.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -1317,51 +1326,6 @@ impl From<lix::MergeChangeStats> for MergeChangeStatsDto {
             added: stats.added,
             modified: stats.modified,
             removed: stats.removed,
-        }
-    }
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MergeConflictDto {
-    kind: &'static str,
-    row_ref: String,
-    file_id: Option<String>,
-    target: MergeConflictSideDto,
-    source: MergeConflictSideDto,
-}
-
-impl From<lix::MergeConflict> for MergeConflictDto {
-    fn from(conflict: lix::MergeConflict) -> Self {
-        Self {
-            kind: "sameRowChanged",
-            row_ref: conflict.row_ref.to_string(),
-            file_id: conflict.file_id,
-            target: conflict.target.into(),
-            source: conflict.source.into(),
-        }
-    }
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MergeConflictSideDto {
-    kind: &'static str,
-    before_change_id: Option<String>,
-    after_change_id: Option<String>,
-}
-
-impl From<lix::MergeConflictSide> for MergeConflictSideDto {
-    fn from(side: lix::MergeConflictSide) -> Self {
-        let kind = match side.kind {
-            lix::MergeConflictChangeKind::Added => "added",
-            lix::MergeConflictChangeKind::Modified => "modified",
-            lix::MergeConflictChangeKind::Removed => "removed",
-        };
-        Self {
-            kind,
-            before_change_id: side.before_change_id,
-            after_change_id: side.after_change_id,
         }
     }
 }

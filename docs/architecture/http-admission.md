@@ -8,10 +8,10 @@ Finite remote SQL protocol responses have a 16 MiB response budget; observations
 
 ## Metadata operation
 
-`GET /lix/v1/{repository UUID}/admission` (normalized from the public `/lix/{UUID}` locator), with `lix-sync-protocol-version: 16`, returns authenticated metadata:
+`GET /lix/v1/{repository UUID}/admission` (normalized from the public `/lix/{UUID}` locator), with `lix-sync-protocol-version: 17`, returns authenticated metadata:
 
 ```
-{ repositoryId, principalId, protocolEpoch: 16, storageEpoch: 81 }
+{ repositoryId, principalId, protocolEpoch: 17, storageEpoch: 81 }
 ```
 
 The gateway authenticates and authorizes the request. For current storage, the reference host reads durable catalog metadata without opening an engine or scanning repository contents. An older saved transport epoch does not require a storage migration: the running server supplies the current protocol epoch. Older storage or missing admission metadata starts the server's shared, owned repository opener. That opener inspects the existing authority, migrates supported older storage with retained source banks and storage fencing, and publishes current admission metadata without changing repository identity or physical storage mapping. Requests wait briefly, then return a typed in-progress response if migration is still running. No SQL session is created by admission. Unsupported newer formats and failed preservation checks remain errors. Principal IDs follow the host's bounded opaque-account contract (1–255 visible ASCII characters). The stable repository ID must match the requested repository.

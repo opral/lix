@@ -138,6 +138,20 @@ pub(crate) enum LogicalReadInterest {
     },
 }
 impl LogicalReadInterest {
+    /// Immutable historical recipes retain already fetched inputs but do not
+    /// need reevaluation when a branch advances. A diff with either moving
+    /// endpoint still depends on the candidate basis, including negative reads.
+    fn follows_branch_state(&self) -> bool {
+        !matches!(
+            self,
+            Self::Diff {
+                from: DiffInterestEndpoint::Fixed(_),
+                to: DiffInterestEndpoint::Fixed(_),
+                ..
+            }
+        )
+    }
+
     pub(crate) fn scan(request: &HotStateScanRequest, domain: HotStateReadDomain) -> Self {
         Self::Scan {
             request: request.clone(),
@@ -189,6 +203,21 @@ pub(crate) struct ReadInterestSnapshot {
     pub(crate) revision: u64,
     pub(crate) interests: Vec<Arc<LogicalReadInterest>>,
     pub(crate) serialized_bytes: usize,
+}
+/// Retained requirements that must stay warm as the branch basis moves.
+/// This is not an observer subscription: successful moving reads remain in the
+/// durable working set even after their originating operation has completed.
+/// The private inner snapshot prevents passing historical retention inventory
+/// directly to candidate publication.
+#[derive(Clone)]
+pub(crate) struct MovingReadInterestSnapshot(ReadInterestSnapshot);
+impl MovingReadInterestSnapshot {
+    pub(crate) fn revision(&self) -> u64 {
+        self.0.revision
+    }
+    pub(crate) fn as_read_snapshot(&self) -> &ReadInterestSnapshot {
+        &self.0
+    }
 }
 pub(crate) struct ReadInterestOperation {
     registry: Arc<ReadInterestRegistry>,
@@ -335,6 +364,16 @@ impl ReadInterestRegistry {
             serialized_bytes: state.bytes,
         })
     }
+    /// Select moving requirements while preserving the full inventory revision
+    /// for the publication fence. Historical data stays retained locally and
+    /// persisted; excluding its recipe never invalidates its immutable inputs.
+    pub(crate) fn moving_snapshot(&self) -> Result<MovingReadInterestSnapshot, LixError> {
+        let mut snapshot = self.snapshot()?;
+        snapshot
+            .interests
+            .retain(|interest| interest.follows_branch_state());
+        Ok(MovingReadInterestSnapshot(snapshot))
+    }
     pub(crate) async fn begin_publication(
         self: &Arc<Self>,
         prepared_revision: u64,
@@ -442,6 +481,86 @@ mod tests {
             HotStateReadDomain::Tracked,
         )
     }
+    fn diff_recipe(from: DiffInterestEndpoint, to: DiffInterestEndpoint) -> LogicalReadInterest {
+        LogicalReadInterest::Diff {
+            branch_id: Some("branch".into()),
+            relation: "lix_key_value".into(),
+            from,
+            to,
+            filter: Default::default(),
+            retain_payloads: true,
+            projected_columns: vec!["value".into()],
+            limit: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_retention_is_separate_from_moving_publication_requirements() {
+        use DiffInterestEndpoint::*;
+        let registry = ReadInterestRegistry::new_durable(16, 16384);
+        let historical = diff_recipe(Fixed("old".into()), Fixed("new".into()));
+        let moving = [
+            diff_recipe(Fixed("old".into()), ActiveHead),
+            diff_recipe(ActiveHead, Fixed("old".into())),
+            diff_recipe(WorkingCheckpoint, ActiveHead),
+            negative_recipe(),
+        ];
+        registry.merge_persisted(vec![historical.clone()]).unwrap();
+        let capture = ReadInterestRegistry::capture(registry.clone());
+        capture.register(historical.clone()).unwrap();
+        for recipe in &moving {
+            capture.register(recipe.clone()).unwrap();
+        }
+        // Initial operation preparation must see historical and moving inputs.
+        assert_eq!(capture.snapshot().unwrap().interests.len(), 5);
+        assert_eq!(
+            registry
+                .moving_snapshot()
+                .unwrap()
+                .as_read_snapshot()
+                .interests
+                .len(),
+            0
+        );
+        capture.publish_capture().unwrap();
+        let retained = registry.snapshot().unwrap();
+        assert_eq!(retained.interests.len(), 5);
+        registry.acknowledge_durable(retained.revision).unwrap();
+        let prepared = registry.moving_snapshot().unwrap();
+        assert_eq!(prepared.revision(), retained.revision);
+        assert_eq!(prepared.as_read_snapshot().interests.len(), 4);
+        for recipe in &moving {
+            assert!(
+                prepared
+                    .as_read_snapshot()
+                    .interests
+                    .iter()
+                    .any(|actual| actual.as_ref() == recipe)
+            );
+        }
+        drop(
+            registry
+                .begin_publication(prepared.revision())
+                .await
+                .unwrap(),
+        );
+        registry
+            .register(diff_recipe(Fixed("other".into()), ActiveHead))
+            .unwrap();
+        registry
+            .acknowledge_durable(registry.snapshot().unwrap().revision)
+            .unwrap();
+        assert_eq!(
+            registry
+                .begin_publication(prepared.revision())
+                .await
+                .err()
+                .unwrap()
+                .code,
+            "LIX_PARTIAL_READ_INTEREST_CHANGED"
+        );
+    }
+
     #[test]
     fn operation_capture_publishes_new_scope_only_after_success() {
         let parent = ReadInterestRegistry::new(8, 8192);

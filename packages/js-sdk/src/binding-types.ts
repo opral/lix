@@ -94,6 +94,7 @@ export type LixBinding = {
 	exportReplicaRecovery(id: string): Promise<ReplicaRecoveryExport>;
 	recoverReplica(id: string): Promise<ReplicaRecoveryReceipt>;
 	recoverReplicaWithServer(id: string, server: SyncServerBindingOptions): Promise<ReplicaRecoveryReceipt>;
+	syncHealth(): Promise<import("./types.js").SyncHealth>;
 	activeBranchId(): Promise<string>;
 	activeAccountId(): Promise<string>;
 	createBranch(options: CreateBranchOptions): Promise<CreateBranchReceipt>;
@@ -132,7 +133,7 @@ export type LixStorageProviderModule = {
 	createLixStorageProvider(options: unknown): Promise<LixStorageProvider>;
 };
 
-export type LixStorageConfig =
+export type LixStorageConfig = { durability?: import("./types.js").Durability } & (
 	| { kind: "memory" }
 	| {
 			kind: "jsStorage";
@@ -143,7 +144,7 @@ export type LixStorageConfig =
 			kind: "filesystem";
 			path: string;
 			syncAllFiles: boolean;
-	  };
+	  });
 
 export type HostedServerBindingOptions = {
 	idempotencyKey?: string;

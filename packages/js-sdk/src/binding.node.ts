@@ -29,12 +29,14 @@ type NativeAddon = {
 			serverHeaders?: [string, string][],
 			openProgress?: (progressJson: string) => void,
 			componentDispatch?: ComponentDispatch,
+			durability?: import("./types.js").Durability,
 		): Promise<NativeLixBinding>;
 		openMemoryFromSnapshot(
 			telemetry?: (spanJson: string) => void,
 			telemetryParentJson?: string,
 			openProgress?: (progressJson: string) => void,
 			componentDispatch?: ComponentDispatch,
+			durability?: import("./types.js").Durability,
 		): SnapshotRestoreBinding<NativeLixBinding>;
 		openFilesystemStorage(
 			path: string,
@@ -45,6 +47,7 @@ type NativeAddon = {
 			serverHeaders?: [string, string][],
 			openProgress?: (progressJson: string) => void,
 			componentDispatch?: ComponentDispatch,
+			durability?: import("./types.js").Durability,
 		): Promise<NativeLixBinding>;
 		openFilesystemStorageFromSnapshot(
 			path: string,
@@ -53,6 +56,7 @@ type NativeAddon = {
 			telemetryParentJson?: string,
 			openProgress?: (progressJson: string) => void,
 			componentDispatch?: ComponentDispatch,
+			durability?: import("./types.js").Durability,
 		): SnapshotRestoreBinding<NativeLixBinding>;
 	};
 };
@@ -209,6 +213,7 @@ export async function openLixBinding(
 				telemetryParent,
 				openProgress,
 				snapshot,
+				storage.durability,
 			);
 		} catch (wasmError) {
 			throw new AggregateError(
@@ -254,6 +259,7 @@ export async function openNativeLixBinding(
 					telemetryParent ? JSON.stringify(telemetryParent) : undefined,
 					nativeOpenProgress,
 					componentDispatch,
+					storage.durability,
 				);
 				return normalizeNativeBinding(await restoreSnapshot(snapshot, restore));
 			}
@@ -266,6 +272,7 @@ export async function openNativeLixBinding(
 						server?.headers,
 						nativeOpenProgress,
 						componentDispatch,
+						storage.durability,
 					),
 				);
 			}
@@ -277,6 +284,7 @@ export async function openNativeLixBinding(
 					server?.headers,
 					nativeOpenProgress,
 					componentDispatch,
+					storage.durability,
 				),
 			);
 		}
@@ -297,6 +305,7 @@ export async function openNativeLixBinding(
 					telemetryParent ? JSON.stringify(telemetryParent) : undefined,
 					nativeOpenProgress,
 					componentDispatch,
+					storage.durability,
 				);
 				return normalizeNativeBinding(await restoreSnapshot(snapshot, restore));
 			}
@@ -311,6 +320,7 @@ export async function openNativeLixBinding(
 						server?.headers,
 						nativeOpenProgress,
 						componentDispatch,
+						storage.durability,
 					),
 				);
 			}
@@ -324,6 +334,7 @@ export async function openNativeLixBinding(
 					server?.headers,
 					nativeOpenProgress,
 					componentDispatch,
+					storage.durability,
 				),
 			);
 		}

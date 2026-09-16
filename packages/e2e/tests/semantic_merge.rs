@@ -39,7 +39,7 @@ async fn plugin_resolved_rows_are_included_in_semantic_merge_change_stats() {
         })
         .await
         .unwrap();
-    assert!(preview.conflicts.is_empty());
+    assert_eq!(preview.outcome, lix::MergeBranchOutcome::MergeCommitted);
     assert_eq!(preview.change_stats.total, 1);
     assert_eq!(preview.change_stats.added, 0);
     assert_eq!(preview.change_stats.modified, 1);

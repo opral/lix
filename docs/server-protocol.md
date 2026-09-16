@@ -49,7 +49,7 @@ contract in another language. See [Hosting](./hosting.md).
 | SQL         | `/lix/v1/{lix_id}/execute`, `/lix/v1/{lix_id}/execute-batch`                    |
 | Transaction | `/lix/v1/{lix_id}/transaction/{begin,execute,commit,rollback}`                  |
 | Files       | `/lix/v1/{lix_id}/file`, `/lix/v1/{lix_id}/file/upsert{,-batch}`               |
-| Sync        | `/lix/v1/{lix_id}/sync/{push,pull,history,checkpoints,descriptor,update,native-objects,native-object-range,native-metadata,baseline-lease/renew,blob,chunk,retained-bodies,merge,merge/restart,migration/merge,migration/cleanup,migration/global/restart,migration/global/cleanup,migration/global/merge,migration/global/bodies}`                          |
+| Sync        | `/lix/v1/{lix_id}/sync/{push,pull,history,checkpoints,descriptor,native-objects,native-object-range,native-metadata,baseline-lease/renew,blob,chunk,retained-bodies,merge,merge/restart,migration/merge,migration/cleanup,migration/global/restart,migration/global/cleanup,migration/global/merge,migration/global/bodies}`                          |
 | Versioning  | `/lix/v1/{lix_id}/branch/{create,switch,merge,merge-preview}`, `/lix/v1/{lix_id}/{undo,redo}`       |
 | Observation | `/lix/v1/{lix_id}/observe`, `/lix/v1/{lix_id}/observe/multiplex`                |
 | Snapshot    | `/lix/v1/{lix_id}/snapshot`                                                     |
@@ -85,7 +85,7 @@ receives an already-trusted principal in process and never derives identity from
 request headers.
 
 Protocol requests except snapshot download require exactly one
-`lix-server-protocol-version: 7` header. Missing, duplicate, malformed, or older
+`lix-server-protocol-version: 11` header. Missing, duplicate, malformed, or older
 versions return `426 LIX_PROTOCOL_VERSION_MISMATCH` before opening a session or
 executing SQL. Clients must upgrade together with the checkpoint metadata and
 SQL API changes.
@@ -109,6 +109,13 @@ The protocol has no default request-body byte ceiling. Hosts can set
 `ServerProtocolOptions::max_request_body_bytes` to enforce a byte budget;
 explicit budgets still return `413` for oversized bodies. Proxy limits and the
 separate sync-chunk limits still apply.
+
+## Merge previews
+
+Server protocol 11 removes the `conflicts` field from merge previews. Overlapping
+row edits reconcile automatically through LWW or plugin column merging. Preview
+returns the outcome, branch and commit IDs, and change counts. Upgrade clients
+and servers together; no persisted repository format changes are required.
 
 ## SQL transaction receipts
 
@@ -168,7 +175,7 @@ executes on the authority.
   `PUT /lix/v1/{lix_id}/sync/chunk?chunkId=...` transfer raw chunks. Both identities are
   64-character lowercase BLAKE3 hex digests; chunks are at most 4 MiB.
 
-All sync routes require exactly one `lix-sync-protocol-version: 16` header.
+All sync routes require exactly one `lix-sync-protocol-version: 17` header.
 Missing, duplicate, malformed, or incompatible versions are rejected before
 reading or publishing sync data. The handshake advertises
 `syncCheckpointInventory: true`. Commit bodies and headers both carry immutable
@@ -188,7 +195,7 @@ again. There is no separate presence request.
 
 ### Partial replica with on-demand sync
 
-Sync protocol 16 defines the native transport for a partial replica with
+Sync protocol 17 defines the native transport for a partial replica with
 on-demand sync. SDK callers opt in with `server.mode: "partial_replica"` and
 local storage. The default server mode is `remote`. Client and server must
 upgrade together; this transport change does not alter the repository format.
@@ -222,14 +229,11 @@ incompatible sync versions before sync work; upgrade SDK and server together.
   coherent descriptor. Unrelated repository changes may advance its cursor;
   receiving the response does not publish a local baseline or certify coverage.
   A candidate baseline has an independent lease until local publication.
-- `POST /sync/update` accepts the selected `branchId`, an optional long-poll
-  `after` cursor, a `knownCursor`, and retained SQL read interests. It returns a
-  leased descriptor with a bounded working-set bundle of native objects,
-  metadata and inline blobs. The bundle is capped at 1 MiB and 1024 entries;
-  individual inline blobs are capped at 256 KiB. Oversized working sets use the
-  existing on-demand hydration path. The local candidate evaluator still
-  validates coverage before publication. Initial opening uses the bounded
-  descriptor endpoint and does not collect a working set.
+- Descriptor discovery carries no client read recipes or optional prefetch work.
+  The replica prepares its moving read requirements against the leased descriptor
+  using the native on-demand routes, then atomically publishes the candidate.
+  Retained fixed historical reads do not gate moving-state publication. Sync
+  protocol 17 removes `/sync/update`; SDK and server must upgrade together.
 - Small-file publication includes canonical inline blobs in the existing
   `/sync/push` request, up to a 1 MiB combined request budget. Larger publications
   retain chunk upload. Both paths use the same authoritative row merge and

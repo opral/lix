@@ -13,6 +13,7 @@ use lix::{
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ExecuteOptions {
     pub(crate) origin_key: Option<String>,
+    pub(crate) max_auto_commit_retries: Option<u32>,
     // Transport retry identity is only used by the remote protocol client.
     pub(crate) idempotency_key: Option<String>,
 }
@@ -44,6 +45,7 @@ pub(crate) trait SessionOperations: Sized {
         statements: &[ExecuteBatchStatement],
         options: ExecuteOptions,
     ) -> Result<lix::ExecuteBatchResult, LixError>;
+    async fn sync_health(&self) -> Result<lix::SyncHealth, LixError>;
     async fn active_branch_id(&self) -> Result<String, LixError>;
     async fn active_account_id(&self) -> Result<String, LixError>;
     async fn create_branch(
@@ -110,6 +112,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> SessionOperations for Lix<S> {
     ) -> Result<ExecuteResult, LixError> {
         let _ = options.idempotency_key;
         let execution = Lix::execute(self, sql, params);
+        let execution = match options.max_auto_commit_retries {
+            Some(limit) => execution.with_max_auto_commit_retries(limit),
+            None => execution,
+        };
         match options.origin_key {
             Some(origin_key) => execution.with_origin_key(origin_key).await,
             None => execution.await,
@@ -122,12 +128,19 @@ impl<S: Storage + Clone + Send + Sync + 'static> SessionOperations for Lix<S> {
         options: ExecuteOptions,
     ) -> Result<lix::ExecuteBatchResult, LixError> {
         let execution = Lix::execute_batch(self, statements);
+        let execution = match options.max_auto_commit_retries {
+            Some(limit) => execution.with_max_auto_commit_retries(limit),
+            None => execution,
+        };
         match options.origin_key {
             Some(origin_key) => execution.with_origin_key(origin_key).await,
             None => execution.await,
         }
     }
 
+    async fn sync_health(&self) -> Result<lix::SyncHealth, LixError> {
+        Ok(Lix::sync_health(self))
+    }
     async fn active_branch_id(&self) -> Result<String, LixError> {
         Lix::active_branch_id(self).await
     }
@@ -233,6 +246,7 @@ mod remote {
         fn from(options: ExecuteOptions) -> Self {
             Self {
                 origin_key: options.origin_key,
+                max_auto_commit_retries: options.max_auto_commit_retries,
                 idempotency_key: options.idempotency_key,
             }
         }
@@ -323,6 +337,10 @@ mod remote {
             ClientCore::execute_batch(self, statements, Some(options.into())).await
         }
 
+        async fn sync_health(&self) -> Result<lix::SyncHealth, LixError> {
+            // Remote SQL sessions have no local replica synchronization worker.
+            Ok(lix::SyncHealth::default())
+        }
         async fn active_branch_id(&self) -> Result<String, LixError> {
             ClientCore::active_branch_id(self).await
         }

@@ -54,8 +54,8 @@ export function registerPluginExecutionContract(
         ]);
         expect(
           (await lix.mergeBranchPreview({ sourceBranchId: draft.id }))
-            .conflicts,
-        ).toEqual([]);
+            .outcome,
+        ).toEqual("mergeCommitted");
         await lix.mergeBranch({ sourceBranchId: draft.id });
         expect(await cells(lix)).toEqual([
           ["name", "age"],

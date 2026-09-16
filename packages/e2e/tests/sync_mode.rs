@@ -2856,16 +2856,6 @@ where
         .await
         .expect("collect HTTP request body")
         .to_bytes();
-    if parts.method == Method::POST && path.ends_with("/sync/update") {
-        probe.descriptor_pulls.fetch_add(1, Ordering::Release);
-        let request: JsonValue =
-            serde_json::from_slice(&body).expect("decode partial update probe");
-        // Working-set updates carry the same held-watch cursor in the body.
-        // Count only actual waits, not immediate refresh requests (after=null).
-        if request.get("after").is_some_and(JsonValue::is_u64) {
-            probe.descriptor_waits.fetch_add(1, Ordering::Release);
-        }
-    }
     let response = protocol
         .handle(
             Request::from_parts(parts, ServerProtocolBody::full(body)),

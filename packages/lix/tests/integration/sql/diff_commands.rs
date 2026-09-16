@@ -653,3 +653,221 @@ simulation_test!(
         assert_eq!(empty.rows_affected(), 0);
     }
 );
+
+simulation_test!(
+    inverse_apply_undoes_a_transaction_and_preserves_later_unrelated_changes,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        session.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('modified', 'before'), ('removed', 'restore')",
+            &[],
+        ).await.unwrap();
+        let before = session
+            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("id")
+            .unwrap();
+        let mut tx = session.begin_transaction().await.unwrap();
+        tx.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('added', 'remove')",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "UPDATE lix_key_value SET value = 'after' WHERE key = 'modified'",
+            &[],
+        )
+        .await
+        .unwrap();
+        tx.execute("DELETE FROM lix_key_value WHERE key = 'removed'", &[])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let after = session
+            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("id")
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('later', 'keep')",
+                &[],
+            )
+            .await
+            .unwrap();
+        let head_before_undo = session
+            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("id")
+            .unwrap();
+
+        let undo = session.execute(
+            "INSERT INTO lix_apply (row_ref) SELECT row_ref FROM lix_diff('lix_key_value', $1, $2) WHERE key IN ('added', 'modified', 'removed') RETURNING commit_id",
+            &[Value::Text(after.clone()), Value::Text(before.clone())],
+        ).await.expect("a reversed commit pair should undo the selected transaction");
+        assert_eq!(undo.rows_affected(), 3);
+        let undo_commit = undo.rows()[0].get::<String>("commit_id").unwrap();
+        assert_ne!(undo_commit, before);
+        assert_ne!(undo_commit, after);
+        assert_ne!(undo_commit, head_before_undo);
+        assert_eq!(select_rows(&session,
+            "SELECT key, value FROM lix_key_value WHERE key IN ('added', 'modified', 'removed', 'later') ORDER BY key"
+        ).await, vec![
+            vec![Value::Text("later".into()), Value::Jsonb(serde_json::json!("keep").into())],
+            vec![Value::Text("modified".into()), Value::Jsonb(serde_json::json!("before").into())],
+            vec![Value::Text("removed".into()), Value::Jsonb(serde_json::json!("restore").into())],
+        ]);
+        let original = session.execute(
+            "SELECT key, diff_type FROM lix_diff('lix_key_value', $1, $2) WHERE key IN ('added', 'modified', 'removed') ORDER BY key",
+            &[Value::Text(before), Value::Text(after)],
+        ).await.unwrap();
+        assert_eq!(
+            original.rows().len(),
+            3,
+            "undo must preserve the original history"
+        );
+    }
+);
+
+simulation_test!(
+    inverse_apply_rejects_stale_rows_without_partially_undoing,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('a', 'before'), ('b', 'before')",
+                &[],
+            )
+            .await
+            .unwrap();
+        let edit = session
+            .execute(
+                "UPDATE lix_key_value SET value = 'agent' WHERE key IN ('a', 'b')",
+                &[],
+            )
+            .await
+            .unwrap();
+        let span = edit.commit().expect("write has a commit span");
+        let before = span.before().to_owned();
+        let after = span.after().to_owned();
+        session
+            .execute(
+                "UPDATE lix_key_value SET value = 'human' WHERE key = 'b'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let head = session
+            .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("id")
+            .unwrap();
+        let error = session.execute(
+            "INSERT INTO lix_apply (row_ref) SELECT row_ref FROM lix_diff('lix_key_value', $1, $2) WHERE key IN ('a', 'b')",
+            &[Value::Text(after), Value::Text(before)],
+        ).await.expect_err("a later version of one selected row must reject the entire undo");
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT key, value FROM lix_key_value WHERE key IN ('a', 'b') ORDER BY key"
+            )
+            .await,
+            vec![
+                vec![
+                    Value::Text("a".into()),
+                    Value::Jsonb(serde_json::json!("agent").into())
+                ],
+                vec![
+                    Value::Text("b".into()),
+                    Value::Jsonb(serde_json::json!("human").into())
+                ],
+            ]
+        );
+        assert_eq!(
+            session
+                .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+                .await
+                .unwrap()
+                .rows()[0]
+                .get::<String>("id")
+                .unwrap(),
+            head,
+            "rejected undo must not publish a commit"
+        );
+    }
+);
+
+simulation_test!(
+    inverse_apply_rejects_a_later_edit_to_a_different_column,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        let schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "undo_clip",
+            "columns": [
+                {"name": "id", "type": "text", "nullable": false},
+                {"name": "position", "type": "int8", "nullable": false},
+                {"name": "title", "type": "text", "nullable": false}
+            ],
+            "primary_key": ["id"]
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES ($1)",
+                &[Value::Jsonb(schema.into())],
+            )
+            .await
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO undo_clip (id, position, title) VALUES ('clip', 1, 'original')",
+                &[],
+            )
+            .await
+            .unwrap();
+        let edit = session
+            .execute("UPDATE undo_clip SET position = 2 WHERE id = 'clip'", &[])
+            .await
+            .unwrap();
+        let span = edit.commit().unwrap();
+        session
+            .execute(
+                "UPDATE undo_clip SET title = 'human title' WHERE id = 'clip'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let error = session
+            .execute(
+                "INSERT INTO lix_apply (row_ref) SELECT row_ref FROM lix_diff('undo_clip', $1, $2)",
+                &[
+                    Value::Text(span.after().to_owned()),
+                    Value::Text(span.before().to_owned()),
+                ],
+            )
+            .await
+            .expect_err("inverse apply checks whole-row versions, not individual columns");
+        assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT position, title FROM undo_clip WHERE id = 'clip'"
+            )
+            .await,
+            vec![vec![Value::Integer(2), Value::Text("human title".into())]]
+        );
+    }
+);

@@ -4,11 +4,11 @@ use lix::{
     ExecuteBatchStatement as RsExecuteBatchStatement, ExecuteResult as RsExecuteResult,
     Lix as RsLix, LixError, LixTransaction as RsLixTransaction, Memory,
     MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
-    MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats, MergeConflict,
-    MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, ObserveEvent as RsObserveEvent,
-    ObserveEvents as RsObserveEvents, OpenPhase, OpenProgress, OpenProgressSink, OpenReport,
-    RedoReceipt, ServerOptions, SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt,
-    UndoReceipt, Value, open_lix,
+    MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats,
+    ObserveEvent as RsObserveEvent, ObserveEvents as RsObserveEvents, OpenPhase, OpenProgress,
+    OpenProgressSink, OpenReport, RedoReceipt, ServerOptions,
+    SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt, UndoReceipt, Value,
+    open_lix,
 };
 use lix_storage_filesystem::FilesystemStorage;
 use napi::JsDeferred;
@@ -108,6 +108,8 @@ enum NativeObserveEventsInner {
 pub struct NativeExecuteOptions {
     #[napi(js_name = "originKey")]
     pub origin_key: Option<String>,
+    #[napi(js_name = "maxAutoCommitRetries")]
+    pub max_auto_commit_retries: Option<u32>,
 }
 
 #[napi(object)]
@@ -284,12 +286,12 @@ enum LixCommand {
     Execute {
         sql: String,
         params: Vec<Value>,
-        options: Option<String>,
+        options: crate::session::ExecuteOptions,
         deferred: NativeExecuteDeferred,
     },
     ExecuteBatch {
         statements: Vec<RsExecuteBatchStatement>,
-        options: Option<String>,
+        options: crate::session::ExecuteOptions,
         deferred: NativeExecuteBatchDeferred,
     },
     BeginTransaction {
@@ -309,6 +311,7 @@ enum LixCommand {
         server: Option<ServerOptions>,
         deferred: NativeDeferred<serde_json::Value>,
     },
+    SyncHealth(NativeDeferred<serde_json::Value>),
     ActiveBranchId(NativeStringDeferred),
     ActiveAccountId(NativeStringDeferred),
     CreateBranch {
@@ -349,7 +352,7 @@ enum LixCommand {
         transaction_id: u64,
         sql: String,
         params: Vec<Value>,
-        options: Option<String>,
+        options: crate::session::ExecuteOptions,
         deferred: NativeExecuteDeferred,
     },
     TransactionCommit {
@@ -935,6 +938,7 @@ fn reject_pending_lix_commands(receiver: mpsc::Receiver<QueuedLixCommand>, error
                 deferred.reject(to_napi_error(&error))
             }
             LixCommand::RecoverReplica { deferred, .. } => deferred.reject(to_napi_error(&error)),
+            LixCommand::SyncHealth(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::ActiveBranchId(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::ActiveAccountId(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::CreateBranch { deferred, .. } => deferred.reject(to_napi_error(&error)),
@@ -1047,6 +1051,11 @@ fn handle_lix_command(
             deferred,
         } => {
             settle_deferred(deferred, block_on!(state.lix.recover_replica(&id, server)));
+            None
+        }
+        LixCommand::SyncHealth(deferred) => {
+            let result = block_on!(state.lix.sync_health());
+            settle_deferred(deferred, result);
             None
         }
         LixCommand::ActiveBranchId(deferred) => {
@@ -1313,6 +1322,9 @@ fn settle_command_after_close(command: LixCommand) {
         LixCommand::RecoverReplica { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
+        LixCommand::SyncHealth(deferred) => {
+            settle_deferred(deferred, Err(lix_closed_error()));
+        }
         LixCommand::ActiveBranchId(deferred) => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
@@ -1445,12 +1457,8 @@ impl NativeLixInner {
         &self,
         sql: &str,
         params: &[Value],
-        options: Option<String>,
+        options: crate::session::ExecuteOptions,
     ) -> std::result::Result<RsExecuteResult, LixError> {
-        let options = crate::session::ExecuteOptions {
-            origin_key: options,
-            ..Default::default()
-        };
         match self {
             Self::Memory(lix) => {
                 crate::session::SessionOperations::execute(lix, sql, params, options).await
@@ -1464,12 +1472,8 @@ impl NativeLixInner {
     async fn execute_batch(
         &self,
         statements: &[RsExecuteBatchStatement],
-        options: Option<String>,
+        options: crate::session::ExecuteOptions,
     ) -> std::result::Result<lix::ExecuteBatchResult, LixError> {
-        let options = crate::session::ExecuteOptions {
-            origin_key: options,
-            ..Default::default()
-        };
         match self {
             Self::Memory(lix) => {
                 crate::session::SessionOperations::execute_batch(lix, statements, options).await
@@ -1504,6 +1508,16 @@ impl NativeLixInner {
                 crate::session::SessionOperations::observe(lix, sql, params).await?,
             )),
         }
+    }
+
+    async fn sync_health(&self) -> std::result::Result<serde_json::Value, LixError> {
+        let health = match self {
+            Self::Memory(lix) => crate::session::SessionOperations::sync_health(lix).await?,
+            Self::FilesystemStorage(lix, _, _) => {
+                crate::session::SessionOperations::sync_health(lix).await?
+            }
+        };
+        serde_json::to_value(health).map_err(|error| LixError::unknown(error.to_string()))
     }
 
     async fn active_branch_id(&self) -> std::result::Result<String, LixError> {
@@ -1669,12 +1683,8 @@ impl NativeLixTransactionInner {
         &mut self,
         sql: &str,
         params: &[Value],
-        options: Option<String>,
+        options: crate::session::ExecuteOptions,
     ) -> std::result::Result<RsExecuteResult, LixError> {
-        let options = crate::session::ExecuteOptions {
-            origin_key: options,
-            ..Default::default()
-        };
         match self {
             Self::Memory(transaction) => {
                 crate::session::TransactionOperations::execute(transaction, sql, params, options)
@@ -1728,6 +1738,7 @@ impl NativeObserveEventsInner {
 
 #[expect(missing_debug_implementations)]
 pub struct OpenFilesystemStorageTask {
+    durability: lix::Durability,
     component_runtime: Arc<dyn lix::plugin::runtime::WasmRuntime>,
     path: String,
     sync_all_files: bool,
@@ -1741,6 +1752,7 @@ pub struct OpenFilesystemStorageTask {
 
 #[expect(missing_debug_implementations)]
 pub struct OpenMemoryTask {
+    durability: lix::Durability,
     component_runtime: Arc<dyn lix::plugin::runtime::WasmRuntime>,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
     telemetry_parent: Option<SpanContext>,
@@ -1756,6 +1768,7 @@ impl Task for OpenFilesystemStorageTask {
 
     fn compute(&mut self) -> Result<Self::Output> {
         Ok(open_filesystem_storage_native(
+            self.durability,
             std::mem::take(&mut self.path),
             self.sync_all_files,
             self.telemetry_dispatch.take(),
@@ -1781,6 +1794,7 @@ impl Task for OpenMemoryTask {
 
     fn compute(&mut self) -> Result<Self::Output> {
         Ok(open_memory_native(
+            self.durability,
             self.telemetry_dispatch.take(),
             self.telemetry_parent.take(),
             self.open_progress_dispatch.take(),
@@ -1845,6 +1859,7 @@ fn parse_server_headers(headers: Option<Vec<Vec<String>>>) -> Result<Vec<(String
 }
 
 fn open_memory_native(
+    durability: lix::Durability,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
     telemetry_parent: Option<SpanContext>,
     open_progress_dispatch: Option<SharedJsOpenProgressDispatch>,
@@ -1862,6 +1877,7 @@ fn open_memory_native(
         .map_or((None, None), |(sink, parent)| (Some(sink), Some(parent)));
     let mut builder = open_lix()
         .with_storage(Memory::new())
+        .with_durability(durability)
         .with_wasm_runtime(component_runtime);
     if let Some(telemetry) = telemetry {
         builder = builder.with_telemetry(telemetry);
@@ -1883,6 +1899,7 @@ fn open_memory_native(
 }
 
 fn open_filesystem_storage_native(
+    durability: lix::Durability,
     path: String,
     sync_all_files: bool,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
@@ -1905,6 +1922,7 @@ fn open_filesystem_storage_native(
         .map_or((None, None), |(sink, parent)| (Some(sink), Some(parent)));
     let mut builder = open_lix()
         .with_storage(storage.clone())
+        .with_durability(durability)
         .with_wasm_runtime(component_runtime);
     if let Some(telemetry) = telemetry {
         builder = builder.with_telemetry(telemetry);
@@ -2041,12 +2059,15 @@ impl NativeLix {
         server_headers: Option<Vec<Vec<String>>>,
         open_progress_dispatch: Option<Function<'_, String, ()>>,
         component_dispatch: Option<JsDispatch<'_>>,
+        durability: Option<String>,
     ) -> Result<AsyncTask<OpenMemoryTask>> {
         let component_runtime = component_runtime::runtime(component_runtime::platform::create(
             component_dispatch
                 .ok_or_else(|| Error::from_reason("JavaScript component host is required"))?,
         )?);
         Ok(AsyncTask::new(OpenMemoryTask {
+            durability: crate::parse_durability(durability.as_deref())
+                .map_err(|error| Error::from_reason(error.to_string()))?,
             component_runtime,
             telemetry_dispatch: optional_telemetry_dispatch(telemetry_dispatch)?,
             telemetry_parent: crate::telemetry::parse_parent_context_json(telemetry_parent_json)
@@ -2064,6 +2085,7 @@ impl NativeLix {
         telemetry_parent_json: Option<String>,
         open_progress_dispatch: Option<Function<'_, String, ()>>,
         component_dispatch: Option<JsDispatch<'_>>,
+        durability: Option<String>,
     ) -> Result<NativeSnapshotRestore> {
         let component_runtime = component_runtime::runtime(component_runtime::platform::create(
             component_dispatch
@@ -2073,8 +2095,11 @@ impl NativeLix {
         let telemetry_parent = crate::telemetry::parse_parent_context_json(telemetry_parent_json)
             .map_err(Error::from_reason)?;
         let open_progress_dispatch = optional_open_progress_dispatch(open_progress_dispatch)?;
+        let durability = crate::parse_durability(durability.as_deref())
+            .map_err(|error| Error::from_reason(error.to_string()))?;
         start_native_snapshot_restore(move |snapshot| {
             open_memory_native(
+                durability,
                 telemetry_dispatch,
                 telemetry_parent,
                 open_progress_dispatch,
@@ -2096,12 +2121,15 @@ impl NativeLix {
         server_headers: Option<Vec<Vec<String>>>,
         open_progress_dispatch: Option<Function<'_, String, ()>>,
         component_dispatch: Option<JsDispatch<'_>>,
+        durability: Option<String>,
     ) -> Result<AsyncTask<OpenFilesystemStorageTask>> {
         let component_runtime = component_runtime::runtime(component_runtime::platform::create(
             component_dispatch
                 .ok_or_else(|| Error::from_reason("JavaScript component host is required"))?,
         )?);
         Ok(AsyncTask::new(OpenFilesystemStorageTask {
+            durability: crate::parse_durability(durability.as_deref())
+                .map_err(|error| Error::from_reason(error.to_string()))?,
             path,
             sync_all_files,
             component_runtime,
@@ -2123,6 +2151,7 @@ impl NativeLix {
         telemetry_parent_json: Option<String>,
         open_progress_dispatch: Option<Function<'_, String, ()>>,
         component_dispatch: Option<JsDispatch<'_>>,
+        durability: Option<String>,
     ) -> Result<NativeSnapshotRestore> {
         let component_runtime = component_runtime::runtime(component_runtime::platform::create(
             component_dispatch
@@ -2132,8 +2161,11 @@ impl NativeLix {
         let telemetry_parent = crate::telemetry::parse_parent_context_json(telemetry_parent_json)
             .map_err(Error::from_reason)?;
         let open_progress_dispatch = optional_open_progress_dispatch(open_progress_dispatch)?;
+        let durability = crate::parse_durability(durability.as_deref())
+            .map_err(|error| Error::from_reason(error.to_string()))?;
         start_native_snapshot_restore(move |snapshot| {
             open_filesystem_storage_native(
+                durability,
                 path,
                 sync_all_files,
                 telemetry_dispatch,
@@ -2182,7 +2214,13 @@ impl NativeLix {
                 .map_err(|error| throw_lix_error(env, error))?,
             None => Vec::new(),
         };
-        let options = options.and_then(|options| options.origin_key);
+        let options = options
+            .map(|options| crate::session::ExecuteOptions {
+                origin_key: options.origin_key,
+                max_auto_commit_retries: options.max_auto_commit_retries,
+                ..Default::default()
+            })
+            .unwrap_or_default();
         let (deferred, promise): (NativeExecuteDeferred, Object<'env>) = env.create_deferred()?;
         self.actor
             .send_with_deferred(deferred, |deferred| LixCommand::Execute {
@@ -2218,7 +2256,13 @@ impl NativeLix {
             })
             .collect::<std::result::Result<Vec<_>, LixError>>()
             .map_err(|error| throw_lix_error(env, error))?;
-        let options = options.and_then(|options| options.origin_key);
+        let options = options
+            .map(|options| crate::session::ExecuteOptions {
+                origin_key: options.origin_key,
+                max_auto_commit_retries: options.max_auto_commit_retries,
+                ..Default::default()
+            })
+            .unwrap_or_default();
         let (deferred, promise): (NativeExecuteBatchDeferred, Object<'env>) =
             env.create_deferred()?;
         self.actor
@@ -2269,6 +2313,15 @@ impl NativeLix {
                 actor,
                 deferred,
             });
+        Ok(promise)
+    }
+
+    #[napi(js_name = "syncHealth")]
+    pub fn sync_health<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeDeferred<serde_json::Value>, Object<'env>) =
+            env.create_deferred()?;
+        self.actor
+            .send_with_deferred(deferred, LixCommand::SyncHealth);
         Ok(promise)
     }
 
@@ -2759,7 +2812,13 @@ impl NativeLixTransaction {
                 .map_err(|error| throw_lix_error(env, error))?,
             None => Vec::new(),
         };
-        let options = options.and_then(|options| options.origin_key);
+        let options = options
+            .map(|options| crate::session::ExecuteOptions {
+                origin_key: options.origin_key,
+                max_auto_commit_retries: options.max_auto_commit_retries,
+                ..Default::default()
+            })
+            .unwrap_or_default();
         let (deferred, promise): (NativeExecuteDeferred, Object<'env>) = env.create_deferred()?;
         if self.closed.load(Ordering::SeqCst) {
             settle_deferred(deferred, Err(transaction_closed_error()));
@@ -2976,7 +3035,6 @@ pub struct MergeBranchPreviewDto {
     pub target_head_commit_id: String,
     pub source_head_commit_id: String,
     pub change_stats: MergeChangeStatsDto,
-    pub conflicts: Vec<MergeConflictDto>,
 }
 
 impl From<MergeBranchPreview> for MergeBranchPreviewDto {
@@ -2989,7 +3047,6 @@ impl From<MergeBranchPreview> for MergeBranchPreviewDto {
             target_head_commit_id: preview.target_head_commit_id,
             source_head_commit_id: preview.source_head_commit_id,
             change_stats: preview.change_stats.into(),
-            conflicts: preview.conflicts.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -3021,60 +3078,6 @@ impl From<MergeChangeStats> for MergeChangeStatsDto {
             removed: stats.removed as u32,
         }
     }
-}
-
-#[napi(object)]
-pub struct MergeConflictDto {
-    pub kind: String,
-    pub row_ref: String,
-    pub file_id: Option<String>,
-    pub target: MergeConflictSideDto,
-    pub source: MergeConflictSideDto,
-}
-
-impl From<MergeConflict> for MergeConflictDto {
-    fn from(conflict: MergeConflict) -> Self {
-        Self {
-            kind: merge_conflict_kind_to_string(conflict.kind),
-            row_ref: conflict.row_ref.to_string(),
-            file_id: conflict.file_id,
-            target: conflict.target.into(),
-            source: conflict.source.into(),
-        }
-    }
-}
-
-fn merge_conflict_kind_to_string(kind: MergeConflictKind) -> String {
-    match kind {
-        MergeConflictKind::SameRowChanged => "sameRowChanged",
-    }
-    .to_string()
-}
-
-#[napi(object)]
-pub struct MergeConflictSideDto {
-    pub kind: String,
-    pub before_change_id: Option<String>,
-    pub after_change_id: Option<String>,
-}
-
-impl From<MergeConflictSide> for MergeConflictSideDto {
-    fn from(side: MergeConflictSide) -> Self {
-        Self {
-            kind: merge_conflict_change_kind_to_string(side.kind),
-            before_change_id: side.before_change_id,
-            after_change_id: side.after_change_id,
-        }
-    }
-}
-
-fn merge_conflict_change_kind_to_string(kind: MergeConflictChangeKind) -> String {
-    match kind {
-        MergeConflictChangeKind::Added => "added",
-        MergeConflictChangeKind::Modified => "modified",
-        MergeConflictChangeKind::Removed => "removed",
-    }
-    .to_string()
 }
 
 #[expect(missing_debug_implementations)]

@@ -5,6 +5,7 @@
 //! This adapter uses the RocksDB storage adapter for Lix metadata while keeping
 //! a working directory synchronized with a Lix repository session.
 
+mod atomic_write;
 mod filesystem;
 
 pub use filesystem::{

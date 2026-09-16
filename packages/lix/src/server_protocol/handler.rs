@@ -288,7 +288,6 @@ enum RequestBodyPolicy {
     None,
     Json,
     NativeObjects,
-    WorkingSet,
     Binary,
     Chunk,
 }
@@ -334,7 +333,6 @@ protocol_routes! {
    SyncNativeObjects => ("POST", "/sync/native-objects", NativeObjects),
    SyncRenewBaselineLease => ("POST", "/sync/baseline-lease/renew", NativeObjects),
    SyncDescriptor => ("GET", "/sync/descriptor", None),
-   SyncPartialUpdate => ("POST", "/sync/update", WorkingSet),
    SyncPull => ("GET", "/sync/pull", None),
    SyncHistory => ("GET", "/sync/history", None),
    SyncCheckpoints => ("GET", "/sync/checkpoints", None),
@@ -376,6 +374,103 @@ pub const FILE_FOUND_HEADER: &str = "lix-file-found";
 pub const FILE_UPLOAD_ID_HEADER: &str = "lix-upload-id";
 /// Default maximum number of live remote sessions for one repository.
 pub const DEFAULT_MAX_SESSIONS: usize = 64;
+/// Storage admission decided from protocol headers before opening a runtime.
+/// Hosts must authenticate the principal first and still call `handle` after
+/// admission: this preflight does not replace canonical dispatch validation.
+#[derive(Debug)]
+pub struct ServerProtocolRuntimeAdmission {
+    session_id: Option<String>,
+    delete: bool,
+}
+impl ServerProtocolRuntimeAdmission {
+    /// Only a fresh handshake or snapshot can create a storage runtime.
+    pub fn opens_runtime(&self) -> bool {
+        self.session_id.is_none()
+    }
+
+    /// A prior process's sessions cannot survive a missing runtime. Session
+    /// deletion remains idempotent and never opens storage just to return 204.
+    pub fn missing_runtime_response(&self) -> ServerProtocolResponse {
+        admission_response(if self.delete {
+            StatusCode::NO_CONTENT.into_response()
+        } else {
+            ApiError::session_gone().into_response()
+        })
+    }
+}
+
+fn admission_response(mut response: ServerProtocolResponse) -> ServerProtocolResponse {
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, http::HeaderValue::from_static("no-store"));
+    response
+}
+
+/// Classify a protocol path relative to `/lix/v1/{lix_id}/` without storage I/O.
+pub fn server_protocol_runtime_admission(
+    method: &Method,
+    protocol_path: &str,
+    headers: &HeaderMap,
+    principal: &ServerProtocolPrincipal,
+) -> Result<ServerProtocolRuntimeAdmission, Box<ServerProtocolResponse>> {
+    let classify = || -> Result<ServerProtocolRuntimeAdmission, ApiError> {
+        if headers.contains_key(http::header::CONTENT_ENCODING) {
+            return Err(ApiError::unsupported_media_type(
+                "hosts must decode Content-Encoding before protocol dispatch",
+            ));
+        }
+        let path = if protocol_path.is_empty() {
+            PROTOCOL_PATH.to_owned()
+        } else {
+            format!("{PROTOCOL_PATH}/{protocol_path}")
+        };
+        let route = ProtocolRoute::ALL
+            .iter()
+            .find(|route| route.path() == path && route.method() == method.as_str())
+            .copied();
+        if route != Some(ProtocolRoute::Snapshot) {
+            require_server_protocol_version(headers)?;
+        }
+        if route.is_none()
+            && ProtocolRoute::ALL.iter().any(|route| route.path() == path)
+            && matches!(protocol_path, "" | "session" | "snapshot")
+        {
+            // These endpoints reject unsupported methods before session lookup.
+            return Err(ApiError::new(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "LIX_ERROR_METHOD_NOT_ALLOWED",
+                "the HTTP method is not defined for this Lix Server Protocol path",
+            ));
+        }
+        if protocol_path.starts_with("sync/") {
+            require_sync_protocol_version(headers)?;
+        }
+        if route == Some(ProtocolRoute::Snapshot) {
+            if matches!(principal, ServerProtocolPrincipal::Anonymous) {
+                return Err(ApiError::new(
+                    StatusCode::UNAUTHORIZED,
+                    "LIX_ERROR_UNAUTHENTICATED",
+                    "snapshot export requires an authenticated principal",
+                ));
+            }
+            return Ok(ServerProtocolRuntimeAdmission {
+                session_id: None,
+                delete: false,
+            });
+        }
+        let session_id = if route == Some(ProtocolRoute::Handshake) {
+            optional_session_id(headers)?
+        } else {
+            Some(required_session_id(headers)?)
+        };
+        Ok(ServerProtocolRuntimeAdmission {
+            session_id,
+            delete: route == Some(ProtocolRoute::DeleteSession),
+        })
+    };
+    classify().map_err(|error| Box::new(admission_response(error.into_response())))
+}
+
 /// Default idle lifetime for a remote session.
 pub const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_mins(30);
 /// No application-level request-body ceiling by default. Hosts that require a
@@ -1923,6 +2018,7 @@ where
         let lease = match self
             .lease(
                 &session_id,
+                &context.principal,
                 context.durable_terminal_storage_notifier.clone(),
             )
             .await
@@ -1938,9 +2034,7 @@ where
             .map(ProtocolRoute::body)
             .unwrap_or(RequestBodyPolicy::None);
         match body_policy {
-            RequestBodyPolicy::Json
-            | RequestBodyPolicy::NativeObjects
-            | RequestBodyPolicy::WorkingSet => {
+            RequestBodyPolicy::Json | RequestBodyPolicy::NativeObjects => {
                 if let Err(error) = require_json_content_type(&parts.headers) {
                     return error.into_response();
                 }
@@ -1960,8 +2054,6 @@ where
                 RequestBodyPolicy::Chunk => {
                     MAX_SYNC_CHUNK_BYTES.min(self.inner.options.max_request_body_bytes)
                 }
-                RequestBodyPolicy::WorkingSet => crate::sync::MAX_PARTIAL_UPDATE_REQUEST_BYTES
-                    .min(self.inner.options.max_request_body_bytes),
                 _ => self.inner.options.max_request_body_bytes,
             };
             match body.into_bytes(body_limit).await {
@@ -2186,10 +2278,6 @@ where
                 sync_renew_baseline_lease(lease, json_request!(SyncRenewBaselineLeaseRequest))
                     .await,
             ),
-            Some(ProtocolRoute::SyncPartialUpdate) => result_response(
-                partial_update::update(lease, json_request!(crate::sync::PartialUpdateRequest))
-                    .await,
-            ),
             Some(ProtocolRoute::SyncDescriptor) => {
                 let query = match decode_query::<SyncDescriptorQuery>(parts.uri.query()) {
                     Ok(query) => query,
@@ -2351,6 +2439,35 @@ where
         registry
             .values()
             .all(|record| record.is_idle_expired(now, self.inner.options.session_idle_timeout))
+    }
+
+    /// Check a cached runtime's session without touching session activity or
+    /// storage. Hosts pin the runtime only after this succeeds, under their
+    /// eviction lock, so rejected traffic cannot extend its lifetime.
+    pub async fn validate_runtime_admission(
+        &self,
+        admission: &ServerProtocolRuntimeAdmission,
+        principal: &ServerProtocolPrincipal,
+    ) -> Result<(), ServerProtocolResponse> {
+        let Some(id) = &admission.session_id else {
+            return Ok(());
+        };
+        let registry = self.inner.registry.lock().await;
+        let Some(record) = registry.get(id) else {
+            return Err(admission.missing_runtime_response());
+        };
+        if record.principal != *principal {
+            return Err(admission_response(
+                ApiError::account_mismatch().into_response(),
+            ));
+        }
+        if record.is_idle_expired(Instant::now(), self.inner.options.session_idle_timeout) {
+            return Err(admission.missing_runtime_response());
+        }
+        self.inner
+            .session_open_gate
+            .ensure_open()
+            .map_err(|error| admission_response(error.into_response()))
     }
 
     /// Closes every client session and rejects future handshakes.
@@ -2569,6 +2686,7 @@ where
     async fn lease(
         &self,
         session_id: &str,
+        principal: &ServerProtocolPrincipal,
         durable_terminal_storage_notifier: Option<DurableTerminalStorageNotifier>,
     ) -> Result<SessionLease<S>, ApiError> {
         let mut registry = self.inner.registry.lock().await;
@@ -2576,6 +2694,7 @@ where
         let Some(record) = registry.get(session_id).cloned() else {
             return Err(ApiError::session_gone());
         };
+        if record.principal != *principal { return Err(ApiError::account_mismatch()); }
         if record.is_idle_expired(Instant::now(), self.inner.options.session_idle_timeout) {
             let removed = registry.remove(session_id);
             drop(registry);
@@ -2794,7 +2913,7 @@ where
                 ));
             }
             let lease = server
-                .lease(&session_id, durable_terminal_storage_notifier.clone())
+                .lease(&session_id, &context.principal, durable_terminal_storage_notifier.clone())
                 .await?;
             validate_principal(&lease, &context.principal)?;
             lease
@@ -2859,7 +2978,7 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let session_id = required_session_id(&headers)?;
-    match server.lease(&session_id, None).await {
+    match server.lease(&session_id, &context.principal, None).await {
         Ok(lease) => {
             validate_principal(&lease, &context.principal)?;
             drop(lease);
@@ -3155,7 +3274,6 @@ where
 
 mod descriptor_wait;
 mod partial_merge;
-mod partial_update;
 
 async fn sync_descriptor<S>(
     lease: SessionLease<S>,
@@ -5100,12 +5218,14 @@ struct BinaryFileReadRequest {
 #[serde(rename_all = "camelCase")]
 struct ExecuteOptionsRequest {
     origin_key: Option<String>,
+    max_auto_commit_retries: Option<u32>,
 }
 
 impl From<ExecuteOptionsRequest> for ExecuteOptions {
     fn from(value: ExecuteOptionsRequest) -> Self {
         Self {
             origin_key: value.origin_key,
+            max_auto_commit_retries: value.max_auto_commit_retries,
         }
     }
 }
@@ -5820,7 +5940,6 @@ mod tests {
                 ("POST", "/lix/v1/{lix_id}/sync/migration/cleanup") => "syncNativeMigrationCleanup",
                 ("GET", "/lix/v1/{lix_id}/sync/pull") => "syncPull",
                 ("GET", "/lix/v1/{lix_id}/sync/descriptor") => "syncDescriptor",
-                ("POST", "/lix/v1/{lix_id}/sync/update") => "syncPartialUpdate",
                 ("POST", "/lix/v1/{lix_id}/sync/baseline-lease/renew") => "syncRenewBaselineLease",
                 ("POST", "/lix/v1/{lix_id}/sync/native-objects") => "syncNativeObjects",
                 ("POST", "/lix/v1/{lix_id}/sync/native-object-range") => "syncNativeObjectRange",
@@ -5875,13 +5994,12 @@ mod tests {
             openapi
                 .matches("$ref: \"#/components/parameters/SyncProtocolVersion\"")
                 .count(),
-            23,
+            22,
             "every sync HTTP operation must declare the required version header",
         );
         for operation_id in [
             "syncPush",
             "syncDescriptor",
-            "syncPartialUpdate",
             "syncRenewBaselineLease",
             "syncNativeObjects",
             "syncNativeObjectRange",
@@ -7643,6 +7761,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_principal_does_not_refresh_session_activity() {
+        let app = app().await;
+        let (session, _) = new_session(&app.router).await;
+        let before = app.server.inner.registry.lock().await[&session].last_used();
+        let wrong = ServerProtocolPrincipal::Authenticated {
+            account_id: "22222222-2222-4222-8222-222222222222".into(),
+            idempotency_scope: "other".into(),
+        };
+        let admission = ServerProtocolRuntimeAdmission {
+            session_id: Some(session.clone()),
+            delete: false,
+        };
+        assert!(
+            app.server
+                .validate_runtime_admission(&admission, &wrong)
+                .await
+                .is_err()
+        );
+        assert!(app.server.lease(&session, &wrong, None).await.is_err());
+        assert_eq!(
+            app.server.inner.registry.lock().await[&session].last_used(),
+            before
+        );
+        app.server
+            .validate_runtime_admission(&admission, &ServerProtocolPrincipal::Anonymous)
+            .await
+            .unwrap();
+        let response = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session),
+            Some(json!({"sql":"SELECT 1", "params":[]})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn expired_session_admission_preserves_idempotent_delete() {
+        let app = app_with_options(ServerProtocolOptions {
+            session_idle_timeout: Duration::ZERO,
+            ..Default::default()
+        })
+        .await;
+        let (session, _) = new_session(&app.router).await;
+        let admission = ServerProtocolRuntimeAdmission {
+            session_id: Some(session.clone()),
+            delete: false,
+        };
+        let response = app
+            .server
+            .validate_runtime_admission(&admission, &ServerProtocolPrincipal::Anonymous)
+            .await
+            .unwrap_err();
+        assert_eq!(response.status(), StatusCode::GONE);
+        let admission = ServerProtocolRuntimeAdmission {
+            session_id: Some(session),
+            delete: true,
+        };
+        let response = app
+            .server
+            .validate_runtime_admission(&admission, &ServerProtocolPrincipal::Anonymous)
+            .await
+            .unwrap_err();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(app.server.is_idle());
+    }
+
+    #[tokio::test]
     async fn sql_mutations_require_an_idempotency_key() {
         let app = app().await;
         let (session_id, _) = new_session(&app.router).await;
@@ -7897,7 +8085,9 @@ mod tests {
 
         let storage = DurableMemoryStorage::new();
         let adapter = crate::migration::admit_current_repository(&storage, true)
-            .await.expect("create current sparse epoch").adapter;
+            .await
+            .expect("create current sparse epoch")
+            .adapter;
         Engine::initialize_with_adapter(adapter, Some(default_branch_id))
             .await
             .expect("initialize sparse replica storage");
@@ -9004,7 +9194,7 @@ mod tests {
     async fn descriptor_continuation_rejects_future_cursor_and_requires_selected_branch() {
         let app = app().await;
         let (session_id, _) = new_session(&app.router).await;
-        let lease = app.server.lease(&session_id, None).await.unwrap();
+        let lease = app.server.lease(&session_id, &ServerProtocolPrincipal::Anonymous, None).await.unwrap();
         let descriptor = lease
             .record
             .lix
@@ -9029,7 +9219,7 @@ mod tests {
             let response = request(&app.router, "GET", &path, Some(&session_id), None).await;
             assert_eq!(response.status(), status);
         }
-        let lease = app.server.lease(&session_id, None).await.unwrap();
+        let lease = app.server.lease(&session_id, &ServerProtocolPrincipal::Anonymous, None).await.unwrap();
         let response = descriptor_wait::wait_descriptor_until(
             lease,
             Some(branch.clone()),
@@ -9043,7 +9233,7 @@ mod tests {
             response_json(response).await["descriptor"]["cursor"],
             descriptor.cursor
         );
-        let lease = app.server.lease(&session_id, None).await.unwrap();
+        let lease = app.server.lease(&session_id, &ServerProtocolPrincipal::Anonymous, None).await.unwrap();
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(10),
@@ -9058,14 +9248,14 @@ mod tests {
             .await
             .is_err()
         );
-        assert!(app.server.lease(&session_id, None).await.is_ok());
+        assert!(app.server.lease(&session_id, &ServerProtocolPrincipal::Anonymous, None).await.is_ok());
     }
 
     #[tokio::test]
     async fn descriptor_wait_wakes_on_commit_and_cursor_neutral_wakes_keep_deadline() {
         let app = app().await;
         let (session_id, _) = new_session(&app.router).await;
-        let lease = app.server.lease(&session_id, None).await.unwrap();
+        let lease = app.server.lease(&session_id, &ServerProtocolPrincipal::Anonymous, None).await.unwrap();
         let descriptor = lease
             .record
             .lix
@@ -9092,8 +9282,8 @@ mod tests {
                 .expect("commit wakes descriptor waiter");
         let next = response_json(response.unwrap()).await["descriptor"].clone();
         assert!(next["cursor"].as_u64().unwrap() > descriptor.cursor);
-        let neutral_lease = app.server.lease(&session_id, None).await.unwrap();
-        let lease = app.server.lease(&session_id, None).await.unwrap();
+        let neutral_lease = app.server.lease(&session_id, &ServerProtocolPrincipal::Anonymous, None).await.unwrap();
+        let lease = app.server.lease(&session_id, &ServerProtocolPrincipal::Anonymous, None).await.unwrap();
         let wait = descriptor_wait::wait_descriptor_until(
             lease,
             Some(descriptor.selected_branch.branch_id),
@@ -9365,11 +9555,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_object_request_body_limit_precedes_json_parsing() {
-        for configured_limit in [
-            2 * crate::sync::MAX_PARTIAL_UPDATE_REQUEST_BYTES,
-            64 * 1024,
-            1024,
-        ] {
+        for configured_limit in [128 * 1024, 64 * 1024, 1024] {
             let app = app_with_options(ServerProtocolOptions {
                 max_request_body_bytes: configured_limit,
                 ..ServerProtocolOptions::default()
@@ -9380,13 +9566,8 @@ mod tests {
                 "/lix/v1/sync/native-objects",
                 "/lix/v1/sync/native-object-range",
                 "/lix/v1/sync/native-metadata",
-                "/lix/v1/sync/update",
             ] {
-                let effective_limit = configured_limit.min(if path.ends_with("/update") {
-                    crate::sync::MAX_PARTIAL_UPDATE_REQUEST_BYTES
-                } else {
-                    16 * 1024
-                });
+                let effective_limit = configured_limit.min(16 * 1024);
                 for (length, expected_status) in [
                     (effective_limit, StatusCode::BAD_REQUEST),
                     (effective_limit + 1, StatusCode::PAYLOAD_TOO_LARGE),
@@ -9664,7 +9845,7 @@ mod tests {
         let preview = response_json(response).await;
         assert_eq!(preview["targetBranchId"], target_branch);
         assert_eq!(preview["sourceBranchId"], source_branch);
-        assert_eq!(preview["conflicts"], json!([]));
+        assert!(preview.get("conflicts").is_none());
         // Preview must not publish source changes; merge publishes source changes.
         for (merge, expected_count) in [(false, 0), (true, 1)] {
             if merge {
@@ -15060,7 +15241,7 @@ mod tests {
 
         let (notifier, signal) = durable_terminal_storage_signal();
         let lease = server
-            .lease(&session_id, Some(notifier))
+            .lease(&session_id, &ServerProtocolPrincipal::Anonymous, Some(notifier))
             .await
             .expect("session lease");
         storage.block_next_branch_control_read();
@@ -15183,9 +15364,12 @@ mod tests {
     async fn persisted_sync_replica_cannot_be_served_as_an_authority() {
         let storage = Memory::new();
         let adapter = crate::migration::admit_current_repository(&storage, true)
-            .await.expect("create current epoch").adapter;
+            .await
+            .expect("create current epoch")
+            .adapter;
         Engine::initialize_with_adapter(adapter.clone(), None)
-            .await.expect("initialize replica storage");
+            .await
+            .expect("initialize replica storage");
         let mut writes = adapter.new_write_set();
         writes.put(
             crate::sync::SYNC_REPLICA_STATE_SPACE,
@@ -15236,7 +15420,7 @@ mod tests {
             .unwrap();
         let router = handler(server.clone());
         let (session_id, _) = new_session(&router).await;
-        let lease = server.lease(&session_id, None).await.unwrap();
+        let lease = server.lease(&session_id, &ServerProtocolPrincipal::Anonymous, None).await.unwrap();
         let authority = &lease.record.lix;
         local
             .execute(

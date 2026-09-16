@@ -7,6 +7,7 @@ pub(crate) async fn open_partial_lix<StorageImpl>(
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
     server: Option<ServerOptions>,
+    durability: Durability,
 ) -> Result<Lix<StorageImpl>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -16,6 +17,7 @@ where
         .await?;
     let owner = crate::engine::PartialOwnerLifetime::install(owner);
     let mut prepared = crate::sync::prepare_partial_open(storage, server.clone()).await?;
+    prepared.adapter = prepared.adapter.with_durability(durability);
     let result = async {
         #[cfg(feature = "default_wasm_runtime")]
         let wasm_runtime = match wasm_runtime {
@@ -97,8 +99,14 @@ where
     if let Some(telemetry) = source.engine.telemetry() {
         options = options.with_telemetry(telemetry.clone());
     }
-    let (mut engine, initial_session) =
-        Engine::new_partial_replica(admitted.adapter, options, &expected).await?;
+    let (mut engine, initial_session) = Engine::new_partial_replica(
+        admitted
+            .adapter
+            .with_durability(source.engine.storage().durability()),
+        options,
+        &expected,
+    )
+    .await?;
     engine.inherit_partial_storage_runtime(&source.engine);
     engine.inherit_sync_mode(source.engine.sync_mode());
     crate::sync::admit_partial_storage_session(&engine, &expected)?;
@@ -229,6 +237,7 @@ mod tests {
             Some(ServerOptions::new(format!(
                 "http://127.0.0.1:9/lix/{repository_id}"
             ))),
+            Durability::default(),
         )
         .await
         .err()
@@ -296,8 +305,7 @@ mod tests {
                 let first = headers.lines().next().unwrap();
                 let path = first.split_whitespace().nth(1).unwrap();
                 let route = path.split('?').next().unwrap();
-                let background = (route.ends_with("/sync/descriptor") && path.contains('?'))
-                    || route.ends_with("/sync/update");
+                let background = route.ends_with("/sync/descriptor") && path.contains("after=");
                 let closing = first.starts_with("DELETE ");
                 let body = if closing {
                     serde_json::json!({})
@@ -306,19 +314,6 @@ mod tests {
                         descriptor.clone(),
                         authority.active_account_id(),
                     ))
-                    .unwrap()
-                } else if route.ends_with("/sync/update") {
-                    let request: crate::sync::PartialUpdateRequest =
-                        serde_json::from_slice(&bytes).unwrap();
-                    request.snapshot().unwrap();
-                    assert_eq!(request.branch_id, descriptor.selected_branch.branch_id);
-                    serde_json::to_value(crate::sync::PartialUpdateResponse {
-                        descriptor: crate::sync::LeasedPartialReplicaDescriptor::for_test(
-                            descriptor.clone(),
-                            authority.active_account_id(),
-                        ),
-                        bundle: crate::sync::WorkingSetBundle::default(),
-                    })
                     .unwrap()
                 } else if path.ends_with("/sync/native-metadata") {
                     let request: crate::sync::NativeMetadataRequest =
@@ -413,11 +408,22 @@ mod tests {
         assert_eq!(lix.execute(sql, &params).await.unwrap().rows().len(), 1);
         assert_eq!(requests.load(Ordering::SeqCst), warm);
         let mut online_snapshot = Vec::new();
-        lix.export_snapshot().write_to(&mut online_snapshot).await.unwrap();
-        assert_eq!(requests.load(Ordering::SeqCst), warm,
-            "local partial export must not download the authority snapshot");
-        assert!(crate::snapshot::format::decode_streamed_snapshot_header(
-            &online_snapshot[..crate::snapshot::format::HEADER_BYTES]).unwrap().partial_replica);
+        lix.export_snapshot()
+            .write_to(&mut online_snapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            warm,
+            "local partial export must not download the authority snapshot"
+        );
+        assert!(
+            crate::snapshot::format::decode_streamed_snapshot_header(
+                &online_snapshot[..crate::snapshot::format::HEADER_BYTES]
+            )
+            .unwrap()
+            .partial_replica
+        );
         lix.close().await.unwrap();
         let contender = StorageSession::acquire(backing.clone()).await.unwrap();
         assert!(
@@ -456,17 +462,37 @@ mod tests {
         let offline = open_lix().with_storage(backing.clone()).await.unwrap();
         assert!(!offline.open_report().initialized);
         let mut snapshot = Vec::new();
-        offline.export_snapshot().write_to(&mut snapshot).await.unwrap();
-        assert!(crate::snapshot::format::decode_streamed_snapshot_header(
-            &snapshot[..crate::snapshot::format::HEADER_BYTES]).unwrap().partial_replica);
+        offline
+            .export_snapshot()
+            .write_to(&mut snapshot)
+            .await
+            .unwrap();
+        assert!(
+            crate::snapshot::format::decode_streamed_snapshot_header(
+                &snapshot[..crate::snapshot::format::HEADER_BYTES]
+            )
+            .unwrap()
+            .partial_replica
+        );
         let restored = open_lix()
             .with_storage(crate::sync::durable_memory_for_test(Memory::new()))
             .from_snapshot(futures_lite::io::Cursor::new(snapshot.clone()))
-            .await.unwrap();
+            .await
+            .unwrap();
         let mut roundtrip = Vec::new();
-        restored.export_snapshot().write_to(&mut roundtrip).await.unwrap();
-        assert_eq!(roundtrip, snapshot, "partial restoration preserves exact local inputs and journals");
-        assert_eq!(restored.execute(sql, &params).await.unwrap().rows().len(), 1);
+        restored
+            .export_snapshot()
+            .write_to(&mut roundtrip)
+            .await
+            .unwrap();
+        assert_eq!(
+            roundtrip, snapshot,
+            "partial restoration preserves exact local inputs and journals"
+        );
+        assert_eq!(
+            restored.execute(sql, &params).await.unwrap().rows().len(),
+            1
+        );
         restored.close().await.unwrap();
         assert_eq!(offline.execute(sql, &params).await.unwrap().rows().len(), 1);
         assert_eq!(
@@ -512,104 +538,4 @@ where
     let authenticated =
         crate::sync::authenticate_partial_conversion(server, Some(&selected)).await?;
     crate::migration::retry_published_conversion_cleanup(&storage, &authenticated).await
-}
-
-impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
-    pub(crate) async fn collect_partial_working_set(
-        &self,
-        leased: &crate::sync::LeasedPartialReplicaDescriptor,
-        interests: &crate::hot_state::ReadInterestSnapshot,
-    ) -> Result<crate::sync::WorkingSetBundle, LixError> {
-        let state = crate::sync::PartialReplicaState::from_leased(
-            format!("https://working-set.invalid/lix/{}", self.lix_id()),
-            self.active_account_id().to_owned(),
-            uuid::Uuid::now_v7().to_string(),
-            leased.clone(),
-        )?
-        .with_leased_descriptor_and_fresh_generations(leased.clone())?;
-        let storage = self.storage_adapter();
-        let read = storage.begin_read(Default::default()).await?;
-        crate::gc::require_native_baseline_lease(
-            &read,
-            &leased.lease.lease_id,
-            self.active_account_id(),
-            crate::telemetry::unix_time_ms(),
-        )
-        .await?;
-        self.engine
-            .collect_partial_working_set(read, &state, interests)
-            .await
-    }
-}
-
-#[cfg(test)]
-mod working_set_delivery_tests {
-    use super::*;
-    use crate::hot_state::{
-        FilePathInterest, HotStateScanRequest, LogicalReadInterest, ReadInterestSnapshot,
-    };
-
-    #[tokio::test]
-    async fn authority_working_set_collects_selected_file_inputs_without_mutating_controls() {
-        let authority = open_lix().await.unwrap();
-        authority.execute("INSERT INTO lix_file (id,path,content) VALUES ('00000000-0000-7000-8000-000000000123','/selected.txt', CAST('hello' AS BYTEA))", &[]).await.unwrap();
-        let descriptor = authority.partial_replica_descriptor(None).await.unwrap();
-        let state = crate::sync::PartialReplicaState::new(
-            format!("https://example.test/lix/{}", authority.lix_id()),
-            authority.active_account_id().to_owned(),
-            uuid::Uuid::now_v7().to_string(),
-            descriptor.clone(),
-        )
-        .unwrap()
-        .with_descriptor_and_fresh_generations(descriptor.clone())
-        .unwrap();
-        let mut request = HotStateScanRequest::default();
-        request.filter.branch_ids = vec![authority.active_branch_id().await.unwrap()];
-        request.filter.schema_keys = vec!["lix_file".into()];
-        request.projection.columns = vec!["content".into()];
-        let interests = ReadInterestSnapshot {
-            revision: 1,
-            serialized_bytes: 0,
-            interests: vec![Arc::new(LogicalReadInterest::FileContent {
-                request,
-                file_ids: Some(vec!["00000000-0000-7000-8000-000000000123".into()]),
-                directory_ids: None,
-                root_directory: false,
-                indexed: true,
-                path_predicate: FilePathInterest::All,
-                byte_range: None,
-            })],
-        };
-        let storage = authority.storage_adapter();
-        let read = storage.begin_read(Default::default()).await.unwrap();
-        let bundle = authority
-            .engine
-            .collect_partial_working_set(read, &state, &interests)
-            .await
-            .unwrap();
-        assert!(bundle.complete);
-        assert!(!bundle.objects.is_empty());
-        assert!(!bundle.metadata.is_empty());
-        let selected_id = crate::binary_cas::BlobId::from_content(b"hello").to_hex();
-        let selected_blob = bundle
-            .blobs
-            .iter()
-            .find(|blob| blob.blob_id == selected_id)
-            .expect("selected file's canonical blob must be delivered");
-        use base64::Engine as _;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(
-                selected_blob
-                    .inline_bytes_base64
-                    .as_ref()
-                    .expect("selected content must be inline"),
-            )
-            .unwrap();
-        assert_eq!(bytes, b"hello");
-        assert_eq!(
-            authority.partial_replica_descriptor(None).await.unwrap(),
-            descriptor
-        );
-        authority.close().await.unwrap();
-    }
 }

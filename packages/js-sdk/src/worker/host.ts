@@ -351,6 +351,8 @@ export function startWorkerHost(
                 return requiredLix(sessionId).recoverReplica(operation.id);
             case "recoverReplicaWithServer":
                 return requiredLix(sessionId).recoverReplicaWithServer(operation.id, createSyncServerBridge(operation.server, operation.transportScope)!);
+			case "syncHealth":
+				return requiredLix(sessionId).syncHealth();
 			case "activeBranchId":
 				return requiredLix(sessionId).activeBranchId();
 			case "activeAccountId":

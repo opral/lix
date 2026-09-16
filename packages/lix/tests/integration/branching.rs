@@ -1097,7 +1097,6 @@ simulation_test!(
                 removed: 0,
             }
         );
-        assert_eq!(preview.conflicts.len(), 0);
         assert_eq!(
             engine
                 .load_branch_head_commit_id(sim.main_branch_id())
@@ -1495,7 +1494,6 @@ simulation_test!(
             .expect("disjoint changes should merge without conflicts");
         assert_eq!(preview.base_commit_id, checkpoint.commit_id);
         assert_eq!(preview.outcome, MergeBranchOutcome::MergeCommitted);
-        assert_eq!(preview.conflicts.len(), 0);
         assert_eq!(
             preview.change_stats,
             MergeChangeStats {
@@ -1603,7 +1601,6 @@ simulation_test!(
             .await
             .expect("true conflict preview should succeed");
         assert_eq!(preview.base_commit_id, checkpoint);
-        assert_eq!(preview.conflicts.len(), 0);
         assert_eq!(
             commit_parent_edges(&main, &source_head).await,
             vec![(recovered_head, 0), (checkpoint, 1)]

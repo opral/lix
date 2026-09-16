@@ -189,7 +189,6 @@ async fn checkpoint_preserves_branch_merge_base_after_reopen<S: ReopenStorage>()
         .expect("disjoint merge preview after cold reopen");
     assert_eq!(preview.base_commit_id, checkpoint_commit_id);
     assert_eq!(preview.outcome, MergeBranchOutcome::MergeCommitted);
-    assert!(preview.conflicts.is_empty());
     assert_eq!(
         preview.change_stats,
         MergeChangeStats {

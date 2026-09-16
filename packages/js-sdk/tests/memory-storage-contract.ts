@@ -370,11 +370,11 @@ export function registerMemoryStorageContract({
 				await lix.switchBranch({ branchId: main });
 				expect(await readTextFile(lix, "/contract-branch.txt")).toBe("main");
 				const preview = await lix.mergeBranchPreview({ sourceBranchId: draft.id });
+				expect(preview).not.toHaveProperty("conflicts");
 				expect(preview).toMatchObject({
 					outcome: "fastForward",
 					targetBranchId: main,
 					sourceBranchId: draft.id,
-					conflicts: [],
 				});
 				const merge = await lix.mergeBranch({ sourceBranchId: draft.id });
 				expect(merge.outcome).toBe("fastForward");

@@ -80,7 +80,10 @@ impl LixError {
     /// that the current engine target cannot execute safely.
     pub const CODE_UNSUPPORTED_SQL_RUNTIME_PLAN: &'static str = "LIX_UNSUPPORTED_SQL_RUNTIME_PLAN";
 
-    /// Storage I/O failed.
+    /// Another owner already has exclusive access to this storage.
+    pub const CODE_STORAGE_IN_USE: &'static str = "LIX_STORAGE_IN_USE";
+
+    /// A storage operation failed.
     pub const CODE_STORAGE_ERROR: &'static str = "LIX_STORAGE_ERROR";
 
     /// A coherent storage read was invalidated by a concurrent commit.
@@ -189,7 +192,9 @@ impl LixError {
     /// An operation is incompatible with the current session mode or state.
     pub const CODE_INVALID_SESSION_STATE: &'static str = "LIX_INVALID_SESSION_STATE";
 
-    /// A merge found incompatible changes to the same tracked-state identity.
+    /// Plugin ownership or generations are incompatible, or a tracked change
+    /// collides with an untracked row. Ordinary overlapping row edits reconcile
+    /// automatically.
     pub const CODE_MERGE_CONFLICT: &'static str = "LIX_MERGE_CONFLICT";
 
     /// A caller referenced a branch id that has no matching branch ref.
@@ -435,9 +440,10 @@ impl From<crate::storage_adapter::StorageError> for LixError {
     fn from(error: crate::storage_adapter::StorageError) -> Self {
         match error {
             crate::storage_adapter::StorageError::InUse => Self::new(
-                "LIX_STORAGE_IN_USE",
-                "storage already has an active partial replica engine owner",
-            ),
+                Self::CODE_STORAGE_IN_USE,
+                "storage is already open by another owner",
+            )
+            .with_hint("Use the existing repository owner, or close it before reopening."),
             crate::storage_adapter::StorageError::WriteConflict
             | crate::storage_adapter::StorageError::PreconditionFailed(_) => Self::new(
                 Self::CODE_TRANSACTION_CONFLICT,

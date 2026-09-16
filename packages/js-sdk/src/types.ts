@@ -162,6 +162,9 @@ export type ReplicaRecoveryReceipt = {
 	unresolved: string[];
 };
 
+/** Local persistence policy. Buffered acknowledgement can lose saves on a crash. */
+export type Durability = "durable" | "buffered";
+
 export type LixOpenProgressOptions = {
 	/** Observes local or authority inspection, automatic migration, and opening. */
 	onProgress?(progress: LixOpenProgress): void;
@@ -179,16 +182,21 @@ export type PartialReplicaLixServerOptions = Omit<LixServerOptions, "mode"> & {
 export type OpenLixOptions =
 	| ({
 			storage?: import("./storage-adapter.js").LixStorage;
+			/** Defaults to durable; applies to all local sessions and transactions. */
+			durability?: Durability;
 			server?: never;
 			telemetry?: LixTelemetryOptions;
 	  } & LixOpenProgressOptions)
 	| ({
 			storage?: never;
+			/** Remote persistence is configured by the authority. */
+			durability?: never;
 			server: RemoteLixServerOptions;
 			telemetry?: never;
 	  } & LixOpenProgressOptions)
 	| ({
 			storage: import("./storage-adapter.js").LixStorage;
+			durability?: Durability;
 			server: PartialReplicaLixServerOptions;
 			telemetry?: LixTelemetryOptions;
 	  } & LixOpenProgressOptions);
@@ -224,6 +232,12 @@ export type SqlParam = JsonValue | Uint8Array | import("./value.js").Value;
 
 export type ExecuteOptions = {
 	originKey?: string;
+	/**
+	 * Caps whole automatic-transaction replays after conflict or snapshot expiry.
+	 * Zero fails on the first failed attempt. Omit to retain default recovery budgets.
+	 * Does not control explicit transactions, read recovery, or transport retries.
+	 */
+	maxAutoCommitRetries?: number;
 	/** Returns positional arrays instead of plain objects. Defaults to "object". */
 	rowMode?: "object" | "array";
 	/**
@@ -242,6 +256,12 @@ export type LixBatchStatement = {
 
 export type LixBatchOptions = {
 	originKey?: string;
+	/**
+	 * Caps whole automatic-transaction replays after conflict or snapshot expiry.
+	 * Zero fails on the first failed attempt. Omit to retain default recovery budgets.
+	 * Does not control explicit transactions, read recovery, or transport retries.
+	 */
+	maxAutoCommitRetries?: number;
 	/** Returns positional arrays instead of plain objects. Defaults to "object". */
 	rowMode?: "object" | "array";
 	/** See {@link ExecuteOptions.idempotencyKey}. */
@@ -374,7 +394,6 @@ export type MergeBranchPreview = {
 	targetHeadCommitId: string;
 	sourceHeadCommitId: string;
 	changeStats: MergeChangeStats;
-	conflicts: MergeConflict[];
 };
 
 export type MergeChangeStats = {
@@ -384,16 +403,11 @@ export type MergeChangeStats = {
 	removed: number;
 };
 
-export type MergeConflict = {
-	kind: "sameRowChanged";
-	rowRef: string;
-	fileId: string | null;
-	target: MergeConflictSide;
-	source: MergeConflictSide;
-};
-
-export type MergeConflictSide = {
-	kind: "added" | "modified" | "removed";
-	beforeChangeId: string | null;
-	afterChangeId: string | null;
+/** Local partial-replica worker health. Running does not guarantee remote freshness. */
+export type SyncHealth = {
+	state: "inactive" | "running" | "stalled" | "failed" | "stopped";
+	appliedCursor: number | null;
+	observedCursor: number | null;
+	failures: Partial<Record<"descriptor" | "publication" | "upload" | "lease", { code: string; message: string }>>;
+	terminalError: { code: string; message: string } | null;
 };
