@@ -1,0 +1,30 @@
+name: Compiler cache
+description: Persist a bounded local sccache through the runner's Actions cache service.
+inputs:
+  scope:
+    description: Compilation lane (target and profile); share only compatible lanes.
+    required: true
+runs:
+  using: composite
+  steps:
+    # The per-object GHA backend reported 1,331 write errors in one Rust job.
+    # Archive the local cache once instead of making a remote write per object.
+    - name: Configure local compiler cache
+      shell: bash
+      run: |
+        echo "SCCACHE_DIR=$RUNNER_TEMP/lix-sccache" >> "$GITHUB_ENV"
+        echo 'SCCACHE_CACHE_SIZE=2G' >> "$GITHUB_ENV"
+        echo 'SCCACHE_GHA_ENABLED=false' >> "$GITHUB_ENV"
+        echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
+        echo 'RUSTC_WRAPPER=sccache' >> "$GITHUB_ENV"
+    - name: Restore compiler objects
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/lix-sccache
+        key: sccache-disk-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: |
+          sccache-disk-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ hashFiles('rust-toolchain.toml') }}-
+    - name: Install compiler cache
+      uses: mozilla-actions/sccache-action@v0.0.10
+      with:
+        version: v0.18.0
