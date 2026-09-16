@@ -257,7 +257,7 @@ where
             ));
         }
     }
-    let interests = registry.snapshot()?;
+    let interests = registry.moving_snapshot()?;
     preconditions.push(stage_partial_replica_state(
         &mut writes,
         &next,
@@ -292,7 +292,7 @@ where
         branch_switch_completion: None,
         previous,
         next,
-        interests_revision: interests.revision,
+        interests_revision: interests.revision(),
         deadline,
         writes,
         preconditions,
@@ -606,7 +606,7 @@ where
             observation.raw_token,
         )?);
     }
-    let interests = registry.snapshot()?;
+    let interests = registry.moving_snapshot()?;
     preconditions.push(stage_partial_replica_state(
         &mut writes,
         &next,
@@ -631,7 +631,7 @@ where
         origin_write_gate: engine.collaboration_write_gate(),
         previous,
         next,
-        interests_revision: interests.revision,
+        interests_revision: interests.revision(),
         deadline,
         writes,
         preconditions,

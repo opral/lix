@@ -616,3 +616,17 @@ test.each([204, 205, 304])(
 		expect(response.body).toBeNull();
 	},
 );
+
+test("sync health forwards the phase failures and cursor snapshot", async () => {
+	const transport = fakeConnection();
+	const client = new LixWorkerClient(transport.connection);
+	client.beginLease();
+	const binding = workerBinding(client, new BindingLease(() => undefined));
+	const result = binding.syncHealth();
+	const request = transport.sent.at(-1);
+	if (!request || !("id" in request)) throw new Error("expected health request");
+	expect(request.operation).toEqual({ kind: "syncHealth" });
+	const health = { state: "stalled", appliedCursor: 492, observedCursor: 543, failures: { descriptor: { code: "OFFLINE", message: "unavailable" } }, terminalError: null };
+	transport.emit({ id: request.id, ok: true, value: health });
+	await expect(result).resolves.toEqual(health);
+});

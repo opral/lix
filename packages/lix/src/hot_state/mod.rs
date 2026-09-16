@@ -6,7 +6,7 @@ mod reader;
 #[allow(unused_imports)]
 pub(crate) use read_interests::{
     DiffInterestEndpoint, ExactReadIdentity, FilePathInterest, FilePathInterestComparison,
-    InterestDomain, LogicalReadInterest, ReadInterestOperation, ReadInterestPublication,
+    InterestDomain, LogicalReadInterest, MovingReadInterestSnapshot, ReadInterestOperation, ReadInterestPublication,
     ReadInterestRegistry, ReadInterestSnapshot,
 };
 mod row_columnar_cache;

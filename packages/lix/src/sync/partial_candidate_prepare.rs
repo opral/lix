@@ -3,9 +3,7 @@
 use super::partial_replica::PartialReplicaDescriptor;
 use crate::LixError;
 use crate::filesystem::{FilesystemPathIndexReader, FilesystemPathIndexRequest};
-use crate::hot_state::{
-    HotStateContext, HotStateReader, LogicalReadInterest, ReadInterestSnapshot,
-};
+use crate::hot_state::{HotStateContext, HotStateReader, LogicalReadInterest};
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use crate::storage_adapter::{
     StorageBeginScanOptions as BeginScanOptions, StorageCoreProjection as CoreProjection,
@@ -270,7 +268,7 @@ pub(super) fn interest_belongs_to_candidate(
 pub(crate) async fn prepare_candidate_native_interests<R>(
     read: R,
     state: &super::partial_state::PartialReplicaState,
-    interests: &ReadInterestSnapshot,
+    interests: &crate::hot_state::MovingReadInterestSnapshot,
     plugin_host: crate::plugin::runtime::PluginRuntimeHost,
     hot: HotStateContext,
     allow_missing_selected_control: bool,
@@ -278,57 +276,7 @@ pub(crate) async fn prepare_candidate_native_interests<R>(
 where
     R: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    prepare_candidate_interests_inner(
-        read,
-        state,
-        interests,
-        plugin_host,
-        hot,
-        allow_missing_selected_control,
-        true,
-    )
-    .await
-}
-
-/// Authority delivery evaluates the same recipes using ephemeral root controls.
-/// It never copies the authority's local untracked plane into the candidate.
-pub(super) async fn prepare_authority_working_set<R>(
-    read: R,
-    state: &super::partial_state::PartialReplicaState,
-    interests: &ReadInterestSnapshot,
-    plugin_host: crate::plugin::runtime::PluginRuntimeHost,
-) -> Result<(), LixError>
-where
-    R: StorageAdapterRead + Clone + Send + Sync + 'static,
-{
-    prepare_candidate_interests_inner(
-        read,
-        state,
-        interests,
-        plugin_host,
-        HotStateContext::new(
-            crate::tracked_state::TrackedStateContext::new(),
-            crate::commit_graph::CommitGraphContext::new(),
-        ),
-        false,
-        false,
-    )
-    .await
-    .map(|_| ())
-}
-
-async fn prepare_candidate_interests_inner<R>(
-    read: R,
-    state: &super::partial_state::PartialReplicaState,
-    interests: &ReadInterestSnapshot,
-    plugin_host: crate::plugin::runtime::PluginRuntimeHost,
-    hot: HotStateContext,
-    allow_missing_selected_control: bool,
-    copy_untracked: bool,
-) -> Result<PreparedCandidateState, LixError>
-where
-    R: StorageAdapterRead + Clone + Send + Sync + 'static,
-{
+    let interests = interests.as_read_snapshot();
     let descriptor = state.descriptor();
     let mut active_interests = interests.clone();
     active_interests.interests.clear();
@@ -407,17 +355,15 @@ where
             observation.raw_token,
         )?);
         if let Some(source) = observation.control {
-            if copy_untracked {
-                crate::hot_state::TrackedHeadContext::new()
-                    .writer(&read, &mut staged)
-                    .stage_untracked_for_root_generation(
-                        &branch.branch_id,
-                        source.tracked_generation,
-                        state.serving_generation(&branch.branch_id)?,
-                        head,
-                    )
-                    .await?;
-            }
+            crate::hot_state::TrackedHeadContext::new()
+                .writer(&read, &mut staged)
+                .stage_untracked_for_root_generation(
+                    &branch.branch_id,
+                    source.tracked_generation,
+                    state.serving_generation(&branch.branch_id)?,
+                    head,
+                )
+                .await?;
         } else if !(allow_missing_selected_control
             && branch.branch_id == descriptor.selected_branch.branch_id
             && branch.branch_id != crate::GLOBAL_BRANCH_ID)

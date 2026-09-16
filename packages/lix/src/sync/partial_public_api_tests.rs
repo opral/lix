@@ -1,5 +1,7 @@
 //! Public awaited SQL across lease expiry, using the canonical authority handler.
 mod live_file_listing;
+mod retained_history;
+mod supplied_snapshot;
 use crate::engine::{Engine, EngineOptions};
 use crate::server_protocol::{LixServerProtocol, ServerProtocolBody, ServerProtocolContext};
 use crate::storage_adapter::{StorageAdapter, StorageWriteOptions};
@@ -22,7 +24,7 @@ struct ExpiringClient {
 impl RawHttpClient for ExpiringClient {
     fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
         Box::pin(async move {
-            if request.url.ends_with("/sync/update") {
+            if request.url.contains("/sync/descriptor?") && request.url.contains("after=") {
                 match &self.live_updates {
                     Some(enabled) => while !enabled.load(Ordering::SeqCst) {
                         crate::sync::platform::sleep(std::time::Duration::from_millis(1)).await;

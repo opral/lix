@@ -94,6 +94,7 @@ export type LixBinding = {
 	exportReplicaRecovery(id: string): Promise<ReplicaRecoveryExport>;
 	recoverReplica(id: string): Promise<ReplicaRecoveryReceipt>;
 	recoverReplicaWithServer(id: string, server: SyncServerBindingOptions): Promise<ReplicaRecoveryReceipt>;
+	syncHealth(): Promise<import("./types.js").SyncHealth>;
 	activeBranchId(): Promise<string>;
 	activeAccountId(): Promise<string>;
 	createBranch(options: CreateBranchOptions): Promise<CreateBranchReceipt>;

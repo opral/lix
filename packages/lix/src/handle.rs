@@ -1337,6 +1337,12 @@ impl<StorageImpl> Lix<StorageImpl>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    /// Returns local synchronization health without issuing SQL or network requests.
+    /// Available after close so a stopped worker can still be diagnosed.
+    pub fn sync_health(&self) -> crate::SyncHealth {
+        self.engine.sync_mode().health().snapshot()
+    }
+
     /// Configures a deterministic, stream-first snapshot export.
     pub fn export_snapshot(&self) -> crate::snapshot::SnapshotExportBuilder<StorageImpl> {
         let export = crate::snapshot::SnapshotExportBuilder::new(self.engine.storage());
@@ -3985,9 +3991,20 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
         session: SessionContext<StorageSession<S>>,
         sender: tokio::sync::mpsc::Sender<crate::sync::SyncDemand>,
     ) -> Self {
-        let lix = Self { engine, session: Arc::new(session), transaction_lifecycle: Arc::default(),
-            primary_switch_gate: Some(Arc::default()), sync_lease: None, sync_demand_tx: Some(sender), server: None,
-            open_report: Arc::new(OpenReport { format: crate::init::CURRENT_FORMAT_VERSION, initialized: false, migration: None }) };
+        let lix = Self {
+            engine,
+            session: Arc::new(session),
+            transaction_lifecycle: Arc::default(),
+            primary_switch_gate: Some(Arc::default()),
+            sync_lease: None,
+            sync_demand_tx: Some(sender),
+            server: None,
+            open_report: Arc::new(OpenReport {
+                format: crate::init::CURRENT_FORMAT_VERSION,
+                initialized: false,
+                migration: None,
+            }),
+        };
         lix.bind_session();
         lix
     }

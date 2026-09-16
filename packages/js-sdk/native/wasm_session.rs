@@ -52,6 +52,14 @@ macro_rules! wasm_session_methods {
                 crate::wasm::to_js(&crate::wasm::ExecuteBatchResultDto { results, commit })
             }
 
+            #[wasm_bindgen(js_name = syncHealth)]
+            pub async fn sync_health(&self) -> Result<JsValue, JsValue> {
+                let health = crate::session::SessionOperations::sync_health(&self.inner)
+                    .await
+                    .map_err(crate::wasm::lix_error_to_js)?;
+                crate::wasm::to_js(&health)
+            }
+
             #[wasm_bindgen(js_name = activeBranchId)]
             pub async fn active_branch_id(&self) -> Result<String, JsValue> {
                 self.instrument_operation(crate::session::SessionOperations::active_branch_id(

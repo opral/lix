@@ -288,7 +288,6 @@ enum RequestBodyPolicy {
     None,
     Json,
     NativeObjects,
-    WorkingSet,
     Binary,
     Chunk,
 }
@@ -334,7 +333,6 @@ protocol_routes! {
    SyncNativeObjects => ("POST", "/sync/native-objects", NativeObjects),
    SyncRenewBaselineLease => ("POST", "/sync/baseline-lease/renew", NativeObjects),
    SyncDescriptor => ("GET", "/sync/descriptor", None),
-   SyncPartialUpdate => ("POST", "/sync/update", WorkingSet),
    SyncPull => ("GET", "/sync/pull", None),
    SyncHistory => ("GET", "/sync/history", None),
    SyncCheckpoints => ("GET", "/sync/checkpoints", None),
@@ -1938,9 +1936,7 @@ where
             .map(ProtocolRoute::body)
             .unwrap_or(RequestBodyPolicy::None);
         match body_policy {
-            RequestBodyPolicy::Json
-            | RequestBodyPolicy::NativeObjects
-            | RequestBodyPolicy::WorkingSet => {
+            RequestBodyPolicy::Json | RequestBodyPolicy::NativeObjects => {
                 if let Err(error) = require_json_content_type(&parts.headers) {
                     return error.into_response();
                 }
@@ -1960,8 +1956,6 @@ where
                 RequestBodyPolicy::Chunk => {
                     MAX_SYNC_CHUNK_BYTES.min(self.inner.options.max_request_body_bytes)
                 }
-                RequestBodyPolicy::WorkingSet => crate::sync::MAX_PARTIAL_UPDATE_REQUEST_BYTES
-                    .min(self.inner.options.max_request_body_bytes),
                 _ => self.inner.options.max_request_body_bytes,
             };
             match body.into_bytes(body_limit).await {
@@ -2184,10 +2178,6 @@ where
             }
             Some(ProtocolRoute::SyncRenewBaselineLease) => result_response(
                 sync_renew_baseline_lease(lease, json_request!(SyncRenewBaselineLeaseRequest))
-                    .await,
-            ),
-            Some(ProtocolRoute::SyncPartialUpdate) => result_response(
-                partial_update::update(lease, json_request!(crate::sync::PartialUpdateRequest))
                     .await,
             ),
             Some(ProtocolRoute::SyncDescriptor) => {
@@ -3155,7 +3145,6 @@ where
 
 mod descriptor_wait;
 mod partial_merge;
-mod partial_update;
 
 async fn sync_descriptor<S>(
     lease: SessionLease<S>,
@@ -5820,7 +5809,6 @@ mod tests {
                 ("POST", "/lix/v1/{lix_id}/sync/migration/cleanup") => "syncNativeMigrationCleanup",
                 ("GET", "/lix/v1/{lix_id}/sync/pull") => "syncPull",
                 ("GET", "/lix/v1/{lix_id}/sync/descriptor") => "syncDescriptor",
-                ("POST", "/lix/v1/{lix_id}/sync/update") => "syncPartialUpdate",
                 ("POST", "/lix/v1/{lix_id}/sync/baseline-lease/renew") => "syncRenewBaselineLease",
                 ("POST", "/lix/v1/{lix_id}/sync/native-objects") => "syncNativeObjects",
                 ("POST", "/lix/v1/{lix_id}/sync/native-object-range") => "syncNativeObjectRange",
@@ -5875,13 +5863,12 @@ mod tests {
             openapi
                 .matches("$ref: \"#/components/parameters/SyncProtocolVersion\"")
                 .count(),
-            23,
+            22,
             "every sync HTTP operation must declare the required version header",
         );
         for operation_id in [
             "syncPush",
             "syncDescriptor",
-            "syncPartialUpdate",
             "syncRenewBaselineLease",
             "syncNativeObjects",
             "syncNativeObjectRange",
@@ -7897,7 +7884,9 @@ mod tests {
 
         let storage = DurableMemoryStorage::new();
         let adapter = crate::migration::admit_current_repository(&storage, true)
-            .await.expect("create current sparse epoch").adapter;
+            .await
+            .expect("create current sparse epoch")
+            .adapter;
         Engine::initialize_with_adapter(adapter, Some(default_branch_id))
             .await
             .expect("initialize sparse replica storage");
@@ -9365,11 +9354,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_object_request_body_limit_precedes_json_parsing() {
-        for configured_limit in [
-            2 * crate::sync::MAX_PARTIAL_UPDATE_REQUEST_BYTES,
-            64 * 1024,
-            1024,
-        ] {
+        for configured_limit in [128 * 1024, 64 * 1024, 1024] {
             let app = app_with_options(ServerProtocolOptions {
                 max_request_body_bytes: configured_limit,
                 ..ServerProtocolOptions::default()
@@ -9380,13 +9365,8 @@ mod tests {
                 "/lix/v1/sync/native-objects",
                 "/lix/v1/sync/native-object-range",
                 "/lix/v1/sync/native-metadata",
-                "/lix/v1/sync/update",
             ] {
-                let effective_limit = configured_limit.min(if path.ends_with("/update") {
-                    crate::sync::MAX_PARTIAL_UPDATE_REQUEST_BYTES
-                } else {
-                    16 * 1024
-                });
+                let effective_limit = configured_limit.min(16 * 1024);
                 for (length, expected_status) in [
                     (effective_limit, StatusCode::BAD_REQUEST),
                     (effective_limit + 1, StatusCode::PAYLOAD_TOO_LARGE),
@@ -15183,9 +15163,12 @@ mod tests {
     async fn persisted_sync_replica_cannot_be_served_as_an_authority() {
         let storage = Memory::new();
         let adapter = crate::migration::admit_current_repository(&storage, true)
-            .await.expect("create current epoch").adapter;
+            .await
+            .expect("create current epoch")
+            .adapter;
         Engine::initialize_with_adapter(adapter.clone(), None)
-            .await.expect("initialize replica storage");
+            .await
+            .expect("initialize replica storage");
         let mut writes = adapter.new_write_set();
         writes.put(
             crate::sync::SYNC_REPLICA_STATE_SPACE,

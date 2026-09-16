@@ -397,3 +397,12 @@ export type MergeConflictSide = {
 	beforeChangeId: string | null;
 	afterChangeId: string | null;
 };
+
+/** Local partial-replica worker health. Running does not guarantee remote freshness. */
+export type SyncHealth = {
+	state: "inactive" | "running" | "stalled" | "failed" | "stopped";
+	appliedCursor: number | null;
+	observedCursor: number | null;
+	failures: Partial<Record<"descriptor" | "publication" | "upload" | "lease", { code: string; message: string }>>;
+	terminalError: { code: string; message: string } | null;
+};

@@ -9,7 +9,6 @@ use futures_util::{FutureExt, select_biased};
 use crate::storage_adapter::{Storage, StorageAdapter, StorageWriteOptions};
 use crate::{LixError, tracked_state::NativeMetadataRef};
 
-use super::SyncTransport;
 use super::http::{HttpSyncTransport, RawHttpClient};
 use super::native_metadata::{
     NativeMetadataRequest, native_metadata_is_resident, stage_native_metadata,
@@ -18,6 +17,7 @@ use super::partial_hydration::{hydrate_native_object, native_object_is_resident}
 use super::partial_state::{PartialReplicaState, load_partial_replica_state};
 use super::platform::{sleep, spawn_sync_task};
 use super::runtime::{SyncDemand, SyncDemandRequest, SyncRuntime, SyncShutdown, stopped_error};
+use super::{SyncPhase, SyncTransport};
 
 pub(crate) async fn start_partial_runtime_with_engine<S>(
     storage: StorageAdapter<S>,
@@ -66,6 +66,7 @@ where
         .filter(|engine| engine.partial_owner().is_installed())
         .map(|engine| engine.partial_owner().retain_for_owned_work())
         .transpose()?;
+    let health = engine.as_ref().map(|engine| engine.sync_mode().health());
     let task = spawn_sync_task(async move {
         let _owner_guard = owner_guard;
         let result = run_platform_partial_worker(
@@ -79,6 +80,9 @@ where
             engine,
         )
         .await;
+        if let Some(health) = health {
+            health.stopped(result.as_ref().err());
+        }
         let _ = completion_tx.send(result);
     })?;
     Ok(Arc::new(SyncRuntime {
@@ -314,7 +318,9 @@ async fn demand_is_resident<S: Storage + Clone + Send + Sync + 'static>(
             }
             Ok(resident)
         }
-        SyncDemandRequest::Pinned(request) => Box::pin(demand_is_resident(storage, state, request)).await,
+        SyncDemandRequest::Pinned(request) => {
+            Box::pin(demand_is_resident(storage, state, request)).await
+        }
         SyncDemandRequest::ReconcilePartial => Ok(false),
         SyncDemandRequest::History(_) => Err(LixError::new(
             "LIX_PARTIAL_REPLICA_DEMAND_UNSUPPORTED",
@@ -436,7 +442,9 @@ pub(super) fn hydrate_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: 
                 }
                 Ok(())
             }
-            SyncDemandRequest::Pinned(request) => hydrate_demand(storage, state, transport, *request).await,
+            SyncDemandRequest::Pinned(request) => {
+                hydrate_demand(storage, state, transport, *request).await
+            }
             SyncDemandRequest::ReconcilePartial => Err(LixError::unknown(
                 "reconciliation must run through the partial owner",
             )),
@@ -571,13 +579,17 @@ where
             Ok(changed) => progress |= changed,
             Err(error) if error.code == "LIX_PARTIAL_CREATED_REF_SOURCE_PENDING" => {}
             Err(error) if is_terminal_partial_transport_error(&error) => return Err(error),
-            Err(error) => { deferred_error.get_or_insert(error); },
+            Err(error) => {
+                deferred_error.get_or_insert(error);
+            }
         }
     }
     // A divergent GLOBAL lane must not starve an independently publishable
     // selected upload. Its acknowledgment can be the fence recovery needs.
     if !progress {
-        if let Some(error) = deferred_error { return Err(error); }
+        if let Some(error) = deferred_error {
+            return Err(error);
+        }
     }
     Ok(progress)
 }
@@ -589,7 +601,7 @@ fn reconciliation_can_retry(error: &LixError) -> bool {
         LixError::CODE_TRANSACTION_CONFLICT
             | "LIX_PARTIAL_BASELINE_EXPIRED"
             | "LIX_PARTIAL_CANDIDATE_EXPIRED"
-        | "LIX_PARTIAL_READ_INTEREST_CHANGED"
+            | "LIX_PARTIAL_READ_INTEREST_CHANGED"
             | "LIX_PARTIAL_REPLICA_REBASE_REQUIRED"
             | "LIX_PARTIAL_REPLICA_BASELINE_RECOVERY_PENDING"
             | "LIX_PARTIAL_REPLICA_MERGE_PENDING"
@@ -732,7 +744,9 @@ where
             .ok_or_else(|| LixError::unknown("partial recovery lost admission"))?;
         // Ordinary pending work on an unchanged server head needs upload, not
         // a divergent merge. Use the fresh lease for any missing upload inputs.
-        *transport = Some(if current.as_ref() == state.as_ref() { candidate } else {
+        *transport = Some(if current.as_ref() == state.as_ref() {
+            candidate
+        } else {
             candidate.fork_native_baseline_lease(current.baseline_lease())?
         });
         match upload_pending_once(&storage, &current, transport, connect).await {
@@ -746,9 +760,11 @@ where
                         &current,
                         transport.as_ref().expect("connected"),
                         demand,
-                    ).await {
-                        Ok(()) => {},
-                        Err(error) if reconciliation_can_retry(&error) => {},
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(error) if reconciliation_can_retry(&error) => {}
                         Err(error) => return Err(error),
                     }
                 } else {
@@ -839,6 +855,11 @@ where
     C: RawHttpClient + Clone + 'static,
     Connect: FnMut() -> super::SyncTransportFuture<'static, HttpSyncTransport<C>>,
 {
+    let health = engine
+        .as_ref()
+        .map(|engine| engine.sync_mode().health())
+        .unwrap_or_default();
+    health.started(state.descriptor().cursor);
     let mut publication: Option<super::SyncTransportFuture<'static, ()>> = None;
     let mut watch_cursor = state.descriptor().cursor;
     let mut blocked_global_cursor: Option<u64> = None;
@@ -872,11 +893,14 @@ where
                     .map(|value| value.fork_native_baseline_lease(current.baseline_lease()))
                     .transpose()?;
                 state = current;
+                health.applied(state.descriptor().cursor);
+                health.succeeded(SyncPhase::Publication);
                 watch_cursor = state.descriptor().cursor;
                 watch_after = web_time::Instant::now();
                 renewal_deadline = web_time::Instant::now()
                     + lease_renewal_delay(state.baseline_lease().expires_at_ms);
                 if lease_changed {
+                    health.succeeded(SyncPhase::Lease);
                     baseline_expired = None;
                 }
             }
@@ -917,9 +941,12 @@ where
                             // server long poll is the wait. Failed adoption
                             // retains the cursor and needs the existing backoff.
                             watch_after = web_time::Instant::now() + if let Err(error) = result {
+                                health.failed(SyncPhase::Publication, &error);
                                 tracing::warn!(code=%error.code, "partial publication did not complete");
                                 Duration::from_millis(100)
                             } else {
+                                health.succeeded(SyncPhase::Publication);
+                                if let Some(current) = engine.as_ref().and_then(|engine| engine.sync_mode().partial_admission()) { health.applied(current.descriptor().cursor); }
                                 Duration::ZERO
                             };
                             continue;
@@ -960,12 +987,13 @@ where
                     // A successful renewal proves a fresh server TTL. Use a
                     // monotonic interval so client/server clock skew cannot
                     // trigger a zero-delay renewal loop.
-                    Ok(_) => renewal_deadline = web_time::Instant::now() + Duration::from_millis(crate::gc::NATIVE_BASELINE_LEASE_TTL_MS / 2),
+                    Ok(_) => { health.succeeded(SyncPhase::Lease); renewal_deadline = web_time::Instant::now() + Duration::from_millis(crate::gc::NATIVE_BASELINE_LEASE_TTL_MS / 2); },
                     Err(error) => {
                         if is_terminal_partial_transport_error(&error) {
                             terminal_error = Some(error);
                             break 'worker;
                         }
+                        health.failed(SyncPhase::Lease, &error);
                         tracing::warn!(code = %error.code, message = %error.message, "partial replica baseline renewal failed");
                         if error.code == "LIX_PARTIAL_BASELINE_EXPIRED" {
                             baseline_expired = Some(error);
@@ -1000,6 +1028,7 @@ where
                 },
                 result = upload => match result {
                     Ok(progress) => {
+                        health.succeeded(SyncPhase::Upload);
                         if progress {
                             force_descriptor_refresh=true;
                             // Publication changed the authority basis. A prior
@@ -1014,6 +1043,7 @@ where
                             break 'worker;
                         }
                         force_descriptor_refresh=true;
+                        health.failed(SyncPhase::Upload, &error);
                         tracing::warn!(code = %error.code, message = %error.message, "partial replica upload retained for retry");
                         retry_upload = true;
                         retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
@@ -1046,34 +1076,18 @@ where
                     transport = Some(connected);
                 }
                 let connected = transport.as_ref().expect("connected");
-                let interests = engine.sync_mode().read_interests()
-                    .ok_or_else(|| LixError::unknown("partial update has no retained interests"))?
-                    .snapshot()?;
-                let request = super::partial_update::PartialUpdateRequest {
-                    branch_id: state.descriptor().selected_branch.branch_id.clone(),
-                    after: if request_fresh { None } else { Some(after_cursor) },
-                    // A successful own-write acknowledgment can leave the serving
-                    // admission unchanged. Reuse the observed cursor so its
-                    // already installed working set is not delivered again.
-                    known_cursor: if blocked_cursor.is_none() {
-                        state.descriptor().cursor.max(after_cursor)
-                    } else { state.descriptor().cursor },
-                    interests: interests.interests.iter().filter_map(|interest| {
-                        match super::partial_candidate_prepare::interest_belongs_to_candidate(
-                            interest, &state.descriptor().selected_branch.branch_id,
-                            &state.descriptor().global_branch.branch_id, state.archived_branch_ids(),
-                        ) {
-                            Ok(true) => Some(Ok(interest.as_ref().clone())),
-                            Ok(false) => None,
-                            Err(error) => Some(Err(error)),
-                        }
-                    }).collect::<Result<Vec<_>, LixError>>()?,
+                // Progress discovery has no query recipes or payload evaluation.
+                // Missing native inputs are fetched only by the client candidate
+                // evaluator below, under this descriptor's original lease.
+                let branch = &state.descriptor().selected_branch.branch_id;
+                let wrapper = if request_fresh {
+                    connected.partial_replica_descriptor(Some(branch)).await?
+                } else {
+                    connected.wait_partial_replica_descriptor(branch, after_cursor).await?
                 };
-                let (wrapper, bundle) = connected.partial_replica_update(&request).await?;
-                wrapper.deadline.check(&wrapper.wire.lease.lease_id)?;
-                super::partial_update::install_bundle(&storage, &state, &bundle).await?;
                 wrapper.deadline.check(&wrapper.wire.lease.lease_id)?;
                 let cursor = wrapper.wire.descriptor.cursor;
+                engine.sync_mode().health().observed(cursor);
                 if !request_fresh && blocked_cursor.is_some_and(|blocked| cursor <= blocked) {
                     return Ok((
                         cursor,
@@ -1135,22 +1149,29 @@ where
                 _ = retry => { upload_due = true; },
                 result = watch => match result {
                     Ok((cursor, super::partial_reconcile::PreparedDescriptor::LocalProgress)) => {
+                        health.observed(cursor); health.succeeded(SyncPhase::Descriptor);
                         watch_cursor=watch_cursor.max(cursor);blocked_global_cursor=None;
                         force_descriptor_refresh=true;upload_due=true;retry_upload=false;
                         watch_after=web_time::Instant::now();
                     },
                     Ok((cursor, super::partial_reconcile::PreparedDescriptor::NoChange)) => {
+                        health.observed(cursor);
+                        if !blocked_global_cursor.is_some_and(|blocked| cursor <= blocked) {
+                            health.succeeded(SyncPhase::Descriptor);
+                        }
                         force_descriptor_refresh=false;
                         if blocked_global_cursor.is_some_and(|blocked|cursor>blocked){blocked_global_cursor=None;}
                         watch_cursor = watch_cursor.max(cursor);
                         // The next request long-polls after this processed cursor.
                         watch_after = web_time::Instant::now();
                     },
-                    Ok((_, super::partial_reconcile::PreparedDescriptor::Ready(prepared))) => {
+                    Ok((cursor, super::partial_reconcile::PreparedDescriptor::Ready(prepared))) => {
+                        health.observed(cursor); health.succeeded(SyncPhase::Descriptor);
                         force_descriptor_refresh=false; blocked_global_cursor=None;
                         publication = Some(Box::pin(super::partial_publication::publish_prepared_partial(engine.clone(), prepared)));
                     },
                     Err(error) => {
+                        health.failed(SyncPhase::Descriptor, &error);
                         if is_terminal_partial_transport_error(&error) {
                             terminal_error = Some(error);
                             break 'worker;
@@ -1239,10 +1260,12 @@ where
                             transport = transport.as_ref().map(|value|
                                 value.fork_native_baseline_lease(current.baseline_lease())).transpose()?;
                             state = current;
+                            health.applied(state.descriptor().cursor);
+                            health.succeeded(SyncPhase::Publication);
                             watch_cursor = state.descriptor().cursor;
                             renewal_deadline = web_time::Instant::now()
                                 + lease_renewal_delay(state.baseline_lease().expires_at_ms);
-                            if lease_changed { baseline_expired = None; }
+                            if lease_changed { health.succeeded(SyncPhase::Lease); baseline_expired = None; }
                         }
                     }
                     if matches!(demand.request, SyncDemandRequest::ReconcilePartial) {
@@ -1561,9 +1584,13 @@ mod tests {
             opts: crate::storage::WriteOptions,
         ) -> Result<Self::Write<'_>, crate::storage::StorageError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
-            if self.conflicts.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                remaining.checked_sub(1)
-            }).is_ok() {
+            if self
+                .conflicts
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
                 return Err(crate::storage::StorageError::PreconditionFailed(vec![
                     crate::storage::PreconditionFailure { index: 0 },
                 ]));
@@ -1584,15 +1611,26 @@ mod tests {
             conflicts: conflicts.clone(),
             writes: writes.clone(),
         });
-        tokio::time::timeout(Duration::from_secs(5), hydrate_metadata(
-            &storage, &state, &transport, address.clone(),
-        )).await.expect("contention must settle").unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            hydrate_metadata(&storage, &state, &transport, address.clone()),
+        )
+        .await
+        .expect("contention must settle")
+        .unwrap();
         assert_eq!(conflicts.load(Ordering::SeqCst), 0);
         assert!(writes.load(Ordering::SeqCst) >= 7);
-        assert_eq!(client.fetches.load(Ordering::SeqCst), 1,
-            "local contention must not refetch authenticated metadata");
+        assert_eq!(
+            client.fetches.load(Ordering::SeqCst),
+            1,
+            "local contention must not refetch authenticated metadata"
+        );
         let read = storage.begin_read(Default::default()).await.unwrap();
-        assert!(native_metadata_is_resident(&read, &state, &address).await.unwrap());
+        assert!(
+            native_metadata_is_resident(&read, &state, &address)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

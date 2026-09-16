@@ -571,6 +571,53 @@ mod tests {
         assert!(restored.begin_publication(0).await.is_err());
     }
     #[tokio::test]
+    async fn reopening_retains_history_without_making_it_a_moving_requirement() {
+        let (storage, state) = fixture().await;
+        let registry = ReadInterestRegistry::new_durable(MAX_RECIPES, MAX_RECIPE_BYTES);
+        let historical = LogicalReadInterest::Diff {
+            branch_id: Some(state.descriptor().selected_branch.branch_id.clone()),
+            relation: "lix_key_value".into(),
+            from: crate::hot_state::DiffInterestEndpoint::Fixed("historical-from".into()),
+            to: crate::hot_state::DiffInterestEndpoint::Fixed("historical-to".into()),
+            filter: Default::default(),
+            retain_payloads: true,
+            projected_columns: vec!["value".into()],
+            limit: None,
+        };
+        registry.register(historical.clone()).unwrap();
+        let moving = recipe("future-row");
+        registry.register(moving.clone()).unwrap();
+        flush_partial_read_interests(&storage, &state, &registry)
+            .await
+            .unwrap();
+        let reopened = ReadInterestRegistry::new_durable(MAX_RECIPES, MAX_RECIPE_BYTES);
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        restore_candidate_read_interests(&read, &state, &reopened)
+            .await
+            .unwrap();
+        assert_eq!(reopened.snapshot().unwrap().interests.len(), 2);
+        let requirements = reopened.moving_snapshot().unwrap();
+        assert_eq!(
+            requirements.as_read_snapshot().interests.as_slice(),
+            &[Arc::new(moving)]
+        );
+        drop(
+            reopened
+                .begin_publication(requirements.revision())
+                .await
+                .unwrap(),
+        );
+        assert!(
+            reopened
+                .snapshot()
+                .unwrap()
+                .interests
+                .iter()
+                .any(|recipe| recipe.as_ref() == &historical)
+        );
+    }
+
+    #[tokio::test]
     async fn lossy_version_one_journal_is_rejected_even_when_empty() {
         let (storage, state) = fixture().await;
         let mut writes = storage.new_write_set();

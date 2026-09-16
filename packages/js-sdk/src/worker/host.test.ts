@@ -171,3 +171,17 @@ test("worker forwards the durable transaction commit receipt", async () => {
 	receive({ id: 3, sessionId: 0, operation: { kind: "transaction.commit", transactionId: 1 } });
 	await vi.waitFor(() => expect(responses).toContainEqual({ id: 3, ok: true, value: { commit: span } }));
 });
+
+test("worker host routes sync health to the local binding", async () => {
+	const responses: WorkerResponse[] = [];
+	let receive: (message: WorkerInput) => void = () => undefined;
+	const endpoint: WorkerHostEndpoint = { postMessage: (message) => { responses.push(message); }, onMessage: (listener) => { receive = listener; } };
+	const health = { state: "stalled", appliedCursor: 492, observedCursor: 543, failures: { descriptor: { code: "OFFLINE", message: "unavailable" } }, terminalError: null };
+	const binding = { syncHealth: vi.fn(async () => health), setTelemetryParent() {} } as unknown as LixBinding;
+	startWorkerHost(endpoint, async () => binding);
+	receive({ id: 1, sessionId: 0, operation: { kind: "open", storage: { kind: "memory" } } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 1, ok: true }));
+	receive({ id: 2, sessionId: 0, operation: { kind: "syncHealth" } });
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 2, ok: true, value: health }));
+	expect(binding.syncHealth).toHaveBeenCalledOnce();
+});

@@ -169,7 +169,15 @@ Foreign-key, uniqueness, filesystem ancestry, delete restrictions, plugin extrac
 
 ## 5. Keep the working set warm through background sync
 
-Add server-side scoped delivery. A client subscribes to retained native scopes; the server delivers row changes, new matches, departures, tombstones and ordering-boundary information. It must not send complete unrelated commit bodies or file chunks for the browser to discard. Preserve transaction and commit identity through bounded authenticated control/provenance information and selectively fetched native dependencies.
+The current implementation discovers leased descriptors independently of read
+recipes. The replica hydrates required native inputs and publishes the moving
+working set atomically. Fixed-to-fixed historical reads retain their recipes and
+immutable bytes without participating in moving-state publication. Dynamic reads,
+including negative scopes and diffs involving a moving head, remain publication
+requirements. This retained warm working set is not an observer-lifetime lease;
+explicit subscription disposal and cache eviction remain separate future work.
+Optional prefetch must remain independent of descriptor discovery and publication.
+It must never turn unavailable historical inputs into a synchronization barrier.
 
 A scope snapshot and its following changes need a race-free boundary. Apply cross-scope changes as a coherent transaction, with rows, provenance and coverage updates installed together. A move between two loaded directories must not transiently disappear from both or be counted twice in a combined query.
 
@@ -180,6 +188,18 @@ Maintain a coherent applied working-set version; the latest authority notificati
 Some scopes may remain retained without an active subscription, but then they describe an older complete snapshot. The system cannot unsubscribe and still promise latest-server values immediately on return. Pin scopes requiring continuously warm editing; bound other subscriptions and retained bytes explicitly.
 
 Pending commits and their base/validation/recovery dependencies are not evictable cache. Garbage collection must understand remote references and incomplete local availability; it cannot assume local reachability is a complete inventory of authority state. Reset must not trigger an implicit full-repository bootstrap.
+
+### Synchronization health
+
+Use Rust `lix.sync_health()` or JavaScript `await lix.syncHealth()` to inspect
+partial-replica background progress independently of local read availability. The snapshot reports
+`inactive`, `running`, `stalled`, `failed`, or `stopped`, the latest observed and
+locally applied cursors, and phase-specific failures. A successful local read does
+not clear a failed sync phase. Each phase clears its own failure only after it
+succeeds. `running` is not a promise of instant server freshness; new remote writes
+may not have been observed yet. Health is process-local and shared by handles of
+the same engine; a newly opened worker starts a new health lifecycle. Other modes
+report `inactive`. JavaScript sessions must still be open when reading health.
 
 ## 6. Permit server SQL fallback under a precise rule
 

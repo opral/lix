@@ -101,6 +101,7 @@ export type WorkerOperation =
 	| { kind: "exportReplicaRecovery"; id: string }
 	| { kind: "recoverReplica"; id: string }
 	| { kind: "recoverReplicaWithServer"; id: string; server: WorkerSyncServerOptions; transportScope: number }
+	| { kind: "syncHealth" }
 	| { kind: "activeBranchId" }
 	| { kind: "activeAccountId" }
 	| { kind: "createBranch"; options: CreateBranchOptions }

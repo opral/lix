@@ -292,6 +292,8 @@ async fn run_pending_native_conversion_inner(
                 }
                 Err(e) => panic!("{e}"),
             };
+            // Accepted sockets inherit nonblocking mode on Darwin.
+            stream.set_nonblocking(false).unwrap();
             let server = server.clone();
             let global_before = global_before.clone();
             let global_after = global_after.clone();
