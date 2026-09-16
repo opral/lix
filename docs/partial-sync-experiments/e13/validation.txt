@@ -1,0 +1,24 @@
+git diff --check
+
+node scripts/validate-changes.mjs
+Validated 7 change fragment(s).
+
+node scripts/validate-server-protocol-docs.mjs
+Validated 42 server protocol path(s).
+
+Extended timing terminal; starting full engine gate
+nextest: 0
+doctest: 0
+fmt: 1
+Traceback (most recent call last):
+  File "/root/repos/history-sync-research/run_e13_gates.py", line 17, in <module>
+    assert result.returncode==0,name
+           ^^^^^^^^^^^^^^^^^^^^
+AssertionError: fmt
+
+Follow-up validation: cargo fmt -p lix -- --check passed in controlled and report worktrees.
+The failed --all formatter covers unchanged baseline server and storage-filesystem files; git status shows only the two intended engine files modified.
+All E13 gates passed for the changed engine scope; original workspace-wide formatting failure retained above.
+
+     Summary [  58.346s] 4323 tests run: 4323 passed, 84 skipped
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

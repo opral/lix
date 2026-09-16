@@ -390,8 +390,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                 let mut next = Some(anchor);
                 let mut position = 0i64;
                 let mut emitted = 0usize;
-                let mut resumed_history_checkpoints = 0usize;
-                let mut visited_history_checkpoints = 0usize;
+                let mut completed_history_checkpoints = 0usize;
                 while let Some(id) = next {
                     if max_position.is_some_and(|ceiling| position > ceiling) { break; }
                     if limit.is_some_and(|n| emitted >= n) || remaining_ids.as_ref().is_some_and(|ids| ids.is_empty()) { break; }
@@ -405,7 +404,6 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                     if !matches_metadata(&metadata_batch(&node, current_position, relation.is_some(), 1)?, &metadata_filters)? { continue; }
                     if let Some(relation) = &relation {
                         let Some(parent) = next else { continue; }; // root is a baseline, not a synthetic change
-                        visited_history_checkpoints = visited_history_checkpoints.saturating_add(1);
                         let diff_projection = schema.fields().iter().filter_map(|field| relation.schema.index_of(field.name()).ok()).collect::<Vec<_>>();
                         record_work(true);
                         let diff = DiffSpec { blob_reader: Arc::clone(&blob_reader), store: store.clone(), read_interests: None, interest_endpoints: None, relation: relation.clone(), from_commit_id: parent.to_string(),
@@ -417,7 +415,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                             Err(error) => {
                                 let error = frontier::discover(
                                     &diff, parent, &diff_projection, &row_filters,
-                                    resumed_history_checkpoints, checkpoint_constraint, datafusion_error_to_lix_error(error),
+                                    completed_history_checkpoints, checkpoint_constraint, datafusion_error_to_lix_error(error),
                                 ).await;
                                 Err(lix_error_to_datafusion_error(error))?
                             }
@@ -430,13 +428,12 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                             let mut output = RecordBatch::try_new_with_options(schema.clone(), columns, &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())))?;
                             if let Some(n) = limit { output = output.slice(0, output.num_rows().min(n - emitted)); }
                             emitted += output.num_rows();
-                            let nonempty = output.num_rows() != 0;
                             yield output;
-                            // Grow with selected checkpoints already traversed, including empty
-                            // diffs, but only after downstream resumes a nonempty result.
-                            if nonempty { resumed_history_checkpoints = visited_history_checkpoints; }
                             if limit.is_some_and(|n| emitted >= n) { break; }
                         }
+                        // Reaching the next selected checkpoint means the consumer still
+                        // needs history, even when the completed diff produced no rows.
+                        completed_history_checkpoints = completed_history_checkpoints.saturating_add(1);
                     } else {
                         let batch = metadata_batch(&node, current_position, false, 1)?;
                         let indices = schema.fields().iter().map(|f| batch.schema().index_of(f.name())).collect::<std::result::Result<Vec<_>, _>>()?;

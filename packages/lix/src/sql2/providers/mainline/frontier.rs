@@ -107,11 +107,11 @@ pub(super) async fn discover<S: StorageAdapterRead + Clone + Send + Sync + 'stat
     mut next: CommitId,
     projection: &Vec<usize>,
     filters: &[Expr],
-    resumed_checkpoints: usize,
+    completed_checkpoints: usize,
     checkpoint: Option<bool>,
     error: LixError,
 ) -> LixError {
-    if resumed_checkpoints == 0 {
+    if completed_checkpoints == 0 {
         return error;
     }
     let Ok(Some(mut frontier)) = MissingFrontier::from_error(&error) else {
@@ -120,7 +120,7 @@ pub(super) async fn discover<S: StorageAdapterRead + Clone + Send + Sync + 'stat
     let required = frontier.len();
     let mut graph = CommitGraphContext::new().reader(diff.store.clone());
     let mut seen = BTreeSet::new();
-    for _ in 1..resumed_checkpoints.saturating_add(1).min(MAX_CHECKPOINTS) {
+    for _ in 1..completed_checkpoints.saturating_add(1).min(MAX_CHECKPOINTS) {
         if frontier.full() || !seen.insert(next) {
             break;
         }
