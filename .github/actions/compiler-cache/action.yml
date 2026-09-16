@@ -17,14 +17,31 @@ runs:
         echo 'SCCACHE_GHA_ENABLED=false' >> "$GITHUB_ENV"
         echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
         echo 'RUSTC_WRAPPER=sccache' >> "$GITHUB_ENV"
-    - name: Restore compiler objects
+    # Immutable snapshots are keyed by compilation inputs, not run IDs. A retry
+    # with unchanged inputs can restore an exact key without another upload.
+    # sccache itself validates each compiler invocation; this outer key only
+    # controls snapshot freshness, never whether a compilation is correct.
+    # PR-scoped snapshots compete with main's reusable caches and cannot be
+    # read by sibling PRs. Keep PRs read-only to avoid evicting the shared seed.
+    - name: Restore compiler objects for pull requests
+      if: github.ref != 'refs/heads/main'
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/lix-sccache
+        key: sccache-disk-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'tooling/Cargo.lock', 'tooling/Cargo.toml', '.cargo/**', 'packages/**', 'plugins/**', 'scripts/**', '.github/workflows/**', '.github/actions/compiler-cache/**', '!packages/**/node_modules/**', '!packages/**/dist/**', '!packages/**/target/**') }}
+        restore-keys: |
+          sccache-disk-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ hashFiles('rust-toolchain.toml') }}-
+    - name: Restore and retain main compiler objects
+      if: github.ref == 'refs/heads/main'
       uses: actions/cache@v4
       with:
         path: ${{ runner.temp }}/lix-sccache
-        key: sccache-disk-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+        key: sccache-disk-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'tooling/Cargo.lock', 'tooling/Cargo.toml', '.cargo/**', 'packages/**', 'plugins/**', 'scripts/**', '.github/workflows/**', '.github/actions/compiler-cache/**', '!packages/**/node_modules/**', '!packages/**/dist/**', '!packages/**/target/**') }}
         restore-keys: |
           sccache-disk-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ hashFiles('rust-toolchain.toml') }}-
+    # Install only the binary. sccache-action exports ACTIONS_RESULTS_URL into
+    # later steps, bypassing the runner provider's transparent cache endpoint.
     - name: Install compiler cache
-      uses: mozilla-actions/sccache-action@v0.0.10
+      uses: taiki-e/install-action@v2
       with:
-        version: v0.18.0
+        tool: sccache@0.18.0

@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { binaryManifest, cacheKey, restoreBinaries } from "./ci-sdk-cache.mjs";
+import { binaryManifest, cacheKey, restoreBinaries, saveBinaries } from "./ci-sdk-cache.mjs";
 import { findReusableRun, readArtifactJson } from "./ci-merge-reuse.mjs";
 
 function sourceTree(root) {
@@ -66,11 +66,36 @@ export function restoreReleaseBrowser(root, downloaded, revision, env = process.
 	restoreBinaries(join(root, "packages/js-sdk"), sdk, "browser", expected.key);
 }
 
+// The exact-tree merge path skips SDK jobs, so their PR-scoped Actions cache
+// never becomes visible to subsequent PRs. Seed main from the verified artifact.
+export function prepareMergedBrowserCache(root, revision, env = process.env) {
+	const manifest = JSON.parse(readFileSync(join(root, "ci-artifact/browser.json"), "utf8"));
+	const key = cacheKey(root, "browser", env);
+	if (!matchesBrowserBuild(manifest, { revision, tree: sourceTree(root), key })) {
+		throw new Error("Merged browser artifact does not match checkout/build settings");
+	}
+	const sdk = join(root, "packages/js-sdk");
+	if (JSON.stringify(binaryManifest(sdk, "browser", key)) !== JSON.stringify(manifest.releaseBuild.binaries)) {
+		throw new Error("Merged browser artifact checksum mismatch");
+	}
+	saveBinaries(sdk, join(root, ".ci-sdk-cache/browser"), "browser", key);
+	return key;
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
 	const [command, downloaded, revision] = process.argv.slice(2);
 	if (command === "describe") {
 		mkdirSync("ci-artifact", { recursive: true });
 		writeFileSync("ci-artifact/browser.json", JSON.stringify(describeBrowser(process.cwd(), process.env.LIX_SOURCE_SHA)));
+	} else if (command === "prepare-merged-cache") {
+		// Cache warming is optional; an old or incompatible artifact must not
+		// invalidate otherwise valid merge evidence or enter the shared cache.
+		try {
+			const key = prepareMergedBrowserCache(process.cwd(), process.env.SOURCE_REVISION);
+			appendFileSync(process.env.GITHUB_OUTPUT, `key=${key}\n`);
+		} catch (error) {
+			console.log(`Not seeding browser cache: ${error.message}`);
+		}
 	} else if (command === "restore") {
 		try {
 			restoreReleaseBrowser(process.cwd(), downloaded, revision);

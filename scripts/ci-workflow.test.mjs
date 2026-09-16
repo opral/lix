@@ -390,7 +390,8 @@ test("CI and release share bounded disk compiler caches with separate native pro
 	assert.match(cache, /SCCACHE_GHA_ENABLED=false/);
 	assert.match(cache, /SCCACHE_CACHE_SIZE=2G/);
 	assert.match(cache, /uses: actions\/cache@v4/);
-	assert.match(cache, /version: v0\.18\.0/);
+	assert.match(cache, /tool: sccache@0\.18\.0/);
+	assert.doesNotMatch(cache, /uses: mozilla-actions\/sccache-action/);
 	assert.match(cache, /hashFiles\('rust-toolchain\.toml'\)/);
 	assert.match(workflow, /scope: sdk-\$\{\{ matrix\.runtime \}\}/);
 	assert.match(publishWorkflow, /scope: sdk-release-\$\{\{ matrix\.suffix \}\}/);
@@ -411,4 +412,23 @@ test("content revisions preserve compatible consumer artifacts without compilati
   assert.match(promotion, /name: ci-browser-build/);
   const gate = workflow.split("\n  release-ready:\n")[1].split("\n  merge-reuse:\n")[0];
   assert.match(gate, /needs: .*content-browser-sdk/);
+});
+
+test("merge promotion warms main browser binaries and retries do not duplicate compiler snapshots", () => {
+  const promotion = workflow.split("\n  promote-browser-sdk:\n")[1].split("\n  changelog:\n")[0];
+  assert.match(promotion, /prepare-merged-cache/);
+  assert.match(promotion, /lookup-only: true/);
+  assert.match(promotion, /uses: actions\/cache\/save@v4/);
+  const cache = readFileSync(resolve(repositoryRoot, ".github/actions/compiler-cache/action.yml"), "utf8");
+  assert.doesNotMatch(cache, /github\.(run_id|run_attempt|sha)/);
+  assert.match(cache, /hashFiles\('Cargo.lock'/);
+  assert.ok(cache.includes("'packages/**'"));
+  assert.ok(cache.includes("'scripts/**'"));
+});
+
+
+test("only main writes compiler snapshots; PRs restore without creating private copies", () => {
+  const cache = readFileSync(resolve(repositoryRoot, ".github/actions/compiler-cache/action.yml"), "utf8");
+  assert.match(cache, /if: github\.ref != 'refs\/heads\/main'\n\s+uses: actions\/cache\/restore@v4/);
+  assert.match(cache, /if: github\.ref == 'refs\/heads\/main'\n\s+uses: actions\/cache@v4/);
 });
