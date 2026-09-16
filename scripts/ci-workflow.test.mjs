@@ -81,7 +81,7 @@ test("Clippy caches both workspaces and SDK build modes have separate main-seede
 	);
 	assert.match(
 		workflow,
-		/shared-key: ci-js-\$\{\{ matrix\.runtime \}\}\n\s+save-if: \$\{\{ github\.ref == 'refs\/heads\/main' \}\}/,
+		/shared-key: ci-js-\$\{\{ matrix\.runtime \}\}\n\s+key: parallel-sdk-v1\n\s+cache-targets: false\n\s+save-if: \$\{\{ github\.ref == 'refs\/heads\/main' \}\}/,
 	);
 });
 
