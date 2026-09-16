@@ -390,7 +390,8 @@ test("CI and release share bounded disk compiler caches with separate native pro
 	assert.match(cache, /SCCACHE_GHA_ENABLED=false/);
 	assert.match(cache, /SCCACHE_CACHE_SIZE=2G/);
 	assert.match(cache, /uses: actions\/cache@v4/);
-	assert.match(cache, /version: v0\.18\.0/);
+	assert.match(cache, /tool: sccache@0\.18\.0/);
+	assert.doesNotMatch(cache, /uses: mozilla-actions\/sccache-action/);
 	assert.match(cache, /hashFiles\('rust-toolchain\.toml'\)/);
 	assert.match(workflow, /scope: sdk-\$\{\{ matrix\.runtime \}\}/);
 	assert.match(publishWorkflow, /scope: sdk-release-\$\{\{ matrix\.suffix \}\}/);

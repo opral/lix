@@ -507,6 +507,7 @@ jobs:
         run: |
           df -h "$GITHUB_WORKSPACE"
           free -h
+          if command -v sccache >/dev/null; then sccache --show-stats; fi
 
   js-sdk-test:
     name: JS SDK ${{ matrix.runtime == 'browser' && 'Browser' || 'Native' }} Test
@@ -745,6 +746,7 @@ jobs:
         run: |
           df -h "$GITHUB_WORKSPACE"
           free -h
+          if command -v sccache >/dev/null; then sccache --show-stats; fi
 
   preview-artifact-changes:
     name: Select preview artifacts
@@ -865,6 +867,7 @@ jobs:
         run: |
           df -h "$GITHUB_WORKSPACE"
           free -h
+          if command -v sccache >/dev/null; then sccache --show-stats; fi
 
   content-browser-sdk:
     name: Reuse unchanged content SDK

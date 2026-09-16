@@ -39,7 +39,9 @@ runs:
         key: sccache-disk-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'tooling/Cargo.lock', 'tooling/Cargo.toml', '.cargo/**', 'packages/**', 'plugins/**', 'scripts/**', '.github/workflows/**', '.github/actions/compiler-cache/**', '!packages/**/node_modules/**', '!packages/**/dist/**', '!packages/**/target/**') }}
         restore-keys: |
           sccache-disk-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.scope }}-${{ hashFiles('rust-toolchain.toml') }}-
+    # Install only the binary. sccache-action exports ACTIONS_RESULTS_URL into
+    # later steps, bypassing the runner provider's transparent cache endpoint.
     - name: Install compiler cache
-      uses: mozilla-actions/sccache-action@v0.0.10
+      uses: taiki-e/install-action@v2
       with:
-        version: v0.18.0
+        tool: sccache@0.18.0
