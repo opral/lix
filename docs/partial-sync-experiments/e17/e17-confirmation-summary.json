@@ -1,0 +1,46 @@
+{
+  "warmup0": {
+    "first": {
+      "pairs": 10,
+      "baseline_median_us": 5930.0,
+      "candidate_median_us": 7279.5,
+      "paired_improvement": -0.22964208438514244,
+      "bootstrap95": [
+        -0.25305051247070354,
+        -0.20525532969757054
+      ]
+    },
+    "steady": {
+      "pairs": 10,
+      "baseline_median_us": 5753.0,
+      "candidate_median_us": 7161.0,
+      "paired_improvement": -0.24493046924035267,
+      "bootstrap95": [
+        -0.2522203041818548,
+        -0.24171127804248171
+      ]
+    }
+  },
+  "warmup500-20pairs": {
+    "first": {
+      "pairs": 20,
+      "baseline_median_us": 7757.0,
+      "candidate_median_us": 7360.5,
+      "paired_improvement": 0.03767469372509358,
+      "bootstrap95": [
+        -0.0013823173881761797,
+        0.1253084427935286
+      ]
+    },
+    "steady": {
+      "pairs": 20,
+      "baseline_median_us": 5776.0,
+      "candidate_median_us": 5680.5,
+      "paired_improvement": 0.015423524834997648,
+      "bootstrap95": [
+        0.011703384723942944,
+        0.01830214161961169
+      ]
+    }
+  }
+}

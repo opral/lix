@@ -1138,6 +1138,10 @@ impl TableSpec for LixFileSpec {
                 .filesystem_path_index
                 .path_index(
                     &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
+                        .with_file_ids(match &target_file_ids {
+                            FileIdConstraint::Ids(ids) if ids.iter().all(|id| file_id_row_pk(id).is_ok()) => Some(ids.iter().cloned().collect()),
+                            _ => None,
+                        })
                         .with_blob_refs(needs_blob_rows)
                         .with_cached_blob_data(needs_data),
                 )

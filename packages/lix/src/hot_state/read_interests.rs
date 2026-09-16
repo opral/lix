@@ -110,6 +110,8 @@ pub(crate) enum LogicalReadInterest {
         schema_key: String,
     },
     FilesystemPaths {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_ids: Option<Vec<String>>,
         branch_ids: Vec<String>,
         include_blob_refs: bool,
         cache_small_blob_data: bool,
@@ -722,6 +724,16 @@ mod tests {
         );
         drop(operation);
         drop(registry.begin_publication(snapshot.revision).await.unwrap());
+    }
+
+    #[test]
+    fn scoped_filesystem_recipe_preserves_legacy_decode_and_selected_refresh_scope() {
+        let legacy = serde_json::json!({"kind":"filesystem_paths", "branch_ids":["branch"], "include_blob_refs":false, "cache_small_blob_data":false});
+        let decoded: LogicalReadInterest = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(matches!(&decoded, LogicalReadInterest::FilesystemPaths { file_ids: None, .. }));
+        assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
+        let selected = LogicalReadInterest::FilesystemPaths { branch_ids:vec!["branch".to_owned()], file_ids:Some(vec!["file".to_owned()]), include_blob_refs:true, cache_small_blob_data:false };
+        assert_eq!(serde_json::from_slice::<LogicalReadInterest>(&serde_json::to_vec(&selected).unwrap()).unwrap(), selected);
     }
 
     #[tokio::test]

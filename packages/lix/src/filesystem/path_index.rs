@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::mem::size_of;
 use std::ops::Bound;
 use std::sync::{Arc, Mutex};
@@ -17,6 +17,7 @@ use crate::common::{LixTimestamp, compose_directory_path, compose_file_path};
 use crate::row_pk::RowPk;
 use crate::hot_state::{
     HotStateFilter, HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
+    MaterializedHotStateBatchBuilder,
     MaterializedHotStateRow,
 };
 use crate::storage_adapter::{
@@ -1132,6 +1133,7 @@ fn estimated_entry_index_bytes(entry: &FilesystemPathEntry) -> usize {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FilesystemPathIndexRequest {
+    pub(crate) file_ids: Option<Vec<String>>,
     pub(crate) branch_ids: Vec<String>,
     pub(crate) include_blob_refs: bool,
     pub(crate) cache_small_blob_data: bool,
@@ -1142,10 +1144,21 @@ impl FilesystemPathIndexRequest {
         branch_ids.sort();
         branch_ids.dedup();
         Self {
+            file_ids: None,
             branch_ids,
             include_blob_refs: false,
             cache_small_blob_data: false,
         }
+    }
+
+    /// Restrict a file view without changing ordinary full-index consumers.
+    pub(crate) fn with_file_ids(mut self, file_ids: Option<Vec<String>>) -> Self {
+        self.file_ids = file_ids.map(|mut ids| {
+            ids.sort();
+            ids.dedup();
+            ids
+        });
+        self
     }
 
     pub(crate) fn with_blob_refs(mut self, enabled: bool) -> Self {
@@ -1214,7 +1227,7 @@ pub(crate) async fn build_path_index(
     hot_state: &dyn HotStateReader,
     request: &FilesystemPathIndexRequest,
 ) -> Result<Arc<FilesystemPathIndex>, LixError> {
-    let rows = hot_state.scan_batch(&request.hot_state_request()).await?;
+    let rows = read_path_index_rows(hot_state, request).await?;
     #[cfg(test)]
     {
         FULL_REBUILD_BUILDS.with(|builds| builds.set(builds.get().saturating_add(1)));
@@ -1224,8 +1237,96 @@ pub(crate) async fn build_path_index(
     Ok(Arc::new(FilesystemPathIndex::from_live_batch(&rows)?))
 }
 
+/// Read only selected file owners and the directory ancestry needed to resolve
+/// their paths. Each depth batches independent parents; visited IDs bound cycles,
+/// whose semantic error remains the ordinary path constructor's responsibility.
+async fn read_path_index_rows(
+    hot_state: &dyn HotStateReader,
+    request: &FilesystemPathIndexRequest,
+) -> Result<MaterializedHotStateBatch, LixError> {
+    let Some(file_ids) = &request.file_ids else {
+        return hot_state.scan_batch(&request.hot_state_request()).await;
+    };
+    if file_ids.is_empty() {
+        return Ok(MaterializedHotStateBatch::default());
+    }
+    let mut selected = request.hot_state_request();
+    selected
+        .filter
+        .schema_keys
+        .retain(|key| key != DIRECTORY_DESCRIPTOR_SCHEMA_KEY);
+    selected.filter.file_ids = file_ids
+        .iter()
+        .cloned()
+        .map(crate::NullableKeyFilter::Value)
+        .collect();
+    let files = hot_state.scan_batch(&selected).await?;
+    let mut pending = BTreeSet::new();
+    for row in files
+        .iter()
+        .filter(|row| !row.deleted() && row.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY)
+    {
+        let snapshot: FileSnapshot = serde_json::from_value(
+            row.snapshot_json_value()?
+                .ok_or_else(|| LixError::unknown("file descriptor has no payload"))?,
+        )
+        .map_err(|error| LixError::unknown(format!("invalid file descriptor: {error}")))?;
+        if let Some(parent) = snapshot.directory_id {
+            pending.insert((row.branch_id().to_owned(), parent));
+        }
+    }
+    let parents = crate::hot_state::HotStateExactBatchRequest {
+        rows: pending
+            .into_iter()
+            .map(|(branch_id, id)| {
+                Ok(crate::hot_state::HotStateExactRowRequest {
+                    schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_owned(),
+                    branch_id,
+                    row_pk: RowPk::uuid_from_canonical(&id).map_err(|error| {
+                        LixError::unknown(format!("invalid directory identity: {error}"))
+                    })?,
+                    file_id: None,
+                })
+            })
+            .collect::<Result<Vec<_>, LixError>>()?,
+        ..Default::default()
+    };
+    let directories = hot_state
+        .load_exact_parent_closure(&parents, directory_parent_row_pk)
+        .await?;
+    let batches = [files, directories];
+    let mut builder = MaterializedHotStateBatchBuilder::with_capacity(
+        batches.iter().map(MaterializedHotStateBatch::len).sum(),
+    );
+    for batch in &batches {
+        for row in batch.iter() {
+            builder.push_ref(row, None);
+        }
+    }
+    Ok(builder.finish())
+}
+
+fn directory_parent_row_pk(
+    row: crate::hot_state::MaterializedHotStateRowRef<'_>,
+) -> Result<Option<RowPk>, LixError> {
+    if row.deleted() {
+        return Ok(None);
+    }
+    let snapshot: DirectorySnapshot = serde_json::from_value(
+        row.snapshot_json_value()?
+            .ok_or_else(|| LixError::unknown("directory descriptor has no payload"))?,
+    )
+    .map_err(|error| LixError::unknown(format!("invalid directory descriptor: {error}")))?;
+    snapshot
+        .parent_id
+        .as_deref()
+        .map(RowPk::uuid_from_canonical)
+        .transpose()
+        .map_err(|error| LixError::unknown(format!("invalid directory identity: {error}")))
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CacheKey {
+    file_ids: Option<Vec<String>>,
     branch_ids: Vec<String>,
     revision: Option<Vec<u8>>,
     include_blob_refs: bool,
@@ -1234,7 +1335,8 @@ struct CacheKey {
 
 impl CacheKey {
     fn estimated_heap_bytes(&self) -> usize {
-        self.branch_ids.capacity() * size_of::<String>()
+        self.file_ids.as_ref().map_or(0, |ids| ids.capacity() * size_of::<String>() + ids.iter().map(String::capacity).sum::<usize>())
+            + self.branch_ids.capacity() * size_of::<String>()
             + self.branch_ids.iter().map(String::capacity).sum::<usize>()
             + self.revision.as_ref().map_or(0, Vec::capacity)
     }
@@ -1269,6 +1371,7 @@ impl FilesystemPathIndexCache {
         revision: Option<&[u8]>,
     ) -> Option<Arc<FilesystemPathIndex>> {
         let key = CacheKey {
+            file_ids: request.file_ids.clone(),
             branch_ids: request.branch_ids.clone(),
             revision: revision.map(<[u8]>::to_vec),
             include_blob_refs: request.include_blob_refs,
@@ -1298,6 +1401,7 @@ impl FilesystemPathIndexCache {
         index: Arc<FilesystemPathIndex>,
     ) -> Arc<FilesystemPathIndex> {
         let key = CacheKey {
+            file_ids: request.file_ids.clone(),
             branch_ids: request.branch_ids.clone(),
             revision: revision.map(<[u8]>::to_vec),
             include_blob_refs: request.include_blob_refs,
@@ -1316,7 +1420,8 @@ impl FilesystemPathIndexCache {
             Arc::new((*index).clone().with_generation(revision))
         };
         entries.retain(|candidate| {
-            candidate.key.branch_ids != key.branch_ids
+            candidate.key.file_ids != key.file_ids
+                || candidate.key.branch_ids != key.branch_ids
                 || candidate.key.include_blob_refs != key.include_blob_refs
                 || candidate.key.cache_small_blob_data != key.cache_small_blob_data
         });
@@ -1367,7 +1472,7 @@ impl FilesystemPathIndexCache {
             // A multi-branch effective view needs cross-branch precedence
             // reconciliation. Filesystem queries normally use one branch, so
             // keep this uncommon case on the correctness fallback as well.
-            if candidate.key.branch_ids.len() != 1 {
+            if candidate.key.file_ids.is_some() || candidate.key.branch_ids.len() != 1 {
                 return false;
             }
             let request = FilesystemPathIndexRequest::new(candidate.key.branch_ids.clone())
@@ -1383,6 +1488,7 @@ impl FilesystemPathIndexCache {
         });
         for (request, index) in advanced {
             let key = CacheKey {
+            file_ids: request.file_ids.clone(),
                 branch_ids: request.branch_ids,
                 revision: next_revision.map(<[u8]>::to_vec),
                 include_blob_refs: request.include_blob_refs,
@@ -1428,7 +1534,7 @@ impl FilesystemPathIndexCache {
             let Some(next_revision) = next_revision_for(previous_revision) else {
                 return true;
             };
-            if invalidates_delta || candidate.key.branch_ids.len() != 1 {
+            if invalidates_delta || candidate.key.file_ids.is_some() || candidate.key.branch_ids.len() != 1 {
                 return false;
             }
             let request = FilesystemPathIndexRequest::new(candidate.key.branch_ids.clone())
@@ -1445,6 +1551,7 @@ impl FilesystemPathIndexCache {
         });
         for (request, revision, index) in advanced {
             let key = CacheKey {
+            file_ids: request.file_ids.clone(),
                 branch_ids: request.branch_ids,
                 revision: Some(revision),
                 include_blob_refs: request.include_blob_refs,
@@ -1601,6 +1708,46 @@ mod tests {
         ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
             unreachable!("path-index construction only scans live state")
         }
+    }
+
+    #[tokio::test]
+    async fn scoped_path_index_reads_only_selected_files_and_ancestor_closure() {
+        let lix = crate::open_lix().await.unwrap();
+        for path in ["/top/nested/a.bin", "/top/other.bin", "/elsewhere/x.bin", "/root.bin"] {
+            lix.upsert_file_content(path, b"content".to_vec()).await.unwrap();
+        }
+        let id = lix.execute("SELECT id FROM lix_file WHERE path='/top/nested/a.bin'", &[]).await.unwrap().rows()[0].get::<String>("id").unwrap();
+        let root_id = lix.execute("SELECT id FROM lix_file WHERE path='/root.bin'", &[]).await.unwrap().rows()[0].get::<String>("id").unwrap();
+        let branch = lix.partial_replica_descriptor(None).await.unwrap().selected_branch.branch_id;
+        let hot = crate::hot_state::HotStateContext::new(crate::tracked_state::TrackedStateContext::new(), crate::commit_graph::CommitGraphContext::new());
+        let adapter = lix.storage_adapter();
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let reader = hot.reader(&read);
+        let request = FilesystemPathIndexRequest::new(vec![branch]).with_file_ids(Some(vec![id]));
+        let rows = read_path_index_rows(&reader, &request).await.unwrap();
+        assert_eq!(rows.len(), 3, "one file and its two ancestors, no siblings or blobs");
+        let index = reader.path_index(&request).await.unwrap();
+        assert_eq!(index.entries().iter().map(|entry| entry.path.as_str()).collect::<Vec<_>>(), vec!["/top", "/top/nested", "/top/nested/a.bin"]);
+        assert!(Arc::ptr_eq(&index, &reader.path_index(&request).await.unwrap()), "scoped reads reuse the revision cache");
+        let root = request.clone().with_file_ids(Some(vec![root_id]));
+        assert_eq!(read_path_index_rows(&reader, &root).await.unwrap().len(), 1);
+        let missing = request.with_file_ids(Some(vec!["00000000-0000-0000-0000-000000000000".to_owned()]));
+        assert!(read_path_index_rows(&reader, &missing).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn scoped_path_index_cache_separates_selection_and_evicts_on_revision_change() {
+        let cache = FilesystemPathIndexCache::default();
+        let full = FilesystemPathIndexRequest::new(vec!["branch".to_owned()]);
+        let a = full.clone().with_file_ids(Some(vec!["a".to_owned()]));
+        let b = full.clone().with_file_ids(Some(vec!["b".to_owned()]));
+        let index = cache.insert(&a, Some(&[1]), Arc::new(FilesystemPathIndex::default()));
+        assert!(cache.get(&full, Some(&[1])).is_none());
+        assert!(cache.get(&b, Some(&[1])).is_none());
+        assert!(Arc::ptr_eq(&index, &cache.get(&a, Some(&[1])).unwrap()));
+        cache.advance_committed(Some(&[1]), Some(&[2]), &[]);
+        assert!(cache.get(&a, Some(&[1])).is_none());
+        assert!(cache.get(&a, Some(&[2])).is_none());
     }
 
     #[test]

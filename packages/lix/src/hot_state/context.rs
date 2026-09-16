@@ -421,7 +421,7 @@ impl HotStateContext {
     }
 
     pub(crate) fn new(
-        _tracked_state: TrackedStateContext,
+        tracked_state: TrackedStateContext,
         commit_graph: CommitGraphContext,
     ) -> Self {
         let row_columnar_array_budget =
@@ -444,7 +444,9 @@ impl HotStateContext {
                 row_columnar_array_budget,
             ),
             global_key_value_rows: std::sync::Arc::new(GlobalKeyValueRowCache::default()),
-            root_base_cache: std::sync::Arc::default(),
+            root_base_cache: std::sync::Arc::new(
+                crate::hot_state::tracked_head::RootBaseBatchCache::with_tracked_state(tracked_state),
+            ),
             prepared_read_rows: std::sync::Arc::default(),
         }
     }
@@ -1480,6 +1482,14 @@ where
             return MaterializedHotStateExactBatch::new(builder.finish(), slots);
         }
 
+        let scope = self.exact_batch_scope(request).await?;
+        self.load_exact_batch_in_scope(request, &scope).await
+    }
+
+    async fn exact_batch_scope(
+        &self,
+        request: &HotStateExactBatchRequest,
+    ) -> Result<HotStateScanScope, LixError> {
         let branch_ids = request
             .rows
             .iter()
@@ -1510,6 +1520,14 @@ where
             self.branch_head_control_cache.as_deref(),
         )
         .await?;
+        Ok(scope)
+    }
+
+    async fn load_exact_batch_in_scope(
+        &self,
+        request: &HotStateExactBatchRequest,
+        scope: &HotStateScanScope,
+    ) -> Result<MaterializedHotStateExactBatch, LixError> {
         let visible_branch_ids = scope
             .projection_branch_ids
             .iter()
@@ -1734,6 +1752,27 @@ where
         MaterializedHotStateExactBatch::new(builder.finish(), slots)
     }
 
+    async fn load_exact_parent_closure(
+        &self,
+        request: &HotStateExactBatchRequest,
+        parent: super::reader::ParentRowPk,
+    ) -> Result<MaterializedHotStateBatch, LixError> {
+        if request.rows.is_empty() { return Ok(MaterializedHotStateBatch::default()); }
+        if request.rows.iter().any(|row| is_derived_schema(&row.schema_key)) {
+            return super::reader::load_parent_closure_with(request, parent, |batch| async move {
+                self.load_exact_batch(&batch).await
+            }).await;
+        }
+        let scope = self.exact_batch_scope(request).await?;
+        let scope = &scope;
+        super::reader::load_parent_closure_with(request, parent, |batch| async move {
+            if let Some(registry) = &self.read_interest_registry {
+                registry.register(super::LogicalReadInterest::exact(&batch))?;
+            }
+            self.load_exact_batch_in_scope(&batch, scope).await
+        }).await
+    }
+
     pub(crate) async fn scan_tracked_batch(
         &self,
         request: &HotStateScanRequest,
@@ -1928,6 +1967,14 @@ where
         Self::load_exact_batch(self, request).await
     }
 
+    async fn load_exact_parent_closure(
+        &self,
+        request: &HotStateExactBatchRequest,
+        parent: super::reader::ParentRowPk,
+    ) -> Result<MaterializedHotStateBatch, LixError> {
+        Self::load_exact_parent_closure(self, request, parent).await
+    }
+
     async fn collection_generation(
         &self,
         branch_id: &str,
@@ -1978,6 +2025,7 @@ where
         }
         if let Some(registry) = &self.read_interest_registry {
             registry.register(super::LogicalReadInterest::FilesystemPaths {
+                file_ids: request.file_ids.clone(),
                 branch_ids: request.branch_ids.clone(),
                 include_blob_refs: request.include_blob_refs,
                 cache_small_blob_data: request.cache_small_blob_data,

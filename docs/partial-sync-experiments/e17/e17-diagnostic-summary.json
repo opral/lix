@@ -1,0 +1,170 @@
+{
+  "rtt25-idle0": {
+    "baseline": {
+      "replicas": 5,
+      "reads_per_replica": 20,
+      "first_median_us": 5961,
+      "steady_median_of_replica_medians_us": 5789,
+      "steady_replica_medians_us": [
+        5850,
+        5731,
+        5789,
+        5782,
+        5848
+      ],
+      "counter_tuples_decode_tree_reads_storage_calls_keys_bytes_replays": [
+        [
+          56,
+          11,
+          70,
+          78,
+          43107,
+          0
+        ]
+      ],
+      "median_decode_ns": 72722.5,
+      "median_tree_read_ns": 55259.0,
+      "median_hash_ns": 28754.5,
+      "median_measured_io_ns": 367084.5
+    },
+    "candidate": {
+      "replicas": 5,
+      "reads_per_replica": 20,
+      "first_median_us": 7448,
+      "steady_median_of_replica_medians_us": 7328,
+      "steady_replica_medians_us": [
+        7388,
+        7328,
+        7324,
+        7323,
+        7397
+      ],
+      "counter_tuples_decode_tree_reads_storage_calls_keys_bytes_replays": [
+        [
+          56,
+          11,
+          70,
+          78,
+          43107,
+          0
+        ]
+      ],
+      "median_decode_ns": 90942.5,
+      "median_tree_read_ns": 64226.5,
+      "median_hash_ns": 36268.5,
+      "median_measured_io_ns": 425294.5
+    }
+  },
+  "rtt25-idle100": {
+    "baseline": {
+      "replicas": 5,
+      "reads_per_replica": 20,
+      "first_median_us": 6342,
+      "steady_median_of_replica_medians_us": 8134,
+      "steady_replica_medians_us": [
+        8134,
+        8100,
+        8179,
+        8315,
+        7925
+      ],
+      "counter_tuples_decode_tree_reads_storage_calls_keys_bytes_replays": [
+        [
+          56,
+          11,
+          70,
+          78,
+          43107,
+          0
+        ]
+      ],
+      "median_decode_ns": 93110.0,
+      "median_tree_read_ns": 73780.5,
+      "median_hash_ns": 37218.0,
+      "median_measured_io_ns": 483461.5
+    },
+    "candidate": {
+      "replicas": 5,
+      "reads_per_replica": 20,
+      "first_median_us": 8075,
+      "steady_median_of_replica_medians_us": 8024,
+      "steady_replica_medians_us": [
+        7968,
+        7879,
+        8175,
+        8024,
+        8080
+      ],
+      "counter_tuples_decode_tree_reads_storage_calls_keys_bytes_replays": [
+        [
+          56,
+          11,
+          70,
+          78,
+          43107,
+          0
+        ]
+      ],
+      "median_decode_ns": 92093.0,
+      "median_tree_read_ns": 66240.0,
+      "median_hash_ns": 36478.5,
+      "median_measured_io_ns": 436611.0
+    }
+  },
+  "rtt0-idle0": {
+    "baseline": {
+      "replicas": 5,
+      "reads_per_replica": 20,
+      "first_median_us": 5855,
+      "steady_median_of_replica_medians_us": 5779,
+      "steady_replica_medians_us": [
+        5753,
+        5779,
+        5835,
+        5766,
+        5875
+      ],
+      "counter_tuples_decode_tree_reads_storage_calls_keys_bytes_replays": [
+        [
+          56,
+          11,
+          70,
+          78,
+          43107,
+          0
+        ]
+      ],
+      "median_decode_ns": 72256.0,
+      "median_tree_read_ns": 55229.5,
+      "median_hash_ns": 28742.5,
+      "median_measured_io_ns": 362650.5
+    },
+    "candidate": {
+      "replicas": 5,
+      "reads_per_replica": 20,
+      "first_median_us": 5920,
+      "steady_median_of_replica_medians_us": 5778,
+      "steady_replica_medians_us": [
+        5786,
+        5811,
+        5778,
+        5710,
+        5753
+      ],
+      "counter_tuples_decode_tree_reads_storage_calls_keys_bytes_replays": [
+        [
+          56,
+          11,
+          70,
+          78,
+          43107,
+          0
+        ]
+      ],
+      "median_decode_ns": 71427.5,
+      "median_tree_read_ns": 51122.0,
+      "median_hash_ns": 28550.0,
+      "median_measured_io_ns": 337326.0
+    }
+  }
+}

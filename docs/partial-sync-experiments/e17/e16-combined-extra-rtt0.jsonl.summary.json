@@ -1,0 +1,650 @@
+{
+  "dense64": {
+    "open_us": {
+      "baseline_median": 8626.5,
+      "candidate_median": 8612.5,
+      "paired_improvement_median": 0.001276509488577382,
+      "bootstrap_95_interval": [
+        -0.040760986454972725,
+        0.022692076739790346
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        8356,
+        13108
+      ],
+      "candidate_range": [
+        8376,
+        10021
+      ]
+    },
+    "file_open_us": {
+      "baseline_median": 35147.0,
+      "candidate_median": 25128.5,
+      "paired_improvement_median": 0.2943815831771765,
+      "bootstrap_95_interval": [
+        0.2761787730073266,
+        0.3057507015134202
+      ],
+      "latency_threshold_pass": true,
+      "baseline_range": [
+        33606,
+        48924
+      ],
+      "candidate_range": [
+        23943,
+        26917
+      ]
+    },
+    "file_lookup_warm_us": {
+      "baseline_median": 840.0,
+      "candidate_median": 857.5,
+      "paired_improvement_median": -0.019874536062917336,
+      "bootstrap_95_interval": [
+        -0.06527093596059119,
+        -0.0011391145356827725
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        812,
+        1123
+      ],
+      "candidate_range": [
+        839,
+        924
+      ]
+    },
+    "file_native_requests": {
+      "baseline_median": 17.0,
+      "candidate_median": 12.0,
+      "paired_improvement_median": 0.2941176470588235,
+      "bootstrap_95_interval": [
+        0.2941176470588235,
+        0.2941176470588235
+      ],
+      "latency_threshold_pass": true,
+      "baseline_range": [
+        17,
+        17
+      ],
+      "candidate_range": [
+        12,
+        12
+      ]
+    },
+    "file_native_bytes": {
+      "baseline_median": 11742.0,
+      "candidate_median": 8026.0,
+      "paired_improvement_median": 0.3164707886220406,
+      "bootstrap_95_interval": [
+        0.3164707886220406,
+        0.3164707886220406
+      ],
+      "latency_threshold_pass": true,
+      "baseline_range": [
+        11742,
+        11742
+      ],
+      "candidate_range": [
+        8026,
+        8026
+      ]
+    },
+    "history_us": {
+      "baseline_median": 31972.0,
+      "candidate_median": 31910.0,
+      "paired_improvement_median": -0.0007514415121413487,
+      "bootstrap_95_interval": [
+        -0.02973370887210347,
+        0.03155027847481484
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        30691,
+        37882
+      ],
+      "candidate_range": [
+        30721,
+        32721
+      ]
+    },
+    "warm_us": {
+      "baseline_median": 5717.0,
+      "candidate_median": 5587.5,
+      "paired_improvement_median": 0.003503763464140497,
+      "bootstrap_95_interval": [
+        -0.01443001443001446,
+        0.06274509803921569
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        5505,
+        6636
+      ],
+      "candidate_range": [
+        5450,
+        6214
+      ]
+    },
+    "history_native_requests": {
+      "baseline_median": 4.0,
+      "candidate_median": 4.0,
+      "paired_improvement_median": 0.0,
+      "bootstrap_95_interval": [
+        0.0,
+        0.0
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        4,
+        4
+      ],
+      "candidate_range": [
+        4,
+        4
+      ]
+    },
+    "history_native_bytes": {
+      "baseline_median": 4753.0,
+      "candidate_median": 4753.0,
+      "paired_improvement_median": 0.0,
+      "bootstrap_95_interval": [
+        0.0,
+        0.0
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        4753,
+        4753
+      ],
+      "candidate_range": [
+        4753,
+        4753
+      ]
+    },
+    "history_total_requests": {
+      "baseline_median": 4.0,
+      "candidate_median": 4.0,
+      "paired_improvement_median": 0.0,
+      "bootstrap_95_interval": [
+        0.0,
+        0.0
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        4,
+        4
+      ],
+      "candidate_range": [
+        4,
+        4
+      ]
+    },
+    "history_total_bytes": {
+      "baseline_median": 4753.0,
+      "candidate_median": 4753.0,
+      "paired_improvement_median": 0.0,
+      "bootstrap_95_interval": [
+        0.0,
+        0.0
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        4753,
+        4753
+      ],
+      "candidate_range": [
+        4753,
+        4753
+      ]
+    },
+    "history_descriptor_requests": {
+      "baseline_median": 0.0,
+      "candidate_median": 0.0,
+      "paired_improvement_median": null,
+      "bootstrap_95_interval": null,
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        0,
+        0
+      ],
+      "candidate_range": [
+        0,
+        0
+      ],
+      "note": "relative change undefined when a baseline count is zero; compare absolute counts"
+    }
+  },
+  "deep16": {
+    "open_us": {
+      "baseline_median": 9125.0,
+      "candidate_median": 9052.0,
+      "paired_improvement_median": 0.005775977722517256,
+      "bootstrap_95_interval": [
+        -0.05373911075913562,
+        0.03914098610417688
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        8726,
+        10960
+      ],
+      "candidate_range": [
+        8867,
+        9700
+      ]
+    },
+    "file_open_us": {
+      "baseline_median": 37606.0,
+      "candidate_median": 31524.0,
+      "paired_improvement_median": 0.1827356248081502,
+      "bootstrap_95_interval": [
+        0.15633210284947113,
+        0.22914383517487352
+      ],
+      "latency_threshold_pass": true,
+      "baseline_range": [
+        36712,
+        46799
+      ],
+      "candidate_range": [
+        29915,
+        33327
+      ]
+    },
+    "file_lookup_warm_us": {
+      "baseline_median": 837.5,
+      "candidate_median": 875.5,
+      "paired_improvement_median": -0.01358467974353339,
+      "bootstrap_95_interval": [
+        -0.08536585365853666,
+        0.06790617619981587
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        812,
+        1047
+      ],
+      "candidate_range": [
+        810,
+        1033
+      ]
+    },
+    "file_native_requests": {
+      "baseline_median": 18.0,
+      "candidate_median": 13.0,
+      "paired_improvement_median": 0.2777777777777778,
+      "bootstrap_95_interval": [
+        0.2777777777777778,
+        0.2777777777777778
+      ],
+      "latency_threshold_pass": true,
+      "baseline_range": [
+        18,
+        18
+      ],
+      "candidate_range": [
+        13,
+        13
+      ]
+    },
+    "file_native_bytes": {
+      "baseline_median": 14349.0,
+      "candidate_median": 10639.0,
+      "paired_improvement_median": 0.25855460310823053,
+      "bootstrap_95_interval": [
+        0.25855460310823053,
+        0.25855460310823053
+      ],
+      "latency_threshold_pass": true,
+      "baseline_range": [
+        14349,
+        14349
+      ],
+      "candidate_range": [
+        10639,
+        10639
+      ]
+    },
+    "history_us": {
+      "baseline_median": 36055.0,
+      "candidate_median": 36337.5,
+      "paired_improvement_median": -0.005193276418942461,
+      "bootstrap_95_interval": [
+        -0.03805587832165602,
+        0.04628561056577302
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        34829,
+        46967
+      ],
+      "candidate_range": [
+        35280,
+        38147
+      ]
+    },
+    "warm_us": {
+      "baseline_median": 9712.0,
+      "candidate_median": 9856.5,
+      "paired_improvement_median": 0.002634355934479138,
+      "bootstrap_95_interval": [
+        -0.01935538945655707,
+        0.008942337341967366
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        9534,
+        12775
+      ],
+      "candidate_range": [
+        9592,
+        10325
+      ]
+    },
+    "history_native_requests": {
+      "baseline_median": 4.0,
+      "candidate_median": 4.0,
+      "paired_improvement_median": 0.0,
+      "bootstrap_95_interval": [
+        0.0,
+        0.0
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        4,
+        4
+      ],
+      "candidate_range": [
+        4,
+        4
+      ]
+    },
+    "history_native_bytes": {
+      "baseline_median": 5325.0,
+      "candidate_median": 5325.0,
+      "paired_improvement_median": 0.0,
+      "bootstrap_95_interval": [
+        0.0,
+        0.0
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        5325,
+        5325
+      ],
+      "candidate_range": [
+        5325,
+        5325
+      ]
+    },
+    "history_total_requests": {
+      "baseline_median": 4.0,
+      "candidate_median": 4.0,
+      "paired_improvement_median": 0.0,
+      "bootstrap_95_interval": [
+        0.0,
+        0.0
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        4,
+        4
+      ],
+      "candidate_range": [
+        4,
+        4
+      ]
+    },
+    "history_total_bytes": {
+      "baseline_median": 5325.0,
+      "candidate_median": 5325.0,
+      "paired_improvement_median": 0.0,
+      "bootstrap_95_interval": [
+        0.0,
+        0.0
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        5325,
+        5325
+      ],
+      "candidate_range": [
+        5325,
+        5325
+      ]
+    },
+    "history_descriptor_requests": {
+      "baseline_median": 0.0,
+      "candidate_median": 0.0,
+      "paired_improvement_median": null,
+      "bootstrap_95_interval": null,
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        0,
+        0
+      ],
+      "candidate_range": [
+        0,
+        0
+      ],
+      "note": "relative change undefined when a baseline count is zero; compare absolute counts"
+    }
+  },
+  "deep64": {
+    "open_us": {
+      "baseline_median": 8589.5,
+      "candidate_median": 8609.5,
+      "paired_improvement_median": 0.002838883990010199,
+      "bootstrap_95_interval": [
+        -0.018535571685412533,
+        0.022316922731860478
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        8467,
+        11434
+      ],
+      "candidate_range": [
+        8303,
+        8895
+      ]
+    },
+    "file_open_us": {
+      "baseline_median": 38069.0,
+      "candidate_median": 40817.0,
+      "paired_improvement_median": -0.05890034844580938,
+      "bootstrap_95_interval": [
+        -0.10650369859744946,
+        0.0016923378789365229
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        37149,
+        52795
+      ],
+      "candidate_range": [
+        39360,
+        44141
+      ]
+    },
+    "file_lookup_warm_us": {
+      "baseline_median": 838.5,
+      "candidate_median": 873.0,
+      "paired_improvement_median": -0.03585611106272646,
+      "bootstrap_95_interval": [
+        -0.13030679161753456,
+        -0.007009345794392496
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        807,
+        1397
+      ],
+      "candidate_range": [
+        837,
+        1423
+      ]
+    },
+    "file_native_requests": {
+      "baseline_median": 18.0,
+      "candidate_median": 13.0,
+      "paired_improvement_median": 0.2777777777777778,
+      "bootstrap_95_interval": [
+        0.2777777777777778,
+        0.2777777777777778
+      ],
+      "latency_threshold_pass": true,
+      "baseline_range": [
+        18,
+        18
+      ],
+      "candidate_range": [
+        13,
+        13
+      ]
+    },
+    "file_native_bytes": {
+      "baseline_median": 17342.0,
+      "candidate_median": 13629.0,
+      "paired_improvement_median": 0.21410448621842926,
+      "bootstrap_95_interval": [
+        0.21410448621842926,
+        0.21410448621842926
+      ],
+      "latency_threshold_pass": true,
+      "baseline_range": [
+        17342,
+        17342
+      ],
+      "candidate_range": [
+        13629,
+        13629
+      ]
+    },
+    "history_us": {
+      "baseline_median": 48610.0,
+      "candidate_median": 49357.0,
+      "paired_improvement_median": -0.006868464095379889,
+      "bootstrap_95_interval": [
+        -0.04574035260756992,
+        0.03661989729708792
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        47846,
+        61508
+      ],
+      "candidate_range": [
+        48365,
+        52392
+      ]
+    },
+    "warm_us": {
+      "baseline_median": 22714.5,
+      "candidate_median": 22296.0,
+      "paired_improvement_median": 0.0199749730389277,
+      "bootstrap_95_interval": [
+        -0.012958176054598924,
+        0.037160480746526336
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        22153,
+        28791
+      ],
+      "candidate_range": [
+        22083,
+        23363
+      ]
+    },
+    "history_native_requests": {
+      "baseline_median": 4.0,
+      "candidate_median": 4.0,
+      "paired_improvement_median": 0.0,
+      "bootstrap_95_interval": [
+        0.0,
+        0.0
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        4,
+        4
+      ],
+      "candidate_range": [
+        4,
+        4
+      ]
+    },
+    "history_native_bytes": {
+      "baseline_median": 6982.0,
+      "candidate_median": 6982.0,
+      "paired_improvement_median": 0.0,
+      "bootstrap_95_interval": [
+        0.0,
+        0.0
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        6982,
+        6982
+      ],
+      "candidate_range": [
+        6982,
+        6982
+      ]
+    },
+    "history_total_requests": {
+      "baseline_median": 4.0,
+      "candidate_median": 4.0,
+      "paired_improvement_median": 0.0,
+      "bootstrap_95_interval": [
+        0.0,
+        0.0
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        4,
+        4
+      ],
+      "candidate_range": [
+        4,
+        4
+      ]
+    },
+    "history_total_bytes": {
+      "baseline_median": 6982.0,
+      "candidate_median": 6982.0,
+      "paired_improvement_median": 0.0,
+      "bootstrap_95_interval": [
+        0.0,
+        0.0
+      ],
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        6982,
+        6982
+      ],
+      "candidate_range": [
+        6982,
+        6982
+      ]
+    },
+    "history_descriptor_requests": {
+      "baseline_median": 0.0,
+      "candidate_median": 0.0,
+      "paired_improvement_median": null,
+      "bootstrap_95_interval": null,
+      "latency_threshold_pass": false,
+      "baseline_range": [
+        0,
+        0
+      ],
+      "candidate_range": [
+        0,
+        0
+      ],
+      "note": "relative change undefined when a baseline count is zero; compare absolute counts"
+    }
+  }
+}

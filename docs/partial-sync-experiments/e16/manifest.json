@@ -21,7 +21,7 @@
     "run_e16_combined_extra.py"
   ],
   "files": {
-    "README.md": "664aea21569774b0b2e61667c559d194bf70e2fb47c4c2185ee2ce644c6d88e9",
+    "README.md": "659303352dcd9ea107deaa55b965f0282d86e231af68e14e434d32fce9172687",
     "e16-build-orchestrator.log.gz": "d1936e3c703d3216df33ffd9d7229f1b800ee46735b3addc195fbfd11286c19a",
     "e16-candidate-engine.patch.gz": "325227f1a21db13a8261c6109815ba86416d4aa3b39008322af0be89036c481c",
     "e16-combined-build.jsonl": "3ce4571787160e013d6cda8bc8f2e0b81cb6959dbb266dc5a5b7ab7c428d1292",
@@ -164,5 +164,6 @@
     "run_e16_shared_root_smokes.py": "0328608c491178c8a1a18e66c6d374a8d3b9f0d8ab89175fa4e2ad380ee67771",
     "save_build_binary.py": "4e090fd416cc9d82b19faf562af7ae06f93f7a05da46030a44134ca35c130630",
     "verify_e16_opening.py": "92020f003ff3f6e10610f40eefc8ddef923911c9a16aae0eef9c26aa5cf43681"
-  }
+  },
+  "superseded_by": "../e17/README.md"
 }

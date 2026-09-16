@@ -1,6 +1,8 @@
 # E16: scoped filesystem indexes and ancestor reads
 
-**Rejected.** Finite-ID indexes produce large cold-selection gains, but every tested follow-up variant has a repeatable warm-history regression on the wide fixture after latency-injected hydration. This draft retains the prototypes and measurements; it applies no engine change. Consecutive substantive non-improvements: **2** (E15 and E16). The E16 variants are one experiment, not separate streak entries.
+**Original decision: rejected; revised by [E17](../e17/README.md).** E17 attributes the warm-history difference to CPU execution conditions and accepts the combined implementation after corrected controls. The original report below is retained as the decision record.
+
+**At E16 publication: rejected.** Finite-ID indexes produce large cold-selection gains, but every tested follow-up variant has a repeatable warm-history regression on the wide fixture after latency-injected hydration. This draft retains the prototypes and measurements; it applies no engine change. Consecutive substantive non-improvements: **2** (E15 and E16). The E16 variants are one experiment, not separate streak entries.
 
 ## Decision and paired results
 
