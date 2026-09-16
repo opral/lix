@@ -702,6 +702,13 @@ impl RemoteExecuteBatchBuilder<'_> {
         self.options.origin_key = Some(origin_key.into());
         self
     }
+
+    /// Caps whole automatic-transaction replays. Zero fails on the first failed attempt.
+    /// Without an override, Lix retains its default conflict and snapshot-recovery budgets.
+    pub fn with_max_auto_commit_retries(mut self, retries: u32) -> Self {
+        self.options.max_auto_commit_retries = Some(retries);
+        self
+    }
 }
 impl<'a> IntoFuture for RemoteExecuteBatchBuilder<'a> {
     type Output = Result<crate::ExecuteBatchResult, LixError>;
@@ -727,6 +734,13 @@ pub struct RemoteExecuteBuilder<'a> {
 impl RemoteExecuteBuilder<'_> {
     pub fn with_origin_key(mut self, origin_key: impl Into<String>) -> Self {
         self.options.origin_key = Some(origin_key.into());
+        self
+    }
+
+    /// Caps whole automatic-transaction replays. Zero fails on the first failed attempt.
+    /// Without an override, Lix retains its default conflict and snapshot-recovery budgets.
+    pub fn with_max_auto_commit_retries(mut self, retries: u32) -> Self {
+        self.options.max_auto_commit_retries = Some(retries);
         self
     }
 }
@@ -914,6 +928,13 @@ where
         self.options.origin_key = Some(origin_key.into());
         self
     }
+
+    /// Caps whole automatic-transaction replays. Zero fails on the first failed attempt.
+    /// Without an override, Lix retains its default conflict and snapshot-recovery budgets.
+    pub fn with_max_auto_commit_retries(mut self, retries: u32) -> Self {
+        self.options.max_auto_commit_retries = Some(retries);
+        self
+    }
 }
 
 impl<'a, StorageImpl> IntoFuture for ExecuteBuilder<'a, StorageImpl>
@@ -977,6 +998,13 @@ where
     /// Identifies the caller-defined origin of this batch.
     pub fn with_origin_key(mut self, origin_key: impl Into<String>) -> Self {
         self.options.origin_key = Some(origin_key.into());
+        self
+    }
+
+    /// Caps whole automatic-transaction replays. Zero fails on the first failed attempt.
+    /// Without an override, Lix retains its default conflict and snapshot-recovery budgets.
+    pub fn with_max_auto_commit_retries(mut self, retries: u32) -> Self {
+        self.options.max_auto_commit_retries = Some(retries);
         self
     }
 }

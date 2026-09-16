@@ -224,6 +224,12 @@ export type SqlParam = JsonValue | Uint8Array | import("./value.js").Value;
 
 export type ExecuteOptions = {
 	originKey?: string;
+	/**
+	 * Caps whole automatic-transaction replays after conflict or snapshot expiry.
+	 * Zero fails on the first failed attempt. Omit to retain default recovery budgets.
+	 * Does not control explicit transactions, read recovery, or transport retries.
+	 */
+	maxAutoCommitRetries?: number;
 	/** Returns positional arrays instead of plain objects. Defaults to "object". */
 	rowMode?: "object" | "array";
 	/**
@@ -242,6 +248,12 @@ export type LixBatchStatement = {
 
 export type LixBatchOptions = {
 	originKey?: string;
+	/**
+	 * Caps whole automatic-transaction replays after conflict or snapshot expiry.
+	 * Zero fails on the first failed attempt. Omit to retain default recovery budgets.
+	 * Does not control explicit transactions, read recovery, or transport retries.
+	 */
+	maxAutoCommitRetries?: number;
 	/** Returns positional arrays instead of plain objects. Defaults to "object". */
 	rowMode?: "object" | "array";
 	/** See {@link ExecuteOptions.idempotencyKey}. */

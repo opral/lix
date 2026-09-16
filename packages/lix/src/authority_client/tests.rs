@@ -459,20 +459,33 @@ async fn execute_recovers_once_on_server_closed() {
     http.push_json(200, execute_ok());
     http.push_empty(204);
 
-    let client = open_protocol_client(http.clone(), "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc", None)
-        .await
-        .expect("open");
+    let client = open_protocol_client(
+        http.clone(),
+        "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        None,
+    )
+    .await
+    .expect("open");
     client
         .execute(
             "SELECT 1",
             &[Value::Integer(1)],
             Some(ProtocolExecuteOptions {
                 origin_key: None,
+                max_auto_commit_retries: Some(0),
                 idempotency_key: Some("retry-1".to_owned()),
             }),
         )
         .await
         .expect("recovered execute");
+    for request in http
+        .requests()
+        .iter()
+        .filter(|request| request.method == "POST")
+    {
+        let body: serde_json::Value = serde_json::from_slice(request.body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["options"]["maxAutoCommitRetries"], 0);
+    }
     client.close().await.expect("close");
     assert!(
         http.requests()
