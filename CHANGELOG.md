@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.18.0 - 2026-09-16
+
+### Minor
+
+- Partial replicas load file history with fewer network round trips and retain admission and pending update watches during foreground reads.
+
+  History hydration batches independent dependencies, fetches bounded ancestor metadata, and includes small owner metadata dependencies with native objects. This release advances the sync protocol to version 19; upgrade clients and servers together. Existing repository storage does not require a reset.
+
+  Long history queries discover dependencies across known checkpoints as results are consumed. Discovery respects checkpoint selection, while latest-event queries retain their bounded fetch behavior.
+
+  Queries selecting files by ID load only the selected files and the parent directories needed to resolve their paths.
+
+### Patch
+
+- Filesystem synchronization preserves `.git` files stored in Lix during live disk reconciliation. These paths remain excluded from disk materialization; their intentional absence on disk no longer deletes the stored records during the session. Reopening still cleans up previously imported Git entries.
+- Fixed repeated row replacement within SQL batches and explicit transactions.
+
+  Repeated updates now retain the same transaction commit ID, so earlier `RETURNING lixcol_commit_id` results agree with the published commit after the transaction succeeds. Deleting and reinserting the same key within a transaction no longer reports a false duplicate-key error; live duplicate keys remain rejected.
+
 ## 0.17.0 - 2026-09-16
 
 ### Partial replicas with on-demand sync
