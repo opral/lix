@@ -4245,7 +4245,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_text"
-version = "0.16.2"
+version = "0.1.0"
 dependencies = [
  "base64",
  "lix",
