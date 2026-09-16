@@ -15,7 +15,7 @@ pub(crate) use diff::{arm_diff_commits_test_probe, take_diff_commits_test_probe}
 mod diff_id;
 mod merge;
 mod native_object;
-pub(crate) use native_object::{NativeMetadataRef, NativeObjectRef};
+pub(crate) use native_object::{NativeHistoryFrontier, NativeMetadataRef, NativeObjectRef};
 pub(crate) mod mutation_directory;
 pub(crate) mod replacement_part;
 mod row_materialization;

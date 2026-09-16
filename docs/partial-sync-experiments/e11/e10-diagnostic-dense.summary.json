@@ -1,0 +1,38 @@
+{
+  "probes": 202,
+  "elapsed_us": 68449,
+  "productive_probes": 146,
+  "unproductive_us": 40798,
+  "by_resumed_batches": {
+    "2": {
+      "probes": 4,
+      "elapsed_us": 784,
+      "productive": 4
+    },
+    "5": {
+      "probes": 10,
+      "elapsed_us": 1896,
+      "productive": 10
+    },
+    "11": {
+      "probes": 12,
+      "elapsed_us": 2235,
+      "productive": 12
+    },
+    "18": {
+      "probes": 60,
+      "elapsed_us": 20559,
+      "productive": 44
+    },
+    "34": {
+      "probes": 60,
+      "elapsed_us": 20605,
+      "productive": 44
+    },
+    "50": {
+      "probes": 56,
+      "elapsed_us": 22370,
+      "productive": 32
+    }
+  }
+}

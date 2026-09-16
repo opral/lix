@@ -322,6 +322,65 @@ pub(super) struct DiffSpec<S> {
     pub(super) mode: DiffMode,
 }
 
+fn diff_filter_schema(
+    relation: &DiffRelation,
+    schema: &SchemaRef,
+    filters: &[Expr],
+) -> Result<SchemaRef> {
+    let mut fields = schema.fields().to_vec();
+    for filter in filters {
+        for column in filter.column_refs() {
+            if !fields.iter().any(|field| field.name() == &column.name) {
+                fields.push(Arc::new(
+                    relation.schema.field_with_name(&column.name)?.clone(),
+                ));
+            }
+        }
+    }
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> DiffSpec<S> {
+    /// Prepare only native inputs. Never evaluate SQL expressions or user functions
+    /// while looking ahead beyond the first required history miss.
+    pub(super) async fn prepare_history_inputs(
+        &self,
+        from: &str,
+        to: &str,
+        projection: &Vec<usize>,
+        filters: &[Expr],
+    ) -> Result<(), crate::LixError> {
+        let schema = projected_schema(&self.relation.schema, Some(projection));
+        let metadata_filters = if self.relation.kind == DiffRelationKind::File {
+            filter_conjuncts(filters)
+                .into_iter()
+                .filter(|filter| file_metadata_filter(filter, &self.relation.schema))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let schema = diff_filter_schema(&self.relation, &schema, &metadata_filters)
+            .map_err(datafusion_error_to_lix_error)?;
+        let route = DiffRoute::from_filters(filters, &self.relation, &schema);
+        if route.contradictory {
+            return Ok(());
+        }
+        prepare_native_diff_interest(
+            self.store.clone(),
+            &self.relation.name,
+            from,
+            to,
+            &route.request,
+            &schema
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>(),
+        )
+        .await
+    }
+}
+
 #[async_trait]
 impl<S> TableSpec for DiffSpec<S>
 where
@@ -377,20 +436,7 @@ where
         } else {
             Vec::new()
         };
-        let mut filter_fields = schema.fields().to_vec();
-        for filter in &metadata_filters {
-            for column in filter.column_refs() {
-                if !filter_fields
-                    .iter()
-                    .any(|field| field.name() == &column.name)
-                {
-                    filter_fields.push(Arc::new(
-                        self.relation.schema.field_with_name(&column.name)?.clone(),
-                    ));
-                }
-            }
-        }
-        let filter_schema = Arc::new(Schema::new(filter_fields));
+        let filter_schema = diff_filter_schema(&self.relation, &schema, &metadata_filters)?;
         let df_schema = DFSchema::try_from(filter_schema.as_ref().clone())?;
         let metadata_filters = metadata_filters
             .iter()

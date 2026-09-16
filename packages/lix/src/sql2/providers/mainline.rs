@@ -24,6 +24,8 @@ use crate::sql2::error::{datafusion_error_to_lix_error, lix_error_to_datafusion_
 use crate::sql2::udfs::{ExecutionSlots, execution_slots};
 use crate::storage_adapter::StorageAdapterRead;
 
+mod frontier;
+
 use super::diff::{DiffMode, DiffRelation, DiffSpec};
 use super::spec::{
     PlannedScan, SpecTableProvider, TableSpec, batch_stream_source, projected_schema,
@@ -350,6 +352,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
             Ok(super::file::FileIdConstraint::None) => Some(BTreeSet::new()),
             _ => None,
         };
+        let checkpoint_constraint = frontier::checkpoint_constraint(&metadata_filters);
         let df_meta_schema = DFSchema::try_from(meta_schema.as_ref().clone())?;
         let metadata_filters = metadata_filters
             .iter()
@@ -387,6 +390,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                 let mut next = Some(anchor);
                 let mut position = 0i64;
                 let mut emitted = 0usize;
+                let mut resumed_history_batches = 0usize;
                 while let Some(id) = next {
                     if max_position.is_some_and(|ceiling| position > ceiling) { break; }
                     if limit.is_some_and(|n| emitted >= n) || remaining_ids.as_ref().is_some_and(|ids| ids.is_empty()) { break; }
@@ -406,7 +410,16 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                             to_commit_id: id.to_string(), active_branch_id: active_branch_id.clone(), mode: DiffMode::General };
                         let plan = diff.plan_scan(Some(&diff_projection), &row_filters, None, &ExecutionProps::new()).await?;
                         let mut batches = plan.source.open(0, context.clone())?;
-                        while let Some(batch) = batches.try_next().await? {
+                        while let Some(batch) = match batches.try_next().await {
+                            Ok(batch) => batch,
+                            Err(error) => {
+                                let error = frontier::discover(
+                                    &diff, parent, &diff_projection, &row_filters,
+                                    resumed_history_batches, checkpoint_constraint, datafusion_error_to_lix_error(error),
+                                ).await;
+                                Err(lix_error_to_datafusion_error(error))?
+                            }
+                        } {
                             let meta = metadata_batch(&node, current_position, true, batch.num_rows())?;
                             let columns = schema.fields().iter().map(|field| {
                                 batch.column_by_name(field.name()).or_else(|| meta.column_by_name(field.name())).cloned()
@@ -415,7 +428,10 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                             let mut output = RecordBatch::try_new_with_options(schema.clone(), columns, &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())))?;
                             if let Some(n) = limit { output = output.slice(0, output.num_rows().min(n - emitted)); }
                             emitted += output.num_rows();
+                            let nonempty = output.num_rows() != 0;
                             yield output;
+                            // Resuming past a nonempty batch demonstrates demand for more history.
+                            if nonempty { resumed_history_batches = resumed_history_batches.saturating_add(1); }
                             if limit.is_some_and(|n| emitted >= n) { break; }
                         }
                     } else {

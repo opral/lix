@@ -38,6 +38,7 @@ pub(crate) use native_metadata::MAX_NATIVE_METADATA_RESPONSE_BYTES;
 pub(crate) use native_metadata::NativeMetadataRequest;
 pub(crate) use native_metadata::{
     key as native_metadata_storage_key, space as native_metadata_storage_space,
+    validate_bytes as validate_native_metadata_bytes,
 };
 pub(crate) use native_metadata_walk::NativeMetadataWalkRequest;
 pub(crate) mod native_object;

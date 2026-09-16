@@ -1487,6 +1487,11 @@ where
         &mut self,
         error: &LixError,
     ) -> Result<bool, LixError> {
+        enum OptionalNative {
+            Object(crate::tracked_state::NativeObjectRef),
+            Metadata(crate::tracked_state::NativeMetadataRef),
+        }
+        let mut optional = BTreeMap::new();
         let mut keys = Vec::new();
         let objects = crate::tracked_state::NativeObjectRef::batch_from_missing_error(error)?
             .or_else(|| {
@@ -1496,12 +1501,17 @@ where
                     .map(|address| vec![address])
             });
         if let Some(objects) = objects {
-            keys.extend(objects.into_iter().map(|address| {
-                (
+            let required =
+                crate::tracked_state::NativeHistoryFrontier::required_len(error, objects.len())?;
+            for (index, address) in objects.into_iter().enumerate() {
+                if index >= required {
+                    optional.insert(keys.len(), OptionalNative::Object(address));
+                }
+                keys.push((
                     address.space(),
                     crate::storage_adapter::StorageKey(Bytes::from(address.storage_key())),
-                )
-            }));
+                ));
+            }
         }
         let metadata = crate::tracked_state::NativeMetadataRef::batch_from_missing_error(error)?
             .or_else(|| {
@@ -1511,7 +1521,12 @@ where
                     .map(|address| vec![address])
             });
         if let Some(metadata) = metadata {
-            for address in metadata {
+            let required =
+                crate::tracked_state::NativeHistoryFrontier::required_len(error, metadata.len())?;
+            for (index, address) in metadata.into_iter().enumerate() {
+                if index >= required {
+                    optional.insert(keys.len(), OptionalNative::Metadata(address.clone()));
+                }
                 keys.push((
                     crate::sync::native_metadata_storage_space(&address),
                     crate::sync::native_metadata_storage_key(&address)?,
@@ -1549,7 +1564,8 @@ where
             .storage
             .begin_read(StorageReadOptions::default())
             .await?;
-        for (space, key) in &keys {
+        let mut omitted = BTreeSet::new();
+        for (index, (space, key)) in keys.iter().enumerate() {
             let result = StorageAdapterRead::get_many(
                 &read,
                 &[crate::storage_adapter::StorageGetManyRequest {
@@ -1558,7 +1574,31 @@ where
                     opts: Default::default(),
                 }],
             )
-            .await?;
+            .await;
+            // A failed speculative batch may leave optional inputs absent or
+            // corrupt. Extend the pinned snapshot only with validated optional
+            // bytes; never turn their failure into a required-query conflict.
+            if let Some(input) = optional.get(&index) {
+                let valid = match &result {
+                    Ok(result) => match result.values.first() {
+                        Some(Some(crate::storage_adapter::StorageProjectedValue::FullValue(
+                            bytes,
+                        ))) => match input {
+                            OptionalNative::Object(address) => address.validate(bytes).is_ok(),
+                            OptionalNative::Metadata(address) => {
+                                crate::sync::validate_native_metadata_bytes(address, bytes).is_ok()
+                            }
+                        },
+                        _ => false,
+                    },
+                    Err(_) => false,
+                };
+                if !valid {
+                    omitted.insert(index);
+                }
+                continue;
+            }
+            let result = result?;
             if result.values.first().is_none_or(Option::is_none) {
                 return Err(LixError::new(
                     LixError::CODE_TRANSACTION_CONFLICT,
@@ -1566,6 +1606,11 @@ where
                 ));
             }
         }
+        keys = keys
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, key)| (!omitted.contains(&index)).then_some(key))
+            .collect();
         if let Some(blob) = blob {
             keys.extend(crate::binary_cas::hydrated_manifest_input_keys(&read, blob).await?);
         }
@@ -2600,7 +2645,8 @@ where
         sender: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
     ) {
         self.sync_demand_tx = sender;
-        if self.sync_demand_tx.is_some() && self.sync_role == crate::sync::SyncRole::PartialReplica {
+        if self.sync_demand_tx.is_some() && self.sync_role == crate::sync::SyncRole::PartialReplica
+        {
             self.requires_individual_commit_span = true;
         }
     }
@@ -2611,10 +2657,16 @@ where
         prepared_writes: PreparedWriteSet,
         materialize_span: Option<ActiveTelemetrySpan>,
     ) -> NativePreparationFuture<'a> {
-        let sender = self.sync_demand_tx.clone()
+        let sender = self
+            .sync_demand_tx
+            .clone()
             .filter(|_| self.sync_role == crate::sync::SyncRole::PartialReplica);
         let Some(sender) = sender else {
-            return self.prepare_storage_commit_once(runtime_functions, prepared_writes, materialize_span);
+            return self.prepare_storage_commit_once(
+                runtime_functions,
+                prepared_writes,
+                materialize_span,
+            );
         };
         Box::pin(async move {
             let mut span = materialize_span;
@@ -2630,9 +2682,13 @@ where
                 let checkpoint_replacements = self.pending_branch_checkpoint_replacements.clone();
                 let migration_bridges = self.native_migration_branch_bridges.clone();
                 let metadata_preconditions = self.atomic_metadata_preconditions.clone();
-                let result = self.prepare_storage_commit_once(
-                    runtime_functions, prepared_writes.clone(), span.take(),
-                ).await;
+                let result = self
+                    .prepare_storage_commit_once(
+                        runtime_functions,
+                        prepared_writes.clone(),
+                        span.take(),
+                    )
+                    .await;
                 let error = match result {
                     Ok(prepared) => return Ok(prepared),
                     Err(error) => error,
@@ -2644,7 +2700,9 @@ where
                 self.pending_branch_checkpoint_replacements = checkpoint_replacements;
                 self.native_migration_branch_bridges = migration_bridges;
                 self.atomic_metadata_preconditions = metadata_preconditions;
-                retry.hydrate_pinned_for_retry(Some(&sender), error.clone()).await?;
+                retry
+                    .hydrate_pinned_for_retry(Some(&sender), error.clone())
+                    .await?;
                 self.refresh_hydrated_native_inputs(&error).await?;
             }
         })
@@ -18282,6 +18340,153 @@ fallback={large_fallback} decoded={large_decoded}"
     }
 
     #[tokio::test]
+    async fn pinned_native_refresh_keeps_valid_optional_inputs_and_ignores_failed_speculation() {
+        use crate::storage_adapter::{StorageKey, StorageValue};
+        use crate::tracked_state::{NativeHistoryFrontier, NativeMetadataRef, NativeObjectRef};
+        let authority = crate::open_lix().await.unwrap();
+        let first = authority
+            .partial_replica_descriptor(None)
+            .await
+            .unwrap()
+            .selected_branch
+            .head
+            .commit_id;
+        authority
+            .upsert_file_content("/optional.txt", b"new".to_vec())
+            .await
+            .unwrap();
+        let second = authority
+            .partial_replica_descriptor(None)
+            .await
+            .unwrap()
+            .selected_branch
+            .head
+            .commit_id;
+        let metadata = authority
+            .read_sync_native_metadata(&crate::sync::native_metadata::NativeMetadataRequest {
+                epoch_id: "00000000-0000-7000-8000-000000000599".into(),
+                objects: vec![
+                    NativeMetadataRef::CommitStateHeader(first),
+                    NativeMetadataRef::CommitStateHeader(second),
+                ],
+            })
+            .await
+            .unwrap()
+            .objects;
+        for use_metadata in [false, true] {
+            for optional_status in 0..3 {
+                let storage = Memory::new();
+                let (_, _, _, _, mut transaction) = open_test_transaction(&storage).await;
+                let adapter = StorageAdapter::new(storage);
+                let (plain, inputs) = if use_metadata {
+                    let addresses = metadata
+                        .iter()
+                        .map(|v| v.address.clone())
+                        .collect::<Vec<_>>();
+                    let error = NativeMetadataRef::annotate_missing_batch(
+                        addresses,
+                        LixError::unknown("required header"),
+                    );
+                    let inputs = metadata
+                        .iter()
+                        .map(|v| {
+                            (
+                                crate::sync::native_metadata_storage_space(&v.address),
+                                crate::sync::native_metadata_storage_key(&v.address).unwrap(),
+                                v.bytes.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    (error, inputs)
+                } else {
+                    let inputs = [vec![7; 16], vec![8; 16]]
+                        .into_iter()
+                        .map(|bytes| {
+                            let address = NativeObjectRef::TrackedStateTreeChunk(
+                                *blake3::hash(&bytes).as_bytes(),
+                            );
+                            (address, bytes)
+                        })
+                        .collect::<Vec<_>>();
+                    let error = NativeObjectRef::annotate_missing_batch(
+                        inputs.iter().map(|v| v.0),
+                        LixError::unknown("required object"),
+                    );
+                    (
+                        error,
+                        inputs
+                            .into_iter()
+                            .map(|(address, bytes)| {
+                                (
+                                    address.space(),
+                                    StorageKey(Bytes::from(address.storage_key())),
+                                    bytes,
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                };
+                let mut writes = adapter.new_write_set();
+                for (index, (space, key, bytes)) in inputs.iter().enumerate() {
+                    if index == 1 && optional_status == 0 {
+                        continue;
+                    }
+                    let bytes = if index == 1 && optional_status == 1 {
+                        b"corrupt optional input".to_vec()
+                    } else {
+                        bytes.clone()
+                    };
+                    writes.put(
+                        *space,
+                        key.clone(),
+                        StorageValue {
+                            bytes: Bytes::from(bytes),
+                        },
+                    );
+                }
+                adapter
+                    .commit_write_set(writes, Default::default())
+                    .await
+                    .unwrap();
+                let error = NativeHistoryFrontier::annotate_optional_suffix(plain.clone(), 1);
+                assert!(
+                    transaction
+                        .refresh_hydrated_native_inputs(&error)
+                        .await
+                        .unwrap()
+                );
+                let read = transaction.opening_read();
+                for (index, (space, key, _)) in inputs.iter().enumerate() {
+                    let values = read
+                        .get_many(&[crate::storage_adapter::StorageGetManyRequest {
+                            space: *space,
+                            keys: std::slice::from_ref(key),
+                            opts: Default::default(),
+                        }])
+                        .await
+                        .unwrap()
+                        .values;
+                    assert_eq!(
+                        values[0].is_some(),
+                        index == 0 || optional_status == 2,
+                        "pinned fallback admits required and validated optional inputs only"
+                    );
+                }
+                drop(read);
+                if optional_status == 0 {
+                    assert!(
+                        transaction
+                            .refresh_hydrated_native_inputs(&plain)
+                            .await
+                            .is_err(),
+                        "the same missing input must fail when it is required"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn pinned_blob_hydration_preserves_referenced_content_readiness_through_commit() {
         for inline in [false, true] {
             let storage = Memory::new();
@@ -18306,7 +18511,9 @@ fallback={large_fallback} decoded={large_decoded}"
             let mut writes = adapter.new_write_set();
             if inline {
                 crate::binary_cas::stage_verified_inline_canonical_blob(
-                    &mut writes, &manifest, bytes,
+                    &mut writes,
+                    &manifest,
+                    bytes,
                 )
                 .unwrap();
             } else {

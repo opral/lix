@@ -1,0 +1,18 @@
+{
+  "probes": 326,
+  "elapsed_us": 539061,
+  "productive_probes": 7,
+  "unproductive_us": 537046,
+  "by_resumed_batches": {
+    "2": {
+      "probes": 10,
+      "elapsed_us": 2418,
+      "productive": 4
+    },
+    "3": {
+      "probes": 316,
+      "elapsed_us": 536643,
+      "productive": 3
+    }
+  }
+}

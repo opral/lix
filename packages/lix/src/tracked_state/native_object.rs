@@ -299,6 +299,44 @@ impl NativeObjectRef {
     }
 }
 
+/// A history frontier can contain a speculative suffix. Only its original
+/// required prefix may determine whether the caller's query succeeds.
+pub(crate) struct NativeHistoryFrontier;
+impl NativeHistoryFrontier {
+    pub(crate) fn annotate_optional_suffix(mut error: LixError, required: usize) -> LixError {
+        let details = error.details.get_or_insert_with(|| serde_json::json!({}));
+        if let Some(details) = details.as_object_mut() {
+            details.insert(
+                "nativeHistoryFrontier".into(),
+                serde_json::json!({"version": 1, "required": required}),
+            );
+        }
+        error
+    }
+    pub(crate) fn required_len(error: &LixError, total: usize) -> Result<usize, LixError> {
+        let Some(marker) = error
+            .details
+            .as_ref()
+            .and_then(|v| v.get("nativeHistoryFrontier"))
+        else {
+            return Ok(total);
+        };
+        let required = marker
+            .get("required")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok());
+        if marker.get("version").and_then(serde_json::Value::as_u64) != Some(1)
+            || required.is_none_or(|n| n == 0 || n >= total)
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "invalid native history frontier requirement",
+            ));
+        }
+        Ok(required.expect("validated required prefix"))
+    }
+}
+
 /// UUID-addressed metadata needs authenticated authority provenance; unlike
 /// NativeObjectRef, this address supplies no content hash or completeness proof.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -522,6 +560,25 @@ impl NativeMetadataRef {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn speculative_history_prefix_cannot_remove_all_required_inputs() {
+        let plain = LixError::unknown("missing");
+        assert_eq!(
+            NativeHistoryFrontier::required_len(&plain, 3).unwrap(),
+            3
+        );
+        for required in [0, 3, 4] {
+            let error =
+                NativeHistoryFrontier::annotate_optional_suffix(plain.clone(), required);
+            assert!(NativeHistoryFrontier::required_len(&error, 3).is_err());
+        }
+        let error = NativeHistoryFrontier::annotate_optional_suffix(plain, 1);
+        assert_eq!(
+            NativeHistoryFrontier::required_len(&error, 3).unwrap(),
+            1
+        );
+    }
+
     use super::*;
     use serde_json::json;
 
