@@ -83,6 +83,8 @@ pub trait SyncTransport: SyncTransportBounds {
     ) -> SyncTransportFuture<'a, SyncHistoryResponse>;
 
     /// Loads one bounded batch of canonical flat blob manifests.
+    /// Each returned manifest confirms that the authority holds the complete,
+    /// verified blob content, not merely a manifest with missing chunks.
     fn get_blobs<'a>(
         &'a self,
         blob_ids: &'a [String],

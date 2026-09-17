@@ -2,6 +2,20 @@ use super::*;
 
 #[tokio::test]
 async fn descriptor_only_checkpoint_preserves_native_serving_basis_and_reopens() {
+    checkpoint_after_edits(false, false).await;
+}
+
+#[tokio::test]
+async fn checkpoint_after_acknowledged_edits_uploads() {
+    checkpoint_after_edits(true, false).await;
+}
+
+#[tokio::test]
+async fn checkpoint_after_pending_ordinary_upload_recovers_offline_send() {
+    checkpoint_after_edits(true, true).await;
+}
+
+async fn checkpoint_after_edits(acknowledge_edits: bool, pending_ordinary: bool) {
     for selected in [false, true] {
         let width = 16usize;
         let authority = open_lix().await.unwrap();
@@ -66,6 +80,37 @@ async fn descriptor_only_checkpoint_preserves_native_serving_basis_and_reopens()
             .await
             .unwrap();
         }
+        if acknowledge_edits {
+            let uploaded = crate::sync::partial_upload_cycle::upload_partial_once(
+                &storage,
+                &state,
+                &state.descriptor().selected_branch.branch_id,
+                uuid::Uuid::now_v7().to_string(),
+                32,
+                1024 * 1024,
+                |request| {
+                    let authority = &authority;
+                    let state = &state;
+                    async move {
+                        if pending_ordinary {
+                            return Err(LixError::new(
+                                "LIX_TRANSPORT_NETWORK",
+                                "ordinary edit send interrupted",
+                            ));
+                        }
+                        authority
+                            .push_sync_repository_for_account(&request, state.active_account_id())
+                            .await
+                    }
+                },
+            )
+            .await;
+            if pending_ordinary {
+                assert_eq!(uploaded.unwrap_err().code, "LIX_TRANSPORT_NETWORK");
+            } else {
+                assert!(uploaded.unwrap());
+            }
+        }
         let checkpoint = if selected {
             "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key = 'partial-demand-000000'))"
         } else {
@@ -103,6 +148,51 @@ async fn descriptor_only_checkpoint_preserves_native_serving_basis_and_reopens()
             if selected { 15 } else { 0 }
         );
         let branch_id = &state.descriptor().selected_branch.branch_id;
+        if pending_ordinary {
+            assert!(
+                crate::sync::partial_upload_cycle::upload_partial_once(
+                    &storage,
+                    &state,
+                    branch_id,
+                    uuid::Uuid::now_v7().to_string(),
+                    32,
+                    1024 * 1024,
+                    |request| {
+                        let authority = &authority;
+                        let state = &state;
+                        async move {
+                            authority
+                                .push_sync_repository_for_account(
+                                    &request,
+                                    state.active_account_id(),
+                                )
+                                .await
+                        }
+                    },
+                )
+                .await
+                .unwrap()
+            );
+        }
+        if acknowledge_edits {
+            let error = crate::sync::partial_upload_cycle::upload_partial_once(
+                &storage,
+                &state,
+                branch_id,
+                uuid::Uuid::now_v7().to_string(),
+                32,
+                1024 * 1024,
+                |_request| async {
+                    Err(LixError::new(
+                        "LIX_TRANSPORT_NETWORK",
+                        "checkpoint authored offline",
+                    ))
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, "LIX_TRANSPORT_NETWORK");
+        }
         let read = storage.begin_read(Default::default()).await.unwrap();
         let prepared = crate::sync::partial_checkpoint_upload::prepare_partial_checkpoint_upload(
             &read,
@@ -122,7 +212,6 @@ async fn descriptor_only_checkpoint_preserves_native_serving_basis_and_reopens()
                 .iter()
                 .any(|commit| commit.is_checkpoint)
         );
-        assert!(prepared.request.commits.len() >= 3);
         let mut writes = storage.new_write_set();
         let mut guards = crate::sync::partial_push_state::stage_prepare_partial_upload(
             &read,
@@ -156,6 +245,17 @@ async fn descriptor_only_checkpoint_preserves_native_serving_basis_and_reopens()
                     error.details
                 )
             });
+        assert_eq!(
+            authority
+                .partial_replica_descriptor(None)
+                .await
+                .unwrap()
+                .selected_branch
+                .checkpoint
+                .commit_id,
+            prepared.upload.target.checkpoint,
+            "authority must publish the locally authored checkpoint identity"
+        );
         let read = storage.begin_read(Default::default()).await.unwrap();
         let mut writes = storage.new_write_set();
         let guards = crate::sync::partial_push_state::stage_acknowledge_partial_upload(

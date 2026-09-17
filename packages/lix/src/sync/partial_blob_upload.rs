@@ -128,18 +128,45 @@ where
             .into_vec()
             .into_iter()
             .next()
-            .flatten()
-            .ok_or_else(|| LixError::unknown("captured local blob metadata is missing"))?;
+            .flatten();
+        let Some(metadata) = metadata else {
+            // A checkpoint can copy an authority-backed reference whose content
+            // was never demanded locally. Confirm its exact immutable identity
+            // at the authority instead of hydrating and uploading it again.
+            drop(read);
+            confirm_authority_blob(transport, &blob).await?;
+            continue;
+        };
         if metadata.size_bytes > super::blob::MAX_INLINE_SYNC_BLOB_BYTES as u64 {
-            let manifest =
-                crate::binary_cas::load_streaming_canonical_manifest(&read, &metadata).await?;
+            let manifest = match crate::binary_cas::load_streaming_canonical_manifest(
+                &read, &metadata,
+            )
+            .await
+            {
+                Ok(manifest) => manifest,
+                Err(error) if error.code == "LIX_SYNC_CHUNKS_REQUIRED" => {
+                    drop(read);
+                    confirm_authority_blob(transport, &blob).await?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             drop(read);
             upload_streaming_blob(storage, state, transport, &metadata, &manifest).await?;
             continue;
         }
-        let chunks = load_canonical_blob_chunks(&read, id)
-            .await?
-            .ok_or_else(|| LixError::unknown("captured local blob content is missing"))?;
+        let chunks = match load_canonical_blob_chunks(&read, id).await {
+            Ok(Some(chunks)) => chunks,
+            Err(error) if error.code == "LIX_SYNC_CHUNKS_REQUIRED" => {
+                // A resident deferred manifest is also a valid sparse state.
+                // Other storage errors, including corruption, remain errors.
+                drop(read);
+                confirm_authority_blob(transport, &blob).await?;
+                continue;
+            }
+            Ok(None) => return Err(LixError::unknown("captured local blob content is missing")),
+            Err(error) => return Err(error),
+        };
         let mut manifest = super::blob::encode_manifest(id, &chunks)?;
         drop(read);
         if mode == TransferMode::Combined && manifest.inline_bytes_base64.is_some() {
@@ -189,6 +216,21 @@ where
         }
     }
     Ok(())
+}
+
+async fn confirm_authority_blob<T: SyncTransport>(
+    transport: &T,
+    blob: &str,
+) -> Result<(), LixError> {
+    let ids = [blob.to_owned()];
+    let manifests = transport.get_blobs(&ids).await?;
+    if manifests.len() != 1 || manifests[0].blob_id != blob {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "authority must confirm exactly the referenced checkpoint blob",
+        ));
+    }
+    super::blob::validate_sync_blob_manifest(&manifests[0])
 }
 
 /// Transfer large flat or delta-backed blobs with at most one forced anchor's

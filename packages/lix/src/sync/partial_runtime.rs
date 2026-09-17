@@ -1,7 +1,10 @@
 //! Demand-only worker for an admitted partial replica. It never performs the
 //! full replica's snapshot, history inventory, upload or certified pull loop.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use futures_util::{FutureExt, select_biased};
@@ -1122,6 +1125,11 @@ where
             } else {
                 super::partial_publication::PartialRecoveryPolicy::Normal
             };
+            // Upload retries may interrupt an idle long poll, but must not
+            // cancel the recovery that makes a rejected upload publishable.
+            // Fresh discovery is part of recovery too: its HTTP response can
+            // take longer than the capped upload backoff on a remote server.
+            let recovery_in_progress = AtomicBool::new(request_fresh);
             let watch = async {
                 if transport.is_none() {
                     let connected = connect().await?;
@@ -1155,6 +1163,7 @@ where
                     pending_descriptor = None;
                     response?
                 };
+                recovery_in_progress.store(true, Ordering::Relaxed);
                 wrapper.deadline.check(&wrapper.wire.lease.lease_id)?;
                 let cursor = wrapper.wire.descriptor.cursor;
                 engine.sync_mode().health().observed(cursor);
@@ -1202,9 +1211,12 @@ where
             .fuse();
             let retry_enabled = retry_upload;
             let retry_at = retry_deadline;
-            let retry = async move {
+            let retry = async {
                 if retry_enabled {
                     sleep(retry_at.saturating_duration_since(web_time::Instant::now())).await;
+                    if recovery_in_progress.load(Ordering::Relaxed) {
+                        futures_util::future::pending::<()>().await;
+                    }
                 } else {
                     futures_util::future::pending::<()>().await;
                 }
