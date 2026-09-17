@@ -30,7 +30,7 @@ await lix.execute("UPDATE lix_file SET content = $1 WHERE path = $2", [
 ]);
 ```
 
-Lix records both writes automatically. You do not need to create commits.
+Every write becomes a commit automatically. You never run a commit command.
 
 `execute()` runs one statement. To run several statements atomically, pass an array of statements to `lix.executeBatch()`. Do not concatenate SQL into one script string.
 
@@ -50,7 +50,16 @@ for (const row of history.rows) {
 }
 ```
 
-Position `0` is the head commit. Higher positions walk back through the first-parent chain. Read file bytes with `lix_as_of` at an event endpoint.
+Position `0` is the head commit. Higher positions walk back through the first-parent chain.
+
+To read the file's bytes at one of those commits, pass its `lixcol_to_commit_id` to `lix_as_of`:
+
+```ts
+const snapshot = await lix.execute(
+  "SELECT content FROM lix_as_of('lix_file', $1) WHERE path = $2",
+  [history.rows[0].lixcol_to_commit_id, "/hello.txt"],
+);
+```
 
 ## Undo the update
 

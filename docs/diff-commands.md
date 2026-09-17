@@ -44,7 +44,7 @@ The working baseline is `lix_branch.working_base_commit_id`. It can be an ordina
 
 Every relation diff exposes `row_ref`, the relation's typed primary-key columns, `diff_type`, and a `from_<column>` / `to_<column>` pair for each non-primary-key column of the compared relation. `diff_type` is `added`, `modified`, or `removed`. Added rows have SQL `NULL` `from_` values; removed rows have SQL `NULL` `to_` values. A present row can also have nullable columns, so use `diff_type` to identify an absent side. Use `coalesce(to_path, from_path)` when displaying a path that also covers removed or renamed files.
 
-Project `from_content` and `to_content` to reconstruct historical file bytes. For each present side, these bytes equal `content` from `lix_as_of('lix_file', endpoint_commit_id)` for the same file. Absent sides are SQL `NULL`; an existing empty file is an empty `BYTEA`. A snapshot of an absent file returns no row. Read or reconstruction failures are errors, not absent rows or empty bytes. Content is only materialized when projected or used by a predicate. File metadata predicates, including `id`, `from_path`, and `to_path`, select rows before content materialization. A content predicate itself requires reading bytes. Projecting content, including in a working diff, can require fetching deferred historical state or blob chunks on partial replicas. Metadata-only working diffs retain their existing HOT read contract. Missing inputs produce typed hydration demands, never a null value for an existing file.
+Project `from_content` and `to_content` to reconstruct historical file bytes. For each present side, these bytes equal `content` from `lix_as_of('lix_file', endpoint_commit_id)` for the same file. Absent sides are SQL `NULL`; an existing empty file is an empty `BYTEA`. A snapshot of an absent file returns no row. Read or reconstruction failures are errors, not absent rows or empty bytes. Content is only materialized when projected or used by a predicate. File metadata predicates, including `id`, `from_path`, and `to_path`, select rows before content materialization. A content predicate itself requires reading bytes. On a partial replica, projecting `from_content` or `to_content` may fetch data from the server. If the data cannot be fetched, the query errors; it never returns NULL for a file that exists.
 
 ```sql
 SELECT id, diff_type, from_content, to_content
@@ -52,7 +52,7 @@ FROM lix_diff('lix_file', $1, $2)
 WHERE id = $3;
 ```
 
-Count the relation being displayed. `row_count` is no longer an engine diff column: internal descriptor/content records do not describe a user-facing edit count. For example, count file diff rows for changed files, or query a plugin relation and count its diff rows for changed entities.
+Count the rows of the relation being displayed. For example, count file diff rows for changed files, or query a plugin relation and count its diff rows for changed entities.
 
 ```sql
 SELECT count(*) AS changed_files FROM lix_diff('lix_file');

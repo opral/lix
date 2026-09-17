@@ -65,8 +65,8 @@ const GoLogo = ({ className = "" }) => (
 const sdkLanguages = [
   {
     label: "Rust",
-    href: "https://crates.io/crates/lix",
-    title: "The Rust SDK on crates.io.",
+    href: "/docs/rust-quickstart",
+    title: "Rust SDK quickstart.",
     Logo: RustLogo,
   },
   {
@@ -120,449 +120,152 @@ function CopyInstallButton({
   );
 }
 
+type RepositoryFile = {
+  name: string;
+  size: string;
+} & (
+  | { badge: { text: string; bg: string; fg: string } }
+  | { icon: { src: string; alt: string } }
+  | { table: true }
+);
+
 /**
- * Hero diagram: your product sits on top of a Lix repo that holds files, a SQL
- * database, and version control.
+ * Small table glyph for application-state rows in the hero diagram.
  *
  * @example
- * <LixRepoDiagram />
+ * <TableIcon />
  */
-function LixRepoDiagram() {
+const TableIcon = () => (
+  <svg
+    viewBox="0 0 22 22"
+    className="block h-[22px] w-[22px] shrink-0"
+    aria-hidden="true"
+  >
+    <rect
+      x="2.5"
+      y="4.5"
+      width="17"
+      height="14"
+      rx="2"
+      fill="#FFFFFF"
+      stroke="#8A8F96"
+      strokeWidth="1.2"
+    />
+    <line
+      x1="2.5"
+      y1="9.5"
+      x2="19.5"
+      y2="9.5"
+      stroke="#8A8F96"
+      strokeWidth="1.2"
+    />
+    <line x1="2.5" y1="14" x2="19.5" y2="14" stroke="#C9C7BF" />
+    <line x1="8.5" y1="9.5" x2="8.5" y2="18.5" stroke="#C9C7BF" />
+  </svg>
+);
+
+/**
+ * Rows shown in the hero diagram: one repository holding source code next to
+ * documents, spreadsheets, media, and application tables. Familiar icons only.
+ */
+const repositoryFiles: RepositoryFile[] = [
+  {
+    name: "app.js",
+    size: "12 KB",
+    icon: { src: "/assets/icons/javascript.svg", alt: "JavaScript" },
+  },
+  {
+    name: "contract.docx",
+    size: "840 KB",
+    icon: { src: "/assets/icons/word.svg", alt: "Word" },
+  },
+  {
+    name: "pricing.xlsx",
+    size: "1.2 MB",
+    icon: { src: "/assets/icons/excel.svg", alt: "Excel" },
+  },
+  {
+    name: "train.py",
+    size: "8 KB",
+    icon: { src: "/assets/icons/python.svg", alt: "Python" },
+  },
+  {
+    name: "hero.psd",
+    size: "412 MB",
+    badge: { text: "Ps", bg: "#001E36", fg: "#31A8FF" },
+  },
+  { name: "orders", size: "12,400 rows", table: true },
+  { name: "customers", size: "3,180 rows", table: true },
+];
+
+/**
+ * Hero diagram: one Lix repository holding every file format side by side.
+ *
+ * @example
+ * <OneRepositoryDiagram />
+ */
+function OneRepositoryDiagram() {
   return (
     <div className="w-[300px] shrink-0 self-center sm:w-[340px]">
-      <svg
-        viewBox="0 0 400 326"
-        className="block h-auto w-full"
+      <div
+        className="relative rounded-xl border-[1.5px] border-cyan-bright bg-[rgba(7,182,213,0.05)] px-3.5 pb-3.5 pt-[26px]"
         role="img"
-        aria-label="Your product uses a Lix repo containing files, a database, and version control."
+        aria-label="One Lix repository holding source code, documents, spreadsheets, images, and the application's own database tables."
       >
-        <defs>
-          <marker
-            id="hero-repo-arrow"
-            markerWidth="8"
-            markerHeight="8"
-            refX="6"
-            refY="4"
-            orient="auto"
-          >
-            <path d="M0 0 L7 4 L0 8 Z" fill="#8A8F96" />
-          </marker>
-        </defs>
-        <rect
-          x="115"
-          y="10"
-          width="170"
-          height="40"
-          rx="20"
-          fill="#FFFFFF"
-          stroke="#C9C7BF"
-        />
-        <text
-          x="200"
-          y="35"
-          textAnchor="middle"
-          className="font-mono text-[11px] font-bold tracking-[0.07em]"
-          fill="#15171B"
-        >
-          YOUR PRODUCT
-        </text>
-        <line
-          x1="200"
-          y1="50"
-          x2="200"
-          y2="76"
-          stroke="#8A8F96"
-          strokeWidth="1.2"
-          markerEnd="url(#hero-repo-arrow)"
-        />
-        <rect
-          x="20"
-          y="82"
-          width="360"
-          height="230"
-          rx="14"
-          fill="rgba(7,182,213,0.05)"
-          stroke="#07B6D5"
-          strokeWidth="1.5"
-        />
-        <text
-          x="200"
-          y="112"
-          textAnchor="middle"
-          className="font-mono text-[11.5px] font-bold tracking-[0.09em]"
-          fill="#0891AC"
-        >
-          LIX REPO
-        </text>
-
-        <g transform="translate(110, 196)">
-          <rect
-            x="-14"
-            y="-28"
-            width="30"
-            height="40"
-            rx="3"
-            fill="#FBFAF7"
-            stroke="#C9C7BF"
-            strokeWidth="1.5"
-          />
-          <rect
-            x="-19"
-            y="-23"
-            width="30"
-            height="40"
-            rx="3"
-            fill="#FFFFFF"
-            stroke="#8A8F96"
-            strokeWidth="1.5"
-          />
-          <line
-            x1="-12"
-            y1="-13"
-            x2="4"
-            y2="-13"
-            stroke="#C9C7BF"
-            strokeWidth="1.5"
-            strokeLinecap="round"
-          />
-          <line
-            x1="-12"
-            y1="-5"
-            x2="4"
-            y2="-5"
-            stroke="#C9C7BF"
-            strokeWidth="1.5"
-            strokeLinecap="round"
-          />
-          <line
-            x1="-12"
-            y1="3"
-            x2="-3"
-            y2="3"
-            stroke="#07B6D5"
-            strokeWidth="1.5"
-            strokeLinecap="round"
-          />
-        </g>
-        <text
-          x="110"
-          y="248"
-          textAnchor="middle"
-          className="font-mono text-[10.5px]"
-          fill="#6B7076"
-        >
-          files
-        </text>
-
-        <g transform="translate(200, 196)">
-          <ellipse
-            cx="0"
-            cy="-16"
-            rx="19"
-            ry="6"
-            fill="#FFFFFF"
-            stroke="#8A8F96"
-            strokeWidth="1.5"
-          />
-          <path
-            d="M-19 -16 V10 C-19 13.3 -10.5 16 0 16 C10.5 16 19 13.3 19 10 V-16"
-            fill="none"
-            stroke="#8A8F96"
-            strokeWidth="1.5"
-          />
-          <path
-            d="M-19 -3 C-19 0.3 -10.5 3 0 3 C10.5 3 19 0.3 19 -3"
-            fill="none"
-            stroke="#C9C7BF"
-            strokeWidth="1.5"
-          />
-          <line
-            x1="-7"
-            y1="9"
-            x2="7"
-            y2="9"
-            stroke="#07B6D5"
-            strokeWidth="1.5"
-            strokeLinecap="round"
-          />
-        </g>
-        <text
-          x="200"
-          y="248"
-          textAnchor="middle"
-          className="font-mono text-[10.5px]"
-          fill="#6B7076"
-        >
-          database
-        </text>
-
-        <g transform="translate(290, 196)">
-          <line
-            x1="-26"
-            y1="12"
-            x2="26"
-            y2="12"
-            stroke="#8A8F96"
-            strokeWidth="1.5"
-          />
-          <path
-            d="M-18 12 C-18 -2 -8 -10 0 -10 C10 -10 18 -2 18 12"
-            fill="none"
-            stroke="#07B6D5"
-            strokeWidth="1.5"
-          />
-          <circle cx="0" cy="-10" r="3.2" fill="#07B6D5" />
-          <circle
-            cx="-18"
-            cy="12"
-            r="3.2"
-            fill="#FFFFFF"
-            stroke="#8A8F96"
-            strokeWidth="1.5"
-          />
-          <circle
-            cx="18"
-            cy="12"
-            r="3.2"
-            fill="#FFFFFF"
-            stroke="#8A8F96"
-            strokeWidth="1.5"
-          />
-        </g>
-        <text
-          x="290"
-          y="248"
-          textAnchor="middle"
-          className="font-mono text-[10.5px]"
-          fill="#6B7076"
-        >
-          version control
-        </text>
-      </svg>
+        <span className="absolute -top-2 left-1/2 -translate-x-1/2 bg-paper px-2.5 font-mono text-[11.5px] font-bold tracking-[0.09em] text-cyan-deep">
+          ONE REPOSITORY
+        </span>
+        <div className="flex flex-col gap-[7px]">
+          {repositoryFiles.map((file) => (
+            <div
+              key={file.name}
+              className="flex min-w-0 items-center gap-2.5 rounded-md border border-line bg-white px-3 py-[9px]"
+            >
+              {"table" in file ? (
+                <TableIcon />
+              ) : "badge" in file ? (
+                <span
+                  className="inline-flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-[5px] font-sans text-[10px] font-bold"
+                  style={{ background: file.badge.bg, color: file.badge.fg }}
+                >
+                  {file.badge.text}
+                </span>
+              ) : (
+                <img
+                  src={file.icon.src}
+                  alt={file.icon.alt}
+                  className="block h-[22px] w-[22px] shrink-0 object-contain"
+                />
+              )}
+              <span className="min-w-0 flex-1 truncate font-mono text-[12.5px] text-ink">
+                {file.name}
+              </span>
+              <span className="shrink-0 font-mono text-[11px] text-ink-faint">
+                {file.size}
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
 
-const whatYouGet = [
+const pillars = [
   {
-    title: "Files, in any format",
+    title: "Any format",
     description:
-      "Text and Markdown, but also DOCX, XLSX, and CAD. Plugins map any format to versioned rows.",
-    icon: (
-      <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
-        <rect
-          x="28"
-          y="6"
-          width="30"
-          height="38"
-          rx="3"
-          fill="#FBFAF7"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-        />
-        <rect
-          x="24"
-          y="10"
-          width="30"
-          height="38"
-          rx="3"
-          fill="#FBFAF7"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-        />
-        <rect
-          x="20"
-          y="14"
-          width="30"
-          height="38"
-          rx="3"
-          fill="#FFFFFF"
-          stroke="#8A8F96"
-          strokeWidth="1.5"
-        />
-        <line
-          x1="26"
-          y1="24"
-          x2="44"
-          y2="24"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-          strokeLinecap="round"
-        />
-        <line
-          x1="26"
-          y1="31"
-          x2="44"
-          y2="31"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-          strokeLinecap="round"
-        />
-        <line
-          x1="26"
-          y1="38"
-          x2="36"
-          y2="38"
-          stroke="#07B6D5"
-          strokeWidth="1.5"
-          strokeLinecap="round"
-        />
-      </svg>
-    ),
+      "Text, binaries, large blobs. Plugins diff and merge DOCX, XLSX, or JSON by clause, cell, or row.",
   },
   {
-    title: "SQL database",
+    title: "Embeddable",
     description:
-      "File content, app data, and history live in an ACID OLTP database. Query millions of rows with SQL.",
-    icon: (
-      <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
-        <ellipse
-          cx="40"
-          cy="15"
-          rx="19"
-          ry="6"
-          fill="#FFFFFF"
-          stroke="#8A8F96"
-          strokeWidth="1.5"
-        />
-        <path
-          d="M21 15 V41 C21 44.3 29.5 47 40 47 C50.5 47 59 44.3 59 41 V15"
-          fill="none"
-          stroke="#8A8F96"
-          strokeWidth="1.5"
-        />
-        <path
-          d="M21 28 C21 31.3 29.5 34 40 34 C50.5 34 59 31.3 59 28"
-          fill="none"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-        />
-        <line
-          x1="33"
-          y1="40"
-          x2="47"
-          y2="40"
-          stroke="#07B6D5"
-          strokeWidth="1.5"
-          strokeLinecap="round"
-        />
-      </svg>
-    ),
+      "Runs in-process inside your product. Storage is pluggable: memory, filesystem, browser OPFS, or S3.",
   },
   {
-    title: "Version control",
+    title: "Designed as a database",
     description:
-      "Semantic changes: the clause, cell, or row that changed, not a byte blob. Review, merge, and roll back.",
-    icon: (
-      <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
-        <line
-          x1="14"
-          y1="40"
-          x2="66"
-          y2="40"
-          stroke="#8A8F96"
-          strokeWidth="1.5"
-        />
-        <path
-          d="M22 40 C22 26 30 18 40 18 C50 18 58 26 58 40"
-          fill="none"
-          stroke="#07B6D5"
-          strokeWidth="1.5"
-        />
-        <circle cx="40" cy="18" r="3.5" fill="#07B6D5" />
-        <circle
-          cx="22"
-          cy="40"
-          r="3.5"
-          fill="#FFFFFF"
-          stroke="#8A8F96"
-          strokeWidth="1.5"
-        />
-        <circle
-          cx="58"
-          cy="40"
-          r="3.5"
-          fill="#FFFFFF"
-          stroke="#8A8F96"
-          strokeWidth="1.5"
-        />
-      </svg>
-    ),
-  },
-  {
-    title: "Real-time collaboration",
-    description:
-      "Companies work live, not in pull requests. People and agents share a repository and see changes as they happen.",
-    icon: (
-      <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
-        <rect
-          x="18"
-          y="10"
-          width="44"
-          height="36"
-          rx="4"
-          fill="#FFFFFF"
-          stroke="#8A8F96"
-          strokeWidth="1.5"
-        />
-        <line
-          x1="26"
-          y1="20"
-          x2="54"
-          y2="20"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-          strokeLinecap="round"
-        />
-        <line
-          x1="26"
-          y1="28"
-          x2="46"
-          y2="28"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-          strokeLinecap="round"
-        />
-        <path d="M32 34 L32 42 L38 38.5 Z" fill="#07B6D5" />
-        <path d="M50 24 L50 32 L56 28.5 Z" fill="#8A8F96" />
-      </svg>
-    ),
-  },
-  {
-    title: "Permissions",
-    badge: "soon",
-    description:
-      "Finance, legal, and contractors need different access. Permissions will live inside the repository: per file, per group, and versioned like any other change.",
-    icon: (
-      <svg viewBox="0 0 80 56" className="block h-11 w-16" aria-hidden="true">
-        <path
-          d="M32 25 V18 a8 8 0 0 1 16 0 V25"
-          fill="none"
-          stroke="#C9C7BF"
-          strokeWidth="1.5"
-        />
-        <rect
-          x="27"
-          y="25"
-          width="26"
-          height="21"
-          rx="3"
-          fill="#FFFFFF"
-          stroke="#8A8F96"
-          strokeWidth="1.5"
-        />
-        <circle cx="40" cy="33.5" r="2.6" fill="#07B6D5" />
-        <line
-          x1="40"
-          y1="36"
-          x2="40"
-          y2="40.5"
-          stroke="#07B6D5"
-          strokeWidth="1.5"
-          strokeLinecap="round"
-        />
-      </svg>
-    ),
+      "Files, app tables, and history are rows in one ACID database. Query all of it with SQL.",
   },
 ];
 
@@ -586,13 +289,11 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
               Open source · MIT
             </p>
             <h1 className="text-balance text-[30px] font-bold leading-[1.1] tracking-[-0.03em] sm:text-[40px]">
-              Embeddable repository for your product
+              Universal version control system
             </h1>
             <p className="mt-4 max-w-[620px] text-base leading-[1.6] text-ink-secondary">
-              Files, SQL database, and version control in one. Everything
-              inside is versioned data: file content, app tables, reviews,
-              comments. There is no external control plane to sync. Agents
-              read and write normal files. Your product queries SQL.
+              Versions any file format. Runs in-process on pluggable storage.
+              Designed as a database.
             </p>
             <div className="mt-6 flex flex-wrap items-center gap-5">
               <span className="flex items-center gap-1.5 border-b-2 border-ink pb-0.5 text-[13px] font-semibold text-ink">
@@ -623,16 +324,35 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
               </a>
             </div>
           </div>
-          <LixRepoDiagram />
+          <OneRepositoryDiagram />
+        </section>
+
+        {/* Pillars */}
+        <section className="grid grid-cols-1 gap-10 pt-20 sm:grid-cols-3">
+          {pillars.map((pillar) => (
+            <div
+              key={pillar.title}
+              className="flex flex-col gap-3 border-t-2 border-ink pt-[22px]"
+            >
+              <h2 className="text-[22px] font-semibold tracking-[-0.02em]">
+                {pillar.title}
+              </h2>
+              <p className="text-base leading-[1.6] text-ink-secondary">
+                {pillar.description}
+              </p>
+            </div>
+          ))}
         </section>
 
         {/* Stats */}
-        <section className="mt-12 flex flex-wrap gap-10 border-y border-line py-5">
+        <section className="mt-[84px] flex flex-wrap gap-10 border-y border-line py-5">
           <div className="flex flex-col gap-1">
             <span className="text-[22px] font-bold leading-none tracking-[-0.02em]">
               {coarseWeeklyDownloads()}
             </span>
-            <span className="text-[13px] text-ink-muted">weekly downloads</span>
+            <span className="text-[13px] text-ink-muted">
+              npm weekly downloads
+            </span>
           </div>
           {githubStars !== null && (
             <a
@@ -651,40 +371,6 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
 
         {/* Adoption chart */}
         <DownloadsChart />
-
-        {/* What you get */}
-        <section className="pt-14">
-          <h2 className="mb-1 text-[22px] font-bold tracking-[-0.02em]">
-            What you get
-          </h2>
-          <p className="mt-3 max-w-[640px] text-[15px] leading-[1.6] text-ink-secondary">
-            Files for AI agents, SQL for your app, version control for review
-            flows. All in one repository.
-          </p>
-          <div className="mt-5">
-            {whatYouGet.map((item, index) => (
-              <div
-                key={item.title}
-                className={`grid grid-cols-1 items-center gap-3 border-t border-line py-3 sm:grid-cols-[84px_210px_1fr] sm:gap-7 ${
-                  index === whatYouGet.length - 1 ? "border-b" : ""
-                }`}
-              >
-                {item.icon}
-                <span className="flex flex-wrap items-center gap-2 text-[15px] font-semibold tracking-[-0.01em]">
-                  {item.title}
-                  {"badge" in item && (
-                    <span className="rounded border border-line-strong px-1.5 py-0.5 font-mono text-[10px] font-normal uppercase tracking-[0.08em] text-ink-muted">
-                      {item.badge}
-                    </span>
-                  )}
-                </span>
-                <span className="text-[15px] leading-[1.6] text-ink-secondary">
-                  {item.description}
-                </span>
-              </div>
-            ))}
-          </div>
-        </section>
 
         {/* README */}
         {readmeHtml && (
@@ -726,7 +412,7 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
           <div className="flex flex-wrap items-center justify-between gap-8 rounded-xl border border-line bg-white px-6 py-7 sm:px-10">
             <div className="flex flex-col gap-1.5">
               <h2 className="text-[19px] font-bold tracking-[-0.02em]">
-                Start with the SDK
+                Start with the JavaScript SDK
               </h2>
               <p className="text-[14.5px] text-ink-muted">
                 MIT licensed. Runs in the browser and on the server.

@@ -1,6 +1,6 @@
 # Lix Server Protocol
 
-The Lix Server Protocol is the HTTP contract for talking to a remote Lix. Its stable HTTP API major is `v1`. Collection creation uses `/lix/v1`; repository operations live under `/lix/v1/{lix_id}`.
+The Lix Server Protocol is the HTTP contract for talking to a remote repository. Its stable HTTP API major is `v1`. Collection creation uses `/lix/v1`; repository operations live under `/lix/v1/{lix_id}`.
 
 It defines the methods, wire formats, session behavior, and error envelopes. It does not define HTTP frameworks, authentication schemes, or deployment policy.
 
@@ -22,17 +22,17 @@ The `lix` crate contains a reusable Rust handler and this repository ships a [re
 
 ## Surface
 
-| Group       | Paths                                                                                         |
-| :---------- | :-------------------------------------------------------------------------------------------- |
-| Lifecycle   | `/lix/v1`, `/lix/v1/{lix_id}`                                                   |
-| Handshake   | `/lix/v1/{lix_id}`, `/lix/v1/{lix_id}/session`                                  |
-| SQL         | `/lix/v1/{lix_id}/execute`, `/lix/v1/{lix_id}/execute-batch`                    |
-| Transaction | `/lix/v1/{lix_id}/transaction/{begin,execute,commit,rollback}`                  |
-| Files       | `/lix/v1/{lix_id}/file`, `/lix/v1/{lix_id}/file/upsert{,-batch}`               |
-| Sync        | `/lix/v1/{lix_id}/sync/{push,pull,history,checkpoints,descriptor,native-objects,native-object-range,native-metadata,native-metadata-walk,baseline-lease/renew,blob,chunk,retained-bodies,merge,merge/restart,migration/merge,migration/cleanup,migration/global/restart,migration/global/cleanup,migration/global/merge,migration/global/bodies}`                          |
-| Versioning  | `/lix/v1/{lix_id}/branch/{create,switch,merge,merge-preview}`, `/lix/v1/{lix_id}/{undo,redo}`       |
-| Observation | `/lix/v1/{lix_id}/observe`, `/lix/v1/{lix_id}/observe/multiplex`                |
-| Snapshot    | `/lix/v1/{lix_id}/snapshot`                                                     |
+| Group       | Paths                                                                                                                                                                                                                                                                                                                                             |
+| :---------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Lifecycle   | `/lix/v1`, `/lix/v1/{lix_id}`                                                                                                                                                                                                                                                                                                                     |
+| Handshake   | `/lix/v1/{lix_id}`, `/lix/v1/{lix_id}/session`                                                                                                                                                                                                                                                                                                    |
+| SQL         | `/lix/v1/{lix_id}/execute`, `/lix/v1/{lix_id}/execute-batch`                                                                                                                                                                                                                                                                                      |
+| Transaction | `/lix/v1/{lix_id}/transaction/{begin,execute,commit,rollback}`                                                                                                                                                                                                                                                                                    |
+| Files       | `/lix/v1/{lix_id}/file`, `/lix/v1/{lix_id}/file/upsert{,-batch}`                                                                                                                                                                                                                                                                                  |
+| Sync        | `/lix/v1/{lix_id}/sync/{push,pull,history,checkpoints,descriptor,native-objects,native-object-range,native-metadata,native-metadata-walk,baseline-lease/renew,blob,chunk,retained-bodies,merge,merge/restart,migration/merge,migration/cleanup,migration/global/restart,migration/global/cleanup,migration/global/merge,migration/global/bodies}` |
+| Versioning  | `/lix/v1/{lix_id}/branch/{create,switch,merge,merge-preview}`, `/lix/v1/{lix_id}/{undo,redo}`                                                                                                                                                                                                                                                     |
+| Observation | `/lix/v1/{lix_id}/observe`, `/lix/v1/{lix_id}/observe/multiplex`                                                                                                                                                                                                                                                                                  |
+| Snapshot    | `/lix/v1/{lix_id}/snapshot`                                                                                                                                                                                                                                                                                                                       |
 
 SDK users pass the complete stable locator `https://host/lix/{lix_id}`. `openLix()` rewrites that terminal locator to `/lix/v1/{lix_id}`, opens a session, carries the server-issued `Lix-Session-Id` on later requests, and reconnects observation streams. Raw HTTP clients use the versioned paths directly.
 
@@ -59,17 +59,15 @@ On session creation it ensures the Lix account exists, pins the session to it, a
 
 SQL and file mutations accept an optional `Idempotency-Key` header. Replaying a key after a lost response applies the mutation once. Sync pushes are instead idempotent by immutable commit identity and compare-and-swap branch updates.
 
-SQL request fingerprints now hash typed parameters directly. Receipts created with the previous JSON-based fingerprint remain stored, but replaying those keys after upgrading returns `409 LIX_IDEMPOTENCY_KEY_REUSED` without executing the request again. Reconcile an uncertain pre-upgrade request before submitting it with a new key. Repository content and storage formats are unchanged.
-
 The protocol has no default request-body byte ceiling. Hosts can set `ServerProtocolOptions::max_request_body_bytes` to enforce a byte budget; explicit budgets still return `413` for oversized bodies. Proxy limits and the separate sync-chunk limits still apply.
 
 ## Merge previews
 
-Server protocol 11 removes the `conflicts` field from merge previews. Overlapping row edits reconcile automatically through LWW or plugin column merging. Preview returns the outcome, branch and commit IDs, and change counts. Upgrade clients and servers together; no persisted repository format changes are required.
+Merge previews have no `conflicts` field. Overlapping row edits reconcile automatically through LWW or plugin column merging. Preview returns the outcome, branch and commit IDs, and change counts.
 
 ## SQL transaction receipts
 
-Server protocol 10 changes `POST /execute-batch` to return `{ results: [...], commit: { before, after } | null }`. Statement entries retain `statementIndex`, labels, rows, counts, and notices, but carry no commit field. The receipt describes the entire committed batch, including statements with `RETURNING`; it is null for a read-only batch. Clients using protocol 8 must upgrade.
+`POST /execute-batch` returns `{ results: [...], commit: { before, after } | null }`. Statement entries retain `statementIndex`, labels, rows, counts, and notices, but carry no commit field. The receipt describes the entire committed batch, including statements with `RETURNING`; it is null for a read-only batch.
 
 `POST /transaction/commit` returns HTTP 200 with `{ commit: { before, after } | null }`. Repeating the same transaction capability returns the same receipt. Rollback continues to return HTTP 204. Explicit transaction statements carry no durable receipt until commit succeeds. Single `/execute` responses include `commit` for writes and omit it for reads; the JavaScript SDK normalizes that omitted field to `null`.
 
@@ -100,18 +98,18 @@ The live pull protocol has one repository cursor. It has no schema or branch fil
 
 ### Partial replica with on-demand sync
 
-Sync protocol 19 defines the native transport for a partial replica with on-demand sync. SDK callers opt in with `server.mode: "partial_replica"` and local storage. The default server mode is `remote`. Client and server must upgrade together; this transport change does not alter the repository format.
+Sync protocol 19 defines the native transport for a partial replica with on-demand sync. SDK callers opt in with `server.mode: "partial_replica"` and local storage. The default server mode is `remote`.
 
-Protocol 16 adds `abandon: true` to the exact partial-attempt restart request. Lix uses this during automatic recovery to fence an unsupported active merge before adopting the server working set. An already committed merge receipt wins; otherwise the authority durably prevents delayed requests from reviving the abandoned attempt. Ordinary restarts omit this field and still require expiry. Upgrade server and SDK together: older servers reject the new field, and protocol negotiation rejects incompatible peers before synchronization. The storage format remains 81; cached admission proofs are reacquired for the new protocol epoch.
+The exact partial-attempt restart request accepts `abandon: true`. Lix uses this during automatic recovery to fence an unsupported active merge before adopting the server working set. An already committed merge receipt wins; otherwise the authority durably prevents delayed requests from reviving the abandoned attempt. Ordinary restarts omit this field and still require expiry.
 
-Partial merge receipts use the authority head at admission as the first parent, which may differ from the head captured when the client prepared its attempt. Protocol 13 clients require that captured head as the first parent and cannot settle these receipts. Both handshakes and requests on existing sessions reject incompatible sync versions before sync work; upgrade SDK and server together.
+Partial merge receipts use the authority head at admission as the first parent, which may differ from the head captured when the client prepared its attempt. Both handshakes and requests on existing sessions reject incompatible sync versions before sync work.
 
 - `GET /sync/descriptor` returns a required `{descriptor, lease}` envelope of at
   most 6144 encoded bytes. The descriptor contains selected/default and global native head/checkpoint coordinates, canonical branch-ref metadata, and a cursor. It does not enumerate branches, rows, checkpoints, or blobs. The authority durably pins those exact native roots before returning the envelope. Protocol fixes the lease TTL at 300000 ms; changing this duration requires a protocol version change. Candidate publication uses a process-local monotonic deadline starting before the descriptor request, so waiting and transfer consume the budget. The serialized `expiresAtMs` field alone is not a cross-clock proof.
 - `GET /sync/descriptor?branchId=...&after=...` waits up to 30 seconds for a newer
   coherent descriptor. Unrelated repository changes may advance its cursor; receiving the response does not publish a local baseline or certify coverage. A candidate baseline has an independent lease until local publication.
 - Descriptor discovery carries no client read recipes or optional prefetch work.
-  The replica prepares its moving read requirements against the leased descriptor using the native on-demand routes, then atomically publishes the candidate. Retained fixed historical reads do not gate moving-state publication. Sync protocol 17 removes `/sync/update`; SDK and server must upgrade together.
+  The replica prepares its moving read requirements against the leased descriptor using the native on-demand routes, then atomically publishes the candidate. Retained fixed historical reads do not gate moving-state publication.
 - Small-file publication includes canonical inline blobs in the existing
   `/sync/push` request, up to a 1 MiB combined request budget. Larger publications retain chunk upload. Both paths use the same authoritative row merge and acknowledgment machinery.
 - `POST /sync/native-objects`, `/sync/native-object-range`, and
@@ -119,7 +117,7 @@ Partial merge receipts use the authority head at admission as the first parent, 
 - `POST /sync/native-metadata-walk` fetches up to 16 first-parent commits
   with optional headers under the same baseline lease. The response is bounded to 32 records and 256 KiB of decoded metadata. Unavailable optional ancestors truncate the walk; required inputs still fail normally.
 - Native metadata responses may include a bounded dependency bundle containing
-  the locator owner's header and catalog. Clients validate ownership, hashes, and admission before atomically installing the bundle. Missing or corrupt optional companions are omitted; required object failures remain errors. Protocol 18 introduced metadata walks and protocol 19 adds these bundles; clients and servers must upgrade together, without resetting local storage.
+  the locator owner's header and catalog. Clients validate ownership, hashes, and admission before atomically installing the bundle. Missing or corrupt optional companions are omitted; required object failures remain errors.
 - `POST /sync/baseline-lease/renew` accepts `{leaseId}` and extends an unexpired
   lease without changing its account or roots. Expired leases cannot be resurrected. Cold requests return `LIX_PARTIAL_BASELINE_EXPIRED` (HTTP 410); clients preserve pending edits and explicitly reconcile a new baseline.
 - Shared blob/chunk GET routes validate a supplied baseline lease in the same
@@ -127,7 +125,7 @@ Partial merge receipts use the authority head at admission as the first parent, 
 
 Native objects must pass their native hash or codec validation and durable admission checks before installation. Caching inputs does not by itself prove SQL coverage. Warm resident reads do not consult the network lease clock.
 
-Existing authorities must explicitly upgrade their authority capability marker before serving protocol 10 baseline leases. In Rust, close existing handles and call `lix::upgrade_authority_for_partial_sync(storage).await?`. Complete any ordinary repository-format migration first. This operation preserves rows, atomically replaces the prior authority marker, and fences older authority writers (including their GC). It is not an implicit partial-opening fallback.
+Existing authorities must explicitly upgrade their authority capability marker before serving baseline leases. In Rust, close existing handles and call `lix::upgrade_authority_for_partial_sync(storage).await?`. Complete any ordinary repository-format migration first. This operation preserves rows, atomically replaces the prior authority marker, and fences older authority writers (including their GC). It is not an implicit partial-opening fallback.
 
 Every commit member and snapshot row encodes its physical replication identity as `(schemaKey, fileId, rowPk)`. This is deliberately not the public SQL/SDK `lix_row_ref`: one logical file reference may aggregate several physical rows. The sync-only `rowPk` is an ordered array of typed components. Each component is an object with `type` equal to `uuid`, `integer`, `string`, or `bytes`; `value` is respectively a canonical UUID string, a JSON integer, a string, or a base64 string. For example:
 
@@ -154,9 +152,9 @@ Behavior that OpenAPI cannot express — session pinning, transaction ownership,
 
 To run a server, see [Hosting](./hosting.md).
 
-### Typed sync rows (sync protocol version 9)
+### Typed sync rows
 
-Every live sync member and snapshot row includes `snapshotPayload`, the base64-encoded canonical Schema v1 typed row, alongside its JSON `snapshot` projection. Tombstones encode both fields as null. Receivers verify canonical encoding, primary-key identity, and agreement with the JSON projection before installing the payload. Preserving type information and schema fingerprints lets custom and plugin-defined rows sync without rebuilding them against the engine's built-in catalog. A retained row may predate the currently registered schema, so import preserves its authoring fingerprint rather than validating it against the current catalog. SQL reads retain their existing resolved-schema validation. Storage compression does not affect the wire encoding. Sync protocol 8 and earlier peers must upgrade; there is no JSON-only or checkpoint-marker fallback.
+Every live sync member and snapshot row includes `snapshotPayload`, the base64-encoded canonical Schema v1 typed row, alongside its JSON `snapshot` projection. Tombstones encode both fields as null. Receivers verify canonical encoding, primary-key identity, and agreement with the JSON projection before installing the payload. Preserving type information and schema fingerprints lets custom and plugin-defined rows sync without rebuilding them against the engine's built-in catalog. A retained row may predate the currently registered schema, so import preserves its authoring fingerprint rather than validating it against the current catalog. SQL reads retain their existing resolved-schema validation. Storage compression does not affect the wire encoding.
 
 ## Reference-host provisioning
 

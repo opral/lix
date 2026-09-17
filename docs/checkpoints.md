@@ -4,7 +4,7 @@ description: Create restore points and query relation-specific changes between c
 
 # Checkpoints
 
-Lix automatically commits tracked changes. A checkpoint marks one of those states as a user-meaningful restore point. Compare its commit with the active branch head to inspect subsequent changes at the relation level your interface uses.
+Every write becomes a commit automatically. You never run a commit command. A checkpoint marks one of those commits as a restore point. Compare its commit with the active branch head to inspect subsequent changes at the relation level your interface uses.
 
 ```ts
 const checkpoint = await lix.execute(
@@ -74,10 +74,6 @@ The first query is branch-relative; the second includes repository-global, off-b
 
 Use `lix_diff('lix_file')` for working changes. Its baseline is exposed as `lix_branch.working_base_commit_id` and can be an ordinary commit after a fork or restore. The latest marked commit is not necessarily the working baseline.
 
-Full checkpoint publication aliases the captured state root; it does not scan or copy the working interval. Physical reclamation runs in the background. Selective checkpoint source dependencies remain available for offline sync.
+A full checkpoint creates a new metadata-only commit. It copies no rows. Storage is reclaimed in the background.
 
 See [History](./history.md) for log, endpoint history, snapshots, and paged previews, and [Diff commands](./diff-commands.md) for scoped checkpoints.
-
-Partial replicas upload ordinary pending edits and checkpoint dependencies in bounded waves of at most 32 commits and 1 MiB of commit/ref JSON. Intermediate ordinary uploads keep the authority's previous checkpoint; checkpoint publication waits for its native dependencies. Lost replies resume the durable captured wave. Binary file content uses the separate bounded blob uploader and is not counted as commit JSON.
-
-A single commit or minimal checkpoint publication closure that exceeds the 1 MiB request budget still requires multipart body preparation, which is not implemented by this lane. Its local data remains pending; splitting a long sequence into waves does not remove that atomic-body limit.

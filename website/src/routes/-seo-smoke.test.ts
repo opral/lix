@@ -80,7 +80,7 @@ describe("SEO route smoke tests", () => {
       "How Lix compares to Git | Lix Documentation",
     );
     expect(findMetaContent(head.meta, "twitter:description")).toBe(
-      "Lix is not a Git replacement. Keep code in Git; use Lix to version, query, and merge the files and data your app works with.",
+      "Git is a CLI for source code. Lix is a library that versions any file format and stores files and app data in one SQL database.",
     );
     expect(rendered.title).toBe("How Lix compares to Git");
     expect(rendered.body).not.toContain("<h1");

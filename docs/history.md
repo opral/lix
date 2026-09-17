@@ -4,14 +4,14 @@ description: Query commit logs, endpoint changes, working diffs, and historical 
 
 # History
 
-Lix automatically commits tracked writes. Checkpoints compact a working interval into a retained commit. SQL exposes four complementary reads:
+Every write becomes a commit automatically. You never run a commit command. A checkpoint marks a commit as a restore point; the automatic commits before it are compacted into that one retained commit. SQL exposes four reads:
 
-| Function | Result |
-| --- | --- |
-| `lix_log([anchor])` | Retained commits along the anchor's first-parent chain |
-| `lix_history(relation [, anchor])` | Logical rows changed by each of those commits |
-| `lix_diff(relation [, from, to])` | Net differences between two complete states |
-| `lix_as_of(relation, commit)` | The complete relation state at one commit |
+| Function                           | Result                                                 |
+| ---------------------------------- | ------------------------------------------------------ |
+| `lix_log([anchor])`                | Retained commits along the anchor's first-parent chain |
+| `lix_history(relation [, anchor])` | Logical rows changed by each of those commits          |
+| `lix_diff(relation [, from, to])`  | Net differences between two complete states            |
+| `lix_as_of(relation, commit)`      | The complete relation state at one commit              |
 
 Relation arguments are text literals such as `'lix_file'`. Commit arguments may be bound text parameters. Log and history default to the active head pinned for the statement. Pass the same explicit anchor across requests to keep a page stable while the branch advances. Automatic commits that compaction removes are not permanently retained.
 
@@ -24,7 +24,7 @@ FROM lix_as_of('lix_file', (
 ));
 ```
 
-The commit argument must resolve to one non-null text commit ID. A scalar subquery returning multiple rows produces an error; no rows yields NULL, which must be handled (for example, with `COALESCE`) or the commit argument is rejected. References to rows of the outer query are not supported in these commit arguments. Relation names retain their existing argument rules. Each commit argument resolves independently. Bind a shared commit ID when multiple arguments must reuse a value computed by a volatile expression; CTEs do not guarantee shared evaluation across arguments.
+The commit argument must resolve to one non-null text commit ID. A subquery that returns more than one row is an error. A subquery that returns no rows yields NULL, which is rejected; wrap it in `COALESCE`. The subquery cannot reference the outer query. Each commit argument is resolved independently. Bind one parameter when several arguments must share one value.
 
 ## Commit log
 
@@ -95,7 +95,7 @@ WHERE id = $2;
 
 An absent file returns no row; an existing empty file returns a row with zero-length `BYTEA` content. Read or reconstruction failures produce errors, not missing rows or empty content. For each present side of a file diff, `from_content` / `to_content` equals the snapshot's `content` at that endpoint. Use `diff_type` to distinguish absent diff sides from nullable values.
 
-Select only metadata columns when bytes are unnecessary. Content projections can demand deferred historical state and blob chunks on partial replicas, including in working diffs. Snapshot reads use live relation columns and include complete tracked state, with its pinned global state, but exclude untracked rows. Collection-generation expansion restrictions remain explicit errors where row-level expansion is unsupported.
+Select only metadata columns when bytes are unnecessary. Content projections can demand deferred historical state and blob chunks on partial replicas, including in working diffs. Snapshot reads use live relation columns and include complete tracked state, with its pinned global state, but exclude untracked rows. Bulk-deleting a whole schema is stored as one marker. `lix_as_of` and `lix_diff` cannot expand it into per-row results and return an error.
 
 ## Working review and commands
 
@@ -113,10 +113,6 @@ The one-argument diff uses the active branch's `working_base_commit_id` and `com
 
 Use `row_ref` from the intended current or explicit-pair diff for selected commands. A logical row can recur in many history commits, so a multi-commit history selection is not an unambiguous command source. Guard commands against stale endpoints and handle an empty/stale selection explicitly.
 
-## Source-record activity
+## Change log
 
-`lix_change` lists retained repository-global source records. It is distinct from first-parent endpoint history and from checkpoint counts. New checkpoints store membership directly on the commit and do not publish a marker change. Historical marker records from migrated repositories can remain as old facts until normal garbage collection.
-
-## Breaking migration
-
-`lix_state_at` is renamed to `lix_as_of`; `lix_checkpoint` is replaced by `lix_commit WHERE is_checkpoint`. Replace the latest-checkpoint scalar with a filtered, ordered `lix_log` query when a checkpoint is required, or the actual branch working baseline for working changes. Existing revision-style history queries must migrate to endpoint events; there is no permanent alias for the old observation/depth/source-provenance shape. Upgrade storage and sync peers together before writing with the new version.
+`lix_change` is the flat log of every recorded change across all branches. It is not filtered by branch or by first parent, so it is not a history view and not a checkpoint count. Creating a checkpoint does not add a row to it.

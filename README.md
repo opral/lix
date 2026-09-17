@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/opral/lix/main/website/public/logo.svg" alt="Lix" height="60">
 </p>
 
-<h3 align="center">Embeddable repository for your product</h3>
+<h3 align="center">Universal version control system</h3>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@lix-js/sdk"><img src="https://img.shields.io/npm/dw/%40lix-js%2Fsdk?logo=npm&logoColor=red&label=npm%20downloads" alt="weekly downloads on NPM"></a>
@@ -11,16 +11,28 @@
   <a href="https://x.com/lixCCS"><img src="https://img.shields.io/badge/Follow-@lixCCS-black?logo=x&logoColor=white" alt="X (Twitter)"></a>
 </p>
 
-Files, SQL database, and version control in one. Everything inside is versioned data: file content, app tables, reviews, comments. There is no external control plane to sync. Agents read and write normal files. Your product queries SQL. You branch, diff, merge, and roll back all of it together:
+Lix is a version control system for any file format: code, documents, spreadsheets, design files, video, datasets. It runs in-process on pluggable storage. Files, app tables, and history are rows in one ACID database. Agents read and write normal files. Your product queries SQL. You branch, diff, merge, and roll back all of it together:
 
-<img src="./website/public/assets/lix-repo.svg" alt="A Lix repo holds files, a SQL database, and version control in one system" width="760" />
+<img src="./website/public/assets/one-lix-repo.svg" alt="One Lix repository holding files of every format and the application's own database tables" width="760" />
 
-- 📄 **Files, in any format.** Store text and binary files. Plugins make supported formats queryable as versioned rows.
-- 🗄️ **SQL database.** File content, app data, and history live in an ACID OLTP database. Query millions of rows with SQL.
-- 🔀 **Version control.** Diffs name the clause, cell, or row that changed, not a byte blob. Review, merge, and roll back.
+- 📄 **Any format.** Text, binaries, large blobs. Plugins make formats like DOCX, XLSX, and JSON diffable and mergeable by clause, cell, or row.
+- 🧩 **Embeddable.** Runs in-process as a library. Storage is pluggable: memory, filesystem, browser OPFS, or S3.
+- 🗄️ **Designed as a database.** File content, app tables, and history are rows in one ACID OLTP database. Query millions of rows with SQL. Every write becomes a commit automatically. You never run a commit command.
 - ⚡ **Real-time collaboration.** People and agents share a repository and see changes as they happen.
-- 🧩 **Pluggable storage.** Local filesystem, SQLite on browser OPFS, or S3 behind a Lix server.
-- 🔒 **Permissions (soon).** Finance, legal, and contractors need different access. Permissions will live inside the repository: per file, per group, and versioned like any other change.
+- 🔒 **Permissions (planned).** Per file, per group, stored in the repository and versioned like any other change.
+
+## Why not Git?
+
+Git is a CLI designed for source code. It assumes a local POSIX filesystem, tracks whole files, and diffs text lines. Keep software engineering in Git. Use Lix when your product stores files and data for its users.
+
+|                   | Git                  | Lix                             |
+| ----------------- | -------------------- | ------------------------------- |
+| Process model     | Separate CLI process | Library in your process         |
+| Storage           | Local disk           | Memory · filesystem · OPFS · S3 |
+| Application data  | Separate database    | SQL rows, ACID, with the files  |
+| Recording changes | Manual commits       | Every write, automatically      |
+| Formats           | Text lines           | Any, by clause, cell, or row    |
+| Collaboration     | Push and pull        | Real time                       |
 
 ## Getting started
 
@@ -61,19 +73,39 @@ const lix = await openLix({
 });
 ```
 
-## Try a demo
-
-Try out [lixray.com](https://lixray.com):
-
-<a href="https://lixray.com"><img src="./website/public/assets/lixray-og.png" alt="LixRay: a repository for your entire company. Works with Claude, OpenAI, and Gemini." width="760" /></a>
+Lix is in alpha.
 
 ## Prime use cases
 
+### Co-locate code, documents, and app state
+
+Code lives in Git. Documents, design files, and media live in Drive, Figma, and S3. App state lives in Postgres. No system versions all of them together. Lix stores them in one repository with one history.
+
+<img src="./website/public/assets/one-lix-repo.svg" alt="One Lix repository holding files of every format and the application's own database tables" width="760" />
+
+```ts
+// A script, a 4.8 GB video, and an app table in one transaction.
+await lix.executeBatch([
+  {
+    sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+    params: ["/automations/weekly-report.js", source],
+  },
+  {
+    sql: "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+    params: ["/media/launch.mp4", video],
+  },
+  {
+    sql: "UPDATE orders SET status = 'shipped' WHERE id = $1",
+    params: [1002],
+  },
+]);
+
+// Branch, diff, and roll back all of it together.
+```
+
 ### Give each customer a repository
 
-Your product gives every customer their own repository: their files, their data, and the automations LLMs now write for them.
-
-Lix handles any file format, collaborates in real time, and embeds in your product. Non-technical users get accept and undo, not branches and pull requests. Permissions are coming.
+Your customers want agents that write automations and edit their documents, with a way to review and undo. Drive has no version control. Your customers do not have GitHub repos. Embed Lix and give each customer a repository that holds their code, documents, spreadsheets, and media.
 
 <img src="./website/public/assets/customer-repositories.svg" alt="Your product creates one Lix repository per customer, each holding a different mix of automations, handbooks, pricing, and knowledge files" width="760" />
 
@@ -85,7 +117,7 @@ const lix = await openLix({
   },
 });
 
-// The agent writes an automation. Lix records the change, no commit needed.
+// The agent writes an automation. Lix commits the change automatically.
 await lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
   "/automations/booking.ts",
   code,
@@ -94,31 +126,6 @@ await lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
 // Your UI shows the diff. The customer clicks accept or undo.
 ```
 
-### Sync files
-
-Sync the files that coding agents and applications work on, between machines and with a server.
-
-<img src="./website/public/assets/file-sync.svg" alt="Client A and client B each hold the same project files on their own filesystem and synchronize them with a Lix server" width="760" />
-
-```ts
-import { openLix } from "@lix-js/sdk";
-import { FilesystemStorage } from "@lix-js/storage-filesystem";
-
-// ./project stays a normal directory. Lix syncs it through the server.
-const lix = await openLix({
-  storage: new FilesystemStorage({ path: "./project" }),
-  server: {
-    mode: "partial_replica",
-    url: "https://lixray.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
-  },
-});
-```
-
-This creates a **partial replica with on-demand sync**. SQL loads missing inputs;
-reads and writes whose dependencies are resident run locally, with commits uploaded in the background.
-
-Use [LixRay](https://lixray.com) or [run your own server](./docs/hosting.md).
-
 ### Apps with version control
 
 Your app reads and writes SQL rows and normal files. Lix records every change with its author, so history, blame, branching, and rollback are queries instead of features you build.
@@ -126,7 +133,7 @@ Your app reads and writes SQL rows and normal files. Lix records every change wi
 <img src="./website/public/assets/app-with-history.svg" alt="An app window with a document diff, an accept and undo control, and a history sidebar with checkpoints, all provided by Lix" width="760" />
 
 ```ts
-// A normal app write. Lix records the change automatically.
+// A normal app write. "orders" is a table you registered with a Lix schema.
 await lix.execute("UPDATE orders SET status = 'shipped' WHERE id = 1002");
 
 // The history sidebar, diff view, and undo button are queries:
@@ -136,8 +143,6 @@ const changes = await lix.execute(`
   ORDER BY created_at DESC
 `);
 ```
-
-Files and rows update in one ACID transaction.
 
 [Read more about diffs →](https://lix.dev/docs/diffs)
 
@@ -153,31 +158,20 @@ With `FilesystemStorage`, the file stays available on disk. Its rows are queryab
 
 ### Runs in-process as part of your infrastructure
 
-Lix runs in-process with pluggable storage: in memory, on the local filesystem, or in a server backed by S3.
+Lix runs in-process with pluggable storage: memory, filesystem, browser OPFS, or S3. See the [Storage](https://lix.dev/docs/persistence) docs.
 
 <img src="./website/public/assets/pluggable-storage.svg" alt="Lix runs in-process inside your product, with an arrow to pluggable storage: memory, filesystem, or S3" width="760" />
 
-Existing VCS like Git assume a local POSIX filesystem, which makes them hard to embed and scale. See the [Storage](https://lix.dev/docs/persistence) docs.
+## Try a hosted repository
 
-## Comparison
+Try out [lixray.com](https://lixray.com):
 
-Git tracks files but has no SQL. PostgreSQL/SQLite have SQL but no files and no change history. Lix has all three.
-
-<img src="./website/public/assets/comparison-quadrant.svg" alt="Quadrant chart: database capability on the vertical axis, version control on the horizontal axis. PostgreSQL and SQLite sit top left, Git bottom right, Lix top right." width="760" />
-
-| Capability                    | Lix            | Git                | PostgreSQL / SQLite |
-| ----------------------------- | -------------- | ------------------ | ------------------- |
-| Normal files                  | ✅             | ✅                 | ❌                  |
-| SQL and transactions          | ✅             | ❌                 | ✅                  |
-| Branches and merging          | ✅             | ✅                 | ❌                  |
-| Diffs by cell, clause, or row | ✅ via plugins | ❌ text lines only | ❌                  |
-| Pluggable storage             | ✅             | ❌                 | ❌                  |
+<a href="https://lixray.com"><img src="./website/public/assets/lixray-og.png" alt="LixRay: a repository for your entire company. Works with Claude, OpenAI, and Gemini." width="760" /></a>
 
 ## Learn more
 
 - **[Getting Started Guide](https://lix.dev/docs/getting-started)** - Build your first app with Lix
 - **[Documentation](https://lix.dev/docs)** - Full API reference and guides
-- **[Error codes](./docs/error-codes.md)** - Code catalog, server responses, and retry guidance
 - **[Discord](https://discord.gg/gdMPPWy57R)** - Get help and join the community
 - **[GitHub](https://github.com/opral/lix)** - Report issues and contribute
 
