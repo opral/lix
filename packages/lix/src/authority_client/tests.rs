@@ -777,6 +777,58 @@ async fn observe_client_request_passes_server_version_gate_and_streams_initial_r
 }
 
 #[tokio::test]
+async fn opening_reports_authority_migration_from_typed_admission_errors() {
+    let http = ScriptHttp::default();
+    for details in [
+        serde_json::json!({"fromVersion": 79, "toVersion": 81}),
+        serde_json::json!({"fromFormat": 79, "toFormat": 81}),
+    ] {
+        http.push_json(
+            503,
+            serde_json::json!({"error": {
+                "code": "LIX_REPOSITORY_MIGRATING",
+                "message": "migration in progress",
+                "details": details,
+            }}),
+        );
+    }
+    http.push_json(200, handshake("ready", "main"));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&events);
+    let sink =
+        crate::CallbackOpenProgressSink::new(move |event| captured.lock().unwrap().push(event));
+    let client = super::open_protocol_client_with_progress(
+        http.clone(),
+        "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        None,
+        Some(Arc::new(sink)),
+    )
+    .await
+    .unwrap();
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 4);
+    assert_eq!(events.first().unwrap().phase, crate::OpenPhase::Inspecting);
+    assert_eq!(events.last().unwrap().phase, crate::OpenPhase::Complete);
+    assert_eq!(
+        client.open_report().migrations,
+        vec![crate::OpenMigration {
+            scope: crate::OpenScope::Authority,
+            from_format: 79,
+            to_format: 81,
+        }]
+    );
+    assert!(
+        events[1..3]
+            .iter()
+            .all(|event| event.scope == crate::OpenScope::Authority
+                && event.phase == crate::OpenPhase::Migrating
+                && event.from_format == Some(79)
+                && event.to_format == 81)
+    );
+    assert_eq!(http.requests().len(), 3);
+}
+
+#[tokio::test]
 async fn opening_awaits_typed_migration_without_a_total_deadline() {
     let http = ScriptHttp::default();
     for index in 0..40 {
@@ -854,4 +906,63 @@ async fn opening_does_not_delay_healthy_admission_or_retry_terminal_errors() {
         assert_eq!(http.requests().len(), 2);
         assert_eq!(*http.sleeps.lock().unwrap(), vec![Duration::from_secs(1)]);
     }
+}
+
+#[tokio::test]
+async fn bounded_admission_waits_for_migration_and_reports_authority_upgrade() {
+    let http = ScriptHttp::default();
+    http.push_json(503, serde_json::json!({"error": {"code":"LIX_REPOSITORY_MIGRATING", "details":{"fromVersion":80,"toVersion":81}}}));
+    http.push_json(200, serde_json::json!({
+        "repositoryId":"01936f4e-7b6c-7c3d-8f9a-123456789abc", "principalId":"account-test",
+        "storageEpoch":crate::CURRENT_STORAGE_FORMAT_VERSION, "protocolEpoch":crate::SYNC_PROTOCOL_VERSION,
+    }));
+    let (identity, report) = super::admit_protocol_client(
+        http.clone(),
+        "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(identity.principal_id, "account-test");
+    assert_eq!(
+        report.migrations,
+        vec![crate::OpenMigration {
+            scope: crate::OpenScope::Authority,
+            from_format: 80,
+            to_format: 81
+        }]
+    );
+    assert_eq!(*http.sleeps.lock().unwrap(), vec![Duration::from_secs(1)]);
+    assert!(
+        http.requests()
+            .iter()
+            .all(|request| request.method == "GET" && request.url.ends_with("/admission"))
+    );
+}
+
+#[tokio::test]
+async fn bounded_admission_rejects_auth_and_oversized_responses_without_retry() {
+    let url = "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc";
+    let http = ScriptHttp::default();
+    http.push_json(
+        403,
+        serde_json::json!({"error":{"code":"LIX_REPOSITORY_MIGRATING"}}),
+    );
+    assert_eq!(
+        super::admit_protocol_client(http.clone(), url, None)
+            .await
+            .unwrap_err()
+            .code,
+        "LIX_ADMISSION_AUTH_REJECTED"
+    );
+    assert!(http.sleeps.lock().unwrap().is_empty());
+    http.push_stream(200, &"x".repeat(16 * 1024 + 1));
+    assert_eq!(
+        super::admit_protocol_client(http.clone(), url, None)
+            .await
+            .unwrap_err()
+            .code,
+        "LIX_ADMISSION_PROTOCOL"
+    );
+    assert_eq!(http.stream_cancellations.load(Ordering::SeqCst), 1);
 }

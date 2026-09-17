@@ -5,17 +5,15 @@ mod pending_conversion_journal;
 pub(crate) use pending_conversion_journal::{
     PendingConversionJournal, retry_published_conversion_cleanup,
 };
-#[cfg(any(feature = "offline-migration", test))]
 mod partial_conversion;
-#[cfg(any(feature = "offline-migration", test))]
 pub(crate) use partial_conversion::convert_clean_replica_to_partial;
 mod partial;
 mod partial_replacement;
-pub(crate) use partial_replacement::{inspect_partial_replacement, install_replacement_partial_epoch};
 pub(crate) use partial::{
     PartialEpochAdmission, admit_partial_epoch, has_partial_replica_marker,
     install_fresh_partial_epoch, partial_epoch_has_no_markers,
 };
+pub(crate) use partial_replacement::inspect_partial_replacement;
 
 use std::{ops::Bound, sync::Arc, time::Duration};
 
@@ -450,6 +448,7 @@ where
             Ok(EpochAdmission {
                 adapter: StorageAdapter::for_epoch(storage.clone(), bank, bytes),
                 report: OpenReport {
+                    migrations: Vec::new(),
                     format,
                     initialized: false,
                     migration: None,
@@ -529,6 +528,7 @@ where
             Ok(EpochAdmission {
                 adapter: StorageAdapter::for_epoch(storage.clone(), EpochBank::A, bytes),
                 report: OpenReport {
+                    migrations: Vec::new(),
                     format: crate::init::CURRENT_FORMAT_VERSION,
                     initialized: true,
                     migration: None,
@@ -538,7 +538,6 @@ where
     }
 }
 
-#[cfg(any(feature = "offline-migration", test))]
 pub(crate) async fn admit_repository<S>(
     storage: &S,
     progress: Option<&Arc<dyn OpenProgressSink>>,
@@ -549,7 +548,6 @@ where
     admit_repository_with_server(storage, progress, None).await
 }
 
-#[cfg(any(feature = "offline-migration", test))]
 pub(crate) async fn admit_repository_with_server<S>(
     storage: &S,
     progress: Option<&Arc<dyn OpenProgressSink>>,
@@ -567,7 +565,6 @@ where
     .await
 }
 
-#[cfg(any(feature = "offline-migration", test))]
 pub(crate) async fn admit_repository_with_options<S>(
     storage: &S,
     progress: Option<&Arc<dyn OpenProgressSink>>,
@@ -606,6 +603,7 @@ where
                 return Ok(EpochAdmission {
                     adapter: StorageAdapter::for_epoch(storage.clone(), bank, bytes),
                     report: OpenReport {
+                        migrations: Vec::new(),
                         format,
                         initialized: false,
                         migration: None,
@@ -674,6 +672,7 @@ fn emit_migrating(progress: Option<&Arc<dyn OpenProgressSink>>, from_format: u32
     emit_open_progress(
         progress,
         OpenProgress {
+            scope: crate::OpenScope::Local,
             phase: OpenPhase::Migrating,
             from_format: (from_format != 0).then_some(from_format),
             to_format: crate::init::CURRENT_FORMAT_VERSION,
@@ -687,6 +686,7 @@ fn emit_validating(progress: Option<&Arc<dyn OpenProgressSink>>, from_format: u3
     emit_open_progress(
         progress,
         OpenProgress {
+            scope: crate::OpenScope::Local,
             phase: OpenPhase::Validating,
             from_format: (from_format != 0).then_some(from_format),
             to_format: crate::init::CURRENT_FORMAT_VERSION,
@@ -865,7 +865,6 @@ where
     delete_pointer_resolving_outcome(storage, &recovery_bytes).await
 }
 
-#[cfg(any(feature = "offline-migration", test))]
 async fn admit_legacy<S>(
     storage: &S,
     progress: Option<&Arc<dyn OpenProgressSink>>,
@@ -937,6 +936,7 @@ where
             Ok(EpochAdmission {
                 adapter: StorageAdapter::for_epoch(storage.clone(), target, active_bytes),
                 report: OpenReport {
+                    migrations: Vec::new(),
                     format: crate::init::CURRENT_FORMAT_VERSION,
                     // This admission owns the fresh open; the engine-open path
                     // completes initialization after sync can supply its
@@ -1063,6 +1063,7 @@ where
                 server,
             ))
             .await?;
+            let rebuilt_replica = replica.is_some();
             clear_bank(&target).await?;
             if let Some((proof, server)) = replica {
                 retain_replica_source(
@@ -1111,8 +1112,18 @@ where
                     )));
                 }
             }
+            super::authority_baseline_fence::upgrade_candidate_if_authority(&target).await?;
             let engine = Engine::new_with_adapter(target.clone(), EngineOptions::new()).await?;
             drop(engine);
+            if !rebuilt_replica {
+                Box::pin(verify_migration_candidate(
+                    &migration_source,
+                    &target,
+                    from_format,
+                    options,
+                ))
+                .await?;
+            }
             Ok::<(), LixError>(())
         }
         .await;
@@ -1140,6 +1151,7 @@ where
         Ok(EpochAdmission {
             adapter: StorageAdapter::for_epoch(storage.clone(), target_bank, active_bytes),
             report: OpenReport {
+                migrations: Vec::new(),
                 format: crate::init::CURRENT_FORMAT_VERSION,
                 initialized: false,
                 migration: Some(OpenMigrationReport {
@@ -1153,7 +1165,6 @@ where
     finish_after_heartbeat(heartbeat, result).await
 }
 
-#[cfg(any(feature = "offline-migration", test))]
 async fn migrate_active<S>(
     storage: &S,
     source_bank: EpochBank,
@@ -1281,6 +1292,7 @@ where
                 server,
             ))
             .await?;
+            let rebuilt_replica = replica.is_some();
             clear_bank(&target).await?;
             if let Some((proof, server)) = replica {
                 retain_replica_source(
@@ -1311,8 +1323,18 @@ where
                 .await?;
             }
             emit_validating(progress, from_format);
+            super::authority_baseline_fence::upgrade_candidate_if_authority(&target).await?;
             let engine = Engine::new_with_adapter(target.clone(), EngineOptions::new()).await?;
             drop(engine);
+            if !rebuilt_replica {
+                Box::pin(verify_migration_candidate(
+                    &migration_source,
+                    &target,
+                    from_format,
+                    options,
+                ))
+                .await?;
+            }
             Ok::<(), LixError>(())
         }
         .await;
@@ -1336,6 +1358,7 @@ where
         Ok(EpochAdmission {
             adapter: StorageAdapter::for_epoch(storage.clone(), target_bank, active_bytes),
             report: OpenReport {
+                migrations: Vec::new(),
                 format: crate::init::CURRENT_FORMAT_VERSION,
                 initialized: false,
                 migration: Some(OpenMigrationReport {
@@ -1349,7 +1372,103 @@ where
     finish_after_heartbeat(heartbeat, result).await
 }
 
-#[cfg(any(feature = "offline-migration", test))]
+/// Preservation checks run while the source is still the active rollback
+/// destination. Any failure rolls back the epoch claim before opening returns.
+async fn verify_migration_candidate<S>(
+    source: &StorageAdapter<S>,
+    target: &StorageAdapter<S>,
+    from_format: u32,
+    options: super::MigrationOptions,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    match from_format {
+        73 | 74 | 75 | 76 | 77 | 78 => {
+            super::older_witness::verify_candidate(source, target, from_format, options).await
+        }
+        79 | 80 | crate::init::CURRENT_FORMAT_VERSION => {
+            let mut plan = if from_format == 79 {
+                let read = MigrationPlanningRead::new(source).await?;
+                let plan = super::incorporation::preservation_plan(&read, options).await?;
+                read.finish()?;
+                Some(plan)
+            } else {
+                None
+            };
+            let read = source.begin_read(ReadOptions::default()).await?;
+            if let Some((_, writes, _)) =
+                crate::sync::prepare_owned_partial_metadata_upgrade(&read).await?
+            {
+                for space in [
+                    crate::sync::PARTIAL_REPLICA_STATE_SPACE,
+                    crate::sync::PARTIAL_BRANCH_PUSH_SPACE,
+                    crate::sync::PARTIAL_BRANCH_MERGE_SPACE,
+                ] {
+                    let values = writes.staged_values_in_space(space);
+                    if !values.is_empty() {
+                        plan.get_or_insert_with(|| {
+                            super::publish::PublicationPlan::bounded(
+                                options.max_changes,
+                                options.max_preflight_bytes,
+                            )
+                        })
+                        .put_mutable(
+                            space,
+                            values
+                                .into_iter()
+                                .map(|(key, value)| (key.to_vec(), value.to_vec()))
+                                .collect(),
+                        )?;
+                    }
+                }
+            }
+            let marker = crate::storage_adapter::PointReadPlan::new(
+                crate::sync::SYNC_AUTHORITY_STATE_SPACE,
+                &[crate::sync::authority_state_key()],
+            )
+            .materialize(&read, Default::default())
+            .await?
+            .value;
+            if matches!(marker.first(), Some(Some(ProjectedValue::FullValue(value)))
+                if value.as_ref() == b"certified-authority-v4")
+            {
+                plan.get_or_insert_with(|| {
+                    super::publish::PublicationPlan::bounded(
+                        options.max_changes,
+                        options.max_preflight_bytes,
+                    )
+                })
+                .put_mutable(
+                    crate::sync::SYNC_AUTHORITY_STATE_SPACE,
+                    vec![(
+                        crate::sync::authority_state_key().0.to_vec(),
+                        crate::sync::AUTHORITY_STATE_VALUE.to_vec(),
+                    )],
+                )?;
+            }
+            drop(read);
+            let expected = super::public_api::content_digest_with_adapter(source, plan).await?;
+            let actual = super::public_api::content_digest_with_adapter(target, None).await?;
+            if expected != actual {
+                return Err(LixError::new(
+                    "LIX_MIGRATION_PRESERVATION_FAILED",
+                    "candidate content differs from the source-derived preservation witness",
+                ));
+            }
+            Ok(())
+        }
+        // These migrations include logical amendments and index repairs. Their
+        // bounded migration plans validate the original branches and records;
+        // exact byte equality is not their preservation contract.
+        72 => super::older_witness::verify_v72_source_history(source, target, options).await,
+        _ => Err(LixError::new(
+            "LIX_MIGRATION_PRESERVATION_FAILED",
+            "repository format has no candidate preservation contract",
+        )),
+    }
+}
+
 async fn migrate_sparse_candidate<S>(
     source: &StorageAdapter<S>,
     target: &StorageAdapter<S>,
@@ -1401,6 +1520,13 @@ where
         Engine::new_partial_replica(target.clone(), EngineOptions::new(), &state).await?;
     drop(session);
     drop(engine);
+    Box::pin(verify_migration_candidate(
+        source,
+        target,
+        from_format,
+        options,
+    ))
+    .await?;
     Ok(true)
 }
 
@@ -3791,20 +3917,22 @@ pub(super) mod tests {
         let mut raw = storage.begin_write(WriteOptions::default()).await.unwrap();
         put_lease(&mut raw, lease.clone()).await.unwrap();
         raw.commit().await.unwrap();
-        recover_interrupted_migration(&storage, state, &migrating, Some(&lease), None)
+        let lix = crate::open_lix()
+            .with_storage(storage.clone())
             .await
             .unwrap();
-        assert_eq!(load_pointer(&storage).await.unwrap().unwrap().1, active);
-
-        let admitted = admit_repository(&storage, None).await.unwrap();
-        assert_eq!(admitted.adapter.epoch_bank(), EpochBank::B);
-        assert_eq!(
-            admitted.report.migration,
-            Some(OpenMigrationReport {
-                from_format: 75,
-                to_format: crate::init::CURRENT_FORMAT_VERSION,
-            })
-        );
+        assert_eq!(lix.open_report().migration.unwrap().from_format, 75);
+        lix.close().await.unwrap();
+        let owned = crate::storage_adapter::StorageSession::acquire(storage)
+            .await
+            .unwrap();
+        assert!(matches!(
+            load_pointer(&owned).await.unwrap().unwrap().0,
+            PointerState::Active {
+                bank: EpochBank::B,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

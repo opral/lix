@@ -11,6 +11,7 @@ import {
 import { DurableLocalAdmission } from "./durable-local-admission.js";
 import { startWorkerHost } from "./host.js";
 import { SharedEngineOwner, type SharedEngineClient } from "./shared-engine.js";
+import type { LixOpenReport } from "../types.js";
 import type { SyncServerBindingOptions } from "../binding-types.js";
 import { serializeWorkerError, type WorkerInput, type WorkerResponse } from "./protocol.js";
 
@@ -46,6 +47,7 @@ scope.onconnect = (event) => {
       let candidateOnline = false;
       let candidateGeneration = 0;
       let candidateCredentialGeneration = 0;
+      let admissionReport: LixOpenReport | undefined;
       const providerOptions = storage.kind === "jsStorage" ? storage.options : undefined;
       const physicalScope = providerOptions && typeof providerOptions === "object" &&
         "sharedEngineKey" in providerOptions && typeof providerOptions.sharedEngineKey === "string"
@@ -58,7 +60,10 @@ scope.onconnect = (event) => {
         let result: { identity: AdmissionIdentity; online: boolean };
         try {
           result = await admitted.verify(raw.url, headers, rootIdentity,
-            () => requestAdmission(raw.url, headers, transport), allowOffline);
+            () => requestAdmission(raw.url, headers, transport, allowOffline ? {
+              onProgress: progress,
+              onReport: report => { admissionReport = report; },
+            } : undefined), allowOffline);
         } catch (error) {
           const code = (error as {code?: string})?.code;
           if (code === "LIX_ADMISSION_AUTH_REJECTED") {
@@ -157,7 +162,7 @@ scope.onconnect = (event) => {
         verifyIdentity: async () => {
           const headers = await readHeaders();
           const {identity, online} = await authenticate(headers, true);
-          return { authorityUrl: raw.url, accountId: identity.principalId, headers, online };
+          return { authorityUrl: raw.url, accountId: identity.principalId, headers, online, report: admissionReport };
         },
       };
       return { owner, client };

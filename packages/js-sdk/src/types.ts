@@ -78,8 +78,8 @@ export type LixOpenPhase =
 /** One observational repository-open progress snapshot. */
 export type LixOpenProgress = {
 	phase: LixOpenPhase;
-	/** Present for an upgrade owned by the remote authority. */
-	scope?: "authority";
+	/** The repository whose opening is being observed. */
+	scope: "local" | "authority";
 	/** May be unknown while waiting for a remote authority upgrade. */
 	fromFormat?: number;
 	toFormat: number;
@@ -93,11 +93,17 @@ export type LixOpenMigrationReport = {
 	toFormat: number;
 };
 
-/** Immutable facts about how a local Lix handle was opened. */
+export type LixOpenMigration = LixOpenMigrationReport & {
+	scope: "local" | "authority";
+};
+
+/** Immutable facts about how a Lix handle was opened. */
 export type LixOpenReport = {
 	format: number;
 	initialized: boolean;
+	/** @deprecated Use migrations for scoped upgrade reports. */
 	migration?: LixOpenMigrationReport;
+	migrations: readonly LixOpenMigration[];
 };
 
 /** A retained local generation. Presence does not mean recovery is complete. */

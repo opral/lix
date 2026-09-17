@@ -2,22 +2,63 @@
 //! Source banks remain detached and intact; opening never migrates their rows.
 
 use super::*;
-use crate::storage_adapter::{StorageReadDurability, StorageWriteSet, StorageWriteSetError};
+use crate::storage_adapter::StorageReadDurability;
+#[cfg(test)]
+use crate::storage_adapter::{StorageWriteSet, StorageWriteSetError};
 
 pub(crate) struct PartialReplacementSource {
+    #[cfg(test)]
     pointer: Option<Bytes>,
     bank: EpochBank,
+    #[cfg(test)]
     interrupted_target: Option<EpochBank>,
+    #[cfg(test)]
     generation: u64,
     format: u32,
+    #[cfg(test)]
     protocol: Bytes,
+    #[cfg(test)]
     repository_id: String,
     // A partial receipt is small and already contains the durable account and
     // remote binding. Complete-replica receipts can grow with history, so only
     // their role key is probed; no old account's content enters the new cache.
     partial_receipt: Option<Bytes>,
+    #[cfg(test)]
     partial_account: Option<String>,
     partial_remote: Option<String>,
+}
+
+impl PartialReplacementSource {
+    pub(crate) fn is_partial(&self) -> bool {
+        self.partial_receipt.is_some()
+    }
+
+    pub(crate) fn remote_id(&self) -> Option<&str> {
+        self.partial_remote.as_deref()
+    }
+
+    pub(crate) fn format(&self) -> u32 {
+        self.format
+    }
+
+    pub(crate) async fn require_preserving_upgrade<S>(&self, storage: &S) -> Result<(), LixError>
+    where
+        S: Storage + Clone + Send + Sync + 'static,
+    {
+        if self.is_partial() || self.format >= 80 {
+            return Ok(());
+        }
+        let adapter = StorageAdapter::for_epoch_unfenced(storage.clone(), self.bank);
+        let read = adapter.begin_read(ReadOptions::default()).await?;
+        let proof = crate::sync::inspect_replica_rebuild_source(&read, self.format).await?;
+        if proof.is_none_or(|proof| proof.recovery_required) {
+            return Err(LixError::new(
+                "LIX_PARTIAL_REPLICA_CONVERSION_RECOVERY_REQUIRED",
+                "older full replica has pending work requiring recovery before upgrade; source retained unchanged",
+            ));
+        }
+        Ok(())
+    }
 }
 
 async fn metadata(
@@ -196,15 +237,23 @@ where
     if uuid::Uuid::parse_str(&repository_id).is_err() {
         return Err(unknown());
     }
+    #[cfg(not(test))]
+    let _ = (&pointer, &generation, &protocol, &partial_account);
     Ok(PartialReplacementSource {
+        #[cfg(test)]
         pointer,
         bank,
+        #[cfg(test)]
         interrupted_target,
+        #[cfg(test)]
         generation,
         format,
+        #[cfg(test)]
         protocol,
+        #[cfg(test)]
         repository_id,
         partial_receipt,
+        #[cfg(test)]
         partial_account,
         partial_remote,
     })
@@ -214,6 +263,7 @@ where
 /// the epoch fence. Candidate collisions retain old banks and try another
 /// physical namespace; each check is an indexed existence predicate, never a
 /// scan or cleanup of the old cache. There are at most 4093 generation banks.
+#[cfg(test)]
 pub(crate) async fn install_replacement_partial_epoch<S>(
     storage: S,
     source: PartialReplacementSource,

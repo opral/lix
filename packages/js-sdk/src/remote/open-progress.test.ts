@@ -1,33 +1,30 @@
 import { beforeEach, expect, test, vi } from "vitest";
-import type { HttpTransport } from "../http-transport.js";
 import { openLix } from "../open-lix.js";
-const mocks=vi.hoisted(()=>({open:vi.fn()}));
-vi.mock("../wasm-init.js",()=>({initializeWasm:async()=>{}}));
-vi.mock("../wasm/lix_js_sdk.js",()=>({openRemote:mocks.open}));
-const url="https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc";
-const request={url:url.replace("/lix/","/lix/v1/")+"/",init:{method:"GET"},response:{mode:"buffered" as const,maxBytes:1024}};
-beforeEach(()=>{mocks.open.mockReset();});
-test("public remote opening forwards authority progress and completes once",async()=>{
- const callback=vi.fn(); let retained:HttpTransport;
- mocks.open.mockImplementation(async(_url,transport:HttpTransport)=>{
-  retained=transport;
-  expect((await transport(request)).status).toBe(503);
-  expect((await transport(request)).status).toBe(200);
-  return {close:async()=>{}};
- });
- const fetcher=vi.fn().mockResolvedValueOnce(Response.json({error:{code:"LIX_ERROR_MIGRATING",details:{fromVersion:80}}},{status:503}))
-  .mockResolvedValueOnce(Response.json({ok:true})).mockResolvedValueOnce(Response.json({error:{code:"LIX_ERROR_MIGRATING"}},{status:503}));
- const lix=await openLix({server:{url,fetch:fetcher},onProgress:callback});
- expect(callback.mock.calls.map(([p])=>p.phase)).toEqual(["migrating","opening","complete"]);
- await retained!(request);
- expect(callback).toHaveBeenCalledTimes(3);
- await lix.close();
+import type { LixOpenProgress } from "../types.js";
+const mocks = vi.hoisted(() => ({ open: vi.fn() }));
+vi.mock("../wasm-init.js", () => ({ initializeWasm: async () => {} }));
+vi.mock("../wasm/lix_js_sdk.js", () => ({ openRemote: mocks.open }));
+const url = "https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc";
+beforeEach(() => { mocks.open.mockReset(); });
+test("remote opening forwards Rust progress and immutable scoped report", async () => {
+  const callback = vi.fn();
+  const migration = { scope: "authority", fromFormat: 80, toFormat: 81 };
+  mocks.open.mockImplementation(async (_url, _transport, _headers, _branch, progress) => {
+    progress({ phase: "migrating", ...migration });
+    progress({ phase: "complete", ...migration });
+    return { close: async () => {}, openReport: () => ({ format: 81, initialized: false, migrations: [migration] }) };
+  });
+  const lix = await openLix({ server: { url }, onProgress: callback });
+  expect(callback.mock.calls.map(([event]) => event.phase)).toEqual(["migrating", "complete"]);
+  expect(lix.openReport?.migrations).toEqual([migration]);
+  await lix.close();
 });
-test("public remote progress errors stay observational and terminal failure has no complete",async()=>{
- const callback=vi.fn(()=>{throw new Error("UI callback failed");});
- mocks.open.mockImplementation(async(_url,transport:HttpTransport)=>{
-  await transport(request); throw new Error("migration failed");
- });
- await expect(openLix({server:{url,fetch:async()=>Response.json({error:{code:"LIX_REPOSITORY_MIGRATING"}},{status:503})},onProgress:callback})).rejects.toThrow("migration failed");
- expect(callback).toHaveBeenCalledTimes(1);
+test("remote observer failure does not replace the Rust opening result", async () => {
+  const callback = vi.fn((_progress: LixOpenProgress) => { throw new Error("UI callback failed"); });
+  mocks.open.mockImplementation(async (_url, _transport, _headers, _branch, progress) => {
+    progress({ phase: "migrating", scope: "authority", toFormat: 81 });
+    throw new Error("migration failed");
+  });
+  await expect(openLix({ server: { url }, onProgress: callback })).rejects.toThrow("migration failed");
+  expect(callback).toHaveBeenCalledOnce();
 });

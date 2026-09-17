@@ -8,6 +8,7 @@ pub(crate) async fn open_partial_lix<StorageImpl>(
     telemetry: Option<Arc<dyn TelemetrySink>>,
     server: Option<ServerOptions>,
     durability: Durability,
+    progress: Option<Arc<dyn OpenProgressSink>>,
 ) -> Result<Lix<StorageImpl>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -16,8 +17,20 @@ where
         .acquire_partial_replica_owner(storage.token())
         .await?;
     let owner = crate::engine::PartialOwnerLifetime::install(owner);
-    let mut prepared = crate::sync::prepare_partial_open(storage, server.clone()).await?;
+    let mut prepared =
+        crate::sync::prepare_partial_open(storage, server.clone(), progress.as_ref()).await?;
     prepared.adapter = prepared.adapter.with_durability(durability);
+    emit_open_progress(
+        progress.as_ref(),
+        OpenProgress {
+            scope: crate::OpenScope::Local,
+            phase: OpenPhase::Opening,
+            from_format: prepared.migration.map(|migration| migration.from_format),
+            to_format: crate::init::CURRENT_FORMAT_VERSION,
+            completed: None,
+            total: None,
+        },
+    );
     let result = async {
         #[cfg(feature = "default_wasm_runtime")]
         let wasm_runtime = match wasm_runtime {
@@ -50,7 +63,12 @@ where
             open_report: Arc::new(OpenReport {
                 format: crate::init::CURRENT_FORMAT_VERSION,
                 initialized: prepared.initialized,
-                migration: None,
+                migration: prepared.migration,
+                migrations: prepared.migration.into_iter().map(|migration| crate::OpenMigration {
+                    scope: crate::OpenScope::Local,
+                    from_format: migration.from_format,
+                    to_format: migration.to_format,
+                }).collect(),
             }),
         };
         lix.bind_session();
@@ -133,8 +151,7 @@ where
 
 // Keep explicit migration's large owned future out of ordinary caller poll
 // frames, including SQL performed before the migration itself is awaited.
-/// Normal partial opening never invokes this explicit conversion operation.
-#[cfg(any(feature = "offline-migration", test))]
+/// Operator entry point using the same conversion machinery as normal opening.
 pub(crate) fn convert_full_replica_for_partial_open<S>(
     storage: S,
     server: ServerOptions,
@@ -164,7 +181,6 @@ where
 
 // Kept separate so the compile-time safety proof inspects the raw operation,
 // not an already-asserted Send wrapper.
-#[cfg(any(feature = "offline-migration", test))]
 async fn convert_full_replica_owned<S>(
     storage: S,
     server: ServerOptions,
@@ -238,6 +254,7 @@ mod tests {
                 "http://127.0.0.1:9/lix/{repository_id}"
             ))),
             Durability::default(),
+            None,
         )
         .await
         .err()
@@ -369,7 +386,7 @@ mod tests {
             .with_headers([("Authorization".to_owned(), "Bearer partial-test".to_owned())]);
         let lix = open_lix()
             .with_storage(backing.clone())
-            .with_server(server)
+            .with_server(server.clone())
             .await
             .unwrap();
         assert_eq!(
@@ -468,7 +485,11 @@ mod tests {
         backing_session.close().await.unwrap();
         // All closed handles remain allocated across the successful reopen.
         thread.join().unwrap();
-        let offline = open_lix().with_storage(backing.clone()).await.unwrap();
+        let offline = open_lix()
+            .with_storage(backing.clone())
+            .with_server(server)
+            .await
+            .unwrap();
         assert!(!offline.open_report().initialized);
         let mut snapshot = Vec::new();
         offline
@@ -525,7 +546,6 @@ mod browser_file_profile_authority;
 
 /// Explicitly retry retained native migration pins. Storage must be closed;
 /// success never changes the published serving baseline or cached working set.
-#[cfg(any(feature = "offline-migration", test))]
 pub(crate) async fn retry_partial_migration_cleanup<S>(
     storage: S,
     server: ServerOptions,

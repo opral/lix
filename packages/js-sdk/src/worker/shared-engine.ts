@@ -1,3 +1,4 @@
+import type { LixOpenReport } from "../types.js";
 import { fetchTransport, HttpTransportError } from "../http-transport.js";
 import type { LixBinding, SyncServerBindingOptions, TelemetryDispatch, TelemetryParentContext, OpenProgressDispatch } from "../binding-types.js";
 
@@ -9,7 +10,7 @@ export type SharedEngineClient = {
   progress?: OpenProgressDispatch;
   commitIdentity?(): void | Promise<void>;
   rejectCredentials?(headers: [string, string][]): void | Promise<void>;
-  verifyIdentity(): Promise<{ authorityUrl: string; accountId: string; headers: [string, string][]; online?: boolean }>;
+  verifyIdentity(): Promise<{ authorityUrl: string; accountId: string; headers: [string, string][]; online?: boolean; report?: LixOpenReport }>;
 };
 
 /** One physical owner; ports receive independent sessions, never the root. */
@@ -44,7 +45,7 @@ export class SharedEngineOwner {
         // Bind native admission to the exact credentials actually used during
         // opening; a later dynamic-header read cannot authorize another principal.
         client.server = { ...originalServer, headers, headerProvider: identity.online === false
-          ? async () => { throw new HttpTransportError("LIX_IDENTITY_UNVERIFIED_OFFLINE", "Cached local admission does not authorize remote requests"); }
+          ? async () => { throw new HttpTransportError("LIX_VERIFIED_OFFLINE_ADMISSION", "Verified cached admission permits local opening only"); }
           : undefined };
         this.clients.add(client);
         try {
@@ -80,11 +81,26 @@ export class SharedEngineOwner {
         }
         await client.commitIdentity?.();
         this.clients.add(client);
-        const report = opensRoot ? root.openReport?.() : undefined;
+        const rootReport = root.openReport?.();
+        const localReport = opensRoot ? rootReport : rootReport ? {
+          format: rootReport.format, initialized: false, migrations: [],
+        } : undefined;
+        const admissionMigrations = identity.report?.migrations ?? [];
+        const report = localReport || admissionMigrations.length ? {
+          ...(localReport ?? identity.report!),
+          migrations: [...admissionMigrations, ...(localReport?.migrations ?? [])].reduce<LixOpenReport["migrations"][number][]>((merged, migration) => {
+            const previous = merged.find(other => other.scope === migration.scope);
+            if (previous) {
+              previous.fromFormat = Math.min(previous.fromFormat, migration.fromFormat);
+              previous.toFormat = Math.max(previous.toFormat, migration.toFormat);
+            } else merged.push({ ...migration });
+            return merged;
+          }, []),
+        } : undefined;
         const child = await root.openAnotherSession({}, client.telemetry ?? (() => {}));
         if (report === undefined) return child;
-        // Only the opening caller performed initialization/migration. Later
-        // attachments must not inherit that first caller's opening report.
+        // Each attachment reports its own work; later sessions do not inherit
+        // the first caller's initialization or completed migrations.
         return new Proxy(child, {
           get(target, property) {
             if (property === "openReport") return () => report;

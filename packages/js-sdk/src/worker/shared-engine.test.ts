@@ -1,4 +1,5 @@
 import { expect, test, vi } from "vitest";
+import { HttpTransportError } from "../http-transport.js";
 import type { LixBinding, SyncServerBindingOptions } from "../binding-types.js";
 import { SharedEngineOwner, type SharedEngineClient } from "./shared-engine.js";
 
@@ -118,8 +119,8 @@ test("root admission records the exact frozen opening credentials", async () => 
   expect(sent).toEqual(["old-token"]);
 });
 
-test("only the first attachment receives the root initialization report", async () => {
-  const report = { format: 79, initialized: true };
+test("later attachments report no repeated initialization or migration", async () => {
+  const report = { format: 79, initialized: true, migrations: [] };
   const close = vi.fn(async () => {});
   const child = { close, activeAccountId: async () => "account-a" } as unknown as LixBinding;
   const root = {
@@ -135,8 +136,8 @@ test("only the first attachment receives the root initialization report", async 
   });
   const first = await owner.attach(client());
   const second = await owner.attach(client());
-  expect(first.openReport?.()).toBe(report);
-  expect(second.openReport?.()).toBeUndefined();
+  expect(first.openReport?.()).toEqual(report);
+  expect(second.openReport?.()).toEqual({format:79,initialized:false,migrations:[]});
   expect(await first.activeAccountId()).toBe("account-a");
   await first.close();
   expect(close).toHaveBeenCalledTimes(1);
@@ -359,7 +360,7 @@ test("cached offline admission cannot install a remote lease when reopening a ro
   client.verifyIdentity = async () => ({...await verify(), online: false});
   f.open.mockImplementationOnce(async (server) => {
     await expect(server.transport!({url: client.server.url, init: {}, response: {mode:"buffered",maxBytes:16}}))
-      .rejects.toMatchObject({code:"LIX_IDENTITY_UNVERIFIED_OFFLINE"});
+      .rejects.toMatchObject({code:"LIX_VERIFIED_OFFLINE_ADMISSION"});
     return {activeAccountId: async()=>"account-a", openAnotherSession:async()=>({}),close:async()=>{}} as unknown as LixBinding;
   });
   await f.owner.attach(client);
@@ -411,4 +412,31 @@ test("authorization rejection revokes the exact request credentials despite late
   respond(new Response(null,{status:401}));
   await pending;
   expect(client.rejectCredentials).toHaveBeenCalledWith([["authorization","old-token"]]);
+});
+
+test("shared opening retains an authority upgrade completed during admission", async () => {
+  const migration = { scope: "authority" as const, fromFormat: 80, toFormat: 81 };
+  const child = { close: async () => {}, activeAccountId: async () => "account-a" } as unknown as LixBinding;
+  const root = {
+    activeAccountId: async () => "account-a",
+    openReport: () => ({ format: 81, initialized: false, migrations: [] }),
+    openAnotherSession: async () => child,
+    close: async () => {},
+  } as unknown as LixBinding;
+  const owner = new SharedEngineOwner(async () => root);
+  const binding = await owner.attach({
+    server: { url: "https://example.test", headers: [] },
+    verifyIdentity: async () => ({ authorityUrl: "https://example.test", accountId: "account-a", headers: [], report: { format: 81, initialized: false, migrations: [migration] } }),
+  });
+  expect(binding.openReport?.()?.migrations).toEqual([migration]);
+  await binding.close();
+});
+
+
+test("unverified offline admission never opens storage or supplies a cached proof", async () => {
+  const f = fixture();
+  const client = f.client();
+  client.verifyIdentity = async () => { throw new HttpTransportError("LIX_IDENTITY_UNVERIFIED_OFFLINE", "No cached proof"); };
+  await expect(f.owner.attach(client)).rejects.toMatchObject({ code: "LIX_IDENTITY_UNVERIFIED_OFFLINE" });
+  expect(f.open).not.toHaveBeenCalled();
 });

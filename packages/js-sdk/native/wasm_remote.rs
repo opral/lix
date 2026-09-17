@@ -6,17 +6,19 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use js_sys::{Array, Function, Promise, Reflect, Uint8Array};
-use lix::LixError;
 use lix::server_protocol::client::{
     ClientCore, ProtocolClient, ProtocolHttp, ProtocolHttpRequest, ProtocolHttpResponse,
-    ProtocolHttpStream, ProtocolObserveEvents, ProtocolTransaction, open_protocol_client,
+    ProtocolHttpStream, ProtocolObserveEvents, ProtocolTransaction, admit_protocol_client,
+    open_protocol_client_with_progress,
 };
+use lix::{LixError, OpenProgressSink};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 
 use super::{
-    OpenAnotherSessionOptionsDto, execute_result_to_js, from_js, lix_error_to_js, values_from_js,
+    BrowserFunctionDispatch, BrowserOpenProgressSink, OpenAnotherSessionOptionsDto, OpenReportDto,
+    execute_result_to_js, from_js, lix_error_to_js, to_js, values_from_js,
 };
 
 #[wasm_bindgen]
@@ -134,23 +136,79 @@ impl ProtocolHttp for JsHttp {
     }
 }
 
+/// Authorize a shared-worker attachment without opening local storage.
+#[wasm_bindgen(js_name = admitRemote)]
+pub async fn admit_remote(
+    url: String,
+    fetch: Function,
+    headers: JsValue,
+    on_progress: Option<Function>,
+) -> Result<JsValue, JsValue> {
+    let sink = on_progress.map(|callback| {
+        let sink: Arc<dyn OpenProgressSink> =
+            Arc::new(BrowserOpenProgressSink(BrowserFunctionDispatch(callback)));
+        sink
+    });
+    let (identity, report) = admit_protocol_client(JsHttp { fetch, headers }, url, sink)
+        .await
+        .map_err(lix_error_to_js)?;
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Identity {
+        repository_id: String,
+        principal_id: String,
+        protocol_epoch: u32,
+        storage_epoch: u32,
+    }
+    #[derive(serde::Serialize)]
+    struct Admission {
+        identity: Identity,
+        report: OpenReportDto,
+    }
+    to_js(&Admission {
+        identity: Identity {
+            repository_id: identity.repository_id,
+            principal_id: identity.principal_id,
+            protocol_epoch: identity.protocol_epoch,
+            storage_epoch: identity.storage_epoch,
+        },
+        report: OpenReportDto::from(&report),
+    })
+}
+
 #[wasm_bindgen(js_name = openRemote)]
 pub async fn open_remote(
     url: String,
     fetch: Function,
     headers: JsValue,
     initial_active_branch_id: Option<String>,
+    on_progress: Option<Function>,
 ) -> Result<WasmRemoteLix, JsValue> {
     console_error_panic_hook::set_once();
     let http = JsHttp { fetch, headers };
-    let inner = open_protocol_client(http.clone(), url.clone(), initial_active_branch_id)
-        .await
-        .map_err(lix_error_to_js)?;
+    let sink = on_progress.map(|callback| {
+        let sink: Arc<dyn OpenProgressSink> =
+            Arc::new(BrowserOpenProgressSink(BrowserFunctionDispatch(callback)));
+        sink
+    });
+    let inner = open_protocol_client_with_progress(
+        http.clone(),
+        url.clone(),
+        initial_active_branch_id,
+        sink,
+    )
+    .await
+    .map_err(lix_error_to_js)?;
     Ok(WasmRemoteLix { inner })
 }
 
 #[wasm_bindgen]
 impl WasmRemoteLix {
+    #[wasm_bindgen(js_name = openReport)]
+    pub fn open_report(&self) -> Result<JsValue, JsValue> {
+        to_js(&OpenReportDto::from(self.inner.open_report()))
+    }
+
     #[wasm_bindgen(js_name = replicaRecoverySources)]
     pub async fn replica_recovery_sources(&self) -> Result<JsValue, JsValue> {
         Err(lix_error_to_js(LixError::new(
@@ -310,7 +368,7 @@ impl WasmRemoteLixTransaction {
         let receipt = crate::session::TransactionOperations::commit(&mut self.inner)
             .await
             .map_err(lix_error_to_js)?;
-        crate::wasm::to_js(&receipt)
+        to_js(&receipt)
     }
 
     #[wasm_bindgen(js_name = rollback)]

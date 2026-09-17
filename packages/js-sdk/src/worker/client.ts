@@ -1,5 +1,5 @@
 import { ADMISSION_PROTOCOL_EPOCH, ADMISSION_STORAGE_EPOCH } from "./shared-admission.js";
-import { observeOpenProgress, emitOpenProgress } from "../open-progress.js";
+import { emitOpenProgress } from "../open-progress.js";
 import { fetchTransport, type HttpTransport } from "../http-transport.js";
 import { createWorkerConnection, createSharedWorkerConnection, openDirectLixBinding } from "#worker-factory";
 import type {
@@ -163,16 +163,8 @@ export async function openLixWorkerBinding(
  server?: SyncServerRuntimeOptions, onProgress?: (progress: LixOpenProgress) => void,
  snapshot?: ReadableStream<Uint8Array>,
 ): Promise<LixBinding> {
- const progress = observeOpenProgress(onProgress);
- const routed = server && onProgress ? { ...server,
-   transport: progress.transport(server.transport ?? fetchTransport(server.fetch)),
- } : server;
- try {
-   const binding = await openLixWorkerBindingInner(storage, onDisposed, telemetry, routed,
-     onProgress ? value => emitOpenProgress(onProgress, value) : undefined, snapshot);
-   progress.complete();
-   return binding;
- } finally { progress.stop(); }
+ return await openLixWorkerBindingInner(storage, onDisposed, telemetry, server,
+   onProgress ? value => emitOpenProgress(onProgress, value) : undefined, snapshot);
 }
 
 async function openLixWorkerBindingInner(

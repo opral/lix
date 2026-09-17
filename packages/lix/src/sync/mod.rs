@@ -106,7 +106,7 @@ pub(crate) use partial_state::{
     partial_replica_state_key,
 };
 mod platform;
-#[cfg(test)]
+#[cfg(all(test, feature = "server-protocol"))]
 pub(crate) use partial_replica::MAX_PARTIAL_REPLICA_DESCRIPTOR_BYTES;
 #[cfg(all(test, feature = "server-protocol"))]
 pub(crate) use partial_replica::PARTIAL_REPLICA_DESCRIPTOR_VERSION;
@@ -515,7 +515,9 @@ pub(crate) use repository::{
 
 pub(crate) use partial_open::authenticate_partial_source_conversion;
 
-pub(crate) use partial_state::upgrade_owned_partial_receipt;
+pub(crate) use partial_state::{
+    prepare_owned_partial_metadata_upgrade, upgrade_owned_partial_receipt,
+};
 mod partial_branch_switch;
 pub(crate) use partial_branch_switch::{PartialBranchSwitchCompletion, switch_existing_branch};
 

@@ -897,9 +897,8 @@ impl LixRuntimeManager {
         let storage_started = Instant::now();
         let storage = self.open_storage(&storage_id, io.clone())?;
         let storage_open_ms = elapsed_millis(storage_started);
-        if let Some(record) = existing {
-            self.prepare_existing_authority(lix_id, record, &storage, opened)
-                .await?;
+        if existing.is_some() {
+            self.validate_existing_authority(&storage).await?;
         }
 
         let engine_started = Instant::now();
@@ -925,6 +924,14 @@ impl LixRuntimeManager {
         }
         .instrument(info_span!("lix.engine.open", lix.id = lix_id))
         .await?;
+        if let Some(record) = existing {
+            if let Err(error) = self.publish_open_admission(lix_id, record).await {
+                // Do not expose a runtime whose catalog identity changed while
+                // Rust was upgrading/opening its physical repository.
+                protocol.close().await?;
+                return Err(error);
+            }
+        }
         let engine_open_ms = elapsed_millis(engine_started);
         let io = io.snapshot();
         info!(

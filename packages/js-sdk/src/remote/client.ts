@@ -1,4 +1,4 @@
-import { observeOpenProgress } from "../open-progress.js";
+import { emitOpenProgress } from "../open-progress.js";
 import { fetchTransport } from "../http-transport.js";
 import type { LixBinding } from "../binding-types.js";
 import { initializeWasm } from "../wasm-init.js";
@@ -43,15 +43,13 @@ export async function openRemoteLixBinding(
 	const locator = connectionUrl(options.url);
 	const protocolLocator = locator.toString();
 	await initializeWasm();
-	const progress = observeOpenProgress(clientOptions.onProgress);
-	try {
-		const binding = await openRemote(
-			protocolLocator, progress.transport(fetchTransport(options.fetch)),
-			options.headers, clientOptions.initialActiveBranchId,
-		);
-		progress.complete();
-		return binding;
-	} finally { progress.stop(); }
+	return await openRemote(
+		protocolLocator, fetchTransport(options.fetch),
+		options.headers, clientOptions.initialActiveBranchId,
+		clientOptions.onProgress
+			? (event: LixOpenProgress) => emitOpenProgress(clientOptions.onProgress, event)
+			: undefined,
+	);
 }
 function connectionUrl(value: string | URL): URL {
 	let locator: URL;

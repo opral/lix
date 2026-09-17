@@ -103,5 +103,4 @@ pub(crate) use tracked_head::root_generation_absence_preconditions;
 
 pub(crate) use tracked_head::stage_root_working_diff_epoch;
 
-#[cfg(feature = "offline-migration")]
 pub(crate) use tracked_head::verify_migrated_deterministic_witness;

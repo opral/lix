@@ -42,12 +42,52 @@ where
     let adapter = super::epoch::admit_repository(storage, None).await?.adapter;
     let read = adapter.begin_read(Default::default()).await?;
     let marker = supported_authority_marker(&read).await?;
-    if marker != original_marker {
+    if marker != original_marker
+        && !(original_marker.as_ref() == PRE_LEASE_AUTHORITY_MARKER
+            && marker.as_ref() == crate::sync::AUTHORITY_STATE_VALUE)
+    {
         return Err(LixError::new(
             "LIX_AUTHORITY_UPGRADE_REQUIRED",
             "authority identity changed during format migration",
         ));
     }
+    drop(read);
+    upgrade_adapter(&adapter).await
+}
+
+/// Upgrade the hidden candidate before its epoch can become active.
+pub(crate) async fn upgrade_candidate_if_authority<S>(
+    adapter: &crate::storage_adapter::StorageAdapter<S>,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let read = adapter.begin_read(Default::default()).await?;
+    let values = PointReadPlan::new(
+        crate::sync::SYNC_AUTHORITY_STATE_SPACE,
+        &[crate::sync::authority_state_key()],
+    )
+    .materialize(&read, Default::default())
+    .await?
+    .value;
+    if values.iter().all(|value| value.is_none())
+        || matches!(values.first(), Some(Some(StorageProjectedValue::FullValue(value)))
+            if value.as_ref() == crate::sync::AUTHORITY_STATE_VALUE)
+    {
+        return Ok(());
+    }
+    drop(read);
+    upgrade_adapter(adapter).await
+}
+
+async fn upgrade_adapter<S>(
+    adapter: &crate::storage_adapter::StorageAdapter<S>,
+) -> Result<(), LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let read = adapter.begin_read(Default::default()).await?;
+    let marker = supported_authority_marker(&read).await?;
     ensure_authority_only_sync_state(&read, &marker).await?;
     if marker.as_ref() == crate::sync::AUTHORITY_STATE_VALUE {
         return Ok(());

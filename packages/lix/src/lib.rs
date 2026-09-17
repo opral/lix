@@ -33,7 +33,7 @@
 )]
 
 pub const SERVER_PROTOCOL_VERSION: u32 = 11;
-/// Current persisted repository format. Old stores require explicit migration.
+/// Current persisted repository format. Supported older stores upgrade automatically during opening.
 #[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
 pub const CURRENT_STORAGE_FORMAT_VERSION: u32 = init::CURRENT_FORMAT_VERSION;
 /// Current sync wire epoch; obsolete clients are rejected before mutation.
@@ -170,7 +170,7 @@ pub use handle::{
     RemoteOpenAnotherSessionBuilder, RemoteTransactionExecuteBuilder, RemoteExecuteBatchBuilder, open_lix,
 };
 pub use open_types::{
-    OpenMigrationReport, OpenPhase, OpenProgress, OpenProgressSink, OpenReport,
+    OpenMigration, OpenMigrationReport, OpenPhase, OpenProgress, OpenProgressSink, OpenReport, OpenScope,
 };
 #[cfg(target_family = "wasm")]
 #[doc(hidden)]
@@ -216,9 +216,7 @@ pub(crate) use session::{
 pub(crate) use session::VerifiedRequestBlob;
 #[cfg(feature = "storage-benches")]
 pub(crate) use sql_profile::SqlReadProfile;
-#[cfg(any(feature = "offline-migration", test))]
 pub use migration::upgrade_authority_for_partial_sync;
-#[cfg(any(feature = "offline-migration", test))]
 pub use handle::{convert_replica_to_partial, retry_replica_migration_cleanup};
 pub use storage::Memory;
 pub use sync::{

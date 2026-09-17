@@ -214,6 +214,7 @@ async fn partial_handle_http_opening_profile() {
                 None,
                 Some(ServerOptions::new(&locator)),
                 Durability::default(),
+                None,
             )
             .await
             .unwrap();
@@ -255,7 +256,7 @@ async fn partial_handle_http_opening_profile() {
             let network_after_close = samples.lock().unwrap().len();
             let storage = StorageSession::acquire(destination).await.unwrap();
             let started = Instant::now();
-            let offline = open_partial_lix(storage, None, None, None, Durability::default())
+            let offline = open_partial_lix(storage, None, None, None, Durability::default(), None)
                 .await
                 .unwrap();
             let reopen_micros = started.elapsed().as_micros();

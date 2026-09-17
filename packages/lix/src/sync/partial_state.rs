@@ -580,24 +580,11 @@ where
             ..Default::default()
         })
         .await?;
-    let mut writes = adapter.new_write_set();
-    let Some((state, _upgraded, mut preconditions)) =
-        prepare_owned_partial_receipt_upgrade(&read, &mut writes).await?
+    let Some((state, writes, preconditions)) =
+        prepare_owned_partial_metadata_upgrade(&read).await?
     else {
         return Ok(None);
     };
-    preconditions.extend(
-        super::partial_push_state::prepare_owned_partial_push_upgrade(&read, &mut writes, &state)
-            .await?,
-    );
-    preconditions.extend(
-        super::partial_merge_state::prepare_owned_partial_merge_upload_upgrade(
-            &read,
-            &mut writes,
-            &state,
-        )
-        .await?,
-    );
     drop(read);
     if !writes.is_empty() {
         adapter
@@ -613,6 +600,38 @@ where
             .await?;
     }
     Ok(Some(state))
+}
+
+/// The exact bounded metadata plan is also used by epoch preservation checks.
+pub(crate) async fn prepare_owned_partial_metadata_upgrade(
+    read: &(impl StorageAdapterRead + ?Sized),
+) -> Result<
+    Option<(
+        PartialReplicaState,
+        StorageWriteSet,
+        Vec<StoragePrecondition>,
+    )>,
+    LixError,
+> {
+    let mut writes = StorageWriteSet::new();
+    let Some((state, _upgraded, mut preconditions)) =
+        prepare_owned_partial_receipt_upgrade(read, &mut writes).await?
+    else {
+        return Ok(None);
+    };
+    preconditions.extend(
+        super::partial_push_state::prepare_owned_partial_push_upgrade(read, &mut writes, &state)
+            .await?,
+    );
+    preconditions.extend(
+        super::partial_merge_state::prepare_owned_partial_merge_upload_upgrade(
+            read,
+            &mut writes,
+            &state,
+        )
+        .await?,
+    );
+    Ok(Some((state, writes, preconditions)))
 }
 
 pub(crate) async fn prepare_owned_partial_receipt_upgrade(

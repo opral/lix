@@ -9,6 +9,7 @@ export default defineConfig({
   resolve: {alias: {'#binding': binding, '#worker-factory': fileURLToPath(new URL('./src/worker/factory.browser.ts', import.meta.url))}},
   worker: {plugins: () => [{name: 'admission-binding', enforce: 'pre' as const, resolveId(id: string) {if(id === '#binding') return binding;}}]},
   plugins: [{ name: 'admission-authority', configureServer(server) {
+    const upgraded = new Set<string>();
     server.middlewares.use((req,res,next) => {
       const match = req.url?.match(/^\/lix\/(?:v1\/)?([0-9a-f-]{36})\/(admission|probe)$/);
       if (!match) return next();
@@ -16,6 +17,14 @@ export default defineConfig({
       if (token.includes('offline') || req.headers['x-test-drop']) {req.socket.destroy(); return;}
       if (token.includes('denied')) {res.statusCode=401; res.end(); return;}
       if (match[2] === 'probe') {res.end(token);return;}
+      if (token.includes('upgrading') && !upgraded.has(token)) {
+        upgraded.add(token);
+        res.statusCode = 503;
+        res.setHeader('content-type', 'application/json');
+        res.setHeader('retry-after', '0');
+        res.end(JSON.stringify({error:{code:'LIX_REPOSITORY_MIGRATING',details:{fromVersion:80}}}));
+        return;
+      }
       if (req.headers['lix-sync-protocol-version'] !== String(compatibility.syncProtocolVersion)) {res.statusCode=426;res.end();return;}
       res.setHeader('content-type','application/json');
       res.end(JSON.stringify({repositoryId:match[1],principalId: token.includes('other') ? '00000000-0000-7000-8000-000000000005' : '00000000-0000-7000-8000-000000000003',protocolEpoch:compatibility.syncProtocolVersion,storageEpoch:compatibility.storageFormatVersion}));

@@ -1735,7 +1735,6 @@ pub(crate) async fn stage_deterministic_identity_witness_migration(
 
 /// Independent detached-migration qualification. Reads the original physical
 /// identities directly; does not invoke the witness staging implementation.
-#[cfg(feature = "offline-migration")]
 pub(crate) async fn verify_migrated_deterministic_witness(
     source: &(impl StorageAdapterRead + ?Sized),
     target: &(impl StorageAdapterRead + ?Sized),

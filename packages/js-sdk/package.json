@@ -51,6 +51,7 @@
 		"test": "npm run build && vitest run",
 		"test:browser": "npm run build:browser && vitest run --config vitest.browser.config.ts",
 		"test:browser:built": "vitest run --config vitest.browser.config.ts",
+		"test:native:production": "node ./scripts/test-packed-native-open.js",
 		"test:browser:production": "node ./scripts/test-packed-vite.js",
 		"typecheck": "tsc -p tsconfig.test.json --noEmit"
 	},

@@ -126,6 +126,13 @@ where
     if from_version <= 72 {
         migrate_v72_account_profile_uri(&adapter, &storage, options).await?;
     }
+    // The v72 amendment authors ordinary commits. Qualify the deterministic
+    // remainder from that amended source, after its logical preservation check.
+    let amendment_witness = if from_version == 72 {
+        Some(Box::pin(super::older_witness::plan_adapter(&adapter, options)).await?)
+    } else {
+        None
+    };
     if from_version <= 73 {
         migrate_v73_row_pk_indexes(&adapter, &storage, options).await?;
     }
@@ -197,6 +204,9 @@ where
         super::incorporation::migrate(&adapter, options, false).await?;
     }
     super::runtime_epoch::migrate(&adapter, false).await?;
+    if let Some(witness) = amendment_witness {
+        witness.verify_adapter(&adapter, options).await?;
+    }
     Ok(MigrationReport {
         from_version,
         to_version: CURRENT_FORMAT_VERSION,
@@ -296,6 +306,7 @@ where
     let target_schema = lix_schema::from_value(target.clone()).map_err(|error| {
         migration_error(format!("bundled lix_account schema is invalid: {error}"))
     })?;
+    let amendment_witness = super::account_amendment_witness::capture(adapter, options).await?;
     let engine = crate::engine::Engine::new_for_migration_with_adapter(adapter.clone(), 72).await?;
     for branch_id in branch_ids {
         let session = engine.open_session_at_for_migration(&branch_id);
@@ -353,6 +364,7 @@ where
         session.close().await?;
     }
     drop(engine);
+    amendment_witness.verify(adapter, options, &target).await?;
 
     let read = super::MigrationPlanningRead::new(adapter)
         .await

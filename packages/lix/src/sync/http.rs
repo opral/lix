@@ -169,6 +169,14 @@ where
     Client: RawHttpClient,
 {
     pub(super) async fn connect_with(client: Client, lix_url: &str) -> Result<Self, LixError> {
+        Self::connect_with_progress_sink(client, lix_url, None).await
+    }
+
+    pub(super) async fn connect_with_progress_sink(
+        client: Client,
+        lix_url: &str,
+        progress: Option<&std::sync::Arc<dyn crate::OpenProgressSink>>,
+    ) -> Result<Self, LixError> {
         let normalized = normalize_sync_locator(lix_url)?;
         let protocol_url = normalized.protocol_url;
         let handshake: HandshakeResponse = loop {
@@ -183,7 +191,10 @@ where
                 Ok(handshake) => break handshake,
                 Err(error) => {
                     match crate::authority_client::opening_migration_retry_delay(&error) {
-                        Some(delay) => super::platform::sleep(delay).await,
+                        Some(delay) => {
+                            crate::authority_client::report_authority_migration(&error, progress);
+                            super::platform::sleep(delay).await;
+                        },
                         None => return Err(error),
                     }
                 }

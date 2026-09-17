@@ -83,7 +83,12 @@ export function createHostedFromLix(
 }
 
 export class Lix {
-	readonly openReport: LixOpenReport | undefined;
+	readonly #openReport: LixOpenReport | undefined;
+	/** Immutable facts about this handle's successful opening. */
+	get openReport(): LixOpenReport {
+		if (!this.#openReport) throw new Error("Lix binding did not provide an open report");
+		return this.#openReport;
+	}
 	private closePromise: Promise<void> | undefined;
 	readonly #activeBranchListeners = new Set<() => void>();
 	readonly #inFlightOperations = new Set<Promise<unknown>>();
@@ -103,9 +108,12 @@ export class Lix {
 			}),
 		);
 		const report = binding.openReport?.();
-		this.openReport = report
+		this.#openReport = report
 			? Object.freeze({
 					...report,
+					migrations: Object.freeze(
+						report.migrations.map((migration) => Object.freeze({ ...migration })),
+					),
 					...(report.migration
 						? { migration: Object.freeze({ ...report.migration }) }
 						: {}),

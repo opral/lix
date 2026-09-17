@@ -23,7 +23,14 @@ async fn capture<S: Storage + Clone + Send + Sync + 'static>(
     options: MigrationOptions,
 ) -> Result<Records, LixError> {
     let adapter = super::epoch::inspect_existing_epoch_adapter(storage).await?;
-    let read = super::MigrationPlanningRead::new(&adapter).await?;
+    capture_adapter(&adapter, options).await
+}
+
+async fn capture_adapter<S: Storage + Clone + Send + Sync + 'static>(
+    adapter: &StorageAdapter<S>,
+    options: MigrationOptions,
+) -> Result<Records, LixError> {
+    let read = super::MigrationPlanningRead::new(adapter).await?;
     let mut records = Records::new();
     let mut bytes = 0usize;
     for space in crate::storage_spaces::SNAPSHOT_STORAGE_SPACES {
@@ -103,13 +110,98 @@ pub(super) async fn plan<S: Storage + Clone + Send + Sync + 'static>(
     })
 }
 
+/// Validate the unpublished epoch against an independently qualified source.
+/// Legacy source markers are fenced during migration, so restore the recognized
+/// original marker only in the detached planning copy.
+pub(super) async fn verify_candidate<S: Storage + Clone + Send + Sync + 'static>(
+    source: &StorageAdapter<S>,
+    target: &StorageAdapter<S>,
+    from_format: u32,
+    options: MigrationOptions,
+) -> Result<(), LixError> {
+    let mut source_records = capture_adapter(source, options).await?;
+    source_records.insert(
+        (
+            crate::init::REPOSITORY_PROTOCOL_SPACE.id.0,
+            Bytes::from_static(crate::init::REPOSITORY_PROTOCOL_KEY),
+        ),
+        Bytes::from(format!("tracked-default-branch.v{from_format}")),
+    );
+    let authority = source_records.contains_key(&(
+        crate::sync::SYNC_AUTHORITY_STATE_SPACE.id.0,
+        crate::sync::authority_state_key().0,
+    ));
+    let detached = copy(&source_records).await?;
+    let witness = plan(&detached, options, authority).await?;
+    let actual = capture_adapter(target, options).await?;
+    witness.verify_records(actual, options).await
+}
+
+pub(super) async fn plan_adapter<S: Storage + Clone + Send + Sync + 'static>(
+    adapter: &StorageAdapter<S>,
+    options: MigrationOptions,
+) -> Result<Witness, LixError> {
+    let detached = copy(&capture_adapter(adapter, options).await?).await?;
+    Box::pin(plan(&detached, options, false)).await
+}
+
+pub(super) async fn verify_v72_source_history<S: Storage + Clone + Send + Sync + 'static>(
+    source: &StorageAdapter<S>,
+    target: &StorageAdapter<S>,
+    options: MigrationOptions,
+) -> Result<(), LixError> {
+    let mut source = capture_adapter(source, options).await?;
+    source.insert(
+        (
+            crate::init::REPOSITORY_PROTOCOL_SPACE.id.0,
+            Bytes::from_static(crate::init::REPOSITORY_PROTOCOL_KEY),
+        ),
+        Bytes::from_static(b"tracked-default-branch.v72"),
+    );
+    let target = capture_adapter(target, options).await?;
+    // The amendment may append commits, but never discard the original payload
+    // chunks, file bytes, or source history. Descriptor comparison below also
+    // verifies every original commit and manifest through codec conversion.
+    for ((space, key), value) in &source {
+        if [
+            crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE.id.0,
+            crate::binary_cas::BINARY_CAS_MANIFEST_SPACE.id.0,
+            crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE.id.0,
+            crate::binary_cas::BINARY_CAS_CHUNK_SPACE.id.0,
+        ]
+        .contains(space)
+            && target.get(&(*space, key.clone())) != Some(value)
+        {
+            return Err(failure("v72 amendment dropped original historical payload"));
+        }
+    }
+    descriptors(&source, &target, options).await
+}
+
 impl Witness {
+    pub(super) async fn verify_adapter<S: Storage + Clone + Send + Sync + 'static>(
+        &self,
+        adapter: &StorageAdapter<S>,
+        options: MigrationOptions,
+    ) -> Result<(), LixError> {
+        self.verify_records(capture_adapter(adapter, options).await?, options)
+            .await
+    }
+
     pub(super) async fn verify<S: Storage + Clone + Send + Sync + 'static>(
         &self,
         storage: &S,
         options: MigrationOptions,
     ) -> Result<(), LixError> {
         let actual = capture(storage, options).await?;
+        self.verify_records(actual, options).await
+    }
+
+    async fn verify_records(
+        &self,
+        actual: Records,
+        options: MigrationOptions,
+    ) -> Result<(), LixError> {
         independent_invariants(&self.source, &actual)?;
         descriptors(&self.source, &actual, options).await?;
         // Only the exact protocol marker and physical mutation counter are
@@ -263,14 +355,18 @@ async fn descriptors(
             Bytes::from_static(crate::init::REPOSITORY_PROTOCOL_KEY),
         ))
         .ok_or_else(|| failure("source repository protocol absent"))?;
+    let logical_amendment = matches!(
+        crate::init::parse_repository_protocol(protocol),
+        crate::init::RepositoryProtocolStatus::MigrationRequired { found_version: 72 }
+    );
     let native_checkpoints = match crate::init::parse_repository_protocol(protocol) {
         crate::init::RepositoryProtocolStatus::MigrationRequired { found_version: 78 } => true,
         crate::init::RepositoryProtocolStatus::MigrationRequired {
-            found_version: 74 | 77,
+            found_version: 72 | 73 | 74 | 75 | 76 | 77,
         } => false,
         _ => {
             return Err(failure(
-                "source witness requires repository format 74, 77, or 78",
+                "source witness requires repository format 73 through 78",
             ));
         }
     };
@@ -440,7 +536,7 @@ async fn descriptors(
             )));
         }
     }
-    if target
+    if !logical_amendment && target
         .keys()
         .filter(|(s, _)| *s == crate::changelog::COMMIT_SPACE.id.0)
         .count()
@@ -463,7 +559,9 @@ async fn descriptors(
         crate::tracked_state::scan_commit_state_manifest_commit_ids(&source_read).await?;
     let target_ids =
         crate::tracked_state::scan_commit_state_manifest_commit_ids(&target_read).await?;
-    if source_ids != target_ids {
+    if (!logical_amendment && source_ids != target_ids)
+        || source_ids.iter().any(|id| !target_ids.contains(id))
+    {
         return Err(failure("candidate changed manifest identities"));
     }
     let mut indexed_rows = 0usize;
@@ -743,6 +841,51 @@ mod tests {
             report.after.role,
             super::super::public_api::RepositoryRole::Authority
         );
+    }
+
+    #[cfg(feature = "server-protocol")]
+    #[tokio::test]
+    async fn ordinary_serve_upgrades_legacy_authority_capability() {
+        for current_format in [false, true] {
+            let source = v77_source().await;
+            let source = if current_format {
+                let witness = plan(&source, MigrationOptions::default(), true)
+                    .await
+                    .unwrap();
+                let mut records = witness.expected;
+                records.insert(
+                    (
+                        crate::sync::SYNC_AUTHORITY_STATE_SPACE.id.0,
+                        crate::sync::authority_state_key().0,
+                    ),
+                    Bytes::from_static(b"certified-authority-v4"),
+                );
+                copy(&records).await.unwrap()
+            } else {
+                source
+            };
+            let server = crate::open_lix()
+                .with_storage(source.clone())
+                .serve()
+                .with_embedded_lix_id()
+                .await
+                .unwrap();
+            server.close().await.unwrap();
+            let storage = StorageSession::acquire(source).await.unwrap();
+            let records = capture(&storage, MigrationOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                records.get(&(
+                    crate::sync::SYNC_AUTHORITY_STATE_SPACE.id.0,
+                    crate::sync::authority_state_key().0
+                )),
+                Some(&Bytes::from_static(crate::sync::AUTHORITY_STATE_VALUE))
+            );
+            let lix = crate::open_lix().with_storage(storage).await.unwrap();
+            lix.partial_replica_descriptor(None).await.unwrap();
+            lix.close().await.unwrap();
+        }
     }
 
     #[tokio::test]
