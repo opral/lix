@@ -57,6 +57,13 @@ pub(crate) struct MigrationReport {
 
 use super::inspection::{MigrationStatus, inspect_lix_with_adapter};
 
+// Build each cold migration future outside the orchestration poll frame. A
+// boxed value alone still constructs that large future on the caller's stack.
+#[inline(never)]
+fn migration_step<F: Future>(create: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
+    Box::pin(create())
+}
+
 pub(crate) async fn migrate_lix_with_adapter<S>(
     storage: S,
     adapter: crate::storage_adapter::StorageAdapter<S>,
@@ -113,31 +120,31 @@ where
     };
     read.finish().map_err(storage_error)?;
     if from_version <= 78 {
-        super::deterministic_witness::backfill(&adapter, options, false).await?;
+        migration_step(|| super::deterministic_witness::backfill(&adapter, options, false)).await?;
     }
     // Every step from here on loads commit records through the current
     // v6 decoder, so the v5 records are rewritten first, under whichever
     // marker the repository currently carries.
     let commit_records_rewritten = if from_version <= 74 {
-        rewrite_commit_records_to_v6(&adapter, &storage, options, from_version).await?
+        migration_step(|| rewrite_commit_records_to_v6(&adapter, &storage, options, from_version)).await?
     } else {
         0
     };
     if from_version <= 72 {
-        migrate_v72_account_profile_uri(&adapter, &storage, options).await?;
+        migration_step(|| migrate_v72_account_profile_uri(&adapter, &storage, options)).await?;
     }
     // The v72 amendment authors ordinary commits. Qualify the deterministic
     // remainder from that amended source, after its logical preservation check.
     let amendment_witness = if from_version == 72 {
-        Some(Box::pin(super::older_witness::plan_adapter(&adapter, options)).await?)
+        Some(super::older_witness::plan_adapter(&adapter, options).await?)
     } else {
         None
     };
     if from_version <= 73 {
-        migrate_v73_row_pk_indexes(&adapter, &storage, options).await?;
+        migration_step(|| migrate_v73_row_pk_indexes(&adapter, &storage, options)).await?;
     }
     let commit_members_rewritten = if from_version <= 74 {
-        migrate_v74_complete_snapshot_commits(&adapter, &storage, options).await?
+        migration_step(|| migrate_v74_complete_snapshot_commits(&adapter, &storage, options)).await?
     } else {
         0
     };
@@ -181,12 +188,12 @@ where
         .await?;
     }
     let checkpoint_records_rewritten = if from_version <= 77 {
-        super::checkpoint_metadata::migrate(&adapter, options).await?
+        migration_step(|| super::checkpoint_metadata::migrate(&adapter, options)).await?
     } else {
         0
     };
     if from_version <= 78 {
-        backfill_missing_row_pk_indexes(
+        migration_step(|| backfill_missing_row_pk_indexes(
             &adapter,
             &storage,
             options,
@@ -196,14 +203,14 @@ where
             "v79 complete row-PK catalog repair",
             false,
             true,
-        )
+        ))
         .await?;
-        super::deterministic_witness::backfill(&adapter, options, true).await?;
+        migration_step(|| super::deterministic_witness::backfill(&adapter, options, true)).await?;
     }
     if from_version <= 79 {
-        super::incorporation::migrate(&adapter, options, false).await?;
+        migration_step(|| super::incorporation::migrate(&adapter, options, false)).await?;
     }
-    super::runtime_epoch::migrate(&adapter, false).await?;
+    migration_step(|| super::runtime_epoch::migrate(&adapter, false)).await?;
     if let Some(witness) = amendment_witness {
         witness.verify_adapter(&adapter, options).await?;
     }
@@ -306,7 +313,9 @@ where
     let target_schema = lix_schema::from_value(target.clone()).map_err(|error| {
         migration_error(format!("bundled lix_account schema is invalid: {error}"))
     })?;
-    let amendment_witness = super::account_amendment_witness::capture(adapter, options).await?;
+    // Keep bounded but deeply nested historical scans off the opener stack.
+    let amendment_witness =
+        Box::pin(super::account_amendment_witness::capture(adapter, options)).await?;
     let engine = crate::engine::Engine::new_for_migration_with_adapter(adapter.clone(), 72).await?;
     for branch_id in branch_ids {
         let session = engine.open_session_at_for_migration(&branch_id);
@@ -364,7 +373,7 @@ where
         session.close().await?;
     }
     drop(engine);
-    amendment_witness.verify(adapter, options, &target).await?;
+    Box::pin(amendment_witness.verify(adapter, options, &target)).await?;
 
     let read = super::MigrationPlanningRead::new(adapter)
         .await
@@ -417,7 +426,7 @@ where
 /// authority flip. Manifest replacements and the protocol marker remain one
 /// atomic publication, so interruption either leaves a retryable v73
 /// repository or a complete v74 repository.
-async fn migrate_v73_row_pk_indexes<S>(
+pub(super) async fn migrate_v73_row_pk_indexes<S>(
     adapter: &crate::storage_adapter::StorageAdapter<S>,
     storage: &S,
     options: MigrationOptions,
@@ -652,7 +661,7 @@ fn resolve_missing_directory_closure(
 /// Tree-chunk writes commit here — content-addressed, safe if orphaned by a
 /// crash — while the returned manifests must be published by the caller
 /// atomically with the v75 marker replacement.
-async fn repair_filesystem_closure<S>(
+pub(super) async fn repair_filesystem_closure<S>(
     adapter: &crate::storage_adapter::StorageAdapter<S>,
     _storage: &S,
     options: MigrationOptions,

@@ -146,8 +146,8 @@ pub struct RepositoryMigrationReport {
 
 /// Explicit, resumable copy-and-activate migration. Close all repository handles
 /// and hold the physical owner fence before calling. Source banks are retained.
-/// The reference server invokes this before constructing its serving runtime;
-/// the low-level current-format engine does not run historical migrations.
+/// Operator tools can invoke this directly; normal repository opening already
+/// coordinates supported upgrades through the same Rust migration machinery.
 pub async fn migrate_repository<S>(storage: S) -> Result<RepositoryMigrationReport, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -156,14 +156,17 @@ where
     migrate_owned(&storage, super::MigrationOptions::default()).await
 }
 
-async fn migrate_owned<S>(
+// Construct the historical orchestration future on its own frame. Keeping it
+// inline in restore/open callers leaves too little stack for schema SQL writes.
+#[inline(never)]
+fn migrate_owned<S>(
     storage: &S,
     options: super::MigrationOptions,
-) -> Result<RepositoryMigrationReport, LixError>
+) -> std::pin::Pin<Box<impl Future<Output = Result<RepositoryMigrationReport, LixError>> + '_>>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    migrate_owned_with_progress(storage, options, None).await
+    Box::pin(migrate_owned_with_progress(storage, options, None))
 }
 
 pub(crate) async fn migrate_owned_with_progress<S>(

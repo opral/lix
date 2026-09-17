@@ -64,11 +64,15 @@ where
                 format: crate::init::CURRENT_FORMAT_VERSION,
                 initialized: prepared.initialized,
                 migration: prepared.migration,
-                migrations: prepared.migration.into_iter().map(|migration| crate::OpenMigration {
-                    scope: crate::OpenScope::Local,
-                    from_format: migration.from_format,
-                    to_format: migration.to_format,
-                }).collect(),
+                migrations: prepared
+                    .migration
+                    .into_iter()
+                    .map(|migration| crate::OpenMigration {
+                        scope: crate::OpenScope::Local,
+                        from_format: migration.from_format,
+                        to_format: migration.to_format,
+                    })
+                    .collect(),
             }),
         };
         lix.bind_session();
@@ -288,6 +292,7 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap();
+            let mut upgrade_pending = true;
             'connections: loop {
                 let (mut connection, _) = listener.accept().unwrap();
                 connection
@@ -324,6 +329,18 @@ mod tests {
                 let route = path.split('?').next().unwrap();
                 let background = route.ends_with("/sync/descriptor") && path.contains("after=");
                 let closing = first.starts_with("DELETE ");
+                if upgrade_pending
+                    && route.trim_end_matches('/') == format!("/lix/v1/{repository_id}")
+                {
+                    upgrade_pending = false;
+                    received.fetch_add(1, Ordering::SeqCst);
+                    let body = serde_json::json!({"error": {
+                        "code": "LIX_REPOSITORY_MIGRATING", "message": "upgrading",
+                        "details": {"fromVersion": 80, "toVersion": crate::CURRENT_STORAGE_FORMAT_VERSION}
+                    }}).to_string();
+                    write!(connection, "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    continue;
+                }
                 let body = if closing {
                     serde_json::json!({})
                 } else if route.ends_with("/sync/descriptor") {
@@ -384,17 +401,43 @@ mod tests {
         let backing = crate::sync::durable_memory_for_test(Memory::new());
         let server = ServerOptions::new(locator)
             .with_headers([("Authorization".to_owned(), "Bearer partial-test".to_owned())]);
+        let progress = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = progress.clone();
         let lix = open_lix()
             .with_storage(backing.clone())
             .with_server(server.clone())
+            .on_progress(move |event| observed.lock().unwrap().push(event))
             .await
             .unwrap();
         assert_eq!(
             requests.load(Ordering::SeqCst),
-            2,
-            "foreground opening must only handshake and fetch its descriptor"
+            3,
+            "foreground opening must retry migration, handshake and fetch its descriptor"
         );
         assert!(lix.open_report().initialized);
+        assert_eq!(
+            lix.open_report().migrations,
+            vec![crate::OpenMigration {
+                scope: crate::OpenScope::Authority,
+                from_format: 80,
+                to_format: crate::CURRENT_STORAGE_FORMAT_VERSION,
+            }]
+        );
+        let authority_phases = progress
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.scope == crate::OpenScope::Authority)
+            .map(|event| event.phase)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            authority_phases,
+            vec![
+                OpenPhase::Inspecting,
+                OpenPhase::Migrating,
+                OpenPhase::Complete
+            ]
+        );
         let backing_session = lix.open_storage_session(backing.clone()).await.unwrap();
         assert_eq!(backing_session.active_account_id(), lix.active_account_id());
         assert!(
@@ -423,14 +466,14 @@ mod tests {
         global.close().await.unwrap();
         assert_eq!(
             requests.load(Ordering::SeqCst),
-            2,
+            3,
             "partial session admission and scope rejection must not hydrate cold rows"
         );
         let sql = "SELECT value FROM lix_key_value WHERE key = $1";
         let params = [Value::Text("partial-handle".into())];
         assert_eq!(lix.execute(sql, &params).await.unwrap().rows().len(), 1);
         let warm = requests.load(Ordering::SeqCst);
-        assert!(warm > 2, "cold SQL must demand missing native inputs");
+        assert!(warm > 3, "cold SQL must demand missing native inputs");
         assert_eq!(lix.execute(sql, &params).await.unwrap().rows().len(), 1);
         assert_eq!(requests.load(Ordering::SeqCst), warm);
         let mut online_snapshot = Vec::new();
@@ -485,12 +528,24 @@ mod tests {
         backing_session.close().await.unwrap();
         // All closed handles remain allocated across the successful reopen.
         thread.join().unwrap();
+        let offline_progress = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = offline_progress.clone();
         let offline = open_lix()
             .with_storage(backing.clone())
             .with_server(server)
+            .on_progress(move |event| observed.lock().unwrap().push(event))
             .await
             .unwrap();
         assert!(!offline.open_report().initialized);
+        assert!(offline.open_report().migrations.is_empty());
+        assert!(
+            !offline_progress
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.scope == crate::OpenScope::Authority
+                    && event.phase == OpenPhase::Complete)
+        );
         let mut snapshot = Vec::new();
         offline
             .export_snapshot()

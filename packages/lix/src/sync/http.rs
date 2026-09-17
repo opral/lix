@@ -179,6 +179,20 @@ where
     ) -> Result<Self, LixError> {
         let normalized = normalize_sync_locator(lix_url)?;
         let protocol_url = normalized.protocol_url;
+        let report = |phase| {
+            crate::open_types::emit_open_progress(
+                progress,
+                crate::OpenProgress {
+                    scope: crate::OpenScope::Authority,
+                    phase,
+                    from_format: None,
+                    to_format: crate::CURRENT_STORAGE_FORMAT_VERSION,
+                    completed: None,
+                    total: None,
+                },
+            )
+        };
+        report(crate::OpenPhase::Inspecting);
         let handshake: HandshakeResponse = loop {
             let response = client
                 .send(raw_request(
@@ -194,13 +208,14 @@ where
                         Some(delay) => {
                             crate::authority_client::report_authority_migration(&error, progress);
                             super::platform::sleep(delay).await;
-                        },
+                        }
                         None => return Err(error),
                     }
                 }
             }
         };
         let lix_id = validate_handshake(&handshake)?.to_owned();
+        report(crate::OpenPhase::Complete);
         Ok(Self {
             client,
             protocol_url,

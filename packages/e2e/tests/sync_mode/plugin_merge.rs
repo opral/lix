@@ -21,14 +21,16 @@ async fn partial_sync_uses_registered_row_merger_and_preserves_offline_pending_r
     probe.set_offline(true);
     replica.execute("UPDATE merge_test_row SET body='Alice said hello.\n\nBob said GOODBYE.',label='incoming' WHERE id='0198b7a1-0000-7000-8000-000000000001'", &[]).await.unwrap();
     replica.close().await.unwrap();
-    let replica = open_replica(directory.path(), &url).await;
+    let replica = open_replica_offline(directory.path()).await;
     let pending = replica.execute(read, &[]).await.unwrap();
     assert_eq!(
         pending.rows()[0].get::<String>("label").unwrap(),
         "incoming"
     );
     authority.execute("UPDATE merge_test_row SET body='Alice said HELLO.\n\nBob said goodbye.',label='authority-first' WHERE id='0198b7a1-0000-7000-8000-000000000001'", &[]).await;
+    replica.close().await.expect("close offline replica before reconnecting");
     probe.set_offline(false);
+    let replica = open_replica(directory.path(), &url).await;
     let expected = "Alice said HELLO.\n\nBob said GOODBYE.";
     tokio::time::timeout(WAIT_TIMEOUT, async {
         loop {
