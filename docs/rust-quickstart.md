@@ -55,7 +55,7 @@ async fn main() -> Result<(), lix::LixError> {
 }
 ```
 
-Every write becomes a commit automatically. You never run a commit command. Position `0` is the head commit. Higher positions walk back through the first-parent chain.
+Every tracked write becomes a commit automatically. You never run a commit command. Position `0` is the head commit. Higher positions walk back through the first-parent chain.
 
 `execute()` runs one statement. To run several statements atomically, pass an array of statements to `lix.execute_batch`. Do not concatenate SQL into one script string.
 

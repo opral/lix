@@ -30,7 +30,7 @@ await lix.execute("UPDATE lix_file SET content = $1 WHERE path = $2", [
 ]);
 ```
 
-Every write becomes a commit automatically. You never run a commit command.
+Every tracked write becomes a commit automatically. You never run a commit command.
 
 `execute()` runs one statement. To run several statements atomically, pass an array of statements to `lix.executeBatch()`. Do not concatenate SQL into one script string.
 

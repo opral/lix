@@ -4,7 +4,7 @@ description: Create restore points and query relation-specific changes between c
 
 # Checkpoints
 
-Every write becomes a commit automatically. You never run a commit command. A checkpoint marks one of those commits as a restore point. Compare its commit with the active branch head to inspect subsequent changes at the relation level your interface uses.
+Every tracked write becomes a commit automatically. You never run a commit command. A checkpoint marks one of those commits as a restore point. Compare its commit with the active branch head to inspect subsequent changes at the relation level your interface uses.
 
 ```ts
 const checkpoint = await lix.execute(

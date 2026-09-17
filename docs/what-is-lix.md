@@ -6,7 +6,7 @@ description: Lix is a version control system for any file format. It runs in-pro
 
 Lix is a version control system for any file format. It runs in-process on pluggable storage. Files, application tables, and history are rows in one ACID database that you query with SQL.
 
-Agents and tools read and write normal files. Your product queries and updates SQL rows. Both work on the same repository. Lix versions everything they write, with branches, history, review, rollback, and merge. Every write becomes a commit automatically. You never run a commit command.
+Agents and tools read and write normal files. Your product queries and updates SQL rows. Both work on the same repository. Lix versions everything they write, with branches, history, review, rollback, and merge. Every tracked write becomes a commit automatically. You never run a commit command.
 
 Unlike Git, Lix tracks the rows inside files, not lines of text. See [How Lix compares to Git](./comparison-to-git.md).
 

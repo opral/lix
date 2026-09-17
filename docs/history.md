@@ -4,7 +4,7 @@ description: Query commit logs, endpoint changes, working diffs, and historical 
 
 # History
 
-Every write becomes a commit automatically. You never run a commit command. A checkpoint marks a commit as a restore point; the automatic commits before it are compacted into that one retained commit. SQL exposes four reads:
+Every tracked write becomes a commit automatically. You never run a commit command. A checkpoint marks a commit as a restore point; the automatic commits before it are compacted into that one retained commit. SQL exposes four reads:
 
 | Function                           | Result                                                 |
 | ---------------------------------- | ------------------------------------------------------ |
