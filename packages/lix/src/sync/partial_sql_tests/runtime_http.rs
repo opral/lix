@@ -59,9 +59,21 @@ impl RawHttpClient for Client {
 struct CountPublicationRequests {
     inner: Client,
     requests: Arc<std::sync::Mutex<Vec<String>>>,
+    blob_reply: Arc<std::sync::Mutex<Option<Vec<crate::sync::SyncBlobManifest>>>>,
 }
 impl RawHttpClient for CountPublicationRequests {
     fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
+        if request.method == "GET" && request.url.contains("/sync/blob?") {
+            if let Some(reply) = self.blob_reply.lock().unwrap().clone() {
+                return Box::pin(async move {
+                    Ok(RawHttpResponse {
+                        status: 200,
+                        status_text: "OK".into(),
+                        body: serde_json::to_vec(&reply).unwrap(),
+                    })
+                });
+            }
+        }
         if request.url.ends_with("/sync/push")
             || (request.method != "GET"
                 && (request.url.contains("/sync/blob") || request.url.contains("/sync/chunk")))
@@ -468,25 +480,40 @@ async fn lost_wave_with_pending_edit(
 
 #[tokio::test]
 async fn file_checkpoint_upload_retries_lost_ack_with_original_content() {
-    file_checkpoint_upload_case(false, 1024 * 1024, false).await;
+    file_checkpoint_upload_case(false, 1024 * 1024, false, None).await;
 }
 
 #[tokio::test]
 async fn file_checkpoint_upload_pages_offline_edits_and_repeated_checkpoints() {
-    file_checkpoint_upload_case(true, 1024 * 1024, false).await;
+    file_checkpoint_upload_case(true, 1024 * 1024, false, None).await;
 }
 
 #[tokio::test]
 async fn file_checkpoint_upload_pages_aggregate_wire_bytes() {
-    file_checkpoint_upload_case(true, 8 * 1024, false).await;
+    file_checkpoint_upload_case(true, 8 * 1024, false, None).await;
 }
 
 #[tokio::test]
 async fn file_ordinary_upload_pages_aggregate_wire_bytes() {
-    file_checkpoint_upload_case(true, 8 * 1024, true).await;
+    file_checkpoint_upload_case(true, 8 * 1024, true, None).await;
 }
 
-async fn file_checkpoint_upload_case(paging: bool, wire_budget: usize, ordinary_only: bool) {
+#[tokio::test]
+async fn checkpoint_publishes_cold_authority_blobs_without_hydrating_content() {
+    file_checkpoint_upload_case(false, 1024 * 1024, false, Some(false)).await;
+}
+
+#[tokio::test]
+async fn checkpoint_publishes_deferred_authority_blobs_without_hydrating_content() {
+    file_checkpoint_upload_case(false, 1024 * 1024, false, Some(true)).await;
+}
+
+async fn file_checkpoint_upload_case(
+    paging: bool,
+    wire_budget: usize,
+    ordinary_only: bool,
+    cold_blob: Option<bool>,
+) {
     let backing = Memory::new();
     let authority = open_lix().with_storage(backing.clone()).await.unwrap();
     authority
@@ -508,6 +535,17 @@ async fn file_checkpoint_upload_case(paging: bool, wire_budget: usize, ordinary_
             .await
             .unwrap();
     }
+    let cold_content = vec![31u8; 96 * 1024];
+    let cold_id = crate::binary_cas::CanonicalBlobManifest::from_bytes(&cold_content).blob_id;
+    if cold_blob.is_some() {
+        authority
+            .execute(
+                "INSERT INTO lix_file(path,content) VALUES('/cold.bin',$1)",
+                &[Value::Blob(cold_content.clone().into())],
+            )
+            .await
+            .unwrap();
+    }
     let server = open_lix()
         .with_storage(backing)
         .serve()
@@ -515,6 +553,7 @@ async fn file_checkpoint_upload_case(paging: bool, wire_budget: usize, ordinary_
         .await
         .unwrap();
     let publication_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let blob_reply = Arc::new(std::sync::Mutex::new(None));
     let transport = HttpSyncTransport::connect_with(
         CountPublicationRequests {
             inner: Client {
@@ -522,6 +561,7 @@ async fn file_checkpoint_upload_case(paging: bool, wire_budget: usize, ordinary_
                 lose_body: Arc::new(AtomicBool::new(false)),
             },
             requests: Arc::clone(&publication_requests),
+            blob_reply: blob_reply.clone(),
         },
         &format!("https://example.test/lix/{}", authority.lix_id()),
     )
@@ -606,10 +646,22 @@ async fn file_checkpoint_upload_case(paging: bool, wire_budget: usize, ordinary_
             .unwrap();
         }
         if !ordinary_only {
-            execute_hydrating(&session, &storage, &old, &authority,
-            "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_file') WHERE to_path='/checkpoint.bin'))",
-            &[], &mut fetches,
-        ).await.unwrap();
+            let checkpoint_sql = if cold_blob.is_some() {
+                "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_file')))"
+            } else {
+                "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_file') WHERE to_path='/checkpoint.bin'))"
+            };
+            execute_hydrating(
+                &session,
+                &storage,
+                &old,
+                &authority,
+                checkpoint_sql,
+                &[],
+                &mut fetches,
+            )
+            .await
+            .unwrap();
         }
     }
     if paging {
@@ -627,6 +679,67 @@ async fn file_checkpoint_upload_case(paging: bool, wire_budget: usize, ordinary_
         .unwrap();
     }
     let branch = &old.descriptor().selected_branch.branch_id;
+    if let Some(deferred) = cold_blob {
+        assert!(
+            !crate::sync::partial_blob::manifest_is_resident(&storage, &old, cold_id)
+                .await
+                .unwrap()
+        );
+        let mut manifest = authority
+            .get_sync_blob_manifest(&cold_id.to_hex())
+            .await
+            .unwrap()
+            .unwrap();
+        manifest.inline_bytes_base64 = None;
+        if deferred {
+            crate::sync::partial_blob::install_manifest(&storage, &old, cold_id, &manifest)
+                .await
+                .unwrap();
+        }
+        let mut unrelated = manifest.clone();
+        unrelated.blob_id = "00".repeat(32);
+        let mut malformed = manifest.clone();
+        malformed.size_bytes += 1;
+        let mut captured = None;
+        for reply in [vec![], vec![unrelated], vec![malformed]] {
+            *blob_reply.lock().unwrap() = Some(reply);
+            let error = crate::sync::partial_upload_cycle::upload_partial_once(
+                &storage,
+                &old,
+                branch,
+                uuid::Uuid::now_v7().to_string(),
+                32,
+                wire_budget,
+                |request| {
+                    let (storage, old, transport) = (&storage, &old, &transport);
+                    async move {
+                        crate::sync::partial_blob_upload::push_partial_with_blobs(
+                            storage, old, transport, &request,
+                        )
+                        .await
+                    }
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+            let read = storage.begin_read(Default::default()).await.unwrap();
+            let (push, _, _) =
+                crate::sync::partial_push_state::load_partial_push_state(&read, &old, branch)
+                    .await
+                    .unwrap();
+            let pending = push
+                .prepared
+                .expect("unconfirmed content retains exact publication");
+            if let Some(previous) = &captured {
+                assert_eq!(previous, &pending);
+            } else {
+                captured = Some(pending);
+            }
+            assert!(publication_requests.lock().unwrap().is_empty());
+        }
+        *blob_reply.lock().unwrap() = None;
+    }
     let first = crate::sync::partial_upload_cycle::upload_partial_once(
         &storage,
         &old,
@@ -859,6 +972,39 @@ async fn file_checkpoint_upload_case(paging: bool, wire_budget: usize, ordinary_
         .await
         .unwrap();
     assert_eq!(result.rows()[0].get::<Vec<u8>>("content").unwrap(), content);
+    if let Some(deferred) = cold_blob {
+        let cold = authority
+            .execute("SELECT content FROM lix_file WHERE path='/cold.bin'", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            cold.rows()[0].get::<Vec<u8>>("content").unwrap(),
+            cold_content
+        );
+
+        assert_eq!(
+            crate::sync::partial_blob::manifest_is_resident(&storage, &old, cold_id)
+                .await
+                .unwrap(),
+            deferred
+        );
+        let chunks = crate::binary_cas::CanonicalBlobManifest::from_bytes(&cold_content).chunks;
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        for chunk in chunks {
+            assert!(
+                crate::binary_cas::load_verified_chunk(&read, chunk.hash)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                crate::binary_cas::chunk_presence_many(&read, &[chunk.hash])
+                    .await
+                    .unwrap(),
+                vec![false]
+            );
+        }
+    }
 }
 
 mod retained_files;
@@ -868,10 +1014,11 @@ mod conflict_file;
 mod global_during_merge;
 mod included_upload;
 
-
 mod combined_body_limit;
 mod large_blob_upload;
 
 mod branch_switch_recovery;
 
 mod transaction_hydration;
+
+mod recovery_latency;
