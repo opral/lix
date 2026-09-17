@@ -960,7 +960,7 @@ async fn sync_runtime_outlives_the_primary_session() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn warm_runtime_protocol_mismatch_is_terminal_without_reconnect() {
+async fn warm_open_protocol_mismatch_is_terminal_without_reconnect() {
     let (authority_storage, authority) = open_authority().await;
     put_value(&authority, "protocol-seed", "authority").await;
     authority.close().await.expect("close authority setup");
@@ -975,7 +975,13 @@ async fn warm_runtime_protocol_mismatch_is_terminal_without_reconnect() {
         .mismatch_handshake_protocol
         .store(true, Ordering::Release);
 
-    let reopened = open_replica(replica_dir.path(), &url).await;
+    let error = open_lix()
+        .with_storage(FilesystemStorage::new(replica_dir.path()).open().unwrap())
+        .with_server(ServerOptions::new(&url))
+        .await
+        .err()
+        .expect("configured opening must reject the authority protocol mismatch");
+    assert_eq!(error.code, "LIX_SYNC_PROTOCOL_MISMATCH");
     wait_for_counter(&probe.handshakes, initial_handshakes + 1).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert_eq!(
@@ -983,11 +989,6 @@ async fn warm_runtime_protocol_mismatch_is_terminal_without_reconnect() {
         initial_handshakes + 1,
         "a terminal protocol mismatch must not enter the reconnect loop"
     );
-    let error = reopened
-        .close()
-        .await
-        .expect_err("close should surface the worker's terminal mismatch");
-    assert_eq!(error.code, "LIX_SYNC_PROTOCOL_MISMATCH");
     stop_server(server_task).await;
 }
 
@@ -1206,7 +1207,7 @@ async fn binary_chunks_hydrate_on_demand_and_remain_available_offline() {
     );
     assert_eq!(probe.chunk_gets.load(Ordering::Acquire), chunk_gets);
     replica.close().await.expect("close hydrated replica");
-    let replica = open_replica(replica_dir.path(), &url).await;
+    let replica = open_replica_offline(replica_dir.path()).await;
     assert_eq!(
         read_file_content(&replica, "/lazy.bin").await,
         Some(payload)
@@ -1517,7 +1518,7 @@ async fn cold_update_supports_offline_current_reads_and_repeated_edits() {
         .await
         .expect("close offline cold-write replica");
     drop(replica);
-    let reopened = open_replica(directory.path(), &url).await;
+    let reopened = open_replica_offline(directory.path()).await;
     assert_eq!(
         read_value(&reopened, "cold-update").await.as_deref(),
         Some("offline-2")
@@ -1598,7 +1599,7 @@ async fn first_select_at_16000_rows_supports_offline_updates_and_reopen() {
     }
     replica.close().await.unwrap();
     drop(replica);
-    let reopened = open_replica(directory.path(), &url).await;
+    let reopened = open_replica_offline(directory.path()).await;
     assert_eq!(
         read_value(&reopened, "partial-open-000000")
             .await
@@ -1670,7 +1671,7 @@ async fn ordinary_select_supports_repeated_offline_kv_and_file_edits() {
     }
     replica.close().await.expect("close offline replica");
     drop(replica);
-    let reopened = open_replica(directory.path(), &url).await;
+    let reopened = open_replica_offline(directory.path()).await;
     assert_eq!(
         read_value(&reopened, "ordinary-prefetch").await.as_deref(),
         Some("offline-2")
@@ -1782,7 +1783,7 @@ async fn local_writes_checkpoints_and_folder_moves_survive_offline_reopen() {
         .await
         .expect("close with durable pending transactions");
 
-    let replica = open_replica(directory.path(), &url).await;
+    let replica = open_replica_offline(directory.path()).await;
     assert_eq!(
         read_value(&replica, "offline-marker").await.as_deref(),
         Some("durable")
@@ -1791,7 +1792,9 @@ async fn local_writes_checkpoints_and_folder_moves_survive_offline_reopen() {
         read_file_content(&replica, "/b/a/note.txt").await,
         Some(b"original".to_vec())
     );
+    replica.close().await.expect("close offline replica before reconnecting");
     probe.set_offline(false);
+    let replica = open_replica(directory.path(), &url).await;
     remote.wait_for_value("offline-marker", "durable").await;
     tokio::time::timeout(WAIT_TIMEOUT, async {
         loop {
@@ -1926,7 +1929,7 @@ async fn scoped_checkpoint_from_uncheckpointed_authority_survives_reconnect(
         "unselected rows require a working head beyond the partial checkpoint",
     );
     replica.close().await.unwrap();
-    let replica = open_replica(directory.path(), &url).await;
+    let replica = open_replica_offline(directory.path()).await;
     assert_eq!(
         replica
             .execute("SELECT commit_id AS id FROM lix_log() WHERE is_checkpoint ORDER BY position LIMIT 1", &[])
@@ -1947,7 +1950,9 @@ async fn scoped_checkpoint_from_uncheckpointed_authority_survives_reconnect(
             .unwrap(),
         0,
     );
+    replica.close().await.expect("close offline replica before reconnecting");
     probe.set_offline(false);
+    let replica = open_replica(directory.path(), &url).await;
     tokio::time::timeout(WAIT_TIMEOUT, async {
         loop {
             let rows = remote
@@ -2066,7 +2071,7 @@ async fn conflicting_remote_edits_converge_and_preserve_pending_rows_across_reop
     );
     replica.close().await.unwrap();
     probe.set_offline(true);
-    let replica = open_replica(directory.path(), &url).await;
+    let replica = open_replica_offline(directory.path()).await;
     assert_eq!(
         read_value(&replica, "shared").await.as_deref(),
         Some("pending")
@@ -2131,7 +2136,7 @@ async fn fetched_immutable_history_is_cached_across_offline_reopen() {
         value
     );
     replica.close().await.unwrap();
-    let replica = open_replica(directory.path(), &url).await;
+    let replica = open_replica_offline(directory.path()).await;
     assert_eq!(
         replica
             .execute(sql, &params)
@@ -2343,6 +2348,16 @@ async fn local_first_foreground_profile_scorecard() {
     if let Ok(path) = std::env::var("LIX_LOCAL_FIRST_PROFILE_OUTPUT") {
         std::fs::write(path, serde_json::to_vec_pretty(&artifact).unwrap()).unwrap();
     }
+}
+
+// The HTTP probe deliberately returns an application 503 while disconnected.
+// Offline reopening supplies storage alone, so no server error is mistaken for
+// authenticated admission. Reconnect explicitly with open_replica afterwards.
+async fn open_replica_offline(path: &Path) -> Lix<FilesystemStorage> {
+    open_lix()
+        .with_storage(FilesystemStorage::new(path).open().expect("open filesystem storage"))
+        .await
+        .expect("open existing replica offline")
 }
 
 async fn open_replica(path: &Path, url: &str) -> Lix<FilesystemStorage> {
@@ -3317,14 +3332,16 @@ async fn existing_branch_admission_preserves_pending_work_and_restores_archived_
         Some("pending-target")
     );
     replica.close().await.unwrap();
-    let replica = open_replica(directory.path(), &url).await;
+    let replica = open_replica_offline(directory.path()).await;
     assert_eq!(replica.active_branch_id().await.unwrap(), target);
     assert_eq!(
         read_value(&replica, "branch-marker").await.as_deref(),
         Some("pending-target")
     );
     remote.switch_branch(target).await;
+    replica.close().await.expect("close offline replica before reconnecting");
     probe.set_offline(false);
+    let replica = open_replica(directory.path(), &url).await;
     remote
         .wait_for_value("branch-marker", "pending-target")
         .await;
@@ -3345,7 +3362,7 @@ async fn existing_branch_admission_preserves_pending_work_and_restores_archived_
         Some("main")
     );
     replica.close().await.unwrap();
-    let replica = open_replica(directory.path(), &url).await;
+    let replica = open_replica_offline(directory.path()).await;
     assert_eq!(replica.active_branch_id().await.unwrap(), main);
     assert_eq!(
         read_value(&replica, "branch-marker").await.as_deref(),
@@ -3436,13 +3453,15 @@ async fn local_created_branch_publishes_refs_then_admits_without_losing_main() {
         Some("child-offline")
     );
     replica.close().await.unwrap();
-    let replica = open_replica(directory.path(), &url).await;
+    let replica = open_replica_offline(directory.path()).await;
     assert_eq!(replica.active_branch_id().await.unwrap(), created.id);
     assert_eq!(
         read_value(&replica, "creation-value").await.as_deref(),
         Some("child-offline")
     );
+    replica.close().await.expect("close offline replica before reconnecting");
     probe.set_offline(false);
+    let replica = open_replica(directory.path(), &url).await;
     remote
         .wait_for_value("creation-value", "child-offline")
         .await;

@@ -21,8 +21,8 @@ workspace = true
 [features]
 default = ["default_wasm_runtime"]
 all-simulations = []
-# Historical migration support for operator tools and the server-owned opener.
-# Ordinary client bindings keep this in a separate migration artifact.
+# Compatibility feature for operator tooling. Supported upgrades are always
+# part of the Rust-owned opening lifecycle.
 offline-migration = []
 storage-benches = []
 # Per-node cost attribution for commit-root replay (experiment AA). Kept out of

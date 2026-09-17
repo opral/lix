@@ -44,7 +44,7 @@ impl AuthorityHttp {
         let response = builder
             .send()
             .await
-            .map_err(|error| transport_error("upload repository", error))?;
+            .map_err(|error| request_error("upload repository", error))?;
         let status = response.status().as_u16();
         let headers = response
             .headers()
@@ -87,6 +87,15 @@ impl HttpSyncTransport<reqwest::Client> {
     ) -> Result<Self, LixError> {
         let client = build_client(headers)?;
         Self::connect_with(client, repository_url).await
+    }
+
+    pub(crate) async fn connect_with_progress(
+        repository_url: &str,
+        headers: &[(String, String)],
+        progress: Option<&Arc<dyn crate::OpenProgressSink>>,
+    ) -> Result<Self, LixError> {
+        let client = build_client(headers)?;
+        Self::connect_with_progress_sink(client, repository_url, progress).await
     }
 }
 
@@ -141,7 +150,7 @@ impl ProtocolHttp for AuthorityHttp {
         let response = builder
             .send()
             .await
-            .map_err(|error| transport_error("authority request", error))?;
+            .map_err(|error| request_error("authority request", error))?;
         let status = response.status().as_u16();
         let headers = response
             .headers()
@@ -186,7 +195,7 @@ impl ProtocolHttp for AuthorityHttp {
         let response = builder
             .send()
             .await
-            .map_err(|error| transport_error("authority stream", error))?;
+            .map_err(|error| request_error("authority stream", error))?;
         let status = response.status().as_u16();
         let headers = response
             .headers()
@@ -235,7 +244,7 @@ impl RawHttpClient for reqwest::Client {
             let mut response = builder
                 .send()
                 .await
-                .map_err(|error| transport_error(request.operation, error))?;
+                .map_err(|error| request_error(request.operation, error))?;
             let status = response.status();
             let status_text = status
                 .canonical_reason()
@@ -270,6 +279,14 @@ impl RawHttpClient for reqwest::Client {
                 body,
             })
         })
+    }
+}
+
+fn request_error(operation: &str, error: reqwest::Error) -> LixError {
+    if error.is_connect() || error.is_timeout() {
+        LixError::new("LIX_TRANSPORT_NETWORK", format!("{operation}: {error}"))
+    } else {
+        transport_error(operation, error)
     }
 }
 

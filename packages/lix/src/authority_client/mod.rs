@@ -1,5 +1,7 @@
 //! Host-pluggable Lix Server Protocol client.
 
+mod admission;
+pub use admission::{ProtocolAdmissionIdentity, admit_protocol_client};
 mod blobs;
 mod http;
 mod observe;
@@ -98,6 +100,7 @@ impl<H> std::fmt::Debug for ClientCore<H> {
 }
 
 pub struct ProtocolClient<H: ProtocolHttp> {
+    open_report: Arc<crate::OpenReport>,
     core: ClientCore<H>,
     observe: observe::ObservationHub<ClientCore<H>>,
 }
@@ -105,9 +108,17 @@ pub struct ProtocolClient<H: ProtocolHttp> {
 impl<H: ProtocolHttp> Clone for ProtocolClient<H> {
     fn clone(&self) -> Self {
         Self {
+            open_report: Arc::clone(&self.open_report),
             core: self.core.clone(),
             observe: self.observe.clone(),
         }
+    }
+}
+
+impl<H: ProtocolHttp> ProtocolClient<H> {
+    /// Facts observed while opening this remote session.
+    pub fn open_report(&self) -> &crate::OpenReport {
+        &self.open_report
     }
 }
 
@@ -147,10 +158,21 @@ pub async fn open_protocol_client<H: ProtocolHttp + Clone + 'static>(
     base_url: impl Into<String>,
     initial_active_branch_id: Option<String>,
 ) -> Result<ProtocolClient<H>, LixError> {
+    open_protocol_client_with_progress(http, base_url, initial_active_branch_id, None).await
+}
+
+/// Open a remote session while observing authority migration during admission.
+pub async fn open_protocol_client_with_progress<H: ProtocolHttp + Clone + 'static>(
+    http: H,
+    base_url: impl Into<String>,
+    initial_active_branch_id: Option<String>,
+    progress: Option<Arc<dyn crate::OpenProgressSink>>,
+) -> Result<ProtocolClient<H>, LixError> {
     open_protocol_client_at_base(
         http,
         normalize_protocol_base_url(&base_url.into())?,
         initial_active_branch_id,
+        progress,
     )
     .await
 }
@@ -159,6 +181,7 @@ async fn open_protocol_client_at_base<H: ProtocolHttp + Clone + 'static>(
     http: H,
     base_url: String,
     initial_active_branch_id: Option<String>,
+    progress: Option<Arc<dyn crate::OpenProgressSink>>,
 ) -> Result<ProtocolClient<H>, LixError> {
     if let Some(branch_id) = &initial_active_branch_id
         && branch_id.is_empty()
@@ -181,10 +204,63 @@ async fn open_protocol_client_at_base<H: ProtocolHttp + Clone + 'static>(
         operation_lock: Arc::new(Mutex::new(())),
         accepting: Arc::new(AtomicBool::new(true)),
     };
-    core.handshake_create(initial_active_branch_id.as_deref())
+    let migrations = Arc::new(std::sync::Mutex::new(Vec::<crate::OpenMigration>::new()));
+    let captured = Arc::clone(&migrations);
+    let retained: Arc<dyn crate::OpenProgressSink> = Arc::new(
+        crate::CallbackOpenProgressSink::new(move |event: crate::OpenProgress| {
+            if event.phase == crate::OpenPhase::Migrating {
+                if let Some(from_format) = event.from_format {
+                    let migration = crate::OpenMigration {
+                        scope: crate::OpenScope::Authority,
+                        from_format,
+                        to_format: event.to_format,
+                    };
+                    let mut observed = captured.lock().unwrap_or_else(|error| error.into_inner());
+                    if let Some(first) = observed.first_mut() {
+                        first.from_format = first.from_format.min(migration.from_format);
+                        first.to_format = first.to_format.max(migration.to_format);
+                    } else {
+                        observed.push(migration);
+                    }
+                }
+            }
+            crate::open_types::emit_open_progress(progress.as_ref(), event);
+        }),
+    );
+    let snapshot = |phase| crate::OpenProgress {
+        scope: crate::OpenScope::Authority,
+        phase,
+        from_format: None,
+        to_format: crate::CURRENT_STORAGE_FORMAT_VERSION,
+        completed: None,
+        total: None,
+    };
+    crate::open_types::emit_open_progress(Some(&retained), snapshot(crate::OpenPhase::Inspecting));
+    core.handshake_create_with_progress(initial_active_branch_id.as_deref(), Some(&retained))
         .await?;
+    crate::open_types::emit_open_progress(Some(&retained), snapshot(crate::OpenPhase::Complete));
+    let migrations = migrations
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    let migration = migrations
+        .first()
+        .map(|migration| crate::OpenMigrationReport {
+            from_format: migration.from_format,
+            to_format: migration.to_format,
+        });
+    let open_report = Arc::new(crate::OpenReport {
+        format: crate::CURRENT_STORAGE_FORMAT_VERSION,
+        initialized: false,
+        migration,
+        migrations,
+    });
     let observe = observe::ObservationHub::new(core.clone());
-    Ok(ProtocolClient { core, observe })
+    Ok(ProtocolClient {
+        core,
+        observe,
+        open_report,
+    })
 }
 
 impl<H: ProtocolHttp> ClientCore<H> {
@@ -237,6 +313,15 @@ impl<H: ProtocolHttp> ClientCore<H> {
     }
 
     async fn handshake_create(&self, active_branch_id: Option<&str>) -> Result<(), LixError> {
+        self.handshake_create_with_progress(active_branch_id, None)
+            .await
+    }
+
+    async fn handshake_create_with_progress(
+        &self,
+        active_branch_id: Option<&str>,
+        progress: Option<&Arc<dyn crate::OpenProgressSink>>,
+    ) -> Result<(), LixError> {
         let mut url = url::Url::parse(&self.base_url).map_err(|error| {
             protocol_error(format!("invalid Lix Server Protocol base URL: {error}"))
         })?;
@@ -249,7 +334,9 @@ impl<H: ProtocolHttp> ClientCore<H> {
         if url.query() == Some("") {
             url.set_query(None);
         }
-        let handshake = self.request_handshake(url.to_string(), false).await?;
+        let handshake = self
+            .request_handshake(url.to_string(), false, progress)
+            .await?;
         self.apply_handshake(handshake)
     }
 
@@ -265,6 +352,7 @@ impl<H: ProtocolHttp> ClientCore<H> {
         &self,
         url: String,
         include_session: bool,
+        progress: Option<&Arc<dyn crate::OpenProgressSink>>,
     ) -> Result<HandshakeResponse, LixError> {
         // Migration responses prove that the authority has not opened the
         // requested session yet. Wait here, never replay arbitrary SQL writes.
@@ -282,7 +370,10 @@ impl<H: ProtocolHttp> ClientCore<H> {
             {
                 Ok(value) => break value,
                 Err(error) => match opening_migration_retry_delay(&error) {
-                    Some(delay) => self.http.sleep(delay).await,
+                    Some(delay) => {
+                        report_authority_migration(&error, progress);
+                        self.http.sleep(delay).await;
+                    }
                     None => return Err(error),
                 },
             }
@@ -625,7 +716,10 @@ impl<H: ProtocolHttp> ClientCore<H> {
     }
 
     async fn resume_or_recover_handshake(&self) -> Result<(), LixError> {
-        match self.request_handshake(self.base_url.clone(), true).await {
+        match self
+            .request_handshake(self.base_url.clone(), true, None)
+            .await
+        {
             Ok(handshake) => {
                 let current = self
                     .state
@@ -925,6 +1019,7 @@ impl<H: ProtocolHttp + Clone + 'static> ProtocolClient<H> {
             self.http().clone(),
             self.base_url.clone(),
             Some(branch_id),
+            None,
         )
         .await?;
         if child.active_account_id().await? != parent_account_id {
@@ -1270,4 +1365,30 @@ pub(crate) fn opening_migration_retry_delay(error: &LixError) -> Option<std::tim
             "LIX_REPOSITORY_MIGRATING" | "LIX_ERROR_MIGRATING"
         ))
     .then_some(std::time::Duration::from_secs(1))
+}
+
+pub(crate) fn report_authority_migration(
+    error: &LixError,
+    progress: Option<&Arc<dyn crate::OpenProgressSink>>,
+) {
+    let format = |primary: &str, alternate: &str| {
+        error
+            .details
+            .as_ref()
+            .and_then(|details| details.get(primary).or_else(|| details.get(alternate)))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok())
+    };
+    crate::open_types::emit_open_progress(
+        progress,
+        crate::OpenProgress {
+            scope: crate::OpenScope::Authority,
+            phase: crate::OpenPhase::Migrating,
+            from_format: format("fromVersion", "fromFormat"),
+            to_format: format("toVersion", "toFormat")
+                .unwrap_or(crate::CURRENT_STORAGE_FORMAT_VERSION),
+            completed: None,
+            total: None,
+        },
+    );
 }

@@ -7,6 +7,7 @@ test("Lix captures an immutable open report", () => {
 		format: 75,
 		initialized: false,
 		migration: { fromFormat: 74, toFormat: 75 },
+		migrations: [{ scope: "local", fromFormat: 74, toFormat: 75 }],
 	};
 	const binding = {
 		openReport: vi.fn(() => source),
@@ -15,13 +16,17 @@ test("Lix captures an immutable open report", () => {
 	const lix = new Lix(binding);
 	source.format = 76;
 	source.migration.fromFormat = 73;
+	source.migrations[0]!.fromFormat = 73;
 
 	expect(lix.openReport).toEqual({
 		format: 75,
 		initialized: false,
 		migration: { fromFormat: 74, toFormat: 75 },
+		migrations: [{ scope: "local", fromFormat: 74, toFormat: 75 }],
 	});
 	expect(Object.isFrozen(lix.openReport)).toBe(true);
+	expect(Object.isFrozen(lix.openReport?.migrations)).toBe(true);
+	expect(Object.isFrozen(lix.openReport?.migrations[0])).toBe(true);
 	expect(Object.isFrozen(lix.openReport?.migration)).toBe(true);
 });
 

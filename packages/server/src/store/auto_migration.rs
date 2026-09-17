@@ -3,41 +3,22 @@
 use super::*;
 
 impl LixRuntimeManager {
-    pub(super) async fn prepare_existing_authority(
-        &self,
-        id: &str,
-        expected: &RepositoryRecord,
-        storage: &SlateDB,
-        opened: &watch::Sender<RuntimeOpenState>,
-    ) -> Result<()> {
+    pub(super) async fn validate_existing_authority(&self, storage: &SlateDB) -> Result<()> {
+        // Catalogued stores must already be authorities. The shared opening
+        // lifecycle may initialize empty stores or promote local repositories;
+        // neither is permitted for an existing hosted catalog entry.
         let before = lix_sdk::migration::inspect_repository(storage.clone()).await?;
         if before.role != lix_sdk::migration::RepositoryRole::Authority {
             anyhow::bail!("catalogued storage is not an existing authority");
         }
-        if !before.current {
-            let from_version = before.format.context("authority format is missing")?;
-            if from_version > lix_sdk::CURRENT_STORAGE_FORMAT_VERSION {
-                anyhow::bail!("authority requires a newer storage format");
-            }
-            opened.send_replace(RuntimeOpenState::Migrating {
-                from_version,
-                to_version: lix_sdk::CURRENT_STORAGE_FORMAT_VERSION,
-            });
-            let migration =
-                Box::pin(lix_sdk::migration::migrate_repository(storage.clone())).await?;
-            if !migration.semantic_preservation_verified
-                || !migration.after.current
-                || migration.after.role != lix_sdk::migration::RepositoryRole::Authority
-            {
-                anyhow::bail!("authority migration did not verify preservation and identity");
-            }
-        }
-        self.publish_open_admission(id, expected).await?;
-        opened.send_replace(RuntimeOpenState::Opening);
         Ok(())
     }
 
-    async fn publish_open_admission(&self, id: &str, expected: &RepositoryRecord) -> Result<()> {
+    pub(super) async fn publish_open_admission(
+        &self,
+        id: &str,
+        expected: &RepositoryRecord,
+    ) -> Result<()> {
         if expected.admission.as_ref() == Some(&AuthorityAdmission::current()) {
             return Ok(());
         }
@@ -208,7 +189,10 @@ mod tests {
     async fn await_admission(manager: &Arc<LixRuntimeManager>) {
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                match manager.authority_admission(ID, tokio::time::Instant::now() + Duration::from_secs(30)).await {
+                match manager
+                    .authority_admission(ID, tokio::time::Instant::now() + Duration::from_secs(30))
+                    .await
+                {
                     Ok(Some(admission)) => {
                         assert_eq!(admission, AuthorityAdmission::current());
                         break;
@@ -273,6 +257,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn catalogued_local_repository_is_not_promoted_during_open() {
+        let manager = LixRuntimeManager::new_in_memory(4);
+        let physical = uuid::Uuid::new_v4().to_string();
+        let storage = manager.open_storage(&physical, Default::default()).unwrap();
+        let local = lix_sdk::open_lix()
+            .with_storage(storage.clone())
+            .await
+            .unwrap();
+        local.close().await.unwrap();
+        drop(local);
+        catalog(&manager, &physical, None).await;
+        let (opened, _) = watch::channel(RuntimeOpenState::Opening);
+        let error = manager.open_lix(ID, &opened).await.err().unwrap();
+        assert!(error.to_string().contains("not an existing authority"));
+        assert_ne!(
+            lix_sdk::migration::inspect_repository(storage)
+                .await
+                .unwrap()
+                .role,
+            lix_sdk::migration::RepositoryRole::Authority,
+        );
+        assert_eq!(
+            manager
+                .repository_record(ID)
+                .await
+                .unwrap()
+                .unwrap()
+                .admission,
+            None
+        );
+        manager.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn missing_catalog_admission_is_repaired_from_existing_current_authority() {
         let manager = LixRuntimeManager::new_in_memory(4);
         let physical = seeded_authority(&manager).await;
@@ -303,7 +321,10 @@ mod tests {
         )
         .await;
         assert_eq!(
-            manager.authority_admission(ID, tokio::time::Instant::now() + Duration::from_secs(30)).await.unwrap(),
+            manager
+                .authority_admission(ID, tokio::time::Instant::now() + Duration::from_secs(30))
+                .await
+                .unwrap(),
             Some(AuthorityAdmission::current())
         );
         assert!(manager.state.lock().await.entries.is_empty());
@@ -322,13 +343,26 @@ mod tests {
         let physical = seeded_authority(&manager).await;
         catalog(&manager, &physical, None).await;
         use tower::ServiceExt as _;
-        let app = crate::router(manager.clone(), None, Duration::from_secs(1), Default::default());
-        let response = app.oneshot(Request::builder()
-            .uri(format!("/lix/v1/{ID}/admission"))
-            .header("lix-sync-protocol-version", lix_sdk::SYNC_PROTOCOL_VERSION)
-            .body(Body::empty()).unwrap()).await.unwrap();
+        let app = crate::router(
+            manager.clone(),
+            None,
+            Duration::from_secs(1),
+            Default::default(),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/lix/v1/{ID}/admission"))
+                    .header("lix-sync-protocol-version", lix_sdk::SYNC_PROTOCOL_VERSION)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
-        let body = axum::body::to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
         let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(error["error"]["code"], "LIX_REPOSITORY_MIGRATING");
         let lifecycle = manager.lifecycle_lock(ID).await;
@@ -362,7 +396,11 @@ mod tests {
         )
         .await;
         assert_eq!(
-            manager.authority_admission(ID, tokio::time::Instant::now() + Duration::from_secs(30)).await.unwrap_err().code,
+            manager
+                .authority_admission(ID, tokio::time::Instant::now() + Duration::from_secs(30))
+                .await
+                .unwrap_err()
+                .code,
             "LIX_PROTOCOL_VERSION_MISMATCH"
         );
         assert!(manager.state.lock().await.entries.is_empty());

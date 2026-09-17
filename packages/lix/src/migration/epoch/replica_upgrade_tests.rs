@@ -953,9 +953,7 @@ async fn legacy_dirty_archive_survives_partial_conversion_and_remains_exportable
     );
     full.close().await.unwrap();
     drop(full);
-    crate::convert_replica_to_partial(storage.clone(), authority.options(), None)
-        .await
-        .unwrap();
+    // Normal opening owns preserving conversion, including retained archives.
     let partial = crate::open_lix()
         .with_storage(storage)
         .with_server(authority.options())
@@ -1031,4 +1029,49 @@ async fn legacy_dirty_archive_survives_partial_conversion_and_remains_exportable
         serde_json::to_value(&before).unwrap()
     );
     partial.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn normal_open_retains_dirty_legacy_replica_without_archiving_pending_work() {
+    let authority = Authority::new().await;
+    let memory = crate::Memory::new();
+    let source =
+        old_replica_with_recovery_data(&authority, EpochBank::Legacy, true, true, memory.clone())
+            .await;
+    drop(source);
+    let storage = crate::sync::durable_memory_for_test(memory);
+    let owned = crate::storage_adapter::StorageSession::acquire(storage.clone())
+        .await
+        .unwrap();
+    let before = crate::migration::public_api::content_digest(&owned)
+        .await
+        .unwrap();
+    let pointer = load_pointer(&owned).await.unwrap();
+    drop(owned);
+    let error = crate::open_lix()
+        .with_storage(storage.clone())
+        .with_server(authority.options())
+        .await
+        .err()
+        .expect("pending legacy work requires recovery");
+    assert_eq!(
+        error.code,
+        "LIX_PARTIAL_REPLICA_CONVERSION_RECOVERY_REQUIRED"
+    );
+    let owned = crate::storage_adapter::StorageSession::acquire(storage)
+        .await
+        .unwrap();
+    assert_eq!(load_pointer(&owned).await.unwrap(), pointer);
+    assert_eq!(
+        crate::migration::public_api::content_digest(&owned)
+            .await
+            .unwrap(),
+        before
+    );
+    assert!(
+        list_retained_replica_sources(&owned)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

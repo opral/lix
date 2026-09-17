@@ -6,7 +6,7 @@ use lix::{
     MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
     MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats,
     ObserveEvent as RsObserveEvent, ObserveEvents as RsObserveEvents, OpenPhase, OpenProgress,
-    OpenProgressSink, OpenReport, RedoReceipt, ServerOptions,
+    OpenProgressSink, OpenReport, OpenScope, RedoReceipt, ServerOptions,
     SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt, UndoReceipt, Value,
     open_lix,
 };
@@ -131,11 +131,22 @@ pub struct NativeOpenMigrationReport {
 }
 
 #[napi(object)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
+pub struct NativeScopedOpenMigration {
+    pub scope: String,
+    #[napi(js_name = "fromFormat")]
+    pub from_format: u32,
+    #[napi(js_name = "toFormat")]
+    pub to_format: u32,
+}
+
+#[napi(object)]
+#[derive(Clone, Debug)]
 pub struct NativeOpenReport {
     pub format: u32,
     pub initialized: bool,
     pub migration: Option<NativeOpenMigrationReport>,
+    pub migrations: Vec<NativeScopedOpenMigration>,
 }
 
 impl From<&OpenReport> for NativeOpenReport {
@@ -143,6 +154,15 @@ impl From<&OpenReport> for NativeOpenReport {
         Self {
             format: report.format,
             initialized: report.initialized,
+            migrations: report
+                .migrations
+                .iter()
+                .map(|migration| NativeScopedOpenMigration {
+                    scope: open_scope_name(migration.scope).to_owned(),
+                    from_format: migration.from_format,
+                    to_format: migration.to_format,
+                })
+                .collect(),
             migration: report.migration.map(|migration| NativeOpenMigrationReport {
                 from_format: migration.from_format,
                 to_format: migration.to_format,
@@ -155,6 +175,7 @@ impl From<&OpenReport> for NativeOpenReport {
 #[serde(rename_all = "camelCase")]
 struct OpenProgressDto {
     phase: &'static str,
+    scope: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     from_format: Option<u32>,
     to_format: u32,
@@ -172,11 +193,19 @@ impl From<OpenProgress> for OpenProgressDto {
     fn from(progress: OpenProgress) -> Self {
         Self {
             phase: open_phase_name(progress.phase),
+            scope: open_scope_name(progress.scope),
             from_format: progress.from_format,
             to_format: progress.to_format,
             completed: progress.completed.map(|value| value as f64),
             total: progress.total.map(|value| value as f64),
         }
+    }
+}
+
+fn open_scope_name(scope: OpenScope) -> &'static str {
+    match scope {
+        OpenScope::Local => "local",
+        OpenScope::Authority => "authority",
     }
 }
 

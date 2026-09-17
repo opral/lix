@@ -5253,5 +5253,4 @@ pub(crate) async fn stage_root_working_diff_epoch(
     Ok(guard)
 }
 
-#[cfg(feature = "offline-migration")]
 pub(crate) use hot::verify_migrated_deterministic_witness;

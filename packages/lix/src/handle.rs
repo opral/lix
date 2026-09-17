@@ -21,7 +21,6 @@ use std::{
 
 use crate::authority_client::{
     ClientCore, ProtocolClient, ProtocolExecuteOptions, ProtocolObserveEvents, ProtocolTransaction,
-    open_protocol_client,
 };
 use crate::common::ExpiredReadRetryState;
 use crate::engine::{Engine, EngineOptions};
@@ -58,9 +57,21 @@ where
     }
 }
 
+#[cfg(feature = "server-protocol")]
+struct AuthorityOpenProgressSink(Arc<dyn OpenProgressSink>);
+#[cfg(feature = "server-protocol")]
+impl OpenProgressSink for AuthorityOpenProgressSink {
+    fn report(&self, mut progress: OpenProgress) {
+        progress.scope = crate::OpenScope::Authority;
+        self.0.report(progress);
+    }
+}
+
 struct RetainingOpenProgressSink {
     downstream: Option<Arc<dyn OpenProgressSink>>,
     migrated_from: AtomicU32,
+    authority_migrated_from: AtomicU32,
+    authority_completed_from: AtomicU32,
     initialized: AtomicBool,
 }
 
@@ -69,6 +80,8 @@ impl RetainingOpenProgressSink {
         Self {
             downstream,
             migrated_from: AtomicU32::new(0),
+            authority_migrated_from: AtomicU32::new(0),
+            authority_completed_from: AtomicU32::new(0),
             initialized: AtomicBool::new(false),
         }
     }
@@ -94,9 +107,25 @@ impl RetainingOpenProgressSink {
 impl OpenProgressSink for RetainingOpenProgressSink {
     fn report(&self, mut progress: OpenProgress) {
         if let Some(from_format) = progress.from_format {
-            self.migrated_from.store(from_format, Ordering::Release);
+            let slot = match progress.scope {
+                crate::OpenScope::Local => &self.migrated_from,
+                crate::OpenScope::Authority => &self.authority_migrated_from,
+            };
+            let _ = slot.fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+                Some(if old == 0 { from_format } else { old.min(from_format) })
+            });
         } else if matches!(progress.phase, OpenPhase::Opening | OpenPhase::Complete) {
-            progress.from_format = self.migrated_from();
+            let version = match progress.scope {
+                crate::OpenScope::Local => self.migrated_from.load(Ordering::Acquire),
+                crate::OpenScope::Authority => self.authority_migrated_from.load(Ordering::Acquire),
+            };
+            progress.from_format = (version != 0).then_some(version);
+        }
+        if progress.scope == crate::OpenScope::Authority && progress.phase == OpenPhase::Complete {
+            self.authority_completed_from.store(
+                self.authority_migrated_from.load(Ordering::Acquire),
+                Ordering::Release,
+            );
         }
         if let Some(downstream) = &self.downstream {
             downstream.report(progress);
@@ -221,7 +250,7 @@ impl<StorageImpl> OpenLixBuilder<StorageImpl> {
         self
     }
 
-    /// Observes current-format repository inspection and opening. Migration is explicit.
+    /// Observes repository inspection, supported automatic upgrades, and opening.
     ///
     /// ```no_run
     /// # async fn example() -> Result<(), lix::LixError> {
@@ -236,6 +265,14 @@ impl<StorageImpl> OpenLixBuilder<StorageImpl> {
     /// # Ok(())
     /// # }
     /// ```
+    /// Observe opening without implementing a progress sink.
+    pub fn on_progress<F>(self, callback: F) -> Self
+    where
+        F: Fn(OpenProgress) + Send + Sync + 'static,
+    {
+        self.with_open_progress_sink(Arc::new(CallbackOpenProgressSink::new(callback)))
+    }
+
     pub fn with_open_progress_sink(mut self, sink: Arc<dyn OpenProgressSink>) -> Self {
         self.open_progress = Some(sink);
         self
@@ -270,7 +307,7 @@ where
         let retained_progress = Arc::new(RetainingOpenProgressSink::new(self.open_progress));
         let (engine, migrated_from) = retry_expired_read(|| {
             let storage = storage.clone();
-            let open_progress: Arc<dyn OpenProgressSink> = retained_progress.clone();
+            let open_progress: Arc<dyn OpenProgressSink> = Arc::new(AuthorityOpenProgressSink(retained_progress.clone()));
             let wasm_runtime = self.wasm_runtime.clone();
             let telemetry = self.telemetry.clone();
             async move {
@@ -283,6 +320,7 @@ where
                 emit_open_progress(
                     Some(&open_progress),
                     OpenProgress {
+                        scope: crate::OpenScope::Local,
                         phase: OpenPhase::Opening,
                         from_format: migrated_from,
                         to_format: crate::init::CURRENT_FORMAT_VERSION,
@@ -312,11 +350,18 @@ where
             }
         })
         .await?;
-        let migrated_from = migrated_from.or_else(|| retained_progress.migrated_from());
-        let open_progress: Arc<dyn OpenProgressSink> = retained_progress;
+        let migrated_from = migrated_from.or_else(|| {
+            let value = retained_progress
+                .authority_migrated_from
+                .load(Ordering::Acquire);
+            (value != 0).then_some(value)
+        });
+        let open_progress: Arc<dyn OpenProgressSink> =
+            Arc::new(AuthorityOpenProgressSink(retained_progress));
         emit_open_progress(
             Some(&open_progress),
             OpenProgress {
+                scope: crate::OpenScope::Local,
                 phase: OpenPhase::Complete,
                 from_format: migrated_from,
                 to_format: crate::init::CURRENT_FORMAT_VERSION,
@@ -369,6 +414,14 @@ impl UnconfiguredOpenLixBuilder {
         self.0 = self.0.with_telemetry(telemetry);
         self
     }
+    /// Observe opening without implementing a progress sink.
+    pub fn on_progress<F>(self, callback: F) -> Self
+    where
+        F: Fn(OpenProgress) + Send + Sync + 'static,
+    {
+        self.with_open_progress_sink(Arc::new(CallbackOpenProgressSink::new(callback)))
+    }
+
     pub fn with_open_progress_sink(mut self, sink: Arc<dyn OpenProgressSink>) -> Self {
         self.0 = self.0.with_open_progress_sink(sink);
         self
@@ -397,6 +450,18 @@ pub struct RemoteOpenLixBuilder {
     server: ServerOptions,
 }
 impl RemoteOpenLixBuilder {
+    /// Observe remote authority upgrades while opening remains pending.
+    pub fn on_progress<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(OpenProgress) + Send + Sync + 'static,
+    {
+        self.open = self.open.on_progress(callback);
+        self
+    }
+    pub fn with_open_progress_sink(mut self, sink: Arc<dyn OpenProgressSink>) -> Self {
+        self.open = self.open.with_open_progress_sink(sink);
+        self
+    }
     /// Selects a local replica with durable local writes and background sync.
     pub fn with_storage<S>(self, storage: S) -> OpenLixBuilder<S> {
         self.open.with_storage(storage).with_server(self.server)
@@ -409,17 +474,19 @@ impl IntoFuture for RemoteOpenLixBuilder {
         Box::pin(async move {
             if self.open.wasm_runtime.is_some()
                 || self.open.telemetry.is_some()
-                || self.open.open_progress.is_some()
             {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,
-                    "remote execution cannot configure a local runtime, telemetry sink, or storage progress sink",
+                    "remote execution cannot configure a local runtime or telemetry sink",
                 ));
             }
             let http = crate::sync::authority_http(&self.server.headers)?;
-            let client = open_protocol_client(http, self.server.url, None).await?;
+            let client = crate::authority_client::open_protocol_client_with_progress(
+                http, self.server.url, None, self.open.open_progress,
+            ).await?;
             let account_id = client.active_account_id().await?;
-            Ok(RemoteLix { client, account_id })
+            let open_report = Arc::new(client.open_report().clone());
+            Ok(RemoteLix { client, account_id, open_report })
         })
     }
 }
@@ -427,10 +494,14 @@ impl IntoFuture for RemoteOpenLixBuilder {
 /// A repository whose operations execute on its server.
 #[derive(Debug, Clone)]
 pub struct RemoteLix {
+    open_report: Arc<OpenReport>,
     account_id: String,
     client: ProtocolClient<crate::sync::AuthorityHttp>,
 }
 impl RemoteLix {
+    pub fn open_report(&self) -> &OpenReport {
+        &self.open_report
+    }
     /// Streams a complete snapshot from the server without allocating local storage.
     pub fn export_snapshot(&self) -> crate::snapshot::SnapshotExportBuilder<Memory> {
         crate::snapshot::SnapshotExportBuilder::remote(
@@ -646,7 +717,8 @@ impl<'a> IntoFuture for RemoteOpenAnotherSessionBuilder<'a> {
                 .open_another_session(self.branch_id, self.account_id)
                 .await?;
             let account_id = client.active_account_id().await?;
-            Ok(RemoteLix { client, account_id })
+            let open_report = Arc::new(client.open_report().clone());
+            Ok(RemoteLix { client, account_id, open_report })
         })
     }
 }
@@ -816,13 +888,30 @@ where
                 to_format: crate::init::CURRENT_FORMAT_VERSION,
             })
     });
-    if initialized != lix.open_report.initialized || migration != lix.open_report.migration {
-        lix.open_report = Arc::new(OpenReport {
-            format: lix.open_report.format,
-            initialized,
-            migration,
+    let mut migrations = Vec::new();
+    if let Some(local) = migration {
+        migrations.push(crate::OpenMigration {
+            scope: crate::OpenScope::Local,
+            from_format: local.from_format,
+            to_format: local.to_format,
         });
     }
+    let authority_from = retained_progress
+        .authority_completed_from
+        .load(Ordering::Acquire);
+    if authority_from != 0 {
+        migrations.push(crate::OpenMigration {
+            scope: crate::OpenScope::Authority,
+            from_format: authority_from,
+            to_format: crate::init::CURRENT_FORMAT_VERSION,
+        });
+    }
+    lix.open_report = Arc::new(OpenReport {
+        migrations,
+        format: lix.open_report.format,
+        initialized,
+        migration,
+    });
     Ok(lix)
 }
 
@@ -1226,7 +1315,8 @@ where
         emit_open_progress(
             Some(&open_progress),
             OpenProgress {
-                phase: OpenPhase::Opening,
+                scope: crate::OpenScope::Local,
+                phase: OpenPhase::Inspecting,
                 from_format: None,
                 to_format: crate::init::CURRENT_FORMAT_VERSION,
                 completed: None,
@@ -1234,11 +1324,12 @@ where
             },
         );
         let lix =
-            partial::open_partial_lix(storage, wasm_runtime, telemetry, server, durability).await?;
+            partial::open_partial_lix(storage, wasm_runtime, telemetry, server, durability, Some(open_progress.clone())).await?;
         retained_progress.retain_initialized(lix.open_report.initialized);
         emit_open_progress(
             Some(&open_progress),
             OpenProgress {
+                scope: crate::OpenScope::Local,
                 phase: OpenPhase::Complete,
                 from_format: None,
                 to_format: crate::init::CURRENT_FORMAT_VERSION,
@@ -1256,6 +1347,7 @@ where
     emit_open_progress(
         Some(&open_progress),
         OpenProgress {
+            scope: crate::OpenScope::Local,
             phase: OpenPhase::Opening,
             from_format: migrated_from,
             to_format: crate::init::CURRENT_FORMAT_VERSION,
@@ -1290,6 +1382,7 @@ where
     emit_open_progress(
         Some(&open_progress),
         OpenProgress {
+            scope: crate::OpenScope::Local,
             phase: OpenPhase::Complete,
             from_format: migrated_from,
             to_format: crate::init::CURRENT_FORMAT_VERSION,
@@ -1323,6 +1416,7 @@ where
         sync_demand_tx: None,
         server: None,
         open_report: Arc::new(OpenReport {
+            migrations: Vec::new(),
             format: crate::init::CURRENT_FORMAT_VERSION,
             initialized: false,
             migration: None,
@@ -1371,6 +1465,7 @@ where
     emit_open_progress(
         progress,
         OpenProgress {
+            scope: crate::OpenScope::Local,
             phase: OpenPhase::Inspecting,
             from_format: None,
             to_format: current,
@@ -1378,7 +1473,17 @@ where
             total: None,
         },
     );
-    let admission = crate::migration::admit_current_repository(storage, true).await?;
+    let admission = match crate::migration::admit_current_repository(storage, true).await {
+        Ok(admission) => admission,
+        Err(error) if error.code == "LIX_ERROR_REPOSITORY_MIGRATION_REQUIRED" => {
+            Box::pin(crate::migration::admit_repository_with_server(
+                storage, progress, None,
+            ))
+            .await?
+        }
+        Err(error) => return Err(error),
+    };
+    crate::migration::upgrade_candidate_if_authority(&admission.adapter).await?;
     Ok(RepositoryAdmission {
         adapter: admission.adapter,
         report: admission.report,
@@ -1445,6 +1550,7 @@ where
             sync_demand_tx: None,
             server: None,
             open_report: Arc::new(OpenReport {
+                migrations: Vec::new(),
                 format: crate::init::CURRENT_FORMAT_VERSION,
                 initialized: false,
                 migration: None,
@@ -3082,15 +3188,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn incomplete_authority_upgrade_is_not_reported_as_completed() {
+        let sink = RetainingOpenProgressSink::new(None);
+        let progress = OpenProgress {
+            scope: crate::OpenScope::Authority,
+            phase: OpenPhase::Migrating,
+            from_format: Some(80),
+            to_format: crate::CURRENT_STORAGE_FORMAT_VERSION,
+            completed: None,
+            total: None,
+        };
+        sink.report(progress);
+        // A network failure may return an existing replica offline here.
+        assert_eq!(sink.authority_completed_from.load(Ordering::Acquire), 0);
+        sink.report(OpenProgress {
+            phase: OpenPhase::Complete,
+            from_format: None,
+            ..progress
+        });
+        assert_eq!(sink.authority_completed_from.load(Ordering::Acquire), 80);
+    }
+
     #[tokio::test]
     async fn remote_open_rejects_local_configuration_before_network_access() {
         let result = open_lix()
-            .with_open_progress_sink(Arc::new(CallbackOpenProgressSink::new(|_| {})))
+            .with_telemetry(Arc::new(CallbackTelemetrySink::new(|_| {})))
             .with_server(ServerOptions::new(
                 "https://example.invalid/lix/00000000-0000-4000-8000-000000000001",
             ))
             .await;
-        let error = result.expect_err("remote open must reject local progress configuration");
+        let error = result.expect_err("remote open must reject local telemetry configuration");
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
         assert!(error.message.contains("local runtime"));
     }
@@ -4009,7 +4137,6 @@ mod recovery_branch_publication_tests;
 /// branch-descriptor additions reconcile natively before publication. Other
 /// unsupported global/checkpoint/reset changes preserve the full
 /// source and return an explicit recovery error. Migration may inspect all data.
-#[cfg(any(feature = "offline-migration", test))]
 pub async fn convert_replica_to_partial<S>(
     storage: S,
     server: ServerOptions,
@@ -4025,7 +4152,6 @@ where
 /// This explicit maintenance may inspect journals and contact the authority;
 /// ordinary opening and the published local working set remain unchanged.
 /// Returns the number of newly acknowledged cleanup records.
-#[cfg(any(feature = "offline-migration", test))]
 pub async fn retry_replica_migration_cleanup<S>(
     storage: S,
     server: ServerOptions,
@@ -4056,6 +4182,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
             sync_demand_tx: Some(sender),
             server: None,
             open_report: Arc::new(OpenReport {
+                migrations: Vec::new(),
                 format: crate::init::CURRENT_FORMAT_VERSION,
                 initialized: false,
                 migration: None,

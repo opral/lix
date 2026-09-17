@@ -35,7 +35,7 @@ test("metadata admission uses bounded GET and explicit credentials without SQL o
   expect(await requestAdmission(url, headers, transport)).toEqual(identity);
   const request = transport.mock.calls[0]![0] as any;
   expect(request.url).toBe(`https://example.test/lix/v1/${repositoryId}/admission`);
-  expect(request.response).toEqual({mode: "buffered", maxBytes: 16384});
+  expect(request.response.mode).toBe("streaming");
   expect(new Headers(request.init.headers).get("authorization")).toBe("Bearer exact-token");
   expect(new Headers(request.init.headers).get("lix-sync-protocol-version")).toBe("19");
   expect(request.init.credentials).toBe("omit");
@@ -87,18 +87,16 @@ test("another port's rejection removes a delayed durable write and invalidates t
 });
 
 
-test("admission waits through server-owned migration and returns the upgraded identity", async () => {
-  vi.useFakeTimers();
-  try {
-    const transport = vi.fn()
-      .mockResolvedValueOnce(Response.json({error: {code: "LIX_REPOSITORY_MIGRATING"}}, {status: 503}))
-      .mockResolvedValueOnce(Response.json({error: {code: "LIX_REPOSITORY_MIGRATING"}}, {status: 503}))
-      .mockResolvedValueOnce(Response.json(identity));
-    const pending = requestAdmission(url, headers, transport);
-    await vi.advanceTimersByTimeAsync(2_000);
-    expect(await pending).toEqual(identity);
-    expect(transport).toHaveBeenCalledTimes(3);
-  } finally { vi.useRealTimers(); }
+test("admission waits in Rust and retains authority progress and report", async () => {
+  const transport = vi.fn()
+    .mockResolvedValueOnce(Response.json({error: {code: "LIX_REPOSITORY_MIGRATING", details: { fromVersion: 80 }}}, {status: 503, headers: { "retry-after": "0" }}))
+    .mockResolvedValueOnce(Response.json(identity));
+  const progress = vi.fn();
+  const report = vi.fn();
+  expect(await requestAdmission(url, headers, transport, { onProgress: progress, onReport: report })).toEqual(identity);
+  expect(transport).toHaveBeenCalledTimes(2);
+  expect(progress.mock.calls.some(([event]) => event.phase === "migrating" && event.scope === "authority")).toBe(true);
+  expect(report.mock.calls[0]?.[0].migrations).toEqual([{ scope: "authority", fromFormat: 80, toFormat: 81 }]);
 });
 
 test("admission does not retry unrelated service failures", async () => {

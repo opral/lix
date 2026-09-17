@@ -16,8 +16,8 @@ use lix::{
     BROWSER_TRANSPORT_CONFIG_HEADER, ExecuteBatchStatement as RsExecuteBatchStatement,
     ExecuteResult as RsExecuteResult, Lix as RsLix, LixError, LixTransaction as RsLixTransaction,
     Memory, MergeBranchOutcome, ObserveEvents as RsObserveEvents, OpenPhase, OpenProgress,
-    OpenProgressSink, OpenReport, ServerOptions, Value, open_lix, register_browser_sync_transport,
-    unregister_browser_sync_transport,
+    OpenProgressSink, OpenReport, OpenScope, ServerOptions, Value, open_lix,
+    register_browser_sync_transport, unregister_browser_sync_transport,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_bytes::ByteBuf;
@@ -715,6 +715,7 @@ impl WasmLix {
 #[serde(rename_all = "camelCase")]
 struct OpenProgressDto {
     phase: &'static str,
+    scope: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     from_format: Option<u32>,
     to_format: u32,
@@ -732,6 +733,7 @@ impl From<OpenProgress> for OpenProgressDto {
     fn from(progress: OpenProgress) -> Self {
         Self {
             phase: open_phase_name(progress.phase),
+            scope: open_scope_name(progress.scope),
             from_format: progress.from_format,
             to_format: progress.to_format,
             completed: progress.completed.map(|value| value as f64),
@@ -749,11 +751,20 @@ struct OpenMigrationReportDto {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ScopedOpenMigrationDto {
+    scope: &'static str,
+    from_format: u32,
+    to_format: u32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct OpenReportDto {
     format: u32,
     initialized: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     migration: Option<OpenMigrationReportDto>,
+    migrations: Vec<ScopedOpenMigrationDto>,
 }
 
 impl From<&OpenReport> for OpenReportDto {
@@ -761,11 +772,27 @@ impl From<&OpenReport> for OpenReportDto {
         Self {
             format: report.format,
             initialized: report.initialized,
+            migrations: report
+                .migrations
+                .iter()
+                .map(|migration| ScopedOpenMigrationDto {
+                    scope: open_scope_name(migration.scope),
+                    from_format: migration.from_format,
+                    to_format: migration.to_format,
+                })
+                .collect(),
             migration: report.migration.map(|migration| OpenMigrationReportDto {
                 from_format: migration.from_format,
                 to_format: migration.to_format,
             }),
         }
+    }
+}
+
+fn open_scope_name(scope: OpenScope) -> &'static str {
+    match scope {
+        OpenScope::Local => "local",
+        OpenScope::Authority => "authority",
     }
 }
 

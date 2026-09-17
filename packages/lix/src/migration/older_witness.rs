@@ -23,7 +23,14 @@ async fn capture<S: Storage + Clone + Send + Sync + 'static>(
     options: MigrationOptions,
 ) -> Result<Records, LixError> {
     let adapter = super::epoch::inspect_existing_epoch_adapter(storage).await?;
-    let read = super::MigrationPlanningRead::new(&adapter).await?;
+    capture_adapter(&adapter, options).await
+}
+
+async fn capture_adapter<S: Storage + Clone + Send + Sync + 'static>(
+    adapter: &StorageAdapter<S>,
+    options: MigrationOptions,
+) -> Result<Records, LixError> {
+    let read = super::MigrationPlanningRead::new(adapter).await?;
     let mut records = Records::new();
     let mut bytes = 0usize;
     for space in crate::storage_spaces::SNAPSHOT_STORAGE_SPACES {
@@ -80,36 +87,131 @@ async fn copy(records: &Records) -> Result<Memory, LixError> {
     Ok(memory)
 }
 
-pub(super) async fn plan<S: Storage + Clone + Send + Sync + 'static>(
-    storage: &S,
+#[inline(never)]
+pub(super) fn plan<'a, S: Storage + Clone + Send + Sync + 'static>(
+    storage: &'a S,
     options: MigrationOptions,
     authority: bool,
-) -> Result<Witness, LixError> {
-    let source = capture(storage, options).await?;
-    let memory = StorageSession::acquire(copy(&source).await?).await?;
-    let adapter = StorageAdapter::new(memory.clone());
-    super::api::migrate_lix_with_adapter(memory.clone(), adapter, options).await?;
-    if authority {
-        super::authority_baseline_fence::upgrade_authority_native_baseline_fence(&memory).await?;
-    }
-    let expected = capture(&memory, options).await?;
-    independent_invariants(&source, &expected)?;
-    descriptors(&source, &expected, options).await?;
-    let expected_digest = super::public_api::content_digest(&memory).await?;
-    Ok(Witness {
-        source,
-        expected,
-        expected_digest,
+) -> std::pin::Pin<Box<impl Future<Output = Result<Witness, LixError>> + 'a>> {
+    Box::pin(async move {
+        let source = capture(storage, options).await?;
+        let memory = StorageSession::acquire(copy(&source).await?).await?;
+        let adapter = StorageAdapter::new(memory.clone());
+        super::api::migrate_lix_with_adapter(memory.clone(), adapter, options).await?;
+        if authority {
+            super::authority_baseline_fence::upgrade_authority_native_baseline_fence(&memory)
+                .await?;
+        }
+        let expected = capture(&memory, options).await?;
+        independent_invariants(&source, &expected)?;
+        descriptors(&source, &expected, options).await?;
+        let expected_digest = super::public_api::content_digest(&memory).await?;
+        Ok(Witness {
+            source,
+            expected,
+            expected_digest,
+        })
     })
 }
 
+/// Validate the unpublished epoch against an independently qualified source.
+/// Legacy source markers are fenced during migration, so restore the recognized
+/// original marker only in the detached planning copy.
+pub(super) async fn verify_candidate<S: Storage + Clone + Send + Sync + 'static>(
+    source: &StorageAdapter<S>,
+    target: &StorageAdapter<S>,
+    from_format: u32,
+    options: MigrationOptions,
+) -> Result<(), LixError> {
+    let mut source_records = capture_adapter(source, options).await?;
+    source_records.insert(
+        (
+            crate::init::REPOSITORY_PROTOCOL_SPACE.id.0,
+            Bytes::from_static(crate::init::REPOSITORY_PROTOCOL_KEY),
+        ),
+        Bytes::from(format!("tracked-default-branch.v{from_format}")),
+    );
+    let authority = source_records.contains_key(&(
+        crate::sync::SYNC_AUTHORITY_STATE_SPACE.id.0,
+        crate::sync::authority_state_key().0,
+    ));
+    let detached = copy(&source_records).await?;
+    let witness = plan(&detached, options, authority).await?;
+    let actual = capture_adapter(target, options).await?;
+    witness.verify_records(actual, options).await
+}
+
+#[inline(never)]
+pub(super) fn plan_adapter<'a, S: Storage + Clone + Send + Sync + 'static>(
+    adapter: &'a StorageAdapter<S>,
+    options: MigrationOptions,
+) -> std::pin::Pin<Box<impl Future<Output = Result<Witness, LixError>> + 'a>> {
+    Box::pin(async move {
+        let detached = copy(&capture_adapter(adapter, options).await?).await?;
+        plan(&detached, options, false).await
+    })
+}
+
+pub(super) async fn verify_v72_source_history<S: Storage + Clone + Send + Sync + 'static>(
+    source: &StorageAdapter<S>,
+    target: &StorageAdapter<S>,
+    options: MigrationOptions,
+) -> Result<(), LixError> {
+    let mut source = capture_adapter(source, options).await?;
+    source.insert(
+        (
+            crate::init::REPOSITORY_PROTOCOL_SPACE.id.0,
+            Bytes::from_static(crate::init::REPOSITORY_PROTOCOL_KEY),
+        ),
+        Bytes::from_static(b"tracked-default-branch.v72"),
+    );
+    let target = capture_adapter(target, options).await?;
+    // The amendment may append commits, but never discard the original payload
+    // chunks, file bytes, or source history. Descriptor comparison below also
+    // verifies every original commit and manifest through codec conversion.
+    for ((space, key), value) in &source {
+        if [
+            crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE.id.0,
+            crate::binary_cas::BINARY_CAS_MANIFEST_SPACE.id.0,
+            crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE.id.0,
+            crate::binary_cas::BINARY_CAS_CHUNK_SPACE.id.0,
+        ]
+        .contains(space)
+            && target.get(&(*space, key.clone())) != Some(value)
+        {
+            return Err(failure("v72 amendment dropped original historical payload"));
+        }
+    }
+    descriptors(&source, &target, options).await
+}
+
 impl Witness {
+    #[inline(never)]
+    pub(super) fn verify_adapter<'a, S: Storage + Clone + Send + Sync + 'static>(
+        &'a self,
+        adapter: &'a StorageAdapter<S>,
+        options: MigrationOptions,
+    ) -> std::pin::Pin<Box<impl Future<Output = Result<(), LixError>> + 'a>> {
+        Box::pin(async move {
+            self.verify_records(capture_adapter(adapter, options).await?, options)
+                .await
+        })
+    }
+
     pub(super) async fn verify<S: Storage + Clone + Send + Sync + 'static>(
         &self,
         storage: &S,
         options: MigrationOptions,
     ) -> Result<(), LixError> {
         let actual = capture(storage, options).await?;
+        self.verify_records(actual, options).await
+    }
+
+    async fn verify_records(
+        &self,
+        actual: Records,
+        options: MigrationOptions,
+    ) -> Result<(), LixError> {
         independent_invariants(&self.source, &actual)?;
         descriptors(&self.source, &actual, options).await?;
         // Only the exact protocol marker and physical mutation counter are
@@ -249,282 +351,388 @@ fn commit(raw: &[u8]) -> Result<(crate::changelog::CommitRecord, bool), LixError
     ))
 }
 
-async fn descriptors(
-    source: &Records,
-    target: &Records,
+// Keep the source planner's large owned future off the descriptor witness's
+// poll frame. This is also used by native opening on ordinary thread stacks.
+#[inline(never)]
+fn source_closure_plan(
+    adapter: StorageAdapter<Memory>,
+    memory: Memory,
     options: MigrationOptions,
-) -> Result<(), LixError> {
-    use crate::tracked_state::{
-        TrackedStateContext, TrackedStateFilter, TrackedStateReadColumns, TrackedStateScanRequest,
-    };
-    let protocol = source
-        .get(&(
-            crate::init::REPOSITORY_PROTOCOL_SPACE.id.0,
-            Bytes::from_static(crate::init::REPOSITORY_PROTOCOL_KEY),
-        ))
-        .ok_or_else(|| failure("source repository protocol absent"))?;
-    let native_checkpoints = match crate::init::parse_repository_protocol(protocol) {
-        crate::init::RepositoryProtocolStatus::MigrationRequired { found_version: 78 } => true,
-        crate::init::RepositoryProtocolStatus::MigrationRequired {
-            found_version: 74 | 77,
-        } => false,
-        _ => {
-            return Err(failure(
-                "source witness requires repository format 74, 77, or 78",
-            ));
-        }
-    };
-    let mut normalized = source.clone();
-    let source_memory = copy(source).await?;
-    let source_adapter = StorageAdapter::new(source_memory);
-    let read = super::MigrationPlanningRead::new(&source_adapter).await?;
-    let control = crate::branch::BranchHeadControlContext::new()
-        .reader(read.clone())
-        .load(crate::GLOBAL_BRANCH_ID)
-        .await?
-        .ok_or_else(|| failure("source global branch absent"))?;
-    let mut commits = BTreeMap::new();
-    for ((space, key), raw) in source {
-        if *space == crate::changelog::COMMIT_SPACE.id.0 {
-            let (record, legacy) = commit(raw)?;
-            if key.as_ref() != record.commit_id.as_uuid().as_bytes() {
-                return Err(failure("source commit key differs from identity"));
-            }
-            commits.insert(record.commit_id, (record, legacy));
-        }
-    }
-    let mut global = std::collections::BTreeSet::new();
-    // Only v5 lacks native base authority. v6/v7 must retain their explicit
-    // bases, and a previously collected older ancestor need not be rehydrated.
-    let mut next = commits
-        .values()
-        .any(|(_, legacy)| *legacy)
-        .then_some(control.head_commit_id);
-    while let Some(id) = next {
-        if !global.insert(id) {
-            return Err(failure("source first-parent cycle"));
-        }
-        next = commits
-            .get(&id)
-            .ok_or_else(|| failure("source global ancestry missing"))?
-            .0
-            .parent_commit_ids
-            .first()
-            .copied();
-    }
-    let mut chronology = global
-        .iter()
-        .map(|id| {
-            let r = &commits[id].0;
-            (r.created_at, r.generation, *id)
-        })
-        .collect::<Vec<_>>();
-    chronology.sort();
-    for (record, legacy) in commits.values_mut() {
-        if *legacy && !global.contains(&record.commit_id) {
-            record.base_commit_id = Some(
-                chronology
-                    .iter()
-                    .rev()
-                    .find(|(time, _, _)| *time <= record.created_at)
-                    .ok_or_else(|| failure("source global base cannot be proven"))?
-                    .2,
-            );
-        }
-        normalized.insert(
-            (
-                crate::changelog::COMMIT_SPACE.id.0,
-                Bytes::copy_from_slice(record.commit_id.as_uuid().as_bytes()),
-            ),
-            Bytes::from(crate::storage_codec::encode(
-                "witness canonical commit",
-                record,
-            )?),
-        );
-    }
-    read.finish()?;
-    // Decode-only projection: source records/payloads are retained unchanged;
-    // only commit arity/base semantics are normalized to permit typed reads.
-    let normalized_memory = copy(&normalized).await?;
-    let normalized_adapter = StorageAdapter::new(normalized_memory);
-    let source_read = super::MigrationPlanningRead::new(&normalized_adapter).await?;
-    let mut checkpoint_ids = std::collections::BTreeSet::new();
-    if native_checkpoints {
-        // v78 retired lix_checkpoint markers. Its canonical commit flags are
-        // the source authority, independently corroborated by its inventory.
-        checkpoint_ids.extend(
-            commits
-                .values()
-                .filter_map(|(record, _)| record.is_checkpoint.then_some(record.commit_id)),
-        );
-    } else {
-        let mut reader = TrackedStateContext::new().reader(source_read.clone());
-        let checkpoints = reader
-            .scan_batch_at_commit(
-                &control.head_commit_id.to_string(),
-                &TrackedStateScanRequest {
-                    filter: TrackedStateFilter {
-                        schema_keys: vec!["lix_checkpoint".to_owned()],
-                        ..Default::default()
-                    },
-                    read_columns: TrackedStateReadColumns {
-                        columns: vec!["row_pk".to_owned()],
-                    },
-                    limit: Some(options.max_changes.saturating_add(1)),
+    bootstrap_indexes: bool,
+) -> std::pin::Pin<
+    Box<impl Future<Output = Result<Vec<crate::tracked_state::CommitStateManifest>, LixError>>>,
+> {
+    Box::pin(async move {
+        let mut write = adapter.begin_migration_write(Default::default()).await?;
+        write
+            .put_many(
+                crate::init::REPOSITORY_PROTOCOL_SPACE,
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: StorageKey(Bytes::from_static(crate::init::REPOSITORY_PROTOCOL_KEY)),
+                        value: StorageValue {
+                            bytes: Bytes::from_static(if bootstrap_indexes {
+                                b"tracked-default-branch.v73"
+                            } else {
+                                b"tracked-default-branch.v74"
+                            }),
+                        },
+                    }],
                 },
             )
-            .await?
-            .into_rows();
-        if checkpoints.len() > options.max_changes {
-            return Err(failure("checkpoint witness exceeded bounds"));
+            .await?;
+        write.commit().await?;
+        if bootstrap_indexes {
+            Box::pin(super::api::migrate_v73_row_pk_indexes(
+                &adapter, &memory, options,
+            ))
+            .await?;
         }
-        for marker in checkpoints {
-            if marker.deleted {
-                continue;
+        let (_, repaired) = Box::pin(super::api::repair_filesystem_closure(
+            &adapter,
+            &memory,
+            options,
+            b"tracked-default-branch.v74",
+        ))
+        .await?;
+        Ok(repaired)
+    })
+}
+
+#[inline(never)]
+fn descriptors<'a>(
+    source: &'a Records,
+    target: &'a Records,
+    options: MigrationOptions,
+) -> std::pin::Pin<Box<impl Future<Output = Result<(), LixError>> + 'a>> {
+    Box::pin(async move {
+        use crate::tracked_state::{
+            TrackedStateContext, TrackedStateFilter, TrackedStateReadColumns,
+            TrackedStateScanRequest,
+        };
+        let protocol = source
+            .get(&(
+                crate::init::REPOSITORY_PROTOCOL_SPACE.id.0,
+                Bytes::from_static(crate::init::REPOSITORY_PROTOCOL_KEY),
+            ))
+            .ok_or_else(|| failure("source repository protocol absent"))?;
+        let logical_amendment = matches!(
+            crate::init::parse_repository_protocol(protocol),
+            crate::init::RepositoryProtocolStatus::MigrationRequired { found_version: 72 }
+        );
+        let native_checkpoints = match crate::init::parse_repository_protocol(protocol) {
+            crate::init::RepositoryProtocolStatus::MigrationRequired { found_version: 78 } => true,
+            crate::init::RepositoryProtocolStatus::MigrationRequired {
+                found_version: 72 | 73 | 74 | 75 | 76 | 77,
+            } => false,
+            _ => {
+                return Err(failure(
+                    "source witness requires repository format 73 through 78",
+                ));
             }
-            let parts = marker.row_pk.into_parts();
-            let [id] = parts.as_slice() else {
-                return Err(failure("source checkpoint identity invalid"));
-            };
-            checkpoint_ids.insert(
-                id.parse::<crate::changelog::CommitId>()
-                    .map_err(|_| failure("source checkpoint UUID invalid"))?,
+        };
+        let mut normalized = source.clone();
+        let source_memory = copy(source).await?;
+        let source_adapter = StorageAdapter::new(source_memory);
+        let read = super::MigrationPlanningRead::new(&source_adapter).await?;
+        let control = crate::branch::BranchHeadControlContext::new()
+            .reader(read.clone())
+            .load(crate::GLOBAL_BRANCH_ID)
+            .await?
+            .ok_or_else(|| failure("source global branch absent"))?;
+        let mut commits = BTreeMap::new();
+        for ((space, key), raw) in source {
+            if *space == crate::changelog::COMMIT_SPACE.id.0 {
+                let (record, legacy) = commit(raw)?;
+                if key.as_ref() != record.commit_id.as_uuid().as_bytes() {
+                    return Err(failure("source commit key differs from identity"));
+                }
+                commits.insert(record.commit_id, (record, legacy));
+            }
+        }
+        let mut global = std::collections::BTreeSet::new();
+        // Only v5 lacks native base authority. v6/v7 must retain their explicit
+        // bases, and a previously collected older ancestor need not be rehydrated.
+        let mut next = commits
+            .values()
+            .any(|(_, legacy)| *legacy)
+            .then_some(control.head_commit_id);
+        while let Some(id) = next {
+            if !global.insert(id) {
+                return Err(failure("source first-parent cycle"));
+            }
+            next = commits
+                .get(&id)
+                .ok_or_else(|| failure("source global ancestry missing"))?
+                .0
+                .parent_commit_ids
+                .first()
+                .copied();
+        }
+        let mut chronology = global
+            .iter()
+            .map(|id| {
+                let r = &commits[id].0;
+                (r.created_at, r.generation, *id)
+            })
+            .collect::<Vec<_>>();
+        chronology.sort();
+        for (record, legacy) in commits.values_mut() {
+            if *legacy && !global.contains(&record.commit_id) {
+                record.base_commit_id = Some(
+                    chronology
+                        .iter()
+                        .rev()
+                        .find(|(time, _, _)| *time <= record.created_at)
+                        .ok_or_else(|| failure("source global base cannot be proven"))?
+                        .2,
+                );
+            }
+            normalized.insert(
+                (
+                    crate::changelog::COMMIT_SPACE.id.0,
+                    Bytes::copy_from_slice(record.commit_id.as_uuid().as_bytes()),
+                ),
+                Bytes::from(crate::storage_codec::encode(
+                    "witness canonical commit",
+                    record,
+                )?),
             );
         }
-        drop(reader);
-    }
-    let expected_inventory = checkpoint_ids
-        .iter()
-        .map(|id| {
-            (
-                Bytes::copy_from_slice(id.as_uuid().as_bytes()),
-                Bytes::new(),
+        read.finish()?;
+        // Decode-only projection: source records/payloads are retained unchanged;
+        // only commit arity/base semantics are normalized to permit typed reads.
+        let normalized_memory = copy(&normalized).await?;
+        let normalized_adapter = StorageAdapter::new(normalized_memory.clone());
+        let repairable_closure = matches!(
+            crate::init::parse_repository_protocol(protocol),
+            crate::init::RepositoryProtocolStatus::MigrationRequired {
+                found_version: 72..=74
+            }
+        );
+        let repaired_manifests = if repairable_closure {
+            // Recompute the authorized closure from source history alone. Index
+            // bootstrap must precede closure planning just as it does in the
+            // registered chain. This detached copy never changes source storage.
+            let repaired = source_closure_plan(
+                normalized_adapter.clone(),
+                normalized_memory.clone(),
+                options,
+                matches!(
+                    crate::init::parse_repository_protocol(protocol),
+                    crate::init::RepositoryProtocolStatus::MigrationRequired {
+                        found_version: 72 | 73
+                    }
+                ),
             )
-        })
-        .collect::<BTreeMap<_, _>>();
-    if native_checkpoints {
-        let source_inventory = source
+            .await?;
+            // Verify every generated content-addressed chunk, not merely each root
+            // pointer, so absent/corrupt historical subtrees cannot pass the proof.
+            for (key, value) in capture_adapter(&normalized_adapter, options).await? {
+                if key.0 == crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE.id.0
+                    && target.get(&key) != Some(&value)
+                {
+                    return Err(failure(
+                        "candidate closure chunk differs from the source-derived repair",
+                    ));
+                }
+            }
+            repaired
+                .into_iter()
+                .map(|manifest| (manifest.commit_id, manifest))
+                .collect::<BTreeMap<_, _>>()
+        } else {
+            BTreeMap::new()
+        };
+        let source_read = super::MigrationPlanningRead::new(&normalized_adapter).await?;
+        let mut checkpoint_ids = std::collections::BTreeSet::new();
+        if native_checkpoints {
+            // v78 retired lix_checkpoint markers. Its canonical commit flags are
+            // the source authority, independently corroborated by its inventory.
+            checkpoint_ids.extend(
+                commits
+                    .values()
+                    .filter_map(|(record, _)| record.is_checkpoint.then_some(record.commit_id)),
+            );
+        } else {
+            let mut reader = TrackedStateContext::new().reader(source_read.clone());
+            let checkpoints = reader
+                .scan_batch_at_commit(
+                    &control.head_commit_id.to_string(),
+                    &TrackedStateScanRequest {
+                        filter: TrackedStateFilter {
+                            schema_keys: vec!["lix_checkpoint".to_owned()],
+                            ..Default::default()
+                        },
+                        read_columns: TrackedStateReadColumns {
+                            columns: vec!["row_pk".to_owned()],
+                        },
+                        limit: Some(options.max_changes.saturating_add(1)),
+                    },
+                )
+                .await?
+                .into_rows();
+            if checkpoints.len() > options.max_changes {
+                return Err(failure("checkpoint witness exceeded bounds"));
+            }
+            for marker in checkpoints {
+                if marker.deleted {
+                    continue;
+                }
+                let parts = marker.row_pk.into_parts();
+                let [id] = parts.as_slice() else {
+                    return Err(failure("source checkpoint identity invalid"));
+                };
+                checkpoint_ids.insert(
+                    id.parse::<crate::changelog::CommitId>()
+                        .map_err(|_| failure("source checkpoint UUID invalid"))?,
+                );
+            }
+            drop(reader);
+        }
+        let expected_inventory = checkpoint_ids
+            .iter()
+            .map(|id| {
+                (
+                    Bytes::copy_from_slice(id.as_uuid().as_bytes()),
+                    Bytes::new(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if native_checkpoints {
+            let source_inventory = source
+                .iter()
+                .filter(|((space, _), _)| {
+                    *space == crate::checkpoint::CHECKPOINT_INVENTORY_SPACE.id.0
+                })
+                .map(|((_, key), value)| (key.clone(), value.clone()))
+                .collect::<BTreeMap<_, _>>();
+            if source_inventory != expected_inventory {
+                return Err(failure(
+                    "source checkpoint inventory differs from native commit flags",
+                ));
+            }
+        }
+        let actual_inventory = target
             .iter()
             .filter(|((space, _), _)| *space == crate::checkpoint::CHECKPOINT_INVENTORY_SPACE.id.0)
             .map(|((_, key), value)| (key.clone(), value.clone()))
             .collect::<BTreeMap<_, _>>();
-        if source_inventory != expected_inventory {
+        if actual_inventory != expected_inventory {
             return Err(failure(
-                "source checkpoint inventory differs from native commit flags",
+                "candidate checkpoint inventory differs from source checkpoint identities",
             ));
         }
-    }
-    let actual_inventory = target
-        .iter()
-        .filter(|((space, _), _)| *space == crate::checkpoint::CHECKPOINT_INVENTORY_SPACE.id.0)
-        .map(|((_, key), value)| (key.clone(), value.clone()))
-        .collect::<BTreeMap<_, _>>();
-    if actual_inventory != expected_inventory {
-        return Err(failure(
-            "candidate checkpoint inventory differs from source checkpoint identities",
-        ));
-    }
-    for (id, (mut expected, _)) in commits.clone() {
-        expected.is_checkpoint = checkpoint_ids.contains(&id);
-        let key = (
-            crate::changelog::COMMIT_SPACE.id.0,
-            Bytes::copy_from_slice(id.as_uuid().as_bytes()),
-        );
-        let raw = target
-            .get(&key)
-            .ok_or_else(|| failure("candidate dropped source commit"))?;
-        let (actual, legacy) = commit(raw)?;
-        if legacy || actual != expected {
-            return Err(failure(format!(
-                "candidate changed source commit descriptor {id}"
-            )));
-        }
-    }
-    if target
-        .keys()
-        .filter(|(s, _)| *s == crate::changelog::COMMIT_SPACE.id.0)
-        .count()
-        != commits.len()
-    {
-        return Err(failure("candidate invented a commit"));
-    }
-    let target_memory = copy(target).await?;
-    let target_adapter = StorageAdapter::new(target_memory);
-    let target_read = super::MigrationPlanningRead::new(&target_adapter).await?;
-    crate::hot_state::verify_migrated_deterministic_witness(
-        &source_read,
-        &target_read,
-        control.tracked_generation,
-        options.max_changes,
-        options.max_preflight_bytes,
-    )
-    .await?;
-    let source_ids =
-        crate::tracked_state::scan_commit_state_manifest_commit_ids(&source_read).await?;
-    let target_ids =
-        crate::tracked_state::scan_commit_state_manifest_commit_ids(&target_read).await?;
-    if source_ids != target_ids {
-        return Err(failure("candidate changed manifest identities"));
-    }
-    let mut indexed_rows = 0usize;
-    let mut indexed_bytes = 0u64;
-    for id in source_ids {
-        let mut old = crate::tracked_state::load_commit_state_manifest(&source_read, id)
-            .await?
-            .ok_or_else(|| failure("source manifest absent"))?;
-        let new = crate::tracked_state::load_commit_state_manifest(&target_read, id)
-            .await?
-            .ok_or_else(|| failure("target manifest absent"))?;
-        // Only the authenticated native incorporation fact and rebuilt lookup
-        // catalog may change. In particular mutation membership, snapshot roots,
-        // scope, account and payload references remain source-authoritative.
-        let topology = crate::tracked_state::load_published_commit_state_topology(&source_read, id)
-            .await?
-            .ok_or_else(|| failure("source topology absent"))?;
-        old.incorporation = topology.incorporation();
-        let mut writes = normalized_adapter.new_write_set();
-        let (root, rows) = crate::tracked_state::backfill_row_pk_index_for_commit(
-            &source_read,
-            &mut writes,
-            &old,
-            options.max_changes.saturating_sub(indexed_rows),
-        )
-        .await?;
-        indexed_rows = indexed_rows.saturating_add(rows);
-        indexed_bytes = indexed_bytes.saturating_add(writes.stats().written_bytes);
-        if indexed_rows > options.max_changes || indexed_bytes > options.max_preflight_bytes as u64
-        {
-            return Err(failure(
-                "source index qualification exceeds aggregate bounds",
-            ));
-        }
-        // Verify every byte emitted for the independently rebuilt index,
-        // not just its root pointer. This also detects corrupt or missing
-        // content-addressed child chunks in the candidate.
-        let chunks = Memory::default();
-        let chunk_adapter = StorageAdapter::new(chunks.clone());
-        let mut chunk_write = chunk_adapter
-            .begin_migration_write(Default::default())
-            .await?;
-        writes.lower_into(&mut chunk_write).await?;
-        chunk_write.commit().await?;
-        for (key, value) in capture(&chunks, options).await? {
-            if target.get(&key) != Some(&value) {
-                return Err(failure(
-                    "candidate row-PK index chunk differs from source-derived content",
-                ));
+        for (id, (mut expected, _)) in commits.clone() {
+            expected.is_checkpoint = checkpoint_ids.contains(&id);
+            let key = (
+                crate::changelog::COMMIT_SPACE.id.0,
+                Bytes::copy_from_slice(id.as_uuid().as_bytes()),
+            );
+            let raw = target
+                .get(&key)
+                .ok_or_else(|| failure("candidate dropped source commit"))?;
+            let (actual, legacy) = commit(raw)?;
+            if legacy || actual != expected {
+                return Err(failure(format!(
+                    "candidate changed source commit descriptor {id}"
+                )));
             }
         }
-        old.row_pk_index_root_id = root;
-        if old != new {
-            return Err(failure(format!(
-                "candidate changed source manifest semantics {id}; a separately certified closure repair is required"
-            )));
+        if !logical_amendment
+            && target
+                .keys()
+                .filter(|(s, _)| *s == crate::changelog::COMMIT_SPACE.id.0)
+                .count()
+                != commits.len()
+        {
+            return Err(failure("candidate invented a commit"));
         }
-    }
-    source_read.finish()?;
-    target_read.finish()?;
-    Ok(())
+        let target_memory = copy(target).await?;
+        let target_adapter = StorageAdapter::new(target_memory);
+        let target_read = super::MigrationPlanningRead::new(&target_adapter).await?;
+        crate::hot_state::verify_migrated_deterministic_witness(
+            &source_read,
+            &target_read,
+            control.tracked_generation,
+            options.max_changes,
+            options.max_preflight_bytes,
+        )
+        .await?;
+        let source_ids =
+            crate::tracked_state::scan_commit_state_manifest_commit_ids(&source_read).await?;
+        let target_ids =
+            crate::tracked_state::scan_commit_state_manifest_commit_ids(&target_read).await?;
+        if (!logical_amendment && source_ids != target_ids)
+            || source_ids.iter().any(|id| !target_ids.contains(id))
+        {
+            return Err(failure("candidate changed manifest identities"));
+        }
+        let mut indexed_rows = 0usize;
+        let mut indexed_bytes = 0u64;
+        for id in source_ids {
+            let mut old = match repaired_manifests.get(&id) {
+                Some(repaired) => repaired.clone(),
+                None => crate::tracked_state::load_commit_state_manifest(&source_read, id)
+                    .await?
+                    .ok_or_else(|| failure("source manifest absent"))?,
+            };
+            let new = crate::tracked_state::load_commit_state_manifest(&target_read, id)
+                .await?
+                .ok_or_else(|| failure("target manifest absent"))?;
+            // Only source-qualified filesystem closure, native incorporation and
+            // rebuilt lookup catalogs may change. Mutation membership, scope,
+            // account and payload references remain source-authoritative.
+            let topology =
+                crate::tracked_state::load_published_commit_state_topology(&source_read, id)
+                    .await?
+                    .ok_or_else(|| failure("source topology absent"))?;
+            old.incorporation = topology.incorporation();
+            let mut writes = normalized_adapter.new_write_set();
+            let (root, rows) = crate::tracked_state::backfill_row_pk_index_for_commit(
+                &source_read,
+                &mut writes,
+                &old,
+                options.max_changes.saturating_sub(indexed_rows),
+            )
+            .await?;
+            indexed_rows = indexed_rows.saturating_add(rows);
+            indexed_bytes = indexed_bytes.saturating_add(writes.stats().written_bytes);
+            if indexed_rows > options.max_changes
+                || indexed_bytes > options.max_preflight_bytes as u64
+            {
+                return Err(failure(
+                    "source index qualification exceeds aggregate bounds",
+                ));
+            }
+            // Verify every byte emitted for the independently rebuilt index,
+            // not just its root pointer. This also detects corrupt or missing
+            // content-addressed child chunks in the candidate.
+            let chunks = Memory::default();
+            let chunk_adapter = StorageAdapter::new(chunks.clone());
+            let mut chunk_write = chunk_adapter
+                .begin_migration_write(Default::default())
+                .await?;
+            writes.lower_into(&mut chunk_write).await?;
+            chunk_write.commit().await?;
+            for (key, value) in capture(&chunks, options).await? {
+                if target.get(&key) != Some(&value) {
+                    return Err(failure(
+                        "candidate row-PK index chunk differs from source-derived content",
+                    ));
+                }
+            }
+            old.row_pk_index_root_id = root;
+            if old != new {
+                return Err(failure(format!(
+                    "candidate changed source manifest semantics beyond the authorized repair {id}"
+                )));
+            }
+        }
+        source_read.finish()?;
+        target_read.finish()?;
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -743,6 +951,106 @@ mod tests {
             report.after.role,
             super::super::public_api::RepositoryRole::Authority
         );
+    }
+
+    #[cfg(feature = "server-protocol")]
+    #[tokio::test]
+    async fn ordinary_serve_upgrades_legacy_authority_capability() {
+        for current_format in [false, true] {
+            let source = v77_source().await;
+            let source = if current_format {
+                let witness = plan(&source, MigrationOptions::default(), true)
+                    .await
+                    .unwrap();
+                let mut records = witness.expected;
+                records.insert(
+                    (
+                        crate::sync::SYNC_AUTHORITY_STATE_SPACE.id.0,
+                        crate::sync::authority_state_key().0,
+                    ),
+                    Bytes::from_static(b"certified-authority-v4"),
+                );
+                copy(&records).await.unwrap()
+            } else {
+                source
+            };
+            let server = crate::open_lix()
+                .with_storage(source.clone())
+                .serve()
+                .with_embedded_lix_id()
+                .await
+                .unwrap();
+            server.close().await.unwrap();
+            let storage = StorageSession::acquire(source).await.unwrap();
+            let records = capture(&storage, MigrationOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                records.get(&(
+                    crate::sync::SYNC_AUTHORITY_STATE_SPACE.id.0,
+                    crate::sync::authority_state_key().0
+                )),
+                Some(&Bytes::from_static(crate::sync::AUTHORITY_STATE_VALUE))
+            );
+            let lix = crate::open_lix().with_storage(storage).await.unwrap();
+            lix.partial_replica_descriptor(None).await.unwrap();
+            lix.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn released_partial_checkpoints_preserve_authorized_closure_and_reject_tampering() {
+        // Same released-engine fixture as e2e/tests/fixtures, generated from
+        // 4816fdba5 after v71 authoring and v72 partial checkpoints. SHA-256:
+        // 634eefb12a96bbb656214d5f203fb2f0dbd0fc552379754e3c86eb9cb99b6f70.
+        // Keep a crate-local copy so published crate tests are self-contained.
+        let storage = StorageSession::acquire(Memory::new()).await.unwrap();
+        let storage = crate::snapshot::restore_snapshot(
+            storage,
+            futures_lite::io::Cursor::new(
+                include_bytes!("../../tests/fixtures/v72_partial_checkpoints.lixsnap").as_slice(),
+            ),
+        )
+        .await
+        .unwrap();
+        let options = MigrationOptions::default();
+        let original = capture(&storage, options).await.unwrap();
+        let lix = crate::open_lix()
+            .with_storage(storage.clone())
+            .await
+            .unwrap();
+        lix.close().await.unwrap();
+        let mut candidate = capture(&storage, options).await.unwrap();
+        descriptors(&original, &candidate, options).await.unwrap();
+        let adapter = super::super::epoch::inspect_existing_epoch_adapter(&storage)
+            .await
+            .unwrap();
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let id = crate::changelog::CommitId::parse_lix(
+            "01a03bf7-c29f-7fd2-a9c1-1b4000000000",
+            "released closure fixture",
+        )
+        .unwrap();
+        let mut manifest = crate::tracked_state::load_commit_state_manifest(&read, id)
+            .await
+            .unwrap()
+            .unwrap();
+        manifest
+            .snapshot_root
+            .as_mut()
+            .expect("repaired complete snapshot")
+            .row_count_estimate += 1;
+        for (space, key, value) in
+            crate::tracked_state::encode_commit_state_manifest_replacement_for_migration(&manifest)
+                .unwrap()
+        {
+            candidate.insert((space.id.0, Bytes::from(key)), Bytes::from(value));
+        }
+        let error = descriptors(&original, &candidate, options)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "LIX_MIGRATION_PRESERVATION_FAILED");
+        assert!(error.message.contains("beyond the authorized repair"));
     }
 
     #[tokio::test]

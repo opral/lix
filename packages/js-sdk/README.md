@@ -29,11 +29,15 @@ For compiled plugin downloads, installation, updates, and uninstalling, see
 
 ### Automatic upgrades and progress
 
-Opening a supported older hosted repository automatically upgrades it on the
-server. The SDK waits inside `openLix()`; applications do not implement migration
-or retry logic. Concurrent opens share the server's upgrade operation.
+Opening a supported older repository automatically upgrades it in Rust, including
+filesystem and OPFS storage. The SDK waits inside `openLix()`; applications do not
+implement migration or retry logic. Hosted upgrades run on the server, where
+concurrent opens share the upgrade operation. The normal native and WASM engines
+include this capability; opening never loads a separate migration artifact.
 
-Use `onProgress` to display status in either remote or partial-replica mode.
+Use `onProgress` to display status for local, remote, or synchronized opening.
+Local events emit `scope: "local"`. `lix.openReport.migrations` records the
+scoped upgrades completed during opening.
 Authority upgrades emit `scope: "authority"` and `phase: "migrating"`, followed
 by opening and completion. The source format and work totals may be unknown:
 show “Upgrading repository” with an indeterminate indicator instead of inventing
@@ -150,29 +154,25 @@ See [Collaboration and Sync](https://lix.dev/docs/collaboration-and-sync).
 
 ### Upgrading a local replica
 
-Keep the same storage name across SDK upgrades. Opening an existing full replica
-with `server.mode: "partial_replica"` requires an explicit conversion; normal opening does not download a
-replacement repository. Run conversion while the storage has no open Lix handle:
+Keep the same storage name across SDK upgrades. Opening with storage and a server
+upgrades supported local formats and reconciles a full replica into the current
+partial replica representation in Rust:
 
 ```ts
-import { convertReplicaToPartial, openLix } from "@lix-js/sdk";
-
-const storage = new OpfsStorage({ name: "acme" });
-const server = {
-  mode: "partial_replica" as const,
-  url: "https://example.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
-  headers: async () => ({ Authorization: `Bearer ${await accessToken()}` }),
-};
-await convertReplicaToPartial({ storage, server });
-const lix = await openLix({ storage, server });
+const lix = await openLix({
+  storage: new OpfsStorage({ name: "acme" }),
+  server: {
+    url: "https://example.com/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+    headers: async () => ({ Authorization: `Bearer ${await accessToken()}` }),
+  },
+  onProgress: (event) => console.log(event.scope, event.phase),
+});
 ```
 
-Conversion authenticates the repository and account, preserves the original
-storage generation, and publishes a separate partial replica only after its
-required reconciliation and validation succeed. It can require time and extra
-storage; measure it separately from ordinary opening. Unsupported pending work
-returns an error with the original source preserved. Do not clear storage to
-bypass that error.
+Opening authenticates the repository and account, retains source generations,
+and publishes the upgraded replica only after reconciliation and validation
+succeed. Unsupported pending work returns a recovery error with the source
+preserved. Do not clear storage to bypass that error.
 
 If authority cleanup is interrupted after conversion, retry it explicitly while
 storage is closed. Ordinary opening does not scan migration journals:
@@ -186,8 +186,8 @@ This returns the number of newly completed cleanup records; repeating a
 successful cleanup returns zero. It preserves the active replica and retained
 source generation.
 
-For retained pre-native sources, explicit format migration can succeed while
-partial conversion reports that recovery is required. Open the resulting local
+For retained pre-native sources, opening with a server can report that recovery
+is required. Open the retained local
 recovery repository without `server`, then inspect and restore retained work:
 
 ```ts

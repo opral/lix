@@ -679,6 +679,11 @@ jobs:
         working-directory: packages/js-sdk
         run: npm exec -- vitest run
 
+      - name: Verify installed native SDK upgrades released repositories
+        if: matrix.runtime == 'native'
+        working-directory: packages/js-sdk
+        run: npm run test:native:production
+
       - name: Build and check OPFS storage package
         if: matrix.runtime == 'browser'
         working-directory: packages/storage-opfs

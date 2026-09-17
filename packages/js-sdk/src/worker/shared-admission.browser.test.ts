@@ -54,3 +54,18 @@ test.runIf(import.meta.env.LIX_ADMISSION_REGRESSION === true)('real SharedWorker
     await expect(attach('Bearer denied')).rejects.toMatchObject({code:'LIX_ADMISSION_AUTH_REJECTED'});
   } finally {for(const client of clients) await client.terminate();}
 },30000);
+
+
+test.runIf(import.meta.env.LIX_ADMISSION_REGRESSION === true)('real SharedWorker retains Rust authority progress and report from admission', async () => {
+  const physicalScope = `lix:opfs:admission-upgrade-${crypto.randomUUID()}`;
+  const url = `${location.origin}/lix/00000000-0000-7000-8000-000000000004`;
+  const client = new LixWorkerClient(createSharedWorkerConnection(physicalScope), false);
+  const events: import('../types.js').LixOpenProgress[] = [];
+  client.beginLease(undefined, undefined, { url, headers: [['Authorization', `Bearer upgrading-${crypto.randomUUID()}`]] }, event => events.push(event));
+  try {
+    const report = await client.request<import('../types.js').LixOpenReport>({kind:'open',storage:{kind:'jsStorage',moduleUrl:new URL('../../admission-regression-binding.ts', import.meta.url).href,options:{sharedEngineKey:physicalScope}},telemetryEnabled:false,progressEnabled:true,server:{url,headers:[],dynamicHeaders:true}});
+    expect(report.migrations).toEqual([{scope:'authority',fromFormat:80,toFormat:81}]);
+    expect(events.some(event => event.scope === 'authority' && event.phase === 'migrating')).toBe(true);
+    expect(events.some(event => event.scope === 'authority' && event.phase === 'complete')).toBe(true);
+  } finally { await client.terminate(); }
+}, 30_000);

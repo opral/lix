@@ -1,6 +1,5 @@
 //! Read-only inventory and detached operator entry points. Inspection never
 //! admits an engine or repairs a repository as a side effect.
-#[cfg(feature = "offline-migration")]
 use crate::storage_adapter::StorageAdapterRead as _;
 use crate::{
     LixError,
@@ -129,7 +128,6 @@ where
     })
 }
 
-#[cfg(feature = "offline-migration")]
 #[derive(Debug, Clone, Serialize)]
 pub struct RepositoryMigrationReport {
     /// Portable embedded identity, read from repository contents. Hosted URL/catalog
@@ -148,9 +146,8 @@ pub struct RepositoryMigrationReport {
 
 /// Explicit, resumable copy-and-activate migration. Close all repository handles
 /// and hold the physical owner fence before calling. Source banks are retained.
-/// The reference server invokes this before constructing its serving runtime;
-/// the low-level current-format engine does not run historical migrations.
-#[cfg(feature = "offline-migration")]
+/// Operator tools can invoke this directly; normal repository opening already
+/// coordinates supported upgrades through the same Rust migration machinery.
 pub async fn migrate_repository<S>(storage: S) -> Result<RepositoryMigrationReport, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -159,10 +156,23 @@ where
     migrate_owned(&storage, super::MigrationOptions::default()).await
 }
 
-#[cfg(feature = "offline-migration")]
-async fn migrate_owned<S>(
+// Construct the historical orchestration future on its own frame. Keeping it
+// inline in restore/open callers leaves too little stack for schema SQL writes.
+#[inline(never)]
+fn migrate_owned<S>(
     storage: &S,
     options: super::MigrationOptions,
+) -> std::pin::Pin<Box<impl Future<Output = Result<RepositoryMigrationReport, LixError>> + '_>>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    Box::pin(migrate_owned_with_progress(storage, options, None))
+}
+
+pub(crate) async fn migrate_owned_with_progress<S>(
+    storage: &S,
+    options: super::MigrationOptions,
+    progress: Option<&std::sync::Arc<dyn crate::OpenProgressSink>>,
 ) -> Result<RepositoryMigrationReport, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -200,7 +210,7 @@ where
     } else {
         ("exact-records-v1", before_content_digest.clone())
     };
-    super::epoch::admit_repository_with_options(storage, None, None, options).await?;
+    super::epoch::admit_repository_with_options(storage, progress, None, options).await?;
     if before.role == RepositoryRole::Authority {
         super::authority_baseline_fence::upgrade_authority_native_baseline_fence(storage).await?;
     }
@@ -231,7 +241,6 @@ where
     })
 }
 
-#[cfg(feature = "offline-migration")]
 async fn validated_repository_id<S>(storage: &S, role: RepositoryRole) -> Result<String, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -269,7 +278,6 @@ where
 /// Domain-separated digest of every logical persisted record except the format
 /// marker and mutation revision, the two intended v81 migration publications.
 /// Includes pending operations, blobs, history, and all deduplication receipts.
-#[cfg(feature = "offline-migration")]
 pub(super) async fn content_digest<S>(storage: &S) -> Result<String, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -277,9 +285,19 @@ where
     content_digest_with_plan(storage, None).await
 }
 
-#[cfg(feature = "offline-migration")]
 async fn content_digest_with_plan<S>(
     storage: &S,
+    plan: Option<super::publish::PublicationPlan>,
+) -> Result<String, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let adapter = super::epoch::inspect_existing_epoch_adapter(storage).await?;
+    content_digest_with_adapter(&adapter, plan).await
+}
+
+pub(super) async fn content_digest_with_adapter<S>(
+    adapter: &crate::storage_adapter::StorageAdapter<S>,
     plan: Option<super::publish::PublicationPlan>,
 ) -> Result<String, LixError>
 where
@@ -288,8 +306,7 @@ where
     let (mut overlay, cleared) = plan
         .map(super::publish::PublicationPlan::into_preservation_overlay)
         .unwrap_or_default();
-    let adapter = super::epoch::inspect_existing_epoch_adapter(storage).await?;
-    let read = super::MigrationPlanningRead::new(&adapter).await?;
+    let read = super::MigrationPlanningRead::new(adapter).await?;
     let mut digest = blake3::Hasher::new();
     digest.update(b"lix.migration.logical-content.v1");
     for space in crate::storage_spaces::SNAPSHOT_STORAGE_SPACES {
@@ -349,7 +366,6 @@ where
     Ok(digest.finalize().to_hex().to_string())
 }
 
-#[cfg(feature = "offline-migration")]
 fn digest_record(digest: &mut blake3::Hasher, space: u32, key: &[u8], value: &[u8]) {
     digest.update(&space.to_le_bytes());
     digest.update(&(key.len() as u64).to_le_bytes());
@@ -358,14 +374,13 @@ fn digest_record(digest: &mut blake3::Hasher, space: u32, key: &[u8], value: &[u
     digest.update(value);
 }
 
-#[cfg(all(test, feature = "offline-migration"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage_adapter::{PutBatch, PutEntry, StorageValue, StorageWrite};
 
     #[tokio::test]
-    async fn current_open_rejects_v80_without_writes_then_explicit_migration_preserves_all_records()
-    {
+    async fn normal_open_upgrades_v80_preserves_all_records_and_reports_progress() {
         let storage = StorageSession::acquire(crate::Memory::new()).await.unwrap();
         let lix = crate::open_lix()
             .with_storage(storage.clone())
@@ -386,26 +401,29 @@ mod tests {
         let inspection = inspect_repository(storage.clone()).await.unwrap();
         assert_eq!(inspection.format, Some(80));
         assert!(!inspection.current);
-        let error = crate::open_lix()
-            .with_storage(storage.clone())
-            .await
-            .err()
-            .expect("legacy opening must fail");
-        assert_eq!(error.code, "LIX_ERROR_REPOSITORY_MIGRATION_REQUIRED");
-        assert_eq!(content_digest(&storage).await.unwrap(), before);
-        assert_eq!(
-            inspect_repository(storage.clone()).await.unwrap(),
-            inspection
-        );
-        let report = migrate_repository(storage.clone()).await.unwrap();
-        assert_eq!(report.embedded_repository_id, original_id);
-        assert!(report.after.current);
-        assert!(report.semantic_preservation_verified);
-        assert_eq!(report.before_content_digest, report.after_content_digest);
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = events.clone();
         let reopened = crate::open_lix()
             .with_storage(storage.clone())
-            .await
-            .unwrap();
+            .on_progress(move |event| observed.lock().unwrap().push(event))
+            .await.unwrap();
+        assert_eq!(reopened.lix_id(), original_id);
+        assert_eq!(
+            reopened.open_report().migrations,
+            vec![crate::OpenMigration {
+                scope: crate::OpenScope::Local,
+                from_format: 80,
+                to_format: crate::CURRENT_STORAGE_FORMAT_VERSION,
+            }]
+        );
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.phase == crate::OpenPhase::Migrating)
+        );
+        assert_eq!(content_digest(&storage).await.unwrap(), before);
         assert_eq!(
             reopened
                 .execute(
@@ -418,8 +436,13 @@ mod tests {
                 .len(),
             1
         );
-        assert!(reopened.open_report().migration.is_none());
         reopened.close().await.unwrap();
+        let current = crate::open_lix()
+            .with_storage(storage.clone())
+            .await
+            .unwrap();
+        assert!(current.open_report().migrations.is_empty());
+        current.close().await.unwrap();
         assert!(
             migrate_repository(storage)
                 .await
@@ -443,9 +466,28 @@ mod tests {
         let storage = StorageSession::acquire(crate::sync::durable_memory_for_test(memory))
             .await
             .unwrap();
-        super::super::epoch::install_fresh_partial_epoch(storage.clone(), &state)
+        let installed = super::super::epoch::install_fresh_partial_epoch(storage.clone(), &state)
             .await
             .unwrap();
+        let expected = content_digest(&storage).await.unwrap();
+        let mut legacy_receipt = serde_json::to_value(&state).unwrap();
+        legacy_receipt["version"] = serde_json::json!(1);
+        legacy_receipt
+            .as_object_mut()
+            .unwrap()
+            .remove("archivedBranchIds");
+        let mut writes = installed.adapter.new_write_set();
+        writes.put(
+            crate::sync::PARTIAL_REPLICA_STATE_SPACE,
+            crate::sync::partial_replica_state_key(),
+            serde_json::to_vec(&legacy_receipt).unwrap(),
+        );
+        // Seed historical metadata through the fixture's migration writer;
+        // ordinary partial writer capabilities remain sync-private.
+        use crate::storage_adapter::StorageWrite as _;
+        let mut write = installed.adapter.begin_migration_write(Default::default()).await.unwrap();
+        writes.lower_into(&mut write).await.unwrap();
+        write.commit().await.unwrap();
         super::super::epoch::stage_v80_repository_for_test(&storage, true)
             .await
             .unwrap();
@@ -454,10 +496,15 @@ mod tests {
                 .await
                 .is_err()
         );
-        let report = migrate_repository(storage.clone()).await.unwrap();
-        assert!(report.semantic_preservation_verified);
-        assert_eq!(report.embedded_repository_id, state.repository_id());
-        assert_eq!(report.after.role, RepositoryRole::PartialReplica);
+        assert_ne!(content_digest(&storage).await.unwrap(), expected);
+        let lix = crate::open_lix()
+            .with_storage(storage.clone())
+            .await
+            .unwrap();
+        assert_eq!(lix.lix_id(), state.repository_id());
+        assert_eq!(lix.open_report().migration.unwrap().from_format, 80);
+        lix.close().await.unwrap();
+        assert_eq!(content_digest(&storage).await.unwrap(), expected);
         let admitted = super::super::epoch::admit_partial_epoch(&storage)
             .await
             .unwrap();
@@ -556,7 +603,6 @@ mod tests {
 
 /// Restore an historical snapshot into fresh storage and migrate explicitly.
 /// The destination remains separate from the snapshot source on all failures.
-#[cfg(feature = "offline-migration")]
 pub async fn restore_and_migrate_repository<S, R>(
     storage: S,
     source: R,
@@ -572,7 +618,6 @@ where
 
 /// Explicit resource budgets for historical preflight. Exceeding a limit leaves
 /// source storage recoverable and reports LIX_ERROR_MIGRATION_LIMIT_EXCEEDED.
-#[cfg(feature = "offline-migration")]
 pub async fn migrate_repository_with_options<S>(
     storage: S,
     options: super::MigrationOptions,
@@ -592,14 +637,12 @@ where
 
 /// Sealed source witness for explicit standalone-to-authority certification.
 /// Keep the physical owner barrier until verification and catalog publication.
-#[cfg(feature = "offline-migration")]
 #[derive(Debug)]
 pub struct AuthorityActivationWitness {
     before_content_digest: String,
     expected_content_digest: String,
 }
 
-#[cfg(feature = "offline-migration")]
 #[derive(Debug, Serialize)]
 pub struct AuthorityActivationReport {
     pub before_content_digest: String,
@@ -610,7 +653,6 @@ pub struct AuthorityActivationReport {
 /// Prepare the only permitted activation mutation: install the current exact
 /// authority capability marker. Serving must still perform its full eligibility
 /// validation; this helper does not promote storage or admit an engine.
-#[cfg(feature = "offline-migration")]
 pub async fn prepare_authority_activation<S>(
     storage: S,
 ) -> Result<AuthorityActivationWitness, LixError>
@@ -643,7 +685,6 @@ where
 
 /// Verify all logical bytes after ordinary explicit serving certification.
 /// A successful engine open or an Authority role alone is not preservation.
-#[cfg(feature = "offline-migration")]
 pub async fn verify_authority_activation<S>(
     storage: S,
     witness: AuthorityActivationWitness,
@@ -670,7 +711,7 @@ where
     })
 }
 
-#[cfg(all(test, feature = "offline-migration", feature = "server-protocol"))]
+#[cfg(all(test, feature = "server-protocol"))]
 mod activation_tests {
     use super::*;
     use crate::storage_adapter::{PutBatch, PutEntry, StorageValue, StorageWrite};

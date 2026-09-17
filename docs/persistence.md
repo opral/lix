@@ -8,6 +8,32 @@ Lix runs in memory by default. Choose a storage adapter when you need to keep da
 
 <img src="../website/public/assets/local-only-storage.webp" alt="Lix runs on one device with a choice of memory, filesystem, or browser OPFS storage adapter. No server is required." width="760" decoding="async" />
 
+## Opening and upgrades
+
+`open_lix()` in Rust and `openLix()` in JavaScript own repository opening, including supported format upgrades. Use the same call for a new, current, or supported older repository. Upgrades retain source data and validate the candidate before activating it. Unsupported formats and replica states that require recovery fail without replacing the repository with an empty one.
+
+```rust
+let lix = lix::open_lix()
+    .with_storage(storage)
+    .on_progress(|event| eprintln!("{:?}: {:?}", event.scope, event.phase))
+    .await?;
+let upgrades = &lix.open_report().migrations;
+```
+
+```ts
+const lix = await openLix({
+  storage,
+  onProgress(event) {
+    console.log(event.scope, event.phase);
+  },
+});
+const upgrades = lix.openReport.migrations;
+```
+
+Progress identifies local or authority work and can report inspecting, migrating, validating, opening, and completion. The open remains pending during supported upgrades. Progress callbacks are observers: a UI exception cannot stop an upgrade. The immutable opening report records observed upgrades by scope and source/target format; an unchanged repository has no local migration entry.
+
+With a server configured, opening waits for explicit authority-upgrade responses. Existing replicas can still reopen from their durable state when the network is unavailable; authentication and identity failures are not treated as offline success. Browser sharing additionally requires its existing verified credential proof. Omitting the server opens an existing partial replica offline without making a network request.
+
 ## Commit acknowledgement
 
 Repositories on durable storage wait for the storage backend's durable boundary before acknowledging writes by default. This applies to automatic statements, batches, explicit transaction commits, and additional sessions opened from the handle. RocksDB synchronizes its WAL; SlateDB waits for the WAL upload; OPFS uses SQLite `synchronous=FULL`. Memory remains ephemeral even with the default policy.

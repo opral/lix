@@ -19,9 +19,17 @@ pub enum OpenPhase {
     Complete,
 }
 
+/// Repository whose opening produced this event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenScope {
+    Local,
+    Authority,
+}
+
 /// One Lix-open progress snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenProgress {
+    pub scope: OpenScope,
     pub phase: OpenPhase,
     pub from_format: Option<u32>,
     pub to_format: u32,
@@ -36,9 +44,18 @@ pub struct OpenMigrationReport {
     pub to_format: u32,
 }
 
-/// Immutable facts about how this handle was opened.
+/// A completed upgrade observed during opening.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenMigration {
+    pub scope: OpenScope,
+    pub from_format: u32,
+    pub to_format: u32,
+}
+
+/// Immutable facts about how this handle was opened.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenReport {
+    pub migrations: Vec<OpenMigration>,
     pub format: u32,
     pub initialized: bool,
     pub migration: Option<OpenMigrationReport>,

@@ -169,8 +169,30 @@ where
     Client: RawHttpClient,
 {
     pub(super) async fn connect_with(client: Client, lix_url: &str) -> Result<Self, LixError> {
+        Self::connect_with_progress_sink(client, lix_url, None).await
+    }
+
+    pub(super) async fn connect_with_progress_sink(
+        client: Client,
+        lix_url: &str,
+        progress: Option<&std::sync::Arc<dyn crate::OpenProgressSink>>,
+    ) -> Result<Self, LixError> {
         let normalized = normalize_sync_locator(lix_url)?;
         let protocol_url = normalized.protocol_url;
+        let report = |phase| {
+            crate::open_types::emit_open_progress(
+                progress,
+                crate::OpenProgress {
+                    scope: crate::OpenScope::Authority,
+                    phase,
+                    from_format: None,
+                    to_format: crate::CURRENT_STORAGE_FORMAT_VERSION,
+                    completed: None,
+                    total: None,
+                },
+            )
+        };
+        report(crate::OpenPhase::Inspecting);
         let handshake: HandshakeResponse = loop {
             let response = client
                 .send(raw_request(
@@ -183,13 +205,17 @@ where
                 Ok(handshake) => break handshake,
                 Err(error) => {
                     match crate::authority_client::opening_migration_retry_delay(&error) {
-                        Some(delay) => super::platform::sleep(delay).await,
+                        Some(delay) => {
+                            crate::authority_client::report_authority_migration(&error, progress);
+                            super::platform::sleep(delay).await;
+                        }
                         None => return Err(error),
                     }
                 }
             }
         };
         let lix_id = validate_handshake(&handshake)?.to_owned();
+        report(crate::OpenPhase::Complete);
         Ok(Self {
             client,
             protocol_url,

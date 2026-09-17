@@ -62,6 +62,7 @@ export type {
 	LixTelemetrySpan,
 	LixTelemetrySpanLink,
 	LixOpenMigrationReport,
+	LixOpenMigration,
 	LixOpenPhase,
 	LixOpenProgress,
 	LixOpenProgressOptions,

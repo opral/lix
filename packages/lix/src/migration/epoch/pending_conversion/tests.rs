@@ -46,9 +46,17 @@ fn convert_fixture_replica<'a, S>(
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    Box::pin(crate::convert_replica_to_partial(
-        storage, server, branch_id,
-    ))
+    Box::pin(async move {
+        if let Some(branch) = branch_id {
+            crate::convert_replica_to_partial(storage, server, Some(branch)).await
+        } else {
+            let lix = crate::open_lix()
+                .with_storage(storage)
+                .with_server(server)
+                .await?;
+            lix.close().await
+        }
+    })
 }
 
 // The test runtime must hold only a pointer to this large end-to-end scenario.
@@ -529,7 +537,7 @@ async fn run_pending_native_conversion_inner(
     let first = convert_fixture_replica(
         local_storage.clone(),
         options.clone(),
-        Some(&requested_branch),
+        with_new_branch.then_some(requested_branch.as_str()),
     )
     .await;
     assert!(first.is_err());
@@ -565,7 +573,7 @@ async fn run_pending_native_conversion_inner(
         let result = convert_fixture_replica(
             local_storage.clone(),
             options.clone(),
-            Some(&requested_branch),
+            with_new_branch.then_some(requested_branch.as_str()),
         )
         .await;
         if result.is_ok() {
