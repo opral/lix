@@ -13,9 +13,9 @@ export const Route = createFileRoute("/")({
     return await loadReadmeContent();
   },
   head: () => {
-    const title = "Lix | Embeddable repository for your product";
+    const title = "Lix | Universal version control system";
     const description =
-      "Lix is an embeddable repository for your product. Files, SQL database, and version control in one. No external control plane to sync.";
+      "Lix versions any file format, runs in-process on pluggable storage, and stores files, app data, and history as rows in one ACID SQL database.";
     const canonicalUrl = buildCanonicalUrl("/");
     const ogImage = resolveOgImage();
     const jsonLd = buildWebSiteJsonLd({
@@ -30,8 +30,8 @@ export const Route = createFileRoute("/")({
       description,
       url: canonicalUrl,
       applicationCategory: "DeveloperApplication",
-      operatingSystem: "Web, Node.js",
-      programmingLanguage: "TypeScript",
+      operatingSystem: "Any",
+      programmingLanguage: ["Rust", "TypeScript"],
       codeRepository: "https://github.com/opral/lix",
       offers: {
         "@type": "Offer",

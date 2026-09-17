@@ -1,16 +1,16 @@
 ---
-description: Start with in-memory Lix, persist local files, connect to a server, or keep a browser replica.
+description: Start in memory, store a repository on disk, connect to a server, or keep a browser replica.
 ---
 
 # Storage
 
-Lix runs in memory by default. Choose a storage adapter when you need to keep data across restarts. Files, SQL, and version control use the same API.
+Lix runs in memory by default. Choose a storage adapter when you need to keep data across restarts. The same SQL works on every storage adapter.
 
 <img src="../website/public/assets/local-only-storage.webp" alt="Lix runs on one device with a choice of memory, filesystem, or browser OPFS storage adapter. No server is required." width="760" decoding="async" />
 
 ## Commit acknowledgement
 
-Persistent repositories wait for the storage backend's durable boundary before acknowledging writes by default. This applies to automatic statements, batches, explicit transaction commits, and additional sessions opened from the handle. RocksDB synchronizes its WAL; SlateDB waits for the WAL upload; OPFS uses SQLite `synchronous=FULL`. Memory remains ephemeral even with the default policy.
+Repositories on durable storage wait for the storage backend's durable boundary before acknowledging writes by default. This applies to automatic statements, batches, explicit transaction commits, and additional sessions opened from the handle. RocksDB synchronizes its WAL; SlateDB waits for the WAL upload; OPFS uses SQLite `synchronous=FULL`. Memory remains ephemeral even with the default policy.
 
 Applications that accept losing acknowledged saves after a crash can opt into buffered acknowledgement when opening local storage:
 
@@ -26,7 +26,7 @@ const lix = await openLix({
 
 In Rust, use `open_lix().with_storage(storage).with_durability(Durability::Buffered)`. The policy belongs to the open repository handle, not the stored repository format. Reopening without the option restores the durable default. It does not weaken internal durability requirements for publication, migration, or sync. Buffered acknowledgement differs by adapter: RocksDB can lose writes on power loss; SlateDB can also lose writes when its process exits before WAL upload.
 
-Durability covers repository storage, not completion of background filesystem exports or synchronization with a server. For remote execution the authority chooses its storage policy; remote clients cannot override it. Hardware and storage services must honor their synchronization guarantees. Tests verify the backend requests and acknowledgement boundaries, not physical power failures. Durable acknowledgement can increase write latency. Use a batch or explicit transaction to group related changes into one commit. The [`commit_durability` example](../packages/storage-rocksdb/examples/commit_durability.rs) measures a small sequential RocksDB workload under both policies.
+Durability covers repository storage, not completion of background filesystem exports or synchronization with a server. For remote execution the authority chooses its storage policy; remote clients cannot override it. Hardware and storage services must honor their synchronization guarantees. Tests verify the backend requests and acknowledgement boundaries, not physical power failures. Durable acknowledgement can increase write latency. Use a batch or explicit transaction to group related changes into one commit. The [`commit_durability` example](https://github.com/opral/lix/blob/main/packages/storage-rocksdb/examples/commit_durability.rs) measures a small sequential RocksDB workload under both policies.
 
 ## In-memory (default)
 
@@ -44,7 +44,7 @@ await lix.close();
 
 ## Local filesystem
 
-Use [`@lix-js/storage-filesystem`](https://www.npmjs.com/package/%40lix-js/storage-filesystem) in Node.js to persist a directory. Agents and tools can read and write its ordinary files:
+Use [`@lix-js/storage-filesystem`](https://www.npmjs.com/package/%40lix-js/storage-filesystem) in Node.js to store a repository in a directory. Agents and tools can read and write its ordinary files:
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -112,7 +112,7 @@ Each operation requires a network round trip; successful writes are accepted by 
 
 <a id="sync-a-browser-with-a-server"></a>
 
-`OpfsStorage` persists Lix in the browser across reloads. Add `server: { url: repositoryUrl, mode: "partial_replica" }` alongside `storage` to create a **partial replica with on-demand sync**.
+`OpfsStorage` stores the repository in the browser across reloads. Add `server: { url: repositoryUrl, mode: "partial_replica" }` alongside `storage` to create a **partial replica with on-demand sync**.
 
 Opening loads bounded metadata. SQL fetches missing native inputs and retains them locally. Reads and writes whose dependencies are resident run locally, including offline; local commits upload in the background. Background synchronization advances the local state without making warm foreground operations wait for the server.
 
@@ -131,7 +131,7 @@ const lix = await openLix({
 });
 ```
 
-Install [`@lix-js/storage-opfs`](https://www.npmjs.com/package/%40lix-js/storage-opfs). SQLite Wasm persists the replica in the browser's Origin Private File System (OPFS). Reuse `name` within the same browser origin to reopen it after reloads. Omit `server` for a browser-only repository. Workers and tabs can share the same name through the package's storage worker and cross-tab Web Lock.
+Install [`@lix-js/storage-opfs`](https://www.npmjs.com/package/%40lix-js/storage-opfs). SQLite Wasm stores the replica in the browser's Origin Private File System (OPFS). Reuse `name` within the same browser origin to reopen it after reloads. Omit `server` for a browser-only repository. Workers and tabs can share the same name through the package's storage worker and cross-tab Web Lock.
 
 These configurations create a **partial replica with on-demand sync**. Opening loads bounded metadata; SQL fetches missing native inputs and caches them locally. Reads and writes whose dependencies are resident execute locally, including offline. Local commits upload in the background. `server.mode` defaults to `"remote"`, which rejects storage; the partial-replica opt-in is required. See [opening and reconnecting](./collaboration-and-sync.md#opening-and-reconnecting).
 
@@ -139,15 +139,15 @@ These configurations create a **partial replica with on-demand sync**. Opening l
 
 The client configures its local adapter with `storage`. The host configures server storage. In the diagram, SlateDB runs inside the server process and uses S3 as its external backing store.
 
-| Adapter | Available in | Stores data in |
-| --- | --- | --- |
-| `Memory` (default) | JavaScript, Rust | Temporary in-memory data |
-| `FilesystemStorage` | JavaScript (Node.js), Rust | Files and repository state on disk |
-| `OpfsStorage` | JavaScript (browser) | Browser OPFS through SQLite Wasm |
-| `RocksDB` | Rust | Local disk for native embedded persistence |
-| `SlateDB` | Rust | S3-compatible object storage |
+| Adapter             | Available in               | Stores data in                         |
+| ------------------- | -------------------------- | -------------------------------------- |
+| `Memory` (default)  | JavaScript, Rust           | Temporary in-memory data               |
+| `FilesystemStorage` | JavaScript (Node.js), Rust | Files and repository state on disk     |
+| `OpfsStorage`       | JavaScript (browser)       | Browser OPFS through SQLite Wasm       |
+| `RocksDB`           | Rust                       | Local disk for native embedded storage |
+| `SlateDB`           | Rust                       | S3-compatible object storage           |
 
-The [reference server](https://github.com/opral/lix/tree/main/packages/server) uses SlateDB; custom hosts can choose another adapter. The separate `server` option controls remote execution or replica synchronization. See the [connection reference](./collaboration-and-sync.md#connection-reference). JavaScript sync clients require a durable adapter, such as `OpfsStorage` or `FilesystemStorage`. Use [Snapshots](./snapshots.md) to export or restore a complete repository.
+The [reference server](https://github.com/opral/lix/tree/main/packages/server) uses SlateDB; custom hosts can choose another adapter. The separate `server` option controls remote execution or replica synchronization. See the [connection reference](./collaboration-and-sync.md#connection-reference). JavaScript partial replicas require a durable adapter, such as `OpfsStorage` or `FilesystemStorage`. Use [Snapshots](./snapshots.md) to export or restore a complete repository.
 
 ### Rust filesystem adapter
 
@@ -173,14 +173,6 @@ Opening a supported older format copies it into an inactive storage epoch, valid
 
 Lix retains the previous generation for rollback. Budget roughly 2× the live repository size plus WAL, compaction, and temporary-write space. Upgrade time depends on data size, storage, and hardware; available capacity is the practical limit. Later upgrades reuse the inactive epoch and reclaim legacy storage asynchronously.
 
-Run the RocksDB capacity profile against a released-v75 repository:
-
-```sh
-LIX_MIGRATION_PROFILE_MIB=256 cargo test -p lix-storage-rocksdb \
-  --features storage-benches --test migration_profile --release -- \
-  --ignored --nocapture
-```
-
 ## Closing
 
 Always `await lix.close()` in scripts and tests. Long-lived servers can hold one Lix instance for the process lifetime.
@@ -195,7 +187,7 @@ Implement three asynchronous traits from `lix::storage`: `Storage`, `StorageRead
 2. **Coherent read views.** A read handle observes one coherent view for its lifetime.
 3. **Ordered scans.** Scans return keys in ascending byte order.
 4. **Atomic commits.** A commit publishes all staged mutations or none.
-5. **Persistence.** Persistent implementations define their durability boundary. `Memory` is ephemeral.
+5. **Durability.** Durable implementations define their durability boundary. `Memory` is ephemeral.
 
 Validate an implementation with the public conformance suite:
 

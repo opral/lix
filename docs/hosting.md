@@ -1,10 +1,10 @@
 ---
-description: Run Lix against the official host at lixray.com, or host Lixes yourself with the Lix Server Protocol.
+description: Run Lix against the official host at lixray.com, or host repositories yourself with the Lix Server Protocol.
 ---
 
 # Hosting
 
-A hosted Lix lives on a server. The server owns its storage and authentication. Clients can execute directly on the server or keep a synchronized local replica.
+A hosted repository lives on a server. The server owns its storage and authentication. Clients can execute directly on the server or keep a synchronized local replica.
 
 A service can access the repository through SDK calls, an agent sandbox can synchronize a filesystem directory, and a browser can keep a local replica in OPFS. All three connect to the same server. See the [setup examples](./persistence.md) for client configuration and storage adapters.
 
@@ -22,6 +22,40 @@ Both speak the same protocol. Only the URL changes in client code.
 Use `createLix({ server: { url: hostOrigin, headers } })` to create a hosted repository programmatically. It returns `{ id, url }`; pass `url` to `openLix({ server: { url, headers } })`. Add `storage` and explicitly set `server.mode: "partial_replica"` to keep a partial replica with on-demand sync. Omitting the mode defaults to remote SQL and does not accept client storage.
 
 `createLix({ server, from: localLix })` creates a point-in-time copy including history and untracked rows. It does not connect the source handle. Use `deleteLix({ server: { url, headers } })` to delete the hosted repository; closing a session does not delete it. See the [API reference](./js-api-reference.md#hosted-repository-lifecycle).
+
+### Rust
+
+```rust
+use lix::{create_lix, delete_lix, open_lix, ServerOptions};
+
+let local = open_lix().await?;
+let repository = create_lix()
+    .with_server(ServerOptions::new("https://example.com"))
+    .from_lix(&local)
+    .await?;
+let remote = open_lix()
+    .with_server(ServerOptions::new(&repository.url))
+    .await?;
+remote.execute("SELECT * FROM lix_file", &[]).await?;
+remote.close().await?;
+
+// Use a durable adapter supplied by a storage package.
+let replica = open_lix()
+    .with_storage(storage)
+    .with_server(ServerOptions::new(&repository.url))
+    .await?;
+replica.close().await?;
+
+delete_lix()
+    .with_server(ServerOptions::new(&repository.url))
+    .await?;
+```
+
+Omit `.from_lix(&local)` to create an empty hosted repository. The result is `HostedLix { id, url }`. The copy is taken at one point in time and preserves history and untracked rows. It does not connect the source. Pass `.with_idempotency_key(key)` to get the same result on retries; when omitted, a key is generated for each call. Configure credentials with `ServerOptions::with_headers`.
+
+To reconnect the original durable storage to the hosted copy: pause writes, create the hosted copy, close the source, and reopen that same storage with the returned server URL. Diverged local history is rejected.
+
+Opening a missing server repository returns an error. Deleting a hosted repository does not delete its local replicas, and reopening a replica cannot recreate a deleted hosted repository.
 
 ## Official host: lixray.com
 
@@ -102,7 +136,7 @@ Your host is responsible for three things:
 
 1. **Authenticate the request** and choose a principal. The protocol does not
    read tokens, cookies, or certificates. Never derive an `account_id` from an unverified header.
-2. **Resolve the Lix** identified by `{lix_id}` without creating an unknown
+2. **Resolve the repository** identified by `{lix_id}` without creating an unknown
    target. Pass the complete root `/lix/v1/{lix_id}/...` request to the protocol; it validates the immutable ID before dispatch. If your product is mounted below a deployment prefix, strip that prefix at the reverse-proxy boundary before dispatch. SDK connection locators themselves never contain a deployment prefix.
 3. **Forward the request and the response.** Preserve protocol status codes,
    headers, and body bytes. Keep the Lix runtime alive until every streaming response body closes, including server-sent events (SSE) and snapshot downloads.

@@ -1,28 +1,26 @@
 ---
-description: Lix is not a Git replacement. Keep code in Git; use Lix to version, query, and merge the files and data your app works with.
+description: Git is a CLI for source code. Lix is a library that versions any file format and stores files and app data in one SQL database.
 ---
 
 # How Lix compares to Git
 
-Lix is not a Git replacement. Git versions source code as line-diffed text. Lix is an SDK you embed in an app. It versions files and data with row-level diffs. It exposes content and history as SQL.
-
-Keep your code in Git. Use Lix for the documents and app data your product needs to diff, merge, and roll back.
+Git is a CLI designed for source code. It assumes a local POSIX filesystem, tracks whole files, and diffs text lines. Lix is a library you embed in a product. It versions any file format with row-level diffs, runs on pluggable storage, and stores files, app tables, and history as rows in one SQL database.
 
 ## When to use which
 
-- **Use Git** for source code repositories and developer workflows.
-- **Use Lix** when non-developers and agents change files and data: documents, spreadsheets, and app records. Lix is built for their workflows: real-time collaboration, automatic change tracking, review, and restore. Lix commits automatically, so nobody runs a commit command or opens a terminal.
-- **Use both.** Code lives in a Git repository. Your product's files and data live in a Lix repository. The two stay independent.
+- **Use Git** for software engineering. Your source code needs GitHub, CI, code review, and the tooling every developer knows.
+- **Use Lix** when your product stores files and data for its users: documents, spreadsheets, media, app records, and the scripts that work on them. Those scripts do not need the Git ecosystem. They need history next to the data they touch.
+- **Use both.** Your source code lives in Git. Your product's repositories live in Lix. The two stay independent.
 
 ## What Lix adds over Git
 
-| Capability                                | Git                          | Lix                                     |
-| ----------------------------------------- | ---------------------------- | --------------------------------------- |
-| Diffs by cell, clause, or row             | Text lines only              | Yes, via plugins (Markdown, CSV today)  |
-| SQL over content and history              | No                           | Yes                                     |
-| ACID transactions across files and rows   | No                           | Yes                                     |
-| Runs embedded in your app                 | CLI-first; libraries exist   | SDK-first                               |
-| Pluggable storage (memory, disk, S3)      | Assumes a POSIX filesystem   | Yes                                     |
+| Capability                              | Git                        | Lix                                                                                                  |
+| --------------------------------------- | -------------------------- | ---------------------------------------------------------------------------------------------------- |
+| Diffs by cell, clause, or row           | Text lines only            | Yes, via plugins. Markdown and CSV ship with the JS SDK; JSON, text, and Excalidraw are installable. |
+| SQL over content and history            | No                         | Yes                                                                                                  |
+| ACID transactions across files and rows | No                         | Yes                                                                                                  |
+| Runs embedded in your app               | CLI-first; libraries exist | Library-first                                                                                        |
+| Pluggable storage (memory, disk, S3)    | Assumes a POSIX filesystem | Yes                                                                                                  |
 
 An agent updates one field in an orders CSV. Git shows a changed text line. Lix shows the row that changed:
 
@@ -36,7 +34,7 @@ order_id 1002 status:
 You query that history with SQL:
 
 ```sql
-SELECT created_at, schema_key, row_ref, snapshot_content
+SELECT created_at, schema_key, row_pk, snapshot_content
 FROM lix_change
 ORDER BY created_at DESC
 LIMIT 20;
@@ -53,3 +51,4 @@ LIMIT 20;
 - [Diffs](./diffs.md): how plugins split files into rows.
 - [History](./history.md): query what changed with SQL.
 - [Storage](./persistence.md): storage adapters from memory to S3.
+- [Plugins](./plugins.md): install plugins for more file formats.

@@ -21,7 +21,8 @@
   ],
   "Guides": [
     { "path": "./lix-for-ai-agents.md", "label": "Lix for AI Agents" },
-    { "path": "./hosting.md", "label": "Hosting" }
+    { "path": "./hosting.md", "label": "Hosting" },
+    { "path": "./plugins.md", "label": "Plugins" }
   ],
   "Reference": [
     { "path": "./checkpoints.md", "label": "Checkpoints" },

@@ -10,7 +10,7 @@ Users, agents, and devices share one authoritative repository through a Lix serv
 - [Sandboxes and machines](./persistence.md#filesystem-sync) synchronize local files.
 - [Browser apps](./persistence.md#browser-opfs) read and edit an OPFS replica.
 
-Use [LixRay](https://lixray.com/docs) or [host your own server](./hosting.md). See [storage adapters](./persistence.md#how-storage-adapters-fit) for persistence options.
+Use [LixRay](https://lixray.com/docs) or [host your own server](./hosting.md). See [storage adapters](./persistence.md#how-storage-adapters-fit) for storage options.
 
 ## Connection reference
 
@@ -18,13 +18,13 @@ Use [LixRay](https://lixray.com/docs) or [host your own server](./hosting.md). S
 
 `openLix()` defaults `server.mode` to `"remote"`, executing SQL on the server. Supply storage and `server.mode: "partial_replica"` to create a **partial replica with on-demand sync**. Remote mode rejects storage; partial-replica mode requires it. No `"sync"` alias or full `"replica"` mode is supported.
 
-| | `remote` | `partial_replica` |
-| --- | --- | --- |
-| Reads and writes execute | On the server | On a local replica |
-| Client storage | None; do not pass `storage` | An explicit durable adapter |
-| Network round trip | Every operation | Background synchronization; uncached data may need a fetch |
-| Successful write | Accepted by the server | Committed locally; may not yet be on the server |
-| Offline work | No | Covered reads and writes with resident dependencies |
+|                          | `remote`                    | `partial_replica`                                          |
+| ------------------------ | --------------------------- | ---------------------------------------------------------- |
+| Reads and writes execute | On the server               | On a local replica                                         |
+| Client storage           | None; do not pass `storage` | An explicit durable adapter                                |
+| Network round trip       | Every operation             | Background synchronization; uncached data may need a fetch |
+| Successful write         | Accepted by the server      | Committed locally; may not yet be on the server            |
+| Offline work             | No                          | Covered reads and writes with resident dependencies        |
 
 ### Remote mode
 
@@ -71,15 +71,11 @@ for (const source of sources.filter((item) => item.recoveryRequired)) {
 }
 ```
 
-Recovery restores captured tracked rows onto separate branches with stable identities, based on the repository root. Their captured state is independent of the branch from which recovery is requested. A retry returns its existing receipt rather than overwriting edits made on a recovery branch. Local-only data remains in the local export/source; it is not uploaded by restoration. The export also records original branch and checkpoint coordinates and available commit/blob data. Unavailable content is reported explicitly. Export and restoration do not delete the source, and a local restoration receipt is not a server acknowledgement or proof that all historical content was recovered.
-
-Recovery exports are materialized in memory and bounded: 100,000 current rows, 64 MiB per blob and 128 MiB of blob content, with a separate 128 MiB budget for unfinished upload content. Exceeding a limit either reports unavailable content or fails the export without changing the source. Retained sources currently have no automatic cleanup, so successive upgrades can increase local storage use.
-
-Completed upload receipts and redundant checkpoint bookkeeping do not by themselves indicate unsynced edits. Pending writes and local-only data remain reachable through recovery. Permanent push rejection reports an error while preserving pending work; it never silently discards those edits.
+Recovery restores the captured rows onto separate branches. It does not delete the source. A restoration receipt is not a server acknowledgement. See the [migration guide](./partial-replica-migration.md) for limits and cleanup.
 
 ## Receive collaborative updates
 
-Both remote and sync clients can observe queries:
+Both remote clients and partial replicas can observe queries:
 
 ```ts
 const files = lix.observe("SELECT path FROM lix_file ORDER BY path");
@@ -88,7 +84,7 @@ const initial = await files.next();
 const update = await files.next();
 ```
 
-Remote clients receive updated query results from the server. Sync clients apply incoming commits locally, then update affected observations.
+Remote clients receive updated query results from the server. Partial replicas apply incoming commits locally, then update affected observations.
 
 Share a branch to see collaborators' accepted changes; use separate branches for work requiring review.
 
@@ -108,8 +104,8 @@ Use a separate service for presence: cursors, selections, typing, online status,
 
 ## Closing
 
-Call `await lix.close()` for cleanup. Remote mode closes the server session. Sync mode stops its background worker without waiting for network delivery. Durable pending commits resume uploading on the next open.
+Call `await lix.close()` for cleanup. Remote mode closes the server session. A partial replica stops its background worker without waiting for network delivery. Durable pending commits resume uploading on the next open.
 
-Sync has no public API to await server confirmation. Use remote mode when each successful write requires server acknowledgment.
+A partial replica has no public API to await server confirmation. Use remote mode when each successful write requires server acknowledgment.
 
 Closing does not delete either repository. Use `deleteLix()` for explicit hosted deletion.

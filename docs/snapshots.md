@@ -4,33 +4,33 @@ description: Export and restore a complete Lix for reproduction, transfer, and r
 
 # Snapshots
 
-A Lix snapshot is a point-in-time copy of the state held by a Lix handle. It is a binary artifact with the extension `.lixsnap`. A local partial replica exports its resident inputs and pending edits, explicitly marked as partial. A remote handle or standalone repository exports the complete repository.
+A snapshot is a point-in-time copy of the repository state held by an open handle. It is a binary artifact with the extension `.lixsnap`. A local partial replica exports its resident inputs and pending edits, explicitly marked as partial. A remote handle or standalone repository exports the complete repository.
 
 Use a snapshot to:
 
 - attach an exact state to a bug report or test;
 - reproduce a problem in another environment;
-- move a Lix between supported storage adapters;
-- restore a Lix into new persistent storage;
+- move a repository between supported storage adapters;
+- restore a repository into new durable storage;
 - provide the full-copy payload to a backup system.
 
 ## Snapshot versus checkpoint
 
-A [checkpoint](./checkpoints.md) is a meaningful version inside Lix history. A snapshot is a portable copy outside Lix.
+A [checkpoint](./checkpoints.md) is a commit marked inside the repository history. A snapshot is a portable copy of the whole repository.
 
-| | Checkpoint | Snapshot |
-| --- | --- | --- |
-| Location | Inside Lix history | External `.lixsnap` artifact |
-| Scope | One version on a branch | All branches, history, data, and blobs |
-| Use | Review, undo, and version history | Reproduction, transfer, and recovery |
+|          | Checkpoint                | Snapshot                               |
+| -------- | ------------------------- | -------------------------------------- |
+| Location | Inside Lix history        | External `.lixsnap` artifact           |
+| Scope    | One commit on a branch    | All branches, history, data, and blobs |
+| Use      | Review, undo, and history | Reproduction, transfer, and recovery   |
 
-Creating a snapshot does not create a commit or checkpoint. Restoring one does not merge new history into an existing Lix.
+Creating a snapshot does not create a commit or checkpoint. Restoring one does not merge new history into an existing repository.
 
 ## What a snapshot contains
 
 Lix opens one coherent read and exports every registered logical storage space. This includes files, application rows, schemas, branches, history, blobs, untracked rows, and engine-owned state.
 
-Creating a hosted repository from an existing Lix uses this same snapshot contract. Untracked rows are preserved in `.lixsnap` files and hosted copies. The host-local authority fence is excluded; active sessions are not transferred.
+Creating a hosted repository from an existing repository uses this same snapshot contract. Untracked rows are preserved in `.lixsnap` files and hosted copies. The host-local authority fence is excluded; active sessions are not transferred.
 
 It does not contain inactive migration data, backend WALs or caches, active sessions or transactions, server configuration, or transport credentials. Application data stored in rows is included, even when marked untracked. The container adds no export timestamp, hostname, Lix name, random identifier, or exporter metadata, so equal logical states produce equal bytes.
 
@@ -102,7 +102,7 @@ let restored = lix::open_lix()
     .await?;
 ```
 
-Select a fresh persistent destination before `from_snapshot()`:
+Select a fresh durable destination before `from_snapshot()`:
 
 ```rust
 use lix_storage_rocksdb::RocksDB;
@@ -116,9 +116,9 @@ let restored = lix::open_lix()
     .await?;
 ```
 
-The destination must be empty of every known Lix-owned logical space, including retired spaces. Lix verifies the complete stream, writes into an unpublished storage epoch, publishes it atomically, applies any supported format migration, and then opens it. It never merges a snapshot into or overwrites an existing Lix.
+The destination must be empty of every known Lix-owned logical space, including retired spaces. Lix verifies the complete stream, writes into an unpublished storage epoch, publishes it atomically, applies any supported format migration, and then opens it. It never merges a snapshot into or overwrites an existing repository.
 
-There is deliberately no `lix.import_snapshot()`. Replacing storage under a live handle would invalidate active sessions, transactions, observers, and caches. To persist a restored in-memory Lix after changing it, export a new snapshot and restore that artifact into a fresh persistent destination.
+There is deliberately no `lix.import_snapshot()`. Replacing storage under a live handle would invalidate active sessions, transactions, observers, and caches. To keep a restored in-memory repository after changing it, export a new snapshot and restore that artifact into a fresh durable destination.
 
 ## JavaScript
 
@@ -132,13 +132,13 @@ await snapshot.pipeTo(writable, {
 });
 ```
 
-Restore and open a fresh in-memory Lix from a stream:
+Restore and open a fresh in-memory repository from a stream:
 
 ```ts
 const restored = await openLix.fromSnapshot(snapshotStream);
 ```
 
-Select a fresh persistent destination with the normal open options:
+Select a fresh durable destination with the normal open options:
 
 ```ts
 const restored = await openLix.fromSnapshot(snapshotStream, {
@@ -146,7 +146,7 @@ const restored = await openLix.fromSnapshot(snapshotStream, {
 });
 ```
 
-`openLix.fromSnapshot()` also accepts a `Uint8Array` for bounded fixtures. It rejects `server` and any destination that already contains a Lix. There is no separate byte-array export method; bounded callers can use standard APIs such as `new Response(lix.exportSnapshot()).arrayBuffer()`.
+`openLix.fromSnapshot()` also accepts a `Uint8Array` for bounded fixtures. It rejects `server` and any destination that already contains a repository. There is no separate byte-array export method; bounded callers can use standard APIs such as `new Response(lix.exportSnapshot()).arrayBuffer()`.
 
 ## Remote export
 
@@ -158,7 +158,7 @@ Authorization: Bearer <access-token>
 Accept: application/vnd.lix.snapshot
 ```
 
-The response is a backpressured `application/vnd.lix.snapshot` stream with `Cache-Control: no-store, no-transform`. Snapshot export requires an authenticated host principal even when selected files from the Lix are public. `lix.exportSnapshot()` on a remote handle streams this authoritative snapshot. On a local partial replica, the same call streams the local cache, pending edits, and replica receipts without contacting the server. This works offline and preserves differences between the local and remote views for reproduction. Partial exports do not contain inputs that have never been fetched, so they are not complete backups. Restore them into fresh durable storage to reopen the same partial replica offline; resident queries use the captured inputs, and missing inputs still require the authenticated authority. Export the remote handle separately when a complete repository snapshot is needed.
+The response is a backpressured `application/vnd.lix.snapshot` stream with `Cache-Control: no-store, no-transform`. Snapshot export requires an authenticated host principal even when selected files from the repository are public. `lix.exportSnapshot()` on a remote handle streams this authoritative snapshot. On a local partial replica, the same call streams the local cache, pending edits, and replica receipts without contacting the server. This works offline and preserves differences between the local and remote views for reproduction. Partial exports do not contain inputs that have never been fetched, so they are not complete backups. Restore them into fresh durable storage to reopen the same partial replica offline; resident queries use the captured inputs, and missing inputs still require the authenticated authority. Export the remote handle separately when a complete repository snapshot is needed.
 
 Create a new hosted repository from a snapshot with `POST /lix/v1`, using `Content-Type: application/vnd.lix.snapshot` and an `Idempotency-Key` header. The SDK's `createLix({ server, from: localLix })` streams the same payload; Rust also accepts a snapshot reader with `create_lix().from_snapshot(reader)`. Creation never overwrites an existing hosted repository. See the [server protocol](./server-protocol.md) for the lifecycle contract.
 
@@ -170,7 +170,7 @@ The binary `LIXSNAP` version 1 container records its container version, Lix form
 
 Logical space identifiers and their storage semantics form an append-only wire registry. New identifiers may be added, but an identifier emitted by a snapshot is never removed or reused, even after its space is retired from the current layout. This lets a future engine decode the old bytes before applying the migration selected by the embedded Lix format version.
 
-The v1 decoder accepts at most 10 million entries and 64 GiB of canonical payload, with individual keys limited to 16 MiB and values to 256 MiB. These bounds make malformed or unexpectedly large inputs fail as `LIX_INVALID_SNAPSHOT` instead of exhausting memory. Larger Lixes need a future container version or a deliberately revised implementation limit.
+The v1 decoder accepts at most 10 million entries and 64 GiB of canonical payload, with individual keys limited to 16 MiB and values to 256 MiB. These bounds make malformed or unexpectedly large inputs fail as `LIX_INVALID_SNAPSHOT` instead of exhausting memory. Larger repositories need a future container version or a deliberately revised implementation limit.
 
 The digest detects accidental corruption; it does not authenticate who made the artifact. A snapshot can contain current data and deleted content retained in history, so protect it like the source data.
 
@@ -180,4 +180,4 @@ The digest detects accidental corruption; it does not authenticate who made the 
 
 A `.lixsnap` file can be a full backup artifact, but export alone is not a backup system. Production recovery also requires scheduling, retention, encryption, access control, independent storage, monitoring, and restore drills.
 
-Version 1 does not provide incremental backups, point-in-time log replay, compression, encryption, signing, automatic upload, or restore over a live Lix. Those features can be added around or alongside the stable full-snapshot format when operational demand justifies them.
+Version 1 does not provide incremental backups, point-in-time log replay, compression, encryption, signing, automatic upload, or restore over a live repository. Those features can be added around or alongside the stable full-snapshot format when operational demand justifies them.

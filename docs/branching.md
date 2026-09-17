@@ -41,7 +41,7 @@ const [mainRows, draftRows] = await Promise.all([
 await draftLix.close();
 ```
 
-Each session has independent branch selection, transactions, observations, and lifecycle. Use `lix_diff('acme_section', mainCommit, draftCommit)` when the desired result is a relation-specific commit-to-commit change set rather than two current-state result sets.
+Each session has independent branch selection, transactions, observations, and lifecycle. To see what changed between the two branches, use `lix_diff('acme_section', mainCommit, draftCommit)` instead of comparing two result sets.
 
 ## Preview a merge
 
@@ -74,7 +74,7 @@ await lix.mergeBranch({ sourceBranchId: draft.id });
 
 Lix reconciles overlapping edits automatically. Changes to different columns of the same row combine. For competing changes to the same column, the incoming source value wins by default; a plugin can provide a column merger instead. Creation/deletion races use whole-row last-writer-wins (LWW).
 
-“Last” follows acceptance order, not client timestamps. In a branch merge, the source branch is incoming. Overlapping edits do not require caller conflict resolution. Merges can still fail when plugin ownership or generations are incompatible, or when tracked changes collide with untracked rows.
+“Last” follows acceptance order, not client timestamps. In a branch merge, the source branch is incoming. Overlapping edits do not require caller conflict resolution.
 
 Preview reports the merge outcome and change counts; it does not reserve the branch heads or approve a later merge against changing data.
 
@@ -89,7 +89,7 @@ await lix.execute("UPDATE lix_branch SET hidden = true WHERE id = $1", [
 await lix.execute("DELETE FROM lix_branch WHERE id = $1", [draft.id]);
 ```
 
-Lix creates a built-in branch named `global` when it opens a repository. You cannot delete that branch, and you cannot delete the active branch.
+A new repository opens on a branch named `main`. Lix also creates a hidden branch named `global` that holds repository-wide rows such as branch descriptors. You cannot delete `global`, and you cannot delete the active branch.
 
 `hidden` only marks a branch for UIs. It does not change what SQL queries can see.
 
@@ -98,10 +98,10 @@ Lix creates a built-in branch named `global` when it opens a repository. You can
 Use `lix_branch.lixcol_metadata` to attach a JSON object to a branch:
 
 ```ts
-await lix.execute(
-  "UPDATE lix_branch SET lixcol_metadata = $1 WHERE id = $2",
-  [JSON.stringify({ owner: "design" }), draft.id],
-);
+await lix.execute("UPDATE lix_branch SET lixcol_metadata = $1 WHERE id = $2", [
+  JSON.stringify({ owner: "design" }),
+  draft.id,
+]);
 ```
 
 Metadata belongs to the tracked `lix_branch_descriptor` row, just as file and directory metadata belongs to their descriptors. Branch descriptors are global, so the metadata is visible from every branch. Renaming, hiding, or moving the branch head preserves it. Set `lixcol_metadata = NULL` to clear it.

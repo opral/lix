@@ -6,16 +6,16 @@ description: Built-in scalar SQL functions and PostgreSQL JSONB syntax supported
 
 Lix exposes a small set of runtime functions. JSON uses PostgreSQL casts and operators; there are no public `lix_json_*` functions.
 
-| Function | Returns | Purpose |
-| :-- | :-- | :-- |
-| `lix_active_account_id()` | text | Active SQL-session account. |
-| `lix_active_branch_id()` | text | Active branch. |
-| `lix_active_branch_commit_id()` | text | Active branch head pinned for the statement. |
-| `lix_root_commit_id()` | text | Repository bootstrap root. |
-| `lix_row_ref(relation, primary_key...)` | row_ref | Opaque address of one relation row, including composite keys. |
-| `lix_order_between(previous, next)` | text | Allocate a plugin row order key between exclusive bounds; NULL means an open end. |
-| `uuidv7()` | uuid | Generate a UUIDv7 value. |
-| `CURRENT_TIMESTAMP` | timestamptz | Transaction-start instant at microsecond precision. |
+| Function                                | Returns     | Purpose                                                                           |
+| :-------------------------------------- | :---------- | :-------------------------------------------------------------------------------- |
+| `lix_active_account_id()`               | text        | Active SQL-session account.                                                       |
+| `lix_active_branch_id()`                | text        | Active branch.                                                                    |
+| `lix_active_branch_commit_id()`         | text        | Active branch head pinned for the statement.                                      |
+| `lix_root_commit_id()`                  | text        | Repository bootstrap root.                                                        |
+| `lix_row_ref(relation, primary_key...)` | row_ref     | Opaque address of one relation row, including composite keys.                     |
+| `lix_order_between(previous, next)`     | text        | Allocate a plugin row order key between exclusive bounds; NULL means an open end. |
+| `uuidv7()`                              | uuid        | Generate a UUIDv7 value.                                                          |
+| `CURRENT_TIMESTAMP`                     | timestamptz | Transaction-start instant at microsecond precision.                               |
 
 `lix_row_ref` takes the relation's typed primary-key values in declared order:
 
@@ -78,9 +78,7 @@ WHERE id IN ($2, $3);
 
 The relation argument must be a text literal. The commit may be a text parameter or `lix_root_commit_id()` / `lix_active_branch_commit_id()`. Primary key `=` and `IN` predicates are pushed into the point-in-time read, so batched entity lookups do not scan unrelated tracked rows. Untracked rows are never included.
 
-The supplied commit is a closed snapshot. A local commit records its exact global dependency in `lix_commit.base_commit_id`; its physical state is an immutable local-overlay root plus that pinned immutable global root. `lix_as_of` composes both roots and returns inherited global rows plus local values and tombstones, with local intent winning. Global commits have a null base. The base is a state dependency, not ancestry, so it is deliberately absent from `parent_commit_ids` and `lix_commit_ancestry()`. History compares complete endpoint states, including their pinned bases, while traversing only first parents.
-
-When global advances, the next live access to a local branch lazily publishes one metadata-only local commit pinned to the latest global commit. An actual local write performs the same base advance in its own commit, so multiple global advances coalesce and global publication remains O(1) rather than fanning out over every branch. No global rows are copied into the local overlay. The active commit ID and every live row therefore always describe the same closed snapshot.
+A commit on a branch records the `global` commit it depends on in `lix_commit.base_commit_id`. `lix_as_of` returns the branch rows at that commit plus the repository-wide rows from that `global` commit; a branch value wins over a global value. Commits on `global` have a null base. The base is a state dependency, not an ancestor, so it does not appear in `parent_commit_ids` or `lix_commit_ancestry()`.
 
 `lix_commit_ancestry()` returns the active head at depth `0` and every reachable ancestor once at its shortest depth. Pass one commit ID to use an explicit graph anchor:
 
