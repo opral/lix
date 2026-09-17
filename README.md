@@ -17,7 +17,7 @@ Lix is a version control system for any file format: code, documents, spreadshee
 
 - 📄 **Any format.** Text, binaries, large blobs. Plugins make formats like DOCX, XLSX, and JSON diffable and mergeable by clause, cell, or row.
 - 🧩 **Embeddable.** Runs in-process as a library. Storage is pluggable: memory, filesystem, browser OPFS, or S3.
-- 🗄️ **Designed as a database.** File content, app tables, and history are rows in one ACID OLTP database. Query millions of rows with SQL. Every write becomes a commit automatically. You never run a commit command.
+- 🗄️ **Designed as a database.** File content, app tables, and history are rows in one ACID OLTP database. Query millions of rows with SQL.
 - ⚡ **Real-time collaboration.** People and agents share a repository and see changes as they happen.
 - 🔒 **Permissions (planned).** Per file, per group, stored in the repository and versioned like any other change.
 
