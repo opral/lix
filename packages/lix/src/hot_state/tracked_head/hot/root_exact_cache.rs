@@ -231,6 +231,36 @@ mod tests {
         assert!(cache.entries.lock().unwrap().bytes <= MAX_BYTES);
     }
     #[tokio::test]
+    async fn exact_read_falls_back_to_authenticated_head_without_local_root() {
+        use super::super::*;
+        let authority = crate::open_lix().await.unwrap();
+        authority
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('head-fallback', 'before')",
+                &[],
+            )
+            .await
+            .unwrap();
+        let descriptor = authority.partial_replica_descriptor(None).await.unwrap();
+        let branch = descriptor.selected_branch.branch_id;
+        let base = CommitId::parse(&descriptor.selected_branch.head.commit_id).unwrap();
+        let storage = authority.storage_adapter();
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        let result = load_root_current_base_exact(
+            &read,
+            &branch,
+            CommitId::for_test_label("uninstalled-generation"),
+            None,
+            &refs(&[key("head-fallback")]),
+            ChangeRecordProjection::full(),
+            None,
+            Some(base),
+        )
+        .await
+        .unwrap();
+        assert!(result.row(0).is_some());
+    }
+    #[tokio::test]
     async fn cached_native_candidate_still_obeys_new_current_collection_control() {
         use super::super::*;
         let authority = crate::open_lix().await.unwrap();
@@ -270,6 +300,7 @@ mod tests {
             &refs(&keys),
             ChangeRecordProjection::full(),
             Some(&cache),
+            None,
         )
         .await
         .unwrap();
@@ -311,6 +342,7 @@ mod tests {
             &refs(&keys),
             ChangeRecordProjection::full(),
             Some(&cache),
+            None,
         )
         .await
         .unwrap();

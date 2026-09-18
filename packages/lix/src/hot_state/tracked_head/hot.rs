@@ -2637,8 +2637,11 @@ async fn scan_root_current_base_rows(
     active_checkpoint_commit_id: Option<CommitId>,
     request: &TrackedStateScanRequest,
     root_base_cache: Option<&RootBaseBatchCache>,
+    fallback_base_commit_id: Option<CommitId>,
 ) -> Result<MaterializedHotStateBatch, LixError> {
-    let Some(base_commit_id) = load_root_current_base_commit(store, branch_id, generation).await?
+    let Some(base_commit_id) = load_root_current_base_commit(store, branch_id, generation)
+        .await?
+        .or(fallback_base_commit_id)
     else {
         return Ok(MaterializedHotStateBatch::default());
     };
@@ -2746,8 +2749,11 @@ async fn scan_root_current_base_rows_for_merge(
     request: &TrackedStateScanRequest,
     other_candidate_count: usize,
     root_base_cache: Option<&RootBaseBatchCache>,
+    fallback_base_commit_id: Option<CommitId>,
 ) -> Result<MaterializedHotStateBatch, LixError> {
-    let Some(base_commit_id) = load_root_current_base_commit(store, branch_id, generation).await?
+    let Some(base_commit_id) = load_root_current_base_commit(store, branch_id, generation)
+        .await?
+        .or(fallback_base_commit_id)
     else {
         return Ok(MaterializedHotStateBatch::default());
     };
@@ -2873,6 +2879,7 @@ async fn scan_root_current_base_rows_for_merge(
         active_checkpoint_commit_id,
         &root_request,
         root_base_cache,
+        None,
     )
     .await
 }
@@ -2885,12 +2892,15 @@ async fn load_root_current_base_exact(
     keys: &[TrackedStateKeyRef<'_>],
     projection: ChangeRecordProjection,
     cache: Option<&RootBaseBatchCache>,
+    fallback_base_commit_id: Option<CommitId>,
 ) -> Result<MaterializedHotStateExactBatch, LixError> {
     #[cfg(test)]
     let profile_read = root_exact_profile::Read::new(store, keys.len());
     #[cfg(test)]
     let store = &profile_read;
-    let Some(base_commit_id) = load_root_current_base_commit(store, branch_id, generation).await?
+    let Some(base_commit_id) = load_root_current_base_commit(store, branch_id, generation)
+        .await?
+        .or(fallback_base_commit_id)
     else {
         return MaterializedHotStateExactBatch::new(
             MaterializedHotStateBatch::default(),
@@ -4593,16 +4603,40 @@ where
         request: &TrackedStateScanRequest,
         requested_untracked: Option<bool>,
     ) -> Result<MaterializedHotStateBatch, LixError> {
+        self.scan_live_batch_for_retention_with_fallback(
+            branch_id,
+            control,
+            request,
+            requested_untracked,
+            None,
+        )
+        .await
+    }
+
+    /// Scan a serving generation, falling back to the authenticated branch
+    /// head when the lazy current-base projection has not been installed yet.
+    /// The fallback traverses the same immutable native state as a full read;
+    /// missing headers/chunks remain typed hydration demands instead of an
+    /// empty result.
+    pub(crate) async fn scan_live_batch_for_retention_with_fallback(
+        &self,
+        branch_id: &str,
+        control: BranchHeadControl,
+        request: &TrackedStateScanRequest,
+        requested_untracked: Option<bool>,
+        fallback_base_commit_id: Option<CommitId>,
+    ) -> Result<MaterializedHotStateBatch, LixError> {
         // The branch has one serving generation. Tracked and history-free
         // rows share it and are separated only by their per-row flag, so an
         // explicit retention filter is a row predicate over a single scan,
         // never a second authority domain.
         let rows = self
-            .scan_live_batch_for_generation(
+            .scan_live_batch_for_generation_with_fallback(
                 branch_id,
                 control.tracked_generation,
                 control.working_diff_checkpoint_commit_id,
                 request,
+                fallback_base_commit_id,
             )
             .await?;
         Ok(match requested_untracked {
@@ -4617,10 +4651,32 @@ where
         request: &TrackedStateScanRequest,
         requested_untracked: Option<bool>,
     ) -> Result<Vec<(String, MaterializedHotStateBatch)>, LixError> {
+        self.scan_live_batches_for_controls_with_fallback(
+            controls,
+            request,
+            requested_untracked,
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn scan_live_batches_for_controls_with_fallback(
+        &self,
+        controls: &[(String, BranchHeadControl)],
+        request: &TrackedStateScanRequest,
+        requested_untracked: Option<bool>,
+        fallback_to_head: bool,
+    ) -> Result<Vec<(String, MaterializedHotStateBatch)>, LixError> {
         let mut rows = Vec::with_capacity(controls.len());
         for (branch_id, control) in controls {
             let branch_rows = self
-                .scan_live_batch_for_retention(branch_id, *control, request, requested_untracked)
+                .scan_live_batch_for_retention_with_fallback(
+                    branch_id,
+                    *control,
+                    request,
+                    requested_untracked,
+                    fallback_to_head.then_some(control.head_commit_id),
+                )
                 .await?;
             rows.push((branch_id.clone(), branch_rows));
         }
@@ -4944,6 +5000,7 @@ where
                         limit: None,
                     },
                     self.root_base_cache.as_deref(),
+                    None,
                 ))
                 .await?
             } else {
@@ -5360,12 +5417,31 @@ where
         active_checkpoint_commit_id: Option<CommitId>,
         request: &TrackedStateScanRequest,
     ) -> Result<MaterializedHotStateBatch, LixError> {
+        self.scan_live_batch_for_generation_with_fallback(
+            branch_id,
+            generation,
+            active_checkpoint_commit_id,
+            request,
+            None,
+        )
+        .await
+    }
+
+    async fn scan_live_batch_for_generation_with_fallback(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+        active_checkpoint_commit_id: Option<CommitId>,
+        request: &TrackedStateScanRequest,
+        fallback_base_commit_id: Option<CommitId>,
+    ) -> Result<MaterializedHotStateBatch, LixError> {
         self.scan_live_batch_for_generation_with_visibility(
             branch_id,
             generation,
             active_checkpoint_commit_id,
             request,
             true,
+            fallback_base_commit_id,
         )
         .await
     }
@@ -5377,6 +5453,7 @@ where
         active_checkpoint_commit_id: Option<CommitId>,
         request: &TrackedStateScanRequest,
         apply_collection_visibility: bool,
+        fallback_base_commit_id: Option<CommitId>,
     ) -> Result<MaterializedHotStateBatch, LixError> {
         let collection_control = if apply_collection_visibility {
             match request.filter.schema_keys.as_slice() {
@@ -5490,6 +5567,7 @@ where
             request,
             rows.len().saturating_add(packed_rows.len()),
             self.root_base_cache.as_deref(),
+            fallback_base_commit_id,
         ))
         .await?;
         let combined = merge_ordered_live_batches(rows, packed_rows);
@@ -5586,16 +5664,34 @@ where
         projection: &ChangeRecordProjection,
         domain: HotStateReadDomain,
     ) -> Result<MaterializedHotStateExactBatch, LixError> {
+        self.load_projected_live_batch_refs_for_domain_with_fallback(
+            branch_id, control, keys, projection, domain, None,
+        )
+        .await
+    }
+
+    pub(crate) async fn load_projected_live_batch_refs_for_domain_with_fallback(
+        &self,
+        branch_id: &str,
+        control: BranchHeadControl,
+        keys: &[TrackedStateKeyRef<'_>],
+        projection: &ChangeRecordProjection,
+        domain: HotStateReadDomain,
+        fallback_base_commit_id: Option<CommitId>,
+    ) -> Result<MaterializedHotStateExactBatch, LixError> {
         // One serving generation holds at most one row per identity, so the
         // read domain is a predicate on the row that was found rather than a
         // precedence rule between two roots.
-        let rows = Box::pin(self.load_projected_live_batch_for_generation_refs(
-            branch_id,
-            control.tracked_generation,
-            control.working_diff_checkpoint_commit_id,
-            keys,
-            projection,
-        ))
+        let rows = Box::pin(
+            self.load_projected_live_batch_for_generation_refs_with_fallback(
+                branch_id,
+                control.tracked_generation,
+                control.working_diff_checkpoint_commit_id,
+                keys,
+                projection,
+                fallback_base_commit_id,
+            ),
+        )
         .await?;
         match domain {
             HotStateReadDomain::Combined => Ok(rows),
@@ -5612,6 +5708,26 @@ where
         keys: &[TrackedStateKeyRef<'_>],
         projection: &ChangeRecordProjection,
     ) -> Result<MaterializedHotStateExactBatch, LixError> {
+        self.load_projected_live_batch_for_generation_refs_with_fallback(
+            branch_id,
+            generation,
+            active_checkpoint_commit_id,
+            keys,
+            projection,
+            None,
+        )
+        .await
+    }
+
+    async fn load_projected_live_batch_for_generation_refs_with_fallback(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+        active_checkpoint_commit_id: Option<CommitId>,
+        keys: &[TrackedStateKeyRef<'_>],
+        projection: &ChangeRecordProjection,
+        fallback_base_commit_id: Option<CommitId>,
+    ) -> Result<MaterializedHotStateExactBatch, LixError> {
         self.load_projected_live_batch_for_generation_refs_with_visibility(
             branch_id,
             generation,
@@ -5619,6 +5735,7 @@ where
             keys,
             projection,
             true,
+            fallback_base_commit_id,
         )
         .await
     }
@@ -5631,6 +5748,7 @@ where
         keys: &[TrackedStateKeyRef<'_>],
         projection: &ChangeRecordProjection,
         apply_collection_visibility: bool,
+        fallback_base_commit_id: Option<CommitId>,
     ) -> Result<MaterializedHotStateExactBatch, LixError> {
         if keys.is_empty() {
             return Ok(MaterializedHotStateExactBatch::default());
@@ -5734,10 +5852,10 @@ where
             self.transaction_cache.as_deref(),
         )
         .await?;
-        let root_backed = load_root_current_base_commit(&self.store, branch_id, generation)
+        let root_base_commit_id = load_root_current_base_commit(&self.store, branch_id, generation)
             .await?
-            .is_some();
-        let root = if root_backed {
+            .or(fallback_base_commit_id);
+        let root = if root_base_commit_id.is_some() {
             Box::pin(load_root_current_base_exact(
                 &self.store,
                 branch_id,
@@ -5746,6 +5864,7 @@ where
                 keys,
                 *projection,
                 self.root_base_cache.as_deref(),
+                root_base_commit_id,
             ))
             .await?
         } else {
@@ -7881,6 +8000,7 @@ where
                 predecessor_checkpoint_commit_id,
                 &packed_previous_keys,
                 ChangeRecordProjection::identity_only(),
+                None,
                 None,
             ))
             .await?
