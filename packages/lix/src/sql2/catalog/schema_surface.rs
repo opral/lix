@@ -27,6 +27,7 @@ pub(crate) const TRACKED_ROW_SYSTEM_COLUMN_NAMES: [&str; 8] = [
     "lixcol_commit_id",
     "lixcol_untracked",
 ];
+pub(crate) const SCHEMA_V1_TYPE_METADATA_KEY: &str = "lix.schema_v1.type";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SchemaColumnType {
@@ -398,11 +399,17 @@ pub(crate) fn schema_surface_schema(
                 arrow_data_type_for_schema_column_type(column.column_type),
                 column.read_nullable,
             );
-            if column.column_type == SchemaColumnType::Jsonb {
+            let field = if column.column_type == SchemaColumnType::Jsonb {
                 mark_json_field(field)
             } else {
                 field
-            }
+            };
+            let mut metadata = field.metadata().clone();
+            metadata.insert(
+                SCHEMA_V1_TYPE_METADATA_KEY.to_owned(),
+                column.native_type.postgres_name().to_owned(),
+            );
+            field.with_metadata(metadata)
         })
         .collect::<Vec<_>>();
 
@@ -423,7 +430,7 @@ pub(crate) fn row_visible_fields(spec: &SchemaSurfaceSpec) -> Vec<Field> {
         .map(|(field, column)| {
             let mut metadata = field.metadata().clone();
             metadata.insert(
-                "lix.schema_v1.type".to_owned(),
+                SCHEMA_V1_TYPE_METADATA_KEY.to_owned(),
                 column.native_type.postgres_name().to_owned(),
             );
             if let Some(ordinal) = primary_key_ordinals.get(column.name.as_str()) {
@@ -466,7 +473,10 @@ fn arrow_data_type_for_schema_column_type(column_type: SchemaColumnType) -> Data
 mod tests {
     use serde_json::json;
 
-    use super::derive_schema_surface_spec_from_schema;
+    use super::{
+        SCHEMA_V1_TYPE_METADATA_KEY, SchemaSurfaceShape, derive_schema_surface_spec_from_schema,
+        schema_surface_schema,
+    };
 
     fn path_value_schema(value_type: &str) -> serde_json::Value {
         json!({
@@ -478,6 +488,28 @@ mod tests {
             ],
             "primary_key": ["path"]
         })
+    }
+
+    #[test]
+    fn schema_surface_schema_preserves_native_type_metadata() {
+        let spec = derive_schema_surface_spec_from_schema(&json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "uuid_rows",
+            "columns": [
+                { "name": "id", "type": "uuid", "nullable": false },
+            ],
+            "primary_key": ["id"],
+        }))
+        .expect("uuid schema should derive");
+        let schema = schema_surface_schema(&spec, SchemaSurfaceShape::Active);
+        let field = schema
+            .field_with_name("id")
+            .expect("uuid column should be exposed");
+
+        assert_eq!(
+            field.metadata().get(SCHEMA_V1_TYPE_METADATA_KEY),
+            Some(&"uuid".to_owned())
+        );
     }
 
     #[test]

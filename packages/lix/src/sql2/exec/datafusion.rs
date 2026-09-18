@@ -2311,8 +2311,19 @@ fn datafusion_expr_from_bound_expr(
             Ok(Expr::Literal(value, metadata))
         }
         BoundExpr::Cast { expr, data_type } => {
+            let expr = datafusion_expr_from_bound_expr(session, expr, params)?;
+            if *data_type == BoundCastType::Uuid {
+                let udf = session
+                    .udf("__lix_uuid_cast")
+                    .map_err(datafusion_error_to_lix_error)?;
+                return Ok(Expr::ScalarFunction(ScalarFunction::new_udf(
+                    udf,
+                    vec![expr],
+                )));
+            }
             let data_type = match data_type {
                 BoundCastType::Text => DataType::Utf8,
+                BoundCastType::Uuid => unreachable!("UUID casts are handled by __lix_uuid_cast"),
                 BoundCastType::Binary => DataType::Binary,
                 BoundCastType::BigInt => DataType::Int64,
                 BoundCastType::Double => DataType::Float64,
@@ -2320,7 +2331,7 @@ fn datafusion_expr_from_bound_expr(
                 BoundCastType::Jsonb => DataType::Utf8,
             };
             Ok(Expr::Cast(Cast::new(
-                Box::new(datafusion_expr_from_bound_expr(session, expr, params)?),
+                Box::new(expr),
                 data_type,
             )))
         }
@@ -2450,6 +2461,7 @@ fn bound_expr_requires_datafusion(expr: &BoundExpr) -> bool {
             !matches!(
                 name.as_str(),
                 "uuidv7"
+                    | "__lix_uuid_cast"
                     | "__lix_current_timestamp"
                     | "lix_active_branch_id"
                     | "lix_active_branch_commit_id"

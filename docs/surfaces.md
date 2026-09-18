@@ -43,7 +43,7 @@ ORDER BY ordinal_position;
 
 `description` is what the column means, in prose: a registered schema's own `description` annotations for its table and columns, and the engine's words for the composed views and the `lixcol_*` bookkeeping columns. It is NULL where nothing was written. `information_schema.lix_surfaces` carries the same for each relation, so a tool can present a table and its columns the way the schema author explained them.
 
-Lix reports the canonical SQL types `TEXT`, `BYTEA`, `BIGINT`, `DOUBLE PRECISION`, and `BOOLEAN`. The reported scalar type name is executable as an explicit `CAST` in `SELECT`, `INSERT`, and `UPDATE`. Bound Lix writes use those canonical names; read expressions accept DataFusion's wider cast dialect.
+Lix reports the canonical SQL types `TEXT`, `UUID`, `BYTEA`, `BIGINT`, `DOUBLE PRECISION`, and `BOOLEAN`. UUID columns retain their logical schema type in SQL metadata even though the Arrow execution representation is UTF-8. The reported scalar type name is executable as an explicit `CAST` in `SELECT`, `INSERT`, and `UPDATE`. Bound Lix writes use those canonical names; read expressions accept DataFusion's wider cast dialect.
 
 History functions are discoverable through `information_schema.table_functions`, which reports their argument signature and result columns. They do not appear in `information_schema.tables` or `information_schema.columns`.
 
