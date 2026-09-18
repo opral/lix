@@ -1,5 +1,5 @@
-//! Evaluate retained native recipes at unpublished candidate roots. No SQL is
-//! replayed; no control, receipt, cursor, or derived cache is published here.
+//! Stage coherent candidate controls; branch switching can additionally warm
+//! retained native recipes. No SQL is replayed or state published here.
 use super::partial_replica::PartialReplicaDescriptor;
 use crate::LixError;
 use crate::filesystem::{FilesystemPathIndexReader, FilesystemPathIndexRequest};
@@ -265,10 +265,10 @@ pub(super) fn interest_belongs_to_candidate(
 
 /// Concrete trusted caller must scope `read` through the session-owned bridge;
 /// no Arc reader or callback escapes this unit-returning native operation.
-pub(crate) async fn prepare_candidate_native_interests<R>(
+pub(crate) async fn prepare_candidate_state<R>(
     read: R,
     state: &super::partial_state::PartialReplicaState,
-    interests: &crate::hot_state::MovingReadInterestSnapshot,
+    interests: Option<&crate::hot_state::MovingReadInterestSnapshot>,
     plugin_host: crate::plugin::runtime::PluginRuntimeHost,
     hot: HotStateContext,
     allow_missing_selected_control: bool,
@@ -276,23 +276,7 @@ pub(crate) async fn prepare_candidate_native_interests<R>(
 where
     R: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
-    let interests = interests.as_read_snapshot();
     let descriptor = state.descriptor();
-    let mut active_interests = interests.clone();
-    active_interests.interests.clear();
-    for interest in &interests.interests {
-        if interest_belongs_to_candidate(
-            interest,
-            &descriptor.selected_branch.branch_id,
-            &descriptor.global_branch.branch_id,
-            state.archived_branch_ids(),
-        )? {
-            active_interests.interests.push(interest.clone());
-        }
-    }
-    // Keep the original revision and byte bound for the publisher's journal
-    // fence; filtering is a private evaluation view, never journal mutation.
-    let interests = &active_interests;
     descriptor.validate(
         &descriptor.lix_id,
         Some(&descriptor.selected_branch.branch_id),
@@ -400,6 +384,28 @@ where
             );
     }
     let staged = Arc::new(staged);
+    // Clean adoption publishes coherent coordinates, not the union of every
+    // previously read query. Missing inputs are hydrated by each subsequent
+    // foreground operation against its pinned serving basis.
+    let Some(interests) = interests else {
+        return Ok(PreparedCandidateState {
+            writes: staged,
+            source_control_guards,
+        });
+    };
+    let mut active_interests = interests.as_read_snapshot().clone();
+    active_interests.interests.clear();
+    for interest in &interests.as_read_snapshot().interests {
+        if interest_belongs_to_candidate(
+            interest,
+            &descriptor.selected_branch.branch_id,
+            &descriptor.global_branch.branch_id,
+            state.archived_branch_ids(),
+        )? {
+            active_interests.interests.push(interest.clone());
+        }
+    }
+    let interests = &active_interests;
     let read = CandidateRead {
         base: read,
         staged: Arc::clone(&staged),

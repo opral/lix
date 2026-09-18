@@ -656,10 +656,17 @@ async fn engine_worker_retains_watch_across_demands_then_publishes_negative_scop
             while engine.sync_mode().partial_admission().as_deref() == Some(old.as_ref()) {
                 tokio::task::yield_now().await;
             }
+            let mut refreshed = session
+                .observe(sql, &[])
+                .unwrap()
+                .with_sync_demand_sender(Some(sender.clone()));
+            let rows = refreshed.next().await.unwrap().unwrap().rows;
+            assert!(value(rows).contains("remote"));
+            drop(refreshed);
             let native_reads = client.native_reads.load(Ordering::SeqCst);
             assert!(
                 native_reads > 0,
-                "candidate preparation hydrates the changed scope on demand"
+                "foreground observation hydrates the changed scope on demand"
             );
             for _ in 0..10 {
                 assert!(value(session.execute(sql, &[]).await.unwrap()).contains("remote"));

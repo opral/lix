@@ -1,6 +1,6 @@
-//! Atomic adoption of a fully prepared authority working set. Hydration is
-//! deliberately outside this module: preparation returns native missing-input
-//! errors before any control or receipt is published.
+//! Atomic adoption of coherent authority coordinates. Structural inputs are
+//! prepared before publication; ordinary query inputs hydrate on demand after
+//! adoption. Explicit branch switching can additionally warm retained recipes.
 use std::sync::Arc;
 
 use super::http::CandidateBaselineDeadline;
@@ -24,7 +24,7 @@ pub(super) struct PreparedPartialPublication {
         Option<Arc<super::partial_branch_switch::PartialBranchSwitchCompletion>>,
     previous: Arc<PartialReplicaState>,
     next: Arc<PartialReplicaState>,
-    interests_revision: u64,
+    interests_revision: Option<u64>,
     deadline: CandidateBaselineDeadline,
     writes: StorageWriteSet,
     preconditions: Vec<StoragePrecondition>,
@@ -107,10 +107,11 @@ where
     if &actual != previous.as_ref() {
         return Err(conflict("partial publication admission changed"));
     }
-    let mut preconditions = super::partial_interest_journal::restore_candidate_read_interests(
-        &read, &previous, &registry,
-    )
-    .await?;
+    // Validate/restore the inventory without fencing its contents: adoption
+    // neither evaluates nor overwrites recipes registered by concurrent reads.
+    super::partial_interest_journal::restore_candidate_read_interests(&read, &previous, &registry)
+        .await?;
+    let mut preconditions = Vec::new();
     let mut writes = storage.new_write_set();
     let mut changed = false;
     if policy == PartialRecoveryPolicy::AuthorityWins {
@@ -257,7 +258,6 @@ where
             ));
         }
     }
-    let interests = registry.moving_snapshot()?;
     preconditions.push(stage_partial_replica_state(
         &mut writes,
         &next,
@@ -280,9 +280,7 @@ where
     }
     // This bridge owns and drops the coherent read. Only the exact evaluated
     // staged values and their source/fresh-generation guards can escape.
-    let prepared = engine
-        .prepare_partial_candidate(read, &next, &interests)
-        .await?;
+    let prepared = engine.prepare_partial_candidate(read, &next).await?;
     preconditions.extend(prepared.source_control_guards);
     let candidate_writes = Arc::try_unwrap(prepared.writes)
         .map_err(|_| conflict("candidate evaluator retained a publication write capability"))?;
@@ -292,7 +290,7 @@ where
         branch_switch_completion: None,
         previous,
         next,
-        interests_revision: interests.revision(),
+        interests_revision: None,
         deadline,
         writes,
         preconditions,
@@ -336,7 +334,10 @@ where
             // server's candidate pin. Bound both gates by the original HTTP
             // request deadline, including after caller cancellation.
             let gates = async {
-                let interest = registry.begin_publication(prepared.interests_revision).await?;
+                let interest = match prepared.interests_revision {
+                    Some(revision) => registry.begin_publication(revision).await?,
+                    None => registry.begin_basis_publication().await,
+                };
                 let write = engine.collaboration_write_gate().lock_owned().await;
                 Ok::<_, LixError>((interest, write))
             };
@@ -500,7 +501,7 @@ where
         branch_switch_completion: None,
         previous,
         next,
-        interests_revision,
+        interests_revision: Some(interests_revision),
         deadline,
         writes,
         preconditions: guards,
@@ -631,7 +632,7 @@ where
         origin_write_gate: engine.collaboration_write_gate(),
         previous,
         next,
-        interests_revision: interests.revision(),
+        interests_revision: Some(interests.revision()),
         deadline,
         writes,
         preconditions,

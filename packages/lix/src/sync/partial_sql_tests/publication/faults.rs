@@ -111,6 +111,7 @@ async fn prepared_fault_fixture() -> (
     Arc<PartialReplicaState>,
     PreparedPartialPublication,
     AcceptanceFault,
+    Lix<Memory>,
 ) {
     prepared_fault_fixture_with_deadline(None).await
 }
@@ -123,6 +124,7 @@ async fn prepared_fault_fixture_with_deadline(
     Arc<PartialReplicaState>,
     PreparedPartialPublication,
     AcceptanceFault,
+    Lix<Memory>,
 ) {
     let authority = open_lix().await.unwrap();
     authority
@@ -210,13 +212,13 @@ async fn prepared_fault_fixture_with_deadline(
     } else {
         prepared
     };
-    (engine, session, old, next, prepared, fault)
+    (engine, session, old, next, prepared, fault, authority)
 }
 
 #[tokio::test]
 async fn cancelled_publication_caller_retains_gates_until_acknowledgement() {
     tokio::time::timeout(Duration::from_secs(10),async {
-        let (engine,session,old,next,prepared,fault)=prepared_fault_fixture().await;
+        let (engine,session,old,next,prepared,fault,authority)=prepared_fault_fixture().await;
         fault.mode.store(1,Ordering::SeqCst);
         let mut caller=Box::pin(publish_prepared_partial(engine.clone(),prepared));
         tokio::select! {
@@ -235,7 +237,9 @@ async fn cancelled_publication_caller_retains_gates_until_acknowledgement() {
         let mut query=Box::pin(session.execute("SELECT value FROM lix_key_value WHERE key='resident'",&[]));
         assert!(tokio::time::timeout(Duration::from_millis(30),&mut query).await.is_err(),"direct SQL escaped publication gate before acknowledgement");
         fault.release.notify_one();
-        assert!(value(query.await.unwrap()).contains("remote"));
+        let missing = query.await.unwrap_err();
+        assert!(NativeObjectRef::from_missing_error(&missing).unwrap().is_some()
+            || NativeMetadataRef::from_missing_error(&missing).unwrap().is_some(), "{missing:?}");
         // Gate acquisition by SQL establishes that the owned publisher finished
         // its ACK and state swap. Its final guard drop may be scheduled next.
         let _new_owner = loop {
@@ -247,15 +251,16 @@ async fn cancelled_publication_caller_retains_gates_until_acknowledgement() {
         };
         assert_eq!(engine.sync_mode().partial_admission().as_deref(),Some(next.as_ref()));
         let (reopened,fresh)=Engine::new_partial_replica(engine.storage(),EngineOptions::new(),&next).await.unwrap();
-        reopened.sync_mode().admit_partial_replica(next,crate::sync::partial_replica_write_capability());
-        assert!(value(fresh.execute("SELECT value FROM lix_key_value WHERE key='resident'",&[]).await.unwrap()).contains("remote"));
+        reopened.sync_mode().admit_partial_replica(next.clone(),crate::sync::partial_replica_write_capability());
+        assert!(value(execute_hydrating(&fresh, &reopened.storage(), &next, &authority,
+            "SELECT value FROM lix_key_value WHERE key='resident'", &[], &mut Fetches::default()).await.unwrap()).contains("remote"));
     }).await.expect("publication cancellation test timed out");
 }
 
 #[tokio::test]
 async fn accepted_unknown_publication_poison_blocks_sql_until_durable_reopen() {
     tokio::time::timeout(Duration::from_secs(10),async {
-        let (engine,session,_,next,prepared,fault)=prepared_fault_fixture().await;
+        let (engine,session,_,next,prepared,fault,authority)=prepared_fault_fixture().await;
         fault.mode.store(2,Ordering::SeqCst);
         let mut caller=Box::pin(publish_prepared_partial(engine.clone(),prepared));
         tokio::select! {
@@ -275,14 +280,15 @@ async fn accepted_unknown_publication_poison_blocks_sql_until_durable_reopen() {
         drop(read);
         let (reopened,fresh)=Engine::new_partial_replica(storage,EngineOptions::new(),&durable).await.unwrap();
         reopened.sync_mode().admit_partial_replica(Arc::new(durable),crate::sync::partial_replica_write_capability());
-        assert!(value(fresh.execute("SELECT value FROM lix_key_value WHERE key='resident'",&[]).await.unwrap()).contains("remote"));
+        assert!(value(execute_hydrating(&fresh, &reopened.storage(), &next, &authority,
+            "SELECT value FROM lix_key_value WHERE key='resident'", &[], &mut Fetches::default()).await.unwrap()).contains("remote"));
     }).await.expect("unknown publication test timed out");
 }
 
 #[tokio::test]
 async fn expired_candidate_waiting_for_write_gate_never_publishes_even_if_caller_cancelled() {
     for cancel in [false, true] {
-        let (engine, _session, old, _next, prepared, _fault) =
+        let (engine, _session, old, _next, prepared, _fault, _authority) =
             prepared_fault_fixture_with_deadline(Some(Duration::from_secs(2))).await;
         let held = engine.collaboration_write_gate().lock_owned().await;
         let mut caller = Box::pin(publish_prepared_partial(engine.clone(), prepared));
@@ -340,7 +346,7 @@ async fn expired_candidate_waiting_for_write_gate_never_publishes_even_if_caller
 
 #[tokio::test]
 async fn candidate_expiring_after_storage_acceptance_poison_blocks_live_sql() {
-    let (engine, session, old, next, prepared, fault) =
+    let (engine, session, old, next, prepared, fault, _authority) =
         prepared_fault_fixture_with_deadline(Some(Duration::from_secs(2))).await;
     fault.mode.store(1, Ordering::SeqCst);
     let mut caller = Box::pin(publish_prepared_partial(engine.clone(), prepared));
@@ -380,7 +386,7 @@ async fn candidate_expiring_after_storage_acceptance_poison_blocks_live_sql() {
 
 #[tokio::test]
 async fn cancelled_publication_finishes_owned_branch_selector_after_ack() {
-    let (engine, _session, old, next, prepared, fault) = prepared_fault_fixture().await;
+    let (engine, _session, old, next, prepared, fault, _authority) = prepared_fault_fixture().await;
     let selector = crate::session::SessionBranch::new(crate::GLOBAL_BRANCH_ID.into());
     let primary = Arc::new(tokio::sync::Mutex::new(()));
     let completion = crate::sync::PartialBranchSwitchCompletion {

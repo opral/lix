@@ -2052,6 +2052,43 @@ async fn conflicting_remote_edits_converge_and_preserve_pending_rows_across_reop
     })
     .await
     .expect("later accepted incoming rows must converge after reconnect");
+    // Authority acceptance precedes local coordinate publication. Wait for
+    // that exact basis before demanding the rows whose offline cache we test.
+    let response = remote
+        .protocol
+        .handle(
+            Request::builder()
+                .header(SERVER_PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
+                .header(
+                    "lix-sync-protocol-version",
+                    lix::SYNC_PROTOCOL_VERSION.to_string(),
+                )
+                .header("lix-session-id", &remote.session_id)
+                .method("GET")
+                .uri(format!(
+                    "/lix/v1/{}/sync/descriptor",
+                    remote.protocol.lix_id()
+                ))
+                .body(ServerProtocolBody::empty())
+                .unwrap(),
+            remote.context.clone(),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let descriptor: JsonValue = serde_json::from_slice(&body).unwrap();
+    let accepted_cursor = descriptor["descriptor"]["cursor"].as_u64().unwrap();
+    tokio::time::timeout(WAIT_TIMEOUT, async {
+        while replica
+            .sync_health()
+            .applied_cursor
+            .is_none_or(|cursor| cursor < accepted_cursor)
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("replica must adopt the accepted authority basis before offline prefetch");
     assert_eq!(probe.merge_conflicts.load(Ordering::Acquire), 0);
     assert_eq!(
         read_value(&replica, "shared").await.as_deref(),

@@ -432,14 +432,31 @@ async fn lost_wave_with_pending_edit(
     crate::sync::partial_publication::publish_prepared_partial(engine.clone(), prepared)
         .await
         .unwrap();
-    let local = session
-        .execute("SELECT value FROM lix_key_value WHERE key='local'", &[])
-        .await
-        .unwrap();
-    let remote = session
-        .execute("SELECT value FROM lix_key_value WHERE key='remote'", &[])
-        .await
-        .unwrap();
+    // Publication installs coordinates; these consumers hydrate the newly
+    // admitted basis before subsequent offline reads assert its contents.
+    let current = engine.sync_mode().partial_admission().unwrap();
+    let local = execute_hydrating(
+        &session,
+        &storage,
+        &current,
+        &authority,
+        "SELECT value FROM lix_key_value WHERE key='local'",
+        &[],
+        &mut fetches,
+    )
+    .await
+    .unwrap();
+    let remote = execute_hydrating(
+        &session,
+        &storage,
+        &current,
+        &authority,
+        "SELECT value FROM lix_key_value WHERE key='remote'",
+        &[],
+        &mut fetches,
+    )
+    .await
+    .unwrap();
     assert!(format!("{local:?}").contains(if created_branch.is_some() { "L3" } else { "L2" }));
     if let Some(branch) = created_branch {
         assert!(
@@ -1022,3 +1039,5 @@ mod branch_switch_recovery;
 mod transaction_hydration;
 
 mod recovery_latency;
+
+mod lazy_publication;

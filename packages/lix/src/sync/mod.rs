@@ -441,7 +441,7 @@ mod partial_write_frontier;
 
 mod partial_candidate_prepare;
 pub(crate) use partial_candidate_prepare::{
-    PreparedCandidateState, prepare_candidate_native_interests,
+    PreparedCandidateState, prepare_candidate_state,
 };
 
 mod pending_conversion;

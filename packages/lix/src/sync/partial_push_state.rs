@@ -418,7 +418,7 @@ pub(super) async fn partial_push_observation_guards(
 
 /// Publication of prepared remote state may advance a clean confirmed ref.
 /// Unlike an own ACK, this accompanies a new serving basis. The caller must
-/// also CAS the observed local control and prepare all retained read scopes.
+/// also CAS the observed local control and install coherent fresh root controls.
 #[must_use = "publish confirmation with the prepared serving basis and every guard"]
 pub(super) async fn stage_remote_partial_confirmation(
     read: &(impl StorageAdapterRead + ?Sized),

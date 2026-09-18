@@ -278,6 +278,19 @@ async fn native_merge_adoption_atomically_settles_outbox_and_preserves_local_and
     publish_prepared_partial(engine.clone(), prepared)
         .await
         .unwrap();
+    for key in ["resident", "remote-new"] {
+        execute_hydrating(
+            &session,
+            &storage,
+            &next,
+            &authority,
+            "SELECT value FROM lix_key_value WHERE key=$1",
+            &[Value::Text(key.into())],
+            &mut Fetches::default(),
+        )
+        .await
+        .unwrap();
+    }
     assert!(
         value(
             session

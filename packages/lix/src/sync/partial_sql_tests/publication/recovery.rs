@@ -246,10 +246,25 @@ async fn changed_basis_recovery_prepares_previously_negative_scope() {
         )
         .await
         .unwrap();
-    let (_, prepared) = recovery_candidate(&engine, &old, &authority).await;
+    let (next, prepared) = recovery_candidate(&engine, &old, &authority).await;
     assert!(session.execute(sql, &[]).await.unwrap().rows().is_empty());
     publish_prepared_partial(engine, prepared).await.unwrap();
-    assert!(value(session.execute(sql, &[]).await.unwrap()).contains("arrived"));
+    assert!(
+        value(
+            execute_hydrating(
+                &session,
+                &storage,
+                &next,
+                &authority,
+                sql,
+                &[],
+                &mut Fetches::default()
+            )
+            .await
+            .unwrap()
+        )
+        .contains("arrived")
+    );
 }
 #[tokio::test]
 async fn same_basis_recovery_preserves_pending_suffix_and_frozen_upload() {
@@ -544,6 +559,17 @@ async fn authority_recovery_replaces_conflicting_suffix_and_accepts_new_writes()
     publish_prepared_partial(engine.clone(), prepared)
         .await
         .unwrap();
+    execute_hydrating(
+        &session,
+        &storage,
+        &next,
+        &authority,
+        "SELECT value FROM lix_key_value WHERE key='resident'",
+        &[],
+        &mut Fetches::default(),
+    )
+    .await
+    .unwrap();
     assert!(
         value(
             session

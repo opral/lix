@@ -417,22 +417,42 @@ async fn run_concurrent_global_creation(newer_global: bool) {
         .await
         .unwrap()
     );
-    assert_eq!(
-        value(
-            sb.execute("SELECT value FROM lix_key_value WHERE key='race'", &[])
-                .await
+    transport
+        .bind_native_baseline_lease(current.baseline_lease())
+        .unwrap();
+    // Ordinary foreground observation owns cold-input hydration after adoption.
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<crate::sync::SyncDemand>(4);
+    let reads = async {
+        for (key, expected) in [("race", "after-capture"), ("resident", "unchanged")] {
+            let mut events = sb
+                .observe(
+                    "SELECT value FROM lix_key_value WHERE key=$1",
+                    &[Value::Text(key.into())],
+                )
                 .unwrap()
-        ),
-        "after-capture"
-    );
-    assert_eq!(
-        value(
-            sb.execute("SELECT value FROM lix_key_value WHERE key='resident'", &[])
-                .await
-                .unwrap()
-        ),
-        "unchanged"
-    );
+                .with_sync_demand_sender(Some(sender.clone()));
+            let result = events.next().await.unwrap().unwrap();
+            assert_eq!(value(result.rows), expected);
+        }
+        drop(sender);
+    };
+    let hydrate = async {
+        while let Some(demand) = receiver.recv().await {
+            let result = crate::sync::partial_runtime::hydrate_demand(
+                &storage_b,
+                &current,
+                &transport,
+                demand.request,
+            )
+            .await;
+            demand.response.send(result).unwrap();
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        tokio::join!(reads, hydrate);
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

@@ -13170,7 +13170,7 @@ mod assume_send_future_proofs_borrowing {
 pub(crate) async fn prepare_partial_candidate_read_scope<StorageImpl>(
     read: StorageAdapterReadScope<StorageImpl::Read<'_>>,
     state: &crate::sync::PartialReplicaState,
-    interests: &crate::hot_state::MovingReadInterestSnapshot,
+    interests: Option<&crate::hot_state::MovingReadInterestSnapshot>,
     plugin_host: crate::plugin::runtime::PluginRuntimeHost,
     hot: crate::hot_state::HotStateContext,
     allow_missing_selected_control: bool,
@@ -13179,7 +13179,7 @@ where
     StorageImpl: Storage + 'static,
 {
     with_static_session_sql_read::<StorageImpl, _, _, _>(read, |read| async move {
-        crate::sync::prepare_candidate_native_interests(
+        crate::sync::prepare_candidate_state(
             read,
             state,
             interests,

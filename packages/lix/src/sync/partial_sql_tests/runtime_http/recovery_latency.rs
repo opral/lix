@@ -139,7 +139,7 @@ async fn slow_recovery(path: &'static str) {
             .unwrap();
         let (shutdown, shutdown_rx) =
             tokio::sync::watch::channel(crate::sync::runtime::SyncShutdown::Running);
-        let (_demand_tx, demand_rx) = tokio::sync::mpsc::channel(1);
+        let (demand_tx, demand_rx) = tokio::sync::mpsc::channel(1);
         let (_changes, changes_rx) = tokio::sync::watch::channel(0);
         let worker = crate::sync::partial_runtime::run_partial_worker_with_engine(
             storage.clone(),
@@ -161,18 +161,38 @@ async fn slow_recovery(path: &'static str) {
                 if result.rows()[0].get::<serde_json::Value>("value").unwrap() == "L"
                     && current.descriptor().cursor > old.descriptor().cursor
                 {
-                    let result = session
-                        .execute("SELECT value FROM lix_key_value WHERE key='remote'", &[])
-                        .await
-                        .unwrap();
+                    // The newly published basis is intentionally cold. Exercise
+                    // its SQL demand through the same worker under test.
+                    let mut retry = crate::sync::SyncDemandRetry::default();
+                    let result = loop {
+                        match session
+                            .execute("SELECT value FROM lix_key_value WHERE key='remote'", &[])
+                            .await
+                        {
+                            Ok(result) => break result,
+                            Err(error) => retry
+                                .hydrate_for_retry(Some(&demand_tx), error)
+                                .await
+                                .unwrap(),
+                        }
+                    };
                     assert_eq!(
                         result.rows()[0].get::<serde_json::Value>("value").unwrap(),
                         "R"
                     );
-                    let local = session
-                        .execute("SELECT value FROM lix_key_value WHERE key='local'", &[])
-                        .await
-                        .unwrap();
+                    let mut retry = crate::sync::SyncDemandRetry::default();
+                    let local = loop {
+                        match session
+                            .execute("SELECT value FROM lix_key_value WHERE key='local'", &[])
+                            .await
+                        {
+                            Ok(result) => break result,
+                            Err(error) => retry
+                                .hydrate_for_retry(Some(&demand_tx), error)
+                                .await
+                                .unwrap(),
+                        }
+                    };
                     assert_eq!(
                         local.rows()[0].get::<serde_json::Value>("value").unwrap(),
                         "L"

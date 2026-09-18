@@ -140,7 +140,9 @@ Each operation requires a network round trip; successful writes are accepted by 
 
 `OpfsStorage` stores the repository in the browser across reloads. Add `server: { url: repositoryUrl, mode: "partial_replica" }` alongside `storage` to create a **partial replica with on-demand sync**.
 
-Opening loads bounded metadata. SQL fetches missing native inputs and retains them locally. Reads and writes whose dependencies are resident run locally, including offline; local commits upload in the background. Background synchronization advances the local state without making warm foreground operations wait for the server.
+Opening loads bounded metadata. SQL fetches missing native inputs and retains them locally. Reads and writes whose dependencies are resident run locally, including offline; local commits upload in the background.
+
+Background synchronization adopts remote branch updates atomically without first fetching everything that previous queries read. A query or observer evaluating the new state fetches its own missing inputs before returning a coherent result. A previously cached query can therefore need network data after a remote update; missing data is never returned as an empty result. Applications can mount their workspace when opening completes and show loading separately for each pending query.
 
 <img src="../website/public/assets/browser-server-storage.webp" alt="A browser runs Replica Lix with a SQLite storage adapter backed by OPFS. It synchronizes with Authoritative Lix on a server, whose SlateDB storage adapter uses S3." width="760" decoding="async" loading="lazy" />
 

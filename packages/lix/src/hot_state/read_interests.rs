@@ -206,7 +206,7 @@ pub(crate) struct ReadInterestSnapshot {
     pub(crate) interests: Vec<Arc<LogicalReadInterest>>,
     pub(crate) serialized_bytes: usize,
 }
-/// Retained requirements that must stay warm as the branch basis moves.
+/// Retained moving requirements available for explicit branch-switch warming.
 /// This is not an observer subscription: successful moving reads remain in the
 /// durable working set even after their originating operation has completed.
 /// The private inner snapshot prevents passing historical retention inventory
@@ -375,6 +375,13 @@ impl ReadInterestRegistry {
             .interests
             .retain(|interest| interest.follows_branch_state());
         Ok(MovingReadInterestSnapshot(snapshot))
+    }
+    /// Serialize a basis-only publication with foreground operations. The
+    /// publisher does not evaluate or replace the retained recipe inventory.
+    pub(crate) async fn begin_basis_publication(self: &Arc<Self>) -> ReadInterestPublication {
+        ReadInterestPublication {
+            _guard: Arc::clone(&self.gate).write_owned().await,
+        }
     }
     pub(crate) async fn begin_publication(
         self: &Arc<Self>,
