@@ -6,7 +6,7 @@ JavaScript clients select `server.mode: "partial_replica"` and provide durable s
 
 Covered reads execute locally. Writes whose read, validation and publication dependencies are resident commit after local durability, without waiting for the server. Call `lix.execute()` with the intended SELECT on hover to fetch its inputs ahead of interaction. Writes use ordinary `execute()`; a cold write may fetch additional validation or commit inputs and can fail offline. One successful query does not prepare every possible subsequent statement.
 
-Current data means the coherently synchronized local state plus pending local writes. Immediate reads see those writes. Background synchronization advances retained scopes, including newly matching rows and rows leaving a scope. Own acknowledgments preserve the local working set and newer local commits.
+Current data means the coherently synchronized local state plus pending local writes. Immediate reads see those writes. Background synchronization publishes coherent branch coordinates without first warming every retained query. Queries and observers hydrate missing inputs against the new state, including newly matching rows and rows leaving a scope. A cached query may need network data after a remote update. Own acknowledgments preserve the local working set and newer local commits.
 
 ## Reconciliation and migration
 

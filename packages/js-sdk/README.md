@@ -111,8 +111,8 @@ execution do not require streaming uploads.
 
 Provide storage and set `server.mode: "partial_replica"` to create a
 **partial replica with on-demand sync**. Opening loads bounded metadata. SQL fetches missing native inputs on
-demand and retains them locally; background synchronization updates the loaded
-working set:
+demand and retains them locally; background synchronization adopts remote branch
+updates atomically:
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -136,6 +136,11 @@ whose dependencies are resident work offline, with immediate local visibility.
 A statement requiring missing inputs needs a connection; missing data is never
 silently treated as an empty result. Current data means the coherently applied
 server state plus pending local writes.
+
+Remote adoption does not first replay every previous read. Queries and observers
+fetch the inputs they need when evaluating the new state, so a previously cached
+query may need network data after an update. Mount the workspace after `openLix`
+resolves and handle pending queries in the views that use them.
 
 Prefetch a view on hover using the same ordinary SELECT it will display:
 

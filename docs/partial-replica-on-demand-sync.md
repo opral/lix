@@ -39,7 +39,7 @@ Protocol and storage changes may break compatibility. Migrate authoritative and 
 | Write with resident read/validation/publication dependencies | Commits after local durability; no authority acknowledgment required |
 | Immediate read after local write | Sees that write locally without rehydration |
 | SQL referencing new dependencies | Cold operation; hydrate before execution/commit or report unavailable offline |
-| Background sync | Updates retained scopes transactionally without downloading unrelated row/content payloads |
+| Background sync | Publishes coherent branch coordinates atomically; queries and observers hydrate their own missing inputs afterward |
 | Offline | Covered operations work; uncovered operations fail explicitly rather than returning incomplete results |
 
 “Current” means the browser’s latest coherently applied authority state plus its pending local commits. Globally latest server state cannot be guaranteed without communication. Coverage remains usable at its local version during a disconnect; reconnect updates it in the background according to the existing reconciliation policy.
@@ -138,17 +138,17 @@ Passing requires zero foreground requests for the prepared mutation, no hidden w
 
 Foreign-key, uniqueness, filesystem ancestry, delete restrictions, plugin extraction and checkpoint dependencies are part of write readiness. Full predicates may require broad coverage. Preserve the existing local provisional commit/server admission policy; do not silently convert validation into deferred speculative checks to make an operation appear local.
 
-## 5. Keep the working set warm through background sync
+## 5. Publish updates independently of query hydration
 
-The current implementation discovers leased descriptors independently of read recipes. The replica hydrates required native inputs and publishes the moving working set atomically. Fixed-to-fixed historical reads retain their recipes and immutable bytes without participating in moving-state publication. Dynamic reads, including negative scopes and diffs involving a moving head, remain publication requirements. This retained warm working set is not an observer-lifetime lease; explicit subscription disposal and cache eviction remain separate future work. Optional prefetch must remain independent of descriptor discovery and publication. It must never turn unavailable historical inputs into a synchronization barrier.
+The implementation discovers leased descriptors and atomically publishes validated branch coordinates independently of retained read recipes. Normal remote adoption prepares structural inputs without prewarming previous queries, including negative scopes and diffs involving a moving head. Queries and observers then hydrate missing inputs against the newly admitted coherent basis. A previously cached query can therefore require network data after adoption. Retained recipes still support explicit branch-switch preparation; subscription disposal and cache eviction are separate concerns. Optional prefetch must remain independent of descriptor discovery and publication.
 
-A scope snapshot and its following changes need a race-free boundary. Apply cross-scope changes as a coherent transaction, with rows, provenance and coverage updates installed together. A move between two loaded directories must not transiently disappear from both or be counted twice in a combined query.
+A scope snapshot and its following changes need a race-free boundary. Publish branch coordinates and serving generations together; each query returns rows and provenance from one coherent basis after validating its coverage. A move between two loaded directories must not transiently disappear from both or be counted twice in a combined query.
 
 **Do not invalidate every scope on each head change.** Covered local mutations update local indexes, coverage and observation results immediately. Their acknowledgments advance confirmation metadata without discarding newer local descendants or reloading the scope. Remote changes outside a scope must allow that scope’s unchanged state to advance without downloading their payloads.
 
 Maintain a coherent applied working-set version; the latest authority notification is not automatically the version visible to SQL. Dependencies and coverage from incompatible versions cannot be joined as though they were one snapshot. Gaps/resets retain the last coherent view until repaired, or produce a defined unavailable state; they never bless incomplete newer data.
 
-Some scopes may remain retained without an active subscription, but then they describe an older complete snapshot. The system cannot unsubscribe and still promise latest-server values immediately on return. Pin scopes requiring continuously warm editing; bound other subscriptions and retained bytes explicitly.
+Retained immutable inputs are reusable, but their presence does not guarantee that a moving query is warm at the newly admitted basis. Each query validates its dependencies before returning; offline queries with missing inputs fail explicitly. Bound retained bytes independently of observer lifetimes.
 
 Pending commits and their base/validation/recovery dependencies are not evictable cache. Garbage collection must understand remote references and incomplete local availability; it cannot assume local reachability is a complete inventory of authority state. Reset must not trigger an implicit full-repository bootstrap.
 

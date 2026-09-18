@@ -410,7 +410,36 @@ async fn conflicting_file_case_at_path(
     }
     let sql = "SELECT CAST(content AS TEXT) AS content FROM lix_file WHERE path=$1";
     let params = [Value::Text(final_path.into())];
+    let current = engine.sync_mode().partial_admission().unwrap();
+    // Keep the previous transport's pin immutable, just as runtime adoption
+    // forks a transport for the newly admitted baseline.
+    let transport = transport
+        .fork_native_baseline_lease(current.baseline_lease())
+        .unwrap();
+    let mut attempts = 0;
+    let hydrated = loop {
+        match session.execute(sql, &params).await {
+            Ok(rows) => break rows,
+            Err(error) => {
+                attempts += 1;
+                assert!(
+                    attempts <= 128,
+                    "merged file demand did not settle: {error:?}"
+                );
+                let demand = crate::sync::runtime::native_sync_demand_request_for_error(&error)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("unexpected merged file error: {error:?}"));
+                crate::sync::partial_runtime::hydrate_demand(
+                    &storage, &current, &transport, demand,
+                )
+                .await
+                .unwrap();
+            }
+        }
+    };
+    // Once demanded, the merged file remains readable without a transport.
     let local = session.execute(sql, &params).await.unwrap();
+    assert_eq!(local, hydrated);
     let remote = authority.execute(sql, &params).await.unwrap();
     assert_eq!(local, remote);
     if expected != "<deleted>" {

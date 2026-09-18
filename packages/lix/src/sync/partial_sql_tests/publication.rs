@@ -253,7 +253,32 @@ async fn unavailable_historical_recipe_does_not_block_moving_negative_scope() {
     publish_prepared_partial(engine.clone(), prepared)
         .await
         .unwrap();
-    assert!(value(session.execute(sql, &[]).await.unwrap()).contains("arrived"));
+    let missing = session.execute(sql, &[]).await.unwrap_err();
+    assert!(
+        NativeObjectRef::from_missing_error(&missing)
+            .unwrap()
+            .is_some()
+            || NativeMetadataRef::from_missing_error(&missing)
+                .unwrap()
+                .is_some(),
+        "{missing:?}"
+    );
+    assert!(
+        value(
+            execute_hydrating(
+                &session,
+                &storage,
+                &next,
+                &authority,
+                sql,
+                &[],
+                &mut Fetches::default()
+            )
+            .await
+            .unwrap()
+        )
+        .contains("arrived")
+    );
     assert_eq!(
         session.execute(&history_sql, &[]).await.unwrap().rows(),
         history.rows(),
@@ -274,7 +299,64 @@ async fn unavailable_historical_recipe_does_not_block_moving_negative_scope() {
 }
 
 #[tokio::test]
-async fn remote_publication_prepares_negative_scope_then_keeps_reads_local() {
+async fn unavailable_moving_recipe_does_not_block_unrelated_publication() {
+    let (authority, engine, session, old) = fixture().await;
+    let storage = engine.storage();
+    let registry = engine.sync_mode().read_interests().unwrap();
+    // A retained moving diff can refer to a fixed endpoint no longer available
+    // remotely. It must not prevent unrelated current data from advancing.
+    registry
+        .register(crate::hot_state::LogicalReadInterest::Diff {
+            branch_id: Some(old.descriptor().selected_branch.branch_id.clone()),
+            relation: "lix_key_value".into(),
+            from: crate::hot_state::DiffInterestEndpoint::Fixed(uuid::Uuid::now_v7().to_string()),
+            to: crate::hot_state::DiffInterestEndpoint::ActiveHead,
+            filter: Default::default(),
+            retain_payloads: true,
+            projected_columns: vec!["value".into()],
+            limit: None,
+        })
+        .unwrap();
+    crate::sync::partial_interest_journal::flush_partial_read_interests(&storage, &old, &registry)
+        .await
+        .unwrap();
+    authority
+        .execute(
+            "UPDATE lix_key_value SET value='independent' WHERE key='resident'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let next = Arc::new(
+        old.with_descriptor_and_fresh_generations(
+            authority.partial_replica_descriptor(None).await.unwrap(),
+        )
+        .unwrap(),
+    );
+    let prepared = prepare_hydrating(&engine, &old, next.clone(), &authority).await;
+    publish_prepared_partial(engine.clone(), prepared)
+        .await
+        .unwrap();
+    assert!(
+        value(
+            execute_hydrating(
+                &session,
+                &storage,
+                &next,
+                &authority,
+                "SELECT value FROM lix_key_value WHERE key='resident'",
+                &[],
+                &mut Fetches::default()
+            )
+            .await
+            .unwrap()
+        )
+        .contains("independent")
+    );
+}
+
+#[tokio::test]
+async fn remote_publication_adopts_before_hydrating_previously_read_scope() {
     let (authority, engine, session, old) = fixture().await;
     let storage = engine.storage();
     let sql = "SELECT value FROM lix_key_value WHERE key='future'";
@@ -318,7 +400,32 @@ async fn remote_publication_prepares_negative_scope_then_keeps_reads_local() {
         engine.sync_mode().partial_admission().as_deref(),
         Some(next.as_ref())
     );
-    assert!(value(session.execute(sql, &[]).await.unwrap()).contains("arrived"));
+    let missing = session.execute(sql, &[]).await.unwrap_err();
+    assert!(
+        NativeObjectRef::from_missing_error(&missing)
+            .unwrap()
+            .is_some()
+            || NativeMetadataRef::from_missing_error(&missing)
+                .unwrap()
+                .is_some(),
+        "{missing:?}"
+    );
+    assert!(
+        value(
+            execute_hydrating(
+                &session,
+                &storage,
+                &next,
+                &authority,
+                sql,
+                &[],
+                &mut Fetches::default()
+            )
+            .await
+            .unwrap()
+        )
+        .contains("arrived")
+    );
     // Fresh engine and session prove this is durable native state, not merely
     // a cached query result held by the original SQL execution.
     let (reopened, reopened_session) =
@@ -332,7 +439,7 @@ async fn remote_publication_prepares_negative_scope_then_keeps_reads_local() {
 }
 
 #[tokio::test]
-async fn remote_publication_rejects_new_interest_after_candidate_preparation() {
+async fn remote_publication_accepts_new_interest_after_candidate_preparation() {
     let (authority, engine, session, old) = fixture().await;
     let storage = engine.storage();
     execute_hydrating(
@@ -359,7 +466,7 @@ async fn remote_publication_rejects_new_interest_after_candidate_preparation() {
         )
         .unwrap(),
     );
-    let prepared = prepare_hydrating(&engine, &old, next, &authority).await;
+    let prepared = prepare_hydrating(&engine, &old, next.clone(), &authority).await;
     execute_hydrating(
         &session,
         &storage,
@@ -371,22 +478,28 @@ async fn remote_publication_rejects_new_interest_after_candidate_preparation() {
     )
     .await
     .unwrap();
-    let error = publish_prepared_partial(engine.clone(), prepared)
+    publish_prepared_partial(engine.clone(), prepared)
         .await
-        .unwrap_err();
-    assert_eq!(error.code, "LIX_PARTIAL_READ_INTEREST_CHANGED");
+        .unwrap();
     assert_eq!(
         engine.sync_mode().partial_admission().as_deref(),
-        Some(old.as_ref())
+        Some(next.as_ref())
     );
     assert!(
         value(
-            session
-                .execute("SELECT value FROM lix_key_value WHERE key='resident'", &[])
-                .await
-                .unwrap()
+            execute_hydrating(
+                &session,
+                &storage,
+                &next,
+                &authority,
+                "SELECT value FROM lix_key_value WHERE key='resident'",
+                &[],
+                &mut Fetches::default()
+            )
+            .await
+            .unwrap()
         )
-        .contains("before")
+        .contains("remote")
     );
 }
 
@@ -503,7 +616,22 @@ async fn remote_publication_preserves_local_untracked_rows_in_fresh_generation()
     for (key, expected) in [("private-one", "keep-one"), ("private-two", "keep-two")] {
         let sql =
             format!("SELECT value FROM lix_key_value WHERE key='{key}' AND lixcol_untracked=true");
-        assert!(value(reopened_session.execute(&sql, &[]).await.unwrap()).contains(expected));
+        assert!(
+            value(
+                execute_hydrating(
+                    &reopened_session,
+                    &storage,
+                    &next,
+                    &authority,
+                    &sql,
+                    &[],
+                    &mut Fetches::default()
+                )
+                .await
+                .unwrap()
+            )
+            .contains(expected)
+        );
         assert!(
             authority
                 .execute(&sql, &[])
@@ -623,11 +751,23 @@ async fn prepared_update_remains_local_after_remote_baseline_publication() {
         )
         .unwrap(),
     );
-    let prepared = prepare_hydrating(&engine, &old, next, &authority).await;
+    let prepared = prepare_hydrating(&engine, &old, next.clone(), &authority).await;
     publish_prepared_partial(engine.clone(), prepared)
         .await
         .unwrap();
-    // These are direct session calls: no hydration callback or network exists.
+    // An explicit read prepares bounded edit inputs on the newly adopted basis.
+    execute_hydrating(
+        &session,
+        &storage,
+        &next,
+        &authority,
+        "SELECT value FROM lix_key_value WHERE key='resident'",
+        &[],
+        &mut Fetches::default(),
+    )
+    .await
+    .unwrap();
+    // Subsequent edits on this basis remain local.
     for value in ["offline-one", "offline-two", "offline-three"] {
         session
             .execute(update, &[Value::Text(value.into())])
@@ -793,12 +933,25 @@ async fn remote_file_publication_rotates_live_path_index_and_count_cache() {
     publish_prepared_partial(engine.clone(), prepared)
         .await
         .unwrap();
+    for query in [sql, count, directory_sql] {
+        execute_hydrating(
+            &session,
+            &storage,
+            &next,
+            &authority,
+            query,
+            &[],
+            &mut Fetches::default(),
+        )
+        .await
+        .unwrap();
+    }
     assert_eq!(session.execute(sql, &[]).await.unwrap().rows().len(), 1);
     assert_eq!(
         session
             .execute(directory_sql, &[])
             .await
-            .expect("newly matching directory is prepared before publication")
+            .expect("newly matching directory remains readable after query hydration")
             .rows()
             .len(),
         1
@@ -933,6 +1086,17 @@ async fn remote_global_publication_invalidates_active_account_proof() {
         Some(&token),
         &account
     ));
+    execute_hydrating(
+        &session,
+        &storage,
+        &next,
+        &authority,
+        sql,
+        &params,
+        &mut Fetches::default(),
+    )
+    .await
+    .unwrap();
     let read = storage.begin_read(Default::default()).await.unwrap();
     let revision_before_read = crate::storage_adapter::load_repository_mutation_revision(&read)
         .await
@@ -949,8 +1113,7 @@ async fn remote_global_publication_invalidates_active_account_proof() {
         .map(|control| control.raw_token)
         .collect::<Vec<_>>();
     drop(read);
-    // Exact previously covered SQL must remain local after publication,
-    // including catalog inputs invalidated by the new global head.
+    // After foreground hydration, repeated SQL remains local on the new head.
     assert_eq!(
         session.execute(sql, &params).await.unwrap().rows()[0]
             .get::<String>("status")
@@ -995,7 +1158,7 @@ async fn remote_global_publication_invalidates_active_account_proof() {
 }
 
 #[tokio::test]
-async fn remote_global_publication_keeps_global_session_sql_and_catalog_warm() {
+async fn remote_global_publication_hydrates_global_session_sql_and_catalog_on_demand() {
     let account = uuid::Uuid::now_v7().to_string();
     let (authority, engine, _selected, old) = fixture_with_account(Some(&account)).await;
     let storage = engine.storage();
@@ -1064,6 +1227,17 @@ async fn remote_global_publication_keeps_global_session_sql_and_catalog_warm() {
     publish_prepared_partial(engine.clone(), prepared)
         .await
         .unwrap();
+    execute_hydrating(
+        &global,
+        &storage,
+        &next,
+        &authority,
+        sql,
+        &params,
+        &mut Fetches::default(),
+    )
+    .await
+    .unwrap();
     let read = storage.begin_read(Default::default()).await.unwrap();
     let revision_before_read = crate::storage_adapter::load_repository_mutation_revision(&read)
         .await
@@ -1788,10 +1962,17 @@ async fn scoped_file_index_publication_prepares_renamed_ancestors_and_new_matche
     publish_prepared_partial(engine.clone(), prepared)
         .await
         .unwrap();
-    let result = session
-        .execute(sql, &params)
-        .await
-        .expect("publication prepares new scoped paths before switching generations");
+    let result = execute_hydrating(
+        &session,
+        &storage,
+        &next,
+        &authority,
+        sql,
+        &params,
+        &mut Fetches::default(),
+    )
+    .await
+    .expect("query hydrates new scoped paths after switching generations");
     assert_eq!(
         result
             .rows()
