@@ -189,6 +189,19 @@ fn rewrite_postgresql_expressions(statement: &mut DataFusionStatement) {
                 *expr = private_function("__lix_jsonb", vec![*inner]);
                 return ControlFlow::Continue(());
             }
+            if let Expr::Cast {
+                expr: inner,
+                data_type: SqlDataType::Uuid,
+                array: false,
+                format: None,
+                ..
+            } = expr
+            {
+                let placeholder = Box::new(Expr::Value(Value::Boolean(false).into()));
+                let inner = std::mem::replace(inner, placeholder);
+                *expr = private_function("__lix_uuid_cast", vec![*inner]);
+                return ControlFlow::Continue(());
+            }
             let Expr::BinaryOp { left, op, right } = expr else {
                 return ControlFlow::Continue(());
             };

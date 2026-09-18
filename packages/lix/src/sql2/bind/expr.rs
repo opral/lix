@@ -36,6 +36,7 @@ pub(crate) enum BoundBinaryOperator {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BoundCastType {
     Text,
+    Uuid,
     Binary,
     BigInt,
     Double,
@@ -47,6 +48,7 @@ impl BoundCastType {
     pub(crate) fn canonical_sql_name(self) -> &'static str {
         match self {
             Self::Text => "TEXT",
+            Self::Uuid => "UUID",
             Self::Binary => "BYTEA",
             Self::BigInt => "BIGINT",
             Self::Double => "DOUBLE PRECISION",
@@ -106,6 +108,7 @@ pub(crate) fn bind_public_cast_type(
 ) -> Result<BoundCastType, LixError> {
     let cast_type = match data_type {
         SqlDataType::Text => Some(BoundCastType::Text),
+        SqlDataType::Uuid => Some(BoundCastType::Uuid),
         SqlDataType::Bytea => Some(BoundCastType::Binary),
         SqlDataType::Int8(None) | SqlDataType::BigInt(None) => Some(BoundCastType::BigInt),
         SqlDataType::Float8 | SqlDataType::DoublePrecision => Some(BoundCastType::Double),
@@ -127,7 +130,7 @@ fn unsupported_public_cast(expr: &Expr, data_type: &SqlDataType) -> LixError {
         format!("unsupported SQL cast 'CAST({expr} AS {data_type})'"),
     )
     .with_hint(
-        "Use one of the canonical PostgreSQL cast types supported by Lix: TEXT, BYTEA, BIGINT, DOUBLE PRECISION, BOOLEAN, or JSONB.",
+        "Use one of the canonical PostgreSQL cast types supported by Lix: TEXT, UUID, BYTEA, BIGINT, DOUBLE PRECISION, BOOLEAN, or JSONB.",
     )
 }
 

@@ -3556,6 +3556,7 @@ fn returning_expr_column_type(
         BoundExpr::Literal(BoundLiteral::Json(_)) => Some(crate::ResultColumnType::Jsonb),
         BoundExpr::Cast { data_type, .. } => Some(match data_type {
             BoundCastType::Text => crate::ResultColumnType::Text,
+            BoundCastType::Uuid => crate::ResultColumnType::Text,
             BoundCastType::Binary => crate::ResultColumnType::Blob,
             BoundCastType::BigInt => crate::ResultColumnType::Integer,
             BoundCastType::Double => crate::ResultColumnType::Real,
@@ -5898,8 +5899,30 @@ fn cast_row_eval_value(
                 }),
         };
     }
+    if cast_type == BoundCastType::Uuid {
+        return match value {
+            RowEvalValue::SqlNull | RowEvalValue::Json(JsonValue::Null) => {
+                Ok(RowEvalValue::SqlNull)
+            }
+            RowEvalValue::SqlText(value) | RowEvalValue::Json(JsonValue::String(value)) => {
+                uuid::Uuid::parse_str(&value)
+                    .map(|value| RowEvalValue::SqlText(value.to_string()))
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_TYPE_MISMATCH,
+                            format!("CAST AS UUID failed: {error}"),
+                        )
+                    })
+            }
+            _ => Err(LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                "CAST AS UUID requires a text UUID value",
+            )),
+        };
+    }
     let target_type = match cast_type {
         BoundCastType::Text => DataType::Utf8,
+        BoundCastType::Uuid => unreachable!("UUID casts are handled above"),
         BoundCastType::BigInt => DataType::Int64,
         BoundCastType::Double => DataType::Float64,
         BoundCastType::Boolean => DataType::Boolean,
@@ -6067,6 +6090,12 @@ fn eval_expr_value(
             Ok(active_branch_commit_id
                 .map(|commit_id| RowEvalValue::SqlText(commit_id.to_string()))
                 .unwrap_or(RowEvalValue::SqlNull))
+        }
+        BoundExpr::Function { name, args }
+            if name == "__lix_uuid_cast" && args.len() == 1 =>
+        {
+            let value = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
+            cast_row_eval_value(value, BoundCastType::Uuid)
         }
         BoundExpr::Function { name, args } if name == "__lix_jsonb" && args.len() == 1 => {
             let value = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
@@ -6710,7 +6739,7 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
                 | "__lix_json_exists"
                 | "lix_order_between"
                     if args.len() == 2 => {}
-                "__lix_jsonb" if args.len() == 1 => {}
+                "__lix_jsonb" | "__lix_uuid_cast" if args.len() == 1 => {}
                 _ => {
                     return Err(LixError::new(
                         LixError::CODE_UNSUPPORTED_SQL,

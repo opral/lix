@@ -717,7 +717,7 @@ simulation_test!(
                 ],
                 vec![
                     Value::Text("id".to_string()),
-                    Value::Text("TEXT".to_string()),
+                    Value::Text("UUID".to_string()),
                     Value::Text("NO".to_string()),
                     Value::Text("uuidv7()".to_string()),
                     Value::Null,
@@ -756,6 +756,19 @@ simulation_test!(
                     Value::Text("REQUIRED".to_string()),
                 ],
             ],
+        );
+
+        let account_id_contract = session
+            .execute(
+                "SELECT data_type FROM information_schema.columns \
+                 WHERE table_name = 'lix_account' AND column_name = 'id'",
+                &[],
+            )
+            .await
+            .expect("lix_account.id contract query should succeed");
+        assert_rows_eq(
+            account_id_contract,
+            vec![vec![Value::Text("UUID".to_string())]],
         );
 
         let file_contract = session
@@ -925,7 +938,7 @@ simulation_test!(
 
         let history_contract = session
             .execute(
-                "SELECT result_column, is_nullable \
+                "SELECT result_column, data_type, is_nullable \
                  FROM information_schema.table_functions \
                  WHERE function_name = 'lix_history' \
                    AND source_relation = 'engine_column_contract' \
@@ -938,9 +951,14 @@ simulation_test!(
         assert_rows_eq(
             history_contract,
             vec![
-                vec![Value::Text("id".to_string()), Value::Text("NO".to_string())],
+                vec![
+                    Value::Text("id".to_string()),
+                    Value::Text("UUID".to_string()),
+                    Value::Text("NO".to_string()),
+                ],
                 vec![
                     Value::Text("to_title".to_string()),
+                    Value::Text("TEXT".to_string()),
                     Value::Text("YES".to_string()),
                 ],
             ],
@@ -964,6 +982,13 @@ simulation_test!(
                 contract.column_name.as_str(),
                 contract.value_kind.as_deref(),
             ) {
+                ("id", None) => (
+                    Value::Text("00000000-0000-7000-8000-000000000001".to_string()),
+                    Value::Text("00000000-0000-7000-8000-000000000001".to_string()),
+                    Value::Text("00000000-0000-7000-8000-000000000001".to_string()),
+                    Value::Text("00000000-0000-7000-8000-000000000002".to_string()),
+                    Value::Text("00000000-0000-7000-8000-000000000002".to_string()),
+                ),
                 ("text_value", None) => (
                     Value::Integer(101),
                     Value::Text("101".to_string()),
@@ -1039,7 +1064,7 @@ simulation_test!(
                  WHERE (\
                    table_name = 'engine_scalar_cast_contract' \
                    AND column_name IN (\
-                     'text_value', 'integer_value', 'number_value', \
+                     'id', 'text_value', 'integer_value', 'number_value', \
                      'boolean_value', 'json_value'\
                    )\
                  ) OR (table_name = 'lix_file' AND column_name = 'content') \
@@ -1074,10 +1099,15 @@ simulation_test!(
                 }
             })
             .collect::<Vec<_>>();
-        assert_eq!(contracts.len(), 6, "expected five row types plus BYTEA");
+        assert_eq!(
+            contracts.len(),
+            7,
+            "expected UUID, five row types, plus BYTEA"
+        );
 
         for contract in &contracts {
             let expected_type = match contract.column_name.as_str() {
+                "id" => "UUID",
                 "text_value" | "json_value" => "TEXT",
                 "integer_value" => "BIGINT",
                 "number_value" => "DOUBLE PRECISION",
@@ -1153,11 +1183,18 @@ simulation_test!(
             ],
         );
 
-        let update_params = row_contracts
+        // The primary-key UUID is insert-only. Exercise UPDATE casts for the
+        // writable scalar columns while preserving the inserted UUID id.
+        let update_contracts = row_contracts
+            .iter()
+            .filter(|contract| contract.column_name != "id")
+            .copied()
+            .collect::<Vec<_>>();
+        let update_params = update_contracts
             .iter()
             .map(|contract| values_for_contract(contract).3)
             .collect::<Vec<_>>();
-        let update_casts = row_contracts
+        let update_casts = update_contracts
             .iter()
             .enumerate()
             .map(|(index, contract)| {
@@ -1194,7 +1231,13 @@ simulation_test!(
             vec![
                 row_contracts
                     .iter()
-                    .map(|contract| values_for_contract(contract).4)
+                    .map(|contract| {
+                        if contract.column_name == "id" {
+                            values_for_contract(contract).2
+                        } else {
+                            values_for_contract(contract).4
+                        }
+                    })
                     .collect(),
             ],
         );

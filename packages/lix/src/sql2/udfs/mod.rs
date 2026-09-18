@@ -12,6 +12,7 @@ mod lix_octet_length;
 mod lix_order_between;
 mod lix_root_commit_id;
 mod lix_row_ref;
+mod lix_uuid_cast;
 mod uuidv7;
 
 use std::sync::Arc;
@@ -55,6 +56,7 @@ pub(crate) fn register_static_sql2_functions(ctx: &SessionContext) {
         lix_json_predicate::LixJsonPredicate::exists(),
     ));
     ctx.register_udf(ScalarUDF::from(lix_jsonb::LixJsonb::new()));
+    ctx.register_udf(ScalarUDF::from(lix_uuid_cast::LixUuidCast::new()));
     ctx.register_udf(ScalarUDF::from(lix_octet_length::LixOctetLength::new()));
     ctx.register_udf(ScalarUDF::from(lix_order_between::LixOrderBetween::new()));
 }

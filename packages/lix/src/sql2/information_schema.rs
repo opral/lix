@@ -17,7 +17,7 @@ use crate::LixError;
 
 use super::catalog::{
     PublicCatalog, PublicColumnInsertPolicy, PublicRelationKind, PublicSurfaceClass,
-    PublicSurfaceKind,
+    PublicSurfaceKind, SCHEMA_V1_TYPE_METADATA_KEY,
 };
 use super::result_metadata::{field_is_json, field_is_row_ref};
 
@@ -202,7 +202,7 @@ impl LixInformationSchemaProvider {
                 result_column.push(field.name().clone());
                 ordinal_position.push((position + 1) as u64);
                 is_nullable.push(if field.is_nullable() { "YES" } else { "NO" }.to_string());
-                data_type.push(public_sql_type(field.data_type()));
+                data_type.push(public_sql_type(field));
                 lix_value_kind.push(field_value_kind(field));
             }
         }
@@ -253,7 +253,7 @@ impl LixInformationSchemaProvider {
                         ordinal_position.push((position + 1) as u64);
                         is_nullable
                             .push(if field.is_nullable() { "YES" } else { "NO" }.to_string());
-                        data_type.push(public_sql_type(field.data_type()));
+                        data_type.push(public_sql_type(field));
                         lix_value_kind.push(field_value_kind(field));
                     }
                 }
@@ -298,7 +298,7 @@ impl LixInformationSchemaProvider {
                 result_column.push(field.name().clone());
                 ordinal_position.push((position + 1) as u64);
                 is_nullable.push(if field.is_nullable() { "YES" } else { "NO" }.to_string());
-                data_type.push(public_sql_type(field.data_type()));
+                data_type.push(public_sql_type(field));
                 lix_value_kind.push(field_value_kind(field));
             }
         }
@@ -556,7 +556,7 @@ impl ColumnsRows {
                 .map_or_else(|| field.is_nullable(), |(_, column)| column.read_nullable);
             self.is_nullable
                 .push(if read_nullable { "YES" } else { "NO" }.to_string());
-            self.data_type.push(public_sql_type(field.data_type()));
+            self.data_type.push(public_sql_type(field));
             self.character_maximum_length.push(character_maximum_length);
             self.character_octet_length.push(character_octet_length);
             self.numeric_precision.push(numeric_precision);
@@ -600,7 +600,19 @@ impl ColumnsRows {
     }
 }
 
-fn public_sql_type(data_type: &DataType) -> String {
+fn public_sql_type(field: &Field) -> String {
+    if field
+        .metadata()
+        .get(SCHEMA_V1_TYPE_METADATA_KEY)
+        .is_some_and(|type_name| type_name == "uuid")
+    {
+        return "UUID".to_string();
+    }
+
+    public_arrow_sql_type(field.data_type())
+}
+
+fn public_arrow_sql_type(data_type: &DataType) -> String {
     match data_type {
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "TEXT".to_string(),
         DataType::Binary
@@ -659,5 +671,24 @@ fn numeric_metadata(data_type: &DataType) -> (Option<u64>, Option<u64>, Option<u
             u64::try_from(*scale).ok(),
         ),
         _ => (None, None, None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use datafusion::arrow::datatypes::{DataType, Field};
+
+    use super::{SCHEMA_V1_TYPE_METADATA_KEY, public_sql_type};
+
+    #[test]
+    fn public_sql_type_prefers_uuid_schema_metadata_over_arrow_utf8() {
+        let field = Field::new("id", DataType::Utf8, false).with_metadata(HashMap::from([(
+            SCHEMA_V1_TYPE_METADATA_KEY.to_owned(),
+            "uuid".to_owned(),
+        )]));
+
+        assert_eq!(public_sql_type(&field), "UUID");
     }
 }
