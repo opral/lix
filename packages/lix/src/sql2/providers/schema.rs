@@ -313,7 +313,7 @@ impl SchemaSpec {
     ) -> Result<(SchemaRef, HotStateScanRequest, Vec<RowFilter>)> {
         if self.spec.schema_key == "lix_commit" && self.hot_state.is_partial_replica() {
             return Err(lix_error_to_datafusion_error(LixError::new(
-                "LIX_PARTIAL_REPLICA_SCOPE_UNSUPPORTED",
+                LixError::CODE_PARTIAL_REPLICA_SCOPE_UNSUPPORTED,
                 "lix_commit requires authoritative commit inventory; resident graph records do not prove completeness",
             )));
         }

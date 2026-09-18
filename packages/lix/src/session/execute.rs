@@ -524,6 +524,34 @@ impl ExecuteResult {
             .map_or(&[], |backing| backing.notices.as_slice())
     }
 
+    pub(crate) fn with_authority_notice(self) -> Self {
+        let columns = self.columns().to_vec();
+        let column_types = self.column_types().to_vec();
+        let rows = self
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect();
+        let mut notices = self.notices().to_vec();
+        notices.push(LixNotice {
+            code: "LIX_AUTHORITY_SQL".to_owned(),
+            message: "Executed against the authority; local pending edits are not included"
+                .to_owned(),
+            hint: None,
+        });
+        let mut result =
+            Self::from_query_parts(columns, column_types, rows, self.rows_affected, notices);
+        result.statement_index = self.statement_index;
+        result.statement_label = self.statement_label;
+        result.commit = self.commit;
+        result.checkpoint_telemetry = self.checkpoint_telemetry;
+        #[cfg(feature = "storage-benches")]
+        {
+            result.profile_provider_rows_examined = self.profile_provider_rows_examined;
+        }
+        result
+    }
+
     /// Looks up the value for `column_name` on an owned row from this set.
     pub fn get<'a>(&self, row: &'a Row, column_name: &str) -> Option<&'a Value> {
         let index = self.column_index(column_name)?;
@@ -1095,6 +1123,11 @@ where
     ) -> Result<ExecutionDisposition, LixError> {
         let statement = self.sql_planning_cache.parse_statement(sql)?;
         execution_disposition(&statement)
+    }
+
+    pub(crate) fn is_standalone_global_history_read(&self, sql: &str) -> Result<bool, LixError> {
+        let statement = self.sql_planning_cache.parse_statement(sql)?;
+        Ok(sql2::is_standalone_global_history_read(&statement))
     }
 
     /// Classifies an atomic SQL batch for a caller that owns its transport

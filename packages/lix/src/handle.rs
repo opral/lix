@@ -21,6 +21,7 @@ use std::{
 
 use crate::authority_client::{
     ClientCore, ProtocolClient, ProtocolExecuteOptions, ProtocolObserveEvents, ProtocolTransaction,
+    open_protocol_client,
 };
 use crate::common::ExpiredReadRetryState;
 use crate::engine::{Engine, EngineOptions};
@@ -155,6 +156,137 @@ impl ServerOptions {
     pub fn with_headers(mut self, headers: impl IntoIterator<Item = (String, String)>) -> Self {
         self.headers = headers.into_iter().collect();
         self
+    }
+}
+
+#[derive(Default)]
+struct AuthorityHistorySession {
+    state: tokio::sync::Mutex<AuthorityHistorySessionState>,
+}
+
+enum AuthorityHistorySessionState {
+    Uninitialized,
+    #[cfg(not(target_family = "wasm"))]
+    Open(Box<ProtocolClient<crate::sync::AuthorityHttp>>),
+    Closed,
+}
+
+impl Default for AuthorityHistorySessionState {
+    fn default() -> Self {
+        Self::Uninitialized
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl AuthorityHistorySession {
+    async fn execute(
+        &self,
+        server: &ServerOptions,
+        expected_account_id: &str,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<ExecuteResult, LixError> {
+        let mut state = self.state.lock().await;
+        if matches!(*state, AuthorityHistorySessionState::Closed) {
+            return Err(LixError::new(
+                LixError::CODE_CLOSED,
+                "cannot execute an authority history query from a closed Lix handle",
+            ));
+        }
+        if matches!(*state, AuthorityHistorySessionState::Uninitialized) {
+            let http = crate::sync::authority_http(&server.headers)?;
+            // These relations are repository-global. A partial replica may have
+            // a local branch that has never been published, and branch selection
+            // does not change the result of either history inventory.
+            let client = open_protocol_client(http, server.url.clone(), None).await?;
+            let authority_account_id = match client.active_account_id().await {
+                Ok(account_id) => account_id,
+                Err(error) => {
+                    let _ = client.close().await;
+                    return Err(error);
+                }
+            };
+            if authority_account_id != expected_account_id {
+                let _ = client.close().await;
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "authority session authentication changed while opening a history session",
+                ));
+            }
+            *state = AuthorityHistorySessionState::Open(Box::new(client));
+        }
+        let AuthorityHistorySessionState::Open(client) = &*state else {
+            unreachable!("closed authority history session was handled above");
+        };
+        client.execute(sql, params, None).await
+    }
+
+    async fn close(&self) -> Result<(), LixError> {
+        let client = {
+            let mut state = self.state.lock().await;
+            match std::mem::replace(&mut *state, AuthorityHistorySessionState::Closed) {
+                AuthorityHistorySessionState::Open(client) => Some(client),
+                AuthorityHistorySessionState::Uninitialized
+                | AuthorityHistorySessionState::Closed => None,
+            }
+        };
+        match client {
+            Some(client) => client.close().await,
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(target_family = "wasm")]
+impl AuthorityHistorySession {
+    async fn execute(
+        &self,
+        server: &ServerOptions,
+        expected_account_id: &str,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<ExecuteResult, LixError> {
+        let state = self.state.lock().await;
+        if matches!(*state, AuthorityHistorySessionState::Closed) {
+            return Err(LixError::new(
+                LixError::CODE_CLOSED,
+                "cannot execute an authority history query from a closed Lix handle",
+            ));
+        }
+
+        // ProtocolClient owns browser event callbacks that are intentionally
+        // not Send. Keep it scoped to this request so the public Lix handle
+        // remains Send across wasm bindings.
+        let http = crate::sync::authority_http(&server.headers)?;
+        let client = open_protocol_client(http, server.url.clone(), None).await?;
+        let authority_account_id = match client.active_account_id().await {
+            Ok(account_id) => account_id,
+            Err(error) => {
+                let _ = client.close().await;
+                return Err(error);
+            }
+        };
+        if authority_account_id != expected_account_id {
+            let _ = client.close().await;
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "authority session authentication changed while opening a history session",
+            ));
+        }
+
+        let result = client.execute(sql, params, None).await;
+        let close_result = client.close().await;
+        match (result, close_result) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    async fn close(&self) -> Result<(), LixError> {
+        let mut state = self.state.lock().await;
+        *state = AuthorityHistorySessionState::Closed;
+        Ok(())
     }
 }
 
@@ -1075,7 +1207,15 @@ where
         Box::pin(unsafe {
             crate::session::AssumeSendFuture::new(async move {
                 let route = self.lix.session.execution_disposition(&self.sql)?;
-                self.lix
+                let authority_history_fallback = route == ExecutionDisposition::CancellableRead
+                    && self.lix.engine.sync_mode().role() == crate::sync::SyncRole::PartialReplica
+                    && self
+                        .lix
+                        .session
+                        .is_standalone_global_history_read(&self.sql)?
+                    && self.lix.server.is_some();
+                let local = self
+                    .lix
                     .retry_replica_read(route, || {
                         self.lix.retry_sync_demands(|| {
                             self.lix.session.execute_with_options(
@@ -1085,7 +1225,18 @@ where
                             )
                         })
                     })
-                    .await
+                    .await;
+                match local {
+                    Err(error)
+                        if authority_history_fallback
+                            && error.code == LixError::CODE_PARTIAL_REPLICA_SCOPE_UNSUPPORTED =>
+                    {
+                        self.lix
+                            .execute_authority_history_read(&self.sql, &self.params)
+                            .await
+                    }
+                    result => result,
+                }
             })
         })
     }
@@ -1186,6 +1337,7 @@ where
     sync_lease: Option<Arc<SyncSessionLease>>,
     sync_demand_tx: Option<tokio::sync::mpsc::Sender<crate::sync::SyncDemand>>,
     server: Option<ServerOptions>,
+    authority_history_session: Arc<AuthorityHistorySession>,
     open_report: Arc<OpenReport>,
 }
 
@@ -1376,6 +1528,7 @@ where
         sync_lease: None,
         sync_demand_tx: None,
         server: server.clone(),
+        authority_history_session: Arc::new(AuthorityHistorySession::default()),
         open_report: Arc::new(open_report),
     };
     lix.bind_session();
@@ -1415,6 +1568,7 @@ where
         sync_lease: None,
         sync_demand_tx: None,
         server: None,
+        authority_history_session: Arc::new(AuthorityHistorySession::default()),
         open_report: Arc::new(OpenReport {
             migrations: Vec::new(),
             format: crate::init::CURRENT_FORMAT_VERSION,
@@ -1549,6 +1703,7 @@ where
             sync_lease: None,
             sync_demand_tx: None,
             server: None,
+            authority_history_session: Arc::new(AuthorityHistorySession::default()),
             open_report: Arc::new(OpenReport {
                 migrations: Vec::new(),
                 format: crate::init::CURRENT_FORMAT_VERSION,
@@ -1797,6 +1952,7 @@ where
             sync_lease: None,
             sync_demand_tx: self.sync_demand_tx.clone(),
             server: self.server.clone(),
+            authority_history_session: Arc::new(AuthorityHistorySession::default()),
             open_report: Arc::clone(&self.open_report),
         })
     }
@@ -2194,6 +2350,24 @@ where
         self.session.active_account_id()
     }
 
+    async fn execute_authority_history_read(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<ExecuteResult, LixError> {
+        let server = self.server.as_ref().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_PARTIAL_REPLICA_SCOPE_UNSUPPORTED,
+                "authoritative history query requires a configured server",
+            )
+        })?;
+        let expected_account_id = self.active_account_id().to_owned();
+        self.authority_history_session
+            .execute(server, &expected_account_id, sql, params)
+            .await
+            .map(ExecuteResult::with_authority_notice)
+    }
+
     /// Repository identity stored as `lix_key_value.lix_id`.
     pub fn lix_id(&self) -> &str {
         self.engine.lix_id()
@@ -2384,11 +2558,15 @@ where
         }
         // Check the independent transactions before mutating any session or
         // remote lifecycle, including their shared publication worker.
-        self.session.close().await?;
-
-        if let Some(lease) = &self.sync_lease {
-            lease.release().await?;
-        }
+        let session_result = self.session.close().await;
+        let authority_result = self.authority_history_session.close().await;
+        let lease_result = match &self.sync_lease {
+            Some(lease) => lease.release().await,
+            None => Ok(()),
+        };
+        session_result?;
+        authority_result?;
+        lease_result?;
         Ok(())
     }
     pub(crate) fn set_sync_role(&self, role: crate::sync::SyncRole) -> Result<(), LixError> {
@@ -4181,6 +4359,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
             sync_lease: None,
             sync_demand_tx: Some(sender),
             server: None,
+            authority_history_session: Arc::new(AuthorityHistorySession::default()),
             open_report: Arc::new(OpenReport {
                 migrations: Vec::new(),
                 format: crate::init::CURRENT_FORMAT_VERSION,

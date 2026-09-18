@@ -92,7 +92,7 @@ where
     ) -> Result<PlannedScan> {
         if self.partial_replica {
             return Err(lix_error_to_datafusion_error(LixError::new(
-                "LIX_PARTIAL_REPLICA_SCOPE_UNSUPPORTED",
+                LixError::CODE_PARTIAL_REPLICA_SCOPE_UNSUPPORTED,
                 "lix_change requires authoritative change inventory; resident metadata does not prove completeness",
             )));
         }
