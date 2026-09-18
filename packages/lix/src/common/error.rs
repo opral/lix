@@ -72,6 +72,11 @@ impl LixError {
     /// A SQL write targeted a read-only internal/component surface.
     pub const CODE_READ_ONLY: &'static str = "LIX_ERROR_READ_ONLY";
 
+    /// A partial replica cannot prove completeness for a global history surface.
+    /// Single read statements may be retried against the configured authority.
+    pub const CODE_PARTIAL_REPLICA_SCOPE_UNSUPPORTED: &'static str =
+        "LIX_PARTIAL_REPLICA_SCOPE_UNSUPPORTED";
+
     /// SQL syntax is valid, but the feature is intentionally outside the Lix
     /// SQL surface.
     pub const CODE_UNSUPPORTED_SQL: &'static str = "LIX_UNSUPPORTED_SQL";

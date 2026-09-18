@@ -60,6 +60,7 @@ where
             sync_demand_tx: Some(runtime.demand_tx.clone()),
             sync_lease: Some(SyncSessionLease::root_with_owner(runtime, owner.clone())),
             server,
+            authority_history_session: Arc::new(AuthorityHistorySession::default()),
             open_report: Arc::new(OpenReport {
                 format: crate::init::CURRENT_FORMAT_VERSION,
                 initialized: prepared.initialized,
@@ -147,6 +148,7 @@ where
         sync_demand_tx: source.sync_demand_tx.clone(),
         sync_lease: source.sync_lease.as_ref().map(|lease| lease.child()),
         server: source.server.clone(),
+        authority_history_session: Arc::new(AuthorityHistorySession::default()),
         open_report: source.open_report.clone(),
     };
     lix.bind_session();

@@ -42,7 +42,7 @@ pub(crate) use error::datafusion_error_to_lix_error;
 pub(crate) use bind::bind_statement;
 pub(crate) use bind::{
     BoundStatementRoute, bind_read_statement, bind_statement_route, bind_statement_with_catalog,
-    statement_has_durable_runtime_function,
+    is_standalone_global_history_read, statement_has_durable_runtime_function,
 };
 pub(crate) use catalog::{
     PublicCatalog, PublicSurfaceKind, SchemaColumnType, SchemaIndexedColumn, SchemaSurfaceSpec,
