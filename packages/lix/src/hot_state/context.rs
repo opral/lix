@@ -445,7 +445,9 @@ impl HotStateContext {
             ),
             global_key_value_rows: std::sync::Arc::new(GlobalKeyValueRowCache::default()),
             root_base_cache: std::sync::Arc::new(
-                crate::hot_state::tracked_head::RootBaseBatchCache::with_tracked_state(tracked_state),
+                crate::hot_state::tracked_head::RootBaseBatchCache::with_tracked_state(
+                    tracked_state,
+                ),
             ),
             prepared_read_rows: std::sync::Arc::default(),
         }
@@ -882,6 +884,11 @@ where
             self.branch_head_control_cache.as_deref(),
         )
         .await?;
+        ensure_partial_projection_complete(
+            request,
+            &scope,
+            self.partial_scope_policy.is_some() || self.partial_scope_source.is_some(),
+        )?;
         if skip_proven_empty_schema && !scope_may_have_schema_rows(request, &scope) {
             return Ok(MaterializedHotStateBatch::default());
         }
@@ -1142,7 +1149,12 @@ where
             )
             .with_root_base_cache(std::sync::Arc::clone(&self.root_base_cache));
         let rows_by_branch = tracked_head
-            .scan_live_batches_for_controls(&controls, &tracked_request, request.filter.untracked)
+            .scan_live_batches_for_controls_with_fallback(
+                &controls,
+                &tracked_request,
+                request.filter.untracked,
+                self.partial_scope_policy.is_some() || self.partial_scope_source.is_some(),
+            )
             .await?;
         let rows = concat_hot_state_batches(
             rows_by_branch
@@ -1520,6 +1532,11 @@ where
             self.branch_head_control_cache.as_deref(),
         )
         .await?;
+        ensure_partial_projection_complete(
+            &scope_request,
+            &scope,
+            self.partial_scope_policy.is_some() || self.partial_scope_source.is_some(),
+        )?;
         Ok(scope)
     }
 
@@ -1593,12 +1610,15 @@ where
                         .tracked_head
                         .reader(&self.store)
                         .with_root_base_cache(std::sync::Arc::clone(&self.root_base_cache))
-                        .load_projected_live_batch_refs_for_domain(
+                        .load_projected_live_batch_refs_for_domain_with_fallback(
                             branch_id,
                             control,
                             &keys,
                             &projection,
                             domain,
+                            (self.partial_scope_policy.is_some()
+                                || self.partial_scope_source.is_some())
+                            .then_some(control.head_commit_id),
                         )
                         .await?;
                     Ok::<_, LixError>((range, rows))
@@ -1675,12 +1695,14 @@ where
                 .tracked_head
                 .reader(&self.store)
                 .with_root_base_cache(std::sync::Arc::clone(&self.root_base_cache))
-                .load_projected_live_batch_refs_for_domain(
+                .load_projected_live_batch_refs_for_domain_with_fallback(
                     GLOBAL_BRANCH_ID,
                     global_control,
                     &keys,
                     &projection,
                     domain,
+                    (self.partial_scope_policy.is_some() || self.partial_scope_source.is_some())
+                        .then_some(global_control.head_commit_id),
                 )
                 .await?;
             let batch_index = current_batches.len();
@@ -1757,11 +1779,18 @@ where
         request: &HotStateExactBatchRequest,
         parent: super::reader::ParentRowPk,
     ) -> Result<MaterializedHotStateBatch, LixError> {
-        if request.rows.is_empty() { return Ok(MaterializedHotStateBatch::default()); }
-        if request.rows.iter().any(|row| is_derived_schema(&row.schema_key)) {
+        if request.rows.is_empty() {
+            return Ok(MaterializedHotStateBatch::default());
+        }
+        if request
+            .rows
+            .iter()
+            .any(|row| is_derived_schema(&row.schema_key))
+        {
             return super::reader::load_parent_closure_with(request, parent, |batch| async move {
                 self.load_exact_batch(&batch).await
-            }).await;
+            })
+            .await;
         }
         let scope = self.exact_batch_scope(request).await?;
         let scope = &scope;
@@ -1770,7 +1799,8 @@ where
                 registry.register(super::LogicalReadInterest::exact(&batch))?;
             }
             self.load_exact_batch_in_scope(&batch, scope).await
-        }).await
+        })
+        .await
     }
 
     pub(crate) async fn scan_tracked_batch(
@@ -1804,6 +1834,11 @@ where
             self.branch_head_control_cache.as_deref(),
         )
         .await?;
+        ensure_partial_projection_complete(
+            request,
+            &scope,
+            self.partial_scope_policy.is_some() || self.partial_scope_source.is_some(),
+        )?;
         if skip_proven_empty_schema && !scope_may_have_schema_rows(request, &scope) {
             return Ok(MaterializedHotStateBatch::default());
         }
@@ -1904,11 +1939,14 @@ where
                         .tracked_head
                         .reader(store)
                         .with_root_base_cache(std::sync::Arc::clone(&self.root_base_cache))
-                        .scan_live_batch_for_retention(
+                        .scan_live_batch_for_retention_with_fallback(
                             &branch_id,
                             control,
                             &tracked_request,
                             request.filter.untracked,
+                            (self.partial_scope_policy.is_some()
+                                || self.partial_scope_source.is_some())
+                            .then_some(control.head_commit_id),
                         )
                         .await?;
                     Ok::<_, LixError>(HotBranchRows {
@@ -2224,6 +2262,30 @@ fn scope_may_have_schema_rows(request: &HotStateScanRequest, scope: &HotStateSca
             .get(branch_id)
             .is_none_or(|control| control.may_have_schema(schema_key))
     })
+}
+
+/// A partial replica must never turn an unavailable admitted branch into a
+/// successful empty result. Full replicas retain the historical branch-list
+/// behavior, while partial readers fail closed so the SQL layer can keep the
+/// operation pending/error instead of publishing a false negative.
+fn ensure_partial_projection_complete(
+    request: &HotStateScanRequest,
+    scope: &HotStateScanScope,
+    partial: bool,
+) -> Result<(), LixError> {
+    if partial
+        && request
+            .filter
+            .branch_ids
+            .iter()
+            .any(|branch| !scope.projection_branch_ids.contains(branch))
+    {
+        return Err(LixError::new(
+            "LIX_PARTIAL_REPLICA_SCOPE_UNSUPPORTED",
+            "partial query branch admission is not available in the serving snapshot",
+        ));
+    }
+    Ok(())
 }
 
 async fn scan_scope(
