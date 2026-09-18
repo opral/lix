@@ -351,8 +351,22 @@ pub(super) async fn stage_acknowledge_included_partial_upload(
         }
         let ancestor = super::partial_merge_analysis::record(read, local, true).await?;
         let included = if working_head {
-            super::partial_merge_analysis::incorporated(read, &ancestor, remote, &mut cache, 1024)
-                .await?
+            // The frozen expected coordinate is validated against confirmed.
+            // Prove it precedes the upload before excluding its older history;
+            // a competing authority head cannot incorporate this upload there.
+            let confirmed = super::partial_merge_analysis::record(
+                read,
+                crate::changelog::CommitId::parse_lix(
+                    &accepted.expected.head,
+                    "included upload confirmed base",
+                )?,
+                true,
+            )
+            .await?;
+            super::partial_merge_analysis::ancestry::incorporated_since(
+                read, &ancestor, remote, &confirmed, &mut cache, 1024,
+            )
+            .await?
         } else {
             super::partial_merge_analysis::bounded_ancestor(
                 read, &ancestor, remote, &mut cache, 1024,

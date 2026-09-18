@@ -4,15 +4,20 @@ use std::collections::BTreeMap;
 
 #[tokio::test]
 async fn included_frozen_upload_preserves_later_authority_winner_and_new_local_suffix() {
-    included_upload_case(false).await;
+    included_upload_case(false, true).await;
 }
 
 #[tokio::test]
 async fn lost_ordinary_ack_then_authority_checkpoint_is_settled_without_replay() {
-    included_upload_case(true).await;
+    included_upload_case(true, true).await;
 }
 
-async fn included_upload_case(checkpoint_authority: bool) {
+#[tokio::test]
+async fn competing_upload_inclusion_does_not_fetch_history_before_confirmed_base() {
+    included_upload_case(false, false).await;
+}
+
+async fn included_upload_case(checkpoint_authority: bool, upload_accepted: bool) {
     let backing = Memory::new();
     let authority = open_lix().with_storage(backing.clone()).await.unwrap();
     authority
@@ -25,6 +30,19 @@ async fn included_upload_case(checkpoint_authority: bool) {
         )
         .await
         .unwrap();
+    if !upload_accepted {
+        // Keep unrelated ancestors cold on the replica; the confirmed base is
+        // sufficient to reject a competing upload without reading this history.
+        for index in 0..8 {
+            authority
+                .execute(
+                    "UPDATE lix_key_value SET value=$1 WHERE key='newer'",
+                    &[Value::Text(format!("historical-{index}"))],
+                )
+                .await
+                .unwrap();
+        }
+    }
     let server = open_lix()
         .with_storage(backing)
         .serve()
@@ -96,7 +114,9 @@ async fn included_upload_case(checkpoint_authority: bool) {
         |request| {
             let transport = &transport;
             async move {
-                crate::sync::SyncTransport::push(transport, &request).await?;
+                if upload_accepted {
+                    crate::sync::SyncTransport::push(transport, &request).await?;
+                }
                 Err(LixError::new(
                     "TEST_LOST_ORDINARY_ACK",
                     "authority accepted before response was lost",
@@ -153,6 +173,69 @@ async fn included_upload_case(checkpoint_authority: bool) {
     let leased = transport
         .fork_native_baseline_lease(&remote.wire.lease)
         .unwrap();
+    if !upload_accepted {
+        assert_eq!(frozen.expected, pending.confirmed);
+        for attempt in 0..16 {
+            let read = storage.begin_read(Default::default()).await.unwrap();
+            let mut writes = storage.new_write_set();
+            let result =
+                crate::sync::partial_push_state::stage_acknowledge_included_partial_upload(
+                    &read,
+                    &mut writes,
+                    &state,
+                    &remote.wire.descriptor,
+                )
+                .await;
+            drop(read);
+            assert!(
+                writes.is_empty(),
+                "a competing upload must not be acknowledged"
+            );
+            match result {
+                Ok(result) => {
+                    assert!(result.is_none());
+                    let read = storage.begin_read(Default::default()).await.unwrap();
+                    let (unchanged, _, _) =
+                        crate::sync::partial_push_state::load_partial_push_state(
+                            &read, &state, branch,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(unchanged, pending);
+                    return;
+                }
+                Err(error) => {
+                    assert!(attempt < 15, "{error}");
+                    let address = NativeMetadataRef::from_missing_error(&error)
+                        .unwrap()
+                        .unwrap_or_else(|| panic!("{error}"));
+                    match &address {
+                        NativeMetadataRef::CommitGraphRecord(commit)
+                        | NativeMetadataRef::CommitStateHeader(commit) => {
+                            assert!(
+                                commit == &remote.wire.descriptor.selected_branch.head.commit_id
+                                    || commit == &frozen.expected.head,
+                                "inclusion fetched unrelated history before confirmed base: {address:?}"
+                            );
+                        }
+                        _ => panic!("unexpected inclusion input: {address:?}"),
+                    }
+                    // Hydrate exactly the checked address: the general demand
+                    // helper resumes the whole ancestry walk internally and
+                    // would hide subsequent forbidden dependencies from this test.
+                    crate::sync::partial_runtime::hydrate_metadata_batch(
+                        &storage,
+                        &state,
+                        &leased,
+                        vec![address],
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+        }
+        unreachable!("bounded inclusion attempts must finish or fail");
+    }
     if checkpoint_authority {
         assert_ne!(
             remote.wire.descriptor.selected_branch.checkpoint.commit_id, frozen.target.checkpoint,
