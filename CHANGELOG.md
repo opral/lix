@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.18.0 - 2026-09-19
+
+### Minor
+
+- Partial replicas adopt remote updates without first fetching data for every previously executed query.
+
+  Queries and observers fetch their own missing inputs before returning coherent results. A previously cached query may therefore need a connection after a remote update. Applications can mount their workspace after opening and handle pending queries within each view; missing data is never returned as an empty result.
+
+  Recovery after an upload loses its acknowledgment uses the confirmed base to avoid fetching unrelated older ancestry.
+- Recovery and apply commands now use explicit top-level `SELECT commit_id FROM ...` functions.
+
+  Use `lix_restore` to copy a source state into a new commit, `lix_revert` or `lix_revert_range` to reverse changes, and `lix_apply(before, after, rows)` to replay a selected endpoint diff. Each command returns one commit receipt row; an unchanged or empty recovery/apply selection returns `commit_id = NULL`.
+
+  This is a breaking change: the `INSERT INTO lix_restore`, `lix_revert`, and `lix_apply` command sinks are removed without aliases. Restore no longer rewinds the branch or resets its working baseline. Row references select identities; source versions are supplied explicitly, and `lix_diff` is optional for selection.
+- Open supported older repositories through the normal Rust and JavaScript APIs.
+
+  `open_lix()` and `openLix()` now coordinate local and hosted upgrades, retain recoverable source data, and report upgrade progress. Native filesystem applications can upgrade repositories created with SDK 0.16.0 without a separate migration tool. Opening reports include local and authority upgrades; replica states that cannot be reconciled safely return a recovery error.
+
+### Patch
+
+- Browser OPFS repositories now share a dedicated worker that owns both the engine and storage, removing the separate storage-worker lifecycle.
+
+  Opening, credential callbacks, finite worker operations, and shutdown are bounded. After owner loss, surviving tabs elect a replacement and restore acknowledged session context and live observations. Interrupted transactions and snapshot streams fail explicitly and must be restarted. Recovery is bounded. Potentially writing operations whose acknowledgement is lost report `LIX_WRITE_OUTCOME_UNKNOWN` and must not be blindly retried. SharedWorker support is no longer required; OPFS, dedicated workers, BroadcastChannel, and Web Locks are required.
+- JavaScript `lix.observe(sql, params, { signal })` now returns a standard async iterator. Consume results with `for await...of`; manual `next()` calls return `{ value, done }`. The custom `ObserveEvents` export and observation `close()` method are removed without a compatibility adapter.
+
+  Abort the supplied signal to cancel from outside the loop. Breaking out of iteration, closing Lix, or reaching the end of the stream releases the observation; cancellation settles pending reads even while binding setup is pending. Observation failures terminate iteration and propagate through normal promise rejection and `try/catch`. Existing result contents and coalescing remain unchanged.
+- Partial replicas now query the authoritative server for complete `lix_commit` and `lix_change` inventories when their local data cannot prove completeness.
+
+  Queries that combine these global history tables with local replica data remain local and retain the existing partial-replica scope error, avoiding results that silently omit pending local edits.
+- Keep partial replicas syncing when reconciliation takes longer than an upload retry, and publish checkpoints that reference existing authority blobs without downloading their content first.
+- Fixed plugin upgrades rejecting compatible schema amendments, including documentation changes and supported column additions.
+
+  Upgrades now follow the same schema amendment rules as other schema updates, preserve readable existing rows, and persist added column defaults. Incompatible changes and conflicting definitions shared by different plugins remain rejected.
+- Report schema-declared UUID columns as `UUID` in SQL metadata.
+
+  `information_schema.columns` now preserves and exposes logical UUID types for schema-declared surfaces such as `lix_account`, including their history and state views.
+
 ## 0.17.1 - 2026-09-16
 
 ### Faster partial replica history hydration
