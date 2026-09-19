@@ -3635,6 +3635,72 @@ fn reorder_rows_by_source_permutation(
     }
 }
 
+/// Registered schemas from the final commit write set. The transaction's
+/// mutable staging buffer has already been drained when validation runs.
+pub(crate) struct PreparedSchemaOverlay<'a> {
+    rows: Vec<PreparedStateRowRef<'a>>,
+}
+
+impl<'a> PreparedSchemaOverlay<'a> {
+    pub(crate) fn new(rows: &'a PreparedStateBatch) -> Self {
+        Self {
+            rows: rows
+                .iter()
+                .filter(|row| {
+                    row.schema_key.as_str()
+                        == crate::transaction::normalization::REGISTERED_SCHEMA_KEY
+                })
+                .collect(),
+        }
+    }
+}
+
+impl crate::hot_state::StagedHotStateRows for PreparedSchemaOverlay<'_> {
+    fn staged_batch(
+        &self,
+        request: &HotStateScanRequest,
+    ) -> Result<MaterializedHotStateBatch, LixError> {
+        if matches!(
+            request.filter.rows,
+            crate::hot_state::HotStateRowFilter::None
+        ) {
+            return Ok(MaterializedHotStateBatch::default());
+        }
+        let mut output = MaterializedHotStateBatchBuilder::with_capacity(self.rows.len());
+        for &row in &self.rows {
+            if staged_row_identity_matches_scan(row, request, false) {
+                push_prepared_materialized(&mut output, row);
+            }
+        }
+        Ok(output.finish())
+    }
+
+    fn load_exact_batch(
+        &self,
+        request: &HotStateExactBatchRequest,
+    ) -> Result<MaterializedHotStateExactBatch, LixError> {
+        let mut output = MaterializedHotStateBatchBuilder::with_capacity(request.rows.len());
+        let mut slots = Vec::with_capacity(request.rows.len());
+        for key in &request.rows {
+            let row = self.rows.iter().copied().find(|row| {
+                row.schema_key.as_str() == key.schema_key
+                    && row.row_pk == &key.row_pk
+                    && row.branch_id.as_str() == key.branch_id
+                    && row.file_id.map(SharedStr::as_str) == key.file_id.as_deref()
+                    && request
+                        .untracked
+                        .is_none_or(|untracked| row.untracked == untracked)
+                    && (request.include_tombstones || !row.is_deleted())
+            });
+            slots.push(row.map(|row| {
+                u32::try_from(push_prepared_materialized(&mut output, row))
+                    .expect("prepared schema exact batch ordinal must fit u32")
+            }));
+        }
+        MaterializedHotStateExactBatch::new(output.finish(), slots)
+    }
+}
+
 /// Read overlay derived from staged transaction writes.
 #[derive(Clone)]
 pub(crate) struct PreparedStateRowOverlay {
