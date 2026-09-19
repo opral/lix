@@ -6785,15 +6785,14 @@ async fn v2_generation_upgrade_preflights_owned_files_and_fences_stale_sessions(
 
     let mut changed_schema: serde_json::Value =
         serde_json::from_str(include_str!("../../../plugins/csv/schema/csv_row.json")).unwrap();
-    changed_schema["description"] =
-        serde_json::Value::String("incompatible replacement definition".to_string());
+    changed_schema["columns"][0]["type"] = serde_json::Value::String("text".to_string());
     let changed_schema = serde_json::to_vec(&changed_schema).unwrap();
     let schema_changing =
         build_csv_plugin_archive_variant(&wasm, &changed_schema, Some(b"schema-changing"));
     let schema_error = install_plugin(&lix, "plugin_csv", &schema_changing)
         .await
-        .expect_err("an owned schema definition change must be rejected");
-    assert_eq!(schema_error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        .expect_err("an incompatible owned schema definition change must be rejected");
+    assert_eq!(schema_error.code, LixError::CODE_SCHEMA_DEFINITION);
 
     // The archive validator intentionally performs only a bounded header
     // check. This component reaches the production compiler and is rejected

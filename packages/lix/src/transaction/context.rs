@@ -3336,7 +3336,7 @@ where
         let checkpoint = self.begin_sql_statement_checkpoint()?;
         let result = async {
             let outcome = Box::pin(self.stage_write_without_schema_default_backfill(write)).await?;
-            Box::pin(self.materialize_schema_defaults(&schemas)).await?;
+            self.materialize_schema_defaults(&schemas).await?;
             Ok(outcome)
         }
         .await;
@@ -3836,7 +3836,8 @@ where
         self.pending_plugin_actor_publications
             .extend(actor_publications);
         if !plugin_schema_defaults.is_empty() {
-            Box::pin(self.materialize_schema_defaults(&plugin_schema_defaults)).await?;
+            self.materialize_schema_defaults(&plugin_schema_defaults)
+                .await?;
         }
         Ok(outcome)
     }
@@ -4197,6 +4198,50 @@ where
         overlay_scan_batch(&base, &staged, request).await
     }
 
+    /// Plugin input, output validation, and row authorities must share the
+    /// transaction-visible schema, including a plugin upgraded earlier in the
+    /// same explicit transaction.
+    fn plugin_schema_catalog<'a>(
+        &'a mut self,
+        file_key: &'a PluginFileWriteKey,
+    ) -> futures_util::future::BoxFuture<'a, Result<Arc<CatalogSnapshot>, LixError>> {
+        // Catalog resolution can contain large storage-adapter futures. Keep
+        // that frame off the ordinary plugin reconciliation future's stack.
+        Box::pin(async move {
+            let domain = Domain::schema_catalog(file_key.branch_id.clone(), file_key.untracked);
+            if self
+                .staged_writes
+                .has_staged_schema_catalog_change(&domain)?
+            {
+                // A tracked amendment also affects an already-cached untracked
+                // view. Rebuild from the staged registrations rather than the
+                // immutable opening catalog or a previously resolved domain.
+                self.schema_resolver.clear_cached_catalogs();
+            }
+            let staged = self.staged_writes.staging_overlay()?;
+            let read = self.opening_read();
+            let base = self
+                .hot_state
+                .transaction_reader(read, Arc::clone(&self.branch_head_control_cache));
+            let catalog = self
+                .schema_resolver
+                .catalog_for_row_normalization(&base, &staged, &domain)
+                .await?;
+            if let crate::catalog::TransactionCatalog::Shared(snapshot) = catalog {
+                return Ok(Arc::clone(snapshot));
+            }
+            let crate::catalog::TransactionCatalog::Owned(snapshot) = std::mem::replace(
+                catalog,
+                crate::catalog::TransactionCatalog::Shared(CatalogSnapshot::builtin_shared()),
+            ) else {
+                unreachable!("shared catalogs returned above");
+            };
+            let snapshot = Arc::new(snapshot);
+            *catalog = crate::catalog::TransactionCatalog::Shared(Arc::clone(&snapshot));
+            Ok(snapshot)
+        })
+    }
+
     async fn visible_materialization(
         &mut self,
         key: &PluginFileWriteKey,
@@ -4238,6 +4283,7 @@ where
         factory: Arc<dyn WasmComponentFactory>,
         current_publications: &mut Vec<PendingPluginActorPublication>,
     ) -> Result<PluginObservation, LixError> {
+        let schema_catalog = self.plugin_schema_catalog(file_key).await?;
         let cache = self.plugin_host.actor_cache();
         let _cold_open_guard = cache.cold_open_guard().await;
         let staged = self.staged_writes.staging_overlay()?;
@@ -4335,12 +4381,12 @@ where
         } else {
             MaterializedHotStateBatch::default()
         };
-        let rows = rebind_plugin_rows_for_schema_amendments(rows, &self.sql_schema_snapshot)?;
+        let rows = rebind_plugin_rows_for_schema_amendments(rows, &schema_catalog)?;
         let row_ordinals = v2_host_row_ordinals_from_live_batch(
             &rows,
             file_key,
             plugin.schema_keys(),
-            &self.sql_schema_snapshot,
+            &schema_catalog,
         )?;
         let row_authorities = plugin_row_authorities_from_live_batch(&rows, &row_ordinals)?;
         let row_count = row_ordinals.len();
@@ -4583,7 +4629,8 @@ where
                 .existing_authorities
                 .retain(|key| !known.contains(key));
         }
-        materialize_keyless_creates(changes, bound.creates(), &self.sql_schema_snapshot)?;
+        let schema_catalog = self.plugin_schema_catalog(file_key).await?;
+        materialize_keyless_creates(changes, bound.creates(), &schema_catalog)?;
         if !validation.requires_reservation && validation.existing_authorities.is_empty() {
             return Ok(RawWriteBatch::new());
         }
@@ -6320,10 +6367,9 @@ where
                 }
 
                 let descriptor = v2_file_descriptor(write, &selected);
-                let schemas = SchemaAllowlist::from_catalog(
-                    selected.schema_keys(),
-                    Arc::clone(&self.sql_schema_snapshot),
-                )?;
+                let schema_catalog = self.plugin_schema_catalog(&file_key).await?;
+                let schemas =
+                    SchemaAllowlist::from_catalog(selected.schema_keys(), schema_catalog)?;
                 let mutation_identity = write.mutation_identity().unwrap_or_else(|| {
                     local_mutation_identity(self.functions.call_uuid_v7().into_bytes())
                 });
@@ -6650,10 +6696,9 @@ where
                 .with_hint("combine the byte edits into one file update"));
             }
             let descriptor = v2_file_descriptor(write, selected);
-            let schemas = SchemaAllowlist::from_catalog(
-                selected.schema_keys(),
-                Arc::clone(&self.sql_schema_snapshot),
-            )?;
+            let schema_catalog = self.plugin_schema_catalog(&file_key).await?;
+            let schemas =
+                SchemaAllowlist::from_catalog(selected.schema_keys(), Arc::clone(&schema_catalog))?;
             let mutation_identity = write.mutation_identity().unwrap_or_else(|| {
                 local_mutation_identity(self.functions.call_uuid_v7().into_bytes())
             });
@@ -6683,13 +6728,46 @@ where
 
             let (changes, publication, materialized_bytes, create_rows) = if same_plugin_owner {
                 'same_owner: {
-                    let acknowledged_view = self.acknowledged_session_plugin_view(
+                    let mut acknowledged_view = self.acknowledged_session_plugin_view(
                         &session_key,
                         selected,
                         current_owner_change_id
                             .as_deref()
                             .expect("same-owner component file should have an owner incarnation"),
                     );
+                    // Explicit-transaction reads deliberately do not publish
+                    // uncommitted observations into the shared session cache.
+                    // A byte-preserving upgrade staged by this transaction can
+                    // bridge its own still-current opening observation into a
+                    // cold replacement view without weakening stale-session
+                    // fencing for another transaction's upgrade or edits.
+                    if acknowledged_view.is_none()
+                        // Upgrade preflight currently proves byte preservation
+                        // only for tracked owned files.
+                        && !write.untracked
+                        && self.plugin_generation_upgrade_guard.is_some()
+                        && write.branch_id == self.active_branch_id
+                        && !self.pending_file_view_mutations.contains_key(&session_key)
+                        && let Some(previous) = self.opening_plugin_registry.plugin(selected.key())
+                        && previous.archive_blob_hash() != selected.archive_blob_hash()
+                        && let Some(mut remembered) = self.session_file_views.plugin_file_view(
+                            &session_key,
+                            previous.key(),
+                            previous.archive_blob_hash(),
+                            current_owner_change_id
+                                .as_deref()
+                                .expect("same owner checked"),
+                        )
+                        && remembered.path == actor_key.path
+                        && let Some(observation) = remembered.observation.as_ref()
+                        && let Some(materialization) =
+                            self.visible_materialization(&file_key).await?
+                        && observation.semantic_root() == materialization.semantic_root
+                    {
+                        remembered.plugin_generation = selected.archive_blob_hash().to_owned();
+                        remembered.observation = None;
+                        acknowledged_view = Some(remembered);
+                    }
                     let cache = self.plugin_host.actor_cache().clone();
                     let acknowledged_observation = acknowledged_view
                         .as_ref()
@@ -6887,15 +6965,13 @@ where
                                 },
                             )
                             .await?;
-                            let rows = rebind_plugin_rows_for_schema_amendments(
-                                rows,
-                                &self.sql_schema_snapshot,
-                            )?;
+                            let rows =
+                                rebind_plugin_rows_for_schema_amendments(rows, &schema_catalog)?;
                             let row_ordinals = v2_host_row_ordinals_from_live_batch(
                                 &rows,
                                 &file_key,
                                 selected.schema_keys(),
-                                &self.sql_schema_snapshot,
+                                &schema_catalog,
                             )?;
                             let row_count = row_ordinals.len();
                             let cold_base_authorities =
@@ -7596,11 +7672,9 @@ where
                 ));
             }
             let limits = WasmTransitionLimits::default();
-            let changes = v2_host_changes_from_prepared_rows(
-                &prepared,
-                file_key.untracked,
-                Arc::clone(&self.sql_schema_snapshot),
-            )?;
+            let schema_catalog = self.plugin_schema_catalog(&file_key).await?;
+            let changes =
+                v2_host_changes_from_prepared_rows(&prepared, file_key.untracked, schema_catalog)?;
             if changes.row_change_count() == 0 {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,

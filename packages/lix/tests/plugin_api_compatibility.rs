@@ -322,3 +322,184 @@ fn schema_only_archive(schema: &serde_json::Value) -> Vec<u8> {
     }
     archive.finish().unwrap().into_inner()
 }
+
+#[tokio::test]
+async fn owned_file_edit_after_plugin_upgrade_in_same_transaction() {
+    edit_after_plugin_upgrade_in_same_transaction(false).await;
+}
+
+#[tokio::test]
+async fn owned_semantic_edit_after_plugin_upgrade_in_same_transaction() {
+    edit_after_plugin_upgrade_in_same_transaction(true).await;
+}
+
+async fn edit_after_plugin_upgrade_in_same_transaction(semantic: bool) {
+    let lix = open_lix().await.unwrap();
+    lix.execute(
+        "INSERT INTO lix_file (path, content) VALUES ('/.lix/plugins/plugin_csv.lixplugin', $1)",
+        &[Value::Blob(
+            include_bytes!("fixtures/plugin-api/v2/plugin_csv.lixplugin")
+                .to_vec()
+                .into(),
+        )],
+    )
+    .await
+    .unwrap();
+    lix.execute(
+        "INSERT INTO lix_file (path, content) VALUES ('/people.csv', $1)",
+        &[Value::Blob(b"name,age\nAda,36\n".to_vec().into())],
+    )
+    .await
+    .unwrap();
+    let rows = lix
+        .execute("SELECT id FROM csv_row ORDER BY order_key", &[])
+        .await
+        .unwrap();
+    let id = rows.rows()[1].values()[0].clone();
+    let mut transaction = lix.begin_transaction().await.unwrap();
+    transaction
+        .execute(
+            "UPDATE lix_file SET content = $1 WHERE path = '/.lix/plugins/plugin_csv.lixplugin'",
+            &[Value::Blob(
+                include_bytes!("fixtures/plugin-api/schema-amendment/plugin_csv.lixplugin")
+                    .to_vec()
+                    .into(),
+            )],
+        )
+        .await
+        .unwrap();
+    let content = Value::Blob(b"name,age\nAda,37\n".to_vec().into());
+    if semantic {
+        transaction
+            .execute(
+                "UPDATE csv_row SET cells = $1 WHERE id = $2",
+                &[Value::Jsonb(serde_json::json!(["Ada", "37"]).into()), id],
+            )
+            .await
+            .expect("semantic writes must use the staged plugin schema");
+    } else {
+        // The upgrade preserves the bytes visible inside this transaction.
+        // This read must not publish an uncommitted session observation.
+        let observed = transaction
+            .execute(
+                "SELECT content FROM lix_file WHERE path = '/people.csv'",
+                &[],
+            )
+            .await
+            .expect("read exact bytes under the staged plugin generation");
+        assert_eq!(
+            observed.rows()[0].values()[0],
+            Value::Blob(b"name,age\nAda,36\n".to_vec().into())
+        );
+        transaction
+            .execute(
+                "UPDATE lix_file SET content = $1 WHERE path = '/people.csv'",
+                std::slice::from_ref(&content),
+            )
+            .await
+            .expect("file writes must use the staged plugin schema");
+    }
+    let file = transaction
+        .execute(
+            "SELECT content FROM lix_file WHERE path = '/people.csv'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(file.rows()[0].values()[0], content);
+    transaction.commit().await.unwrap();
+    let mut snapshot = Vec::new();
+    lix.export_snapshot().write_to(&mut snapshot).await.unwrap();
+    lix.close().await.unwrap();
+    let reopened = open_lix()
+        .from_snapshot(Cursor::new(snapshot))
+        .await
+        .unwrap();
+    let file = reopened
+        .execute(
+            "SELECT content FROM lix_file WHERE path = '/people.csv'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(file.rows()[0].values()[0], content);
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn plugin_upgrade_does_not_bridge_an_observation_before_another_sessions_edit() {
+    let lix = open_lix().await.unwrap();
+    lix.execute(
+        "INSERT INTO lix_file (path, content) VALUES ('/.lix/plugins/plugin_csv.lixplugin', $1)",
+        &[Value::Blob(
+            include_bytes!("fixtures/plugin-api/v2/plugin_csv.lixplugin")
+                .to_vec()
+                .into(),
+        )],
+    )
+    .await
+    .unwrap();
+    lix.execute(
+        "INSERT INTO lix_file (path, content) VALUES ('/people.csv', $1)",
+        &[Value::Blob(b"name,age\nAda,36\n".to_vec().into())],
+    )
+    .await
+    .unwrap();
+    lix.execute(
+        "SELECT content FROM lix_file WHERE path = '/people.csv'",
+        &[],
+    )
+    .await
+    .unwrap();
+    let other = lix.open_another_session().await.unwrap();
+    let rows = other
+        .execute("SELECT id FROM csv_row ORDER BY order_key", &[])
+        .await
+        .unwrap();
+    other
+        .execute(
+            "UPDATE csv_row SET cells = $1 WHERE id = $2",
+            &[
+                Value::Jsonb(serde_json::json!(["Ada", "38"]).into()),
+                rows.rows()[1].values()[0].clone(),
+            ],
+        )
+        .await
+        .unwrap();
+    let mut transaction = lix.begin_transaction().await.unwrap();
+    transaction
+        .execute(
+            "UPDATE lix_file SET content = $1 WHERE path = '/.lix/plugins/plugin_csv.lixplugin'",
+            &[Value::Blob(
+                include_bytes!("fixtures/plugin-api/schema-amendment/plugin_csv.lixplugin")
+                    .to_vec()
+                    .into(),
+            )],
+        )
+        .await
+        .unwrap();
+    let error = transaction
+        .execute(
+            "UPDATE lix_file SET content = $1 WHERE path = '/people.csv'",
+            &[Value::Blob(b"name,age\nAda,37\n".to_vec().into())],
+        )
+        .await
+        .expect_err(
+            "own plugin upgrade must not authorize stale bytes over another session's edit",
+        );
+    assert_eq!(error.code, lix::LixError::CODE_PLUGIN_OBSERVATION_STALE);
+    transaction.rollback().await.unwrap();
+    let file = other
+        .execute(
+            "SELECT content FROM lix_file WHERE path = '/people.csv'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        file.rows()[0].values()[0],
+        Value::Blob(b"name,age\nAda,38\n".to_vec().into())
+    );
+    other.close().await.unwrap();
+    lix.close().await.unwrap();
+}
