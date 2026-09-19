@@ -2,7 +2,11 @@ import { beforeEach, expect, test, vi } from "vitest";
 import { openLixWorkerBinding } from "./client.js";
 import type { OpenProgressDispatch } from "../binding-types.js";
 const mocks = vi.hoisted(() => ({ direct: vi.fn() }));
-vi.mock("#worker-factory", () => ({ openDirectLixBinding: mocks.direct, createWorkerConnection: vi.fn(), createSharedWorkerConnection: vi.fn() }));
+vi.mock("#worker-factory", () => ({
+	openDirectLixBinding: mocks.direct,
+	createWorkerConnection: vi.fn(),
+	createRepositoryConnection: vi.fn(),
+}));
 beforeEach(() => { mocks.direct.mockReset(); });
 const url = "https://example.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc";
 test("native direct opening forwards Rust migration events", async () => {

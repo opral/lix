@@ -76,7 +76,11 @@ test("an active-transaction close preflight preserves the Lix and observations",
 	const observationClose = vi.fn();
 	const binding = {
 		observe: vi.fn(async () => ({
-			next: async () => undefined,
+			next: async () => ({
+				sequence: 1,
+				mutationSequence: 1,
+				rows: { columns: [], rows: [], rowsAffected: 0 },
+			}),
 			close: observationClose,
 		})),
 		beginTransaction: vi.fn(async () => ({
@@ -89,7 +93,9 @@ test("an active-transaction close preflight preserves the Lix and observations",
 	} as unknown as LixBinding;
 	const lix = new Lix(binding);
 	const observation = lix.observe("SELECT 1");
-	await observation.next();
+	await observation
+		.next()
+		.then((result) => (result.done ? undefined : result.value));
 	const transaction = await lix.beginTransaction();
 
 	await expect(lix.close()).rejects.toMatchObject({

@@ -24,7 +24,9 @@ test("remote observe streams native Lix results", async () => {
 	});
 
 	const events = lix.observe("SELECT $1 AS value", ["hello"]);
-	const initial = await events.next();
+	const initial = await events
+		.next()
+		.then((result) => (result.done ? undefined : result.value));
 	expect(initial?.sequence).toBe(0);
 	expect(initial?.mutationSequence).toBe(7);
 	expect(initial?.result.rows[0]?.value).toBe("hello");
@@ -46,8 +48,12 @@ test("remote observe streams native Lix results", async () => {
 		requests.some((request) => new URL(request.url).pathname.endsWith("/execute")),
 	).toBe(false);
 
-	events.close();
-	expect(await events.next()).toBeUndefined();
+	events.return?.();
+	expect(
+		await events
+			.next()
+			.then((result) => (result.done ? undefined : result.value)),
+	).toBeUndefined();
 	await lix.close();
 });
 
@@ -110,14 +116,16 @@ test("remote observe applies every blob delta before coalescing delivery", async
 		"file-1",
 	]);
 	await new Promise((resolve) => setTimeout(resolve, 0));
-	const latest = await events.next();
+	const latest = await events
+		.next()
+		.then((result) => (result.done ? undefined : result.value));
 	expect(latest?.sequence).toBe(2);
 	expect(latest?.mutationSequence).toBe(12);
 	expect(
 		new TextDecoder().decode(latest?.result.rows[0]?.content as Uint8Array),
 	).toBe("abX!ef");
 
-	events.close();
+	events.return?.();
 	await lix.close();
 });
 
@@ -182,7 +190,9 @@ test("remote observe applies sequential row deltas before coalescing delivery", 
 
 	const events = lix.observe("SELECT value FROM state ORDER BY value");
 	await new Promise((resolve) => setTimeout(resolve, 0));
-	const latest = await events.next();
+	const latest = await events
+		.next()
+		.then((result) => (result.done ? undefined : result.value));
 	expect(latest?.sequence).toBe(2);
 	expect(latest?.mutationSequence).toBe(12);
 	expect(latest?.result.rows.map((row) => row.value)).toEqual([
@@ -192,7 +202,7 @@ test("remote observe applies sequential row deltas before coalescing delivery", 
 		"c",
 	]);
 
-	events.close();
+	events.return?.();
 	await lix.close();
 });
 
@@ -231,9 +241,21 @@ test("adding an observation reconnects an established multiplex stream with the 
 	});
 
 	const first = lix.observe("SELECT 'first' AS value");
-	expect((await first.next())?.result.rows[0]?.value).toBe("first");
+	expect(
+		(
+			await first
+				.next()
+				.then((result) => (result.done ? undefined : result.value))
+		)?.result.rows[0]?.value,
+	).toBe("first");
 	const second = lix.observe("SELECT 'second' AS value");
-	expect((await second.next())?.result.rows[0]?.value).toBe("second");
+	expect(
+		(
+			await second
+				.next()
+				.then((result) => (result.done ? undefined : result.value))
+		)?.result.rows[0]?.value,
+	).toBe("second");
 
 	const activeRequests = observeRequests.filter(
 		(request) => !request.signal.aborted,
@@ -247,8 +269,8 @@ test("adding an observation reconnects an established multiplex stream with the 
 		"observe-2",
 	]);
 
-	first.close();
-	second.close();
+	first.return?.();
+	second.return?.();
 	await lix.close();
 });
 
@@ -340,7 +362,11 @@ test("remote observe shards more than 32 subscriptions without blocking execute"
 		lix.observe(`SELECT ${index} AS value`),
 	);
 	const initial = await Promise.all(
-		observations.map((observation) => observation.next()),
+		observations.map((observation) =>
+			observation
+				.next()
+				.then((result) => (result.done ? undefined : result.value)),
+		),
 	);
 	expect(initial.map((event) => event?.result.rows[0]?.value)).toEqual(
 		Array.from({ length: 33 }, (_, index) => `value-${index}`),
@@ -379,7 +405,7 @@ test("remote observe shards more than 32 subscriptions without blocking execute"
 	expect(liveObserveRequests).toBe(2);
 
 	rebalanced = true;
-	observations[0]?.close();
+	observations[0]?.return?.();
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	expect(liveObserveRequests).toBe(1);
 	const rebalancedRequests = observeRequests.filter(
@@ -396,7 +422,9 @@ test("remote observe shards more than 32 subscriptions without blocking execute"
 	expect(rebalancedBody.subscriptions.map(({ id }) => id)).toContain(
 		"observe-33",
 	);
-	const rebalancedEvent = await observations[32]?.next();
+	const rebalancedEvent = await observations[32]
+		?.next()
+		.then((result) => (result.done ? undefined : result.value));
 	expect(rebalancedEvent?.result.rows[0]?.value).toBe("rebalanced-32");
 	expect(rebalancedEvent?.mutationSequence).toBe(1);
 
@@ -439,7 +467,9 @@ test("hub-wide protocol failures abort a held multiplex stream without reconnect
 		});
 
 		const events = lix.observe("SELECT value");
-		await expect(events.next()).rejects.toMatchObject({
+		await expect(
+			events.next().then((result) => (result.done ? undefined : result.value)),
+		).rejects.toMatchObject({
 			code: "LIX_SERVER_PROTOCOL_ERROR",
 		});
 		expect(liveObserveRequests).toBe(0);
@@ -452,7 +482,7 @@ test("hub-wide protocol failures abort a held multiplex stream without reconnect
 	}
 });
 
-test("remote observe can continue after a semantic SSE error", async () => {
+test("remote observe ends after a surfaced semantic SSE error", async () => {
 	vi.useFakeTimers();
 	try {
 		let observeRequests = 0;
@@ -494,19 +524,20 @@ test("remote observe can continue after a semantic SSE error", async () => {
 		});
 
 		const events = lix.observe("SELECT value");
-		await expect(events.next()).rejects.toMatchObject({
+		await expect(
+			events.next().then((result) => (result.done ? undefined : result.value)),
+		).rejects.toMatchObject({
 			name: "LixError",
 			code: "LIX_OBSERVE_RUNTIME",
 			message: "temporary observation failure",
 			hint: "Retry the observation",
 			details: { transient: true },
 		});
-		const recovered = events.next();
+		expect(await events.next()).toEqual({ done: true, value: undefined });
 		await vi.advanceTimersByTimeAsync(100);
-		expect((await recovered)?.result.rows[0]?.value).toBe("recovered");
-		expect(observeRequests).toBe(2);
+		expect(observeRequests).toBe(1);
 
-		events.close();
+		events.return?.();
 		await lix.close();
 	} finally {
 		vi.useRealTimers();
@@ -541,17 +572,17 @@ test("remote observe treats unmarked semantic errors as terminal", async () => {
 		});
 
 		const events = lix.observe("INVALID");
-		await expect(events.next()).rejects.toMatchObject({
+		await expect(
+			events.next().then((result) => (result.done ? undefined : result.value)),
+		).rejects.toMatchObject({
 			code: "LIX_INVALID_SQL",
 		});
-		await expect(events.next()).rejects.toMatchObject({
-			code: "LIX_INVALID_SQL",
-		});
+		expect(await events.next()).toEqual({ done: true, value: undefined });
 		expect(observeRequests).toBe(1);
 		await vi.advanceTimersByTimeAsync(100);
 		expect(observeRequests).toBe(1);
 
-		events.close();
+		events.return?.();
 		await lix.close();
 	} finally {
 		vi.useRealTimers();
@@ -615,9 +646,17 @@ test("a successful branch switch restarts observations on the pinned session", a
 	});
 
 	const events = lix.observe("SELECT active_branch");
-	expect((await events.next())?.result.rows[0]?.value).toBe("main-id");
+	expect(
+		(
+			await events
+				.next()
+				.then((result) => (result.done ? undefined : result.value))
+		)?.result.rows[0]?.value,
+	).toBe("main-id");
 	expect(await lix.activeBranchId()).toBe("main-id");
-	const afterSwitch = events.next();
+	const afterSwitch = events
+		.next()
+		.then((result) => (result.done ? undefined : result.value));
 	await lix.switchBranch({ branchId: "draft-id" });
 	const switched = await afterSwitch;
 	expect(switched?.result.rows[0]?.value).toBe("draft-id");
@@ -630,7 +669,7 @@ test("a successful branch switch restarts observations on the pinned session", a
 	expect(await lix.activeBranchId()).toBe("draft-id");
 	expect(observeRequests).toBe(2);
 
-	events.close();
+	events.return?.();
 	await lix.close();
 });
 
@@ -670,7 +709,13 @@ test("a local branch switch setup failure preserves a healthy observation", asyn
 	});
 
 	const events = lix.observe("SELECT active_branch");
-	expect((await events.next())?.result.rows[0]?.value).toBe("main-id");
+	expect(
+		(
+			await events
+				.next()
+				.then((result) => (result.done ? undefined : result.value))
+		)?.result.rows[0]?.value,
+	).toBe("main-id");
 	failHeaders = true;
 	await expect(
 		lix.switchBranch({ branchId: "draft-id" }),
@@ -681,7 +726,7 @@ test("a local branch switch setup failure preserves a healthy observation", asyn
 	expect(await lix.activeBranchId()).toBe("main-id");
 
 	failHeaders = false;
-	events.close();
+	events.return?.();
 	await lix.close();
 });
 
@@ -723,9 +768,13 @@ test("remote observe reconnects after a gone protocol session instead of failing
 	});
 
 	const events = lix.observe("SELECT value");
-	expect((await events.next())?.result.rows[0]?.value).toBe(
-		"recovered",
-	);
+	expect(
+		(
+			await events
+				.next()
+				.then((result) => (result.done ? undefined : result.value))
+		)?.result.rows[0]?.value,
+	).toBe("recovered");
 	expect(observeCalls).toBe(2);
 	expect(
 		requests
@@ -748,7 +797,7 @@ test("remote observe reconnects after a gone protocol session instead of failing
 			.map((request) => request.headers.get("lix-session-id")),
 	).toEqual(["session-1", "session-2"]);
 
-	events.close();
+	events.return?.();
 	await lix.close();
 });
 
@@ -814,7 +863,11 @@ test("remote observe recovers multiple expired shards with one handshake", async
 		lix.observe(`SELECT ${index} AS value`),
 	);
 	const initial = await Promise.all(
-		observations.map((observation) => observation.next()),
+		observations.map((observation) =>
+			observation
+				.next()
+				.then((result) => (result.done ? undefined : result.value)),
+		),
 	);
 	expect(initial.map((event) => event?.result.rows[0]?.value)).toEqual(
 		Array.from({ length: 33 }, (_, index) => `value-${index}`),
@@ -822,13 +875,19 @@ test("remote observe recovers multiple expired shards with one handshake", async
 	const observeCallsBeforeExpiry = observeCalls;
 	expiredShardResponses = 2;
 	valuePrefix = "recovered";
-	observations[0]?.close();
+	observations[0]?.return?.();
 	const replacement = lix.observe("SELECT 33 AS value");
 	const recovered = await Promise.all([
 		...observations
 			.slice(1)
-			.map((observation) => observation.next()),
-		replacement.next(),
+			.map((observation) =>
+				observation
+					.next()
+					.then((result) => (result.done ? undefined : result.value)),
+			),
+		replacement
+			.next()
+			.then((result) => (result.done ? undefined : result.value)),
 	]);
 	expect(recovered.map((event) => event?.result.rows[0]?.value)).toEqual(
 		Array.from({ length: 33 }, (_, index) => `recovered-${index + 1}`),
@@ -872,7 +931,9 @@ test("remote observe fails if the recovered protocol session is also gone", asyn
 		});
 
 		const events = lix.observe("SELECT value");
-		await expect(events.next()).rejects.toMatchObject({
+		await expect(
+			events.next().then((result) => (result.done ? undefined : result.value)),
+		).rejects.toMatchObject({
 			code: "LIX_ERROR_PROTOCOL_SESSION_GONE",
 			status: 410,
 		});
@@ -881,7 +942,7 @@ test("remote observe fails if the recovered protocol session is also gone", asyn
 		await vi.advanceTimersByTimeAsync(10_000);
 		expect(observeCalls).toBe(2);
 
-		events.close();
+		events.return?.();
 		await lix.close();
 	} finally {
 		vi.useRealTimers();
@@ -929,8 +990,16 @@ test("remote observe reconnects retryable failures with fresh headers", async ()
 		});
 
 		const events = lix.observe("SELECT value");
-		expect((await events.next())?.result.rows[0]?.value).toBe("first");
-		const afterReconnect = events.next();
+		expect(
+			(
+				await events
+					.next()
+					.then((result) => (result.done ? undefined : result.value))
+			)?.result.rows[0]?.value,
+		).toBe("first");
+		const afterReconnect = events
+			.next()
+			.then((result) => (result.done ? undefined : result.value));
 		await Promise.resolve();
 		await Promise.resolve();
 		await vi.advanceTimersByTimeAsync(200);
@@ -945,7 +1014,7 @@ test("remote observe reconnects retryable failures with fresh headers", async ()
 		]);
 		expect(observedSessionIds).toEqual(["session-1", "session-1", "session-1"]);
 
-		events.close();
+		events.return?.();
 		await lix.close();
 	} finally {
 		vi.useRealTimers();
@@ -967,10 +1036,16 @@ test("closing Lix resolves pending remote observation reads", async () => {
 	});
 
 	const events = lix.observe("SELECT value");
-	const pending = events.next();
+	const pending = events
+		.next()
+		.then((result) => (result.done ? undefined : result.value));
 	await lix.close();
 	expect(await pending).toBeUndefined();
-	expect(await events.next()).toBeUndefined();
+	expect(
+		await events
+			.next()
+			.then((result) => (result.done ? undefined : result.value)),
+	).toBeUndefined();
 });
 
 test("closing Lix stops observations before an earlier finite request settles", async () => {
@@ -1000,7 +1075,9 @@ test("closing Lix stops observations before an earlier finite request settles", 
 	});
 
 	const events = lix.observe("SELECT value");
-	const pendingEvent = events.next();
+	const pendingEvent = events
+		.next()
+		.then((result) => (result.done ? undefined : result.value));
 	const executing = lix.execute("SELECT blocked");
 	await executeStarted.promise;
 	const closing = lix.close();
@@ -1133,18 +1210,45 @@ function deferred<T>() {
 }
 
 test("typed network failures reconnect actual WASM observations", async () => {
-  const {HttpTransportError} = await import('../http-transport.js');
-  let attempts=0;
-  const lix=await openLix({server:{url:'https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc',fetch:async(input,init)=>{
-    const request=new Request(input,init);
-    if(request.method==='DELETE')return closedSession();
-    if(new URL(request.url).pathname.endsWith('/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/'))return handshake();
-    if(++attempts===1)throw new HttpTransportError('LIX_TRANSPORT_NETWORK','connection unavailable');
-    return heldSseResponse(sseFrame('next',multiplexObservePayload('observe-1','reconnected',0,1)),request.signal);
-  }}});
-  const events=lix.observe('SELECT value');
-  try {
-    expect((await events.next())?.result.rows[0]?.value).toBe('reconnected');
-    expect(attempts).toBe(2);
-  }finally{events.close();await lix.close();}
+	const { HttpTransportError } = await import("../http-transport.js");
+	let attempts = 0;
+	const lix = await openLix({
+		server: {
+			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				if (request.method === "DELETE") return closedSession();
+				if (
+					new URL(request.url).pathname.endsWith("/lix/v1/01936f4e-7b6c-7c3d-8f9a-123456789abc/")
+				)
+					return handshake();
+				if (++attempts === 1)
+					throw new HttpTransportError(
+						"LIX_TRANSPORT_NETWORK",
+						"connection unavailable",
+					);
+				return heldSseResponse(
+					sseFrame(
+						"next",
+						multiplexObservePayload("observe-1", "reconnected", 0, 1),
+					),
+					request.signal,
+				);
+			},
+		},
+	});
+	const events = lix.observe("SELECT value");
+	try {
+		expect(
+			(
+				await events
+					.next()
+					.then((result) => (result.done ? undefined : result.value))
+			)?.result.rows[0]?.value,
+		).toBe("reconnected");
+		expect(attempts).toBe(2);
+	} finally {
+		events.return?.();
+		await lix.close();
+	}
 });

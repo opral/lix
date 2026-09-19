@@ -1,4 +1,4 @@
-export { Lix, LixTransaction, ObserveEvents, openLix } from "./open-lix.js";
+export { Lix, LixTransaction, openLix } from "./open-lix.js";
 export type {
 	LixStorage,
 	LixStorageBound,
@@ -89,7 +89,5 @@ export type {
 } from "./types.js";
 
 export { createLix, deleteLix } from "./hosted-lix.js";
-
-
 
 export { networkFetch, HttpTransportError } from "./http-transport.js";

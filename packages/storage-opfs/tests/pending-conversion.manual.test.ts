@@ -1,17 +1,27 @@
 import { openLix, type Lix } from "@lix-js/sdk";
 import { convertReplicaToPartial } from "@lix-js/sdk/migration";
-import { OpfsStorage } from "@lix-js/storage-opfs";
+import { OpfsStorage } from "./rpc-test-storage.js";
 import { expect, test } from "vitest";
-import { OpfsStorageClient } from "../js/client.js";
+import { OpfsStorageClient } from "./legacy-rpc/client.js";
 
 type Entry = { space: number; key: number[]; value: number[] };
-type Fixture = { url: string; branchId: string; additionalBranchId: string; entries: Entry[] };
-const space = (id: number) => ({ id, name: `fixture-${id}`, valueSemantics: "mutable" as const, valueIntegrity: "backendVerified" as const });
+type Fixture = {
+	url: string;
+	branchId: string;
+	additionalBranchId: string;
+	entries: Entry[];
+};
+const space = (id: number) => ({
+	id,
+	name: `fixture-${id}`,
+	valueSemantics: "mutable" as const,
+	valueIntegrity: "backendVerified" as const,
+});
 
 test("pending full OPFS replica resumes lost merge outcomes and preserves both branches", async () => {
 	const response = await fetch("/__conversion_fixture.json");
 	expect(response.ok).toBe(true);
-	const fixture = await response.json() as Fixture;
+	const fixture = (await response.json()) as Fixture;
 	const name = `pending-full-conversion-${crypto.randomUUID()}`;
 	// Starting the public storage owner precedes direct fixture installation.
 	void new OpfsStorage({ name }).lixStorage;
@@ -76,10 +86,16 @@ async function verifyMerged(lix: Lix, branchId: string) {
 	expect(await lix.replicaRecoverySources()).toHaveLength(1);
 }
 
-async function proxyFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+async function proxyFetch(
+	input: RequestInfo | URL,
+	init?: RequestInit,
+): Promise<Response> {
 	const request = new Request(input, init);
 	const original = new URL(request.url);
-	const proxy = new URL(`/__conversion_authority${original.pathname}${original.search}`, location.href);
+	const proxy = new URL(
+		`/__conversion_authority${original.pathname}${original.search}`,
+		location.href,
+	);
 	const body = ["GET", "HEAD"].includes(request.method) ? undefined : await request.arrayBuffer();
 	return fetch(proxy, { method: request.method, headers: request.headers, body, signal: request.signal });
 }

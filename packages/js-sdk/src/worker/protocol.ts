@@ -51,8 +51,17 @@ export type WorkerRequest = {
 };
 
 export type WorkerOperation =
- | {kind:"replica.cleanup";storage:LixStorageConfig;server:WorkerSyncServerOptions}
- | {kind:"replica.convert";storage:LixStorageConfig;server:WorkerSyncServerOptions;branchId?:string}
+	| {
+			kind: "replica.cleanup";
+			storage: LixStorageConfig;
+			server: WorkerSyncServerOptions;
+	  }
+	| {
+			kind: "replica.convert";
+			storage: LixStorageConfig;
+			server: WorkerSyncServerOptions;
+			branchId?: string;
+	  }
 	| {
 			kind: "hosted.create";
 			server: import("../binding-types.js").HostedServerBindingOptions;
@@ -100,7 +109,12 @@ export type WorkerOperation =
 	| { kind: "replicaRecoverySources" }
 	| { kind: "exportReplicaRecovery"; id: string }
 	| { kind: "recoverReplica"; id: string }
-	| { kind: "recoverReplicaWithServer"; id: string; server: WorkerSyncServerOptions; transportScope: number }
+	| {
+			kind: "recoverReplicaWithServer";
+			id: string;
+			server: WorkerSyncServerOptions;
+			transportScope: number;
+	  }
 	| { kind: "syncHealth" }
 	| { kind: "activeBranchId" }
 	| { kind: "activeAccountId" }
@@ -173,12 +187,22 @@ export type SerializedWorkerError = {
 };
 
 export type WorkerResponse =
-	| { id: number; ok: true; value?: unknown }
+	| {
+			id: number;
+			ok: true;
+			value?: unknown;
+			context?: { branchId: string; accountId: string };
+	  }
 	| { id: number; ok: false; error: SerializedWorkerError }
 	| { kind: "telemetry"; span: LixTelemetrySpan }
 	| { kind: "open.progress"; progress: LixOpenProgress }
 	| { kind: "sync.headers"; requestId: number; transportScope?: number }
-	| { kind: "sync.fetch"; requestId: number; request: WorkerSyncFetchRequest; transportScope?: number }
+	| {
+			kind: "sync.fetch";
+			requestId: number;
+			request: WorkerSyncFetchRequest;
+			transportScope?: number;
+	  }
 	| { kind: "sync.fetch.stream.pull"; requestId: number }
 	| { kind: "sync.fetch.cancel"; requestId: number };
 
@@ -221,11 +245,12 @@ function redactDiagnostic(value: string): string {
         .replace(/((?:authorization|cookie|token|password|secret)\s*[:=]\s*)[^\n]+/gi, "$1[redacted]");
 }
 function redactDetails(value: unknown, depth = 0): unknown {
-    if (depth > 3) return "[truncated]";
-    if (typeof value === "string") return redactDiagnostic(value);
-    if (value === null || typeof value === "number" || typeof value === "boolean" || value === undefined) return value;
-    if (Array.isArray(value)) return value.slice(0, 32).map(item => redactDetails(item, depth + 1));
-    if (typeof value === "object") return Object.fromEntries(Object.entries(value).slice(0, 32).map(([key, item]) =>
+	if (depth > 3) return "[truncated]";
+	if (typeof value === "string") return redactDiagnostic(value);
+	if (value === null || typeof value === "number" || typeof value === "boolean" || value === undefined) return value;
+	if (Array.isArray(value))
+		return value.slice(0, 32).map((item) => redactDetails(item, depth + 1));
+	if (typeof value === "object") return Object.fromEntries(Object.entries(value).slice(0, 32).map(([key, item]) =>
         [key, /authorization|cookie|token|password|secret|headers/i.test(key) ? "[redacted]" : redactDetails(item, depth + 1)]));
-    return "[unsupported]";
+	return "[unsupported]";
 }

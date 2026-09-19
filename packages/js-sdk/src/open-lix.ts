@@ -11,7 +11,7 @@ import type {
 	LixServerOptions,
 } from "./types.js";
 
-export { Lix, LixTransaction, ObserveEvents } from "./lix.js";
+export { Lix, LixTransaction } from "./lix.js";
 
 import { openStorages, storageAlreadyOpen } from "./storage-ownership.js";
 

@@ -129,27 +129,37 @@ test("observation setup bypasses a blocked finite operation", async () => {
 });
 
 test("disconnect drains active work but rejects queued writes and closes late observers", async () => {
- const active=deferred<void>();const observed=deferred<ObserveEventsBinding>();
- const responses:WorkerResponse[]=[];let receive!:(message:WorkerInput)=>void;
- const writes:string[]=[];const closed=vi.fn(async()=>{});const observationClose=vi.fn();
- const binding={setTelemetryParent(){},close:closed,
+	const active = deferred<void>();
+	const observed=deferred<ObserveEventsBinding>();
+	const responses: WorkerResponse[] = [];
+	let receive!: (message: WorkerInput) => void;
+	const writes: string[] = [];
+	const closed = vi.fn(async () => {});
+	const observationClose = vi.fn();
+	const binding={setTelemetryParent(){},close:closed,
   execute:async(sql:string)=>{writes.push(sql);await active.promise;return {columns:[],rows:[],rowsAffected:0,notices:[]};},
   observe:async()=>observed.promise,
  } as unknown as LixBinding;
- const controller=startWorkerHost({postMessage:message=>responses.push(message),onMessage:listener=>{receive=listener;}},async()=>binding);
- receive({id:1,sessionId:0,operation:{kind:"open",storage:{kind:"memory"},telemetryEnabled:false,progressEnabled:false}});
- await vi.waitFor(()=>expect(responses).toContainEqual(expect.objectContaining({id:1,ok:true})));
- receive({id:2,sessionId:0,operation:{kind:"execute",sql:"active write",params:[]}});
- await vi.waitFor(()=>expect(writes).toEqual(["active write"]));
- receive({id:3,sessionId:0,operation:{kind:"execute",sql:"queued write",params:[]}});
- receive({id:4,sessionId:0,operation:{kind:"observe",sql:"SELECT value",params:[]}});
- const closing=controller.close();expect(closed).not.toHaveBeenCalled();
- observed.resolve({setTelemetryParent(){},next:async()=>undefined,close:observationClose});
- active.resolve();await closing;
- expect(writes).toEqual(["active write"]);
- expect(responses).toContainEqual(expect.objectContaining({id:3,ok:false}));
- expect(responses).toContainEqual(expect.objectContaining({id:4,ok:false}));
- expect(observationClose).toHaveBeenCalledTimes(1);expect(closed).toHaveBeenCalledTimes(1);
+	const controller = startWorkerHost({
+		postMessage: (message) => responses.push(message),
+		onMessage: (listener) => { receive = listener; },
+	}, async () => binding);
+	receive({id:1,sessionId:0,operation:{kind:"open",storage:{kind:"memory"},telemetryEnabled:false,progressEnabled:false}});
+	await vi.waitFor(()=>expect(responses).toContainEqual(expect.objectContaining({id:1,ok:true})));
+	receive({id:2,sessionId:0,operation:{kind:"execute",sql:"active write",params:[]}});
+	await vi.waitFor(()=>expect(writes).toEqual(["active write"]));
+	receive({id:3,sessionId:0,operation:{kind:"execute",sql:"queued write",params:[]}});
+	receive({id:4,sessionId:0,operation:{kind:"observe",sql:"SELECT value",params:[]}});
+	const closing = controller.close();
+	expect(closed).not.toHaveBeenCalled();
+	observed.resolve({setTelemetryParent(){},next:async()=>undefined,close:observationClose});
+	active.resolve();
+	await closing;
+	expect(writes).toEqual(["active write"]);
+	expect(responses).toContainEqual(expect.objectContaining({id:3,ok:false}));
+	expect(responses).toContainEqual(expect.objectContaining({id:4,ok:false}));
+	expect(observationClose).toHaveBeenCalledTimes(1);
+	expect(closed).toHaveBeenCalledTimes(1);
 });
 
 test("worker forwards the durable transaction commit receipt", async () => {
@@ -184,4 +194,61 @@ test("worker host routes sync health to the local binding", async () => {
 	receive({ id: 2, sessionId: 0, operation: { kind: "syncHealth" } });
 	await vi.waitFor(() => expect(responses).toContainEqual({ id: 2, ok: true, value: health }));
 	expect(binding.syncHealth).toHaveBeenCalledOnce();
+});
+
+test("a credential callback from a nonresponsive page cannot leave opening pending", async () => {
+	vi.useFakeTimers();
+	try {
+		const responses: WorkerResponse[] = [];
+		let receive!: (input: WorkerInput) => void;
+		const host = startWorkerHost(
+			{
+		postMessage: (message) => responses.push(message),
+		onMessage: (listener) => { receive = listener; },
+	},
+			async (_storage, _telemetry, _parent, server) => {
+				await server!.headerProvider!();
+				throw new Error("Late credentials must never reach this line");
+			},
+		);
+		receive({
+			id: 1,
+			sessionId: 0,
+			operation: {
+				kind: "open",
+				storage: { kind: "memory" },
+				telemetryEnabled: false,
+				progressEnabled: false,
+				server: {
+					url: "https://example.invalid",
+					headers: [],
+					dynamicHeaders: true,
+				},
+			},
+		});
+		await vi.advanceTimersByTimeAsync(15_000);
+		expect(responses).toContainEqual(
+			expect.objectContaining({
+				id: 1,
+				ok: false,
+				error: expect.objectContaining({ code: "LIX_CREDENTIALS_TIMEOUT" }),
+			}),
+		);
+		const header = responses.find(
+			(message) => "kind" in message && message.kind === "sync.headers",
+		);
+		if (!header || !("requestId" in header))
+			throw new Error("Expected credential request");
+		receive({
+			kind: "sync.headers.result",
+			requestId: header.requestId,
+			result: { ok: true, headers: [] },
+		});
+		await host.close();
+		expect(
+			responses.filter((message) => "id" in message && message.id === 1),
+		).toHaveLength(1);
+	} finally {
+		vi.useRealTimers();
+	}
 });

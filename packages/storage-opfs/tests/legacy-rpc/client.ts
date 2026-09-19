@@ -1,4 +1,4 @@
-import { PartialOwnerLifetimes } from "./partial-owner.js";
+import { PartialOwnerLifetimes } from "../../js/partial-owner.js";
 import type {
 	LixStorageCommitResult,
 	LixStorageChangeWatch,
@@ -14,17 +14,41 @@ import type {
 	LixStorageSpace,
 	LixStorageWriteOptions,
 } from "@lix-js/sdk";
-import { BufferedOpfsWrite } from "./buffered-write.js";
-import { StorageChangeNotifier } from "./change-watch.js";
-import { deserializeError, OPFS_RPC_CHANNEL, OPFS_RPC_PROTOCOL_VERSION, type OpfsChannelMessage, type OpfsCommitPayload, type OpfsOpenResult, type OpfsRpcRequest, type OpfsScanPagePayload } from "./rpc.js";
+import { BufferedOpfsWrite } from "../../js/buffered-write.js";
+import { StorageChangeNotifier } from "../../js/change-watch.js";
+import {
+	deserializeError,
+	OPFS_RPC_CHANNEL,
+	OPFS_RPC_PROTOCOL_VERSION,
+	type OpfsChannelMessage,
+	type OpfsCommitPayload,
+	type OpfsOpenResult,
+	type OpfsRpcRequest,
+	type OpfsScanPagePayload,
+} from "./rpc.js";
 
-export async function createLixStorageProvider(options: unknown): Promise<LixStorageProvider> {
-	if (!options || typeof options !== "object" || !("name" in options) || typeof options.name !== "string" || options.name.length === 0) {
+export async function createLixStorageProvider(
+	options: unknown,
+): Promise<LixStorageProvider> {
+	if (
+		!options ||
+		typeof options !== "object" ||
+		!("name" in options) ||
+		typeof options.name !== "string" ||
+		options.name.length === 0
+	) {
 		throw new TypeError("OPFS storage provider requires a non-empty name");
 	}
-	const value = options as { name: string; mode?: unknown; channelName?: unknown };
+	const value = options as {
+		name: string;
+		mode?: unknown;
+		channelName?: unknown;
+	};
 	if (value.mode !== "shared" || value.channelName !== OPFS_RPC_CHANNEL) {
-		throw storageError("LIX_STORAGE_UNSUPPORTED", "OPFS provider client requires a package-owned owner worker");
+		throw storageError(
+			"LIX_STORAGE_UNSUPPORTED",
+			"OPFS provider client requires a package-owned owner worker",
+		);
 	}
 	return OpfsStorageClient.open(value.name);
 }
@@ -32,13 +56,16 @@ export async function createLixStorageProvider(options: unknown): Promise<LixSto
 export class OpfsStorageClient implements LixStorageProvider {
 	readonly #channel: BroadcastChannel;
 	readonly #clientId = crypto.randomUUID();
-	readonly #pending = new Map<string, {
-		resolve: (value: unknown) => void;
-		reject: (error: Error) => void;
-		accepted?: () => void;
-		operation: OpfsRpcRequest["operation"];
-		retryable: boolean;
-	}>();
+	readonly #pending = new Map<
+		string,
+		{
+			resolve: (value: unknown) => void;
+			reject: (error: Error) => void;
+			accepted?: () => void;
+			operation: OpfsRpcRequest["operation"];
+			retryable: boolean;
+		}
+	>();
 	readonly #changes = new StorageChangeNotifier();
 	#storageState: string | undefined;
 	#sessionToken: string | undefined;
@@ -67,7 +94,8 @@ export class OpfsStorageClient implements LixStorageProvider {
 				}
 				return;
 			}
-			if (response.kind !== "response" || response.clientId !== this.#clientId) return;
+			if (response.kind !== "response" || response.clientId !== this.#clientId)
+				return;
 			const pending = this.#pending.get(response.requestId);
 			if (!pending) return;
 			this.#pending.delete(response.requestId);
@@ -80,12 +108,23 @@ export class OpfsStorageClient implements LixStorageProvider {
 		name: string,
 		channelName = OPFS_RPC_CHANNEL,
 	): Promise<OpfsStorageClient> {
-		if (typeof BroadcastChannel === "undefined") throw storageError("LIX_STORAGE_UNSUPPORTED", "OPFS shared storage requires BroadcastChannel");
+		if (typeof BroadcastChannel === "undefined")
+			throw storageError(
+				"LIX_STORAGE_UNSUPPORTED",
+				"OPFS shared storage requires BroadcastChannel",
+			);
 		const client = new OpfsStorageClient(name, channelName);
 		try {
-			const state = (await client.#rpc("open", undefined, true)) as OpfsOpenResult;
+			const state = (await client.#rpc(
+				"open",
+				undefined,
+				true,
+			)) as OpfsOpenResult;
 			client.#acceptStorageState(state.ownerEpoch, state.generation);
-			client.#heartbeatTimer = setInterval(() => void client.refreshState(), 5_000);
+			client.#heartbeatTimer = setInterval(
+				() => void client.refreshState(),
+				5_000,
+			);
 			return client;
 		} catch (error) {
 			client.#channel.close();
@@ -121,7 +160,11 @@ export class OpfsStorageClient implements LixStorageProvider {
 	async beginRead(options: LixStorageReadOptions): Promise<LixStorageRead> {
 		this.#assertOpen();
 		this.#assertSession(options.sessionToken);
-		const result = (await this.#rpc("beginRead", options, true)) as { generation: number; snapshotCacheKey: string; ownerEpoch: string };
+		const result = (await this.#rpc("beginRead", options, true)) as {
+			generation: number;
+			snapshotCacheKey: string;
+			ownerEpoch: string;
+		};
 		this.#acceptStorageState(result.ownerEpoch, result.generation);
 		return new RemoteRead(
 			this,
@@ -151,25 +194,36 @@ export class OpfsStorageClient implements LixStorageProvider {
 	}
 
 	close(): Promise<void> {
-		return this.#closing ??= (async () => {
+		return (this.#closing ??= (async () => {
 			this.#closed = true;
 			if (this.#heartbeatTimer) clearInterval(this.#heartbeatTimer);
 			// Stop retry emitters before posting close, not after its acknowledgement.
 			for (const pending of this.#pending.values()) {
-				if (pending.retryable) pending.reject(storageError("LIX_STORAGE_CLOSED", "storage client is closing"));
+				if (pending.retryable)
+					pending.reject(
+						storageError("LIX_STORAGE_CLOSED", "storage client is closing"),
+					);
 			}
 			await this.#partialOwners.close();
-			try { await this.#rpc("close", undefined, false); }
-			finally {
-				for (const pending of this.#pending.values()) pending.reject(storageError(
-					pending.operation === "commit" ? "LIX_STORAGE_COMMIT_OUTCOME_UNKNOWN" : "LIX_STORAGE_CLOSED",
-					"storage client closed before the operation response was confirmed",
-				));
+			try {
+				await this.#rpc("close", undefined, false);
+			} finally {
+				for (const pending of this.#pending.values())
+					pending.reject(
+						storageError(
+							pending.operation === "commit"
+								? "LIX_STORAGE_COMMIT_OUTCOME_UNKNOWN"
+								: "LIX_STORAGE_CLOSED",
+							"storage client closed before the operation response was confirmed",
+						),
+					);
 				this.#pending.clear();
-				this.#changes.close(storageError("LIX_STORAGE_CLOSED", "storage client is closed"));
+				this.#changes.close(
+					storageError("LIX_STORAGE_CLOSED", "storage client is closed"),
+				);
 				this.#channel.close();
 			}
-		})();
+		})());
 	}
 
 	/** Package-internal liveness probe which also repairs a missed announcement. */
@@ -177,7 +231,11 @@ export class OpfsStorageClient implements LixStorageProvider {
 		if (this.#closed || this.#heartbeatPending) return;
 		this.#heartbeatPending = true;
 		try {
-			const state = (await this.#rpc("heartbeat", undefined, true)) as OpfsOpenResult;
+			const state = (await this.#rpc(
+				"heartbeat",
+				undefined,
+				true,
+			)) as OpfsOpenResult;
 			this.#acceptStorageState(state.ownerEpoch, state.generation);
 		} catch {
 			// Ordinary operations retain their own error semantics. A liveness probe
@@ -187,25 +245,54 @@ export class OpfsStorageClient implements LixStorageProvider {
 		}
 	}
 
-	readMany(requests: LixStorageGetManyRequest[], generation: number, ownerEpoch: string, sessionToken?: string) {
+	readMany(
+		requests: LixStorageGetManyRequest[],
+		generation: number,
+		ownerEpoch: string,
+		sessionToken?: string,
+	) {
 		this.#assertSession(sessionToken);
-		return this.#rpc("readMany", { requests, generation, ownerEpoch, sessionToken }, true) as Promise<Array<LixStorageProjectedValue | null>>;
+		return this.#rpc(
+			"readMany",
+			{ requests, generation, ownerEpoch, sessionToken },
+			true,
+		) as Promise<Array<LixStorageProjectedValue | null>>;
 	}
 
 	scanPage(payload: OpfsScanPagePayload) {
 		this.#assertSession(payload.sessionToken);
-		return this.#rpc("scanPage", payload, true) as Promise<{ entries: Array<{ key: Uint8Array; value: LixStorageProjectedValue }>; hasMore: boolean }>;
+		return this.#rpc("scanPage", payload, true) as Promise<{
+			entries: Array<{ key: Uint8Array; value: LixStorageProjectedValue }>;
+			hasMore: boolean;
+		}>;
 	}
 
 	commit(payload: OpfsCommitPayload) {
 		this.#assertSession(payload.sessionToken);
-		return this.#rpc("commit", payload, false) as Promise<LixStorageCommitResult>;
+		return this.#rpc(
+			"commit",
+			payload,
+			false,
+		) as Promise<LixStorageCommitResult>;
 	}
 
-	async #rpc(operation: OpfsRpcRequest["operation"], payload: unknown, retry: boolean): Promise<unknown> {
-		if (this.#closed && operation !== "close") throw storageError("LIX_STORAGE_CLOSED", "storage client is closed");
+	async #rpc(
+		operation: OpfsRpcRequest["operation"],
+		payload: unknown,
+		retry: boolean,
+	): Promise<unknown> {
+		if (this.#closed && operation !== "close")
+			throw storageError("LIX_STORAGE_CLOSED", "storage client is closed");
 		const requestId = crypto.randomUUID();
-		const request: OpfsRpcRequest = { kind: "request", protocolVersion: OPFS_RPC_PROTOCOL_VERSION, requestId, clientId: this.#clientId, storageName: this.name, operation, payload };
+		const request: OpfsRpcRequest = {
+			kind: "request",
+			protocolVersion: OPFS_RPC_PROTOCOL_VERSION,
+			requestId,
+			clientId: this.#clientId,
+			storageName: this.name,
+			operation,
+			payload,
+		};
 		return new Promise((resolve, reject) => {
 			let done = false;
 			let accepted = false;
@@ -219,33 +306,50 @@ export class OpfsStorageClient implements LixStorageProvider {
 				fn(value);
 			};
 			const scheduleTimeout = (milliseconds: number, phase: string) => {
-				timeout = setTimeout(() => finish(
-					reject,
-					storageError(
-						operation === "commit" ? "LIX_STORAGE_COMMIT_OUTCOME_UNKNOWN" : "LIX_STORAGE_IO",
-						`OPFS storage ${phase} did not complete ${operation} within ${milliseconds / 1_000} seconds`,
-					),
-				), milliseconds);
+				timeout = setTimeout(
+					() =>
+						finish(
+							reject,
+							storageError(
+								operation === "commit"
+									? "LIX_STORAGE_COMMIT_OUTCOME_UNKNOWN"
+									: "LIX_STORAGE_IO",
+								`OPFS storage ${phase} did not complete ${operation} within ${milliseconds / 1_000} seconds`,
+							),
+						),
+					milliseconds,
+				);
 			};
-			scheduleTimeout(operation === "open" ? 2_000 : 15_000, operation === "open" ? "owner discovery" : "owner request");
-			const retryTimer = retry ? setInterval(() => this.#channel.postMessage(request), 50) : undefined;
+			scheduleTimeout(
+				operation === "open" ? 2_000 : 15_000,
+				operation === "open" ? "owner discovery" : "owner request",
+			);
+			const retryTimer = retry
+				? setInterval(() => this.#channel.postMessage(request), 50)
+				: undefined;
 			this.#pending.set(requestId, {
 				operation,
 				retryable: retry,
 				resolve: (value) => finish(resolve, value),
 				reject: (error) => finish(reject, error),
-				accepted: operation === "open" ? () => {
-					if (accepted || done) return;
-					accepted = true;
-					clearTimeout(timeout);
-					scheduleTimeout(15_000, "backend startup");
-				} : undefined,
+				accepted:
+					operation === "open"
+						? () => {
+								if (accepted || done) return;
+								accepted = true;
+								clearTimeout(timeout);
+								scheduleTimeout(15_000, "backend startup");
+							}
+						: undefined,
 			});
 			this.#channel.postMessage(request);
 		});
 	}
 
-	#assertOpen() { if (this.#closed) throw storageError("LIX_STORAGE_CLOSED", "storage client is closed"); }
+	#assertOpen() {
+		if (this.#closed)
+			throw storageError("LIX_STORAGE_CLOSED", "storage client is closed");
+	}
 
 	#assertSession(sessionToken: string | undefined): void {
 		if (this.#sessionToken !== sessionToken) {
@@ -269,25 +373,95 @@ export class OpfsStorageClient implements LixStorageProvider {
 }
 
 class RemoteRead implements LixStorageRead {
-	constructor(private readonly client: OpfsStorageClient, private readonly generation: number, private readonly cacheKey: string, private readonly ownerEpoch: string, private readonly sessionToken: string | undefined) {}
+	constructor(
+		private readonly client: OpfsStorageClient,
+		private readonly generation: number,
+		private readonly cacheKey: string,
+		private readonly ownerEpoch: string,
+		private readonly sessionToken: string | undefined,
+	) {}
 	// The owner epoch is not a decimal u128. Disable derived-value caching so a
 	// handoff cannot reuse a cache entry from the previous owner generation.
-	snapshotCacheKey(): undefined { return undefined; }
-	getMany(requests: LixStorageGetManyRequest[]) { return this.client.readMany(requests, this.generation, this.ownerEpoch, this.sessionToken); }
-	beginScan(space: LixStorageSpace, range: LixStorageKeyRange, options: { projection: "keyOnly" | "fullValue"; order: LixStorageScanOrder }): Promise<LixStorageScanSource> {
-		return Promise.resolve(new RemoteScan(this.client, this.generation, this.ownerEpoch, this.sessionToken, space, range, options));
+	snapshotCacheKey(): undefined {
+		return undefined;
+	}
+	getMany(requests: LixStorageGetManyRequest[]) {
+		return this.client.readMany(
+			requests,
+			this.generation,
+			this.ownerEpoch,
+			this.sessionToken,
+		);
+	}
+	beginScan(
+		space: LixStorageSpace,
+		range: LixStorageKeyRange,
+		options: {
+			projection: "keyOnly" | "fullValue";
+			order: LixStorageScanOrder;
+		},
+	): Promise<LixStorageScanSource> {
+		return Promise.resolve(
+			new RemoteScan(
+				this.client,
+				this.generation,
+				this.ownerEpoch,
+				this.sessionToken,
+				space,
+				range,
+				options,
+			),
+		);
 	}
 }
 
 class RemoteScan implements LixStorageScanSource {
 	#after: Uint8Array | undefined;
-	constructor(private readonly client: OpfsStorageClient, private readonly generation: number, private readonly ownerEpoch: string, private readonly sessionToken: string | undefined, private readonly space: LixStorageSpace, private readonly range: LixStorageKeyRange, private readonly options: { projection: "keyOnly" | "fullValue"; order: LixStorageScanOrder }) {}
+	constructor(
+		private readonly client: OpfsStorageClient,
+		private readonly generation: number,
+		private readonly ownerEpoch: string,
+		private readonly sessionToken: string | undefined,
+		private readonly space: LixStorageSpace,
+		private readonly range: LixStorageKeyRange,
+		private readonly options: {
+			projection: "keyOnly" | "fullValue";
+			order: LixStorageScanOrder;
+		},
+	) {}
 	nextPage(limitRows: number) {
-		return this.client.scanPage({ space: this.space, range: this.range, after: this.#after, limit: limitRows, order: this.options.order, projection: this.options.projection, generation: this.generation, ownerEpoch: this.ownerEpoch, sessionToken: this.sessionToken }).then((page) => { this.#after = page.entries.at(-1)?.key; return page; });
+		return this.client
+			.scanPage({
+				space: this.space,
+				range: this.range,
+				after: this.#after,
+				limit: limitRows,
+				order: this.options.order,
+				projection: this.options.projection,
+				generation: this.generation,
+				ownerEpoch: this.ownerEpoch,
+				sessionToken: this.sessionToken,
+			})
+			.then((page) => {
+				this.#after = page.entries.at(-1)?.key;
+				return page;
+			});
 	}
 }
 
-function storageError(code: LixStorageErrorCode, message: string, details?: unknown) { const error = new Error(message) as Error & { code: LixStorageErrorCode; details?: unknown }; error.name = "LixStorageError"; Object.assign(error, { code, details }); return error; }
+function storageError(
+	code: LixStorageErrorCode,
+	message: string,
+	details?: unknown,
+) {
+	const error = new Error(message) as Error & {
+		code: LixStorageErrorCode;
+		details?: unknown;
+	};
+	error.name = "LixStorageError";
+	Object.assign(error, { code, details });
+	return error;
+}
 
 function isCanonicalSessionToken(value: unknown): value is string {
 	if (typeof value !== "string" || !/^(0|[1-9]\d*)$/.test(value)) return false;

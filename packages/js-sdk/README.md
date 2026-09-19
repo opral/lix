@@ -261,7 +261,7 @@ const lix = await openLix({
 });
 
 const files = lix.observe("SELECT path FROM lix_file ORDER BY path");
-const initial = await files.next();
+const initial = await files.next(); // { value: ObserveEvent, done: false }
 
 await lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
   "/hello.txt",
@@ -269,7 +269,7 @@ await lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
 ]);
 const update = await files.next();
 
-files.close();
+await files.return?.();
 await lix.close();
 ```
 
@@ -411,8 +411,12 @@ try {
   ```
 - If the native addon cannot load in Node.js, in-memory Lix instances fall back
   to the bundled WebAssembly engine. Filesystem storage still requires the native addon.
-- Every browser `openLix()` owns one dedicated worker, so database work does
-  not block the page's main thread. Node.js uses the native binding's actor.
+- Browser database work runs off the page's main thread. OPFS handles share one
+  elected dedicated worker per physical repository; it owns both engine and
+  storage. On owner loss, surviving tabs restore sessions and observations within
+  a bounded recovery window. Interrupted transactions and snapshot streams must
+  be restarted. In-flight writes may reject with `LIX_WRITE_OUTCOME_UNKNOWN`; do
+  not blindly replay them. Node.js uses the native binding's actor.
 - Node.js and browsers execute installed Component API v2 plugins through the
   same JavaScript Component host. The host adapts Component interfaces to the
   platform's built-in WebAssembly runtime and connects them to Lix's shared Rust

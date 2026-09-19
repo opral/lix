@@ -20,19 +20,22 @@
 	},
 	"files": [
 		"dist",
+		"!dist/provider*",
 		"README.md"
 	],
 	"scripts": {
-		"build": "npm run clean && tsc -p tsconfig.json && esbuild js/client.ts --bundle --format=esm --platform=browser --target=es2022 --sourcemap --outfile=dist/provider.js && esbuild js/provider.ts --bundle --format=esm --platform=browser --target=es2022 --loader:.wasm=dataurl --sourcemap --outfile=dist/direct.js && esbuild js/owner.ts --bundle --format=esm --platform=browser --target=es2022 --loader:.wasm=dataurl --sourcemap --outfile=dist/owner.js && npm run build:migration",
+		"build": "npm run clean && tsc -p tsconfig.json && esbuild js/provider.ts --bundle --format=esm --platform=browser --target=es2022 --loader:.wasm=dataurl --sourcemap --outfile=dist/direct.js && npm run build:migration",
 		"benchmark": "npm run build && vitest run --config vitest.browser.config.ts --fileParallelism=false tests/storage-path.bench.browser.test.ts tests/opfs-scale.bench.browser.test.ts tests/lix-interaction.bench.browser.test.ts --reporter=verbose",
 		"benchmark:multi-tab": "LIX_OPFS_BENCHMARK=1 node ./scripts/test-packed-vite.js",
 		"clean": "node -e \"import('node:fs/promises').then(({ rm }) => rm('dist', { recursive: true, force: true }))\"",
 		"test:browser": "npm run build && npm run test:browser:built",
-		"test:browser:built": "vitest run --config vitest.browser.config.ts --exclude 'tests/*.bench.browser.test.ts'",
-		"test:browser:production": "node ./scripts/test-packed-vite.js",
+		"test:browser:built": "npm run build:test-harness && vitest run --config vitest.browser.config.ts --exclude 'tests/*.bench.browser.test.ts'",
+		"test:browser:production": "node ./scripts/test-packed-vite.js && node ./scripts/test-repository-owner.mjs",
 		"typecheck": "tsc -p tsconfig.test.json --noEmit",
 		"benchmark:partial-sync": "vitest run --config vitest.partial-sync.config.ts --reporter=verbose",
-		"build:migration": "node ./scripts/build-migration.js"
+		"build:migration": "node ./scripts/build-migration.js",
+		"test:repository-owner": "node ./scripts/test-repository-owner.mjs",
+		"build:test-harness": "esbuild tests/legacy-rpc/client.ts --bundle --format=esm --platform=browser --target=es2022 --sourcemap --outfile=tests/.generated/provider.js && esbuild tests/legacy-rpc/owner.ts --bundle --format=esm --platform=browser --target=es2022 --loader:.wasm=dataurl --sourcemap --outfile=tests/.generated/owner.js"
 	},
 	"dependencies": {
 		"@sqlite.org/sqlite-wasm": "3.53.0-build1"

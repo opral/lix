@@ -1,7 +1,11 @@
-import { ADMISSION_PROTOCOL_EPOCH, ADMISSION_STORAGE_EPOCH } from "./shared-admission.js";
+import { operationDeadline, lostOperationError } from "./request-lifecycle.js";
 import { emitOpenProgress } from "../open-progress.js";
 import { fetchTransport, type HttpTransport } from "../http-transport.js";
-import { createWorkerConnection, createSharedWorkerConnection, openDirectLixBinding } from "#worker-factory";
+import {
+	createWorkerConnection,
+	createRepositoryConnection,
+	openDirectLixBinding,
+} from "#worker-factory";
 import type {
 	LixBinding,
 	LixStorageConfig,
@@ -25,9 +29,12 @@ import {
 	type WorkerSyncServerOptions,
 } from "./protocol.js";
 
-type SyncServerRuntimeOptions = LixServerOptions & { transport?: HttpTransport };
+type SyncServerRuntimeOptions = LixServerOptions & {
+	transport?: HttpTransport;
+};
 
 type PendingRequest = {
+	operation: WorkerOperation;
 	resolve(value: unknown): void;
 	reject(error: unknown): void;
 };
@@ -49,10 +56,18 @@ export async function openLixWorker(
 	snapshot?: ReadableStream<Uint8Array>,
 ): Promise<LixWorkerClient> {
 	const providerOptions = storage.kind === "jsStorage" ? storage.options : undefined;
-	const sharedKey = !snapshot && server && providerOptions && typeof providerOptions === "object"
-		&& "sharedEngineKey" in providerOptions && typeof providerOptions.sharedEngineKey === "string"
-		&& providerOptions.sharedEngineKey.startsWith("lix:opfs:") ? providerOptions.sharedEngineKey : undefined;
-	const sharedConnection = sharedKey ? createSharedWorkerConnection(`${sharedKey}:protocol-${ADMISSION_PROTOCOL_EPOCH}:storage-${ADMISSION_STORAGE_EPOCH}`) : undefined;
+	const sharedKey =
+		!snapshot &&
+		providerOptions &&
+		typeof providerOptions === "object" &&
+		"sharedEngineKey" in providerOptions &&
+		typeof providerOptions.sharedEngineKey === "string" &&
+		providerOptions.sharedEngineKey.startsWith("lix:opfs:")
+			? providerOptions.sharedEngineKey
+			: undefined;
+	const sharedConnection = sharedKey
+		? createRepositoryConnection(sharedKey)
+		: undefined;
 	let client = sharedConnection ? new LixWorkerClient(sharedConnection, false) : idleWorkers.pop();
 	while (client?.isDisposed) client = idleWorkers.pop();
 	client ??= new LixWorkerClient();
@@ -88,7 +103,7 @@ export async function openLixWorker(
 			await snapshotReader.cancel(error).catch(() => undefined);
 			snapshotReader.releaseLock();
 		}
-		await client.terminate();
+		await client.terminate().catch(() => undefined);
 		throw error;
 	}
 }
@@ -159,12 +174,21 @@ export async function pumpSnapshotToWorker(
 
 /** Opens the local worker transport behind the semantic Lix binding. */
 export async function openLixWorkerBinding(
- storage: LixStorageConfig, onDisposed?: () => void, telemetry?: LixTelemetryOptions,
- server?: SyncServerRuntimeOptions, onProgress?: (progress: LixOpenProgress) => void,
- snapshot?: ReadableStream<Uint8Array>,
+	storage: LixStorageConfig,
+	onDisposed?: () => void,
+	telemetry?: LixTelemetryOptions,
+	server?: SyncServerRuntimeOptions,
+	onProgress?: (progress: LixOpenProgress) => void,
+	snapshot?: ReadableStream<Uint8Array>,
 ): Promise<LixBinding> {
- return await openLixWorkerBindingInner(storage, onDisposed, telemetry, server,
-   onProgress ? value => emitOpenProgress(onProgress, value) : undefined, snapshot);
+	return await openLixWorkerBindingInner(
+		storage,
+		onDisposed,
+		telemetry,
+		server,
+		onProgress ? (value) => emitOpenProgress(onProgress, value) : undefined,
+		snapshot,
+	);
 }
 
 async function openLixWorkerBindingInner(
@@ -504,9 +528,9 @@ export class LixWorkerClient {
 	private onDisposed?: () => void;
 	private telemetry?: LixTelemetryOptions;
 	private syncServer?: SyncServerRuntimeOptions;
-    private scopedServers = new Map<number, SyncServerRuntimeOptions>();
-    private nextTransportScope = 1;
-    async withRecoveryServer<T>(server: import("../binding-types.js").SyncServerBindingOptions, operation: (scope: number, server: WorkerSyncServerOptions) => Promise<T>): Promise<T> {
+	private scopedServers = new Map<number, SyncServerRuntimeOptions>();
+	private nextTransportScope = 1;
+	async withRecoveryServer<T>(server: import("../binding-types.js").SyncServerBindingOptions, operation: (scope: number, server: WorkerSyncServerOptions) => Promise<T>): Promise<T> {
         const scope = this.nextTransportScope++;
         const runtime = {url: server.url, headers: server.headerProvider ?? server.headers, transport: server.transport};
         this.scopedServers.set(scope, runtime);
@@ -577,9 +601,35 @@ export class LixWorkerClient {
 		const id = this.nextRequestId++;
 		if (this.pending.size === 0) this.connection.ref();
 		return new Promise<T>((resolve, reject) => {
+			const milliseconds = operationDeadline(operation);
+			const timer =
+				milliseconds === undefined
+					? undefined
+					: setTimeout(() => {
+							this.handleFatal(
+								Object.assign(
+									new Error(
+										`Lix ${operation.kind} did not settle within ${milliseconds}ms`,
+									),
+									{
+										code:
+											operation.kind === "open"
+												? "LIX_OPEN_TIMEOUT"
+												: "LIX_OPERATION_TIMEOUT",
+									},
+								),
+							);
+						}, milliseconds);
 			this.pending.set(id, {
-				resolve: (value) => resolve(value as T),
-				reject,
+				operation,
+				resolve: (value) => {
+					clearTimeout(timer);
+					resolve(value as T);
+				},
+				reject: (error) => {
+					clearTimeout(timer);
+					reject(error);
+				},
 			});
 			try {
 				this.connection.postMessage({
@@ -589,9 +639,10 @@ export class LixWorkerClient {
 					operation,
 				});
 			} catch (error) {
+				const pending = this.pending.get(id);
 				this.pending.delete(id);
 				if (this.pending.size === 0) this.connection.unref();
-				reject(error);
+				pending?.reject(error);
 			}
 		});
 	}
@@ -820,10 +871,12 @@ export class LixWorkerClient {
 		fatal.code ??= "LIX_WORKER_TERMINATED";
 		this.rejectPending(fatal);
 		this.endLease();
+		void this.connection.terminate().catch(() => undefined);
 	}
 
 	private rejectPending(error: Error): void {
-		for (const pending of this.pending.values()) pending.reject(error);
+		for (const pending of this.pending.values())
+			pending.reject(lostOperationError(pending.operation, error));
 		this.pending.clear();
 		this.connection.unref();
 	}
@@ -892,15 +945,21 @@ export async function hostedLixWorkerOperation<T>(
 	}
 }
 
-export async function convertReplicaWorkerOperation(storage:LixStorageConfig,server:SyncServerRuntimeOptions,branchId?:string):Promise<void> {
- const providerOptions = storage.kind === "jsStorage" ? storage.options : undefined;
- const sharedKey = providerOptions && typeof providerOptions === "object"
+export async function convertReplicaWorkerOperation(
+	storage: LixStorageConfig,
+	server: SyncServerRuntimeOptions,
+	branchId?: string,
+): Promise<void> {
+	const providerOptions = storage.kind === "jsStorage" ? storage.options : undefined;
+	const sharedKey = providerOptions && typeof providerOptions === "object"
   && "sharedEngineKey" in providerOptions && typeof providerOptions.sharedEngineKey === "string"
   && providerOptions.sharedEngineKey.startsWith("lix:opfs:") ? providerOptions.sharedEngineKey : undefined;
- const connection = sharedKey ? createSharedWorkerConnection(`${sharedKey}:protocol-${ADMISSION_PROTOCOL_EPOCH}:storage-${ADMISSION_STORAGE_EPOCH}`) : undefined;
- const client = connection ? new LixWorkerClient(connection, false) : new LixWorkerClient();
- client.beginLease(undefined,undefined,server);
- try { await client.request({kind:"replica.convert",storage,server:serializeSyncServer(server)!,branchId},0); }
+	const connection = sharedKey
+		? createRepositoryConnection(sharedKey)
+		: undefined;
+	const client = connection ? new LixWorkerClient(connection, false) : new LixWorkerClient();
+	client.beginLease(undefined,undefined,server);
+	try { await client.request({kind:"replica.convert",storage,server:serializeSyncServer(server)!,branchId},0); }
  finally { await client.terminate(); }
 }
 

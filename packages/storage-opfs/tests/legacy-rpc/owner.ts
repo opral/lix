@@ -1,4 +1,4 @@
-import { OpfsBackend } from "./provider.js";
+import { OpfsBackend } from "../../js/provider.js";
 import {
 	OPFS_RPC_CHANNEL,
 	OPFS_RPC_PROTOCOL_VERSION,
@@ -54,7 +54,8 @@ setInterval(() => {
 channel.onmessage = (event: MessageEvent<OpfsRpcRequest>) => {
 	const request = event.data;
 	if (!request || request.kind !== "request") return;
-	if (request.operation === "close") closedClients.set(request.clientId, Date.now());
+	if (request.operation === "close")
+		closedClients.set(request.clientId, Date.now());
 	else if (closedClients.has(request.clientId)) return;
 
 	// BroadcastChannel retries can deliver the same request while a SQLite
@@ -86,12 +87,20 @@ channel.onmessage = (event: MessageEvent<OpfsRpcRequest>) => {
 
 async function dispatch(request: OpfsRpcRequest): Promise<boolean> {
 	// Also fence requests that were waiting for a closing backend to drain.
-	if (request.operation !== "close" && closedClients.has(request.clientId)) return false;
+	if (request.operation !== "close" && closedClients.has(request.clientId))
+		return false;
 	const entry = getEntry(request.storageName);
 	if (entry.closing) {
-		try { await entry.closing; }
-		catch (error) {
-			postResponse({kind:"response", requestId:request.requestId, clientId:request.clientId, ok:false, error:serializeError(error)});
+		try {
+			await entry.closing;
+		} catch (error) {
+			postResponse({
+				kind: "response",
+				requestId: request.requestId,
+				clientId: request.clientId,
+				ok: false,
+				error: serializeError(error),
+			});
 			return true;
 		}
 		return dispatch(request);
@@ -102,13 +111,29 @@ async function dispatch(request: OpfsRpcRequest): Promise<boolean> {
 			await entry.opening;
 			// Relay workers must never acknowledge another owner's close.
 			if (!entry.ownsRepository) {
-				if (entry.clients.size === 0 && backends.get(request.storageName) === entry) backends.delete(request.storageName);
+				if (
+					entry.clients.size === 0 &&
+					backends.get(request.storageName) === entry
+				)
+					backends.delete(request.storageName);
 				return false;
 			}
 			await closeIdleBackend(request.storageName, entry);
-			postResponse({kind:"response",requestId:request.requestId,clientId:request.clientId,ok:true,result:undefined});
+			postResponse({
+				kind: "response",
+				requestId: request.requestId,
+				clientId: request.clientId,
+				ok: true,
+				result: undefined,
+			});
 		} catch (error) {
-			postResponse({kind:"response",requestId:request.requestId,clientId:request.clientId,ok:false,error:serializeError(error)});
+			postResponse({
+				kind: "response",
+				requestId: request.requestId,
+				clientId: request.clientId,
+				ok: false,
+				error: serializeError(error),
+			});
 		}
 		return true;
 	}
@@ -182,7 +207,9 @@ async function dispatch(request: OpfsRpcRequest): Promise<boolean> {
 				};
 			}
 			case "beginWrite": {
-				const payload = request.payload as Parameters<OpfsBackend["beginWrite"]>[0];
+				const payload = request.payload as Parameters<
+					OpfsBackend["beginWrite"]
+				>[0];
 				backend.assertSession(payload.sessionToken);
 				return { ownerEpoch: entry.epoch! };
 			}
@@ -301,7 +328,10 @@ async function ensureBackend(
 	return entry.opening;
 }
 
-function assertOwnerEpoch(entry: BackendEntry, ownerEpoch: string | undefined): void {
+function assertOwnerEpoch(
+	entry: BackendEntry,
+	ownerEpoch: string | undefined,
+): void {
 	if (entry.epoch !== ownerEpoch) {
 		throw storageError(
 			"LIX_STORAGE_READ_EXPIRED",
@@ -344,7 +374,9 @@ function closeIdleBackend(name: string, entry: BackendEntry): Promise<void> {
 		entry.ownsRepository = false;
 		if (backends.get(name) === entry) backends.delete(name);
 	})();
-	entry.closing = closing.then(() => {entry.closing = undefined;});
+	entry.closing = closing.then(() => {
+		entry.closing = undefined;
+	});
 	// Preserve a failed close as a failed ownership state. Never silently
 	// create a competing backend when physical release was not confirmed.
 	return entry.closing;
