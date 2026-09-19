@@ -17,7 +17,7 @@ use crate::sql2::catalog::{
     SchemaSurfaceShape, SchemaSurfaceSpec, derive_schema_surface_spec_from_schema,
     schema_exposed_as_history_surface, schema_exposed_as_schema_surface,
 };
-use crate::sql2::result_metadata::{json_field, row_ref_field};
+use crate::sql2::result_metadata::json_field;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PublicCatalog {
@@ -151,18 +151,11 @@ impl PublicCatalog {
             | PublicSurfaceKind::HistoryFunction
             | PublicSurfaceKind::DiffFunction
             | PublicSurfaceKind::CheckpointFunction
+            | PublicSurfaceKind::RecoveryFunction
             | PublicSurfaceKind::StateAtFunction
             | PublicSurfaceKind::CommitAncestryFunction => {
                 return None;
             }
-            PublicSurfaceKind::Revert | PublicSurfaceKind::Apply => {
-                Arc::new(Schema::new(vec![row_ref_field("row_ref", false)]))
-            }
-            PublicSurfaceKind::Restore => Arc::new(Schema::new(vec![Field::new(
-                "commit_id",
-                DataType::Utf8,
-                false,
-            )])),
             PublicSurfaceKind::Change => Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
                 Field::new("account_id", DataType::Utf8, false),
@@ -320,6 +313,15 @@ impl PublicCatalog {
             vec![PublicColumn::public_read_only("commit_id", false)],
             SurfaceCapabilities::read_only(),
         ))?;
+        for name in ["lix_restore", "lix_revert", "lix_revert_range", "lix_apply"] {
+            self.insert(surface(
+                name,
+                PublicSurfaceClass::TableFunction,
+                PublicSurfaceKind::RecoveryFunction,
+                vec![PublicColumn::public_read_only("commit_id", true)],
+                SurfaceCapabilities::read_only(),
+            ))?;
+        }
         self.insert(surface(
             "lix_as_of",
             PublicSurfaceClass::TableFunction,
@@ -333,36 +335,6 @@ impl PublicCatalog {
             PublicSurfaceKind::CommitAncestryFunction,
             Vec::new(),
             SurfaceCapabilities::read_only(),
-        ))?;
-        for (name, kind) in [
-            ("lix_revert", PublicSurfaceKind::Revert),
-            ("lix_apply", PublicSurfaceKind::Apply),
-        ] {
-            self.insert(surface(
-                name,
-                PublicSurfaceClass::CommandSink,
-                kind,
-                vec![
-                    PublicColumn::public_insert_only("row_ref", false),
-                    PublicColumn::public_read_only("commit_id", false),
-                ],
-                SurfaceCapabilities {
-                    insert: true,
-                    update: false,
-                    delete: false,
-                },
-            ))?;
-        }
-        self.insert(surface(
-            "lix_restore",
-            PublicSurfaceClass::CommandSink,
-            PublicSurfaceKind::Restore,
-            vec![PublicColumn::public_insert_only("commit_id", false)],
-            SurfaceCapabilities {
-                insert: true,
-                update: false,
-                delete: false,
-            },
         ))?;
         for name in PUBLIC_SCALAR_FUNCTION_NAMES {
             self.insert_scalar_function(name)?;

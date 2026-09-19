@@ -276,6 +276,30 @@ impl LixInformationSchemaProvider {
                         false,
                     )])),
                 ),
+                PublicSurfaceKind::RecoveryFunction => (
+                    match surface.name.as_str() {
+                        "lix_restore" => {
+                            "(source_commit_id TEXT) | (source_commit_id TEXT, row_refs ROW_REF[])"
+                        }
+                        "lix_revert" => {
+                            "(commit_id TEXT) | (commit_id TEXT, row_refs ROW_REF[])"
+                        }
+                        "lix_revert_range" | "lix_apply" => {
+                            "(before_commit_id TEXT, after_commit_id TEXT) | (before_commit_id TEXT, after_commit_id TEXT, row_refs ROW_REF[])"
+                        }
+                        _ => {
+                            return Err(DataFusionError::Execution(format!(
+                                "unknown recovery function '{}'",
+                                surface.name
+                            )));
+                        }
+                    },
+                    Arc::new(Schema::new(vec![Field::new(
+                        "commit_id",
+                        DataType::Utf8,
+                        true,
+                    )])),
+                ),
                 PublicSurfaceKind::DiffFunction => {
                     unreachable!("relation-specific diffs handled above")
                 }
@@ -345,13 +369,13 @@ impl LixInformationSchemaProvider {
                 PublicSurfaceClass::Relation(PublicRelationKind::View) => Some("VIEW".to_string()),
                 _ => None,
             });
-            can_read.push(!matches!(surface.class, PublicSurfaceClass::CommandSink));
+            can_read.push(true);
             can_insert.push(surface.capabilities.insert);
             can_update.push(surface.capabilities.update);
             can_delete.push(surface.capabilities.delete);
             is_side_effecting.push(
-                matches!(surface.class, PublicSurfaceClass::CommandSink)
-                    || surface.kind == PublicSurfaceKind::CheckpointFunction,
+                surface.kind == PublicSurfaceKind::CheckpointFunction
+                    || surface.kind == PublicSurfaceKind::RecoveryFunction,
             );
             description.push(surface.description.clone());
         }

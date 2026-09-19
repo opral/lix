@@ -170,6 +170,29 @@ where
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) async fn restore_branch_ref_for_test(
+        &mut self,
+        branch_id: &str,
+        expected_head_commit_id: &str,
+        target_commit_id: &str,
+    ) -> Result<(), LixError> {
+        let expected_head_commit_id = crate::changelog::CommitId::parse_lix(
+            expected_head_commit_id,
+            "test restore expected branch head",
+        )?;
+        let target_commit_id = crate::changelog::CommitId::parse_lix(
+            target_commit_id,
+            "test restore target branch head",
+        )?;
+        if expected_head_commit_id == target_commit_id {
+            return Ok(());
+        }
+        self.transaction_mut()?
+            .restore_branch_ref(branch_id, expected_head_commit_id, target_commit_id)
+            .await
+    }
+
     pub fn active_branch_id(&self) -> Result<&str, LixError> {
         self.ensure_session_open()?;
         self.transaction

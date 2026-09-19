@@ -16,7 +16,6 @@ pub(crate) use commit_ancestry::commit_ancestry_schema;
 mod diff;
 mod directory;
 pub(crate) use diff::relation_diff_schema;
-mod diff_command;
 mod file;
 mod mainline;
 pub(crate) use mainline::relation_history_schema;
@@ -528,10 +527,8 @@ where
             | PublicSurfaceKind::HistoryFunction
             | PublicSurfaceKind::DiffFunction
             | PublicSurfaceKind::CheckpointFunction
-            | PublicSurfaceKind::StateAtFunction
-            | PublicSurfaceKind::Revert
-            | PublicSurfaceKind::Apply
-            | PublicSurfaceKind::Restore => {}
+            | PublicSurfaceKind::RecoveryFunction
+            | PublicSurfaceKind::StateAtFunction => {}
         }
     }
     schema::register_row_providers(
@@ -681,32 +678,14 @@ async fn register_write_from_catalog(
                 )
                 .await?;
             }
-            PublicSurfaceKind::Revert => {
-                diff_command::register_diff_command_provider(
-                    session,
-                    &surface.name,
-                    crate::sql2::DiffCommand::Revert,
-                    write_ctx.clone(),
-                )
-                .await?;
-            }
-            PublicSurfaceKind::Apply => {
-                diff_command::register_diff_command_provider(
-                    session,
-                    &surface.name,
-                    crate::sql2::DiffCommand::Apply,
-                    write_ctx.clone(),
-                )
-                .await?;
-            }
             PublicSurfaceKind::Change
             | PublicSurfaceKind::LogFunction
             | PublicSurfaceKind::HistoryFunction
             | PublicSurfaceKind::DiffFunction
             | PublicSurfaceKind::CheckpointFunction
+            | PublicSurfaceKind::RecoveryFunction
             | PublicSurfaceKind::StateAtFunction
-            | PublicSurfaceKind::CommitAncestryFunction
-            | PublicSurfaceKind::Restore => {}
+            | PublicSurfaceKind::CommitAncestryFunction => {}
             PublicSurfaceKind::SchemaBase { .. } => {}
         }
     }
@@ -964,6 +943,7 @@ mod tests {
         assert_eq!(
             read_only,
             vec![
+                "lix_apply",
                 "lix_as_of",
                 "lix_change",
                 "lix_commit_ancestry",
@@ -971,23 +951,23 @@ mod tests {
                 "lix_diff",
                 "lix_history",
                 "lix_log",
+                "lix_restore",
+                "lix_revert",
+                "lix_revert_range",
             ]
         );
         assert_eq!(
             writable,
             vec![
-                "lix_apply",
                 "lix_branch",
                 "lix_directory",
                 "lix_file",
-                "lix_restore",
-                "lix_revert",
                 "phase8_row",
             ]
         );
         assert_eq!(read_only.len() + writable.len(), catalog.surfaces().count());
-        assert_eq!(all_read + writable.len(), 21, "construction count");
-        assert_eq!(read_only.len() + writable.len(), 14, "surface count");
+        assert_eq!(all_read + writable.len(), 19, "construction count");
+        assert_eq!(read_only.len() + writable.len(), 15, "surface count");
     }
 
     #[test]
@@ -1004,7 +984,7 @@ mod tests {
             .map(|surface| surface.name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(all_writable, 6, "standalone write count");
+        assert_eq!(all_writable, 3, "standalone write count");
         assert_eq!(selected_writable, vec!["lix_file"]);
     }
 

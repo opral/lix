@@ -19,9 +19,9 @@ simulation_test!(
             "SELECT surface_name, surface_class, relation_kind, can_read, can_insert, is_side_effecting \
              FROM information_schema.lix_surfaces \
              WHERE surface_name IN (\
-               'lix_active_branch_id', 'lix_create_checkpoint', 'lix_diff',\
-               'lix_file', 'lix_log', \
-               'lix_restore', 'lix_root_commit_id'\
+               'lix_active_branch_id', 'lix_apply', 'lix_create_checkpoint', 'lix_diff',\
+               'lix_file', 'lix_log', 'lix_restore', 'lix_revert', 'lix_revert_range',\
+               'lix_root_commit_id'\
              ) \
              ORDER BY surface_name",
             &[],
@@ -39,6 +39,14 @@ simulation_test!(
                     Value::Boolean(true),
                     Value::Boolean(false),
                     Value::Boolean(false),
+                ],
+                vec![
+                    Value::Text("lix_apply".to_string()),
+                    Value::Text("TABLE_FUNCTION".to_string()),
+                    Value::Null,
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                    Value::Boolean(true),
                 ],
                 vec![
                     Value::Text("lix_create_checkpoint".to_string()),
@@ -74,10 +82,26 @@ simulation_test!(
                 ],
                 vec![
                     Value::Text("lix_restore".to_string()),
-                    Value::Text("COMMAND_SINK".to_string()),
+                    Value::Text("TABLE_FUNCTION".to_string()),
                     Value::Null,
+                    Value::Boolean(true),
                     Value::Boolean(false),
                     Value::Boolean(true),
+                ],
+                vec![
+                    Value::Text("lix_revert".to_string()),
+                    Value::Text("TABLE_FUNCTION".to_string()),
+                    Value::Null,
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                    Value::Boolean(true),
+                ],
+                vec![
+                    Value::Text("lix_revert_range".to_string()),
+                    Value::Text("TABLE_FUNCTION".to_string()),
+                    Value::Null,
+                    Value::Boolean(true),
+                    Value::Boolean(false),
                     Value::Boolean(true),
                 ],
                 vec![
@@ -152,6 +176,65 @@ simulation_test!(
                 Value::Text("TEXT".to_string()),
                 Value::Text("NO".to_string()),
             ]],
+        );
+    }
+);
+
+simulation_test!(
+    recovery_table_functions_advertise_nullable_receipts_and_signatures,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let rows = session
+            .execute(
+                "SELECT function_name, argument_signature, result_column, data_type, is_nullable \
+                 FROM information_schema.table_functions \
+                 WHERE function_name IN ('lix_restore', 'lix_revert', 'lix_revert_range', 'lix_apply') \
+                 ORDER BY function_name",
+                &[],
+            )
+            .await
+            .expect("recovery function metadata should be readable");
+
+        assert_rows_eq(
+            rows,
+            vec![
+                vec![
+                    Value::Text("lix_apply".to_string()),
+                    Value::Text("(before_commit_id TEXT, after_commit_id TEXT) | (before_commit_id TEXT, after_commit_id TEXT, row_refs ROW_REF[])".to_string()),
+                    Value::Text("commit_id".to_string()),
+                    Value::Text("TEXT".to_string()),
+                    Value::Text("YES".to_string()),
+                ],
+                vec![
+                    Value::Text("lix_restore".to_string()),
+                    Value::Text("(source_commit_id TEXT) | (source_commit_id TEXT, row_refs ROW_REF[])".to_string()),
+                    Value::Text("commit_id".to_string()),
+                    Value::Text("TEXT".to_string()),
+                    Value::Text("YES".to_string()),
+                ],
+                vec![
+                    Value::Text("lix_revert".to_string()),
+                    Value::Text("(commit_id TEXT) | (commit_id TEXT, row_refs ROW_REF[])".to_string()),
+                    Value::Text("commit_id".to_string()),
+                    Value::Text("TEXT".to_string()),
+                    Value::Text("YES".to_string()),
+                ],
+                vec![
+                    Value::Text("lix_revert_range".to_string()),
+                    Value::Text("(before_commit_id TEXT, after_commit_id TEXT) | (before_commit_id TEXT, after_commit_id TEXT, row_refs ROW_REF[])".to_string()),
+                    Value::Text("commit_id".to_string()),
+                    Value::Text("TEXT".to_string()),
+                    Value::Text("YES".to_string()),
+                ],
+            ],
         );
     }
 );

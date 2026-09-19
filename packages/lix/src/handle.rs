@@ -2734,6 +2734,20 @@ where
             .await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn restore_branch_ref_for_test(
+        &mut self,
+        branch_id: &str,
+        expected_head_commit_id: &str,
+        target_commit_id: &str,
+    ) -> Result<(), LixError> {
+        self.inner
+            .as_mut()
+            .ok_or_else(closed_transaction_error)?
+            .restore_branch_ref_for_test(branch_id, expected_head_commit_id, target_commit_id)
+            .await
+    }
+
     pub async fn commit(mut self) -> Result<crate::CommitReceipt, LixError> {
         self.inner
             .take()

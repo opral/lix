@@ -11163,6 +11163,23 @@ mod tests {
             .expect("active branch head should decode")
     }
 
+    async fn reset_branch_for_test(lix: &Lix<Memory>, target_commit_id: &str) {
+        let branch_id = lix
+            .active_branch_id()
+            .await
+            .expect("active branch should resolve");
+        let expected_head_commit_id = current_branch_head(lix).await;
+        let mut transaction = lix
+            .begin_transaction()
+            .await
+            .expect("branch reset transaction opens");
+        transaction
+            .restore_branch_ref_for_test(&branch_id, &expected_head_commit_id, target_commit_id)
+            .await
+            .expect("branch reset stages");
+        transaction.commit().await.expect("branch reset commits");
+    }
+
     async fn working_diff_count(lix: &Lix<Memory>) -> i64 {
         let branch_id = lix
             .active_branch_id()
@@ -11395,13 +11412,7 @@ mod tests {
             .rows()[0]
             .get::<String>("id")
             .expect("abandoned head should decode");
-        authority
-            .execute(
-                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-                &[Value::Text(target_head.clone())],
-            )
-            .await
-            .expect("ancestor restore should succeed");
+        reset_branch_for_test(&authority, &target_head).await;
 
         let delta = authority
             .pull_sync_repository(Some(cursor), 16)
@@ -13749,13 +13760,7 @@ mod tests {
             )
             .await
             .expect("restore history should import");
-        replica
-            .execute(
-                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-                &[Value::Text(historical_head.clone())],
-            )
-            .await
-            .expect("historical restore should succeed");
+        reset_branch_for_test(&replica, &historical_head).await;
         write_key_value(&replica, "after-restore", "local-child").await;
 
         let push = replica
@@ -13807,13 +13812,7 @@ mod tests {
         write_key_value(&replica, "offline-target", "kept").await;
         let unpublished_target = current_branch_head(&replica).await;
         write_key_value(&replica, "offline-abandoned", "removed").await;
-        replica
-            .execute(
-                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-                &[Value::Text(unpublished_target.clone())],
-            )
-            .await
-            .expect("restore to the first offline commit should succeed");
+        reset_branch_for_test(&replica, &unpublished_target).await;
 
         let request = replica
             .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
@@ -13856,13 +13855,7 @@ mod tests {
         let replica = replica_from_snapshot(&authority, &snapshot).await;
         let remote_writer = replica_from_snapshot(&authority, &snapshot).await;
         hydrate_history_commit(&authority, &replica, &target).await;
-        replica
-            .execute(
-                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-                &[Value::Text(target)],
-            )
-            .await
-            .expect("offline restore should succeed");
+        reset_branch_for_test(&replica, &target).await;
 
         write_key_value(&remote_writer, "restore-race", "authority-wins").await;
         let published = publish_pending(&remote_writer, &authority).await;
@@ -13929,13 +13922,7 @@ mod tests {
             let replica = replica_from_snapshot(&authority, &snapshot).await;
             hydrate_history_commit(&authority, &replica, &middle).await;
             hydrate_history_commit(&authority, &replica, &oldest).await;
-            replica
-                .execute(
-                    "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-                    &[Value::Text(middle)],
-                )
-                .await
-                .expect("restore A");
+            reset_branch_for_test(&replica, &middle).await;
             write_key_value(&replica, "after-A", "child").await;
             let first = replica
                 .build_sync_push(TEST_REMOTE, 128)
@@ -13950,15 +13937,8 @@ mod tests {
                 // Restoring CURRENT HEAD is a no-op. Make H an ancestor
                 // before restoring it to establish the distinct (H,H) pair.
                 write_key_value(&replica, "temporary-before-B", "discarded").await;
-                replica
-                    .execute(
-                        "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-                        &[Value::Text(
-                            first.ref_updates[0].head_commit_id.clone().unwrap(),
-                        )],
-                    )
-                    .await
-                    .expect("restore B to same H with a new C");
+                let first_head = first.ref_updates[0].head_commit_id.clone().unwrap();
+                reset_branch_for_test(&replica, &first_head).await;
             } else {
                 write_key_value(&replica, "after-B", "ordinary child").await;
             }
@@ -13969,13 +13949,7 @@ mod tests {
                 .await
                 .expect("prepare B")
                 .expect("pending B");
-            replica
-                .execute(
-                    "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-                    &[Value::Text(oldest)],
-                )
-                .await
-                .expect("restore C");
+            reset_branch_for_test(&replica, &oldest).await;
             write_key_value(&replica, "after-C", "preserved").await;
             let local_head = current_branch_head(&replica).await;
             let read = replica
@@ -14107,13 +14081,7 @@ mod tests {
             hydrate_history_commit(&authority, &replica, &middle).await;
             hydrate_history_commit(&authority, &replica, &oldest).await;
 
-            replica
-                .execute(
-                    "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-                    &[Value::Text(middle.clone())],
-                )
-                .await
-                .expect("first restore should succeed");
+            reset_branch_for_test(&replica, &middle).await;
             write_key_value(&replica, "after-first-restore", "local-child").await;
             let first_prepared_head = current_branch_head(&replica).await;
             let first = replica
@@ -14139,17 +14107,12 @@ mod tests {
             if same_head_restore {
                 write_key_value(&replica, "temporary-before-newer-restore", "discarded").await;
             }
-            replica
-                .execute(
-                    "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-                    &[Value::Text(if same_head_restore {
-                        first_prepared_head.clone()
-                    } else {
-                        oldest.clone()
-                    })],
-                )
-                .await
-                .expect("newer restore should replace the in-flight intent");
+            let newer_target = if same_head_restore {
+                first_prepared_head.clone()
+            } else {
+                oldest.clone()
+            };
+            reset_branch_for_test(&replica, &newer_target).await;
             if local_child {
                 write_key_value(&replica, "after-second-restore", "preserved").await;
             }
@@ -14295,23 +14258,11 @@ mod tests {
         let replica = replica_from_snapshot(&authority, &snapshot).await;
         hydrate_history_commit(&authority, &replica, &ancestor).await;
 
-        replica
-            .execute(
-                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-                &[Value::Text(ancestor)],
-            )
-            .await
-            .expect("first restore should succeed");
+        reset_branch_for_test(&replica, &ancestor).await;
         write_key_value(&replica, "offline-chain", "keep").await;
         let desired_descendant = current_branch_head(&replica).await;
         write_key_value(&replica, "offline-chain", "discard").await;
-        replica
-            .execute(
-                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-                &[Value::Text(desired_descendant.clone())],
-            )
-            .await
-            .expect("second restore should succeed");
+        reset_branch_for_test(&replica, &desired_descendant).await;
 
         let push = replica
             .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
@@ -14364,20 +14315,8 @@ mod tests {
         write_key_value(&replica, "unpublished-chain", "first").await;
         let unpublished_ancestor = current_branch_head(&replica).await;
         write_key_value(&replica, "unpublished-chain", "second").await;
-        replica
-            .execute(
-                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-                &[Value::Text(unpublished_ancestor)],
-            )
-            .await
-            .expect("first restore should succeed");
-        replica
-            .execute(
-                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-                &[Value::Text(authority_ancestor.clone())],
-            )
-            .await
-            .expect("second restore should succeed");
+        reset_branch_for_test(&replica, &unpublished_ancestor).await;
+        reset_branch_for_test(&replica, &authority_ancestor).await;
 
         let push = replica
             .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
@@ -14439,13 +14378,7 @@ mod tests {
             })
             .await
             .expect("side lineage should merge into main");
-        replica
-            .execute(
-                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-                &[Value::Text(side_target.clone())],
-            )
-            .await
-            .expect("restore to the second-parent lineage should succeed");
+        reset_branch_for_test(&replica, &side_target).await;
 
         let push = replica
             .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
@@ -14711,13 +14644,7 @@ mod tests {
         let replica = replica_from_snapshot(&authority, &snapshot).await;
         let remote_writer = replica_from_snapshot(&authority, &snapshot).await;
         hydrate_history_commit(&authority, &replica, &target).await;
-        replica
-            .execute(
-                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-                &[Value::Text(target)],
-            )
-            .await
-            .expect("offline restore should succeed");
+        reset_branch_for_test(&replica, &target).await;
         write_key_value(&replica, "local-only", "survives").await;
         let local_head = current_branch_head(&replica).await;
 

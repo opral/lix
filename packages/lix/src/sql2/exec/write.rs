@@ -12,7 +12,6 @@ use datafusion::sql::parser::Statement as DataFusionStatement;
 use super::{SqlLogicalPlan, SqlWriteResult};
 use crate::common::ExecuteStatementMetadata;
 use crate::sql2::SqlWriteExecutionContext;
-use crate::sql2::bind::write::BoundWriteTarget;
 use crate::sql2::plan::LogicalWritePlan;
 use crate::{LixError, Value};
 
@@ -32,30 +31,6 @@ pub(crate) enum WriteExecutorPath {
 
 pub(crate) struct WriteLogicalPlan {
     pub(super) plan: LogicalWritePlan,
-}
-
-pub(crate) fn diff_command_query(
-    plan: &SqlLogicalPlan,
-) -> Option<(
-    crate::sql2::DiffCommand,
-    String,
-    Option<crate::sql2::bind::write::BoundReturning>,
-)> {
-    let SqlLogicalPlan::Write(write) = plan else {
-        return None;
-    };
-    let BoundWriteTarget::DiffCommand(command) = write.plan.bound.target else {
-        return None;
-    };
-    let crate::sql2::bind::write::BoundWriteInput::Query { query, .. } = &write.plan.bound.input
-    else {
-        return None;
-    };
-    Some((
-        command,
-        query.query.to_string(),
-        write.plan.bound.returning.clone(),
-    ))
 }
 
 /// Returns whether an explicit transaction needs a statement checkpoint

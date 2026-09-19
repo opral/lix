@@ -21,9 +21,9 @@ History reads endpoint differences along a commit’s first-parent chain; `lix_c
 
 The engine defines a Lix logical path as an absolute `/`-separated sequence of literal UTF-8 segments. Empty segments, `.`, `..`, `/` within a segment, NUL, and a trailing slash are invalid; `/` itself is only the root directory. All other segment text is preserved exactly: the engine does not URL-decode, case-fold, or Unicode-normalize paths. Filesystem adapters diagnose names that the target host cannot represent.
 
-The checkpoint and diff relations are read-only. `lix_diff()` exposes `row_ref`, the relation's typed primary-key columns, `diff_type`, and paired `from_<column>` / `to_<column>` relation columns. Pass `row_ref` to the `lix_revert` and `lix_apply` command sinks or to the `lix_create_checkpoint()` function. See [Checkpoints](./checkpoints.md) and [Diff commands](./diff-commands.md).
+The checkpoint and diff relations are read-only. `lix_diff()` exposes `row_ref`, the relation's typed primary-key columns, `diff_type`, and paired `from_<column>` / `to_<column>` relation columns. Pass `row_ref` in an array to the recovery and apply functions or to the `lix_create_checkpoint()` function. See [Checkpoints](./checkpoints.md) and [Diff commands](./diff-commands.md).
 
-For working changes, use `lix_diff(relation)`. Its actual baseline is exposed as `lix_branch.working_base_commit_id`; it can differ from the latest marked checkpoint after a fork or restore.
+For working changes, use `lix_diff(relation)`. Its actual baseline is exposed as `lix_branch.working_base_commit_id`; it can differ from the latest marked checkpoint after a fork.
 
 The rule is: `lixcol_` prefixes only engine-owned system metadata, while relation-specific payload always uses ordinary names such as `diff_type`, `from_path` and `to_path`. Registered user schemas reject column names beginning with `lixcol_` or containing `_lixcol_`; this keeps system metadata mechanically distinguishable even after `from_`/`to_` side prefixing.
 
@@ -61,13 +61,12 @@ The fixed Lix surfaces are classified as follows. Every additional registered sc
 | --- | --- |
 | Relation / base | `lix_account`, `lix_commit`, `lix_key_value`, `lix_registered_schema` |
 | Relation / view | `lix_branch`, `lix_change`, `lix_directory`, `lix_file` |
-| Table function | `lix_commit_ancestry`, `lix_create_checkpoint` (mutating), `lix_diff`, `lix_history`, `lix_log`, `lix_as_of` |
-| Command sink | `lix_apply`, `lix_restore`, `lix_revert` |
+| Table function | `lix_apply` (mutating), `lix_commit_ancestry`, `lix_create_checkpoint` (mutating), `lix_diff`, `lix_history`, `lix_log`, `lix_as_of`, `lix_restore` (mutating), `lix_revert` (mutating), `lix_revert_range` (mutating) |
 | Scalar function | `lix_active_account_id`, `lix_active_branch_commit_id`, `lix_active_branch_id`, `lix_root_commit_id`, `lix_row_ref`, `uuidv7` |
 
 Standard SQL value expressions such as `CURRENT_TIMESTAMP` are supported SQL syntax, not Lix-owned scalar-function surfaces, and are therefore omitted from `information_schema.lix_surfaces`.
 
-Classify by SQL shape, not merely by whether data is computed dynamically. Unparameterized, table-shaped projections are views. Row producers invoked in the `FROM` clause with function syntax are table functions. Apply, restore, and revert are command sinks and use `INSERT`. Checkpoint creation is the one narrow mutating table function so full and scoped checkpoints share one SQL surface.
+Classify by SQL shape, not merely by whether data is computed dynamically. Unparameterized, table-shaped projections are views. Row producers invoked in the `FROM` clause with function syntax are table functions. Apply, restore, revert, revert-range, and checkpoint creation are top-level mutating table functions and use the exact `SELECT commit_id FROM ...` command shape.
 
 JSON-backed columns are SQL `TEXT` and are marked with `lix_value_kind = 'JSONB'`. `is_nullable` describes values returned by reads; `column_default` and `lix_insert_policy` separately describe whether a write may omit a column. A defaulted ID, for example, is non-null when read, may be omitted on insert, and rejects an explicit `NULL`.
 

@@ -295,16 +295,20 @@ simulation_test!(
             .create_checkpoint()
             .await
             .expect("later checkpoint should commit");
-        main.execute(
-            "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-            &[Value::Text(checkpoint.commit_id.clone())],
-        )
-        .await
-        .expect("restoring the older checkpoint should succeed");
+        let restored = main
+            .execute(
+                "SELECT commit_id FROM lix_restore($1)",
+                &[Value::Text(checkpoint.commit_id.clone())],
+            )
+            .await
+            .expect("restoring the older checkpoint should succeed");
+        restored.rows()[0]
+            .get::<String>("commit_id")
+            .expect("restore should publish a new commit");
         assert_eq!(
             latest_checkpoint_commit_id(&main).await,
-            checkpoint.commit_id,
-            "an abandoned later global checkpoint must not remain active"
+            abandoned.commit_id,
+            "a new-commit restore keeps the later checkpoint in the active history"
         );
         assert_ne!(abandoned.commit_id, checkpoint.commit_id);
 
@@ -327,16 +331,20 @@ simulation_test!(
         )
         .await
         .expect("later ordinary change should commit");
-        main.execute(
-            "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-            &[Value::Text(restore_target)],
-        )
-        .await
-        .expect("restoring an ordinary commit should succeed");
+        let restored = main
+            .execute(
+                "SELECT commit_id FROM lix_restore($1)",
+                &[Value::Text(restore_target)],
+            )
+            .await
+            .expect("restoring an ordinary commit should succeed");
+        restored.rows()[0]
+            .get::<String>("commit_id")
+            .expect("restore should publish a new commit");
         assert_eq!(
             latest_checkpoint_commit_id(&main).await,
-            checkpoint.commit_id,
-            "a non-checkpoint restore target must not masquerade as a checkpoint"
+            abandoned.commit_id,
+            "a non-checkpoint restore target must not change checkpoint history"
         );
     }
 );

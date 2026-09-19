@@ -966,7 +966,7 @@ test("remote lix_restore uses the existing execute endpoint", async () => {
 
 	await expect(
 		lix.execute(
-			"INSERT INTO lix_restore (commit_id) VALUES ($1) RETURNING commit_id",
+			"SELECT commit_id FROM lix_restore($1)",
 			["target-commit-id"],
 		),
 	).resolves.toBeDefined();
@@ -976,7 +976,7 @@ test("remote lix_restore uses the existing execute endpoint", async () => {
 	expect(request?.method).toBe("POST");
 	expect(request?.headers.get("lix-session-id")).toBe("session-1");
 	expect(await request?.json()).toMatchObject({
-		sql: "INSERT INTO lix_restore (commit_id) VALUES ($1) RETURNING commit_id",
+		sql: "SELECT commit_id FROM lix_restore($1)",
 		params: [{ kind: "text", value: "target-commit-id" }],
 	});
 

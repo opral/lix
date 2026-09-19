@@ -23,22 +23,24 @@ for (const row of changedFiles.rows) {
 }
 
 const reverted = await lix.execute(
-  `INSERT INTO lix_revert (row_ref)
-   SELECT row_ref
-   FROM lix_diff('lix_file')
-   WHERE id = $1
-   RETURNING commit_id`,
+  `SELECT commit_id
+   FROM lix_restore(
+     (SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()),
+     ARRAY(
+       SELECT row_ref
+       FROM lix_diff('lix_file')
+       WHERE id = $1
+     )
+   )`,
   [changedFiles.rows[0].id],
 );
 
-if (reverted.rows.length > 0) {
-  console.log("reverted in commit", reverted.rows[0].commit_id);
-}
+console.log("restored in commit", reverted.rows[0].commit_id);
 
 await lix.close();
 ```
 
-The working baseline is `lix_branch.working_base_commit_id`. It can be an ordinary commit after a fork or restore, so use the one-argument diff for working changes.
+The working baseline is `lix_branch.working_base_commit_id`. It can be an ordinary commit after a fork, so use the one-argument diff for working changes.
 
 ## Diff rows
 
@@ -71,35 +73,59 @@ FROM lix_diff('lix_file', lix_root_commit_id(), $commit_id);
 
 ## Undo a selected change
 
-To undo a write, reverse its commit span and apply the resulting diff:
+To undo a historical span, use `lix_revert_range` with the original endpoint order:
 
 ```sql
-INSERT INTO lix_apply (row_ref)
-SELECT row_ref
-FROM lix_diff('acme_task', $after_commit_id, $before_commit_id)
-RETURNING commit_id;
+SELECT commit_id FROM lix_revert_range(
+  $before_commit_id,
+  $after_commit_id,
+  ARRAY(
+    SELECT row_ref
+    FROM lix_diff('acme_task', $before_commit_id, $after_commit_id)
+  )
+);
+```
+
+To undo one commit, use `lix_revert`, which resolves that commit's actual first parent:
+
+```sql
+SELECT commit_id FROM lix_revert(
+  $commit_id,
+  ARRAY[lix_row_ref('acme_task', $row_id)]
+);
 ```
 
 Use the `commit.before` and `commit.after` returned by the original write or transaction. Add a `WHERE` clause to undo only selected rows. The reversed diff removes rows the write added, restores rows it deleted, and restores the previous values of rows it modified. Undo creates a new commit; it does not erase history or move the branch back to the original commit.
 
 Later changes to unrelated rows are preserved. Each affected row must still have the version expected by the reversed diff (or be absent when absence is expected). A later edit to an affected row rejects the entire statement with `LIX_CONSTRAINT_VIOLATION`, even if that edit changed a different column. No subset of the undo is committed. Related rows required for a valid apply can also be included by dependency planning; constraints and their version checks still apply.
 
-`lix_revert` serves a different purpose: it restores selected rows to the active branch's working baseline/checkpoint. A diff supplied to `lix_revert` selects row identities; its endpoints do not specify the versions to restore. Use reversed `lix_apply` for undoing a particular historical commit span.
+`lix_restore` copies selected rows from a source commit into a new commit on the active branch. Pass `(SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id())` as the source when discarding current working edits. Use `lix_revert_range(before, after[, rows])` for a historical span, or `lix_revert(commit[, rows])` for a single commit. Use `lix_apply(before, after[, rows])` when replaying a forward difference.
 
 ## Commands
 
-The insert-only apply and revert command sinks consume queries selecting one `row_ref` column:
+The recovery and apply functions are top-level mutating `SELECT` commands. Their outer statement must select the one `commit_id` receipt column:
 
 ```sql
-INSERT INTO lix_revert (row_ref)
-SELECT row_ref
-FROM lix_diff('lix_file')
-WHERE coalesce(to_path, from_path) LIKE '/docs/%';
+SELECT commit_id
+FROM lix_restore(
+  (SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()),
+  ARRAY(
+    SELECT row_ref
+    FROM lix_diff('lix_file')
+    WHERE coalesce(to_path, from_path) LIKE '/docs/%'
+  )
+);
 
-INSERT INTO lix_apply (row_ref)
-SELECT row_ref
-FROM lix_diff('acme_task', $from_commit_id, $to_commit_id)
-WHERE to_done = true;
+SELECT commit_id
+FROM lix_apply(
+  $from_commit_id,
+  $to_commit_id,
+  ARRAY(
+    SELECT row_ref
+    FROM lix_diff('acme_task', $from_commit_id, $to_commit_id)
+    WHERE to_done = true
+  )
+);
 
 SELECT commit_id
 FROM lix_create_checkpoint(ARRAY(
@@ -113,6 +139,6 @@ SELECT commit_id FROM lix_create_checkpoint();
 
 Selecting a file includes the tracked rows composing that file. Partial file checkpoints also include required ancestor directory descriptors. Directory rows and mixed-relation selections use the same dependency planner. A scope that cannot be closed into a valid checkpoint fails before commit.
 
-Each statement is atomic. An empty selection succeeds without creating a commit and duplicate selected identities are rejected. Apply and revert support `RETURNING commit_id`; `lix_create_checkpoint()` returns the commit ID as its one result row. For apply and revert, `rowsAffected` reports the number of selected identities. Full checkpoints structurally reuse the branch state without copying application rows.
+Each statement is atomic. An empty recovery/apply selection succeeds without creating a content commit and returns one receipt row with `commit_id = NULL`; duplicate selected identities are rejected. A non-empty command returns one new commit ID. Full checkpoints retain their intentional empty milestone behavior. The command result is a receipt, so callers should inspect its row rather than infer the commit from selected-row counts. Full checkpoints structurally reuse the branch state without copying application rows.
 
 Rows written with `lixcol_untracked` are absent from every diff. Untracked state belongs to the local repository replica and is not transported through commit-based synchronization; use a separate service for state that needs synchronization without version history.

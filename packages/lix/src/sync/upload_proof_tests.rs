@@ -199,13 +199,7 @@ async fn ordinary_upload_ack_preserves_a_later_restore_without_prior_reset() {
         if append_before_restore {
             write_key_value(&replica, "ordinary-restore", "unprepared-child").await;
         }
-        replica
-            .execute(
-                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-                &[Value::Text(target.clone())],
-            )
-            .await
-            .expect("user restores before seeing prefix acknowledgment");
+        reset_branch_for_test(&replica, &target).await;
         let restored_head = current_branch_head(&replica).await;
         if competing_server_write {
             authority
@@ -318,13 +312,7 @@ async fn authority_coordinate_aba_cannot_revive_an_old_upload_proof() {
             "an authority source transition retires its prepared requests"
         );
         drop(read);
-        replica
-            .execute(
-                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-                &[Value::Text(restore_target)],
-            )
-            .await
-            .unwrap();
+        reset_branch_for_test(&replica, &restore_target).await;
         // This is a new foreign A -> T, not the old request's acknowledgment.
         // Equal commit coordinates must not revive its retired proof.
         frontier_apply_upload(

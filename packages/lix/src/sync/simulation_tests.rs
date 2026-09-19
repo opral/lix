@@ -361,6 +361,32 @@ async fn write_key_value(lix: &Lix<Memory>, key: &str, value: &str) {
     .expect("simulation write should commit");
 }
 
+async fn current_branch_head(lix: &Lix<Memory>) -> String {
+    lix.execute("SELECT lix_active_branch_commit_id() AS id", &[])
+        .await
+        .expect("active branch head should load")
+        .rows()[0]
+        .get::<String>("id")
+        .expect("active branch head should decode")
+}
+
+async fn reset_branch_for_test(lix: &Lix<Memory>, target_commit_id: &str) {
+    let branch_id = lix
+        .active_branch_id()
+        .await
+        .expect("active branch should resolve");
+    let expected_head_commit_id = current_branch_head(lix).await;
+    let mut transaction = lix
+        .begin_transaction()
+        .await
+        .expect("branch reset transaction opens");
+    transaction
+        .restore_branch_ref_for_test(&branch_id, &expected_head_commit_id, target_commit_id)
+        .await
+        .expect("branch reset stages");
+    transaction.commit().await.expect("branch reset commits");
+}
+
 async fn hot_digest(lix: &Lix<Memory>) -> Vec<(String, String)> {
     lix.execute(
         "SELECT key, value FROM lix_key_value \
@@ -2097,13 +2123,7 @@ async fn checkpoint_inventory_bootstrap_preserves_abandoned_state(_sim: Simulati
         .await
         .unwrap();
     let abandoned = authority.create_checkpoint().await.unwrap().commit_id;
-    authority
-        .execute(
-            "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-            &[Value::Text(first.clone())],
-        )
-        .await
-        .unwrap();
+    reset_branch_for_test(&authority, &first).await;
     let metadata = authority.pull_sync_repository(None, 1).await.unwrap();
     let SyncRepositoryPullResponse::Snapshot { cursor, .. } = metadata else {
         panic!("snapshot");
@@ -2283,8 +2303,8 @@ impl XorShift64 {
 async fn sparse_inventory_jump_bootstrap_and_restore(_sim: Simulation) {
     let authority = fresh_authority().await;
     authority.create_checkpoint().await.unwrap();
-    // Restoring an automatic commit makes it the working baseline. A later
-    // checkpoint can therefore jump to unmarked history outside inventory.
+    // Resetting to an automatic commit leaves the later checkpoint attached to
+    // unmarked history outside inventory.
     for generation in 0..32 {
         authority
             .execute(
@@ -2314,13 +2334,7 @@ async fn sparse_inventory_jump_bootstrap_and_restore(_sim: Simulation) {
         )
         .await
         .unwrap();
-    authority
-        .execute(
-            "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-            &[Value::Text(automatic)],
-        )
-        .await
-        .unwrap();
+    reset_branch_for_test(&authority, &automatic).await;
     authority
         .execute(
             "UPDATE lix_key_value SET value = 'after' WHERE key = 'sparse-0'",
@@ -2370,13 +2384,7 @@ async fn sparse_inventory_jump_bootstrap_and_restore(_sim: Simulation) {
         )
         .await
         .unwrap();
-    // The deterministic replica has no background worker: explicitly service
-    // the same graph-history demand the live runtime retries automatically.
-    replica
-        .hydrate_and_retry(&format!(
-            "INSERT INTO lix_restore (commit_id) VALUES ('{abandoned}')"
-        ))
-        .await;
+    reset_branch_for_test(&replica.lix, &abandoned).await;
     replica
         .lix
         .execute(

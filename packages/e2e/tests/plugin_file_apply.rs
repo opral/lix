@@ -48,7 +48,8 @@ async fn apply(lix: &Lix, to: &str) {
     let from = head(lix).await;
     let mut tx = lix.begin_transaction().await.unwrap();
     tx.execute(
-        "INSERT INTO lix_apply(row_ref) SELECT row_ref FROM lix_diff('lix_file',$1,$2)",
+        "SELECT commit_id FROM lix_apply(\
+           $1, $2, ARRAY(SELECT row_ref FROM lix_diff('lix_file',$1,$2)))",
         &[Value::Text(from), Value::Text(to.into())],
     )
     .await
@@ -153,7 +154,9 @@ async fn restored_plugin_file_accepts_semantic_edits_but_not_public_owner_writes
         .unwrap();
     let deleted = head(&lix).await;
     let owner_only = lix.execute(
-        "INSERT INTO lix_apply(row_ref) SELECT row_ref FROM lix_diff('lix_key_value',$1,$2) WHERE key='lix_plugin_owner_v2'",
+        "SELECT commit_id FROM lix_apply(\
+           $1, $2, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value',$1,$2) \
+                         WHERE key='lix_plugin_owner_v2'))",
         &[Value::Text(deleted), Value::Text(added.clone())],
     ).await.expect_err("selecting owner history alone must not authorize its restoration");
     assert!(

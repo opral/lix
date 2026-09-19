@@ -88,15 +88,45 @@ FROM lix_commit_ancestry($1)
 ORDER BY depth, commit_id;
 ```
 
-`lix_restore` is an insert-only command sink:
+`(SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id())` returns the active branch's actual working-diff baseline. It may be an ordinary commit after a fork and is not necessarily the newest marked checkpoint.
+
+Recovery and apply are top-level mutating `SELECT` functions. The exact outer shape is `SELECT commit_id FROM ...`; each command returns one receipt row, with `commit_id = NULL` for an empty or unchanged recovery/apply selection:
 
 ```sql
-INSERT INTO lix_restore (commit_id)
-VALUES ($1)
-RETURNING commit_id;
+SELECT commit_id FROM lix_restore($1);
+
+SELECT commit_id
+FROM lix_restore(
+  (SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()),
+  ARRAY(
+    SELECT row_ref
+    FROM lix_diff('lix_file')
+    WHERE id = $1
+  )
+);
+
+SELECT commit_id
+FROM lix_apply(
+  $1,
+  $2,
+  ARRAY(
+    SELECT row_ref
+    FROM lix_diff('lix_file', $1, $2)
+    WHERE id = $3
+  )
+);
+
+SELECT commit_id FROM lix_revert($1);
+
+SELECT commit_id
+FROM lix_revert_range(
+  $1,
+  $2,
+  ARRAY[lix_row_ref('lix_file', $3)]
+);
 ```
 
-The commit must exist and be an ancestor of the active branch head. The command returns the restored commit ID. It creates no commit, leaves other branches untouched, preserves branch-local untracked rows, and starts a fresh undo interval. A restore cannot be combined with another write in the same transaction and must be the final statement before commit or rollback. Orphaned commits may remain stored until ordinary reachability-based garbage collection reclaims them. Checkpoint commits remain stored even when they are no longer on the branch.
+Restore makes selected tracked content equal the source commit in a new commit on the current branch. Omitted scope restores the whole tracked repository, including deleting rows absent from the source. Selected restore leaves unrelated content alone and handles required dependencies atomically. It leaves the current working baseline unchanged, preserves branch-local untracked rows, and does not move the branch pointer backward. Revert reverses one commit, including a checkpoint commit, against its actual first parent; `lix_revert_range(before, after [, rows])` reverses the net endpoint difference. Apply replays the forward difference between explicit `before` and `after` endpoints. Later conflicting versions reject the command atomically. Mutating functions execute once as top-level commands and cannot be used as join inputs.
 
 Use `execute` for remote callers as well; restore does not add a server-protocol endpoint or a typed SDK method.
 
@@ -107,4 +137,4 @@ INSERT INTO event (id, occurred_at)
 VALUES (uuidv7(), CURRENT_TIMESTAMP);
 ```
 
-Bound parameters may use `?` or `$1`, `$2`, and so on, but a statement cannot mix the two styles.
+Use numbered bound parameters: `$1`, `$2`, and so on.
