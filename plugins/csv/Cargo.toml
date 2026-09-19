@@ -1,6 +1,6 @@
 [package]
 name = "plugin_csv"
-version = "0.16.1"
+version = "0.1.0"
 authors.workspace = true
 edition.workspace = true
 description = "CSV plugin for the row-first Lix Wasm Component API v2"
