@@ -5429,123 +5429,16 @@ where
         }
 
         if !lifecycle_schema_rows.is_empty() {
-            let mut desired_schemas = BTreeMap::<(String, RowPk), (String, JsonValue)>::new();
-            for (lifecycle_key, row) in lifecycle_schema_keys
-                .iter()
-                .zip(lifecycle_schema_rows.iter())
-            {
-                let row_pk = row.row_pk.cloned().ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "plugin schema row is missing its row identity",
-                    )
-                })?;
-                let snapshot = row.snapshot_json().ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "plugin schema row is missing its definition",
-                    )
-                })?;
-                let identity = (row.branch_id.to_string(), row_pk);
-                let definition = snapshot.value().clone();
-                if let Some((other_plugin, other_definition)) = desired_schemas.get(&identity)
-                    && other_definition != &definition
-                {
-                    return Err(plugin_schema_collision_error(
-                        &lifecycle_key.plugin_key,
-                        &identity.1,
-                        Some(other_plugin),
-                    ));
-                }
-                desired_schemas.insert(identity, (lifecycle_key.plugin_key.clone(), definition));
-            }
-
-            let schema_rows = overlay_scan_batch(
+            reconcile_plugin_schema_amendments(
                 &base,
                 &staged,
-                &HotStateScanRequest {
-                    filter: HotStateFilter {
-                        schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
-                        row_pks: desired_schemas
-                            .keys()
-                            .map(|(_, row_pk)| row_pk.clone())
-                            .collect::<BTreeSet<_>>()
-                            .into_iter()
-                            .collect(),
-                        branch_ids: desired_schemas
-                            .keys()
-                            .map(|(branch_id, _)| branch_id.clone())
-                            .collect::<BTreeSet<_>>()
-                            .into_iter()
-                            .collect(),
-                        file_ids: vec![NullableKeyFilter::Null],
-                        untracked: Some(false),
-                        ..Default::default()
-                    },
-                    projection: plugin_registry_hot_state_projection(),
-                    ..Default::default()
-                },
+                &lifecycle_schema_keys,
+                lifecycle_schema_rows,
+                &registries,
+                rows,
+                input_row_count,
             )
             .await?;
-            let mut existing_schemas = BTreeMap::<(String, RowPk), JsonValue>::new();
-            for row in schema_rows.iter() {
-                if row.deleted() {
-                    continue;
-                }
-                let snapshot = row.snapshot_json_value()?.ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "live registered schema row must have exactly one payload",
-                    )
-                })?;
-                existing_schemas.insert(
-                    (row.branch_id().to_string(), row.row_pk().clone()),
-                    snapshot,
-                );
-            }
-            // Programmatic writes may pair a schema mutation with a plugin
-            // archive in one transaction batch. Model those rows after the
-            // visible snapshot before checking the derived plugin rows.
-            for row in rows.iter().take(input_row_count) {
-                if row.schema_key != REGISTERED_SCHEMA_KEY
-                    || row.global
-                    || row.untracked
-                    || row.file_id.is_some()
-                {
-                    continue;
-                }
-                let Some(row_pk) = row.row_pk.cloned() else {
-                    continue;
-                };
-                let identity = (row.branch_id.to_string(), row_pk);
-                if !desired_schemas.contains_key(&identity) {
-                    continue;
-                }
-                match row.snapshot_json() {
-                    Some(snapshot) => {
-                        existing_schemas.insert(identity, snapshot.value().clone());
-                    }
-                    None => {
-                        existing_schemas.remove(&identity);
-                    }
-                }
-            }
-            for (identity, (plugin_key, definition)) in &desired_schemas {
-                if let Some(existing) = existing_schemas.get(identity)
-                    && existing != definition
-                {
-                    validate_plugin_schema_amendment(
-                        plugin_key,
-                        &identity.1,
-                        registries
-                            .get(&identity.0)
-                            .expect("schema branch registry loaded"),
-                        existing,
-                        definition,
-                    )?;
-                }
-            }
-            rows.append(lifecycle_schema_rows);
         }
 
         for (key, mutation) in lifecycle {
@@ -15809,6 +15702,138 @@ fn duplicate_plugin_lifecycle_mutation() -> LixError {
         LixError::CODE_CONSTRAINT_VIOLATION,
         "a write batch may mutate each plugin archive at most once",
     )
+}
+
+// Isolate upgrade-only validation from the ordinary file-reconciliation frame.
+fn reconcile_plugin_schema_amendments<'a>(
+    base: &'a dyn HotStateReader,
+    staged: &'a (impl StagedHotStateRows + Sync),
+    lifecycle_schema_keys: &'a [PluginLifecycleKey],
+    lifecycle_schema_rows: RawWriteBatch,
+    registries: &'a BTreeMap<String, PluginRegistry>,
+    rows: &'a mut RawWriteBatch,
+    input_row_count: usize,
+) -> futures_util::future::BoxFuture<'a, Result<(), LixError>> {
+    Box::pin(async move {
+        let mut desired_schemas = BTreeMap::<(String, RowPk), (String, JsonValue)>::new();
+        for (lifecycle_key, row) in lifecycle_schema_keys
+            .iter()
+            .zip(lifecycle_schema_rows.iter())
+        {
+            let row_pk = row.row_pk.cloned().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "plugin schema row is missing its row identity",
+                )
+            })?;
+            let snapshot = row.snapshot_json().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "plugin schema row is missing its definition",
+                )
+            })?;
+            let identity = (row.branch_id.to_string(), row_pk);
+            let definition = snapshot.value().clone();
+            if let Some((other_plugin, other_definition)) = desired_schemas.get(&identity)
+                && other_definition != &definition
+            {
+                return Err(plugin_schema_collision_error(
+                    &lifecycle_key.plugin_key,
+                    &identity.1,
+                    Some(other_plugin),
+                ));
+            }
+            desired_schemas.insert(identity, (lifecycle_key.plugin_key.clone(), definition));
+        }
+
+        let schema_rows = overlay_scan_batch(
+            base,
+            staged,
+            &HotStateScanRequest {
+                filter: HotStateFilter {
+                    schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
+                    row_pks: desired_schemas
+                        .keys()
+                        .map(|(_, row_pk)| row_pk.clone())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
+                    branch_ids: desired_schemas
+                        .keys()
+                        .map(|(branch_id, _)| branch_id.clone())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
+                    file_ids: vec![NullableKeyFilter::Null],
+                    untracked: Some(false),
+                    ..Default::default()
+                },
+                projection: plugin_registry_hot_state_projection(),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let mut existing_schemas = BTreeMap::<(String, RowPk), JsonValue>::new();
+        for row in schema_rows.iter() {
+            if row.deleted() {
+                continue;
+            }
+            let snapshot = row.snapshot_json_value()?.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "live registered schema row must have exactly one payload",
+                )
+            })?;
+            existing_schemas.insert(
+                (row.branch_id().to_string(), row.row_pk().clone()),
+                snapshot,
+            );
+        }
+        // Programmatic writes may pair a schema mutation with a plugin
+        // archive in one transaction batch. Model those rows after the
+        // visible snapshot before checking the derived plugin rows.
+        for row in rows.iter().take(input_row_count) {
+            if row.schema_key != REGISTERED_SCHEMA_KEY
+                || row.global
+                || row.untracked
+                || row.file_id.is_some()
+            {
+                continue;
+            }
+            let Some(row_pk) = row.row_pk.cloned() else {
+                continue;
+            };
+            let identity = (row.branch_id.to_string(), row_pk);
+            if !desired_schemas.contains_key(&identity) {
+                continue;
+            }
+            match row.snapshot_json() {
+                Some(snapshot) => {
+                    existing_schemas.insert(identity, snapshot.value().clone());
+                }
+                None => {
+                    existing_schemas.remove(&identity);
+                }
+            }
+        }
+        for (identity, (plugin_key, definition)) in &desired_schemas {
+            if let Some(existing) = existing_schemas.get(identity)
+                && existing != definition
+            {
+                validate_plugin_schema_amendment(
+                    plugin_key,
+                    &identity.1,
+                    registries
+                        .get(&identity.0)
+                        .expect("schema branch registry loaded"),
+                    existing,
+                    definition,
+                )?;
+            }
+        }
+        rows.append(lifecycle_schema_rows);
+        Ok(())
+    })
 }
 
 // A replacement may amend its own schema, but cannot rewrite a contract
