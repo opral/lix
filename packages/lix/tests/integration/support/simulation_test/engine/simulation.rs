@@ -474,16 +474,14 @@ fn classify_statement(sql: &str) -> StatementKind {
 }
 
 fn is_mutating_select(sql: &str) -> bool {
-    let upper = sql.to_ascii_uppercase();
-    [
-        "SELECT COMMIT_ID FROM LIX_APPLY(",
-        "SELECT COMMIT_ID FROM LIX_CREATE_CHECKPOINT(",
-        "SELECT COMMIT_ID FROM LIX_RESTORE(",
-        "SELECT COMMIT_ID FROM LIX_REVERT(",
-        "SELECT COMMIT_ID FROM LIX_REVERT_RANGE(",
-    ]
-    .iter()
-    .any(|prefix| upper.starts_with(prefix))
+    crate::sql2::parse_statement(sql)
+        .ok()
+        .and_then(|statement| {
+            crate::sql2::checkpoint_function_plan(&statement)
+                .ok()
+                .flatten()
+        })
+        .is_some()
 }
 
 fn first_keyword_and_rest(sql: &str) -> (String, &str) {
@@ -559,6 +557,26 @@ fn execute_result_looks_like_write(result: &ExecuteResult) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_mutating_selects_with_sql_formatting() {
+        for sql in [
+            "SELECT\ncommit_id FROM lix_restore($1)",
+            "SELECT /* receipt */ commit_id FROM lix_revert($1)",
+            "SELECT commit_id FROM lix_revert_range /* source span */ ($1, $2)",
+            "SELECT commit_id FROM public.\"lix_apply\"($1, $2)",
+            "SELECT\tcommit_id\nFROM lix_create_checkpoint /* boundary */ ()",
+        ] {
+            assert_eq!(classify_statement(sql), StatementKind::Write, "{sql}");
+        }
+        for sql in [
+            "SELECT 'SELECT commit_id FROM lix_restore($1)'",
+            "SELECT 1 /* SELECT commit_id FROM lix_apply($1, $2) */",
+            "EXPLAIN SELECT commit_id FROM lix_restore($1)",
+        ] {
+            assert_eq!(classify_statement(sql), StatementKind::Read, "{sql}");
+        }
+    }
 
     #[test]
     fn classify_statement_splits_reads_writes_and_utility() {

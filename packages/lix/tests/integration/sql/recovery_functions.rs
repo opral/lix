@@ -412,7 +412,7 @@ simulation_test!(
         let target = sim.wrap_session(engine.open_session_at(target_id).await.unwrap(), &engine);
         commit(
             &target,
-            "SELECT commit_id FROM lix_restore($1, ARRAY[$2])",
+            "SELECT\ncommit_id FROM public.\"lix_restore\" /* saved row */ ($1, ARRAY[$2])",
             &[Value::Text(source_commit), row_ref],
         )
         .await;
