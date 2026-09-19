@@ -2,8 +2,8 @@ use lix::session::CreateCheckpointReceipt;
 use lix::storage::Memory;
 use lix::{
     CreateBranchOptions, CreateBranchReceipt, ExecuteResult, MergeBranchOptions,
-    MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt, SessionTransaction,
-    SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt,
+    MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt, RedoReceipt,
+    SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt,
 };
 use lix::{LixError, Value};
 use lix::{engine::Engine, init::InitReceipt, session::SessionContext};
@@ -202,6 +202,14 @@ impl SimSession {
 
     pub async fn undo(&self) -> Result<UndoReceipt, LixError> {
         let result = self.session.undo().await;
+        if result.is_ok() {
+            self.sim.rebuild_tracked_state.after_successful_write();
+        }
+        result
+    }
+
+    pub async fn redo(&self) -> Result<RedoReceipt, LixError> {
+        let result = self.session.redo().await;
         if result.is_ok() {
             self.sim.rebuild_tracked_state.after_successful_write();
         }
@@ -455,11 +463,25 @@ fn classify_statement(sql: &str) -> StatementKind {
     }
 
     let (keyword, _rest) = first_keyword_and_rest(sql);
+    if keyword == "SELECT" && is_mutating_select(sql) {
+        return StatementKind::Write;
+    }
     match keyword.as_str() {
         "SELECT" | "WITH" | "VALUES" | "FROM" | "TABLE" | "EXPLAIN" => StatementKind::Read,
         "INSERT" | "UPDATE" | "DELETE" => StatementKind::Write,
         _ => StatementKind::Utility,
     }
+}
+
+fn is_mutating_select(sql: &str) -> bool {
+    crate::sql2::parse_statement(sql)
+        .ok()
+        .and_then(|statement| {
+            crate::sql2::checkpoint_function_plan(&statement)
+                .ok()
+                .flatten()
+        })
+        .is_some()
 }
 
 fn first_keyword_and_rest(sql: &str) -> (String, &str) {
@@ -537,10 +559,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn classify_mutating_selects_with_sql_formatting() {
+        for sql in [
+            "SELECT\ncommit_id FROM lix_restore($1)",
+            "SELECT /* receipt */ commit_id FROM lix_revert($1)",
+            "SELECT commit_id FROM lix_revert_range /* source span */ ($1, $2)",
+            "SELECT commit_id FROM public.\"lix_apply\"($1, $2)",
+            "SELECT\tcommit_id\nFROM lix_create_checkpoint /* boundary */ ()",
+        ] {
+            assert_eq!(classify_statement(sql), StatementKind::Write, "{sql}");
+        }
+        for sql in [
+            "SELECT 'SELECT commit_id FROM lix_restore($1)'",
+            "SELECT 1 /* SELECT commit_id FROM lix_apply($1, $2) */",
+            "EXPLAIN SELECT commit_id FROM lix_restore($1)",
+        ] {
+            assert_eq!(classify_statement(sql), StatementKind::Read, "{sql}");
+        }
+    }
+
+    #[test]
     fn classify_statement_splits_reads_writes_and_utility() {
         assert_eq!(classify_statement("SELECT 1"), StatementKind::Read);
         assert_eq!(
-            classify_statement("INSERT INTO lix_restore (commit_id) VALUES ($1)"),
+            classify_statement("SELECT commit_id FROM lix_restore($1)"),
+            StatementKind::Write
+        );
+        assert_eq!(
+            classify_statement("SELECT commit_id FROM lix_apply($1, $2, ARRAY[])"),
             StatementKind::Write
         );
         assert_eq!(

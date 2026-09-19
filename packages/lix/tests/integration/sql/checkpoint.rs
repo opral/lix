@@ -1043,13 +1043,16 @@ simulation_test!(
             .await
             .expect("second checkpoint should commit");
 
-        session
+        let restored = session
             .execute(
-                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
+                "SELECT commit_id FROM lix_restore($1)",
                 &[Value::Text(first_checkpoint.commit_id.clone())],
             )
             .await
             .expect("restore to first checkpoint should succeed");
+        let restored_commit = restored.rows()[0]
+            .get::<String>("commit_id")
+            .expect("restore should publish a commit");
 
         let global_rows = select_rows(
             &session,
@@ -1065,13 +1068,16 @@ simulation_test!(
             &session,
             &format!(
                 "SELECT commit_id FROM lix_log('{}') WHERE is_checkpoint ORDER BY position",
-                first_checkpoint.commit_id
+                restored_commit
             ),
         )
         .await;
         assert_eq!(
             reachable_history,
-            vec![vec![Value::Text(first_checkpoint.commit_id.clone())]]
+            vec![
+                vec![Value::Text(abandoned_checkpoint.commit_id.clone())],
+                vec![Value::Text(first_checkpoint.commit_id.clone())]
+            ]
         );
         assert_eq!(
             select_rows(
@@ -1079,7 +1085,10 @@ simulation_test!(
                 "SELECT commit_id FROM lix_log() WHERE is_checkpoint ORDER BY position"
             )
             .await,
-            vec![vec![Value::Text(first_checkpoint.commit_id)]]
+            vec![
+                vec![Value::Text(abandoned_checkpoint.commit_id)],
+                vec![Value::Text(first_checkpoint.commit_id)]
+            ]
         );
     }
 );

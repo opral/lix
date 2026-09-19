@@ -806,13 +806,7 @@ async fn cached_upload_restore_discards_abandoned_wave_before_next_page() {
     let generation = cache.as_ref().unwrap().plan.generation();
     frontier_apply_upload(&authority, &replica, &first).await;
     cache.as_mut().unwrap().acknowledge().unwrap();
-    replica
-        .execute(
-            "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-            &[Value::Text(target.clone())],
-        )
-        .await
-        .expect("restore invalidates old wave");
+    reset_branch_for_test(&replica, &target).await;
     let request = replica
         .build_sync_push_with_plan(TEST_REMOTE, 128, &mut cache)
         .await

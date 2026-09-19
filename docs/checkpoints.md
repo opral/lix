@@ -72,7 +72,7 @@ ORDER BY created_at DESC, id DESC;
 
 The first query is branch-relative; the second includes repository-global, off-branch checkpoints. There is no separate `lix_checkpoint` relation or marker write. Commit creation time is the single public checkpoint timestamp.
 
-Use `lix_diff('lix_file')` for working changes. Its baseline is exposed as `lix_branch.working_base_commit_id` and can be an ordinary commit after a fork or restore. The latest marked commit is not necessarily the working baseline.
+Use `lix_diff('lix_file')` for working changes. Its baseline is exposed as `lix_branch.working_base_commit_id` and can be an ordinary commit after a fork. The latest marked commit is not necessarily the working baseline.
 
 A full checkpoint creates a new metadata-only commit. It copies no rows. Storage is reclaimed in the background.
 

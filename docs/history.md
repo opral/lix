@@ -109,7 +109,7 @@ FROM lix_branch
 WHERE id = lix_active_branch_id();
 ```
 
-The one-argument diff uses the active branch's `working_base_commit_id` and `commit_id` (current head), pinned for the statement. The baseline can be an ordinary commit after branch creation or restore. It must not be inferred from the latest checkpoint. Read the branch pair and diff in a coherent batch when an empty diff still needs an addressable context.
+The one-argument diff uses the active branch's `working_base_commit_id` and `commit_id` (current head), pinned for the statement. The baseline can be an ordinary commit after branch creation. It must not be inferred from the latest checkpoint. Read the branch pair and diff in a coherent batch when an empty diff still needs an addressable context.
 
 Use `row_ref` from the intended current or explicit-pair diff for selected commands. A logical row can recur in many history commits, so a multi-commit history selection is not an unambiguous command source. Guard commands against stale endpoints and handle an empty/stale selection explicitly.
 

@@ -127,9 +127,10 @@ async fn profile_sample(rows: usize, sample: usize) {
         execute(
             &session,
             &format!(
-                "INSERT INTO lix_revert (row_ref) \
+                "SELECT commit_id FROM lix_restore(\
+                 (SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()), ARRAY( \
                  SELECT row_ref FROM {WORKING_SOURCE} \
-                 ORDER BY key LIMIT {selected}"
+                 ORDER BY key LIMIT {selected}))"
             ),
         )
         .await;
@@ -141,10 +142,10 @@ async fn profile_sample(rows: usize, sample: usize) {
         execute(
             &session,
             &format!(
-                "INSERT INTO lix_apply (row_ref) \
-                 SELECT row_ref \
+                "SELECT commit_id FROM lix_apply(\
+                 '{baseline}', '{head}', ARRAY(SELECT row_ref \
                  FROM lix_diff('lix_key_value', '{baseline}', '{head}') \
-                 ORDER BY key LIMIT {selected}"
+                 ORDER BY key LIMIT {selected}))"
             ),
         )
         .await;
@@ -225,25 +226,32 @@ async fn apply_fixture(rows: usize, selected: usize) -> (Lix<Memory>, String) {
         &command_sql("lix_revert", WORKING_SOURCE, "", selected),
     )
     .await;
-    let source = format!("lix_diff('lix_key_value', '{baseline}', '{head}')");
-    (session, command_sql("lix_apply", &source, "", selected))
+    let sql = format!(
+        "SELECT commit_id FROM lix_apply(\
+         '{baseline}', '{head}', ARRAY(SELECT row_ref \
+         FROM lix_diff('lix_key_value', '{baseline}', '{head}') \
+         ORDER BY key LIMIT {selected}))"
+    );
+    (session, sql)
 }
 
 fn command_sql(command: &str, source: &str, extra_predicate: &str, selected: usize) -> String {
-    if command == "lix_create_checkpoint" {
-        return format!(
+    match command {
+        "lix_create_checkpoint" => format!(
             "SELECT commit_id FROM lix_create_checkpoint(ARRAY( \
              SELECT row_ref FROM {source} \
              WHERE true {extra_predicate} \
              ORDER BY key LIMIT {selected}))"
-        );
+        ),
+        "lix_revert" => format!(
+            "SELECT commit_id FROM lix_restore(\
+             (SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()), ARRAY( \
+             SELECT row_ref FROM {source} \
+             WHERE true {extra_predicate} \
+             ORDER BY key LIMIT {selected}))"
+        ),
+        _ => panic!("unsupported benchmark command: {command}"),
     }
-    format!(
-        "INSERT INTO {command} (row_ref) \
-         SELECT row_ref FROM {source} \
-         WHERE true {extra_predicate} \
-         ORDER BY key LIMIT {selected}"
-    )
 }
 
 async fn active_commit(session: &Lix<Memory>) -> String {

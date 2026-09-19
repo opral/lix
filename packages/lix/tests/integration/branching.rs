@@ -111,7 +111,7 @@ simulation_test!(
             remaining,
             "refresh after partial checkpoint must retain unselected before images"
         );
-        draft.execute("INSERT INTO lix_revert (row_ref) SELECT row_ref FROM lix_diff('lix_key_value') WHERE key = 'deleted'", &[]).await.unwrap();
+        draft.execute("SELECT commit_id FROM lix_restore((SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()), ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key = 'deleted'))", &[]).await.unwrap();
         assert_key_value(&draft, "deleted", Some("\"before\"")).await;
         assert_key_value(&draft, "owned", Some("\"after\"")).await;
         draft.create_checkpoint().await.unwrap();
@@ -2472,9 +2472,9 @@ simulation_test!(
         draft
             .execute(
                 &format!(
-                    "INSERT INTO lix_revert (row_ref) \
-                     SELECT row_ref FROM {} \
-                     WHERE key = 'branch-revert'",
+                    "SELECT commit_id FROM lix_restore(\
+                       (SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()), \
+                       ARRAY(SELECT row_ref FROM {} WHERE key = 'branch-revert'))",
                     key_value_diff_relation(&draft).await
                 ),
                 &[],

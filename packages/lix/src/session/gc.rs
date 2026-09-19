@@ -804,13 +804,18 @@ mod tests {
         let commit_d_id =
             CommitId::parse_lix(&commit_d, "restore GC commit D").expect("D commit id parses");
 
-        session
-            .execute(
-                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
-                &[Value::Text(commit_c.clone())],
-            )
+        let mut transaction = session
+            .begin_transaction()
             .await
-            .expect("restore to C succeeds");
+            .expect("branch reset transaction opens");
+        transaction
+            .restore_branch_ref_for_test(&branch_id, &commit_d, &commit_c)
+            .await
+            .expect("branch reset to C stages");
+        transaction
+            .commit()
+            .await
+            .expect("branch reset to C commits");
         assert_eq!(head(&engine, &branch_id).await, commit_c);
         assert_eq!(
             present(&session, std::slice::from_ref(&commit_d)).await,

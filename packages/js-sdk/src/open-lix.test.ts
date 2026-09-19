@@ -818,25 +818,65 @@ test("checkpoint SQL returns the new active head through the local worker", asyn
 	await lix.close();
 });
 
-test("lix_restore moves the active branch to an ancestor through the local worker", async () => {
+test("lix_restore creates a new commit from an ancestor through the local worker", async () => {
 	const lix = await openLix();
 	const initial = await activeHeadCommitId(lix);
+	const baseline = await workingBaselineCommitId(lix);
 	await lix.execute(
 		"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
 		["restore-test", "later"],
 	);
 
-	await lix.execute(
-		"INSERT INTO lix_restore (commit_id) VALUES ($1) RETURNING commit_id",
-		[initial],
-	);
+	const restored = await lix.execute("SELECT commit_id FROM lix_restore($1)", [
+		initial,
+	]);
+	const restoredCommit = restored.rows[0]?.commit_id;
 
-	expect(await activeHeadCommitId(lix)).toBe(initial);
+	expect(restoredCommit).toEqual(expect.any(String));
+	expect(restoredCommit).not.toBe(initial);
+	expect(await activeHeadCommitId(lix)).toBe(restoredCommit);
 	expect(
 		(await lix.execute("SELECT * FROM lix_key_value WHERE key = $1", [
 			"restore-test",
 		])).rows,
 	).toHaveLength(0);
+	expect(await workingBaselineCommitId(lix)).toBe(baseline);
+	await lix.close();
+});
+
+test("lix_restore is undoable and redoable through the local worker", async () => {
+	const lix = await openLix();
+	const source = await activeHeadCommitId(lix);
+	const baseline = await workingBaselineCommitId(lix);
+	await lix.execute(
+		"INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+		["restore-undo-test", "later"],
+	);
+
+	const restored = await lix.execute("SELECT commit_id FROM lix_restore($1)", [
+		source,
+	]);
+	const restoredCommit = restored.rows[0]?.commit_id;
+	expect(restoredCommit).toEqual(expect.any(String));
+	expect(await workingBaselineCommitId(lix)).toBe(baseline);
+
+	const undone = await lix.undo();
+	expect(undone.targetCommitId).toBe(restoredCommit);
+	expect(
+		(await lix.execute(
+			"SELECT value FROM lix_key_value WHERE key = 'restore-undo-test'",
+		)).rows,
+	).toHaveLength(1);
+	expect(await workingBaselineCommitId(lix)).toBe(baseline);
+
+	const redone = await lix.redo();
+	expect(redone.targetCommitId).toBe(restoredCommit);
+	expect(
+		(await lix.execute(
+			"SELECT value FROM lix_key_value WHERE key = 'restore-undo-test'",
+		)).rows,
+	).toHaveLength(0);
+	expect(await workingBaselineCommitId(lix)).toBe(baseline);
 	await lix.close();
 });
 
@@ -2586,6 +2626,13 @@ async function currentFileChange(
 async function activeHeadCommitId(lix: Lix): Promise<string> {
 	const result = await lix.execute("SELECT lix_active_branch_commit_id()");
 	return String(get(result, "lix_active_branch_commit_id()"));
+}
+
+async function workingBaselineCommitId(lix: Lix): Promise<string> {
+	const result = await lix.execute(
+		"SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()",
+	);
+	return String(get(result, "working_base_commit_id"));
 }
 
 function get(result: ExecuteResult, column: string, rowIndex = 0): unknown {

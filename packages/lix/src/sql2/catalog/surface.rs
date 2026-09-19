@@ -21,7 +21,6 @@ pub(crate) enum PublicRelationKind {
 pub(crate) enum PublicSurfaceClass {
     Relation(PublicRelationKind),
     TableFunction,
-    CommandSink,
     ScalarFunction,
 }
 
@@ -30,7 +29,6 @@ impl PublicSurfaceClass {
         match self {
             Self::Relation(_) => "RELATION",
             Self::TableFunction => "TABLE_FUNCTION",
-            Self::CommandSink => "COMMAND_SINK",
             Self::ScalarFunction => "SCALAR_FUNCTION",
         }
     }
@@ -87,11 +85,9 @@ pub(crate) enum PublicSurfaceKind {
     HistoryFunction,
     DiffFunction,
     CheckpointFunction,
+    RecoveryFunction,
     StateAtFunction,
     CommitAncestryFunction,
-    Revert,
-    Apply,
-    Restore,
     Change,
 }
 
@@ -107,9 +103,9 @@ impl PublicSurfaceKind {
             | Self::HistoryFunction
             | Self::DiffFunction
             | Self::CheckpointFunction
+            | Self::RecoveryFunction
             | Self::StateAtFunction
             | Self::CommitAncestryFunction => class == PublicSurfaceClass::TableFunction,
-            Self::Revert | Self::Apply | Self::Restore => class == PublicSurfaceClass::CommandSink,
         }
     }
 }

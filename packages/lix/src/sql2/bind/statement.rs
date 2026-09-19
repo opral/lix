@@ -332,42 +332,7 @@ fn bind_insert_returning(
     returning: Option<&Vec<SelectItem>>,
     params: &mut ParamBinder,
 ) -> Result<Option<BoundReturning>, LixError> {
-    let Some(returning) = returning else {
-        return Ok(None);
-    };
-
-    if !matches!(
-        table.surface.kind,
-        PublicSurfaceKind::Revert | PublicSurfaceKind::Apply | PublicSurfaceKind::Restore
-    ) {
-        return bind_returning(table, Some(returning), params, "INSERT");
-    }
-
-    let mut items = Vec::with_capacity(returning.len());
-    for item in returning {
-        let (sql_expr, output_name) = match item {
-            SelectItem::UnnamedExpr(expr) => (expr, "commit_id".to_string()),
-            SelectItem::ExprWithAlias { expr, alias } => (expr, normalize_identifier(alias)),
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
-                return Err(super::error::unsupported(
-                    "command sink INSERT RETURNING only supports commit_id",
-                ));
-            }
-        };
-        let expr = bind_expr(table, sql_expr, params)?;
-        if !matches!(&expr, BoundExpr::Column(column) if column.name == "commit_id") {
-            return Err(super::error::unsupported(
-                "command sink INSERT RETURNING only supports commit_id",
-            ));
-        }
-        items.push(BoundReturningItem { expr, output_name });
-    }
-    if items.is_empty() {
-        return Err(super::error::unsupported(
-            "diff command INSERT RETURNING requires commit_id",
-        ));
-    }
-    Ok(Some(BoundReturning { items }))
+    bind_returning(table, returning, params, "INSERT")
 }
 
 fn reject_returning_wildcard_options(
@@ -625,15 +590,6 @@ fn bind_insert_input(
     };
     if matches!(source.body.as_ref(), SetExpr::Values(_)) {
         reject_unsupported_insert_values_query_clauses(source)?;
-    }
-    if matches!(
-        surface_kind,
-        PublicSurfaceKind::Revert | PublicSurfaceKind::Apply
-    ) && matches!(source.body.as_ref(), SetExpr::Values(_))
-    {
-        return Err(super::error::unsupported(
-            "diff command sinks require INSERT ... SELECT; INSERT ... VALUES is not supported",
-        ));
     }
     let SetExpr::Values(values) = source.body.as_ref() else {
         if matches!(surface_kind, PublicSurfaceKind::SchemaBase { .. }) {
@@ -1372,17 +1328,13 @@ fn bound_write_target(kind: &PublicSurfaceKind) -> BoundWriteTarget {
         PublicSurfaceKind::File => BoundWriteTarget::File(FileWriteSurface::Base),
         PublicSurfaceKind::Directory => BoundWriteTarget::Directory(DirectoryWriteSurface::Base),
         PublicSurfaceKind::Branch => BoundWriteTarget::Branch,
-        PublicSurfaceKind::Revert => {
-            BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::Revert)
-        }
-        PublicSurfaceKind::Apply => BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::Apply),
         PublicSurfaceKind::Change
         | PublicSurfaceKind::LogFunction
         | PublicSurfaceKind::HistoryFunction
         | PublicSurfaceKind::DiffFunction
         | PublicSurfaceKind::CheckpointFunction
+        | PublicSurfaceKind::RecoveryFunction
         | PublicSurfaceKind::StateAtFunction
-        | PublicSurfaceKind::Restore
         | PublicSurfaceKind::CommitAncestryFunction => {
             unreachable!("write capability checked before target binding")
         }
@@ -1391,34 +1343,9 @@ fn bound_write_target(kind: &PublicSurfaceKind) -> BoundWriteTarget {
 
 fn bound_insert_target(
     kind: &PublicSurfaceKind,
-    input: &BoundWriteInput,
+    _input: &BoundWriteInput,
 ) -> Result<BoundWriteTarget, LixError> {
-    if !matches!(kind, PublicSurfaceKind::Restore) {
-        return Ok(bound_write_target(kind));
-    }
-    let BoundWriteInput::Values(values) = input else {
-        return Err(super::error::unsupported(
-            "lix_restore requires exactly one INSERT ... VALUES row",
-        ));
-    };
-    let Some(commit_id_index) = values.column_index("commit_id") else {
-        return Err(super::error::unsupported(
-            "lix_restore requires the commit_id column",
-        ));
-    };
-    let [row] = values.rows.as_slice() else {
-        return Err(super::error::unsupported(
-            "lix_restore requires exactly one INSERT ... VALUES row",
-        ));
-    };
-    let Some(commit_id) = row.get(commit_id_index) else {
-        return Err(super::error::unsupported(
-            "lix_restore requires the commit_id column",
-        ));
-    };
-    Ok(BoundWriteTarget::Restore {
-        commit_id: commit_id.clone(),
-    })
+    Ok(bound_write_target(kind))
 }
 
 fn bind_write_branch_scope(
@@ -1489,26 +1416,6 @@ impl ParamBinder {
 mod tests {
     use super::*;
     use datafusion::sql::parser::Statement as DataFusionStatement;
-
-    #[test]
-    fn bind_statement_binds_restore_command_sink() {
-        let statement =
-            parse_statement("INSERT INTO lix_restore (commit_id) VALUES ($1) RETURNING commit_id");
-        let bound = bind_statement(&statement, &[], "branch1").expect("restore should bind");
-
-        assert!(matches!(
-            bound.target,
-            BoundWriteTarget::Restore {
-                commit_id: BoundExpr::Param(BoundParamRef { index: 1 }),
-            }
-        ));
-        assert_eq!(
-            bound.branch_scope,
-            BranchScope::Active {
-                branch_id: "branch1".to_string()
-            }
-        );
-    }
 
     #[test]
     fn bind_statement_rejects_removed_restore_scalar_syntax() {
@@ -1990,36 +1897,19 @@ mod tests {
     }
 
     #[test]
-    fn bind_statement_allows_only_commit_id_for_diff_command_insert_returning() {
-        let bound = bind_statement(
-            &parse_statement(
-                "INSERT INTO lix_revert (row_ref) \
-                 SELECT lix_row_ref('lix_key_value', 'test') \
-                 RETURNING commit_id AS created_commit_id",
-            ),
-            &[],
-            "branch1",
-        )
-        .expect("diff command RETURNING commit_id should bind");
-        assert!(matches!(
-            bound
-                .returning
-                .expect("RETURNING should be bound")
-                .items
-                .as_slice(),
-            [BoundReturningItem {
-                expr: BoundExpr::Column(column),
-                output_name,
-            }] if column.name == "commit_id" && output_name == "created_commit_id"
-        ));
-
+    fn bind_statement_rejects_retired_recovery_insert_sinks() {
         for sql in [
-            "INSERT INTO lix_revert (row_ref) SELECT lix_row_ref('lix_key_value', 'test') RETURNING row_ref",
-            "INSERT INTO lix_revert (row_ref) SELECT lix_row_ref('lix_key_value', 'test') RETURNING *",
+            "INSERT INTO lix_revert (row_ref) SELECT lix_row_ref('lix_key_value', 'test')",
+            "INSERT INTO lix_apply (row_ref) SELECT lix_row_ref('lix_key_value', 'test')",
+            "INSERT INTO lix_restore (commit_id) VALUES ($1)",
         ] {
             let error = bind_statement(&parse_statement(sql), &[], "branch1")
-                .expect_err("unsupported INSERT RETURNING shape should fail");
-            assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL, "{sql}");
+                .expect_err("retired recovery INSERT sink should fail");
+            assert_eq!(error.code, LixError::CODE_READ_ONLY, "{sql}");
+            assert!(
+                error.message.contains("read-only SQL table"),
+                "{sql}: {error}"
+            );
         }
     }
 

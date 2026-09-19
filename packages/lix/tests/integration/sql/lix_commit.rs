@@ -72,7 +72,9 @@ simulation_test!(
                 ),
             )
             .await,
-            vec![vec![Value::Text(sim.initial_global_commit_id().to_string())]],
+            vec![vec![Value::Text(
+                sim.initial_global_commit_id().to_string()
+            )]],
             "the initial local commit pins the global initialization commit"
         );
 
@@ -250,13 +252,16 @@ simulation_test!(
             ]
         );
 
-        session
+        let restore = session
             .execute(
-                "INSERT INTO lix_restore (commit_id) VALUES ($1)",
+                "SELECT commit_id FROM lix_restore($1)",
                 &[Value::Text(first_head.clone())],
             )
             .await
             .expect("restore should succeed");
+        let restore_commit = restore.rows()[0]
+            .get::<String>("commit_id")
+            .expect("restore should publish a new commit");
         let restored = select_rows(
             &session,
             "SELECT commit_id, depth FROM lix_commit_ancestry() ORDER BY depth, commit_id",
@@ -264,13 +269,12 @@ simulation_test!(
         .await;
         assert_eq!(
             restored[0],
-            vec![Value::Text(first_head.clone()), Value::Integer(0)]
+            vec![Value::Text(restore_commit.clone()), Value::Integer(0)]
         );
         assert!(
             restored
                 .iter()
-                .all(|row| row[0] != Value::Text(second_head.clone())),
-            "zero-argument ancestry must stop exposing an abandoned descendant after restore"
+                .any(|row| row[0] == Value::Text(second_head.clone()))
         );
 
         let function_contract = select_rows(
@@ -326,7 +330,7 @@ simulation_test!(
 
         assert_eq!(
             select_rows(&session, "SELECT * FROM lix_commit_ancestry() LIMIT 1").await,
-            vec![vec![Value::Text(first_head.clone()), Value::Integer(0)]],
+            vec![vec![Value::Text(restore_commit), Value::Integer(0)]],
             "a bounded ancestry scan should return only the active anchor"
         );
 

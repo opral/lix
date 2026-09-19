@@ -239,6 +239,7 @@ mod tests {
             "lix_registered_schema",
             "lix_restore",
             "lix_revert",
+            "lix_revert_range",
         ];
 
         assert_eq!(actual, expected);

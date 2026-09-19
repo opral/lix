@@ -38,26 +38,21 @@ simulation_test!(
         assert_eq!(working.len(), 2);
         assert_eq!(working[0][1], Value::Text("added".to_string()));
 
-        let legacy = session
-            .execute("INSERT INTO lix_revert (diff_id) VALUES ('legacy')", &[])
+        let _legacy = session
+            .execute("SELECT lix_revert($1)", &[Value::Text(original_head.clone())])
             .await
-            .expect_err("the retired diff_id command currency must not bind");
-        assert_eq!(legacy.code, "LIX_COLUMN_NOT_FOUND");
+            .expect_err("the scalar command shape must not bind");
 
         let reverted = session
             .execute(
-                "INSERT INTO lix_revert (row_ref) \
-                 SELECT row_ref \
-                 FROM lix_diff(\
-                   'lix_key_value', lix_root_commit_id(), lix_active_branch_commit_id()\
-                 ) \
-                 WHERE key IN ('a', 'b') \
-                 RETURNING commit_id",
+                "SELECT commit_id FROM lix_restore(\
+                   (SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()), \
+                   ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') \
+                         WHERE key IN ('a', 'b')))",
                 &[],
             )
             .await
-            .expect("relation-row revert should accept root/head scalar source commits");
-        assert_eq!(reverted.rows_affected(), 2);
+            .expect("relation-row restore should use the actual working baseline");
         assert_eq!(reverted.columns(), &["commit_id"]);
         assert_eq!(reverted.rows().len(), 1);
         assert_eq!(
@@ -71,16 +66,15 @@ simulation_test!(
 
         let applied = session
             .execute(
-                "INSERT INTO lix_apply (row_ref) \
-                 SELECT row_ref \
-                 FROM lix_diff('lix_key_value', lix_root_commit_id(), $1) \
-                 WHERE key IN ('a', 'b') \
-                 RETURNING commit_id",
+                "SELECT commit_id FROM lix_apply(\
+                   lix_root_commit_id(), $1, \
+                   ARRAY(SELECT row_ref \
+                         FROM lix_diff('lix_key_value', lix_root_commit_id(), $1) \
+                         WHERE key IN ('a', 'b')))",
                 &[Value::Text(original_head)],
             )
             .await
             .expect("historical relation-row apply should resolve the root scalar source commit");
-        assert_eq!(applied.rows_affected(), 2);
         assert_eq!(applied.columns(), &["commit_id"]);
         assert_eq!(applied.rows().len(), 1);
 
@@ -118,19 +112,16 @@ simulation_test!(
 
         let empty = session
             .execute(
-                "INSERT INTO lix_revert (row_ref) \
-                 SELECT row_ref \
-                 FROM lix_diff('lix_key_value', $1, $2) WHERE 1 = 0 \
-                 RETURNING commit_id",
-                &[
-                    Value::Text(checkpoint_commit_id.clone()),
-                    Value::Text(child_head.clone()),
-                ],
+                "SELECT commit_id FROM lix_restore(\
+                   (SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()), \
+                   ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE 1 = 0))",
+                &[],
             )
             .await
             .expect("empty relation-row selection should be a successful no-op");
-        assert_eq!(empty.rows_affected(), 0);
-        assert!(empty.is_empty());
+        assert_eq!(empty.columns(), &["commit_id"]);
+        assert_eq!(empty.rows().len(), 1);
+        assert!(matches!(empty.rows()[0].values(), [Value::Null]));
         assert_eq!(
             engine
                 .load_branch_head_commit_id(sim.main_branch_id())
@@ -143,10 +134,11 @@ simulation_test!(
 
         let duplicate = session
             .execute(
-                "INSERT INTO lix_revert (row_ref) \
-                 SELECT lix_row_ref('lix_key_value', 'b') \
-                 UNION ALL \
-                 SELECT lix_row_ref('lix_key_value', 'b')",
+                "SELECT commit_id FROM lix_restore(\
+                   (SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()), \
+                   ARRAY(SELECT lix_row_ref('lix_key_value', 'b') \
+                         UNION ALL \
+                         SELECT lix_row_ref('lix_key_value', 'b')))",
                 &[],
             )
             .await
@@ -193,15 +185,15 @@ simulation_test!(
 
         let reverted = session
             .execute(
-                "INSERT INTO lix_revert (row_ref) \
-                 SELECT row_ref \
-                 FROM lix_diff('lix_key_value') \
-                 RETURNING commit_id",
+                "SELECT commit_id FROM lix_restore(\
+                   (SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()), \
+                   ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))",
                 &[],
             )
             .await
-            .expect("revert should resolve the branch's checkpoint/head source commits");
-        assert_eq!(reverted.rows_affected(), 1);
+            .expect("restore should resolve the branch's actual working baseline");
+        assert_eq!(reverted.columns(), &["commit_id"]);
+        assert_eq!(reverted.rows().len(), 1);
         assert_eq!(
             select_rows(
                 &session,
@@ -214,19 +206,15 @@ simulation_test!(
 
         let applied = session
             .execute(
-                "INSERT INTO lix_apply (row_ref) \
-                 SELECT row_ref \
-                 FROM lix_diff(\
-                   'lix_key_value', \
-                   $2, \
-                   $1\
-                 ) \
-                 RETURNING commit_id",
+                "SELECT commit_id FROM lix_apply(\
+                   $2, $1, \
+                   ARRAY(SELECT row_ref FROM lix_diff('lix_key_value', $2, $1)))",
                 &[Value::Text(working_head), Value::Text(baseline)],
             )
             .await
             .expect("apply should resolve the active branch checkpoint source");
-        assert_eq!(applied.rows_affected(), 1);
+        assert_eq!(applied.columns(), &["commit_id"]);
+        assert_eq!(applied.rows().len(), 1);
         assert_eq!(
             select_rows(
                 &session,
@@ -304,14 +292,15 @@ simulation_test!(
 
         let reverted = session
             .execute(
-                "INSERT INTO lix_revert (row_ref) \
-                 SELECT lix_row_ref('lix_key_value', 'recycled') \
-                 RETURNING commit_id",
+                "SELECT commit_id FROM lix_restore(\
+                   (SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()), \
+                   ARRAY(SELECT lix_row_ref('lix_key_value', 'recycled')))",
                 &[],
             )
             .await
-            .expect("relation identity should revert a tombstone-backed add");
-        assert_eq!(reverted.rows_affected(), 1);
+            .expect("relation identity should restore a tombstone-backed row");
+        assert_eq!(reverted.columns(), &["commit_id"]);
+        assert_eq!(reverted.rows().len(), 1);
         assert!(
             select_rows(
                 &session,
@@ -488,13 +477,13 @@ simulation_test!(
             .expect("recursive directory delete should succeed");
         session
             .execute(
-                "INSERT INTO lix_revert (row_ref) \
-                 SELECT row_ref FROM lix_diff('lix_file') WHERE id = $1 \
-                 RETURNING commit_id",
+                "SELECT commit_id FROM lix_restore(\
+                   (SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()), \
+                   ARRAY(SELECT row_ref FROM lix_diff('lix_file') WHERE id = $1))",
                 &[Value::Text(file_id.to_owned())],
             )
             .await
-            .expect("file revert should close over its removed parent directory");
+            .expect("file restore should close over its removed parent directory");
 
         assert_eq!(
             select_rows(
@@ -555,20 +544,22 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_revert (row_ref) \
-                 SELECT row_ref FROM lix_diff('lix_file') WHERE id = $1",
+                "SELECT commit_id FROM lix_restore(\
+                   (SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()), \
+                   ARRAY(SELECT row_ref FROM lix_diff('lix_file') WHERE id = $1))",
                 &[Value::Text(file_id.to_owned())],
             )
             .await
-            .expect("precondition revert should remove the file");
+            .expect("precondition restore should remove the file");
         session
             .execute(
-                "INSERT INTO lix_revert (row_ref) \
-                 SELECT row_ref FROM lix_diff('lix_directory') WHERE id = $1",
+                "SELECT commit_id FROM lix_restore(\
+                   (SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()), \
+                   ARRAY(SELECT row_ref FROM lix_diff('lix_directory') WHERE id = $1))",
                 &[Value::Text(directory_id.to_owned())],
             )
             .await
-            .expect("precondition revert should remove the parent directory");
+            .expect("precondition restore should remove the parent directory");
         assert!(
             select_rows(
                 &session,
@@ -580,9 +571,9 @@ simulation_test!(
         );
         session
             .execute(
-                "INSERT INTO lix_apply (row_ref) \
-                 SELECT row_ref FROM lix_diff('lix_file', $1, $2) WHERE id = $3 \
-                 RETURNING commit_id",
+                "SELECT commit_id FROM lix_apply(\
+                   $1, $2, \
+                   ARRAY(SELECT row_ref FROM lix_diff('lix_file', $1, $2) WHERE id = $3))",
                 &[
                     Value::Text(baseline),
                     Value::Text(target),
@@ -627,30 +618,36 @@ simulation_test!(
         let source_head = engine.load_branch_head_commit_id(sim.main_branch_id())
             .await.expect("head loads").expect("head exists").to_string();
         session.execute(
-            "INSERT INTO lix_revert (row_ref) SELECT row_ref FROM lix_diff('lix_key_value') WHERE key = 'subquery-apply'",
+            "SELECT commit_id FROM lix_restore(\
+               (SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()), \
+               ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') \
+                     WHERE key = 'subquery-apply'))",
             &[],
-        ).await.expect("revert removes the selected value");
+        ).await.expect("restore removes the selected value");
 
         let applied = session.execute(
-            "INSERT INTO lix_apply (row_ref) \
-             WITH endpoint AS (SELECT $1::text AS commit_id) \
-             SELECT row_ref FROM lix_diff('lix_key_value', \
-               (SELECT lix_root_commit_id()), (SELECT commit_id FROM endpoint)) \
-             WHERE key = 'subquery-apply'",
+            "SELECT commit_id FROM lix_apply(\
+               lix_root_commit_id(), $1, \
+               ARRAY(SELECT row_ref FROM lix_diff('lix_key_value', \
+                 lix_root_commit_id(), $1) WHERE key = 'subquery-apply'))",
             &[Value::Text(source_head.clone())],
-        ).await.expect("apply uses the endpoints resolved for the selected rows");
-        assert_eq!(applied.rows_affected(), 1);
+        ).await.expect("apply uses explicit endpoints for the selected rows");
+        assert_eq!(applied.columns(), &["commit_id"]);
+        assert_eq!(applied.rows().len(), 1);
         assert_eq!(select_rows(&session,
             "SELECT value FROM lix_key_value WHERE key = 'subquery-apply'").await,
             vec![vec![Value::Jsonb(serde_json::json!("original").into())]]);
 
         let empty = session.execute(
-            "INSERT INTO lix_apply (row_ref) SELECT row_ref \
-             FROM lix_diff('lix_key_value', (SELECT lix_root_commit_id()), (SELECT $1::text)) \
-             WHERE key = 'absent-subquery-apply'",
+            "SELECT commit_id FROM lix_apply(\
+               lix_root_commit_id(), $1, \
+               ARRAY(SELECT row_ref FROM lix_diff('lix_key_value', \
+                 lix_root_commit_id(), $1) WHERE key = 'absent-subquery-apply'))",
             &[Value::Text(source_head)],
         ).await.expect("empty selection with resolved endpoints remains a no-op");
-        assert_eq!(empty.rows_affected(), 0);
+        assert_eq!(empty.columns(), &["commit_id"]);
+        assert_eq!(empty.rows().len(), 1);
+        assert!(matches!(empty.rows()[0].values(), [Value::Null]));
     }
 );
 
@@ -710,10 +707,13 @@ simulation_test!(
             .unwrap();
 
         let undo = session.execute(
-            "INSERT INTO lix_apply (row_ref) SELECT row_ref FROM lix_diff('lix_key_value', $1, $2) WHERE key IN ('added', 'modified', 'removed') RETURNING commit_id",
+            "SELECT commit_id FROM lix_apply(\
+               $1, $2, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value', $1, $2) \
+                             WHERE key IN ('added', 'modified', 'removed'))) ",
             &[Value::Text(after.clone()), Value::Text(before.clone())],
         ).await.expect("a reversed commit pair should undo the selected transaction");
-        assert_eq!(undo.rows_affected(), 3);
+        assert_eq!(undo.columns(), &["commit_id"]);
+        assert_eq!(undo.rows().len(), 1);
         let undo_commit = undo.rows()[0].get::<String>("commit_id").unwrap();
         assert_ne!(undo_commit, before);
         assert_ne!(undo_commit, after);
@@ -774,7 +774,9 @@ simulation_test!(
             .get::<String>("id")
             .unwrap();
         let error = session.execute(
-            "INSERT INTO lix_apply (row_ref) SELECT row_ref FROM lix_diff('lix_key_value', $1, $2) WHERE key IN ('a', 'b')",
+            "SELECT commit_id FROM lix_apply(\
+               $1, $2, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value', $1, $2) \
+                             WHERE key IN ('a', 'b'))) ",
             &[Value::Text(after), Value::Text(before)],
         ).await.expect_err("a later version of one selected row must reject the entire undo");
         assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
@@ -852,7 +854,8 @@ simulation_test!(
             .unwrap();
         let error = session
             .execute(
-                "INSERT INTO lix_apply (row_ref) SELECT row_ref FROM lix_diff('undo_clip', $1, $2)",
+                "SELECT commit_id FROM lix_apply(\
+                   $1, $2, ARRAY(SELECT row_ref FROM lix_diff('undo_clip', $1, $2)))",
                 &[
                     Value::Text(span.after().to_owned()),
                     Value::Text(span.before().to_owned()),

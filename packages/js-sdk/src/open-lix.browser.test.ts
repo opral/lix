@@ -214,7 +214,7 @@ test("checkpoint GC starts without requiring a browser Tokio runtime", async () 
 	}
 });
 
-test("lix_restore moves the active branch to an ancestor through browser WASM", async () => {
+test("lix_restore creates a new commit from an ancestor through browser WASM", async () => {
 	const { openLix } = await import("@lix-js/sdk");
 	const lix = await openLix();
 	try {
@@ -226,16 +226,18 @@ test("lix_restore moves the active branch to an ancestor through browser WASM", 
 			["restore-test", "later"],
 		);
 
-		await lix.execute(
-			"INSERT INTO lix_restore (commit_id) VALUES ($1) RETURNING commit_id",
-			[initial],
-		);
+		const restored = await lix.execute("SELECT commit_id FROM lix_restore($1)", [
+			initial,
+		]);
+		const restoredCommit = restored.rows[0]?.commit_id;
 
 		expect(
 			(
 				await lix.execute("SELECT lix_active_branch_commit_id() AS commit_id")
 			).rows[0]?.commit_id,
-		).toBe(initial);
+		).toBe(restoredCommit);
+		expect(restoredCommit).toEqual(expect.any(String));
+		expect(restoredCommit).not.toBe(initial);
 		expect(
 			(await lix.execute("SELECT * FROM lix_key_value WHERE key = $1", [
 				"restore-test",

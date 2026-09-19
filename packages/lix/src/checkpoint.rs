@@ -229,7 +229,7 @@ mod metadata_tests {
         let empty = lix.create_checkpoint().await.unwrap().commit_id;
         assert_ne!(full, empty, "empty checkpoint is a new immutable commit");
         lix.execute(
-            "INSERT INTO lix_restore (commit_id) VALUES ($1)",
+            "SELECT commit_id FROM lix_restore($1)",
             &[crate::Value::Text(selected)],
         )
         .await

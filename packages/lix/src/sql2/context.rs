@@ -32,12 +32,11 @@ use super::{PublicCatalog, SessionFileViews};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DiffCommand {
-    Revert,
     Apply,
     CreateCheckpoint,
 }
 
-/// Relation-row identity selected by a public diff command.
+/// Relation-row identity selected by a recovery patch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DiffCommandSelection {
     pub(crate) relation: String,
@@ -331,28 +330,6 @@ pub(crate) trait SqlWriteExecutionContext: Send {
         live_count: u64,
         ordered_identity_digest: [u8; 32],
     ) -> Result<bool, LixError>;
-
-    async fn execute_diff_command(
-        &mut self,
-        _command: DiffCommand,
-        _selections: Vec<DiffCommandSelection>,
-    ) -> Result<DiffCommandOutcome, LixError> {
-        Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "diff commands are not supported by this write context",
-        ))
-    }
-
-    async fn restore_active_branch(&mut self, _commit_id: String) -> Result<(), LixError> {
-        Err(LixError::new(
-            LixError::CODE_UNSUPPORTED_SQL,
-            "lix_restore is not supported by this write context",
-        ))
-    }
-
-    fn staged_commit_id(&self, _branch_id: &str) -> Result<Option<String>, LixError> {
-        Ok(None)
-    }
 }
 
 #[derive(Clone)]
@@ -719,24 +696,6 @@ impl SqlWriteContext {
                 .as_mut()
                 .unwrap()
                 .stage_write(write)
-                .await
-        }
-    }
-
-    pub(crate) async fn execute_diff_command(
-        &self,
-        command: DiffCommand,
-        selections: Vec<DiffCommandSelection>,
-    ) -> Result<DiffCommandOutcome, LixError> {
-        let _guard = self.gate.lock().await;
-        self.ensure_context_live("execute_diff_command")?;
-        unsafe {
-            self.ptr
-                .0
-                .as_ptr()
-                .as_mut()
-                .unwrap()
-                .execute_diff_command(command, selections)
                 .await
         }
     }

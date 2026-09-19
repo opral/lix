@@ -3273,9 +3273,9 @@ async fn migrated_partial_checkpoint_repository_reads_state_on_a_sparse_replica(
         .expect("working edit on a checkpoint-selected row succeeds");
     replica
         .execute(
-            "INSERT INTO lix_revert (row_ref) \
-             SELECT row_ref FROM lix_diff('lix_file') WHERE id = $1 \
-             RETURNING commit_id",
+            "SELECT commit_id FROM lix_restore(\
+               (SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()), \
+               ARRAY(SELECT row_ref FROM lix_diff('lix_file') WHERE id = $1))",
             &[Value::Text(brand_file_id)],
         )
         .await

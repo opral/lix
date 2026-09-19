@@ -1646,7 +1646,7 @@ where
             .parse_statement(sql)
             .ok()
             .and_then(|statement| sql2::checkpoint_function_plan(&statement).ok().flatten())
-            .is_some();
+            .is_some_and(|plan| !matches!(plan, sql2::CheckpointFunctionPlan::Recovery { .. }));
         let result = if checkpoint_statement {
             // The checkpoint-only wrapper must begin while the SQL span is
             // current so transaction/storage spans become its children. Box
@@ -4387,16 +4387,19 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     if let sql2::SqlLogicalPlan::Checkpoint(checkpoint) = plan {
+        let recovery = matches!(checkpoint, sql2::CheckpointFunctionPlan::Recovery { .. });
         let outcome = transaction
             .execute_checkpoint_function(checkpoint, params.to_vec())
             .await?;
+        if recovery {
+            return Ok(sql2::SqlWriteResult::returning(outcome.rows_affected, SqlQueryResult {
+                columns: vec!["commit_id".to_string()],
+                column_types: vec![ResultColumnType::Text],
+                rows: vec![vec![outcome.commit_id.map(Value::Text).unwrap_or(Value::Null)]],
+                notices: Vec::new(),
+            }));
+        }
         return sql2::SqlWriteResult::checkpoint_function(outcome);
-    }
-    if let Some((command, query_sql, returning)) = sql2::diff_command_query(&plan) {
-        let outcome = transaction
-            .execute_diff_command_query_owned(command, query_sql, params.to_vec())
-            .await?;
-        return sql2::SqlWriteResult::diff_command(outcome, returning.as_ref());
     }
     sql2::execute_write_logical_plan_result_with_metadata(transaction, plan, params, metadata).await
 }
@@ -5022,7 +5025,7 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                let sql = "INSERT INTO lix_revert (row_ref) SELECT row_ref FROM lix_diff('lix_key_value', lix_root_commit_id(), lix_active_branch_commit_id()) WHERE key = 'cap'";
+                let sql = "SELECT commit_id FROM lix_restore((SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()), ARRAY(SELECT row_ref FROM lix_diff('lix_key_value', lix_root_commit_id(), lix_active_branch_commit_id()) WHERE key = 'cap'))";
                 storage.expire_after_each_transaction_open(3);
                 let options = ExecuteOptions {
                     max_auto_commit_retries: Some(limit),
@@ -5271,11 +5274,11 @@ mod tests {
         assert_eq!(span.before(), head);
         assert_eq!(span.after(), active_head(&session).await);
 
-        // A restore moves the head to a commit it did not author.
+        // Restoring the current state is a no-op with a NULL receipt.
         let target = span.before().to_owned();
         let restored = session
             .execute(
-                "INSERT INTO lix_restore (commit_id) VALUES ($1) RETURNING commit_id",
+                "SELECT commit_id FROM lix_restore($1)",
                 &[Value::Text(target.clone())],
             )
             .await
@@ -5452,12 +5455,12 @@ mod tests {
         storage.expire_after_each_transaction_open(3);
         let reverted = session
             .execute(
-                "INSERT INTO lix_revert (row_ref) \
+                "SELECT commit_id FROM lix_restore((SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()), ARRAY(\
                  SELECT row_ref \
                  FROM lix_diff(\
                    'lix_key_value', lix_root_commit_id(), lix_active_branch_commit_id()\
                  ) \
-                 WHERE key = 'retry-revert'",
+                 WHERE key = 'retry-revert'))",
                 &[],
             )
             .await
@@ -5516,12 +5519,12 @@ mod tests {
             [7; 32],
         )
         .with_branch(branch_id);
-        let sql = "INSERT INTO lix_revert (row_ref) \
+        let sql = "SELECT commit_id FROM lix_restore((SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()), ARRAY(\
                    SELECT row_ref \
                    FROM lix_diff(\
                      'lix_key_value', lix_root_commit_id(), lix_active_branch_commit_id()\
                    ) \
-                   WHERE key = 'idempotent-revert'";
+                   WHERE key = 'idempotent-revert'))";
 
         // The first read checks for a pre-existing receipt, then every attempt
         // opens its coherent transaction read before the tracked-state reader.
@@ -5553,97 +5556,6 @@ mod tests {
             history.rows()[0].get::<i64>("count"),
             Ok(2),
             "idempotent retries must publish one revert"
-        );
-    }
-
-    #[tokio::test]
-    async fn lix_restore_repairs_a_legacy_missing_checkpoint_cursor() {
-        let session = open_session().await;
-        let branch_id = session
-            .active_branch_id()
-            .await
-            .expect("active branch should load");
-        let restore_target = session
-            .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
-            .await
-            .expect("initial head should read")
-            .rows()[0]
-            .get::<String>("commit_id")
-            .expect("initial head should be text");
-        session
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('legacy-cursor', 'later')",
-                &[],
-            )
-            .await
-            .expect("later state should commit");
-
-        let read = session
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("branch control read should open");
-        let mut control = crate::branch::BranchHeadControlContext::new()
-            .reader(&read)
-            .load(&branch_id)
-            .await
-            .expect("branch control should read")
-            .expect("active branch control should exist");
-        control.working_diff_checkpoint_commit_id = None;
-        drop(read);
-        let mut corrupt = session.storage.new_write_set();
-        crate::branch::stage_branch_head_control(&mut corrupt, &branch_id, control)
-            .expect("legacy cursor corruption should stage");
-        session
-            .storage
-            .commit_write_set(corrupt, StorageWriteOptions::default())
-            .await
-            .expect("legacy cursor corruption should commit");
-
-        let checkpoints = session
-            .execute("SELECT commit_id FROM lix_log() WHERE is_checkpoint", &[])
-            .await
-            .expect("checkpoint membership is independent of the private cursor");
-        assert!(checkpoints.is_empty());
-
-        let restored = session
-            .execute(
-                "INSERT INTO lix_restore (commit_id) VALUES ($1) RETURNING commit_id",
-                &[Value::Text(restore_target.clone())],
-            )
-            .await
-            .expect("restore should repair the legacy branch atomically");
-        let restored_commit_id = restored.rows()[0].get::<String>("commit_id").unwrap();
-        assert_eq!(
-            restored_commit_id, restore_target,
-            "restore should repoint the branch to the requested complete-state commit"
-        );
-        let working_diff = session
-            .execute(
-                "SELECT row_ref FROM lix_diff(\
-                 'lix_key_value', $1, lix_active_branch_commit_id())",
-                &[Value::Text(restore_target.clone())],
-            )
-            .await
-            .expect("working diff should read after repair");
-        assert!(working_diff.rows().is_empty());
-
-        let read = session
-            .storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("repaired branch control read should open");
-        let repaired = crate::branch::BranchHeadControlContext::new()
-            .reader(&read)
-            .load(&branch_id)
-            .await
-            .expect("repaired branch control should read")
-            .expect("repaired branch control should exist");
-        assert_eq!(
-            repaired
-                .working_diff_checkpoint_commit_id
-                .map(|commit_id| commit_id.to_string()),
-            Some(restored_commit_id)
         );
     }
 

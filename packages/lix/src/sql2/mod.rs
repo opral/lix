@@ -48,7 +48,9 @@ pub(crate) use catalog::{
     PublicCatalog, PublicSurfaceKind, SchemaColumnType, SchemaIndexedColumn, SchemaSurfaceSpec,
     derive_schema_surface_spec_from_schema, row_visible_fields,
 };
-pub(crate) use checkpoint_function::{CheckpointFunctionPlan, checkpoint_function_plan};
+pub(crate) use checkpoint_function::{
+    CheckpointFunctionPlan, RecoveryCommand, checkpoint_function_plan,
+};
 pub(crate) use context::WriteContextLiveness;
 pub(crate) use context::{
     ChangelogQuerySource, DiffCommand, DiffCommandOutcome, DiffCommandSelection,
@@ -66,14 +68,13 @@ pub(crate) use exec::{SessionReadResult, SessionReadSqlResult, SqlWriteResult};
 pub(crate) use exec::{
     SqlLogicalPlan, append_path_value_replacement_snapshot,
     append_path_value_replacement_snapshot_text, create_write_logical_plan_from_template,
-    create_write_plan_template_from_parsed, diff_command_query,
-    execute_read_statement_in_session_from_parsed, execute_read_statement_in_session_with_result,
-    execute_transaction_read_statement_from_parsed, execute_write_logical_plan_parameter_batch,
-    execute_write_logical_plan_result_with_metadata, execute_write_logical_plan_value_batch,
-    parameter_record_batch, parameter_row, prepare_path_value_replacement_program,
-    prepare_path_value_replacement_row, prepare_read_session, prepare_read_session_at_head,
-    query_result_from_batches, query_values_from_batches,
-    write_plan_requires_post_stage_returning_checkpoint,
+    create_write_plan_template_from_parsed, execute_read_statement_in_session_from_parsed,
+    execute_read_statement_in_session_with_result, execute_transaction_read_statement_from_parsed,
+    execute_write_logical_plan_parameter_batch, execute_write_logical_plan_result_with_metadata,
+    execute_write_logical_plan_value_batch, parameter_record_batch, parameter_row,
+    prepare_path_value_replacement_program, prepare_path_value_replacement_row,
+    prepare_read_session, prepare_read_session_at_head, query_result_from_batches,
+    query_values_from_batches, write_plan_requires_post_stage_returning_checkpoint,
 };
 #[cfg(test)]
 pub(crate) use exec::{
@@ -89,7 +90,7 @@ pub(crate) use exec::{
 pub(crate) use file_view::{
     SessionFileViewKey, SessionFileViewMutation, SessionFileViews, SessionPluginFileView,
 };
-pub(crate) use parse::{object_name_is_public_function, parse_statement};
+pub(crate) use parse::parse_statement;
 pub(crate) use plan::plan_write;
 pub(crate) use planning_cache::{
     CachedPhysicalRead, CachedReadPlan, CachedScanRequest, CachedUpdateLiteralShape,

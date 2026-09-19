@@ -61,44 +61,6 @@ impl SqlWriteResult {
         result.checkpoint_telemetry = checkpoint_telemetry;
         Ok(result)
     }
-
-    pub(crate) fn diff_command(
-        outcome: crate::sql2::DiffCommandOutcome,
-        returning: Option<&crate::sql2::bind::write::BoundReturning>,
-    ) -> Result<Self, crate::LixError> {
-        let Some(returning) = returning else {
-            return Ok(Self::affected(outcome.rows_affected));
-        };
-        let rows = match outcome.commit_id {
-            Some(commit_id) => vec![
-                returning
-                    .items
-                    .iter()
-                    .map(|_| crate::Value::Text(commit_id.clone()))
-                    .collect(),
-            ],
-            None if outcome.rows_affected == 0 => Vec::new(),
-            None => {
-                return Err(crate::LixError::new(
-                    crate::LixError::CODE_INTERNAL_ERROR,
-                    "diff command staged rows without a commit ID",
-                ));
-            }
-        };
-        Ok(Self::returning(
-            outcome.rows_affected,
-            SqlQueryResult {
-                columns: returning
-                    .items
-                    .iter()
-                    .map(|item| item.output_name.clone())
-                    .collect(),
-                column_types: vec![crate::ResultColumnType::Text; returning.items.len()],
-                rows,
-                notices: Vec::new(),
-            },
-        ))
-    }
 }
 
 #[cfg(feature = "storage-benches")]
@@ -121,10 +83,9 @@ pub(crate) use write::{
 };
 pub(crate) use write::{
     WriteLogicalPlan as SqlWriteLogicalPlan, create_write_logical_plan_from_template,
-    create_write_plan_template_from_parsed, diff_command_query,
-    execute_write_logical_plan_parameter_batch, execute_write_logical_plan_result_with_metadata,
-    execute_write_logical_plan_value_batch, parameter_record_batch, parameter_row,
-    write_plan_requires_post_stage_returning_checkpoint,
+    create_write_plan_template_from_parsed, execute_write_logical_plan_parameter_batch,
+    execute_write_logical_plan_result_with_metadata, execute_write_logical_plan_value_batch,
+    parameter_record_batch, parameter_row, write_plan_requires_post_stage_returning_checkpoint,
 };
 
 pub(crate) enum SqlLogicalPlan {

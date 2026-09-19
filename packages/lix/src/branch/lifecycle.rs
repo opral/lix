@@ -11,7 +11,6 @@ pub(crate) enum BranchOperation {
     SwitchBranch,
     MergeBranch,
     MergeBranchPreview,
-    Restore,
     LoadDefaultBranch,
 }
 
@@ -22,7 +21,6 @@ impl BranchOperation {
             Self::SwitchBranch => "switch_branch",
             Self::MergeBranch => "merge_branch",
             Self::MergeBranchPreview => "merge_branch_preview",
-            Self::Restore => "restore",
             Self::LoadDefaultBranch => "load_default_branch_id",
         }
     }

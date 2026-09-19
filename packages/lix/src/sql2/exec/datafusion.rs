@@ -1257,22 +1257,13 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
     let write_target = session.write_target(&table_name)?;
     let table_schema = table.schema();
     let state = session.state();
-    // Diff command sinks own their dedicated RETURNING contract. Every
-    // registered table surface takes the normal DML path below, where a
-    // provider must explicitly capture the relevant image (pre-delete or
-    // post-insert/update) rather than silently returning only an affected
-    // count.
-    let returning = if matches!(plan.bound.target, BoundWriteTarget::DiffCommand(_)) {
-        None
-    } else {
-        datafusion_dml_returning(
-            &session,
-            table_schema.as_ref(),
-            plan.bound.returning.as_ref(),
-            params,
-            matches!(plan.bound.op, BoundWriteOp::Delete),
-        )?
-    };
+    let returning = datafusion_dml_returning(
+        &session,
+        table_schema.as_ref(),
+        plan.bound.returning.as_ref(),
+        params,
+        matches!(plan.bound.op, BoundWriteOp::Delete),
+    )?;
 
     let exec = match plan.bound.op {
         BoundWriteOp::Insert => {
@@ -1389,18 +1380,6 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
     let result =
         query_result_from_batches(&[Field::new("count", DataType::UInt64, false)], &batches)?;
     let rows_affected = affected_rows_from_query_result(result)?;
-    if matches!(plan.bound.target, BoundWriteTarget::DiffCommand(_)) {
-        let outcome = crate::sql2::DiffCommandOutcome {
-            rows_affected,
-            commit_id: if rows_affected == 0 {
-                None
-            } else {
-                ctx.staged_commit_id(ctx.active_branch_id())?
-            },
-            parent_commit_id: None,
-        };
-        return SqlWriteResult::diff_command(outcome, plan.bound.returning.as_ref());
-    }
     match returning {
         Some(returning) => sql_write_captured_returning_result(rows_affected, &returning),
         None => Ok(SqlWriteResult::affected(rows_affected)),
@@ -2414,22 +2393,6 @@ fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> 
         BoundWriteTarget::File(FileWriteSurface::Base) => Ok("lix_file".to_string()),
         BoundWriteTarget::Directory(DirectoryWriteSurface::Base) => Ok("lix_directory".to_string()),
         BoundWriteTarget::Branch => Ok("lix_branch".to_string()),
-        BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::Revert) => {
-            Ok("lix_revert".to_string())
-        }
-        BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::Apply) => {
-            Ok("lix_apply".to_string())
-        }
-        BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::CreateCheckpoint) => {
-            Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "checkpoint function reached the writable-table executor",
-            ))
-        }
-        BoundWriteTarget::Restore { .. } => Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "lix_restore reached the DataFusion write executor",
-        )),
         BoundWriteTarget::Row(_) => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             "sql2 DataFusion reference writer does not support this row write",
@@ -3982,22 +3945,6 @@ mod tests {
         ) -> Result<bool, LixError> {
             Ok(false)
         }
-
-        async fn execute_diff_command(
-            &mut self,
-            _command: crate::sql2::DiffCommand,
-            selections: Vec<crate::sql2::DiffCommandSelection>,
-        ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
-            Ok(crate::sql2::DiffCommandOutcome {
-                rows_affected: selections.len() as u64,
-                commit_id: (!selections.is_empty()).then(|| "commit-diff-command".to_string()),
-                parent_commit_id: None,
-            })
-        }
-
-        fn staged_commit_id(&self, _branch_id: &str) -> Result<Option<String>, LixError> {
-            Ok(Some("commit-diff-command".to_string()))
-        }
     }
 
     #[async_trait]
@@ -4195,13 +4142,7 @@ mod tests {
 
         assert_eq!(
             table_names,
-            vec![
-                "lix_apply",
-                "lix_branch",
-                "lix_directory",
-                "lix_file",
-                "lix_revert",
-            ]
+            vec!["lix_branch", "lix_directory", "lix_file"]
         );
     }
 
@@ -4246,48 +4187,6 @@ mod tests {
                 .deltas
                 .len(),
             1
-        );
-    }
-
-    #[tokio::test]
-    async fn diff_command_returning_executes_through_datafusion() {
-        let mut ctx = DummySqlWriteExecutionContext {
-            active_branch_id: "01920000-0000-7000-8000-0000000000a1",
-            blob_reader: Arc::new(StaticBlobReader { bytes: Vec::new() }),
-            hot_state: Arc::new(CapturingRowsHotStateReader {
-                rows: Vec::new(),
-                requests: Arc::new(Mutex::new(Vec::new())),
-            }),
-            staged_writes: Arc::new(Mutex::new(CapturingStagedWrites::default())),
-            schema_definitions: Vec::new(),
-        };
-        let plan = create_write_logical_plan(
-            &mut ctx,
-            "INSERT INTO lix_revert (row_ref) \
-             SELECT lix_row_ref('lix_file', '01920000-0000-7000-8000-0000000000d2') \
-             RETURNING commit_id",
-        )
-        .await
-        .expect("diff command RETURNING should plan");
-        let (result, path) = crate::sql2::execute_write_logical_plan_with_mode_and_trace_result(
-            &mut ctx,
-            plan,
-            &[],
-            WriteExecutorMode::ForceDataFusion,
-        )
-        .await
-        .expect("diff command RETURNING should execute through DataFusion");
-
-        assert_eq!(path, WriteExecutorPath::DataFusion);
-        assert_eq!(result.rows_affected, 1);
-        assert_eq!(
-            result.returning,
-            Some(crate::SqlQueryResult {
-                columns: vec!["commit_id".to_string()],
-                column_types: vec![crate::ResultColumnType::Text],
-                rows: vec![vec![Value::Text("commit-diff-command".to_string())]],
-                notices: Vec::new(),
-            })
         );
     }
 
