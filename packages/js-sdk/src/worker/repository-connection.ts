@@ -49,6 +49,7 @@ export function createRepositoryConnection(key: string): WorkerConnection {
 		connected = false;
 	let generation: string | undefined, nonce: string | undefined;
 	let lastSeen = Date.now();
+	let lastPoll = lastSeen;
 	let listener: ((message: WorkerResponse) => void) | undefined;
 	let fatal: ((error: Error) => void) | undefined;
 	let failure: Error | undefined;
@@ -78,7 +79,12 @@ export function createRepositoryConnection(key: string): WorkerConnection {
 		send({ kind: "discover", client, nonce });
 	};
 	const poll = setInterval(() => {
-		if (connected && Date.now() - lastSeen > OPEN_TIMEOUT_MS)
+		const now = Date.now();
+		// A suspended/throttled event loop cannot establish owner liveness.
+		// Give a fresh probe a full response window when polling resumes.
+		if (now - lastPoll > 1000 || now < lastPoll) lastSeen = now;
+		lastPoll = now;
+		if (connected && now - lastSeen > OPEN_TIMEOUT_MS)
 			fail(
 				repositoryError(
 					"LIX_OWNER_LOST",

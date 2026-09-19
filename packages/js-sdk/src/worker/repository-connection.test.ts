@@ -150,3 +150,38 @@ test("late discovery after a timeout cannot attach an abandoned client", async (
 	expect(c.sent.filter((m) => m.kind === "connect")).toHaveLength(count);
 	await c.result.terminate();
 });
+
+test("resuming a suspended page probes before declaring its owner lost", async () => {
+	vi.useFakeTimers();
+	const c = connection();
+	const client = c.elect();
+	await vi.advanceTimersByTimeAsync(250);
+	vi.setSystemTime(Date.now() + 60000);
+	await vi.advanceTimersByTimeAsync(250);
+	const resumedProbe = c.discover();
+	const failedOnResume = c.fatal.mock.calls.length;
+	c.receive({
+		kind: "owner",
+		client,
+		nonce: resumedProbe.nonce,
+		generation: "owner-1",
+	});
+	const closing = c.result.terminate();
+	c.receive({ kind: "disconnected", client, generation: "owner-1" });
+	await closing;
+	expect(failedOnResume).toBe(0);
+});
+test("a silent owner still times out after the page resumes", async () => {
+	vi.useFakeTimers();
+	const c = connection();
+	c.elect();
+	vi.setSystemTime(Date.now() + 60000);
+	await vi.advanceTimersByTimeAsync(250);
+	const failedOnResume = c.fatal.mock.calls.length;
+	await vi.advanceTimersByTimeAsync(30250);
+	expect(c.fatal).toHaveBeenCalledWith(
+		expect.objectContaining({ code: "LIX_OWNER_LOST" }),
+	);
+	await c.result.terminate();
+	expect(failedOnResume).toBe(0);
+});
