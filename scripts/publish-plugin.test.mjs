@@ -142,3 +142,30 @@ test("unexpected assets added during upload prevent publication", async t => {
   await assert.rejects(run, /unexpected or duplicate/);
   assert.equal(state.release.draft, true);
 });
+
+
+test("first independent plugin release may reset inherited version, later downgrades fail", t => {
+  const root = mkdtempSync(join(tmpdir(), "plugin-first-release-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const git = (...args) => execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
+  git("init", "--quiet"); git("config", "user.name", "Test"); git("config", "user.email", "test@example.com");
+  mkdirSync(join(root, "plugins/json"), { recursive: true });
+  const manifest = join(root, "plugins/json/Cargo.toml");
+  const changelog = join(root, "plugins/json/CHANGELOG.md");
+  writeFileSync(manifest, '[package]\nversion = "0.16.1"\n');
+  writeFileSync(changelog, "# Changelog\n");
+  git("add", "."); git("commit", "-qm", "unreleased plugin");
+  writeFileSync(manifest, '[package]\nversion = "0.1.0"\n');
+  writeFileSync(changelog, "# Changelog\n\n## 0.1.0\n\nInitial release.\n");
+  git("add", "."); git("commit", "-qm", "first release");
+  const first = git("rev-parse", "HEAD"); git("update-ref", "refs/remotes/origin/main", first);
+  assert.deepEqual(selectPluginReleases(root, { sha: first, target: "plugin_json" }), [
+    { target: "plugin_json", version: "0.1.0", sha: first, tag: "plugin_json/v0.1.0" },
+  ]);
+  writeFileSync(manifest, '[package]\nversion = "0.16.1"\n');
+  git("add", "."); git("commit", "-qm", "later version");
+  writeFileSync(manifest, '[package]\nversion = "0.1.0"\n');
+  git("add", "."); git("commit", "-qm", "invalid downgrade");
+  const later = git("rev-parse", "HEAD"); git("update-ref", "refs/remotes/origin/main", later);
+  assert.throws(() => selectPluginReleases(root, { sha: later, target: "plugin_json" }), /must increase/);
+});
