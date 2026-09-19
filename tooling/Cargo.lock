@@ -3957,7 +3957,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_excalidraw"
-version = "0.16.1"
+version = "0.1.0"
 dependencies = [
  "lix",
  "serde",

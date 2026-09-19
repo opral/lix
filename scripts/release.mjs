@@ -587,6 +587,10 @@ function updateReleaseVersion(root, target, version) {
 	}
 }
 
+export function hasReleaseHistory(changelog) {
+	return /^## \[?\d+\.\d+\.\d+\]?(?:\s|$)/m.test(changelog);
+}
+
 export function prepareRelease(root, {
 	target = "lix", date = new Date().toISOString().slice(0, 10), runCargo = execFileSync,
 } = {}) {
@@ -594,7 +598,10 @@ export function prepareRelease(root, {
 	const changes = loadChanges(root).filter(change => change.target === target);
 	if (changes.length === 0) return null;
 	const type = highestChangeType(changes);
-	const version = bumpVersion(currentVersion(root, target), type);
+	const changelogPath = join(root, releaseTarget(target).path, "CHANGELOG.md");
+	const firstPluginRelease = target !== "lix" &&
+		(!existsSync(changelogPath) || !hasReleaseHistory(readFileSync(changelogPath, "utf8")));
+	const version = firstPluginRelease ? "0.1.0" : bumpVersion(currentVersion(root, target), type);
 	updateReleaseVersion(root, target, version);
 	updateChangelog(root, version, date, changes, target);
 	updateCargoLockfiles(root, { runCargo });
