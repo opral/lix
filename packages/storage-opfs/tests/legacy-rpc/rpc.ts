@@ -6,12 +6,11 @@ import type {
 	LixStorageScanOrder,
 	LixStorageSpace,
 } from "@lix-js/sdk";
-import type { OpfsWritePayload } from "./buffered-write.js";
+import type { OpfsWritePayload } from "../../js/buffered-write.js";
 
 /** Internal protocol shared by the package-owned owner worker and its clients. */
 export const OPFS_RPC_PROTOCOL_VERSION = 4 as const;
-export const OPFS_RPC_CHANNEL =
-	`lix-js:storage-opfs:rpc:v${OPFS_RPC_PROTOCOL_VERSION}`;
+export const OPFS_RPC_CHANNEL = `lix-js:storage-opfs:rpc:v${OPFS_RPC_PROTOCOL_VERSION}`;
 
 export type OpfsRpcRequest = {
 	kind: "request";
@@ -32,19 +31,21 @@ export type OpfsRpcRequest = {
 	payload: unknown;
 };
 
-export type OpfsRpcResponse = {
-	kind: "response";
-	requestId: string;
-	clientId: string;
-	ok: true;
-	result: unknown;
-} | {
-	kind: "response";
-	requestId: string;
-	clientId: string;
-	ok: false;
-	error: SerializedError;
-};
+export type OpfsRpcResponse =
+	| {
+			kind: "response";
+			requestId: string;
+			clientId: string;
+			ok: true;
+			result: unknown;
+	  }
+	| {
+			kind: "response";
+			requestId: string;
+			clientId: string;
+			ok: false;
+			error: SerializedError;
+	  };
 
 export type OpfsRpcAccepted = {
 	kind: "accepted";

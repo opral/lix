@@ -501,10 +501,12 @@ test("observe.next samples its own telemetry parent", async () => {
 	});
 	const observation = lix.observe("SELECT 'observe-private' AS value");
 	activeParent = nextParent;
-	await observation.next();
+	await observation
+		.next()
+		.then((result) => (result.done ? undefined : result.value));
 	const span = await received;
 	expect(span.parentSpanId).toBe(nextParent.spanId);
-	observation.close();
+	observation.return?.();
 	await lix.close();
 });
 
@@ -933,9 +935,13 @@ test("observe close reliably resolves pending next calls", async () => {
 			`js-observe-close-stress-${i}`,
 		]);
 
-		await events.next();
-		const pending = events.next();
-		events.close();
+		await events
+			.next()
+			.then((result) => (result.done ? undefined : result.value));
+		const pending = events
+			.next()
+			.then((result) => (result.done ? undefined : result.value));
+		events.return?.();
 		await expect(withTimeout(pending)).resolves.toBeUndefined();
 	}
 
@@ -953,17 +959,27 @@ test("observe remains usable during a transaction and after rollback", async () 
 	await tx.execute(
 		"INSERT INTO lix_key_value (key, value) VALUES ('js-observe-error', 'rolled-back')",
 	);
-	expect((await withTimeout(events.next()))?.result.rows).toEqual([]);
+	expect(
+		(
+			await withTimeout(
+				events
+					.next()
+					.then((result) => (result.done ? undefined : result.value)),
+			)
+		)?.result.rows,
+	).toEqual([]);
 	await tx.rollback();
 
 	await lix.execute(
 		"INSERT INTO lix_key_value (key, value) VALUES ('js-observe-error', 'after-error')",
 	);
-	const update = await events.next();
+	const update = await events
+		.next()
+		.then((result) => (result.done ? undefined : result.value));
 	expect(update?.sequence).toBe(1);
 	expect(update?.result.rows[0]?.value).toBe("after-error");
 
-	events.close();
+	events.return?.();
 	await lix.close();
 });
 
@@ -1208,7 +1224,6 @@ test("executeBatch propagates originKey to every write", async () => {
 
 	await lix.close();
 });
-
 
 test("fs storage on-demand sync imports selected paths and lix-created files", async () => {
 	const dir = tempFsDir();
@@ -1536,7 +1551,6 @@ test("fs storage on-demand sync matches directory paths by segment boundaries", 
 
 	await lix.close();
 });
-
 
 test.skipIf(process.platform === "win32")(
 	"fs storage ignores unrelated symlinks and diagnoses materialization collisions",
@@ -2549,7 +2563,9 @@ async function readFile(
 	if (result.rows.length === 0) {
 		return undefined;
 	}
-	return (result.rows[0]?.content as Uint8Array | undefined) ?? new Uint8Array();
+	return (
+		(result.rows[0]?.content as Uint8Array | undefined) ?? new Uint8Array()
+	);
 }
 
 async function currentFileChange(

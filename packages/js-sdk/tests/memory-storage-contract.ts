@@ -161,47 +161,90 @@ export function registerMemoryStorageContract({
 			let tx: Awaited<ReturnType<ContractLix["beginTransaction"]>> | undefined;
 			let other: ContractLix | undefined;
 			try {
-				expect((await wait(existing.next(), "initial observer"))?.result.rows).toEqual([]);
+				expect(
+					(
+						await wait(
+							existing
+								.next()
+								.then((result) => (result.done ? undefined : result.value)),
+							"initial observer",
+						)
+					)?.result.rows,
+				).toEqual([]);
 				tx = await wait(lix.beginTransaction(), "begin independent transaction");
-				await tx.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [
-					params[1],
-					"pending",
-				]);
+				await tx.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [params[1], "pending"]);
 				expect((await wait(lix.execute(sql, params), "parent read during transaction")).rows).toEqual(
 					[],
 				);
 				expect((await tx.execute(sql, params)).rows).toEqual([{ key: params[1], value: "pending" }]);
 				fresh = lix.observe(sql, params);
-				expect((await wait(fresh.next(), "new observer during transaction"))?.result.rows).toEqual([]);
+				expect(
+					(
+						await wait(
+							fresh
+								.next()
+								.then((result) => (result.done ? undefined : result.value)),
+							"new observer during transaction",
+						)
+					)?.result.rows,
+				).toEqual([]);
 				other = await lix.openAnotherSession();
 				await other.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [
 					params[0],
 					"committed",
 				]);
 				expect(
-					(await wait(existing.next(), "existing observer during transaction"))?.result.rows,
+					(
+						await wait(
+							existing
+								.next()
+								.then((result) => (result.done ? undefined : result.value)),
+							"existing observer during transaction",
+						)
+					)?.result.rows,
 				).toEqual([{ key: params[0], value: "committed" }]);
-				expect((await wait(fresh.next(), "fresh observer external commit"))?.result.rows).toEqual([
-					{ key: params[0], value: "committed" },
-				]);
-                // The transaction read a snapshot that the other writer advanced.
-                // Retry the whole operation, including its reads, on a fresh snapshot.
-                await expect(tx.commit()).rejects.toMatchObject({ code: "LIX_TRANSACTION_CONFLICT" });
-                tx = await lix.beginTransaction();
-                expect((await tx.execute(sql, params)).rows).toEqual([{ key: params[0], value: "committed" }]);
-                await tx.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [params[1], "pending"]);
-                await tx.commit();
-                tx = undefined;
-                const expected = [
+				expect(
+					(
+						await wait(
+							fresh
+								.next()
+								.then((result) => (result.done ? undefined : result.value)),
+							"fresh observer external commit",
+						)
+					)?.result.rows,
+				).toEqual([{ key: params[0], value: "committed" }]);
+				// The transaction read a snapshot that the other writer advanced.
+				// Retry the whole operation, including its reads, on a fresh snapshot.
+				await expect(tx.commit()).rejects.toMatchObject({ code: "LIX_TRANSACTION_CONFLICT" });
+				tx = await lix.beginTransaction();
+				expect((await tx.execute(sql, params)).rows).toEqual([{ key: params[0], value: "committed" }]);
+				await tx.execute("INSERT INTO lix_key_value (key, value) VALUES ($1, $2)", [params[1], "pending"]);
+				await tx.commit();
+				tx = undefined;
+				const expected = [
 					{ key: params[0], value: "committed" },
 					{ key: params[1], value: "pending" },
 				];
 				expect(
-					(await wait(existing.next(), "existing observer transaction commit"))?.result.rows,
+					(
+						await wait(
+							existing
+								.next()
+								.then((result) => (result.done ? undefined : result.value)),
+							"existing observer transaction commit",
+						)
+					)?.result.rows,
 				).toEqual(expected);
-				expect((await wait(fresh.next(), "fresh observer transaction commit"))?.result.rows).toEqual(
-					expected,
-				);
+				expect(
+					(
+						await wait(
+							fresh
+								.next()
+								.then((result) => (result.done ? undefined : result.value)),
+							"fresh observer transaction commit",
+						)
+					)?.result.rows,
+				).toEqual(expected);
 				tx = await lix.beginTransaction();
 				await tx.execute("DELETE FROM lix_key_value WHERE key = $1", [params[1]]);
 				expect((await lix.execute(sql, params)).rows).toEqual(expected);
@@ -209,8 +252,8 @@ export function registerMemoryStorageContract({
 				tx = undefined;
 				expect((await lix.execute(sql, params)).rows).toEqual(expected);
 			} finally {
-				existing.close();
-				fresh?.close();
+				existing.return?.();
+				fresh?.return?.();
 				await tx?.rollback().catch(() => undefined);
 				await other?.close();
 				await lix.close();
@@ -393,7 +436,12 @@ export function registerMemoryStorageContract({
 				["contract-observe"],
 			);
 
-			const initial = await wait(events.next(), "initial observation");
+			const initial = await wait(
+				events
+					.next()
+					.then((result) => (result.done ? undefined : result.value)),
+				"initial observation",
+			);
 			expect(initial?.sequence).toBe(0);
 			expect(initial?.result.rows).toHaveLength(0);
 			await lix.execute(
@@ -401,13 +449,18 @@ export function registerMemoryStorageContract({
 				["contract-observe", "updated"],
 			);
 
-			const update = await wait(events.next(), "updated observation");
+			const update = await wait(
+				events
+					.next()
+					.then((result) => (result.done ? undefined : result.value)),
+				"updated observation",
+			);
 			expect(update?.sequence).toBe(1);
 			expect(update?.result.rows[0]).toEqual({
 				key: "contract-observe",
 				value: "updated",
 			});
-			events.close();
+			events.return?.();
 			await lix.close();
 		});
 
@@ -420,10 +473,17 @@ export function registerMemoryStorageContract({
 			);
 
 			try {
-				const initial = await wait(events.next(), "initial batch observation");
+				const initial = await wait(
+					events
+						.next()
+						.then((result) => (result.done ? undefined : result.value)),
+					"initial batch observation",
+				);
 				expect(initial?.result.rows).toHaveLength(0);
 
-				const updatePromise = events.next();
+				const updatePromise = events
+					.next()
+					.then((result) => (result.done ? undefined : result.value));
 				const batch = lix.executeBatch([
 					{
 						sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
@@ -442,7 +502,9 @@ export function registerMemoryStorageContract({
 					{ key: "batch-observe-b", value: "second" },
 				]);
 
-				const noIntermediateUpdate = events.next();
+				const noIntermediateUpdate = events
+					.next()
+					.then((result) => (result.done ? undefined : result.value));
 				await expect(
 					withTimeout(
 						noIntermediateUpdate,
@@ -450,12 +512,12 @@ export function registerMemoryStorageContract({
 						100,
 					),
 				).rejects.toThrow(/timed out/);
-				events.close();
+				events.return?.();
 				await expect(
 					wait(noIntermediateUpdate, "closed batch observation"),
 				).resolves.toBeUndefined();
 			} finally {
-				events.close();
+				events.return?.();
 				await lix.close();
 			}
 		});
@@ -468,15 +530,30 @@ export function registerMemoryStorageContract({
 				["contract-observe-pending"],
 			);
 
-			await wait(events.next(), "initial observation");
-			const pending = events.next();
-			await expect(events.next()).rejects.toMatchObject({
+			await wait(
+				events
+					.next()
+					.then((result) => (result.done ? undefined : result.value)),
+				"initial observation",
+			);
+			const pending = events
+				.next()
+				.then((result) => (result.done ? undefined : result.value));
+			await expect(
+				events
+					.next()
+					.then((result) => (result.done ? undefined : result.value)),
+			).rejects.toMatchObject({
 				name: "LixError",
 				code: "LIX_OBSERVE_NEXT_IN_FLIGHT",
 			});
-			events.close();
+			events.return?.();
 			await expect(wait(pending, "closed observation")).resolves.toBeUndefined();
-			await expect(events.next()).resolves.toBeUndefined();
+			await expect(
+				events
+					.next()
+					.then((result) => (result.done ? undefined : result.value)),
+			).resolves.toBeUndefined();
 			await lix.close();
 		});
 

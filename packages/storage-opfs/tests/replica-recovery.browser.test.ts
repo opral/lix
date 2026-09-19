@@ -3,9 +3,9 @@ import {
 	type LixStorageSpace,
 	type LixStoragePutEntry,
 } from "@lix-js/sdk";
-import { OpfsStorage } from "@lix-js/storage-opfs";
+import { OpfsStorage } from "./rpc-test-storage.js";
 import { expect, test } from "vitest";
-import { OpfsStorageClient } from "../js/client.js";
+import { OpfsStorageClient } from "./legacy-rpc/client.js";
 
 // Current physical layout fixture. Migration crash/old-format fixtures live in
 // the Rust engine; this fixture exercises real OPFS, WASM, and public recovery.

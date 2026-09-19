@@ -26,55 +26,50 @@ offline, and local commits upload in the background. The default `"remote"` mode
 rejects local storage. See
 [Collaboration and Sync](https://lix.dev/docs/collaboration-and-sync).
 
-Partial replicas coordinate one Lix engine per physical OPFS database through an
-SDK-owned SharedWorker. Each tab receives an independent session on that engine,
-so loaded data and pending offline edits are shared. Closing one tab releases its
-sessions without closing the other tabs' engine. This is automatic with the
-existing `openLix()` options and requires SharedWorker support in addition to
-OPFS and Web Locks. The physical engine-owner lock remains the final fence across
-different SDK builds. Sessions still obey the partial replica's admitted branch
-scope; sharing an engine does not admit every repository branch.
+All OPFS sessions for a physical repository share one elected dedicated worker.
+That worker owns both the Lix engine and the SQLite/OPFS connection. Each page
+starts a candidate, and a repository-scoped Web Lock permits only one candidate
+to open storage. Session requests cross a BroadcastChannel; storage reads and
+writes stay inside the engine's worker. SharedWorker is no longer required.
 
-`OpfsStorage` starts one package-owned dedicated worker in the page. The Lix
-engine workers use a package-internal `BroadcastChannel` RPC client, while the
-owner worker holds the SQLite Wasm OPFS SAH-pool connection. This keeps the
-SQLite connection and OPFS sync handles in one worker, while multiple tabs and
-multiple Lix workers attach to the same repository. Writes are batched before
-crossing the channel and commits are serialized by the owner.
+The public `openLix({ storage: new OpfsStorage({ name }) })` API is unchanged.
+Each handle gets an independent session. Closing a handle does not terminate an
+owner that still serves other tabs. A page-scoped client lock detects abrupt
+client loss, cancels its credential/transport callbacks, and closes its sessions.
+Partial replicas retain their existing authority and account admission checks;
+sharing an engine does not authorize another account or admit additional branches.
 
-The SQLite owner is deliberately a dedicated worker rather than a SharedWorker:
-SQLite's OPFS sync-access-handle VFS is only available in dedicated workers.
-The partial-engine SharedWorker uses this provider protocol and does not host
-the SQLite connection itself.
+When the document hosting the owner disappears, a surviving tab's candidate
+acquires ownership. The SDK reopens each acknowledged session with its last
+acknowledged branch/account context and re-registers observations. An observation
+emits a fresh snapshot after recovery and retains its logical sequence. Network
+and credential callbacks are fenced by owner generation and fresh callback IDs.
+Interrupted transactions and snapshot exports fail explicitly; start new ones.
+In-flight writes are never replayed. Every request and response is fenced by the
+owner generation.
 
-After every committed write, the owner broadcasts a package-private storage
-position. Each attached provider turns a changed position into the SDK's
-payload-free storage invalidation signal, so `lix.observe()` reruns in other Lix
-workers and browser tabs. Periodic heartbeats announce the current position as
-well, allowing a client to recover if a `BroadcastChannel` message was missed.
-Read handles retain a coherent view across commits through a bounded owner-local
-SQLite undo history of changed keys. Writers never wait for an asynchronous read.
-The history retains at most 512 committed generations and 32 MiB of accounted
-key/value data; older reads expire and complete buffered engine read operations
-restart within their bounded retry budget. This is not a full-database copy.
-Owner loss still invalidates every handle.
-If a commit response is lost after SQLite has accepted the transaction, the
-client reports `LIX_STORAGE_COMMIT_OUTCOME_UNKNOWN` rather than replaying it.
+If a potentially writing operation loses its acknowledgement, it rejects with
+`LIX_WRITE_OUTCOME_UNKNOWN`. The operation may already have committed: inspect
+repository state before deciding whether to retry it. SQL is conservatively
+classified as potentially writing, including SQL submitted through `execute()`.
 
-OPFS and Web Locks are required. A Web Lock is the split-brain fence: one owner
-worker serves a repository name and other tabs remain listeners until the owner
-goes away. The generic `@lix-js/sdk` storage protocol exposes only
-`watchForChanges()`/`changed()`; OPFS owner epochs and generations stay private
-to this package. Browsers without workers or BroadcastChannel use the package's
-direct-worker fallback; that fallback is single-owner and does not provide
-multi-tab attachment.
+Worker opening has a 30-second budget, credential callbacks a 15-second budget,
+and other finite worker requests a 60-second budget. The close RPC has a
+5-second budget after the public handle drains its in-flight operations.
+`observe().next()` remains long-lived until a change, closure, or unrecoverable
+owner failure.
+A failed or timed-out connection is disposed, rather than leaving a reusable
+half-open session. Cleanup that cannot drain is stopped at the worker boundary;
+physical storage locks remain the final fence until the browser releases them.
+A suspended live owner is not replaced by stealing its locks.
 
-Closing the last attached client drains accepted storage operations and releases
-the SQLite handle and physical Web Lock before acknowledging close. Idle owners
-do not cache an open backend. Failed close remains an ownership failure rather
-than allowing a competing backend. Internal RPC version 4 isolates these close
-acknowledgements from older relay workers; the physical data lock remains
-unversioned so a different protocol cannot bypass an existing owner.
+OPFS sync access handles, dedicated workers, BroadcastChannel, and Web Locks are
+required. There is no silent single-tab fallback. Test actual Safari on the
+supported macOS/iOS versions; Linux Playwright WebKit is not Safari qualification.
+The generic storage protocol still exposes `watchForChanges()`/`changed()`.
+SQLite read handles retain a coherent view using bounded owner-local undo history
+(512 generations and 32 MiB); expired reads retry within the engine's bounded
+read budget. Durable writes retain the existing SQLite WAL checkpoint fence.
 
 The separate `@lix-js/storage-opfs/migration` entry copies retained source stores
 to unpublished namespaces. It is loaded before ordinary opening only when a
@@ -82,10 +77,14 @@ browser profile needs routing/migration. It never clears a failed source.
 
 ## Development
 
-Run `npm run test:browser` for provider persistence, multi-client attach, and
-cross-engine observation tests. `npm run test:browser:production` tests packed
-SDK and storage artifacts, including cross-tab observation, in a minimal Vite
-application. `npm run benchmark` reports raw samples plus p50/p95 for warm Lix
+Run `npm run test:browser` for adapter conformance and persistence. The retired
+storage-RPC implementation lives under `tests/legacy-rpc` and is built only for
+conformance tests;
+public `OpfsStorage` never selects it. Run `npm run test:repository-owner` for
+production-bundled cross-tab sessions, observations, transactions, owner loss,
+and repeated warm reopen. `npm run test:browser:production` tests packed
+SDK and storage artifacts in a minimal Vite application and runs the repository
+ownership/recovery regression suite. `npm run benchmark` reports raw samples plus p50/p95 for warm Lix
 reopen, local execute-through-observer delivery, and the 10k/1M-row storage
 scorecards. `npm run benchmark:multi-tab` reports cross-tab observer delivery
 and owner-failover recovery from packed production artifacts.

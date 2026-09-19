@@ -237,17 +237,30 @@ console.log(returning[0].rows[0]?.done);
 ### observe()
 
 ```ts
-const events = lix.observe(sql, params?);
+const events = lix.observe(sql, params?, { signal }?);
 ```
 
-Observes a SQL query. Returns an `ObserveEvents` handle. Call `next()` to await the next result; it resolves with `{ sequence, mutationSequence, result }` for the initial result and after each change, or `undefined` after the observation is closed. Call `close()` to stop observing.
+Observes a SQL query as a standard async iterator. Each value is `{ sequence, mutationSequence, result }`, beginning with the initial result. Consume it with `for await...of`; manual `next()` returns `{ value, done }`.
 
 ```ts
-const events = lix.observe("SELECT path FROM lix_file");
-const event = await events.next();
-console.log(event?.result.rows.length);
-events.close();
+const controller = new AbortController();
+try {
+  for await (const event of lix.observe("SELECT path FROM lix_file", [], {
+    signal: controller.signal,
+  })) {
+    console.log(event.result.rows.length);
+    // break exits iteration and releases the observation.
+  }
+} catch (error) {
+  console.error("Observation failed", error);
+}
+// A component or task owner can abort from outside the loop:
+controller.abort();
 ```
+
+Aborting, reaching EOF, or closing Lix ends iteration and settles pending reads. Breaking or returning from the loop releases the observation through the standard iterator `return()` method. Errors reject and terminate the observation. Cancellation does not cancel work already started by your loop body; check the signal before publishing the result of additional asynchronous work. Result coalescing is unchanged: observations represent current query results, not a lossless mutation log.
+
+The custom `ObserveEvents` export and observation `close()` method are removed.
 
 ### beginTransaction()
 

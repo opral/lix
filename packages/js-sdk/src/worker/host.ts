@@ -1,3 +1,4 @@
+import { CALLBACK_TIMEOUT_MS } from "./repository-protocol.js";
 import { validateHttpRequest, type HttpRequest, type HttpTransport } from "../http-transport.js";
 import {
 	openLixBinding,
@@ -33,6 +34,7 @@ export function startWorkerHost(
 	endpoint: WorkerHostEndpoint,
 	openBinding: typeof openLixBinding = openLixBinding,
 	convertBinding: typeof convertReplicaBinding = convertReplicaBinding,
+	checkpointSessions = false,
 ): { close(): Promise<void> } {
 	let closed = false;
 	const sessions = new Map<number, LixBinding>();
@@ -235,7 +237,31 @@ export function startWorkerHost(
 	): Promise<void> {
 		try {
 			const value = await operation();
-			endpoint.postMessage({ id: request.id, ok: true, value });
+			const kind = request.operation.kind;
+			const checkpoint =
+				checkpointSessions &&
+				(kind === "open" ||
+					kind === "openAnotherSession" ||
+					kind === "switchBranch");
+			const session = checkpoint
+				? sessions.get(
+						kind === "openAnotherSession"
+							? (value as number)
+							: request.sessionId,
+					)
+				: undefined;
+			const context = session
+				? {
+						branchId: await session.activeBranchId(),
+						accountId: await session.activeAccountId(),
+					}
+				: undefined;
+			endpoint.postMessage({
+				id: request.id,
+				ok: true,
+				value,
+				...(context ? { context } : {}),
+			});
 		} catch (error) {
 			endpoint.postMessage({
 				id: request.id,
@@ -460,7 +486,7 @@ export function startWorkerHost(
 		await input.writer.close();
 	}
 
-    return { async close() {
+	return { async close() {
         if (closed) return;
         closed = true;
         const failure = workerStateError("Worker client disconnected");
@@ -488,7 +514,10 @@ export function startWorkerHost(
         sessions.clear();
     } };
 
-	function createSyncServerBridge(server: WorkerSyncServerOptions | undefined, transportScope?: number):
+	function createSyncServerBridge(
+		server: WorkerSyncServerOptions | undefined,
+		transportScope?: number,
+	):
 		| {
 				url: string;
 				headers: [string, string][];
@@ -503,9 +532,29 @@ export function startWorkerHost(
 			headerProvider: server.dynamicHeaders
 				? () => {
 						if (closed) throw workerStateError("Worker client disconnected");
-                    const requestId = nextSyncRequestId++;
+						const requestId = nextSyncRequestId++;
 						return new Promise((resolve, reject) => {
-							pendingSyncHeaders.set(requestId, { resolve, reject });
+							const timer = setTimeout(() => {
+								pendingSyncHeaders.delete(requestId);
+								reject(
+									Object.assign(
+										new Error("Credential callback did not settle"),
+										{
+											code: "LIX_CREDENTIALS_TIMEOUT",
+										},
+									),
+								);
+							}, CALLBACK_TIMEOUT_MS);
+							pendingSyncHeaders.set(requestId, {
+								resolve: (headers) => {
+									clearTimeout(timer);
+									resolve(headers);
+								},
+								reject: (error) => {
+									clearTimeout(timer);
+									reject(error);
+								},
+							});
 							endpoint.postMessage({ kind: "sync.headers", requestId, transportScope });
 						});
 					}

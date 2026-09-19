@@ -1,13 +1,13 @@
 import { openLix, type LixStorageProvider, type LixStorageProviderRegistration } from "@lix-js/sdk";
-import { OpfsStorage } from "@lix-js/storage-opfs";
+import { OpfsStorage } from "./rpc-test-storage.js";
 import { expect, test } from "vitest";
-import { OpfsStorageClient } from "../js/client.js";
+import { OpfsStorageClient } from "./legacy-rpc/client.js";
 import { StorageChangeNotifier } from "../js/change-watch.js";
 import {
 	OPFS_RPC_CHANNEL,
 	type OpfsRpcRequest,
 	type OpfsRpcResponse,
-} from "../js/rpc.js";
+} from "./legacy-rpc/rpc.js";
 
 test("storage watch resolves after a commit from another engine", async () => {
 	const storage = new OpfsStorage({
@@ -105,13 +105,15 @@ test("storage notifier coalesces delivered changes without losing a later change
 	}
 });
 
-test.each([false, true])("watching-client read barrier before consumption: %s", async (readBeforeConsume) => {
-	const channelName = `lix-opfs-watch-order:${crypto.randomUUID()}`;
-	const storageName = `watch-order-storage:${crypto.randomUUID()}`;
-	const ownerEpoch = crypto.randomUUID();
-	let generation = 0;
-	const owner = new BroadcastChannel(channelName);
-	owner.onmessage = (event: MessageEvent<OpfsRpcRequest>) => {
+test.each([false, true])(
+	"watching-client read barrier before consumption: %s",
+	async (readBeforeConsume) => {
+		const channelName = `lix-opfs-watch-order:${crypto.randomUUID()}`;
+		const storageName = `watch-order-storage:${crypto.randomUUID()}`;
+		const ownerEpoch = crypto.randomUUID();
+		let generation = 0;
+		const owner = new BroadcastChannel(channelName);
+		owner.onmessage = (event: MessageEvent<OpfsRpcRequest>) => {
 		const request = event.data;
 		if (!request || request.kind !== "request" || request.storageName !== storageName) return;
 		const response: OpfsRpcResponse = {
@@ -125,11 +127,11 @@ test.each([false, true])("watching-client read barrier before consumption: %s", 
 		};
 		owner.postMessage(response);
 	};
-	const client = await OpfsStorageClient.open(storageName, channelName);
-	const sessionToken = await client.acquireSession();
-	const readOptions = { sessionToken, consistency: "latest", durability: "visible" } as const;
-	const watch = await client.watchForChanges();
-	try {
+		const client = await OpfsStorageClient.open(storageName, channelName);
+		const sessionToken = await client.acquireSession();
+		const readOptions = { sessionToken, consistency: "latest", durability: "visible" } as const;
+		const watch = await client.watchForChanges();
+		try {
 		generation = 1;
 		await client.beginRead(readOptions);
 		// Both owner commits are complete, but generation 2 has deliberately
@@ -158,7 +160,8 @@ test.each([false, true])("watching-client read barrier before consumption: %s", 
 		await client.close();
 		owner.close();
 	}
-});
+	},
+);
 
 test("closing a watch or provider rejects its pending waiter", async () => {
 	const storage = new OpfsStorage({
@@ -256,7 +259,7 @@ test("does not send current requests onto the legacy RPC bus", async () => {
 			legacyRequests += 1;
 		}
 	};
-	const worker = new Worker(new URL("../dist/owner.js", import.meta.url), {
+	const worker = new Worker(new URL("./.generated/owner.js", import.meta.url), {
 		type: "module",
 	});
 	try {
@@ -295,7 +298,7 @@ test("rejects an incompatible owner of the stable repository lock without hangin
 	);
 	await lockAcquired;
 
-	const worker = new Worker(new URL("../dist/owner.js", import.meta.url), {
+	const worker = new Worker(new URL("./.generated/owner.js", import.meta.url), {
 		type: "module",
 	});
 	let oldLockWasReleased = false;
@@ -390,7 +393,7 @@ test("accepted ownership extends the deadline for a slow backend startup", async
 
 test("only the repository owner answers protocol mismatch across relay workers", async () => {
 	const storageName = `owner-protocol-authority:${crypto.randomUUID()}`;
-	const ownerUrl = new URL("../dist/owner.js", import.meta.url);
+	const ownerUrl = new URL("./.generated/owner.js", import.meta.url);
 	const workers = [
 		new Worker(ownerUrl, { type: "module" }),
 		new Worker(ownerUrl, { type: "module" }),
@@ -448,7 +451,10 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
 	return Promise.race([
 		promise,
 		new Promise<T>((_, reject) =>
-			setTimeout(() => reject(new Error(`timed out after ${timeoutMs}ms`)), timeoutMs),
+			setTimeout(
+				() => reject(new Error(`timed out after ${timeoutMs}ms`)),
+				timeoutMs,
+			),
 		),
 	]);
 }

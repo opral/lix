@@ -1,7 +1,6 @@
 import { fetchTransport } from "./http-transport.js";
 import { invalidArgument } from "./errors.js";
 import type {
-	BindingObserveEvent,
 	LixBinding,
 	LixTransactionBinding,
 	ObserveEventsBinding,
@@ -92,7 +91,7 @@ export class Lix {
 	private closePromise: Promise<void> | undefined;
 	readonly #activeBranchListeners = new Set<() => void>();
 	readonly #inFlightOperations = new Set<Promise<unknown>>();
-	readonly #observations = new Map<number, WeakRef<ObserveEvents>>();
+	readonly #observations = new Map<number, WeakRef<Observation>>();
 	readonly #snapshotExports = new Set<{ cancel(): Promise<void> }>();
 	#nextObservationId = 0;
 	#transactionsOpening = 0;
@@ -197,11 +196,15 @@ export class Lix {
 		});
 	}
 
-	observe(sql: string, params: SqlParam[] = []): ObserveEvents {
+	observe(
+		sql: string,
+		params: SqlParam[] = [],
+		options: { signal?: AbortSignal } = {},
+	): AsyncIterableIterator<ObserveEvent> {
 		assertSqlArgs("observe", "lix", sql, params);
 		const observationId = ++this.#nextObservationId;
-		let events!: ObserveEvents;
-		events = new ObserveEvents(
+		let events!: Observation;
+		events = new Observation(
 			this.#runOperation(() =>
 				this.binding.observe(
 					sql,
@@ -211,8 +214,10 @@ export class Lix {
 				),
 			),
 			() => this.#observations.delete(observationId),
+			options.signal,
 		);
-		this.#observations.set(observationId, new WeakRef(events));
+		if (!options.signal?.aborted)
+			this.#observations.set(observationId, new WeakRef(events));
 		return events;
 	}
 
@@ -250,7 +255,7 @@ export class Lix {
 	}
 
 	/** Explicitly hydrates retained-source recovery dependencies; does not start sync. */
-    async recoverReplicaWithServer(id: string, server: import("./types.js").LixServerOptions): Promise<ReplicaRecoveryReceipt> {
+	async recoverReplicaWithServer(id: string, server: import("./types.js").LixServerOptions): Promise<ReplicaRecoveryReceipt> {
         const entries = (headers: HeadersInit | undefined): [string,string][] => {
             const result: [string,string][] = []; new Headers(headers).forEach((value,key) => result.push([key,value])); return result;
         };
@@ -437,7 +442,7 @@ export class Lix {
 			// already entered the gate are allowed to finish; later calls fail closed.
 			this.#acceptingOperations = false;
 			for (const observation of this.#observations.values()) {
-				observation.deref()?.close();
+				observation.deref()?.stop();
 			}
 			this.#observations.clear();
 			this.closePromise = (async () => {
@@ -504,7 +509,9 @@ function assertOpenAnotherSessionOptions(
 	}
 }
 
-export class ObserveEvents {
+class Observation implements AsyncIterableIterator<ObserveEvent> {
+	private readonly stopped = new Set<() => void>();
+	private readonly abort = () => this.stop();
 	private readonly setup: { error?: unknown } = {};
 	private closed = false;
 	private readonly observeBinding: Promise<ObserveEventsBinding | undefined>;
@@ -512,6 +519,7 @@ export class ObserveEvents {
 	constructor(
 		observeBinding: Promise<ObserveEventsBinding>,
 		private readonly onClose: () => void = () => undefined,
+		private readonly signal?: AbortSignal,
 	) {
 		const setup = this.setup;
 		this.observeBinding = observeBinding.catch((error: unknown) => {
@@ -523,28 +531,67 @@ export class ObserveEvents {
 			{ observe: this.observeBinding, onClose: this.onClose },
 			this,
 		);
+		if (signal?.aborted) this.stop();
+		else signal?.addEventListener("abort", this.abort, { once: true });
 	}
 
-	async next(): Promise<ObserveEvent | undefined> {
-		if (this.closed) return undefined;
-		const binding = await this.observeBinding;
-		if (binding === undefined) {
-			throw this.setup.error;
+	[Symbol.asyncIterator](): AsyncIterableIterator<ObserveEvent> {
+		return this;
+	}
+
+	async next(): Promise<IteratorResult<ObserveEvent>> {
+		if (this.closed || this.signal?.aborted) {
+			this.stop();
+			return { done: true, value: undefined };
 		}
-		const event: BindingObserveEvent | null | undefined = await binding.next();
-		if (event == null) {
-			return undefined;
-		}
-		return {
+		let stop!: () => void;
+		const stopped = new Promise<undefined>((resolve) => {
+			stop = () => resolve(undefined);
+			this.stopped.add(stop);
+		});
+		try {
+			const event = await Promise.race([
+				(async () => {
+					const binding = await this.observeBinding;
+					if (this.closed) return undefined;
+					if (binding === undefined) throw this.setup.error;
+					return await binding.next();
+				})(),
+				stopped,
+			]);
+			if (this.closed || event == null) {
+				this.stop();
+				return { done: true, value: undefined };
+			}
+			return {
+				done: false,
+				value: {
 			sequence: event.sequence,
 			mutationSequence: event.mutationSequence,
 			result: wrapExecuteResult(event.rows),
-		};
+		},
+			};
+		} catch (error) {
+			const wasClosed = this.closed;
+			this.stop();
+			if (wasClosed) return { done: true, value: undefined };
+			throw error;
+		} finally {
+			this.stopped.delete(stop);
+		}
 	}
 
-	close(): void {
+	async return(): Promise<IteratorResult<ObserveEvent>> {
+		this.stop();
+		return { done: true, value: undefined };
+	}
+
+	stop(): void {
 		if (this.closed) return;
 		this.closed = true;
+		this.signal?.removeEventListener("abort", this.abort);
+		for (const stop of this.stopped) stop();
+		this.stopped.clear();
 		this.onClose();
 		observeFinalizer.unregister(this);
 		void this.observeBinding.then((binding) => {
@@ -597,7 +644,15 @@ export class LixTransaction {
 					toNativeValue(normalizeParam(param, index)),
 				),
 				bindingOptions,
-			),
+			)
+				.catch((error: unknown) => {
+					if ((error as { code?: string })?.code === "LIX_TRANSACTION_LOST") {
+						this.finished = true;
+						transactionFinalizer.unregister(this);
+						this.onFinish();
+					}
+					throw error;
+				}),
 			rowMode,
 		);
 		return statement;

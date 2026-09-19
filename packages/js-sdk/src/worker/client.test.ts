@@ -630,3 +630,56 @@ test("sync health forwards the phase failures and cursor snapshot", async () => 
 	transport.emit({ id: request.id, ok: true, value: health });
 	await expect(result).resolves.toEqual(health);
 });
+
+test("an unanswered open rejects within its budget and disposes its connection", async () => {
+	vi.useFakeTimers();
+	try {
+		const transport = fakeConnection();
+		const client = new LixWorkerClient(transport.connection, false);
+		client.beginLease();
+		const opening = client.request({
+			kind: "open",
+			storage: { kind: "memory" },
+			telemetryEnabled: false,
+			progressEnabled: false,
+		});
+		const failure = expect(opening).rejects.toMatchObject({
+			code: "LIX_OPEN_TIMEOUT",
+		});
+		await vi.advanceTimersByTimeAsync(30_000);
+		await failure;
+		expect(transport.terminateCount()).toBe(1);
+		expect(client.isDisposed).toBe(true);
+		transport.emit({ id: 1, ok: true, value: undefined });
+		await expect(
+			client.request({ kind: "activeBranchId" }),
+		).rejects.toMatchObject({
+			code: "LIX_ERROR_CLOSED",
+		});
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test("lost execute acknowledgement rejects as unknown outcome without replaying", async () => {
+	vi.useFakeTimers();
+	try {
+		const transport = fakeConnection();
+		const client = new LixWorkerClient(transport.connection, false);
+		client.beginLease();
+		const pending = client.request({
+			kind: "execute",
+			sql: "INSERT INTO example VALUES (1)",
+			params: [],
+		});
+		const failure = expect(pending).rejects.toMatchObject({
+			code: "LIX_WRITE_OUTCOME_UNKNOWN",
+		});
+		await vi.advanceTimersByTimeAsync(60_000);
+		await failure;
+		expect(transport.sent).toHaveLength(1);
+		expect(transport.terminateCount()).toBe(1);
+	} finally {
+		vi.useRealTimers();
+	}
+});

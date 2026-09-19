@@ -65,9 +65,21 @@ test("adding an observation reconnects an established browser multiplex stream",
 	});
 
 	const first = lix.observe("SELECT 'first' AS value");
-	expect((await first.next())?.result.rows[0]?.value).toBe("first");
+	expect(
+		(
+			await first
+				.next()
+				.then((result) => (result.done ? undefined : result.value))
+		)?.result.rows[0]?.value,
+	).toBe("first");
 	const second = lix.observe("SELECT 'second' AS value");
-	expect((await second.next())?.result.rows[0]?.value).toBe("second");
+	expect(
+		(
+			await second
+				.next()
+				.then((result) => (result.done ? undefined : result.value))
+		)?.result.rows[0]?.value,
+	).toBe("second");
 	expect(executeRequests).toBe(0);
 
 	const activeRequests = observeRequests.filter(
@@ -82,8 +94,8 @@ test("adding an observation reconnects an established browser multiplex stream",
 		"observe-2",
 	]);
 
-	first.close();
-	second.close();
+	first.return?.();
+	second.return?.();
 	await lix.close();
 });
 

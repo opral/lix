@@ -188,8 +188,12 @@ async function startObservation() {
 		"SELECT value FROM lix_key_value WHERE key = $1",
 		["cross-tab-observe"],
 	);
-	await observation.next();
-	pendingObservation = observation.next();
+	await observation
+		.next()
+		.then((result) => (result.done ? undefined : result.value));
+	pendingObservation = observation
+		.next()
+		.then((result) => (result.done ? undefined : result.value));
 }
 
 async function commitObservedValue(value) {
@@ -216,7 +220,7 @@ async function finishObservation() {
 		]);
 		return event?.result.rows[0]?.value;
 	} finally {
-		observation?.close();
+		observation?.return?.();
 		await observedLix?.close();
 		observation = undefined;
 		observedLix = undefined;
@@ -264,10 +268,14 @@ async function benchmarkCrossTab(sampleCount) {
 	);
 	const control = new BroadcastChannel(benchmarkChannelName);
 	try {
-		await observed.next();
+		await observed
+			.next()
+			.then((result) => (result.done ? undefined : result.value));
 		const samples = [];
 		for (let sequence = 0; sequence < sampleCount; sequence += 1) {
-			const changed = observed.next();
+			const changed = observed
+				.next()
+				.then((result) => (result.done ? undefined : result.value));
 			const startedAt = performance.now();
 			control.postMessage({ kind: "commit", sequence, value: sequence });
 			const event = await Promise.race([
@@ -280,14 +288,16 @@ async function benchmarkCrossTab(sampleCount) {
 				),
 			]);
 			if (event?.result.rows[0]?.value !== sequence) {
-				throw new Error(`cross-tab benchmark observed the wrong value at ${sequence}`);
+				throw new Error(
+					`cross-tab benchmark observed the wrong value at ${sequence}`,
+				);
 			}
 			samples.push(performance.now() - startedAt);
 		}
 		return samples;
 	} finally {
 		control.close();
-		observed.close();
+		observed.return?.();
 		await lix.close();
 	}
 }

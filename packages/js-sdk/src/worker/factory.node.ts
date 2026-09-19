@@ -83,6 +83,8 @@ export const openDirectLixBinding = async (
 	);
 };
 
-export function createSharedWorkerConnection(_key: string): WorkerConnection | undefined {
- return undefined;
+export function createRepositoryConnection(
+	_key: string,
+): WorkerConnection | undefined {
+	return undefined;
 }
