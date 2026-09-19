@@ -4819,9 +4819,9 @@ where
                 }
                 reject_external_plugin_registry_rows(&rows)?;
                 let mut file_content = Vec::new();
-                let mut reconciliation =
-                    Box::pin(self.plugin_write_reconciliation(&mut rows, &mut file_content))
-                        .await?;
+                let mut reconciliation = self
+                    .plugin_write_reconciliation(&mut rows, &mut file_content)
+                    .await?;
                 let mut rows = reconciliation.take_reconciled_rows(rows);
                 // Applying historical plugin rows can also supply their old blob
                 // reference. The reconciled materialization replaces that reference;
@@ -4905,14 +4905,13 @@ where
             } => {
                 let mut rows = rows;
                 reject_external_plugin_registry_rows(&rows)?;
-                let mut reconciliation = Box::pin(
-                    self.plugin_write_reconciliation(&mut rows, &mut file_content)
-                        .instrument(tracing::debug_span!(
-                            target: "lix_perf",
-                            "lix.perf.plugin_reconciliation"
-                        )),
-                )
-                .await?;
+                let mut reconciliation = self
+                    .plugin_write_reconciliation(&mut rows, &mut file_content)
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.plugin_reconciliation"
+                    ))
+                    .await?;
                 let mut rows = reconciliation.take_reconciled_rows(rows);
                 rows.retain_raw(|row| {
                     !reconciliation
@@ -5126,7 +5125,17 @@ where
     /// registry row. An empty registry returns before owner, filesystem,
     /// matcher, state, archive, CAS, or WASM work. Non-empty registries use
     /// batched owner/state/CAS reads and execute plugin calls in input order.
-    async fn plugin_write_reconciliation(
+    fn plugin_write_reconciliation<'a>(
+        &'a mut self,
+        rows: &'a mut RawWriteBatch,
+        file_content: &'a mut Vec<TransactionFileContent>,
+    ) -> futures_util::future::BoxFuture<'a, Result<PluginWriteReconciliation, LixError>> {
+        // Construct this large future outside the caller's poll frame; boxing
+        // only at the await site still reserves its construction temporary there.
+        Box::pin(self.plugin_write_reconciliation_inner(rows, file_content))
+    }
+
+    async fn plugin_write_reconciliation_inner(
         &mut self,
         rows: &mut RawWriteBatch,
         file_content: &mut Vec<TransactionFileContent>,
