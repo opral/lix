@@ -68,7 +68,7 @@ Bulk deletion of an entire schema collection is represented by an internal colle
 
 ```sql
 SELECT row_ref, id, to_path
-FROM lix_diff('lix_file', lix_root_commit_id(), $commit_id);
+FROM lix_diff('lix_file', lix_root_commit_id(), $1);
 ```
 
 ## Undo a selected change
@@ -77,11 +77,11 @@ To undo a historical span, use `lix_revert_range` with the original endpoint ord
 
 ```sql
 SELECT commit_id FROM lix_revert_range(
-  $before_commit_id,
-  $after_commit_id,
+  $1,
+  $2,
   ARRAY(
     SELECT row_ref
-    FROM lix_diff('acme_task', $before_commit_id, $after_commit_id)
+    FROM lix_diff('acme_task', $1, $2)
   )
 );
 ```
@@ -90,8 +90,8 @@ To undo one commit, use `lix_revert`, which resolves that commit's actual first 
 
 ```sql
 SELECT commit_id FROM lix_revert(
-  $commit_id,
-  ARRAY[lix_row_ref('acme_task', $row_id)]
+  $1,
+  ARRAY[lix_row_ref('acme_task', $2)]
 );
 ```
 
@@ -118,11 +118,11 @@ FROM lix_restore(
 
 SELECT commit_id
 FROM lix_apply(
-  $from_commit_id,
-  $to_commit_id,
+  $1,
+  $2,
   ARRAY(
     SELECT row_ref
-    FROM lix_diff('acme_task', $from_commit_id, $to_commit_id)
+    FROM lix_diff('acme_task', $1, $2)
     WHERE to_done = true
   )
 );
