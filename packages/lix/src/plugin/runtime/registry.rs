@@ -400,10 +400,12 @@ impl PluginRegistry {
         if row.deleted() {
             return Ok(Self::empty());
         }
-        let typed = row.decoded_snapshot().map(Arc::as_ref).ok_or_else(|| {
+        // Staged mutations retain native durable bytes without necessarily
+        // caching a decoded serving view. This is still typed input.
+        let typed = row.materialize_decoded_snapshot()?.ok_or_else(|| {
             invalid_registry("live plugin registry row has no native typed payload")
         })?;
-        Self::from_typed_key_value_row(typed, PLUGIN_REGISTRY_KEY)
+        Self::from_typed_key_value_row(&typed, PLUGIN_REGISTRY_KEY)
     }
 
     fn from_typed_key_value_row(

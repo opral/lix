@@ -32,26 +32,46 @@ pub(super) fn schemas_with_defaults(
         } else {
             continue;
         };
-        let Some(schema) = snapshot.get("value") else {
-            continue;
-        };
-        let Some(key) = schema.get("key").and_then(JsonValue::as_str) else {
-            continue;
-        };
-        if schema
-            .get("columns")
-            .and_then(JsonValue::as_array)
-            .is_some_and(|columns| {
-                columns.iter().any(|column| {
-                    column.get("default_expression").is_some()
-                        || column.get("default_value").is_some()
-                })
-            })
-        {
-            schemas.push((key.to_owned(), schema.clone()));
+        push_schema_with_defaults(&mut schemas, &snapshot);
+    }
+    Ok(schemas)
+}
+
+// Plugin archive reconciliation injects registered-schema writes after the
+// public write was dispatched. Read those definitions from the prepared batch.
+pub(super) fn prepared_schemas_with_defaults(
+    write: &PreparedTransactionWrite,
+) -> Result<Vec<(String, JsonValue)>, LixError> {
+    let mut schemas = Vec::new();
+    for row in prepared_transaction_write_rows(write)
+        .iter()
+        .filter(|row| row.schema_key == REGISTERED_SCHEMA_KEY)
+    {
+        if let Some(snapshot) = row.materialize_decoded_snapshot()? {
+            push_schema_with_defaults(&mut schemas, &snapshot.to_json_value()?);
         }
     }
     Ok(schemas)
+}
+
+fn push_schema_with_defaults(schemas: &mut Vec<(String, JsonValue)>, snapshot: &JsonValue) {
+    let Some(schema) = snapshot.get("value") else {
+        return;
+    };
+    let Some(key) = schema.get("key").and_then(JsonValue::as_str) else {
+        return;
+    };
+    if schema
+        .get("columns")
+        .and_then(JsonValue::as_array)
+        .is_some_and(|columns| {
+            columns.iter().any(|column| {
+                column.get("default_expression").is_some() || column.get("default_value").is_some()
+            })
+        })
+    {
+        schemas.push((key.to_owned(), schema.clone()));
+    }
 }
 
 impl<StorageImpl> Transaction<StorageImpl>

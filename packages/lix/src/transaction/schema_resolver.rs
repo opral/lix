@@ -29,7 +29,7 @@ impl TransactionSchemaResolver {
     async fn load_catalog_for_domain(
         &mut self,
         hot_state: &dyn HotStateReader,
-        staged: Option<&PreparedStateRowOverlay>,
+        staged: Option<&(dyn StagedHotStateRows + Sync)>,
         domain: &Domain,
     ) -> Result<(), LixError> {
         let domain = domain.schema_catalog_domain();
@@ -86,7 +86,7 @@ impl TransactionSchemaResolver {
     pub(crate) async fn catalog_for_validation(
         &mut self,
         hot_state: &dyn HotStateReader,
-        staged: &PreparedStateRowOverlay,
+        staged: &(dyn StagedHotStateRows + Sync),
         domain: &Domain,
     ) -> Result<&CatalogSnapshot, LixError> {
         self.load_catalog_for_domain(hot_state, Some(staged), domain)

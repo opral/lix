@@ -385,7 +385,7 @@ impl TypedRow {
         )
     }
 
-    fn from_compiled_row(
+    pub(crate) fn from_compiled_row(
         schema_key: &str,
         compiled_schema: &lix_schema::CompiledSchema,
         schema_fingerprint: [u8; 32],
