@@ -79,7 +79,6 @@ simulation_test!(
     }
 );
 
-
 simulation_test!(
     bootstrap_lix_files_belong_to_initial_main_commit,
     |sim| async move {

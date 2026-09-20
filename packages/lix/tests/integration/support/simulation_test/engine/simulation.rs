@@ -2,8 +2,8 @@ use lix::session::CreateCheckpointReceipt;
 use lix::storage::Memory;
 use lix::{
     CreateBranchOptions, CreateBranchReceipt, ExecuteResult, MergeBranchOptions,
-    MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt, RedoReceipt,
-    SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt,
+    MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt, SessionTransaction,
+    SwitchBranchOptions, SwitchBranchReceipt,
 };
 use lix::{LixError, Value};
 use lix::{engine::Engine, init::InitReceipt, session::SessionContext};
@@ -194,22 +194,6 @@ impl SimSession {
 
     pub async fn create_checkpoint(&self) -> Result<CreateCheckpointReceipt, LixError> {
         let result = self.session.create_checkpoint().await;
-        if result.is_ok() {
-            self.sim.rebuild_tracked_state.after_successful_write();
-        }
-        result
-    }
-
-    pub async fn undo(&self) -> Result<UndoReceipt, LixError> {
-        let result = self.session.undo().await;
-        if result.is_ok() {
-            self.sim.rebuild_tracked_state.after_successful_write();
-        }
-        result
-    }
-
-    pub async fn redo(&self) -> Result<RedoReceipt, LixError> {
-        let result = self.session.redo().await;
         if result.is_ok() {
             self.sim.rebuild_tracked_state.after_successful_write();
         }

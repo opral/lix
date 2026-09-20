@@ -58,9 +58,13 @@ async fn packed_indexes_survive_checkpoint_fork_and_snapshot_reopen() {
     .unwrap();
     assert_index_matches_scan(&db, "replacement", "new_v", 1).await;
     assert_index_matches_scan(&db, "stale entries", "v", 0).await;
-    db.undo().await.unwrap();
+    db.execute("SELECT commit_id FROM lix_undo()", &[])
+        .await
+        .unwrap();
     assert_index_matches_scan(&db, "undo", "v", 1).await;
-    db.redo().await.unwrap();
+    db.execute("SELECT commit_id FROM lix_redo()", &[])
+        .await
+        .unwrap();
     assert_index_matches_scan(&db, "redo", "new_v", 1).await;
     db.switch_branch(SwitchBranchOptions { branch_id: main })
         .await

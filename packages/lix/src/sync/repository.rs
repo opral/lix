@@ -2058,6 +2058,12 @@ struct ParsedCommit {
     members: Vec<ParsedMember>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedUndoBaselineTransition {
+    before: CommitId,
+    after: CommitId,
+}
+
 #[derive(Clone)]
 struct ParsedSyncHeader {
     incorporation: crate::tracked_state::CommitStateIncorporation,
@@ -2522,6 +2528,216 @@ impl ParsedCommit {
                 _ => None,
             })
     }
+}
+
+/// Extract the authenticated baseline transition carried by an undo/redo
+/// marker. The marker is the durable proof that a receipt changed the working
+/// baseline. Keep this check at the sync admission boundary so a partial
+/// marker or a forged ref coordinate cannot advance a replica's baseline.
+fn parsed_undo_baseline_transition(
+    commit: &ParsedCommit,
+) -> Result<Option<ParsedUndoBaselineTransition>, LixError> {
+    let mut transition = None;
+    for member in commit
+        .members
+        .iter()
+        .filter(|member| member.schema_key == crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY)
+        .filter(|member| !member.deleted)
+    {
+        let snapshot = member.snapshot_json.as_deref().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!("sync undo marker in '{}' has no snapshot", commit.commit_id),
+            )
+        })?;
+        let Some(candidate) = parse_undo_baseline_marker(snapshot)? else {
+            continue;
+        };
+        if transition
+            .replace(candidate.clone())
+            .is_some_and(|previous| previous != candidate)
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!(
+                    "sync undo marker commit '{}' carries conflicting baseline transitions",
+                    commit.commit_id
+                ),
+            ));
+        }
+    }
+    Ok(transition)
+}
+
+fn parse_undo_baseline_marker(snapshot: &str) -> Result<Option<ParsedUndoBaselineTransition>, LixError> {
+    use crate::undo_redo::{UndoRedoKind, UndoRedoMarker};
+    let marker: UndoRedoMarker = serde_json::from_str(snapshot).map_err(|error| {
+        LixError::new(LixError::CODE_INVALID_PARAM, format!("invalid sync undo marker: {error}"))
+    })?;
+    if marker.baseline_before.is_some() != marker.baseline_after.is_some() {
+        return Err(LixError::new(LixError::CODE_INVALID_PARAM, "sync undo marker has an incomplete baseline transition"));
+    }
+    let (Some(before), Some(after)) = (marker.baseline_before, marker.baseline_after) else {
+        return Ok(None);
+    };
+    let (target, parent) = match marker.kind {
+        UndoRedoKind::Undo => (before, after),
+        UndoRedoKind::Redo => (after, before),
+    };
+    if !marker.checkpoint || target != marker.target_commit_id || target == parent {
+        return Err(LixError::new(LixError::CODE_INVALID_PARAM, "sync undo marker baseline transition does not match its checkpoint target and direction"));
+    }
+    Ok(Some(ParsedUndoBaselineTransition { before, after }))
+}
+
+fn validate_undo_marker_target(
+    marker: &crate::undo_redo::UndoRedoMarker,
+    is_checkpoint: bool,
+    parents: &[CommitId],
+) -> Result<(), LixError> {
+    if marker.checkpoint != is_checkpoint || parents.len() != 1 {
+        return Err(LixError::new(LixError::CODE_INVALID_PARAM, "sync undo marker does not match its target role or topology"));
+    }
+    let recorded_parent = match marker.kind {
+        crate::undo_redo::UndoRedoKind::Undo => marker.baseline_after,
+        crate::undo_redo::UndoRedoKind::Redo => marker.baseline_before,
+    };
+    if recorded_parent.is_some_and(|parent| parents != [parent]) {
+        return Err(LixError::new(LixError::CODE_INVALID_PARAM, "sync undo baseline does not match the checkpoint's immutable parent"));
+    }
+    Ok(())
+}
+
+/// Validate an incoming marker suffix when physical checkpoint compaction
+/// prevents the first-parent walk from reaching the expected ref head. A
+/// checkpoint commit in the parsed suffix is itself an authenticated baseline
+/// anchor; ordinary commits without a marker can remain under native ref CAS.
+fn validate_unanchored_baseline_suffix(
+    chain: &[&ParsedCommit],
+    final_checkpoint: Option<CommitId>,
+) -> Result<(), LixError> {
+    let mut chronological = chain.to_vec();
+    chronological.reverse();
+    let Some(checkpoint_index) = chronological
+        .iter()
+        .position(|commit| commit.wire.is_checkpoint)
+    else {
+        let contains_transition = chain.iter().try_fold(false, |seen, commit| {
+            let has_marker = parsed_undo_baseline_transition(commit)?.is_some();
+            Ok::<_, LixError>(seen || has_marker)
+        })?;
+        if contains_transition {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync baseline transition chain has no authenticated checkpoint anchor",
+            ));
+        }
+        return Ok(());
+    };
+
+    let mut checkpoint = Some(chronological[checkpoint_index].commit_id);
+    for commit in &chronological[checkpoint_index + 1..] {
+        if let Some(transition) = parsed_undo_baseline_transition(commit)? {
+            if checkpoint != Some(transition.before) {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!(
+                        "sync baseline transition in '{}' expected {:?}, found {:?}",
+                        commit.commit_id, transition.before, checkpoint
+                    ),
+                ));
+            }
+            checkpoint = Some(transition.after);
+        } else if commit.wire.is_checkpoint {
+            checkpoint = Some(commit.commit_id);
+        }
+    }
+    if checkpoint != final_checkpoint {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!(
+                "sync ref checkpoint {:?} disagrees with its compacted baseline {:?}",
+                final_checkpoint, checkpoint
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate all baseline transitions in one ref update's first-parent batch.
+/// A sync push can contain undo C→B followed immediately by redo U→C, so the
+/// final marker's `before` is not necessarily the ref update's original
+/// expected checkpoint. Check the chronological chain all the way back to
+/// the expected head. A physically compacted ordinary prefix can fall back to
+/// native ref CAS, while a marker suffix needs either the incoming checkpoint
+/// anchor or a complete first-parent chain.
+fn validate_sync_baseline_transition_chain(
+    parsed: &BTreeMap<CommitId, ParsedCommit>,
+    expected_head: Option<CommitId>,
+    expected_checkpoint: Option<CommitId>,
+    final_head: Option<CommitId>,
+    final_checkpoint: Option<CommitId>,
+) -> Result<(), LixError> {
+    let (Some(expected_head), Some(final_head)) = (expected_head, final_head) else {
+        return Ok(());
+    };
+    if expected_head == final_head {
+        return Ok(());
+    }
+    let mut chain: Vec<&ParsedCommit> = Vec::new();
+    let mut visited = BTreeSet::new();
+    let mut cursor = final_head;
+    while cursor != expected_head {
+        if !visited.insert(cursor) {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "sync baseline transition chain contains a cycle",
+            ));
+        }
+        let Some(commit) = parsed.get(&cursor) else {
+            // Checkpoint compaction can legitimately publish a physical
+            // first-parent jump over an already-authoritative ordinary head.
+            // Validate a suffix anchored by an incoming checkpoint; otherwise
+            // leave ordinary publication to native ref CAS.
+            validate_unanchored_baseline_suffix(&chain, final_checkpoint)?;
+            return Ok(());
+        };
+        chain.push(commit);
+        let Some(parent) = commit.parent_commit_ids.first().copied() else {
+            validate_unanchored_baseline_suffix(&chain, final_checkpoint)?;
+            return Ok(());
+        };
+        cursor = parent;
+    }
+    chain.reverse();
+
+    let mut checkpoint = expected_checkpoint;
+    for commit in chain {
+        if let Some(transition) = parsed_undo_baseline_transition(commit)? {
+            if checkpoint != Some(transition.before) {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!(
+                        "sync baseline transition in '{}' expected {:?}, found {:?}",
+                        commit.commit_id, transition.before, checkpoint
+                    ),
+                ));
+            }
+            checkpoint = Some(transition.after);
+        } else if commit.wire.is_checkpoint {
+            checkpoint = Some(commit.commit_id);
+        }
+    }
+    if checkpoint != final_checkpoint {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!(
+                "sync ref checkpoint {:?} disagrees with its chronological baseline {:?}",
+                final_checkpoint, checkpoint
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_sync_member(member: &SyncCommitMember) -> Result<ParsedMember, LixError> {
@@ -5988,6 +6204,13 @@ where
                     "sync ref head and checkpoint coordinates must be paired",
                 ));
             }
+            validate_sync_baseline_transition_chain(
+                &parsed,
+                expected,
+                expected_checkpoint,
+                head,
+                checkpoint,
+            )?;
             branch_ids.push(update.branch_id.clone());
             parsed_refs.push((
                 update.clone(),
@@ -6000,6 +6223,27 @@ where
 
         let adapter = self.storage_adapter();
         let read = adapter.begin_read(StorageReadOptions::default()).await?;
+        for commit in parsed.values() {
+            parsed_undo_baseline_transition(commit)?;
+            // Hydration does not publish a branch coordinate. Ref publication
+            // additionally validates every marker's target, including partial
+            // operations that leave the working baseline unchanged.
+            if parsed_refs.is_empty() {
+                continue;
+            }
+            for member in commit.members.iter().filter(|member| member.schema_key == crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY && !member.deleted) {
+                let marker: crate::undo_redo::UndoRedoMarker = serde_json::from_str(member.snapshot_json.as_deref().ok_or_else(|| LixError::unknown("missing undo marker"))?)
+                    .map_err(|error| LixError::new(LixError::CODE_INVALID_PARAM, format!("invalid sync undo marker: {error}")))?;
+                let (is_checkpoint, parents) = if let Some(target) = parsed.get(&marker.target_commit_id) {
+                    (target.wire.is_checkpoint, target.parent_commit_ids.clone())
+                } else {
+                    let target = CommitGraphContext::new().reader(&read).load_node(&marker.target_commit_id).await?
+                        .ok_or_else(|| LixError::new(LixError::CODE_INVALID_PARAM, "sync undo marker target does not exist"))?;
+                    (target.is_checkpoint, target.parent_commit_ids)
+                };
+                validate_undo_marker_target(&marker, is_checkpoint, &parents)?;
+            }
+        }
         let default_branch_id = self.repository_default_branch_id_for_sync(&read).await?;
         if parsed_refs.iter().any(|(update, _, _, head, _)| {
             (update.branch_id == default_branch_id || update.branch_id == crate::GLOBAL_BRANCH_ID)
@@ -10281,7 +10525,8 @@ mod tests {
             while let Some(demand) = demand_rx.recv().await {
                 assert!(
                     demand.is_publication_barrier_for_test(),
-                    "the synthetic replica fixture only answers publication barriers",
+                    "the synthetic replica fixture only answers publication barriers: {:?}",
+                    demand.request,
                 );
                 demand.succeed_for_test();
             }
@@ -10512,6 +10757,252 @@ mod tests {
             .expect("snapshot should initialize replica");
         install_publication_fence_responder_for_test(&mut replica);
         replica
+    }
+
+    #[test]
+    fn sync_undo_marker_requires_checkpoint_role_and_direction() {
+        let target = CommitId::for_test_label("undo-target");
+        let parent = CommitId::for_test_label("undo-parent");
+        let marker = serde_json::json!({
+            "branch_id": GLOBAL_BRANCH_ID,
+            "kind": "undo",
+            "target_commit_id": target,
+            "undo_target_after": null,
+            "redo_top_after": null,
+            "redo_next": null,
+            "checkpoint": true,
+            "baseline_before": target,
+            "baseline_after": parent
+        });
+        let parsed = parse_undo_baseline_marker(&marker.to_string()).unwrap().unwrap();
+        assert_eq!(parsed.before, target);
+        assert_eq!(parsed.after, parent);
+        for (field, value) in [
+            ("kind", serde_json::json!("restore")),
+            ("checkpoint", serde_json::json!(false)),
+            ("target_commit_id", serde_json::json!(parent)),
+            ("baseline_after", serde_json::json!(target)),
+            ("baseline_before", serde_json::Value::Null),
+        ] {
+            let mut invalid = marker.clone();
+            invalid[field] = value;
+            assert!(parse_undo_baseline_marker(&invalid.to_string()).is_err(), "accepted invalid {field}");
+        }
+        let mut partial: crate::undo_redo::UndoRedoMarker = serde_json::from_value(marker.clone()).unwrap();
+        partial.baseline_before = None;
+        partial.baseline_after = None;
+        assert!(validate_undo_marker_target(&partial, true, &[parent]).is_ok());
+        assert!(validate_undo_marker_target(&partial, false, &[parent]).is_err());
+        assert!(validate_undo_marker_target(&partial, true, &[]).is_err());
+        partial.checkpoint = false;
+        assert!(validate_undo_marker_target(&partial, true, &[parent]).is_err());
+        assert!(validate_undo_marker_target(&partial, false, &[parent]).is_ok());
+        let mut redo = marker;
+        redo["kind"] = serde_json::json!("redo");
+        assert!(parse_undo_baseline_marker(&redo.to_string()).is_err());
+        redo["baseline_before"] = serde_json::json!(parent);
+        redo["baseline_after"] = serde_json::json!(target);
+        assert_eq!(parse_undo_baseline_marker(&redo.to_string()).unwrap().unwrap().before, parent);
+    }
+
+    #[tokio::test]
+    async fn offline_checkpoint_then_undo_syncs_across_compacted_parent() {
+        for second_checkpoint in [false, true] {
+        let authority = open_lix().await.unwrap();
+        write_key_value(&authority, "offline-checkpoint", "before").await;
+        let mut baseline = authority.create_checkpoint().await.unwrap().commit_id;
+        // The acknowledged ordinary head will be skipped by checkpoint compaction.
+        write_key_value(&authority, "offline-checkpoint", "checkpoint-one").await;
+        let snapshot = authority
+            .pull_sync_repository(None, crate::sync::MAX_SYNC_REQUEST_ITEMS)
+            .await
+            .unwrap();
+        let replica = replica_from_snapshot(&authority, &snapshot).await;
+        let history = authority
+            .execute("SELECT commit_id FROM lix_log()", &[])
+            .await
+            .unwrap();
+        for row in history.rows() {
+            hydrate_history_commit(
+                &authority,
+                &replica,
+                &row.get::<String>("commit_id").unwrap(),
+            )
+            .await;
+        }
+        let mut checkpoint = replica.create_checkpoint().await.unwrap().commit_id;
+        if second_checkpoint {
+            baseline = checkpoint;
+            write_key_value(&replica, "offline-checkpoint", "after").await;
+            checkpoint = replica.create_checkpoint().await.unwrap().commit_id;
+        }
+        let undone = replica
+            .execute(
+                "SELECT commit_id FROM lix_undo($1)",
+                &[Value::Text(checkpoint)],
+            )
+            .await
+            .unwrap();
+        assert!(undone.rows()[0].get::<String>("commit_id").is_ok());
+        let request = replica
+            .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
+            .await
+            .unwrap()
+            .unwrap();
+        authority.push_sync_repository(&request).await.unwrap();
+        assert_eq!(
+            read_key_value(&authority, "offline-checkpoint").await,
+            if second_checkpoint { "checkpoint-one" } else { "before" }
+        );
+        assert_eq!(
+            authority
+                .execute(
+                    "SELECT working_base_commit_id FROM lix_branch WHERE id=lix_active_branch_id()",
+                    &[]
+                )
+                .await
+                .unwrap()
+                .rows()[0]
+                .get::<String>("working_base_commit_id")
+                .unwrap(),
+            baseline
+        );
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_undo_then_redo_is_validated_as_one_sync_ref_batch() {
+        let authority = open_lix().await.expect("authority opens");
+        write_key_value(&authority, "sync-undo", "before").await;
+        let baseline = authority
+            .create_checkpoint()
+            .await
+            .expect("baseline checkpoint")
+            .commit_id;
+        write_key_value(&authority, "sync-undo", "after").await;
+        let checkpoint = authority
+            .create_checkpoint()
+            .await
+            .expect("checkpoint")
+            .commit_id;
+        let snapshot = authority
+            .pull_sync_repository(None, crate::sync::MAX_SYNC_REQUEST_ITEMS)
+            .await
+            .expect("snapshot");
+        let (branch_id, snapshot_head) = default_head(&snapshot);
+        let replica = replica_from_snapshot(&authority, &snapshot).await;
+        // An offline navigation test must cache historical before-images,
+        // not merely the current snapshot. Keep the publication-only demand
+        // responder so an accidental online dependency still fails the test.
+        let history = authority
+            .execute("SELECT commit_id FROM lix_log()", &[])
+            .await
+            .unwrap();
+        for row in history.rows() {
+            hydrate_history_commit(
+                &authority,
+                &replica,
+                &row.get::<String>("commit_id").unwrap(),
+            )
+            .await;
+        }
+
+        let undone = replica
+            .execute(
+                "SELECT commit_id FROM lix_undo($1)",
+                &[Value::Text(checkpoint.clone())],
+            )
+            .await
+            .expect("offline undo")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("undo receipt");
+        assert_eq!(
+            replica
+                .execute(
+                    "SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()",
+                    &[],
+                )
+                .await
+                .expect("replica baseline")
+                .rows()[0]
+                .get::<String>("working_base_commit_id")
+                .expect("replica baseline id"),
+            baseline
+        );
+        let redone = replica
+            .execute(
+                "SELECT commit_id FROM lix_redo($1)",
+                &[Value::Text(undone.clone())],
+            )
+            .await
+            .expect("offline redo")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("redo receipt");
+        assert_eq!(
+            replica
+                .execute(
+                    "SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()",
+                    &[],
+                )
+                .await
+                .expect("replica final baseline")
+                .rows()[0]
+                .get::<String>("working_base_commit_id")
+                .expect("replica final baseline id"),
+            checkpoint
+        );
+
+        let request = replica
+            .build_sync_push(TEST_REMOTE, crate::sync::MAX_SYNC_REQUEST_ITEMS)
+            .await
+            .expect("offline push builds")
+            .expect("offline undo and redo remain pending");
+        let pushed_ids = request
+            .commits
+            .iter()
+            .map(|commit| commit.commit_id.clone())
+            .collect::<BTreeSet<_>>();
+        assert!(pushed_ids.contains(&undone));
+        assert!(pushed_ids.contains(&redone));
+        let update = request
+            .ref_updates
+            .iter()
+            .find(|update| update.branch_id == branch_id)
+            .expect("main branch ref update");
+        assert_eq!(
+            update.expected_head_commit_id.as_deref(),
+            Some(snapshot_head.as_str())
+        );
+        assert_eq!(update.head_commit_id.as_deref(), Some(redone.as_str()));
+        assert_eq!(
+            update.expected_checkpoint_commit_id.as_deref(),
+            Some(checkpoint.as_str())
+        );
+        assert_eq!(
+            update.checkpoint_commit_id.as_deref(),
+            Some(checkpoint.as_str())
+        );
+
+        authority
+            .push_sync_repository(&request)
+            .await
+            .expect("authority accepts the chronological undo/redo batch");
+        assert_eq!(read_key_value(&authority, "sync-undo").await, "after");
+        assert_eq!(
+            authority
+                .execute(
+                    "SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()",
+                    &[],
+                )
+                .await
+                .expect("authority baseline")
+                .rows()[0]
+                .get::<String>("working_base_commit_id")
+                .expect("authority baseline id"),
+            checkpoint
+        );
     }
 
     #[tokio::test]

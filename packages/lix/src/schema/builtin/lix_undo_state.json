@@ -1,0 +1,10 @@
+{
+  "$schema": "https://lix.dev/schema-v1.json",
+  "key": "lix_undo_state",
+  "description": "Internal tracked undo receipt consumption and checkpoint cycle state.",
+  "columns": [
+    { "name": "id", "type": "uuid", "nullable": false },
+    { "name": "state", "type": "jsonb", "nullable": false }
+  ],
+  "primary_key": ["id"]
+}

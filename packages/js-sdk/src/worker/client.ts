@@ -431,8 +431,6 @@ export function workerBinding(
 		activeBranchId: () => request({ kind: "activeBranchId" }),
 		activeAccountId: () => request({ kind: "activeAccountId" }),
 		createBranch: (options) => request({ kind: "createBranch", options }),
-		undo: () => request({ kind: "undo" }),
-		redo: () => request({ kind: "redo" }),
 		switchBranch: (options) => request({ kind: "switchBranch", options }),
 		importFilesystemPaths: (paths) =>
 			request({ kind: "importFilesystemPaths", paths }),

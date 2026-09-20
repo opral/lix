@@ -38,6 +38,11 @@ LIMIT 20;
 
 Position zero is the anchor; positions increase toward older commits and are assigned before filtering, so filtered positions can have gaps. The parent is the actual first parent, not the preceding marked checkpoint. Empty commits appear in the log. The parentless root is a baseline and produces no synthetic history additions.
 
+`is_checkpoint` records immutable commit metadata. For an application's current
+checkpoint list, filter `lix_log()` by `is_checkpoint_active`; it excludes
+checkpoints retired by [undo](./undo-redo.md) at the query anchor. Historical
+queries anchored before the undo still show the checkpoint as active.
+
 `lix_commit` is the repository-global inventory, including retained off-branch checkpoints. Use `SELECT count(*) FROM lix_commit WHERE is_checkpoint` for a global checkpoint metric. `lix_log` is branch-relative. For full DAG inspection, use `lix_commit.parent_commit_ids` and `lix_commit_ancestry`.
 
 ## Row history

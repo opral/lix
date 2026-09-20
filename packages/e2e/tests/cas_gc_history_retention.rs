@@ -478,12 +478,12 @@ where
         .expect("retained historical blob diff should remain readable");
     assert_eq!(diff.rows()[0].get::<i64>("entries").unwrap(), 1);
     session
-        .undo()
+        .execute("SELECT commit_id FROM lix_undo()", &[])
         .await
         .expect("retained historical blob should support undo");
     assert_eq!(read_current_file(&session).await, V1);
     session
-        .redo()
+        .execute("SELECT commit_id FROM lix_redo()", &[])
         .await
         .expect("retained historical blob should support redo");
     assert_eq!(read_current_file(&session).await, V2);

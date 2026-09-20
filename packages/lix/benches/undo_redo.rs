@@ -1,7 +1,4 @@
-use std::{
-    future::IntoFuture,
-    time::{Duration, Instant},
-};
+use std::{cell::RefCell, future::IntoFuture, time::Instant};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use lix::{ExecuteBatchStatement, Memory, Value};
@@ -193,6 +190,39 @@ fn seeded_descriptor_unrelated_width_storage(
     })
 }
 
+fn seeded_checkpoint_inventory_storage(
+    runtime: &tokio::runtime::Runtime,
+    effect_width: usize,
+) -> (Memory, String) {
+    runtime.block_on(async move {
+        let storage = Memory::new();
+        let session = open_lix()
+            .with_storage(storage.clone())
+            .await
+            .expect("benchmark lix opens");
+        let values = (0..effect_width)
+            .map(|index| format!("('checkpoint-{index}', '{index}')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        session
+            .execute(
+                &format!("INSERT INTO lix_key_value (key, value) VALUES {values}"),
+                &[],
+            )
+            .await
+            .expect("checkpoint inventory rows commit");
+        let checkpoint = session
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .await
+            .expect("checkpoint inventory checkpoint succeeds")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("checkpoint inventory receipt");
+        drop(session);
+        (storage, checkpoint)
+    })
+}
+
 fn open_session(runtime: &tokio::runtime::Runtime, storage: Memory) -> Lix<Memory> {
     runtime.block_on(async move {
         open_lix()
@@ -200,6 +230,53 @@ fn open_session(runtime: &tokio::runtime::Runtime, storage: Memory) -> Lix<Memor
             .await
             .expect("benchmark lix opens")
     })
+}
+
+thread_local! {
+    static BENCH_TIMINGS: RefCell<Vec<(&'static str, u128)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn timed_operation<T>(name: &'static str, operation: impl FnOnce() -> T) -> T {
+    if std::env::var_os("LIX_BENCH_TIMINGS").is_none() {
+        return operation();
+    }
+    let started = Instant::now();
+    let output = operation();
+    BENCH_TIMINGS.with(|timings| {
+        timings
+            .borrow_mut()
+            .push((name, started.elapsed().as_nanos()))
+    });
+    output
+}
+
+fn dump_bench_timings() {
+    if std::env::var_os("LIX_BENCH_TIMINGS").is_none() {
+        return;
+    }
+    BENCH_TIMINGS.with(|timings| {
+        let mut timings = timings.borrow_mut();
+        timings.sort_unstable_by_key(|(name, nanos)| (*name, *nanos));
+        let mut start = 0;
+        while start < timings.len() {
+            let name = timings[start].0;
+            let end = timings[start..]
+                .iter()
+                .position(|(candidate, _)| *candidate != name)
+                .map_or(timings.len(), |offset| start + offset);
+            let values = &timings[start..end];
+            let median = values[values.len() / 2].1;
+            println!(
+                "LIX_BENCH_TIMING name={name} samples={} min_ns={} median_ns={} max_ns={}",
+                values.len(),
+                values.first().expect("timing sample exists").1,
+                median,
+                values.last().expect("timing sample exists").1,
+            );
+            start = end;
+        }
+        timings.clear();
+    });
 }
 
 fn benchmark_undo_redo(criterion: &mut Criterion) {
@@ -214,51 +291,55 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
             BenchmarkId::new("ordinary_update", history_depth),
             &history_depth,
             |benchmark, _| {
-                benchmark.iter_custom(|iterations| {
-                    let mut elapsed = Duration::ZERO;
-                    for _ in 0..iterations {
-                        let session = open_session(
+                benchmark.iter_with_setup(
+                    || {
+                        open_session(
                             &runtime,
                             undo_snapshot
                                 .fork()
                                 .expect("update benchmark fixture forks"),
-                        );
-                        let started = Instant::now();
-                        runtime
-                            .block_on(
-                                session
-                                    .execute(
-                                        "UPDATE lix_key_value SET value = 'next' WHERE key = 'bench-key'",
-                                        &[],
-                                    )
-                                    .into_future(),
-                            )
-                            .expect("benchmarked ordinary update succeeds");
-                        elapsed += started.elapsed();
-                    }
-                    elapsed
-                });
+                        )
+                    },
+                    |session| {
+                        timed_operation("ordinary_update", || {
+                            runtime
+                                .block_on(
+                                    session
+                                        .execute(
+                                            "UPDATE lix_key_value SET value = 'next' WHERE key = 'bench-key'",
+                                            &[],
+                                        )
+                                        .into_future(),
+                                )
+                                .expect("benchmarked ordinary update succeeds");
+                        });
+                    },
+                );
             },
         );
         group.bench_with_input(
             BenchmarkId::new("undo", history_depth),
             &history_depth,
             |benchmark, _| {
-                benchmark.iter_custom(|iterations| {
-                    let mut elapsed = Duration::ZERO;
-                    for _ in 0..iterations {
-                        let session = open_session(
+                benchmark.iter_with_setup(
+                    || {
+                        open_session(
                             &runtime,
                             undo_snapshot.fork().expect("undo benchmark fixture forks"),
-                        );
-                        let started = Instant::now();
-                        runtime
-                            .block_on(session.undo())
-                            .expect("benchmarked undo succeeds");
-                        elapsed += started.elapsed();
-                    }
-                    elapsed
-                });
+                        )
+                    },
+                    |session| {
+                        timed_operation("undo", || {
+                            runtime
+                                .block_on(
+                                    session
+                                        .execute("SELECT commit_id FROM lix_undo()", &[])
+                                        .into_future(),
+                                )
+                                .expect("benchmarked undo succeeds");
+                        });
+                    },
+                );
             },
         );
 
@@ -266,7 +347,11 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
         let redo_storage = redo_snapshot.fork().expect("redo seed fixture forks");
         let redo_session = open_session(&runtime, redo_storage.clone());
         runtime
-            .block_on(redo_session.undo())
+            .block_on(
+                redo_session
+                    .execute("SELECT commit_id FROM lix_undo()", &[])
+                    .into_future(),
+            )
             .expect("redo benchmark starts undone");
         drop(redo_session);
         let redo_snapshot = redo_storage.fork().expect("undone benchmark fixture forks");
@@ -274,21 +359,25 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
             BenchmarkId::new("redo", history_depth),
             &history_depth,
             |benchmark, _| {
-                benchmark.iter_custom(|iterations| {
-                    let mut elapsed = Duration::ZERO;
-                    for _ in 0..iterations {
-                        let session = open_session(
+                benchmark.iter_with_setup(
+                    || {
+                        open_session(
                             &runtime,
                             redo_snapshot.fork().expect("redo benchmark fixture forks"),
-                        );
-                        let started = Instant::now();
-                        runtime
-                            .block_on(session.redo())
-                            .expect("benchmarked redo succeeds");
-                        elapsed += started.elapsed();
-                    }
-                    elapsed
-                });
+                        )
+                    },
+                    |session| {
+                        timed_operation("redo", || {
+                            runtime
+                                .block_on(
+                                    session
+                                        .execute("SELECT commit_id FROM lix_redo()", &[])
+                                        .into_future(),
+                                )
+                                .expect("benchmarked redo succeeds");
+                        });
+                    },
+                );
             },
         );
     }
@@ -301,21 +390,94 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
             BenchmarkId::new("undo_file_delete", unrelated_width),
             &unrelated_width,
             |benchmark, _| {
-                benchmark.iter_custom(|iterations| {
-                    let mut elapsed = Duration::ZERO;
-                    for _ in 0..iterations {
-                        let session = open_session(
+                benchmark.iter_with_setup(
+                    || {
+                        open_session(
                             &runtime,
                             snapshot.fork().expect("descriptor benchmark fixture forks"),
-                        );
-                        let started = Instant::now();
-                        runtime
-                            .block_on(session.undo())
-                            .expect("benchmarked descriptor undo succeeds");
-                        elapsed += started.elapsed();
-                    }
-                    elapsed
-                });
+                        )
+                    },
+                    |session| {
+                        timed_operation("undo_file_delete", || {
+                            runtime
+                                .block_on(
+                                    session
+                                        .execute("SELECT commit_id FROM lix_undo()", &[])
+                                        .into_future(),
+                                )
+                                .expect("benchmarked descriptor undo succeeds");
+                        });
+                    },
+                );
+            },
+        );
+    }
+    group.finish();
+
+    // A first undo of a checkpoint must build its complete immutable effect
+    // inventory even when the caller selects one row. Keep full and scoped
+    // cases beside each other to expose whether that inventory scales with the
+    // checkpoint width rather than with the selected row count.
+    let mut group = criterion.benchmark_group("undo_checkpoint_effect_inventory");
+    for effect_width in [1_usize, 100, 1_000, 10_000] {
+        let (snapshot, checkpoint) = seeded_checkpoint_inventory_storage(&runtime, effect_width);
+        let target_params = [Value::Text(checkpoint.clone())];
+        group.bench_with_input(
+            BenchmarkId::new("full", effect_width),
+            &effect_width,
+            |benchmark, _| {
+                benchmark.iter_with_setup(
+                    || {
+                        open_session(
+                            &runtime,
+                            snapshot.fork().expect("checkpoint inventory fixture forks"),
+                        )
+                    },
+                    |session| {
+                        timed_operation("checkpoint_full", || {
+                            runtime
+                                .block_on(
+                                    session
+                                        .execute(
+                                            "SELECT commit_id FROM lix_undo($1)",
+                                            &target_params,
+                                        )
+                                        .into_future(),
+                                )
+                                .expect("full checkpoint undo succeeds");
+                        });
+                    },
+                );
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("scoped_first_undo", effect_width),
+            &effect_width,
+            |benchmark, _| {
+                benchmark.iter_with_setup(
+                    || {
+                        open_session(
+                            &runtime,
+                            snapshot
+                                .fork()
+                                .expect("checkpoint inventory fixture forks"),
+                        )
+                    },
+                    |session| {
+                        timed_operation("checkpoint_scoped_first_undo", || {
+                            runtime
+                                .block_on(
+                                    session
+                                        .execute(
+                                            "SELECT commit_id FROM lix_undo($1, ARRAY[lix_row_ref('lix_key_value', 'checkpoint-0')])",
+                                            &target_params,
+                                        )
+                                        .into_future(),
+                                )
+                                .expect("scoped checkpoint undo succeeds");
+                        });
+                    },
+                );
             },
         );
     }
@@ -328,23 +490,27 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
             BenchmarkId::new("undo", transition_width),
             &transition_width,
             |benchmark, _| {
-                benchmark.iter_custom(|iterations| {
-                    let mut elapsed = Duration::ZERO;
-                    for _ in 0..iterations {
-                        let session = open_session(
+                benchmark.iter_with_setup(
+                    || {
+                        open_session(
                             &runtime,
                             snapshot
                                 .fork()
                                 .expect("wide-transition benchmark fixture forks"),
-                        );
-                        let started = Instant::now();
-                        runtime
-                            .block_on(session.undo())
-                            .expect("benchmarked wide-transition undo succeeds");
-                        elapsed += started.elapsed();
-                    }
-                    elapsed
-                });
+                        )
+                    },
+                    |session| {
+                        timed_operation("transition_undo", || {
+                            runtime
+                                .block_on(
+                                    session
+                                        .execute("SELECT commit_id FROM lix_undo()", &[])
+                                        .into_future(),
+                                )
+                                .expect("benchmarked wide-transition undo succeeds");
+                        });
+                    },
+                );
             },
         );
     }
@@ -357,23 +523,27 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
             BenchmarkId::new("undo", parent_width),
             &parent_width,
             |benchmark, _| {
-                benchmark.iter_custom(|iterations| {
-                    let mut elapsed = Duration::ZERO;
-                    for _ in 0..iterations {
-                        let session = open_session(
+                benchmark.iter_with_setup(
+                    || {
+                        open_session(
                             &runtime,
                             snapshot
                                 .fork()
                                 .expect("wide-parent benchmark fixture forks"),
-                        );
-                        let started = Instant::now();
-                        runtime
-                            .block_on(session.undo())
-                            .expect("benchmarked wide-parent undo succeeds");
-                        elapsed += started.elapsed();
-                    }
-                    elapsed
-                });
+                        )
+                    },
+                    |session| {
+                        timed_operation("wide_parent_undo", || {
+                            runtime
+                                .block_on(
+                                    session
+                                        .execute("SELECT commit_id FROM lix_undo()", &[])
+                                        .into_future(),
+                                )
+                                .expect("benchmarked wide-parent undo succeeds");
+                        });
+                    },
+                );
             },
         );
     }
@@ -386,25 +556,30 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
             BenchmarkId::new("undo", history_depth),
             &history_depth,
             |benchmark, _| {
-                benchmark.iter_custom(|iterations| {
-                    let mut elapsed = Duration::ZERO;
-                    for _ in 0..iterations {
-                        let session = open_session(
+                benchmark.iter_with_setup(
+                    || {
+                        open_session(
                             &runtime,
                             snapshot.fork().expect("sparse-gap benchmark fixture forks"),
-                        );
-                        let started = Instant::now();
-                        runtime
-                            .block_on(session.undo())
-                            .expect("benchmarked sparse-gap undo succeeds");
-                        elapsed += started.elapsed();
-                    }
-                    elapsed
-                });
+                        )
+                    },
+                    |session| {
+                        timed_operation("sparse_undo", || {
+                            runtime
+                                .block_on(
+                                    session
+                                        .execute("SELECT commit_id FROM lix_undo()", &[])
+                                        .into_future(),
+                                )
+                                .expect("benchmarked sparse-gap undo succeeds");
+                        });
+                    },
+                );
             },
         );
     }
     group.finish();
+    dump_bench_timings();
 }
 
 criterion_group!(benches, benchmark_undo_redo);

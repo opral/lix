@@ -53,9 +53,16 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
         // Bootstrap may retain ref facts; ordinary writes must not append head movements.
-        let initial_ref_changes = session.execute(
-            "SELECT count(*) AS n FROM lix_change WHERE schema_key = 'lix_branch_ref'", &[],
-        ).await.unwrap().rows()[0].get::<i64>("n").unwrap();
+        let initial_ref_changes = session
+            .execute(
+                "SELECT count(*) AS n FROM lix_change WHERE schema_key = 'lix_branch_ref'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<i64>("n")
+            .unwrap();
         let file_id = "01950000-0000-7000-8000-000000000041";
         session.execute(
         "INSERT INTO lix_file (id, path, content) VALUES ($1, '/record.txt', CAST('hello' AS BYTEA))",

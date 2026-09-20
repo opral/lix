@@ -32,6 +32,36 @@
       "name": "undo_target_after",
       "type": "uuid",
       "nullable": true
+    },
+    {
+      "name": "effects",
+      "type": "jsonb",
+      "nullable": true
+    },
+    {
+      "name": "selected_files",
+      "type": "jsonb",
+      "nullable": true
+    },
+    {
+      "name": "checkpoint",
+      "type": "boolean",
+      "nullable": true
+    },
+    {
+      "name": "source_undo_commit_id",
+      "type": "uuid",
+      "nullable": true
+    },
+    {
+      "name": "baseline_before",
+      "type": "uuid",
+      "nullable": true
+    },
+    {
+      "name": "baseline_after",
+      "type": "uuid",
+      "nullable": true
     }
   ],
   "primary_key": [

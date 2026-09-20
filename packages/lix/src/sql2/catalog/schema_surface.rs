@@ -377,7 +377,7 @@ pub(crate) fn schema_exposed_as_schema_surface(schema_key: &str) -> bool {
             | "lix_checkpoint"
             | "lix_directory_descriptor"
             | "lix_file_descriptor"
-            | "lix_undo_redo_marker"
+            | "lix_undo_redo_marker" | "lix_undo_state"
             | "lix_collection_generation"
     )
 }

@@ -459,17 +459,21 @@ where
     register_schema(&session).await;
     seed_rows(&session, rows).await;
     let seed_commit_id = current_head_commit_id(&session).await;
-    let seed_has_root = has_durable_commit_root_for_bench(storage.clone(), &seed_commit_id)
+    let session_storage = session.storage_adapter();
+    let seed_has_root = has_durable_commit_root_for_bench(&session_storage, &seed_commit_id)
         .await
         .expect("inspect seeded undo benchmark root");
     stage_transition(&session, rows, width).await;
     let transition_commit_id = current_head_commit_id(&session).await;
     let transition_has_root =
-        has_durable_commit_root_for_bench(storage.clone(), &transition_commit_id)
+        has_durable_commit_root_for_bench(&session_storage, &transition_commit_id)
             .await
             .expect("inspect transition undo benchmark root");
     if matches!(ready, ReadyState::Redo) {
-        session.undo().await.expect("prepare redo-ready fixture");
+        session
+            .execute("SELECT commit_id FROM lix_undo()", &[])
+            .await
+            .expect("prepare redo-ready fixture");
     }
     let expected_after = if matches!(ready, ReadyState::Undo) {
         width
@@ -618,17 +622,29 @@ async fn measure<S>(
 
     match operation {
         Operation::Undo => {
-            session.undo().await.expect("measure undo");
+            session
+                .execute("SELECT commit_id FROM lix_undo()", &[])
+                .await
+                .expect("measure undo");
         }
         Operation::Redo => {
-            session.redo().await.expect("measure redo");
+            session
+                .execute("SELECT commit_id FROM lix_redo()", &[])
+                .await
+                .expect("measure redo");
         }
         Operation::Chain => {
             for index in 0..steps {
                 if index.is_multiple_of(2) {
-                    session.undo().await.expect("measure chained undo");
+                    session
+                        .execute("SELECT commit_id FROM lix_undo()", &[])
+                        .await
+                        .expect("measure chained undo");
                 } else {
-                    session.redo().await.expect("measure chained redo");
+                    session
+                        .execute("SELECT commit_id FROM lix_redo()", &[])
+                        .await
+                        .expect("measure chained redo");
                 }
             }
         }

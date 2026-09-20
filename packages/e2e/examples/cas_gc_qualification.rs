@@ -564,7 +564,7 @@ where
         .expect("retained root B file absence should read");
     assert_eq!(absent.rows()[0].get::<i64>("entries").unwrap(), 0);
     session
-        .undo()
+        .execute("SELECT commit_id FROM lix_undo()", &[])
         .await
         .expect("retained owner undo should succeed");
     let bytes = read_current_file(&session).await;
@@ -575,7 +575,7 @@ where
     );
     drop(bytes);
     session
-        .redo()
+        .execute("SELECT commit_id FROM lix_redo()", &[])
         .await
         .expect("retained owner redo should succeed");
     let absent = session

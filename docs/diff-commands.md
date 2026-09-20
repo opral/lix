@@ -71,7 +71,7 @@ SELECT row_ref, id, to_path
 FROM lix_diff('lix_file', lix_root_commit_id(), $1);
 ```
 
-## Undo a selected change
+## Revert a selected historical change
 
 To undo a historical span, use `lix_revert_range` with the original endpoint order:
 
@@ -99,7 +99,58 @@ Use the `commit.before` and `commit.after` returned by the original write or tra
 
 Later changes to unrelated rows are preserved. Each affected row must still have the version expected by the reversed diff (or be absent when absence is expected). A later edit to an affected row rejects the entire statement with `LIX_CONSTRAINT_VIOLATION`, even if that edit changed a different column. No subset of the undo is committed. Related rows required for a valid apply can also be included by dependency planning; constraints and their version checks still apply.
 
-`lix_restore` copies selected rows from a source commit into a new commit on the active branch. Pass `(SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id())` as the source when discarding current working edits. Use `lix_revert_range(before, after[, rows])` for a historical span, or `lix_revert(commit[, rows])` for a single commit. Use `lix_apply(before, after[, rows])` when replaying a forward difference.
+`lix_restore` copies selected rows from a source commit into a new commit on the active branch. Pass `(SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id())` as the source when discarding current working edits. Use `lix_revert_range(before, after[, rows])` for a historical span, or `lix_revert(commit[, rows])` for a single commit. Use `lix_apply(before, after[, rows])` when replaying a forward difference. These commands are explicit content operations; they do not alter checkpoint designation or undo/redo receipt bookkeeping.
+
+## Undo and redo
+
+SQL undo/redo navigates the durable logical editor stack while keeping every
+commit in immutable history. The one-argument undo target is the original
+ordinary commit or checkpoint `C`; redo takes the undo receipt `U` returned by
+that call:
+
+```sql
+SELECT commit_id FROM lix_undo($1);
+SELECT commit_id FROM lix_redo($1); -- $1 is U, not C
+
+SELECT commit_id
+FROM lix_undo(
+  $1,
+  ARRAY(
+    SELECT row_ref
+    FROM lix_diff('acme_task', $2, $3)
+    WHERE done = false
+  )
+);
+
+SELECT commit_id
+FROM lix_redo(
+  $1,
+  ARRAY[lix_row_ref('acme_task', $2)]
+);
+```
+
+Use `lix_undo()` and `lix_redo()` for the current stack cursor. Generated undo
+and redo commits are skipped by that cursor. A later ordinary edit clears the
+convenience redo path; retained ordinary receipts remain explicitly replayable
+when their exact effects are still pending and current-row preconditions hold.
+Undoing a restore or revert commit is ordinary stack navigation, while issuing
+restore/revert/apply itself does not silently become checkpoint navigation.
+
+`row_ref` selects row identities; the target commit or undo receipt determines
+the exact historical effects. Omitted scope includes all content dependencies and
+checkpoint metadata. `ARRAY[]` is a successful no-op and returns `commit_id =
+NULL`; NULL scope is an error. Every non-empty call commits atomically. A
+selected conflict rejects content, receipt consumption, checkpoint metadata,
+baseline, and stack movement together.
+
+For a checkpoint, partial undo keeps its baseline. Final causal undo retires
+the checkpoint and moves the working baseline to its predecessor; complete redo
+reactivates it. A checkpoint with no content rows still has a durable metadata
+effect, so its undo and redo each return a non-NULL commit. A newer checkpoint
+stales all explicit receipts for the older checkpoint, including filtered redo.
+On a partial replica, the command requires authoritative complete effect
+coverage, before-images, dependencies, and checkpoint metadata. Event arrival
+alone does not move the working baseline.
 
 ## Commands
 
@@ -139,6 +190,6 @@ SELECT commit_id FROM lix_create_checkpoint();
 
 Selecting a file includes the tracked rows composing that file. Partial file checkpoints also include required ancestor directory descriptors. Directory rows and mixed-relation selections use the same dependency planner. A scope that cannot be closed into a valid checkpoint fails before commit.
 
-Each statement is atomic. An empty recovery/apply selection succeeds without creating a content commit and returns one receipt row with `commit_id = NULL`; duplicate selected identities are rejected. A non-empty command returns one new commit ID. Full checkpoints retain their intentional empty milestone behavior. The command result is a receipt, so callers should inspect its row rather than infer the commit from selected-row counts. Full checkpoints structurally reuse the branch state without copying application rows.
+Each statement is atomic. An empty recovery/apply selection succeeds without creating a content commit and returns one receipt row with `commit_id = NULL`; duplicate selected identities are rejected. A non-empty command returns one new commit ID. Full checkpoints retain their intentional empty milestone behavior. Undo/redo metadata-only transitions are the exception: they intentionally create a non-NULL commit even when no content row changes. The command result is a receipt, so callers should inspect its row rather than infer the commit from selected-row counts. Full checkpoints structurally reuse the branch state without copying application rows.
 
 Rows written with `lixcol_untracked` are absent from every diff. Untracked state belongs to the local repository replica and is not transported through commit-based synchronization; use a separate service for state that needs synchronization without version history.

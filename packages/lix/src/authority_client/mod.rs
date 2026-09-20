@@ -1,7 +1,7 @@
 //! Host-pluggable Lix Server Protocol client.
 
 mod admission;
-pub use admission::{ProtocolAdmissionIdentity, admit_protocol_client};
+pub use admission::admit_protocol_client;
 mod blobs;
 mod http;
 mod observe;
@@ -25,7 +25,7 @@ use tokio::sync::Mutex;
 use crate::{
     CreateBranchOptions, CreateBranchReceipt, ExecuteBatchStatement, ExecuteResult, LixError,
     MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
-    RedoReceipt, SwitchBranchReceipt, UndoReceipt, Value,
+    SwitchBranchReceipt, Value,
 };
 
 use blobs::{BlobCache, PreparedRequestParams, request_blob_slot};
@@ -35,8 +35,8 @@ use wire::{
     ExecuteBatchStatementBody, ExecuteOptionsBody, ExecuteRequestBody, ExecuteResponseBody,
     HandshakeResponse, IDEMPOTENCY_KEY_HEADER, MergeBranchPreviewRequestBody,
     MergeBranchPreviewResponseBody, MergeBranchRequestBody, MergeBranchResponseBody,
-    RedoResponseBody, SERVER_PROTOCOL_VERSION, SESSION_HEADER, SwitchBranchRequestBody,
-    SwitchBranchResponseBody, TRANSACTION_HEADER, UndoResponseBody, closed_error,
+    SERVER_PROTOCOL_VERSION, SESSION_HEADER, SwitchBranchRequestBody, SwitchBranchResponseBody,
+    TRANSACTION_HEADER, closed_error,
     encode_engine_values, is_recoverable_session_error, protocol_error, remote_error,
     unsupported_remote_operation, validate_session_id,
 };
@@ -765,54 +765,6 @@ impl<H: ProtocolHttp> ClientCore<H> {
                     name: value.name,
                     hidden: value.hidden,
                     commit_id: value.commit_id,
-                })
-            })
-            .await
-        })
-        .await
-    }
-
-    pub async fn undo(&self) -> Result<UndoReceipt, LixError> {
-        self.enqueue(|| async {
-            self.with_session_recovery(|| async {
-                let value = self
-                    .request_json::<UndoResponseBody, EmptyBody>(
-                        "POST",
-                        self.join_path("undo")?,
-                        true,
-                        None,
-                        Some(EmptyBody {}),
-                        "json",
-                    )
-                    .await?;
-                Ok(UndoReceipt {
-                    branch_id: value.branch_id,
-                    target_commit_id: value.target_commit_id,
-                    inverse_commit_id: value.inverse_commit_id,
-                })
-            })
-            .await
-        })
-        .await
-    }
-
-    pub async fn redo(&self) -> Result<RedoReceipt, LixError> {
-        self.enqueue(|| async {
-            self.with_session_recovery(|| async {
-                let value = self
-                    .request_json::<RedoResponseBody, EmptyBody>(
-                        "POST",
-                        self.join_path("redo")?,
-                        true,
-                        None,
-                        Some(EmptyBody {}),
-                        "json",
-                    )
-                    .await?;
-                Ok(RedoReceipt {
-                    branch_id: value.branch_id,
-                    target_commit_id: value.target_commit_id,
-                    replay_commit_id: value.replay_commit_id,
                 })
             })
             .await

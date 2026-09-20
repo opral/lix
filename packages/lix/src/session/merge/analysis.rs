@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::LixError;
 use crate::changelog::CommitId;
 use crate::storage_adapter::StorageAdapterRead;
@@ -103,6 +105,7 @@ where
             .diff_commit_members(&base_commit_id, &target_commit_id, &request)
             .await?
     };
+    reject_independent_undo_state_overlap(&target_diff, &source_diff)?;
     exclude_checkpoint_rows(&mut source_diff);
     exclude_checkpoint_rows(&mut target_diff);
 
@@ -152,6 +155,50 @@ fn exclude_checkpoint_rows(diff: &mut TrackedStateDiff) {
     });
 }
 
+/// Undo/redo state is a semantic receipt ledger. Two branches may carry the
+/// same resulting JSON after independently consuming a receipt, but those
+/// writes are still different events and cannot be reconciled by the generic
+/// equal-final-state merge rule. Preserve a shared event identity when both
+/// sides selected the exact same immutable change; reject every other overlap
+/// before any merge plan or write is staged.
+fn reject_independent_undo_state_overlap(
+    target: &TrackedStateDiff,
+    source: &TrackedStateDiff,
+) -> Result<(), LixError> {
+    // `analyze` receives globally sorted diffs, while partial incoming-row
+    // analysis assembles independently filtered groups. Search only the
+    // sparse internal ledger rows so this guard does not depend on either
+    // caller's concatenation order.
+    let source_undo_state = source
+        .entries
+        .iter()
+        .filter(|entry| entry.identity.schema_key() == crate::undo_redo::UNDO_STATE_SCHEMA_KEY)
+        .map(|entry| (entry.identity.clone(), entry))
+        .collect::<HashMap<_, _>>();
+
+    for target_entry in target
+        .entries
+        .iter()
+        .filter(|entry| entry.identity.schema_key() == crate::undo_redo::UNDO_STATE_SCHEMA_KEY)
+    {
+        let Some(source_entry) = source_undo_state.get(&target_entry.identity) else {
+            continue;
+        };
+        if target_entry.after.as_ref().map(|row| row.change_id)
+            != source_entry.after.as_ref().map(|row| row.change_id)
+        {
+            return Err(LixError::new(
+                LixError::CODE_MERGE_CONFLICT,
+                format!(
+                    "independent undo state changes conflict for row '{}'",
+                    target_entry.identity.row_pk().as_json_array_text()?
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Analyze only caller-proven incoming identities. Remote-only rows remain in
 /// the target root, so reconciliation never needs a repository-wide diff.
 pub(crate) async fn analyze_incoming_rows<S: StorageAdapterRead>(
@@ -162,6 +209,7 @@ pub(crate) async fn analyze_incoming_rows<S: StorageAdapterRead>(
     mut source_diff: TrackedStateDiff,
     mut target_diff: TrackedStateDiff,
 ) -> Result<MergeAnalysis, LixError> {
+    reject_independent_undo_state_overlap(&target_diff, &source_diff)?;
     exclude_checkpoint_rows(&mut source_diff);
     exclude_checkpoint_rows(&mut target_diff);
     let fallback = crate::tracked_state::merge_payload_fallback_ids(&target_diff, &source_diff)?;

@@ -313,7 +313,7 @@ impl PublicCatalog {
             vec![PublicColumn::public_read_only("commit_id", false)],
             SurfaceCapabilities::read_only(),
         ))?;
-        for name in ["lix_restore", "lix_revert", "lix_revert_range", "lix_apply"] {
+        for name in ["lix_restore", "lix_revert", "lix_revert_range", "lix_apply", "lix_undo", "lix_redo"] {
             self.insert(surface(
                 name,
                 PublicSurfaceClass::TableFunction,

@@ -100,32 +100,6 @@ macro_rules! wasm_session_methods {
                 })
             }
 
-            #[wasm_bindgen(js_name = undo)]
-            pub async fn undo(&self) -> Result<JsValue, JsValue> {
-                let receipt = self
-                    .instrument_operation(crate::session::SessionOperations::undo(&self.inner))
-                    .await
-                    .map_err(crate::wasm::lix_error_to_js)?;
-                crate::wasm::to_js(&crate::wasm::UndoReceiptDto {
-                    branch_id: receipt.branch_id,
-                    target_commit_id: receipt.target_commit_id,
-                    inverse_commit_id: receipt.inverse_commit_id,
-                })
-            }
-
-            #[wasm_bindgen(js_name = redo)]
-            pub async fn redo(&self) -> Result<JsValue, JsValue> {
-                let receipt = self
-                    .instrument_operation(crate::session::SessionOperations::redo(&self.inner))
-                    .await
-                    .map_err(crate::wasm::lix_error_to_js)?;
-                crate::wasm::to_js(&crate::wasm::RedoReceiptDto {
-                    branch_id: receipt.branch_id,
-                    target_commit_id: receipt.target_commit_id,
-                    replay_commit_id: receipt.replay_commit_id,
-                })
-            }
-
             #[wasm_bindgen(js_name = switchBranch)]
             pub async fn switch_branch(&self, options: JsValue) -> Result<JsValue, JsValue> {
                 let options: crate::wasm::SwitchBranchOptionsDto = crate::wasm::from_js(options)?;

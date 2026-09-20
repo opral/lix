@@ -90,7 +90,7 @@ ORDER BY depth, commit_id;
 
 `(SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id())` returns the active branch's actual working-diff baseline. It may be an ordinary commit after a fork and is not necessarily the newest marked checkpoint.
 
-Recovery and apply are top-level mutating `SELECT` functions. The exact outer shape is `SELECT commit_id FROM ...`; each command returns one receipt row, with `commit_id = NULL` for an empty or unchanged recovery/apply selection:
+Recovery, undo/redo, and apply are top-level mutating `SELECT` functions. The exact outer shape is `SELECT commit_id FROM ...`; each command returns one receipt row, with `commit_id = NULL` for an empty or unchanged selection:
 
 ```sql
 SELECT commit_id FROM lix_restore($1);
@@ -124,11 +124,35 @@ FROM lix_revert_range(
   $2,
   ARRAY[lix_row_ref('lix_file', $3)]
 );
+
+SELECT commit_id FROM lix_undo();
+SELECT commit_id FROM lix_undo($1); -- original ordinary commit or checkpoint C
+SELECT commit_id
+FROM lix_undo(
+  $1,
+  ARRAY(
+    SELECT row_ref FROM lix_diff('acme_task', $2, $3) WHERE selected
+  )
+);
+
+SELECT commit_id FROM lix_redo();
+SELECT commit_id FROM lix_redo($1); -- undo receipt U returned by lix_undo
+SELECT commit_id
+FROM lix_redo($1, ARRAY[lix_row_ref('acme_task', $2)]);
 ```
 
 Restore makes selected tracked content equal the source commit in a new commit on the current branch. Omitted scope restores the whole tracked repository, including deleting rows absent from the source. Selected restore leaves unrelated content alone and handles required dependencies atomically. It leaves the current working baseline unchanged, preserves branch-local untracked rows, and does not move the branch pointer backward. Revert reverses one commit, including a checkpoint commit, against its actual first parent; `lix_revert_range(before, after [, rows])` reverses the net endpoint difference. Apply replays the forward difference between explicit `before` and `after` endpoints. Later conflicting versions reject the command atomically. Mutating functions execute once as top-level commands and cannot be used as join inputs.
 
-Use `execute` for remote callers as well; restore does not add a server-protocol endpoint or a typed SDK method.
+Undo and redo are SQL-only navigation commands. `lix_undo(C [, rows])` targets an eligible ordinary forward commit or checkpoint cycle and returns a new undo receipt commit `U`. `lix_redo(U [, rows])` takes that undo receipt, never the original `C` and never a redo receipt. Receipt effect identities are consumed exactly once, so partial redo leaves the unconsumed effects on the same receipt. An exhausted receipt returns `NULL`; a wrong-role or unknown ID is an error.
+
+See [Undo and redo](./undo-redo.md) for the complete signatures, operation
+selection guide, checkpoint-cycle rules, and replication contract.
+
+No-argument undo and redo follow the durable logical editor stack and skip generated undo/redo commits. A later ordinary edit clears the convenience redo cursor but does not erase immutable receipts or history. A restore or revert commit is an ordinary undoable action and does not update undo/redo bookkeeping merely because it reverses content.
+
+For checkpoints, partial undo keeps the checkpoint as the working baseline. The final causal undo retires the checkpoint and changes the baseline to its predecessor; complete redo reactivates it. The transition includes one durable metadata effect even when the checkpoint contains no content rows, so metadata-only undo and redo return non-NULL commits. `ARRAY[]` is an explicit empty selection and returns `NULL`; an omitted scope includes checkpoint metadata. A newer checkpoint makes every explicit receipt for the older checkpoint stale, including filtered redo, without changing state.
+
+Partial replicas may execute these commands only with authoritative complete effect coverage, before-images, dependency closure, and checkpoint metadata. Receiving an event or a row subset alone does not advance the working baseline. Incorporation publishes content, metadata, baseline, and logical stack together; failed hydration or a selected conflict leaves all of them unchanged. Undo/redo do not add a server-protocol endpoint or a typed SDK method; remote callers use `execute` with these SQL statements.
 
 ## IDs and time
 

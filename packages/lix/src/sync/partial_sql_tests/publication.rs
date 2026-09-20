@@ -130,6 +130,335 @@ pub(super) async fn fixture_from_authority(
     storage.admit_partial_replica_writer(crate::sync::partial_replica_write_capability());
     (authority, Arc::new(engine), session, state)
 }
+
+#[tokio::test]
+async fn checkpoint_undo_hydrates_partial_history_and_preserves_unrelated_rows() {
+    let authority = open_lix().await.unwrap();
+    authority
+        .set_sync_role(crate::sync::SyncRole::Authority)
+        .unwrap();
+    authority
+        .execute(
+            "INSERT INTO lix_key_value(key,value) VALUES ('undo-target','before'), ('undo-unrelated','keep')",
+            &[],
+        )
+        .await
+        .unwrap();
+    let before_checkpoint = authority
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("commit_id")
+        .unwrap();
+    authority
+        .execute(
+            "UPDATE lix_key_value SET value='after' WHERE key='undo-target'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let target_checkpoint = authority
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("commit_id")
+        .unwrap();
+
+    let (authority, engine, session, state) = fixture_from_authority(authority, None).await;
+    let mut fetches = Fetches::default();
+    let undo = execute_hydrating(
+        &session,
+        &engine.storage(),
+        &state,
+        &authority,
+        "SELECT commit_id FROM lix_undo($1)",
+        &[Value::Text(target_checkpoint.clone())],
+        &mut fetches,
+    )
+    .await
+    .unwrap();
+    assert!(undo.rows()[0].get::<String>("commit_id").is_ok());
+    assert!(
+        fetches.metadata_requests > 0 || fetches.object_requests > 0,
+        "the partial replica must hydrate cold undo history/dependencies"
+    );
+    let target_after_undo = execute_hydrating(
+        &session,
+        &engine.storage(),
+        &state,
+        &authority,
+        "SELECT value FROM lix_key_value WHERE key='undo-target'",
+        &[],
+        &mut Fetches::default(),
+    )
+    .await
+    .unwrap();
+    assert!(value(target_after_undo).contains("before"));
+    let unrelated_after_undo = execute_hydrating(
+        &session,
+        &engine.storage(),
+        &state,
+        &authority,
+        "SELECT value FROM lix_key_value WHERE key='undo-unrelated'",
+        &[],
+        &mut Fetches::default(),
+    )
+    .await
+    .unwrap();
+    assert!(value(unrelated_after_undo).contains("keep"));
+    let baseline_result = execute_hydrating(
+        &session,
+        &engine.storage(),
+        &state,
+        &authority,
+        "SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()",
+        &[],
+        &mut Fetches::default(),
+    )
+    .await
+    .unwrap();
+    let baseline = baseline_result.rows()[0]
+        .get::<String>("working_base_commit_id")
+        .unwrap();
+    assert_eq!(baseline, before_checkpoint);
+    assert!(
+        value(
+            authority
+                .execute(
+                    "SELECT value FROM lix_key_value WHERE key='undo-target'",
+                    &[],
+                )
+                .await
+                .unwrap(),
+        )
+        .contains("after")
+    );
+}
+
+#[tokio::test]
+async fn incorporated_checkpoint_undo_preserves_baseline_on_partial_publication() {
+    let (authority, engine, session, old) = fixture().await;
+    let storage = engine.storage();
+
+    // Keep the pre-publication row resident so this test isolates event
+    // incorporation from an unrelated initial data demand.
+    execute_hydrating(
+        &session,
+        &storage,
+        &old,
+        &authority,
+        "SELECT value FROM lix_key_value WHERE key='resident'",
+        &[],
+        &mut Fetches::default(),
+    )
+    .await
+    .unwrap();
+
+    let baseline = authority
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("commit_id")
+        .unwrap();
+    authority
+        .execute(
+            "UPDATE lix_key_value SET value='checkpoint-after' WHERE key='resident'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let target = authority
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("commit_id")
+        .unwrap();
+    authority
+        .execute(
+            "SELECT commit_id FROM lix_undo($1)",
+            &[Value::Text(target.clone())],
+        )
+        .await
+        .unwrap();
+
+    let next = Arc::new(
+        old.with_descriptor_and_fresh_generations(
+            authority.partial_replica_descriptor(None).await.unwrap(),
+        )
+        .unwrap(),
+    );
+    let prepared = prepare_hydrating(&engine, &old, next.clone(), &authority).await;
+    publish_prepared_partial(engine.clone(), prepared)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        value(
+            execute_hydrating(
+                &session,
+                &storage,
+                &next,
+                &authority,
+                "SELECT value FROM lix_key_value WHERE key='resident'",
+                &[],
+                &mut Fetches::default(),
+            )
+            .await
+            .unwrap(),
+        ),
+        "before"
+    );
+    let partial_baseline_result = execute_hydrating(
+        &session,
+        &storage,
+        &next,
+        &authority,
+        "SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()",
+        &[],
+        &mut Fetches::default(),
+    )
+    .await
+    .unwrap();
+    let partial_baseline = partial_baseline_result.rows()[0]
+        .get::<String>("working_base_commit_id")
+        .unwrap();
+    assert_eq!(partial_baseline, baseline);
+
+    let target_metadata_result = execute_hydrating(
+        &session,
+        &storage,
+        &next,
+        &authority,
+        "SELECT is_checkpoint, is_checkpoint_active FROM lix_log() WHERE commit_id=$1",
+        &[Value::Text(target)],
+        &mut Fetches::default(),
+    )
+    .await
+    .unwrap();
+    let target_metadata = target_metadata_result.rows();
+    assert_eq!(target_metadata.len(), 1);
+    assert_eq!(
+        target_metadata[0].get::<bool>("is_checkpoint").unwrap(),
+        true
+    );
+    assert_eq!(
+        target_metadata[0]
+            .get::<bool>("is_checkpoint_active")
+            .unwrap(),
+        false
+    );
+
+    // Reopening proves the baseline was incorporated into durable branch
+    // state, rather than supplied by the session that performed publication.
+    let (reopened, reopened_session) =
+        Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &next)
+            .await
+            .unwrap();
+    reopened
+        .sync_mode()
+        .admit_partial_replica(next, crate::sync::partial_replica_write_capability());
+    assert_eq!(
+        reopened_session
+            .execute(
+                "SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()",
+                &[],
+            )
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("working_base_commit_id")
+            .unwrap(),
+        baseline
+    );
+}
+
+#[tokio::test]
+async fn unavailable_checkpoint_undo_dependency_leaves_partial_admission_unchanged() {
+    let (authority, engine, session, old) = fixture().await;
+    let storage = engine.storage();
+    execute_hydrating(
+        &session,
+        &storage,
+        &old,
+        &authority,
+        "SELECT value FROM lix_key_value WHERE key='resident'",
+        &[],
+        &mut Fetches::default(),
+    )
+    .await
+    .unwrap();
+
+    authority
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await
+        .unwrap();
+    authority
+        .execute(
+            "UPDATE lix_key_value SET value='unavailable-after' WHERE key='resident'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let target = authority
+        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("commit_id")
+        .unwrap();
+    authority
+        .execute("SELECT commit_id FROM lix_undo($1)", &[Value::Text(target)])
+        .await
+        .unwrap();
+
+    let next = Arc::new(
+        old.with_descriptor_and_fresh_generations(
+            authority.partial_replica_descriptor(None).await.unwrap(),
+        )
+        .unwrap(),
+    );
+    let controls_before = admitted_controls(&storage, &old).await.unwrap();
+    let deadline = super::super::http::CandidateBaselineDeadline::for_test(
+        &next.baseline_lease().lease_id,
+        std::time::Duration::from_secs(300),
+    );
+    let error = match prepare_clean_partial_publication(&engine, next.clone(), deadline).await {
+        Ok(Some(_)) => panic!("unavailable undo dependency unexpectedly prepared"),
+        Ok(None) => panic!("undo publication unexpectedly had no remote change"),
+        Err(error) => error,
+    };
+    assert!(
+        NativeObjectRef::from_missing_error(&error)
+            .unwrap()
+            .is_some()
+            || NativeMetadataRef::from_missing_error(&error)
+                .unwrap()
+                .is_some(),
+        "expected an unavailable undo dependency, got {error:?}"
+    );
+    assert_eq!(
+        engine.sync_mode().partial_admission().as_deref(),
+        Some(old.as_ref())
+    );
+    assert_eq!(
+        admitted_controls(&storage, &old).await.unwrap(),
+        controls_before
+    );
+    assert_eq!(
+        value(
+            session
+                .execute("SELECT value FROM lix_key_value WHERE key='resident'", &[])
+                .await
+                .unwrap()
+        ),
+        "before"
+    );
+}
+
 async fn prepare_hydrating<S: crate::storage_adapter::Storage + Clone + Send + Sync + 'static>(
     engine: &Engine<S>,
     old: &PartialReplicaState,

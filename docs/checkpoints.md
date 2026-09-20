@@ -76,4 +76,26 @@ Use `lix_diff('lix_file')` for working changes. Its baseline is exposed as `lix_
 
 A full checkpoint creates a new metadata-only commit. It copies no rows. Storage is reclaimed in the background.
 
+## Undo and redo a checkpoint
+
+Use SQL undo/redo to navigate a checkpoint cycle while retaining immutable
+history:
+
+```sql
+SELECT commit_id FROM lix_undo($checkpoint_id);
+SELECT commit_id FROM lix_redo($undo_receipt_id);
+```
+
+Undoing selected effects keeps the checkpoint as the working baseline. The
+final causal undo applies the recorded checkpoint interval from C to its
+pre-checkpoint baseline B; a complete redo restores C. The endpoints are the
+checkpoint cycle's durable baseline metadata. Locally authored checkpoints set
+B as C's first parent; the recovered head used to compact the interval is a
+separate alias. A metadata-only checkpoint still produces a non-NULL undo or
+redo receipt. Explicit receipts for an old checkpoint become stale after a
+newer checkpoint is created.
+
 See [History](./history.md) for log, endpoint history, snapshots, and paged previews, and [Diff commands](./diff-commands.md) for scoped checkpoints.
+
+See [Undo and redo](./undo-redo.md) for the full receipt contract and
+checkpoint-cycle behavior.

@@ -1,10 +1,10 @@
 ---
-description: Install the Lix JavaScript SDK, write a file, inspect its history, and undo a change.
+description: Install the Lix JavaScript SDK, write a file, inspect its history, and use SQL recovery.
 ---
 
 # JavaScript quickstart
 
-This guide creates an in-memory Lix repository, writes a file, reads its history, and undoes the latest change.
+This guide creates an in-memory Lix repository, writes a file, reads its history, and uses SQL to undo the latest change.
 
 ## Install
 
@@ -61,10 +61,11 @@ const snapshot = await lix.execute(
 );
 ```
 
-## Undo the update
+## Undo the update with SQL
 
 ```ts
-await lix.undo();
+const undone = await lix.execute("SELECT commit_id FROM lix_undo()");
+console.log("undo receipt", undone.rows[0].commit_id);
 await lix.close();
 ```
 

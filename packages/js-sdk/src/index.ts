@@ -31,7 +31,6 @@ export { Value } from "./value.js";
 export type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
-	RedoReceipt,
 	CommitSpan,
 	ExecuteOptions,
 	ExecuteResult,
@@ -82,7 +81,6 @@ export type {
 	HostedLix,
 	CreateLixOptions,
 	DeleteLixOptions,
-	UndoReceipt,
 	SqlParam,
 	SwitchBranchOptions,
 	SwitchBranchReceipt,

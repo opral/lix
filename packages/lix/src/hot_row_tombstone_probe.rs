@@ -868,7 +868,10 @@ async fn undo_restores_a_row_whose_tombstone_was_removed() {
         .expect("collection reads")
         .len();
 
-    session.undo().await.expect("undo should publish");
+    session
+        .execute("SELECT commit_id FROM lix_undo()", &[])
+        .await
+        .expect("undo should publish");
     let after_undo = session
         .execute("SELECT id FROM undorow", &[])
         .await
@@ -1054,7 +1057,7 @@ async fn retention_fence_durability_across_supported_operations() {
         // the tracked row back, the identity is simultaneously tracked and
         // untracked.
         if result.is_ok() {
-            let undo = session.undo().await;
+            let undo = session.execute("SELECT commit_id FROM lix_undo()", &[]).await;
             match undo {
                 Ok(_) => {
                     let rows = session
@@ -2453,7 +2456,10 @@ async fn interval_local_tombstone_has_no_dependent_reader() {
             0
         };
         let session = reopen_session(&storage).await;
-        session.undo().await.expect("undo should run");
+        session
+            .execute("SELECT commit_id FROM lix_undo()", &[])
+            .await
+            .expect("undo should run");
         let live = session
             .execute("SELECT id FROM p12undo", &[])
             .await

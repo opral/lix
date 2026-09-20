@@ -1240,22 +1240,6 @@ pub(super) struct CreateBranchReceiptDto {
     pub(super) commit_id: String,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct UndoReceiptDto {
-    pub(super) branch_id: String,
-    pub(super) target_commit_id: String,
-    pub(super) inverse_commit_id: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct RedoReceiptDto {
-    pub(super) branch_id: String,
-    pub(super) target_commit_id: String,
-    pub(super) replay_commit_id: String,
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct SwitchBranchOptionsDto {

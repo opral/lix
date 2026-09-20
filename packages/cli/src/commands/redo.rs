@@ -7,17 +7,16 @@ use crate::hints::CommandOutput;
 pub fn run(context: &AppContext, command: RedoCommand) -> Result<CommandOutput, CliError> {
     let path = resolve_db_path(context)?;
     let lix = open_lix_at(&path)?;
-    let receipt = if let Some(branch_id) = command.branch {
+    if let Some(branch_id) = command.branch {
         crate::db::block_on(lix.switch_branch(lix::SwitchBranchOptions { branch_id }))
             .map_err(|error| CliError::msg(error.to_string()))?;
-        crate::db::block_on(lix.redo())
-    } else {
-        crate::db::block_on(lix.redo())
     }
-    .map_err(|error| CliError::msg(error.to_string()))?;
-    println!(
-        "Redid commit {} on branch {} as {}.",
-        receipt.target_commit_id, receipt.branch_id, receipt.replay_commit_id
-    );
+    let result = crate::db::block_on(lix.execute("SELECT commit_id FROM lix_redo()", &[]))
+        .map_err(|error| CliError::msg(error.to_string()))?;
+    let commit_id = result
+        .rows()
+        .first()
+        .and_then(|row| row.get::<String>("commit_id").ok());
+    println!("{}", commit_id.unwrap_or_else(|| "null".to_string()));
     Ok(CommandOutput::empty())
 }

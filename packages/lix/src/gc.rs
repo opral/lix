@@ -4785,7 +4785,7 @@ mod tests {
         // permitted to retire the last-1 interval.
         for expected in ["v9", "v8"] {
             session
-                .undo()
+                .execute("SELECT commit_id FROM lix_undo()", &[])
                 .await
                 .expect("undo must survive reclaim at every commit");
             let value = session

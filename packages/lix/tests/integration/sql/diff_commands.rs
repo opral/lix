@@ -39,7 +39,10 @@ simulation_test!(
         assert_eq!(working[0][1], Value::Text("added".to_string()));
 
         let _legacy = session
-            .execute("SELECT lix_revert($1)", &[Value::Text(original_head.clone())])
+            .execute(
+                "SELECT lix_revert($1)",
+                &[Value::Text(original_head.clone())],
+            )
             .await
             .expect_err("the scalar command shape must not bind");
 
@@ -602,7 +605,6 @@ simulation_test!(
     }
 );
 
-
 simulation_test!(
     diff_commands_apply_resolves_scalar_subquery_endpoints_once,
     |sim| async move {
@@ -611,40 +613,61 @@ simulation_test!(
             engine.open_session().await.expect("session should open"),
             &engine,
         );
-        session.execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('subquery-apply', 'original')",
-            &[],
-        ).await.expect("insert should succeed");
-        let source_head = engine.load_branch_head_commit_id(sim.main_branch_id())
-            .await.expect("head loads").expect("head exists").to_string();
-        session.execute(
-            "SELECT commit_id FROM lix_restore(\
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('subquery-apply', 'original')",
+                &[],
+            )
+            .await
+            .expect("insert should succeed");
+        let source_head = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("head loads")
+            .expect("head exists")
+            .to_string();
+        session
+            .execute(
+                "SELECT commit_id FROM lix_restore(\
                (SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()), \
                ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') \
                      WHERE key = 'subquery-apply'))",
-            &[],
-        ).await.expect("restore removes the selected value");
+                &[],
+            )
+            .await
+            .expect("restore removes the selected value");
 
-        let applied = session.execute(
-            "SELECT commit_id FROM lix_apply(\
+        let applied = session
+            .execute(
+                "SELECT commit_id FROM lix_apply(\
                lix_root_commit_id(), $1, \
                ARRAY(SELECT row_ref FROM lix_diff('lix_key_value', \
                  lix_root_commit_id(), $1) WHERE key = 'subquery-apply'))",
-            &[Value::Text(source_head.clone())],
-        ).await.expect("apply uses explicit endpoints for the selected rows");
+                &[Value::Text(source_head.clone())],
+            )
+            .await
+            .expect("apply uses explicit endpoints for the selected rows");
         assert_eq!(applied.columns(), &["commit_id"]);
         assert_eq!(applied.rows().len(), 1);
-        assert_eq!(select_rows(&session,
-            "SELECT value FROM lix_key_value WHERE key = 'subquery-apply'").await,
-            vec![vec![Value::Jsonb(serde_json::json!("original").into())]]);
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT value FROM lix_key_value WHERE key = 'subquery-apply'"
+            )
+            .await,
+            vec![vec![Value::Jsonb(serde_json::json!("original").into())]]
+        );
 
-        let empty = session.execute(
-            "SELECT commit_id FROM lix_apply(\
+        let empty = session
+            .execute(
+                "SELECT commit_id FROM lix_apply(\
                lix_root_commit_id(), $1, \
                ARRAY(SELECT row_ref FROM lix_diff('lix_key_value', \
                  lix_root_commit_id(), $1) WHERE key = 'absent-subquery-apply'))",
-            &[Value::Text(source_head)],
-        ).await.expect("empty selection with resolved endpoints remains a no-op");
+                &[Value::Text(source_head)],
+            )
+            .await
+            .expect("empty selection with resolved endpoints remains a no-op");
         assert_eq!(empty.columns(), &["commit_id"]);
         assert_eq!(empty.rows().len(), 1);
         assert!(matches!(empty.rows()[0].values(), [Value::Null]));
@@ -706,12 +729,15 @@ simulation_test!(
             .get::<String>("id")
             .unwrap();
 
-        let undo = session.execute(
-            "SELECT commit_id FROM lix_apply(\
+        let undo = session
+            .execute(
+                "SELECT commit_id FROM lix_apply(\
                $1, $2, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value', $1, $2) \
                              WHERE key IN ('added', 'modified', 'removed'))) ",
-            &[Value::Text(after.clone()), Value::Text(before.clone())],
-        ).await.expect("a reversed commit pair should undo the selected transaction");
+                &[Value::Text(after.clone()), Value::Text(before.clone())],
+            )
+            .await
+            .expect("a reversed commit pair should undo the selected transaction");
         assert_eq!(undo.columns(), &["commit_id"]);
         assert_eq!(undo.rows().len(), 1);
         let undo_commit = undo.rows()[0].get::<String>("commit_id").unwrap();
@@ -773,12 +799,15 @@ simulation_test!(
             .rows()[0]
             .get::<String>("id")
             .unwrap();
-        let error = session.execute(
-            "SELECT commit_id FROM lix_apply(\
+        let error = session
+            .execute(
+                "SELECT commit_id FROM lix_apply(\
                $1, $2, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value', $1, $2) \
                              WHERE key IN ('a', 'b'))) ",
-            &[Value::Text(after), Value::Text(before)],
-        ).await.expect_err("a later version of one selected row must reject the entire undo");
+                &[Value::Text(after), Value::Text(before)],
+            )
+            .await
+            .expect_err("a later version of one selected row must reject the entire undo");
         assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
         assert_eq!(
             select_rows(

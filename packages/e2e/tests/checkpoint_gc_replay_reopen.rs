@@ -95,11 +95,18 @@ async fn checkpoint_gc_retains_replay_and_selected_owners_after_reopen<S: Reopen
         churn_once(&lix, 2, true).await;
         let superseded_head = newest_commit_id(&lix).await;
 
-        lix.undo().await.expect("undo second churn commit");
+        lix.execute("SELECT commit_id FROM lix_undo()", &[])
+            .await
+            .expect("undo second churn commit");
         assert_generation(&lix, 1, false).await;
-        let redo = lix.redo().await.expect("redo second churn commit");
-        assert_eq!(redo.target_commit_id, superseded_head);
-        let replay_owner = redo.replay_commit_id;
+        let replay_owner = lix
+            .execute("SELECT commit_id FROM lix_redo()", &[])
+            .await
+            .expect("redo second churn commit")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("redo commit id");
+        assert_ne!(replay_owner, superseded_head);
         assert_generation(&lix, 2, true).await;
 
         let compacted_owner = lix

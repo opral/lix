@@ -145,6 +145,7 @@ pub(super) fn metadata_schema(history: bool) -> SchemaRef {
             Field::new("created_at", DataType::Utf8, false),
             Field::new("is_checkpoint", DataType::Boolean, false),
             Field::new("position", DataType::Int64, false),
+            Field::new("is_checkpoint_active", DataType::Boolean, false),
         ]
     };
     Arc::new(Schema::new(fields))
@@ -154,15 +155,19 @@ fn metadata_batch(
     position: i64,
     history: bool,
     count: usize,
+    checkpoint_active: bool,
 ) -> Result<RecordBatch> {
     let parent = node.parent_commit_ids.first().map(ToString::to_string);
-    let columns: Vec<ArrayRef> = vec![
+    let mut columns: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(vec![parent.as_deref(); count])),
         Arc::new(StringArray::from(vec![node.commit_id.to_string(); count])),
         Arc::new(StringArray::from(vec![node.created_at.to_string(); count])),
         Arc::new(BooleanArray::from(vec![node.is_checkpoint; count])),
         Arc::new(Int64Array::from(vec![position; count])),
     ];
+    if !history {
+        columns.push(Arc::new(BooleanArray::from(vec![checkpoint_active; count])));
+    }
     Ok(RecordBatch::try_new(metadata_schema(history), columns)?)
 }
 fn conjuncts(filters: &[Expr]) -> Vec<Expr> {
@@ -352,6 +357,14 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
             Ok(super::file::FileIdConstraint::None) => Some(BTreeSet::new()),
             _ => None,
         };
+        let needs_checkpoint_active = self.relation.is_none()
+            && (schema.index_of("is_checkpoint_active").is_ok()
+                || metadata_filters.iter().any(|filter| {
+                    filter
+                        .column_refs()
+                        .iter()
+                        .any(|column| column.name == "is_checkpoint_active")
+                }));
         let checkpoint_constraint = frontier::checkpoint_constraint(&metadata_filters);
         let df_meta_schema = DFSchema::try_from(meta_schema.as_ref().clone())?;
         let metadata_filters = metadata_filters
@@ -401,7 +414,8 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                     if let Some(ids) = remaining_ids.as_mut() { ids.remove(&id.to_string()); }
                     let current_position = position;
                     position += 1;
-                    if !matches_metadata(&metadata_batch(&node, current_position, relation.is_some(), 1)?, &metadata_filters)? { continue; }
+                    let checkpoint_active = node.is_checkpoint && (!needs_checkpoint_active || !checkpoint_retired_at(store.clone(), anchor, id).await.map_err(lix_error_to_datafusion_error)?);
+                    if !matches_metadata(&metadata_batch(&node, current_position, relation.is_some(), 1, checkpoint_active)?, &metadata_filters)? { continue; }
                     if let Some(relation) = &relation {
                         let Some(parent) = next else { continue; }; // root is a baseline, not a synthetic change
                         let diff_projection = schema.fields().iter().filter_map(|field| relation.schema.index_of(field.name()).ok()).collect::<Vec<_>>();
@@ -420,7 +434,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                                 Err(lix_error_to_datafusion_error(error))?
                             }
                         } {
-                            let meta = metadata_batch(&node, current_position, true, batch.num_rows())?;
+                            let meta = metadata_batch(&node, current_position, true, batch.num_rows(), checkpoint_active)?;
                             let columns = schema.fields().iter().map(|field| {
                                 batch.column_by_name(field.name()).or_else(|| meta.column_by_name(field.name())).cloned()
                                     .ok_or_else(|| DataFusionError::Internal(format!("missing history column {}", field.name())))
@@ -435,7 +449,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                         // needs history, even when the completed diff produced no rows.
                         completed_history_checkpoints = completed_history_checkpoints.saturating_add(1);
                     } else {
-                        let batch = metadata_batch(&node, current_position, false, 1)?;
+                        let batch = metadata_batch(&node, current_position, false, 1, checkpoint_active)?;
                         let indices = schema.fields().iter().map(|f| batch.schema().index_of(f.name())).collect::<std::result::Result<Vec<_>, _>>()?;
                         emitted += 1;
                         yield batch.project(&indices)?;
@@ -482,4 +496,43 @@ pub(crate) fn relation_history_schema(
             .map(|f| f.as_ref().clone()),
     );
     Ok(Arc::new(Schema::new(fields)))
+}
+
+/// Retirement is projected at the query anchor; immutable commit metadata is
+/// still available as is_checkpoint and through lix_commit.
+async fn checkpoint_retired_at<S: StorageAdapterRead + Clone + Send + Sync + 'static>(
+    store: S,
+    anchor: CommitId,
+    checkpoint: CommitId,
+) -> std::result::Result<bool, crate::LixError> {
+    use crate::tracked_state::{TrackedStateContext, TrackedStateKey};
+    let key = TrackedStateKey {
+        schema_key: crate::undo_redo::UNDO_STATE_SCHEMA_KEY.into(),
+        file_id: None,
+        row_pk: crate::row_pk::RowPk::uuid_from_canonical(&checkpoint.to_string())
+            .map_err(|error| crate::LixError::unknown(error.to_string()))?,
+    };
+    let rows = TrackedStateContext::new()
+        .reader(store)
+        .load_projected_batch_at_commit(
+            &anchor.to_string(),
+            &[key],
+            &crate::changelog::ChangeRecordProjection::from_columns(&["snapshot_content".into()]),
+        )
+        .await?;
+    let Some(snapshot) = rows
+        .row(0)
+        .filter(|row| !row.deleted())
+        .and_then(|row| row.snapshot_content())
+    else {
+        return Ok(false);
+    };
+    #[derive(serde::Deserialize)]
+    struct RetirementSnapshot { state: RetirementState }
+    #[derive(serde::Deserialize)]
+    struct RetirementState { retired: bool }
+    let value: RetirementSnapshot = serde_json::from_str(snapshot.as_str()).map_err(|error| {
+        crate::LixError::unknown(format!("invalid checkpoint retirement state: {error}"))
+    })?;
+    Ok(value.state.retired)
 }

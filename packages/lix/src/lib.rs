@@ -200,7 +200,7 @@ pub(crate) use common::{parse_row_metadata_value, serialize_row_metadata};
 pub use session::{
     CreateBranchOptions, CreateBranchReceipt, MergeBranchOptions,
     MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
-    MergeChangeStats, RedoReceipt, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt,
+    MergeChangeStats, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
 };
 pub use session::{
     CommitReceipt, CommitSpan, ExecuteBatchResult, ExecuteBatchStatement, ExecuteResult, ObserveEvent, ResultRowRef, Row,

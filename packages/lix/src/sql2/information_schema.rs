@@ -278,6 +278,8 @@ impl LixInformationSchemaProvider {
                 ),
                 PublicSurfaceKind::RecoveryFunction => (
                     match surface.name.as_str() {
+                        "lix_undo" => "() | (target_commit_id TEXT) | (target_commit_id TEXT, row_refs ROW_REF[])",
+                        "lix_redo" => "() | (undo_commit_id TEXT) | (undo_commit_id TEXT, row_refs ROW_REF[])",
                         "lix_restore" => {
                             "(source_commit_id TEXT) | (source_commit_id TEXT, row_refs ROW_REF[])"
                         }

@@ -2359,14 +2359,13 @@ where
 /// durable tracked-state root. This keeps layout admission observable to
 /// storage benchmarks without expanding the production engine API.
 pub async fn has_durable_commit_root_for_bench<StorageImpl>(
-    storage: StorageImpl,
+    storage: &StorageAdapter<StorageImpl>,
     commit_id: &str,
 ) -> Result<bool, crate::LixError>
 where
     StorageImpl: Storage,
 {
-    let adapter = StorageAdapter::new(storage);
-    let read = adapter.begin_read(ReadOptions::default()).await?;
+    let read = storage.begin_read(ReadOptions::default()).await?;
     let reader = crate::tracked_state::TrackedStateContext::new().reader(read);
     reader.has_durable_commit_root(commit_id).await
 }

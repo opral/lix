@@ -1646,7 +1646,7 @@ where
             .parse_statement(sql)
             .ok()
             .and_then(|statement| sql2::checkpoint_function_plan(&statement).ok().flatten())
-            .is_some_and(|plan| !matches!(plan, sql2::CheckpointFunctionPlan::Recovery { .. }));
+            .is_some_and(|plan| !matches!(plan, sql2::CheckpointFunctionPlan::Recovery { .. } | sql2::CheckpointFunctionPlan::UndoRedo { .. }));
         let result = if checkpoint_statement {
             // The checkpoint-only wrapper must begin while the SQL span is
             // current so transaction/storage spans become its children. Box
@@ -4224,6 +4224,7 @@ where
     if sql2::bind_statement_route(parsed_statement)? != sql2::BoundStatementRoute::Write {
         return Ok(None);
     }
+    transaction.ensure_sql_mutation_allowed_after_undo_redo()?;
 
     let previous_origin_key = transaction.replace_origin_key(options.origin_key.clone());
     let execution = async {
@@ -4338,6 +4339,7 @@ async fn execute_transaction_write_auto<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    transaction.ensure_sql_mutation_allowed_after_undo_redo()?;
     transaction.ensure_statement_allowed_after_restore()?;
     let previous_origin_key = transaction.replace_origin_key(options.origin_key);
     let result = async {
@@ -4387,7 +4389,7 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     if let sql2::SqlLogicalPlan::Checkpoint(checkpoint) = plan {
-        let recovery = matches!(checkpoint, sql2::CheckpointFunctionPlan::Recovery { .. });
+        let recovery = matches!(checkpoint, sql2::CheckpointFunctionPlan::Recovery { .. } | sql2::CheckpointFunctionPlan::UndoRedo { .. });
         let outcome = transaction
             .execute_checkpoint_function(checkpoint, params.to_vec())
             .await?;
@@ -4630,6 +4632,7 @@ async fn execute_transaction_write_with_mode<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    transaction.ensure_sql_mutation_allowed_after_undo_redo()?;
     let tx_plan = transaction.prepare_sql_write_logical_plan(sql, &statement)?;
     let result =
         sql2::execute_write_logical_plan_with_mode_result(transaction, tx_plan, params, mode)
@@ -4648,6 +4651,7 @@ async fn execute_transaction_write_with_mode_and_trace<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    transaction.ensure_sql_mutation_allowed_after_undo_redo()?;
     let tx_plan = transaction.prepare_sql_write_logical_plan(sql, &statement)?;
     let (result, path) = sql2::execute_write_logical_plan_with_mode_and_trace_result(
         transaction,
@@ -7589,12 +7593,12 @@ mod tests {
             .await
             .expect("draft update should commit");
         draft_session
-            .undo()
+            .execute("SELECT commit_id FROM lix_undo()", &[])
             .await
             .expect("draft update should undo");
         assert_typed_lifecycle_current(&draft_session, ROW_COUNT, "base-0000", "base-1023").await;
         draft_session
-            .redo()
+            .execute("SELECT commit_id FROM lix_redo()", &[])
             .await
             .expect("draft update should redo");
 
@@ -7659,7 +7663,9 @@ mod tests {
         )
         .await
         .expect("post-merge update should commit");
-        main.undo().await.expect("post-merge update should undo");
+        main.execute("SELECT commit_id FROM lix_undo()", &[])
+            .await
+            .expect("post-merge update should undo");
         let restored = main
             .execute(
                 "SELECT value FROM columnar_lifecycle_probe WHERE id = '00512'",

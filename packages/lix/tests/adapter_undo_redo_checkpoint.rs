@@ -67,7 +67,9 @@ where
     .expect("B commits");
     assert_values(lix, "a1", "b1").await;
 
-    lix.undo().await.expect("B undoes");
+    lix.execute("SELECT commit_id FROM lix_undo()", &[])
+        .await
+        .expect("B undoes");
     assert_values(lix, "a1", "b0").await;
 
     lix.active_branch_id()
@@ -83,7 +85,9 @@ where
         .await
         .expect("cold repository switches to the branch after undo");
     assert_values(lix, "a1", "b0").await;
-    lix.redo().await.expect("B redoes after cold reopen");
+    lix.execute("SELECT commit_id FROM lix_redo()", &[])
+        .await
+        .expect("B redoes after cold reopen");
     assert_values(lix, "a1", "b1").await;
 }
 

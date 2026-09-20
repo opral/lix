@@ -112,6 +112,7 @@ mod mainline;
 mod metadata;
 mod read_only;
 mod recovery_functions;
+mod recovery_regressions;
 mod row_ref;
 mod schema_expression_amendment;
 mod schema_history;

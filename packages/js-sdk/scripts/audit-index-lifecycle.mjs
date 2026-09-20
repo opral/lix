@@ -59,9 +59,9 @@ for (const untracked of [false, true])
     await db.execute("UPDATE note SET label=concat('new_',label)");
     await check(db, stage + " replacement");
     if (!untracked) {
-      await db.undo();
+      await db.execute("SELECT commit_id FROM lix_undo()");
       await check(db, stage + " undo");
-      await db.redo();
+      await db.execute("SELECT commit_id FROM lix_redo()");
       await check(db, stage + " redo");
     }
     await db.switchBranch({ branchId: main });

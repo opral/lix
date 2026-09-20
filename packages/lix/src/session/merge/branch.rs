@@ -276,7 +276,7 @@ where
 
             if analysis.outcome == MergeOutcome::FastForward {
                 transaction
-                    .advance_branch_ref(&active_branch_id, analysis.commits.source_commit_id)
+                    .fast_forward_branch_ref(&active_branch_id, analysis.commits.source_commit_id, &source_branch_id)
                     .await?;
 
                 return Ok(MergeBranchReceipt {

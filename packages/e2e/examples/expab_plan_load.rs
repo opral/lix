@@ -190,7 +190,9 @@ where
     }
 
     let undo_start = Instant::now();
-    let undo = session.undo().await;
+    let undo = session
+        .execute("SELECT commit_id FROM lix_undo()", &[])
+        .await;
     let undo_wall = undo_start.elapsed();
     match undo {
         Ok(_) => println!("op undo wall_ms {:.1}", undo_wall.as_secs_f64() * 1000.0),

@@ -1234,6 +1234,7 @@ fn push_branch_stage_rows(
             origin.clone(),
         ));
         rows.push_branch_head(BranchHeadWrite {
+            source_branch_id: None,
             branch_id: row.id,
             head_commit_id: None,
             origin,
@@ -1243,6 +1244,7 @@ fn push_branch_stage_rows(
         descriptor.metadata = row.metadata;
         rows.push(with_origin(descriptor, origin.clone()));
         rows.push_branch_head(BranchHeadWrite {
+            source_branch_id: None,
             branch_id: row.id,
             head_commit_id: Some(row.commit_id),
             origin,

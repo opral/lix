@@ -4,7 +4,7 @@ description: Choose the JavaScript or Rust quickstart and make your first versio
 
 # Getting started
 
-Choose your SDK. Both quickstarts create a repository, write a file, inspect its history, and undo a change.
+Choose your SDK. Both quickstarts create a repository, write a file, inspect its history, and use SQL recovery.
 
 ## JavaScript
 

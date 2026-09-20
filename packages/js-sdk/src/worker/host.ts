@@ -385,10 +385,6 @@ export function startWorkerHost(
 				return requiredLix(sessionId).activeAccountId();
 			case "createBranch":
 				return requiredLix(sessionId).createBranch(operation.options);
-			case "undo":
-				return requiredLix(sessionId).undo();
-			case "redo":
-				return requiredLix(sessionId).redo();
 			case "switchBranch":
 				return requiredLix(sessionId).switchBranch(operation.options);
 			case "mergeBranchPreview":

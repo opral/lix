@@ -860,8 +860,8 @@ test("lix_restore is undoable and redoable through the local worker", async () =
 	expect(restoredCommit).toEqual(expect.any(String));
 	expect(await workingBaselineCommitId(lix)).toBe(baseline);
 
-	const undone = await lix.undo();
-	expect(undone.targetCommitId).toBe(restoredCommit);
+	const undone = await lix.execute("SELECT commit_id FROM lix_undo()");
+	expect(undone.rows[0]?.commit_id).toEqual(expect.any(String));
 	expect(
 		(await lix.execute(
 			"SELECT value FROM lix_key_value WHERE key = 'restore-undo-test'",
@@ -869,8 +869,8 @@ test("lix_restore is undoable and redoable through the local worker", async () =
 	).toHaveLength(1);
 	expect(await workingBaselineCommitId(lix)).toBe(baseline);
 
-	const redone = await lix.redo();
-	expect(redone.targetCommitId).toBe(restoredCommit);
+	const redone = await lix.execute("SELECT commit_id FROM lix_redo()");
+	expect(redone.rows[0]?.commit_id).toEqual(expect.any(String));
 	expect(
 		(await lix.execute(
 			"SELECT value FROM lix_key_value WHERE key = 'restore-undo-test'",
@@ -887,17 +887,16 @@ test("undo and redo roundtrip tracked state through the local worker", async () 
 		["undo-test", "present"],
 	);
 
-	const undone = await lix.undo();
-	expect(undone.branchId).toBe(await lix.activeBranchId());
-	expect(undone.inverseCommitId).not.toBe(undone.targetCommitId);
+	const undone = await lix.execute("SELECT commit_id FROM lix_undo()");
+	expect(undone.rows[0]?.commit_id).toEqual(expect.any(String));
 	let result = await lix.execute(
 		"SELECT value FROM lix_key_value WHERE key = $1",
 		["undo-test"],
 	);
 	expect(result.rows).toHaveLength(0);
 
-	const redone = await lix.redo();
-	expect(redone.targetCommitId).toBe(undone.targetCommitId);
+	const redone = await lix.execute("SELECT commit_id FROM lix_redo()");
+	expect(redone.rows[0]?.commit_id).toEqual(expect.any(String));
 	result = await lix.execute(
 		"SELECT value FROM lix_key_value WHERE key = $1",
 		["undo-test"],

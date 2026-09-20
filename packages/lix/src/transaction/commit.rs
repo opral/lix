@@ -56,6 +56,22 @@ use tracing::Instrument as _;
 
 type RowIndex = usize;
 
+/// A pending working-diff baseline publication attached to the transaction's
+/// active branch. The inverse patch and its undo marker are staged in the same
+/// transaction; this intent selects the immutable root publication and
+/// control update that must accompany them.
+///
+/// The branch ID is carried here instead of inferred from the target commit:
+/// the same checkpoint can be visible from more than one branch, and a
+/// baseline transition must never accidentally rewrite another branch's local
+/// working plane.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UndoBaselinePublication {
+    pub(crate) branch_id: String,
+    pub(crate) expected: CommitId,
+    pub(crate) target: CommitId,
+}
+
 // Below this size, per-row HOT writes are cheaper and keep repeated ordinary
 // INSERT transactions at one point-addressable current-state lookup. At 1K,
 // measured HOT publication still emitted one backend put per row, while the
@@ -171,6 +187,7 @@ pub(crate) async fn commit_prepared_writes(
         false,
         &BTreeMap::new(),
         &BTreeMap::new(),
+        None,
         prepared_writes,
     )
     .await?;
@@ -226,6 +243,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     capture_sync_commits: bool,
     restore_targets: &BTreeMap<String, PendingRestoreIntent>,
     native_merge_checkpoints: &BTreeMap<String, CommitId>,
+    undo_baseline: Option<&UndoBaselinePublication>,
     prepared_writes: PreparedWriteSet,
 ) -> Result<MaterializedCommit, LixError> {
     Box::pin(validate_active_account_and_account_rows(
@@ -661,6 +679,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &staged_delta_index.ordered_addressable_commits,
         &replacement_generation_commits,
         &ordered_replacements,
+        undo_baseline,
     ))
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -3639,6 +3658,7 @@ async fn stage_tracked_head(
     ordered_addressable_commits: &BTreeSet<CommitId>,
     replacement_generation_commits: &BTreeSet<CommitId>,
     ordered_replacements: &BTreeMap<CommitId, Arc<OrderedMutationJournal>>,
+    undo_baseline: Option<&UndoBaselinePublication>,
 ) -> Result<StagedHotHeads, LixError> {
     let mut lifecycle_ids = lifecycle_snapshot_commit_ids(
         tracked_roots,
@@ -3647,12 +3667,17 @@ async fn stage_tracked_head(
         observations,
         checkpoint_epochs,
     )?;
-    // Only the authority-owned native application can choose a different
-    // existing checkpoint. Its complete canonical M root is already staged;
-    // do not reconstruct every tracked row merely to rotate the local epoch.
+    // Only the authority-owned native application, or an undo/redo baseline
+    // transition with a complete immutable commit root, can choose a different
+    // existing checkpoint. Its canonical root is already staged; do not
+    // reconstruct every tracked row merely to rotate the local epoch.
     let mut root_checkpoint_overrides = BTreeMap::new();
     for root in tracked_roots.iter().filter(|root| root.publish_head) {
-        let Some(checkpoint) = native_merge_checkpoints.get(&root.branch_id) else {
+        let native_checkpoint = native_merge_checkpoints.get(&root.branch_id).copied();
+        let undo_checkpoint = undo_baseline
+            .filter(|intent| intent.branch_id == root.branch_id)
+            .map(|intent| intent.target);
+        let Some(checkpoint) = native_checkpoint.or(undo_checkpoint) else {
             continue;
         };
         let control = observations
@@ -3664,11 +3689,11 @@ async fn stage_tracked_head(
                     "native checkpoint publication lacks branch control",
                 )
             })?;
-        if control.working_diff_checkpoint_commit_id == Some(*checkpoint) {
+        if control.working_diff_checkpoint_commit_id == Some(checkpoint) {
             continue;
         }
         if root.parent_commit_id != Some(control.head_commit_id)
-            || root.commit_id == *checkpoint
+            || root.commit_id == checkpoint
             || checkpoint_epochs.contains_key(&root.branch_id)
             || explicit_branch_targets.contains_key(&root.branch_id)
         {
@@ -3677,8 +3702,41 @@ async fn stage_tracked_head(
                 "native checkpoint publication has unrelated lifecycle work",
             ));
         }
+        if let Some(intent) = undo_baseline.filter(|intent| intent.branch_id == root.branch_id) {
+            if native_checkpoint.is_some()
+                || control.working_diff_checkpoint_commit_id != Some(intent.expected)
+            {
+                return Err(LixError::new(
+                    "LIX_UNDO_BASELINE_CONFLICT",
+                    format!(
+                        "undo baseline expected '{}' but branch '{}' is based on '{}', or another lifecycle publication is pending",
+                        intent.expected,
+                        root.branch_id,
+                        control
+                            .working_diff_checkpoint_commit_id
+                            .map(|commit| commit.to_string())
+                            .unwrap_or_else(|| "none".to_owned()),
+                    ),
+                ));
+            }
+        }
         lifecycle_ids.remove(&root.commit_id);
-        root_checkpoint_overrides.insert(root.commit_id, *checkpoint);
+        root_checkpoint_overrides.insert(root.commit_id, checkpoint);
+    }
+    if let Some(intent) = undo_baseline {
+        let published = root_checkpoint_overrides.iter().any(|(commit_id, _)| {
+            tracked_roots.iter().any(|root| {
+                root.publish_head
+                    && root.branch_id == intent.branch_id
+                    && root.commit_id == *commit_id
+            })
+        });
+        if !published {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "undo baseline publication lacks a complete immutable root",
+            ));
+        }
     }
     let mut publication_preconditions = Vec::new();
     let mut tracked_snapshots = build_lifecycle_tracked_snapshots(
@@ -5437,6 +5495,7 @@ async fn stage_root_backed_branch_publication(
     head_commit_id: CommitId,
     target: &BranchHeadTarget,
     previous_control: Option<BranchHeadControl>,
+    source_baseline: Option<CommitId>,
     restore: bool,
     stage_initial_working_diff_epoch: bool,
     state_rows: &PreparedStateBatch,
@@ -5485,8 +5544,14 @@ async fn stage_root_backed_branch_publication(
     let reused_generation = (!restore)
         .then_some(previous_control)
         .flatten()
-        .filter(|previous| previous.head_commit_id == head_commit_id)
+        .filter(|previous| previous.head_commit_id == head_commit_id && source_baseline.is_none_or(|baseline| previous.working_diff_checkpoint_commit_id == Some(baseline)))
         .map(|previous| previous.tracked_generation);
+    // Keep the baseline that will be written to the branch-control row next
+    // to the generation we stage below. A fast-forward adopts its explicit
+    // source's baseline; retaining only the rebase-local value would make
+    // the next editor write resurrect the destination's old cursor.
+    let mut working_diff_checkpoint_commit_id =
+        previous_control.and_then(|control| control.working_diff_checkpoint_commit_id);
     let generation = match reused_generation {
         Some(generation) => generation,
         None => {
@@ -5531,14 +5596,16 @@ async fn stage_root_backed_branch_publication(
             } else if let Some(checkpoint_commit_id) =
                 previous_control.and_then(|control| control.working_diff_checkpoint_commit_id)
             {
-                // Moving an existing branch to another immutable root changes
-                // its serving generation but not its private checkpoint. Build
-                // the new generation and its sparse dirty index together so a
+                // Explicit moves preserve the baseline; fast-forwards use the
+                // selected source's baseline. Build the new generation and
+                // its sparse dirty index together so a
                 // later ordinary write cannot observe a cursor bound to the
                 // retired generation.
                 let current =
                     load_local_overlay_with_inherited_catalog(read, branch_id, head_commit_id)
                         .await?;
+                let checkpoint_commit_id = source_baseline.unwrap_or(checkpoint_commit_id);
+                working_diff_checkpoint_commit_id = Some(checkpoint_commit_id);
                 let checkpoint = load_local_overlay_with_inherited_catalog(
                     read,
                     branch_id,
@@ -5640,7 +5707,7 @@ async fn stage_root_backed_branch_publication(
         working_diff_checkpoint_commit_id: match (restore, previous_control) {
             (true, _) => Some(head_commit_id),
             (false, None) => Some(head_commit_id),
-            (false, Some(control)) => control.working_diff_checkpoint_commit_id,
+            (false, Some(_)) => working_diff_checkpoint_commit_id,
         },
         created_at: previous_control.map_or(target.created_at, |control| control.created_at),
         updated_at: target.updated_at,
@@ -5761,6 +5828,18 @@ async fn stage_branch_head_control_publications(
         {
             crate::sync::stage_upload_plan_invalidation(writes);
         }
+        let source_baseline = if let Some(source_branch_id) = target.source_branch_id {
+            let source_id = source_branch_id.to_string();
+            let source = observations.get(&source_id).ok_or_else(|| LixError::unknown("merge source was not observed"))?;
+            let control = source.control.ok_or_else(|| LixError::new(LixError::CODE_TRANSACTION_CONFLICT, "merge source branch no longer exists"))?;
+            if Some(control.head_commit_id) != target.head_commit_id {
+                return Err(LixError::new(LixError::CODE_TRANSACTION_CONFLICT, "merge source head changed before fast-forward publication"));
+            }
+            preconditions.push(branch_head_control_precondition(&source_id, source.raw_token.clone())?);
+            Some(control.working_diff_checkpoint_commit_id.ok_or_else(|| LixError::unknown("merge source has no working baseline"))?)
+        } else {
+            None
+        };
         let mut desired = match target.head_commit_id {
             None => None,
             Some(head_commit_id) => {
@@ -5775,6 +5854,7 @@ async fn stage_branch_head_control_publications(
                     head_commit_id,
                     target,
                     existing,
+                    source_baseline,
                     restore_targets
                         .get(branch_id)
                         .is_some_and(|intent| intent.target_commit_id == head_commit_id),
@@ -6235,6 +6315,7 @@ async fn observe_branch_head_controls(
         }
     }
     branch_ids.extend(explicit_branch_targets.keys().cloned());
+    branch_ids.extend(explicit_branch_targets.values().filter_map(|target| target.source_branch_id.map(|id| id.to_string())));
     branch_ids.extend(engine_rows.iter().map(|row| row.branch_id.clone()));
     // Every authored change references a global account. Observing and later
     // fencing this control serializes account deletion/disable with writes on
@@ -7912,6 +7993,7 @@ mod tests {
             .expect("fixture main head parses");
         let checkpoint = commit_id("branch-bridge-checkpoint");
         let target = BranchHeadTarget {
+            source_branch_id: None,
             head_commit_id: Some(recovered_head),
             ref_change_id: change_id("branch-bridge-ref-change"),
             created_at: ts("2026-01-01T00:00:00Z"),

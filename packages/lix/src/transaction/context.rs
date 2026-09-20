@@ -268,6 +268,8 @@ where
         && b.pending_branch_checkpoint_replacements.is_empty()
         && a.pending_restore_targets.is_empty()
         && b.pending_restore_targets.is_empty()
+        && a.pending_undo_baseline.is_none()
+        && b.pending_undo_baseline.is_none()
         && !a.await_durable_commit
         && !b.await_durable_commit
         && eligible_a
@@ -738,6 +740,10 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// Explicit SQL reads and UPDATE/DELETE predicates are decisions against
     /// the opening snapshot, not edits that may be silently reconciled later.
     protect_sql_write_snapshot: bool,
+    /// A successful SQL undo/redo owns the transaction's one mutation slot.
+    /// Keep this at the SQL execution boundary so commit-internal staging can
+    /// still materialize the already-authorized receipt commit.
+    successful_undo_redo: bool,
     commit_boundary: Option<TransactionCommitBoundary>,
     trust_filesystem_planner: bool,
     origin_key: Option<SharedStr>,
@@ -768,6 +774,7 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
     pending_plugin_actor_publications: Vec<PendingPluginActorPublication>,
     pending_checkpoint_gc_sequence: Option<u64>,
+    pending_undo_baseline: Option<commit::UndoBaselinePublication>,
     /// Explicit historical branch sources whose branchability may be owned by
     /// one still-pending authenticated checkpoint replacement. Resolution is
     /// delayed to the coherent commit-boundary read so its queue observation
@@ -849,22 +856,6 @@ impl TransactionMutationJournal {
     }
 }
 
-/// One already-resolved tracked-state transition. The expected side is
-/// certified by the active branch head and its immutable historical root;
-/// target payloads come from an exact read of the desired root.
-struct TypedStateTransition {
-    identity: TrackedStateKey,
-    expected_change_id: Option<ChangeId>,
-    target: Option<TypedStateTransitionTarget>,
-}
-
-struct TypedStateTransitionTarget {
-    change_id: ChangeId,
-    snapshot_content: Option<SharedStr>,
-    decoded_snapshot: Option<Arc<WasmTypedRow>>,
-    metadata: Option<SharedStr>,
-}
-
 /// State which must be restored when `RETURNING` evaluation fails after a
 /// write has been staged in an explicit SQL transaction.
 pub(crate) struct SqlStatementCheckpoint {
@@ -873,6 +864,8 @@ pub(crate) struct SqlStatementCheckpoint {
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
     trust_filesystem_planner: bool,
     pending_checkpoint_gc_sequence: Option<u64>,
+    pending_undo_baseline: Option<commit::UndoBaselinePublication>,
+    successful_undo_redo: bool,
 }
 
 #[derive(Clone)]
@@ -1035,6 +1028,24 @@ where
 {
     pub(crate) fn checkpoint_gc_sequence(&self) -> Option<u64> {
         self.pending_checkpoint_gc_sequence
+    }
+
+    /// Reject another SQL mutation after a receipt-producing undo/redo has
+    /// already been staged in this explicit transaction. The guard belongs to
+    /// SQL dispatch rather than generic staging so commit reconciliation and
+    /// history materialization can finish the authorized operation normally.
+    pub(crate) fn ensure_sql_mutation_allowed_after_undo_redo(&self) -> Result<(), LixError> {
+        if self.successful_undo_redo {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_TRANSACTION_STATE,
+                "a successful undo/redo must be the only mutation in a transaction",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mark_successful_undo_redo(&mut self) {
+        self.successful_undo_redo = true;
     }
 
     // Transaction owner. Only AdmittedNativeGlobalMigration constructs this path.
@@ -2100,7 +2111,7 @@ where
                 )
                 .await?;
             if let Some(entry) = diff.entries.iter().find(|entry| {
-                entry.identity.schema_key() != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+                !crate::undo_redo::is_undo_metadata(entry.identity.schema_key())
             }) {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -2367,6 +2378,7 @@ where
             opening_active_branch_head,
             opening_global_branch_head,
             protect_sql_write_snapshot: false,
+            successful_undo_redo: false,
             commit_boundary: None,
             trust_filesystem_planner: false,
             origin_key: None,
@@ -2387,6 +2399,7 @@ where
             pending_file_view_mutations: BTreeMap::new(),
             pending_plugin_actor_publications: Vec::new(),
             pending_checkpoint_gc_sequence: None,
+            pending_undo_baseline: None,
             pending_branch_checkpoint_replacements: BTreeMap::new(),
             pending_restore_targets: BTreeMap::new(),
             plugin_generation_read_guard: None,
@@ -2884,6 +2897,7 @@ where
                     capture_sync_commits,
                     &restore_targets,
                     &transaction.native_merge_checkpoints,
+                    transaction.pending_undo_baseline.as_ref(),
                     prepared_writes,
                 )
                 .instrument(tracing::debug_span!(
@@ -3158,6 +3172,8 @@ where
             pending_file_view_mutations: self.pending_file_view_mutations.clone(),
             trust_filesystem_planner: self.trust_filesystem_planner,
             pending_checkpoint_gc_sequence: self.pending_checkpoint_gc_sequence,
+            pending_undo_baseline: self.pending_undo_baseline.clone(),
+            successful_undo_redo: self.successful_undo_redo,
         })
     }
 
@@ -3173,6 +3189,8 @@ where
             pending_file_view_mutations,
             trust_filesystem_planner,
             pending_checkpoint_gc_sequence,
+            pending_undo_baseline,
+            successful_undo_redo,
         } = checkpoint;
         self.staged_writes.restore(staged_writes)?;
         self.filesystem_path_index_epoch
@@ -3183,6 +3201,8 @@ where
         self.pending_file_view_mutations = pending_file_view_mutations;
         self.trust_filesystem_planner = trust_filesystem_planner;
         self.pending_checkpoint_gc_sequence = pending_checkpoint_gc_sequence;
+        self.pending_undo_baseline = pending_undo_baseline;
+        self.successful_undo_redo = successful_undo_redo;
         // A failed statement may have chained a predecessor actor successor.
         // Its prior document can no longer be restored byte-for-byte, so
         // conservatively discard all unpublished actor cache work. The staged
@@ -8539,6 +8559,7 @@ where
         sql: &str,
         params: &[Value],
     ) -> Result<Option<crate::sql2::SqlWriteResult>, LixError> {
+        self.ensure_sql_mutation_allowed_after_undo_redo()?;
         if let Some(error) = &self.mutation_journal_terminal_error {
             return Err(error.clone());
         }
@@ -8686,6 +8707,7 @@ where
         next_origin_key: Option<&str>,
         params: &[impl AsRef<str>],
     ) -> Result<Option<crate::sql2::SqlWriteResult>, LixError> {
+        self.ensure_sql_mutation_allowed_after_undo_redo()?;
         if let Some(error) = &self.mutation_journal_terminal_error {
             return Err(error.clone());
         }
@@ -9360,14 +9382,6 @@ where
         self.sql_schema_snapshot.schema_jsons()
     }
 
-    pub(crate) fn visible_schema_keys(&self) -> Result<Vec<String>, LixError> {
-        self.sql_visible_schemas()
-            .iter()
-            .map(crate::schema::schema_key_from_definition)
-            .map(|result| result.map(|key| key.schema_key))
-            .collect()
-    }
-
     /// Returns the immutable Schema v1 plan used by plugin merge admission.
     /// Callers must use this plan rather than rebuilding a schema or guessing
     /// a fingerprint from row content.
@@ -9393,6 +9407,23 @@ where
             rows,
         })
         .await?;
+        Ok(())
+    }
+
+    /// Fast-forward content and its working baseline from this exact source.
+    pub(crate) async fn fast_forward_branch_ref(
+        &mut self,
+        branch_id: &str,
+        commit_id: CommitId,
+        source_branch_id: &str,
+    ) -> Result<(), LixError> {
+        let mut command = BranchHeadWrite::new(branch_id, Some(commit_id));
+        command.source_branch_id = Some(uuid::Uuid::parse_str(source_branch_id).map_err(|error| {
+            LixError::new(LixError::CODE_INVALID_PARAM, format!("invalid merge source branch: {error}"))
+        })?);
+        let mut rows = RawWriteBatch::with_capacity(1);
+        rows.push_branch_head(command);
+        self.stage_write(TransactionWrite::Rows { mode: TransactionWriteMode::Replace, rows }).await?;
         Ok(())
     }
 
@@ -9568,191 +9599,23 @@ where
         Ok(CommitGraphContext::new().reader(SharedStorageAdapterRead::new(read)))
     }
 
-    /// Applies a tracked-state transition resolved from two immutable commits.
-    ///
-    /// This is the internal counterpart to the public diff command. The
-    /// caller supplies typed tracked-state identities. The transaction's
-    /// coherent opening head certifies the current
-    /// side, so undo/redo does not need to reload visible live state after it
-    /// has already read that exact historical root.
-    pub(crate) async fn execute_tracked_state_transition(
-        &mut self,
-        current_commit_id: CommitId,
-        desired_commit_id: CommitId,
-        keys: Vec<TrackedStateKey>,
-    ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
-        let branch_id = self.active_branch_id.clone();
-        if self.opening_active_branch_head != Some(current_commit_id) {
-            return Err(LixError::new(
-                LixError::CODE_CONSTRAINT_VIOLATION,
-                "tracked-state transition source is no longer the active branch head",
-            ));
-        }
-        if self
-            .staged_writes
-            .commit_id_for_branch(&branch_id)?
-            .is_some()
-        {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "typed tracked-state transitions require a clean branch transaction",
-            ));
-        }
-        if keys.is_empty() {
-            return Err(empty_state_transition(current_commit_id, desired_commit_id));
-        }
-        let unique = keys.iter().collect::<BTreeSet<_>>();
-        if unique.len() != keys.len() {
-            return Err(LixError::new(
-                LixError::CODE_CONSTRAINT_VIOLATION,
-                "typed tracked-state transition contains more than one row for the same row",
-            ));
-        }
-
-        let (current_rows, desired_rows) = {
-            let mut tracked = self.tracked_state_reader().await?;
-            let current_rows = tracked
-                .load_projected_batch_at_commit(
-                    &current_commit_id.to_string(),
-                    &keys,
-                    &ChangeRecordProjection::identity_only(),
-                )
-                .await?;
-            let desired_rows = tracked
-                .load_projected_batch_at_commit(
-                    &desired_commit_id.to_string(),
-                    &keys,
-                    &ChangeRecordProjection::full(),
-                )
-                .await?;
-            (current_rows, desired_rows)
-        };
-        let mut transitions = Vec::with_capacity(keys.len());
-        for (index, identity) in keys.into_iter().enumerate() {
-            let current = current_rows.row(index).filter(|row| !row.deleted());
-            let desired = desired_rows.row(index).filter(|row| !row.deleted());
-            for row in [current, desired].into_iter().flatten() {
-                if row.schema_key() != identity.schema_key
-                    || row.file_id() != identity.file_id.as_deref()
-                    || row.row_pk() != &identity.row_pk
-                {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "historical exact read returned a mismatched transition identity",
-                    ));
-                }
-            }
-            let expected_change_id = current.map(|row| row.change_id());
-            let target = desired.map(|row| TypedStateTransitionTarget {
-                change_id: row.change_id(),
-                snapshot_content: row.snapshot_content().cloned(),
-                decoded_snapshot: row.decoded_snapshot().cloned(),
-                metadata: row.metadata().cloned(),
-            });
-            if expected_change_id != target.as_ref().map(|target| target.change_id) {
-                transitions.push(TypedStateTransition {
-                    identity,
-                    expected_change_id,
-                    target,
-                });
-            }
-        }
-        self.execute_typed_state_transitions(current_commit_id, desired_commit_id, transitions)
-            .await
-    }
-
-    async fn execute_typed_state_transitions(
-        &mut self,
-        current_commit_id: CommitId,
-        desired_commit_id: CommitId,
-        transitions: Vec<TypedStateTransition>,
-    ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
-        if transitions.is_empty() {
-            return Err(empty_state_transition(current_commit_id, desired_commit_id));
-        }
-        let branch_id = self.active_branch_id.clone();
-        let rows_affected = transitions.len() as u64;
-        let mut rows = RawWriteBatch::with_capacity(transitions.len());
-        for transition in transitions {
-            if transition.expected_change_id
-                == transition.target.as_ref().map(|target| target.change_id)
-            {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "typed tracked-state transition contains an unchanged row",
-                ));
-            }
-            let (snapshot, decoded_snapshot, metadata) = match transition.target {
-                Some(target) => (
-                    parse_materialized_diff_json(
-                        target.snapshot_content,
-                        "typed state transition target",
-                    )?,
-                    target.decoded_snapshot,
-                    parse_materialized_diff_json(
-                        target.metadata,
-                        "typed state transition target metadata",
-                    )?,
-                ),
-                None => (None, None, None),
-            };
-            let row_pk = Some(transition.identity.row_pk);
-            let schema_key = transition.identity.schema_key.into();
-            let file_id = transition.identity.file_id.map(Into::into);
-            if let Some(decoded_snapshot) = decoded_snapshot {
-                rows.push_typed_parts(
-                    row_pk,
-                    schema_key,
-                    file_id,
-                    Some(decoded_snapshot),
-                    metadata,
-                    None,
-                    None,
-                    None,
-                    false,
-                    None,
-                    None,
-                    false,
-                    branch_id.clone().into(),
-                );
-            } else {
-                rows.push(TransactionWriteRow {
-                    row_pk,
-                    schema_key,
-                    file_id,
-                    snapshot,
-                    metadata,
-                    origin: None,
-                    created_at: None,
-                    updated_at: None,
-                    global: false,
-                    change_id: None,
-                    commit_id: None,
-                    untracked: false,
-                    branch_id: branch_id.clone().into(),
-                });
-            }
-        }
-        self.stage_write(TransactionWrite::Rows {
-            mode: TransactionWriteMode::Replace,
-            rows,
-        })
-        .await?;
-        Ok(crate::sql2::DiffCommandOutcome {
-            rows_affected,
-            commit_id: self
-                .staged_writes
-                .commit_id_for_branch(&branch_id)?
-                .map(|commit_id| commit_id.to_string()),
-            parent_commit_id: None,
-        })
-    }
-
-    async fn execute_recovery_patch(
+    pub(crate) async fn execute_recovery_patch(
         &mut self,
         command: DiffCommand,
         diff_ids: Vec<String>,
         selected_files: BTreeSet<String>,
+    ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
+        self.execute_recovery_patch_inner(command, diff_ids, selected_files, false).await
+    }
+
+    pub(crate) async fn execute_undo_patch(
+        &mut self, diff_ids: Vec<String>, selected_files: BTreeSet<String>,
+    ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
+        self.execute_recovery_patch_inner(DiffCommand::Apply, diff_ids, selected_files, true).await
+    }
+
+    async fn execute_recovery_patch_inner(
+        &mut self, command: DiffCommand, diff_ids: Vec<String>, selected_files: BTreeSet<String>, causal_replay: bool,
     ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
         let selections = diff_ids
             .iter()
@@ -9875,31 +9738,30 @@ where
         // Exact HOT probes can still return physical child rows masked by a
         // deleted descriptor. Only a source-matching, explicitly selected file
         // descriptor establishes that those children are logically absent.
-        let hidden_files = plans
-            .iter()
-            .zip(&current)
-            .filter_map(|((_, (schema, pk, _), expected, _), row)| {
-                if schema != FILE_DESCRIPTOR_SCHEMA_KEY {
-                    return None;
+        let mut replay_provenance = BTreeMap::new();
+        let mut hidden_files = BTreeSet::new();
+        for ((_, (schema, pk, _), expected, _), row) in plans.iter().zip(&current) {
+            if schema != FILE_DESCRIPTOR_SCHEMA_KEY { continue; }
+            let id = pk.as_single_string_owned()?;
+            if !selected_files.contains(&id) || row.as_ref().is_some_and(|row| !row.deleted) { continue; }
+            let mut matches = match expected {
+                Some(expected) => row.as_ref().and_then(|row| row.change_id) == Some(*expected),
+                None => true,
+            };
+            if !matches && causal_replay {
+                if let (Some(expected), Some(writer)) = (expected, row.as_ref().and_then(|row| row.change_id.and_then(crate::tracked_state::direct_change_locator).map(|locator| locator.commit_id).or(row.commit_id))) {
+                    matches = crate::undo_redo::replayed_change_matches(self, writer, *expected, &mut replay_provenance).await?;
                 }
-                let id = pk.as_single_string_owned().ok()?;
-                if !selected_files.contains(&id) || row.as_ref().is_some_and(|row| !row.deleted) {
-                    return None;
-                }
-                let matches = match expected {
-                    Some(expected) => row.as_ref().and_then(|row| row.change_id) == Some(*expected),
-                    None => true,
-                };
-                matches.then_some(id)
-            })
-            .collect::<BTreeSet<_>>();
+            }
+            if matches { hidden_files.insert(id); }
+        }
         let mut target_change_ids = Vec::new();
         let mut historical_files = BTreeSet::new();
         let mut rows = RawWriteBatch::with_capacity(plans.len());
         for ((diff_id, (schema_key, row_pk, file_id), expected, target), current) in
             plans.into_iter().zip(current)
         {
-            let current_matches = match expected {
+            let mut current_matches = match expected {
                 Some(expected) => current
                     .as_ref()
                     .and_then(|row| row.change_id)
@@ -9910,9 +9772,17 @@ where
                             && file_id.as_ref().is_some_and(|id| hidden_files.contains(id)))
                 }
             };
+            if !current_matches && causal_replay {
+                if let (Some(expected), Some(commit_id)) = (expected, current.as_ref().and_then(|row| row.change_id.and_then(crate::tracked_state::direct_change_locator).map(|locator| locator.commit_id).or(row.commit_id))) {
+                    current_matches = crate::undo_redo::replayed_change_matches(self, commit_id, expected, &mut replay_provenance).await?;
+                }
+            }
             if !current_matches {
                 return Err(stale_or_unknown_diff_id().with_details(serde_json::json!({
                     "operation": diff_command_operation(command),
+                    "expectedChangeId": expected,
+                    "currentChangeId": current.as_ref().and_then(|row| row.change_id),
+                    "currentCommitId": current.as_ref().and_then(|row| row.commit_id),
                     "rowRef": crate::row_ref::encode_schema_identity(&schema_key, &row_pk)?
                         .as_str(),
                 })));
@@ -10031,7 +9901,7 @@ where
     /// Resolves public relation identities against one coherent immutable diff.
     /// Encoded change pairs remain a private implementation detail of the
     /// existing selected/unselected machinery.
-    async fn resolve_diff_command_selections(
+    pub(crate) async fn resolve_diff_command_selections(
         &mut self,
         command: DiffCommand,
         selections: &[DiffCommandSelection],
@@ -10263,7 +10133,7 @@ where
         let mut resolved = Vec::new();
         for entry in &entries {
             if entry.identity.schema_key() == CHECKPOINT_SCHEMA_KEY
-                || entry.identity.schema_key() == crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+                || crate::undo_redo::is_undo_metadata(entry.identity.schema_key())
             {
                 continue;
             }
@@ -10526,6 +10396,9 @@ where
         params: Vec<Value>,
     ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
         match plan {
+            crate::sql2::CheckpointFunctionPlan::UndoRedo { redo, target_query, selection } => {
+                self.execute_undo_redo_function(redo, target_query, *selection, params).await
+            }
             crate::sql2::CheckpointFunctionPlan::Recovery {
                 command,
                 commits_query,
@@ -10549,6 +10422,82 @@ where
                 .await
             }
         }
+    }
+
+    pub(crate) async fn stage_undo_baseline(&mut self, expected: CommitId, target: CommitId) -> Result<(), LixError> {
+        let branch = self.active_branch_id.clone();
+        if self.load_branch_working_base(&branch).await? != Some(expected) {
+            return Err(LixError::new("LIX_UNDO_BASELINE_CONFLICT", "working baseline changed during undo/redo"));
+        }
+        self.pending_undo_baseline = Some(commit::UndoBaselinePublication { branch_id: branch, expected, target });
+        Ok(())
+    }
+
+    pub(crate) fn staged_undo_commit_id(&self) -> Result<CommitId, LixError> {
+        self.staged_writes.commit_id_for_branch(&self.active_branch_id)?
+            .ok_or_else(|| LixError::unknown("undo/redo did not stage a commit"))
+    }
+
+    async fn execute_undo_redo_function(
+        &mut self,
+        redo: bool,
+        target_query: Option<String>,
+        selection: crate::sql2::CheckpointFunctionPlan,
+        params: Vec<Value>,
+    ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
+        use crate::sql2::CheckpointFunctionPlan;
+        self.ensure_sql_mutation_allowed_after_undo_redo()?;
+        if self.staged_writes.has_staged_state_rows()? || self.active_branch_id == GLOBAL_BRANCH_ID {
+            return Err(LixError::new("LIX_INVALID_TRANSACTION_STATE",
+                "undo/redo requires a non-global branch and cannot follow another write"));
+        }
+        let target_statement = target_query.as_ref().map(|query| crate::sql2::parse_statement(query)).transpose()?;
+        let target_params = target_statement.as_ref().map(|statement| recovery_query_params(statement, &params)).transpose()?.unwrap_or_default();
+        let selection_statement = match &selection {
+            CheckpointFunctionPlan::SelectionQuery(query) => Some(crate::sql2::parse_statement(query)?),
+            _ => None,
+        };
+        let selection_params = selection_statement.as_ref().map(|statement| recovery_query_params(statement, &params)).transpose()?.unwrap_or_default();
+        let expected = target_params.len().max(selection_params.len());
+        if params.len() != expected {
+            return Err(LixError::new(LixError::CODE_INVALID_PARAM,
+                format!("SQL expected {expected} parameter(s), but {} parameter(s) were provided", params.len())));
+        }
+        let target = if let Some(query) = target_query {
+            let result = Box::pin(self.execute_read_sql_statement(query, target_statement.expect("parsed target"), target_params)).await?;
+            let [row] = result.rows.as_slice() else {
+                return Err(LixError::new(LixError::CODE_TYPE_MISMATCH, "undo/redo target must produce one row"));
+            };
+            let [Value::Text(id)] = row.as_slice() else {
+                return Err(LixError::new(LixError::CODE_TYPE_MISMATCH, "undo/redo target must be non-null text"));
+            };
+            Some(CommitId::parse_lix(id, "undo/redo target")?)
+        } else { None };
+        let scope = match selection {
+            CheckpointFunctionPlan::Full => None,
+            CheckpointFunctionPlan::Empty => Some(Vec::new()),
+            CheckpointFunctionPlan::SelectionQuery(query) => {
+                let result = Box::pin(self.execute_read_sql_statement(query, selection_statement.expect("parsed selection"), selection_params)).await?;
+                if result.columns.len() != 1 {
+                    return Err(LixError::new(LixError::CODE_TYPE_MISMATCH, "selection must return one row_ref column"));
+                }
+                let mut scope = Vec::with_capacity(result.rows.len());
+                for row in result.rows {
+                    let [Value::RowRef(row_ref)] = row.as_slice() else {
+                        return Err(LixError::new(LixError::CODE_TYPE_MISMATCH, "selection must contain non-null row references"));
+                    };
+                    let decoded = crate::row_ref::decode(row_ref)?;
+                    scope.push(DiffCommandSelection { relation: decoded.relation, row_pk: decoded.row_pk, source_commits: None });
+                }
+                Some(scope)
+            }
+            _ => unreachable!("nested recovery selection"),
+        };
+        let outcome = Box::pin(crate::undo_redo::execute(self, redo, target, scope)).await?;
+        if outcome.commit_id.is_some() {
+            self.mark_successful_undo_redo();
+        }
+        Ok(outcome)
     }
 
     /// Resolve versions explicitly, then reuse the atomic patch/dependency machinery.
@@ -10711,9 +10660,7 @@ where
                 let mut diff_ids = Vec::new();
                 let mut selected_files = BTreeSet::new();
                 for entry in entries {
-                    if entry.identity.schema_key() == CHECKPOINT_SCHEMA_KEY
-                        || entry.identity.schema_key()
-                            == crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+                    if crate::undo_redo::is_undo_metadata(entry.identity.schema_key())
                     {
                         continue;
                     }
@@ -10728,7 +10675,7 @@ where
                 self.execute_recovery_patch(DiffCommand::Apply, diff_ids, selected_files)
                     .await
             }
-            CheckpointFunctionPlan::Recovery { .. } => {
+            CheckpointFunctionPlan::Recovery { .. } | CheckpointFunctionPlan::UndoRedo { .. } => {
                 unreachable!("nested recovery plans cannot be parsed")
             }
         }
@@ -10916,8 +10863,7 @@ where
                 let mut unselected_source_membership_exact = true;
                 for entry in diff.entries.into_iter().filter(|entry| {
                     entry.identity.schema_key() != CHECKPOINT_SCHEMA_KEY
-                        && entry.identity.schema_key()
-                            != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+                        && !crate::undo_redo::is_undo_metadata(entry.identity.schema_key())
                 }) {
                     let diff_id = entry.diff_id()?;
                     let target = entry.after.ok_or_else(|| {
@@ -11367,13 +11313,6 @@ fn stale_or_unknown_diff_id() -> LixError {
     )
 }
 
-fn empty_state_transition(current: CommitId, desired: CommitId) -> LixError {
-    LixError::new(
-        LixError::CODE_INTERNAL_ERROR,
-        format!("tracked-state transition from '{current}' to '{desired}' is empty"),
-    )
-}
-
 async fn opening_parent_complete_lifecycle_created_at(
     read: &(impl StorageAdapterRead + ?Sized),
     parent_commit_id: Option<CommitId>,
@@ -11544,7 +11483,7 @@ fn close_and_validate_diff_command_selection(
     let mut registration_by_schema_key = BTreeMap::new();
     for entry in entries.iter().filter(|entry| {
         entry.identity.schema_key() != CHECKPOINT_SCHEMA_KEY
-            && entry.identity.schema_key() != crate::undo_redo::UNDO_REDO_MARKER_SCHEMA_KEY
+            && !crate::undo_redo::is_undo_metadata(entry.identity.schema_key())
     }) {
         let diff_id = entry.diff_id()?;
         by_diff_id.insert(diff_id.clone(), entry);
