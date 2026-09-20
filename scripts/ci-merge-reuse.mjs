@@ -33,7 +33,8 @@ export async function findReusableRun({ github, repository, sha, tree, readEvide
 			if (!evidenceArtifact || !browser) continue;
 			const evidence = await readEvidence(evidenceArtifact);
 			if (matchesTestedSource(evidence, { revision, tree }) &&
-				await acceptBrowser({ artifacts, revision, run })) return { runId: run.id, revision };
+				await acceptBrowser({ artifacts, revision, run })) return { runId: run.id, revision,
+          serverArtifact: artifacts.some(a => a.name === `lix-server-image-linux-x64-${revision}` && !a.expired) };
 		}
 	}
 	return null;
@@ -68,6 +69,7 @@ export async function selectMergeReuse({ github, context, core }) {
 		core.setOutput("reuse", "true");
 		core.setOutput("run_id", result.runId);
 		core.setOutput("revision", result.revision);
+		core.setOutput("server_artifact", String(result.serverArtifact));
 	} catch (error) {
 		// Lookup failures must never suppress validation.
 		core.warning(`Cannot prove prior CI coverage; running full CI: ${error.message}`);

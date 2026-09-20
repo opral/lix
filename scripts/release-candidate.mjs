@@ -41,6 +41,15 @@ export function assertReleaseReady({ needs, eventName, event, currentPr }) {
 	if (needs["merge-reuse"].outputs?.reuse === "true") {
 		if (eventName !== "push") throw new Error("PR candidates must run validation.");
 		requireSuccess("promote-browser-sdk");
+		requireSuccess("preview-artifact-changes");
+		if (needs["merge-reuse"].outputs.server_artifact === "true") {
+			requireSuccess("promote-server-image");
+			if (needs["preview-artifact-changes"].outputs?.server !== "false" ||
+				needs["preview-server-image"]?.result !== "skipped") throw new Error("Unexpected server promotion scope");
+		} else {
+			if (needs["preview-artifact-changes"].outputs?.server !== "true") throw new Error("Missing server build scope");
+			requireSuccess("preview-server-image");
+		}
 		return;
 	}
 	requireSuccess("changelog");
@@ -58,9 +67,10 @@ export function assertReleaseReady({ needs, eventName, event, currentPr }) {
 	if (needs.changelog.outputs?.rust === "false") {
 		if (needs.cargo?.result !== "skipped") throw new Error("Unexpected Rust scope result");
 	} else requireSuccess("cargo");
-	if (eventName === "pull_request") {
+	if (["pull_request", "push"].includes(eventName)) {
 		requireSuccess("preview-artifact-changes");
 		const server = needs["preview-artifact-changes"].outputs?.server;
+		if (eventName === "push" && server !== "true") throw new Error("Main requires a server artifact");
 		if (server === "true") requireSuccess("preview-server-image");
 		else if (server !== "false" || needs["preview-server-image"]?.result !== "skipped") {
 			throw new Error("Unexpected server preview scope result");

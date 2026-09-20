@@ -20,7 +20,7 @@ function fixture() {
   return { pr, run, artifacts, args: { github, repository: 'opral/lix', sha: 'merge', tree: 'tree', readEvidence: async () => evidence } };
 }
 test('successful matching PR run retains a downstream SDK artifact without recompilation', async () => {
-  assert.deepEqual(await findReusableRun(fixture().args), { runId: 42, revision: 'head' });
+  assert.deepEqual(await findReusableRun(fixture().args), { runId: 42, revision: 'head', serverArtifact: false });
 });
 for (const [name, mutate] of [
   ['unmerged PR', f => f.pr.merged_at = null],
@@ -55,4 +55,15 @@ test('API failure falls back to full CI', async () => {
   } });
   assert.equal(outputs.reuse, 'false');
   assert.equal(warnings.length, 1);
+});
+
+test('server promotion is available only for the matching unexpired artifact', async () => {
+  const f = fixture();
+  f.artifacts.push({ name: 'lix-server-image-linux-x64-head' });
+  assert.equal((await findReusableRun(f.args)).serverArtifact, true);
+  f.artifacts.at(-1).expired = true;
+  assert.equal((await findReusableRun(f.args)).serverArtifact, false);
+  f.artifacts.at(-1).expired = false;
+  f.artifacts.at(-1).name = 'lix-server-image-linux-x64-other';
+  assert.equal((await findReusableRun(f.args)).serverArtifact, false);
 });

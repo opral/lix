@@ -176,7 +176,7 @@ test("server-changing pull requests retain one reusable preview image", () => {
 		workflow,
 		/name: lix-server-image-linux-x64-\$\{\{ env\.LIX_SOURCE_SHA \}\}/,
 	);
-	assert.match(workflow, /retention-days: 14/);
+	assert.match(workflow.split("\n  preview-server-image:\n")[1].split("\n  content-browser-sdk:\n")[0], /retention-days: 90/);
 	assert.match(publishWorkflow, /node scripts\/ci-server-image\.mjs/);
 });
 
@@ -201,7 +201,7 @@ test("the readiness gate aggregates real results and draft runs have a distinct 
 	const gate = workflow.split("\n  release-ready:\n")[1].split("\n  merge-reuse:\n")[0];
 	assert.match(gate, /always\(\)/);
 	assert.match(gate, /'Draft - full CI deferred' \|\| 'Release ready'/);
-	for (const job of ["merge-reuse", "promote-browser-sdk", "changelog", "cargo-config", "cargo", "js-sdk-test", "preview-artifact-changes", "preview-server-image"]) {
+	for (const job of ["merge-reuse", "promote-browser-sdk", "promote-server-image", "changelog", "cargo-config", "cargo", "js-sdk-test", "preview-artifact-changes", "preview-server-image"]) {
 		assert.ok(gate.split("    needs: ")[1].split("\n")[0].includes(job));
 	}
 	assert.match(gate, /github\.rest\.pulls\.get/);
@@ -431,4 +431,18 @@ test("only main writes compiler snapshots; PRs restore without creating private 
   const cache = readFileSync(resolve(repositoryRoot, ".github/actions/compiler-cache/action.yml"), "utf8");
   assert.match(cache, /if: github\.ref != 'refs\/heads\/main'\n\s+uses: actions\/cache\/restore@v4/);
   assert.match(cache, /if: github\.ref == 'refs\/heads\/main'\n\s+uses: actions\/cache@v4/);
+});
+
+test("merge reuse promotes the server image and main builds when the source artifact is absent", () => {
+  const job = workflow.split("\n  promote-server-image:\n")[1].split("\n  changelog:\n")[0];
+  assert.match(job, /outputs\.reuse == 'true' && needs\.merge-reuse\.outputs\.server_artifact == 'true'/);
+  assert.match(job, /run-id: \$\{\{ needs\.merge-reuse\.outputs\.run_id \}\}/);
+  assert.match(job, /node scripts\/ci-promote-server-image\.mjs/);
+  assert.match(job, /retention-days: 90/);
+  assert.match(job, /name: lix-server-image-linux-x64-\$\{\{ github\.sha \}\}/);
+  assert.doesNotMatch(job, /cargo |packages\/server\/Dockerfile/);
+  const selector = workflow.split("\n  preview-artifact-changes:\n")[1].split("\n  preview-server-image:\n")[0];
+  assert.match(selector, /github\.event_name == 'push'/);
+  assert.match(selector, /PROMOTE_SERVER:/);
+  assert.match(selector, /\[ "\$GITHUB_EVENT_NAME" = push \]/);
 });

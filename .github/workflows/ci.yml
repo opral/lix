@@ -38,7 +38,7 @@ jobs:
     # Draft reruns must not overwrite the required ready-candidate check.
     name: ${{ inputs.artifacts_only && 'Artifacts only - not release validation' || github.event.pull_request.draft && 'Draft - full CI deferred' || 'Release ready' }}
     if: always() && inputs.artifacts_only != true && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
-    needs: [merge-reuse, promote-browser-sdk, content-browser-sdk, changelog, cargo-config, cargo, js-sdk-test, preview-artifact-changes, preview-server-image]
+    needs: [merge-reuse, promote-browser-sdk, promote-server-image, content-browser-sdk, changelog, cargo-config, cargo, js-sdk-test, preview-artifact-changes, preview-server-image]
     runs-on: ubicloud-standard-2-ubuntu-2404
     timeout-minutes: 5
     permissions:
@@ -74,6 +74,7 @@ jobs:
       reuse: ${{ steps.reuse.outputs.reuse }}
       run_id: ${{ steps.reuse.outputs.run_id }}
       revision: ${{ steps.reuse.outputs.revision }}
+      server_artifact: ${{ steps.reuse.outputs.server_artifact }}
       content_only: ${{ steps.content.outputs.content_only }}
     steps:
       - uses: actions/checkout@v4
@@ -184,6 +185,41 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
+  promote-server-image:
+    name: Reuse tested server image
+    needs: merge-reuse
+    if: needs.merge-reuse.outputs.reuse == 'true' && needs.merge-reuse.outputs.server_artifact == 'true'
+    runs-on: ubicloud-standard-2-ubuntu-2404
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          name: lix-server-image-linux-x64-${{ needs.merge-reuse.outputs.revision }}
+          run-id: ${{ needs.merge-reuse.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: ci-artifact
+      - name: Promote tested server layers to the landed revision
+        env:
+          SOURCE_REVISION: ${{ needs.merge-reuse.outputs.revision }}
+          SOURCE_RUN: ${{ needs.merge-reuse.outputs.run_id }}
+        run: node scripts/ci-promote-server-image.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lix-server-image-linux-x64-${{ github.sha }}
+          path: |
+            ci-artifact/lix-server-image.tar
+            ci-artifact/server-linux-x64.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+
   changelog:
     name: Changelog
     needs: merge-reuse
@@ -233,7 +269,10 @@ jobs:
         run: node scripts/validate-server-protocol-docs.mjs
 
       - name: Validate CI workflow invariants
-        run: node --test scripts/compatibility.test.mjs scripts/native-build.test.mjs scripts/ci-workflow.test.mjs scripts/ci-merge-reuse.test.mjs scripts/ci-rust-scope.test.mjs scripts/ci-content-scope.test.mjs scripts/ci-content-artifact.test.mjs scripts/ci-sdk-cache.test.mjs scripts/ci-build-sdk.test.mjs scripts/ci-test-browser.test.mjs scripts/release-browser-artifact.test.mjs scripts/ci-server-image.test.mjs scripts/release.test.mjs scripts/release-candidate.test.mjs scripts/publish-plugin.test.mjs
+        run: node --test scripts/compatibility.test.mjs scripts/native-build.test.mjs scripts/ci-workflow.test.mjs scripts/ci-merge-reuse.test.mjs scripts/ci-rust-scope.test.mjs scripts/ci-content-scope.test.mjs scripts/ci-content-artifact.test.mjs scripts/ci-sdk-cache.test.mjs scripts/ci-build-sdk.test.mjs scripts/ci-test-browser.test.mjs scripts/release-browser-artifact.test.mjs scripts/ci-server-image.test.mjs scripts/ci-promote-server-image.test.mjs scripts/release.test.mjs scripts/release-candidate.test.mjs scripts/publish-plugin.test.mjs
+
+      - name: Test server artifact promotion with Docker
+        run: LIX_TEST_DOCKER_PROMOTION=1 node --test scripts/ci-promote-server-image.test.mjs
 
   cargo-config:
     name: Cargo config (${{ matrix.name }})
@@ -728,7 +767,7 @@ jobs:
         with:
           name: sdk-build-timings-${{ matrix.runtime }}-${{ github.run_attempt }}
           path: ci-sdk-timings/${{ matrix.runtime }}
-          retention-days: 14
+          retention-days: 90
           if-no-files-found: warn
 
       - name: Cache successfully tested SDK binaries
@@ -747,7 +786,7 @@ jobs:
 
   preview-artifact-changes:
     name: Select preview artifacts
-    if: (github.event_name == 'pull_request' && github.event.pull_request.draft == false) || inputs.artifacts_only == true
+    if: (github.event_name == 'pull_request' && github.event.pull_request.draft == false) || github.event_name == 'push' || inputs.artifacts_only == true
     needs: merge-reuse
     runs-on: ubicloud-standard-2-ubuntu-2404
     outputs:
@@ -764,11 +803,20 @@ jobs:
         id: changes
         env:
           ARTIFACTS_ONLY: ${{ inputs.artifacts_only || false }}
+          PROMOTE_SERVER: ${{ needs.merge-reuse.outputs.server_artifact }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           if [ "$ARTIFACTS_ONLY" = true ]; then
             echo 'server=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            if [ "$PROMOTE_SERVER" = true ]; then
+              echo 'server=false' >> "$GITHUB_OUTPUT"
+            else
+              echo 'server=true' >> "$GITHUB_OUTPUT"
+            fi
             exit 0
           fi
           if git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- \
@@ -857,7 +905,7 @@ jobs:
             ci-artifact/server-linux-x64.json
           if-no-files-found: error
           compression-level: 0
-          retention-days: 14
+          retention-days: 90
 
       - name: Report remaining runner resources
         if: always()
