@@ -14,6 +14,7 @@ function validation() {
 		needs: {
 			"merge-reuse": { result: "success", outputs: { reuse: "false" } },
 			"promote-browser-sdk": { result: "skipped" },
+			"promote-server-image": { result: "skipped" },
 			changelog: { result: "success", outputs: { rust: "true" } },
 			"cargo-config": { result: "success" }, cargo: { result: "success" },
 			"js-sdk-test": { result: "success" },
@@ -148,4 +149,42 @@ test("content-only skips are explicit and never hide failures", () => {
   }
   delete input.needs['merge-reuse'].outputs.content_only;
   assert.throws(() => assertReleaseReady(input));
+});
+
+test("merged server promotion is required before main is release-ready", () => {
+  const input = validation();
+  input.eventName = "push";
+  input.needs["merge-reuse"].outputs = { reuse: "true", server_artifact: "true" };
+  input.needs["promote-browser-sdk"].result = "success";
+  input.needs["preview-artifact-changes"].outputs.server = "false";
+  input.needs["preview-server-image"].result = "skipped";
+  for (const result of ["skipped", "failure", "cancelled", undefined]) {
+    input.needs["promote-server-image"].result = result;
+    assert.throws(() => assertReleaseReady(input), /promote-server-image/);
+  }
+  input.needs["promote-server-image"].result = "success";
+  assert.doesNotThrow(() => assertReleaseReady(input));
+});
+
+test("missing source server artifact requires a main build, not silent omission", () => {
+  const input = validation();
+  input.eventName = "push";
+  input.needs["merge-reuse"].outputs = { reuse: "true", server_artifact: "false" };
+  input.needs["promote-browser-sdk"].result = "success";
+  input.needs["preview-server-image"].result = "skipped";
+  assert.throws(() => assertReleaseReady(input), /preview-server-image/);
+  input.needs["preview-server-image"].result = "success";
+  assert.doesNotThrow(() => assertReleaseReady(input));
+  input.needs["preview-artifact-changes"].outputs.server = "false";
+  assert.throws(() => assertReleaseReady(input), /server build scope/);
+});
+
+test("non-reused main pushes must also publish a server artifact", () => {
+  const input = validation();
+  input.eventName = "push";
+  input.needs["preview-server-image"].result = "failure";
+  assert.throws(() => assertReleaseReady(input), /preview-server-image/);
+  input.needs["preview-server-image"].result = "skipped";
+  input.needs["preview-artifact-changes"].outputs.server = "false";
+  assert.throws(() => assertReleaseReady(input), /Main requires a server artifact/);
 });
