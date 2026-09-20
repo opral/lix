@@ -66,6 +66,11 @@ use crate::filesystem::MAX_DIRECTORY_PARENT_DEPTH;
 pub(crate) struct TransactionValidationInput<'a> {
     staged_writes: &'a PreparedWriteValidationSet<'a>,
     schema_catalog: &'a CatalogSnapshot,
+    /// Catalog used for delete-side FK planning. Row/schema validation keeps
+    /// using `schema_catalog`, whose durability scope is deliberately narrow,
+    /// while tracked targets must also see source schemas from the untracked
+    /// lane.
+    delete_schema_catalog: Option<&'a CatalogSnapshot>,
     hot_state: &'a dyn HotStateReader,
     staged_commit_ids: BTreeSet<CommitId>,
     trust_filesystem_planner: bool,
@@ -80,6 +85,7 @@ impl<'a> TransactionValidationInput<'a> {
         Self {
             staged_writes,
             schema_catalog,
+            delete_schema_catalog: None,
             hot_state,
             staged_commit_ids: BTreeSet::new(),
             trust_filesystem_planner: false,
@@ -96,6 +102,14 @@ impl<'a> TransactionValidationInput<'a> {
     /// validation because their planner snapshot can become stale.
     pub(crate) fn with_trusted_filesystem_planner(mut self) -> Self {
         self.trust_filesystem_planner = true;
+        self
+    }
+
+    pub(crate) fn with_delete_schema_catalog(
+        mut self,
+        delete_schema_catalog: &'a CatalogSnapshot,
+    ) -> Self {
+        self.delete_schema_catalog = Some(delete_schema_catalog);
         self
     }
 
@@ -2974,12 +2988,14 @@ async fn validate_committed_delete_restrictions(
     schema_catalog: &CatalogSnapshot,
     pending_constraints: &PendingConstraintIndexes,
 ) -> Result<(), LixError> {
+    let delete_schema_catalog = input.delete_schema_catalog.unwrap_or(schema_catalog);
     let mut normal_batches = BTreeMap::<
         NormalDeleteRestrictionBatchKey,
         BTreeMap<UniqueConstraintValue, Vec<DomainRowIdentity>>,
     >::new();
     for tombstone in &pending_constraints.tombstones {
-        let delete_plan = schema_catalog.delete_plan_for_key(tombstone.identity.schema_key());
+        let delete_plan =
+            delete_schema_catalog.delete_plan_for_key(tombstone.identity.schema_key());
         if !delete_plan.has_committed_checks() {
             continue;
         }

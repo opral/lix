@@ -920,3 +920,51 @@ simulation_test!(
         }
     }
 );
+
+
+simulation_test!(foreign_key_restricts_parent_point_delete, |sim| async move {
+    assert_parent_delete_restricted(&sim, "DELETE FROM fk_delete_parent WHERE id = 'p1'").await;
+});
+
+simulation_test!(foreign_key_restricts_parent_collection_delete, |sim| async move {
+    assert_parent_delete_restricted(&sim, "DELETE FROM fk_delete_parent").await;
+});
+
+async fn assert_parent_delete_restricted(sim: &crate::support::simulation_test::engine::Simulation, delete_sql: &str) {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    for schema in [
+        serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json", "key": "fk_delete_parent",
+            "columns": [{"name":"id", "type":"text", "nullable":false}],
+            "primary_key": ["id"]
+        }),
+        serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json", "key": "fk_delete_child",
+            "columns": [{"name":"id", "type":"text", "nullable":false},
+                        {"name":"parent_id", "type":"text", "nullable":false}],
+            "primary_key": ["id"],
+            "foreign_keys": [{"columns":["parent_id"], "references":{
+                "schema_key":"fk_delete_parent", "columns":["id"]}}]
+        }),
+    ] {
+        session.execute("INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)",
+            &[Value::Text(schema.to_string())]).await.unwrap();
+    }
+    let error = session.execute("INSERT INTO fk_delete_child (id, parent_id) VALUES ('bad', 'missing')", &[])
+        .await.expect_err("missing parent must be rejected");
+    assert_eq!(error.code, lix::LixError::CODE_FOREIGN_KEY);
+    session.execute("INSERT INTO fk_delete_parent (id) VALUES ('p1'), ('p2')", &[]).await.unwrap();
+    session.execute("INSERT INTO fk_delete_child (id, parent_id) VALUES ('c1', 'p1')", &[]).await.unwrap();
+    let error = session.execute(delete_sql, &[]).await.expect_err("referenced parent must not be deleted");
+    assert_eq!(error.code, lix::LixError::CODE_FOREIGN_KEY);
+    assert_rows_eq(session.execute("SELECT id FROM fk_delete_parent ORDER BY id", &[]).await.unwrap(),
+        vec![vec![Value::Text("p1".into())], vec![Value::Text("p2".into())]]);
+    assert_rows_eq(session.execute("SELECT parent_id FROM fk_delete_child", &[]).await.unwrap(),
+        vec![vec![Value::Text("p1".into())]]);
+    // Final-state validation must still allow removing both sides together.
+    let mut tx = session.begin_transaction().await.unwrap();
+    tx.execute("DELETE FROM fk_delete_child", &[]).await.unwrap();
+    tx.execute(delete_sql, &[]).await.unwrap();
+    tx.commit().await.expect("deleting the child and parent together is valid");
+}

@@ -83,20 +83,34 @@ impl TransactionSchemaResolver {
             .map(|(_, plan)| plan)
     }
 
-    pub(crate) async fn catalog_for_validation(
+    /// Returns the scope catalog and the branch-visible catalog used for
+    /// delete-side foreign-key planning together. The latter includes both
+    /// durability lanes, while the former remains narrow so tracked rows
+    /// cannot validate against untracked-only schema definitions.
+    pub(crate) async fn catalogs_for_validation(
         &mut self,
         hot_state: &dyn HotStateReader,
         staged: &(dyn StagedHotStateRows + Sync),
         domain: &Domain,
-    ) -> Result<&CatalogSnapshot, LixError> {
+    ) -> Result<(&CatalogSnapshot, &CatalogSnapshot), LixError> {
+        let delete_domain = domain.with_untracked(true);
+        self.load_catalog_for_domain(hot_state, Some(staged), &delete_domain)
+            .await?;
         self.load_catalog_for_domain(hot_state, Some(staged), domain)
             .await?;
-        let domain = domain.schema_catalog_domain();
-        Ok(self
+        let delete_domain = delete_domain.schema_catalog_domain();
+        let schema_domain = domain.schema_catalog_domain();
+        let delete_catalog = self
             .catalogs_by_domain
-            .get(&domain)
-            .expect("catalog cache should contain requested branch")
-            .snapshot())
+            .get(&delete_domain)
+            .expect("delete catalog cache should contain requested branch")
+            .snapshot();
+        let schema_catalog = self
+            .catalogs_by_domain
+            .get(&schema_domain)
+            .expect("schema catalog cache should contain requested branch")
+            .snapshot();
+        Ok((schema_catalog, delete_catalog))
     }
 
     pub(crate) fn remember_compiled_catalog(

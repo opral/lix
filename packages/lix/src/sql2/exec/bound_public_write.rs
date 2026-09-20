@@ -1978,6 +1978,22 @@ async fn row_delete_collection(
 ) -> Result<Option<SqlWriteResult>, LixError> {
     use crate::collection_generation::{CollectionScopeRef, collection_delete_stage_row};
 
+    // Collection generation markers do not stage individual tombstones.
+    // Foreign-key validation needs those identities on both sides of a
+    // relationship, including when a transaction deletes children and parents.
+    if spec.has_inter_row_constraints || ctx.has_staged_schema_changes()? {
+        return Ok(None);
+    }
+    let Some(catalog) = ctx.schema_catalog_snapshot() else {
+        return Ok(None);
+    };
+    if catalog
+        .delete_plan_for_key(&spec.schema_key)
+        .has_committed_checks()
+    {
+        return Ok(None);
+    }
+
     let scope = CollectionScopeRef {
         schema_key: &spec.schema_key,
         file_id: None,
@@ -3801,11 +3817,25 @@ fn certify_fileless_typed_sql_rows(
     }) {
         return Ok(());
     }
+    // A parent may have no constraints of its own but still be referenced.
+    // Include untracked source schemas even for a tracked parent deletion.
+    let has_deletes = rows.iter().any(|row| row.decoded_snapshot().is_none());
+    let requires_delete_validation = if has_deletes {
+        let Some(delete_catalog) = ctx.schema_catalog_snapshot() else {
+            return Ok(());
+        };
+        delete_catalog
+            .delete_plan_for_key(&spec.schema_key)
+            .has_committed_checks()
+    } else {
+        false
+    };
     rows.certify_fileless_typed_sql_rows(
         schema_plan_id,
         PreparedRowFacts {
             row_content_validated: true,
-            requires_transaction_validation: spec.has_inter_row_constraints,
+            requires_transaction_validation: spec.has_inter_row_constraints
+                || requires_delete_validation,
         },
     )
 }
