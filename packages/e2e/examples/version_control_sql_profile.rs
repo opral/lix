@@ -8,6 +8,8 @@ use lix::storage::Storage;
 use lix::{Lix, Value, open_lix};
 use std::time::Instant;
 
+const PROFILE_FILE_ID: &str = "01940000-0000-7000-8000-000000000001";
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sizes = std::env::args()
         .skip(1)
@@ -50,6 +52,7 @@ where
     for size in sizes {
         while retained < size {
             lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('history', $1) ON CONFLICT (key) DO UPDATE SET value = excluded.value", &[Value::Text(retained.to_string())]).await?;
+            lix.execute("INSERT INTO lix_file (id, path, content) VALUES ($1, '/profile-history.txt', $2) ON CONFLICT (id) DO UPDATE SET content = excluded.content", &[Value::Text(PROFILE_FILE_ID.into()), Value::Blob(retained.to_string().into_bytes().into())]).await?;
             lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
                 .await?;
             retained += 1;
@@ -69,9 +72,28 @@ where
                 "history_page",
                 "WITH page AS (SELECT commit_id, position FROM lix_log($1) WHERE is_checkpoint ORDER BY position LIMIT 20) SELECT p.commit_id, h.key, h.diff_type FROM page p LEFT JOIN lix_history('lix_key_value', $1) h ON h.lixcol_to_commit_id = p.commit_id ORDER BY p.position",
             ),
+            (
+                "history_inner_page",
+                "WITH page AS (SELECT commit_id, position FROM lix_log($1) WHERE is_checkpoint ORDER BY position LIMIT 20) SELECT p.commit_id, h.key, h.diff_type FROM page p JOIN lix_history('lix_key_value', $1) h ON h.lixcol_to_commit_id = p.commit_id ORDER BY p.position",
+            ),
+            (
+                "file_history_page",
+                "WITH page AS (SELECT commit_id, position FROM lix_log($1) WHERE is_checkpoint ORDER BY position LIMIT 20) SELECT p.commit_id, h.id, h.diff_type FROM page p LEFT JOIN lix_history('lix_file', $1) h ON h.lixcol_to_commit_id = p.commit_id ORDER BY p.position",
+            ),
+            (
+                "file_history_inner_page",
+                "WITH page AS (SELECT commit_id, position FROM lix_log($1) WHERE is_checkpoint ORDER BY position LIMIT 20) SELECT p.commit_id, h.id, h.diff_type FROM page p JOIN lix_history('lix_file', $1) h ON h.lixcol_to_commit_id = p.commit_id ORDER BY p.position",
+            ),
         ] {
             let (median, p95, rows) = measure(&lix, query, &parameters).await?;
-            assert_eq!(rows, size.min(20));
+            if name.contains("inner") {
+                assert!(
+                    rows > 0 && rows <= 20,
+                    "inner history page returned {rows} rows"
+                );
+            } else {
+                assert_eq!(rows, size.min(20));
+            }
             println!(
                 "{}",
                 serde_json::json!({"backend":backend,"query":name,"retained":size,"page":20,"median_us":median,"p95_us":p95,"rows":rows})

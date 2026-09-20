@@ -55,7 +55,7 @@ A runnable Rust version lives at [`checkpoints.rs`](https://github.com/opral/lix
 
 ## Commit membership and queries
 
-A checkpoint is a new immutable commit with `is_checkpoint = true`. Automatic commits have the flag set to false. Empty checkpoints are retained log entries. A selected checkpoint creates a marked commit and an ordinary child containing remaining working changes. The flag cannot be updated through SQL.
+A checkpoint is a new immutable commit with internal checkpoint identity. `lix_log().is_checkpoint` exposes whether it is active at the query anchor. Empty checkpoints are retained log entries. A selected checkpoint creates a marked commit and an ordinary child containing remaining working changes. Checkpoint status changes only through checkpoint creation and undo/redo.
 
 ```sql
 SELECT commit_id, parent_commit_id, created_at
@@ -63,14 +63,9 @@ FROM lix_log()
 WHERE is_checkpoint
 ORDER BY position
 LIMIT 20;
-
-SELECT id, created_at
-FROM lix_commit
-WHERE is_checkpoint
-ORDER BY created_at DESC, id DESC;
 ```
 
-The first query is branch-relative; the second includes repository-global, off-branch checkpoints. There is no separate `lix_checkpoint` relation or marker write. Commit creation time is the single public checkpoint timestamp.
+The query follows the anchor’s first-parent history. There is no public checkpoint relation or checkpoint column on `lix_commit`. Commit creation time is the single public checkpoint timestamp.
 
 Use `lix_diff('lix_file')` for working changes. Its baseline is exposed as `lix_branch.working_base_commit_id` and can be an ordinary commit after a fork. The latest marked commit is not necessarily the working baseline.
 
@@ -99,3 +94,16 @@ See [History](./history.md) for log, endpoint history, snapshots, and paged prev
 
 See [Undo and redo](./undo-redo.md) for the full receipt contract and
 checkpoint-cycle behavior.
+
+## SQL surface upgrade
+
+Checkpoint status is exposed only by `lix_log().is_checkpoint`. The commit
+inventory has no checkpoint column, and row history has no checkpoint flag.
+Join log and history on `commit_id = lixcol_to_commit_id` at the same anchor.
+The removed columns have no compatibility aliases.
+
+This SQL change retains the internal commit encoding and checkpoint inventory.
+Current-format repositories keep their commit IDs, content, working baselines,
+and undo receipts. Older supported repository formats continue through Lix's
+registered migration chain; changing the public catalog does not rewrite
+historical commits or their historical schema registrations.

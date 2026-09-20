@@ -20,7 +20,7 @@ test("normal WASM opening upgrades released OPFS history without a migration art
     expect(progress.some(event => event.phase === "migrating" && event.scope === "local")).toBe(true);
     const rows = await lix.execute("SELECT value FROM lix_key_value WHERE key = 'fixture-shared'");
     expect(rows.rows).toEqual([{ value: { generation: 75, lane: "main" } }]);
-    const checkpoints = await lix.execute("SELECT id FROM lix_commit WHERE is_checkpoint");
+    const checkpoints = await lix.execute("SELECT commit_id FROM lix_log() WHERE is_checkpoint");
     expect(checkpoints.rows.length).toBeGreaterThanOrEqual(3);
     const file = await lix.execute("SELECT content FROM lix_file WHERE path = '/docs/released-v75.bin'");
     expect((file.rows[0]?.content as Uint8Array).length).toBe(65537);

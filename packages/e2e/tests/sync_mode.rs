@@ -828,7 +828,7 @@ async fn connected_api_routes_local_work_and_hot_reads_need_no_round_trip() {
     ] {
         let error = replica
             .execute_coherent_read_batch(&[
-                ("SELECT * FROM lix_commit WHERE is_checkpoint", &[]),
+                ("SELECT * FROM lix_log() WHERE is_checkpoint", &[]),
                 (sql, &[]),
             ])
             .await
@@ -2277,11 +2277,35 @@ async fn partial_replica_open_profile() {
                 "read_own_write",
                 "SELECT value FROM lix_key_value WHERE key = 'partial-profile-marker'",
             ),
+            (
+                "checkpoint_log_page",
+                "SELECT commit_id FROM lix_log($1) WHERE is_checkpoint ORDER BY position LIMIT 20",
+            ),
+            (
+                "key_history_page",
+                "WITH page AS (SELECT commit_id, position FROM lix_log($1) WHERE is_checkpoint ORDER BY position LIMIT 20) SELECT p.commit_id, h.key, h.diff_type FROM page p LEFT JOIN lix_history('lix_key_value', $1) h ON h.lixcol_to_commit_id = p.commit_id ORDER BY p.position",
+            ),
+            (
+                "file_history_page",
+                "WITH page AS (SELECT commit_id, position FROM lix_log($1) WHERE is_checkpoint ORDER BY position LIMIT 20) SELECT p.commit_id, h.id, h.diff_type FROM page p LEFT JOIN lix_history('lix_file', $1) h ON h.lixcol_to_commit_id = p.commit_id ORDER BY p.position",
+            ),
         ] {
+            let parameters = if matches!(operation, "checkpoint_log_page" | "key_history_page" | "file_history_page") {
+                let anchor = replica
+                    .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+                    .await
+                    .unwrap()
+                    .rows()[0]
+                    .get::<String>("id")
+                    .unwrap();
+                vec![Value::Text(anchor)]
+            } else {
+                Vec::new()
+            };
             let before = probe.attempted_requests.load(Ordering::Relaxed);
             let bytes_before = probe.response_body_bytes.load(Ordering::Relaxed);
             let started = Instant::now();
-            let result = replica.execute(sql, &[]).await.unwrap();
+            let result = replica.execute(sql, &parameters).await.unwrap();
             if operation == "read_own_write" {
                 let value = result.rows()[0].get::<Value>("value").unwrap();
                 let value = match value {
@@ -3189,7 +3213,7 @@ async fn migrated_partial_checkpoint_repository_reads_state_on_a_sparse_replica(
     );
     let checkpoints = authority
         .execute(
-            "SELECT id AS commit_id FROM lix_commit WHERE is_checkpoint ORDER BY created_at ASC",
+            "SELECT commit_id FROM lix_log() WHERE is_checkpoint ORDER BY position DESC",
             &[],
         )
         .await

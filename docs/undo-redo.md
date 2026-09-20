@@ -123,7 +123,7 @@ Working baseline:              B
 ```
 
 `lix_redo(U)` appends another commit and reactivates C. Neither operation
-changes C's stored `is_checkpoint` flag. Retirement is recorded as new tracked
+changes C's immutable internal checkpoint identity. Retirement is recorded as new tracked
 state, so replicas receive it with the operation. Unrelated working edits are
 preserved; conflicting selected edits cause the whole operation to fail.
 
@@ -191,14 +191,14 @@ cannot be used. Newly created undo/redo receipts follow the contracts above.
 
 ## Checkpoint history in applications
 
-`lix_commit.is_checkpoint` and `lix_log().is_checkpoint` describe immutable
-commit metadata. `lix_log().is_checkpoint_active` reflects retirement at the
-log's anchor. Applications list effective checkpoints with:
+`lix_log().is_checkpoint` is the only public checkpoint status. It reflects
+retirement at the log's anchor. Row history carries endpoint IDs and can join
+the log at the same anchor. Applications list effective checkpoints with:
 
 ```sql
 SELECT commit_id, parent_commit_id, created_at
 FROM lix_log()
-WHERE is_checkpoint_active
+WHERE is_checkpoint
 ORDER BY position;
 ```
 

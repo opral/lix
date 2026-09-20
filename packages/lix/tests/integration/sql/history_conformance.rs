@@ -19,7 +19,6 @@ simulation_test!(
                 "diff_type",
                 "lixcol_from_commit_id",
                 "lixcol_to_commit_id",
-                "lixcol_commit_is_checkpoint",
                 "lixcol_commit_created_at",
                 "lixcol_position",
             ] {
@@ -29,6 +28,7 @@ simulation_test!(
                 );
             }
             for retired in [
+                "lixcol_commit_is_checkpoint",
                 "lixcol_depth",
                 "lixcol_observed_commit_id",
                 "lixcol_source_changes",

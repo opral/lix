@@ -35,7 +35,7 @@ try {
   assert.ok(events.some(event => event.phase === 'migrating' && event.scope === 'local'));
   const working = await lix.execute("SELECT content FROM lix_file WHERE path = '/notes.md'");
   assert.equal(new TextDecoder().decode(working.rows[0].content), '# Notes\\n\\nWorking paragraph.\\n');
-  const checkpoints = await lix.execute('SELECT id FROM lix_commit WHERE is_checkpoint');
+  const checkpoints = await lix.execute('SELECT commit_id AS id FROM lix_log() WHERE is_checkpoint');
   assert.equal(checkpoints.rows.length, 1);
   const nodes = await lix.execute('SELECT kind FROM markdown_node ORDER BY kind');
   assert.deepEqual(nodes.rows.map(row => row.kind), ['document', 'heading', 'paragraph']);

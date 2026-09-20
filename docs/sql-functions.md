@@ -58,15 +58,16 @@ await lix.execute(
 
 ```sql
 SELECT lixcol_position, diff_type, from_title, to_title
-FROM lix_history('acme_task')
-WHERE id = 't1' AND lixcol_commit_is_checkpoint
+FROM lix_log() l
+JOIN lix_history('acme_task') h ON h.lixcol_to_commit_id = l.commit_id
+WHERE h.id = 't1' AND l.is_checkpoint
 ORDER BY lixcol_position;
 
 SELECT row_ref, id, diff_type
 FROM lix_diff('lix_file');
 ```
 
-The one-argument diff uses the branch working baseline. Read `working_base_commit_id` alongside `commit_id` from `lix_branch` when the comparison context is needed even for an empty diff. See [History](./history.md) for endpoint columns, global checkpoint metrics, and paged previews.
+The one-argument diff uses the branch working baseline. Read `working_base_commit_id` alongside `commit_id` from `lix_branch` when the comparison context is needed even for an empty diff. See [History](./history.md) for endpoint columns, anchored checkpoint queries, and paged previews.
 
 `lix_as_of(relation, commit_id)` returns the complete tracked state of a relation at one commit. Its columns are identical to the live relation, and entities that did not exist at that commit produce no row:
 

@@ -1084,7 +1084,6 @@ pub(crate) fn canonical_commit_change(node: &CommitGraphNode) -> CommitGraphChan
         &node.commit_id.to_string(),
         &node.parent_commit_ids,
         node.base_commit_id,
-        node.is_checkpoint,
         node.created_at,
     )
     .expect("lix_commit snapshot serialization should not fail");

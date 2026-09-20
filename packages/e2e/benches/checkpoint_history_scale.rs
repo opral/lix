@@ -349,13 +349,14 @@ async fn initialize_query_fixture<StorageImpl>(storage: StorageImpl, additional_
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    open_lix()
+    let lix = open_lix()
         .with_storage(storage.clone())
         .await
         .expect("initialize checkpoint-query fixture");
     if additional_checkpoints == 0 {
         return;
     }
+    drop(lix);
     let lix = open_lix()
         .with_storage(storage)
         .await
@@ -364,7 +365,21 @@ where
         .open_another_session()
         .await
         .expect("open checkpoint-query setup session");
-    for _ in 0..additional_checkpoints {
+    for index in 0..additional_checkpoints {
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('checkpoint-query-history', $1) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                &[lix::Value::Text(index.to_string())],
+            )
+            .await
+            .expect("seed checkpoint-query key history");
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content) VALUES ('01940000-0000-7000-8000-000000000002', '/checkpoint-query-history.txt', $1) ON CONFLICT (id) DO UPDATE SET content = excluded.content",
+                &[lix::Value::Blob(index.to_string().into_bytes().into())],
+            )
+            .await
+            .expect("seed checkpoint-query file history");
         session
             .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
             .await
@@ -456,56 +471,74 @@ async fn measure_query<StorageImpl>(
         .open_another_session()
         .await
         .expect("open checkpoint-query session");
-    for _ in 0..warmups {
-        let rows = session
-            .execute(
-                "SELECT id AS commit_id FROM lix_commit WHERE is_checkpoint",
-                &[],
-            )
-            .await
-            .expect("warm checkpoint query");
-        assert_eq!(rows.len(), expected_checkpoints);
+    let anchor = session
+        .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+        .await
+        .expect("read checkpoint-query anchor")
+        .rows()[0]
+        .get::<String>("id")
+        .expect("checkpoint-query anchor ID");
+    let parameters = [lix::Value::Text(anchor)];
+    for (name, query) in [
+        (
+            "log_page",
+            "SELECT commit_id FROM lix_log($1) WHERE is_checkpoint ORDER BY position LIMIT 20",
+        ),
+        (
+            "key_history_page",
+            "WITH page AS (SELECT commit_id, position FROM lix_log($1) WHERE is_checkpoint ORDER BY position LIMIT 20) SELECT p.commit_id, h.key, h.diff_type FROM page p LEFT JOIN lix_history('lix_key_value', $1) h ON h.lixcol_to_commit_id = p.commit_id ORDER BY p.position",
+        ),
+        (
+            "file_history_page",
+            "WITH page AS (SELECT commit_id, position FROM lix_log($1) WHERE is_checkpoint ORDER BY position LIMIT 20) SELECT p.commit_id, h.id, h.diff_type FROM page p LEFT JOIN lix_history('lix_file', $1) h ON h.lixcol_to_commit_id = p.commit_id ORDER BY p.position",
+        ),
+    ] {
+        let expected_rows = expected_checkpoints.min(20);
+        for _ in 0..warmups {
+            let rows = session
+                .execute(query, &parameters)
+                .await
+                .expect("warm checkpoint query");
+            assert_eq!(rows.len(), expected_rows, "query={name}");
+        }
+        let io_before = counters
+            .as_ref()
+            .map_or_else(SlateDBIoSnapshot::default, SlateDBIoCounters::snapshot);
+        let mut timings = Vec::with_capacity(samples);
+        for _ in 0..samples {
+            let started = Instant::now();
+            let rows = session
+                .execute(query, &parameters)
+                .await
+                .expect("measure checkpoint query");
+            timings.push(started.elapsed());
+            assert_eq!(rows.len(), expected_rows, "query={name}");
+        }
+        timings.sort_unstable();
+        let io = counters
+            .as_ref()
+            .map_or_else(SlateDBIoSnapshot::default, SlateDBIoCounters::snapshot)
+            .saturating_sub(io_before);
+        println!(
+            "checkpoint_history_scale,phase=measure_query,backend={backend},query={name},\
+             history_changes={history_changes},commit_width={commit_width},\
+             requested_checkpoints={expected_checkpoints},rows={expected_rows},\
+             warmups={warmups},samples={samples},\
+             p50_ms={},p95_ms={},p99_ms={},\
+             read_objects={},read_bytes={},write_objects={},write_bytes={},\
+             list_operations={},listed_objects={},backend_bytes={}",
+            millis(percentile(&timings, 50)),
+            millis(percentile(&timings, 95)),
+            millis(percentile(&timings, 99)),
+            io.read_objects,
+            io.read_bytes,
+            io.write_objects,
+            io.write_bytes,
+            io.list_operations,
+            io.listed_objects,
+            directory_bytes(Path::new(path)),
+        );
     }
-    let io_before = counters
-        .as_ref()
-        .map_or_else(SlateDBIoSnapshot::default, SlateDBIoCounters::snapshot);
-    let mut timings = Vec::with_capacity(samples);
-    for _ in 0..samples {
-        let started = Instant::now();
-        let rows = session
-            .execute(
-                "SELECT id AS commit_id FROM lix_commit WHERE is_checkpoint",
-                &[],
-            )
-            .await
-            .expect("measure checkpoint query");
-        timings.push(started.elapsed());
-        assert_eq!(rows.len(), expected_checkpoints);
-    }
-    timings.sort_unstable();
-    let io = counters
-        .as_ref()
-        .map_or_else(SlateDBIoSnapshot::default, SlateDBIoCounters::snapshot)
-        .saturating_sub(io_before);
-    println!(
-        "checkpoint_history_scale,phase=measure_query,backend={backend},\
-         history_changes={history_changes},commit_width={commit_width},\
-         requested_checkpoints={expected_checkpoints},\
-         warmups={warmups},samples={samples},\
-         p50_ms={},p95_ms={},p99_ms={},\
-         read_objects={},read_bytes={},write_objects={},write_bytes={},\
-         list_operations={},listed_objects={},backend_bytes={}",
-        millis(percentile(&timings, 50)),
-        millis(percentile(&timings, 95)),
-        millis(percentile(&timings, 99)),
-        io.read_objects,
-        io.read_bytes,
-        io.write_objects,
-        io.write_bytes,
-        io.list_operations,
-        io.listed_objects,
-        directory_bytes(Path::new(path)),
-    );
 }
 
 #[expect(clippy::too_many_arguments)]

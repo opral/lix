@@ -56,6 +56,25 @@ async fn checkpoint_log_hydrates_missing_graph_nodes_then_reads_offline() {
         expected.rows()
     );
 }
+#[tokio::test]
+async fn joined_checkpoint_history_hydrates_active_selection_and_replays_offline() {
+    let authority = open_lix().await.unwrap();
+    authority.set_sync_role(crate::sync::SyncRole::Authority).unwrap();
+    let mut checkpoints = Vec::new();
+    for index in 0..4 {
+        authority.execute("INSERT INTO lix_key_value (key,value) VALUES ('joined-history',$1) ON CONFLICT (key) DO UPDATE SET value=excluded.value", &[Value::Text(index.to_string())]).await.unwrap();
+        checkpoints.push(authority.create_checkpoint().await.unwrap().commit_id);
+    }
+    authority.execute("SELECT commit_id FROM lix_undo($1)", &[Value::Text(checkpoints[3].clone())]).await.unwrap();
+    let (authority, engine, session, state) = fixture_from_authority(authority, None).await;
+    let sql = "SELECT l.commit_id, h.diff_type FROM lix_log() l JOIN lix_history('lix_key_value') h ON h.lixcol_to_commit_id=l.commit_id WHERE l.is_checkpoint AND h.key='joined-history' ORDER BY l.position";
+    let expected = authority.execute(sql, &[]).await.unwrap();
+    assert_eq!(expected.len(), 3);
+    let actual = execute_hydrating(&session, &engine.storage(), &state, &authority, sql, &[], &mut Fetches::default()).await.unwrap();
+    assert_eq!(actual.rows(), expected.rows());
+    assert_eq!(session.execute(sql, &[]).await.unwrap().rows(), expected.rows());
+}
+
 async fn fixture_with_account(
     account: Option<&str>,
 ) -> (
@@ -333,7 +352,7 @@ async fn incorporated_checkpoint_undo_preserves_baseline_on_partial_publication(
         &storage,
         &next,
         &authority,
-        "SELECT is_checkpoint, is_checkpoint_active FROM lix_log() WHERE commit_id=$1",
+        "SELECT is_checkpoint FROM lix_log() WHERE commit_id=$1",
         &[Value::Text(target)],
         &mut Fetches::default(),
     )
@@ -342,12 +361,8 @@ async fn incorporated_checkpoint_undo_preserves_baseline_on_partial_publication(
     let target_metadata = target_metadata_result.rows();
     assert_eq!(target_metadata.len(), 1);
     assert_eq!(
-        target_metadata[0].get::<bool>("is_checkpoint").unwrap(),
-        true
-    );
-    assert_eq!(
         target_metadata[0]
-            .get::<bool>("is_checkpoint_active")
+            .get::<bool>("is_checkpoint")
             .unwrap(),
         false
     );

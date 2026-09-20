@@ -3694,7 +3694,7 @@ mod tests {
             .expect("mark replica");
 
         let params = [Value::Text(checkpoint.commit_id)];
-        let sql = "SELECT id AS commit_id FROM lix_commit WHERE is_checkpoint AND id = $1";
+        let sql = "SELECT commit_id FROM lix_log($1) WHERE is_checkpoint AND commit_id = $1";
         let local = lix
             .execute(sql, &params)
             .await

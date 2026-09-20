@@ -3367,7 +3367,7 @@ mod tests {
         let lix = db::block_on(open_lix().with_storage(storage))
             .expect("replay Lix should reopen with installed plugin");
         let checkpoint_rows = db::block_on(lix.execute(
-            "SELECT count(*) AS count FROM lix_commit WHERE is_checkpoint",
+            "SELECT count(*) AS count FROM lix_log() WHERE is_checkpoint",
             &[],
         ))
         .expect("checkpoint history should be queryable");
