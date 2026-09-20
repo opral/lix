@@ -1,10 +1,10 @@
 ---
-description: Install the Lix Rust SDK, write a file, inspect its history, and undo a change.
+description: Install the Lix Rust SDK, write a file, inspect its history, and use SQL recovery.
 ---
 
 # Rust quickstart
 
-This guide creates an in-memory Lix repository, writes a file, reads its history, and undoes the latest change.
+This guide creates an in-memory Lix repository, writes a file, reads its history, and uses SQL to undo the latest change.
 
 ## Install
 
@@ -49,7 +49,8 @@ async fn main() -> Result<(), lix::LixError> {
 
     println!("{} versions", history.rows().len());
 
-    lix.undo().await?;
+    let undone = lix.execute("SELECT commit_id FROM lix_undo()", &[]).await?;
+    println!("undo receipt {:?}", undone.rows().first());
     lix.close().await?;
     Ok(())
 }

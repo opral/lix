@@ -28,7 +28,6 @@ mod merge;
 pub(crate) mod observe;
 mod switch_branch;
 mod transaction;
-mod undo_redo;
 
 pub(crate) use media_upload::stage_reclaimable_upload_receipts;
 #[cfg(feature = "storage-benches")]
@@ -62,7 +61,6 @@ pub use observe::ObserveEvent;
 pub(crate) use observe::ObserveEvents as SessionObserveEvents;
 pub use switch_branch::{SwitchBranchOptions, SwitchBranchReceipt};
 pub use transaction::SessionTransaction;
-pub use undo_redo::{RedoReceipt, UndoReceipt};
 
 /// Zero-cost adapter for futures that rustc cannot prove `Send` because an
 /// opaque async call contains higher-ranked references. Construction is unsafe:

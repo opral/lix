@@ -14,7 +14,6 @@ import { normalizeParam, toNativeValue } from "./value.js";
 import type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
-	RedoReceipt,
 	ExecuteOptions,
 	ExecuteResult,
 	ExecuteBatchResult,
@@ -37,7 +36,6 @@ import type {
 	ResultRow,
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
-	UndoReceipt,
 } from "./types.js";
 
 const transactionFinalizer = new FinalizationRegistry<{
@@ -384,14 +382,6 @@ export class Lix {
 			},
 			{ highWaterMark: 0 },
 		);
-	}
-
-	async undo(): Promise<UndoReceipt> {
-		return this.#runOperation(() => this.binding.undo());
-	}
-
-	async redo(): Promise<RedoReceipt> {
-		return this.#runOperation(() => this.binding.redo());
 	}
 
 	async switchBranch(

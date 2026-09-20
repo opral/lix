@@ -431,7 +431,6 @@ simulation_test!(
     }
 );
 
-
 fn assert_single_text(result: ExecuteResult, expected: &str) {
     let row_set = result;
     assert_eq!(row_set.len(), 1);

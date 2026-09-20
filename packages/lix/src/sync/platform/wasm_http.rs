@@ -323,7 +323,7 @@ impl HttpSyncTransport<BrowserHttpClient> {
     pub(crate) async fn connect_with_progress(
         repository_url: &str,
         headers: &[(String, String)],
-        progress: Option<&std::sync::Arc<dyn crate::OpenProgressSink>>,
+        progress: Option<&Arc<dyn crate::OpenProgressSink>>,
     ) -> Result<Self, LixError> {
         let client = BrowserHttpClient::from_headers(headers)?;
         Self::connect_with_progress_sink(client, repository_url, progress).await

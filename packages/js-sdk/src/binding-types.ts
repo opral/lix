@@ -3,8 +3,6 @@ import type {
 	CommitSpan,
 	CreateBranchOptions,
 	CreateBranchReceipt,
-	UndoReceipt,
-	RedoReceipt,
 	ExecuteOptions,
 	LixBatchOptions,
 	MergeBranchOptions,
@@ -98,8 +96,6 @@ export type LixBinding = {
 	activeBranchId(): Promise<string>;
 	activeAccountId(): Promise<string>;
 	createBranch(options: CreateBranchOptions): Promise<CreateBranchReceipt>;
-	undo(): Promise<UndoReceipt>;
-	redo(): Promise<RedoReceipt>;
 	switchBranch(options: SwitchBranchOptions): Promise<SwitchBranchReceipt>;
 	importFilesystemPaths(paths: string[]): Promise<void>;
 	mergeBranchPreview(options: MergeBranchOptions): Promise<MergeBranchPreview>;

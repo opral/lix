@@ -346,30 +346,12 @@ const commitId = result.rows[0].commit_id;
 
 See [Checkpoints](./checkpoints.md) for scoped row-reference selections.
 
-### undo() / redo()
+### Undo and redo
 
-```ts
-const undone = await lix.undo();
-const redone = await lix.redo();
-```
-
-`undo()` reverts the latest change on the active branch by committing an inverse commit. `redo()` replays the last undone change.
-
-Results:
-
-```ts
-type UndoReceipt = {
-  branchId: string;
-  targetCommitId: string;
-  inverseCommitId: string;
-};
-
-type RedoReceipt = {
-  branchId: string;
-  targetCommitId: string;
-  replayCommitId: string;
-};
-```
+Undo and redo are SQL commands. Execute `SELECT commit_id FROM lix_undo()` or
+`SELECT commit_id FROM lix_redo()` and read the returned receipt row. See
+[Undo and redo](./undo-redo.md) for explicit targets and
+row-reference selections.
 
 ### createBranch()
 

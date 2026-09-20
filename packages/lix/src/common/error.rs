@@ -197,6 +197,9 @@ impl LixError {
     /// An operation is incompatible with the current session mode or state.
     pub const CODE_INVALID_SESSION_STATE: &'static str = "LIX_INVALID_SESSION_STATE";
 
+    /// A mutation is incompatible with the current explicit transaction state.
+    pub const CODE_INVALID_TRANSACTION_STATE: &'static str = "LIX_INVALID_TRANSACTION_STATE";
+
     /// Plugin ownership or generations are incompatible, or a tracked change
     /// collides with an untracked row. Ordinary overlapping row edits reconcile
     /// automatically.

@@ -8,7 +8,7 @@ use lix::{
     Blob, CreateBranchOptions, CreateBranchReceipt, ExecuteBatchStatement, ExecuteIdempotency,
     ExecuteResult, ExecuteStatementMetadata, ExecutionDisposition, LixError, Memory,
     MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
-    ObserveEvent, RedoReceipt, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt, Value,
+    ObserveEvent, SwitchBranchOptions, SwitchBranchReceipt, Value,
 };
 use std::{
     future::{Future, IntoFuture},
@@ -678,12 +678,6 @@ impl RemoteLix {
         self.client
             .switch_branch_and_restart(&options.branch_id)
             .await
-    }
-    pub async fn undo(&self) -> Result<UndoReceipt, LixError> {
-        self.client.undo().await
-    }
-    pub async fn redo(&self) -> Result<RedoReceipt, LixError> {
-        self.client.redo().await
     }
     pub async fn begin_transaction(&self) -> Result<RemoteLixTransaction, LixError> {
         let client = self
@@ -2436,16 +2430,6 @@ where
         &self,
     ) -> Result<crate::session::CreateCheckpointReceipt, LixError> {
         self.session.create_checkpoint().await
-    }
-
-    /// Reverses the latest undoable tracked commit on this handle's active branch.
-    pub async fn undo(&self) -> Result<UndoReceipt, LixError> {
-        self.retry_sync_demands(|| self.session.undo()).await
-    }
-
-    /// Replays the latest tracked commit abandoned by undo on this handle's active branch.
-    pub async fn redo(&self) -> Result<RedoReceipt, LixError> {
-        self.retry_sync_demands(|| self.session.redo()).await
     }
 
     pub fn switch_branch(

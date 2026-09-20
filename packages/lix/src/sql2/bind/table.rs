@@ -236,10 +236,12 @@ mod tests {
             "lix_history",
             "lix_key_value",
             "lix_log",
+            "lix_redo",
             "lix_registered_schema",
             "lix_restore",
             "lix_revert",
             "lix_revert_range",
+            "lix_undo",
         ];
 
         assert_eq!(actual, expected);
@@ -285,6 +287,7 @@ mod tests {
             "lix_label_assignment_history",
             "lix_checkpoint_by_branch",
             "lix_undo_redo_marker",
+            "lix_undo_state",
             "lix_collection_generation",
             "lix_binary_blob_ref",
             "lix_binary_blob_ref_by_branch",

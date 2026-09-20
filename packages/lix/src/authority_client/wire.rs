@@ -190,22 +190,6 @@ pub struct CreateBranchResponseBody {
     pub commit_id: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UndoResponseBody {
-    pub branch_id: String,
-    pub target_commit_id: String,
-    pub inverse_commit_id: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RedoResponseBody {
-    pub branch_id: String,
-    pub target_commit_id: String,
-    pub replay_commit_id: String,
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SwitchBranchRequestBody<'a> {

@@ -983,7 +983,7 @@ test("remote lix_restore uses the existing execute endpoint", async () => {
 	await lix.close();
 });
 
-test("remote undo and redo decode branch-history receipts", async () => {
+test("remote undo and redo use SQL functions", async () => {
 	const lix = await openLix({
 		server: {
 			url: "https://lixray.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc",
@@ -998,18 +998,12 @@ test("remote undo and redo decode branch-history receipts", async () => {
 						sessionId: "session-1",
 					});
 				}
-				if (pathname.endsWith("/undo")) {
+				if (pathname.endsWith("/execute")) {
 					return Response.json({
-						branchId: "main-id",
-						targetCommitId: "target-id",
-						inverseCommitId: "inverse-id",
-					});
-				}
-				if (pathname.endsWith("/redo")) {
-					return Response.json({
-						branchId: "main-id",
-						targetCommitId: "target-id",
-						replayCommitId: "replay-id",
+						columns: [{ name: "commit_id", type: "text" }],
+						rows: [[{ kind: "text", value: "new-commit-id" }]],
+						rowsAffected: 1,
+						notices: [],
 					});
 				}
 				if (request.method === "DELETE") {
@@ -1020,15 +1014,11 @@ test("remote undo and redo decode branch-history receipts", async () => {
 		},
 	});
 
-	await expect(lix.undo()).resolves.toEqual({
-		branchId: "main-id",
-		targetCommitId: "target-id",
-		inverseCommitId: "inverse-id",
+	await expect(lix.execute("SELECT commit_id FROM lix_undo()")).resolves.toMatchObject({
+		rows: [{ commit_id: "new-commit-id" }],
 	});
-	await expect(lix.redo()).resolves.toEqual({
-		branchId: "main-id",
-		targetCommitId: "target-id",
-		replayCommitId: "replay-id",
+	await expect(lix.execute("SELECT commit_id FROM lix_redo()")).resolves.toMatchObject({
+		rows: [{ commit_id: "new-commit-id" }],
 	});
 	await lix.close();
 });

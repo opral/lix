@@ -216,11 +216,11 @@ async fn qualify_healthy_reopen_undo_diff_and_branch_control<B: DurableBackend>(
         .await
         .expect("healthy diff should survive reopen");
     assert_eq!(diff.rows()[0].get::<i64>("entries").unwrap(), 1);
-    lix.undo()
+    lix.execute("SELECT commit_id FROM lix_undo()", &[])
         .await
         .expect("healthy undo should survive reopen");
     assert_probe_value(&lix, "before").await;
-    lix.redo()
+    lix.execute("SELECT commit_id FROM lix_redo()", &[])
         .await
         .expect("healthy redo should survive reopen");
     assert_probe_value(&lix, "after").await;

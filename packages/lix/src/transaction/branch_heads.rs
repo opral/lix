@@ -43,7 +43,7 @@ impl PreparedBranchHeads {
             if mode == TransactionWriteMode::Insert {
                 inserts.mark(index, row.origin, None);
             }
-            result.insert_target(&command.branch_id, command.head_commit_id, row)?;
+            result.insert_target(&command.branch_id, command.head_commit_id, command.source_branch_id, row)?;
         }
         result.projection = Some(Box::new(BranchHeadProjection {
             rows: projection,
@@ -56,6 +56,7 @@ impl PreparedBranchHeads {
         &mut self,
         branch_id: &str,
         head_commit_id: Option<CommitId>,
+        source_branch_id: Option<uuid::Uuid>,
         row: crate::transaction_types::PreparedStateRowRef<'_>,
     ) -> Result<(), LixError> {
         let ref_change_id = row.change_id.ok_or_else(|| {
@@ -69,6 +70,7 @@ impl PreparedBranchHeads {
             .insert(
                 branch_id.to_owned(),
                 BranchHeadTarget {
+                    source_branch_id,
                     head_commit_id,
                     ref_change_id,
                     created_at: row.created_at,
@@ -123,7 +125,7 @@ impl PreparedBranchHeads {
                     format!("branch ref for branch '{branch_id}' is missing commit_id"),
                 ));
             }
-            result.insert_target(&branch_id, head_commit_id, row)?;
+            result.insert_target(&branch_id, head_commit_id, None, row)?;
         }
         let mut projection = BranchHeadProjection {
             rows: rows.clone(),

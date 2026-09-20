@@ -20,7 +20,11 @@ pub(super) fn checkpoint_constraint(filters: &[Expr]) -> Option<bool> {
         Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
             match (binary.left.as_ref(), binary.right.as_ref()) {
                 (c, Expr::Literal(ScalarValue::Boolean(Some(value)), _))
-                | (Expr::Literal(ScalarValue::Boolean(Some(value)), _), c) if column(c) => Some(*value),
+                | (Expr::Literal(ScalarValue::Boolean(Some(value)), _), c)
+                    if column(c) =>
+                {
+                    Some(*value)
+                }
                 _ => None,
             }
         }
@@ -52,7 +56,10 @@ impl MissingFrontier {
         };
         // Discover only within known topology. Hydrating optional graph records
         // one at a time would suppress the ordinary required metadata walk.
-        if items.iter().any(|item| matches!(item, NativeMetadataRef::CommitGraphRecord(_))) {
+        if items
+            .iter()
+            .any(|item| matches!(item, NativeMetadataRef::CommitGraphRecord(_)))
+        {
             return Ok(None);
         }
         Ok(Some(Self::Metadata(items)))
@@ -170,10 +177,22 @@ mod tests {
         let checkpoint = col("lixcol_commit_is_checkpoint");
         assert_eq!(checkpoint_constraint(&[checkpoint.clone()]), Some(true));
         assert_eq!(checkpoint_constraint(&[!checkpoint.clone()]), Some(false));
-        assert_eq!(checkpoint_constraint(&[checkpoint.clone().eq(lit(true))]), Some(true));
-        assert_eq!(checkpoint_constraint(&[lit(false).eq(checkpoint.clone())]), Some(false));
-        assert_eq!(checkpoint_constraint(&[checkpoint.clone().is_true()]), Some(true));
-        assert_eq!(checkpoint_constraint(&[checkpoint.clone().is_false()]), Some(false));
+        assert_eq!(
+            checkpoint_constraint(&[checkpoint.clone().eq(lit(true))]),
+            Some(true)
+        );
+        assert_eq!(
+            checkpoint_constraint(&[lit(false).eq(checkpoint.clone())]),
+            Some(false)
+        );
+        assert_eq!(
+            checkpoint_constraint(&[checkpoint.clone().is_true()]),
+            Some(true)
+        );
+        assert_eq!(
+            checkpoint_constraint(&[checkpoint.clone().is_false()]),
+            Some(false)
+        );
         assert_eq!(checkpoint_constraint(&[checkpoint.or(col("other"))]), None);
         assert_eq!(checkpoint_constraint(&[col("other").eq(lit(true))]), None);
         assert_eq!(checkpoint_constraint(&[]), None);
@@ -238,16 +257,52 @@ mod tests {
                 mode: DiffMode::General,
             };
             let first = discover(&diff, commits[18], &projection, &[], 0, None, make_error()).await;
-            assert!(NativeMetadataRef::batch_from_missing_error(&first).unwrap().is_none());
+            assert!(
+                NativeMetadataRef::batch_from_missing_error(&first)
+                    .unwrap()
+                    .is_none()
+            );
             assert_eq!(first.details, make_error().details);
             // This known checkpoint is excluded by the metadata selection. Its
             // missing header must not become an optional hydration demand.
-            let excluded = discover(&diff, commits[18], &projection, &[], 1, Some(false), make_error()).await;
+            let excluded = discover(
+                &diff,
+                commits[18],
+                &projection,
+                &[],
+                1,
+                Some(false),
+                make_error(),
+            )
+            .await;
             assert_eq!(excluded.details, make_error().details);
-            let resumed = discover(&diff, commits[18], &projection, &[], 1, Some(true), make_error()).await;
-            let short = NativeMetadataRef::batch_from_missing_error(&resumed).unwrap().unwrap();
-            assert!((2..=3).contains(&short.len()), "one resumed batch permits only one extra checkpoint");
-            discover(&diff, commits[18], &projection, &[], MAX_CHECKPOINTS, None, make_error()).await
+            let resumed = discover(
+                &diff,
+                commits[18],
+                &projection,
+                &[],
+                1,
+                Some(true),
+                make_error(),
+            )
+            .await;
+            let short = NativeMetadataRef::batch_from_missing_error(&resumed)
+                .unwrap()
+                .unwrap();
+            assert!(
+                (2..=3).contains(&short.len()),
+                "one resumed batch permits only one extra checkpoint"
+            );
+            discover(
+                &diff,
+                commits[18],
+                &projection,
+                &[],
+                MAX_CHECKPOINTS,
+                None,
+                make_error(),
+            )
+            .await
         }
         .await;
         let batch = NativeMetadataRef::batch_from_missing_error(&run)
@@ -295,7 +350,16 @@ mod tests {
             active_branch_id: None,
             mode: DiffMode::General,
         };
-        let preserved = discover(&diff, commits[18], &projection, &[], MAX_CHECKPOINTS, None, make_error()).await;
+        let preserved = discover(
+            &diff,
+            commits[18],
+            &projection,
+            &[],
+            MAX_CHECKPOINTS,
+            None,
+            make_error(),
+        )
+        .await;
         assert_eq!(preserved.code, run.code);
         assert_eq!(preserved.message, run.message);
         assert!(
@@ -312,24 +376,65 @@ mod tests {
         // reaches it, so the required graph miss can select a metadata walk.
         let mut writes = adapter.new_write_set();
         crate::changelog::stage_delete_commits(&mut writes, [commits[17]]);
-        writes.delete(header_space, crate::tracked_state::commit_state_authority_key(commits[17]));
-        adapter.commit_write_set(writes, Default::default()).await.unwrap();
-        let store = SharedStorageAdapterRead::new(adapter.begin_read(Default::default()).await.unwrap());
+        writes.delete(
+            header_space,
+            crate::tracked_state::commit_state_authority_key(commits[17]),
+        );
+        adapter
+            .commit_write_set(writes, Default::default())
+            .await
+            .unwrap();
+        let store =
+            SharedStorageAdapterRead::new(adapter.begin_read(Default::default()).await.unwrap());
         let graph_diff = DiffSpec {
             blob_reader: Arc::new(crate::binary_cas::BinaryCasContext::new().reader(store.clone())),
             store,
             ..diff
         };
-        let missing = graph_diff.prepare_history_inputs(
-            &commits[17].to_string(), &commits[18].to_string(), &projection, &[]
-        ).await.unwrap_err();
-        let addresses = NativeMetadataRef::batch_from_missing_error(&missing).unwrap()
-            .unwrap_or_else(|| vec![NativeMetadataRef::from_missing_error(&missing).unwrap().unwrap()]);
-        assert!(addresses.iter().any(|item| matches!(item, NativeMetadataRef::CommitGraphRecord(_))));
-        let preserved = discover(&graph_diff, commits[18], &projection, &[], MAX_CHECKPOINTS, None, make_error()).await;
+        let missing = graph_diff
+            .prepare_history_inputs(
+                &commits[17].to_string(),
+                &commits[18].to_string(),
+                &projection,
+                &[],
+            )
+            .await
+            .unwrap_err();
+        let addresses = NativeMetadataRef::batch_from_missing_error(&missing)
+            .unwrap()
+            .unwrap_or_else(|| {
+                vec![
+                    NativeMetadataRef::from_missing_error(&missing)
+                        .unwrap()
+                        .unwrap(),
+                ]
+            });
+        assert!(
+            addresses
+                .iter()
+                .any(|item| matches!(item, NativeMetadataRef::CommitGraphRecord(_)))
+        );
+        let preserved = discover(
+            &graph_diff,
+            commits[18],
+            &projection,
+            &[],
+            MAX_CHECKPOINTS,
+            None,
+            make_error(),
+        )
+        .await;
         assert_eq!(preserved.details, make_error().details);
-        let required_graph = discover(&graph_diff, commits[18], &projection, &[], MAX_CHECKPOINTS, None, missing.clone()).await;
+        let required_graph = discover(
+            &graph_diff,
+            commits[18],
+            &projection,
+            &[],
+            MAX_CHECKPOINTS,
+            None,
+            missing.clone(),
+        )
+        .await;
         assert_eq!(required_graph.details, missing.details);
-
     }
 }

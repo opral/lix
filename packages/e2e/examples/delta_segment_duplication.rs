@@ -173,7 +173,9 @@ where
         "undo_roundtrip" => {
             for index in 0..WORKLOAD_COMMITS / 2 {
                 edit_rows(main, 0, window, index + 1).await;
-                main.undo().await.expect("undo duplication-audit commit");
+                main.execute("SELECT commit_id FROM lix_undo()", &[])
+                    .await
+                    .expect("undo duplication-audit commit");
             }
         }
         // Two branches off the same base make the same edit; both are merged

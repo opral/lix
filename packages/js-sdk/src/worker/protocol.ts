@@ -119,8 +119,6 @@ export type WorkerOperation =
 	| { kind: "activeBranchId" }
 	| { kind: "activeAccountId" }
 	| { kind: "createBranch"; options: CreateBranchOptions }
-	| { kind: "undo" }
-	| { kind: "redo" }
 	| { kind: "switchBranch"; options: SwitchBranchOptions }
 	| { kind: "mergeBranchPreview"; options: MergeBranchOptions }
 	| { kind: "mergeBranch"; options: MergeBranchOptions }

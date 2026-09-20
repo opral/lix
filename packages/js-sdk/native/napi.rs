@@ -6,9 +6,8 @@ use lix::{
     MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome, MergeBranchPreview,
     MergeBranchPreviewOptions, MergeBranchReceipt, MergeChangeStats,
     ObserveEvent as RsObserveEvent, ObserveEvents as RsObserveEvents, OpenPhase, OpenProgress,
-    OpenProgressSink, OpenReport, OpenScope, RedoReceipt, ServerOptions,
-    SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt, UndoReceipt, Value,
-    open_lix,
+    OpenProgressSink, OpenReport, OpenScope, ServerOptions,
+    SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt, Value, open_lix,
 };
 use lix_storage_filesystem::FilesystemStorage;
 use napi::JsDeferred;
@@ -292,8 +291,6 @@ type NativeTransactionDeferred = NativeDeferred<NativeLixTransaction>;
 type NativeLixDeferred = NativeDeferred<NativeLix>;
 type NativeStringDeferred = NativeDeferred<String>;
 type NativeCreateBranchDeferred = NativeDeferred<CreateBranchReceiptDto>;
-type NativeUndoDeferred = NativeDeferred<UndoReceiptDto>;
-type NativeRedoDeferred = NativeDeferred<RedoReceiptDto>;
 type NativeSwitchBranchDeferred = NativeDeferred<SwitchBranchReceiptDto>;
 type NativeMergePreviewDeferred = NativeDeferred<MergeBranchPreviewDto>;
 type NativeMergeReceiptDeferred = NativeDeferred<MergeBranchReceiptDto>;
@@ -347,8 +344,6 @@ enum LixCommand {
         options: RsCreateBranchOptions,
         deferred: NativeCreateBranchDeferred,
     },
-    Undo(NativeUndoDeferred),
-    Redo(NativeRedoDeferred),
     SwitchBranch {
         options: RsSwitchBranchOptions,
         deferred: NativeSwitchBranchDeferred,
@@ -971,8 +966,6 @@ fn reject_pending_lix_commands(receiver: mpsc::Receiver<QueuedLixCommand>, error
             LixCommand::ActiveBranchId(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::ActiveAccountId(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::CreateBranch { deferred, .. } => deferred.reject(to_napi_error(&error)),
-            LixCommand::Undo(deferred) => deferred.reject(to_napi_error(&error)),
-            LixCommand::Redo(deferred) => deferred.reject(to_napi_error(&error)),
             LixCommand::SwitchBranch { deferred, .. } => deferred.reject(to_napi_error(&error)),
             LixCommand::MergeBranchPreview { deferred, .. } => {
                 deferred.reject(to_napi_error(&error));
@@ -1099,16 +1092,6 @@ fn handle_lix_command(
         LixCommand::CreateBranch { options, deferred } => {
             let result =
                 block_on!(state.lix.create_branch(options)).map(CreateBranchReceiptDto::from);
-            settle_deferred(deferred, result);
-            None
-        }
-        LixCommand::Undo(deferred) => {
-            let result = block_on!(state.lix.undo()).map(UndoReceiptDto::from);
-            settle_deferred(deferred, result);
-            None
-        }
-        LixCommand::Redo(deferred) => {
-            let result = block_on!(state.lix.redo()).map(RedoReceiptDto::from);
             settle_deferred(deferred, result);
             None
         }
@@ -1363,8 +1346,6 @@ fn settle_command_after_close(command: LixCommand) {
         LixCommand::CreateBranch { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
-        LixCommand::Undo(deferred) => settle_deferred(deferred, Err(lix_closed_error())),
-        LixCommand::Redo(deferred) => settle_deferred(deferred, Err(lix_closed_error())),
         LixCommand::SwitchBranch { deferred, .. } => {
             settle_deferred(deferred, Err(lix_closed_error()));
         }
@@ -1577,24 +1558,6 @@ impl NativeLixInner {
             }
             Self::FilesystemStorage(lix, _, _) => {
                 crate::session::SessionOperations::create_branch(lix, options).await
-            }
-        }
-    }
-
-    async fn undo(&self) -> std::result::Result<UndoReceipt, LixError> {
-        match self {
-            Self::Memory(lix) => crate::session::SessionOperations::undo(lix).await,
-            Self::FilesystemStorage(lix, _, _) => {
-                crate::session::SessionOperations::undo(lix).await
-            }
-        }
-    }
-
-    async fn redo(&self) -> std::result::Result<RedoReceipt, LixError> {
-        match self {
-            Self::Memory(lix) => crate::session::SessionOperations::redo(lix).await,
-            Self::FilesystemStorage(lix, _, _) => {
-                crate::session::SessionOperations::redo(lix).await
             }
         }
     }
@@ -2386,20 +2349,6 @@ impl NativeLix {
         Ok(promise)
     }
 
-    #[napi(js_name = "undo")]
-    pub fn undo<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
-        let (deferred, promise): (NativeUndoDeferred, Object<'env>) = env.create_deferred()?;
-        self.actor.send_with_deferred(deferred, LixCommand::Undo);
-        Ok(promise)
-    }
-
-    #[napi(js_name = "redo")]
-    pub fn redo<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
-        let (deferred, promise): (NativeRedoDeferred, Object<'env>) = env.create_deferred()?;
-        self.actor.send_with_deferred(deferred, LixCommand::Redo);
-        Ok(promise)
-    }
-
     #[napi(js_name = "switchBranch")]
     pub fn switch_branch<'env>(
         &self,
@@ -2939,40 +2888,6 @@ impl From<CreateBranchReceipt> for CreateBranchReceiptDto {
             name: receipt.name,
             hidden: receipt.hidden,
             commit_id: receipt.commit_id,
-        }
-    }
-}
-
-#[napi(object)]
-pub struct UndoReceiptDto {
-    pub branch_id: String,
-    pub target_commit_id: String,
-    pub inverse_commit_id: String,
-}
-
-impl From<UndoReceipt> for UndoReceiptDto {
-    fn from(receipt: UndoReceipt) -> Self {
-        Self {
-            branch_id: receipt.branch_id,
-            target_commit_id: receipt.target_commit_id,
-            inverse_commit_id: receipt.inverse_commit_id,
-        }
-    }
-}
-
-#[napi(object)]
-pub struct RedoReceiptDto {
-    pub branch_id: String,
-    pub target_commit_id: String,
-    pub replay_commit_id: String,
-}
-
-impl From<RedoReceipt> for RedoReceiptDto {
-    fn from(receipt: RedoReceipt) -> Self {
-        Self {
-            branch_id: receipt.branch_id,
-            target_commit_id: receipt.target_commit_id,
-            replay_commit_id: receipt.replay_commit_id,
         }
     }
 }

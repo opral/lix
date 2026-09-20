@@ -951,9 +951,11 @@ mod tests {
                 "lix_diff",
                 "lix_history",
                 "lix_log",
+                "lix_redo",
                 "lix_restore",
                 "lix_revert",
                 "lix_revert_range",
+                "lix_undo",
             ]
         );
         assert_eq!(
@@ -966,8 +968,8 @@ mod tests {
             ]
         );
         assert_eq!(read_only.len() + writable.len(), catalog.surfaces().count());
-        assert_eq!(all_read + writable.len(), 19, "construction count");
-        assert_eq!(read_only.len() + writable.len(), 15, "surface count");
+        assert_eq!(all_read + writable.len(), 21, "construction count");
+        assert_eq!(read_only.len() + writable.len(), 17, "surface count");
     }
 
     #[test]

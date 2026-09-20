@@ -745,26 +745,6 @@ paths:
       responses:
         "200": { description: Branch created. }
         default: { $ref: "#/components/responses/Error" }
-  /lix/v1/{lix_id}/undo:
-    parameters:
-      - $ref: "#/components/parameters/LixId"
-      - $ref: "#/components/parameters/ServerProtocolVersion"
-    post:
-      operationId: undo
-      parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
-      responses:
-        "200": { description: Undo committed. }
-        default: { $ref: "#/components/responses/Error" }
-  /lix/v1/{lix_id}/redo:
-    parameters:
-      - $ref: "#/components/parameters/LixId"
-      - $ref: "#/components/parameters/ServerProtocolVersion"
-    post:
-      operationId: redo
-      parameters: [{ $ref: "#/components/parameters/RequiredSessionId" }]
-      responses:
-        "200": { description: Redo committed. }
-        default: { $ref: "#/components/responses/Error" }
   /lix/v1/{lix_id}/branch/switch:
     parameters:
       - $ref: "#/components/parameters/LixId"

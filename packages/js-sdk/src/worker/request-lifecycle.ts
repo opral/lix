@@ -7,8 +7,6 @@ export function mayHaveCommitted(operation: WorkerOperation): boolean {
 		"executeBatch",
 		"transaction.commit",
 		"createBranch",
-		"undo",
-		"redo",
 		"switchBranch",
 		"mergeBranch",
 		"importFilesystemPaths",

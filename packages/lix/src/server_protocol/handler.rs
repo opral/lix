@@ -349,8 +349,6 @@ protocol_routes! {
    UpsertFile => ("POST", "/file/upsert", Binary),
    UpsertFileBatch => ("POST", "/file/upsert-batch", Binary),
    CreateBranch => ("POST", "/branch/create", Json),
-   Undo => ("POST", "/undo", None),
-   Redo => ("POST", "/redo", None),
    SwitchBranch => ("POST", "/branch/switch", Json),
    MergeBranch => ("POST", "/branch/merge", Json),
    MergeBranchPreview => ("POST", "/branch/merge-preview", Json),
@@ -2395,8 +2393,6 @@ where
             Some(ProtocolRoute::CreateBranch) => {
                 result_response(create_branch(lease, json_request!(CreateBranchRequest)).await)
             }
-            Some(ProtocolRoute::Undo) => result_response(undo(lease).await),
-            Some(ProtocolRoute::Redo) => result_response(redo(lease).await),
             Some(ProtocolRoute::SwitchBranch) => {
                 result_response(switch_branch(lease, json_request!(SwitchBranchRequest)).await)
             }
@@ -4184,38 +4180,6 @@ where
     })
 }
 
-fn undo<S>(lease: SessionLease<S>) -> SqlHandlerFuture<Json<UndoResponse>>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    Box::pin(async move {
-        let receipt = lease
-            .run_durable(move |lix| async move { lix.undo().await })
-            .await?;
-        Ok(Json(UndoResponse {
-            branch_id: receipt.branch_id,
-            target_commit_id: receipt.target_commit_id,
-            inverse_commit_id: receipt.inverse_commit_id,
-        }))
-    })
-}
-
-fn redo<S>(lease: SessionLease<S>) -> SqlHandlerFuture<Json<RedoResponse>>
-where
-    S: Storage + Clone + Send + Sync + 'static,
-{
-    Box::pin(async move {
-        let receipt = lease
-            .run_durable(move |lix| async move { lix.redo().await })
-            .await?;
-        Ok(Json(RedoResponse {
-            branch_id: receipt.branch_id,
-            target_commit_id: receipt.target_commit_id,
-            replay_commit_id: receipt.replay_commit_id,
-        }))
-    })
-}
-
 fn switch_branch<S>(
     lease: SessionLease<S>,
     Json(request): Json<SwitchBranchRequest>,
@@ -5471,22 +5435,6 @@ struct CreateBranchResponse {
     commit_id: String,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UndoResponse {
-    branch_id: String,
-    target_commit_id: String,
-    inverse_commit_id: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RedoResponse {
-    branch_id: String,
-    target_commit_id: String,
-    replay_commit_id: String,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SwitchBranchRequest {
@@ -6004,8 +5952,6 @@ mod tests {
                 ("POST", "/lix/v1/{lix_id}/file/upsert") => "upsertFile",
                 ("POST", "/lix/v1/{lix_id}/file/upsert-batch") => "upsertFileBatch",
                 ("POST", "/lix/v1/{lix_id}/branch/create") => "createBranch",
-                ("POST", "/lix/v1/{lix_id}/undo") => "undo",
-                ("POST", "/lix/v1/{lix_id}/redo") => "redo",
                 ("POST", "/lix/v1/{lix_id}/branch/switch") => "switchBranch",
                 ("POST", "/lix/v1/{lix_id}/branch/merge") => "mergeBranch",
                 ("POST", "/lix/v1/{lix_id}/branch/merge-preview") => "mergeBranchPreview",
@@ -12044,7 +11990,7 @@ mod tests {
     #[tokio::test]
     async fn undo_and_redo_mutate_the_pinned_branch() {
         let app = app().await;
-        let (session_id, handshake) = new_session(&app.router).await;
+        let (session_id, _) = new_session(&app.router).await;
         let inserted = request(
             &app.router,
             "POST",
@@ -12057,19 +12003,31 @@ mod tests {
         .await;
         assert_eq!(inserted.status(), StatusCode::OK);
 
-        let undone = request(&app.router, "POST", "/lix/v1/undo", Some(&session_id), None).await;
+        let undone = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({ "sql": "SELECT commit_id FROM lix_undo()" })),
+        )
+        .await;
         assert_eq!(undone.status(), StatusCode::OK);
         let undone = response_json(undone).await;
-        assert_eq!(undone["branchId"], handshake["activeBranchId"]);
-        assert!(undone["targetCommitId"].is_string());
-        assert!(undone["inverseCommitId"].is_string());
+        assert_eq!(undone["columns"][0]["name"], "commit_id");
+        assert!(undone["rows"][0][0]["value"].is_string());
 
-        let redone = request(&app.router, "POST", "/lix/v1/redo", Some(&session_id), None).await;
+        let redone = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({ "sql": "SELECT commit_id FROM lix_redo()" })),
+        )
+        .await;
         assert_eq!(redone.status(), StatusCode::OK);
         let redone = response_json(redone).await;
-        assert_eq!(redone["branchId"], handshake["activeBranchId"]);
-        assert_eq!(redone["targetCommitId"], undone["targetCommitId"]);
-        assert!(redone["replayCommitId"].is_string());
+        assert_eq!(redone["columns"][0]["name"], "commit_id");
+        assert!(redone["rows"][0][0]["value"].is_string());
     }
 
     #[tokio::test]

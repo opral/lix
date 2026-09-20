@@ -2654,14 +2654,30 @@ mod tests {
             counters.snapshot().list_operations > before.list_operations,
             "retained idle storage should demonstrate the background polling being fixed"
         );
-        let app = crate::routes::router(manager.clone(), None, Duration::from_secs(5), Default::default());
+        let app = crate::routes::router(
+            manager.clone(),
+            None,
+            Duration::from_secs(5),
+            Default::default(),
+        );
         let invalid_session = "a".repeat(64);
         let now = Instant::now();
         manager
             .expire_idle_runtimes(now, Duration::from_secs(60))
             .await;
         for _ in 0..20 {
-            assert_eq!(app.clone().oneshot(stale_session_request("POST","sync/update",Some(&invalid_session))).await.unwrap().status(),410);
+            assert_eq!(
+                app.clone()
+                    .oneshot(stale_session_request(
+                        "POST",
+                        "sync/update",
+                        Some(&invalid_session)
+                    ))
+                    .await
+                    .unwrap()
+                    .status(),
+                410
+            );
         }
         manager
             .expire_idle_runtimes(now + Duration::from_secs(60), Duration::from_secs(60))
@@ -2679,7 +2695,18 @@ mod tests {
         .expect("idle expiry must finish storage cleanup without shutdown");
         let closed = counters.snapshot();
         for _ in 0..20 {
-            assert_eq!(app.clone().oneshot(stale_session_request("POST","sync/update",Some(&invalid_session))).await.unwrap().status(),410);
+            assert_eq!(
+                app.clone()
+                    .oneshot(stale_session_request(
+                        "POST",
+                        "sync/update",
+                        Some(&invalid_session)
+                    ))
+                    .await
+                    .unwrap()
+                    .status(),
+                410
+            );
         }
         tokio::time::sleep(Duration::from_millis(2200)).await;
         let after = counters.snapshot();
@@ -5101,7 +5128,10 @@ mod admission_tests {
             serde_json::json!({"state":"live","fingerprint":null,"storage_id":ID,"retired":[]})
                 .to_string();
         store.put(&path, original.clone().into()).await.unwrap();
-        let error = manager.authority_admission(ID, tokio::time::Instant::now() + Duration::from_secs(30)).await.unwrap_err();
+        let error = manager
+            .authority_admission(ID, tokio::time::Instant::now() + Duration::from_secs(30))
+            .await
+            .unwrap_err();
         assert_eq!(error.code, "LIX_REPOSITORY_OPEN_FAILED");
         assert_eq!(
             store

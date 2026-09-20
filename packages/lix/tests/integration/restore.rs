@@ -84,16 +84,28 @@ simulation_test!(
         assert_eq!(file_count(&session, "/b.txt").await, 0);
         assert_eq!(working_baseline(&session).await, baseline);
 
-        let undone = session.undo().await.expect("restore should be undoable");
-        assert_eq!(undone.target_commit_id, restored);
-        assert_eq!(head(&session).await, undone.inverse_commit_id);
+        let undone = session
+            .execute("SELECT commit_id FROM lix_undo()", &[])
+            .await
+            .expect("restore should be undoable");
+        let undone_commit = undone.rows()[0]
+            .get::<String>("commit_id")
+            .expect("undo commit id");
+        assert_ne!(undone_commit, restored);
+        assert_eq!(head(&session).await, undone_commit);
         assert_eq!(file_count(&session, "/a.txt").await, 1);
         assert_eq!(file_count(&session, "/b.txt").await, 1);
         assert_eq!(working_baseline(&session).await, baseline);
 
-        let redone = session.redo().await.expect("restore should be redoable");
-        assert_eq!(redone.target_commit_id, restored);
-        assert_eq!(head(&session).await, redone.replay_commit_id);
+        let redone = session
+            .execute("SELECT commit_id FROM lix_redo()", &[])
+            .await
+            .expect("restore should be redoable");
+        let redone_commit = redone.rows()[0]
+            .get::<String>("commit_id")
+            .expect("redo commit id");
+        assert_ne!(redone_commit, undone_commit);
+        assert_eq!(head(&session).await, redone_commit);
         assert_eq!(file_count(&session, "/a.txt").await, 1);
         assert_eq!(file_count(&session, "/b.txt").await, 0);
         assert_eq!(working_baseline(&session).await, baseline);

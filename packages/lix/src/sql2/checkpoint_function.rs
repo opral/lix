@@ -17,6 +17,11 @@ pub(crate) enum CheckpointFunctionPlan {
     Full,
     Empty,
     SelectionQuery(String),
+    UndoRedo {
+        redo: bool,
+        target_query: Option<String>,
+        selection: Box<Self>,
+    },
     Recovery {
         command: RecoveryCommand,
         commits_query: String,
@@ -69,6 +74,8 @@ pub(crate) fn checkpoint_function_plan(
         "lix_revert",
         "lix_revert_range",
         "lix_apply",
+        "lix_undo",
+        "lix_redo",
     ]
     .into_iter()
     .find(|candidate| crate::sql2::parse::object_name_is_public_function(name, candidate));
@@ -151,6 +158,26 @@ fn recovery_function_plan(
     function_name: &str,
     arguments: &[FunctionArg],
 ) -> Result<Option<CheckpointFunctionPlan>, LixError> {
+    if matches!(function_name, "lix_undo" | "lix_redo") {
+        if arguments.len() > 2 {
+            return Err(invalid_function_call(function_name));
+        }
+        let target_query = arguments
+            .first()
+            .map(endpoint_expression)
+            .transpose()?
+            .map(|target| format!("SELECT {target} AS commit_id"));
+        let selection = arguments
+            .get(1)
+            .map(selection_plan)
+            .transpose()?
+            .unwrap_or(CheckpointFunctionPlan::Full);
+        return Ok(Some(CheckpointFunctionPlan::UndoRedo {
+            redo: function_name == "lix_redo",
+            target_query,
+            selection: Box::new(selection),
+        }));
+    }
     let command = match function_name {
         "lix_restore" => RecoveryCommand::Restore,
         "lix_revert" => RecoveryCommand::Revert,

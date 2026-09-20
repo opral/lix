@@ -310,35 +310,33 @@ async fn repository_admission(
         }
     };
     let deadline = tokio::time::Instant::now() + state.protocol_timeout;
-    let admission = match tokio::time::timeout_at(
-        deadline,
-        state.manager.authority_admission(&id, deadline),
-    )
-    .await
-    {
-        Ok(Ok(Some(admission))) => admission,
-        Ok(Ok(None)) => {
-            return protocol_error(
-                StatusCode::NOT_FOUND,
-                "LIX_NOT_FOUND",
-                "Lix not found.",
-                None,
-                None,
-            );
-        }
-        Ok(Err(error)) => {
-            return protocol_error(error.status, error.code, error.message, None, None);
-        }
-        Err(_) => {
-            return protocol_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "LIX_CATALOG_UNAVAILABLE",
-                "Repository admission metadata is unavailable.",
-                None,
-                None,
-            );
-        }
-    };
+    let admission =
+        match tokio::time::timeout_at(deadline, state.manager.authority_admission(&id, deadline))
+            .await
+        {
+            Ok(Ok(Some(admission))) => admission,
+            Ok(Ok(None)) => {
+                return protocol_error(
+                    StatusCode::NOT_FOUND,
+                    "LIX_NOT_FOUND",
+                    "Lix not found.",
+                    None,
+                    None,
+                );
+            }
+            Ok(Err(error)) => {
+                return protocol_error(error.status, error.code, error.message, None, None);
+            }
+            Err(_) => {
+                return protocol_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "LIX_CATALOG_UNAVAILABLE",
+                    "Repository admission metadata is unavailable.",
+                    None,
+                    None,
+                );
+            }
+        };
     let mut response = Json(json!({
         "repositoryId": id,
         "principalId": principal,
@@ -658,7 +656,9 @@ async fn lix_protocol_inner(
     let runtime = if !admission.opens_runtime() {
         match tokio::time::timeout(
             state.protocol_timeout,
-            state.manager.get_session_runtime(&lix_id, &admission, &principal),
+            state
+                .manager
+                .get_session_runtime(&lix_id, &admission, &principal),
         )
         .await
         {

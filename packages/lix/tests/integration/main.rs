@@ -24,6 +24,7 @@ mod physical_plan_cache;
 mod pooled_session_reuse;
 mod read_retry;
 mod restore;
+mod undo_redo;
 mod sql;
 mod storage_accounting;
 mod transaction;

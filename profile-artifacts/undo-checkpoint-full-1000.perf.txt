@@ -1,0 +1,78 @@
+# Samples: 1K of event 'cycles:P'
+# Event count (approx.): 5398366061
+     4.62%  [.] lix::order_preserving_key::write_key_string
+     4.30%  [.] <sqlparser::ast::query::TableFactor as core::clone::Clone>::clone
+     4.05%  [.] _int_malloc
+     3.11%  [.] _blake3_compress_in_place_avx512
+     3.08%  [.] _int_free
+     2.51%  [.] malloc_consolidate
+     2.04%  [.] __memcmp_evex_movbe
+     1.06%  [.] lix::tracked_state::codec::read_value_tail
+     1.05%  [k] clear_page_erms
+     1.05%  [.] <[lix::tracked_state::codec::EncodedLeafEntry] as core::slice::CloneFromSpec<lix::tracked_state::codec::EncodedLeafEntry>>::spec_clone_from
+     1.05%  [.] <lix::session::context::SessionContext<lix::storage::session::StorageSession<lix::storage::in_memory::Memory>>>::notify_after_storage_commit
+     1.05%  [.] lix::tracked_state::codec::encode_value_ref_into
+     1.04%  [.] _int_free_merge_chunk
+     1.04%  [.] <lix::transaction::context::Transaction<lix::storage::session::StorageSession<lix::storage::in_memory::Memory>>>::prepare_storage_commit_once::{closure#0}
+     1.04%  [.] __memset_avx512_unaligned_erms
+     1.04%  [.] lix::changelog::materialization::materialize_known_change_payloads_in_order::<core::iter::adapters::map::Map<core::slice::iter::Iter<(lix::transaction::commit::SelectedChangeKey, lix::changelog::types::ChangeRecord)>, lix::t
+     1.04%  [.] <core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<lix::storage::types::GetManyRequest>, core::iter::adapters::map::Map<core::slice::iter::Iter<lix::storage::types::Key>, <lix::storage::in_memory::MemoryRead as
+     1.04%  [.] core::ptr::drop_glue::<sqlparser::tokenizer::Token>
+     1.04%  [.] <tokio::sync::mutex::Mutex<()>>::lock::{closure#0}
+     1.04%  [.] <lix::storage_adapter::write_set::StorageWriteGroup>::lower
+     1.04%  [.] __memmove_avx512_unaligned_erms
+     1.04%  [.] <sqlparser::parser::Parser>::parse_prefix
+     1.04%  [.] lix::hot_state::tracked_head::hot::stage_incremental_collection_controls
+     1.04%  [.] bytes::bytes::owned_drop::<alloc::sync::Arc<[u8]>>
+     1.04%  [.] <alloc::sync::Arc<lix::filesystem::path_index::FilesystemPathIndexCache>>::drop_slow
+     1.04%  [.] <alloc::vec::into_iter::IntoIter<core::option::Option<lix::storage::types::ProjectedValue>> as core::ops::drop::Drop>::drop
+     1.04%  [.] <blake3::ChunkState>::update
+     1.04%  [.] lix::storage::in_memory::physical_key
+     1.04%  [.] lix::tracked_state::storage::load_manifest_snapshot_commit_root::<&lix::storage_adapter::read_scope::SharedStorageAdapterRead<lix::storage::in_memory::MemoryRead>>::{closure#0}
+     1.04%  [.] <alloc::collections::btree::set::BTreeSet<(&str, &str)> as core::iter::traits::collect::FromIterator<(&str, &str)>>::from_iter::<core::iter::adapters::map::Map<core::iter::adapters::filter::Filter<core::slice::iter::Iter<lix
+     1.04%  [.] <alloc::collections::btree::set::BTreeSet<lix::changelog::types::CommitId> as core::iter::traits::collect::FromIterator<lix::changelog::types::CommitId>>::from_iter::<core::iter::adapters::filter::Filter<core::iter::adapters
+     1.04%  [.] <lix::tracked_state::tree::TrackedStateTree>::get_many_encoded::<&lix::storage_adapter::read_scope::SharedStorageAdapterRead<lix::storage::in_memory::MemoryRead>>::{closure#0}
+     1.04%  [.] <alloc::collections::btree::map::BTreeMap<lix::storage::types::Key, bytes::bytes::Bytes>>::insert
+     1.04%  [.] <core::iter::adapters::map::Map<core::iter::adapters::enumerate::Enumerate<core::slice::iter::Iter<lix_schema::row::Value>>, <lix::row_pk::RowPk>::from_schema_values::{closure#0}> as core::iter::traits::iterator::Iterator>::
+     1.04%  [.] lix::hot_state::tracked_head::hot::hot_scan_entries::<&lix::storage_adapter::read_scope::SharedStorageAdapterRead<lix::storage::in_memory::MemoryRead>>::{closure#0}
+     1.04%  [.] lix::tracked_state::storage::decode_commit_delta_leaf
+     1.04%  [.] lix::transaction::commit::commit_prepared_writes_with_parent_heads::<lix::storage_adapter::read_scope::SharedStorageAdapterRead<lix::storage::in_memory::MemoryRead>>::{closure#0}
+     1.04%  [.] <alloc::sync::Arc<lix::filesystem::persistent_map::Node<lix::storage::types::Key, bytes::bytes::Bytes>>>::drop_slow
+     1.04%  [.] <tokio::sync::notify::NotifyGuard>::notify_waiters
+     1.04%  [.] <lix::branch::refs::BranchRefStoreReader<&lix::storage_adapter::read_scope::SharedStorageAdapterRead<lix::storage::in_memory::MemoryRead>> as lix::branch::types::BranchRefReader>::load_head::{closure#0}
+     1.04%  [.] <lix::session::context::SessionContext<lix::storage::session::StorageSession<lix::storage::in_memory::Memory>>>::execute_with_options_inner::{closure#0}
+     1.04%  [.] <lix::common::types::SharedStr as core::convert::From<&str>>::from
+     1.04%  [.] <alloc::vec::Vec<lix::row_pk::RowPk> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<lix::row_pk::RowPk, alloc::collections::btree::set::IntoIter<lix::row_pk::RowPk>>>::from_iter
+     1.04%  [.] __rustc::__rdl_dealloc
+     1.03%  [.] <alloc::vec::Vec<lix::changelog::types::ChangeId> as alloc::vec::spec_from_iter::SpecFromIter<lix::changelog::types::ChangeId, core::iter::adapters::flatten::Flatten<core::iter::adapters::flatten::FlatMap<core::slice::iter::
+     1.03%  [.] lix::tracked_state::storage::collect_strict_commit_delta_members
+     1.03%  [.] lix::tracked_state::codec::decode_value_view
+     1.03%  [.] <alloc::vec::Vec<sqlparser::ast::Expr> as core::clone::Clone>::clone
+     1.03%  [.] <sqlparser::parser::Parser>::parse_data_type_helper
+     1.03%  [.] <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+     1.03%  [.] lix::tracked_state::codec::decode_node_ref
+     1.03%  [.] <lix::row_pk::RowPkComponents as core::cmp::PartialEq>::eq
+     1.03%  [.] <alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Owned, lix::hot_state::tracked_head::HeadRowIdentity, alloc::collections::btree::set_val::SetValZST, alloc::collections::btree::node::marker:
+     1.03%  [.] <alloc::raw_vec::RawVecInner>::finish_grow
+     1.03%  [.] core::ptr::drop_glue::<sqlparser::ast::value::Value>
+     1.03%  [.] lix::order_preserving_key::write_file_id
+     1.03%  [.] core::slice::sort::unstable::quicksort::quicksort::<lix::tracked_state::types::TrackedStateKeyRef, <[lix::tracked_state::types::TrackedStateKeyRef]>::sort_unstable_by<lix::transaction::commit::tracked_head_absence_guards::{c
+     1.03%  [.] <alloc::string::String as core::fmt::Write>::write_str
+     1.03%  [.] lix::tracked_state::mutation_directory::load_mutation_part_read_plan::<&&lix::storage_adapter::read_scope::SharedStorageAdapterRead<lix::storage::in_memory::MemoryRead>>::{closure#0}
+     1.03%  [.] malloc
+     1.03%  [.] lix::order_preserving_key::write_row_pk
+     1.03%  [.] core::ptr::drop_glue::<lix::hot_state::types::MaterializedHotStateBatch>
+     1.02%  [.] <alloc::collections::btree::node::NodeRef<alloc::collections::btree::node::marker::Mut, (alloc::string::String, lix::row_pk::RowPk, core::option::Option<alloc::string::String>), alloc::collections::btree::set_val::SetValZST,
+     1.02%  [.] <alloc::collections::btree::map::BTreeMap<alloc::string::String, serde_json::value::Value>>::insert
+     1.02%  [.] <ahash::fallback_hash::AHasher as core::hash::Hasher>::write
+     1.02%  [.] <lix::hot_state::types::MaterializedHotStateBatchBuilder>::push_columns
+     1.02%  [.] <bytes::bytes::Bytes as core::convert::From<alloc::vec::Vec<u8>>>::from
+     1.02%  [.] cfree@GLIBC_2.2.5
+     1.02%  [.] lz4_flex::block::compress::compress_internal::<lz4_flex::block::hashtable::HashTable4KU16, false, lz4_flex::sink::SliceSink>
+     1.02%  [.] lix::tracked_state::codec::decode_key
+     1.02%  [.] <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&lix::row_pk::RowPk>
+     1.02%  [.] <sqlparser::ast::Statement as core::clone::Clone>::clone
+     1.02%  [.] core::ptr::drop_glue::<std::sync::poison::PoisonError<std::sync::poison::mutex::MutexGuard<core::option::Option<lix::transaction::staging::OrderedMutationJournal>>>>
+     1.02%  [.] <core::iter::adapters::map::Map<alloc::collections::btree::map::Keys<alloc::string::String, lix::transaction::staged_commit_changes::StagedCommitChangeRefs>, <alloc::string::String>::as_str> as core::iter::traits::iterator::
+     1.02%  [.] <core::iter::adapters::map::Map<core::slice::iter::Iter<usize>, lix::transaction::commit::stage_tracked_commit_delta_index<lix::storage_adapter::read_scope::SharedStorageAdapterRead<lix::storage::in_memory::MemoryRead>>::{cl
+     1.01%  [.] <lru::LruCache<[u8; 32], bytes::bytes::Bytes> as core::ops::drop::Drop>::drop

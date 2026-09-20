@@ -76,6 +76,11 @@ Lix reconciles overlapping edits automatically. Changes to different columns of 
 
 “Last” follows acceptance order, not client timestamps. In a branch merge, the source branch is incoming. Overlapping edits do not require caller conflict resolution.
 
+Undo/redo bookkeeping is an exception: independently changing the same receipt
+or checkpoint-cycle state on both branches causes an atomic merge conflict,
+even if the resulting content is equal. A fast-forward adopts the selected
+source branch's working baseline with its head. See [Undo and redo](./undo-redo.md).
+
 Preview reports the merge outcome and change counts; it does not reserve the branch heads or approve a later merge against changing data.
 
 ## Hide or delete a branch

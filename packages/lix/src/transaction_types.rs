@@ -2647,6 +2647,7 @@ pub(crate) struct PluginCheckpointWrite {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BranchHeadWrite {
     pub(crate) branch_id: String,
+    pub(crate) source_branch_id: Option<uuid::Uuid>,
     pub(crate) head_commit_id: Option<CommitId>,
     pub(crate) origin: Option<TransactionWriteOrigin>,
 }
@@ -2655,6 +2656,7 @@ impl BranchHeadWrite {
     pub(crate) fn new(branch_id: &str, head_commit_id: Option<CommitId>) -> Self {
         Self {
             branch_id: branch_id.to_owned(),
+            source_branch_id: None,
             head_commit_id,
             origin: None,
         }
@@ -2664,6 +2666,7 @@ impl BranchHeadWrite {
 /// Validated publication intent; branch controls remain the only head authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BranchHeadTarget {
+    pub(crate) source_branch_id: Option<uuid::Uuid>,
     pub(crate) head_commit_id: Option<CommitId>,
     pub(crate) ref_change_id: ChangeId,
     pub(crate) created_at: LixTimestamp,

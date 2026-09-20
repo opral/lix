@@ -133,37 +133,34 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    lix_branch_components_are_not_public,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine.open_session().await.expect("session should open"),
-            &engine,
-        );
-        session
-            .execute(
-                "INSERT INTO lix_key_value (key, value) \
+simulation_test!(lix_branch_components_are_not_public, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine.open_session().await.expect("session should open"),
+        &engine,
+    );
+    session
+        .execute(
+            "INSERT INTO lix_key_value (key, value) \
                  VALUES ('6272616e-6368-8d72-8566-2d7075626c00', 'next-head')",
-                &[],
-            )
-            .await
-            .expect("tracked write should advance the workspace head");
+            &[],
+        )
+        .await
+        .expect("tracked write should advance the workspace head");
 
-        for table_name in [
-            "lix_branch_descriptor",
-            "lix_branch_descriptor_history",
-            "lix_branch_ref",
-            "lix_branch_ref_history",
-        ] {
-            let error = session
-                .execute(&format!("SELECT * FROM {table_name}"), &[])
-                .await
-                .expect_err("branch component should not be public");
-            assert_eq!(error.code, LixError::CODE_TABLE_NOT_FOUND);
-        }
+    for table_name in [
+        "lix_branch_descriptor",
+        "lix_branch_descriptor_history",
+        "lix_branch_ref",
+        "lix_branch_ref_history",
+    ] {
+        let error = session
+            .execute(&format!("SELECT * FROM {table_name}"), &[])
+            .await
+            .expect_err("branch component should not be public");
+        assert_eq!(error.code, LixError::CODE_TABLE_NOT_FOUND);
     }
-);
+});
 
 simulation_test!(
     lix_branch_insert_reads_back_composed_row,
@@ -287,43 +284,40 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    lix_branch_delete_removes_composed_row,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(
-            engine.open_session().await.expect("session should open"),
-            &engine,
-        );
+simulation_test!(lix_branch_delete_removes_composed_row, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(
+        engine.open_session().await.expect("session should open"),
+        &engine,
+    );
 
-        session
-            .execute(
-                "INSERT INTO lix_branch (id, name) \
+    session
+        .execute(
+            "INSERT INTO lix_branch (id, name) \
                  VALUES ('73716c2d-6272-816e-8368-2d64656c6500', 'Delete Me')",
-                &[],
-            )
-            .await
-            .expect("branch insert should succeed");
+            &[],
+        )
+        .await
+        .expect("branch insert should succeed");
 
-        let delete_result = session
-            .execute(
-                "DELETE FROM lix_branch WHERE id = '73716c2d-6272-816e-8368-2d64656c6500'",
-                &[],
-            )
-            .await
-            .expect("lix_branch delete should succeed");
-        assert_eq!(delete_result, ExecuteResult::from_rows_affected(1));
+    let delete_result = session
+        .execute(
+            "DELETE FROM lix_branch WHERE id = '73716c2d-6272-816e-8368-2d64656c6500'",
+            &[],
+        )
+        .await
+        .expect("lix_branch delete should succeed");
+    assert_eq!(delete_result, ExecuteResult::from_rows_affected(1));
 
-        assert_eq!(
-            count_rows(
-                &session,
-                "SELECT COUNT(*) FROM lix_branch WHERE id = '73716c2d-6272-816e-8368-2d64656c6500'",
-            )
-            .await,
-            0
-        );
-    }
-);
+    assert_eq!(
+        count_rows(
+            &session,
+            "SELECT COUNT(*) FROM lix_branch WHERE id = '73716c2d-6272-816e-8368-2d64656c6500'",
+        )
+        .await,
+        0
+    );
+});
 
 simulation_test!(
     lix_branch_delete_rejects_active_and_global_branches,

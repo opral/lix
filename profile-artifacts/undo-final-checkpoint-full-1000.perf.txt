@@ -1,0 +1,53 @@
+# Samples: 1K of event 'cycles:P'
+# Event count (approx.): 5018432724
+    20.31%  [.] __memmove_avx512_unaligned_erms
+     5.57%  [.] _int_malloc
+     5.29%  [.] lix::hot_state::tracked_head::hot::checked_add_hot_next_value_capacity
+     5.07%  [.] _int_free_merge_chunk
+     2.57%  [.] <alloc::raw_vec::RawVec<core::result::Result<lix::tracked_state::row_materialization::MaterializedTrackedStateBatch, lix::common::error::LixError>>>::grow_one
+     2.27%  [.] lix::tracked_state::storage::commit_delta_member_scopes
+     2.24%  [.] __memcmp_evex_movbe
+     2.23%  [.] __rustc::__rust_no_alloc_shim_is_unstable_v2
+     2.23%  [.] _int_free
+     1.13%  [.] <core::iter::adapters::map::Map<core::slice::iter::Iter<alloc::string::String>, <lix::hot_state::context::HotStateContextReader<&lix::migration::epoch::planning_read::MigrationPlanningRead<lix::storage::session::StorageSessi
+     1.13%  [.] <lix::row_pk::RowPkComponents as core::cmp::PartialEq>::eq
+     1.13%  [.] <alloc::vec::Vec<lix::collection_generation::CollectionScopeRef> as alloc::vec::spec_from_iter::SpecFromIter<lix::collection_generation::CollectionScopeRef, core::iter::adapters::map::Map<core::iter::adapters::filter::Filter
+     1.13%  [.] lix::tracked_state::codec::read_varint
+     1.13%  [.] <alloc::string::String as core::fmt::Write>::write_str
+     1.13%  [.] <lix::branch::control::BranchHeadControlReader<&lix::storage_adapter::read_scope::SharedStorageAdapterRead<lix::storage::in_memory::MemoryRead>>>::load_observed::{closure#0}
+     1.13%  [.] _blake3_compress_in_place_avx512
+     1.13%  [.] <alloc::raw_vec::RawVecInner<_>>::reserve::do_reserve_and_handle::<alloc::alloc::Global>
+     1.13%  [.] lix::tracked_state::storage::validate_commit_state_manifest_inner
+     1.13%  [.] lix::plugin::wire::typed::encode_engine_row_payload
+     1.13%  [.] <hashbrown::map::HashMap<lix::common::types::SharedStr, u32, std::hash::random::RandomState>>::insert
+     1.13%  [.] __rustc::__rust_alloc
+     1.13%  [.] bytes::bytes::shared_drop
+     1.12%  [.] cfree@GLIBC_2.2.5
+     1.12%  [.] <alloc::collections::btree::map::BTreeMap<lix::changelog::types::CommitId, (lix::changelog::types::CommitId, u64)> as core::ops::drop::Drop>::drop
+     1.12%  [.] musli::int::encoding::decode_usize::<&musli::context::default_context::DefaultContext<musli::alloc::global::Global, musli::context::trace::NoTrace, musli::context::capture::Emit<musli::storage::error::Error>>, &mut &[u8], 0>
+     1.12%  [k] clear_page_erms
+     1.12%  [.] lix::hot_state::tracked_head::hot::load_root_current_base_commit::<lix::storage_adapter::read_scope::SharedStorageAdapterRead<lix::storage::in_memory::MemoryRead>>::{closure#0}
+     1.12%  [.] lix::transaction::commit::stage_changelog_commits::<lix::storage_adapter::read_scope::SharedStorageAdapterRead<lix::storage::in_memory::MemoryRead>>::{closure#0}
+     1.12%  [.] <alloc::vec::Vec<alloc::string::String> as core::clone::Clone>::clone
+     1.12%  [.] <&mut lix::storage::in_memory::check_preconditions::{closure#0} as core::ops::function::FnMut<((usize, &lix::storage::error::Precondition),)>>::call_mut
+     1.12%  [.] <sqlparser::parser::Parser>::parse_compound_expr
+     1.12%  [.] <lix::row_pk::RowPkComponents as core::cmp::Ord>::cmp
+     1.11%  [.] <alloc::collections::btree::map::BTreeMap<alloc::string::String, alloc::collections::btree::set_val::SetValZST>>::insert
+     1.11%  [.] <&lix::storage_adapter::read_scope::SharedStorageAdapterRead<lix::storage::in_memory::MemoryRead> as lix::changelog::context::ChangelogStorageRead>::changelog_get_many::{closure#0}
+     1.11%  [.] lix::sql2::parse::parse_statement
+     1.11%  [.] lix::tracked_state::storage::stage_commit_deltas_inner
+     1.11%  [.] <lix::row_pk::RowPkComponents>::from_smallvec
+     1.11%  [.] <lix::tracked_state::tree::TrackedStateTree>::apply_mutations_with_overlay::<lix::storage_adapter::read_scope::SharedStorageAdapterRead<lix::storage::in_memory::MemoryRead>>::{closure#0}
+     1.11%  [.] unlink_chunk.isra.0
+     1.11%  [.] <alloc::vec::Vec<lix::tracked_state::types::TrackedStateMutation> as core::ops::drop::Drop>::drop
+     1.11%  [.] realloc
+     1.11%  [.] core::ptr::drop_glue::<lix::changelog::types::ChangeRecord>
+     1.11%  [.] <lix::commit_graph::context::CommitGraphStoreReader<lix::storage_adapter::read_scope::SharedStorageAdapterRead<lix::storage::in_memory::MemoryRead>>>::merge_base::{closure#0}
+     1.11%  [.] <lix::tracked_state::tree::TrackedStateTree>::rewrite_frontier_node::<lix::storage_adapter::read_scope::SharedStorageAdapterRead<lix::storage::in_memory::MemoryRead>>::{closure#0}
+     1.11%  [.] lix::tracked_state::codec::decode_node_ref
+     1.10%  [.] __rustc::__rdl_alloc_zeroed
+     1.10%  [.] <hashbrown::raw::RawTable<(lix::changelog::types::CommitId, core::option::Option<lix::commit_graph::types::CommitGraphNode>)> as core::ops::drop::Drop>::drop
+     1.10%  [.] <lix::storage_adapter::point::PointReadPlan>::materialize::<&lix::storage_adapter::read_scope::SharedStorageAdapterRead<lix::storage::in_memory::MemoryRead>>::{closure#0}
+     1.10%  [.] <core::iter::adapters::flatten::FlatMap<core::slice::iter::Iter<lix::storage::types::GetManyRequest>, core::iter::adapters::map::Map<core::slice::iter::Iter<lix::storage::types::Key>, <lix::storage::in_memory::MemoryRead as
+     1.09%  [.] <alloc::vec::Vec<datafusion_expr::expr::Expr> as datafusion_common::tree_node::TreeNodeContainer<datafusion_expr::expr::Expr>>::map_elements::<datafusion_optimizer::analyzer::type_coercion::analyze_internal::{closure#0}>
+     1.05%  [.] malloc_consolidate

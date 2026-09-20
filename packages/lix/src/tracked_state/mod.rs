@@ -34,9 +34,7 @@ pub(crate) use commit_root_rebuild::{
 };
 #[cfg(test)]
 pub(crate) use context::DIFF_ROW_CREATED_AT_VALIDATIONS;
-pub(crate) use context::{
-    TrackedStateContext, TrackedStateStoreReader, descriptor_dependency_cascade_file_ids,
-};
+pub(crate) use context::{TrackedStateContext, TrackedStateStoreReader};
 pub(crate) use current_state_data_part::{
     CURRENT_STATE_DATA_PART_SPACE, decode_current_state_data_part_commit_ids,
 };
@@ -47,7 +45,7 @@ pub(crate) use diff::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind,
     TrackedStateDiffRequest, TrackedStateDiffRow, TrackedStatePayloadBatch, TrackedStatePayloadRef,
 };
-pub(crate) use diff_id::decode_diff_id;
+pub(crate) use diff_id::{decode_diff_id, encode_diff_id};
 pub(crate) use merge::{
     TrackedStateMergeConflict, TrackedStateMergePick, TrackedStateMergePlan,
     merge_payload_fallback_ids, plan_merge,

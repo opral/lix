@@ -6,7 +6,7 @@ use lix::storage::Storage;
 use lix::{
     CreateBranchOptions, CreateBranchReceipt, ExecuteBatchStatement, ExecuteResult, Lix, LixError,
     MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
-    RedoReceipt, SwitchBranchOptions, SwitchBranchReceipt, UndoReceipt, Value,
+    SwitchBranchOptions, SwitchBranchReceipt, Value,
 };
 
 #[derive(Default, serde::Deserialize)]
@@ -52,8 +52,6 @@ pub(crate) trait SessionOperations: Sized {
         &self,
         options: CreateBranchOptions,
     ) -> Result<CreateBranchReceipt, LixError>;
-    async fn undo(&self) -> Result<UndoReceipt, LixError>;
-    async fn redo(&self) -> Result<RedoReceipt, LixError>;
     async fn switch_branch(
         &self,
         options: SwitchBranchOptions,
@@ -154,13 +152,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> SessionOperations for Lix<S> {
         options: CreateBranchOptions,
     ) -> Result<CreateBranchReceipt, LixError> {
         Lix::create_branch(self, options).await
-    }
-
-    async fn undo(&self) -> Result<UndoReceipt, LixError> {
-        Lix::undo(self).await
-    }
-    async fn redo(&self) -> Result<RedoReceipt, LixError> {
-        Lix::redo(self).await
     }
 
     async fn switch_branch(
@@ -354,13 +345,6 @@ mod remote {
             options: CreateBranchOptions,
         ) -> Result<CreateBranchReceipt, LixError> {
             ClientCore::create_branch(self, options).await
-        }
-
-        async fn undo(&self) -> Result<UndoReceipt, LixError> {
-            ClientCore::undo(self).await
-        }
-        async fn redo(&self) -> Result<RedoReceipt, LixError> {
-            ClientCore::redo(self).await
         }
 
         async fn switch_branch(
