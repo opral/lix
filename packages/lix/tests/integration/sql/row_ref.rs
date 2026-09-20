@@ -121,6 +121,93 @@ simulation_test!(
 );
 
 simulation_test!(
+    parameterized_row_ref_resolves_newly_registered_schema,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session()
+                .await
+                .expect("session should open"),
+            &engine,
+        );
+        let schema = json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "rr_parameter_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES ($1)",
+                &[Value::Jsonb(schema.into())],
+            )
+            .await
+            .expect("schema registration should succeed");
+
+        let parameterized = session
+            .execute(
+                "SELECT lix_row_ref($1, $2) AS row_ref",
+                &[
+                    Value::Text("rr_parameter_probe".into()),
+                    Value::Text("probe-1".into()),
+                ],
+            )
+            .await
+            .expect("parameterized relation and primary key should construct");
+        assert_eq!(parameterized.column_types(), &[ResultColumnType::RowRef]);
+
+        let literal_relation = session
+            .execute(
+                "SELECT lix_row_ref('rr_parameter_probe', $1) AS row_ref",
+                &[Value::Text("probe-1".into())],
+            )
+            .await
+            .expect("literal relation and parameterized primary key should construct");
+        assert_eq!(parameterized.rows(), literal_relation.rows());
+
+        let expression_relation = session
+            .execute(
+                "SELECT lix_row_ref(CAST($1 AS TEXT), $2) AS row_ref",
+                &[
+                    Value::Text("rr_parameter_probe".into()),
+                    Value::Text("probe-1".into()),
+                ],
+            )
+            .await
+            .expect("an expression relation and parameterized primary key should construct");
+        assert_eq!(parameterized.rows(), expression_relation.rows());
+
+        let column_relation = session
+            .execute(
+                "SELECT lix_row_ref(relation_name, primary_key) AS row_ref \
+                 FROM (VALUES ($1, $2)) AS input(relation_name, primary_key)",
+                &[
+                    Value::Text("rr_parameter_probe".into()),
+                    Value::Text("probe-1".into()),
+                ],
+            )
+            .await
+            .expect("column-sourced relation and primary key should construct");
+        assert_eq!(parameterized.rows(), column_relation.rows());
+
+        let error = session
+            .execute(
+                "SELECT lix_row_ref($1, $2)",
+                &[
+                    Value::Text("rr_parameter_probe_missing".into()),
+                    Value::Text("probe-1".into()),
+                ],
+            )
+            .await
+            .expect_err("unknown parameterized relations should remain rejected");
+        assert!(error.to_string().contains("does not exist"), "{error}");
+    }
+);
+
+simulation_test!(
     composite_diff_exposes_typed_keys_once_for_every_diff_kind,
     |sim| async move {
         let engine = sim.boot_engine().await;

@@ -8330,6 +8330,15 @@ where
             return Ok(());
         }
         let staged = super::staging::PreparedSchemaOverlay::new(&prepared_writes.state_rows);
+        // Catalogs may have been cached while normalizing earlier statements
+        // in this transaction. A final registered-schema write changes both
+        // the narrow source catalog and the branch-visible catalog used for
+        // delete-side FK planning, so rebuild both from the final overlay.
+        if prepared_writes.state_rows.iter().any(|row| {
+            row.schema_key.as_str() == REGISTERED_SCHEMA_KEY
+        }) {
+            self.schema_resolver.clear_cached_catalogs();
+        }
         let staged_commit_ids = prepared_writes
             .commit_change_refs_by_branch
             .values()
@@ -8353,15 +8362,16 @@ where
                 let branch_prepared_writes =
                     validation_index.validation_set_for_schema_scope(scope);
                 let hot_state = self.hot_state.reader(read);
-                let schema_catalog = self
+                let (schema_catalog, delete_schema_catalog) = self
                     .schema_resolver
-                    .catalog_for_validation(&hot_state, &staged, scope)
+                    .catalogs_for_validation(&hot_state, &staged, scope)
                     .await?;
                 let mut validation_input = TransactionValidationInput::new(
                     &branch_prepared_writes,
                     schema_catalog,
                     &hot_state,
                 )
+                .with_delete_schema_catalog(delete_schema_catalog)
                 .with_staged_commit_ids(staged_commit_ids.clone());
                 if self.trust_filesystem_planner {
                     validation_input = validation_input.with_trusted_filesystem_planner();

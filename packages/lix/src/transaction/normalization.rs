@@ -340,10 +340,11 @@ pub(crate) fn normalize_raw_write_row_in_place(
     let requires_transaction_validation = if normalized_snapshot.is_some() {
         !schema_plan.uniques.is_empty() || !schema_plan.foreign_keys.is_empty()
     } else {
-        schema_catalog
-            .snapshot()
-            .delete_plan_for_key(&row.schema_key)
-            .has_committed_checks()
+        // The row-normalization catalog is scoped to the row's durability
+        // lane. A tracked target may still have incoming references from an
+        // untracked child schema, so a tombstone must reach the delete-side
+        // validator unless a trusted SQL certificate replaces this path.
+        true
     } && !row.constraints_unchanged;
 
     let converted_typed = if let Some(snapshot) = normalized_snapshot.as_ref() {
@@ -1044,6 +1045,31 @@ mod tests {
             error
                 .message
                 .contains("value at primary-key pointer '/key' must be a valid string")
+        );
+    }
+
+    #[test]
+    fn normalization_requires_transaction_validation_for_tombstones() {
+        let mut catalog = catalog_with(vec![schema_with_default_id()]);
+        let mut row = base_stage_row();
+        row.snapshot = None;
+        let mut rows = RawWriteBatch::with_capacity(1);
+        rows.push(row);
+        let mut default_timestamp = None;
+
+        let normalized = normalize_raw_write_row_in_place(
+            &mut rows,
+            0,
+            &mut catalog,
+            functions(),
+            &mut default_timestamp,
+            None,
+        )
+        .expect("tombstone should normalize");
+
+        assert!(
+            normalized.facts.requires_transaction_validation,
+            "tombstones must reach delete-side transaction validation"
         );
     }
 

@@ -150,13 +150,21 @@ pub(crate) enum ProviderSelection {
         names: BTreeSet<String>,
         history_relations: BTreeSet<String>,
     },
+    /// Register only the concrete table names referenced by the statements,
+    /// while loading the complete visible catalog for runtime metadata.
+    OnlyWithVisibleSchemas {
+        names: BTreeSet<String>,
+        history_relations: BTreeSet<String>,
+    },
 }
 
 impl ProviderSelection {
     fn includes(&self, surface: &PublicSurfaceContract) -> bool {
         match self {
             Self::All | Self::AllWithHistory(_) => true,
-            Self::Only { names, .. } => names.contains(&surface.name),
+            Self::Only { names, .. } | Self::OnlyWithVisibleSchemas { names, .. } => {
+                names.contains(&surface.name)
+            }
         }
     }
 
@@ -165,6 +173,9 @@ impl ProviderSelection {
             Self::All => Some(empty_history_relations()),
             Self::AllWithHistory(history_relations) => Some(history_relations),
             Self::Only {
+                history_relations, ..
+            }
+            | Self::OnlyWithVisibleSchemas {
                 history_relations, ..
             } => Some(history_relations),
         }
@@ -176,12 +187,12 @@ impl ProviderSelection {
     /// can install providers without scanning `lix_registered_schema` rows.
     /// Runtime registration rejects schema keys whose generated table names
     /// would shadow these fixed providers.
-    /// `All` and every unknown name remain conservative: they load the full
+    /// `All`, `OnlyWithVisibleSchemas`, and every unknown name load the full
     /// visible catalog so information-schema, custom rows, and normal
     /// unknown-table errors keep their current semantics.
     fn requires_visible_schemas(&self) -> bool {
         match self {
-            Self::All | Self::AllWithHistory(_) => true,
+            Self::All | Self::AllWithHistory(_) | Self::OnlyWithVisibleSchemas { .. } => true,
             Self::Only {
                 names,
                 history_relations,
@@ -206,12 +217,13 @@ pub(crate) fn read_provider_selection(
     let mut names = BTreeSet::new();
     let mut history_relations = BTreeSet::new();
     let mut requires_all = false;
+    let mut requires_visible_schemas = false;
     // Resolving references only reads the SQL parser configuration, so the
     // statement's pooled session state is used directly instead of cloning the
     // live one.
     for statement in statements {
         collect_history_relation_literals(statement, &mut history_relations);
-        collect_dynamic_relation_literals(statement, &mut names);
+        collect_dynamic_relation_literals(statement, &mut names, &mut requires_visible_schemas);
         if statement_requires_all_providers(statement) {
             requires_all = true;
             continue;
@@ -229,6 +241,12 @@ pub(crate) fn read_provider_selection(
     }
     if requires_all {
         return all_provider_selection(history_relations);
+    }
+    if requires_visible_schemas {
+        return ProviderSelection::OnlyWithVisibleSchemas {
+            names,
+            history_relations,
+        };
     }
     ProviderSelection::Only {
         names,
@@ -304,12 +322,14 @@ fn collect_history_relation_literals(
     }
 }
 
-/// Diff results inherit their relation's Arrow schema, so runtime schema
-/// literals must participate in snapshot-local catalog selection even though
-/// DataFusion only resolves the table-function name itself.
+/// Runtime relation arguments must participate in snapshot-local catalog
+/// selection even though DataFusion only resolves the function names
+/// themselves. A literal relation can select one surface; a dynamic
+/// `lix_row_ref` relation requires the complete visible catalog.
 fn collect_dynamic_relation_literals(
     statement: &datafusion::sql::parser::Statement,
     relations: &mut BTreeSet<String>,
+    requires_visible_schemas: &mut bool,
 ) {
     use std::ops::ControlFlow;
 
@@ -319,7 +339,10 @@ fn collect_dynamic_relation_literals(
         Visitor,
     };
 
-    struct DiffRelationVisitor<'a>(&'a mut BTreeSet<String>);
+    struct DiffRelationVisitor<'a> {
+        relations: &'a mut BTreeSet<String>,
+        requires_visible_schemas: &'a mut bool,
+    }
 
     impl Visitor for DiffRelationVisitor<'_> {
         type Break = ();
@@ -328,21 +351,30 @@ fn collect_dynamic_relation_literals(
             let SqlExpr::Function(function) = expression else {
                 return ControlFlow::Continue(());
             };
-            if !crate::sql2::parse::object_name_is_public_function(&function.name, "lix_row_ref") {
-                return ControlFlow::Continue(());
-            }
             let datafusion::sql::sqlparser::ast::FunctionArguments::List(arguments) =
                 &function.args
             else {
                 return ControlFlow::Continue(());
             };
-            let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Value(value)))) =
-                arguments.args.first()
-            else {
+            let Some(first_argument) = arguments.args.first() else {
                 return ControlFlow::Continue(());
             };
-            if let SqlValue::SingleQuotedString(relation_name) = &value.value {
-                self.0.insert(relation_name.clone());
+            if !crate::sql2::parse::object_name_is_public_function(&function.name, "lix_row_ref")
+            {
+                return ControlFlow::Continue(());
+            }
+            match first_argument {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Value(value))) => {
+                    if let SqlValue::SingleQuotedString(relation_name) = &value.value {
+                        self.relations.insert(relation_name.clone());
+                    } else {
+                        // A parameter or another expression can name a
+                        // runtime-registered relation. Load the complete
+                        // visible catalog before DataFusion plans the UDF.
+                        *self.requires_visible_schemas = true;
+                    }
+                }
+                _ => *self.requires_visible_schemas = true,
             }
             ControlFlow::Continue(())
         }
@@ -370,7 +402,7 @@ fn collect_dynamic_relation_literals(
                 return ControlFlow::Continue(());
             };
             if let SqlValue::SingleQuotedString(relation_name) = &value.value {
-                self.0.insert(relation_name.clone());
+                self.relations.insert(relation_name.clone());
             }
             ControlFlow::Continue(())
         }
@@ -378,10 +410,17 @@ fn collect_dynamic_relation_literals(
 
     match statement {
         DataFusionStatement::Statement(statement) => {
-            let _ = statement.visit(&mut DiffRelationVisitor(relations));
+            let _ = statement.visit(&mut DiffRelationVisitor {
+                relations,
+                requires_visible_schemas,
+            });
         }
         DataFusionStatement::Explain(explain) => {
-            collect_dynamic_relation_literals(explain.statement.as_ref(), relations);
+            collect_dynamic_relation_literals(
+                explain.statement.as_ref(),
+                relations,
+                requires_visible_schemas,
+            );
         }
         _ => {}
     }
@@ -731,6 +770,13 @@ mod tests {
         }
     }
 
+    fn selected_names_with_visible_schemas(names: &[&str]) -> ProviderSelection {
+        ProviderSelection::OnlyWithVisibleSchemas {
+            names: names.iter().map(|name| (*name).to_string()).collect(),
+            history_relations: BTreeSet::new(),
+        }
+    }
+
     #[test]
     fn referenced_provider_selection_uses_datafusion_cte_and_set_operation_resolution() {
         let selection = selection_for_sql(&["WITH shadowed AS (\
@@ -855,6 +901,31 @@ mod tests {
             selection_for_sql(&["SELECT * FROM lix_diff('runtime_note', $1, $2)"])
                 .requires_visible_schemas()
         );
+    }
+
+    #[test]
+    fn row_ref_provider_selection_loads_visible_catalog_for_dynamic_relation() {
+        assert_eq!(
+            selection_for_sql(&["SELECT lix_row_ref($1, $2)"]),
+            selected_names_with_visible_schemas(&[]),
+        );
+        assert_eq!(
+            selection_for_sql(&["SELECT lix_row_ref(CAST($1 AS TEXT), $2)"]),
+            selected_names_with_visible_schemas(&[]),
+        );
+        assert_eq!(
+            selection_for_sql(&["SELECT lix_row_ref('lix_file', $1)"]),
+            selected_names(&["lix_file"]),
+        );
+        let selection = selection_for_sql(&["SELECT lix_row_ref($1, $2) FROM lix_file"]);
+        assert_eq!(selection, selected_names_with_visible_schemas(&["lix_file"]));
+        assert!(selection.requires_visible_schemas());
+        assert!(selection.includes(PublicCatalog::fixed_system().surface("lix_file").unwrap()));
+        assert!(!selection.includes(
+            PublicCatalog::fixed_system()
+                .surface("lix_directory")
+                .unwrap()
+        ));
     }
 
     #[test]

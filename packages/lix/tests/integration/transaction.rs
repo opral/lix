@@ -1055,6 +1055,116 @@ async fn untracked_commit_retries_when_tracked_fk_target_changes_after_validatio
     assert_eq!(retry_error.code, "LIX_ERROR_FOREIGN_KEY");
 }
 
+/// A tracked target can be referenced by an untracked row whose schema is
+/// itself untracked. Delete-side validation must use the branch-visible
+/// catalog for this cross-lane source schema while keeping tracked row
+/// normalization on the tracked-only catalog.
+#[tokio::test]
+async fn tracked_parent_delete_is_restricted_by_untracked_child_schema() {
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+    let engine = Engine::new(storage)
+        .await
+        .expect("initialized storage should create an engine");
+    let session = engine
+        .open_session()
+        .await
+        .expect("session should open");
+
+    session
+        .execute(
+            r#"INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
+               VALUES (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"tracked_delete_parent","columns":[{"name":"id","type":"text","nullable":false}],"primary_key":["id"]}' AS JSONB), false, false)"#,
+            &[],
+        )
+        .await
+        .expect("tracked parent schema should register");
+    session
+        .execute(
+            r#"INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
+               VALUES (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"untracked_delete_child","columns":[{"name":"id","type":"text","nullable":false},{"name":"parent_id","type":"text","nullable":false}],"primary_key":["id"],"foreign_keys":[{"columns":["parent_id"],"references":{"schema_key":"tracked_delete_parent","columns":["id"]}}]}' AS JSONB), false, true)"#,
+            &[],
+        )
+        .await
+        .expect("untracked child schema should register");
+    session
+        .execute(
+            "INSERT INTO tracked_delete_parent (id) VALUES ('p1'), ('p2')",
+            &[],
+        )
+        .await
+        .expect("tracked parent rows should insert");
+    session
+        .execute(
+            "INSERT INTO untracked_delete_child (id, parent_id, lixcol_untracked) VALUES ('c1', 'p1', true)",
+            &[],
+        )
+        .await
+        .expect("untracked child row should insert");
+
+    for delete_sql in [
+        "DELETE FROM tracked_delete_parent WHERE id = 'p1'",
+        "DELETE FROM tracked_delete_parent",
+    ] {
+        let error = session
+            .execute(delete_sql, &[])
+            .await
+            .expect_err("referenced tracked parent must not be deleted");
+        assert_eq!(error.code, lix::LixError::CODE_FOREIGN_KEY);
+    }
+
+    let mut staged_schema_transaction = session
+        .begin_transaction()
+        .await
+        .expect("staged-schema transaction should begin");
+    staged_schema_transaction
+        .execute(
+            r#"INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
+               VALUES (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"staged_untracked_delete_child","columns":[{"name":"id","type":"text","nullable":false},{"name":"parent_id","type":"text","nullable":false}],"primary_key":["id"],"foreign_keys":[{"columns":["parent_id"],"references":{"schema_key":"tracked_delete_parent","columns":["id"]}}]}' AS JSONB), false, true)"#,
+            &[],
+        )
+        .await
+        .expect("staged untracked child schema should register");
+    staged_schema_transaction
+        .execute(
+            "INSERT INTO staged_untracked_delete_child (id, parent_id, lixcol_untracked) VALUES ('staged-c1', 'p2', true)",
+            &[],
+        )
+        .await
+        .expect("staged untracked child row should insert");
+    staged_schema_transaction
+        .execute(
+            "DELETE FROM tracked_delete_parent WHERE id = 'p2'",
+            &[],
+        )
+        .await
+        .expect("parent delete should stage before final validation");
+    let error = staged_schema_transaction
+        .commit()
+        .await
+        .expect_err("staged untracked FK should restrict tracked parent delete");
+    assert_eq!(error.code, lix::LixError::CODE_FOREIGN_KEY);
+
+    let mut transaction = session
+        .begin_transaction()
+        .await
+        .expect("transaction should begin");
+    transaction
+        .execute("DELETE FROM untracked_delete_child", &[])
+        .await
+        .expect("untracked child delete should stage");
+    transaction
+        .execute("DELETE FROM tracked_delete_parent", &[])
+        .await
+        .expect("parent collection delete should stage after child delete");
+    transaction
+        .commit()
+        .await
+        .expect("deleting both sides in one transaction should be valid");
+}
+
 fn wait_until(description: &str, mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + TEST_WAIT_TIMEOUT;
     while !condition() {
