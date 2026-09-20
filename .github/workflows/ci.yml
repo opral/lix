@@ -218,7 +218,7 @@ jobs:
             ci-artifact/server-linux-x64.json
           if-no-files-found: error
           compression-level: 0
-          retention-days: 14
+          retention-days: 90
 
   changelog:
     name: Changelog
@@ -767,7 +767,7 @@ jobs:
         with:
           name: sdk-build-timings-${{ matrix.runtime }}-${{ github.run_attempt }}
           path: ci-sdk-timings/${{ matrix.runtime }}
-          retention-days: 14
+          retention-days: 90
           if-no-files-found: warn
 
       - name: Cache successfully tested SDK binaries
@@ -905,7 +905,7 @@ jobs:
             ci-artifact/server-linux-x64.json
           if-no-files-found: error
           compression-level: 0
-          retention-days: 14
+          retention-days: 90
 
       - name: Report remaining runner resources
         if: always()

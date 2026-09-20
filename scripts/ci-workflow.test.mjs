@@ -176,7 +176,7 @@ test("server-changing pull requests retain one reusable preview image", () => {
 		workflow,
 		/name: lix-server-image-linux-x64-\$\{\{ env\.LIX_SOURCE_SHA \}\}/,
 	);
-	assert.match(workflow, /retention-days: 14/);
+	assert.match(workflow.split("\n  preview-server-image:\n")[1].split("\n  content-browser-sdk:\n")[0], /retention-days: 90/);
 	assert.match(publishWorkflow, /node scripts\/ci-server-image\.mjs/);
 });
 
@@ -438,6 +438,7 @@ test("merge reuse promotes the server image and main builds when the source arti
   assert.match(job, /outputs\.reuse == 'true' && needs\.merge-reuse\.outputs\.server_artifact == 'true'/);
   assert.match(job, /run-id: \$\{\{ needs\.merge-reuse\.outputs\.run_id \}\}/);
   assert.match(job, /node scripts\/ci-promote-server-image\.mjs/);
+  assert.match(job, /retention-days: 90/);
   assert.match(job, /name: lix-server-image-linux-x64-\$\{\{ github\.sha \}\}/);
   assert.doesNotMatch(job, /cargo |packages\/server\/Dockerfile/);
   const selector = workflow.split("\n  preview-artifact-changes:\n")[1].split("\n  preview-server-image:\n")[0];
