@@ -1115,6 +1115,8 @@ async fn tracked_parent_delete_is_restricted_by_untracked_child_schema() {
         assert_eq!(error.code, lix::LixError::CODE_FOREIGN_KEY);
     }
 
+    // A staged schema registration disables the SQL preparation certificate.
+    // The generic normalization path must still see the untracked source FK.
     let mut staged_schema_transaction = session
         .begin_transaction()
         .await
@@ -1122,29 +1124,19 @@ async fn tracked_parent_delete_is_restricted_by_untracked_child_schema() {
     staged_schema_transaction
         .execute(
             r#"INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
-               VALUES (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"staged_untracked_delete_child","columns":[{"name":"id","type":"text","nullable":false},{"name":"parent_id","type":"text","nullable":false}],"primary_key":["id"],"foreign_keys":[{"columns":["parent_id"],"references":{"schema_key":"tracked_delete_parent","columns":["id"]}}]}' AS JSONB), false, true)"#,
+               VALUES (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"staged_delete_probe","columns":[{"name":"id","type":"text","nullable":false}],"primary_key":["id"]}' AS JSONB), false, true)"#,
             &[],
         )
         .await
-        .expect("staged untracked child schema should register");
+        .expect("staged schema should register");
     staged_schema_transaction
-        .execute(
-            "INSERT INTO staged_untracked_delete_child (id, parent_id, lixcol_untracked) VALUES ('staged-c1', 'p2', true)",
-            &[],
-        )
-        .await
-        .expect("staged untracked child row should insert");
-    staged_schema_transaction
-        .execute(
-            "DELETE FROM tracked_delete_parent WHERE id = 'p2'",
-            &[],
-        )
+        .execute("DELETE FROM tracked_delete_parent WHERE id = 'p1'", &[])
         .await
         .expect("parent delete should stage before final validation");
     let error = staged_schema_transaction
         .commit()
         .await
-        .expect_err("staged untracked FK should restrict tracked parent delete");
+        .expect_err("untracked FK must restrict parent delete with staged schema changes");
     assert_eq!(error.code, lix::LixError::CODE_FOREIGN_KEY);
 
     let mut transaction = session
