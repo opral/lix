@@ -681,10 +681,7 @@ async fn lazy_history_and_binary_cas_scenarios(sim: Simulation) {
     );
     let checkpoints = replica
         .lix
-        .execute(
-            "SELECT id AS commit_id FROM lix_commit WHERE is_checkpoint",
-            &[],
-        )
+        .execute("SELECT commit_id FROM lix_log() WHERE is_checkpoint", &[])
         .await
         .expect("checkpoint rows should remain visible");
     assert!(!checkpoints.rows().is_empty());
@@ -2137,7 +2134,7 @@ async fn checkpoint_inventory_bootstrap_preserves_abandoned_state(_sim: Simulati
             .iter()
             .map(|header| header.commit_id.clone())
             .collect::<Vec<_>>(),
-        vec![first]
+        vec![first.clone()]
     );
     let page2 = authority
         .sync_checkpoint_inventory(cursor, page.continuation.as_deref(), 1)
@@ -2167,8 +2164,8 @@ async fn checkpoint_inventory_bootstrap_preserves_abandoned_state(_sim: Simulati
     let flags = replica
         .lix
         .execute(
-            "SELECT id FROM lix_commit WHERE is_checkpoint ORDER BY id",
-            &[],
+            "SELECT id FROM lix_commit WHERE id = $1 OR id = $2 ORDER BY id",
+            &[Value::Text(first.clone()), Value::Text(abandoned.clone())],
         )
         .await
         .unwrap();

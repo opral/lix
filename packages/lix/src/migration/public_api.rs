@@ -452,6 +452,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn normal_open_upgrades_v80_without_public_checkpoint_membership_loss() {
+        let storage = StorageSession::acquire(crate::Memory::new()).await.unwrap();
+        let lix = crate::open_lix()
+            .with_storage(storage.clone())
+            .await
+            .unwrap();
+        lix.execute(
+            "INSERT INTO lix_key_value (key,value) VALUES ('checkpoint-migration', 'preserved')",
+            &[],
+        )
+        .await
+        .unwrap();
+        let checkpoint = lix
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("commit_id")
+            .unwrap();
+        let undo = lix
+            .execute(
+                "SELECT commit_id FROM lix_undo($1)",
+                &[crate::Value::Text(checkpoint.clone())],
+            )
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("commit_id")
+            .unwrap();
+        assert!(
+            lix.execute(
+                "SELECT value FROM lix_key_value WHERE key = 'checkpoint-migration'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .rows()
+            .is_empty()
+        );
+        lix.close().await.unwrap();
+
+        let before = content_digest(&storage).await.unwrap();
+        super::super::epoch::stage_v80_repository_for_test(&storage, false)
+            .await
+            .unwrap();
+        let reopened = crate::open_lix()
+            .with_storage(storage.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.open_report().migrations,
+            vec![crate::OpenMigration {
+                scope: crate::OpenScope::Local,
+                from_format: 80,
+                to_format: crate::CURRENT_STORAGE_FORMAT_VERSION,
+            }]
+        );
+        assert_eq!(content_digest(&storage).await.unwrap(), before);
+
+        let missing = reopened
+            .execute("SELECT is_checkpoint FROM lix_commit", &[])
+            .await
+            .expect_err("checkpoint membership is no longer a lix_commit column");
+        assert_eq!(missing.code, LixError::CODE_COLUMN_NOT_FOUND);
+        for id in [&checkpoint, &undo] {
+            assert_eq!(
+                reopened
+                    .execute(
+                        "SELECT id FROM lix_commit WHERE id = $1",
+                        &[crate::Value::Text(id.clone())],
+                    )
+                    .await
+                    .unwrap()
+                    .rows()
+                    .len(),
+                1,
+                "migration must preserve commit ID {id}"
+            );
+        }
+        assert!(
+            reopened
+                .execute(
+                    "SELECT is_checkpoint FROM lix_log($1) WHERE commit_id = $2",
+                    &[
+                        crate::Value::Text(checkpoint.clone()),
+                        crate::Value::Text(checkpoint.clone()),
+                    ],
+                )
+                .await
+                .unwrap()
+                .rows()[0]
+                .get::<bool>("is_checkpoint")
+                .unwrap(),
+            "immutable checkpoint membership must survive the upgrade"
+        );
+        assert!(
+            !reopened
+                .execute(
+                    "SELECT is_checkpoint FROM lix_log($1) WHERE commit_id = $2",
+                    &[
+                        crate::Value::Text(undo.clone()),
+                        crate::Value::Text(checkpoint.clone()),
+                    ],
+                )
+                .await
+                .unwrap()
+                .rows()[0]
+                .get::<bool>("is_checkpoint")
+                .unwrap(),
+            "undo state must continue to retire the checkpoint at its anchor"
+        );
+        reopened
+            .execute(
+                "SELECT commit_id FROM lix_redo($1)",
+                &[crate::Value::Text(undo)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .execute(
+                    "SELECT value FROM lix_key_value WHERE key = 'checkpoint-migration'",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .rows()[0]
+                .get::<serde_json::Value>("value")
+                .unwrap(),
+            serde_json::json!("preserved"),
+            "content must remain recoverable after migration"
+        );
+        reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn partial_v80_migration_preserves_admission_and_resident_records_offline() {
         let authority = crate::open_lix().await.unwrap();
         let state = crate::sync::PartialReplicaState::new(

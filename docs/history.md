@@ -38,27 +38,29 @@ LIMIT 20;
 
 Position zero is the anchor; positions increase toward older commits and are assigned before filtering, so filtered positions can have gaps. The parent is the actual first parent, not the preceding marked checkpoint. Empty commits appear in the log. The parentless root is a baseline and produces no synthetic history additions.
 
-`is_checkpoint` records immutable commit metadata. For an application's current
-checkpoint list, filter `lix_log()` by `is_checkpoint_active`; it excludes
-checkpoints retired by [undo](./undo-redo.md) at the query anchor. Historical
-queries anchored before the undo still show the checkpoint as active.
+`lix_log().is_checkpoint` means active at the query anchor. Undo retires a
+checkpoint; complete redo reactivates it. An anchor before the undo still shows
+it as a checkpoint. The stored commit is never changed.
 
-`lix_commit` is the repository-global inventory, including retained off-branch checkpoints. Use `SELECT count(*) FROM lix_commit WHERE is_checkpoint` for a global checkpoint metric. `lix_log` is branch-relative. For full DAG inspection, use `lix_commit.parent_commit_ids` and `lix_commit_ancestry`.
+`lix_commit` is the repository-global commit inventory, including retained
+off-branch commits. It exposes no checkpoint status. For full DAG inspection,
+use `lix_commit.parent_commit_ids` and `lix_commit_ancestry`.
 
 ## Row history
 
 ```sql
 SELECT id, diff_type, from_path, to_path,
        lixcol_from_commit_id, lixcol_to_commit_id,
-       lixcol_commit_created_at, lixcol_commit_is_checkpoint, lixcol_position
-FROM lix_history('lix_file', $1)
-WHERE id = $2 AND lixcol_commit_is_checkpoint
+       lixcol_commit_created_at, lixcol_position
+FROM lix_log($1) l
+JOIN lix_history('lix_file', $1) h ON h.lixcol_to_commit_id = l.commit_id
+WHERE h.id = $2 AND l.is_checkpoint
 ORDER BY lixcol_position;
 ```
 
 Every event compares a commit with its actual first parent. `WHERE`, projection, ordering, and checkpoint filtering never alter those endpoints. A merge event includes changes received relative to its first parent; commits on merged side branches are not separately enumerated.
 
-History shares diff's typed primary keys, opaque `row_ref`, `diff_type` (`added`, `modified`, `removed`), and paired `from_<column>` / `to_<column>` columns. Absent sides are null. The endpoint metadata identifies the compared states; the checkpoint flag, time, and position describe the destination. Repeated edits compact to one net row difference; net-zero differences produce no row. Filtering unmarked history is not a working-status query.
+History shares diff's typed primary keys, opaque `row_ref`, `diff_type` (`added`, `modified`, `removed`), and paired `from_<column>` / `to_<column>` columns. Absent sides are null. The endpoint metadata identifies the compared states; the time and position describe the destination. Checkpoint status comes only from the log at the same anchor. Repeated edits compact to one net row difference; net-zero differences produce no row. Filtering unmarked history is not a working-status query.
 
 A dirty fork can start at an ordinary commit A after checkpoint C0. A new checkpoint C1 compares against A. Its history describes its own contribution; `lix_diff(relation, C0, C1)` answers the different question of what changed between the two marked states.
 

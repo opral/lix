@@ -6,32 +6,6 @@ use crate::tracked_state::{NativeMetadataRef, NativeObjectRef};
 
 const MAX_CHECKPOINTS: usize = 16;
 
-/// Extract only a proven conjunctive checkpoint constraint. Do not evaluate SQL
-/// expressions or user functions during optional dependency discovery.
-pub(super) fn checkpoint_constraint(filters: &[Expr]) -> Option<bool> {
-    use datafusion::common::ScalarValue;
-    fn column(expr: &Expr) -> bool {
-        matches!(expr, Expr::Column(c) if c.name == "lixcol_commit_is_checkpoint")
-    }
-    filters.iter().find_map(|expr| match expr {
-        Expr::Column(_) if column(expr) => Some(true),
-        Expr::Not(inner) | Expr::IsFalse(inner) if column(inner) => Some(false),
-        Expr::IsTrue(inner) if column(inner) => Some(true),
-        Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
-            match (binary.left.as_ref(), binary.right.as_ref()) {
-                (c, Expr::Literal(ScalarValue::Boolean(Some(value)), _))
-                | (Expr::Literal(ScalarValue::Boolean(Some(value)), _), c)
-                    if column(c) =>
-                {
-                    Some(*value)
-                }
-                _ => None,
-            }
-        }
-        _ => None,
-    })
-}
-
 enum MissingFrontier {
     Objects(Vec<NativeObjectRef>),
     Metadata(Vec<NativeMetadataRef>),
@@ -115,7 +89,7 @@ pub(super) async fn discover<S: StorageAdapterRead + Clone + Send + Sync + 'stat
     projection: &Vec<usize>,
     filters: &[Expr],
     completed_checkpoints: usize,
-    checkpoint: Option<bool>,
+    selected_ids: Option<&BTreeSet<String>>,
     error: LixError,
 ) -> LixError {
     if completed_checkpoints == 0 {
@@ -139,7 +113,7 @@ pub(super) async fn discover<S: StorageAdapterRead + Clone + Send + Sync + 'stat
         let Some(parent) = node.parent_commit_ids.first().copied() else {
             break;
         };
-        if checkpoint.is_some_and(|required| node.is_checkpoint != required) {
+        if selected_ids.is_some_and(|ids| !ids.contains(&next.to_string())) {
             next = parent;
             continue;
         }
@@ -170,33 +144,6 @@ mod tests {
     use super::*;
     use crate::storage_adapter::{SharedStorageAdapterRead, StorageKey, StorageValue};
     use bytes::Bytes;
-
-    #[test]
-    fn checkpoint_constraints_require_a_proven_conjunct() {
-        use datafusion::prelude::{col, lit};
-        let checkpoint = col("lixcol_commit_is_checkpoint");
-        assert_eq!(checkpoint_constraint(&[checkpoint.clone()]), Some(true));
-        assert_eq!(checkpoint_constraint(&[!checkpoint.clone()]), Some(false));
-        assert_eq!(
-            checkpoint_constraint(&[checkpoint.clone().eq(lit(true))]),
-            Some(true)
-        );
-        assert_eq!(
-            checkpoint_constraint(&[lit(false).eq(checkpoint.clone())]),
-            Some(false)
-        );
-        assert_eq!(
-            checkpoint_constraint(&[checkpoint.clone().is_true()]),
-            Some(true)
-        );
-        assert_eq!(
-            checkpoint_constraint(&[checkpoint.clone().is_false()]),
-            Some(false)
-        );
-        assert_eq!(checkpoint_constraint(&[checkpoint.or(col("other"))]), None);
-        assert_eq!(checkpoint_constraint(&[col("other").eq(lit(true))]), None);
-        assert_eq!(checkpoint_constraint(&[]), None);
-    }
 
     #[tokio::test]
     async fn discovery_is_bounded_and_preserves_required_error_across_speculative_corruption() {
@@ -271,7 +218,7 @@ mod tests {
                 &projection,
                 &[],
                 1,
-                Some(false),
+                Some(&BTreeSet::new()),
                 make_error(),
             )
             .await;
@@ -282,7 +229,7 @@ mod tests {
                 &projection,
                 &[],
                 1,
-                Some(true),
+                Some(&BTreeSet::from([commits[18].to_string()])),
                 make_error(),
             )
             .await;

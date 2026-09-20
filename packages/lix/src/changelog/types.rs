@@ -993,14 +993,12 @@ pub(crate) fn commit_row_snapshot_json(
     commit_id: &str,
     parent_commit_ids: &[CommitId],
     base_commit_id: Option<CommitId>,
-    is_checkpoint: bool,
     created_at: LixTimestamp,
 ) -> Result<String, LixError> {
     serde_json::to_string(&serde_json::json!({
         "id": commit_id,
         "parent_commit_ids": parent_commit_ids,
         "base_commit_id": base_commit_id,
-        "is_checkpoint": is_checkpoint,
         "created_at": created_at.to_string(),
     }))
     .map_err(|error| {

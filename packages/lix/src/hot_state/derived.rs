@@ -151,7 +151,6 @@ where
                     commit.commit_id,
                     &commit.parent_commit_ids,
                     commit.base_commit_id,
-                    commit.is_checkpoint,
                     commit.change_id,
                     commit.created_at,
                     branch_id,
@@ -198,7 +197,6 @@ where
                     record.commit_id,
                     &record.parent_commit_ids,
                     record.base_commit_id,
-                    record.is_checkpoint,
                     record.change_id,
                     record.created_at,
                     branch_id,
@@ -473,7 +471,6 @@ fn commit_row(
     commit_id: CommitId,
     parent_commit_ids: &[CommitId],
     base_commit_id: Option<CommitId>,
-    is_checkpoint: bool,
     change_id: ChangeId,
     created_at: crate::common::LixTimestamp,
     branch_id: &str,
@@ -482,7 +479,6 @@ fn commit_row(
         &commit_id.to_string(),
         parent_commit_ids,
         base_commit_id,
-        is_checkpoint,
         created_at,
     )?;
     Ok(MaterializedHotStateRow {

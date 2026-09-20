@@ -1371,8 +1371,21 @@ simulation_test!(
             .await
             .expect("draft checkpoint should succeed");
         assert_eq!(
+            draft
+                .execute(
+                    "SELECT commit_id FROM lix_log($1) WHERE is_checkpoint AND commit_id = $1",
+                    &[Value::Text(checkpoint.commit_id.clone())],
+                )
+                .await
+                .expect("draft checkpoint metadata should be queryable through lix_log")
+                .rows()
+                .len(),
+            1,
+            "checkpoint membership remains available through log metadata"
+        );
+        assert_eq!(
             main.execute(
-                "SELECT id AS commit_id FROM lix_commit WHERE is_checkpoint AND id = $1",
+                "SELECT id AS commit_id FROM lix_commit WHERE id = $1",
                 &[Value::Text(checkpoint.commit_id.clone())],
             )
             .await
@@ -1380,7 +1393,7 @@ simulation_test!(
             .rows()[0]
                 .values(),
             &[Value::Text(checkpoint.commit_id.clone())],
-            "checkpoint metadata is visible from every branch"
+            "checkpoint row is visible from every branch"
         );
 
         let receipt = main
@@ -1403,11 +1416,11 @@ simulation_test!(
 
         let checkpoints = main
             .execute(
-                "SELECT id AS commit_id FROM lix_commit WHERE is_checkpoint AND id = $1",
+                "SELECT id AS commit_id FROM lix_commit WHERE id = $1",
                 &[Value::Text(checkpoint.commit_id.clone())],
             )
             .await
-            .expect("global checkpoint should remain queryable");
+            .expect("global checkpoint row should remain queryable");
         assert_eq!(
             checkpoints.len(),
             1,

@@ -64,7 +64,7 @@ async fn checkpointed_directories_survive_the_v74_migration() {
 
     let checkpoints = lix
         .execute(
-            "SELECT id AS commit_id FROM lix_commit WHERE is_checkpoint ORDER BY created_at ASC",
+            "SELECT commit_id FROM lix_log() WHERE is_checkpoint ORDER BY position",
             &[],
         )
         .await

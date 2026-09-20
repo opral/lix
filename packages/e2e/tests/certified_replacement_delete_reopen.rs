@@ -131,7 +131,7 @@ async fn replacement_delete_checkpoint_reopens<S: ReopenStorage>() {
     assert_collection_empty(&lix).await;
     let checkpoints = lix
         .execute(
-            "SELECT COUNT(*) AS count FROM lix_commit WHERE is_checkpoint",
+            "SELECT COUNT(*) AS count FROM lix_log() WHERE is_checkpoint",
             &[],
         )
         .await

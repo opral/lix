@@ -111,9 +111,12 @@ simulation_test!(
         let initial_commit_id = sim.initial_commit_id().to_string();
 
         assert!(
-            select_rows(&session, "SELECT id FROM lix_commit WHERE is_checkpoint")
-                .await
-                .is_empty()
+            select_rows(
+                &session,
+                "SELECT commit_id FROM lix_log() WHERE is_checkpoint",
+            )
+            .await
+            .is_empty()
         );
 
         session
@@ -137,9 +140,12 @@ simulation_test!(
             .expect("head should exist");
 
         assert!(
-            select_rows(&session, "SELECT id FROM lix_commit WHERE is_checkpoint")
-                .await
-                .is_empty(),
+            select_rows(
+                &session,
+                "SELECT commit_id FROM lix_log() WHERE is_checkpoint",
+            )
+            .await
+            .is_empty(),
             "ordinary branch commits do not become checkpoints"
         );
         assert_eq!(
@@ -212,15 +218,12 @@ simulation_test!(
             select_rows(
                 &session,
                 &format!(
-                    "SELECT id, is_checkpoint FROM lix_commit WHERE id = '{}'",
+                    "SELECT commit_id FROM lix_log() WHERE is_checkpoint AND commit_id = '{}'",
                     receipt.commit_id
                 )
             )
             .await,
-            vec![vec![
-                Value::Text(receipt.commit_id.clone()),
-                Value::Boolean(true)
-            ]]
+            vec![vec![Value::Text(receipt.commit_id.clone())]]
         );
         assert!(
             select_rows(
@@ -968,9 +971,12 @@ simulation_test!(
         );
 
         assert!(
-            select_rows(&session, "SELECT id FROM lix_commit WHERE is_checkpoint")
-                .await
-                .is_empty()
+            select_rows(
+                &session,
+                "SELECT commit_id FROM lix_log() WHERE is_checkpoint",
+            )
+            .await
+            .is_empty()
         );
         for sql in [
             "SELECT * FROM lix_checkpoint",
@@ -987,13 +993,22 @@ simulation_test!(
             .await
             .expect("checkpoint publishes");
         let error = session
-            .execute(
-                "UPDATE lix_commit SET is_checkpoint = false WHERE id = $1",
-                &[Value::Text(checkpoint.commit_id)],
-            )
+            .execute("SELECT is_checkpoint FROM lix_commit", &[])
             .await
-            .expect_err("immutable membership cannot be edited");
-        assert_eq!(error.code, LixError::CODE_READ_ONLY);
+            .expect_err("checkpoint membership is no longer a lix_commit column");
+        assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
+        assert_eq!(
+            select_rows(
+                &session,
+                &format!(
+                    "SELECT commit_id FROM lix_log() WHERE is_checkpoint AND commit_id = '{}'",
+                    checkpoint.commit_id
+                ),
+            )
+            .await,
+            vec![vec![Value::Text(checkpoint.commit_id.clone())]],
+            "checkpoint membership remains available through the log metadata"
+        );
 
         for sql in [
             "SELECT * FROM lix_working_diff_by_branch",
@@ -1056,12 +1071,28 @@ simulation_test!(
 
         let global_rows = select_rows(
             &session,
-            "SELECT id FROM lix_commit WHERE is_checkpoint ORDER BY id",
+            &format!(
+                "SELECT id FROM lix_commit WHERE id = '{}'",
+                abandoned_checkpoint.commit_id
+            ),
         )
         .await;
         assert!(
             global_rows.contains(&vec![Value::Text(abandoned_checkpoint.commit_id.clone())]),
-            "the normal global table must retain the abandoned checkpoint marker"
+            "the global commit inventory must retain the abandoned checkpoint row"
+        );
+        assert_eq!(
+            select_rows(
+                &session,
+                &format!(
+                    "SELECT commit_id FROM lix_log('{}') \
+                     WHERE is_checkpoint AND commit_id = '{}'",
+                    abandoned_checkpoint.commit_id, abandoned_checkpoint.commit_id
+                ),
+            )
+            .await,
+            vec![vec![Value::Text(abandoned_checkpoint.commit_id.clone())]],
+            "checkpoint membership remains queryable through anchored log metadata"
         );
 
         let reachable_history = select_rows(

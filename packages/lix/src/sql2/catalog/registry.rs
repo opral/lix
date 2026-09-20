@@ -725,7 +725,6 @@ mod tests {
             "lixcol_from_commit_id",
             "lixcol_to_commit_id",
             "lixcol_commit_created_at",
-            "lixcol_commit_is_checkpoint",
             "lixcol_position",
         ];
         assert!(

@@ -298,7 +298,7 @@ simulation_test!(
         assert_eq!(value(&target, "ff-undo").await.as_deref(), Some("before"));
         let checkpoint_rows = target
             .execute(
-                "SELECT is_checkpoint_active FROM lix_log($1) WHERE commit_id=$2",
+                "SELECT is_checkpoint FROM lix_log($1) WHERE commit_id=$2",
                 &[Value::Text(source_receipt), Value::Text(c.clone())],
             )
             .await
@@ -306,7 +306,7 @@ simulation_test!(
         assert_eq!(checkpoint_rows.rows().len(), 1);
         assert!(
             !checkpoint_rows.rows()[0]
-                .get::<bool>("is_checkpoint_active")
+                .get::<bool>("is_checkpoint")
                 .unwrap()
         );
         // The source marker belongs to another branch. It must reset the
@@ -623,16 +623,15 @@ simulation_test!(
         let d = checkpoint(&lix).await;
         let rows = lix
             .execute(
-                "SELECT is_checkpoint, is_checkpoint_active FROM lix_log($1) WHERE commit_id=$2",
+                "SELECT is_checkpoint FROM lix_log($1) WHERE commit_id=$2",
                 &[Value::Text(u.clone()), Value::Text(c.clone())],
             )
             .await
             .unwrap();
-        assert!(rows.rows()[0].get::<bool>("is_checkpoint").unwrap());
-        assert!(!rows.rows()[0].get::<bool>("is_checkpoint_active").unwrap());
+        assert!(!rows.rows()[0].get::<bool>("is_checkpoint").unwrap());
         assert!(
             lix.execute(
-                "SELECT commit_id FROM lix_log() WHERE is_checkpoint_active AND commit_id=$1",
+                "SELECT commit_id FROM lix_log() WHERE is_checkpoint AND commit_id=$1",
                 &[Value::Text(c)]
             )
             .await

@@ -551,7 +551,7 @@ async fn run_workload<S>(
     );
     let starting_checkpoint_count = scalar_count(
         &lix,
-        "SELECT count(*) AS count FROM lix_commit WHERE is_checkpoint",
+        "SELECT count(*) AS count FROM lix_log() WHERE is_checkpoint",
     )
     .await;
     let files_per_auto_commit = files_per_checkpoint / auto_commits_per_checkpoint;
@@ -697,7 +697,7 @@ async fn run_workload<S>(
     let checkpoint_history_query_start = Instant::now();
     let visible_checkpoint_count = scalar_count(
         &lix,
-        "SELECT count(*) AS count FROM lix_commit WHERE is_checkpoint",
+        "SELECT count(*) AS count FROM lix_log() WHERE is_checkpoint",
     )
     .await;
     let checkpoint_history_query_elapsed = checkpoint_history_query_start.elapsed();
@@ -722,7 +722,7 @@ async fn run_workload<S>(
         .expect("reopen checkpoint run lix");
     let reopened_checkpoint_count = scalar_count(
         &reopened,
-        "SELECT count(*) AS count FROM lix_commit WHERE is_checkpoint",
+        "SELECT count(*) AS count FROM lix_log() WHERE is_checkpoint",
     )
     .await;
     let reopen_and_history_elapsed = reopen_start.elapsed();
@@ -955,7 +955,17 @@ async fn scalar_count<S>(lix: &Lix<S>, sql: &str) -> usize
 where
     S: BenchmarkStorage,
 {
-    let result = lix.execute(sql, &[]).await.expect("execute count query");
+    scalar_count_with_params(lix, sql, &[]).await
+}
+
+async fn scalar_count_with_params<S>(lix: &Lix<S>, sql: &str, parameters: &[Value]) -> usize
+where
+    S: BenchmarkStorage,
+{
+    let result = lix
+        .execute(sql, parameters)
+        .await
+        .expect("execute count query");
     let count = result
         .rows()
         .first()
@@ -1260,20 +1270,32 @@ where
         .await
         .expect("open checkpoint surface lix");
     let open_elapsed = open_start.elapsed();
+    let anchor = lix
+        .execute("SELECT lix_active_branch_commit_id() AS id", &[])
+        .await
+        .expect("read checkpoint surface anchor")
+        .rows()[0]
+        .get::<String>("id")
+        .expect("checkpoint surface anchor ID");
+    let parameters = [Value::Text(anchor)];
 
     let checkpoint_commit_id = working_base_commit_id(&lix).await;
     let working_start = Instant::now();
     let working_count = working_file_diff_count(&lix, &checkpoint_commit_id).await;
     let working_elapsed = working_start.elapsed();
-    let limited_sql = "SELECT id AS commit_id FROM lix_commit WHERE is_checkpoint LIMIT 20";
-    let medium_sql = "SELECT id AS commit_id FROM lix_commit WHERE is_checkpoint LIMIT 128";
-    let full_sql = "SELECT id AS commit_id FROM lix_commit WHERE is_checkpoint";
-    let count_sql = "SELECT count(*) AS count FROM lix_commit WHERE is_checkpoint";
-    let limited_checkpoint_count = row_count(&lix, limited_sql).await;
-    let medium_checkpoint_count = row_count(&lix, medium_sql).await;
-    let checkpoint_count = row_count(&lix, full_sql).await;
+    let limited_sql =
+        "SELECT commit_id FROM lix_log($1) WHERE is_checkpoint ORDER BY position LIMIT 20";
+    let medium_sql =
+        "SELECT commit_id FROM lix_log($1) WHERE is_checkpoint ORDER BY position LIMIT 128";
+    let full_sql = "SELECT commit_id FROM lix_log($1) WHERE is_checkpoint ORDER BY position";
+    let count_sql = "SELECT count(*) AS count FROM lix_log($1) WHERE is_checkpoint";
+    let key_history_sql = "WITH page AS (SELECT commit_id, position FROM lix_log($1) WHERE is_checkpoint ORDER BY position LIMIT 20) SELECT p.commit_id, h.key, h.diff_type FROM page p LEFT JOIN lix_history('lix_key_value', $1) h ON h.lixcol_to_commit_id = p.commit_id ORDER BY p.position";
+    let file_history_sql = "WITH page AS (SELECT commit_id, position FROM lix_log($1) WHERE is_checkpoint ORDER BY position LIMIT 20) SELECT p.commit_id, h.id, h.diff_type FROM page p LEFT JOIN lix_history('lix_file', $1) h ON h.lixcol_to_commit_id = p.commit_id ORDER BY p.position";
+    let limited_checkpoint_count = row_count(&lix, limited_sql, &parameters).await;
+    let medium_checkpoint_count = row_count(&lix, medium_sql, &parameters).await;
+    let checkpoint_count = row_count(&lix, full_sql, &parameters).await;
     assert_eq!(
-        scalar_count(&lix, count_sql).await,
+        scalar_count_with_params(&lix, count_sql, &parameters).await,
         checkpoint_count,
         "checkpoint count and full history must agree"
     );
@@ -1281,17 +1303,27 @@ where
     let mut medium_history_latencies = Vec::with_capacity(SURFACE_REPETITIONS);
     let mut full_history_latencies = Vec::with_capacity(SURFACE_REPETITIONS);
     let mut count_history_latencies = Vec::with_capacity(SURFACE_REPETITIONS);
+    let mut key_history_page_latencies = Vec::with_capacity(SURFACE_REPETITIONS);
+    let mut file_history_page_latencies = Vec::with_capacity(SURFACE_REPETITIONS);
     for repetition in 0..SURFACE_REPETITIONS {
         if repetition.is_multiple_of(2) {
-            limited_history_latencies.push(timed_row_count(&lix, limited_sql).await.1);
-            medium_history_latencies.push(timed_row_count(&lix, medium_sql).await.1);
-            full_history_latencies.push(timed_row_count(&lix, full_sql).await.1);
-            count_history_latencies.push(timed_scalar_count(&lix, count_sql).await.1);
+            limited_history_latencies.push(timed_row_count(&lix, limited_sql, &parameters).await.1);
+            medium_history_latencies.push(timed_row_count(&lix, medium_sql, &parameters).await.1);
+            full_history_latencies.push(timed_row_count(&lix, full_sql, &parameters).await.1);
+            count_history_latencies.push(timed_scalar_count(&lix, count_sql, &parameters).await.1);
+            key_history_page_latencies
+                .push(timed_row_count(&lix, key_history_sql, &parameters).await.1);
+            file_history_page_latencies
+                .push(timed_row_count(&lix, file_history_sql, &parameters).await.1);
         } else {
-            count_history_latencies.push(timed_scalar_count(&lix, count_sql).await.1);
-            full_history_latencies.push(timed_row_count(&lix, full_sql).await.1);
-            medium_history_latencies.push(timed_row_count(&lix, medium_sql).await.1);
-            limited_history_latencies.push(timed_row_count(&lix, limited_sql).await.1);
+            count_history_latencies.push(timed_scalar_count(&lix, count_sql, &parameters).await.1);
+            full_history_latencies.push(timed_row_count(&lix, full_sql, &parameters).await.1);
+            medium_history_latencies.push(timed_row_count(&lix, medium_sql, &parameters).await.1);
+            limited_history_latencies.push(timed_row_count(&lix, limited_sql, &parameters).await.1);
+            key_history_page_latencies
+                .push(timed_row_count(&lix, key_history_sql, &parameters).await.1);
+            file_history_page_latencies
+                .push(timed_row_count(&lix, file_history_sql, &parameters).await.1);
         }
     }
     lix.close().await.expect("close checkpoint surface lix");
@@ -1304,6 +1336,7 @@ where
          checkpoint_history_limit_20_ms={:.3} limited_checkpoints={} \
          checkpoint_history_limit_128_ms={:.3} medium_checkpoints={} \
          checkpoint_history_full_ms={:.3} checkpoint_history_count_ms={:.3} \
+         key_history_page_ms={:.3} file_history_page_ms={:.3} \
          checkpoints={} repetitions={SURFACE_REPETITIONS}",
         S::NAME,
         millis(open_elapsed),
@@ -1315,36 +1348,38 @@ where
         medium_checkpoint_count,
         median_millis(&full_history_latencies),
         median_millis(&count_history_latencies),
+        median_millis(&key_history_page_latencies),
+        median_millis(&file_history_page_latencies),
         checkpoint_count,
     );
 }
 
-async fn row_count<S>(lix: &Lix<S>, sql: &str) -> usize
+async fn row_count<S>(lix: &Lix<S>, sql: &str, parameters: &[Value]) -> usize
 where
     S: BenchmarkStorage,
 {
-    lix.execute(sql, &[])
+    lix.execute(sql, parameters)
         .await
         .expect("execute row-count query")
         .rows()
         .len()
 }
 
-async fn timed_row_count<S>(lix: &Lix<S>, sql: &str) -> (usize, Duration)
+async fn timed_row_count<S>(lix: &Lix<S>, sql: &str, parameters: &[Value]) -> (usize, Duration)
 where
     S: BenchmarkStorage,
 {
     let start = Instant::now();
-    let count = row_count(lix, sql).await;
+    let count = row_count(lix, sql, parameters).await;
     (count, start.elapsed())
 }
 
-async fn timed_scalar_count<S>(lix: &Lix<S>, sql: &str) -> (usize, Duration)
+async fn timed_scalar_count<S>(lix: &Lix<S>, sql: &str, parameters: &[Value]) -> (usize, Duration)
 where
     S: BenchmarkStorage,
 {
     let start = Instant::now();
-    let count = scalar_count(lix, sql).await;
+    let count = scalar_count_with_params(lix, sql, parameters).await;
     (count, start.elapsed())
 }
 

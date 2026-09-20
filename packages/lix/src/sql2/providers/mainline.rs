@@ -135,7 +135,6 @@ pub(super) fn metadata_schema(history: bool) -> SchemaRef {
             Field::new("lixcol_from_commit_id", DataType::Utf8, true),
             Field::new("lixcol_to_commit_id", DataType::Utf8, false),
             Field::new("lixcol_commit_created_at", DataType::Utf8, false),
-            Field::new("lixcol_commit_is_checkpoint", DataType::Boolean, false),
             Field::new("lixcol_position", DataType::Int64, false),
         ]
     } else {
@@ -145,7 +144,6 @@ pub(super) fn metadata_schema(history: bool) -> SchemaRef {
             Field::new("created_at", DataType::Utf8, false),
             Field::new("is_checkpoint", DataType::Boolean, false),
             Field::new("position", DataType::Int64, false),
-            Field::new("is_checkpoint_active", DataType::Boolean, false),
         ]
     };
     Arc::new(Schema::new(fields))
@@ -162,11 +160,10 @@ fn metadata_batch(
         Arc::new(StringArray::from(vec![parent.as_deref(); count])),
         Arc::new(StringArray::from(vec![node.commit_id.to_string(); count])),
         Arc::new(StringArray::from(vec![node.created_at.to_string(); count])),
-        Arc::new(BooleanArray::from(vec![node.is_checkpoint; count])),
         Arc::new(Int64Array::from(vec![position; count])),
     ];
     if !history {
-        columns.push(Arc::new(BooleanArray::from(vec![checkpoint_active; count])));
+        columns.insert(3, Arc::new(BooleanArray::from(vec![checkpoint_active; count])));
     }
     Ok(RecordBatch::try_new(metadata_schema(history), columns)?)
 }
@@ -358,14 +355,13 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
             _ => None,
         };
         let needs_checkpoint_active = self.relation.is_none()
-            && (schema.index_of("is_checkpoint_active").is_ok()
+            && (schema.index_of("is_checkpoint").is_ok()
                 || metadata_filters.iter().any(|filter| {
                     filter
                         .column_refs()
                         .iter()
-                        .any(|column| column.name == "is_checkpoint_active")
+                        .any(|column| column.name == "is_checkpoint")
                 }));
-        let checkpoint_constraint = frontier::checkpoint_constraint(&metadata_filters);
         let df_meta_schema = DFSchema::try_from(meta_schema.as_ref().clone())?;
         let metadata_filters = metadata_filters
             .iter()
@@ -411,9 +407,9 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                     let node = graph.load_node(&id).await.map_err(lix_error_to_datafusion_error)?
                         .ok_or_else(|| lix_error_to_datafusion_error(crate::commit_graph::missing_commit_graph_error(&id)))?;
                     next = node.parent_commit_ids.first().copied();
-                    if let Some(ids) = remaining_ids.as_mut() { ids.remove(&id.to_string()); }
                     let current_position = position;
                     position += 1;
+                    if remaining_ids.as_mut().is_some_and(|ids| !ids.remove(&id.to_string())) { continue; }
                     let checkpoint_active = node.is_checkpoint && (!needs_checkpoint_active || !checkpoint_retired_at(store.clone(), anchor, id).await.map_err(lix_error_to_datafusion_error)?);
                     if !matches_metadata(&metadata_batch(&node, current_position, relation.is_some(), 1, checkpoint_active)?, &metadata_filters)? { continue; }
                     if let Some(relation) = &relation {
@@ -429,7 +425,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                             Err(error) => {
                                 let error = frontier::discover(
                                     &diff, parent, &diff_projection, &row_filters,
-                                    completed_history_checkpoints, checkpoint_constraint, datafusion_error_to_lix_error(error),
+                                    completed_history_checkpoints, remaining_ids.as_ref(), datafusion_error_to_lix_error(error),
                                 ).await;
                                 Err(lix_error_to_datafusion_error(error))?
                             }
@@ -498,8 +494,7 @@ pub(crate) fn relation_history_schema(
     Ok(Arc::new(Schema::new(fields)))
 }
 
-/// Retirement is projected at the query anchor; immutable commit metadata is
-/// still available as is_checkpoint and through lix_commit.
+/// Project retirement at the query anchor without changing internal commit identity.
 async fn checkpoint_retired_at<S: StorageAdapterRead + Clone + Send + Sync + 'static>(
     store: S,
     anchor: CommitId,
