@@ -177,6 +177,18 @@ statements above; there is no separate undo/redo protocol endpoint or typed SDK
 method. Internal marker and state relations are reserved implementation data
 and must not be written directly.
 
+## Upgrade compatibility
+
+This is a breaking replacement of the previous undo/redo implementation.
+Pending undo/redo navigation from repositories written before the state ledger
+is not migrated. An old undo marker is not a valid redo receipt for this API;
+requests that require its missing ledger state are rejected. There is no
+legacy-marker fallback or typed-API compatibility shim.
+
+Existing content commits remain in history. Use `lix_restore`, `lix_revert`, or
+`lix_apply` to recover or replay historical content when an old pending receipt
+cannot be used. Newly created undo/redo receipts follow the contracts above.
+
 ## Checkpoint history in applications
 
 `lix_commit.is_checkpoint` and `lix_log().is_checkpoint` describe immutable
