@@ -1,23 +1,37 @@
 import { execFileSync } from "node:child_process";
-import { appendFileSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, cpSync, openSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { binaryManifest, cacheKey, restoreBinaries, saveBinaries } from "./ci-sdk-cache.mjs";
 import { findReusableRun, readArtifactJson } from "./ci-merge-reuse.mjs";
 
+export function downloadVerifiedArchive(repository, runId, name, staged, run = execFileSync) {
+    const metadata = JSON.parse(run("gh", ["api", `repos/${repository}/actions/runs/${runId}/artifacts?per_page=100`], { encoding: "utf8", timeout: 30_000 }));
+    const artifact = metadata.artifacts.find(item => item.name === name && !item.expired);
+    if (!artifact || !/^sha256:[a-f0-9]{64}$/.test(artifact.digest)) throw new Error("Missing artifact or archive digest");
+    const archive = join(staged, "download.zip");
+    const descriptor = openSync(archive, "w");
+    try {
+        run("gh", ["api", `repos/${repository}/actions/artifacts/${artifact.id}/zip`], { stdio: ["ignore", descriptor, "inherit"], timeout: 180_000 });
+    } finally { closeSync(descriptor); }
+    const digest = `sha256:${createHash("sha256").update(readFileSync(archive)).digest("hex")}`;
+    if (digest !== artifact.digest) throw new Error("Artifact archive checksum mismatch");
+    run("unzip", ["-q", archive, "-d", staged], { stdio: "inherit", timeout: 60_000 });
+    rmSync(archive);
+}
+
 // Stage each attempt separately: a downloader may exit successfully without
 // materializing the complete archive. Never promote such a partial download.
-export function downloadMergedBrowser(root, revision, runId, repository, run = execFileSync) {
+export function downloadMergedBrowser(root, revision, runId, repository, download = downloadVerifiedArchive) {
     if (!/^[a-f0-9]{40}$/.test(revision) || !/^\d+$/.test(String(runId))) {
         throw new Error("Invalid browser artifact source");
     }
     for (let attempt = 1; attempt <= 3; attempt++) {
         const staged = mkdtempSync(join(tmpdir(), "lix-browser-download-"));
         try {
-            run("gh", ["run", "download", String(runId), "--repo", repository,
-                "--name", `lix-browser-sdk-${revision}`, "--dir", staged],
-                { stdio: "inherit", timeout: 180_000 });
+            download(repository, runId, `lix-browser-sdk-${revision}`, staged);
             const manifest = JSON.parse(readFileSync(join(staged, "ci-artifact/browser.json"), "utf8"));
             if (manifest.schemaVersion !== 1 || manifest.kind !== "lix-browser-sdk" ||
                 manifest.sourceRevision !== revision || manifest.target !== "wasm32-unknown-unknown") {
