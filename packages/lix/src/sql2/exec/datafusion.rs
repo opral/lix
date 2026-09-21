@@ -1093,10 +1093,15 @@ fn bind_plan_param_values(plan: LogicalPlan, params: &[Value]) -> Result<Logical
     if params.is_empty() {
         return Ok(plan);
     }
-    plan.with_param_values(ParamValues::List(
-        params.iter().map(scalar_value_from_lix_value).collect(),
-    ))
-    .map_err(datafusion_error_to_lix_error)
+    let plan = plan
+        .with_param_values(ParamValues::List(
+            params
+                .iter()
+                .map(scalar_value_from_lix_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        ))
+        .map_err(datafusion_error_to_lix_error)?;
+    Ok(plan)
 }
 
 async fn execute_logical_plan(
@@ -1653,10 +1658,7 @@ async fn insert_query_input_plan(
                 .unwrap_or_else(|| {
                     Expr::Literal(ScalarValue::try_new_null(field.data_type()).unwrap(), None)
                 });
-            Ok(expr
-                .cast_to(field.data_type(), input_schema.as_ref())
-                .map_err(datafusion_error_to_lix_error)?
-                .alias(field.name()))
+            Ok(coerce_assignment_expr(expr, field, input_schema.as_ref())?.alias(field.name()))
         })
         .collect::<Result<Vec<_>, LixError>>()?;
     let mut dataframe = session
@@ -1666,7 +1668,10 @@ async fn insert_query_input_plan(
     if !params.is_empty() {
         dataframe = dataframe
             .with_param_values(ParamValues::List(
-                params.iter().map(scalar_value_from_lix_value).collect(),
+                params
+                    .iter()
+                    .map(scalar_value_from_lix_value)
+                    .collect::<Result<Vec<_>, _>>()?,
             ))
             .map_err(datafusion_error_to_lix_error)?;
     }
@@ -2053,6 +2058,43 @@ fn insert_field_expr(
         })
 }
 
+fn assignment_source_expr(
+    session: &SessionContext,
+    expr: &BoundExpr,
+    params: &[Value],
+    field: &Field,
+) -> Result<Expr, LixError> {
+    if field.data_type() == &DataType::Int64
+        && let Some(value) =
+            super::bound_public_write::bigint_number_literal(expr, "assignment", field.name())?
+    {
+        return Ok(Expr::Literal(ScalarValue::Int64(Some(value)), None));
+    }
+    datafusion_expr_from_bound_expr(session, expr, params)
+}
+
+fn coerce_assignment_expr(expr: Expr, field: &Field, schema: &DFSchema) -> Result<Expr, LixError> {
+    let target = field.data_type();
+    let (_, source_field) = expr
+        .to_field(schema)
+        .map_err(datafusion_error_to_lix_error)?;
+    if field_is_json(&source_field) && !field_is_json(field) {
+        return Err(LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            "JSONB assignment to a scalar column requires an explicit CAST",
+        ));
+    }
+    let source = expr
+        .get_type(schema)
+        .map_err(datafusion_error_to_lix_error)?;
+    crate::sql2::value_contract::validate_assignment_types(&source, target)?;
+    if source == DataType::Float64 && target == &DataType::Int64 {
+        return Ok(crate::sql2::udfs::assign_bigint::expression(expr));
+    }
+    expr.cast_to(target, schema)
+        .map_err(datafusion_error_to_lix_error)
+}
+
 fn datafusion_assignments(
     session: &SessionContext,
     schema: &Schema,
@@ -2070,10 +2112,9 @@ fn datafusion_assignments(
             let expr = prepare_write_expr(
                 session,
                 &df_schema,
-                datafusion_expr_from_bound_expr(session, &assignment.value, params)?,
-            )?
-            .cast_to(field.data_type(), &df_schema)
-            .map_err(datafusion_error_to_lix_error)?;
+                assignment_source_expr(session, &assignment.value, params, field)?,
+            )?;
+            let expr = coerce_assignment_expr(expr, field, &df_schema)?;
             Ok((assignment.column.name.clone(), expr))
         })
         .collect()
@@ -2120,10 +2161,9 @@ fn datafusion_conflict_assignments(
             let expr = prepare_write_expr(
                 session,
                 &df_schema,
-                datafusion_expr_from_bound_expr(session, &assignment.value, params)?,
-            )?
-            .cast_to(field.data_type(), &df_schema)
-            .map_err(datafusion_error_to_lix_error)?;
+                assignment_source_expr(session, &assignment.value, params, field)?,
+            )?;
+            let expr = coerce_assignment_expr(expr, field, &df_schema)?;
             let physical =
                 datafusion::physical_expr::create_physical_expr(&expr, &df_schema, &props)
                     .map_err(datafusion_error_to_lix_error)?;
@@ -2319,7 +2359,7 @@ fn datafusion_filter_expr_from_bound_expr(
                     format!("missing SQL parameter ${}", param.index),
                 ));
             };
-            let ScalarAndMetadata { value, metadata } = scalar_value_from_lix_value(value);
+            let ScalarAndMetadata { value, metadata } = scalar_value_from_lix_value(value)?;
             if identity_json_comparison_context {
                 if let ScalarValue::Utf8(Some(raw)) = &value {
                     return Ok(Expr::Literal(
@@ -2388,7 +2428,7 @@ fn datafusion_expr_from_bound_expr(
                     format!("missing SQL parameter ${}", param.index),
                 ));
             };
-            let ScalarAndMetadata { value, metadata } = scalar_value_from_lix_value(value);
+            let ScalarAndMetadata { value, metadata } = scalar_value_from_lix_value(value)?;
             Ok(Expr::Literal(value, metadata))
         }
         BoundExpr::Cast { expr, data_type } => {
@@ -2411,19 +2451,26 @@ fn datafusion_expr_from_bound_expr(
                     vec![expr],
                 )));
             }
-            let data_type = match data_type {
+            if *data_type == BoundCastType::Jsonb {
+                let udf = session
+                    .udf("__lix_jsonb")
+                    .map_err(datafusion_error_to_lix_error)?;
+                return Ok(Expr::ScalarFunction(ScalarFunction::new_udf(
+                    udf,
+                    vec![expr],
+                )));
+            }
+            let bound_data_type = match data_type {
                 BoundCastType::Text => unreachable!("TEXT casts are handled by __lix_text_cast"),
                 BoundCastType::Uuid => unreachable!("UUID casts are handled by __lix_uuid_cast"),
                 BoundCastType::Binary => DataType::Binary,
                 BoundCastType::BigInt => DataType::Int64,
                 BoundCastType::Double => DataType::Float64,
                 BoundCastType::Boolean => DataType::Boolean,
-                BoundCastType::Jsonb => DataType::Utf8,
+                BoundCastType::Jsonb => unreachable!("JSONB casts are handled by __lix_jsonb"),
             };
-            Ok(Expr::Cast(Cast::new(
-                Box::new(expr),
-                data_type,
-            )))
+            let cast = Expr::Cast(Cast::new(Box::new(expr), bound_data_type));
+            Ok(cast)
         }
         BoundExpr::Function { name, args } => {
             let udf = session.udf(name).map_err(datafusion_error_to_lix_error)?;
@@ -2536,11 +2583,11 @@ fn bound_expr_requires_datafusion(expr: &BoundExpr) -> bool {
                 name.as_str(),
                 "uuidv7"
                     | "__lix_uuid_cast"
+                    | "__lix_text_cast"
                     | "__lix_current_timestamp"
                     | "lix_active_branch_id"
                     | "lix_active_branch_commit_id"
                     | "__lix_json_get"
-                    | "__lix_text_cast"
                     | "__lix_json_get_text"
                     | "__lix_json_path_get"
                     | "__lix_json_path_get_text"
@@ -2893,26 +2940,16 @@ fn validate_supported_logical_plan(plan: &LogicalPlan) -> Result<(), LixError> {
     Ok(())
 }
 
-fn scalar_value_from_lix_value(value: &Value) -> ScalarAndMetadata {
-    match value {
-        Value::Null => ScalarValue::Null.into(),
-        Value::Boolean(value) => ScalarValue::Boolean(Some(*value)).into(),
-        Value::Integer(value) => ScalarValue::Int64(Some(*value)).into(),
-        Value::Real(value) => ScalarValue::Float64(Some(*value)).into(),
-        Value::Text(value) => ScalarValue::Utf8(Some(value.clone())).into(),
-        Value::Jsonb(value) => ScalarAndMetadata::new(
-            ScalarValue::Utf8(Some(value.to_string())),
-            Some(json_field_metadata()),
-        ),
-        Value::RowRef(value) => ScalarAndMetadata::new(
-            ScalarValue::Utf8(Some(value.as_str().to_owned())),
-            Some(row_ref_field_metadata()),
-        ),
-        Value::Timestamptz(value) => {
-            ScalarValue::TimestampMicrosecond(Some(*value), Some("UTC".into())).into()
-        }
-        Value::Blob(value) => ScalarValue::LargeBinary(Some(value.to_vec())).into(),
-    }
+fn scalar_value_from_lix_value(value: &Value) -> Result<ScalarAndMetadata, LixError> {
+    let metadata = match value {
+        Value::Jsonb(_) => Some(json_field_metadata()),
+        Value::RowRef(_) => Some(row_ref_field_metadata()),
+        _ => None,
+    };
+    Ok(ScalarAndMetadata::new(
+        crate::sql2::value_contract::public_scalar(value)?,
+        metadata,
+    ))
 }
 
 fn json_field_metadata() -> FieldMetadata {
@@ -4272,10 +4309,7 @@ mod tests {
         let mut table_names = public.table_names();
         table_names.sort();
 
-        assert_eq!(
-            table_names,
-            vec!["lix_branch", "lix_directory", "lix_file"]
-        );
+        assert_eq!(table_names, vec!["lix_branch", "lix_directory", "lix_file"]);
     }
 
     #[tokio::test]

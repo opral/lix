@@ -5,7 +5,7 @@ use datafusion::arrow::array::{
     Array, ArrayRef, BooleanArray, Float64Array, Int64Array, LargeStringArray, StringArray,
     TimestampMicrosecondArray,
 };
-use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use serde_json::Value as JsonValue;
@@ -33,7 +33,7 @@ use crate::sql2::plan::LogicalWritePlan;
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::{BoundPredicate, FilterSet};
 use crate::sql2::read_only::reject_read_only_schema_surface;
-use crate::sql2::value_contract::{json_bigint_value, json_double_value};
+use crate::sql2::value_contract::SqlValue as RowEvalValue;
 use crate::sql2::write_normalization::LIX_FILE_CONTENT_CAST_HINT;
 use crate::transaction_types::{
     CertifiedParameterInsertBatch, CertifiedParameterReplacementBatch,
@@ -514,7 +514,31 @@ async fn try_execute_row_update_batch(
 
     let direct_primary_key_param =
         bound_single_text_primary_key_param(&spec, &plan.bound.predicate);
-    let direct_replacement = direct_path_value_replacement(&spec, plan, direct_primary_key_param);
+    let direct_replacement = direct_path_value_replacement(&spec, plan, direct_primary_key_param)
+        .filter(|replacement| {
+            let Some(primary_key_param_index) = direct_primary_key_param else {
+                return false;
+            };
+            if !parameter_batch.column_matches(primary_key_param_index, SchemaColumnType::String)
+                || !parameter_batch
+                    .column_matches(replacement.value_param_index, SchemaColumnType::String)
+            {
+                // Typed JSONB parameters are valid for CAST($n AS JSONB),
+                // but the legacy borrowed direct path only accepts a plain
+                // text parameter column. Let the generic evaluator retain
+                // the parameter's JSONB type.
+                return false;
+            }
+            // The JSON row arena used by this older batch path cannot encode
+            // SQL NULL separately from JSONB null. Let the generic typed
+            // update path handle batches containing a null value.
+            (0..parameter_batch.num_rows()).all(|row_index| {
+                !matches!(
+                    parameter_batch.value(replacement.value_param_index, row_index),
+                    DirectParameterValue::Null
+                )
+            })
+        });
     let borrowed_direct_parameters = match parameter_batch {
         RowInsertParameterBatch::Arrow(batch) => {
             direct_replacement.as_ref().and_then(|replacement| {
@@ -970,6 +994,18 @@ async fn try_execute_direct_path_value_replacement_batch(
                 .collect(),
         ));
     }
+    // The legacy row-content arena represents JSONB null as the same JSON
+    // token used for SQL NULL. Keep SQL NULL out of that fallback: the
+    // generic typed write path retains the distinction and applies the
+    // schema's nullable constraint.
+    if (0..row_count).any(|statement_index| {
+        matches!(
+            parameter_batch.value(replacement.value_param_index, statement_index),
+            DirectParameterValue::Null
+        )
+    }) {
+        return Ok(None);
+    }
     let primary_key_arena = SharedStr::from_utf8(bytes::Bytes::from(primary_key_arena))
         .map_err(|_| LixError::unknown("certified replacement primary-key arena is not UTF-8"))?;
     let row_pks = primary_key_offsets
@@ -1185,20 +1221,21 @@ async fn try_execute_direct_path_value_replacement_batch(
                 .clone();
             let value = match parameter_batch.value(replacement.value_param_index, statement_index)
             {
-                DirectParameterValue::Null => JsonValue::Null,
-                DirectParameterValue::String(raw) => crate::sql2::udfs::common::parse_jsonb(raw)
-                    .map_err(|error| {
-                        LixError::new(
-                            LixError::CODE_TYPE_MISMATCH,
-                            format!("invalid JSONB value: {error}"),
-                        )
-                    })?,
+                DirectParameterValue::Null => lix_schema::Value::Null,
+                DirectParameterValue::String(raw) => lix_schema::Value::Jsonb(
+                    crate::sql2::udfs::common::parse_jsonb(raw)
+                        .map_err(|error| {
+                            LixError::new(
+                                LixError::CODE_TYPE_MISMATCH,
+                                format!("invalid JSONB value: {error}"),
+                            )
+                        })?
+                        .into(),
+                ),
                 DirectParameterValue::Boolean(_) => unreachable!("replacement value is text"),
             };
             typed.invalidate_durable_payload();
-            typed
-                .row
-                .insert("value", lix_schema::Value::Jsonb(value.into()));
+            typed.row.insert("value", value);
             let (_, typed) = finalize_typed_row(ctx, &validation_domain, &spec.schema_key, typed)?;
             snapshots.extend_from_slice(&typed.durable_payload().map_err(|error| {
                 LixError::new(
@@ -1314,7 +1351,13 @@ fn append_certified_path_value_parameter_payload(
     parameter: DirectParameterValue<'_>,
 ) -> Result<(), LixError> {
     let canonical = match parameter {
-        DirectParameterValue::Null => b"null".as_slice(),
+        DirectParameterValue::Null => {
+            return crate::row_payload::TypedRow::append_certified_path_value_null_payload(
+                output,
+                schema_plan,
+                primary_key,
+            );
+        }
         DirectParameterValue::String(raw) => raw.as_bytes(),
         DirectParameterValue::Boolean(_) => {
             unreachable!("the certified replacement value parameter is text")
@@ -2731,7 +2774,9 @@ pub(crate) struct PreparedPathValueReplacementProgram {
 
 pub(crate) struct PreparedPathValueReplacementRow {
     pub(crate) row_pk: RowPk,
-    pub(crate) snapshot: TransactionJson,
+    /// Native durable row payload. Keeping this typed avoids the JSON
+    /// snapshot round trip that used to turn SQL NULL into JSONB null.
+    pub(crate) snapshot: Vec<u8>,
 }
 
 impl PreparedPathValueReplacementProgram {
@@ -2852,25 +2897,6 @@ pub(crate) async fn execute_prepared_path_value_replacement(
     program: &PreparedPathValueReplacementProgram,
     params: &[Value],
 ) -> Result<SqlWriteResult, LixError> {
-    let Some(row) = prepare_path_value_replacement_row(ctx, program, params).await? else {
-        return Ok(SqlWriteResult::affected(0));
-    };
-    let mut rows = CertifiedParameterReplacementBatch::new(
-        vec![row.row_pk],
-        vec![row.snapshot],
-        program.schema_key.as_str().into(),
-        ctx.active_branch_id().into(),
-        CertifiedRawWriteBatchPreparation {
-            schema_plan_id: program.schema_plan_id,
-            facts: PreparedRowFacts {
-                row_content_validated: true,
-                requires_transaction_validation: false,
-            },
-            tracked_keys_strictly_ordered: true,
-            complete_collection_replacement: None,
-            fileless_typed_sql_rows: false,
-        },
-    )?;
     let schema_catalog = ctx.schema_catalog_snapshot().ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -2883,7 +2909,28 @@ pub(crate) async fn execute_prepared_path_value_replacement(
             "prepared path replacement lost its schema plan",
         )
     })?;
-    rows.convert_to_typed(schema_plan)?;
+    let Some(row) = prepare_path_value_replacement_row(ctx, program, params, schema_plan).await?
+    else {
+        return Ok(SqlWriteResult::affected(0));
+    };
+    let snapshot_len = row.snapshot.len();
+    let rows = CertifiedParameterReplacementBatch::new_typed(
+        vec![row.row_pk],
+        row.snapshot,
+        vec![(0, snapshot_len)],
+        program.schema_key.as_str().into(),
+        ctx.active_branch_id().into(),
+        CertifiedRawWriteBatchPreparation {
+            schema_plan_id: program.schema_plan_id,
+            facts: PreparedRowFacts {
+                row_content_validated: true,
+                requires_transaction_validation: false,
+            },
+            tracked_keys_strictly_ordered: true,
+            complete_collection_replacement: None,
+            fileless_typed_sql_rows: true,
+        },
+    )?;
     ctx.stage_certified_parameter_batch_replace(rows).await?;
     Ok(SqlWriteResult::affected(1))
 }
@@ -2892,6 +2939,7 @@ pub(crate) async fn prepare_path_value_replacement_row(
     ctx: &mut dyn SqlWriteExecutionContext,
     program: &PreparedPathValueReplacementProgram,
     params: &[Value],
+    schema_plan: &crate::catalog::SchemaPlan,
 ) -> Result<Option<PreparedPathValueReplacementRow>, LixError> {
     let primary_key = program.primary_key(params)?;
     let row_pk = RowPk::single(primary_key.to_owned());
@@ -2929,75 +2977,108 @@ pub(crate) async fn prepare_path_value_replacement_row(
         ));
     }
 
-    prepare_path_value_replacement_row_known_live(program, params).map(Some)
+    prepare_path_value_replacement_row_known_live(program, params, schema_plan).map(Some)
 }
 
 pub(crate) fn prepare_path_value_replacement_row_known_live(
     program: &PreparedPathValueReplacementProgram,
     params: &[Value],
+    schema_plan: &crate::catalog::SchemaPlan,
 ) -> Result<PreparedPathValueReplacementRow, LixError> {
     let primary_key = program.primary_key(params)?;
     let row_pk = RowPk::single(primary_key.to_owned());
-    let mut normalized = Vec::with_capacity(primary_key.len().saturating_add(32));
-    let (start, end) =
-        append_path_value_replacement_snapshot(program, primary_key, params, &mut normalized)?;
-    // SAFETY: `append_path_value_replacement_snapshot` appends only UTF-8
-    // literals, `str` identities, and canonical JSON parameter text.
-    let snapshot = unsafe {
-        TransactionJson::from_validated_certified_row_content_arena(normalized, vec![(start, end)])?
-    }
-    .pop()
-    .expect("one certified replacement snapshot");
+    let mut snapshot = Vec::with_capacity(primary_key.len().saturating_add(64));
+    append_path_value_replacement_payload(
+        program,
+        primary_key,
+        params,
+        schema_plan,
+        &mut snapshot,
+    )?;
     Ok(PreparedPathValueReplacementRow { row_pk, snapshot })
 }
 
-pub(crate) fn append_path_value_replacement_snapshot(
+pub(crate) fn append_path_value_replacement_payload(
     program: &PreparedPathValueReplacementProgram,
     primary_key: &str,
     params: &[Value],
-    normalized: &mut Vec<u8>,
-) -> Result<(usize, usize), LixError> {
-    let replacement_value = match params.get(program.value_param_index) {
-        Some(Value::Text(value)) => Some(value.as_str()),
-        Some(Value::Null) => None,
-        _ => {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "prepared path replacement value must be text or null",
-            ));
+    schema_plan: &crate::catalog::SchemaPlan,
+    output: &mut Vec<u8>,
+) -> Result<(), LixError> {
+    let value = params.get(program.value_param_index).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            "prepared path replacement value parameter is missing",
+        )
+    })?;
+    // Keep already-canonical text on the allocation-free encoder path. All
+    // native parameters use the same SQL cast as ordinary row evaluation.
+    if let Value::Text(value) = value {
+        return append_path_value_replacement_payload_text(
+            schema_plan,
+            primary_key,
+            Some(value.as_str()),
+            output,
+        );
+    }
+    let value = cast_row_eval_value(value_eval(value)?, BoundCastType::Jsonb)?;
+    match value {
+        RowEvalValue::SqlNull => {
+            append_path_value_replacement_payload_text(schema_plan, primary_key, None, output)
         }
-    };
-    append_path_value_replacement_snapshot_text(primary_key, replacement_value, normalized)
+        RowEvalValue::Json(value) => append_path_value_replacement_payload_text(
+            schema_plan,
+            primary_key,
+            Some(&value.to_string()),
+            output,
+        ),
+        _ => unreachable!("a JSONB cast produces JSONB or SQL NULL"),
+    }
 }
 
-pub(crate) fn append_path_value_replacement_snapshot_text(
+pub(crate) fn append_path_value_replacement_payload_text(
+    schema_plan: &crate::catalog::SchemaPlan,
     primary_key: &str,
     replacement_value: Option<&str>,
-    normalized: &mut Vec<u8>,
-) -> Result<(usize, usize), LixError> {
-    let start = normalized.len();
-    normalized.extend_from_slice(b"{\"path\":");
-    if let Err(error) = append_canonical_json_string(normalized, primary_key) {
-        normalized.truncate(start);
-        return Err(error);
-    }
-    normalized.extend_from_slice(b",\"value\":");
+    output: &mut Vec<u8>,
+) -> Result<(), LixError> {
     let result = match replacement_value {
-        None => normalized.extend_from_slice(b"null"),
+        None => crate::row_payload::TypedRow::append_certified_path_value_null_payload(
+            output,
+            schema_plan,
+            primary_key,
+        ),
         Some(raw) => {
-            if let Err(error) = append_canonical_json_parameter(normalized, raw) {
-                normalized.truncate(start);
-                return Err(error);
+            if crate::row_payload::TypedRow::try_append_certified_path_value_payload_from_canonical_json(
+                output,
+                schema_plan,
+                primary_key,
+                raw.as_bytes(),
+            )? {
+                Ok(())
+            } else {
+                let value = crate::sql2::udfs::common::parse_jsonb(raw).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_TYPE_MISMATCH,
+                        format!("invalid JSONB value: {error}"),
+                    )
+                })?;
+                crate::row_payload::TypedRow::append_certified_path_value_payload(
+                    output,
+                    schema_plan,
+                    primary_key,
+                    value,
+                )
             }
         }
     };
-    let () = result;
-    normalized.push(b'}');
     #[cfg(test)]
-    CERTIFIED_SINGLE_PATH_VALUE_REPLACEMENTS.with(|executions| {
-        executions.set(executions.get().saturating_add(1));
-    });
-    Ok((start, normalized.len()))
+    if result.is_ok() {
+        CERTIFIED_SINGLE_PATH_VALUE_REPLACEMENTS.with(|executions| {
+            executions.set(executions.get().saturating_add(1));
+        });
+    }
+    result
 }
 
 /// Stage row INSERT/UPDATE rows and, when requested, retain their final
@@ -3619,55 +3700,9 @@ fn row_returning_value(
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<Value, LixError> {
-    // A parameter already carries its SQL type. Routing it through JSON would
-    // erase JSON null, timestamps, row references, and binary values.
-    if let BoundExpr::Param(param) = expr {
-        return params
-            .get(param.index.saturating_sub(1))
-            .cloned()
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INVALID_PARAM,
-                    format!("missing SQL parameter ${}", param.index),
-                )
-            });
-    }
-
-    let value = eval_expr_value(expr, context, ctx, params, active_branch_commit_id)?;
-    if bound_expr_is_json(expr, spec) {
-        return Ok(match value {
-            RowEvalValue::SqlNull => Value::Null,
-            RowEvalValue::SqlText(value) => Value::Text(value),
-            RowEvalValue::Json(value) => Value::Jsonb(value.into()),
-        });
-    }
-    if let Some(column) = visible_row_column(expr, spec) {
-        if column.column_type == SchemaColumnType::Integer {
-            let value = value.into_json();
-            return json_bigint_value(Some(&value), &spec.schema_key, &column.name)
-                .map(|value| value.map_or(Value::Null, Value::Integer));
-        }
-        if column.column_type == SchemaColumnType::Number {
-            let value = value.into_json();
-            return json_double_value(Some(&value), &spec.schema_key, &column.name)
-                .map(|value| value.map_or(Value::Null, Value::Real));
-        }
-    }
-    Ok(match value {
-        RowEvalValue::SqlNull | RowEvalValue::Json(JsonValue::Null) => Value::Null,
-        RowEvalValue::SqlText(value) | RowEvalValue::Json(JsonValue::String(value)) => {
-            Value::Text(value)
-        }
-        RowEvalValue::Json(JsonValue::Bool(value)) => Value::Boolean(value),
-        RowEvalValue::Json(JsonValue::Number(value)) => value
-            .as_i64()
-            .map(Value::Integer)
-            .or_else(|| value.as_f64().map(Value::Real))
-            .unwrap_or_else(|| Value::Text(value.to_string())),
-        RowEvalValue::Json(value @ (JsonValue::Array(_) | JsonValue::Object(_))) => {
-            Value::Jsonb(value.into())
-        }
-    })
+    let _ = spec;
+    eval_expr_value(expr, context, ctx, params, active_branch_commit_id)
+        .and_then(RowEvalValue::into_public)
 }
 
 fn visible_row_column<'a>(
@@ -4739,9 +4774,7 @@ fn certified_direct_parameter_insert_batch(
                 }
                 let eval_value = match parameter_value {
                     DirectParameterValue::String(value) => RowEvalValue::SqlText(value.to_owned()),
-                    DirectParameterValue::Boolean(value) => {
-                        RowEvalValue::Json(JsonValue::Bool(value))
-                    }
+                    DirectParameterValue::Boolean(value) => RowEvalValue::Boolean(value),
                     DirectParameterValue::Null => unreachable!("null handled above"),
                 };
                 let data_type = schema_plan
@@ -5383,7 +5416,7 @@ fn append_row_insert_row(
             }
             continue;
         }
-        let value = eval_value.into_json();
+        let value = eval_value.into_json()?;
         match target {
             InsertColumnTarget::Visible { .. } => unreachable!("visible columns handled above"),
             InsertColumnTarget::FileId => {
@@ -5813,79 +5846,61 @@ fn schema_spec(
         })
 }
 
-#[derive(Clone, Debug)]
-enum RowEvalValue {
-    SqlNull,
-    SqlText(String),
-    Json(JsonValue),
-}
-
-impl RowEvalValue {
-    fn into_json(self) -> JsonValue {
-        match self {
-            Self::SqlNull => JsonValue::Null,
-            Self::SqlText(value) => JsonValue::String(value),
-            Self::Json(value) => value,
-        }
-    }
-}
-
 fn row_eval_value_is_null(value: &RowEvalValue) -> bool {
-    matches!(
-        value,
-        RowEvalValue::SqlNull | RowEvalValue::Json(JsonValue::Null)
-    )
+    matches!(value, RowEvalValue::SqlNull)
 }
 
 fn row_eval_value_is_sql_null(value: &RowEvalValue, column_type: SchemaColumnType) -> bool {
+    let _ = column_type;
     matches!(value, RowEvalValue::SqlNull)
-        || (column_type != SchemaColumnType::Jsonb
-            && matches!(value, RowEvalValue::Json(JsonValue::Null)))
 }
 
 fn cast_row_eval_value(
     value: RowEvalValue,
     cast_type: BoundCastType,
 ) -> Result<RowEvalValue, LixError> {
-    if cast_type == BoundCastType::Binary {
-        return Err(LixError::new(
-            LixError::CODE_TYPE_MISMATCH,
-            "BYTEA casts require a binary SQL column",
-        )
-        .with_hint(
-            "Use BYTEA for lix_file.content; registered row schemas expose no binary column type.",
-        ));
-    }
-
     if cast_type == BoundCastType::Jsonb {
         return match value {
             RowEvalValue::SqlNull => Ok(RowEvalValue::SqlNull),
-            RowEvalValue::Json(value) => Ok(RowEvalValue::Json(value)),
-            RowEvalValue::SqlText(value) => serde_json::from_str(&value)
-                .map(RowEvalValue::Json)
-                .map_err(|error| {
-                    LixError::new(
+            RowEvalValue::Json(mut value) => {
+                crate::sql2::udfs::common::normalize_jsonb(&mut value)
+                    .map_err(|e| LixError::new(LixError::CODE_TYPE_MISMATCH, e))?;
+                Ok(RowEvalValue::Json(value))
+            }
+            value => crate::sql2::udfs::common::parse_jsonb(&match value
+                .scalar()
+                .cast_to(&DataType::Utf8)
+                .map_err(crate::sql2::error::datafusion_error_to_lix_error)?
+            {
+                ScalarValue::Utf8(Some(v)) => v,
+                _ => {
+                    return Err(LixError::new(
                         LixError::CODE_TYPE_MISMATCH,
-                        format!("CAST AS JSONB failed: {error}"),
-                    )
-                }),
+                        "invalid JSONB cast",
+                    ));
+                }
+            })
+            .map(RowEvalValue::Json)
+            .map_err(|error| {
+                LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    format!("CAST AS JSONB failed: {error}"),
+                )
+            }),
         };
     }
     if cast_type == BoundCastType::Uuid {
         return match value {
-            RowEvalValue::SqlNull | RowEvalValue::Json(JsonValue::Null) => {
-                Ok(RowEvalValue::SqlNull)
-            }
-            RowEvalValue::SqlText(value) | RowEvalValue::Json(JsonValue::String(value)) => {
-                uuid::Uuid::parse_str(&value)
-                    .map(|value| RowEvalValue::SqlText(value.to_string()))
-                    .map_err(|error| {
-                        LixError::new(
-                            LixError::CODE_TYPE_MISMATCH,
-                            format!("CAST AS UUID failed: {error}"),
-                        )
-                    })
-            }
+            RowEvalValue::SqlNull => Ok(RowEvalValue::SqlNull),
+            RowEvalValue::Uuid(value) => Ok(RowEvalValue::Uuid(value)),
+            RowEvalValue::SqlText(value) => uuid::Uuid::parse_str(&value)
+                .map(RowEvalValue::Uuid)
+                .map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_TYPE_MISMATCH,
+                        format!("CAST AS UUID failed: {error}"),
+                    )
+                }),
             _ => Err(LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
                 "CAST AS UUID requires a text UUID value",
@@ -5898,7 +5913,7 @@ fn cast_row_eval_value(
         BoundCastType::BigInt => DataType::Int64,
         BoundCastType::Double => DataType::Float64,
         BoundCastType::Boolean => DataType::Boolean,
-        BoundCastType::Binary => unreachable!("binary row casts rejected above"),
+        BoundCastType::Binary => DataType::Binary,
         BoundCastType::Jsonb => unreachable!("JSONB row casts handled above"),
     };
     let scalar = scalar_from_row_eval_value(value);
@@ -5912,57 +5927,14 @@ fn cast_row_eval_value(
 }
 
 fn scalar_from_row_eval_value(value: RowEvalValue) -> ScalarValue {
-    match value {
-        RowEvalValue::SqlNull | RowEvalValue::Json(JsonValue::Null) => ScalarValue::Null,
-        RowEvalValue::SqlText(value) | RowEvalValue::Json(JsonValue::String(value)) => {
-            ScalarValue::Utf8(Some(value))
-        }
-        RowEvalValue::Json(JsonValue::Bool(value)) => ScalarValue::Boolean(Some(value)),
-        RowEvalValue::Json(JsonValue::Number(value)) => value.as_i64().map_or_else(
-            || {
-                value.as_u64().map_or_else(
-                    || ScalarValue::Float64(value.as_f64()),
-                    |value| ScalarValue::UInt64(Some(value)),
-                )
-            },
-            |value| ScalarValue::Int64(Some(value)),
-        ),
-        RowEvalValue::Json(value @ (JsonValue::Array(_) | JsonValue::Object(_))) => {
-            ScalarValue::Utf8(Some(value.to_string()))
-        }
-    }
+    value.scalar()
 }
 
 fn row_eval_value_from_cast_scalar(
     value: ScalarValue,
-    cast_type: BoundCastType,
+    _cast_type: BoundCastType,
 ) -> Result<RowEvalValue, LixError> {
-    if value.is_null() {
-        return Ok(RowEvalValue::SqlNull);
-    }
-    match value {
-        ScalarValue::Utf8(Some(value))
-        | ScalarValue::Utf8View(Some(value))
-        | ScalarValue::LargeUtf8(Some(value)) => Ok(RowEvalValue::SqlText(value)),
-        ScalarValue::Int64(Some(value)) => Ok(RowEvalValue::Json(JsonValue::Number(value.into()))),
-        ScalarValue::Float64(Some(value)) => serde_json::Number::from_f64(value)
-            .map(JsonValue::Number)
-            .map(RowEvalValue::Json)
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_TYPE_MISMATCH,
-                    "DOUBLE PRECISION cast produced a non-finite number",
-                )
-            }),
-        ScalarValue::Boolean(Some(value)) => Ok(RowEvalValue::Json(JsonValue::Bool(value))),
-        other => Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "CAST AS {} produced unexpected scalar {other:?}",
-                cast_type.canonical_sql_name()
-            ),
-        )),
-    }
+    RowEvalValue::from_scalar(value)
 }
 
 fn eval_expr(
@@ -5973,7 +5945,7 @@ fn eval_expr(
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<JsonValue, LixError> {
     eval_expr_value(expr, context, ctx, params, active_branch_commit_id)
-        .map(RowEvalValue::into_json)
+        .and_then(RowEvalValue::into_json)
 }
 
 fn eval_expr_value(
@@ -5986,16 +5958,23 @@ fn eval_expr_value(
     match expr {
         BoundExpr::Literal(BoundLiteral::Null) => Ok(RowEvalValue::SqlNull),
         BoundExpr::Literal(BoundLiteral::Text(value)) => Ok(RowEvalValue::SqlText(value.clone())),
-        BoundExpr::Literal(literal) => Ok(RowEvalValue::Json(literal_json(literal))),
+        BoundExpr::Literal(BoundLiteral::Bool(value)) => Ok(RowEvalValue::Boolean(*value)),
+        BoundExpr::Literal(BoundLiteral::Integer(value)) => Ok(RowEvalValue::Integer(*value)),
+        BoundExpr::Literal(BoundLiteral::Number { value, .. }) => Ok(value
+            .as_i64()
+            .map(RowEvalValue::Integer)
+            .or_else(|| value.as_u64().map(RowEvalValue::Unsigned))
+            .unwrap_or_else(|| RowEvalValue::Real(value.as_f64().unwrap()))),
+        BoundExpr::Literal(BoundLiteral::Json(value)) => Ok(RowEvalValue::Json(value.clone())),
         BoundExpr::Param(param) => params
             .get(param.index.saturating_sub(1))
-            .map(value_eval)
             .ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INVALID_PARAM,
                     format!("missing SQL parameter ${}", param.index),
                 )
-            }),
+            })
+            .and_then(value_eval),
         BoundExpr::Column(column) => match column.image {
             Some(crate::sql2::bind::expr::ReturningImage::Old) => {
                 let Some(row) = context.returning_old else {
@@ -6025,9 +6004,9 @@ fn eval_expr_value(
             let value = eval_expr_value(expr, context, ctx, params, active_branch_commit_id)?;
             cast_row_eval_value(value, *data_type)
         }
-        BoundExpr::Function { name, args } if name == "uuidv7" && args.is_empty() => Ok(
-            RowEvalValue::SqlText(ctx.functions().call_uuid_v7().to_string()),
-        ),
+        BoundExpr::Function { name, args } if name == "uuidv7" && args.is_empty() => {
+            Ok(RowEvalValue::Uuid(ctx.functions().call_uuid_v7()))
+        }
         BoundExpr::Function { name, args } if name == "lix_order_between" && args.len() == 2 => {
             let mut bounds = Vec::with_capacity(2);
             for arg in args {
@@ -6051,7 +6030,9 @@ fn eval_expr_value(
         BoundExpr::Function { name, args }
             if name == "__lix_current_timestamp" && args.is_empty() =>
         {
-            Ok(RowEvalValue::SqlText(ctx.current_timestamp().to_string()))
+            chrono::DateTime::parse_from_rfc3339(&ctx.current_timestamp().to_string())
+                .map(|v| RowEvalValue::Timestamptz(v.timestamp_micros()))
+                .map_err(|e| LixError::new(LixError::CODE_TYPE_MISMATCH, e.to_string()))
         }
         BoundExpr::Function { name, args } if name == "lix_active_branch_id" && args.is_empty() => {
             Ok(RowEvalValue::SqlText(ctx.active_branch_id().to_string()))
@@ -6073,33 +6054,7 @@ fn eval_expr_value(
         }
         BoundExpr::Function { name, args } if name == "__lix_jsonb" && args.len() == 1 => {
             let value = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
-            match value {
-                RowEvalValue::SqlNull => Ok(RowEvalValue::SqlNull),
-                RowEvalValue::SqlText(raw) => crate::sql2::udfs::common::parse_jsonb(&raw)
-                    .map(RowEvalValue::Json)
-                    .map_err(|error| {
-                        LixError::new(
-                            LixError::CODE_TYPE_MISMATCH,
-                            format!("invalid JSONB value: {error}"),
-                        )
-                    }),
-                RowEvalValue::Json(value) => {
-                    let raw = serde_json::to_string(&value).map_err(|error| {
-                        LixError::new(
-                            LixError::CODE_TYPE_MISMATCH,
-                            format!("invalid JSONB value: {error}"),
-                        )
-                    })?;
-                    crate::sql2::udfs::common::parse_jsonb(&raw)
-                        .map(RowEvalValue::Json)
-                        .map_err(|error| {
-                            LixError::new(
-                                LixError::CODE_TYPE_MISMATCH,
-                                format!("invalid JSONB value: {error}"),
-                            )
-                        })
-                }
-            }
+            cast_row_eval_value(value, BoundCastType::Jsonb)
         }
         BoundExpr::Function { name, args }
             if matches!(
@@ -6127,6 +6082,12 @@ fn eval_expr_value(
                     JsonValue::Null => return Ok(RowEvalValue::SqlNull),
                     value => value,
                 },
+                _ => {
+                    return Err(LixError::new(
+                        LixError::CODE_TYPE_MISMATCH,
+                        "JSON path requires JSONB or JSON text",
+                    ));
+                }
             };
             for arg in &args[1..] {
                 let segment = eval_expr(arg, context, ctx, params, active_branch_commit_id)?;
@@ -6235,13 +6196,6 @@ fn predicate_matches(
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum NumericComparisonValue {
-    Signed(i64),
-    Unsigned(u64),
-    Double(f64),
-}
-
 fn comparison_values_equal(
     left_expr: &BoundExpr,
     left_value: RowEvalValue,
@@ -6253,99 +6207,51 @@ fn comparison_values_equal(
     if matches!(left_value, RowEvalValue::SqlNull) || matches!(right_value, RowEvalValue::SqlNull) {
         return Ok(false);
     }
-    let (mut left_value, mut right_value) =
-        normalize_comparison_operands(left_expr, left_value, right_expr, right_value, spec)?;
-    normalize_bigint_comparison_literal(left_expr, right_expr, &mut right_value, spec)?;
-    normalize_bigint_comparison_literal(right_expr, left_expr, &mut left_value, spec)?;
-    let left_numeric = numeric_comparison_value(left_expr, &left_value, spec)?;
-    let right_numeric = numeric_comparison_value(right_expr, &right_value, spec)?;
-    match (left_numeric, right_numeric) {
-        (Some(left), Some(right)) => Ok(numeric_values_equal(left, right)),
-        _ => Ok(left_value == right_value),
+    if matches!(left_value, RowEvalValue::Json(_))
+        || matches!(right_value, RowEvalValue::Json(_))
+        || bound_expr_is_json(left_expr, spec)
+        || bound_expr_is_json(right_expr, spec)
+    {
+        let (left, right) =
+            normalize_comparison_operands(left_expr, left_value, right_expr, right_value, spec)?;
+        return Ok(left == right);
     }
-}
-
-fn normalize_bigint_comparison_literal(
-    column_expr: &BoundExpr,
-    value_expr: &BoundExpr,
-    value: &mut JsonValue,
-    spec: &SchemaSurfaceSpec,
-) -> Result<(), LixError> {
-    let Some(column) = visible_row_column(column_expr, spec) else {
-        return Ok(());
+    let normalize = |column_expr: &BoundExpr, value_expr: &BoundExpr, value: RowEvalValue| {
+        if let Some(column) = visible_row_column(column_expr, spec)
+            && column.column_type == SchemaColumnType::Integer
+            && let Some(exact) = bigint_number_literal(value_expr, &spec.schema_key, &column.name)?
+        {
+            return Ok(RowEvalValue::Integer(exact));
+        }
+        Ok::<_, LixError>(value)
     };
-    if column.column_type != SchemaColumnType::Integer {
-        return Ok(());
+    let left = normalize(right_expr, left_expr, left_value)?;
+    let right = normalize(left_expr, right_expr, right_value)?;
+    if let Some(equal) = left.same_type_equal(&right) {
+        return Ok(equal);
     }
-    if let Some(exact) = bigint_number_literal(value_expr, &spec.schema_key, &column.name)? {
-        *value = JsonValue::from(exact);
+    let left = left.scalar();
+    let right = right.scalar();
+    if left.data_type() == right.data_type() {
+        return Ok(left == right);
     }
-    Ok(())
-}
-
-fn numeric_comparison_value(
-    expr: &BoundExpr,
-    value: &JsonValue,
-    spec: &SchemaSurfaceSpec,
-) -> Result<Option<NumericComparisonValue>, LixError> {
-    if let Some(column) = visible_row_column(expr, spec) {
-        return match column.column_type {
-            SchemaColumnType::Integer => {
-                json_bigint_value(Some(value), &spec.schema_key, &column.name)
-                    .map(|value| value.map(NumericComparisonValue::Signed))
-            }
-            SchemaColumnType::Number => {
-                json_double_value(Some(value), &spec.schema_key, &column.name)
-                    .map(|value| value.map(NumericComparisonValue::Double))
-            }
-            SchemaColumnType::String
-            | SchemaColumnType::Jsonb
-            | SchemaColumnType::Boolean
-            | SchemaColumnType::Timestamptz => Ok(None),
-        };
-    }
-
-    let JsonValue::Number(number) = value else {
-        return Ok(None);
-    };
-    if let Some(value) = number.as_i64() {
-        return Ok(Some(NumericComparisonValue::Signed(value)));
-    }
-    if let Some(value) = number.as_u64() {
-        return Ok(Some(NumericComparisonValue::Unsigned(value)));
-    }
-    Ok(number.as_f64().map(NumericComparisonValue::Double))
-}
-
-#[expect(
-    clippy::cast_precision_loss,
-    clippy::float_cmp,
-    reason = "SQL numeric equality coerces mixed BIGINT/DOUBLE operands to DOUBLE PRECISION"
-)]
-fn numeric_values_equal(left: NumericComparisonValue, right: NumericComparisonValue) -> bool {
-    match (left, right) {
-        (NumericComparisonValue::Signed(left), NumericComparisonValue::Signed(right)) => {
-            left == right
-        }
-        (NumericComparisonValue::Unsigned(left), NumericComparisonValue::Unsigned(right)) => {
-            left == right
-        }
-        (NumericComparisonValue::Signed(left), NumericComparisonValue::Unsigned(right))
-        | (NumericComparisonValue::Unsigned(right), NumericComparisonValue::Signed(left)) => {
-            u64::try_from(left).is_ok_and(|left| left == right)
-        }
-        (NumericComparisonValue::Double(left), NumericComparisonValue::Double(right)) => {
-            left == right
-        }
-        (NumericComparisonValue::Double(left), NumericComparisonValue::Signed(right))
-        | (NumericComparisonValue::Signed(right), NumericComparisonValue::Double(left)) => {
-            left == right as f64
-        }
-        (NumericComparisonValue::Double(left), NumericComparisonValue::Unsigned(right))
-        | (NumericComparisonValue::Unsigned(right), NumericComparisonValue::Double(left)) => {
-            left == right as f64
-        }
-    }
+    let target = datafusion::logical_expr::type_coercion::binary::comparison_coercion(
+        &left.data_type(),
+        &right.data_type(),
+    )
+    .ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            "incompatible SQL comparison types",
+        )
+    })?;
+    let left = left
+        .cast_to(&target)
+        .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+    let right = right
+        .cast_to(&target)
+        .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+    Ok(left == right)
 }
 
 fn normalize_comparison_operands(
@@ -6381,7 +6287,7 @@ fn normalize_json_comparison_value(
 ) -> Result<JsonValue, LixError> {
     // Explicit JSONB strings are already JSON values, not encoded JSON text.
     let is_sql_text = matches!(value, RowEvalValue::SqlText(_));
-    let value = value.into_json();
+    let value = value.into_json()?;
     if !other_side_is_json {
         return Ok(value);
     }
@@ -6666,7 +6572,7 @@ fn bound_expr_is_json(expr: &BoundExpr, spec: &SchemaSurfaceSpec) -> bool {
 fn order_key_bound(value: RowEvalValue) -> Result<Option<String>, LixError> {
     match value {
         // Match scalar conversion for both typed and JSON-backed row images.
-        RowEvalValue::SqlNull | RowEvalValue::Json(JsonValue::Null) => Ok(None),
+        RowEvalValue::SqlNull => Ok(None),
         RowEvalValue::SqlText(value) => Ok(Some(value)),
         _ => Err(LixError::new(
             LixError::CODE_TYPE_MISMATCH,
@@ -6722,7 +6628,10 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
                 | "__lix_json_exists"
                 | "lix_order_between"
                     if args.len() == 2 => {}
-                "__lix_jsonb" | "__lix_uuid_cast" | "__lix_text_cast" if args.len() == 1 => {}
+                "__lix_jsonb"
+                | "__lix_uuid_cast"
+                | "__lix_text_cast"
+                    if args.len() == 1 => {}
                 _ => {
                     return Err(LixError::new(
                         LixError::CODE_UNSUPPORTED_SQL,
@@ -6741,6 +6650,7 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
 enum CandidateRowImage<'a> {
     Json(JsonValue),
     Typed(&'a crate::row_payload::TypedRow),
+    Materialized(Arc<crate::row_payload::TypedRow>),
 }
 
 #[derive(Clone, Copy)]
@@ -6755,6 +6665,7 @@ impl<'a> CandidateRowImage<'a> {
         match self {
             Self::Json(value) => RowImageRef::Json(value),
             Self::Typed(value) => RowImageRef::Typed(&value.row),
+            Self::Materialized(value) => RowImageRef::Typed(&value.row),
         }
     }
 }
@@ -6769,6 +6680,7 @@ impl CandidateRowImage<'_> {
         match self {
             Self::Json(value) => OwnedRowImage::Json(value.clone()),
             Self::Typed(value) => OwnedRowImage::Typed((*value).clone()),
+            Self::Materialized(value) => OwnedRowImage::Typed(value.as_ref().clone()),
         }
     }
 }
@@ -6779,6 +6691,11 @@ fn candidate_row_image<'a>(
     let row = row.into();
     if let Some(typed) = row.decoded_snapshot() {
         return Ok(Some(CandidateRowImage::Typed(typed)));
+    }
+    if let RowLiveRowRef::Batch(row) = row
+        && let Some(typed) = row.materialize_decoded_snapshot()?
+    {
+        return Ok(Some(CandidateRowImage::Materialized(typed)));
     }
     row.snapshot_json_value()
         .map(|value| value.map(CandidateRowImage::Json))
@@ -6868,69 +6785,14 @@ fn typed_value_from_eval(
     schema_key: &str,
     column_name: &str,
 ) -> Result<lix_schema::Value, LixError> {
-    use lix_schema::{DataType, Value};
-
-    if matches!(value, RowEvalValue::SqlNull)
-        || (data_type != DataType::Jsonb && matches!(value, RowEvalValue::Json(JsonValue::Null)))
-    {
-        return Ok(Value::Null);
-    }
-    let mismatch = || {
-        LixError::new(
-            LixError::CODE_TYPE_MISMATCH,
-            format!(
-                "schema '{schema_key}' column '{column_name}' expected {}",
-                data_type.postgres_name()
-            ),
-        )
+    let value = if data_type == lix_schema::DataType::Int8 {
+        bigint_number_literal(expr, schema_key, column_name)?
+            .map(RowEvalValue::Integer)
+            .unwrap_or(value)
+    } else {
+        value
     };
-
-    // Keep SQL values native on the typed-row path. The JSON snapshot path
-    // needs `row_json_value` for canonical object construction; turning a
-    // scalar into a JSON DOM node and immediately decoding it back into its
-    // Schema v1 type is pure transport overhead here.
-    match (data_type, value) {
-        (DataType::Text, RowEvalValue::SqlText(value))
-        | (DataType::Text, RowEvalValue::Json(JsonValue::String(value))) => Ok(Value::Text(value)),
-        (DataType::Uuid, RowEvalValue::SqlText(value))
-        | (DataType::Uuid, RowEvalValue::Json(JsonValue::String(value))) => {
-            uuid::Uuid::parse_str(&value)
-                .map(Value::Uuid)
-                .map_err(|_| mismatch())
-        }
-        (DataType::Int8, value) => {
-            if let Some(value) = bigint_number_literal(expr, schema_key, column_name)? {
-                return Ok(Value::Int8(value));
-            }
-            match value {
-                RowEvalValue::Json(JsonValue::Number(value)) => {
-                    value.as_i64().map(Value::Int8).ok_or_else(mismatch)
-                }
-                _ => Err(mismatch()),
-            }
-        }
-        (DataType::Float8, RowEvalValue::Json(JsonValue::Number(value))) => value
-            .as_f64()
-            .filter(|value| value.is_finite())
-            .map(Value::Float8)
-            .ok_or_else(mismatch),
-        (DataType::Boolean, RowEvalValue::Json(JsonValue::Bool(value))) => {
-            Ok(Value::Boolean(value))
-        }
-        (DataType::Jsonb, RowEvalValue::SqlText(value)) => Ok(Value::Jsonb(
-            serde_json::from_str(&value)
-                .unwrap_or(JsonValue::String(value))
-                .into(),
-        )),
-        (DataType::Jsonb, RowEvalValue::Json(value)) => Ok(Value::Jsonb(value.into())),
-        (DataType::Timestamptz, RowEvalValue::SqlText(value))
-        | (DataType::Timestamptz, RowEvalValue::Json(JsonValue::String(value))) => {
-            chrono::DateTime::parse_from_rfc3339(&value)
-                .map(|value| Value::Timestamptz(value.timestamp_micros()))
-                .map_err(|_| mismatch())
-        }
-        _ => Err(mismatch()),
-    }
+    value.assign(data_type)
 }
 
 fn finalize_typed_row(
@@ -7029,56 +6891,16 @@ fn row_json_value(
     schema_key: &str,
     column_name: &str,
 ) -> Result<JsonValue, LixError> {
-    let exact_bigint_literal = if column_type == SchemaColumnType::Integer {
-        bigint_number_literal(expr, schema_key, column_name)?
-    } else {
-        None
+    let target = match column_type {
+        SchemaColumnType::String => lix_schema::DataType::Text,
+        SchemaColumnType::Jsonb => lix_schema::DataType::Jsonb,
+        SchemaColumnType::Integer => lix_schema::DataType::Int8,
+        SchemaColumnType::Number => lix_schema::DataType::Float8,
+        SchemaColumnType::Boolean => lix_schema::DataType::Boolean,
+        SchemaColumnType::Timestamptz => lix_schema::DataType::Timestamptz,
     };
-    let value = exact_bigint_literal.map_or_else(
-        || match (value, column_type) {
-            (RowEvalValue::SqlNull, _) => JsonValue::Null,
-            (RowEvalValue::SqlText(value), SchemaColumnType::Jsonb) => {
-                serde_json::from_str(&value).unwrap_or(JsonValue::String(value))
-            }
-            (RowEvalValue::SqlText(value), _) => JsonValue::String(value),
-            (RowEvalValue::Json(JsonValue::String(value)), SchemaColumnType::String) => {
-                JsonValue::String(value)
-            }
-            (
-                RowEvalValue::Json(JsonValue::Number(value)),
-                SchemaColumnType::Number | SchemaColumnType::Integer,
-            ) => JsonValue::Number(value),
-            (RowEvalValue::Json(JsonValue::Bool(value)), SchemaColumnType::Boolean) => {
-                JsonValue::Bool(value)
-            }
-            (RowEvalValue::Json(value), _) => value,
-        },
-        JsonValue::from,
-    );
-    match column_type {
-        SchemaColumnType::Integer => {
-            json_bigint_value(Some(&value), schema_key, column_name)?;
-        }
-        SchemaColumnType::Number => {
-            json_double_value(Some(&value), schema_key, column_name)?;
-        }
-        SchemaColumnType::Timestamptz => {
-            let timestamp = value.as_str().ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_TYPE_MISMATCH,
-                    format!("{schema_key}.{column_name} expects timestamptz"),
-                )
-            })?;
-            chrono::DateTime::parse_from_rfc3339(timestamp).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_TYPE_MISMATCH,
-                    format!("{schema_key}.{column_name} expects RFC 3339 timestamptz: {error}"),
-                )
-            })?;
-        }
-        SchemaColumnType::String | SchemaColumnType::Jsonb | SchemaColumnType::Boolean => {}
-    }
-    Ok(value)
+    let native = typed_value_from_eval(expr, value, target, true, schema_key, column_name)?;
+    RowEvalValue::from_schema(&native).into_json()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7087,19 +6909,23 @@ enum BigintNumberLiteral {
     NonIntegral,
 }
 
-fn bigint_number_literal(
+pub(super) fn bigint_number_literal(
     expr: &BoundExpr,
     schema_key: &str,
     column_name: &str,
 ) -> Result<Option<i64>, LixError> {
     let raw = match expr {
         BoundExpr::Literal(BoundLiteral::Number { raw, .. }) => raw,
-        BoundExpr::Cast {
-            expr,
-            data_type: BoundCastType::BigInt,
-        } => return bigint_number_literal(expr, schema_key, column_name),
         _ => return Ok(None),
     };
+    exact_bigint_literal(raw, schema_key, column_name).map(Some)
+}
+
+pub(super) fn exact_bigint_literal(
+    raw: &str,
+    schema_key: &str,
+    column_name: &str,
+) -> Result<i64, LixError> {
     let Some(BigintNumberLiteral::Exact(value)) = classify_bigint_literal(raw) else {
         return Err(LixError::new(
             LixError::CODE_TYPE_MISMATCH,
@@ -7111,7 +6937,7 @@ fn bigint_number_literal(
             "Use an exact integer between -9223372036854775808 and 9223372036854775807.",
         ));
     };
-    Ok(Some(value))
+    Ok(value)
 }
 
 fn classify_bigint_literal(raw: &str) -> Option<BigintNumberLiteral> {
@@ -7244,41 +7070,8 @@ fn reject_direct_blob_json_value(
     Ok(())
 }
 
-fn literal_json(literal: &BoundLiteral) -> JsonValue {
-    match literal {
-        BoundLiteral::Null => JsonValue::Null,
-        BoundLiteral::Bool(value) => JsonValue::Bool(*value),
-        BoundLiteral::Integer(value) => JsonValue::from(*value),
-        BoundLiteral::Number { value, .. } => JsonValue::Number(value.clone()),
-        BoundLiteral::Text(value) => JsonValue::String(value.clone()),
-        BoundLiteral::Json(value) => value.clone(),
-    }
-}
-
-fn value_eval(value: &Value) -> RowEvalValue {
-    match value {
-        Value::Null => RowEvalValue::SqlNull,
-        Value::Text(value) => RowEvalValue::SqlText(value.clone()),
-        _ => RowEvalValue::Json(value_json(value)),
-    }
-}
-
-fn value_json(value: &Value) -> JsonValue {
-    match value {
-        Value::Null => JsonValue::Null,
-        Value::Boolean(value) => JsonValue::Bool(*value),
-        Value::Integer(value) => JsonValue::from(*value),
-        Value::Real(value) => serde_json::Number::from_f64(*value)
-            .map(JsonValue::Number)
-            .unwrap_or(JsonValue::Null),
-        Value::Text(value) => JsonValue::String(value.clone()),
-        Value::Jsonb(value) => value.to_value(),
-        Value::RowRef(value) => JsonValue::String(value.as_str().to_owned()),
-        Value::Timestamptz(value) => JsonValue::from(*value),
-        Value::Blob(value) => {
-            JsonValue::Array(value.iter().copied().map(JsonValue::from).collect())
-        }
-    }
+fn value_eval(value: &Value) -> Result<RowEvalValue, LixError> {
+    RowEvalValue::from_public(value)
 }
 
 fn json_path_get(
@@ -7377,7 +7170,7 @@ fn column_eval_value(
     match column_name {
         "lixcol_file_id" => Ok(row
             .file_id()
-            .map(|value| RowEvalValue::Json(JsonValue::String(value.to_string())))
+            .map(|value| RowEvalValue::SqlText(value.to_string()))
             .unwrap_or(RowEvalValue::SqlNull)),
         "lixcol_metadata" => row.metadata().map(|metadata| {
             metadata
@@ -7386,22 +7179,22 @@ fn column_eval_value(
         }),
         "lixcol_change_id" => Ok(row
             .change_id()
-            .map(|value| RowEvalValue::Json(JsonValue::String(value.to_string())))
+            .map(|value| RowEvalValue::SqlText(value.to_string()))
             .unwrap_or(RowEvalValue::SqlNull)),
         "lixcol_created_at" => Ok(row
             .created_at()
-            .map(|value| RowEvalValue::Json(JsonValue::String(value)))
+            .map(RowEvalValue::SqlText)
             .unwrap_or(RowEvalValue::SqlNull)),
         "lixcol_updated_at" => Ok(row
             .updated_at()
-            .map(|value| RowEvalValue::Json(JsonValue::String(value)))
+            .map(RowEvalValue::SqlText)
             .unwrap_or(RowEvalValue::SqlNull)),
         "lixcol_commit_id" => Ok(row
             .commit_id()
-            .map(|value| RowEvalValue::Json(JsonValue::String(value.to_string())))
+            .map(|value| RowEvalValue::SqlText(value.to_string()))
             .unwrap_or(RowEvalValue::SqlNull)),
-        "lixcol_global" => Ok(RowEvalValue::Json(JsonValue::Bool(row.global()))),
-        "lixcol_untracked" => Ok(RowEvalValue::Json(JsonValue::Bool(row.untracked()))),
+        "lixcol_global" => Ok(RowEvalValue::Boolean(row.global())),
+        "lixcol_untracked" => Ok(RowEvalValue::Boolean(row.untracked())),
         _ => Ok(RowEvalValue::SqlNull),
     }
 }
@@ -7448,15 +7241,15 @@ fn excluded_column_eval_value(
     match column_name {
         "lixcol_file_id" => Ok(row
             .file_id
-            .map(|value| RowEvalValue::Json(JsonValue::String(value.to_string())))
+            .map(|value| RowEvalValue::SqlText(value.to_string()))
             .unwrap_or(RowEvalValue::SqlNull)),
         "lixcol_metadata" => row
             .metadata
             .map(|metadata| Ok(RowEvalValue::Json(metadata.value().clone())))
             .transpose()
             .map(|metadata| metadata.unwrap_or(RowEvalValue::SqlNull)),
-        "lixcol_global" => Ok(RowEvalValue::Json(JsonValue::Bool(row.global))),
-        "lixcol_untracked" => Ok(RowEvalValue::Json(JsonValue::Bool(row.untracked))),
+        "lixcol_global" => Ok(RowEvalValue::Boolean(row.global)),
+        "lixcol_untracked" => Ok(RowEvalValue::Boolean(row.untracked)),
         _ => Ok(RowEvalValue::SqlNull),
     }
 }
@@ -7465,12 +7258,32 @@ fn visible_column_eval_value(
     column: Option<&SchemaSurfaceColumn>,
     value: &JsonValue,
 ) -> RowEvalValue {
-    match (column.map(|column| column.column_type), value) {
-        (Some(column_type), JsonValue::Null) if column_type != SchemaColumnType::Jsonb => {
+    if value.is_null() {
+        // Legacy JSON ingress has no null tag. A required JSONB column can
+        // only contain JSON null; nullable legacy columns use SQL NULL.
+        return if column
+            .is_some_and(|c| c.column_type == SchemaColumnType::Jsonb && !c.read_nullable)
+        {
+            RowEvalValue::Json(JsonValue::Null)
+        } else {
             RowEvalValue::SqlNull
-        }
+        };
+    }
+    match (column.map(|column| column.column_type), value) {
         (Some(SchemaColumnType::String), JsonValue::String(value)) => {
             RowEvalValue::SqlText(value.clone())
+        }
+        (Some(SchemaColumnType::Integer), JsonValue::Number(value)) if value.as_i64().is_some() => {
+            RowEvalValue::Integer(value.as_i64().unwrap())
+        }
+        (Some(SchemaColumnType::Number), JsonValue::Number(value)) => {
+            RowEvalValue::Real(value.as_f64().unwrap())
+        }
+        (Some(SchemaColumnType::Boolean), JsonValue::Bool(value)) => RowEvalValue::Boolean(*value),
+        (Some(SchemaColumnType::Timestamptz), JsonValue::String(value)) => {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .map(|v| RowEvalValue::Timestamptz(v.timestamp_micros()))
+                .unwrap_or_else(|_| RowEvalValue::SqlText(value.clone()))
         }
         _ => RowEvalValue::Json(value.clone()),
     }
@@ -7480,31 +7293,7 @@ fn typed_column_eval_value(
     value: &lix_schema::Value,
     _column_type: Option<SchemaColumnType>,
 ) -> Result<RowEvalValue, LixError> {
-    Ok(match value {
-        lix_schema::Value::Null => RowEvalValue::SqlNull,
-        lix_schema::Value::Text(value) => RowEvalValue::SqlText(value.clone()),
-        lix_schema::Value::Uuid(value) => RowEvalValue::SqlText(value.to_string()),
-        lix_schema::Value::Int8(value) => RowEvalValue::Json(JsonValue::Number((*value).into())),
-        lix_schema::Value::Float8(value) => RowEvalValue::Json(JsonValue::Number(
-            serde_json::Number::from_f64(*value).ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_SCHEMA_VALIDATION,
-                    "typed row contains a non-finite float",
-                )
-            })?,
-        )),
-        lix_schema::Value::Boolean(value) => RowEvalValue::Json(JsonValue::Bool(*value)),
-        lix_schema::Value::Jsonb(value) => RowEvalValue::Json(value.as_value().clone()),
-        lix_schema::Value::Timestamptz(value) => {
-            let timestamp = chrono::DateTime::from_timestamp_micros(*value).ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_SCHEMA_VALIDATION,
-                    "typed row contains an invalid timestamptz",
-                )
-            })?;
-            RowEvalValue::SqlText(timestamp.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
-        }
-    })
+    Ok(RowEvalValue::from_schema(value))
 }
 
 fn scan_branch_ids(scope: &BranchScope) -> Result<Vec<String>, LixError> {
@@ -7546,6 +7335,12 @@ fn optional_metadata_from_eval_value(
         RowEvalValue::Json(value) => {
             validate_row_metadata(&value, context)?;
             value
+        }
+        _ => {
+            return Err(LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                "metadata requires JSONB",
+            ));
         }
     };
     TransactionJson::from_value(metadata, &format!("{context} {column_name}")).map(Some)

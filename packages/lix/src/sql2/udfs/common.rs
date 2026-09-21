@@ -21,7 +21,7 @@ pub(crate) fn canonical_jsonb_text(raw: &str) -> std::result::Result<String, Str
     serde_json::to_string(&parse_jsonb(raw)?).map_err(|error| error.to_string())
 }
 
-fn normalize_jsonb(value: &mut JsonValue) -> std::result::Result<(), String> {
+pub(crate) fn normalize_jsonb(value: &mut JsonValue) -> std::result::Result<(), String> {
     match value {
         JsonValue::String(value) => reject_jsonb_nul(value)?,
         JsonValue::Array(values) => {

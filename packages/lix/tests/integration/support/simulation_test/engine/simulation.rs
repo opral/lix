@@ -165,6 +165,27 @@ impl SimSession {
         result
     }
 
+    pub async fn execute_batch(
+        &self,
+        statements: &[lix::ExecuteBatchStatement],
+    ) -> Result<lix::ExecuteBatchResult, LixError> {
+        let active_branch_id = self.session.active_branch_id().await?;
+        self.sim
+            .rebuild_tracked_state
+            .before_read(&self.engine, &active_branch_id)
+            .await?;
+        let result = self.session.execute_batch(statements).await;
+        if let Ok(result) = &result
+            && (result.commit.is_some()
+                || statements
+                    .iter()
+                    .any(|statement| classify_statement(&statement.sql) == StatementKind::Write))
+        {
+            self.sim.rebuild_tracked_state.after_successful_write();
+        }
+        result
+    }
+
     pub async fn begin_transaction(&self) -> Result<SimTransaction, LixError> {
         let active_branch_id = self.session.active_branch_id().await?;
         self.sim

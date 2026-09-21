@@ -543,8 +543,7 @@ impl TypedMutationJournalBatch {
 /// change invalidates the certificate.
 pub(crate) struct CertifiedParameterBatch {
     row_pks: Vec<RowPk>,
-    snapshots: Vec<TransactionJson>,
-    certified_snapshots: Option<CertifiedSnapshots>,
+    certified_snapshots: CertifiedSnapshots,
     durable_predecessors: Vec<Option<CertifiedCurrentStatePredecessor>>,
     schema_key: SharedStr,
     branch_id: SharedStr,
@@ -559,58 +558,6 @@ struct CertifiedSnapshots {
 }
 
 impl CertifiedParameterBatch {
-    pub(crate) fn new(
-        row_pks: Vec<RowPk>,
-        snapshots: Vec<TransactionJson>,
-        schema_key: SharedStr,
-        branch_id: SharedStr,
-        certificate: CertifiedRawWriteBatchPreparation,
-    ) -> Result<Self, LixError> {
-        Self::new_with_lane(
-            row_pks,
-            snapshots,
-            schema_key,
-            branch_id,
-            false,
-            certificate,
-        )
-    }
-
-    pub(crate) fn new_with_lane(
-        row_pks: Vec<RowPk>,
-        snapshots: Vec<TransactionJson>,
-        schema_key: SharedStr,
-        branch_id: SharedStr,
-        untracked: bool,
-        certificate: CertifiedRawWriteBatchPreparation,
-    ) -> Result<Self, LixError> {
-        if row_pks.len() != snapshots.len() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "certified replacement columns are not aligned",
-            ));
-        }
-        if row_pks.len() >= RAW_WRITE_NONE as usize {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "certified replacement row count exceeds u32",
-            ));
-        }
-        Ok(Self {
-            durable_predecessors: std::iter::repeat_with(|| None)
-                .take(row_pks.len())
-                .collect(),
-            row_pks,
-            snapshots,
-            certified_snapshots: None,
-            schema_key,
-            branch_id,
-            untracked,
-            certificate,
-            row_columnar: None,
-        })
-    }
-
     pub(crate) fn new_typed(
         row_pks: Vec<RowPk>,
         snapshot_arena: Vec<u8>,
@@ -689,11 +636,10 @@ impl CertifiedParameterBatch {
                 .take(row_pks.len())
                 .collect(),
             row_pks,
-            snapshots: Vec::new(),
-            certified_snapshots: Some(CertifiedSnapshots {
+            certified_snapshots: CertifiedSnapshots {
                 arena: Bytes::from(snapshot_arena),
                 offsets,
-            }),
+            },
             schema_key,
             branch_id,
             untracked,
@@ -738,94 +684,33 @@ impl CertifiedParameterBatch {
         self.durable_predecessors[index] = value;
     }
 
-    pub(crate) fn convert_to_typed(
-        &mut self,
-        schema_plan: &crate::catalog::SchemaPlan,
-    ) -> Result<(), LixError> {
-        if self.certified_snapshots.is_some() {
-            return Ok(());
-        }
-        let snapshots = std::mem::take(&mut self.snapshots);
-        let mut arena = Vec::new();
-        let mut offsets = Vec::with_capacity(self.row_pks.len());
-        for (row_pk, snapshot) in self.row_pks.iter().zip(snapshots) {
-            let value = serde_json::from_str(snapshot.normalized()).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("certified typed row is not canonical JSON: {error}"),
-                )
-            })?;
-            let typed = WasmTypedRow::from_normalized_json(schema_plan, row_pk, &value)?;
-            let payload = typed.durable_payload().map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("cannot encode certified parameter typed payload: {error:?}"),
-                )
-            })?;
-            let start = u32::try_from(arena.len()).map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "certified typed payload arena exceeds u32",
-                )
-            })?;
-            arena.extend_from_slice(payload.as_ref());
-            let end = u32::try_from(arena.len()).map_err(|_| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "certified typed payload arena exceeds u32",
-                )
-            })?;
-            offsets.push((start, end));
-        }
-        self.certified_snapshots = Some(CertifiedSnapshots {
-            arena: Bytes::from(arena),
-            offsets,
-        });
-        self.certificate.fileless_typed_sql_rows = true;
-        Ok(())
-    }
-
     pub(crate) fn into_raw(self) -> Result<RawWriteBatch, LixError> {
-        if let Some(certified_snapshots) = self.certified_snapshots {
-            let mut rows = RawWriteBatch::with_capacity(self.row_pks.len());
-            for (row_pk, (start, end)) in self.row_pks.into_iter().zip(certified_snapshots.offsets)
-            {
-                let decoded_snapshot = WasmTypedRow::decode_durable_payload(
-                    Arc::from(&certified_snapshots.arena[start as usize..end as usize]),
-                    self.schema_key.as_str(),
-                    &row_pk,
-                )
-                .map(Arc::new)?;
-                rows.push_typed_parts(
-                    Some(row_pk),
-                    self.schema_key.clone(),
-                    None,
-                    Some(decoded_snapshot),
-                    None,
-                    None,
-                    None,
-                    None,
-                    false,
-                    None,
-                    None,
-                    self.untracked,
-                    self.branch_id.clone(),
-                );
-            }
-            rows.certified_preparation = Some(self.certificate);
-            for (index, predecessor) in self.durable_predecessors.into_iter().enumerate() {
-                rows.set_durable_predecessor(index, predecessor);
-            }
-            return Ok(rows);
+        let certified_snapshots = self.certified_snapshots;
+        let mut rows = RawWriteBatch::with_capacity(self.row_pks.len());
+        for (row_pk, (start, end)) in self.row_pks.into_iter().zip(certified_snapshots.offsets) {
+            let decoded_snapshot = WasmTypedRow::decode_durable_payload(
+                Arc::from(&certified_snapshots.arena[start as usize..end as usize]),
+                self.schema_key.as_str(),
+                &row_pk,
+            )
+            .map(Arc::new)?;
+            rows.push_typed_parts(
+                Some(row_pk),
+                self.schema_key.clone(),
+                None,
+                Some(decoded_snapshot),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                self.untracked,
+                self.branch_id.clone(),
+            );
         }
-        let mut rows = RawWriteBatch::from_certified_parameter_rows(
-            self.row_pks,
-            self.snapshots,
-            self.schema_key,
-            self.branch_id,
-            self.untracked,
-            self.certificate,
-        )?;
+        rows.certified_preparation = Some(self.certificate);
         for (index, predecessor) in self.durable_predecessors.into_iter().enumerate() {
             rows.set_durable_predecessor(index, predecessor);
         }
@@ -879,7 +764,6 @@ impl CertifiedParameterBatch {
     ) -> Result<PreparedStateBatch, LixError> {
         let Self {
             row_pks,
-            snapshots,
             certified_snapshots,
             durable_predecessors,
             schema_key,
@@ -888,13 +772,6 @@ impl CertifiedParameterBatch {
             certificate,
             row_columnar,
         } = self;
-        debug_assert!(snapshots.is_empty());
-        let certified_snapshots = certified_snapshots.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "certified parameter rows are missing typed snapshots",
-            )
-        })?;
         let row_count = row_pks.len();
         let predecessor_count = durable_predecessors
             .iter()
@@ -988,7 +865,6 @@ impl CertifiedParameterBatch {
     ) -> Result<PreparedStateBatch, LixError> {
         let Self {
             row_pks,
-            snapshots,
             certified_snapshots,
             durable_predecessors,
             schema_key,
@@ -997,8 +873,6 @@ impl CertifiedParameterBatch {
             certificate,
             row_columnar: _,
         } = self;
-        debug_assert!(snapshots.is_empty());
-        let certified_snapshots = certified_snapshots.expect("snapshot conversion was checked");
         let mut prepared = PreparedStateBatch::with_capacity(row_pks.len());
         for row_pk in row_pks {
             let change_id = if untracked {
@@ -1195,84 +1069,6 @@ impl RawWriteBatch {
             #[cfg(test)]
             origin_promotions: 0,
         }
-    }
-
-    fn from_certified_parameter_rows(
-        row_pks: Vec<RowPk>,
-        snapshots: Vec<TransactionJson>,
-        schema_key: SharedStr,
-        branch_id: SharedStr,
-        untracked: bool,
-        certificate: CertifiedRawWriteBatchPreparation,
-    ) -> Result<Self, LixError> {
-        if row_pks.len() != snapshots.len() {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "certified parameter row columns are not aligned",
-            ));
-        }
-        let row_count = row_pks.len();
-        if row_count >= RAW_WRITE_NONE as usize {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PARAM,
-                "certified parameter row count exceeds u32",
-            ));
-        }
-        #[cfg(feature = "storage-benches")]
-        crate::storage_bench::record_crud_ownership(
-            crate::storage_bench::CRUD_OWNERSHIP_RAW_BATCH,
-            row_count,
-            row_pks
-                .iter()
-                .map(RowPk::estimated_heap_bytes)
-                .sum::<usize>()
-                + schema_key.len()
-                + branch_id.len(),
-            snapshots
-                .iter()
-                .map(|value| value.normalized().len())
-                .sum::<usize>(),
-            row_count.saturating_mul(5),
-            2,
-            2,
-        );
-        let (strings, schema_key_ordinal, branch_id_ordinal) = if schema_key == branch_id {
-            (vec![schema_key], 0, 0)
-        } else {
-            (vec![schema_key, branch_id], 0, 1)
-        };
-        let slot = RawWriteSlot {
-            schema_key: schema_key_ordinal,
-            file_id: RAW_WRITE_NONE,
-            origin: RAW_WRITE_NONE,
-            created_at: RAW_WRITE_NONE,
-            updated_at: RAW_WRITE_NONE,
-            change_id: RAW_WRITE_NONE,
-            commit_id: RAW_WRITE_NONE,
-            branch_id: branch_id_ordinal,
-            flags: if untracked { RAW_WRITE_UNTRACKED } else { 0 },
-        };
-        Ok(Self {
-            branch_heads: Vec::new(),
-            slots: vec![slot; row_count],
-            row_pks: row_pks.into_iter().map(Some).collect(),
-            snapshots: snapshots
-                .into_iter()
-                .map(|snapshot| Some(RawSnapshot::Json(snapshot)))
-                .collect(),
-            metadata: std::iter::repeat_with(|| None).take(row_count).collect(),
-            durable_predecessors: std::iter::repeat_with(|| None).take(row_count).collect(),
-            strings,
-            string_index: None,
-            expected_rows: row_count,
-            origins: Vec::new(),
-            origin_index: None,
-            certified_preparation: Some(certificate),
-            #[cfg(test)]
-            string_promotions: 0,
-            #[cfg(test)]
-            origin_promotions: 0,
-        })
     }
 
     #[cfg(test)]

@@ -8581,6 +8581,13 @@ where
         }
         let program = Arc::clone(program);
         let primary_key = program.primary_key(params)?;
+        let schema_catalog = Arc::clone(&self.sql_schema_snapshot);
+        let schema_plan = schema_catalog.plan(program.schema_plan_id).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "prepared mutation lost its schema plan",
+            )
+        })?;
         if self
             .mutation_journal
             .as_ref()
@@ -8639,8 +8646,13 @@ where
             Some(false) => return Ok(Some(crate::sql2::SqlWriteResult::affected(0))),
             Some(true) => None,
             None => {
-                let Some(row) =
-                    crate::sql2::prepare_path_value_replacement_row(self, &program, params).await?
+                let Some(row) = crate::sql2::prepare_path_value_replacement_row(
+                    self,
+                    &program,
+                    params,
+                    schema_plan,
+                )
+                .await?
                 else {
                     return Ok(Some(crate::sql2::SqlWriteResult::affected(0)));
                 };
@@ -8672,17 +8684,20 @@ where
         let snapshot_offset = match fallback_row {
             Some(row) => {
                 let start = journal.snapshot_arena.len();
-                journal
-                    .snapshot_arena
-                    .extend_from_slice(row.snapshot.normalized().as_bytes());
+                journal.snapshot_arena.extend_from_slice(&row.snapshot);
                 (start, journal.snapshot_arena.len())
             }
-            None => crate::sql2::append_path_value_replacement_snapshot(
-                &program,
-                primary_key,
-                params,
-                &mut journal.snapshot_arena,
-            )?,
+            None => {
+                let start = journal.snapshot_arena.len();
+                crate::sql2::append_path_value_replacement_payload(
+                    &program,
+                    primary_key,
+                    params,
+                    schema_plan,
+                    &mut journal.snapshot_arena,
+                )?;
+                (start, journal.snapshot_arena.len())
+            }
         };
         let timestamp = *timestamp_slot.get_or_insert_with(|| functions.call_timestamp());
         journal.append_identity(primary_key);
@@ -8730,6 +8745,19 @@ where
                 program.replacement_value_text(params)?,
             )
         };
+        let schema_plan_id = self
+            .prepared_mutation_program
+            .as_ref()
+            .expect("prepared literal mutation retains its prepared program")
+            .1
+            .schema_plan_id;
+        let schema_catalog = Arc::clone(&self.sql_schema_snapshot);
+        let schema_plan = schema_catalog.plan(schema_plan_id).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "prepared literal mutation lost its schema plan",
+            )
+        })?;
 
         let same_origin = self
             .mutation_journal
@@ -8823,11 +8851,14 @@ where
                 timestamp: None,
             });
         debug_assert_eq!(journal.origin_key, origin_key);
-        let snapshot_offset = crate::sql2::append_path_value_replacement_snapshot_text(
+        let snapshot_start = journal.snapshot_arena.len();
+        crate::sql2::append_path_value_replacement_payload_text(
+            schema_plan,
             primary_key,
             Some(replacement_value),
             &mut journal.snapshot_arena,
         )?;
+        let snapshot_offset = (snapshot_start, journal.snapshot_arena.len());
         journal.append_identity(primary_key);
         journal.snapshot_offsets.push(snapshot_offset);
         #[cfg(feature = "storage-benches")]
@@ -9103,16 +9134,7 @@ where
                 "non-empty transaction mutation journal has no lifecycle timestamp",
             )
         })?;
-        let schema_plan = self
-            .sql_schema_snapshot
-            .plan(journal.program.schema_plan_id)
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "immutable mutation journal lost its schema plan",
-                )
-            })?;
-        let mut chunk = ImmutableMutationJournalChunk::try_new_single_string_identities(
+        let mut chunk = ImmutableMutationJournalChunk::try_new_typed_single_string_identities(
             journal.program.schema_plan_id,
             journal.program.schema_key.as_str().into(),
             self.active_branch_id.clone().into(),
@@ -9121,7 +9143,6 @@ where
             journal.identity_offsets,
             journal.snapshot_arena,
             journal.snapshot_offsets,
-            schema_plan,
             None,
             timestamp,
         )?;

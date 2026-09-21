@@ -2022,61 +2022,10 @@ fn row_update_typed_value(
     let SqlCell::Value(value) = cell else {
         return Ok(lix_schema::Value::Null);
     };
-    match column.column_type {
-        SchemaColumnType::String => {
-            let raw = scalar_utf8(value, &column.name, spec)?;
-            if column.native_type == lix_schema::DataType::Uuid {
-                uuid::Uuid::parse_str(&raw)
-                    .map(lix_schema::Value::Uuid)
-                    .map_err(|error| {
-                        DataFusionError::Execution(format!(
-                            "UPDATE {} column '{}' produced invalid UUID '{raw}': {error}",
-                            spec.schema_key, column.name
-                        ))
-                    })
-            } else {
-                Ok(lix_schema::Value::Text(raw))
-            }
-        }
-        SchemaColumnType::Jsonb => {
-            let raw = scalar_utf8(value, &column.name, spec)?;
-            let value: JsonValue = serde_json::from_str(&raw).map_err(|error| {
-                DataFusionError::Execution(format!(
-                    "UPDATE {} column '{}' produced invalid JSON: {error}",
-                    spec.schema_key, column.name
-                ))
-            })?;
-            Ok(lix_schema::Value::Jsonb(value.into()))
-        }
-        SchemaColumnType::Integer => match value {
-            ScalarValue::Int64(Some(value)) => Ok(lix_schema::Value::Int8(value)),
-            other => Err(row_update_type_error(spec, &column.name, "BIGINT", &other)),
-        },
-        SchemaColumnType::Number => match value {
-            ScalarValue::Float64(Some(value)) => Ok(lix_schema::Value::Float8(value)),
-            other => Err(row_update_type_error(
-                spec,
-                &column.name,
-                "DOUBLE PRECISION",
-                &other,
-            )),
-        },
-        SchemaColumnType::Boolean => match value {
-            ScalarValue::Boolean(Some(value)) => Ok(lix_schema::Value::Boolean(value)),
-            other => Err(row_update_type_error(spec, &column.name, "BOOLEAN", &other)),
-        },
-        SchemaColumnType::Timestamptz => match value {
-            ScalarValue::TimestampMicrosecond(Some(value), _) => {
-                Ok(lix_schema::Value::Timestamptz(value))
-            }
-            other => Err(row_update_type_error(
-                spec,
-                &column.name,
-                "TIMESTAMPTZ",
-                &other,
-            )),
-        },
-    }
+    let _ = spec;
+    crate::sql2::value_contract::SqlValue::from_scalar(value)
+        .and_then(|value| value.assign(column.native_type))
+        .map_err(lix_error_to_datafusion_error)
 }
 
 fn scalar_utf8(value: ScalarValue, column_name: &str, spec: &SchemaSurfaceSpec) -> Result<String> {

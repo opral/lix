@@ -146,6 +146,31 @@ impl TypedRow {
         Ok(())
     }
 
+    /// Encodes the certified `path`/`value` row with an SQL NULL value.
+    ///
+    /// This must remain separate from [`Self::append_certified_path_value_payload`]:
+    /// JSONB `null` is a present JSON document, while SQL NULL is the absence
+    /// of a value in the nullable column.
+    pub(crate) fn append_certified_path_value_null_payload(
+        output: &mut Vec<u8>,
+        plan: &crate::catalog::SchemaPlan,
+        path: &str,
+    ) -> Result<(), LixError> {
+        let row = lix_schema::Row::from([
+            ("path", lix_schema::Value::Text(path.to_owned())),
+            ("value", lix_schema::Value::Null),
+        ]);
+        let typed = Self::from_row(plan, row)?;
+        let payload = typed.durable_payload().map_err(|error| {
+            LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!("cannot encode typed SQL NULL row: {error:?}"),
+            )
+        })?;
+        output.extend_from_slice(&payload);
+        Ok(())
+    }
+
     /// Canonical-text counterpart used by bound SQL batches. Plugin-owned
     /// rows can retain the validated parameter bytes directly; built-in
     /// compact rows keep the general schema-validation fallback.
