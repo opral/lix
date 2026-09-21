@@ -2584,6 +2584,7 @@ fn bound_expr_requires_datafusion(expr: &BoundExpr) -> bool {
                 "uuidv7"
                     | "__lix_uuid_cast"
                     | "__lix_text_cast"
+                    | "__lix_timestamptz_cast"
                     | "__lix_current_timestamp"
                     | "lix_active_branch_id"
                     | "lix_active_branch_commit_id"

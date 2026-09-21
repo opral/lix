@@ -279,3 +279,68 @@ simulation_test!(
         }
     }
 );
+
+simulation_test!(
+    timestamptz_casts_keep_microsecond_contract,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('timestamp-cast-contract', NULL)",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let micros = 1_735_787_045_123_456;
+        let stamp = Value::Timestamptz(micros);
+        let text_stamp = Value::Text("2025-01-02T03:04:05.123456Z".into());
+        let expected_text_stamp = Value::Timestamptz(1_735_787_045_123_456);
+
+        for (sql, params, expected) in [
+            ("SELECT CAST(NULL AS TIMESTAMPTZ)", Vec::new(), Value::Null),
+            (
+                "SELECT CAST('2025-01-02T03:04:05.123456Z' AS TIMESTAMPTZ)",
+                Vec::new(),
+                expected_text_stamp.clone(),
+            ),
+            (
+                "SELECT CAST($1 AS TIMESTAMPTZ)",
+                vec![stamp.clone()],
+                stamp.clone(),
+            ),
+            (
+                "SELECT CAST($1 AS TIMESTAMPTZ)",
+                vec![text_stamp],
+                expected_text_stamp.clone(),
+            ),
+        ] {
+            let result = session.execute(sql, &params).await.unwrap();
+            assert_eq!(result.rows()[0].values(), &[expected], "{sql}");
+        }
+
+        // An exact-key UPDATE uses the direct row evaluator; LIKE selects the
+        // generic DataFusion reference writer. Both RETURNING routes must expose
+        // the same microsecond/UTC public value type.
+        for predicate in [
+            "key = 'timestamp-cast-contract'",
+            "key LIKE 'timestamp-cast-contract'",
+        ] {
+            let result = session
+            .execute(
+                &format!(
+                    "UPDATE lix_key_value SET value=value WHERE {predicate} RETURNING CAST(NULL AS TIMESTAMPTZ), CAST('2025-01-02T03:04:05.123456Z' AS TIMESTAMPTZ), CAST($1 AS TIMESTAMPTZ)"
+                ),
+                &[stamp.clone()],
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                result.rows()[0].values(),
+                &[Value::Null, expected_text_stamp.clone(), stamp.clone()],
+                "{predicate}"
+            );
+        }
+    }
+);

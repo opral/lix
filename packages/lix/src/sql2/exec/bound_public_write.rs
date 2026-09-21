@@ -3617,12 +3617,16 @@ fn returning_expr_column_type(
                     | "lix_active_branch_id"
                     | "lix_active_branch_commit_id"
                     | "__lix_text_cast"
+                | "__lix_timestamptz_cast"
                     | "__lix_json_get_text"
                     | "__lix_json_path_get_text"
                     | "lix_order_between"
             ) =>
         {
             Some(crate::ResultColumnType::Text)
+        }
+        BoundExpr::Function { name, .. } if name == "__lix_timestamptz_cast" => {
+            Some(crate::ResultColumnType::Timestamptz)
         }
         BoundExpr::Function { name, .. } if name == "__lix_current_timestamp" => {
             Some(crate::ResultColumnType::Timestamptz)
@@ -5926,6 +5930,17 @@ fn cast_row_eval_value(
     row_eval_value_from_cast_scalar(casted, cast_type)
 }
 
+fn cast_timestamptz_row_eval_value(value: RowEvalValue) -> Result<RowEvalValue, LixError> {
+    let target = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+    let casted = value.scalar().cast_to(&target).map_err(|error| {
+        LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            format!("CAST AS TIMESTAMPTZ failed: {error}"),
+        )
+    })?;
+    RowEvalValue::from_scalar(casted)
+}
+
 fn scalar_from_row_eval_value(value: RowEvalValue) -> ScalarValue {
     value.scalar()
 }
@@ -6047,6 +6062,12 @@ fn eval_expr_value(
         BoundExpr::Function { name, args } if name == "__lix_text_cast" && args.len() == 1 => {
             let value = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
             cast_row_eval_value(value, BoundCastType::Text)
+        }
+        BoundExpr::Function { name, args }
+            if name == "__lix_timestamptz_cast" && args.len() == 1 =>
+        {
+            let value = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
+            cast_timestamptz_row_eval_value(value)
         }
         BoundExpr::Function { name, args } if name == "__lix_uuid_cast" && args.len() == 1 => {
             let value = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
@@ -6633,6 +6654,7 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
                 "__lix_jsonb"
                 | "__lix_uuid_cast"
                 | "__lix_text_cast"
+                | "__lix_timestamptz_cast"
                     if args.len() == 1 => {}
                 _ => {
                     return Err(LixError::new(

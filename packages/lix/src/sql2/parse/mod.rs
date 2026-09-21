@@ -1,7 +1,7 @@
 use datafusion::sql::parser::{DFParserBuilder, Statement as DataFusionStatement};
 use datafusion::sql::sqlparser::ast::{
     BinaryOperator, DataType as SqlDataType, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart, Value, VisitMut,
+    FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart, TimezoneInfo, Value, VisitMut,
     VisitorMut,
 };
 use datafusion::sql::sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
@@ -219,6 +219,26 @@ fn rewrite_postgresql_expressions(statement: &mut DataFusionStatement) {
                 let placeholder = Box::new(Expr::Value(Value::Boolean(false).into()));
                 let inner = std::mem::replace(inner, placeholder);
                 *expr = private_function("__lix_uuid_cast", vec![*inner]);
+                return ControlFlow::Continue(());
+            }
+            if let Expr::Cast {
+                kind,
+                expr: inner,
+                data_type: SqlDataType::Timestamp(_, timezone),
+                array: false,
+                format: None,
+                ..
+            } = expr
+                && matches!(
+                    kind,
+                    datafusion::sql::sqlparser::ast::CastKind::Cast
+                        | datafusion::sql::sqlparser::ast::CastKind::DoubleColon
+                )
+                && matches!(timezone, TimezoneInfo::Tz | TimezoneInfo::WithTimeZone)
+            {
+                let placeholder = Box::new(Expr::Value(Value::Boolean(false).into()));
+                let inner = std::mem::replace(inner, placeholder);
+                *expr = private_function("__lix_timestamptz_cast", vec![*inner]);
                 return ControlFlow::Continue(());
             }
             let Expr::BinaryOp { left, op, right } = expr else {
