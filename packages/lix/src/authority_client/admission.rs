@@ -1,6 +1,10 @@
 //! Read-only hosted admission uses the same Rust migration wait policy as open.
 use super::*;
-use futures_util::StreamExt;
+use futures_util::{
+    StreamExt,
+    future::{Either, select},
+};
+use std::time::Duration;
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -12,7 +16,9 @@ pub struct ProtocolAdmissionIdentity {
 }
 
 /// Authenticate repository identity without creating a remote SQL session.
-/// Bodies are limited to 16 KiB and only typed migration responses are retried.
+/// Bodies are limited to 16 KiB. Transient admission failures get at most five
+/// attempts, each bounded to five seconds, with 500ms–4s exponential backoff.
+/// Typed migration waits retain their existing caller-cancellable policy.
 pub async fn admit_protocol_client<H: ProtocolHttp + Clone + 'static>(
     http: H,
     base_url: impl Into<String>,
@@ -56,43 +62,42 @@ pub async fn admit_protocol_client<H: ProtocolHttp + Clone + 'static>(
         total: None,
     };
     crate::open_types::emit_open_progress(Some(&observer), snapshot(crate::OpenPhase::Inspecting));
+    let mut retries = 0_u32;
     let identity = loop {
-        let mut response = http
-            .request_stream(ProtocolHttpRequest {
-                method: "GET".into(),
-                url: format!("{normalized}admission"),
-                headers: vec![(
-                    "lix-sync-protocol-version".into(),
-                    crate::SYNC_PROTOCOL_VERSION.to_string(),
-                )],
-                body: None,
-            })
-            .await?;
-        let mut body = Vec::new();
-        while let Some(chunk) = response.body.next().await {
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    (response.cancel)();
-                    return Err(error);
-                }
-            };
-            if body.len().saturating_add(chunk.len()) > 16 * 1024 {
-                (response.cancel)();
-                return Err(admission_protocol_error());
+        let response = {
+            let request = admission_response(&http, &normalized);
+            let timeout = http.sleep(Duration::from_secs(5));
+            futures_util::pin_mut!(request, timeout);
+            match select(request, timeout).await {
+                Either::Left((result, _)) => result,
+                Either::Right(_) => Err(LixError::new(
+                    "LIX_ADMISSION_TIMEOUT",
+                    "Repository admission timed out",
+                )),
             }
-            body.extend_from_slice(&chunk);
-        }
-        let response = ProtocolHttpResponse {
-            status: response.status,
-            headers: response.headers,
-            body: Bytes::from(body),
+        };
+        let response = match response {
+            Ok(response) => response,
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    "LIX_TRANSPORT_NETWORK" | "LIX_REMOTE_UNAVAILABLE" | "LIX_ADMISSION_TIMEOUT"
+                ) =>
+            {
+                admission_backoff(&http, &mut retries, Some(error)).await?;
+                continue;
+            }
+            Err(error) => return Err(error),
         };
         if !is_success_status(response.status) {
             let error = error_from_http_response(&response);
             if let Some(delay) = opening_migration_retry_delay(&error) {
                 report_authority_migration(&error, Some(&observer));
                 http.sleep(delay).await;
+                continue;
+            }
+            if matches!(response.status, 502 | 503 | 504) {
+                admission_backoff(&http, &mut retries, None).await?;
                 continue;
             }
             return Err(match response.status {
@@ -150,4 +155,67 @@ fn admission_protocol_error() -> LixError {
         "LIX_ADMISSION_PROTOCOL",
         "Authority returned invalid or mismatched admission metadata",
     )
+}
+
+/// Keep network errors recognizable for verified offline admission, but mark
+/// the exhausted budget so callers do not automatically restart it.
+async fn admission_backoff<H: ProtocolHttp>(
+    http: &H,
+    retries: &mut u32,
+    error: Option<LixError>,
+) -> Result<(), LixError> {
+    if *retries == 4 {
+        return Err(error
+            .unwrap_or_else(|| {
+                LixError::new(
+                    "LIX_ADMISSION_UNAVAILABLE",
+                    "Repository service is temporarily unavailable. Please retry.",
+                )
+            })
+            .with_details(serde_json::json!({"admissionRetryExhausted": true})));
+    }
+    http.sleep(Duration::from_millis(500 << *retries)).await;
+    *retries += 1;
+    Ok(())
+}
+
+struct AdmissionCancel(Option<http::StreamCancel>);
+impl Drop for AdmissionCancel {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.0.take() {
+            cancel();
+        }
+    }
+}
+
+async fn admission_response<H: ProtocolHttp>(
+    http: &H,
+    normalized: &str,
+) -> Result<ProtocolHttpResponse, LixError> {
+    let mut response = http
+        .request_stream(ProtocolHttpRequest {
+            method: "GET".into(),
+            url: format!("{normalized}admission"),
+            headers: vec![(
+                "lix-sync-protocol-version".into(),
+                crate::SYNC_PROTOCOL_VERSION.to_string(),
+            )],
+            body: None,
+        })
+        .await?;
+    let mut cancel = AdmissionCancel(Some(response.cancel));
+    let mut body = Vec::new();
+    while let Some(chunk) = response.body.next().await {
+        let chunk = chunk?;
+        if body.len().saturating_add(chunk.len()) > 16 * 1024 {
+            return Err(admission_protocol_error());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    cancel.0 = None;
+    Ok(ProtocolHttpResponse {
+        status: response.status,
+        headers: response.headers,
+        body: Bytes::from(body),
+    })
 }
