@@ -6,6 +6,7 @@ old identity on the authority before publishing the new local storage pointer.
 Local storage names alone do not revoke a worker's ability to upload.
 
 Clients using replacement send a stable `lix-replica-id` header on every request.
+Identities contain 1–512 visible ASCII bytes, without spaces or control characters.
 The identity is scoped by the authority's authenticated account and repository;
 it is not an authentication credential. Reconnecting must reuse the identity of
 the local replica rather than minting a new identity for existing pending work.

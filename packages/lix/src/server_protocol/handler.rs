@@ -1364,7 +1364,7 @@ where
                 return Err(ApiError::bad_request("lix-replica-id must be sent once"));
             }
             let replica = match value.to_str() {
-                Ok(value) if !value.is_empty() && value.len() <= 512 => value.to_owned(),
+                Ok(value) if valid_replica_identity(value) => value.to_owned(),
                 _ => return Err(ApiError::bad_request("invalid lix-replica-id")),
             };
             if identity.as_ref().is_some_and(|current| current != &replica) {
@@ -2211,14 +2211,12 @@ where
                     replacement_id: String,
                 }
                 let Json(request) = json_request!(Replacement);
-                if request.replica_id.is_empty()
-                    || request.replica_id.len() > 512
-                    || request.replacement_id.is_empty()
-                    || request.replacement_id.len() > 512
+                if !valid_replica_identity(&request.replica_id)
+                    || !valid_replica_identity(&request.replacement_id)
                     || request.replica_id == request.replacement_id
                 {
                     return ApiError::bad_request(
-                        "replacement requires two distinct replica identities of 1 to 512 bytes",
+                        "replacement requires two distinct visible-ASCII replica identities of 1 to 512 bytes",
                     )
                     .into_response();
                 }
@@ -5769,6 +5767,10 @@ struct MultiplexObserveEventResponse<'a> {
     subscription_id: &'a str,
     #[serde(flatten)]
     payload: &'a MultiplexObservePayload,
+}
+
+fn valid_replica_identity(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 512 && value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
 }
 
 const MIN_BLOB_DELTA_BYTES: usize = 32 * 1024;
@@ -9399,6 +9401,24 @@ mod tests {
         );
         release.notify_one();
         assert_eq!(replacement.await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn replica_replacement_rejects_unusable_header_identities() {
+        let app = app().await;
+        let (session, _) = new_session(&app.router).await;
+        for invalid in ["", "line\nbreak", "non-ascii-é", "tab\tvalue", " padded "] {
+            for body in [
+                json!({"replicaId":"old", "replacementId":invalid}),
+                json!({"replicaId":invalid, "replacementId":"new"}),
+            ] {
+                let response = request(&app.router, "POST", "/lix/v1/sync/replica/replace", Some(&session), Some(body)).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            }
+        }
+        let response = request(&app.router, "POST", "/lix/v1/sync/replica/replace", Some(&session), Some(json!({"replicaId":"old", "replacementId":"usable"}))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["replicaId"], "usable");
     }
 
     #[tokio::test]

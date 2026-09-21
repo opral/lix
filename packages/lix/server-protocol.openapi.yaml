@@ -145,8 +145,8 @@ paths:
               additionalProperties: false
               required: [replicaId, replacementId]
               properties:
-                replicaId: { type: string, minLength: 1, maxLength: 512 }
-                replacementId: { type: string, minLength: 1, maxLength: 512 }
+                replicaId: { type: string, minLength: 1, maxLength: 512, pattern: '^[!-~]+$' }
+                replacementId: { type: string, minLength: 1, maxLength: 512, pattern: '^[!-~]+$' }
       responses:
         "200":
           description: The old identity is permanently retired.
@@ -951,7 +951,7 @@ components:
       in: header
       required: false
       description: Stable identity of the local replica. Durable operations carrying a retired identity fail with LIX_REPLICA_RETIRED. Must remain unchanged across reconnects of the same local storage.
-      schema: { type: string, minLength: 1, maxLength: 512 }
+      schema: { type: string, minLength: 1, maxLength: 512, pattern: '^[!-~]+$' }
     ServerProtocolVersion:
       name: lix-server-protocol-version
       in: header

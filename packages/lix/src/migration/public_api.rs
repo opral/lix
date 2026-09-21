@@ -201,7 +201,16 @@ where
     } else if before.format == Some(79) {
         let adapter = super::epoch::inspect_existing_epoch_adapter(storage).await?;
         let read = super::MigrationPlanningRead::new(&adapter).await?;
-        let plan = super::incorporation::preservation_plan(&read, options).await?;
+        let mut plan = super::incorporation::preservation_plan(&read, options).await?;
+        if before.role == RepositoryRole::Authority {
+            plan.put_mutable(
+                crate::sync::SYNC_AUTHORITY_STATE_SPACE,
+                vec![(
+                    crate::sync::authority_state_key().0.to_vec(),
+                    crate::sync::AUTHORITY_STATE_VALUE.to_vec(),
+                )],
+            )?;
+        }
         read.finish()?;
         (
             "v79-canonical-plan-v1",
@@ -717,6 +726,11 @@ mod tests {
 
     #[tokio::test]
     async fn v5_authority_upgrade_changes_only_the_capability_marker() {
+        verify_v5_authority_upgrade(false).await;
+        verify_v5_authority_upgrade(true).await;
+    }
+
+    async fn verify_v5_authority_upgrade(from_v79: bool) {
         let storage = StorageSession::acquire(crate::Memory::new()).await.unwrap();
         let lix = crate::open_lix()
             .with_storage(storage.clone())
@@ -754,12 +768,20 @@ mod tests {
             .unwrap();
         write.commit().await.unwrap();
         drop(adapter);
+        if from_v79 {
+            super::super::epoch::stage_repository_format_for_test(&storage, false, 79)
+                .await
+                .unwrap();
+        }
         let report = migrate_repository(storage.clone()).await.unwrap();
         assert_eq!(report.before.role, RepositoryRole::Authority);
         assert!(!report.before.current);
         assert!(report.after.current);
         assert!(report.semantic_preservation_verified);
-        assert_eq!(report.preservation_basis, "authority-capability-marker-v1");
+        assert_eq!(
+            report.preservation_basis,
+            if from_v79 { "v79-canonical-plan-v1" } else { "authority-capability-marker-v1" }
+        );
         assert_eq!(
             content_digest(&storage).await.unwrap(),
             report.expected_content_digest
