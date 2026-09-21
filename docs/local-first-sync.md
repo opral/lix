@@ -17,3 +17,16 @@ Upgrade the SDK and authority together. Existing full replicas require explicit 
 The optional server SQL result fallback is not implemented. Cold SQL hydrates native inputs; unsupported inventories fail explicitly. Aggregate result caches are not a substitute for native coverage or editable rows.
 
 See [configuration](./collaboration-and-sync.md), [on-demand hydration and limits](./partial-replica-on-demand-sync.md), and [performance evidence](./partial-replica-performance.md).
+
+### Transient authority admission failures
+
+Opening a browser replica retries the read-only admission GET on network errors
+and HTTP 502, 503, or 504. There are at most five attempts with five-second request
+timeouts and 0.5, 1, 2, and 4-second backoffs. Authentication, compatibility,
+malformed-response, and cancellation errors remain terminal. Typed migration
+waits retain their separate caller-cancellable policy.
+
+An exhausted network failure retains its network error code so verified cached
+admission can still open offline. Error details include `admissionRetryExhausted`
+so applications can offer manual Retry without automatically restarting the SDK's
+budget. Admission retries never replay SQL or clear local storage.

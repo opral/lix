@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_stream::stream;
@@ -61,9 +61,12 @@ struct ScriptHttp {
     outcomes: Arc<Mutex<VecDeque<ScriptOutcome>>>,
     stream_cancellations: Arc<AtomicUsize>,
     sleeps: Arc<Mutex<Vec<Duration>>>,
+    block_sleeps: Arc<AtomicBool>,
 }
 
 enum ScriptOutcome {
+    Error(LixError),
+    PendingStream,
     Json {
         status: u16,
         body: serde_json::Value,
@@ -129,6 +132,8 @@ impl ProtocolHttp for ScriptHttp {
                 headers: Vec::new(),
                 body: Bytes::new(),
             }),
+            Some(ScriptOutcome::Error(error)) => Err(error),
+            Some(ScriptOutcome::PendingStream) => unreachable!(),
             Some(ScriptOutcome::Stream { .. }) => Err(LixError::new(
                 "LIX_SERVER_PROTOCOL_ERROR",
                 "scripted stream used as a finite request",
@@ -149,6 +154,11 @@ impl ProtocolHttp for ScriptHttp {
             .expect("script requests")
             .push(request.clone());
         match self.outcomes.lock().expect("script outcomes").pop_front() {
+            Some(ScriptOutcome::Error(error)) => Err(error),
+            Some(ScriptOutcome::PendingStream) => {
+                let cancellations = self.stream_cancellations.clone();
+                Ok(ProtocolHttpStream { status: 200, headers: vec![], body: Box::pin(futures_util::stream::pending()), cancel: Arc::new(move || { cancellations.fetch_add(1, Ordering::SeqCst); }) })
+            }
             Some(ScriptOutcome::Stream {
                 status,
                 headers,
@@ -202,6 +212,7 @@ impl ProtocolHttp for ScriptHttp {
 
     async fn sleep(&self, duration: Duration) {
         self.sleeps.lock().unwrap().push(duration);
+        if self.block_sleeps.load(Ordering::SeqCst) { futures_util::future::pending::<()>().await; }
     }
 
     fn spawn(&self, fut: Pin<Box<dyn Future<Output = ()> + Send>>) {
@@ -965,4 +976,172 @@ async fn bounded_admission_rejects_auth_and_oversized_responses_without_retry() 
         "LIX_ADMISSION_PROTOCOL"
     );
     assert_eq!(http.stream_cancellations.load(Ordering::SeqCst), 1);
+}
+
+fn admission_identity() -> serde_json::Value {
+    serde_json::json!({"repositoryId":"01936f4e-7b6c-7c3d-8f9a-123456789abc", "principalId":"account-test", "storageEpoch":crate::CURRENT_STORAGE_FORMAT_VERSION, "protocolEpoch":crate::SYNC_PROTOCOL_VERSION})
+}
+const ADMISSION_URL: &str = "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc";
+
+#[tokio::test]
+async fn admission_recovers_from_gateway_and_network_failures_without_mutations() {
+    let http = ScriptHttp::default();
+    http.push_json(502, serde_json::json!({}));
+    http.outcomes
+        .lock()
+        .unwrap()
+        .push_back(ScriptOutcome::Error(LixError::new(
+            "LIX_TRANSPORT_NETWORK",
+            "connection refused",
+        )));
+    http.push_json(503, serde_json::json!({}));
+    http.push_json(504, serde_json::json!({}));
+    http.push_json(200, admission_identity());
+    super::admit_protocol_client(http.clone(), ADMISSION_URL, None)
+        .await
+        .unwrap();
+    assert_eq!(http.requests().len(), 5);
+    assert!(
+        http.requests()
+            .iter()
+            .all(|r| r.method == "GET" && r.url.ends_with("/admission") && r.body.is_none())
+    );
+    assert_eq!(
+        *http.sleeps.lock().unwrap(),
+        vec![
+            Duration::from_millis(500),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(4)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn admission_retry_budget_exhausts_and_terminal_responses_are_not_retried() {
+    let http = ScriptHttp::default();
+    for _ in 0..5 {
+        http.push_json(502, serde_json::json!({}));
+    }
+    let error = super::admit_protocol_client(http.clone(), ADMISSION_URL, None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "LIX_ADMISSION_UNAVAILABLE");
+    assert_eq!(http.requests().len(), 5);
+    assert_eq!(http.sleeps.lock().unwrap().len(), 4);
+    for status in [400, 401, 403, 404, 409, 426, 500] {
+        let http = ScriptHttp::default();
+        http.push_json(status, serde_json::json!({}));
+        super::admit_protocol_client(http.clone(), ADMISSION_URL, None)
+            .await
+            .unwrap_err();
+        assert_eq!(http.requests().len(), 1);
+        assert!(http.sleeps.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn admission_timeout_cancels_stalled_body_before_retry() {
+    let http = ScriptHttp::default();
+    http.outcomes
+        .lock()
+        .unwrap()
+        .push_back(ScriptOutcome::PendingStream);
+    http.push_json(200, admission_identity());
+    super::admit_protocol_client(http.clone(), ADMISSION_URL, None)
+        .await
+        .unwrap();
+    assert_eq!(http.stream_cancellations.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *http.sleeps.lock().unwrap(),
+        vec![Duration::from_secs(5), Duration::from_millis(500)]
+    );
+}
+
+#[tokio::test]
+async fn admission_cancellation_stops_body_and_backoff_without_more_requests() {
+    for pending_body in [true, false] {
+        let http = ScriptHttp::default();
+        http.block_sleeps.store(true, Ordering::SeqCst);
+        if pending_body {
+            http.outcomes
+                .lock()
+                .unwrap()
+                .push_back(ScriptOutcome::PendingStream);
+        } else {
+            http.push_json(502, serde_json::json!({}));
+        }
+        let mut opening = Box::pin(super::admit_protocol_client(
+            http.clone(),
+            ADMISSION_URL,
+            None,
+        ));
+        assert!(futures_util::poll!(&mut opening).is_pending());
+        drop(opening);
+        assert_eq!(http.requests().len(), 1);
+        assert_eq!(
+            http.stream_cancellations.load(Ordering::SeqCst),
+            usize::from(pending_body)
+        );
+    }
+}
+
+#[tokio::test]
+async fn admission_network_exhaustion_preserves_offline_error_and_abort_is_terminal() {
+    let http = ScriptHttp::default();
+    for _ in 0..5 {
+        http.outcomes
+            .lock()
+            .unwrap()
+            .push_back(ScriptOutcome::Error(LixError::new(
+                "LIX_TRANSPORT_NETWORK",
+                "offline",
+            )));
+    }
+    let error = super::admit_protocol_client(http.clone(), ADMISSION_URL, None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "LIX_TRANSPORT_NETWORK");
+    assert_eq!(error.details.unwrap()["admissionRetryExhausted"], true);
+    assert_eq!(http.requests().len(), 5);
+    let http = ScriptHttp::default();
+    http.outcomes
+        .lock()
+        .unwrap()
+        .push_back(ScriptOutcome::Error(LixError::new(
+            "LIX_TRANSPORT_ABORTED",
+            "cancelled",
+        )));
+    assert_eq!(
+        super::admit_protocol_client(http.clone(), ADMISSION_URL, None)
+            .await
+            .unwrap_err()
+            .code,
+        "LIX_TRANSPORT_ABORTED"
+    );
+    assert!(http.sleeps.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn admission_retries_oversized_gateway_pages_without_accepting_oversized_metadata() {
+    let http = ScriptHttp::default();
+    for status in [502, 503, 504] {
+        http.push_stream(status, &"x".repeat(16 * 1024 + 1));
+    }
+    http.push_json(200, admission_identity());
+    super::admit_protocol_client(http.clone(), ADMISSION_URL, None)
+        .await
+        .unwrap();
+    assert_eq!(http.requests().len(), 4);
+    assert_eq!(http.stream_cancellations.load(Ordering::SeqCst), 3);
+    let http = ScriptHttp::default();
+    http.push_stream(200, &"x".repeat(16 * 1024 + 1));
+    assert_eq!(
+        super::admit_protocol_client(http.clone(), ADMISSION_URL, None)
+            .await
+            .unwrap_err()
+            .code,
+        "LIX_ADMISSION_PROTOCOL"
+    );
+    assert_eq!(http.requests().len(), 1);
 }

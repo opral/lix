@@ -99,8 +99,8 @@ test("admission waits in Rust and retains authority progress and report", async 
   expect(report.mock.calls[0]?.[0].migrations).toEqual([{ scope: "authority", fromFormat: 80, toFormat: 81 }]);
 });
 
-test("admission does not retry unrelated service failures", async () => {
+test("admission bounds retries for non-migration service unavailability", async () => {
   const transport = vi.fn(async () => Response.json({error: {code: "LIX_STORAGE_FAILURE"}}, {status: 503}));
-  await expect(requestAdmission(url, headers, transport)).rejects.toMatchObject({code: "LIX_ADMISSION_HTTP"});
-  expect(transport).toHaveBeenCalledTimes(1);
-});
+  await expect(requestAdmission(url, headers, transport)).rejects.toMatchObject({code: "LIX_ADMISSION_UNAVAILABLE", details: {admissionRetryExhausted: true}});
+  expect(transport).toHaveBeenCalledTimes(5);
+}, 15_000);
