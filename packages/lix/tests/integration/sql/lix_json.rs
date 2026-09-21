@@ -310,3 +310,509 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    json_null_remains_distinct_from_sql_null_across_typed_writes,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let schema = json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "json_null_write_contract",
+            "columns": [
+                {"name": "id", "type": "text", "nullable": false},
+                {"name": "nullable_value", "type": "jsonb", "nullable": true},
+                {"name": "required_value", "type": "jsonb", "nullable": false}
+            ],
+            "primary_key": ["id"]
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES ($1)",
+                &[Value::Jsonb(schema.into())],
+            )
+            .await
+            .expect("schema insert should succeed");
+
+        let json_null = Value::Jsonb(json!(null).into());
+        session
+            .execute(
+                "INSERT INTO json_null_write_contract (id, nullable_value, required_value) \
+                 VALUES ($1, $2, $3)",
+                &[
+                    Value::Text("json-null".into()),
+                    json_null.clone(),
+                    json_null.clone(),
+                ],
+            )
+            .await
+            .expect("JSON null should satisfy both nullable and nonnullable JSONB columns");
+        session
+            .execute(
+                "INSERT INTO json_null_write_contract (id, nullable_value, required_value) \
+                 VALUES ($1, $2, $3)",
+                &[
+                    Value::Text("sql-null".into()),
+                    Value::Null,
+                    Value::Jsonb(json!({"present": true}).into()),
+                ],
+            )
+            .await
+            .expect("SQL NULL should be accepted by the nullable JSONB column");
+
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT id, nullable_value, required_value \
+                     FROM json_null_write_contract ORDER BY id",
+                    &[],
+                )
+                .await
+                .expect("initial JSON values should read"),
+            vec![
+                vec![
+                    Value::Text("json-null".into()),
+                    json_null.clone(),
+                    json_null.clone(),
+                ],
+                vec![
+                    Value::Text("sql-null".into()),
+                    Value::Null,
+                    Value::Jsonb(json!({"present": true}).into()),
+                ],
+            ],
+        );
+
+        session
+            .execute(
+                "UPDATE json_null_write_contract SET nullable_value = $1 WHERE id = 'sql-null'",
+                &[json_null.clone()],
+            )
+            .await
+            .expect("UPDATE should write JSON null into a nullable JSONB column");
+        session
+            .execute(
+                "UPDATE json_null_write_contract \
+                 SET nullable_value = COALESCE(nullable_value, CAST('null' AS JSONB)) \
+                 WHERE id = 'json-null'",
+                &[],
+            )
+            .await
+            .expect("DataFusion UPDATE should preserve JSON null through COALESCE");
+        session
+            .execute(
+                "UPDATE json_null_write_contract SET nullable_value = $1 WHERE id = 'json-null'",
+                &[Value::Null],
+            )
+            .await
+            .expect("UPDATE should write SQL NULL into a nullable JSONB column");
+
+        let returned = session
+            .execute(
+                "UPDATE json_null_write_contract SET nullable_value = nullable_value \
+                 WHERE id = 'json-null' \
+                 RETURNING $1 AS sql_null, $2 AS json_null, \
+                           CAST($2 AS JSONB) AS cast_json_null, $3 AS timestamp",
+                &[
+                    Value::Null,
+                    json_null.clone(),
+                    Value::Timestamptz(1_700_000_000_123_456),
+                ],
+            )
+            .await
+            .expect("RETURNING parameters should retain their native types");
+        assert_rows_eq(
+            returned,
+            vec![vec![
+                Value::Null,
+                json_null.clone(),
+                json_null.clone(),
+                Value::Timestamptz(1_700_000_000_123_456),
+            ]],
+        );
+
+        session
+            .execute(
+                "UPDATE json_null_write_contract SET required_value = $1 WHERE id = 'sql-null'",
+                &[json_null.clone()],
+            )
+            .await
+            .expect("UPDATE should write JSON null into a nonnullable JSONB column");
+
+        let error = session
+            .execute(
+                "UPDATE json_null_write_contract SET required_value = $1 WHERE id = 'json-null'",
+                &[Value::Null],
+            )
+            .await
+            .expect_err("SQL NULL must remain invalid for a nonnullable JSONB column");
+        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+
+        let reopened_engine = sim
+            .reboot_engine_from_current_snapshot()
+            .await
+            .expect("reopened engine should load the committed snapshot");
+        let reopened = sim.wrap_session(
+            reopened_engine
+                .open_session()
+                .await
+                .expect("reopened session should open"),
+            &reopened_engine,
+        );
+        assert_rows_eq(
+            reopened
+                .execute(
+                    "SELECT id, nullable_value, required_value \
+                     FROM json_null_write_contract ORDER BY id",
+                    &[],
+                )
+                .await
+                .expect("updated JSON values should read"),
+            vec![
+                vec![
+                    Value::Text("json-null".into()),
+                    Value::Null,
+                    json_null.clone(),
+                ],
+                vec![
+                    Value::Text("sql-null".into()),
+                    json_null,
+                    Value::Jsonb(json!(null).into()),
+                ],
+            ],
+        );
+    }
+);
+
+simulation_test!(
+    json_null_equality_in_and_null_predicates_distinguish_sql_null,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let schema = json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "json_null_predicate_contract",
+            "columns": [
+                {"name": "id", "type": "text", "nullable": false},
+                {"name": "payload", "type": "jsonb", "nullable": true}
+            ],
+            "primary_key": ["id"]
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES ($1)",
+                &[Value::Jsonb(schema.into())],
+            )
+            .await
+            .expect("schema insert should succeed");
+        let json_null = Value::Jsonb(json!(null).into());
+        for (id, payload) in [
+            ("json-null", json_null.clone()),
+            ("sql-null", Value::Null),
+            ("object", Value::Jsonb(json!({}).into())),
+        ] {
+            session
+                .execute(
+                    "INSERT INTO json_null_predicate_contract (id, payload) VALUES ($1, $2)",
+                    &[Value::Text(id.into()), payload],
+                )
+                .await
+                .expect("predicate fixture insert should succeed");
+        }
+
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT id, \
+                            CAST(payload AS JSONB) = CAST('null' AS JSONB), \
+                            CAST(payload AS JSONB) IN (CAST('null' AS JSONB), CAST('{}' AS JSONB)), \
+                            payload IS NULL, \
+                            payload IS NOT NULL \
+                     FROM json_null_predicate_contract ORDER BY id",
+                    &[],
+                )
+                .await
+                .expect("JSON null predicates should read"),
+            vec![
+                vec![
+                    Value::Text("json-null".into()),
+                    Value::Boolean(true),
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                    Value::Boolean(true),
+                ],
+                vec![
+                    Value::Text("object".into()),
+                    Value::Boolean(false),
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                    Value::Boolean(true),
+                ],
+                vec![
+                    Value::Text("sql-null".into()),
+                    Value::Null,
+                    Value::Null,
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                ],
+            ],
+        );
+
+        assert_eq!(
+            session
+                .execute(
+                    "UPDATE json_null_predicate_contract SET payload = payload \
+                     WHERE payload = CAST($1 AS JSONB)",
+                    &[json_null.clone()],
+                )
+                .await
+                .expect("JSON equality should accept a parameter cast to JSONB")
+                .rows_affected(),
+            1
+        );
+
+        assert_eq!(
+            session
+                .execute(
+                    "UPDATE json_null_predicate_contract SET payload = payload \
+                     WHERE payload = CAST('null' AS JSONB)",
+                    &[],
+                )
+                .await
+                .expect("equality UPDATE should succeed")
+                .rows_affected(),
+            1
+        );
+        assert_eq!(
+            session
+                .execute(
+                    "UPDATE json_null_predicate_contract SET payload = payload \
+                     WHERE payload IN (CAST('null' AS JSONB), CAST('{}' AS JSONB))",
+                    &[],
+                )
+                .await
+                .expect("IN UPDATE should succeed")
+                .rows_affected(),
+            2
+        );
+        assert_eq!(
+            session
+                .execute(
+                    "UPDATE json_null_predicate_contract SET payload = payload \
+                     WHERE payload IS NULL",
+                    &[],
+                )
+                .await
+                .expect("IS NULL UPDATE should succeed")
+                .rows_affected(),
+            1
+        );
+        assert_eq!(
+            session
+                .execute(
+                    "UPDATE json_null_predicate_contract SET payload = payload \
+                     WHERE payload IS NOT NULL",
+                    &[],
+                )
+                .await
+                .expect("IS NOT NULL UPDATE should succeed")
+                .rows_affected(),
+            2
+        );
+
+        assert_eq!(
+            session
+                .execute(
+                    "DELETE FROM json_null_predicate_contract \
+                     WHERE payload = CAST('null' AS JSONB)",
+                    &[],
+                )
+                .await
+                .expect("equality DELETE should succeed")
+                .rows_affected(),
+            1
+        );
+        assert_eq!(
+            session
+                .execute(
+                    "DELETE FROM json_null_predicate_contract \
+                     WHERE payload IN (CAST('null' AS JSONB), CAST('{}' AS JSONB))",
+                    &[],
+                )
+                .await
+                .expect("IN DELETE should succeed")
+                .rows_affected(),
+            1
+        );
+        assert_eq!(
+            session
+                .execute(
+                    "DELETE FROM json_null_predicate_contract WHERE payload IS NULL",
+                    &[],
+                )
+                .await
+                .expect("IS NULL DELETE should succeed")
+                .rows_affected(),
+            1
+        );
+        assert_eq!(
+            session
+                .execute(
+                    "DELETE FROM json_null_predicate_contract WHERE payload IS NOT NULL",
+                    &[],
+                )
+                .await
+                .expect("IS NOT NULL DELETE should succeed")
+                .rows_affected(),
+            0
+        );
+    }
+);
+
+simulation_test!(
+    jsonb_arrow_path_preserves_json_null_value,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let schema = json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "json_null_path_contract",
+            "columns": [
+                {"name": "id", "type": "text", "nullable": false},
+                {"name": "payload", "type": "jsonb", "nullable": true}
+            ],
+            "primary_key": ["id"]
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES ($1)",
+                &[Value::Jsonb(schema.into())],
+            )
+            .await
+            .expect("schema insert should succeed");
+        session
+            .execute(
+                "INSERT INTO json_null_path_contract (id, payload) VALUES ($1, $2), ($3, $4), ($5, $6)",
+                &[
+                    Value::Text("child-json-null".into()),
+                    Value::Jsonb(json!({"child": null}).into()),
+                    Value::Text("root-json-null".into()),
+                    Value::Jsonb(json!(null).into()),
+                    Value::Text("sql-null".into()),
+                    Value::Null,
+                ],
+            )
+            .await
+            .expect("path fixture insert should succeed");
+
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT id, payload -> 'child' AS child, payload -> 'missing' AS missing \
+                     FROM json_null_path_contract ORDER BY id",
+                    &[],
+                )
+                .await
+                .expect("JSON path extraction should succeed"),
+            vec![
+                vec![
+                    Value::Text("child-json-null".into()),
+                    Value::Jsonb(json!(null).into()),
+                    Value::Null,
+                ],
+                vec![
+                    Value::Text("root-json-null".into()),
+                    Value::Null,
+                    Value::Null,
+                ],
+                vec![Value::Text("sql-null".into()), Value::Null, Value::Null],
+            ],
+        );
+    }
+);
+
+simulation_test!(
+    jsonb_string_null_parameter_does_not_match_json_null,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let schema = json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "json_string_null_parameter_contract",
+            "columns": [
+                {"name": "id", "type": "text", "nullable": false},
+                {"name": "payload", "type": "jsonb", "nullable": true}
+            ],
+            "primary_key": ["id"]
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES ($1)",
+                &[Value::Jsonb(schema.into())],
+            )
+            .await
+            .expect("schema insert should succeed");
+        session
+            .execute(
+                "INSERT INTO json_string_null_parameter_contract (id, payload) \
+                 VALUES ($1, $2), ($3, $4), ($5, $6)",
+                &[
+                    Value::Text("json-null".into()),
+                    Value::Jsonb(json!(null).into()),
+                    Value::Text("json-string-null".into()),
+                    Value::Jsonb(json!("null").into()),
+                    Value::Text("object".into()),
+                    Value::Jsonb(json!({}).into()),
+                ],
+            )
+            .await
+            .expect("predicate fixtures should insert");
+
+        assert_rows_eq(
+            session
+                .execute(
+                    "UPDATE json_string_null_parameter_contract SET payload = payload \
+                     WHERE payload = $1 RETURNING id",
+                    &[Value::Jsonb(json!("null").into())],
+                )
+                .await
+                .expect("JSONB string equality should succeed"),
+            vec![vec![Value::Text("json-string-null".into())]],
+        );
+        assert_rows_eq(
+            session
+                .execute(
+                    "UPDATE json_string_null_parameter_contract SET payload = payload \
+                     WHERE payload IN ($1) RETURNING id",
+                    &[Value::Jsonb(json!("null").into())],
+                )
+                .await
+                .expect("JSONB string IN predicate should succeed"),
+            vec![vec![Value::Text("json-string-null".into())]],
+        );
+    }
+);

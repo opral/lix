@@ -28,7 +28,7 @@ use datafusion::arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema, 
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::metadata::{FieldMetadata, ScalarAndMetadata};
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{Column, DFSchema, ParamValues, ScalarValue};
+use datafusion::common::{Column, DFSchema, DFSchemaRef, ParamValues, ScalarValue};
 use datafusion::datasource::{empty::EmptyTable, provider_as_source};
 use datafusion::logical_expr::expr::{BinaryExpr, Cast, InList, Like, ScalarFunction};
 use datafusion::logical_expr::registry::FunctionRegistry;
@@ -52,7 +52,9 @@ use std::time::Instant;
 
 use crate::catalog::CatalogFingerprint;
 use crate::sql2::predicate_typecheck::{
-    json_predicate_placeholder_indexes_with_dfschema, validate_json_predicate_expr_with_dfschema,
+    json_predicate_placeholder_indexes_with_dfschema,
+    json_predicate_placeholder_indexes_with_dfschemas, validate_json_predicate_expr_with_dfschema,
+    validate_json_predicate_expr_with_dfschemas,
 };
 use crate::sql2::providers::ProviderSelection;
 use crate::sql2::result_metadata::{
@@ -708,11 +710,330 @@ async fn create_logical_plan_from_statement(
         params,
     ))
     .await?;
-    session
+    let normalize_numeric_literals = statement_has_numeric_literal_candidate(&statement);
+    let plan = session
         .state()
         .statement_to_plan(statement)
         .await
-        .map_err(datafusion_error_to_lix_error)
+        .map_err(datafusion_error_to_lix_error)?;
+    if normalize_numeric_literals {
+        normalize_bigint_numeric_predicates(plan)
+    } else {
+        Ok(plan)
+    }
+}
+
+fn statement_has_numeric_literal_candidate(statement: &DataFusionStatement) -> bool {
+    struct CandidateVisitor;
+
+    impl Visitor for CandidateVisitor {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &SqlExpr) -> ControlFlow<Self::Break> {
+            if let SqlExpr::Function(function) = expr
+                && function
+                    .name
+                    .to_string()
+                    .eq_ignore_ascii_case("__lix_numeric_literal")
+            {
+                return ControlFlow::Break(());
+            }
+            if let SqlExpr::Value(value) = expr
+                && let SqlValue::Number(raw, _) = &value.value
+                // Decimal/exponent literals are wrapped by the parser only
+                // inside supported predicates. A decimal in a projection or
+                // function argument must not trigger a full plan walk.
+                // Out-of-range integer spellings remain candidates because
+                // DataFusion can materialize them as UInt64 before the
+                // BIGINT predicate rewrite sees them.
+                && !raw.contains(['.', 'e', 'E'])
+                && raw.parse::<i64>().is_err()
+            {
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    fn visit(statement: &DataFusionStatement, visitor: &mut CandidateVisitor) -> bool {
+        match statement {
+            DataFusionStatement::Statement(statement) => statement.visit(visitor).is_break(),
+            DataFusionStatement::Explain(explain) => visit(explain.statement.as_ref(), visitor),
+            _ => false,
+        }
+    }
+
+    visit(statement, &mut CandidateVisitor)
+}
+
+fn normalize_bigint_numeric_predicates(plan: LogicalPlan) -> Result<LogicalPlan, LixError> {
+    let mut has_marker = false;
+    plan.apply_with_subqueries(|node| {
+        for expr in node.expressions() {
+            let _ = expr.apply(|nested| {
+                if is_numeric_literal_candidate(nested) {
+                    has_marker = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            });
+            if has_marker {
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .map_err(datafusion_error_to_lix_error)?;
+    if !has_marker {
+        return Ok(plan);
+    }
+
+    plan.transform_up_with_subqueries(|node| {
+        let fallback_schema = node.schema().clone();
+        let input_schemas = node
+            .inputs()
+            .into_iter()
+            .map(|input| input.schema().clone())
+            .collect::<Vec<_>>();
+        node.map_expressions(|expr| {
+            expr.transform_up(|expr| {
+                normalize_bigint_numeric_expr(expr, &input_schemas, &fallback_schema)
+            })
+        })
+    })
+    .map(|transformed| transformed.data)
+    .map_err(datafusion_error_to_lix_error)
+}
+
+fn normalize_bigint_numeric_expr(
+    expr: Expr,
+    input_schemas: &[DFSchemaRef],
+    fallback_schema: &DFSchemaRef,
+) -> datafusion::common::Result<Transformed<Expr>> {
+    let replace_marker = |value: Expr, column: &Expr| -> datafusion::common::Result<Option<Expr>> {
+        let Some(column) = bigint_column_name(column, input_schemas, fallback_schema) else {
+            return Ok(None);
+        };
+        let exact = match &value {
+            Expr::ScalarFunction(_) => {
+                let Some(raw) = numeric_literal_marker_raw(&value) else {
+                    return Ok(None);
+                };
+                super::bound_public_write::exact_bigint_literal(raw, "read", &column)
+                    .map_err(crate::sql2::error::lix_error_to_datafusion_error)?
+            }
+            Expr::Literal(ScalarValue::UInt64(Some(value)), _) => {
+                i64::try_from(*value).map_err(|_| {
+                    crate::sql2::error::lix_error_to_datafusion_error(
+                        LixError::new(
+                            LixError::CODE_TYPE_MISMATCH,
+                            format!(
+                                "typed SQL surface 'read' column '{column}' cannot represent SQL numeric literal {value} as BIGINT"
+                            ),
+                        )
+                        .with_hint(
+                            "Use an exact integer between -9223372036854775808 and 9223372036854775807.",
+                        ),
+                    )
+                })?
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(Expr::Literal(ScalarValue::Int64(Some(exact)), None)))
+    };
+
+    match expr {
+        Expr::BinaryExpr(binary)
+            if matches!(
+                binary.op,
+                Operator::Eq
+                    | Operator::NotEq
+                    | Operator::Gt
+                    | Operator::GtEq
+                    | Operator::Lt
+                    | Operator::LtEq
+                    | Operator::IsDistinctFrom
+                    | Operator::IsNotDistinctFrom
+            ) =>
+        {
+            let original_left = *binary.left.clone();
+            let original_right = *binary.right.clone();
+            let left = replace_marker(original_left.clone(), &original_right)?;
+            let right = replace_marker(original_right.clone(), &original_left)?;
+            if left.is_none() && right.is_none() {
+                Ok(Transformed::no(Expr::BinaryExpr(binary)))
+            } else {
+                let normalized_left = if right.is_some() {
+                    unwrap_bigint_coercion(original_left, input_schemas, fallback_schema)
+                } else {
+                    original_left
+                };
+                let normalized_right = if left.is_some() {
+                    unwrap_bigint_coercion(original_right, input_schemas, fallback_schema)
+                } else {
+                    original_right
+                };
+                Ok(Transformed::yes(Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(left.unwrap_or(normalized_left)),
+                    binary.op,
+                    Box::new(right.unwrap_or(normalized_right)),
+                ))))
+            }
+        }
+        Expr::InList(mut list) => {
+            let mut transformed = false;
+            let original_expr = *list.expr.clone();
+            if numeric_literal_marker_raw(&original_expr).is_some()
+                || matches!(
+                    original_expr,
+                    Expr::Literal(ScalarValue::UInt64(Some(_)), _)
+                )
+            {
+                for value in &list.list {
+                    if let Some(replaced) = replace_marker(original_expr.clone(), value)? {
+                        list.expr = Box::new(replaced);
+                        transformed = true;
+                        break;
+                    }
+                }
+            }
+            for value in &mut list.list {
+                if let Some(replaced) = replace_marker(value.clone(), &list.expr)? {
+                    *value = replaced;
+                    transformed = true;
+                }
+            }
+            if transformed {
+                list.list = std::mem::take(&mut list.list)
+                    .into_iter()
+                    .map(|value| unwrap_bigint_coercion(value, input_schemas, fallback_schema))
+                    .collect();
+                list.expr = Box::new(unwrap_bigint_coercion(
+                    *list.expr,
+                    input_schemas,
+                    fallback_schema,
+                ));
+                Ok(Transformed::yes(Expr::InList(list)))
+            } else {
+                Ok(Transformed::no(Expr::InList(list)))
+            }
+        }
+        Expr::Between(mut between) => {
+            let mut transformed = false;
+            let original_expr = *between.expr.clone();
+            if numeric_literal_marker_raw(&original_expr).is_some()
+                || matches!(
+                    original_expr,
+                    Expr::Literal(ScalarValue::UInt64(Some(_)), _)
+                )
+            {
+                for bound in [&between.low, &between.high] {
+                    if let Some(replaced) = replace_marker(original_expr.clone(), bound)? {
+                        between.expr = Box::new(replaced);
+                        transformed = true;
+                        break;
+                    }
+                }
+            }
+            if let Some(replaced) = replace_marker(*between.low.clone(), &between.expr)? {
+                between.low = Box::new(replaced);
+                transformed = true;
+            }
+            if let Some(replaced) = replace_marker(*between.high.clone(), &between.expr)? {
+                between.high = Box::new(replaced);
+                transformed = true;
+            }
+            if transformed {
+                between.low = Box::new(unwrap_bigint_coercion(
+                    *between.low,
+                    input_schemas,
+                    fallback_schema,
+                ));
+                between.high = Box::new(unwrap_bigint_coercion(
+                    *between.high,
+                    input_schemas,
+                    fallback_schema,
+                ));
+                between.expr = Box::new(unwrap_bigint_coercion(
+                    *between.expr,
+                    input_schemas,
+                    fallback_schema,
+                ));
+                Ok(Transformed::yes(Expr::Between(between)))
+            } else {
+                Ok(Transformed::no(Expr::Between(between)))
+            }
+        }
+        expr => Ok(Transformed::no(expr)),
+    }
+}
+
+fn unwrap_bigint_coercion(
+    expr: Expr,
+    input_schemas: &[DFSchemaRef],
+    fallback_schema: &DFSchemaRef,
+) -> Expr {
+    match expr {
+        Expr::Cast(cast)
+            if cast.data_type == DataType::Float64
+                && bigint_column_name(&cast.expr, input_schemas, fallback_schema).is_some() =>
+        {
+            *cast.expr
+        }
+        expr => expr,
+    }
+}
+
+fn bigint_column_name(
+    expr: &Expr,
+    input_schemas: &[DFSchemaRef],
+    fallback_schema: &DFSchemaRef,
+) -> Option<String> {
+    if let Expr::Cast(cast) = expr
+        && cast.data_type == DataType::Float64
+    {
+        return bigint_column_name(&cast.expr, input_schemas, fallback_schema);
+    }
+    let Expr::Column(column) = expr else {
+        return None;
+    };
+    input_schemas
+        .iter()
+        .chain(std::iter::once(fallback_schema))
+        .find_map(|schema| {
+            schema
+                .field_with_name(column.relation.as_ref(), &column.name)
+                .ok()
+                .filter(|field| field.data_type() == &DataType::Int64)
+                .map(|_| column.name.clone())
+        })
+}
+
+fn numeric_literal_marker_raw(expr: &Expr) -> Option<&str> {
+    if let Expr::Cast(cast) = expr
+        && cast.data_type == DataType::Float64
+    {
+        return numeric_literal_marker_raw(&cast.expr);
+    }
+    let Expr::ScalarFunction(function) = expr else {
+        return None;
+    };
+    if function.name() != "__lix_numeric_literal" {
+        return None;
+    }
+    let [Expr::Literal(ScalarValue::Utf8(Some(raw)), _)] = function.args.as_slice() else {
+        return None;
+    };
+    Some(raw)
+}
+
+fn is_numeric_literal_marker(expr: &Expr) -> bool {
+    numeric_literal_marker_raw(expr).is_some()
+}
+
+fn is_numeric_literal_candidate(expr: &Expr) -> bool {
+    is_numeric_literal_marker(expr)
+        || matches!(expr, Expr::Literal(ScalarValue::UInt64(Some(_)), _))
 }
 
 /// Table providers need concrete endpoints while planning their schemas. Resolve
@@ -922,16 +1243,30 @@ async fn resolve_temporal_subquery_arguments(
 }
 
 fn validate_json_predicates_in_logical_plan(plan: &LogicalPlan) -> Result<(), LixError> {
+    // `LogicalPlan::expressions()` contains expressions evaluated by this
+    // node. Their columns resolve against the node's inputs, not its output
+    // schema. In particular, a projection such as `payload = ...` has only a
+    // boolean output field, so looking up `payload` in `plan.schema()` loses
+    // the JSONB metadata before predicate validation runs.
+    let input_schemas = plan
+        .inputs()
+        .into_iter()
+        .map(|input| input.schema().as_ref())
+        .collect::<Vec<_>>();
     for expr in plan.expressions() {
-        validate_json_predicate_expr_with_dfschema(plan.schema(), &expr)?;
+        if input_schemas.is_empty() {
+            validate_json_predicate_expr_in_plan(plan.schema(), &expr)?;
+        } else {
+            validate_json_predicate_expr_in_plan_schemas(&input_schemas, &expr)?;
+        }
     }
     match plan {
         LogicalPlan::Filter(filter) => {
-            validate_json_predicate_expr_with_dfschema(filter.input.schema(), &filter.predicate)?;
+            validate_json_predicate_expr_in_plan(filter.input.schema(), &filter.predicate)?;
         }
         LogicalPlan::TableScan(scan) => {
             for filter in &scan.filters {
-                validate_json_predicate_expr_with_dfschema(scan.projected_schema.as_ref(), filter)?;
+                validate_json_predicate_expr_in_plan(scan.projected_schema.as_ref(), filter)?;
             }
         }
         _ => {}
@@ -944,13 +1279,52 @@ fn validate_json_predicates_in_logical_plan(plan: &LogicalPlan) -> Result<(), Li
     Ok(())
 }
 
+fn validate_json_predicate_expr_in_plan(schema: &DFSchema, expr: &Expr) -> Result<(), LixError> {
+    validate_json_predicate_expr_in_plan_schemas(&[schema], expr)
+}
+
+fn validate_json_predicate_expr_in_plan_schemas(
+    schemas: &[&DFSchema],
+    expr: &Expr,
+) -> Result<(), LixError> {
+    if schemas.len() == 1 {
+        validate_json_predicate_expr_with_dfschema(schemas[0], expr)?;
+    } else {
+        validate_json_predicate_expr_with_dfschemas(schemas, expr)?;
+    }
+    expr.apply(|nested| {
+        let subquery = match nested {
+            Expr::ScalarSubquery(subquery) => Some(&subquery.subquery),
+            Expr::InSubquery(subquery) => Some(&subquery.subquery.subquery),
+            Expr::Exists(subquery) => Some(&subquery.subquery.subquery),
+            Expr::SetComparison(subquery) => Some(&subquery.subquery.subquery),
+            _ => None,
+        };
+        if let Some(subquery) = subquery {
+            validate_json_predicates_in_logical_plan(subquery)
+                .map_err(crate::sql2::error::lix_error_to_datafusion_error)?;
+            Ok(TreeNodeRecursion::Jump)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    })
+    .map(|_| ())
+    .map_err(datafusion_error_to_lix_error)
+}
+
 fn json_predicate_params_in_logical_plan(plan: &LogicalPlan) -> BTreeSet<usize> {
     let mut params = BTreeSet::new();
+    let input_schemas = plan
+        .inputs()
+        .into_iter()
+        .map(|input| input.schema().as_ref())
+        .collect::<Vec<_>>();
     for expr in plan.expressions() {
-        params.extend(json_predicate_placeholder_indexes_with_dfschema(
-            plan.schema(),
-            &expr,
-        ));
+        if input_schemas.is_empty() {
+            collect_json_predicate_params_in_expr(plan.schema(), &expr, &mut params);
+        } else {
+            collect_json_predicate_params_in_expr_schemas(&input_schemas, &expr, &mut params);
+        }
     }
     match plan {
         LogicalPlan::Filter(filter) => {
@@ -976,6 +1350,45 @@ fn json_predicate_params_in_logical_plan(plan: &LogicalPlan) -> BTreeSet<usize> 
     params
 }
 
+fn collect_json_predicate_params_in_expr(
+    schema: &DFSchema,
+    expr: &Expr,
+    params: &mut BTreeSet<usize>,
+) {
+    collect_json_predicate_params_in_expr_schemas(&[schema], expr, params);
+}
+
+fn collect_json_predicate_params_in_expr_schemas(
+    schemas: &[&DFSchema],
+    expr: &Expr,
+    params: &mut BTreeSet<usize>,
+) {
+    if schemas.len() == 1 {
+        params.extend(json_predicate_placeholder_indexes_with_dfschema(
+            schemas[0], expr,
+        ));
+    } else {
+        params.extend(json_predicate_placeholder_indexes_with_dfschemas(
+            schemas, expr,
+        ));
+    }
+    let _ = expr.apply(|nested| {
+        let subquery = match nested {
+            Expr::ScalarSubquery(subquery) => Some(&subquery.subquery),
+            Expr::InSubquery(subquery) => Some(&subquery.subquery.subquery),
+            Expr::Exists(subquery) => Some(&subquery.subquery.subquery),
+            Expr::SetComparison(subquery) => Some(&subquery.subquery.subquery),
+            _ => None,
+        };
+        if let Some(subquery) = subquery {
+            params.extend(json_predicate_params_in_logical_plan(subquery));
+            Ok(TreeNodeRecursion::Jump)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    });
+}
+
 /// Substitutes positional parameters into a bound read plan.
 ///
 /// Mirrors `DataFrame::with_param_values`, which is exactly
@@ -999,10 +1412,15 @@ fn bind_plan_param_values(plan: LogicalPlan, params: &[Value]) -> Result<Logical
     if params.is_empty() {
         return Ok(plan);
     }
-    plan.with_param_values(ParamValues::List(
-        params.iter().map(scalar_value_from_lix_value).collect(),
-    ))
-    .map_err(datafusion_error_to_lix_error)
+    let plan = plan
+        .with_param_values(ParamValues::List(
+            params
+                .iter()
+                .map(scalar_value_from_lix_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        ))
+        .map_err(datafusion_error_to_lix_error)?;
+    Ok(plan)
 }
 
 async fn execute_logical_plan(
@@ -1206,6 +1624,14 @@ fn retain_columnar_result(fields: &[Field], batches: &[RecordBatch]) -> bool {
         fields.iter().enumerate().any(|(column_index, field)| {
             let array = batch.column(column_index);
             match field.data_type() {
+                DataType::UInt64 => {
+                    array
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .is_some_and(|values| {
+                            values.iter().flatten().any(|value| value > i64::MAX as u64)
+                        })
+                }
                 DataType::Float32 => {
                     array
                         .as_any()
@@ -1551,10 +1977,7 @@ async fn insert_query_input_plan(
                 .unwrap_or_else(|| {
                     Expr::Literal(ScalarValue::try_new_null(field.data_type()).unwrap(), None)
                 });
-            Ok(expr
-                .cast_to(field.data_type(), input_schema.as_ref())
-                .map_err(datafusion_error_to_lix_error)?
-                .alias(field.name()))
+            Ok(coerce_assignment_expr(expr, field, input_schema.as_ref())?.alias(field.name()))
         })
         .collect::<Result<Vec<_>, LixError>>()?;
     let mut dataframe = session
@@ -1564,7 +1987,10 @@ async fn insert_query_input_plan(
     if !params.is_empty() {
         dataframe = dataframe
             .with_param_values(ParamValues::List(
-                params.iter().map(scalar_value_from_lix_value).collect(),
+                params
+                    .iter()
+                    .map(scalar_value_from_lix_value)
+                    .collect::<Result<Vec<_>, _>>()?,
             ))
             .map_err(datafusion_error_to_lix_error)?;
     }
@@ -1951,6 +2377,43 @@ fn insert_field_expr(
         })
 }
 
+fn assignment_source_expr(
+    session: &SessionContext,
+    expr: &BoundExpr,
+    params: &[Value],
+    field: &Field,
+) -> Result<Expr, LixError> {
+    if field.data_type() == &DataType::Int64
+        && let Some(value) =
+            super::bound_public_write::bigint_number_literal(expr, "assignment", field.name())?
+    {
+        return Ok(Expr::Literal(ScalarValue::Int64(Some(value)), None));
+    }
+    datafusion_expr_from_bound_expr(session, expr, params)
+}
+
+fn coerce_assignment_expr(expr: Expr, field: &Field, schema: &DFSchema) -> Result<Expr, LixError> {
+    let target = field.data_type();
+    let (_, source_field) = expr
+        .to_field(schema)
+        .map_err(datafusion_error_to_lix_error)?;
+    if field_is_json(&source_field) && !field_is_json(field) {
+        return Err(LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            "JSONB assignment to a scalar column requires an explicit CAST",
+        ));
+    }
+    let source = expr
+        .get_type(schema)
+        .map_err(datafusion_error_to_lix_error)?;
+    crate::sql2::value_contract::validate_assignment_types(&source, target)?;
+    if source == DataType::Float64 && target == &DataType::Int64 {
+        return Ok(crate::sql2::udfs::assign_bigint::expression(expr));
+    }
+    expr.cast_to(target, schema)
+        .map_err(datafusion_error_to_lix_error)
+}
+
 fn datafusion_assignments(
     session: &SessionContext,
     schema: &Schema,
@@ -1968,10 +2431,9 @@ fn datafusion_assignments(
             let expr = prepare_write_expr(
                 session,
                 &df_schema,
-                datafusion_expr_from_bound_expr(session, &assignment.value, params)?,
-            )?
-            .cast_to(field.data_type(), &df_schema)
-            .map_err(datafusion_error_to_lix_error)?;
+                assignment_source_expr(session, &assignment.value, params, field)?,
+            )?;
+            let expr = coerce_assignment_expr(expr, field, &df_schema)?;
             Ok((assignment.column.name.clone(), expr))
         })
         .collect()
@@ -2018,10 +2480,9 @@ fn datafusion_conflict_assignments(
             let expr = prepare_write_expr(
                 session,
                 &df_schema,
-                datafusion_expr_from_bound_expr(session, &assignment.value, params)?,
-            )?
-            .cast_to(field.data_type(), &df_schema)
-            .map_err(datafusion_error_to_lix_error)?;
+                assignment_source_expr(session, &assignment.value, params, field)?,
+            )?;
+            let expr = coerce_assignment_expr(expr, field, &df_schema)?;
             let physical =
                 datafusion::physical_expr::create_physical_expr(&expr, &df_schema, &props)
                     .map_err(datafusion_error_to_lix_error)?;
@@ -2036,6 +2497,14 @@ fn datafusion_write_filters(
     plan: &LogicalWritePlan,
     params: &[Value],
 ) -> Result<Vec<Expr>, LixError> {
+    super::bound_public_write::validate_bigint_predicate_literals(
+        &plan.bound.predicate,
+        &|name| {
+            schema
+                .field_with_name(name)
+                .is_ok_and(|field| field.data_type() == &DataType::Int64)
+        },
+    )?;
     let df_schema = DFSchema::try_from(schema.clone()).map_err(datafusion_error_to_lix_error)?;
     let mut filters =
         datafusion_filters_from_predicate(session, schema, &plan.bound.predicate, params)?
@@ -2109,22 +2578,28 @@ fn datafusion_filters_from_predicate(
         BoundPredicate::Eq(left, right) => {
             let left_is_json = bound_expr_is_json(left, schema);
             let right_is_json = bound_expr_is_json(right, schema);
-            Ok(vec![Expr::BinaryExpr(BinaryExpr::new(
-                Box::new(datafusion_filter_expr_from_bound_expr(
+            let left_expr = datafusion_exact_bigint_marker(left, right, schema)?.unwrap_or(
+                datafusion_filter_expr_from_bound_expr(
                     session,
                     left,
                     params,
                     right_is_json,
                     is_identity_json_bound_expr(right),
-                )?),
-                Operator::Eq,
-                Box::new(datafusion_filter_expr_from_bound_expr(
+                )?,
+            );
+            let right_expr = datafusion_exact_bigint_marker(right, left, schema)?.unwrap_or(
+                datafusion_filter_expr_from_bound_expr(
                     session,
                     right,
                     params,
                     left_is_json,
                     is_identity_json_bound_expr(left),
-                )?),
+                )?,
+            );
+            Ok(vec![Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(left_expr),
+                Operator::Eq,
+                Box::new(right_expr),
             ))])
         }
         BoundPredicate::Like {
@@ -2155,23 +2630,39 @@ fn datafusion_filters_from_predicate(
             let values_include_json = values.iter().any(|value| bound_expr_is_json(value, schema));
             let expr_is_identity_json = is_identity_json_bound_expr(expr);
             let values_include_identity_json = values.iter().any(is_identity_json_bound_expr);
-            Ok(vec![Expr::InList(InList::new(
-                Box::new(datafusion_filter_expr_from_bound_expr(
+            let mut exact_expr = None;
+            for value in values {
+                if let Some(exact) = datafusion_exact_bigint_marker(expr, value, schema)? {
+                    exact_expr = Some(exact);
+                    break;
+                }
+            }
+            let input_expr = match exact_expr {
+                Some(exact) => exact,
+                None => datafusion_filter_expr_from_bound_expr(
                     session,
                     expr,
                     params,
                     values_include_json,
                     values_include_identity_json,
-                )?),
+                )?,
+            };
+            Ok(vec![Expr::InList(InList::new(
+                Box::new(input_expr),
                 values
                     .iter()
                     .map(|value| {
-                        datafusion_filter_expr_from_bound_expr(
-                            session,
-                            value,
-                            params,
-                            expr_is_json,
-                            expr_is_identity_json,
+                        datafusion_exact_bigint_marker(value, expr, schema)?.map_or_else(
+                            || {
+                                datafusion_filter_expr_from_bound_expr(
+                                    session,
+                                    value,
+                                    params,
+                                    expr_is_json,
+                                    expr_is_identity_json,
+                                )
+                            },
+                            Ok,
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()?,
@@ -2217,7 +2708,7 @@ fn datafusion_filter_expr_from_bound_expr(
                     format!("missing SQL parameter ${}", param.index),
                 ));
             };
-            let ScalarAndMetadata { value, metadata } = scalar_value_from_lix_value(value);
+            let ScalarAndMetadata { value, metadata } = scalar_value_from_lix_value(value)?;
             if identity_json_comparison_context {
                 if let ScalarValue::Utf8(Some(raw)) = &value {
                     return Ok(Expr::Literal(
@@ -2260,6 +2751,30 @@ fn datafusion_filter_expr_from_bound_expr(
     }
 }
 
+/// Resolve a source-spelled numeric marker only when its comparison operand
+/// is a BIGINT-backed table column.  Keeping the marker as a DataFusion
+/// Float64 expression everywhere else preserves SQL's existing numeric
+/// coercion rules without allowing f64 to round an integer predicate.
+fn datafusion_exact_bigint_marker(
+    value: &BoundExpr,
+    column_expr: &BoundExpr,
+    schema: &Schema,
+) -> Result<Option<Expr>, LixError> {
+    let BoundExpr::Column(column) = column_expr else {
+        return Ok(None);
+    };
+    let Some(field) = schema.field_with_name(&column.name).ok() else {
+        return Ok(None);
+    };
+    if field.data_type() != &DataType::Int64 {
+        return Ok(None);
+    }
+    Ok(
+        super::bound_public_write::bigint_number_literal(value, "DataFusion", &column.name)?
+            .map(|exact| Expr::Literal(ScalarValue::Int64(Some(exact)), None)),
+    )
+}
+
 fn datafusion_expr_from_bound_expr(
     session: &SessionContext,
     expr: &BoundExpr,
@@ -2286,11 +2801,20 @@ fn datafusion_expr_from_bound_expr(
                     format!("missing SQL parameter ${}", param.index),
                 ));
             };
-            let ScalarAndMetadata { value, metadata } = scalar_value_from_lix_value(value);
+            let ScalarAndMetadata { value, metadata } = scalar_value_from_lix_value(value)?;
             Ok(Expr::Literal(value, metadata))
         }
         BoundExpr::Cast { expr, data_type } => {
             let expr = datafusion_expr_from_bound_expr(session, expr, params)?;
+            if *data_type == BoundCastType::Text {
+                let udf = session
+                    .udf("__lix_text_cast")
+                    .map_err(datafusion_error_to_lix_error)?;
+                return Ok(Expr::ScalarFunction(ScalarFunction::new_udf(
+                    udf,
+                    vec![expr],
+                )));
+            }
             if *data_type == BoundCastType::Uuid {
                 let udf = session
                     .udf("__lix_uuid_cast")
@@ -2300,19 +2824,26 @@ fn datafusion_expr_from_bound_expr(
                     vec![expr],
                 )));
             }
-            let data_type = match data_type {
-                BoundCastType::Text => DataType::Utf8,
+            if *data_type == BoundCastType::Jsonb {
+                let udf = session
+                    .udf("__lix_jsonb")
+                    .map_err(datafusion_error_to_lix_error)?;
+                return Ok(Expr::ScalarFunction(ScalarFunction::new_udf(
+                    udf,
+                    vec![expr],
+                )));
+            }
+            let bound_data_type = match data_type {
+                BoundCastType::Text => unreachable!("TEXT casts are handled by __lix_text_cast"),
                 BoundCastType::Uuid => unreachable!("UUID casts are handled by __lix_uuid_cast"),
                 BoundCastType::Binary => DataType::Binary,
                 BoundCastType::BigInt => DataType::Int64,
                 BoundCastType::Double => DataType::Float64,
                 BoundCastType::Boolean => DataType::Boolean,
-                BoundCastType::Jsonb => DataType::Utf8,
+                BoundCastType::Jsonb => unreachable!("JSONB casts are handled by __lix_jsonb"),
             };
-            Ok(Expr::Cast(Cast::new(
-                Box::new(expr),
-                data_type,
-            )))
+            let cast = Expr::Cast(Cast::new(Box::new(expr), bound_data_type));
+            Ok(cast)
         }
         BoundExpr::Function { name, args } => {
             let udf = session.udf(name).map_err(datafusion_error_to_lix_error)?;
@@ -2425,6 +2956,8 @@ fn bound_expr_requires_datafusion(expr: &BoundExpr) -> bool {
                 name.as_str(),
                 "uuidv7"
                     | "__lix_uuid_cast"
+                    | "__lix_text_cast"
+                    | "__lix_timestamptz_cast"
                     | "__lix_current_timestamp"
                     | "lix_active_branch_id"
                     | "lix_active_branch_commit_id"
@@ -2435,6 +2968,7 @@ fn bound_expr_requires_datafusion(expr: &BoundExpr) -> bool {
                     | "__lix_json_contains"
                     | "__lix_json_exists"
                     | "__lix_jsonb"
+                    | "__lix_numeric_literal"
                     | "lix_order_between"
             ) || args.iter().any(bound_expr_requires_datafusion)
         }
@@ -2781,26 +3315,16 @@ fn validate_supported_logical_plan(plan: &LogicalPlan) -> Result<(), LixError> {
     Ok(())
 }
 
-fn scalar_value_from_lix_value(value: &Value) -> ScalarAndMetadata {
-    match value {
-        Value::Null => ScalarValue::Null.into(),
-        Value::Boolean(value) => ScalarValue::Boolean(Some(*value)).into(),
-        Value::Integer(value) => ScalarValue::Int64(Some(*value)).into(),
-        Value::Real(value) => ScalarValue::Float64(Some(*value)).into(),
-        Value::Text(value) => ScalarValue::Utf8(Some(value.clone())).into(),
-        Value::Jsonb(value) => ScalarAndMetadata::new(
-            ScalarValue::Utf8(Some(value.to_string())),
-            Some(json_field_metadata()),
-        ),
-        Value::RowRef(value) => ScalarAndMetadata::new(
-            ScalarValue::Utf8(Some(value.as_str().to_owned())),
-            Some(row_ref_field_metadata()),
-        ),
-        Value::Timestamptz(value) => {
-            ScalarValue::TimestampMicrosecond(Some(*value), Some("UTC".into())).into()
-        }
-        Value::Blob(value) => ScalarValue::LargeBinary(Some(value.to_vec())).into(),
-    }
+fn scalar_value_from_lix_value(value: &Value) -> Result<ScalarAndMetadata, LixError> {
+    let metadata = match value {
+        Value::Jsonb(_) => Some(json_field_metadata()),
+        Value::RowRef(_) => Some(row_ref_field_metadata()),
+        _ => None,
+    };
+    Ok(ScalarAndMetadata::new(
+        crate::sql2::value_contract::public_scalar(value)?,
+        metadata,
+    ))
 }
 
 fn json_field_metadata() -> FieldMetadata {
@@ -3075,9 +3599,7 @@ impl ColumnCursor<'_> {
                     Value::Null
                 } else {
                     let value = values.value(row_index);
-                    i64::try_from(value)
-                        .map(Value::Integer)
-                        .unwrap_or_else(|_| Value::Text(value.to_string()))
+                    crate::sql2::value_contract::unsigned_integer_result(value)?
                 }
             }
             Self::Float32(values) => real_value(*values, row_index)?,
@@ -3161,13 +3683,7 @@ impl ColumnCursor<'_> {
                         Value::Null
                     } else {
                         let value = values.value(row_index);
-                        match i64::try_from(value) {
-                            Ok(value) => Value::Integer(value),
-                            // Unsigned values past the signed range have no
-                            // integer representation in a Lix row, so they are
-                            // preserved exactly as decimal text.
-                            Err(_) => Value::Text(value.to_string()),
-                        }
+                        crate::sql2::value_contract::unsigned_integer_result(value)?
                     });
                 }
             }
@@ -3331,8 +3847,9 @@ mod tests {
 
     use super::{
         SqlExecutionContext, SqlWriteExecutionContext, build_write_session_with_options,
-        execute_sql, query_result_from_batches, query_values_from_batches, row_values_from_batch,
-        write_provider_selection, write_session_options, write_target_table_name,
+        execute_sql, query_result_from_batches, query_values_from_batches, retain_columnar_result,
+        row_values_from_batch, write_provider_selection, write_session_options,
+        write_target_table_name,
     };
     use crate::binary_cas::BlobDataReader;
     use crate::branch::BranchRefReader;
@@ -3416,7 +3933,7 @@ mod tests {
             )),
             Arc::new(UInt64Array::from_iter((0..ROWS).map(|index| {
                 present(index).then_some(if index == 1 {
-                    u64::MAX
+                    i64::MAX as u64
                 } else {
                     index as u64 * 7
                 })
@@ -3640,6 +4157,33 @@ mod tests {
     }
 
     #[test]
+    fn unsigned_overflow_never_changes_integer_results_into_text() {
+        let fields = vec![Field::new("n", DataType::UInt64, true)];
+        for rows in [1, 4096] {
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(fields.clone())),
+                vec![Arc::new(UInt64Array::from(vec![u64::MAX; rows]))],
+            )
+            .unwrap();
+            assert!(!retain_columnar_result(
+                &fields,
+                std::slice::from_ref(&batch)
+            ));
+            assert_eq!(
+                query_result_from_batches(&fields, std::slice::from_ref(&batch))
+                    .unwrap_err()
+                    .code,
+                LixError::CODE_TYPE_MISMATCH
+            );
+            assert_eq!(
+                row_values_from_batch(&fields, &batch, 0).unwrap_err().code,
+                LixError::CODE_TYPE_MISMATCH
+            );
+            assert!(query_values_from_batches(&fields, &[batch]).is_err());
+        }
+    }
+
+    #[test]
     fn typed_row_conversion_covers_every_supported_result_column_type() {
         use datafusion::arrow::array::{
             BooleanArray, Float64Array, LargeBinaryArray, NullArray, StringArray, UInt64Array,
@@ -3662,7 +4206,7 @@ mod tests {
                 Arc::new(NullArray::new(2)),
                 Arc::new(BooleanArray::from(vec![Some(true), None])),
                 Arc::new(Int64Array::from(vec![Some(7i64), None])),
-                Arc::new(UInt64Array::from(vec![Some(u64::MAX), None])),
+                Arc::new(UInt64Array::from(vec![Some(i64::MAX as u64), None])),
                 Arc::new(Float64Array::from(vec![Some(1.5f64), None])),
                 Arc::new(StringArray::from(vec![Some("hello"), None])),
                 Arc::new(StringArray::from(vec![Some(r#"{"a":1}"#), None])),
@@ -3680,7 +4224,7 @@ mod tests {
                 Value::Null,
                 Value::Boolean(true),
                 Value::Integer(7),
-                Value::Text(u64::MAX.to_string()),
+                Value::Integer(i64::MAX),
                 Value::Real(1.5),
                 Value::Text("hello".to_owned()),
                 Value::Jsonb(crate::Json::from_canonical_text(r#"{"a":1}"#)),
@@ -4140,10 +4684,7 @@ mod tests {
         let mut table_names = public.table_names();
         table_names.sort();
 
-        assert_eq!(
-            table_names,
-            vec!["lix_branch", "lix_directory", "lix_file"]
-        );
+        assert_eq!(table_names, vec!["lix_branch", "lix_directory", "lix_file"]);
     }
 
     #[tokio::test]

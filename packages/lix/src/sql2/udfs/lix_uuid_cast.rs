@@ -3,12 +3,12 @@ use std::sync::Arc;
 
 use datafusion::arrow::array::StringArray;
 use datafusion::arrow::datatypes::DataType;
-use datafusion::common::{DataFusionError, Result, ScalarValue, plan_err};
+use datafusion::common::{Result, ScalarValue, plan_err};
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
 
-use super::common::{scalar_inputs, text_like_value};
+use super::common::{parse_uuid, scalar_inputs, text_like_value};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct LixUuidCast(Signature);
@@ -48,13 +48,7 @@ impl ScalarUDFImpl for LixUuidCast {
         for row in 0..arrays[0].len() {
             output.push(match text_like_value(arrays[0].as_ref(), row)? {
                 None => None,
-                Some(raw) => Some(
-                    uuid::Uuid::parse_str(&raw)
-                        .map_err(|error| {
-                            DataFusionError::Execution(format!("invalid UUID value: {error}"))
-                        })?
-                        .to_string(),
-                ),
+                Some(raw) => Some(parse_uuid(&raw)?.to_string()),
             });
         }
         if scalar {

@@ -66,8 +66,8 @@ pub(crate) use exec::{
 pub(crate) use exec::{SessionReadResult, SessionReadSqlResult, SqlWriteResult};
 #[allow(unused_imports)]
 pub(crate) use exec::{
-    SqlLogicalPlan, append_path_value_replacement_snapshot,
-    append_path_value_replacement_snapshot_text, create_write_logical_plan_from_template,
+    SqlLogicalPlan, append_path_value_replacement_payload,
+    append_path_value_replacement_payload_text, create_write_logical_plan_from_template,
     create_write_plan_template_from_parsed, execute_read_statement_in_session_from_parsed,
     execute_read_statement_in_session_with_result, execute_transaction_read_statement_from_parsed,
     execute_write_logical_plan_parameter_batch, execute_write_logical_plan_result_with_metadata,

@@ -1073,15 +1073,17 @@ fn bind_cast_expr(
     let expr = bind_inner(expr, params)?;
     if data_type == BoundCastType::Jsonb {
         return match expr {
-            BoundExpr::Literal(BoundLiteral::Text(raw)) => serde_json::from_str(&raw)
-                .map(BoundLiteral::Json)
-                .map(BoundExpr::Literal)
-                .map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_TYPE_MISMATCH,
-                        format!("invalid JSONB literal: {error}"),
-                    )
-                }),
+            BoundExpr::Literal(BoundLiteral::Text(raw)) => {
+                crate::sql2::udfs::common::parse_jsonb(&raw)
+                    .map(BoundLiteral::Json)
+                    .map(BoundExpr::Literal)
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_TYPE_MISMATCH,
+                            format!("invalid JSONB literal: {error}"),
+                        )
+                    })
+            }
             BoundExpr::Literal(BoundLiteral::Json(_) | BoundLiteral::Null) => Ok(expr),
             _ => Ok(BoundExpr::Cast {
                 expr: Box::new(expr),
@@ -1205,7 +1207,9 @@ fn validate_bound_function_arity(name: &str, actual: usize) -> Result<(), LixErr
         | "__lix_json_contains"
         | "__lix_json_exists"
         | "lix_order_between" => expect_exact_function_arity(name, actual, 2),
-        "__lix_jsonb" => expect_exact_function_arity(name, actual, 1),
+        "__lix_jsonb" | "__lix_text_cast" | "__lix_timestamptz_cast" | "__lix_numeric_literal" => {
+            expect_exact_function_arity(name, actual, 1)
+        }
         // DataFusion validates the signatures of its scalar functions.
         _ => Ok(()),
     }

@@ -21,7 +21,7 @@ pub(crate) fn canonical_jsonb_text(raw: &str) -> std::result::Result<String, Str
     serde_json::to_string(&parse_jsonb(raw)?).map_err(|error| error.to_string())
 }
 
-fn normalize_jsonb(value: &mut JsonValue) -> std::result::Result<(), String> {
+pub(crate) fn normalize_jsonb(value: &mut JsonValue) -> std::result::Result<(), String> {
     match value {
         JsonValue::String(value) => reject_jsonb_nul(value)?,
         JsonValue::Array(values) => {
@@ -78,7 +78,10 @@ pub(super) fn json_value_to_serde(array: &dyn Array, row: usize) -> Result<Optio
 }
 
 pub(super) fn text_like_value(array: &dyn Array, row: usize) -> Result<Option<String>> {
-    if matches!(array.data_type(), datafusion::arrow::datatypes::DataType::Null) {
+    if matches!(
+        array.data_type(),
+        datafusion::arrow::datatypes::DataType::Null
+    ) {
         return Ok(None);
     }
     if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
@@ -100,19 +103,30 @@ pub(super) fn text_like_value(array: &dyn Array, row: usize) -> Result<Option<St
         }));
     }
     if let Some(array) = array.as_any().downcast_ref::<BinaryArray>() {
-        return Ok(
-            (!array.is_null(row)).then(|| String::from_utf8_lossy(array.value(row)).to_string())
-        );
+        return (!array.is_null(row))
+            .then(|| utf8_text(array.value(row)).map(str::to_owned))
+            .transpose();
     }
     if let Some(array) = array.as_any().downcast_ref::<LargeBinaryArray>() {
-        return Ok(
-            (!array.is_null(row)).then(|| String::from_utf8_lossy(array.value(row)).to_string())
-        );
+        return (!array.is_null(row))
+            .then(|| utf8_text(array.value(row)).map(str::to_owned))
+            .transpose();
     }
     Err(DataFusionError::Execution(format!(
         "unsupported argument type for JSON/text function: {:?}",
         array.data_type()
     )))
+}
+
+pub(crate) fn utf8_text(bytes: &[u8]) -> Result<&str> {
+    std::str::from_utf8(bytes).map_err(|error| {
+        DataFusionError::Execution(format!("binary text input is not valid UTF-8: {error}"))
+    })
+}
+
+pub(crate) fn parse_uuid(raw: &str) -> Result<uuid::Uuid> {
+    uuid::Uuid::parse_str(raw)
+        .map_err(|error| DataFusionError::Execution(format!("invalid UUID value: {error}")))
 }
 
 pub(super) fn numeric_value(array: &dyn Array, row: usize) -> Result<Option<String>> {

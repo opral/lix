@@ -239,16 +239,7 @@ async fn assert_session_state(
 fn assert_rows(actual: &[lix::Row], expected: &BTreeMap<String, serde_json::Value>, label: &str) {
     let expected = expected
         .iter()
-        .map(|(key, value)| {
-            vec![
-                Value::Text(key.clone()),
-                if value.is_null() {
-                    Value::Null
-                } else {
-                    Value::Jsonb(value.clone().into())
-                },
-            ]
-        })
+        .map(|(key, value)| vec![Value::Text(key.clone()), Value::Jsonb(value.clone().into())])
         .collect::<Vec<_>>();
     let actual = actual
         .iter()
