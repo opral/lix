@@ -1218,3 +1218,42 @@ simulation_test!(foreign_key_cascade_merge_changed_referenced_key, |sim| async m
     assert_rows_eq(main.execute("SELECT id FROM mutable_parent", &[]).await.unwrap(), vec![]);
     assert_rows_eq(main.execute("SELECT id FROM mutable_child", &[]).await.unwrap(), vec![]);
 });
+
+
+simulation_test!(foreign_key_cascade_merge_rejects_tracked_untracked_identity_collision, |sim| async move {
+    use lix::{CreateBranchOptions, MergeBranchOptions, MergeBranchPreviewOptions};
+    let engine = sim.boot_engine().await;
+    let main = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    for schema in [
+        serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"lane_parent","columns":[{"name":"id","type":"text","nullable":false}],"primary_key":["id"]}),
+        serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"lane_child","columns":[{"name":"id","type":"text","nullable":false},{"name":"parent_id","type":"text","nullable":false}],"primary_key":["id"],"foreign_keys":[{"columns":["parent_id"],"references":{"schema_key":"lane_parent","columns":["id"]},"on_delete":"cascade"}]}),
+    ] {
+        main.execute("INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)", &[Value::Text(schema.to_string())]).await.unwrap();
+    }
+    main.execute("INSERT INTO lane_parent(id) VALUES ('p'),('q')", &[]).await.unwrap();
+    let branch = main.create_branch(CreateBranchOptions { id: None, name: "tracked-child".into(), from_commit_id: None }).await.unwrap();
+    let source = sim.wrap_session(engine.open_session_at(branch.id.clone()).await.unwrap(), &engine);
+    // Diverge tracked history so this uses merge preparation, not a fast-forward.
+    main.execute("INSERT INTO lane_parent(id) VALUES ('target-only')", &[]).await.unwrap();
+    main.execute("INSERT INTO lane_child(id,parent_id,lixcol_untracked) VALUES ('c','p',true)", &[]).await.unwrap();
+    source.execute("INSERT INTO lane_child(id,parent_id) VALUES ('c','q')", &[]).await.unwrap();
+    source.execute("DELETE FROM lane_parent WHERE id='p'", &[]).await.unwrap();
+    let preview_error = main.merge_branch_preview(MergeBranchPreviewOptions { source_branch_id: branch.id.clone() }).await.unwrap_err();
+    let merge_error = main.merge_branch(MergeBranchOptions { source_branch_id: branch.id.clone() }).await.unwrap_err();
+    assert_eq!(preview_error.code, lix::LixError::CODE_MERGE_CONFLICT);
+    assert_eq!(merge_error.code, preview_error.code);
+    assert_rows_eq(main.execute("SELECT id,parent_id,lixcol_untracked FROM lane_child", &[]).await.unwrap(), vec![vec![Value::Text("c".into()), Value::Text("p".into()), Value::Boolean(true)]]);
+    assert_rows_eq(main.execute("SELECT id FROM lane_parent ORDER BY id", &[]).await.unwrap(), vec![vec![Value::Text("p".into())], vec![Value::Text("q".into())], vec![Value::Text("target-only".into())]]);
+    // Resolve the existing durability conflict. Other untracked dependents
+    // still cascade, without inflating tracked merge statistics.
+    main.execute("DELETE FROM lane_child WHERE id='c'", &[]).await.unwrap();
+    main.execute("INSERT INTO lane_child(id,parent_id,lixcol_untracked) VALUES ('d','p',true)", &[]).await.unwrap();
+    let preview = main.merge_branch_preview(MergeBranchPreviewOptions { source_branch_id: branch.id.clone() }).await.unwrap();
+    assert_rows_eq(main.execute("SELECT id FROM lane_child", &[]).await.unwrap(), vec![vec![Value::Text("d".into())]]);
+    let receipt = main.merge_branch(MergeBranchOptions { source_branch_id: branch.id }).await.unwrap();
+    assert_eq!(preview.change_stats, receipt.change_stats);
+    assert_eq!(receipt.change_stats.added, 1);
+    assert_eq!(receipt.change_stats.removed, 1);
+    assert_rows_eq(main.execute("SELECT id,parent_id,lixcol_untracked FROM lane_child", &[]).await.unwrap(), vec![vec![Value::Text("c".into()), Value::Text("q".into()), Value::Boolean(false)]]);
+    assert_rows_eq(main.execute("SELECT id FROM lane_parent ORDER BY id", &[]).await.unwrap(), vec![vec![Value::Text("q".into())], vec![Value::Text("target-only".into())]]);
+});

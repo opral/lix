@@ -441,8 +441,42 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
         let mut deletes =
             super::super::validation::plan_delete_actions(&candidate, catalog, seeds).await?;
         deletes.append(generation_deletes);
+        // Current state has one physical key across durability modes. A
+        // cascaded untracked delete cannot also install a tracked selection at
+        // that key in one publication. Preserve the ordinary merge conflict
+        // contract instead of discarding the selection or emitting duplicate
+        // physical mutations.
+        let untracked_deletes = deletes
+            .iter()
+            .filter(|row| row.untracked)
+            .map(|row| TrackedStateKey {
+                schema_key: row.schema_key.to_string(),
+                file_id: row.file_id.map(ToString::to_string),
+                row_pk: row.row_pk.expect("cascade has an identity").clone(),
+            })
+            .collect::<BTreeSet<_>>();
+        if !untracked_deletes.is_empty() {
+            for pick in picks {
+                let identity = TrackedStateKey {
+                    schema_key: pick.identity.schema_key().into(),
+                    file_id: pick.identity.file_id().map(str::to_owned),
+                    row_pk: pick.identity.row_pk().clone(),
+                };
+                if untracked_deletes.contains(&identity) {
+                    return Err(
+                        commit::selected_tracked_ref_untracked_collision_error(
+                            &branch,
+                            &identity,
+                        ),
+                    );
+                }
+            }
+        }
+        // Untracked cleanup does not replace historical picks or count as
+        // tracked merge changes.
         let identities = deletes
             .iter()
+            .filter(|row| !row.untracked)
             .map(|row| TrackedStateKey {
                 schema_key: row.schema_key.to_string(),
                 file_id: row.file_id.map(ToString::to_string),
