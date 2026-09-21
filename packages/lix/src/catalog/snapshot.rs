@@ -840,6 +840,7 @@ impl DefaultPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ForeignKeyPlan {
+    pub(crate) on_delete: lix_schema::DeleteAction,
     pub(crate) local_properties: PointerGroup,
     pub(crate) referenced_schema: SchemaCatalogKey,
     pub(crate) referenced_plan_id: SchemaPlanId,
@@ -865,6 +866,7 @@ impl DeleteValidationPlan<'_> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UnboundForeignKeyPlan {
+    on_delete: lix_schema::DeleteAction,
     local_properties: PointerGroup,
     referenced_schema: SchemaCatalogKey,
     referenced_properties: PointerGroup,
@@ -950,6 +952,7 @@ fn foreign_key_plans(schema: &JsonValue) -> Result<Vec<UnboundForeignKeyPlan>, L
         .foreign_keys
         .into_iter()
         .map(|foreign_key| UnboundForeignKeyPlan {
+            on_delete: foreign_key.on_delete,
             local_properties: foreign_key
                 .columns
                 .into_iter()
@@ -1032,6 +1035,7 @@ fn bind_foreign_key_plans(
             }
 
             Ok(ForeignKeyPlan {
+                on_delete: foreign_key.on_delete,
                 local_properties: foreign_key.local_properties,
                 referenced_schema: foreign_key.referenced_schema,
                 referenced_plan_id,

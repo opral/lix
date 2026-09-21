@@ -968,3 +968,253 @@ async fn assert_parent_delete_restricted(sim: &crate::support::simulation_test::
     tx.execute(delete_sql, &[]).await.unwrap();
     tx.commit().await.expect("deleting the child and parent together is valid");
 }
+
+simulation_test!(foreign_key_cascade_statement_visibility_and_rollback, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    for (key, target) in [("cascade_parent", None), ("cascade_child", Some("cascade_parent")), ("cascade_leaf", Some("cascade_child"))] {
+        let mut schema = serde_json::json!({
+            "$schema":"https://lix.dev/schema-v1.json", "key":key,
+            "columns":[{"name":"id","type":"text","nullable":false}, {"name":"parent_id","type":"text"}],
+            "primary_key":["id"]
+        });
+        if let Some(target) = target {
+            schema["foreign_keys"] = serde_json::json!([{"columns":["parent_id"],"references":{"schema_key":target,"columns":["id"]},"on_delete":"cascade"}]);
+        }
+        session.execute("INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)", &[Value::Text(schema.to_string())]).await.unwrap();
+    }
+    session.execute("INSERT INTO cascade_parent(id) VALUES ('p')", &[]).await.unwrap();
+    session.execute("INSERT INTO cascade_child(id,parent_id) VALUES ('c','p'), ('null',NULL)", &[]).await.unwrap();
+    session.execute("INSERT INTO cascade_leaf(id,parent_id) VALUES ('l','c')", &[]).await.unwrap();
+    let mut tx = session.begin_transaction().await.unwrap();
+    tx.execute("INSERT INTO cascade_child(id,parent_id) VALUES ('pending','p')", &[]).await.unwrap();
+    tx.execute("INSERT INTO cascade_leaf(id,parent_id) VALUES ('pending_leaf','pending')", &[]).await.unwrap();
+    tx.execute("INSERT INTO cascade_parent(id) VALUES ('new_parent')", &[]).await.unwrap();
+    tx.execute("INSERT INTO cascade_child(id,parent_id) VALUES ('new_child','new_parent')", &[]).await.unwrap();
+    tx.execute("DELETE FROM cascade_parent WHERE id=$1", &[Value::Text("new_parent".into())]).await.unwrap();
+    tx.execute("DELETE FROM cascade_parent WHERE id=$1", &[Value::Text("p".into())]).await.unwrap();
+    assert_rows_eq(tx.execute("SELECT id FROM cascade_child", &[]).await.unwrap(), vec![vec![Value::Text("null".into())]]);
+    assert_rows_eq(tx.execute("SELECT id FROM cascade_leaf", &[]).await.unwrap(), vec![]);
+    tx.rollback().await.unwrap();
+    assert_rows_eq(session.execute("SELECT id FROM cascade_leaf", &[]).await.unwrap(), vec![vec![Value::Text("l".into())]]);
+    let mut invalid = session.begin_transaction().await.unwrap();
+    invalid.execute("DELETE FROM cascade_parent", &[]).await.unwrap();
+    invalid.execute("INSERT INTO cascade_child(id,parent_id) VALUES ('too_late','p')", &[]).await.unwrap();
+    assert_eq!(invalid.commit().await.unwrap_err().code, lix::LixError::CODE_FOREIGN_KEY);
+    session.execute("DELETE FROM cascade_parent", &[]).await.unwrap();
+    assert_rows_eq(session.execute("SELECT id FROM cascade_child", &[]).await.unwrap(), vec![vec![Value::Text("null".into())]]);
+    assert_rows_eq(session.execute("SELECT id FROM cascade_leaf", &[]).await.unwrap(), vec![]);
+    let error = session.execute("INSERT INTO cascade_child(id,parent_id) VALUES ('bad','never_existed')", &[]).await.unwrap_err();
+    assert_eq!(error.code, lix::LixError::CODE_FOREIGN_KEY);
+});
+
+simulation_test!(foreign_key_cascade_merge_destination_delete, |sim| async move {
+    assert_cascade_merge(&sim, true).await;
+});
+simulation_test!(foreign_key_cascade_merge_source_delete, |sim| async move {
+    assert_cascade_merge(&sim, false).await;
+});
+async fn assert_cascade_merge(sim: &crate::support::simulation_test::engine::Simulation, deletion_on_destination: bool) {
+    use lix::{CreateBranchOptions, MergeBranchOptions, MergeBranchPreviewOptions};
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        for schema in [
+            serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"cascade_conversation","columns":[{"name":"id","type":"text","nullable":false}],"primary_key":["id"]}),
+            serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"cascade_comment","columns":[{"name":"id","type":"text","nullable":false},{"name":"conversation_id","type":"text"}],"primary_key":["id"],"foreign_keys":[{"columns":["conversation_id"],"references":{"schema_key":"cascade_conversation","columns":["id"]},"on_delete":"cascade"}]}),
+        ] {
+            main.execute("INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)", &[Value::Text(schema.to_string())]).await.unwrap();
+        }
+        main.execute("INSERT INTO cascade_conversation(id) VALUES ('p')", &[]).await.unwrap();
+        let branch = main.create_branch(CreateBranchOptions { id: None, name: "reply".into(), from_commit_id: None }).await.unwrap();
+        let source = sim.wrap_session(engine.open_session_at(branch.id.clone()).await.unwrap(), &engine);
+        let (deleted, replied) = if deletion_on_destination { (&main, &source) } else { (&source, &main) };
+        deleted.execute("DELETE FROM cascade_conversation", &[]).await.unwrap();
+        replied.execute("INSERT INTO cascade_comment(id,conversation_id) VALUES ('c','p')", &[]).await.unwrap();
+        // The deletion is scoped to its branch.
+        assert_rows_eq(replied.execute("SELECT id FROM cascade_conversation", &[]).await.unwrap(), vec![vec![Value::Text("p".into())]]);
+        let preview = main.merge_branch_preview(MergeBranchPreviewOptions { source_branch_id: branch.id.clone() }).await.unwrap();
+        assert_rows_eq(replied.execute("SELECT id FROM cascade_comment", &[]).await.unwrap(), vec![vec![Value::Text("c".into())]]);
+        let receipt = main.merge_branch(MergeBranchOptions { source_branch_id: branch.id }).await.unwrap();
+        assert_eq!(preview.change_stats, receipt.change_stats);
+        assert_rows_eq(main.execute("SELECT id FROM cascade_comment", &[]).await.unwrap(), vec![]);
+        assert_rows_eq(main.execute("SELECT id FROM cascade_conversation", &[]).await.unwrap(), vec![]);
+}
+
+simulation_test!(foreign_key_cascade_composite_unique_and_cycles, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    for schema in [
+        serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"cascade_pair","columns":[{"name":"id","type":"text","nullable":false},{"name":"a","type":"text","nullable":false},{"name":"b","type":"int8","nullable":false}],"primary_key":["id"],"unique":[["a","b"]]}),
+        serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"cascade_link","columns":[{"name":"id","type":"text","nullable":false},{"name":"a","type":"text"},{"name":"b","type":"int8"}],"primary_key":["id"],"foreign_keys":[{"columns":["a","b"],"references":{"schema_key":"cascade_pair","columns":["a","b"]},"on_delete":"cascade"}]}),
+        serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"cascade_cycle","columns":[{"name":"id","type":"text","nullable":false},{"name":"parent_id","type":"text"}],"primary_key":["id"],"foreign_keys":[{"columns":["parent_id"],"references":{"schema_key":"cascade_cycle","columns":["id"]},"on_delete":"cascade"}]}),
+    ] {
+        session.execute("INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)", &[Value::Text(schema.to_string())]).await.unwrap();
+    }
+    session.execute("INSERT INTO cascade_pair(id,a,b) VALUES ('p','a',1),('q','a',2)", &[]).await.unwrap();
+    session.execute("INSERT INTO cascade_link(id,a,b) VALUES ('match','a',1),('other','a',2),('null','a',NULL)", &[]).await.unwrap();
+    session.execute("DELETE FROM cascade_pair WHERE id='p'", &[]).await.unwrap();
+    assert_rows_eq(session.execute("SELECT id FROM cascade_link ORDER BY id", &[]).await.unwrap(), vec![vec![Value::Text("null".into())],vec![Value::Text("other".into())]]);
+    // Insert both ends before final validation, then traverse the cycle once.
+    let mut tx = session.begin_transaction().await.unwrap();
+    tx.execute("INSERT INTO cascade_cycle(id,parent_id) VALUES ('a','b'),('b','a')", &[]).await.unwrap();
+    tx.commit().await.unwrap();
+    session.execute("DELETE FROM cascade_cycle WHERE id='a'", &[]).await.unwrap();
+    assert_rows_eq(session.execute("SELECT id FROM cascade_cycle", &[]).await.unwrap(), vec![]);
+});
+
+simulation_test!(foreign_key_cascade_concurrent_reply_is_atomic,
+    // Deterministic mode deliberately serializes writers for stable IDs.
+    options = crate::support::simulation_test::engine::SimulationOptions { deterministic: false },
+    |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    for schema in [
+        serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"race_parent","columns":[{"name":"id","type":"text","nullable":false}],"primary_key":["id"]}),
+        serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"race_child","columns":[{"name":"id","type":"text","nullable":false},{"name":"parent_id","type":"text","nullable":false}],"primary_key":["id"],"foreign_keys":[{"columns":["parent_id"],"references":{"schema_key":"race_parent","columns":["id"]},"on_delete":"cascade"}]}),
+    ] {
+        session.execute("INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)", &[Value::Text(schema.to_string())]).await.unwrap();
+    }
+    session.execute("INSERT INTO race_parent(id) VALUES ('p')", &[]).await.unwrap();
+    let other = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    let mut deletion = session.begin_transaction().await.unwrap();
+    deletion.execute("DELETE FROM race_parent WHERE id='p'", &[]).await.unwrap();
+    // The committed child was absent when the DELETE statement planned actions.
+    other.execute("INSERT INTO race_child(id,parent_id) VALUES ('concurrent','p')", &[]).await.unwrap();
+    match deletion.commit().await {
+        Ok(_) => assert_rows_eq(session.execute("SELECT id FROM race_child", &[]).await.unwrap(), vec![]),
+        Err(error) => {
+            assert_eq!(error.code, lix::LixError::CODE_TRANSACTION_CONFLICT);
+            assert_rows_eq(session.execute("SELECT id FROM race_child", &[]).await.unwrap(), vec![vec![Value::Text("concurrent".into())]]);
+            assert_rows_eq(session.execute("SELECT id FROM race_parent", &[]).await.unwrap(), vec![vec![Value::Text("p".into())]]);
+            session.execute("DELETE FROM race_parent WHERE id='p'", &[]).await.unwrap();
+            assert_rows_eq(session.execute("SELECT id FROM race_child", &[]).await.unwrap(), vec![]);
+        }
+    }
+    assert_rows_eq(session.execute("SELECT id FROM race_parent", &[]).await.unwrap(), vec![]);
+    let error = other.execute("INSERT INTO race_child(id,parent_id) VALUES ('late','p')", &[]).await.unwrap_err();
+    assert_eq!(error.code, lix::LixError::CODE_FOREIGN_KEY);
+});
+
+simulation_test!(foreign_key_no_action_merge_rejects_orphan_in_preview_and_execution, |sim| async move {
+    use lix::{CreateBranchOptions, MergeBranchOptions, MergeBranchPreviewOptions};
+    let engine = sim.boot_engine().await;
+    let main = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    for schema in [
+        serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"merge_parent","columns":[{"name":"id","type":"text","nullable":false}],"primary_key":["id"]}),
+        serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"merge_child","columns":[{"name":"id","type":"text","nullable":false},{"name":"parent_id","type":"text","nullable":false}],"primary_key":["id"],"foreign_keys":[{"columns":["parent_id"],"references":{"schema_key":"merge_parent","columns":["id"]}}]}),
+    ] {
+        main.execute("INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)", &[Value::Text(schema.to_string())]).await.unwrap();
+    }
+    main.execute("INSERT INTO merge_parent(id) VALUES ('p')", &[]).await.unwrap();
+    let branch = main.create_branch(CreateBranchOptions { id: None, name: "reply".into(), from_commit_id: None }).await.unwrap();
+    let source = sim.wrap_session(engine.open_session_at(branch.id.clone()).await.unwrap(), &engine);
+    main.execute("DELETE FROM merge_parent", &[]).await.unwrap();
+    source.execute("INSERT INTO merge_child(id,parent_id) VALUES ('c','p')", &[]).await.unwrap();
+    let preview = main.merge_branch_preview(MergeBranchPreviewOptions { source_branch_id: branch.id.clone() }).await.unwrap_err();
+    let execution = main.merge_branch(MergeBranchOptions { source_branch_id: branch.id }).await.unwrap_err();
+    assert_eq!(preview.code, lix::LixError::CODE_FOREIGN_KEY);
+    assert_eq!(execution.code, preview.code);
+    assert_rows_eq(main.execute("SELECT id FROM merge_child", &[]).await.unwrap(), vec![]);
+    assert_rows_eq(source.execute("SELECT id FROM merge_child", &[]).await.unwrap(), vec![vec![Value::Text("c".into())]]);
+});
+
+simulation_test!(foreign_key_cascade_merge_incoming_schema, |sim| async move {
+    assert_generation_cascade_merge(&sim, false, "cascade").await;
+});
+simulation_test!(foreign_key_cascade_merge_incoming_generation, |sim| async move {
+    assert_generation_cascade_merge(&sim, true, "cascade").await;
+});
+simulation_test!(foreign_key_no_action_merge_incoming_generation, |sim| async move {
+    assert_generation_cascade_merge(&sim, true, "no_action").await;
+});
+async fn assert_generation_cascade_merge(
+    sim: &crate::support::simulation_test::engine::Simulation,
+    incoming_delete: bool,
+    action: &str,
+) {
+    use lix::{CreateBranchOptions, MergeBranchOptions, MergeBranchPreviewOptions};
+    let engine = sim.boot_engine().await;
+    let main = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    let parent = serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"incoming_parent","columns":[{"name":"id","type":"text","nullable":false}],"primary_key":["id"]});
+    main.execute("INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)", &[Value::Text(parent.to_string())]).await.unwrap();
+    main.execute("INSERT INTO incoming_parent(id) VALUES ('p')", &[]).await.unwrap();
+    let branch = main.create_branch(CreateBranchOptions { id: None, name: "new-schema".into(), from_commit_id: None }).await.unwrap();
+    let source = sim.wrap_session(engine.open_session_at(branch.id.clone()).await.unwrap(), &engine);
+    let deleting = if incoming_delete { &source } else { &main };
+    let replying = if incoming_delete { &main } else { &source };
+    deleting.execute("DELETE FROM incoming_parent", &[]).await.unwrap();
+    let child = serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"incoming_child","columns":[{"name":"id","type":"text","nullable":false},{"name":"parent_id","type":"text"}],"primary_key":["id"],"foreign_keys":[{"columns":["parent_id"],"references":{"schema_key":"incoming_parent","columns":["id"]},"on_delete":action}]});
+    replying.execute("INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)", &[Value::Text(child.to_string())]).await.unwrap();
+    replying.execute("INSERT INTO incoming_child(id,parent_id) VALUES ('c','p')", &[]).await.unwrap();
+    if action == "no_action" {
+        let preview = main.merge_branch_preview(MergeBranchPreviewOptions { source_branch_id: branch.id.clone() }).await.unwrap_err();
+        let execution = main.merge_branch(MergeBranchOptions { source_branch_id: branch.id }).await.unwrap_err();
+        assert_eq!(preview.code, lix::LixError::CODE_FOREIGN_KEY);
+        assert_eq!(execution.code, preview.code);
+        assert_rows_eq(main.execute("SELECT id FROM incoming_parent", &[]).await.unwrap(), vec![vec![Value::Text("p".into())]]);
+        assert_rows_eq(main.execute("SELECT id FROM incoming_child", &[]).await.unwrap(), vec![vec![Value::Text("c".into())]]);
+        return;
+    }
+    let preview = main.merge_branch_preview(MergeBranchPreviewOptions { source_branch_id: branch.id.clone() }).await.unwrap();
+    let receipt = main.merge_branch(MergeBranchOptions { source_branch_id: branch.id }).await.unwrap();
+    assert_eq!(preview.change_stats, receipt.change_stats);
+    assert_rows_eq(main.execute("SELECT id FROM incoming_child", &[]).await.unwrap(), vec![]);
+    assert_rows_eq(main.execute("SELECT id FROM incoming_parent", &[]).await.unwrap(), vec![]);
+    if !incoming_delete {
+        assert_rows_eq(source.execute("SELECT id FROM incoming_child", &[]).await.unwrap(), vec![vec![Value::Text("c".into())]]);
+        let schema_diff = main.execute(
+            "SELECT COUNT(*) AS n FROM lix_diff('lix_registered_schema', $1, $2)",
+            &[Value::Text(receipt.source_head_before_commit_id), Value::Text(receipt.target_head_after_commit_id)],
+        ).await.unwrap();
+        assert_eq!(schema_diff.rows()[0].get::<i64>("n").unwrap(), 0, "merge must retain the selected schema change identity");
+    }
+}
+
+simulation_test!(foreign_key_cascade_stops_at_no_action_atomically, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    for (key, target, action) in [("boundary_parent", None, "no_action"), ("boundary_child", Some("boundary_parent"), "cascade"), ("boundary_leaf", Some("boundary_child"), "no_action")] {
+        let mut schema = serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":key,"columns":[{"name":"id","type":"text","nullable":false},{"name":"parent_id","type":"text"}],"primary_key":["id"]});
+        if let Some(target) = target {
+            schema["foreign_keys"] = serde_json::json!([{"columns":["parent_id"],"references":{"schema_key":target,"columns":["id"]},"on_delete":action}]);
+        }
+        session.execute("INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)", &[Value::Text(schema.to_string())]).await.unwrap();
+    }
+    session.execute("INSERT INTO boundary_parent(id) VALUES ('p')", &[]).await.unwrap();
+    session.execute("INSERT INTO boundary_child(id,parent_id) VALUES ('c','p')", &[]).await.unwrap();
+    session.execute("INSERT INTO boundary_leaf(id,parent_id) VALUES ('l','c')", &[]).await.unwrap();
+    let error = session.execute("DELETE FROM boundary_parent", &[]).await.unwrap_err();
+    assert_eq!(error.code, lix::LixError::CODE_FOREIGN_KEY);
+    assert_rows_eq(session.execute("SELECT id FROM boundary_parent", &[]).await.unwrap(), vec![vec![Value::Text("p".into())]]);
+    assert_rows_eq(session.execute("SELECT id FROM boundary_child", &[]).await.unwrap(), vec![vec![Value::Text("c".into())]]);
+    let mut tx = session.begin_transaction().await.unwrap();
+    tx.execute("DELETE FROM boundary_parent", &[]).await.unwrap();
+    tx.execute("DELETE FROM boundary_leaf", &[]).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_rows_eq(session.execute("SELECT id FROM boundary_child", &[]).await.unwrap(), vec![]);
+});
+
+simulation_test!(foreign_key_cascade_merge_changed_referenced_key, |sim| async move {
+    use lix::{CreateBranchOptions, MergeBranchOptions, MergeBranchPreviewOptions};
+    let engine = sim.boot_engine().await;
+    let main = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    for schema in [
+        serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"mutable_parent","columns":[{"name":"id","type":"text","nullable":false},{"name":"code","type":"text","nullable":false}],"primary_key":["id"],"unique":[["code"]]}),
+        serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"mutable_child","columns":[{"name":"id","type":"text","nullable":false},{"name":"parent_code","type":"text"}],"primary_key":["id"],"foreign_keys":[{"columns":["parent_code"],"references":{"schema_key":"mutable_parent","columns":["code"]},"on_delete":"cascade"}]}),
+    ] {
+        main.execute("INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)", &[Value::Text(schema.to_string())]).await.unwrap();
+    }
+    main.execute("INSERT INTO mutable_parent(id,code) VALUES ('p','old')", &[]).await.unwrap();
+    let branch = main.create_branch(CreateBranchOptions { id: None, name: "changed-key".into(), from_commit_id: None }).await.unwrap();
+    let source = sim.wrap_session(engine.open_session_at(branch.id.clone()).await.unwrap(), &engine);
+    main.execute("UPDATE mutable_parent SET code='new' WHERE id='p'", &[]).await.unwrap();
+    main.execute("INSERT INTO mutable_child(id,parent_code) VALUES ('c','new')", &[]).await.unwrap();
+    // Incoming deletion wins whole-row reconciliation against the target's
+    // changed unique key; cascade matching must use the target's live value.
+    source.execute("DELETE FROM mutable_parent", &[]).await.unwrap();
+    let preview = main.merge_branch_preview(MergeBranchPreviewOptions { source_branch_id: branch.id.clone() }).await.unwrap();
+    let receipt = main.merge_branch(MergeBranchOptions { source_branch_id: branch.id }).await.unwrap();
+    assert_eq!(preview.change_stats, receipt.change_stats);
+    assert_rows_eq(main.execute("SELECT id FROM mutable_parent", &[]).await.unwrap(), vec![]);
+    assert_rows_eq(main.execute("SELECT id FROM mutable_child", &[]).await.unwrap(), vec![]);
+});

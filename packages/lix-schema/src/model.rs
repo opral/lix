@@ -90,6 +90,8 @@ impl DataType {
 pub struct ForeignKey {
     pub columns: Vec<String>,
     pub references: ForeignKeyReference,
+    #[serde(default, skip_serializing_if = "DeleteAction::is_no_action")]
+    pub on_delete: DeleteAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,4 +99,19 @@ pub struct ForeignKey {
 pub struct ForeignKeyReference {
     pub schema_key: String,
     pub columns: Vec<String>,
+}
+
+/// Action executed when a referenced row is deleted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeleteAction {
+    #[default]
+    NoAction,
+    Cascade,
+}
+
+impl DeleteAction {
+    pub const fn is_no_action(&self) -> bool {
+        matches!(self, Self::NoAction)
+    }
 }

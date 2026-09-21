@@ -93,3 +93,16 @@ A document with an existing `key` is an amendment. Schema v1 permits:
 It rejects removal, rename, reorder, type/nullability/default changes, and all
 primary-key, unique, or foreign-key changes. Incompatible evolution requires an
 explicit future migration facility or a new schema key.
+
+Foreign keys may declare `"on_delete": "cascade"` to delete referencing rows
+when the referenced row is deleted. Omission and `"no_action"` retain final-state
+foreign-key validation. `restrict`, `set_null`, and `set_default` are not supported.
+A deletion policy is part of the schema's constraint semantics and cannot be
+changed by a safe append-only amendment. Existing stored schemas need no rewrite:
+an omitted action retains its original serialization and behavior.
+
+Cascades are ordinary transactional row deletions: subsequent statements see
+removed dependents, rollback restores them, and committed deletions have normal
+history. Composite foreign keys use PostgreSQL `MATCH SIMPLE` null semantics.
+Branch merge preparation applies actions to winning deletion events in the
+resolved candidate, including deletions already present on the destination.
