@@ -18,7 +18,7 @@ export function downloadVerifiedArchive(repository, runId, name, staged, run = e
     } finally { closeSync(descriptor); }
     const digest = `sha256:${createHash("sha256").update(readFileSync(archive)).digest("hex")}`;
     if (digest !== artifact.digest) throw new Error("Artifact archive checksum mismatch");
-    run("unzip", ["-q", archive, "-d", staged], { stdio: "inherit", timeout: 60_000 });
+    run("python3", ["-m", "zipfile", "-e", archive, staged], { stdio: "inherit", timeout: 60_000 });
     rmSync(archive);
 }
 

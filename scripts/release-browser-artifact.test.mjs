@@ -166,7 +166,7 @@ test("archive integrity rejects an incomplete OPFS payload before extraction", t
     mkdirSync(staged);
     let extracted = false;
     assert.throws(() => downloadVerifiedArchive("opral/lix", "123", "browser", staged, (command, args, options) => {
-        if (command === "unzip") { extracted = true; return; }
+        if (command === "python3") { extracted = true; return; }
         if (args[1].includes("?")) return JSON.stringify({artifacts:[{name:"browser",id:1,digest:`sha256:${"0".repeat(64)}`} ]});
         writeFileSync(options.stdio[1], "truncated zip missing OPFS modules");
     }), /archive checksum mismatch/);
