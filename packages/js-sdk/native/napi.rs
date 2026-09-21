@@ -3092,13 +3092,13 @@ impl TryFrom<LixValue> for Value {
                             "timestamptz value must be an RFC 3339 string",
                         )
                     })?;
-                let parsed = chrono::DateTime::parse_from_rfc3339(&raw).map_err(|error| {
+                let micros = crate::parse_timestamptz(&raw).map_err(|error| {
                     LixError::new(
                         LixError::CODE_INVALID_PARAM,
                         format!("timestamptz value is invalid: {error}"),
                     )
                 })?;
-                Ok(Self::Timestamptz(parsed.timestamp_micros()))
+                Ok(Self::Timestamptz(micros))
             }
             "blob" => {
                 let bytes = value.blob.ok_or_else(|| {

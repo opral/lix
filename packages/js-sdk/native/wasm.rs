@@ -1436,10 +1436,10 @@ impl TryFrom<LixValueDto> for Value {
                     .value
                     .and_then(|value| value.as_str().map(str::to_owned))
                     .ok_or_else(|| invalid_param("timestamptz value must be an RFC 3339 string"))?;
-                let parsed = chrono::DateTime::parse_from_rfc3339(&raw).map_err(|error| {
+                let micros = crate::parse_timestamptz(&raw).map_err(|error| {
                     invalid_param(format!("timestamptz value is invalid: {error}"))
                 })?;
-                Ok(Self::Timestamptz(parsed.timestamp_micros()))
+                Ok(Self::Timestamptz(micros))
             }
             "blob" => value
                 .blob

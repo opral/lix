@@ -293,7 +293,9 @@ function validateExplicitValue(value: LixValue) {
 			if (typeof value.value === "string" && isWellFormedString(value.value)) return;
 			break;
 		case "timestamptz":
-			if (typeof value.value === "string" && !Number.isNaN(Date.parse(value.value))) {
+			if (
+				typeof value.value === "string" && isValidTimestamptz(value.value)
+			) {
 				return;
 			}
 			break;
@@ -304,6 +306,89 @@ function validateExplicitValue(value: LixValue) {
 			break;
 	}
 	throw invalidParam(0, "explicit Value contains an invalid native value", "Value");
+}
+
+const TIMESTAMPTZ_PATTERN =
+	/^([+-]\d{4,6}|\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?(?:Z|([+-])(\d{2}):(\d{2}))$/;
+
+function isValidTimestamptz(value: string) {
+	const match = TIMESTAMPTZ_PATTERN.exec(value);
+	if (!match) return false;
+
+	const year = Number(match[1]);
+	const month = Number(match[2]);
+	const day = Number(match[3]);
+	const hour = Number(match[4]);
+	const minute = Number(match[5]);
+	const second = Number(match[6]);
+	if (!Number.isSafeInteger(year) || year < -262_143 || year > 262_142) {
+		return false;
+	}
+	if (
+		month < 1 ||
+		month > 12 ||
+		day < 1 ||
+		day > daysInMonth(year, month) ||
+		hour > 23 ||
+		minute > 59 ||
+		second > 59
+	) {
+		return false;
+	}
+
+	if (match[8] && (Number(match[9]) > 23 || Number(match[10]) > 59)) {
+		return false;
+	}
+	if (
+		!isWithinChronoDateTimeRange(
+			year,
+			month,
+			day,
+			hour,
+			minute,
+			second,
+			match[8],
+			Number(match[9]),
+			Number(match[10]),
+		)
+	) {
+		return false;
+	}
+
+	return true;
+}
+
+function isWithinChronoDateTimeRange(
+	year: number,
+	month: number,
+	day: number,
+	hour: number,
+	minute: number,
+	second: number,
+	offsetSign: string | undefined,
+	offsetHour: number,
+	offsetMinute: number,
+) {
+	if (!offsetSign) return true;
+	const offsetSeconds =
+		(offsetHour * 60 * 60 + offsetMinute * 60) *
+		(offsetSign === "-" ? -1 : 1);
+	const utcSeconds = hour * 60 * 60 + minute * 60 + second - offsetSeconds;
+	if (utcSeconds < 0) {
+		return !(year === -262_143 && month === 1 && day === 1);
+	}
+	if (utcSeconds >= 24 * 60 * 60) {
+		return !(year === 262_142 && month === 12 && day === 31);
+	}
+	return true;
+}
+
+function daysInMonth(year: number, month: number) {
+	if (month === 2) {
+		const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+		return leapYear ? 29 : 28;
+	}
+	return [4, 6, 9, 11].includes(month) ? 30 : 31;
 }
 
 function cloneValue(value: LixValue): LixValue {

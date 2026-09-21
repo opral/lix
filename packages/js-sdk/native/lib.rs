@@ -33,6 +33,165 @@ fn parse_durability(value: Option<&str>) -> Result<lix::Durability, lix::LixErro
     }
 }
 
+fn parse_timestamptz(value: &str) -> Result<i64, String> {
+    if !is_canonical_timestamptz(value) {
+        return Err("timestamp must use canonical RFC 3339 syntax".to_owned());
+    }
+    value
+        .parse::<chrono::DateTime<chrono::FixedOffset>>()
+        .map(|value| value.timestamp_micros())
+        .map_err(|error| error.to_string())
+}
+
+fn is_canonical_timestamptz(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    let signed_year = matches!(bytes.first(), Some(b'+' | b'-'));
+    if signed_year {
+        index += 1;
+    }
+
+    let year_start = index;
+    while matches!(bytes.get(index), Some(byte) if byte.is_ascii_digit()) {
+        index += 1;
+    }
+    let year_len = index - year_start;
+    if (signed_year && !(4..=6).contains(&year_len)) || (!signed_year && year_len != 4) {
+        return false;
+    }
+    if !matches!(bytes.get(index), Some(b'-')) {
+        return false;
+    }
+    index += 1;
+
+    let Some(month) = parse_two_digits(bytes, index) else {
+        return false;
+    };
+    index += 2;
+    if !matches!(bytes.get(index), Some(b'-')) {
+        return false;
+    }
+    index += 1;
+
+    let Some(day) = parse_two_digits(bytes, index) else {
+        return false;
+    };
+    index += 2;
+    if !matches!(bytes.get(index), Some(b'T')) {
+        return false;
+    }
+    index += 1;
+
+    let Some(hour) = parse_two_digits(bytes, index) else {
+        return false;
+    };
+    index += 2;
+    if !matches!(bytes.get(index), Some(b':')) {
+        return false;
+    }
+    index += 1;
+
+    let Some(minute) = parse_two_digits(bytes, index) else {
+        return false;
+    };
+    index += 2;
+    if !matches!(bytes.get(index), Some(b':')) {
+        return false;
+    }
+    index += 1;
+
+    let Some(second) = parse_two_digits(bytes, index) else {
+        return false;
+    };
+    index += 2;
+    if second > 59 {
+        return false;
+    }
+
+    if matches!(bytes.get(index), Some(b'.')) {
+        index += 1;
+        let fraction_start = index;
+        while matches!(bytes.get(index), Some(byte) if byte.is_ascii_digit()) {
+            index += 1;
+        }
+        if !(1..=6).contains(&(index - fraction_start)) {
+            return false;
+        }
+    }
+
+    if matches!(bytes.get(index), Some(b'Z')) {
+        return index + 1 == bytes.len();
+    }
+    if !matches!(bytes.get(index), Some(b'+' | b'-')) {
+        return false;
+    }
+    index += 1;
+    let Some(offset_hour) = parse_two_digits(bytes, index) else {
+        return false;
+    };
+    index += 2;
+    if !matches!(bytes.get(index), Some(b':')) {
+        return false;
+    }
+    index += 1;
+    let Some(offset_minute) = parse_two_digits(bytes, index) else {
+        return false;
+    };
+
+    month > 0
+        && month <= 12
+        && day > 0
+        && day <= 31
+        && hour <= 23
+        && minute <= 59
+        && offset_hour <= 23
+        && offset_minute <= 59
+        && index + 2 == bytes.len()
+}
+
+fn parse_two_digits(bytes: &[u8], index: usize) -> Option<u8> {
+    let first = *bytes.get(index)?;
+    let second = *bytes.get(index + 1)?;
+    if !first.is_ascii_digit() || !second.is_ascii_digit() {
+        return None;
+    }
+    Some((first - b'0') * 10 + second - b'0')
+}
+
+#[cfg(test)]
+mod timestamptz_tests {
+    use super::parse_timestamptz;
+
+    #[test]
+    fn accepts_canonical_and_extended_chrono_timestamps() {
+        for value in [
+            "2015-02-18T23:59:59.234567+05:00",
+            "+010000-01-01T01:02:03.000000Z",
+            "-262143-01-01T01:02:03.000000Z",
+            "-262143-01-01T23:59:00.000000+23:59",
+            "+262142-12-31T00:00:59.000000-23:59",
+        ] {
+            assert!(parse_timestamptz(value).is_ok(), "{value}");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_or_incomplete_timestamps() {
+        for value in [
+            "2026-02-29T01:21:47Z",
+            "2026-09-21",
+            "2026-09-21T01:21:47+2400",
+            "2015-02-18T23:59:60.234567+05:00",
+            "2015-02-18T23:59:59.1234567+05:00",
+            "2015-02-18T23:16:09 UTC",
+            "-262143-01-01T01:02:03.000000+23:59",
+            "+262142-12-31T23:00:00.000000-23:59",
+        ] {
+            assert!(parse_timestamptz(value).is_err(), "{value}");
+        }
+    }
+}
+
 const JS_MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 const JS_MAX_SAFE_INTEGER_I64: i64 = 9_007_199_254_740_991;
 

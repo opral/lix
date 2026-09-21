@@ -2431,6 +2431,27 @@ test("native execute accepts safe integer parameters across JSON number boundari
 	await lix.close();
 });
 
+test("native execute rebinds emitted extended timestamps", async () => {
+	const lix = await openLix();
+	const inputs = [
+		"+010000-01-01T01:02:03.000000Z",
+		"2015-02-18T23:59:59.234567+05:00",
+	];
+
+	for (const input of inputs) {
+		const first = await lix.execute("SELECT $1 AS value", [
+			Value.timestamptz(input),
+		]);
+		const emitted = get(first, "value");
+		const second = await lix.execute("SELECT $1 AS value", [
+			Value.timestamptz(emitted),
+		]);
+		expect(get(second, "value")).toBe(emitted);
+	}
+
+	await lix.close();
+});
+
 test("information_schema.columns SELECT * exposes the Lix column contract", async () => {
 	const lix = await openLix();
 
@@ -2473,6 +2494,27 @@ test("execute rejects invalid explicit Value parameters", async () => {
 		/explicit Value contains an invalid native value/,
 	);
 	expect(() => Value.text("X\uD83DY")).toThrow(/well-formed UTF-16/);
+	expect(() => Value.timestamptz("2026-02-29T01:21:47Z")).toThrow(
+		/explicit Value contains an invalid native value/,
+	);
+	expect(() => Value.timestamptz("2015-02-18T23:59:60.234567+05:00")).toThrow(
+		/explicit Value contains an invalid native value/,
+	);
+	expect(() => Value.timestamptz("2015-02-18T23:16:09 UTC")).toThrow(
+		/explicit Value contains an invalid native value/,
+	);
+	expect(() =>
+		Value.timestamptz("-262143-01-01T01:02:03.000000+23:59"),
+	).toThrow(/explicit Value contains an invalid native value/);
+	expect(() =>
+		Value.timestamptz("+262142-12-31T23:00:00.000000-23:59"),
+	).toThrow(/explicit Value contains an invalid native value/);
+	expect(
+		Value.timestamptz("+010000-01-01T00:00:00Z").toJS(),
+	).toBe("+010000-01-01T00:00:00Z");
+	expect(() => Value.timestamptz("2026-09-21")).toThrow(
+		/explicit Value contains an invalid native value/,
+	);
 	expect(() => Value.blob("AQID" as never)).toThrow(
 		/explicit Value contains an invalid native value/,
 	);
