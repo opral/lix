@@ -91,6 +91,7 @@ macro_rules! simulation_test {
 }
 
 mod checkpoint;
+mod bigint_predicate;
 mod delete_returning;
 mod diff_commands;
 mod diff_relation;

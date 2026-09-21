@@ -44,3 +44,25 @@ cargo bench -p lix --bench sql_value_handling
 Cases: direct UPDATE, direct UPDATE with RETURNING, generic UPDATE forced by
 LIKE, and timestamp-predicate UPDATE. Report compiler/profile and host with
 results; debug/test builds are diagnostic comparisons, not release throughput.
+
+### Paired diagnostic run (2026-09-21)
+
+Linux x86_64, AMD Ryzen 9 9950X, Rust nightly 2026-05-21. The driver was
+linked to the test-profile engine libraries (engine opt-level 0, dependency
+opt-level 1), with both variants pinned to CPU 0. The baseline contains the
+original nullable-JSONB fix (`bc1fb730f`), before the native-value refactor.
+Three paired runs alternated before/after order; each run contains nine measured
+samples per case. The table reports the median of the three paired changes in
+per-run median duration, not a ratio of unpaired aggregate timings.
+
+| Statement, 500 affected rows | Median paired duration change |
+| --- | ---: |
+| Direct UPDATE | -7.29% |
+| Direct UPDATE with RETURNING | -7.29% |
+| Generic UPDATE using LIKE | -5.15% |
+| Timestamp-predicate UPDATE | -0.61% |
+
+These measurements show no material slowdown in the exercised paths. The host
+was shared and one pair showed substantial timing drift, so they are diagnostic
+regression checks, not evidence of a release-build speedup. Repeat the benchmark
+under an isolated release build before making throughput claims.

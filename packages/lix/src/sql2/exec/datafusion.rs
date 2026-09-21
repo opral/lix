@@ -28,7 +28,7 @@ use datafusion::arrow::datatypes::{ArrowPrimitiveType, DataType, Field, Schema, 
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::metadata::{FieldMetadata, ScalarAndMetadata};
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{Column, DFSchema, ParamValues, ScalarValue};
+use datafusion::common::{Column, DFSchema, DFSchemaRef, ParamValues, ScalarValue};
 use datafusion::datasource::{empty::EmptyTable, provider_as_source};
 use datafusion::logical_expr::expr::{BinaryExpr, Cast, InList, Like, ScalarFunction};
 use datafusion::logical_expr::registry::FunctionRegistry;
@@ -710,11 +710,330 @@ async fn create_logical_plan_from_statement(
         params,
     ))
     .await?;
-    session
+    let normalize_numeric_literals = statement_has_numeric_literal_candidate(&statement);
+    let plan = session
         .state()
         .statement_to_plan(statement)
         .await
-        .map_err(datafusion_error_to_lix_error)
+        .map_err(datafusion_error_to_lix_error)?;
+    if normalize_numeric_literals {
+        normalize_bigint_numeric_predicates(plan)
+    } else {
+        Ok(plan)
+    }
+}
+
+fn statement_has_numeric_literal_candidate(statement: &DataFusionStatement) -> bool {
+    struct CandidateVisitor;
+
+    impl Visitor for CandidateVisitor {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expr: &SqlExpr) -> ControlFlow<Self::Break> {
+            if let SqlExpr::Function(function) = expr
+                && function
+                    .name
+                    .to_string()
+                    .eq_ignore_ascii_case("__lix_numeric_literal")
+            {
+                return ControlFlow::Break(());
+            }
+            if let SqlExpr::Value(value) = expr
+                && let SqlValue::Number(raw, _) = &value.value
+                // Decimal/exponent literals are wrapped by the parser only
+                // inside supported predicates. A decimal in a projection or
+                // function argument must not trigger a full plan walk.
+                // Out-of-range integer spellings remain candidates because
+                // DataFusion can materialize them as UInt64 before the
+                // BIGINT predicate rewrite sees them.
+                && !raw.contains(['.', 'e', 'E'])
+                && raw.parse::<i64>().is_err()
+            {
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    fn visit(statement: &DataFusionStatement, visitor: &mut CandidateVisitor) -> bool {
+        match statement {
+            DataFusionStatement::Statement(statement) => statement.visit(visitor).is_break(),
+            DataFusionStatement::Explain(explain) => visit(explain.statement.as_ref(), visitor),
+            _ => false,
+        }
+    }
+
+    visit(statement, &mut CandidateVisitor)
+}
+
+fn normalize_bigint_numeric_predicates(plan: LogicalPlan) -> Result<LogicalPlan, LixError> {
+    let mut has_marker = false;
+    plan.apply_with_subqueries(|node| {
+        for expr in node.expressions() {
+            let _ = expr.apply(|nested| {
+                if is_numeric_literal_candidate(nested) {
+                    has_marker = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            });
+            if has_marker {
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .map_err(datafusion_error_to_lix_error)?;
+    if !has_marker {
+        return Ok(plan);
+    }
+
+    plan.transform_up_with_subqueries(|node| {
+        let fallback_schema = node.schema().clone();
+        let input_schemas = node
+            .inputs()
+            .into_iter()
+            .map(|input| input.schema().clone())
+            .collect::<Vec<_>>();
+        node.map_expressions(|expr| {
+            expr.transform_up(|expr| {
+                normalize_bigint_numeric_expr(expr, &input_schemas, &fallback_schema)
+            })
+        })
+    })
+    .map(|transformed| transformed.data)
+    .map_err(datafusion_error_to_lix_error)
+}
+
+fn normalize_bigint_numeric_expr(
+    expr: Expr,
+    input_schemas: &[DFSchemaRef],
+    fallback_schema: &DFSchemaRef,
+) -> datafusion::common::Result<Transformed<Expr>> {
+    let replace_marker = |value: Expr, column: &Expr| -> datafusion::common::Result<Option<Expr>> {
+        let Some(column) = bigint_column_name(column, input_schemas, fallback_schema) else {
+            return Ok(None);
+        };
+        let exact = match &value {
+            Expr::ScalarFunction(_) => {
+                let Some(raw) = numeric_literal_marker_raw(&value) else {
+                    return Ok(None);
+                };
+                super::bound_public_write::exact_bigint_literal(raw, "read", &column)
+                    .map_err(crate::sql2::error::lix_error_to_datafusion_error)?
+            }
+            Expr::Literal(ScalarValue::UInt64(Some(value)), _) => {
+                i64::try_from(*value).map_err(|_| {
+                    crate::sql2::error::lix_error_to_datafusion_error(
+                        LixError::new(
+                            LixError::CODE_TYPE_MISMATCH,
+                            format!(
+                                "typed SQL surface 'read' column '{column}' cannot represent SQL numeric literal {value} as BIGINT"
+                            ),
+                        )
+                        .with_hint(
+                            "Use an exact integer between -9223372036854775808 and 9223372036854775807.",
+                        ),
+                    )
+                })?
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(Expr::Literal(ScalarValue::Int64(Some(exact)), None)))
+    };
+
+    match expr {
+        Expr::BinaryExpr(binary)
+            if matches!(
+                binary.op,
+                Operator::Eq
+                    | Operator::NotEq
+                    | Operator::Gt
+                    | Operator::GtEq
+                    | Operator::Lt
+                    | Operator::LtEq
+                    | Operator::IsDistinctFrom
+                    | Operator::IsNotDistinctFrom
+            ) =>
+        {
+            let original_left = *binary.left.clone();
+            let original_right = *binary.right.clone();
+            let left = replace_marker(original_left.clone(), &original_right)?;
+            let right = replace_marker(original_right.clone(), &original_left)?;
+            if left.is_none() && right.is_none() {
+                Ok(Transformed::no(Expr::BinaryExpr(binary)))
+            } else {
+                let normalized_left = if right.is_some() {
+                    unwrap_bigint_coercion(original_left, input_schemas, fallback_schema)
+                } else {
+                    original_left
+                };
+                let normalized_right = if left.is_some() {
+                    unwrap_bigint_coercion(original_right, input_schemas, fallback_schema)
+                } else {
+                    original_right
+                };
+                Ok(Transformed::yes(Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(left.unwrap_or(normalized_left)),
+                    binary.op,
+                    Box::new(right.unwrap_or(normalized_right)),
+                ))))
+            }
+        }
+        Expr::InList(mut list) => {
+            let mut transformed = false;
+            let original_expr = *list.expr.clone();
+            if numeric_literal_marker_raw(&original_expr).is_some()
+                || matches!(
+                    original_expr,
+                    Expr::Literal(ScalarValue::UInt64(Some(_)), _)
+                )
+            {
+                for value in &list.list {
+                    if let Some(replaced) = replace_marker(original_expr.clone(), value)? {
+                        list.expr = Box::new(replaced);
+                        transformed = true;
+                        break;
+                    }
+                }
+            }
+            for value in &mut list.list {
+                if let Some(replaced) = replace_marker(value.clone(), &list.expr)? {
+                    *value = replaced;
+                    transformed = true;
+                }
+            }
+            if transformed {
+                list.list = std::mem::take(&mut list.list)
+                    .into_iter()
+                    .map(|value| unwrap_bigint_coercion(value, input_schemas, fallback_schema))
+                    .collect();
+                list.expr = Box::new(unwrap_bigint_coercion(
+                    *list.expr,
+                    input_schemas,
+                    fallback_schema,
+                ));
+                Ok(Transformed::yes(Expr::InList(list)))
+            } else {
+                Ok(Transformed::no(Expr::InList(list)))
+            }
+        }
+        Expr::Between(mut between) => {
+            let mut transformed = false;
+            let original_expr = *between.expr.clone();
+            if numeric_literal_marker_raw(&original_expr).is_some()
+                || matches!(
+                    original_expr,
+                    Expr::Literal(ScalarValue::UInt64(Some(_)), _)
+                )
+            {
+                for bound in [&between.low, &between.high] {
+                    if let Some(replaced) = replace_marker(original_expr.clone(), bound)? {
+                        between.expr = Box::new(replaced);
+                        transformed = true;
+                        break;
+                    }
+                }
+            }
+            if let Some(replaced) = replace_marker(*between.low.clone(), &between.expr)? {
+                between.low = Box::new(replaced);
+                transformed = true;
+            }
+            if let Some(replaced) = replace_marker(*between.high.clone(), &between.expr)? {
+                between.high = Box::new(replaced);
+                transformed = true;
+            }
+            if transformed {
+                between.low = Box::new(unwrap_bigint_coercion(
+                    *between.low,
+                    input_schemas,
+                    fallback_schema,
+                ));
+                between.high = Box::new(unwrap_bigint_coercion(
+                    *between.high,
+                    input_schemas,
+                    fallback_schema,
+                ));
+                between.expr = Box::new(unwrap_bigint_coercion(
+                    *between.expr,
+                    input_schemas,
+                    fallback_schema,
+                ));
+                Ok(Transformed::yes(Expr::Between(between)))
+            } else {
+                Ok(Transformed::no(Expr::Between(between)))
+            }
+        }
+        expr => Ok(Transformed::no(expr)),
+    }
+}
+
+fn unwrap_bigint_coercion(
+    expr: Expr,
+    input_schemas: &[DFSchemaRef],
+    fallback_schema: &DFSchemaRef,
+) -> Expr {
+    match expr {
+        Expr::Cast(cast)
+            if cast.data_type == DataType::Float64
+                && bigint_column_name(&cast.expr, input_schemas, fallback_schema).is_some() =>
+        {
+            *cast.expr
+        }
+        expr => expr,
+    }
+}
+
+fn bigint_column_name(
+    expr: &Expr,
+    input_schemas: &[DFSchemaRef],
+    fallback_schema: &DFSchemaRef,
+) -> Option<String> {
+    if let Expr::Cast(cast) = expr
+        && cast.data_type == DataType::Float64
+    {
+        return bigint_column_name(&cast.expr, input_schemas, fallback_schema);
+    }
+    let Expr::Column(column) = expr else {
+        return None;
+    };
+    input_schemas
+        .iter()
+        .chain(std::iter::once(fallback_schema))
+        .find_map(|schema| {
+            schema
+                .field_with_name(column.relation.as_ref(), &column.name)
+                .ok()
+                .filter(|field| field.data_type() == &DataType::Int64)
+                .map(|_| column.name.clone())
+        })
+}
+
+fn numeric_literal_marker_raw(expr: &Expr) -> Option<&str> {
+    if let Expr::Cast(cast) = expr
+        && cast.data_type == DataType::Float64
+    {
+        return numeric_literal_marker_raw(&cast.expr);
+    }
+    let Expr::ScalarFunction(function) = expr else {
+        return None;
+    };
+    if function.name() != "__lix_numeric_literal" {
+        return None;
+    }
+    let [Expr::Literal(ScalarValue::Utf8(Some(raw)), _)] = function.args.as_slice() else {
+        return None;
+    };
+    Some(raw)
+}
+
+fn is_numeric_literal_marker(expr: &Expr) -> bool {
+    numeric_literal_marker_raw(expr).is_some()
+}
+
+fn is_numeric_literal_candidate(expr: &Expr) -> bool {
+    is_numeric_literal_marker(expr)
+        || matches!(expr, Expr::Literal(ScalarValue::UInt64(Some(_)), _))
 }
 
 /// Table providers need concrete endpoints while planning their schemas. Resolve
@@ -2178,6 +2497,14 @@ fn datafusion_write_filters(
     plan: &LogicalWritePlan,
     params: &[Value],
 ) -> Result<Vec<Expr>, LixError> {
+    super::bound_public_write::validate_bigint_predicate_literals(
+        &plan.bound.predicate,
+        &|name| {
+            schema
+                .field_with_name(name)
+                .is_ok_and(|field| field.data_type() == &DataType::Int64)
+        },
+    )?;
     let df_schema = DFSchema::try_from(schema.clone()).map_err(datafusion_error_to_lix_error)?;
     let mut filters =
         datafusion_filters_from_predicate(session, schema, &plan.bound.predicate, params)?
@@ -2251,22 +2578,28 @@ fn datafusion_filters_from_predicate(
         BoundPredicate::Eq(left, right) => {
             let left_is_json = bound_expr_is_json(left, schema);
             let right_is_json = bound_expr_is_json(right, schema);
-            Ok(vec![Expr::BinaryExpr(BinaryExpr::new(
-                Box::new(datafusion_filter_expr_from_bound_expr(
+            let left_expr = datafusion_exact_bigint_marker(left, right, schema)?.unwrap_or(
+                datafusion_filter_expr_from_bound_expr(
                     session,
                     left,
                     params,
                     right_is_json,
                     is_identity_json_bound_expr(right),
-                )?),
-                Operator::Eq,
-                Box::new(datafusion_filter_expr_from_bound_expr(
+                )?,
+            );
+            let right_expr = datafusion_exact_bigint_marker(right, left, schema)?.unwrap_or(
+                datafusion_filter_expr_from_bound_expr(
                     session,
                     right,
                     params,
                     left_is_json,
                     is_identity_json_bound_expr(left),
-                )?),
+                )?,
+            );
+            Ok(vec![Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(left_expr),
+                Operator::Eq,
+                Box::new(right_expr),
             ))])
         }
         BoundPredicate::Like {
@@ -2297,23 +2630,39 @@ fn datafusion_filters_from_predicate(
             let values_include_json = values.iter().any(|value| bound_expr_is_json(value, schema));
             let expr_is_identity_json = is_identity_json_bound_expr(expr);
             let values_include_identity_json = values.iter().any(is_identity_json_bound_expr);
-            Ok(vec![Expr::InList(InList::new(
-                Box::new(datafusion_filter_expr_from_bound_expr(
+            let mut exact_expr = None;
+            for value in values {
+                if let Some(exact) = datafusion_exact_bigint_marker(expr, value, schema)? {
+                    exact_expr = Some(exact);
+                    break;
+                }
+            }
+            let input_expr = match exact_expr {
+                Some(exact) => exact,
+                None => datafusion_filter_expr_from_bound_expr(
                     session,
                     expr,
                     params,
                     values_include_json,
                     values_include_identity_json,
-                )?),
+                )?,
+            };
+            Ok(vec![Expr::InList(InList::new(
+                Box::new(input_expr),
                 values
                     .iter()
                     .map(|value| {
-                        datafusion_filter_expr_from_bound_expr(
-                            session,
-                            value,
-                            params,
-                            expr_is_json,
-                            expr_is_identity_json,
+                        datafusion_exact_bigint_marker(value, expr, schema)?.map_or_else(
+                            || {
+                                datafusion_filter_expr_from_bound_expr(
+                                    session,
+                                    value,
+                                    params,
+                                    expr_is_json,
+                                    expr_is_identity_json,
+                                )
+                            },
+                            Ok,
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()?,
@@ -2400,6 +2749,30 @@ fn datafusion_filter_expr_from_bound_expr(
         }
         _ => datafusion_expr_from_bound_expr(session, expr, params),
     }
+}
+
+/// Resolve a source-spelled numeric marker only when its comparison operand
+/// is a BIGINT-backed table column.  Keeping the marker as a DataFusion
+/// Float64 expression everywhere else preserves SQL's existing numeric
+/// coercion rules without allowing f64 to round an integer predicate.
+fn datafusion_exact_bigint_marker(
+    value: &BoundExpr,
+    column_expr: &BoundExpr,
+    schema: &Schema,
+) -> Result<Option<Expr>, LixError> {
+    let BoundExpr::Column(column) = column_expr else {
+        return Ok(None);
+    };
+    let Some(field) = schema.field_with_name(&column.name).ok() else {
+        return Ok(None);
+    };
+    if field.data_type() != &DataType::Int64 {
+        return Ok(None);
+    }
+    Ok(
+        super::bound_public_write::bigint_number_literal(value, "DataFusion", &column.name)?
+            .map(|exact| Expr::Literal(ScalarValue::Int64(Some(exact)), None)),
+    )
 }
 
 fn datafusion_expr_from_bound_expr(
@@ -2595,6 +2968,7 @@ fn bound_expr_requires_datafusion(expr: &BoundExpr) -> bool {
                     | "__lix_json_contains"
                     | "__lix_json_exists"
                     | "__lix_jsonb"
+                    | "__lix_numeric_literal"
                     | "lix_order_between"
             ) || args.iter().any(bound_expr_requires_datafusion)
         }

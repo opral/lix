@@ -3617,7 +3617,6 @@ fn returning_expr_column_type(
                     | "lix_active_branch_id"
                     | "lix_active_branch_commit_id"
                     | "__lix_text_cast"
-                | "__lix_timestamptz_cast"
                     | "__lix_json_get_text"
                     | "__lix_json_path_get_text"
                     | "lix_order_between"
@@ -6078,6 +6077,22 @@ fn eval_expr_value(
             cast_row_eval_value(value, BoundCastType::Jsonb)
         }
         BoundExpr::Function { name, args }
+            if name == "__lix_numeric_literal" && args.len() == 1 =>
+        {
+            let BoundExpr::Literal(BoundLiteral::Text(raw)) = &args[0] else {
+                return Err(LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    "numeric literal marker requires a text argument",
+                ));
+            };
+            raw.parse::<f64>().map(RowEvalValue::Real).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    format!("invalid numeric literal '{raw}': {error}"),
+                )
+            })
+        }
+        BoundExpr::Function { name, args }
             if matches!(
                 name.as_str(),
                 "__lix_json_get"
@@ -6331,11 +6346,54 @@ fn normalize_json_comparison_value(
     })
 }
 
+/// Validate source-spelled integer operands before row evaluation or optimizer
+/// short-circuiting can skip an invalid member of a predicate.
+pub(super) fn validate_bigint_predicate_literals(
+    predicate: &BoundPredicate,
+    is_bigint_column: &impl Fn(&str) -> bool,
+) -> Result<(), LixError> {
+    let validate_pair = |value: &BoundExpr, column: &BoundExpr| -> Result<(), LixError> {
+        if let BoundExpr::Column(column) = column
+            && is_bigint_column(&column.name)
+        {
+            bigint_number_literal(value, "predicate", &column.name)?;
+        }
+        Ok(())
+    };
+    match predicate {
+        BoundPredicate::Eq(left, right) => {
+            validate_pair(left, right)?;
+            validate_pair(right, left)?;
+        }
+        BoundPredicate::In { expr, values } => {
+            for value in values {
+                validate_pair(value, expr)?;
+                validate_pair(expr, value)?;
+            }
+        }
+        BoundPredicate::And(predicates) | BoundPredicate::Or(predicates) => {
+            for predicate in predicates {
+                validate_bigint_predicate_literals(predicate, is_bigint_column)?;
+            }
+        }
+        BoundPredicate::True
+        | BoundPredicate::False
+        | BoundPredicate::Like { .. }
+        | BoundPredicate::IsNull(_)
+        | BoundPredicate::IsNotNull(_) => {}
+    }
+    Ok(())
+}
+
 fn validate_bound_write_supported(
     plan: &LogicalWritePlan,
     spec: &SchemaSurfaceSpec,
 ) -> Result<(), LixError> {
     validate_predicate_supported(&plan.bound.predicate)?;
+    validate_bigint_predicate_literals(&plan.bound.predicate, &|name| {
+        spec.visible_column(name)
+            .is_some_and(|column| column.column_type == SchemaColumnType::Integer)
+    })?;
     validate_json_predicate_types(&plan.bound.predicate, spec)?;
     match &plan.bound.input {
         BoundWriteInput::Values(values) => {
@@ -6656,6 +6714,7 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
                 | "__lix_text_cast"
                 | "__lix_timestamptz_cast"
                     if args.len() == 1 => {}
+                "__lix_numeric_literal" if args.len() == 1 => {}
                 _ => {
                     return Err(LixError::new(
                         LixError::CODE_UNSUPPORTED_SQL,
@@ -6940,6 +6999,12 @@ pub(super) fn bigint_number_literal(
 ) -> Result<Option<i64>, LixError> {
     let raw = match expr {
         BoundExpr::Literal(BoundLiteral::Number { raw, .. }) => raw,
+        BoundExpr::Function { name, args } if name == "__lix_numeric_literal" => {
+            let [BoundExpr::Literal(BoundLiteral::Text(raw))] = args.as_slice() else {
+                return Ok(None);
+            };
+            raw
+        }
         _ => return Ok(None),
     };
     exact_bigint_literal(raw, schema_key, column_name).map(Some)
