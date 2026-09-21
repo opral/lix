@@ -919,7 +919,8 @@ fn snapshot_pull_error(error: LixError) -> LixError {
 fn is_terminal_sync_error(error: &LixError) -> bool {
     matches!(
         error.code.as_str(),
-        SYNC_ITEM_TOO_LARGE_CODE
+        "LIX_REPLICA_RETIRED"
+            | SYNC_ITEM_TOO_LARGE_CODE
             | "LIX_ERROR_SYNC_WRITE_REJECTED"
             | SYNC_SNAPSHOT_TOO_LARGE_CODE
             | SYNC_DEMAND_STALLED_CODE

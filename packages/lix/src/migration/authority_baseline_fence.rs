@@ -10,6 +10,9 @@ use crate::{
 };
 use bytes::Bytes;
 const PRE_LEASE_AUTHORITY_MARKER: &[u8] = b"certified-authority-v4";
+pub(super) fn is_previous_authority_marker(marker: &[u8]) -> bool {
+    marker == PRE_LEASE_AUTHORITY_MARKER || marker == b"certified-authority-v5-native-baseline-leases"
+}
 
 /// Explicitly upgrades an existing authority to support partial-replica baseline leases.
 ///
@@ -43,7 +46,7 @@ where
     let read = adapter.begin_read(Default::default()).await?;
     let marker = supported_authority_marker(&read).await?;
     if marker != original_marker
-        && !(original_marker.as_ref() == PRE_LEASE_AUTHORITY_MARKER
+        && !(is_previous_authority_marker(original_marker.as_ref())
             && marker.as_ref() == crate::sync::AUTHORITY_STATE_VALUE)
     {
         return Err(LixError::new(
@@ -198,7 +201,7 @@ async fn supported_authority_marker(
             "existing authority marker is missing",
         ));
     };
-    if marker.as_ref() != PRE_LEASE_AUTHORITY_MARKER
+    if !is_previous_authority_marker(marker.as_ref())
         && marker.as_ref() != crate::sync::AUTHORITY_STATE_VALUE
     {
         return Err(LixError::new(

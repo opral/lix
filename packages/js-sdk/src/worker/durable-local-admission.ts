@@ -51,7 +51,10 @@ export class DurableLocalAdmission {
   }
   private async key(headers: [string, string][]): Promise<string> {
     const entries: [string, string][] = [];
-    new Headers(headers).forEach((value, name) => entries.push([name, value]));
+    // Replica routing is not an authentication credential. Preserve pre-routing offline proofs.
+    new Headers(headers).forEach((value, name) => {
+      if (name !== "lix-replica-id") entries.push([name, value]);
+    });
     const bytes = new TextEncoder().encode(JSON.stringify([1, this.scope, this.url, entries, ADMISSION_PROTOCOL_EPOCH, ADMISSION_STORAGE_EPOCH]));
     const digest = await crypto.subtle.digest("SHA-256", bytes);
     return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");

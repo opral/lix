@@ -114,6 +114,8 @@ pub(crate) use partial_replica::PartialReplicaDescriptor;
 mod protocol;
 mod recovery;
 mod repository;
+#[cfg(feature = "server-protocol")]
+mod replica_retirement;
 pub use recovery::{
     ReplicaRecoveryBlob, ReplicaRecoveryBranch, ReplicaRecoveryExport, ReplicaRecoveryFile,
     ReplicaRecoveryReceipt, ReplicaRecoveryRow, ReplicaRecoverySource,
@@ -170,7 +172,7 @@ pub(crate) use protocol::{
 pub(crate) use repository::admit_sync_authority_storage;
 pub(crate) use repository::has_any_sync_replica_state;
 pub(crate) use repository::{
-    AUTHORITY_STATE_VALUE, SYNC_AUTHORITY_STATE_SPACE, SYNC_REPLICA_STATE_SPACE,
+    AUTHORITY_STATE_VALUE, SYNC_AUTHORITY_STATE_SPACE, SYNC_REPLICA_STATE_SPACE, SYNC_REPLICA_RETIREMENT_SPACE,
     SYNC_REPOSITORY_EVENT_SPACE, SYNC_SEQUENCE_SPACE, authority_state_key,
     load_pending_sync_export_commit_ids, load_replayable_repository_event_commit_ids,
     replica_state_key, stage_repository_transaction_event, stage_sync_restore_intents,

@@ -45,6 +45,16 @@ pub trait Storage: Send + Sync {
         async { Err(StorageError::Unsupported(Capability::PartialReplicaOwner)) }
     }
 
+    /// Exclusively owns replica publication and retirement for this physical authority.
+    /// Cloned leases may share the owner; independent servers must be refused.
+    /// Backends with one physical engine owner can reuse partial-owner exclusion.
+    fn acquire_authority_owner(
+        &self,
+        session: StorageSessionToken,
+    ) -> impl Future<Output = Result<crate::storage::StorageOwnerLease, StorageError>> + Send {
+        self.acquire_partial_replica_owner(session)
+    }
+
     fn begin_read(
         &self,
         opts: ReadOptions,

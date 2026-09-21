@@ -32,7 +32,7 @@
     )
 )]
 
-pub const SERVER_PROTOCOL_VERSION: u32 = 11;
+pub const SERVER_PROTOCOL_VERSION: u32 = 12;
 /// Current persisted repository format. Supported older stores upgrade automatically during opening.
 #[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
 pub const CURRENT_STORAGE_FORMAT_VERSION: u32 = init::CURRENT_FORMAT_VERSION;

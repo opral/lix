@@ -281,7 +281,7 @@ fn independent_invariants(source: &Records, target: &Records) -> Result<(), LixE
         {
             let old = source.get(&(*space, key.clone()));
             let new = target.get(&(*space, key.clone()));
-            if matches!((old,new), (Some(a),Some(b)) if (a.as_ref() == b"certified-authority-v4" || a.as_ref() == crate::sync::AUTHORITY_STATE_VALUE) && b.as_ref() == crate::sync::AUTHORITY_STATE_VALUE)
+            if matches!((old,new), (Some(a),Some(b)) if (super::authority_baseline_fence::is_previous_authority_marker(a.as_ref()) || a.as_ref() == crate::sync::AUTHORITY_STATE_VALUE) && b.as_ref() == crate::sync::AUTHORITY_STATE_VALUE)
             {
                 continue;
             }
