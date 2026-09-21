@@ -3618,33 +3618,24 @@ fn row_returning_value(
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<Value, LixError> {
-    match expr {
-        BoundExpr::Param(param)
-            if params
-                .get(param.index.saturating_sub(1))
-                .is_some_and(|value| matches!(value, Value::Blob(_))) =>
-        {
-            let Value::Blob(value) = params
-                .get(param.index.saturating_sub(1))
-                .expect("checked SQL parameter exists")
-            else {
-                unreachable!("checked SQL parameter is a blob");
-            };
-            return Ok(Value::Blob(value.clone()));
-        }
-        _ => {}
+    // A parameter already carries its SQL type. Routing it through JSON would
+    // erase JSON null, timestamps, row references, and binary values.
+    if let BoundExpr::Param(param) = expr {
+        return params
+            .get(param.index.saturating_sub(1))
+            .cloned()
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!("missing SQL parameter ${}", param.index),
+                )
+            });
     }
 
     let value = eval_expr_value(expr, context, ctx, params, active_branch_commit_id)?;
     if bound_expr_is_json(expr, spec) {
         return Ok(match value {
             RowEvalValue::SqlNull => Value::Null,
-            RowEvalValue::Json(JsonValue::Null)
-                if visible_row_column(expr, spec)
-                    .is_some_and(|column| column.column_type == SchemaColumnType::Jsonb) =>
-            {
-                Value::Null
-            }
             RowEvalValue::SqlText(value) => Value::Text(value),
             RowEvalValue::Json(value) => Value::Jsonb(value.into()),
         });
@@ -6071,9 +6062,7 @@ fn eval_expr_value(
                 .map(|commit_id| RowEvalValue::SqlText(commit_id.to_string()))
                 .unwrap_or(RowEvalValue::SqlNull))
         }
-        BoundExpr::Function { name, args }
-            if name == "__lix_uuid_cast" && args.len() == 1 =>
-        {
+        BoundExpr::Function { name, args } if name == "__lix_uuid_cast" && args.len() == 1 => {
             let value = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
             cast_row_eval_value(value, BoundCastType::Uuid)
         }
@@ -6207,8 +6196,9 @@ fn predicate_matches(
             Ok(false)
         }
         BoundPredicate::Eq(left, right) => {
-            let left_value = eval_expr(left, context, ctx, params, active_branch_commit_id)?;
-            let right_value = eval_expr(right, context, ctx, params, active_branch_commit_id)?;
+            let left_value = eval_expr_value(left, context, ctx, params, active_branch_commit_id)?;
+            let right_value =
+                eval_expr_value(right, context, ctx, params, active_branch_commit_id)?;
             comparison_values_equal(left, left_value, right, right_value, spec)
         }
         BoundPredicate::Like { .. } => Err(LixError::new(
@@ -6216,20 +6206,21 @@ fn predicate_matches(
             "bound row writes do not support LIKE predicates",
         )),
         BoundPredicate::IsNull(expr) => {
-            let value = eval_expr(expr, context, ctx, params, active_branch_commit_id)?;
-            Ok(value.is_null())
+            let value = eval_expr_value(expr, context, ctx, params, active_branch_commit_id)?;
+            Ok(matches!(value, RowEvalValue::SqlNull))
         }
         BoundPredicate::IsNotNull(expr) => {
-            let value = eval_expr(expr, context, ctx, params, active_branch_commit_id)?;
-            Ok(!value.is_null())
+            let value = eval_expr_value(expr, context, ctx, params, active_branch_commit_id)?;
+            Ok(!matches!(value, RowEvalValue::SqlNull))
         }
         BoundPredicate::In { expr, values } => {
-            let candidate = eval_expr(expr, context, ctx, params, active_branch_commit_id)?;
-            if candidate.is_null() {
+            let candidate = eval_expr_value(expr, context, ctx, params, active_branch_commit_id)?;
+            if matches!(candidate, RowEvalValue::SqlNull) {
                 return Ok(false);
             }
             for value_expr in values {
-                let value = eval_expr(value_expr, context, ctx, params, active_branch_commit_id)?;
+                let value =
+                    eval_expr_value(value_expr, context, ctx, params, active_branch_commit_id)?;
                 if comparison_values_equal(expr, candidate.clone(), value_expr, value, spec)? {
                     return Ok(true);
                 }
@@ -6248,19 +6239,19 @@ enum NumericComparisonValue {
 
 fn comparison_values_equal(
     left_expr: &BoundExpr,
-    mut left_value: JsonValue,
+    left_value: RowEvalValue,
     right_expr: &BoundExpr,
-    mut right_value: JsonValue,
+    right_value: RowEvalValue,
     spec: &SchemaSurfaceSpec,
 ) -> Result<bool, LixError> {
-    normalize_bigint_comparison_literal(left_expr, right_expr, &mut right_value, spec)?;
-    normalize_bigint_comparison_literal(right_expr, left_expr, &mut left_value, spec)?;
-    let (left_value, right_value) =
-        normalize_comparison_operands(left_expr, left_value, right_expr, right_value, spec)?;
-    if left_value.is_null() || right_value.is_null() {
+    // SQL NULL never matches equality. JSON null remains a JSONB value.
+    if matches!(left_value, RowEvalValue::SqlNull) || matches!(right_value, RowEvalValue::SqlNull) {
         return Ok(false);
     }
-
+    let (mut left_value, mut right_value) =
+        normalize_comparison_operands(left_expr, left_value, right_expr, right_value, spec)?;
+    normalize_bigint_comparison_literal(left_expr, right_expr, &mut right_value, spec)?;
+    normalize_bigint_comparison_literal(right_expr, left_expr, &mut left_value, spec)?;
     let left_numeric = numeric_comparison_value(left_expr, &left_value, spec)?;
     let right_numeric = numeric_comparison_value(right_expr, &right_value, spec)?;
     match (left_numeric, right_numeric) {
@@ -6354,9 +6345,9 @@ fn numeric_values_equal(left: NumericComparisonValue, right: NumericComparisonVa
 
 fn normalize_comparison_operands(
     left_expr: &BoundExpr,
-    left_value: JsonValue,
+    left_value: RowEvalValue,
     right_expr: &BoundExpr,
-    right_value: JsonValue,
+    right_value: RowEvalValue,
     spec: &SchemaSurfaceSpec,
 ) -> Result<(JsonValue, JsonValue), LixError> {
     let left_is_json = bound_expr_is_json(left_expr, spec);
@@ -6379,14 +6370,17 @@ fn normalize_comparison_operands(
 
 fn normalize_json_comparison_value(
     expr: &BoundExpr,
-    value: JsonValue,
+    value: RowEvalValue,
     other_side_is_json: bool,
     other_side_is_identity_json: bool,
 ) -> Result<JsonValue, LixError> {
+    // Explicit JSONB strings are already JSON values, not encoded JSON text.
+    let is_sql_text = matches!(value, RowEvalValue::SqlText(_));
+    let value = value.into_json();
     if !other_side_is_json {
         return Ok(value);
     }
-    let should_parse = matches!(expr, BoundExpr::Param(_))
+    let should_parse = (is_sql_text && matches!(expr, BoundExpr::Param(_)))
         || (other_side_is_identity_json
             && matches!(expr, BoundExpr::Literal(BoundLiteral::Text(_))));
     if !should_parse {
@@ -6651,7 +6645,11 @@ fn bound_expr_is_json(expr: &BoundExpr, spec: &SchemaSurfaceSpec) -> bool {
                 .is_some_and(|column| column.column_type == SchemaColumnType::Jsonb)
                 || column.name == "lixcol_metadata"
         }
-        BoundExpr::Literal(BoundLiteral::Json(_)) => true,
+        BoundExpr::Literal(BoundLiteral::Json(_))
+        | BoundExpr::Cast {
+            data_type: BoundCastType::Jsonb,
+            ..
+        } => true,
         BoundExpr::Function { name, .. } => matches!(
             name.as_str(),
             "__lix_json_get" | "__lix_json_path_get" | "__lix_jsonb"
@@ -6861,15 +6859,14 @@ fn typed_value_from_eval(
     expr: &BoundExpr,
     value: RowEvalValue,
     data_type: lix_schema::DataType,
-    nullable: bool,
+    _nullable: bool,
     schema_key: &str,
     column_name: &str,
 ) -> Result<lix_schema::Value, LixError> {
     use lix_schema::{DataType, Value};
 
     if matches!(value, RowEvalValue::SqlNull)
-        || ((data_type != DataType::Jsonb || nullable)
-            && matches!(value, RowEvalValue::Json(JsonValue::Null)))
+        || (data_type != DataType::Jsonb && matches!(value, RowEvalValue::Json(JsonValue::Null)))
     {
         return Ok(Value::Null);
     }
@@ -7464,6 +7461,9 @@ fn visible_column_eval_value(
     value: &JsonValue,
 ) -> RowEvalValue {
     match (column.map(|column| column.column_type), value) {
+        (Some(column_type), JsonValue::Null) if column_type != SchemaColumnType::Jsonb => {
+            RowEvalValue::SqlNull
+        }
         (Some(SchemaColumnType::String), JsonValue::String(value)) => {
             RowEvalValue::SqlText(value.clone())
         }
@@ -7473,16 +7473,9 @@ fn visible_column_eval_value(
 
 fn typed_column_eval_value(
     value: &lix_schema::Value,
-    column_type: Option<SchemaColumnType>,
+    _column_type: Option<SchemaColumnType>,
 ) -> Result<RowEvalValue, LixError> {
     Ok(match value {
-        // The historical row-expression contract exposes a null JSONB data
-        // value as JSON null, while a null system column remains SQL NULL.
-        // Native typed rows must preserve that distinction even though both
-        // are represented by Schema v1 `Value::Null` at rest.
-        lix_schema::Value::Null if column_type == Some(SchemaColumnType::Jsonb) => {
-            RowEvalValue::Json(JsonValue::Null)
-        }
         lix_schema::Value::Null => RowEvalValue::SqlNull,
         lix_schema::Value::Text(value) => RowEvalValue::SqlText(value.clone()),
         lix_schema::Value::Uuid(value) => RowEvalValue::SqlText(value.to_string()),

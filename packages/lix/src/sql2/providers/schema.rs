@@ -35,6 +35,7 @@ use crate::hot_state::{
 use crate::row_payload::TypedRow as WasmTypedRow;
 use crate::row_pk::RowPk;
 use crate::sql2::branch_scope::{BranchBinding, resolve_provider_branch_ids};
+use crate::sql2::catalog::schema_surface::SchemaSurfaceColumn;
 use crate::sql2::catalog::{
     PublicCatalog, PublicSurfaceKind, SchemaColumnType, SchemaSurfaceShape, SchemaSurfaceSpec,
     schema_surface_schema,
@@ -562,7 +563,16 @@ struct RowUpdateSnapshotKey {
     branch_id: String,
 }
 
-type RowUpdateSnapshots = Arc<Mutex<BTreeMap<RowUpdateSnapshotKey, SharedStr>>>;
+/// A generic UPDATE source may already have a native row payload. Keep that
+/// payload through the DataFusion write handoff: projecting it to JSON here
+/// would make SQL NULL and JSONB `null` indistinguishable.
+#[derive(Clone, Debug)]
+enum RowUpdateSnapshot {
+    Json(SharedStr),
+    Typed(Arc<WasmTypedRow>),
+}
+
+type RowUpdateSnapshots = Arc<Mutex<BTreeMap<RowUpdateSnapshotKey, RowUpdateSnapshot>>>;
 
 fn capture_row_update_snapshots(
     rows: &MaterializedHotStateBatch,
@@ -570,22 +580,30 @@ fn capture_row_update_snapshots(
 ) -> Result<()> {
     let mut captured = BTreeMap::new();
     for row in rows.iter() {
-        let snapshot = row
-            .snapshot_json_value()
+        let snapshot = if let Some(typed) = row
+            .materialize_decoded_snapshot()
             .map_err(lix_error_to_datafusion_error)?
-            .ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "UPDATE schema surface source row for schema '{}' has no snapshot",
-                    row.schema_key()
-                ))
-            })?;
-        let snapshot: SharedStr = serde_json::to_string(&snapshot)
-            .map_err(|error| {
-                DataFusionError::Execution(format!(
-                    "UPDATE schema surface source row could not serialize: {error}"
-                ))
-            })?
-            .into();
+        {
+            RowUpdateSnapshot::Typed(typed)
+        } else {
+            let snapshot = row
+                .snapshot_json_value()
+                .map_err(lix_error_to_datafusion_error)?
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "UPDATE schema surface source row for schema '{}' has no snapshot",
+                        row.schema_key()
+                    ))
+                })?;
+            let snapshot: SharedStr = serde_json::to_string(&snapshot)
+                .map_err(|error| {
+                    DataFusionError::Execution(format!(
+                        "UPDATE schema surface source row could not serialize: {error}"
+                    ))
+                })?
+                .into();
+            RowUpdateSnapshot::Json(snapshot)
+        };
         let key = RowUpdateSnapshotKey {
             row_pk: row.row_pk().clone(),
             branch_id: if row.global() {
@@ -1795,7 +1813,7 @@ fn row_update_stage_rows_from_batch(
         };
         let row_pk =
             row_pk_from_primary_key_columns(batch, row_index, spec, SchemaRowIdentityUse::Update)?;
-        let snapshot_content = update_snapshots
+        let snapshot = update_snapshots
             .get(&RowUpdateSnapshotKey {
                 row_pk: row_pk.clone(),
                 branch_id: branch_id.clone(),
@@ -1805,29 +1823,58 @@ fn row_update_stage_rows_from_batch(
                     "UPDATE schema surface is missing its source snapshot for schema '{}'",
                     spec.schema_key
                 ))
-            })?;
-        let mut snapshot = parse_snapshot_value(snapshot_content.as_ref()).map_err(|error| {
-            DataFusionError::Execution(format!(
-                "UPDATE schema surface source snapshot is invalid: {error}"
-            ))
-        })?;
-        let object = snapshot.as_object_mut().ok_or_else(|| {
-            DataFusionError::Execution(format!(
-                "UPDATE schema surface expected object snapshot for schema '{}'",
-                spec.schema_key
-            ))
-        })?;
-        for column in &spec.columns {
-            let UpdateCell::Assigned(cell) =
-                assignment_values.assigned_cell(row_index, &column.name)?
-            else {
-                continue;
-            };
-            object.insert(
-                column.name.clone(),
-                row_update_json_value(cell, column.column_type, spec, &column.name)?,
-            );
-        }
+            })?
+            .clone();
+        let (snapshot, decoded_snapshot) = match snapshot {
+            RowUpdateSnapshot::Json(snapshot_content) => {
+                let mut snapshot =
+                    parse_snapshot_value(snapshot_content.as_ref()).map_err(|error| {
+                        DataFusionError::Execution(format!(
+                            "UPDATE schema surface source snapshot is invalid: {error}"
+                        ))
+                    })?;
+                let object = snapshot.as_object_mut().ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "UPDATE schema surface expected object snapshot for schema '{}'",
+                        spec.schema_key
+                    ))
+                })?;
+                for column in &spec.columns {
+                    let UpdateCell::Assigned(cell) =
+                        assignment_values.assigned_cell(row_index, &column.name)?
+                    else {
+                        continue;
+                    };
+                    object.insert(
+                        column.name.clone(),
+                        row_update_json_value(cell, column.column_type, spec, &column.name)?,
+                    );
+                }
+                (Some(snapshot), None)
+            }
+            RowUpdateSnapshot::Typed(source) => {
+                // Preserve the source fingerprint and complete row shape. A
+                // staged schema amendment may be newer than the provider's
+                // opening spec; transaction normalization owns rebinding,
+                // defaults, and complete-row validation against its current
+                // catalog plan. Rebuilding against `spec` here would encode
+                // an amended row with a stale fingerprint and could discard
+                // newly materialized fields.
+                let mut typed = source.as_ref().clone();
+                for column in &spec.columns {
+                    let UpdateCell::Assigned(cell) =
+                        assignment_values.assigned_cell(row_index, &column.name)?
+                    else {
+                        continue;
+                    };
+                    typed.row.insert(
+                        column.name.clone(),
+                        row_update_typed_value(cell, column, spec)?,
+                    );
+                }
+                (None, Some(Arc::new(typed)))
+            }
+        };
         let metadata = match assignment_values.assigned_cell(row_index, "lixcol_metadata")? {
             UpdateCell::Unassigned => {
                 optional_string_value(batch, row_index, "lixcol_metadata", "UPDATE schema surface")?
@@ -1850,27 +1897,45 @@ fn row_update_stage_rows_from_batch(
             "UPDATE schema surface",
         )?
         .unwrap_or(false);
-        rows.push_parts(
-            Some(row_pk),
-            spec.schema_key.as_str().into(),
-            file_id,
-            Some(
-                TransactionJson::from_value(
-                    snapshot,
-                    &format!("{} update snapshot_content", spec.schema_key),
-                )
-                .map_err(lix_error_to_datafusion_error)?,
-            ),
-            metadata,
-            None,
-            None,
-            None,
-            global,
-            None,
-            None,
-            untracked,
-            branch_id.into(),
-        );
+        if let Some(decoded_snapshot) = decoded_snapshot {
+            rows.push_typed_parts(
+                Some(row_pk),
+                spec.schema_key.as_str().into(),
+                file_id,
+                Some(decoded_snapshot),
+                metadata,
+                None,
+                None,
+                None,
+                global,
+                None,
+                None,
+                untracked,
+                branch_id.into(),
+            );
+        } else {
+            rows.push_parts(
+                Some(row_pk),
+                spec.schema_key.as_str().into(),
+                file_id,
+                Some(
+                    TransactionJson::from_value(
+                        snapshot.expect("JSON snapshot was built"),
+                        &format!("{} update snapshot_content", spec.schema_key),
+                    )
+                    .map_err(lix_error_to_datafusion_error)?,
+                ),
+                metadata,
+                None,
+                None,
+                None,
+                global,
+                None,
+                None,
+                untracked,
+                branch_id.into(),
+            );
+        }
     }
     Ok(rows)
 }
@@ -1939,6 +2004,74 @@ fn row_update_json_value(
             other => Err(row_update_type_error(
                 spec,
                 column_name,
+                "TIMESTAMPTZ",
+                &other,
+            )),
+        },
+    }
+}
+
+/// Converts one DataFusion UPDATE result directly into the Schema v1 scalar
+/// used by a native row. In particular, JSONB `null` is a `Jsonb` value while
+/// an assigned SQL NULL is the separate `Value::Null` variant.
+fn row_update_typed_value(
+    cell: SqlCell,
+    column: &SchemaSurfaceColumn,
+    spec: &SchemaSurfaceSpec,
+) -> Result<lix_schema::Value> {
+    let SqlCell::Value(value) = cell else {
+        return Ok(lix_schema::Value::Null);
+    };
+    match column.column_type {
+        SchemaColumnType::String => {
+            let raw = scalar_utf8(value, &column.name, spec)?;
+            if column.native_type == lix_schema::DataType::Uuid {
+                uuid::Uuid::parse_str(&raw)
+                    .map(lix_schema::Value::Uuid)
+                    .map_err(|error| {
+                        DataFusionError::Execution(format!(
+                            "UPDATE {} column '{}' produced invalid UUID '{raw}': {error}",
+                            spec.schema_key, column.name
+                        ))
+                    })
+            } else {
+                Ok(lix_schema::Value::Text(raw))
+            }
+        }
+        SchemaColumnType::Jsonb => {
+            let raw = scalar_utf8(value, &column.name, spec)?;
+            let value: JsonValue = serde_json::from_str(&raw).map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "UPDATE {} column '{}' produced invalid JSON: {error}",
+                    spec.schema_key, column.name
+                ))
+            })?;
+            Ok(lix_schema::Value::Jsonb(value.into()))
+        }
+        SchemaColumnType::Integer => match value {
+            ScalarValue::Int64(Some(value)) => Ok(lix_schema::Value::Int8(value)),
+            other => Err(row_update_type_error(spec, &column.name, "BIGINT", &other)),
+        },
+        SchemaColumnType::Number => match value {
+            ScalarValue::Float64(Some(value)) => Ok(lix_schema::Value::Float8(value)),
+            other => Err(row_update_type_error(
+                spec,
+                &column.name,
+                "DOUBLE PRECISION",
+                &other,
+            )),
+        },
+        SchemaColumnType::Boolean => match value {
+            ScalarValue::Boolean(Some(value)) => Ok(lix_schema::Value::Boolean(value)),
+            other => Err(row_update_type_error(spec, &column.name, "BOOLEAN", &other)),
+        },
+        SchemaColumnType::Timestamptz => match value {
+            ScalarValue::TimestampMicrosecond(Some(value), _) => {
+                Ok(lix_schema::Value::Timestamptz(value))
+            }
+            other => Err(row_update_type_error(
+                spec,
+                &column.name,
                 "TIMESTAMPTZ",
                 &other,
             )),
