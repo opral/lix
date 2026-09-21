@@ -1205,7 +1205,7 @@ fn validate_bound_function_arity(name: &str, actual: usize) -> Result<(), LixErr
         | "__lix_json_contains"
         | "__lix_json_exists"
         | "lix_order_between" => expect_exact_function_arity(name, actual, 2),
-        "__lix_jsonb" => expect_exact_function_arity(name, actual, 1),
+        "__lix_jsonb" | "__lix_text_cast" => expect_exact_function_arity(name, actual, 1),
         // DataFusion validates the signatures of its scalar functions.
         _ => Ok(()),
     }

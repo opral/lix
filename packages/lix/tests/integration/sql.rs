@@ -155,3 +155,4 @@ fn rows_from_result(result: ExecuteResult) -> Vec<Vec<Value>> {
 mod index_schema_amendment;
 
 mod jsonb_projection;
+mod text_cast_metadata;

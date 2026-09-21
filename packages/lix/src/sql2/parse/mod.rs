@@ -190,6 +190,25 @@ fn rewrite_postgresql_expressions(statement: &mut DataFusionStatement) {
                 return ControlFlow::Continue(());
             }
             if let Expr::Cast {
+                kind,
+                expr: inner,
+                data_type: SqlDataType::Text,
+                array: false,
+                format: None,
+                ..
+            } = expr
+                && matches!(
+                    kind,
+                    datafusion::sql::sqlparser::ast::CastKind::Cast
+                        | datafusion::sql::sqlparser::ast::CastKind::DoubleColon
+                )
+            {
+                let placeholder = Box::new(Expr::Value(Value::Boolean(false).into()));
+                let inner = std::mem::replace(inner, placeholder);
+                *expr = private_function("__lix_text_cast", vec![*inner]);
+                return ControlFlow::Continue(());
+            }
+            if let Expr::Cast {
                 expr: inner,
                 data_type: SqlDataType::Uuid,
                 array: false,

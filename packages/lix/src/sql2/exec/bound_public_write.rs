@@ -3535,6 +3535,7 @@ fn returning_expr_column_type(
                 "uuidv7"
                     | "lix_active_branch_id"
                     | "lix_active_branch_commit_id"
+                    | "__lix_text_cast"
                     | "__lix_json_get_text"
                     | "__lix_json_path_get_text"
                     | "lix_order_between"
@@ -6062,6 +6063,10 @@ fn eval_expr_value(
                 .map(|commit_id| RowEvalValue::SqlText(commit_id.to_string()))
                 .unwrap_or(RowEvalValue::SqlNull))
         }
+        BoundExpr::Function { name, args } if name == "__lix_text_cast" && args.len() == 1 => {
+            let value = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
+            cast_row_eval_value(value, BoundCastType::Text)
+        }
         BoundExpr::Function { name, args } if name == "__lix_uuid_cast" && args.len() == 1 => {
             let value = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
             cast_row_eval_value(value, BoundCastType::Uuid)
@@ -6717,7 +6722,7 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
                 | "__lix_json_exists"
                 | "lix_order_between"
                     if args.len() == 2 => {}
-                "__lix_jsonb" | "__lix_uuid_cast" if args.len() == 1 => {}
+                "__lix_jsonb" | "__lix_uuid_cast" | "__lix_text_cast" if args.len() == 1 => {}
                 _ => {
                     return Err(LixError::new(
                         LixError::CODE_UNSUPPORTED_SQL,

@@ -538,8 +538,11 @@ fn is_json_expr<'a>(
             .first()
             .is_some_and(|field| field_is_json(field)),
         Expr::Alias(alias) => is_json_expr(&alias.expr, lookup_field),
-        Expr::Cast(cast) => is_json_expr(&cast.expr, lookup_field),
-        Expr::TryCast(cast) => is_json_expr(&cast.expr, lookup_field),
+        // PostgreSQL JSONB casts are lowered to the typed `__lix_jsonb` UDF
+        // before DataFusion planning. A remaining Cast/TryCast therefore has
+        // the target SQL type of the cast (TEXT, BYTEA, etc.), even when its
+        // input is a physical UTF8 JSONB column.
+        Expr::Cast(_) | Expr::TryCast(_) => false,
         _ => false,
     }
 }
@@ -568,8 +571,6 @@ fn is_identity_json_expr(expr: &Expr) -> bool {
     match expr {
         Expr::Column(column) => column.name == "row_pk",
         Expr::Alias(alias) => is_identity_json_expr(&alias.expr),
-        Expr::Cast(cast) => is_identity_json_expr(&cast.expr),
-        Expr::TryCast(cast) => is_identity_json_expr(&cast.expr),
         _ => false,
     }
 }
