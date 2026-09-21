@@ -1300,6 +1300,14 @@ fn retain_columnar_result(fields: &[Field], batches: &[RecordBatch]) -> bool {
         fields.iter().enumerate().any(|(column_index, field)| {
             let array = batch.column(column_index);
             match field.data_type() {
+                DataType::UInt64 => {
+                    array
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .is_some_and(|values| {
+                            values.iter().flatten().any(|value| value > i64::MAX as u64)
+                        })
+                }
                 DataType::Float32 => {
                     array
                         .as_any()
@@ -3179,9 +3187,7 @@ impl ColumnCursor<'_> {
                     Value::Null
                 } else {
                     let value = values.value(row_index);
-                    i64::try_from(value)
-                        .map(Value::Integer)
-                        .unwrap_or_else(|_| Value::Text(value.to_string()))
+                    crate::sql2::value_contract::unsigned_integer_result(value)?
                 }
             }
             Self::Float32(values) => real_value(*values, row_index)?,
@@ -3265,13 +3271,7 @@ impl ColumnCursor<'_> {
                         Value::Null
                     } else {
                         let value = values.value(row_index);
-                        match i64::try_from(value) {
-                            Ok(value) => Value::Integer(value),
-                            // Unsigned values past the signed range have no
-                            // integer representation in a Lix row, so they are
-                            // preserved exactly as decimal text.
-                            Err(_) => Value::Text(value.to_string()),
-                        }
+                        crate::sql2::value_contract::unsigned_integer_result(value)?
                     });
                 }
             }
@@ -3435,8 +3435,9 @@ mod tests {
 
     use super::{
         SqlExecutionContext, SqlWriteExecutionContext, build_write_session_with_options,
-        execute_sql, query_result_from_batches, query_values_from_batches, row_values_from_batch,
-        write_provider_selection, write_session_options, write_target_table_name,
+        execute_sql, query_result_from_batches, query_values_from_batches, retain_columnar_result,
+        row_values_from_batch, write_provider_selection, write_session_options,
+        write_target_table_name,
     };
     use crate::binary_cas::BlobDataReader;
     use crate::branch::BranchRefReader;
@@ -3520,7 +3521,7 @@ mod tests {
             )),
             Arc::new(UInt64Array::from_iter((0..ROWS).map(|index| {
                 present(index).then_some(if index == 1 {
-                    u64::MAX
+                    i64::MAX as u64
                 } else {
                     index as u64 * 7
                 })
@@ -3744,6 +3745,33 @@ mod tests {
     }
 
     #[test]
+    fn unsigned_overflow_never_changes_integer_results_into_text() {
+        let fields = vec![Field::new("n", DataType::UInt64, true)];
+        for rows in [1, 4096] {
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(fields.clone())),
+                vec![Arc::new(UInt64Array::from(vec![u64::MAX; rows]))],
+            )
+            .unwrap();
+            assert!(!retain_columnar_result(
+                &fields,
+                std::slice::from_ref(&batch)
+            ));
+            assert_eq!(
+                query_result_from_batches(&fields, std::slice::from_ref(&batch))
+                    .unwrap_err()
+                    .code,
+                LixError::CODE_TYPE_MISMATCH
+            );
+            assert_eq!(
+                row_values_from_batch(&fields, &batch, 0).unwrap_err().code,
+                LixError::CODE_TYPE_MISMATCH
+            );
+            assert!(query_values_from_batches(&fields, &[batch]).is_err());
+        }
+    }
+
+    #[test]
     fn typed_row_conversion_covers_every_supported_result_column_type() {
         use datafusion::arrow::array::{
             BooleanArray, Float64Array, LargeBinaryArray, NullArray, StringArray, UInt64Array,
@@ -3766,7 +3794,7 @@ mod tests {
                 Arc::new(NullArray::new(2)),
                 Arc::new(BooleanArray::from(vec![Some(true), None])),
                 Arc::new(Int64Array::from(vec![Some(7i64), None])),
-                Arc::new(UInt64Array::from(vec![Some(u64::MAX), None])),
+                Arc::new(UInt64Array::from(vec![Some(i64::MAX as u64), None])),
                 Arc::new(Float64Array::from(vec![Some(1.5f64), None])),
                 Arc::new(StringArray::from(vec![Some("hello"), None])),
                 Arc::new(StringArray::from(vec![Some(r#"{"a":1}"#), None])),
@@ -3784,7 +3812,7 @@ mod tests {
                 Value::Null,
                 Value::Boolean(true),
                 Value::Integer(7),
-                Value::Text(u64::MAX.to_string()),
+                Value::Integer(i64::MAX),
                 Value::Real(1.5),
                 Value::Text("hello".to_owned()),
                 Value::Jsonb(crate::Json::from_canonical_text(r#"{"a":1}"#)),

@@ -96,3 +96,14 @@ fn double_projection_error(surface_name: &str, column_name: &str, value: String)
         ),
     )
 }
+
+pub(crate) fn unsigned_integer_result(value: u64) -> Result<crate::Value, LixError> {
+    i64::try_from(value)
+        .map(crate::Value::Integer)
+        .map_err(|_| {
+            LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                "SQL integer exceeds BIGINT result range; CAST AS TEXT to return decimal text",
+            )
+        })
+}
