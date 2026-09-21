@@ -12,7 +12,8 @@
 
 mod interest;
 pub(crate) use interest::{
-    prepare_native_file_content_interest, prepare_native_file_metadata_interest,
+    prepare_native_file_content_inputs, prepare_native_file_content_interest,
+    prepare_native_file_metadata_interest,
 };
 pub(super) use interest::{retain_metadata, retain_selected_batch, retain_selected_entries};
 
@@ -1139,7 +1140,11 @@ impl TableSpec for LixFileSpec {
                 .path_index(
                     &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
                         .with_file_ids(match &target_file_ids {
-                            FileIdConstraint::Ids(ids) if ids.iter().all(|id| file_id_row_pk(id).is_ok()) => Some(ids.iter().cloned().collect()),
+                            FileIdConstraint::Ids(ids)
+                                if ids.iter().all(|id| file_id_row_pk(id).is_ok()) =>
+                            {
+                                Some(ids.iter().cloned().collect())
+                            }
                             _ => None,
                         })
                         .with_blob_refs(needs_blob_rows)
@@ -5685,6 +5690,9 @@ async fn load_plugin_render_branches(
         .filter(|branch_id| branch_id.as_str() != GLOBAL_BRANCH_ID)
         .cloned()
         .collect::<BTreeSet<_>>();
+    if branch_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
     let cached = match cache_snapshot {
         Some(snapshot) => host.cached_plugin_registries(snapshot, &branch_ids)?,
         None => None,
@@ -5692,24 +5700,31 @@ async fn load_plugin_render_branches(
     let registries = match cached {
         Some(registries) => registries,
         None => {
-            let registry_reads = branch_ids.iter().cloned().map(|branch_id| {
-                let hot_state = Arc::clone(&hot_state);
-                async move {
-                    let rows = hot_state
-                        .scan_tracked_batch(&HotStateScanRequest {
-                            filter: HotStateFilter {
-                                schema_keys: vec!["lix_key_value".to_string()],
-                                row_pks: vec![RowPk::single(PLUGIN_REGISTRY_KEY)],
-                                branch_ids: vec![branch_id.clone()],
-                                file_ids: vec![crate::NullableKeyFilter::Null],
-                                untracked: Some(false),
-                                ..HotStateFilter::default()
-                            },
-                            projection: plugin_control_hot_state_projection(),
-                            limit: Some(1),
+            // Registry identities are already known. Use the same exact
+            // access path as dependency discovery, including the absent-row
+            // case; a collection scan can require catalogs that the exact
+            // lookup does not visit and restart a cold replica's waterfall.
+            let rows = hot_state
+                .load_exact_batch(&HotStateExactBatchRequest {
+                    rows: branch_ids
+                        .iter()
+                        .map(|branch_id| HotStateExactRowRequest {
+                            schema_key: "lix_key_value".to_owned(),
+                            branch_id: branch_id.clone(),
+                            row_pk: RowPk::single(PLUGIN_REGISTRY_KEY),
+                            file_id: None,
                         })
-                        .await?;
-                    let row = rows.iter().find(|row| {
+                        .collect(),
+                    projection: plugin_control_hot_state_projection(),
+                    untracked: Some(false),
+                    include_tombstones: false,
+                })
+                .await?;
+            let registries = branch_ids
+                .iter()
+                .enumerate()
+                .map(|(index, branch_id)| {
+                    let row = rows.row(index).filter(|row| {
                         row.schema_key() == "lix_key_value"
                             && row.row_pk().as_single_string().ok() == Some(PLUGIN_REGISTRY_KEY)
                             && row.file_id().is_none()
@@ -5717,14 +5732,10 @@ async fn load_plugin_render_branches(
                             && !row.global()
                             && !row.untracked()
                     });
-                    let registry = PluginRegistry::from_optional_hot_state_row(row, &branch_id)?;
-                    Ok::<_, LixError>((branch_id, registry))
-                }
-            });
-            let registries = try_join_all(registry_reads)
-                .await?
-                .into_iter()
-                .collect::<BTreeMap<_, _>>();
+                    PluginRegistry::from_optional_hot_state_row(row, branch_id)
+                        .map(|registry| (branch_id.clone(), registry))
+                })
+                .collect::<Result<BTreeMap<_, _>, LixError>>()?;
             if let Some(snapshot) = cache_snapshot {
                 host.cache_plugin_registries(snapshot, &registries)?;
             }
@@ -5782,21 +5793,19 @@ async fn plugin_render_context_with_branches(
             let file_ids = candidate_keys.keys().cloned().collect::<BTreeSet<_>>();
             async move {
                 let rows = hot_state
-                    .scan_tracked_batch(&HotStateScanRequest {
-                        filter: HotStateFilter {
-                            schema_keys: vec!["lix_key_value".to_string()],
-                            row_pks: vec![RowPk::single(PLUGIN_OWNER_KEY)],
-                            branch_ids: vec![branch_id.clone()],
-                            file_ids: file_ids
-                                .iter()
-                                .cloned()
-                                .map(crate::NullableKeyFilter::Value)
-                                .collect(),
-                            untracked: Some(false),
-                            ..HotStateFilter::default()
-                        },
+                    .load_exact_batch(&HotStateExactBatchRequest {
+                        rows: file_ids
+                            .iter()
+                            .map(|file_id| HotStateExactRowRequest {
+                                schema_key: "lix_key_value".to_owned(),
+                                branch_id: branch_id.clone(),
+                                row_pk: RowPk::single(PLUGIN_OWNER_KEY),
+                                file_id: Some(file_id.clone()),
+                            })
+                            .collect(),
                         projection: plugin_control_hot_state_projection(),
-                        limit: None,
+                        untracked: Some(false),
+                        include_tombstones: false,
                     })
                     .await?;
                 Ok::<_, LixError>((branch_id, file_ids, rows))
@@ -5806,7 +5815,7 @@ async fn plugin_render_context_with_branches(
     let mut owner_change_ids_by_file = BTreeMap::new();
     let owner_rows = try_join_all(owner_reads).await?;
     for (branch_id, file_ids, rows) in owner_rows {
-        for row in rows.iter() {
+        for row in (0..rows.len()).filter_map(|index| rows.row(index)) {
             let Some(file_id) = row.file_id() else {
                 continue;
             };
@@ -5821,7 +5830,7 @@ async fn plugin_render_context_with_branches(
             }
             let owned_row = row.to_owned();
             // KNOWN LANE GAP: this render context resolves owners through
-            // `scan_tracked_batch`, a tracked-only reader, so untracked
+            // tracked-only exact requests, so untracked
             // plugin-owned files are not rendered from rows here. They do
             // not need to be - an untracked file's bytes round-trip through its
             // stored content blob, which is asserted by the lane-parity tests.
@@ -8988,6 +8997,69 @@ mod tests {
         Ok(builder.finish())
     }
 
+    /// Test-only exact reads must retain the decoded snapshot payload that the
+    /// production exact reader returns.  Build the aligned result from the
+    /// same typed fixture batch rather than `MaterializedHotStateExactBatch::from_rows`,
+    /// whose convenience constructor intentionally leaves decoded payloads
+    /// empty.
+    fn typed_fixture_exact_batch(
+        rows: &[MaterializedHotStateRow],
+        request: &HotStateExactBatchRequest,
+    ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
+        let mut present = Vec::new();
+        let mut slots = Vec::with_capacity(request.rows.len());
+        for requested in &request.rows {
+            let matches = |row: &&MaterializedHotStateRow| {
+                row.schema_key == requested.schema_key
+                    && row.row_pk == requested.row_pk
+                    && row.file_id == requested.file_id
+                    && request
+                        .untracked
+                        .is_none_or(|untracked| row.untracked == untracked)
+            };
+            // A branch-local row has precedence over the global fallback. A
+            // local tombstone therefore suppresses the global row even when
+            // tombstones are excluded from the result.
+            let row = rows
+                .iter()
+                .filter(matches)
+                .find(|row| row.branch_id.as_ref() == requested.branch_id.as_str())
+                .or_else(|| {
+                    (requested.branch_id != crate::GLOBAL_BRANCH_ID)
+                        .then(|| {
+                            rows.iter()
+                                .filter(matches)
+                                .find(|row| row.branch_id.as_ref() == crate::GLOBAL_BRANCH_ID)
+                        })
+                        .flatten()
+                });
+            let Some(mut row) = row.cloned() else {
+                slots.push(None);
+                continue;
+            };
+            if row.deleted && !request.include_tombstones {
+                slots.push(None);
+                continue;
+            }
+            if row.branch_id.as_ref() == crate::GLOBAL_BRANCH_ID
+                && requested.branch_id != crate::GLOBAL_BRANCH_ID
+            {
+                row.branch_id = requested.branch_id.clone().into();
+                row.global = true;
+            }
+            let ordinal = u32::try_from(present.len()).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "test exact live-state result exceeds u32 ordinals",
+                )
+            })?;
+            present.push(row);
+            slots.push(Some(ordinal));
+        }
+        let batch = typed_fixture_batch(present)?;
+        crate::hot_state::MaterializedHotStateExactBatch::new(batch, slots)
+    }
+
     #[async_trait]
     impl HotStateReader for RecordingHotStateReader {
         async fn scan_batch(
@@ -9049,44 +9121,7 @@ mod tests {
                 .expect("live-state request mutex should not be poisoned")
                 .push(recorded);
 
-            Ok(crate::hot_state::MaterializedHotStateExactBatch::from_rows(
-                request
-                    .rows
-                    .iter()
-                    .map(|requested| {
-                        let exact_match = |row: &&MaterializedHotStateRow| {
-                            row.schema_key == requested.schema_key
-                                && row.row_pk == requested.row_pk
-                                && row.file_id == requested.file_id
-                                && request
-                                    .untracked
-                                    .is_none_or(|untracked| row.untracked == untracked)
-                        };
-                        let mut row =
-                            self.rows
-                                .iter()
-                                .filter(exact_match)
-                                .find(|row| row.branch_id.as_ref() == requested.branch_id.as_str())
-                                .or_else(|| {
-                                    self.rows.iter().filter(exact_match).find(|row| {
-                                        row.branch_id.as_ref() == crate::GLOBAL_BRANCH_ID
-                                    })
-                                })?
-                                .clone();
-                        if row.branch_id.as_ref() == crate::GLOBAL_BRANCH_ID
-                            && requested.branch_id != crate::GLOBAL_BRANCH_ID
-                        {
-                            row.branch_id = requested.branch_id.clone().into();
-                            row.global = true;
-                        }
-                        if row.deleted && !request.include_tombstones {
-                            None
-                        } else {
-                            Some(row)
-                        }
-                    })
-                    .collect(),
-            ))
+            typed_fixture_exact_batch(&self.rows, request)
         }
     }
 
@@ -9149,7 +9184,7 @@ mod tests {
             &self,
             request: &HotStateExactBatchRequest,
         ) -> Result<crate::hot_state::MaterializedHotStateExactBatch, LixError> {
-            crate::hot_state::load_exact_batch_via_scan_for_test(self, request).await
+            typed_fixture_exact_batch(&self.rows, request)
         }
 
         async fn scan_batch(
@@ -10211,7 +10246,10 @@ mod tests {
         );
         assert_eq!(requests[0].filter.file_ids, vec![NullableKeyFilter::Null]);
         assert_eq!(requests[0].filter.untracked, Some(false));
-        assert_eq!(requests[0].limit, Some(1));
+        assert_eq!(
+            requests[0].limit, None,
+            "registry lookup uses an exact batch"
+        );
         assert_eq!(
             requests[1].filter.row_pks,
             vec![crate::row_pk::RowPk::single(PLUGIN_OWNER_KEY)]

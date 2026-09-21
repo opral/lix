@@ -45,6 +45,19 @@ pub(crate) struct PartialReplicaState {
 }
 
 impl PartialReplicaState {
+    /// Isolate authority recipe evaluation from every mutable serving generation.
+    pub(crate) fn for_read_fulfillment(&self) -> Self {
+        let mut state = self.clone();
+        state.selected_serving_generation = uuid::Uuid::now_v7().to_string();
+        state.global_serving_generation =
+            if state.descriptor.selected_branch.branch_id == state.descriptor.global_branch.branch_id {
+                state.selected_serving_generation.clone()
+            } else {
+                uuid::Uuid::now_v7().to_string()
+            };
+        state
+    }
+
     // Method in PartialReplicaState; only the private switch owner calls this.
     pub(super) fn with_selected_branch(
         &self,

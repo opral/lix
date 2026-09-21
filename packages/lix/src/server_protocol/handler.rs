@@ -283,11 +283,13 @@ impl Event {
 pub const PROTOCOL_PATH: &str = "/lix/v1";
 /// Media type of a complete deterministic Lix snapshot.
 pub const SNAPSHOT_MEDIA_TYPE: &str = "application/vnd.lix.snapshot";
+const MAX_READ_FULFILLMENT_REQUEST_BYTES: usize = 528 * 1024;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RequestBodyPolicy {
     None,
     Json,
     NativeObjects,
+    ReadFulfillment,
     Binary,
     Chunk,
 }
@@ -330,6 +332,7 @@ protocol_routes! {
    SyncNativeMigrationMerge => ("POST", "/sync/migration/merge", NativeObjects),
    SyncNativeMigrationCleanup => ("POST", "/sync/migration/cleanup", NativeObjects),
    SyncNativeMetadata => ("POST", "/sync/native-metadata", NativeObjects),
+   SyncReadFulfillment => ("POST", "/sync/read-fulfillment", ReadFulfillment),
    SyncNativeMetadataWalk => ("POST", "/sync/native-metadata-walk", NativeObjects),
    SyncNativeObjectRange => ("POST", "/sync/native-object-range", NativeObjects),
    SyncNativeObjects => ("POST", "/sync/native-objects", NativeObjects),
@@ -2144,7 +2147,9 @@ where
             .map(ProtocolRoute::body)
             .unwrap_or(RequestBodyPolicy::None);
         match body_policy {
-            RequestBodyPolicy::Json | RequestBodyPolicy::NativeObjects => {
+            RequestBodyPolicy::Json
+            | RequestBodyPolicy::NativeObjects
+            | RequestBodyPolicy::ReadFulfillment => {
                 if let Err(error) = require_json_content_type(&parts.headers) {
                     return error.into_response();
                 }
@@ -2161,6 +2166,8 @@ where
                 RequestBodyPolicy::NativeObjects => {
                     (16 * 1024).min(self.inner.options.max_request_body_bytes)
                 }
+                RequestBodyPolicy::ReadFulfillment => MAX_READ_FULFILLMENT_REQUEST_BYTES
+                    .min(self.inner.options.max_request_body_bytes),
                 RequestBodyPolicy::Chunk => {
                     MAX_SYNC_CHUNK_BYTES.min(self.inner.options.max_request_body_bytes)
                 }
@@ -2387,6 +2394,22 @@ where
                         lease,
                         parts.headers,
                         json_request!(crate::sync::NativeMetadataRequest),
+                    )
+                    .await,
+                )
+            }
+            Some(ProtocolRoute::SyncReadFulfillment) => {
+                if parts.uri.query().is_some() {
+                    return ApiError::bad_request(
+                        "read fulfillment does not accept query parameters",
+                    )
+                    .into_response();
+                }
+                result_response(
+                    sync_read_fulfillment(
+                        lease,
+                        parts.headers,
+                        json_request!(crate::sync::ReadFulfillmentRequest),
                     )
                     .await,
                 )
@@ -3413,6 +3436,27 @@ where
         response,
         "native metadata",
         crate::sync::MAX_NATIVE_METADATA_RESPONSE_BYTES,
+    )
+}
+
+async fn sync_read_fulfillment<S>(
+    lease: SessionLease<S>,
+    headers: HeaderMap,
+    Json(request): Json<crate::sync::ReadFulfillmentRequest>,
+) -> Result<Response, ApiError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    let baseline_id = required_native_baseline_header(&headers)?;
+    let response = lease
+        .run_cancellable_read(move |lix| async move {
+            lix.read_sync_fulfillment(&request, &baseline_id).await
+        })
+        .await?;
+    bounded_sync_json_response(
+        response,
+        "read fulfillment",
+        crate::sync::MAX_READ_FULFILLMENT_RESPONSE_BYTES,
     )
 }
 
@@ -6113,6 +6157,7 @@ mod tests {
                 ("POST", "/lix/v1/{lix_id}/sync/native-objects") => "syncNativeObjects",
                 ("POST", "/lix/v1/{lix_id}/sync/native-object-range") => "syncNativeObjectRange",
                 ("POST", "/lix/v1/{lix_id}/sync/native-metadata") => "syncNativeMetadata",
+                ("POST", "/lix/v1/{lix_id}/sync/read-fulfillment") => "syncReadFulfillment",
                 ("POST", "/lix/v1/{lix_id}/sync/native-metadata-walk") => "syncNativeMetadataWalk",
                 ("GET", "/lix/v1/{lix_id}/sync/history") => "syncHistory",
                 ("GET", "/lix/v1/{lix_id}/sync/checkpoints") => "syncCheckpointInventory",
@@ -6163,7 +6208,7 @@ mod tests {
             openapi
                 .matches("$ref: \"#/components/parameters/SyncProtocolVersion\"")
                 .count(),
-            24,
+            25,
             "every sync HTTP operation must declare the required version header",
         );
         for operation_id in [
@@ -6174,6 +6219,7 @@ mod tests {
             "syncNativeObjects",
             "syncNativeObjectRange",
             "syncNativeMetadata",
+            "syncReadFulfillment",
             "syncNativeMetadataWalk",
             "syncPull",
             "syncHistory",
@@ -10144,6 +10190,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_fulfillment_route_requires_its_lease() {
+        let app = app().await;
+        let (session, _) = new_session(&app.router).await;
+        let envelope = response_json(
+            request(
+                &app.router,
+                "GET",
+                "/lix/v1/sync/descriptor",
+                Some(&session),
+                None,
+            )
+            .await,
+        )
+        .await;
+        let descriptor = envelope["descriptor"].clone();
+        let commit = descriptor["selectedBranch"]["head"]["commitId"].clone();
+        let body = json!({
+            "epochId": uuid::Uuid::now_v7().to_string(),
+            "descriptor": descriptor,
+            "interests": [{
+                "kind": "exact",
+                "rows": [],
+                "projection": {"columns": []},
+                "untracked": null,
+                "include_tombstones": false
+            }],
+            "required": [{
+                "kind": "metadata",
+                "address": {"kind": "commit_graph_record", "commitId": commit}
+            }],
+            "continuation": {"nextInput": 1, "closureDigest": "0000000000000000000000000000000000000000000000000000000000000000"}
+        });
+        let missing = request_with_headers(
+            &app.router,
+            "POST",
+            "/lix/v1/sync/read-fulfillment",
+            Some(&session),
+            &[],
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let unknown = uuid::Uuid::now_v7().to_string();
+        let expired = request_with_headers(
+            &app.router,
+            "POST",
+            "/lix/v1/sync/read-fulfillment",
+            Some(&session),
+            &[("lix-native-baseline-lease", &unknown)],
+            Some(body),
+        )
+        .await;
+        assert_eq!(expired.status(), StatusCode::GONE);
+        assert_eq!(
+            response_json(expired).await["error"]["code"],
+            "LIX_PARTIAL_BASELINE_EXPIRED"
+        );
+    }
+
+    #[tokio::test]
     async fn native_metadata_route_validates_records_epoch_and_session() {
         let app = app().await;
         let (session_id, _) = new_session(&app.router).await;
@@ -10298,13 +10404,17 @@ mod tests {
             })
             .await;
             let (session_id, _) = new_session(&app.router).await;
-            for path in [
-                "/lix/v1/sync/native-objects",
-                "/lix/v1/sync/native-object-range",
-                "/lix/v1/sync/native-metadata",
-                "/lix/v1/sync/native-metadata-walk",
+            for (path, route_limit) in [
+                ("/lix/v1/sync/native-objects", 16 * 1024),
+                ("/lix/v1/sync/native-object-range", 16 * 1024),
+                ("/lix/v1/sync/native-metadata", 16 * 1024),
+                ("/lix/v1/sync/native-metadata-walk", 16 * 1024),
+                (
+                    "/lix/v1/sync/read-fulfillment",
+                    MAX_READ_FULFILLMENT_REQUEST_BYTES,
+                ),
             ] {
-                let effective_limit = configured_limit.min(16 * 1024);
+                let effective_limit = configured_limit.min(route_limit);
                 for (length, expected_status) in [
                     (effective_limit, StatusCode::BAD_REQUEST),
                     (effective_limit + 1, StatusCode::PAYLOAD_TOO_LARGE),

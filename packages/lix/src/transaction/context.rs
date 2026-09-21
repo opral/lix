@@ -1496,7 +1496,83 @@ where
     pub(crate) async fn refresh_hydrated_native_inputs(
         &mut self,
         error: &LixError,
+        hydrated: &crate::sync::HydratedInputs,
     ) -> Result<bool, LixError> {
+        if !hydrated.keys.is_empty() || !hydrated.blob_manifests.is_empty() {
+            let read = self
+                .storage
+                .begin_read(StorageReadOptions::default())
+                .await?;
+            let mut keys = hydrated.keys.clone();
+            let mut prefixes = Vec::new();
+            for blob in &hydrated.blob_manifests {
+                let manifest_key = crate::storage_adapter::StorageKey(
+                    Bytes::copy_from_slice(blob.as_bytes()),
+                );
+                let staged = self
+                    .staged_writes
+                    .load_staged_file_bytes_many(&[*blob])?
+                    .into_vec()
+                    .first()
+                    .is_some_and(Option::is_some);
+                let resident = if staged {
+                    true
+                } else {
+                    StorageAdapterRead::get_many(
+                        &self.opening_read,
+                        &[crate::storage_adapter::StorageGetManyRequest {
+                            space: crate::binary_cas::BINARY_CAS_MANIFEST_SPACE,
+                            keys: std::slice::from_ref(&manifest_key),
+                            opts: Default::default(),
+                        }],
+                    )
+                    .await?
+                    .values
+                    .first()
+                    .is_some_and(|value| value.is_some())
+                };
+                if !resident {
+                    // The operation receipt already names the chunks actually
+                    // delivered. A canonical manifest may describe unrequested
+                    // range chunks, and present chunks have no demand marker.
+                    // Neither is a required resident input of this receipt.
+                    keys.push((crate::binary_cas::BINARY_CAS_MANIFEST_SPACE, manifest_key));
+                    prefixes.push(Bytes::copy_from_slice(blob.as_bytes()));
+                }
+            }
+            if keys.is_empty() && prefixes.is_empty() {
+                return Ok(false);
+            }
+            for (space, key) in &keys {
+                let result = StorageAdapterRead::get_many(
+                    &read,
+                    &[crate::storage_adapter::StorageGetManyRequest {
+                        space: *space,
+                        keys: std::slice::from_ref(key),
+                        opts: Default::default(),
+                    }],
+                )
+                .await?;
+                if result.values.first().is_none_or(Option::is_none) {
+                    return Err(LixError::new(
+                        LixError::CODE_TRANSACTION_CONFLICT,
+                        "transaction snapshot inputs are no longer retained by the authority",
+                    ));
+                }
+            }
+            // SAFETY: like opening_read, the fallback drops before the retained
+            // Arc storage. It only fills immutable coordinates installed by the
+            // pinned fulfillment response.
+            let read = unsafe { assume_static_storage_read::<StorageImpl>(read) };
+            self.opening_read = self.opening_read.with_hydrated_keys(read, keys);
+            for prefix in prefixes {
+                self.opening_read = self.opening_read.clone().with_hydrated_prefix(
+                    crate::binary_cas::BINARY_CAS_MANIFEST_CHUNK_SPACE,
+                    prefix,
+                );
+            }
+            return Ok(true);
+        }
         enum OptionalNative {
             Object(crate::tracked_state::NativeObjectRef),
             Metadata(crate::tracked_state::NativeMetadataRef),
@@ -2712,10 +2788,10 @@ where
                 self.pending_branch_checkpoint_replacements = checkpoint_replacements;
                 self.native_migration_branch_bridges = migration_bridges;
                 self.atomic_metadata_preconditions = metadata_preconditions;
-                retry
+                let hydrated = retry
                     .hydrate_pinned_for_retry(Some(&sender), error.clone())
                     .await?;
-                self.refresh_hydrated_native_inputs(&error).await?;
+                self.refresh_hydrated_native_inputs(&error, &hydrated).await?;
             }
         })
     }
@@ -9350,7 +9426,11 @@ where
     ) -> Result<(SqlQueryResult, DataFusionStatement), LixError> {
         let read_store = self.opening_read();
         let active_branch_id = self.active_branch_id.clone();
-        let hot_state = Arc::clone(&self.hot_state);
+        let capture = self.hot_state.capture_foreground_read_interests();
+        let hot_state = capture.as_ref().map_or_else(
+            || Arc::clone(&self.hot_state),
+            |(hot, _)| Arc::new(hot.clone()),
+        );
         let binary_cas = Arc::clone(&self.binary_cas);
         let branch_ctx = Arc::clone(&self.branch_ctx);
         let visible_schemas = self.sql_visible_schemas();
@@ -9363,6 +9443,15 @@ where
         let plugin_host = self.plugin_host.clone();
         let sql_planning_cache = Arc::clone(&self.sql_planning_cache);
         let sql_catalog_fingerprint = self.sql_catalog_fingerprint().clone();
+
+        if let Some((_, capture)) = &capture {
+            crate::session::seed_foreground_filesystem_interest(
+                Some(capture),
+                &self.active_branch_id,
+                &statement,
+                &params,
+            )?;
+        }
 
         let read_ctx = TransactionSqlReadExecutionContext {
             active_branch_id,
@@ -9382,10 +9471,22 @@ where
             sql_planning_cache,
             sql_catalog_fingerprint,
         };
-        crate::sql2::execute_transaction_read_statement_from_parsed(
+        let result = crate::sql2::execute_transaction_read_statement_from_parsed(
             &read_ctx, self, &sql, statement, &params,
         )
-        .await
+        .await;
+        match result {
+            Ok(result) => {
+                if let Some((_, capture)) = capture {
+                    capture.publish_capture()?;
+                }
+                Ok(result)
+            }
+            Err(error) => Err(crate::sync::annotate_read_fulfillment_capture(
+                error,
+                capture.as_ref().map(|(_, capture)| capture.as_ref()),
+            )),
+        }
     }
 
     fn sql_visible_schemas(&self) -> Vec<JsonValue> {
@@ -18835,7 +18936,10 @@ fallback={large_fallback} decoded={large_decoded}"
                 let error = NativeHistoryFrontier::annotate_optional_suffix(plain.clone(), 1);
                 assert!(
                     transaction
-                        .refresh_hydrated_native_inputs(&error)
+                        .refresh_hydrated_native_inputs(
+                            &error,
+                            &crate::sync::HydratedInputs::default(),
+                        )
                         .await
                         .unwrap()
                 );
@@ -18860,7 +18964,10 @@ fallback={large_fallback} decoded={large_decoded}"
                 if optional_status == 0 {
                     assert!(
                         transaction
-                            .refresh_hydrated_native_inputs(&plain)
+                            .refresh_hydrated_native_inputs(
+                                &plain,
+                                &crate::sync::HydratedInputs::default(),
+                            )
                             .await
                             .is_err(),
                         "the same missing input must fail when it is required"
@@ -18911,7 +19018,10 @@ fallback={large_fallback} decoded={large_decoded}"
                 .await
                 .unwrap();
             transaction
-                .refresh_hydrated_native_inputs(&manifest_demand)
+                .refresh_hydrated_native_inputs(
+                    &manifest_demand,
+                    &crate::sync::HydratedInputs::default(),
+                )
                 .await
                 .unwrap();
 
@@ -18935,7 +19045,10 @@ fallback={large_fallback} decoded={large_decoded}"
                     .await
                     .unwrap();
                 transaction
-                    .refresh_hydrated_native_inputs(&demand)
+                    .refresh_hydrated_native_inputs(
+                        &demand,
+                        &crate::sync::HydratedInputs::default(),
+                    )
                     .await
                     .unwrap();
             }

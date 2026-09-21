@@ -66,7 +66,9 @@ impl RawHttpClient for ExpiringClient {
                     None => futures_util::future::pending::<()>().await,
                 }
             }
-            if request.url.contains("/sync/native-") {
+            if request.url.contains("/sync/native-")
+                || request.url.ends_with("/sync/read-fulfillment")
+            {
                 self.fetches.fetch_add(1, Ordering::SeqCst);
                 if self.expire.load(Ordering::SeqCst)
                     && request.headers.iter().any(|(k, v)| {

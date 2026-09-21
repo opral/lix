@@ -1263,5 +1263,6 @@ mod tests {
 
 pub(crate) use diff::prepare_native_diff_interest;
 pub(crate) use file::{
-    prepare_native_file_content_interest, prepare_native_file_metadata_interest,
+    prepare_native_file_content_inputs, prepare_native_file_content_interest,
+    prepare_native_file_metadata_interest,
 };

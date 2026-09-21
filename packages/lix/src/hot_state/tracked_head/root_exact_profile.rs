@@ -85,6 +85,10 @@ impl<R: ?Sized> Drop for Read<'_, R> {
     }
 }
 impl<R: StorageAdapterRead + ?Sized> StorageAdapterRead for Read<'_, R> {
+    fn requires_physical_reads(&self) -> bool {
+        self.inner.requires_physical_reads()
+    }
+
     fn snapshot_cache_key(&self) -> Option<u128> {
         self.inner.snapshot_cache_key()
     }

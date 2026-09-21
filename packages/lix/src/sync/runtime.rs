@@ -36,6 +36,20 @@ pub(crate) struct SyncRuntime {
     pub(super) task: SyncTask,
 }
 
+/// Ephemeral evidence returned by a pinned partial hydration. The storage
+/// values themselves are installed by the worker; this receipt only tells the
+/// transaction which immutable coordinates may be added to its opening read.
+/// Blob manifests stay separate because their prefix layout is safe to expose
+/// only when the transaction did not already observe that manifest.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HydratedInputs {
+    pub(crate) keys: Vec<(
+        crate::storage_adapter::StorageSpace,
+        crate::storage_adapter::StorageKey,
+    )>,
+    pub(crate) blob_manifests: Vec<crate::binary_cas::BlobId>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SyncShutdown {
     Running,
@@ -45,7 +59,7 @@ pub(super) enum SyncShutdown {
 #[derive(Debug)]
 pub(crate) struct SyncDemand {
     pub(super) request: SyncDemandRequest,
-    pub(super) response: tokio::sync::oneshot::Sender<Result<(), LixError>>,
+    pub(super) response: tokio::sync::oneshot::Sender<Result<HydratedInputs, LixError>>,
 }
 
 #[cfg(test)]
@@ -55,7 +69,7 @@ impl SyncDemand {
     }
 
     pub(crate) fn succeed_for_test(self) {
-        let _ = self.response.send(Ok(()));
+        let _ = self.response.send(Ok(HydratedInputs::default()));
     }
 }
 
@@ -67,6 +81,9 @@ pub(super) enum SyncDemandRequest {
     NativeMetadata(Vec<crate::tracked_state::NativeMetadataRef>, LixError),
     History(Vec<String>),
     Chunks(Vec<String>),
+    /// A chunk demand raised by a captured foreground read. The error carries
+    /// the operation recipe needed by the pinned fulfillment path.
+    ChunksWithRead(Vec<String>, LixError),
     /// Wait for the partial owner to settle local work before changing branches.
     ReconcilePartial,
     /// Hydrate immutable inputs without moving an explicit transaction snapshot.
@@ -394,7 +411,14 @@ pub(super) fn native_sync_demand_request_for_error(
             error.clone(),
         )));
     }
-    sync_demand_request_for_error(error)
+    let request = sync_demand_request_for_error(error)?;
+    if let Some(SyncDemandRequest::Chunks(ids)) = request {
+        if crate::sync::read_fulfillment::interests_for_error(error)?.is_some() {
+            return Ok(Some(SyncDemandRequest::ChunksWithRead(ids, error.clone())));
+        }
+        return Ok(Some(SyncDemandRequest::Chunks(ids)));
+    }
+    Ok(request)
 }
 
 fn full_replica_demand(request: SyncDemandRequest) -> Result<SyncDemandRequest, LixError> {
@@ -405,6 +429,9 @@ fn full_replica_demand(request: SyncDemandRequest) -> Result<SyncDemandRequest, 
         | SyncDemandRequest::BlobManifest(_, error) => {
             sync_demand_request_for_error(&error)?.ok_or(error)
         }
+        SyncDemandRequest::ChunksWithRead(ids, error) => {
+            sync_demand_request_for_error(&error)?.or_else(|| Some(SyncDemandRequest::Chunks(ids))).ok_or(error)
+        }
         request => Ok(request),
     }
 }
@@ -412,20 +439,21 @@ fn full_replica_demand(request: SyncDemandRequest) -> Result<SyncDemandRequest, 
 async fn send_sync_demand(
     demand_tx: &tokio::sync::mpsc::Sender<SyncDemand>,
     request: SyncDemandRequest,
-) -> Result<(), LixError> {
+) -> Result<HydratedInputs, LixError> {
     let (response, done) = tokio::sync::oneshot::channel();
     demand_tx
         .send(SyncDemand { request, response })
         .await
         .map_err(|_| LixError::new(LixError::CODE_CLOSED, "sync demand worker is closed"))?;
-    done.await.map_err(|_| stopped_error())??;
-    Ok(())
+    done.await.map_err(|_| stopped_error())?
 }
 
 pub(crate) async fn reconcile_partial_before_branch_switch(
     demand_tx: &tokio::sync::mpsc::Sender<SyncDemand>,
 ) -> Result<(), LixError> {
-    send_sync_demand(demand_tx, SyncDemandRequest::ReconcilePartial).await
+    send_sync_demand(demand_tx, SyncDemandRequest::ReconcilePartial)
+        .await
+        .map(|_| ())
 }
 
 fn is_sparse_commit_graph_miss(error: &LixError) -> bool {
@@ -468,7 +496,7 @@ impl SyncDemandRetry {
         &mut self,
         demand_tx: Option<&tokio::sync::mpsc::Sender<SyncDemand>>,
         error: LixError,
-    ) -> Result<(), LixError> {
+    ) -> Result<HydratedInputs, LixError> {
         let Some(demand_tx) = demand_tx else {
             return Err(error);
         };
@@ -499,7 +527,7 @@ impl SyncDemandRetry {
                 self.seen.clear();
                 Ok(())
             }
-            result => result,
+            result => result.map(|_| ()),
         }
     }
 }
@@ -1027,6 +1055,7 @@ where
             SyncDemandRequest::ReconcilePartial | SyncDemandRequest::Pinned(_) => {}
             SyncDemandRequest::History(ids) => history_ids.extend(ids),
             SyncDemandRequest::Chunks(ids) => chunk_ids.extend(ids),
+            SyncDemandRequest::ChunksWithRead(ids, _) => chunk_ids.extend(ids),
             #[cfg(test)]
             SyncDemandRequest::PublicationBarrier => {}
         }
@@ -1078,7 +1107,9 @@ fn resolve_sync_demand_results(
                 ))
             }
             SyncDemandRequest::History(_) => history_result.clone(),
-            SyncDemandRequest::Chunks(_) => chunk_result.clone(),
+            SyncDemandRequest::Chunks(_) | SyncDemandRequest::ChunksWithRead(_, _) => {
+                chunk_result.clone()
+            }
             #[cfg(test)]
             SyncDemandRequest::PublicationBarrier => _barrier_result.clone(),
         };
@@ -1088,7 +1119,7 @@ fn resolve_sync_demand_results(
                 retry.push(demand);
             }
             result => {
-                let _ = demand.response.send(result);
+                let _ = demand.response.send(result.map(|_| HydratedInputs::default()));
             }
         }
     }
@@ -1661,6 +1692,9 @@ where
             hydrate_history_ids(lix, transport, ids.into_iter().collect()).await
         }
         Some(SyncDemandRequest::Chunks(ids)) => {
+            hydrate_chunk_ids(lix, transport, ids.into_iter().collect()).await
+        }
+        Some(SyncDemandRequest::ChunksWithRead(ids, _)) => {
             hydrate_chunk_ids(lix, transport, ids.into_iter().collect()).await
         }
         #[cfg(test)]
@@ -3435,7 +3469,10 @@ mod tests {
                 demand.request,
                 SyncDemandRequest::History(ids) if ids == vec![commit_id]
             ));
-            demand.response.send(Ok(())).expect("waiter remains live");
+            demand
+                .response
+                .send(Ok(HydratedInputs::default()))
+                .expect("waiter remains live");
         };
         let (hydrated, ()) = tokio::join!(waiter, responder);
         hydrated.expect("history response succeeds");
@@ -3457,7 +3494,10 @@ mod tests {
                 demand.request,
                 SyncDemandRequest::History(ids) if ids == vec![commit_id]
             ));
-            demand.response.send(Ok(())).expect("waiter remains live");
+            demand
+                .response
+                .send(Ok(HydratedInputs::default()))
+                .expect("waiter remains live");
         };
         let (hydrated, ()) = tokio::join!(waiter, responder);
         hydrated.expect("history response succeeds");
@@ -3490,7 +3530,10 @@ mod tests {
                 demand.request,
                 SyncDemandRequest::Chunks(ids) if ids == vec![chunk_id]
             ));
-            demand.response.send(Ok(())).expect("waiter remains live");
+            demand
+                .response
+                .send(Ok(HydratedInputs::default()))
+                .expect("waiter remains live");
         };
         let (hydrated, ()) = tokio::join!(waiter, responder);
         hydrated.expect("chunk response succeeds");

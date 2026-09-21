@@ -204,6 +204,25 @@ where
         Ok((engine, session))
     }
 
+    pub(crate) async fn discover_read_fulfillment(
+        &self,
+        repository: &str,
+        account: &str,
+        lease_id: &str,
+        request: &crate::sync::ReadFulfillmentRequest,
+    ) -> Result<crate::sync::ReadFulfillmentResponse, LixError> {
+        let read = self.storage.begin_read(Default::default()).await?;
+        crate::session::discover_read_fulfillment::<StorageImpl>(
+            read,
+            repository,
+            account,
+            lease_id,
+            request,
+            HotStateContext::new(TrackedStateContext::new(), CommitGraphContext::new()),
+        )
+        .await
+    }
+
     pub(crate) async fn prepare_partial_candidate(
         &self,
         read: crate::storage_adapter::StorageAdapterReadScope<StorageImpl::Read<'_>>,

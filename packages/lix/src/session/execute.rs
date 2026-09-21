@@ -10,11 +10,11 @@ use crate::common::{ExecuteStatementMetadata, ExpiredReadRetryState};
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::sql_telemetry::{SqlStatementTelemetry, finish_operation, start_batch};
 use crate::sql2;
-#[cfg(test)]
-use crate::sql2::ExactFilesystemRead;
+use crate::sql2::{
+    ExactFilesystemRead, ExactLixFileReadColumn, ExactLixFileReadSelector,
+    exact_filesystem_read_interest_route, exact_filesystem_read_route,
+};
 use crate::sql2::SqlWriteExecutionContext;
-#[cfg(any(test, feature = "storage-benches"))]
-use crate::sql2::exact_filesystem_read_route;
 use crate::sql2::{is_acknowledgeable_file_content_read, late_materialized_lix_file_content_read};
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
@@ -1532,6 +1532,27 @@ where
                         let active_branch_id =
                             self.active_branch_id_from_reader(&read_store).await?;
                         let capture = self.hot_state.capture_foreground_read_interests();
+                        if let Some((_, capture)) = &capture {
+                            let path = paths
+                                .iter()
+                                .next()
+                                .expect("structured file read always has one path")
+                                .clone();
+                            register_seeded_file_interest(
+                                capture,
+                                &active_branch_id,
+                                None,
+                                crate::hot_state::FilePathInterest::Comparison {
+                                    operation:
+                                        crate::hot_state::FilePathInterestComparison::Equal,
+                                    value: path,
+                                },
+                                true,
+                                requested_range
+                                    .as_ref()
+                                    .map(|range| (range.start, range.end)),
+                            )?;
+                        }
                         let read_hot = capture.as_ref().map_or_else(
                             || Arc::clone(&self.hot_state),
                             |(hot, _)| Arc::new(hot.clone()),
@@ -1550,53 +1571,64 @@ where
                         // `lix_file.content` read, so it must acknowledge rendered
                         // plugin state for subsequent collaborative writes.
                         let file_view_collector = self.file_views.fork_for_read();
-                        let result = sql2::execute_exact_lix_file_batch_read(
-                            &active_branch_id,
-                            hot_state,
-                            filesystem_path_index,
-                            branch_ref,
-                            blob_reader,
-                            self.plugin_host.clone(),
-                            Some(file_view_collector.clone()),
-                            plugin_cache_snapshot,
-                            &paths,
-                            requested_range.clone(),
-                        )
-                        .await?;
-                        let content =
-                            native_file_read_from_exact_result(result, &paths, requested_range)?;
-                        if let Some((_, capture)) = &capture {
-                            let reader = self.hot_state.reader(read_store.clone());
-                            let executable_rows = reader
-                                .prepare_captured_read_interests(
-                                    &capture.snapshot()?,
-                                    self.active_account_id(),
-                                )
-                                .await?;
-                            self.catalog_context
-                                .prepare_returned_row_catalogs(
-                                    &reader,
-                                    &executable_rows,
-                                    crate::catalog::load_catalog_revision(&read_store)
-                                        .await?
-                                        .as_ref(),
-                                )
-                                .await?;
-                            crate::plugin::runtime::prepare_returned_row_executables(
-                                &reader,
-                                &self.binary_cas.reader(read_store),
-                                &executable_rows,
+                        let result = async {
+                            let result = sql2::execute_exact_lix_file_batch_read(
+                                &active_branch_id,
+                                hot_state,
+                                filesystem_path_index,
+                                branch_ref,
+                                blob_reader,
+                                self.plugin_host.clone(),
+                                Some(file_view_collector.clone()),
+                                plugin_cache_snapshot,
+                                &paths,
+                                requested_range.clone(),
                             )
                             .await?;
+                            let content =
+                                native_file_read_from_exact_result(result, &paths, requested_range)?;
+                            if let Some((_, capture)) = &capture {
+                                let reader = self.hot_state.reader(read_store.clone());
+                                let executable_rows = reader
+                                    .prepare_captured_read_interests(
+                                        &capture.snapshot()?,
+                                        self.active_account_id(),
+                                    )
+                                    .await?;
+                                self.catalog_context
+                                    .prepare_returned_row_catalogs(
+                                        &reader,
+                                        &executable_rows,
+                                        crate::catalog::load_catalog_revision(&read_store)
+                                            .await?
+                                            .as_ref(),
+                                    )
+                                    .await?;
+                                crate::plugin::runtime::prepare_returned_row_executables(
+                                    &reader,
+                                    &self.binary_cas.reader(read_store),
+                                    &executable_rows,
+                                )
+                                .await?;
+                            }
+                            Ok::<_, LixError>((
+                                content,
+                                file_view_collector.plugin_file_mutations(),
+                                capture
+                                    .as_ref()
+                                    .map(|(_, capture)| Arc::clone(capture))
+                                    .into_iter()
+                                    .collect::<Vec<_>>(),
+                            ))
                         }
-                        Ok((
-                            content,
-                            file_view_collector.plugin_file_mutations(),
-                            capture
-                                .map(|(_, capture)| capture)
-                                .into_iter()
-                                .collect::<Vec<_>>(),
-                        ))
+                        .await
+                        .map_err(|error| {
+                            crate::sync::annotate_read_fulfillment_capture(
+                                error,
+                                capture.as_ref().map(|(_, capture)| capture.as_ref()),
+                            )
+                        })?;
+                        Ok(result)
                     }
                 },
             )
@@ -2691,6 +2723,17 @@ where
                     let parsed = parsed.clone();
                     async move {
                         let capture = self.hot_state.capture_foreground_read_interests();
+                        if let Some((_, capture)) = &capture {
+                            let active_branch_id = self.bound_branch_id()?;
+                            for ((_, params), statement) in statements.iter().zip(&parsed) {
+                                seed_foreground_filesystem_interest(
+                                    Some(capture),
+                                    &active_branch_id,
+                                    statement,
+                                    params,
+                                )?;
+                            }
+                        }
                         let read_hot = capture.as_ref().map_or_else(
                             || Arc::clone(&self.hot_state),
                             |(hot, _)| Arc::new(hot.clone()),
@@ -2822,7 +2865,12 @@ where
                             if let Some(telemetry) = telemetry {
                                 telemetry.finish(&result);
                             }
-                            let result = result?;
+                            let result = result.map_err(|error| {
+                                crate::sync::annotate_read_fulfillment_capture(
+                                    error,
+                                    capture.as_ref().map(|(_, capture)| capture.as_ref()),
+                                )
+                            })?;
                             charge_execute_result(&mut result_budget, &result)?;
                             results.push(result);
                             if acknowledge_statement {
@@ -2833,30 +2881,40 @@ where
                         }
                         drop(read_session);
                         drop(ctx);
-                        if let Some((_, capture)) = &capture {
-                            let reader = self.hot_state.reader(read_store.clone());
-                            let executable_rows = reader
-                                .prepare_captured_read_interests(
-                                    &capture.snapshot()?,
-                                    self.active_account_id(),
-                                )
-                                .await?;
-                            self.catalog_context
-                                .prepare_returned_row_catalogs(
+                        async {
+                            if let Some((_, capture)) = &capture {
+                                let reader = self.hot_state.reader(read_store.clone());
+                                let executable_rows = reader
+                                    .prepare_captured_read_interests(
+                                        &capture.snapshot()?,
+                                        self.active_account_id(),
+                                    )
+                                    .await?;
+                                self.catalog_context
+                                    .prepare_returned_row_catalogs(
+                                        &reader,
+                                        &executable_rows,
+                                        crate::catalog::load_catalog_revision(&read_store)
+                                            .await?
+                                            .as_ref(),
+                                    )
+                                    .await?;
+                                crate::plugin::runtime::prepare_returned_row_executables(
                                     &reader,
+                                    &self.binary_cas.reader(read_store),
                                     &executable_rows,
-                                    crate::catalog::load_catalog_revision(&read_store)
-                                        .await?
-                                        .as_ref(),
                                 )
                                 .await?;
-                            crate::plugin::runtime::prepare_returned_row_executables(
-                                &reader,
-                                &self.binary_cas.reader(read_store),
-                                &executable_rows,
-                            )
-                            .await?;
+                            }
+                            Ok::<_, LixError>(())
                         }
+                        .await
+                        .map_err(|error| {
+                            crate::sync::annotate_read_fulfillment_capture(
+                                error,
+                                capture.as_ref().map(|(_, capture)| capture.as_ref()),
+                            )
+                        })?;
                         captured_interests.extend(capture.map(|(_, capture)| capture));
                         Ok((
                             ReadBatchResult { results, snapshot },
@@ -3053,10 +3111,20 @@ where
         LixError,
     > {
         let capture = self.hot_state.capture_foreground_read_interests();
+        if let Some((_, capture)) = &capture {
+            let active_branch_id = self.bound_branch_id()?;
+            seed_foreground_filesystem_interest(
+                Some(capture),
+                &active_branch_id,
+                &statement,
+                params,
+            )?;
+        }
         let read_hot = capture.as_ref().map_or_else(
             || Arc::clone(&self.hot_state),
             |(hot, _)| Arc::new(hot.clone()),
         );
+        let result = async {
         let result = Box::pin(self.execute_read_statement_with_scoped_hot(
             read_store.clone(),
             read_hot,
@@ -3089,6 +3157,8 @@ where
             )
             .await?;
         }
+        Ok::<_, LixError>(result)
+        }.await.map_err(|error| crate::sync::annotate_read_fulfillment_capture(error, capture.as_ref().map(|(_, capture)| capture.as_ref())))?;
         validate_session_read_result(&result.0.query)?;
         Ok((
             result.0,
@@ -3685,6 +3755,110 @@ fn charge_execute_result(
     Ok(())
 }
 
+/// Seed the operation recipe before DataFusion opens providers or resolves the
+/// branch head. File providers normally register these interests after their
+/// first path-index read, which is too late on a cold partial replica: the
+/// path-index read itself can miss several immutable graph inputs. The seed is
+/// derived from the narrow native filesystem route and is deduplicated by the
+/// operation capture when the provider later records its exact recipe.
+pub(crate) fn seed_foreground_filesystem_interest(
+    capture: Option<&Arc<crate::hot_state::ReadInterestRegistry>>,
+    active_branch_id: &str,
+    statement: &DataFusionStatement,
+    params: &[Value],
+) -> Result<(), LixError> {
+    let Some(capture) = capture else {
+        return Ok(());
+    };
+    let Some(route) = exact_filesystem_read_interest_route(statement, params) else {
+        return Ok(());
+    };
+    let (file_ids, path_predicate, content) = match route {
+        ExactFilesystemRead::RootFileListing
+        | ExactFilesystemRead::RootDirectoryListing => {
+            (None, crate::hot_state::FilePathInterest::All, false)
+        }
+        ExactFilesystemRead::Point(selector, column) => {
+            let content = column == ExactLixFileReadColumn::Content;
+            match selector {
+                ExactLixFileReadSelector::Id(id) => {
+                    (Some(vec![id]), crate::hot_state::FilePathInterest::All, content)
+                }
+                ExactLixFileReadSelector::Path(path) => (
+                    None,
+                    crate::hot_state::FilePathInterest::Comparison {
+                        operation: crate::hot_state::FilePathInterestComparison::Equal,
+                        value: path,
+                    },
+                    content,
+                ),
+            }
+        }
+        ExactFilesystemRead::PathContentBatch(paths) => (
+            None,
+            crate::hot_state::FilePathInterest::In {
+                values: paths.into_iter().collect(),
+            },
+            true,
+        ),
+        ExactFilesystemRead::IdManifestBatch(ids) => (
+            Some(ids.into_iter().collect()),
+            crate::hot_state::FilePathInterest::All,
+            true,
+        ),
+    };
+    register_seeded_file_interest(
+        capture,
+        active_branch_id,
+        file_ids,
+        path_predicate,
+        content,
+        None,
+    )
+}
+
+fn register_seeded_file_interest(
+    capture: &crate::hot_state::ReadInterestRegistry,
+    active_branch_id: &str,
+    file_ids: Option<Vec<String>>,
+    path_predicate: crate::hot_state::FilePathInterest,
+    content: bool,
+    byte_range: Option<(u64, u64)>,
+) -> Result<(), LixError> {
+    capture.register(crate::hot_state::LogicalReadInterest::FilesystemPaths {
+        file_ids: file_ids.clone(),
+        branch_ids: vec![active_branch_id.to_owned()],
+        include_blob_refs: content,
+        cache_small_blob_data: false,
+    })?;
+    if content {
+        capture.register(crate::hot_state::LogicalReadInterest::FileContent {
+            request: crate::hot_state::HotStateScanRequest {
+                filter: crate::hot_state::HotStateFilter {
+                    schema_keys: vec![
+                        "lix_file_descriptor".to_owned(),
+                        "lix_binary_blob_ref".to_owned(),
+                        "lix_directory_descriptor".to_owned(),
+                    ],
+                    branch_ids: vec![active_branch_id.to_owned()],
+                    ..Default::default()
+                },
+                projection: crate::hot_state::HotStateProjection {
+                    columns: vec!["snapshot_content".to_owned()],
+                },
+                limit: None,
+            },
+            file_ids,
+            directory_ids: None,
+            root_directory: false,
+            indexed: true,
+            path_predicate,
+            byte_range,
+        })?;
+    }
+    Ok(())
+}
+
 /// Owns an entire buffered, replayable read operation. Each attempt gets a fresh
 /// read scope; its caches, staged observations and result are discarded together
 /// on expiry. Publication and hydration writes belong after this returns.
@@ -3829,14 +4003,17 @@ where
                     let Some(sender) = &sender else {
                         return Err(error);
                     };
-                    retry.hydrate_pinned_for_retry(Some(sender), error.clone()).await.map_err(|error| {
+                    let hydrated = retry
+                        .hydrate_pinned_for_retry(Some(sender), error.clone())
+                        .await
+                        .map_err(|error| {
                         if error.code == "LIX_ERROR_SYNC_DEMAND_STALLED" {
                             LixError::new(LixError::CODE_TRANSACTION_CONFLICT, "transaction could not preserve its staged snapshot while loading inputs")
                         } else { error }
                     })?;
                     if !self
                         .transaction_mut()?
-                        .refresh_hydrated_native_inputs(&error)
+                        .refresh_hydrated_native_inputs(&error, &hydrated)
                         .await?
                     {
                         return Err(LixError::new(
@@ -3890,11 +4067,11 @@ where
             if !native {
                 return Err(error);
             }
-            retry
+            let hydrated = retry
                 .hydrate_pinned_for_retry(Some(&sender), error.clone())
                 .await?;
             self.transaction_mut()?
-                .refresh_hydrated_native_inputs(&error)
+                .refresh_hydrated_native_inputs(&error, &hydrated)
                 .await?;
         }
     }
@@ -5833,10 +6010,29 @@ mod tests {
                 )]
             ),
             Some(ExactFilesystemRead::Point(
-                sql2::ExactLixFileReadSelector::Id(
+                ExactLixFileReadSelector::Id(
                     "01920000-0000-7000-8000-0000000000a2".to_string()
                 ),
-                sql2::ExactLixFileReadColumn::Content,
+                ExactLixFileReadColumn::Content,
+            ))
+        );
+        let literal_data_by_id = sql2::parse_statement(
+            "SELECT content FROM lix_file WHERE id = \
+             '01920000-0000-7000-8000-0000000000a2'",
+        )
+        .unwrap();
+        assert_eq!(
+            exact_filesystem_read_route(&literal_data_by_id, &[]),
+            None,
+            "literal reads remain on DataFusion's ordinary execution path"
+        );
+        assert_eq!(
+            exact_filesystem_read_interest_route(&literal_data_by_id, &[]),
+            Some(ExactFilesystemRead::Point(
+                ExactLixFileReadSelector::Id(
+                    "01920000-0000-7000-8000-0000000000a2".to_string()
+                ),
+                ExactLixFileReadColumn::Content,
             ))
         );
 
@@ -5845,8 +6041,8 @@ mod tests {
         assert_eq!(
             exact_filesystem_read_route(&change_by_path, &[Value::Text("/a.txt".to_string())]),
             Some(ExactFilesystemRead::Point(
-                sql2::ExactLixFileReadSelector::Path("/a.txt".to_string()),
-                sql2::ExactLixFileReadColumn::ChangeId,
+                ExactLixFileReadSelector::Path("/a.txt".to_string()),
+                ExactLixFileReadColumn::ChangeId,
             ))
         );
 
@@ -13141,4 +13337,16 @@ where
         .await
     })
     .await
+}
+
+/// Keep lifetime erasure scoped to native dependency discovery; no read escapes.
+pub(crate) async fn discover_read_fulfillment<StorageImpl: Storage + 'static>(
+    read: StorageAdapterReadScope<StorageImpl::Read<'_>>,
+    repository: &str, account: &str, lease_id: &str,
+    request: &crate::sync::ReadFulfillmentRequest,
+    hot: crate::hot_state::HotStateContext,
+) -> Result<crate::sync::ReadFulfillmentResponse,LixError> {
+    with_static_session_sql_read::<StorageImpl,_,_,_>(read,|read| async move {
+        crate::sync::discover_read_fulfillment(read,repository,account,lease_id,request,hot).await
+    }).await
 }

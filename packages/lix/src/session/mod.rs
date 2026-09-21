@@ -191,7 +191,10 @@ pub(crate) mod borrowing_proof_storage {
 
 pub(crate) use media_upload::{export_recoverable_uploads, has_recoverable_uploads};
 
-pub(crate) use execute::prepare_partial_candidate_read_scope;
+pub(crate) use execute::{
+    discover_read_fulfillment, prepare_partial_candidate_read_scope,
+    seed_foreground_filesystem_interest,
+};
 
 pub(crate) use merge::{
     MergeAnalysis, analyze_incoming_rows, stage_merge_native_heads, stage_native_change_application,

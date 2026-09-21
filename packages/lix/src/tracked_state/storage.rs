@@ -10690,13 +10690,15 @@ async fn load_compact_exclusive_row_snapshots(
                 "compact replacement directory contains a non-compact entry",
             ));
         };
-        if let Some(cached) = prepared_compact_native_cache()
-            .lock()
-            .expect("prepared compact native cache lock poisoned")
-            .get(*content_digest, *direct_row_count, generation_authority)
-        {
-            prepared.push(Some(cached));
-            continue;
+        if !store.requires_physical_reads() {
+            if let Some(cached) = prepared_compact_native_cache()
+                .lock()
+                .expect("prepared compact native cache lock poisoned")
+                .get(*content_digest, *direct_row_count, generation_authority)
+            {
+                prepared.push(Some(cached));
+                continue;
+            }
         }
         let mut key = commit_delta_segment_key(
             state.commit_id,
@@ -10888,10 +10890,14 @@ async fn load_bounded_exclusive_row_snapshots(
             content_digest: part.content_digest,
             replacement_part: part.replacement_part.clone(),
         };
-        let hit = decoded_commit_delta_cache()
-            .lock()
-            .expect("decoded commit-delta cache lock poisoned")
-            .get_authenticated(part.content_digest, &bounds)?;
+        let hit = if store.requires_physical_reads() {
+            None
+        } else {
+            decoded_commit_delta_cache()
+                .lock()
+                .expect("decoded commit-delta cache lock poisoned")
+                .get_authenticated(part.content_digest, &bounds)?
+        };
         if hit.is_none() {
             let physical_key =
                 commit_delta_segment_key_for_part(state.commit_id, run.entry_index as usize, part)?;
@@ -16864,6 +16870,10 @@ impl<S> StorageAdapterRead for TrackedStateStagedRead<'_, S>
 where
     S: StorageAdapterRead + ?Sized,
 {
+    fn requires_physical_reads(&self) -> bool {
+        self.store.requires_physical_reads()
+    }
+
     async fn get_many(
         &self,
         requests: &[StorageGetManyRequest<'_>],

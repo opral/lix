@@ -12,6 +12,14 @@ use super::epoch::EpochRouting;
 /// Implementations preserve one coherent storage read view while allowing
 /// independent point and scan requests to overlap.
 pub trait StorageAdapterRead: Send + Sync {
+    /// Require callers that can satisfy a read from a decoded/global cache to
+    /// perform the underlying storage read as well. Read discovery uses this
+    /// to make every immutable native input observable in its dependency
+    /// closure; ordinary readers keep the cache-friendly default.
+    fn requires_physical_reads(&self) -> bool {
+        false
+    }
+
     fn snapshot_cache_key(&self) -> Option<u128> {
         None
     }
@@ -378,6 +386,10 @@ impl<T> StorageAdapterRead for &T
 where
     T: StorageAdapterRead + ?Sized,
 {
+    fn requires_physical_reads(&self) -> bool {
+        (*self).requires_physical_reads()
+    }
+
     fn snapshot_cache_key(&self) -> Option<u128> {
         (*self).snapshot_cache_key()
     }
@@ -403,6 +415,10 @@ impl<T> StorageAdapterRead for &mut T
 where
     T: StorageAdapterRead + ?Sized,
 {
+    fn requires_physical_reads(&self) -> bool {
+        (**self).requires_physical_reads()
+    }
+
     fn snapshot_cache_key(&self) -> Option<u128> {
         (**self).snapshot_cache_key()
     }
@@ -421,6 +437,35 @@ where
         opts: BeginScanOptions,
     ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
         (**self).begin_scan(space, range, opts)
+    }
+}
+
+impl<T> StorageAdapterRead for Arc<T>
+where
+    T: StorageAdapterRead + ?Sized,
+{
+    fn requires_physical_reads(&self) -> bool {
+        self.as_ref().requires_physical_reads()
+    }
+
+    fn snapshot_cache_key(&self) -> Option<u128> {
+        self.as_ref().snapshot_cache_key()
+    }
+
+    fn get_many(
+        &self,
+        requests: &[GetManyRequest<'_>],
+    ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
+        self.as_ref().get_many(requests)
+    }
+
+    fn begin_scan(
+        &self,
+        space: StorageSpace,
+        range: KeyRange,
+        opts: BeginScanOptions,
+    ) -> impl Future<Output = Result<ScanCursor<'_>, StorageError>> + Send {
+        self.as_ref().begin_scan(space, range, opts)
     }
 }
 
