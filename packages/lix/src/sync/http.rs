@@ -891,6 +891,34 @@ where
         })
     }
 
+    pub(crate) fn fulfill_read<'a>(
+        &'a self,
+        fulfillment: &'a super::read_fulfillment::ReadFulfillmentRequest,
+    ) -> SyncTransportFuture<'a, super::read_fulfillment::ReadFulfillmentResponse> {
+        Box::pin(async move {
+            fulfillment.validate(&self.lix_id)?;
+            self.require_bound_native_lease()?;
+            let mut request = self.request(
+                Method::POST,
+                "/sync/read-fulfillment",
+                "fulfill native read",
+            );
+            request.response_limit = super::read_fulfillment::MAX_RESPONSE_BYTES;
+            request.headers.push(json_content_type());
+            request.body = Some(json_body(fulfillment, "encode read fulfillment")?);
+            let response = self.send(request).await?;
+            if response.body.len() > super::read_fulfillment::MAX_RESPONSE_BYTES {
+                return Err(response_too_large_limit(
+                    "fulfill native read",
+                    super::read_fulfillment::MAX_RESPONSE_BYTES,
+                ));
+            }
+            let response = decode_response(response, "fulfill native read")?;
+            super::read_fulfillment::validate_response(fulfillment, &response)?;
+            Ok(response)
+        })
+    }
+
     pub(crate) fn native_metadata_walk<'a>(
         &'a self,
         walk: &'a super::native_metadata_walk::NativeMetadataWalkRequest,

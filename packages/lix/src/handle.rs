@@ -4372,3 +4372,15 @@ impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
 
 #[cfg(test)]
 mod durability_tests;
+
+impl<S: Storage + Clone + Send + Sync + 'static> Lix<S> {
+    pub(crate) async fn read_sync_fulfillment(
+        &self,
+        request: &crate::sync::ReadFulfillmentRequest,
+        lease_id: &str,
+    ) -> Result<crate::sync::ReadFulfillmentResponse, LixError> {
+        self.engine
+            .discover_read_fulfillment(self.lix_id(), self.active_account_id(), lease_id, request)
+            .await
+    }
+}

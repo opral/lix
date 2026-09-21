@@ -411,6 +411,25 @@ paths:
           description: Explicit native records bound to the repository and echoed caller epoch.
           content: { application/json: { schema: { $ref: "#/components/schemas/NativeMetadataResponse" } } }
         default: { $ref: "#/components/responses/Error" }
+  /lix/v1/{lix_id}/sync/read-fulfillment:
+    parameters:
+      - $ref: "#/components/parameters/LixId"
+      - $ref: "#/components/parameters/ReplicaId"
+    post:
+      operationId: syncReadFulfillment
+      description: Executes the submitted typed read interests once against the admitted descriptor roots and returns verified immutable native inputs. The request is limited to 528 KiB (512 KiB recipes plus a bounded descriptor). Responses page at 4 MiB, except that one native input may be up to 64 MiB; a closure is limited to 256 MiB, 16384 inputs, 65536 storage calls, and 1 GiB of authority reads. The closure digest binds every page. Returned inputs warm local state and do not certify absence or result membership.
+      parameters:
+        - $ref: "#/components/parameters/RequiredSessionId"
+        - $ref: "#/components/parameters/SyncProtocolVersion"
+        - $ref: "#/components/parameters/NativeBaselineLease"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ReadFulfillmentRequest" } } }
+      responses:
+        "200":
+          description: Immutable typed inputs observed while evaluating all submitted interests at the admitted roots.
+          content: { application/json: { schema: { $ref: "#/components/schemas/ReadFulfillmentResponse" } } }
+        default: { $ref: "#/components/responses/Error" }
   /lix/v1/{lix_id}/sync/native-metadata-walk:
     parameters:
       - $ref: "#/components/parameters/LixId"
@@ -984,7 +1003,7 @@ components:
       in: header
       required: true
       description: Exact sync wire-protocol version advertised by the handshake.
-      schema: { type: integer, const: 19 }
+      schema: { type: integer, const: 20 }
     TransactionId:
       name: Lix-Transaction-Id
       in: header
@@ -1042,7 +1061,7 @@ components:
       required: [protocolVersion, syncProtocolVersion, activeBranchId, activeAccountId, sessionId, capabilities]
       properties:
         protocolVersion: { type: integer, const: 12 }
-        syncProtocolVersion: { type: integer, const: 19 }
+        syncProtocolVersion: { type: integer, const: 20 }
         activeBranchId: { type: string }
         activeAccountId: { type: string }
         sessionId: { type: string }
@@ -1254,7 +1273,7 @@ components:
         abandon:
           type: boolean
           default: false
-          description: When true, terminally fences an active attempt for automatic authoritative recovery. An already committed receipt wins. Otherwise the attempt must have expired. Requires sync protocol 19.
+          description: When true, terminally fences an active attempt for automatic authoritative recovery. An already committed receipt wins. Otherwise the attempt must have expired. Requires sync protocol 20.
     PartialAttemptRestartReceipt:
       type: object
       additionalProperties: false
@@ -1587,6 +1606,105 @@ components:
                 properties:
                   address: { $ref: "#/components/schemas/NativeObjectRef" }
                   bytes: { type: string, format: byte }
+    ReadFulfillmentRequest:
+      type: object
+      additionalProperties: false
+      required: [epochId, descriptor, interests, required]
+      properties:
+        epochId: { type: string, format: uuid }
+        descriptor: { $ref: "#/components/schemas/PartialReplicaDescriptor" }
+        interests:
+          type: array
+          minItems: 1
+          maxItems: 4096
+          items: { $ref: "#/components/schemas/LogicalReadInterest" }
+        required:
+          type: array
+          minItems: 1
+          maxItems: 32
+          uniqueItems: true
+          description: Typed immutable inputs required by the first missing native frontier. The authority verifies and returns every item before evaluating recipes.
+          items: { $ref: "#/components/schemas/ReadInputAddress" }
+        continuation:
+          oneOf:
+            - { $ref: "#/components/schemas/ReadContinuation" }
+            - { type: "null" }
+    ReadContinuation:
+      type: object
+      additionalProperties: false
+      required: [nextInput, closureDigest]
+      properties:
+        nextInput: { type: integer, minimum: 1, maximum: 16383 }
+        closureDigest: { type: string, minLength: 64, maxLength: 64 }
+    LogicalReadInterest:
+      type: object
+      additionalProperties: true
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [filesystem_metadata, file_content, collection_generation, packed_identity_membership, filesystem_paths, scan, exact]
+      description: Tagged native read recipe. Variant fields are the canonical serialized LogicalReadInterest fields; unknown fields are rejected by the implementation.
+    ReadInputAddress:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [kind, address]
+          properties:
+            kind: { type: string, const: metadata }
+            address: { $ref: "#/components/schemas/NativeMetadataRef" }
+        - type: object
+          additionalProperties: false
+          required: [kind, address]
+          properties:
+            kind: { type: string, const: object }
+            address: { $ref: "#/components/schemas/NativeObjectRef" }
+        - type: object
+          additionalProperties: false
+          required: [kind, address]
+          properties:
+            kind: { type: string, const: blob_manifest }
+            address: { $ref: "#/components/schemas/NativeDigest" }
+        - type: object
+          additionalProperties: false
+          required: [kind, address]
+          properties:
+            kind: { type: string, const: blob_chunk }
+            address: { $ref: "#/components/schemas/NativeDigest" }
+    ReadInput:
+      type: object
+      additionalProperties: false
+      required: [address, bytes]
+      properties:
+        address: { $ref: "#/components/schemas/ReadInputAddress" }
+        bytes: { type: string, format: byte, maxLength: 89478488, description: One immutable native input, at most 64 MiB decoded. }
+    DiscoveryProfile:
+      type: object
+      additionalProperties: false
+      required: [storageCalls, storageBytes, payloadBytes]
+      properties:
+        storageCalls: { type: integer, minimum: 0 }
+        storageBytes: { type: integer, minimum: 0 }
+        payloadBytes: { type: integer, minimum: 0 }
+    ReadFulfillmentResponse:
+      type: object
+      additionalProperties: false
+      required: [lixId, epochId, requestDigest, inputs, profile, closureDigest, continuation]
+      properties:
+        lixId: { type: string, format: uuid }
+        epochId: { type: string, format: uuid }
+        requestDigest: { type: string, minLength: 64, maxLength: 64 }
+        inputs:
+          type: array
+          maxItems: 16384
+          description: One page of the immutable closure. The encoded page is bounded by the protocol response limit; decoded page payload is at most 4 MiB unless it contains one 64 MiB input.
+          items: { $ref: "#/components/schemas/ReadInput" }
+        profile: { $ref: "#/components/schemas/DiscoveryProfile" }
+        closureDigest: { type: string, minLength: 64, maxLength: 64 }
+        continuation:
+          oneOf:
+            - { $ref: "#/components/schemas/ReadContinuation" }
+            - { type: "null" }
     NativeObjectRangeRequest:
       type: object
       additionalProperties: false

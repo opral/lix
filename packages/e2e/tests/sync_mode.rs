@@ -53,6 +53,9 @@ struct HttpProbe {
     snapshot_row_pulls: AtomicU64,
     history_gets: AtomicU64,
     blob_gets: AtomicU64,
+    fulfilled_manifests: AtomicU64,
+    fulfilled_chunks: AtomicU64,
+    fulfilled_chunk_ids: std::sync::Mutex<std::collections::BTreeSet<[u8; 32]>>,
     chunk_gets: AtomicU64,
     chunk_puts: AtomicU64,
     reject_requests: AtomicBool,
@@ -1197,9 +1200,11 @@ async fn binary_chunks_hydrate_on_demand_and_remain_available_offline() {
         .await
         .expect("first content read hydrates the requested native content");
     assert_eq!(result.rows()[0].get::<Vec<u8>>("content").unwrap(), payload);
-    assert!(probe.blob_gets.load(Ordering::Acquire) > 0);
+    assert!(probe.fulfilled_manifests.load(Ordering::Acquire) > 0);
+    assert_eq!(probe.blob_gets.load(Ordering::Acquire), 0);
     let chunk_gets = probe.chunk_gets.load(Ordering::Acquire);
-    assert!(chunk_gets > 0);
+    assert_eq!(chunk_gets, 0);
+    assert!(probe.fulfilled_chunks.load(Ordering::Acquire) > 0);
     probe.set_offline(true);
     assert_eq!(
         read_file_content(&replica, "/lazy.bin").await,
@@ -1440,7 +1445,13 @@ async fn remote_branch_content_is_hydrated_only_after_explicit_selection() {
         probe.chunk_gets.load(Ordering::Acquire),
         chunks_before_catch_up
     );
-    let chunks_before_hot_read = probe.chunk_gets.load(Ordering::Acquire);
+    let head_chunk = *blake3::hash(&inherited_head).as_bytes();
+    let checkpoint_chunk = *blake3::hash(&inherited_checkpoint).as_bytes();
+    {
+        let chunks = probe.fulfilled_chunk_ids.lock().unwrap();
+        assert!(!chunks.contains(&head_chunk), "branch admission must not fetch head content");
+        assert!(!chunks.contains(&checkpoint_chunk), "branch admission must not fetch checkpoint content");
+    }
     assert_eq!(
         read_file_content(&replica, "/inherited-head.bin")
             .await
@@ -1461,11 +1472,11 @@ async fn remote_branch_content_is_hydrated_only_after_explicit_selection() {
             .unwrap(),
         1,
     );
-    assert_eq!(
-        probe.chunk_gets.load(Ordering::Acquire),
-        chunks_before_hot_read + 1,
-        "only the requested inherited head chunk should hydrate",
-    );
+    {
+        let chunks = probe.fulfilled_chunk_ids.lock().unwrap();
+        assert!(chunks.contains(&head_chunk), "requested inherited head chunk must hydrate");
+        assert!(!chunks.contains(&checkpoint_chunk), "unrequested historical chunk must stay deferred");
+    }
 
     probe.set_offline(true);
     assert_eq!(
@@ -2881,6 +2892,7 @@ where
     if parts.method == Method::POST && path.ends_with("/sync/native-metadata") {
         probe.native_metadata_reads.fetch_add(1, Ordering::Release);
     }
+    let is_read_fulfillment = parts.method == Method::POST && path.ends_with("/sync/read-fulfillment");
     let is_delta_pull = parts.method == Method::GET
         && path.ends_with("/sync/pull")
         && parts
@@ -2942,7 +2954,23 @@ where
         )
         .await;
     let (parts, body) = response.into_parts();
-    let body = if is_partial_merge && parts.status == StatusCode::CONFLICT {
+    let body = if is_read_fulfillment && parts.status == StatusCode::OK {
+        let bytes = body.collect().await.expect("collect bounded fulfillment").to_bytes();
+        let response: JsonValue = serde_json::from_slice(&bytes).expect("fulfillment JSON");
+        for input in response["inputs"].as_array().expect("fulfillment inputs") {
+            match input["address"]["kind"].as_str() {
+                Some("blob_manifest") => { probe.fulfilled_manifests.fetch_add(1, Ordering::Release); }
+                Some("blob_chunk") => {
+                    probe.fulfilled_chunks.fetch_add(1, Ordering::Release);
+                    probe.fulfilled_chunk_ids.lock().unwrap().insert(
+                        serde_json::from_value(input["address"]["address"].clone()).expect("chunk hash"),
+                    );
+                }
+                _ => {}
+            }
+        }
+        ServerProtocolBody::full(bytes)
+    } else if is_partial_merge && parts.status == StatusCode::CONFLICT {
         let bytes = body
             .collect()
             .await

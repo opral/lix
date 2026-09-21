@@ -115,7 +115,7 @@ async fn checked_chunk_resident(
     Ok(present)
 }
 
-async fn check_manifest_chunk_presence(
+pub(super) async fn check_manifest_chunk_presence(
     read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
     manifest: &crate::binary_cas::CanonicalBlobManifest,
 ) -> Result<(), LixError> {

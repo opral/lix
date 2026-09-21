@@ -31,6 +31,8 @@ mod contract;
 mod current_coverage;
 mod http;
 mod native_dependencies;
+mod read_fulfillment;
+mod read_interest_prepare;
 pub(crate) mod native_metadata;
 mod native_metadata_walk;
 #[cfg(feature = "server-protocol")]
@@ -182,7 +184,13 @@ pub(crate) use repository::{
     ReplicaRebuildSource, inspect_replica_rebuild_source, replica_replacement_unavailable,
     replica_repository_identity,
 };
-pub(crate) use runtime::{SyncDemand, SyncDemandRetry, SyncRuntime};
+pub(crate) use read_fulfillment::{
+    ReadFulfillmentRequest, ReadFulfillmentResponse,
+    MAX_RESPONSE_BYTES as MAX_READ_FULFILLMENT_RESPONSE_BYTES,
+    annotate_capture as annotate_read_fulfillment_capture,
+    discover as discover_read_fulfillment,
+};
+pub(crate) use runtime::{HydratedInputs, SyncDemand, SyncDemandRetry, SyncRuntime};
 pub(crate) use upload_plan::{
     SYNC_UPLOAD_GENERATION_SPACE, stage_invalidate as stage_upload_plan_invalidation,
 };
@@ -201,7 +209,8 @@ pub(crate) const SYNC_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 // v17 removes recipe-driven updates; progress discovery uses leased descriptors.
 // v18 adds bounded first-parent native metadata selection for demand hydration.
 // v19 attaches bounded authenticated native dependencies to exact metadata.
-pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 19;
+// v20 adds operation-level read fulfillment for bounded typed dependency discovery.
+pub(crate) const SYNC_PROTOCOL_VERSION: u32 = 20;
 pub(crate) const SYNC_PROTOCOL_VERSION_HEADER: &str = "lix-sync-protocol-version";
 pub(crate) const SYNC_PROTOCOL_MISMATCH_CODE: &str = "LIX_SYNC_PROTOCOL_MISMATCH";
 pub(crate) const SYNC_REPOSITORY_ID_MISMATCH_CODE: &str = "LIX_SYNC_REPOSITORY_ID_MISMATCH";

@@ -151,7 +151,7 @@ impl PartialReplicaDescriptor {
     }
 }
 
-async fn commit_roots(
+pub(super) async fn commit_roots(
     read: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
 ) -> Result<PartialReplicaCommitRoots, LixError> {

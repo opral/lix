@@ -17,7 +17,9 @@ use super::native_metadata::{NativeMetadataRequest, stage_native_metadata};
 use super::partial_hydration::{hydrate_native_object, native_object_is_resident};
 use super::partial_state::{PartialReplicaState, load_partial_replica_state};
 use super::platform::{sleep, spawn_sync_task};
-use super::runtime::{SyncDemand, SyncDemandRequest, SyncRuntime, SyncShutdown, stopped_error};
+use super::runtime::{
+    HydratedInputs, SyncDemand, SyncDemandRequest, SyncRuntime, SyncShutdown, stopped_error,
+};
 use super::{SyncPhase, SyncTransport};
 
 pub(crate) async fn start_partial_runtime_with_engine<S>(
@@ -302,7 +304,7 @@ async fn demand_is_resident<S: Storage + Clone + Send + Sync + 'static>(
         SyncDemandRequest::BlobManifest(address, _) => {
             super::partial_blob::manifest_is_resident(storage, state, *address).await
         }
-        SyncDemandRequest::Chunks(ids) => {
+        SyncDemandRequest::Chunks(ids) | SyncDemandRequest::ChunksWithRead(ids, _) => {
             let mut resident = true;
             for id in ids {
                 let hash = crate::binary_cas::ChunkHash::from_hex(id)?;
@@ -335,6 +337,23 @@ pub(super) fn hydrate_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: 
     request: SyncDemandRequest,
 ) -> super::SyncTransportFuture<'a, ()> {
     Box::pin(async move {
+        hydrate_demand_with_receipt(storage, state, transport, request)
+            .await
+            .map(|_| ())
+    })
+}
+
+pub(super) fn hydrate_demand_with_receipt<
+    'a,
+    S: Storage + Clone + Send + Sync + 'static,
+    C: RawHttpClient,
+>(
+    storage: &'a StorageAdapter<S>,
+    state: &'a PartialReplicaState,
+    transport: &'a HttpSyncTransport<C>,
+    request: SyncDemandRequest,
+) -> super::SyncTransportFuture<'a, HydratedInputs> {
+    Box::pin(async move {
         let required = match &request {
             SyncDemandRequest::NativeObjects(addresses, error) => {
                 let n = crate::tracked_state::NativeHistoryFrontier::required_len(
@@ -358,8 +377,16 @@ pub(super) fn hydrate_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: 
         };
         // Do not let an optional graph input launch another metadata prefetch.
         let allow_metadata_walk = required.is_none();
-        match hydrate_exact_demand(storage, state, transport, request, allow_metadata_walk).await {
-            Ok(()) => Ok(()),
+        match hydrate_exact_demand_with_receipt(
+            storage,
+            state,
+            transport,
+            request,
+            allow_metadata_walk,
+        )
+        .await
+        {
+            Ok(receipt) => Ok(receipt),
             Err(error)
                 if matches!(
                     error.code.as_str(),
@@ -372,7 +399,8 @@ pub(super) fn hydrate_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: 
             }
             Err(error) => match required {
                 Some(required) => {
-                    hydrate_exact_demand(storage, state, transport, required, true).await
+                    hydrate_exact_demand_with_receipt(storage, state, transport, required, true)
+                        .await
                 }
                 None => Err(error),
             },
@@ -381,14 +409,111 @@ pub(super) fn hydrate_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: 
 }
 
 // Erase this child operation before composing the worker select loop.
-fn hydrate_exact_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: RawHttpClient>(
+fn hydrate_exact_demand_with_receipt<
+    'a,
+    S: Storage + Clone + Send + Sync + 'static,
+    C: RawHttpClient,
+>(
     storage: &'a StorageAdapter<S>,
     state: &'a PartialReplicaState,
     transport: &'a HttpSyncTransport<C>,
     request: SyncDemandRequest,
     allow_metadata_walk: bool,
-) -> super::SyncTransportFuture<'a, ()> {
+) -> super::SyncTransportFuture<'a, HydratedInputs> {
     Box::pin(async move {
+        let error = match &request {
+            SyncDemandRequest::NativeObject(_, error)
+            | SyncDemandRequest::NativeObjects(_, error)
+            | SyncDemandRequest::NativeMetadata(_, error)
+            | SyncDemandRequest::BlobManifest(_, error)
+            | SyncDemandRequest::ChunksWithRead(_, error) => Some(error),
+            _ => None,
+        };
+        if let Some(error) = error
+            && let Some(interests) = super::read_fulfillment::interests_for_error(error)?
+        {
+            use super::read_fulfillment::ReadInputAddress;
+            let frontier = match &request {
+                SyncDemandRequest::NativeObject(address, _) => {
+                    vec![ReadInputAddress::Object(*address)]
+                }
+                SyncDemandRequest::NativeObjects(addresses, _) => addresses
+                    .iter()
+                    .copied()
+                    .map(ReadInputAddress::Object)
+                    .collect(),
+                SyncDemandRequest::NativeMetadata(addresses, _) => addresses
+                    .iter()
+                    .cloned()
+                    .map(ReadInputAddress::Metadata)
+                    .collect(),
+                SyncDemandRequest::BlobManifest(blob, _) => {
+                    vec![ReadInputAddress::BlobManifest(*blob.as_bytes())]
+                }
+                SyncDemandRequest::ChunksWithRead(ids, _) => ids
+                    .iter()
+                    .map(|id| {
+                        crate::binary_cas::ChunkHash::from_hex(id)
+                            .map(|hash| ReadInputAddress::BlobChunk(*hash.as_bytes()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                _ => unreachable!("only captured read errors carry operation recipes"),
+            };
+            // A native frontier may also name inputs already present locally
+            // (including locally derived immutable nodes). Only ask the
+            // authority to supply genuinely absent inputs.
+            let mut required = Vec::new();
+            for address in frontier {
+                let resident = match &address {
+                    ReadInputAddress::Object(object) => {
+                        native_object_is_resident(storage, state, *object).await?
+                    }
+                    ReadInputAddress::Metadata(metadata) => {
+                        let read = storage.begin_read(Default::default()).await?;
+                        super::native_metadata::native_metadata_residency(
+                            &read,
+                            state,
+                            std::slice::from_ref(metadata),
+                        )
+                        .await?[0]
+                    }
+                    ReadInputAddress::BlobManifest(hash) => {
+                        super::partial_blob::manifest_is_resident(
+                            storage,
+                            state,
+                            crate::binary_cas::BlobId::from_bytes(*hash),
+                        )
+                        .await?
+                    }
+                    ReadInputAddress::BlobChunk(hash) => {
+                        super::partial_blob::chunk_is_resident(
+                            storage,
+                            state,
+                            crate::binary_cas::ChunkHash::from_bytes(*hash),
+                        )
+                        .await?
+                    }
+                };
+                if !resident {
+                    required.push(address);
+                    if required.len() == 32 {
+                        break;
+                    }
+                }
+            }
+            if required.is_empty() {
+                return Ok(HydratedInputs::default());
+            }
+            let fulfillment = super::read_fulfillment::ReadFulfillmentRequest {
+                epoch_id: state.epoch_id().into(),
+                descriptor: state.descriptor().clone(),
+                interests,
+                required,
+                continuation: None,
+            };
+            let response = super::read_fulfillment::fetch(transport, &fulfillment).await?;
+            return super::read_fulfillment::install(storage, state, &fulfillment, &response).await;
+        }
         let history_inputs = match &request {
             SyncDemandRequest::NativeMetadata(addresses, error) if allow_metadata_walk => {
                 Some((addresses.as_slice(), error))
@@ -415,7 +540,7 @@ fn hydrate_exact_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: RawHt
         match request {
             SyncDemandRequest::BlobManifest(address, _) => {
                 if super::partial_blob::manifest_is_resident(storage, state, address).await? {
-                    return Ok(());
+                    return Ok(HydratedInputs::default());
                 }
                 let ids = [address.to_hex()];
                 let manifests = transport.get_blobs(&ids).await?;
@@ -427,7 +552,7 @@ fn hydrate_exact_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: RawHt
                 }
                 super::partial_blob::install_manifest(storage, state, address, &manifests[0])
                     .await?;
-                Ok(())
+                Ok(HydratedInputs::default())
             }
             SyncDemandRequest::Chunks(ids) => {
                 for id in ids {
@@ -443,7 +568,23 @@ fn hydrate_exact_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: RawHt
                     })?;
                     super::partial_blob::install_chunk(storage, state, hash, &bytes).await?;
                 }
-                Ok(())
+                Ok(HydratedInputs::default())
+            }
+            SyncDemandRequest::ChunksWithRead(ids, _) => {
+                for id in ids {
+                    let hash = crate::binary_cas::ChunkHash::from_hex(&id)?;
+                    if super::partial_blob::chunk_is_resident(storage, state, hash).await? {
+                        continue;
+                    }
+                    let bytes = transport.get_chunk(&id).await?.ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_STORAGE_ERROR,
+                            "authority lacks demanded blob chunk",
+                        )
+                    })?;
+                    super::partial_blob::install_chunk(storage, state, hash, &bytes).await?;
+                }
+                Ok(HydratedInputs::default())
             }
             SyncDemandRequest::NativeObjects(addresses, _) => {
                 super::partial_hydration::hydrate_native_objects(
@@ -455,7 +596,7 @@ fn hydrate_exact_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: RawHt
                     |range| async move { transport.native_object_range(&range).await },
                 )
                 .await
-                .map(|_| ())
+                .map(|_| HydratedInputs::default())
             }
             SyncDemandRequest::NativeObject(address, _) => {
                 // Scoped native nodes can exceed one transport page; enforce an
@@ -468,7 +609,7 @@ fn hydrate_exact_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: RawHt
                     |range| async move { transport.native_object_range(&range).await },
                 )
                 .await
-                .map(|_| ())
+                .map(|_| HydratedInputs::default())
             }
             SyncDemandRequest::NativeMetadata(addresses, error) => {
                 if super::partial_merge_analysis::ancestry::hydrate(
@@ -476,7 +617,7 @@ fn hydrate_exact_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: RawHt
                 )
                 .await?
                 {
-                    return Ok(());
+                    return Ok(HydratedInputs::default());
                 }
                 let graph = addresses
                     .iter()
@@ -490,10 +631,10 @@ fn hydrate_exact_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: RawHt
                     )
                     .await?;
                 }
-                Ok(())
+                Ok(HydratedInputs::default())
             }
             SyncDemandRequest::Pinned(request) => {
-                hydrate_demand(storage, state, transport, *request).await
+                hydrate_demand_with_receipt(storage, state, transport, *request).await
             }
             SyncDemandRequest::ReconcilePartial => Err(LixError::unknown(
                 "reconciliation must run through the partial owner",
@@ -1354,17 +1495,27 @@ where
                     }
                     if matches!(demand.request, SyncDemandRequest::ReconcilePartial) {
                         let engine = engine.as_ref().ok_or_else(|| LixError::unknown("reconciliation requires an engine"))?;
-                        return Box::pin(reconcile_partial(engine.clone(), &mut transport, &mut connect, true)).await;
+                        return Box::pin(reconcile_partial(engine.clone(), &mut transport, &mut connect, true))
+                            .await
+                            .map(|_| HydratedInputs::default());
                     }
                     let result = async {
-                        if demand_is_resident(&storage, &state, &demand.request).await? { return Ok(()); }
+                        if demand_is_resident(&storage, &state, &demand.request).await? {
+                            return Ok(HydratedInputs::default());
+                        }
                         if let Some(error) = &baseline_expired { return Err(error.clone()); }
                         if transport.is_none() {
                             let connected = connect().await?;
                             validate_admission(&storage, &state, &connected).await?;
                             transport = Some(connected);
                         }
-                        hydrate_demand(&storage, &state, transport.as_ref().expect("connected"), demand.request.clone()).await
+                        hydrate_demand_with_receipt(
+                            &storage,
+                            &state,
+                            transport.as_ref().expect("connected"),
+                            demand.request.clone(),
+                        )
+                        .await
                     }.await;
                     if result.is_ok() { return result; }
                     if result.as_ref().is_err_and(|error| error.code == "LIX_PARTIAL_BASELINE_EXPIRED") {

@@ -445,7 +445,10 @@ async fn run_concurrent_global_creation(newer_global: bool) {
                 demand.request,
             )
             .await;
-            demand.response.send(result).unwrap();
+            demand
+                .response
+                .send(result.map(|_| crate::sync::runtime::HydratedInputs::default()))
+                .unwrap();
         }
     };
     tokio::time::timeout(std::time::Duration::from_secs(20), async {

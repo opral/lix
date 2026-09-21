@@ -109,7 +109,10 @@ async fn explicit_transaction_hydration(commit: bool) {
                             .unwrap();
                         }
                         count += 1;
-                        demand.response.send(Ok(())).unwrap();
+                        demand
+                            .response
+                            .send(Ok(crate::sync::runtime::HydratedInputs::default()))
+                            .unwrap();
                         continue;
                     }
                     _ => panic!("explicit transaction only requests pinned native inputs"),
@@ -123,7 +126,10 @@ async fn explicit_transaction_hydration(commit: bool) {
                     .unwrap();
                 }
                 count += 1;
-                demand.response.send(Ok(())).unwrap();
+                demand
+                    .response
+                    .send(Ok(crate::sync::runtime::HydratedInputs::default()))
+                    .unwrap();
             }
             assert!(
                 count > 0,

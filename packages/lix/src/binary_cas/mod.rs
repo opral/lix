@@ -29,7 +29,8 @@ pub(crate) use kv::{load_bytes_many, load_metadata_many};
 pub(crate) use transfer::{
     CanonicalBlobChunk, CanonicalBlobManifest, chunk_presence_many, load_canonical_blob_anchor,
     load_canonical_blob_chunks, load_streaming_canonical_manifest, load_verified_chunk,
-    stage_deferred_canonical_manifest, stage_transfer_publication_fence,
+    stage_deferred_canonical_manifest, stage_deferred_canonical_manifests_with_chunks,
+    stage_transfer_publication_fence,
     stage_verified_canonical_manifest, stage_verified_inline_canonical_blob,
     stage_verified_raw_chunk, validate_manifest_receipts,
 };

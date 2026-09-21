@@ -29,7 +29,7 @@ The `lix` crate contains a reusable Rust handler and this repository ships a [re
 | SQL         | `/lix/v1/{lix_id}/execute`, `/lix/v1/{lix_id}/execute-batch`                                                                                                                                                                                                                                                                                      |
 | Transaction | `/lix/v1/{lix_id}/transaction/{begin,execute,commit,rollback}`                                                                                                                                                                                                                                                                                    |
 | Files       | `/lix/v1/{lix_id}/file`, `/lix/v1/{lix_id}/file/upsert{,-batch}`                                                                                                                                                                                                                                                                                  |
-| Sync        | `/lix/v1/{lix_id}/sync/{push,replica/replace,pull,history,checkpoints,descriptor,native-objects,native-object-range,native-metadata,native-metadata-walk,baseline-lease/renew,blob,chunk,retained-bodies,merge,merge/restart,migration/merge,migration/cleanup,migration/global/restart,migration/global/cleanup,migration/global/merge,migration/global/bodies}` |
+| Sync        | `/lix/v1/{lix_id}/sync/{push,replica/replace,pull,history,checkpoints,descriptor,read-fulfillment,native-objects,native-object-range,native-metadata,native-metadata-walk,baseline-lease/renew,blob,chunk,retained-bodies,merge,merge/restart,migration/merge,migration/cleanup,migration/global/restart,migration/global/cleanup,migration/global/merge,migration/global/bodies}` |
 | Versioning  | `/lix/v1/{lix_id}/branch/{create,switch,merge,merge-preview}`                                                                                                                                                                                                                                                                                       |
 | Observation | `/lix/v1/{lix_id}/observe`, `/lix/v1/{lix_id}/observe/multiplex`                                                                                                                                                                                                                                                                                  |
 | Snapshot    | `/lix/v1/{lix_id}/snapshot`                                                                                                                                                                                                                                                                                                                       |
@@ -93,7 +93,7 @@ Sync is Lix-scoped: the immutable ID in the path selects the Lix. Connected part
 - `GET /lix/v1/{lix_id}/sync/chunk?chunkId=...` and
   `PUT /lix/v1/{lix_id}/sync/chunk?chunkId=...` transfer raw chunks. Both identities are 64-character lowercase BLAKE3 hex digests; chunks are at most 4 MiB.
 
-All sync routes require exactly one `lix-sync-protocol-version: 19` header. Missing, duplicate, malformed, or incompatible versions are rejected before reading or publishing sync data. The handshake advertises `syncCheckpointInventory: true`. Commit bodies and headers both carry immutable `isCheckpoint` metadata; membership is preserved independently of branch refs.
+All sync routes require exactly one `lix-sync-protocol-version: 20` header. Missing, duplicate, malformed, or incompatible versions are rejected before reading or publishing sync data. The handshake advertises `syncCheckpointInventory: true`. Commit bodies and headers both carry immutable `isCheckpoint` metadata; membership is preserved independently of branch refs.
 
 Bootstrap installs checkpoint headers alongside current branch heads and working bases. Historical checkpoint state remains deferred until an explicit history or snapshot read requests it; bootstrap does not scan every checkpoint state or fetch its binary content.
 
@@ -101,7 +101,7 @@ The live pull protocol has one repository cursor. It has no schema or branch fil
 
 ### Partial replica with on-demand sync
 
-Sync protocol 19 defines the native transport for a partial replica with on-demand sync. SDK callers opt in with `server.mode: "partial_replica"` and local storage. The default server mode is `remote`.
+Sync protocol 20 defines the native transport for a partial replica with on-demand sync. SDK callers opt in with `server.mode: "partial_replica"` and local storage. The default server mode is `remote`.
 
 The exact partial-attempt restart request accepts `abandon: true`. Lix uses this during automatic recovery to fence an unsupported active merge before adopting the server working set. An already committed merge receipt wins; otherwise the authority durably prevents delayed requests from reviving the abandoned attempt. Ordinary restarts omit this field and still require expiry.
 
@@ -115,6 +115,16 @@ Partial merge receipts use the authority head at admission as the first parent, 
   The replica prepares its moving read requirements against the leased descriptor using the native on-demand routes, then atomically publishes the candidate. Retained fixed historical reads do not gate moving-state publication.
 - Small-file publication includes canonical inline blobs in the existing
   `/sync/push` request, up to a 1 MiB combined request budget. Larger publications retain chunk upload. Both paths use the same authoritative row merge and acknowledgment machinery.
+- `POST /sync/read-fulfillment` resolves typed current-read interests against the
+  admitted descriptor roots in one authority storage snapshot. It requires the
+  baseline lease and returns verified immutable dependencies for local query
+  evaluation, including pending client edits. Recipes are bounded to 512 KiB and
+  4,096 interests; closures to 256 MiB and 16,384 inputs. Pages carry up to 4 MiB
+  of payload except a single input may be up to 64 MiB. Continuations bind the
+  next input to the closure digest. Clients validate the complete closure before
+  atomic, admission-fenced installation. Historical diffs retain their specialized
+  discovery path. Protocol 19 peers are rejected without a compatibility fallback.
+  See [Partial-read discovery](./partial-read-discovery.md) for bounds and isolation.
 - `POST /sync/native-objects`, `/sync/native-object-range`, and
   `/sync/native-metadata` fetch explicitly typed native inputs. They require `lix-native-baseline-lease`, checked against the authenticated account in the same storage snapshot as the native read. Request JSON is capped at 16 KiB; object/range payloads are capped at 1 MiB and metadata payloads at 256 KiB.
 - `POST /sync/native-metadata-walk` fetches up to 16 first-parent commits

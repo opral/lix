@@ -2,8 +2,7 @@
 //! retained native recipes. No SQL is replayed or state published here.
 use super::partial_replica::PartialReplicaDescriptor;
 use crate::LixError;
-use crate::filesystem::{FilesystemPathIndexReader, FilesystemPathIndexRequest};
-use crate::hot_state::{HotStateContext, HotStateReader, LogicalReadInterest};
+use crate::hot_state::{HotStateContext, LogicalReadInterest};
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use crate::storage_adapter::{
     StorageBeginScanOptions as BeginScanOptions, StorageCoreProjection as CoreProjection,
@@ -13,6 +12,8 @@ use crate::storage_adapter::{
 };
 use crate::storage_adapter::{StorageKey, StoragePrecondition, StorageReadEntry, StorageScanOrder};
 use std::sync::Arc;
+
+use super::read_interest_prepare::prepare_native_read_interests;
 
 pub(crate) struct PreparedCandidateState {
     pub(crate) writes: Arc<StorageWriteSet>,
@@ -87,11 +88,15 @@ fn in_candidate_range(key: &[u8], range: &KeyRange) -> bool {
 }
 
 #[derive(Clone)]
-struct CandidateRead<R> {
-    base: R,
-    staged: Arc<StorageWriteSet>,
+pub(crate) struct CandidateRead<R> {
+    pub(crate) base: R,
+    pub(crate) staged: Arc<StorageWriteSet>,
 }
 impl<R: StorageAdapterRead> StorageAdapterRead for CandidateRead<R> {
+    fn requires_physical_reads(&self) -> bool {
+        self.base.requires_physical_reads()
+    }
+
     async fn get_many(
         &self,
         requests: &[GetManyRequest<'_>],
@@ -159,10 +164,10 @@ impl<R: StorageAdapterRead> StorageAdapterRead for CandidateRead<R> {
         )
     }
 }
-fn unsupported(message: &str) -> LixError {
+pub(super) fn unsupported(message: &str) -> LixError {
     LixError::new("LIX_PARTIAL_SCOPE_PREPARATION_REQUIRED", message)
 }
-fn selected_branch<'a>(
+pub(super) fn selected_branch<'a>(
     descriptor: &'a PartialReplicaDescriptor,
     branch_id: &str,
 ) -> Result<&'a super::partial_replica::PartialReplicaBranch, LixError> {
@@ -171,7 +176,7 @@ fn selected_branch<'a>(
         .find(|branch| branch.branch_id == branch_id)
         .ok_or_else(|| unsupported("candidate does not include a retained branch"))
 }
-fn endpoint(
+pub(super) fn endpoint(
     descriptor: &PartialReplicaDescriptor,
     branch_id: Option<&str>,
     endpoint: &crate::hot_state::DiffInterestEndpoint,
@@ -414,240 +419,16 @@ where
         &descriptor.selected_branch.branch_id,
         &descriptor.global_branch.branch_id,
     );
-    let blob = crate::binary_cas::BinaryCasContext::new();
-    blob.enable_referenced_manifest_demands();
-    // Candidate controls are staged over the durable read. Never reuse the
-    // durable catalog revision as proof for this unpublished serving state.
-    let candidate_catalog = crate::catalog::CatalogContext::new();
-    let mut mutation_identities = std::collections::BTreeMap::<
-        String,
-        std::collections::BTreeSet<crate::tracked_state::TrackedStateKey>,
-    >::new();
-    for interest in &interests.interests {
-        match interest.as_ref() {
-            LogicalReadInterest::Scan { request, domain } => {
-                for branch in &request.filter.branch_ids {
-                    selected_branch(descriptor, branch)?;
-                }
-                // The shared foreground preparation below performs this scan
-                // once and prepares the rows it actually resolves.
-                if matches!(domain, crate::hot_state::InterestDomain::Untracked) {
-                    hot.reader(read.clone()).scan_batch(request).await?;
-                }
-            }
-            LogicalReadInterest::Exact {
-                rows, untracked, ..
-            } => {
-                for row in rows {
-                    selected_branch(descriptor, &row.branch_id)?;
-                    if *untracked != Some(true) {
-                        mutation_identities
-                            .entry(row.branch_id.clone())
-                            .or_default()
-                            .insert(crate::tracked_state::TrackedStateKey {
-                                schema_key: row.schema_key.clone(),
-                                file_id: row.file_id.clone(),
-                                row_pk: row.row_pk.clone(),
-                            });
-                    }
-                }
-                // Exact absence and payloads are validated by the shared
-                // preparation below; retain explicit keys for insertion paths.
-            }
-            LogicalReadInterest::CollectionGeneration {
-                branch_id,
-                schema_key,
-                file_id,
-            } => {
-                selected_branch(descriptor, branch_id)?;
-                hot.reader(read.clone())
-                    .collection_generation(
-                        branch_id,
-                        crate::collection_generation::CollectionScopeRef {
-                            schema_key,
-                            file_id: file_id.as_deref(),
-                        },
-                    )
-                    .await?;
-            }
-            LogicalReadInterest::PackedIdentityMembership {
-                branch_id,
-                schema_key,
-            } => {
-                selected_branch(descriptor, branch_id)?;
-                hot.transaction_reader(
-                    read.clone(),
-                    Arc::new(crate::hot_state::BranchHeadControlCache::default()),
-                )
-                .prepare_packed_identity_membership(branch_id, schema_key)
-                .await?;
-            }
-            LogicalReadInterest::FilesystemPaths {
-                file_ids,
-                branch_ids,
-                include_blob_refs,
-                cache_small_blob_data,
-            } => {
-                for branch in branch_ids {
-                    selected_branch(descriptor, branch)?;
-                }
-                hot.reader(read.clone())
-                    .path_index(
-                        &FilesystemPathIndexRequest::new(branch_ids.clone())
-                            .with_file_ids(file_ids.clone())
-                            .with_blob_refs(*include_blob_refs)
-                            .with_cached_blob_data(*cache_small_blob_data),
-                    )
-                    .await?;
-            }
-            LogicalReadInterest::Diff {
-                branch_id,
-                relation,
-                from,
-                to,
-                filter,
-                retain_payloads,
-                projected_columns,
-                limit: _,
-            } => {
-                let from = endpoint(descriptor, branch_id.as_deref(), from)?;
-                let to = endpoint(descriptor, branch_id.as_deref(), to)?;
-                crate::sql2::prepare_native_diff_interest(
-                    read.clone(),
-                    relation,
-                    &from,
-                    &to,
-                    &crate::tracked_state::TrackedStateDiffRequest {
-                        filter: filter.clone(),
-                        retain_payloads: *retain_payloads,
-                    },
-                    projected_columns,
-                )
-                .await?;
-            }
-            LogicalReadInterest::FilesystemMetadata {
-                directory,
-                branch_ids,
-                file_ids,
-                directory_ids,
-                root_directory,
-                path_predicate,
-            } => {
-                for branch in branch_ids {
-                    selected_branch(descriptor, branch)?;
-                }
-                let capture = crate::hot_state::ReadInterestRegistry::new(4096, 4 * 1024 * 1024);
-                let replay_hot = hot.with_read_interest_registry(capture.clone());
-                crate::sql2::prepare_native_file_metadata_interest(
-                    Arc::new(replay_hot.reader(read.clone())),
-                    Arc::new(replay_hot.reader(read.clone())),
-                    *directory,
-                    branch_ids,
-                    file_ids.as_deref(),
-                    directory_ids.as_deref(),
-                    *root_directory,
-                    path_predicate,
-                )
-                .await?;
-                let reader = hot.reader(read.clone());
-                let executable_rows = reader
-                    .prepare_captured_read_interests(
-                        &capture.snapshot()?,
-                        state.active_account_id(),
-                    )
-                    .await?;
-                candidate_catalog
-                    .prepare_returned_row_catalogs(&reader, &executable_rows, None)
-                    .await?;
-                crate::plugin::runtime::prepare_returned_row_executables(
-                    &reader,
-                    &blob.reader(read.clone()),
-                    &executable_rows,
-                )
-                .await?;
-            }
-            LogicalReadInterest::FileContent {
-                request,
-                file_ids,
-                directory_ids,
-                root_directory,
-                indexed,
-                path_predicate,
-                byte_range,
-            } => {
-                for branch in &request.filter.branch_ids {
-                    selected_branch(descriptor, branch)?;
-                }
-                // Capture newly matching native identities at this candidate,
-                // independently of the live registry and its persisted epoch.
-                let capture = crate::hot_state::ReadInterestRegistry::new(4096, 4 * 1024 * 1024);
-                let replay_hot = hot.with_read_interest_registry(capture.clone());
-                crate::sql2::prepare_native_file_content_interest(
-                    Arc::new(replay_hot.reader(read.clone())),
-                    Arc::new(replay_hot.reader(read.clone())),
-                    Arc::new(blob.reader(read.clone())),
-                    plugin_host.clone(),
-                    request,
-                    file_ids.as_deref(),
-                    directory_ids.as_deref(),
-                    *root_directory,
-                    *indexed,
-                    path_predicate,
-                    *byte_range,
-                )
-                .await?;
-                let reader = hot.reader(read.clone());
-                let executable_rows = reader
-                    .prepare_captured_read_interests(
-                        &capture.snapshot()?,
-                        state.active_account_id(),
-                    )
-                    .await?;
-                candidate_catalog
-                    .prepare_returned_row_catalogs(&reader, &executable_rows, None)
-                    .await?;
-                crate::plugin::runtime::prepare_returned_row_executables(
-                    &reader,
-                    &blob.reader(read.clone()),
-                    &executable_rows,
-                )
-                .await?;
-            }
-        }
-    }
-    for (branch_id, keys) in mutation_identities {
-        let branch = selected_branch(descriptor, &branch_id)?;
-        let Some(root) = branch.head.row_pk_index_root_id else {
-            return Err(unsupported(
-                "candidate has no native row-PK identity catalog for mutation preparation",
-            ));
-        };
-        crate::tracked_state::prepare_row_pk_index_mutation_inputs(
-            &read,
-            &crate::tracked_state::TrackedStateRootId::new(root),
-            &keys.into_iter().collect::<Vec<_>>(),
-        )
-        .await?;
-    }
-    // Foreground row reads promise the same bounded native edit inputs. Prepare
-    // them against these unpublished controls before they become visible; this
-    // candidate context intentionally has no trusted live-epoch proof cache.
-    let reader = hot.reader(read.clone());
-    let executable_rows = reader
-        .prepare_captured_read_interests(interests, state.active_account_id())
-        .await?;
-    candidate_catalog
-        .prepare_returned_row_catalogs(&reader, &executable_rows, None)
-        .await?;
-    crate::plugin::runtime::prepare_returned_row_executables(
-        &reader,
-        &blob.reader(read.clone()),
-        &executable_rows,
+    prepare_native_read_interests(
+        read.clone(),
+        descriptor,
+        interests,
+        state.active_account_id(),
+        plugin_host,
+        hot.clone(),
     )
     .await?;
-    drop(reader);
-    drop(hot);
-    drop(read);
+
     Ok(PreparedCandidateState {
         writes: staged,
         source_control_guards,

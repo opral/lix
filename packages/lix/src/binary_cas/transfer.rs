@@ -430,32 +430,106 @@ pub(crate) async fn stage_deferred_canonical_manifest(
     writes: &mut StorageWriteSet,
     manifest: &CanonicalBlobManifest,
 ) -> Result<Vec<ChunkHash>, LixError> {
-    validate_manifest_receipts(manifest)?;
-    let presence = chunk_presence_many(
-        store,
-        &manifest
-            .chunks
-            .iter()
-            .map(|chunk| chunk.hash)
-            .collect::<Vec<_>>(),
-    )
-    .await?;
-    let receipt = crate::binary_cas::kv::stage_upload_manifest(writes, &manifest.chunks)?;
-    if receipt.hash != manifest.blob_id || receipt.size_bytes != manifest.size_bytes {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "binary CAS deferred manifest staging changed its identity",
-        ));
+    stage_deferred_canonical_manifests_with_chunks(store, writes, std::slice::from_ref(manifest), &[])
+        .await
+}
+
+/// Stages a batch of canonical manifests and raw chunks in one write set.
+///
+/// A manifest can demand a chunk that is carried in the same fulfillment
+/// response.  Staging those records one at a time would put both a demand and
+/// its deletion for the same key into the write set, which the storage layer
+/// correctly rejects as a duplicate mutation.  This helper computes the final
+/// availability of every referenced chunk first, then emits exactly one
+/// mutation for each demand key.  It also coalesces repeated chunk payloads so
+/// shared chunks across manifests are written once.
+pub(crate) async fn stage_deferred_canonical_manifests_with_chunks(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    manifests: &[CanonicalBlobManifest],
+    chunks: &[CanonicalBlobChunk],
+) -> Result<Vec<ChunkHash>, LixError> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut manifests_by_id = BTreeSet::new();
+    let mut referenced = BTreeSet::new();
+    for manifest in manifests {
+        validate_manifest_receipts(manifest)?;
+        if !manifests_by_id.insert(manifest.blob_id) {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "binary CAS fulfillment repeats a manifest",
+            ));
+        }
+        referenced.extend(manifest.chunks.iter().map(|chunk| chunk.hash));
     }
-    let availability = manifest
-        .chunks
+
+    let mut provided = BTreeMap::<ChunkHash, Vec<u8>>::new();
+    for chunk in chunks {
+        if chunk.bytes.is_empty() || chunk.bytes.len() > MAX_BINARY_CAS_CHUNK_BYTES {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!(
+                    "binary CAS transfer chunks must contain 1 through {} bytes",
+                    MAX_BINARY_CAS_CHUNK_BYTES
+                ),
+            ));
+        }
+        if chunk.receipt.size_bytes != chunk.bytes.len() as u64
+            || ChunkHash::from_content(&chunk.bytes) != chunk.receipt.hash
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "binary CAS chunk receipt does not match its payload",
+            ));
+        }
+        if let Some(existing) = provided.insert(chunk.receipt.hash, chunk.bytes.clone())
+            && existing != chunk.bytes
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "binary CAS fulfillment repeats a chunk with different bytes",
+            ));
+        }
+    }
+
+    let mut all_chunks = referenced.clone();
+    all_chunks.extend(provided.keys().copied());
+    let all_chunks = all_chunks.into_iter().collect::<Vec<_>>();
+    let presence = chunk_presence_many(store, &all_chunks).await?;
+    let presence = all_chunks
         .iter()
+        .copied()
         .zip(presence)
-        .map(|(chunk, present)| (chunk.hash, present))
-        .collect::<std::collections::BTreeMap<_, _>>();
+        .collect::<BTreeMap<_, _>>();
+
+    for manifest in manifests {
+        let receipt = crate::binary_cas::kv::stage_upload_manifest(writes, &manifest.chunks)?;
+        if receipt.hash != manifest.blob_id || receipt.size_bytes != manifest.size_bytes {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "binary CAS deferred manifest staging changed its identity",
+            ));
+        }
+    }
+
     let mut missing = Vec::new();
-    for (chunk_hash, present) in availability {
-        if present {
+    for chunk_hash in all_chunks {
+        let present = presence[&chunk_hash];
+        if let Some(bytes) = provided.get(&chunk_hash) {
+            if present {
+                let resident = load_verified_chunk(store, chunk_hash).await?;
+                if resident.as_deref() != Some(bytes.as_slice()) {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "binary CAS fulfillment conflicts with a resident chunk",
+                    ));
+                }
+                crate::binary_cas::kv::stage_chunk_available(writes, chunk_hash);
+            } else {
+                stage_verified_raw_chunk(writes, chunk_hash, bytes)?;
+            }
+        } else if present {
             crate::binary_cas::kv::stage_chunk_available(writes, chunk_hash);
         } else {
             crate::binary_cas::kv::stage_chunk_demand(writes, chunk_hash);

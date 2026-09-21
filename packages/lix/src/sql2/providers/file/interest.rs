@@ -167,26 +167,23 @@ pub(super) fn retain_content(
     }
     Ok(())
 }
-/// Hydrate the native content inputs, including plugin render inputs, at the
-/// candidate file identities. No user SQL/functions or view acknowledgments run.
-pub(crate) async fn prepare_native_file_content_interest(
-    hot_state: Arc<dyn HotStateReader>,
-    filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
-    blob_reader: Arc<dyn BlobDataReader>,
-    plugin_host: PluginRuntimeHost,
+async fn select_native_file_content_rows(
+    hot_state: &Arc<dyn HotStateReader>,
+    filesystem_path_index: &Arc<dyn FilesystemPathIndexReader>,
     request: &HotStateScanRequest,
     file_ids: Option<&[String]>,
     directory_ids: Option<&[String]>,
     root_directory: bool,
     indexed: bool,
+    cache_small_blob_data: bool,
     path: &FilePathInterest,
     byte_range: Option<(u64, u64)>,
-) -> Result<(), LixError> {
+) -> Result<Option<(PreparedLixFileRows, Option<Range<u64>>)>, LixError> {
     if file_ids.is_some_and(<[String]>::is_empty)
         || directory_ids.is_some_and(<[String]>::is_empty)
         || request.limit == Some(0)
     {
-        return Ok(());
+        return Ok(None);
     }
     let range = byte_range.map(|(start, end)| start..end);
     if range.as_ref().is_some_and(|range| range.start > range.end) {
@@ -200,8 +197,9 @@ pub(crate) async fn prepare_native_file_content_interest(
         let index = filesystem_path_index
             .path_index(
                 &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
+                    .with_file_ids(file_ids.map(<[String]>::to_vec))
                     .with_blob_refs(true)
-                    .with_cached_blob_data(range.is_none()),
+                    .with_cached_blob_data(cache_small_blob_data && range.is_none()),
             )
             .await?;
         let ids = file_ids.map(|ids| ids.iter().cloned().collect::<BTreeSet<_>>());
@@ -221,9 +219,9 @@ pub(crate) async fn prepare_native_file_content_interest(
         } else {
             indexed_file_matches(index, &path)
         };
-        // Native file projection currently loads its candidate content batch before
-        // SQL residual filters/output LIMIT. Retain request.limit as a recipe fact,
-        // never reinterpret it as complete coverage or truncate a file's state rows.
+        // Native file projection currently loads its candidate content batch
+        // before SQL residual filters/output LIMIT. Retain request.limit as a
+        // recipe fact, never reinterpret it as complete coverage.
         retain_selected_entries(hot_state.as_ref(), matches.entries(), true)?;
         let rows = scan_indexed_file_batch(&matches, true)?;
         prepare_indexed_lix_file_rows(&matches, rows)?
@@ -231,8 +229,42 @@ pub(crate) async fn prepare_native_file_content_interest(
         let ids = file_ids.map_or(FileIdConstraint::All, |ids| {
             FileIdConstraint::Ids(ids.iter().cloned().collect())
         });
-        let rows = scan_lix_file_live_batch(Arc::clone(&hot_state), request, &ids).await?;
+        let rows = scan_lix_file_live_batch(Arc::clone(hot_state), request, &ids).await?;
         prepare_lix_file_rows(rows, &path)?
+    };
+    Ok(Some((prepared, range)))
+}
+
+/// Hydrate the native content inputs, including plugin render inputs, at the
+/// candidate file identities. No user SQL/functions or view acknowledgments run.
+pub(crate) async fn prepare_native_file_content_interest(
+    hot_state: Arc<dyn HotStateReader>,
+    filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
+    blob_reader: Arc<dyn BlobDataReader>,
+    plugin_host: PluginRuntimeHost,
+    request: &HotStateScanRequest,
+    file_ids: Option<&[String]>,
+    directory_ids: Option<&[String]>,
+    root_directory: bool,
+    indexed: bool,
+    path: &FilePathInterest,
+    byte_range: Option<(u64, u64)>,
+) -> Result<(), LixError> {
+    let Some((prepared, range)) = select_native_file_content_rows(
+        &hot_state,
+        &filesystem_path_index,
+        request,
+        file_ids,
+        directory_ids,
+        root_directory,
+        indexed,
+        true,
+        path,
+        byte_range,
+    )
+    .await?
+    else {
+        return Ok(());
     };
     let render = if prepared.needs_plugin_render(true) {
         plugin_render_context_for_lix_file_scan_cached(
@@ -249,6 +281,152 @@ pub(crate) async fn prepare_native_file_content_interest(
     };
     exact_path_data_rows_from_prepared(&blob_reader, render, prepared, range.as_ref()).await?;
     Ok(())
+}
+
+/// Prepare the native inputs for a file-content recipe without invoking a
+/// plugin renderer. This is the authority-side dependency-discovery lane:
+/// path selection, descriptor/blob rows, blob manifests/content, and the
+/// selected file's plugin state are read, while rendering remains a client
+/// concern.
+pub(crate) async fn prepare_native_file_content_inputs(
+    hot_state: Arc<dyn HotStateReader>,
+    filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
+    blob_reader: Arc<dyn BlobDataReader>,
+    request: &HotStateScanRequest,
+    file_ids: Option<&[String]>,
+    directory_ids: Option<&[String]>,
+    root_directory: bool,
+    indexed: bool,
+    path: &FilePathInterest,
+    byte_range: Option<(u64, u64)>,
+) -> Result<(), LixError> {
+    let Some((prepared, range)) = select_native_file_content_rows(
+        &hot_state,
+        &filesystem_path_index,
+        request,
+        file_ids,
+        directory_ids,
+        root_directory,
+        indexed,
+        false,
+        path,
+        byte_range,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    prepare_native_file_plugin_inputs(&hot_state, &blob_reader, &prepared).await?;
+    // This deliberately supplies no PluginRenderContext. It still asks the
+    // canonical blob reader for the selected full/ranged bytes so the
+    // authority recorder can emit verified blob dependencies, without
+    // executing user/plugin code.
+    let _ =
+        exact_path_data_rows_from_prepared(&blob_reader, None, prepared, range.as_ref()).await?;
+    Ok(())
+}
+
+async fn prepare_native_file_plugin_inputs(
+    hot_state: &Arc<dyn HotStateReader>,
+    blob_reader: &Arc<dyn BlobDataReader>,
+    prepared: &PreparedLixFileRows,
+) -> Result<(), LixError> {
+    let files = prepared
+        .file_rows
+        .values()
+        .filter(|file| plugin_descriptor_key_can_have_durable_owner(&file.key))
+        .map(|file| (file.key.branch_id().to_owned(), file.id.clone()))
+        .collect::<BTreeSet<_>>();
+    if files.is_empty() {
+        return Ok(());
+    }
+
+    enum PluginInputRequest {
+        Registry(String),
+        Owner { branch: String, file_id: String },
+    }
+    let mut requests = Vec::new();
+    let mut registry_slots = BTreeMap::new();
+    for branch in files
+        .iter()
+        .map(|(branch, _)| branch)
+        .collect::<BTreeSet<_>>()
+    {
+        let slot = requests.len();
+        requests.push(PluginInputRequest::Registry(branch.clone()));
+        registry_slots.insert(branch.clone(), slot);
+    }
+    let mut owner_slots = BTreeMap::new();
+    for (branch, file_id) in &files {
+        let slot = requests.len();
+        requests.push(PluginInputRequest::Owner {
+            branch: branch.clone(),
+            file_id: file_id.clone(),
+        });
+        owner_slots.insert((branch.clone(), file_id.clone()), slot);
+    }
+
+    let exact_rows = requests
+        .iter()
+        .map(|request| match request {
+            PluginInputRequest::Registry(branch) => HotStateExactRowRequest {
+                schema_key: "lix_key_value".to_owned(),
+                branch_id: branch.clone(),
+                row_pk: RowPk::single(PLUGIN_REGISTRY_KEY),
+                file_id: None,
+            },
+            PluginInputRequest::Owner { branch, file_id } => HotStateExactRowRequest {
+                schema_key: "lix_key_value".to_owned(),
+                branch_id: branch.clone(),
+                row_pk: RowPk::single(PLUGIN_OWNER_KEY),
+                file_id: Some(file_id.clone()),
+            },
+        })
+        .collect::<Vec<_>>();
+    let rows = hot_state
+        .load_exact_batch(&HotStateExactBatchRequest {
+            rows: exact_rows,
+            projection: HotStateProjection {
+                columns: vec!["snapshot_content".to_owned()],
+            },
+            untracked: Some(false),
+            include_tombstones: false,
+        })
+        .await?;
+
+    let mut registries = BTreeMap::new();
+    for (branch, slot) in registry_slots {
+        let registry = PluginRegistry::from_optional_hot_state_row(rows.row(slot), &branch)?;
+        registries.insert(branch, registry);
+    }
+    let mut wasm_hashes = BTreeSet::new();
+    for ((branch, file_id), slot) in owner_slots {
+        let Some(row) = rows.row(slot) else {
+            continue;
+        };
+        let Some(owner) = PluginFileOwner::from_hot_state_row(&row.to_owned(), &branch, false)?
+        else {
+            continue;
+        };
+        let Some(plugin) = registries
+            .get(&branch)
+            .and_then(|registry| registry.get(owner.plugin_key()))
+        else {
+            continue;
+        };
+        crate::plugin::runtime::prepare_file_content_state(
+            hot_state.as_ref(),
+            blob_reader.as_ref(),
+            &branch,
+            &file_id,
+            owner.schema_keys(),
+        )
+        .await?;
+        if let Some(hash) = plugin.wasm_blob_hash() {
+            wasm_hashes.insert(BlobId::from_hex(hash)?);
+        }
+    }
+    crate::plugin::runtime::prepare_executable_blobs(blob_reader.as_ref(), wasm_hashes).await
 }
 
 /// Retain exact native identities selected by the provider, including index

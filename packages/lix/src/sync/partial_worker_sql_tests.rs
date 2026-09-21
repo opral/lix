@@ -33,6 +33,17 @@ impl RawHttpClient for AuthorityClient {
             let url = url::Url::parse(&request.url).unwrap();
             let result = if request.method == http::Method::GET && !url.path().contains("/sync/") {
                 serde_json::json!({"protocolVersion":crate::SERVER_PROTOCOL_VERSION,"syncProtocolVersion":crate::sync::SYNC_PROTOCOL_VERSION,"lixId":self.authority.lix_id(),"sessionId":"partial-worker-authority","activeAccountId":self.authority.active_account_id()})
+            } else if url.path().ends_with("/sync/read-fulfillment") {
+                let body = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+                let lease = request
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name == "lix-native-baseline-lease")
+                    .unwrap()
+                    .1
+                    .as_str();
+                serde_json::to_value(self.authority.read_sync_fulfillment(&body, lease).await?)
+                    .unwrap()
             } else if url.path().ends_with("/sync/native-metadata-walk") {
                 let body = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
                 self.metadata.fetch_add(1, Ordering::SeqCst);
@@ -135,11 +146,17 @@ async fn partial_upload_worker_yields_to_demands_and_retries_ambiguous_acceptanc
             )
             .await
             .unwrap();
-        let state = PartialReplicaState::new(
+        authority
+            .set_sync_role(crate::sync::SyncRole::Authority)
+            .unwrap();
+        let state = PartialReplicaState::from_leased(
             format!("https://example.test/lix/{}", authority.lix_id()),
             authority.active_account_id().into(),
             "00000000-0000-7000-8000-000000003399".into(),
-            authority.partial_replica_descriptor(None).await.unwrap(),
+            authority
+                .leased_partial_replica_descriptor(None)
+                .await
+                .unwrap(),
         )
         .unwrap();
         let branch = state.descriptor().selected_branch.branch_id.clone();
@@ -304,11 +321,17 @@ async fn production_frontier_preparation_supports_thirty_local_appends() {
             .await
             .unwrap();
     }
-    let state = PartialReplicaState::new(
+    authority
+        .set_sync_role(crate::sync::SyncRole::Authority)
+        .unwrap();
+    let state = PartialReplicaState::from_leased(
         format!("https://example.test/lix/{}", authority.lix_id()),
         authority.active_account_id().into(),
         "00000000-0000-7000-8000-000000003399".into(),
-        authority.partial_replica_descriptor(None).await.unwrap(),
+        authority
+            .leased_partial_replica_descriptor(None)
+            .await
+            .unwrap(),
     )
     .unwrap();
     let memory = Memory::new();
@@ -455,7 +478,8 @@ impl RawHttpClient for WatchingAuthorityClient {
                     .leased_partial_replica_descriptor(branch.as_deref())
                     .await?;
                 serde_json::to_value(descriptor).unwrap()
-            } else if url.path().ends_with("/sync/native-object-range")
+            } else if url.path().ends_with("/sync/read-fulfillment")
+                || url.path().ends_with("/sync/native-object-range")
                 || url.path().ends_with("/sync/native-metadata")
                 || url.path().ends_with("/sync/native-metadata-walk")
                 || url.path().ends_with("/sync/native-objects")
@@ -468,7 +492,16 @@ impl RawHttpClient for WatchingAuthorityClient {
                     .expect("native request carries authority pin")
                     .1
                     .as_str();
-                if url.path().ends_with("/sync/native-objects") {
+                if url.path().ends_with("/sync/read-fulfillment") {
+                    let body = serde_json::from_slice(request.body.as_ref().unwrap()).unwrap();
+                    serde_json::to_value(
+                        self.base
+                            .authority
+                            .read_sync_fulfillment(&body, lease)
+                            .await?,
+                    )
+                    .unwrap()
+                } else if url.path().ends_with("/sync/native-objects") {
                     #[derive(serde::Deserialize)]
                     #[serde(deny_unknown_fields)]
                     struct Request {
@@ -741,7 +774,8 @@ impl RawHttpClient for ExpiredAuthorityClient {
                     body: serde_json::to_vec(&descriptor).unwrap(),
                 });
             }
-            if url.path().contains("/sync/native-")
+            if (url.path().contains("/sync/native-")
+                || url.path().ends_with("/sync/read-fulfillment"))
                 && request.headers.iter().any(|(name, value)| {
                     name == "lix-native-baseline-lease" && value == &self.expired_lease
                 })

@@ -4,7 +4,7 @@ import { SharedAdmissionCache, requestAdmission, type AdmissionIdentity } from "
 const repositoryId = "00000000-0000-7000-8000-000000000004";
 const url = `https://example.test/lix/${repositoryId}`;
 const headers: [string, string][] = [["Authorization", "Bearer exact-token"]];
-const identity: AdmissionIdentity = {repositoryId, principalId: "00000000-0000-7000-8000-000000000003", protocolEpoch: 19, storageEpoch: 81};
+const identity: AdmissionIdentity = {repositoryId, principalId: "00000000-0000-7000-8000-000000000003", protocolEpoch: 20, storageEpoch: 81};
 const offline = async (): Promise<AdmissionIdentity> => {throw new HttpTransportError("LIX_TRANSPORT_NETWORK", "offline");};
 
 test("new ports verify principal even with previously admitted credentials", async () => {
@@ -37,7 +37,7 @@ test("metadata admission uses bounded GET and explicit credentials without SQL o
   expect(request.url).toBe(`https://example.test/lix/v1/${repositoryId}/admission`);
   expect(request.response.mode).toBe("streaming");
   expect(new Headers(request.init.headers).get("authorization")).toBe("Bearer exact-token");
-  expect(new Headers(request.init.headers).get("lix-sync-protocol-version")).toBe("19");
+  expect(new Headers(request.init.headers).get("lix-sync-protocol-version")).toBe("20");
   expect(request.init.credentials).toBe("omit");
 });
 test.each([401,403])("HTTP %s is authorization rejection", async status => {

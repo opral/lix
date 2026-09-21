@@ -447,7 +447,22 @@ pub(crate) fn exact_filesystem_read_route(
         .or_else(|| {
             exact_id_manifest_batch(point_read.select, params)
                 .map(ExactFilesystemRead::IdManifestBatch)
-        })
+    })
+}
+
+/// The operation-level read-interest seed may accept a literal equality in
+/// addition to the parameterized shapes accepted by the native execution
+/// fast path. This deliberately remains a separate route: literal SQL keeps
+/// DataFusion's normal planning/execution semantics and is never redirected
+/// to the narrow native executor merely because it can seed discovery.
+pub(crate) fn exact_filesystem_read_interest_route(
+    statement: &DataFusionStatement,
+    params: &[Value],
+) -> Option<ExactFilesystemRead> {
+    exact_filesystem_read_route(statement, params).or_else(|| {
+        exact_lix_file_point_read_with_literals(statement, params)
+            .map(|(selector, column)| ExactFilesystemRead::Point(selector, column))
+    })
 }
 
 pub(crate) fn exact_lix_file_root_listing(
@@ -540,6 +555,21 @@ pub(crate) fn exact_lix_file_point_read(
     statement: &DataFusionStatement,
     params: &[Value],
 ) -> Option<(sql2::ExactLixFileReadSelector, sql2::ExactLixFileReadColumn)> {
+    exact_lix_file_point_read_inner(statement, params, false)
+}
+
+fn exact_lix_file_point_read_with_literals(
+    statement: &DataFusionStatement,
+    params: &[Value],
+) -> Option<(sql2::ExactLixFileReadSelector, sql2::ExactLixFileReadColumn)> {
+    exact_lix_file_point_read_inner(statement, params, true)
+}
+
+fn exact_lix_file_point_read_inner(
+    statement: &DataFusionStatement,
+    params: &[Value],
+    allow_literals: bool,
+) -> Option<(sql2::ExactLixFileReadSelector, sql2::ExactLixFileReadColumn)> {
     let point_read = simple_point_read(statement)?;
     if point_read.table_name != "lix_file" || !point_read.exact_table_shape {
         return None;
@@ -559,7 +589,8 @@ pub(crate) fn exact_lix_file_point_read(
         _ => return None,
     };
     let selection = point_read.select.selection.as_ref()?;
-    let (identity_column, identity_value) = exact_point_identity(selection, params)?;
+    let (identity_column, identity_value) =
+        exact_point_identity_inner(selection, params, allow_literals)?;
     let selector = match identity_column.as_str() {
         "id" => sql2::ExactLixFileReadSelector::Id(identity_value),
         "path" => sql2::ExactLixFileReadSelector::Path(identity_value),
@@ -628,7 +659,11 @@ fn exact_parameter_batch(
     (!require_unique || values.len() == list.len()).then_some(values)
 }
 
-fn exact_point_identity(expression: &Expr, params: &[Value]) -> Option<(String, String)> {
+fn exact_point_identity_inner(
+    expression: &Expr,
+    params: &[Value],
+    allow_literals: bool,
+) -> Option<(String, String)> {
     let Expr::BinaryOp {
         left,
         op: BinaryOperator::Eq,
@@ -638,8 +673,14 @@ fn exact_point_identity(expression: &Expr, params: &[Value]) -> Option<(String, 
         return None;
     };
     match (exact_point_column(left), exact_point_column(right)) {
-        (Some(column), None) => Some((column, exact_point_text_param(right, params)?)),
-        (None, Some(column)) => Some((column, exact_point_text_param(left, params)?)),
+        (Some(column), None) => Some((
+            column,
+            exact_point_text_value(right, params, allow_literals)?,
+        )),
+        (None, Some(column)) => Some((
+            column,
+            exact_point_text_value(left, params, allow_literals)?,
+        )),
         _ => None,
     }
 }
@@ -654,7 +695,11 @@ fn exact_point_column(expression: &Expr) -> Option<String> {
     Some(identifier.value.to_ascii_lowercase())
 }
 
-fn exact_point_text_param(expression: &Expr, params: &[Value]) -> Option<String> {
+fn exact_point_text_value(
+    expression: &Expr,
+    params: &[Value],
+    allow_literals: bool,
+) -> Option<String> {
     let Expr::Value(value) = expression else {
         return None;
     };
@@ -665,6 +710,7 @@ fn exact_point_text_param(expression: &Expr, params: &[Value]) -> Option<String>
             };
             Some(value.clone())
         }
+        value if allow_literals => value.clone().into_string(),
         _ => None,
     }
 }

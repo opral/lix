@@ -281,7 +281,13 @@ mod tests {
             .await
             .unwrap();
         let repository_id = authority.lix_id().to_owned();
-        let descriptor = authority.partial_replica_descriptor(None).await.unwrap();
+        authority
+            .set_sync_role(crate::sync::SyncRole::Authority)
+            .unwrap();
+        let leased = authority
+            .leased_partial_replica_descriptor(None)
+            .await
+            .unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let locator = format!(
             "http://{}/lix/{repository_id}",
@@ -346,10 +352,16 @@ mod tests {
                 let body = if closing {
                     serde_json::json!({})
                 } else if route.ends_with("/sync/descriptor") {
-                    serde_json::to_value(crate::sync::LeasedPartialReplicaDescriptor::for_test(
-                        descriptor.clone(),
-                        authority.active_account_id(),
-                    ))
+                    serde_json::to_value(&leased).unwrap()
+                } else if path.ends_with("/sync/read-fulfillment") {
+                    let request = serde_json::from_slice(&bytes).unwrap();
+                    serde_json::to_value(
+                        runtime
+                            .block_on(
+                                authority.read_sync_fulfillment(&request, &leased.lease.lease_id),
+                            )
+                            .unwrap(),
+                    )
                     .unwrap()
                 } else if path.ends_with("/sync/native-metadata-walk") {
                     let request: crate::sync::NativeMetadataWalkRequest =
