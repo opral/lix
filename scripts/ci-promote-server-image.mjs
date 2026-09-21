@@ -16,13 +16,16 @@ export function validateServerImage(manifest, image, revision) {
   validateServerManifest(manifest, revision);
   if (image.Os !== "linux" || image.Architecture !== "amd64" ||
       image.Config?.Labels?.["org.opencontainers.image.revision"] !== revision ||
-      image.Config?.OnBuild?.length || !Array.isArray(image.RootFS?.Layers)) {
-    throw new Error("Unexpected server image platform, revision, or ONBUILD instructions");
+      image.Config?.OnBuild?.length || !Array.isArray(image.RootFS?.Layers) ||
+      !Array.isArray(image.Config?.Env) ||
+      image.Config.Env.filter(value => value.startsWith("LIX_SOURCE_REVISION=")).length !== 1 ||
+      !image.Config.Env.includes(`LIX_SOURCE_REVISION=${revision}`)) {
+    throw new Error("Unexpected server image platform, revision, telemetry revision, or ONBUILD instructions");
   }
 }
 
 // Only image metadata changes. The tested filesystem layers are retained, and
-// consumers can continue requiring the landed SHA in both manifest and OCI label.
+// consumers require the landed SHA in the manifest, OCI label, and telemetry env.
 export function promoteServerImage({ directory, sourceRevision, revision, sourceRun, run = execFileSync }) {
   if (!/^[a-f0-9]{40}$/.test(revision) || !/^\d+$/.test(String(sourceRun))) {
     throw new Error("Invalid promotion revision or source run");
@@ -39,7 +42,7 @@ export function promoteServerImage({ directory, sourceRevision, revision, source
   const image = `lix-server-ci:${revision}`;
   const context = mkdtempSync(join(tmpdir(), "lix-server-promotion-"));
   try {
-    writeFileSync(join(context, "Dockerfile"), `FROM ${manifest.image}\nLABEL org.opencontainers.image.revision=${revision}\n`);
+    writeFileSync(join(context, "Dockerfile"), `FROM ${manifest.image}\nLABEL org.opencontainers.image.revision=${revision}\nENV LIX_SOURCE_REVISION=${revision}\n`);
     run("docker", ["build", "--network=none", "--pull=false", "--tag", image, context], { stdio: "inherit" });
     const promoted = inspect(image);
     const result = { ...manifest, sourceRevision: revision, image,
@@ -48,10 +51,15 @@ export function promoteServerImage({ directory, sourceRevision, revision, source
     if (JSON.stringify(source.RootFS.Layers) !== JSON.stringify(promoted.RootFS.Layers)) {
       throw new Error("Promotion changed tested server filesystem layers");
     }
-    for (const key of ["Cmd", "Entrypoint", "Env", "User", "WorkingDir", "ExposedPorts", "Volumes", "StopSignal", "Healthcheck", "Shell"]) {
+    for (const key of ["Cmd", "Entrypoint", "User", "WorkingDir", "ExposedPorts", "Volumes", "StopSignal", "Healthcheck", "Shell"]) {
       if (JSON.stringify(source.Config[key]) !== JSON.stringify(promoted.Config[key])) {
         throw new Error(`Promotion changed server runtime configuration: ${key}`);
       }
+    }
+    const expectedEnv = source.Config.Env.map(value => value.startsWith("LIX_SOURCE_REVISION=")
+      ? `LIX_SOURCE_REVISION=${revision}` : value);
+    if (JSON.stringify(expectedEnv) !== JSON.stringify(promoted.Config.Env)) {
+      throw new Error("Promotion changed server runtime configuration: Env");
     }
     run("docker", ["save", "--output", archive, image], { stdio: "inherit" });
     writeFileSync(manifestPath, `${JSON.stringify(result, null, 2)}\n`);

@@ -72,3 +72,11 @@ Artifact-only runs have separate concurrency and do not emit **Release ready**,
 run the native SDK or full Rust validation, publish packages, or deploy anything.
 They are preparation for consumer testing, not release approval. Ordinary PR,
 main-push, and default manual CI validation retain their existing behavior.
+
+## Server telemetry identity during image reuse
+
+Server trace revision identity follows the image's OCI revision label. Promotion
+of a tested PR artifact rewrites the label and `LIX_SOURCE_REVISION` together,
+without changing filesystem layers. Content-equivalent image reuse preserves
+its immutable digest and original build revision; a release tag alone does not
+change that provenance.
