@@ -1,9 +1,48 @@
 import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { binaryManifest, cacheKey, restoreBinaries, saveBinaries } from "./ci-sdk-cache.mjs";
 import { findReusableRun, readArtifactJson } from "./ci-merge-reuse.mjs";
+
+// Stage each attempt separately: a downloader may exit successfully without
+// materializing the complete archive. Never promote such a partial download.
+export function downloadMergedBrowser(root, revision, runId, repository, run = execFileSync) {
+    if (!/^[a-f0-9]{40}$/.test(revision) || !/^\d+$/.test(String(runId))) {
+        throw new Error("Invalid browser artifact source");
+    }
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        const staged = mkdtempSync(join(tmpdir(), "lix-browser-download-"));
+        try {
+            run("gh", ["run", "download", String(runId), "--repo", repository,
+                "--name", `lix-browser-sdk-${revision}`, "--dir", staged],
+                { stdio: "inherit", timeout: 180_000 });
+            const manifest = JSON.parse(readFileSync(join(staged, "ci-artifact/browser.json"), "utf8"));
+            if (manifest.schemaVersion !== 1 || manifest.kind !== "lix-browser-sdk" ||
+                manifest.sourceRevision !== revision || manifest.target !== "wasm32-unknown-unknown") {
+                throw new Error("Unexpected source artifact provenance");
+            }
+            const binaries = binaryManifest(join(staged, "packages/js-sdk"), "browser", manifest.releaseBuild?.binaries?.key);
+            if (JSON.stringify(binaries) !== JSON.stringify(manifest.releaseBuild?.binaries)) {
+                throw new Error("Browser artifact checksum mismatch");
+            }
+            for (const path of ["packages/js-sdk/dist/index.js", "packages/storage-opfs/dist/index.js"]) {
+                readFileSync(join(staged, path));
+            }
+            for (const path of ["packages/js-sdk/dist", "packages/storage-opfs/dist", "ci-artifact"]) {
+                mkdirSync(join(root, path), { recursive: true });
+                cpSync(join(staged, path), join(root, path), { recursive: true });
+            }
+            return;
+        } catch (error) {
+            if (attempt === 3) throw new Error("Browser artifact download failed verification after 3 attempts", { cause: error });
+            console.log(`Browser artifact attempt ${attempt} incomplete or invalid; retrying.`);
+        } finally {
+            rmSync(staged, { recursive: true, force: true });
+        }
+    }
+}
 
 function sourceTree(root) {
 	return execFileSync("git", ["rev-parse", "HEAD^{tree}"], { cwd: root, encoding: "utf8" }).trim();
@@ -84,7 +123,9 @@ export function prepareMergedBrowserCache(root, revision, env = process.env) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
 	const [command, downloaded, revision] = process.argv.slice(2);
-	if (command === "describe") {
+	if (command === "download-merged") {
+        downloadMergedBrowser(process.cwd(), process.env.SOURCE_REVISION, process.env.SOURCE_RUN, process.env.GITHUB_REPOSITORY);
+    } else if (command === "describe") {
 		mkdirSync("ci-artifact", { recursive: true });
 		writeFileSync("ci-artifact/browser.json", JSON.stringify(describeBrowser(process.cwd(), process.env.LIX_SOURCE_SHA)));
 	} else if (command === "prepare-merged-cache") {
