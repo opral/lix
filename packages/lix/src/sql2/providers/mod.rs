@@ -906,18 +906,18 @@ mod tests {
     #[test]
     fn row_ref_provider_selection_loads_visible_catalog_for_dynamic_relation() {
         assert_eq!(
-            selection_for_sql(&["SELECT lix_row_ref($1, $2)"]),
+            selection_for_sql(&["SELECT lix_row_ref($1, NULL, $2)"]),
             selected_names_with_visible_schemas(&[]),
         );
         assert_eq!(
-            selection_for_sql(&["SELECT lix_row_ref(CAST($1 AS TEXT), $2)"]),
+            selection_for_sql(&["SELECT lix_row_ref(CAST($1 AS TEXT), NULL, $2)"]),
             selected_names_with_visible_schemas(&[]),
         );
         assert_eq!(
-            selection_for_sql(&["SELECT lix_row_ref('lix_file', $1)"]),
+            selection_for_sql(&["SELECT lix_row_ref('lix_file', NULL, $1)"]),
             selected_names(&["lix_file"]),
         );
-        let selection = selection_for_sql(&["SELECT lix_row_ref($1, $2) FROM lix_file"]);
+        let selection = selection_for_sql(&["SELECT lix_row_ref($1, NULL, $2) FROM lix_file"]);
         assert_eq!(selection, selected_names_with_visible_schemas(&["lix_file"]));
         assert!(selection.requires_visible_schemas());
         assert!(selection.includes(PublicCatalog::fixed_system().surface("lix_file").unwrap()));

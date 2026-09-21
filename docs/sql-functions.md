@@ -12,18 +12,28 @@ Lix exposes a small set of runtime functions. JSON uses PostgreSQL casts and ope
 | `lix_active_branch_id()`                | text        | Active branch.                                                                    |
 | `lix_active_branch_commit_id()`         | text        | Active branch head pinned for the statement.                                      |
 | `lix_root_commit_id()`                  | text        | Repository bootstrap root.                                                        |
-| `lix_row_ref(relation, primary_key...)` | row_ref     | Opaque address of one relation row, including composite keys.                     |
+| `lix_row_ref(relation, file_id, primary_key...)` | row_ref     | Opaque address of one relation row, including file scope and composite keys.       |
 | `lix_order_between(previous, next)`     | text        | Allocate a plugin row order key between exclusive bounds; NULL means an open end. |
 | `uuidv7()`                              | uuid        | Generate a UUIDv7 value.                                                          |
 | `CURRENT_TIMESTAMP`                     | timestamptz | Transaction-start instant at microsecond precision.                               |
 
-`lix_row_ref` takes the relation's typed primary-key values in declared order:
+`lix_row_ref` always takes the relation name, its file scope, and the typed
+primary-key values in declared order. Pass SQL `NULL` for fileless rows,
+including `lix_file` and `lix_directory`; pass the owning file ID for a
+file-scoped plugin row:
 
 ```sql
-SELECT lix_row_ref('json_object_member', $1, $2, $3) AS row_ref;
+SELECT lix_row_ref('json_object_member', $1, $2, $3, $4) AS row_ref;
+SELECT lix_row_ref('lix_file', NULL, $1) AS row_ref;
 ```
 
 For `json_object_member`, the components are `parent_id`, decoded `key`, and `occurrence` (zero for an ordinary unique key).
+
+`NULL` identifies only fileless rows; it never means all files. The reference
+does not contain a branch: operations resolve it in their current branch or
+candidate state. Construction validates the relation and key types without
+requiring the target row to exist. References are opaque; store and pass them
+unchanged. The v2 encoding rejects legacy v1 references.
 
 ## Row ordering
 
@@ -123,7 +133,7 @@ SELECT commit_id
 FROM lix_revert_range(
   $1,
   $2,
-  ARRAY[lix_row_ref('lix_file', $3)]
+  ARRAY[lix_row_ref('lix_file', NULL, $3)]
 );
 
 SELECT commit_id FROM lix_undo();
@@ -139,7 +149,7 @@ FROM lix_undo(
 SELECT commit_id FROM lix_redo();
 SELECT commit_id FROM lix_redo($1); -- undo receipt U returned by lix_undo
 SELECT commit_id
-FROM lix_redo($1, ARRAY[lix_row_ref('acme_task', $2)]);
+FROM lix_redo($1, ARRAY[lix_row_ref('acme_task', $2, $3)]);
 ```
 
 Restore makes selected tracked content equal the source commit in a new commit on the current branch. Omitted scope restores the whole tracked repository, including deleting rows absent from the source. Selected restore leaves unrelated content alone and handles required dependencies atomically. It leaves the current working baseline unchanged, preserves branch-local untracked rows, and does not move the branch pointer backward. Revert reverses one commit, including a checkpoint commit, against its actual first parent; `lix_revert_range(before, after [, rows])` reverses the net endpoint difference. Apply replays the forward difference between explicit `before` and `after` endpoints. Later conflicting versions reject the command atomically. Mutating functions execute once as top-level commands and cannot be used as join inputs.

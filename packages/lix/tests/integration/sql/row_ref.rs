@@ -21,7 +21,7 @@ simulation_test!(
 
         let direct = session
             .execute(
-                "SELECT lix_row_ref('lix_file', $1) AS row_ref",
+                "SELECT lix_row_ref('lix_file', NULL, $1) AS row_ref",
                 &[Value::Text(id.into())],
             )
             .await
@@ -98,16 +98,16 @@ simulation_test!(
 
         for (sql, expected) in [
             (
-                "SELECT lix_row_ref('missing_relation', 'x')",
+                "SELECT lix_row_ref('missing_relation', NULL, 'x')",
                 "does not exist",
             ),
             (
-                "SELECT lix_row_ref('lix_file', 'not-a-uuid')",
+                "SELECT lix_row_ref('lix_file', NULL, 'not-a-uuid')",
                 "invalid primary key",
             ),
-            ("SELECT lix_row_ref('lix_file', NULL)", "non-null"),
+            ("SELECT lix_row_ref('lix_file', NULL, NULL)", "non-null"),
             (
-                "SELECT lix_row_ref('lix_file', 'a', 'b')",
+                "SELECT lix_row_ref('lix_file', NULL, 'a', 'b')",
                 "requires 1 primary-key values",
             ),
         ] {
@@ -149,9 +149,10 @@ simulation_test!(
 
         let parameterized = session
             .execute(
-                "SELECT lix_row_ref($1, $2) AS row_ref",
+                "SELECT lix_row_ref($1, $2, $3) AS row_ref",
                 &[
                     Value::Text("rr_parameter_probe".into()),
+                    Value::Null,
                     Value::Text("probe-1".into()),
                 ],
             )
@@ -161,7 +162,7 @@ simulation_test!(
 
         let literal_relation = session
             .execute(
-                "SELECT lix_row_ref('rr_parameter_probe', $1) AS row_ref",
+                "SELECT lix_row_ref('rr_parameter_probe', NULL, $1) AS row_ref",
                 &[Value::Text("probe-1".into())],
             )
             .await
@@ -170,7 +171,7 @@ simulation_test!(
 
         let expression_relation = session
             .execute(
-                "SELECT lix_row_ref(CAST($1 AS TEXT), $2) AS row_ref",
+                "SELECT lix_row_ref(CAST($1 AS TEXT), NULL, $2) AS row_ref",
                 &[
                     Value::Text("rr_parameter_probe".into()),
                     Value::Text("probe-1".into()),
@@ -182,7 +183,7 @@ simulation_test!(
 
         let column_relation = session
             .execute(
-                "SELECT lix_row_ref(relation_name, primary_key) AS row_ref \
+                "SELECT lix_row_ref(relation_name, NULL, primary_key) AS row_ref \
                  FROM (VALUES ($1, $2)) AS input(relation_name, primary_key)",
                 &[
                     Value::Text("rr_parameter_probe".into()),
@@ -195,7 +196,7 @@ simulation_test!(
 
         let error = session
             .execute(
-                "SELECT lix_row_ref($1, $2)",
+                "SELECT lix_row_ref($1, NULL, $2)",
                 &[
                     Value::Text("rr_parameter_probe_missing".into()),
                     Value::Text("probe-1".into()),
@@ -204,6 +205,205 @@ simulation_test!(
             .await
             .expect_err("unknown parameterized relations should remain rejected");
         assert!(error.to_string().contains("does not exist"), "{error}");
+    }
+);
+
+simulation_test!(
+    row_ref_union_preserves_safe_text_and_canonical_refs,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
+            &engine,
+        );
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('union-row-ref', 'value')",
+                &[],
+            )
+            .await
+            .expect("diff source row should insert");
+
+        let mixed = session
+            .execute(
+                "SELECT row_ref FROM lix_diff('lix_key_value') \
+                 UNION ALL SELECT 'plain text'",
+                &[],
+            )
+            .await
+            .expect("mixed row-ref and text UNION should remain safe text");
+        assert_eq!(mixed.column_types(), &[ResultColumnType::Text]);
+        assert_eq!(mixed.rows().len(), 2);
+        assert!(mixed.rows().iter().any(|row| {
+            matches!(row.values(), [Value::Text(value)] if value.starts_with("lix_row_ref:v2:"))
+        }));
+        assert!(mixed.rows().iter().any(|row| {
+            row.values() == [Value::Text("plain text".into())]
+        }));
+
+        let valid = session
+            .execute(
+                "SELECT row_ref FROM lix_diff('lix_key_value') \
+                 UNION ALL SELECT lix_row_ref('lix_key_value', NULL, 'union-row-ref')",
+                &[],
+            )
+            .await
+            .expect("row-ref values from both UNION inputs should materialize");
+        assert_eq!(valid.column_types(), &[ResultColumnType::RowRef]);
+        assert_eq!(valid.rows().len(), 2);
+        assert!(valid
+            .rows()
+            .iter()
+            .all(|row| matches!(row.values(), [Value::RowRef(_)])));
+    }
+);
+
+simulation_test!(
+    file_scope_distinguishes_duplicate_keys_in_diff_checkpoint_and_restore,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine.open_session().await.expect("session should open"),
+            &engine,
+        );
+        let first_file = "01991b1d-6d8b-7000-8000-0000000000a1";
+        let second_file = "01991b1d-6d8b-7000-8000-0000000000a2";
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, content) VALUES \
+                 ($1, '/row-ref-first', CAST('a' AS BYTEA)), \
+                 ($2, '/row-ref-second', CAST('b' AS BYTEA))",
+                &[Value::Text(first_file.into()), Value::Text(second_file.into())],
+            )
+            .await
+            .expect("scope files should insert");
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_file_id) VALUES \
+                 ('shared-row-ref', 'first-before', $1), \
+                 ('shared-row-ref', 'second-before', $2)",
+                &[Value::Text(first_file.into()), Value::Text(second_file.into())],
+            )
+            .await
+            .expect("duplicate file-scoped keys should insert");
+        let baseline = head(&engine, sim.main_branch_id()).await;
+
+        let first_ref = session
+            .execute(
+                "SELECT lix_row_ref('lix_key_value', $1, 'shared-row-ref')",
+                &[Value::Text(first_file.into())],
+            )
+            .await
+            .expect("first scoped row ref should construct")
+            .rows()[0]
+            .values()[0]
+            .clone();
+        let second_ref = session
+            .execute(
+                "SELECT lix_row_ref('lix_key_value', $1, 'shared-row-ref')",
+                &[Value::Text(second_file.into())],
+            )
+            .await
+            .expect("second scoped row ref should construct")
+            .rows()[0]
+            .values()[0]
+            .clone();
+        assert_ne!(first_ref, second_ref, "file scope must be part of row identity");
+
+        for (file_id, value) in [(first_file, "first-after"), (second_file, "second-after")] {
+            session.execute(
+                "UPDATE lix_key_value SET value=$1 WHERE key='shared-row-ref' AND lixcol_file_id=$2",
+                &[Value::Jsonb(json!(value).into()), Value::Text(file_id.into())],
+            ).await.expect("both scoped rows should update");
+        }
+        let changed = head(&engine, sim.main_branch_id()).await;
+        for (file_id, expected_ref, expected_value) in [
+            (first_file, &first_ref, "first-after"),
+            (second_file, &second_ref, "second-after"),
+        ] {
+            let filtered = session
+                .execute(
+                    "SELECT row_ref, key, diff_type, to_value \
+                     FROM lix_diff('lix_key_value', $1, $2) \
+                     WHERE row_ref = lix_row_ref('lix_key_value', $3, 'shared-row-ref')",
+                    &[
+                        Value::Text(baseline.clone()),
+                        Value::Text(changed.clone()),
+                        Value::Text(file_id.into()),
+                    ],
+                )
+                .await
+                .expect("exact scoped diff filter should execute");
+            assert_eq!(filtered.rows().len(), 1);
+            assert_eq!(&filtered.rows()[0].values()[0], expected_ref);
+            assert_eq!(filtered.rows()[0].values()[1], Value::Text("shared-row-ref".into()));
+            assert_eq!(filtered.rows()[0].values()[2], Value::Text("modified".into()));
+            assert_eq!(filtered.rows()[0].values()[3], Value::Jsonb(json!(expected_value).into()));
+        }
+
+        let checkpoint = session
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(ARRAY[\
+                   lix_row_ref('lix_key_value', $1, 'shared-row-ref')])",
+                &[Value::Text(first_file.into())],
+            )
+            .await
+            .expect("scoped checkpoint should select one duplicate key")
+            .rows()[0]
+            .get::<String>("commit_id")
+            .expect("checkpoint should return a commit id");
+        let remaining = session
+            .execute(
+                "SELECT row_ref FROM lix_diff('lix_key_value') \
+                 WHERE row_ref = lix_row_ref('lix_key_value', $1, 'shared-row-ref')",
+                &[Value::Text(second_file.into())],
+            )
+            .await
+            .expect("unselected scoped row should remain in the diff");
+        assert_eq!(remaining.rows().len(), 1);
+        assert_eq!(remaining.rows()[0].values()[0], second_ref);
+        let selected_crossed = session
+            .execute(
+                "SELECT row_ref FROM lix_diff('lix_key_value') \
+                 WHERE row_ref = lix_row_ref('lix_key_value', $1, 'shared-row-ref')",
+                &[Value::Text(first_file.into())],
+            )
+            .await
+            .expect("selected scoped row should cross the checkpoint");
+        assert!(selected_crossed.rows().is_empty());
+
+        for (file_id, value) in [(first_file, "first-later"), (second_file, "second-later")] {
+            session.execute(
+                "UPDATE lix_key_value SET value=$1 WHERE key='shared-row-ref' AND lixcol_file_id=$2",
+                &[Value::Jsonb(json!(value).into()), Value::Text(file_id.into())],
+            ).await.expect("later scoped edits should update both rows");
+        }
+        session
+            .execute(
+                "SELECT commit_id FROM lix_restore($1, ARRAY[\
+                   lix_row_ref('lix_key_value', $2, 'shared-row-ref')])",
+                &[
+                    Value::Text(checkpoint),
+                    Value::Text(first_file.into()),
+                ],
+            )
+            .await
+            .expect("row-scoped restore should select only the first file");
+        let current = session
+            .execute(
+                "SELECT value, lixcol_file_id FROM lix_key_value \
+                 WHERE key = 'shared-row-ref' ORDER BY lixcol_file_id",
+                &[],
+            )
+            .await
+            .expect("both scoped rows should remain readable");
+        assert_eq!(
+            current.rows().iter().map(|row| row.values().to_vec()).collect::<Vec<_>>(),
+            vec![
+                vec![Value::Jsonb(json!("first-after").into()), Value::Text(first_file.into())],
+                vec![Value::Jsonb(json!("second-later").into()), Value::Text(second_file.into())],
+            ]
+        );
     }
 );
 
@@ -346,7 +546,7 @@ async fn assert_diff(
 
     let direct = session
         .execute(
-            "SELECT lix_row_ref('row_ref_composite_member', 'parent', 7)",
+            "SELECT lix_row_ref('row_ref_composite_member', NULL, 'parent', 7)",
             &[],
         )
         .await

@@ -22,6 +22,20 @@ console.log(result.rows[0]?.message);
 await lix.close();
 ```
 
+### File-qualified row references
+
+Construct row references in SQL with the relation, file scope, and typed
+primary-key values. The file-scope argument is always present: use the owning
+file ID for a file-scoped plugin row and SQL `NULL` for fileless rows such as
+`lix_file` and `lix_directory`.
+
+```ts
+const result = await lix.execute(
+	"SELECT lix_row_ref('acme_task', $1, $2) AS row_ref",
+	[fileId, taskId],
+);
+```
+
 For compiled plugin downloads, installation, updates, and uninstalling, see
 [Installing and managing plugins](../../docs/plugins.md).
 

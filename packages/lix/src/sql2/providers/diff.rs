@@ -734,6 +734,11 @@ where
                             }
                         }
                     };
+                    // Independent storage filters can overfetch a Cartesian
+                    // superset. Preserve correlation before limits or output.
+                    if let Some(refs) = &route.row_refs {
+                        rows.retain(|row| refs.contains(&(row.file_id.clone(), row.row_pk.clone())));
+                    }
                     if !metadata_filters.is_empty() {
                         let metadata = diff_record_batch(
                             filter_schema,
@@ -865,6 +870,7 @@ fn filter_conjuncts(filters: &[Expr]) -> Vec<Expr> {
 
 #[derive(Clone, Debug)]
 struct DiffRoute {
+    row_refs: Option<BTreeSet<(Option<String>, RowPk)>>,
     request: TrackedStateDiffRequest,
     contradictory: bool,
 }
@@ -883,13 +889,38 @@ impl DiffRoute {
         let mut contradictory = row_ref_values.as_ref().is_some_and(Vec::is_empty)
             || id_values.as_ref().is_some_and(Vec::is_empty)
             || typed_row_pks.as_ref().is_some_and(Vec::is_empty);
-        let row_ref_pks = row_ref_values
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|value| {
-                let resolved = crate::row_ref::decode_str(&value).ok()?;
-                (resolved.relation == relation.name).then_some(resolved.row_pk)
-            })
+        let row_refs = row_ref_values.map(|values| {
+            values
+                .into_iter()
+                .filter_map(|value| {
+                    let resolved = crate::row_ref::decode_str(&value).ok()?;
+                    if resolved.relation != relation.name {
+                        return None;
+                    }
+                    // The public filesystem relations have a UUID primary
+                    // key. The generic row-ref codec deliberately does not
+                    // know the catalog, so reject a canonical-but-wrongly
+                    // typed filesystem address before path expansion can
+                    // feed it into uuid_row_pk and turn a no-match into an
+                    // execution error.
+                    if matches!(
+                        &relation.kind,
+                        DiffRelationKind::File | DiffRelationKind::Directory
+                    ) && !matches!(
+                        resolved.row_pk.components.as_slice(),
+                        [RowPkComponent::Uuid(_)]
+                    ) {
+                        return None;
+                    }
+                    Some((resolved.file_id, resolved.row_pk))
+                })
+                .collect::<BTreeSet<_>>()
+        });
+        contradictory |= row_refs.as_ref().is_some_and(BTreeSet::is_empty);
+        let row_ref_pks = row_refs
+            .iter()
+            .flatten()
+            .map(|(_, pk)| pk.clone())
             .collect::<Vec<_>>();
         let mut row_pks = match typed_row_pks {
             Some(typed) if !row_ref_pks.is_empty() => typed
@@ -905,6 +936,13 @@ impl DiffRoute {
         match &relation.kind {
             DiffRelationKind::Schema { schema_key } => {
                 schema_keys.push(schema_key.clone());
+                if let Some(refs) = &row_refs {
+                    file_ids.extend(refs.iter().map(|(file_id, _)| match file_id {
+                        Some(id) => NullableKeyFilter::Value(id.clone()),
+                        None => NullableKeyFilter::Null,
+                    }));
+                    file_ids.dedup();
+                }
                 if let Some(ids) = optional_values(&conjuncts, "from_lixcol_file_id")
                     .or_else(|| optional_values(&conjuncts, "to_lixcol_file_id"))
                 {
@@ -965,6 +1003,7 @@ impl DiffRoute {
                     )
                 });
         Self {
+            row_refs,
             request: TrackedStateDiffRequest {
                 filter: TrackedStateFilter {
                     schema_keys,
@@ -1019,6 +1058,7 @@ fn hot_only_diff_error(error: DataFusionError) -> DataFusionError {
 #[derive(Clone)]
 struct DiffSqlRow {
     row_pk: RowPk,
+    file_id: Option<String>,
     diff_type: &'static str,
 
     from: Option<DiffSide>,
@@ -1393,6 +1433,7 @@ fn schema_diff_rows(
         .map(|entry| {
             Ok(DiffSqlRow {
                 row_pk: entry.identity.row_pk().clone(),
+                file_id: entry.identity.file_id().map(str::to_owned),
                 diff_type: diff_type(entry.kind),
 
                 from: if needs_side {
@@ -1837,6 +1878,7 @@ where
         }
         rows.push(DiffSqlRow {
             row_pk,
+            file_id: None,
             diff_type: diff_type(kind),
             from,
             to,
@@ -1889,6 +1931,7 @@ where
         {
             rows.push(DiffSqlRow {
                 row_pk: uuid_row_pk(&id)?,
+                file_id: None,
                 diff_type: "modified",
 
                 from: Some(from),
@@ -2121,7 +2164,7 @@ fn diff_column_array(
         "row_ref" => Ok(Arc::new(StringArray::from(
             rows.iter()
                 .map(|row| {
-                    crate::row_ref::encode(&relation.name, &row.row_pk)
+                    crate::row_ref::encode(&relation.name, row.file_id.as_deref(), &row.row_pk)
                         .map(|value| value.as_str().to_owned())
                         .map_err(lix_error_to_datafusion_error)
                 })
@@ -2931,6 +2974,31 @@ mod tests {
         );
         assert!(route.request.filter.row_pks.is_empty());
         assert!(!route.request.retain_payloads);
+    }
+
+    #[test]
+    fn relation_diff_rejects_wrongly_typed_filesystem_row_refs() {
+        for relation_name in ["lix_file", "lix_directory"] {
+            let relation = DiffRelation::from_catalog(
+                PublicCatalog::fixed_system(),
+                relation_name,
+            )
+            .expect("filesystem relation is registered");
+            let malformed = crate::row_ref::encode(
+                relation_name,
+                None,
+                &RowPk::single("not-a-uuid"),
+            )
+            .expect("codec accepts catalog-independent canonical payloads");
+            let route = DiffRoute::from_filters(
+                &[col("row_ref").eq(lit(malformed.as_str()))],
+                &relation,
+                &Schema::empty(),
+            );
+
+            assert!(route.contradictory, "{relation_name} must be a no-match");
+            assert!(route.request.filter.row_pks.is_empty());
+        }
     }
 
     #[test]

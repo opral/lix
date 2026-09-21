@@ -1,16 +1,19 @@
-//! Canonical opaque encoding for public relation-qualified row addresses.
+//! Canonical opaque encoding for public relation- and file-qualified row
+//! addresses.
 
-use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use bytes::Bytes;
 use smallvec::SmallVec;
 
-use crate::row_pk::{RowPk, RowPkComponent};
 use crate::row_pk::RowPkComponentType;
+use crate::row_pk::{RowPk, RowPkComponent};
 use crate::sql2::{PublicCatalog, PublicSurfaceKind};
 use crate::{LixError, RowRef};
 
-const PREFIX: &str = "lix_row_ref:v1:";
+const PREFIX: &str = "lix_row_ref:v2:";
+const FILE_NULL_TAG: u8 = 0;
+const FILE_PRESENT_TAG: u8 = 1;
 const UUID_TAG: u8 = 1;
 const INTEGER_TAG: u8 = 2;
 const TEXT_TAG: u8 = 3;
@@ -19,6 +22,7 @@ const BYTES_TAG: u8 = 4;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResolvedRowRef {
     pub(crate) relation: String,
+    pub(crate) file_id: Option<String>,
     pub(crate) row_pk: RowPk,
 }
 
@@ -26,9 +30,9 @@ pub(crate) fn primary_key_component_types(
     catalog: &PublicCatalog,
     relation: &str,
 ) -> Result<Vec<RowPkComponentType>, LixError> {
-    let surface = catalog.surface(relation).ok_or_else(|| {
-        invalid(format!("lix_row_ref relation '{relation}' does not exist"))
-    })?;
+    let surface = catalog
+        .surface(relation)
+        .ok_or_else(|| invalid(format!("lix_row_ref relation '{relation}' does not exist")))?;
     match &surface.kind {
         PublicSurfaceKind::File | PublicSurfaceKind::Directory => {
             Ok(vec![RowPkComponentType::Uuid])
@@ -43,17 +47,37 @@ pub(crate) fn primary_key_component_types(
     }
 }
 
-pub(crate) fn encode(relation: &str, row_pk: &RowPk) -> Result<RowRef, LixError> {
-    if relation.is_empty() || relation.contains('\0') {
-        return Err(invalid("row reference relation must be non-empty text without Unicode NUL"));
-    }
-    let relation_len = u32::try_from(relation.len())
-        .map_err(|_| invalid("row reference relation is too long"))?;
+pub(crate) fn encode(
+    relation: &str,
+    file_id: Option<&str>,
+    row_pk: &RowPk,
+) -> Result<RowRef, LixError> {
+    validate_relation(relation)?;
+    validate_file_scope(relation, file_id)?;
+    let relation_len =
+        u32::try_from(relation.len()).map_err(|_| invalid("row reference relation is too long"))?;
+    let file_len = file_id
+        .map(str::len)
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| invalid("row reference file id is too long"))?;
     let component_count = u16::try_from(row_pk.components.len())
         .map_err(|_| invalid("row reference has too many primary-key components"))?;
-    let mut bytes = Vec::with_capacity(relation.len() + 32);
+    let mut bytes = Vec::with_capacity(relation.len() + file_id.map_or(0, str::len) + 35);
     bytes.extend_from_slice(&relation_len.to_be_bytes());
     bytes.extend_from_slice(relation.as_bytes());
+    match file_id {
+        None => bytes.push(FILE_NULL_TAG),
+        Some(file_id) => {
+            bytes.push(FILE_PRESENT_TAG);
+            bytes.extend_from_slice(
+                &file_len
+                    .expect("file id length was computed")
+                    .to_be_bytes(),
+            );
+            bytes.extend_from_slice(file_id.as_bytes());
+        }
+    }
     bytes.extend_from_slice(&component_count.to_be_bytes());
     for component in &row_pk.components {
         match component {
@@ -87,18 +111,27 @@ pub(crate) fn encode(relation: &str, row_pk: &RowPk) -> Result<RowRef, LixError>
 /// exposing the old JSON row-key representation.
 pub(crate) fn encode_schema_identity(
     schema_key: &str,
+    file_id: Option<&str>,
     row_pk: &RowPk,
 ) -> Result<RowRef, LixError> {
-    let relation = match schema_key {
-        "lix_file_descriptor" => "lix_file",
-        "lix_directory_descriptor" => "lix_directory",
-        relation => relation,
+    let (relation, file_id) = match schema_key {
+        // The public filesystem views are repository-wide logical relations.
+        // Their physical descriptor rows carry the file id as an internal
+        // scope, which must not become part of a public row address.
+        "lix_file_descriptor" => ("lix_file", None),
+        "lix_directory_descriptor" => ("lix_directory", None),
+        "lix_file" | "lix_directory" => (schema_key, None),
+        relation => (relation, file_id),
     };
-    encode(relation, row_pk)
+    encode(relation, file_id, row_pk)
 }
 
-pub(crate) fn schema_identity_detail(schema_key: &str, row_pk: &RowPk) -> serde_json::Value {
-    match encode_schema_identity(schema_key, row_pk) {
+pub(crate) fn schema_identity_detail(
+    schema_key: &str,
+    file_id: Option<&str>,
+    row_pk: &RowPk,
+) -> serde_json::Value {
+    match encode_schema_identity(schema_key, file_id, row_pk) {
         Ok(row_ref) => serde_json::Value::String(row_ref.as_str().to_owned()),
         Err(_) => serde_json::Value::Null,
     }
@@ -120,9 +153,18 @@ pub(crate) fn decode_str(encoded: &str) -> Result<ResolvedRowRef, LixError> {
     let relation = std::str::from_utf8(cursor.read(relation_len)?)
         .map_err(|_| invalid("lix_row_ref relation is not UTF-8"))?
         .to_owned();
-    if relation.is_empty() || relation.contains('\0') {
-        return Err(invalid("lix_row_ref relation is invalid"));
-    }
+    validate_relation(&relation)?;
+    let file_id = match cursor.read_u8()? {
+        FILE_NULL_TAG => None,
+        FILE_PRESENT_TAG => {
+            let value = std::str::from_utf8(cursor.read_sized()?)
+                .map_err(|_| invalid("lix_row_ref file id is not UTF-8"))?;
+            validate_file_id(value)?;
+            Some(value.to_owned())
+        }
+        _ => return Err(invalid("lix_row_ref contains an unknown file scope tag")),
+    };
+    validate_file_scope(&relation, file_id.as_deref())?;
     let component_count = cursor.read_u16()? as usize;
     if component_count == 0 {
         return Err(invalid("lix_row_ref primary key is empty"));
@@ -147,7 +189,11 @@ pub(crate) fn decode_str(encoded: &str) -> Result<ResolvedRowRef, LixError> {
                 RowPkComponent::String(value.to_owned().into())
             }
             BYTES_TAG => RowPkComponent::Bytes(Bytes::copy_from_slice(cursor.read_sized()?)),
-            _ => return Err(invalid("lix_row_ref contains an unknown key component type")),
+            _ => {
+                return Err(invalid(
+                    "lix_row_ref contains an unknown key component type",
+                ))
+            }
         });
     }
     if !cursor.is_finished() {
@@ -156,11 +202,57 @@ pub(crate) fn decode_str(encoded: &str) -> Result<ResolvedRowRef, LixError> {
     let row_pk = RowPk::from_components(components)
         .map_err(|error| invalid(format!("lix_row_ref primary key is invalid: {error}")))?;
     // Reject alternate encodings so equality is byte-canonical.
-    let decoded = ResolvedRowRef { relation, row_pk };
-    if encode(&decoded.relation, &decoded.row_pk)?.as_str() != encoded {
+    let decoded = ResolvedRowRef {
+        relation,
+        file_id,
+        row_pk,
+    };
+    if encode(
+        &decoded.relation,
+        decoded.file_id.as_deref(),
+        &decoded.row_pk,
+    )?
+    .as_str()
+        != encoded
+    {
         return Err(invalid("lix_row_ref is not canonically encoded"));
     }
     Ok(decoded)
+}
+
+fn validate_relation(relation: &str) -> Result<(), LixError> {
+    if relation.is_empty() || relation.contains('\0') {
+        return Err(invalid(
+            "row reference relation must be non-empty text without Unicode NUL",
+        ));
+    }
+    if matches!(relation, "lix_file_descriptor" | "lix_directory_descriptor") {
+        return Err(invalid(
+            "row reference relation must use the public filesystem relation name",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_file_id(file_id: &str) -> Result<(), LixError> {
+    if file_id.is_empty() || file_id.contains('\0') {
+        return Err(invalid(
+            "row reference file id must be non-empty text without Unicode NUL",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_file_scope(relation: &str, file_id: Option<&str>) -> Result<(), LixError> {
+    if let Some(file_id) = file_id {
+        validate_file_id(file_id)?;
+        if matches!(relation, "lix_file" | "lix_directory") {
+            return Err(invalid(format!(
+                "row reference relation '{relation}' only permits a null file scope",
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn write_sized(out: &mut Vec<u8>, value: &[u8]) -> Result<(), LixError> {
@@ -180,23 +272,37 @@ impl<'a> Cursor<'a> {
         Self { bytes, offset: 0 }
     }
     fn read(&mut self, len: usize) -> Result<&'a [u8], LixError> {
-        let end = self.offset.checked_add(len).ok_or_else(|| invalid("lix_row_ref is truncated"))?;
-        let value = self.bytes.get(self.offset..end).ok_or_else(|| invalid("lix_row_ref is truncated"))?;
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or_else(|| invalid("lix_row_ref is truncated"))?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or_else(|| invalid("lix_row_ref is truncated"))?;
         self.offset = end;
         Ok(value)
     }
-    fn read_u8(&mut self) -> Result<u8, LixError> { Ok(self.read(1)?[0]) }
+    fn read_u8(&mut self) -> Result<u8, LixError> {
+        Ok(self.read(1)?[0])
+    }
     fn read_u16(&mut self) -> Result<u16, LixError> {
-        Ok(u16::from_be_bytes(self.read(2)?.try_into().expect("two bytes")))
+        Ok(u16::from_be_bytes(
+            self.read(2)?.try_into().expect("two bytes"),
+        ))
     }
     fn read_u32(&mut self) -> Result<u32, LixError> {
-        Ok(u32::from_be_bytes(self.read(4)?.try_into().expect("four bytes")))
+        Ok(u32::from_be_bytes(
+            self.read(4)?.try_into().expect("four bytes"),
+        ))
     }
     fn read_sized(&mut self) -> Result<&'a [u8], LixError> {
         let len = self.read_u32()? as usize;
         self.read(len)
     }
-    fn is_finished(&self) -> bool { self.offset == self.bytes.len() }
+    fn is_finished(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
 }
 
 fn invalid(message: impl Into<String>) -> LixError {
@@ -213,13 +319,19 @@ mod tests {
         let row_pk = RowPk::from_components(smallvec::smallvec![
             RowPkComponent::String("parent".into()),
             RowPkComponent::Integer(7),
-        ]).unwrap();
-        let encoded = encode("json_object_member", &row_pk).unwrap();
+        ])
+        .unwrap();
+        let encoded = encode("json_object_member", None, &row_pk).unwrap();
         assert!(!encoded.as_str().contains('['));
         assert!(!encoded.as_str().contains("parent"));
-        assert_eq!(decode(&encoded).unwrap(), ResolvedRowRef {
-            relation: "json_object_member".to_owned(), row_pk,
-        });
+        assert_eq!(
+            decode(&encoded).unwrap(),
+            ResolvedRowRef {
+                relation: "json_object_member".to_owned(),
+                file_id: None,
+                row_pk,
+            }
+        );
     }
 
     #[test]
@@ -231,16 +343,70 @@ mod tests {
             RowPkComponent::Bytes(Bytes::from_static(b"\0binary\xff")),
         ])
         .unwrap();
-        let encoded = encode("typed_identity", &row_pk).unwrap();
+        let encoded = encode("typed_identity", None, &row_pk).unwrap();
         assert_eq!(decode(&encoded).unwrap().row_pk, row_pk);
-        assert_eq!(serde_json::from_value::<RowRef>(serde_json::json!(encoded.as_str())).unwrap(), encoded);
+        assert_eq!(
+            serde_json::from_value::<RowRef>(serde_json::json!(encoded.as_str())).unwrap(),
+            encoded
+        );
     }
 
     #[test]
     fn rejects_malformed_or_noncanonical_values() {
         assert!(decode_str("[\"row\"]").is_err());
         assert!(decode_str("lix_row_ref:v1:not-base64!").is_err());
+        assert!(decode_str("lix_row_ref:v1:AAAADWxpeF9rZXlfdmFsdWUAAQMAAAAFaGVsbG8").is_err());
         assert!(serde_json::from_str::<RowRef>(r#""[\"row\"]""#).is_err());
         assert!(serde_json::from_str::<RowRef>(r#""lix_row_ref:v1:not-base64!""#).is_err());
+    }
+
+    #[test]
+    fn file_scope_is_part_of_the_canonical_address() {
+        let row_pk = RowPk::single("row");
+        let unscoped = encode("state", None, &row_pk).unwrap();
+        let first_file = encode("state", Some("file-a"), &row_pk).unwrap();
+        let second_file = encode("state", Some("file-b"), &row_pk).unwrap();
+
+        assert_ne!(unscoped, first_file);
+        assert_ne!(first_file, second_file);
+        assert_eq!(decode(&unscoped).unwrap().file_id, None);
+        assert_eq!(
+            decode(&first_file).unwrap().file_id.as_deref(),
+            Some("file-a")
+        );
+        assert_eq!(
+            decode(&second_file).unwrap().file_id.as_deref(),
+            Some("file-b")
+        );
+    }
+
+    #[test]
+    fn rejects_trailing_bytes_and_private_or_scoped_filesystem_addresses() {
+        let row_pk = RowPk::single("row");
+        assert!(encode("lix_file", Some("file-a"), &row_pk).is_err());
+        assert!(encode("lix_file_descriptor", None, &row_pk).is_err());
+
+        let encoded = encode("state", None, &row_pk).unwrap();
+        let mut bytes = URL_SAFE_NO_PAD
+            .decode(encoded.as_str().strip_prefix(PREFIX).unwrap())
+            .unwrap();
+        bytes.push(0);
+        let trailing = format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes));
+        assert!(decode_str(&trailing).is_err());
+    }
+
+    #[test]
+    fn canonicalizes_physical_filesystem_identity_to_public_unscoped_alias() {
+        let row_pk = RowPk::uuid_from_canonical("01950000-0000-7000-8000-000000000001").unwrap();
+        let encoded =
+            encode_schema_identity("lix_file_descriptor", Some("physical-file"), &row_pk).unwrap();
+        assert_eq!(
+            decode(&encoded).unwrap(),
+            ResolvedRowRef {
+                relation: "lix_file".to_owned(),
+                file_id: None,
+                row_pk,
+            }
+        );
     }
 }

@@ -528,7 +528,8 @@ impl ResultColumnType {
     }
 }
 
-/// Opaque address of one logical row in one Lix relation.
+/// Opaque address of one logical row in one Lix relation and optional file
+/// scope.
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize,
 )]

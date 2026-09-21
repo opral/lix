@@ -1767,7 +1767,7 @@ async fn local_writes_checkpoints_and_folder_moves_survive_offline_reopen() {
         Some(b"original".to_vec())
     );
     let partial = replica.execute(
-        "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_key_value', 'offline-marker')])", &[])
+        "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_key_value', NULL, 'offline-marker')])", &[])
         .await.expect("create partial checkpoint offline").rows()[0]
         .get::<String>("commit_id").unwrap();
     let full = replica
@@ -2375,7 +2375,7 @@ async fn local_first_foreground_profile_scorecard() {
                 ),
                 (
                     "partial_checkpoint",
-                    "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_key_value', 'profile-marker')])",
+                    "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_key_value', NULL, 'profile-marker')])",
                 ),
                 (
                     "folder_move",

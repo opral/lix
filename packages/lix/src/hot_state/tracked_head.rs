@@ -563,7 +563,7 @@ fn current_state_duplicate_delta_error(delta: &CurrentStateDeltaRef<'_>) -> LixE
             delta.schema_key, delta.row_pk, delta.file_id
         ),
         serde_json::json!({
-            "row_ref": crate::row_ref::schema_identity_detail(delta.schema_key, delta.row_pk),
+            "row_ref": crate::row_ref::schema_identity_detail(delta.schema_key, delta.file_id, delta.row_pk),
             "file_id": delta.file_id,
             "change_id": delta.change_id.map(|value| value.to_string()),
             "commit_id": delta.commit_id.map(|value| value.to_string()),
@@ -616,6 +616,7 @@ fn reject_borrowed_guarded_live_member(
     if guarded {
         return Err(tracked_head_duplicate_insert_error_ref(
             delta.schema_key,
+            delta.file_id,
             delta.row_pk,
         ));
     }
@@ -647,7 +648,7 @@ fn reject_retention_change(
                 ),
             )
             .with_details(serde_json::json!({
-                "rowRef": crate::row_ref::encode_schema_identity(delta.schema_key, delta.row_pk)
+                "rowRef": crate::row_ref::encode_schema_identity(delta.schema_key, delta.file_id, delta.row_pk)
                     .map(|row_ref| row_ref.to_string())
                     .ok(),
             })));
@@ -665,7 +666,7 @@ fn reject_retention_change(
             ),
         )
         .with_details(serde_json::json!({
-            "rowRef": crate::row_ref::encode_schema_identity(delta.schema_key, delta.row_pk)
+            "rowRef": crate::row_ref::encode_schema_identity(delta.schema_key, delta.file_id, delta.row_pk)
                 .map(|row_ref| row_ref.to_string())
                 .ok(),
         })));
@@ -674,10 +675,10 @@ fn reject_retention_change(
 }
 
 fn tracked_head_duplicate_insert_error(key: &TrackedStateKey) -> LixError {
-    tracked_head_duplicate_insert_error_ref(&key.schema_key, &key.row_pk)
+    tracked_head_duplicate_insert_error_ref(&key.schema_key, key.file_id.as_deref(), &key.row_pk)
 }
 
-fn tracked_head_duplicate_insert_error_ref(schema_key: &str, row_pk: &RowPk) -> LixError {
+fn tracked_head_duplicate_insert_error_ref(schema_key: &str, file_id: Option<&str>, row_pk: &RowPk) -> LixError {
     LixError::new(
         LixError::CODE_UNIQUE,
         format!(
@@ -686,7 +687,7 @@ fn tracked_head_duplicate_insert_error_ref(schema_key: &str, row_pk: &RowPk) -> 
         ),
     )
     .with_details(serde_json::json!({
-        "rowRef": crate::row_ref::encode_schema_identity(schema_key, row_pk)
+        "rowRef": crate::row_ref::encode_schema_identity(schema_key, file_id, row_pk)
             .map(|row_ref| row_ref.to_string())
             .ok(),
     }))

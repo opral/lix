@@ -5321,7 +5321,7 @@ pub(super) fn selected_tracked_ref_untracked_collision_error(
     branch_id: &str,
     identity: &TrackedStateKey,
 ) -> LixError {
-    let row_ref = crate::row_ref::schema_identity_detail(&identity.schema_key, &identity.row_pk);
+    let row_ref = crate::row_ref::schema_identity_detail(&identity.schema_key, identity.file_id.as_deref(), &identity.row_pk);
     LixError::new(
         LixError::CODE_MERGE_CONFLICT,
         format!(

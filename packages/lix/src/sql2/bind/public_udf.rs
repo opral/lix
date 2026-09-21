@@ -7,8 +7,8 @@ use datafusion::sql::sqlparser::ast::{
 #[cfg(test)]
 use datafusion::sql::sqlparser::parser::Parser;
 
-use crate::LixError;
 use crate::sql2::catalog::PUBLIC_SCALAR_FUNCTION_NAMES;
+use crate::LixError;
 
 #[cfg(test)]
 pub(crate) fn validate_public_udf_calls(sql: &str) -> Result<(), LixError> {
@@ -57,9 +57,9 @@ fn validate_public_function_call(function: &Function) -> Result<(), LixError> {
     match name {
         "current_timestamp" => expect_exact_arity(name, arity, 0),
         "lix_order_between" => expect_exact_arity(name, arity, 2),
-        "lix_row_ref" if arity >= 2 => Ok(()),
+        "lix_row_ref" if arity >= 3 => Ok(()),
         "lix_row_ref" => Err(invalid_param(
-            "lix_row_ref requires a relation and at least one primary-key value",
+            "lix_row_ref requires a relation, a nullable file id, and at least one primary-key value",
         )),
         name if PUBLIC_SCALAR_FUNCTION_NAMES.contains(&name) => expect_exact_arity(name, arity, 0),
         _ => Ok(()),
