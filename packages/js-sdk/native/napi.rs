@@ -3046,14 +3046,7 @@ impl TryFrom<LixValue> for Value {
                     )
                 })?,
             )),
-            "integer" => Ok(Self::Integer(
-                value.value.and_then(|v| v.as_i64()).ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INVALID_PARAM,
-                        "integer value must be an integer",
-                    )
-                })?,
-            )),
+            "integer" => Ok(Self::Integer(crate::parse_json_integer(value.value)?)),
             "real" => {
                 let value = value.value.and_then(|v| v.as_f64()).ok_or_else(|| {
                     LixError::new(LixError::CODE_INVALID_PARAM, "real value must be a number")

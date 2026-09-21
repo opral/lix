@@ -1409,11 +1409,7 @@ impl TryFrom<LixValueDto> for Value {
                 .and_then(|value| value.as_bool())
                 .map(Self::Boolean)
                 .ok_or_else(|| invalid_param("boolean value must be a boolean")),
-            "integer" => value
-                .value
-                .and_then(|value| value.as_i64())
-                .map(Self::Integer)
-                .ok_or_else(|| invalid_param("integer value must be an integer")),
+            "integer" => crate::parse_json_integer(value.value).map(Self::Integer),
             "real" => value
                 .value
                 .and_then(|value| value.as_f64())

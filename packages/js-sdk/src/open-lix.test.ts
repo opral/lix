@@ -2412,6 +2412,25 @@ test("execute accepts explicit Value parameters", async () => {
 	await lix.close();
 });
 
+test("native execute accepts safe integer parameters across JSON number boundaries", async () => {
+	const lix = await openLix();
+	const values = [
+		-2_147_483_649,
+		-2_147_483_648,
+		4_294_967_295,
+		4_294_967_296,
+		Number.MIN_SAFE_INTEGER,
+		Number.MAX_SAFE_INTEGER,
+	];
+
+	for (const value of values) {
+		const result = await lix.execute("SELECT $1 AS value", [Value.integer(value)]);
+		expect(get(result, "value")).toBe(value);
+	}
+
+	await lix.close();
+});
+
 test("information_schema.columns SELECT * exposes the Lix column contract", async () => {
 	const lix = await openLix();
 
