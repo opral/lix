@@ -158,3 +158,102 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    jsonb_numeric_parameter_matches_integral_decimal_across_paths,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        let schema = json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "jsonb_numeric_comparison_contract",
+            "columns": [
+                {"name": "id", "type": "text", "nullable": false},
+                {"name": "payload", "type": "jsonb", "nullable": false}
+            ],
+            "primary_key": ["id"]
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES ($1)",
+                &[Value::Jsonb(schema.into())],
+            )
+            .await
+            .expect("numeric comparison schema should register");
+        session
+            .execute(
+                "INSERT INTO jsonb_numeric_comparison_contract (id, payload) \
+                 VALUES ('one', $1)",
+                &[Value::Jsonb(json!(1).into())],
+            )
+            .await
+            .expect("numeric JSONB fixture should insert");
+
+        let decimal = Value::Jsonb(json!(1.0).into());
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT id FROM jsonb_numeric_comparison_contract \
+                     WHERE payload = $1",
+                    std::slice::from_ref(&decimal),
+                )
+                .await
+                .expect("bare JSONB parameters should use canonical numeric equality"),
+            vec![vec![Value::Text("one".into())]],
+        );
+
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT id FROM jsonb_numeric_comparison_contract \
+                     WHERE payload = CAST($1 AS JSONB)",
+                    std::slice::from_ref(&decimal),
+                )
+                .await
+                .expect("JSONB cast should normalize integral decimal parameters"),
+            vec![vec![Value::Text("one".into())]],
+        );
+
+        assert_rows_eq(
+            session
+                .execute(
+                    "UPDATE jsonb_numeric_comparison_contract SET payload = payload \
+                     WHERE payload = $1 AND id LIKE '%' RETURNING id",
+                    std::slice::from_ref(&decimal),
+                )
+                .await
+                .expect("generic JSONB equality should use canonical numeric parameters"),
+            vec![vec![Value::Text("one".into())]],
+        );
+
+        assert_rows_eq(
+            session
+                .execute(
+                    "UPDATE jsonb_numeric_comparison_contract SET payload = payload \
+                     WHERE payload = $1 RETURNING id",
+                    std::slice::from_ref(&decimal),
+                )
+                .await
+                .expect("direct JSONB equality should use JSONB numeric semantics"),
+            vec![vec![Value::Text("one".into())]],
+        );
+
+        let generic_cast_update = session
+            .execute(
+                "UPDATE jsonb_numeric_comparison_contract \
+                 SET payload = CAST($1 AS JSONB) \
+                 WHERE id LIKE 'one' RETURNING payload",
+                std::slice::from_ref(&decimal),
+            )
+            .await
+            .expect("generic JSONB UPDATE should normalize integral decimals");
+        assert_eq!(
+            generic_cast_update.column_types(),
+            [lix::ResultColumnType::Jsonb]
+        );
+        assert_rows_eq(
+            generic_cast_update,
+            vec![vec![Value::Jsonb(json!(1).into())]],
+        );
+    }
+);

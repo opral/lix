@@ -6287,7 +6287,9 @@ fn normalize_json_comparison_value(
 ) -> Result<JsonValue, LixError> {
     // Explicit JSONB strings are already JSON values, not encoded JSON text.
     let is_sql_text = matches!(value, RowEvalValue::SqlText(_));
-    let value = value.into_json()?;
+    let mut value = value.into_json()?;
+    crate::sql2::udfs::common::normalize_jsonb(&mut value)
+        .map_err(|error| LixError::new(LixError::CODE_TYPE_MISMATCH, error))?;
     if !other_side_is_json {
         return Ok(value);
     }

@@ -123,7 +123,10 @@ impl SqlValue {
             crate::Value::Integer(v) => Self::Integer(*v),
             crate::Value::Real(v) => Self::Real(*v),
             crate::Value::Timestamptz(v) => Self::Timestamptz(*v),
-            crate::Value::Jsonb(v) => Self::Json(v.to_value()),
+            crate::Value::Jsonb(v) => Self::Json(
+                super::udfs::common::parse_jsonb(v.as_str())
+                    .map_err(|error| LixError::new(LixError::CODE_TYPE_MISMATCH, error))?,
+            ),
             crate::Value::RowRef(v) => Self::RowRef(v.clone()),
             crate::Value::Blob(v) => Self::Blob(v.clone()),
         })

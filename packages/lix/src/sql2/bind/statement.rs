@@ -1073,7 +1073,7 @@ fn bind_cast_expr(
     let expr = bind_inner(expr, params)?;
     if data_type == BoundCastType::Jsonb {
         return match expr {
-            BoundExpr::Literal(BoundLiteral::Text(raw)) => serde_json::from_str(&raw)
+            BoundExpr::Literal(BoundLiteral::Text(raw)) => crate::sql2::udfs::common::parse_jsonb(&raw)
                 .map(BoundLiteral::Json)
                 .map(BoundExpr::Literal)
                 .map_err(|error| {
