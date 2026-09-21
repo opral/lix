@@ -78,7 +78,10 @@ pub(super) fn json_value_to_serde(array: &dyn Array, row: usize) -> Result<Optio
 }
 
 pub(super) fn text_like_value(array: &dyn Array, row: usize) -> Result<Option<String>> {
-    if matches!(array.data_type(), datafusion::arrow::datatypes::DataType::Null) {
+    if matches!(
+        array.data_type(),
+        datafusion::arrow::datatypes::DataType::Null
+    ) {
         return Ok(None);
     }
     if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
@@ -100,19 +103,27 @@ pub(super) fn text_like_value(array: &dyn Array, row: usize) -> Result<Option<St
         }));
     }
     if let Some(array) = array.as_any().downcast_ref::<BinaryArray>() {
-        return Ok(
-            (!array.is_null(row)).then(|| String::from_utf8_lossy(array.value(row)).to_string())
-        );
+        return (!array.is_null(row))
+            .then(|| strict_json_utf8(array.value(row)))
+            .transpose();
     }
     if let Some(array) = array.as_any().downcast_ref::<LargeBinaryArray>() {
-        return Ok(
-            (!array.is_null(row)).then(|| String::from_utf8_lossy(array.value(row)).to_string())
-        );
+        return (!array.is_null(row))
+            .then(|| strict_json_utf8(array.value(row)))
+            .transpose();
     }
     Err(DataFusionError::Execution(format!(
         "unsupported argument type for JSON/text function: {:?}",
         array.data_type()
     )))
+}
+
+fn strict_json_utf8(bytes: &[u8]) -> Result<String> {
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|error| {
+            DataFusionError::Execution(format!("JSON input is not valid UTF-8: {error}"))
+        })
 }
 
 pub(super) fn numeric_value(array: &dyn Array, row: usize) -> Result<Option<String>> {

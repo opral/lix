@@ -210,3 +210,37 @@ simulation_test!(
         }
     }
 );
+
+simulation_test!(
+    binary_jsonb_casts_validate_utf8_consistently,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        session
+            .execute(
+                "INSERT INTO lix_key_value(key,value) VALUES ('binary-jsonb-cast',NULL)",
+                &[],
+            )
+            .await
+            .unwrap();
+        for bytes in [b"\"hello\"".as_slice(), &[34, 255, 34]] {
+            let params = [Value::Blob(bytes.to_vec().into())];
+            for sql in [
+                "SELECT CAST($1 AS JSONB)",
+                "UPDATE lix_key_value SET value=value WHERE key='binary-jsonb-cast' RETURNING CAST($1 AS JSONB)",
+                "UPDATE lix_key_value SET value=value WHERE key LIKE 'binary-jsonb-cast' RETURNING CAST($1 AS JSONB)",
+            ] {
+                let result = session.execute(sql, &params).await;
+                if bytes == b"\"hello\"" {
+                    assert_eq!(
+                        result.unwrap().rows()[0].values(),
+                        &[Value::Jsonb(json!("hello").into())],
+                        "{sql}"
+                    );
+                } else {
+                    assert!(result.is_err(), "invalid UTF-8 must be rejected: {sql}");
+                }
+            }
+        }
+    }
+);
