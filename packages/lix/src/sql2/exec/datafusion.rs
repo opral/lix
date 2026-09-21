@@ -52,7 +52,9 @@ use std::time::Instant;
 
 use crate::catalog::CatalogFingerprint;
 use crate::sql2::predicate_typecheck::{
-    json_predicate_placeholder_indexes_with_dfschema, validate_json_predicate_expr_with_dfschema,
+    json_predicate_placeholder_indexes_with_dfschema,
+    json_predicate_placeholder_indexes_with_dfschemas, validate_json_predicate_expr_with_dfschema,
+    validate_json_predicate_expr_with_dfschemas,
 };
 use crate::sql2::providers::ProviderSelection;
 use crate::sql2::result_metadata::{
@@ -922,16 +924,30 @@ async fn resolve_temporal_subquery_arguments(
 }
 
 fn validate_json_predicates_in_logical_plan(plan: &LogicalPlan) -> Result<(), LixError> {
+    // `LogicalPlan::expressions()` contains expressions evaluated by this
+    // node. Their columns resolve against the node's inputs, not its output
+    // schema. In particular, a projection such as `payload = ...` has only a
+    // boolean output field, so looking up `payload` in `plan.schema()` loses
+    // the JSONB metadata before predicate validation runs.
+    let input_schemas = plan
+        .inputs()
+        .into_iter()
+        .map(|input| input.schema().as_ref())
+        .collect::<Vec<_>>();
     for expr in plan.expressions() {
-        validate_json_predicate_expr_with_dfschema(plan.schema(), &expr)?;
+        if input_schemas.is_empty() {
+            validate_json_predicate_expr_in_plan(plan.schema(), &expr)?;
+        } else {
+            validate_json_predicate_expr_in_plan_schemas(&input_schemas, &expr)?;
+        }
     }
     match plan {
         LogicalPlan::Filter(filter) => {
-            validate_json_predicate_expr_with_dfschema(filter.input.schema(), &filter.predicate)?;
+            validate_json_predicate_expr_in_plan(filter.input.schema(), &filter.predicate)?;
         }
         LogicalPlan::TableScan(scan) => {
             for filter in &scan.filters {
-                validate_json_predicate_expr_with_dfschema(scan.projected_schema.as_ref(), filter)?;
+                validate_json_predicate_expr_in_plan(scan.projected_schema.as_ref(), filter)?;
             }
         }
         _ => {}
@@ -944,13 +960,52 @@ fn validate_json_predicates_in_logical_plan(plan: &LogicalPlan) -> Result<(), Li
     Ok(())
 }
 
+fn validate_json_predicate_expr_in_plan(schema: &DFSchema, expr: &Expr) -> Result<(), LixError> {
+    validate_json_predicate_expr_in_plan_schemas(&[schema], expr)
+}
+
+fn validate_json_predicate_expr_in_plan_schemas(
+    schemas: &[&DFSchema],
+    expr: &Expr,
+) -> Result<(), LixError> {
+    if schemas.len() == 1 {
+        validate_json_predicate_expr_with_dfschema(schemas[0], expr)?;
+    } else {
+        validate_json_predicate_expr_with_dfschemas(schemas, expr)?;
+    }
+    expr.apply(|nested| {
+        let subquery = match nested {
+            Expr::ScalarSubquery(subquery) => Some(&subquery.subquery),
+            Expr::InSubquery(subquery) => Some(&subquery.subquery.subquery),
+            Expr::Exists(subquery) => Some(&subquery.subquery.subquery),
+            Expr::SetComparison(subquery) => Some(&subquery.subquery.subquery),
+            _ => None,
+        };
+        if let Some(subquery) = subquery {
+            validate_json_predicates_in_logical_plan(subquery)
+                .map_err(crate::sql2::error::lix_error_to_datafusion_error)?;
+            Ok(TreeNodeRecursion::Jump)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    })
+    .map(|_| ())
+    .map_err(datafusion_error_to_lix_error)
+}
+
 fn json_predicate_params_in_logical_plan(plan: &LogicalPlan) -> BTreeSet<usize> {
     let mut params = BTreeSet::new();
+    let input_schemas = plan
+        .inputs()
+        .into_iter()
+        .map(|input| input.schema().as_ref())
+        .collect::<Vec<_>>();
     for expr in plan.expressions() {
-        params.extend(json_predicate_placeholder_indexes_with_dfschema(
-            plan.schema(),
-            &expr,
-        ));
+        if input_schemas.is_empty() {
+            collect_json_predicate_params_in_expr(plan.schema(), &expr, &mut params);
+        } else {
+            collect_json_predicate_params_in_expr_schemas(&input_schemas, &expr, &mut params);
+        }
     }
     match plan {
         LogicalPlan::Filter(filter) => {
@@ -974,6 +1029,45 @@ fn json_predicate_params_in_logical_plan(plan: &LogicalPlan) -> BTreeSet<usize> 
         params.extend(json_predicate_params_in_logical_plan(input));
     }
     params
+}
+
+fn collect_json_predicate_params_in_expr(
+    schema: &DFSchema,
+    expr: &Expr,
+    params: &mut BTreeSet<usize>,
+) {
+    collect_json_predicate_params_in_expr_schemas(&[schema], expr, params);
+}
+
+fn collect_json_predicate_params_in_expr_schemas(
+    schemas: &[&DFSchema],
+    expr: &Expr,
+    params: &mut BTreeSet<usize>,
+) {
+    if schemas.len() == 1 {
+        params.extend(json_predicate_placeholder_indexes_with_dfschema(
+            schemas[0], expr,
+        ));
+    } else {
+        params.extend(json_predicate_placeholder_indexes_with_dfschemas(
+            schemas, expr,
+        ));
+    }
+    let _ = expr.apply(|nested| {
+        let subquery = match nested {
+            Expr::ScalarSubquery(subquery) => Some(&subquery.subquery),
+            Expr::InSubquery(subquery) => Some(&subquery.subquery.subquery),
+            Expr::Exists(subquery) => Some(&subquery.subquery.subquery),
+            Expr::SetComparison(subquery) => Some(&subquery.subquery.subquery),
+            _ => None,
+        };
+        if let Some(subquery) = subquery {
+            params.extend(json_predicate_params_in_logical_plan(subquery));
+            Ok(TreeNodeRecursion::Jump)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    });
 }
 
 /// Substitutes positional parameters into a bound read plan.
