@@ -244,3 +244,38 @@ simulation_test!(
         }
     }
 );
+
+simulation_test!(
+    native_real_predicates_share_arrow_equality,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('float-equality', '1'::jsonb)",
+                &[],
+            )
+            .await
+            .unwrap();
+        for (left, right, matches) in [
+            (0.0, -0.0, false),
+            (-0.0, -0.0, true),
+            (f64::NAN, f64::NAN, true),
+            (f64::INFINITY, f64::INFINITY, true),
+        ] {
+            let params = [Value::Real(left), Value::Real(right)];
+            for sql in [
+                "SELECT key FROM lix_key_value WHERE key = 'float-equality' AND $1 = $2",
+                "UPDATE lix_key_value SET value = value WHERE key = 'float-equality' AND $1 = $2 RETURNING key",
+                "UPDATE lix_key_value SET value = value WHERE key LIKE 'float-equality' AND $1 = $2 RETURNING key",
+            ] {
+                let result = session.execute(sql, &params).await.unwrap();
+                assert_eq!(
+                    result.rows().len(),
+                    usize::from(matches),
+                    "{sql}: {left:?}, {right:?}"
+                );
+            }
+        }
+    }
+);

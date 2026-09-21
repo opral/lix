@@ -175,7 +175,8 @@ impl SqlValue {
             (Self::Boolean(a), Self::Boolean(b)) => a == b,
             (Self::Integer(a), Self::Integer(b)) => a == b,
             (Self::Unsigned(a), Self::Unsigned(b)) => a == b,
-            (Self::Real(a), Self::Real(b)) => a == b,
+            // Match Arrow total-order equality, including signed zero and NaN bits.
+            (Self::Real(a), Self::Real(b)) => a.to_bits() == b.to_bits(),
             (Self::Timestamptz(a), Self::Timestamptz(b)) => a == b,
             (Self::RowRef(a), Self::RowRef(b)) => a == b,
             (Self::Blob(a), Self::Blob(b)) => a == b,
