@@ -319,6 +319,7 @@ protocol_routes! {
    Execute => ("POST", "/execute", Json),
    ExecuteBatch => ("POST", "/execute-batch", Json),
    SyncPush => ("POST", "/sync/push", Json),
+   SyncReplaceReplica => ("POST", "/sync/replica/replace", Json),
    SyncRetainedBodies => ("POST", "/sync/retained-bodies", Json),
    SyncPartialMergeRestart => ("POST", "/sync/merge/restart", NativeObjects),
    SyncPartialMerge => ("POST", "/sync/merge", NativeObjects),
@@ -736,6 +737,7 @@ where
     engine: Arc<Engine<StorageSession<S>>>,
     options: ServerProtocolOptions,
     registry: AsyncMutex<HashMap<String, Arc<SessionRecord<S>>>>,
+    replica_publication_gate: Arc<ReplicaPublicationGate>,
     request_blob_budget: Arc<RequestBlobCacheBudget>,
     session_open_gate: Arc<SessionOpenGate>,
     active_operations: Arc<ActiveOperationGate>,
@@ -906,6 +908,7 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     lix: Arc<Lix<S>>,
+    replica_identity: Mutex<Option<String>>,
     principal: ServerProtocolPrincipal,
     transactions: AsyncMutex<RemoteTransactionRegistry<S>>,
     last_used: Mutex<Instant>,
@@ -1186,6 +1189,7 @@ where
     ) -> Self {
         Self {
             lix: Arc::new(lix),
+            replica_identity: Mutex::new(None),
             principal,
             transactions: AsyncMutex::new(RemoteTransactionRegistry::default()),
             last_used: Mutex::new(now),
@@ -1244,10 +1248,27 @@ where
     }
 }
 
+#[derive(Default)]
+struct ReplicaPublicationGate {
+    publication: tokio::sync::RwLock<()>,
+    // Retained by detached leases too, so dropping the HTTP server cannot
+    // admit another publisher while an accepted operation is still running.
+    owner: AsyncMutex<Option<crate::storage_adapter::StorageOwnerLease>>,
+}
+impl ReplicaPublicationGate {
+    async fn read(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.publication.read().await
+    }
+    async fn write(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.publication.write().await
+    }
+}
+
 struct SessionLease<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    replica_publication: Option<(Arc<ReplicaPublicationGate>, String)>,
     session_id: String,
     record: Arc<SessionRecord<S>>,
     durable_terminal_storage_notifier: Option<DurableTerminalStorageNotifier>,
@@ -1264,6 +1285,7 @@ where
     ) -> Self {
         record.activity.acquire_lease();
         Self {
+            replica_publication: None,
             session_id,
             record,
             durable_terminal_storage_notifier,
@@ -1289,6 +1311,28 @@ where
         tokio::spawn(
             async move {
                 let _operation_lease = operation_lease;
+                let _replica_guard = match &_operation_lease.replica_publication {
+                    Some((gate, replica)) => {
+                        let guard = gate.read().await;
+                        if _operation_lease
+                            .record
+                            .lix
+                            .retired_replica_replacement(
+                                _operation_lease.record.principal.account_id(),
+                                replica,
+                            )
+                            .await?
+                            .is_some()
+                        {
+                            return Err(LixError::new(
+                                "LIX_REPLICA_RETIRED",
+                                "This replica was replaced; reopen using the active replica",
+                            ));
+                        }
+                        Some(guard)
+                    }
+                    None => None,
+                };
                 let result = operation.await;
                 if let (Some(notifier), Err(error)) = (&durable_terminal_storage_notifier, &result)
                 {
@@ -1306,6 +1350,52 @@ where
                 format!("{join_context}: {error}"),
             )
         })?
+    }
+
+    fn requested_replica(&self, headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+        let identity = self
+            .record
+            .replica_identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut values = headers.get_all("lix-replica-id").iter();
+        if let Some(value) = values.next() {
+            if values.next().is_some() {
+                return Err(ApiError::bad_request("lix-replica-id must be sent once"));
+            }
+            let replica = match value.to_str() {
+                Ok(value) if valid_replica_identity(value) => value.to_owned(),
+                _ => return Err(ApiError::bad_request("invalid lix-replica-id")),
+            };
+            if identity.as_ref().is_some_and(|current| current != &replica) {
+                return Err(ApiError::bad_request(
+                    "a protocol session cannot change replica identity",
+                ));
+            }
+            return Ok(Some(replica));
+        }
+        Ok(identity.clone())
+    }
+
+    fn bind_replica(
+        &mut self,
+        replica: String,
+        gate: &Arc<ReplicaPublicationGate>,
+    ) -> Result<(), ApiError> {
+        let mut identity = self
+            .record
+            .replica_identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Another request may have bound this session while owner acquisition yielded.
+        if identity.as_ref().is_some_and(|current| current != &replica) {
+            return Err(ApiError::bad_request(
+                "a protocol session cannot change replica identity",
+            ));
+        }
+        *identity = Some(replica.clone());
+        self.replica_publication = Some((Arc::clone(gate), replica));
+        Ok(())
     }
 
     async fn run_durable<T, F, Fut>(&self, operation: F) -> Result<T, LixError>
@@ -1501,7 +1591,12 @@ where
     }
 
     async fn rollback_transaction(&self, transaction_id: String) -> Result<(), LixError> {
-        self.finish_transaction(transaction_id, RemoteTransactionOutcome::RolledBack)
+        // Retirement forbids publication, but must not prevent releasing an
+        // already-open transaction and its local resources.
+        let mut cleanup = self.clone();
+        cleanup.replica_publication = None;
+        cleanup
+            .finish_transaction(transaction_id, RemoteTransactionOutcome::RolledBack)
             .await
             .map(|_| ())
     }
@@ -1638,11 +1733,13 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
-        Self::new(
+        let mut lease = Self::new(
             self.session_id.clone(),
             Arc::clone(&self.record),
             self.durable_terminal_storage_notifier.clone(),
-        )
+        );
+        lease.replica_publication = self.replica_publication.clone();
+        lease
     }
 }
 
@@ -1890,6 +1987,7 @@ where
                 engine,
                 options,
                 registry: AsyncMutex::new(HashMap::new()),
+                replica_publication_gate: Arc::new(ReplicaPublicationGate::default()),
                 request_blob_budget: Arc::new(RequestBlobCacheBudget::new(
                     options.max_request_blob_cache_bytes,
                 )),
@@ -2014,7 +2112,7 @@ where
             Ok(session_id) => session_id,
             Err(error) => return error.into_response(),
         };
-        let lease = match self
+        let mut lease = match self
             .lease(
                 &session_id,
                 &context.principal,
@@ -2027,6 +2125,19 @@ where
         };
         if let Err(error) = validate_principal(&lease, &context.principal) {
             return error.into_response();
+        }
+        if route != Some(ProtocolRoute::SyncReplaceReplica) {
+            let admitted = async {
+                if let Some(replica) = lease.requested_replica(&parts.headers)? {
+                    self.ensure_replica_owner().await?;
+                    lease.bind_replica(replica, &self.inner.replica_publication_gate)?;
+                }
+                Ok::<(), ApiError>(())
+            }
+            .await;
+            if let Err(error) = admitted {
+                return error.into_response();
+            }
         }
         let scope = context.principal.idempotency_scope();
         let body_policy = route
@@ -2092,6 +2203,45 @@ where
                 )
                 .await,
             ),
+            Some(ProtocolRoute::SyncReplaceReplica) => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase", deny_unknown_fields)]
+                struct Replacement {
+                    replica_id: String,
+                    replacement_id: String,
+                }
+                let Json(request) = json_request!(Replacement);
+                if !valid_replica_identity(&request.replica_id)
+                    || !valid_replica_identity(&request.replacement_id)
+                    || request.replica_id == request.replacement_id
+                {
+                    return ApiError::bad_request(
+                        "replacement requires two distinct visible-ASCII replica identities of 1 to 512 bytes",
+                    )
+                    .into_response();
+                }
+                if let Err(error) = self.ensure_replica_owner().await {
+                    return error.into_response();
+                }
+                let gate = Arc::clone(&self.inner.replica_publication_gate);
+                let account = lease.record.principal.account_id().to_owned();
+                result_response(
+                    lease
+                        .run_durable(move |lix| async move {
+                            let _guard = gate.write().await;
+                            let replacement = lix
+                                .retire_replica(
+                                    &account,
+                                    &request.replica_id,
+                                    &request.replacement_id,
+                                )
+                                .await?;
+                            Ok(Json(serde_json::json!({"replicaId": replacement})))
+                        })
+                        .await
+                        .map_err(ApiError::from),
+                )
+            }
             Some(ProtocolRoute::SyncPush) => {
                 result_response(sync_push(lease, json_request!(SyncPushRequest)).await)
             }
@@ -2485,6 +2635,21 @@ where
 
     /// Closes every client session and rejects future handshakes.
     /// Repeated calls are safe.
+    async fn ensure_replica_owner(&self) -> Result<(), ApiError> {
+        let mut owner = self.inner.replica_publication_gate.owner.lock().await;
+        if owner.is_none() {
+            let adapter = self.inner.engine.storage();
+            let storage = adapter.storage();
+            *owner = Some(
+                storage
+                    .acquire_authority_owner(storage.token())
+                    .await
+                    .map_err(LixError::from)?,
+            );
+        }
+        Ok(())
+    }
+
     pub async fn close(&self) -> Result<(), LixError> {
         let mut close_result = self.inner.close_result.subscribe();
         self.inner.close_started.call_once(|| {
@@ -2920,7 +3085,7 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let durable_terminal_storage_notifier = context.durable_terminal_storage_notifier.clone();
-    let lease = match optional_session_id(&headers)? {
+    let mut lease = match optional_session_id(&headers)? {
         Some(session_id) => {
             if request.active_branch_id.is_some() {
                 return Err(ApiError::bad_request(
@@ -2960,6 +3125,10 @@ where
                 .await?
         }
     };
+    if let Some(replica) = lease.requested_replica(&headers)? {
+        server.ensure_replica_owner().await?;
+        lease.bind_replica(replica, &server.inner.replica_publication_gate)?;
+    }
     let active_branch_id = lease
         .run_cancellable_read(|lix| async move { lix.active_branch_id().await })
         .await?;
@@ -5063,6 +5232,9 @@ fn is_terminal_storage_error_code(code: &str) -> bool {
 }
 
 fn status_for_lix_error(error: &LixError) -> StatusCode {
+    if error.code == "LIX_REPLICA_RETIRED" {
+        return StatusCode::CONFLICT;
+    }
     match error.code.as_str() {
         LixError::CODE_BRANCH_NOT_FOUND
         | LixError::CODE_COMMIT_NOT_FOUND
@@ -5597,6 +5769,10 @@ struct MultiplexObserveEventResponse<'a> {
     payload: &'a MultiplexObservePayload,
 }
 
+fn valid_replica_identity(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 512 && value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+}
+
 const MIN_BLOB_DELTA_BYTES: usize = 32 * 1024;
 const BLOB_DELTA_COMPARE_CHUNK_BYTES: usize = 64;
 // Compared with only the full blob's Base64 length, this deliberately
@@ -5958,6 +6134,7 @@ mod tests {
                 ("POST", "/lix/v1/{lix_id}/observe") => "observe",
                 ("POST", "/lix/v1/{lix_id}/observe/multiplex") => "observeMultiplex",
                 ("GET", "/lix/v1/{lix_id}/snapshot") => "exportSnapshot",
+                ("POST", "/lix/v1/{lix_id}/sync/replica/replace") => "replaceReplica",
                 _ => panic!("endpoint registry needs an OpenAPI operation mapping"),
             };
             assert!(
@@ -5986,11 +6163,12 @@ mod tests {
             openapi
                 .matches("$ref: \"#/components/parameters/SyncProtocolVersion\"")
                 .count(),
-            23,
+            24,
             "every sync HTTP operation must declare the required version header",
         );
         for operation_id in [
             "syncPush",
+            "replaceReplica",
             "syncDescriptor",
             "syncRenewBaselineLease",
             "syncNativeObjects",
@@ -8927,6 +9105,445 @@ mod tests {
         let app = app().await;
         let (_session_id, _) = new_session(&app.router).await;
         assert!(app.server.inner.engine.telemetry().is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "manual profile: authority replica-fence overhead"]
+    async fn replica_fencing_profile() {
+        let app = app().await;
+        let (session, _) = new_session(&app.router).await;
+        let lease = app
+            .server
+            .lease(&session, &ServerProtocolPrincipal::Anonymous, None)
+            .await
+            .unwrap();
+        let mut tagged = lease.clone();
+        tagged.replica_publication = Some((
+            Arc::clone(&app.server.inner.replica_publication_gate),
+            "profile".to_owned(),
+        ));
+        for (name, candidate) in [("untagged", &lease), ("replica_fenced", &tagged)] {
+            let start = Instant::now();
+            for _ in 0..1000 {
+                candidate.run_durable(|_| async { Ok(()) }).await.unwrap();
+            }
+            eprintln!(
+                "replica-publication {name}: {:.2} us/operation (1000 memory-backed operations)",
+                start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replica_fencing_preserves_concurrent_publication() {
+        let app = app().await;
+        let (session, _) = new_session(&app.router).await;
+        let mut lease = app
+            .server
+            .lease(&session, &ServerProtocolPrincipal::Anonymous, None)
+            .await
+            .unwrap();
+        lease.replica_publication = Some((
+            Arc::clone(&app.server.inner.replica_publication_gate),
+            "active".to_owned(),
+        ));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let first = barrier.clone();
+        let second = barrier;
+        let operations = async {
+            let (a, b) = tokio::join!(
+                lease.run_durable(move |_| async move {
+                    first.wait().await;
+                    Ok(())
+                }),
+                lease.run_durable(move |_| async move {
+                    second.wait().await;
+                    Ok(())
+                }),
+            );
+            a.unwrap();
+            b.unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(5), operations)
+            .await
+            .expect("normal publication must remain concurrent");
+    }
+
+    #[tokio::test]
+    async fn independent_servers_cannot_race_replica_publication_and_retirement() {
+        let storage = Memory::new();
+        let first = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .with_embedded_lix_id()
+            .await
+            .unwrap();
+        let first_router = handler(first.clone());
+        let second = open_lix()
+            .with_storage(storage)
+            .serve()
+            .with_embedded_lix_id()
+            .await
+            .unwrap();
+        let second_router = handler(second.clone());
+        let (session, _) = new_session(&second_router).await;
+        let invalid = request(
+            &second_router,
+            "POST",
+            "/lix/v1/sync/replica/replace",
+            Some(&session),
+            Some(json!({"replicaId":"same", "replacementId":"same"})),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        let tagged = request_with_headers(
+            &first_router,
+            "GET",
+            "/lix/v1",
+            None,
+            &[("lix-replica-id", "old")],
+            None,
+        )
+        .await;
+        assert_eq!(
+            tagged.status(),
+            StatusCode::OK,
+            "invalid replacement must not retain ownership"
+        );
+        let refused = request_with_headers(
+            &second_router,
+            "GET",
+            "/lix/v1",
+            Some(&session),
+            &[("lix-replica-id", "new")],
+            None,
+        )
+        .await;
+        assert!(!refused.status().is_success());
+        let untagged = request(&second_router, "GET", "/lix/v1", Some(&session), None).await;
+        assert_eq!(
+            untagged.status(),
+            StatusCode::OK,
+            "failed owner acquisition must not bind the session"
+        );
+        let blocked = request(
+            &second_router,
+            "POST",
+            "/lix/v1/sync/replica/replace",
+            Some(&session),
+            Some(json!({"replicaId":"old", "replacementId":"new"})),
+        )
+        .await;
+        assert!(!blocked.status().is_success());
+        assert_eq!(
+            response_json(blocked).await["error"]["code"],
+            "LIX_STORAGE_IN_USE"
+        );
+        first.close().await.unwrap();
+        drop(first_router);
+        drop(first);
+        let replaced = request(
+            &second_router,
+            "POST",
+            "/lix/v1/sync/replica/replace",
+            Some(&session),
+            Some(json!({"replicaId":"old", "replacementId":"new"})),
+        )
+        .await;
+        assert_eq!(replaced.status(), StatusCode::OK);
+        second.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replica_retirement_survives_server_restart_and_is_account_scoped() {
+        let storage = Memory::new();
+        let server = open_lix()
+            .with_storage(storage.clone())
+            .serve()
+            .with_embedded_lix_id()
+            .await
+            .unwrap();
+        let router = handler(server.clone());
+        let (session, _) = new_session(&router).await;
+        let response = request(
+            &router,
+            "POST",
+            "/lix/v1/sync/replica/replace",
+            Some(&session),
+            Some(json!({"replicaId":"old", "replacementId":"new"})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        server.close().await.unwrap();
+        drop(router);
+        drop(server);
+        let server = open_lix()
+            .with_storage(storage)
+            .serve()
+            .with_embedded_lix_id()
+            .await
+            .unwrap();
+        let router = handler(server.clone());
+        let (session, _) = new_session(&router).await;
+        let lease = server
+            .lease(&session, &ServerProtocolPrincipal::Anonymous, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            lease
+                .record
+                .lix
+                .retired_replica_replacement(lix::ANONYMOUS_ACCOUNT_ID, "old")
+                .await
+                .unwrap(),
+            Some("new".to_owned())
+        );
+        assert_eq!(
+            lease
+                .record
+                .lix
+                .retired_replica_replacement("different-account", "old")
+                .await
+                .unwrap(),
+            None
+        );
+        drop(lease);
+        server.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replica_retirement_does_not_wait_on_an_open_transaction_and_allows_rollback() {
+        let app = app().await;
+        let (session, _) = new_session(&app.router).await;
+        let mut lease = app
+            .server
+            .lease(&session, &ServerProtocolPrincipal::Anonymous, None)
+            .await
+            .unwrap();
+        lease.replica_publication = Some((
+            Arc::clone(&app.server.inner.replica_publication_gate),
+            "old".to_owned(),
+        ));
+        let transaction = lease.begin_transaction().await.unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            request(
+                &app.router,
+                "POST",
+                "/lix/v1/sync/replica/replace",
+                Some(&session),
+                Some(json!({"replicaId":"old","replacementId":"new"})),
+            ),
+        )
+        .await
+        .expect("retirement must not wait for the next transaction request");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            lease
+                .commit_transaction(transaction.clone())
+                .await
+                .unwrap_err()
+                .code,
+            "LIX_REPLICA_RETIRED"
+        );
+        lease.rollback_transaction(transaction).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replica_retirement_waits_for_detached_publication_after_disconnect() {
+        let app = app().await;
+        let (session, _) = new_session(&app.router).await;
+        let mut lease = app
+            .server
+            .lease(&session, &ServerProtocolPrincipal::Anonymous, None)
+            .await
+            .unwrap();
+        lease.replica_publication = Some((
+            Arc::clone(&app.server.inner.replica_publication_gate),
+            "old".to_owned(),
+        ));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let entered_task = entered.clone();
+        let release_task = release.clone();
+        let task = tokio::spawn(async move {
+            lease
+                .run_durable(move |_| async move {
+                    entered_task.notify_one();
+                    release_task.notified().await;
+                    Ok(())
+                })
+                .await
+        });
+        entered.notified().await;
+        task.abort(); // Only the HTTP-facing future dies; publication is detached.
+        let _ = task.await;
+        let router = app.router.clone();
+        let replacement = tokio::spawn(async move {
+            request(
+                &router,
+                "POST",
+                "/lix/v1/sync/replica/replace",
+                Some(&session),
+                Some(json!({"replicaId":"old", "replacementId":"new"})),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!replacement.is_finished());
+        assert!(
+            app.server
+                .inner
+                .replica_publication_gate
+                .publication
+                .try_write()
+                .is_err()
+        );
+        release.notify_one();
+        assert_eq!(replacement.await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn replica_replacement_rejects_unusable_header_identities() {
+        let app = app().await;
+        let (session, _) = new_session(&app.router).await;
+        for invalid in ["", "line\nbreak", "non-ascii-é", "tab\tvalue", " padded "] {
+            for body in [
+                json!({"replicaId":"old", "replacementId":invalid}),
+                json!({"replicaId":invalid, "replacementId":"new"}),
+            ] {
+                let response = request(&app.router, "POST", "/lix/v1/sync/replica/replace", Some(&session), Some(body)).await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            }
+        }
+        let response = request(&app.router, "POST", "/lix/v1/sync/replica/replace", Some(&session), Some(json!({"replicaId":"old", "replacementId":"usable"}))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["replicaId"], "usable");
+    }
+
+    #[tokio::test]
+    async fn replica_replacement_is_idempotent_and_fences_reconnected_writers() {
+        let app = app().await;
+        let (session, _) = new_session(&app.router).await;
+        let replace = request(
+            &app.router,
+            "POST",
+            "/lix/v1/sync/replica/replace",
+            Some(&session),
+            Some(json!({"replicaId":"old", "replacementId":"new"})),
+        )
+        .await;
+        assert_eq!(replace.status(), StatusCode::OK);
+        assert_eq!(response_json(replace).await["replicaId"], "new");
+        let retry = request(
+            &app.router,
+            "POST",
+            "/lix/v1/sync/replica/replace",
+            Some(&session),
+            Some(json!({"replicaId":"old", "replacementId":"other"})),
+        )
+        .await;
+        assert_eq!(response_json(retry).await["replicaId"], "new");
+        let opened = request_with_headers(
+            &app.router,
+            "GET",
+            "/lix/v1",
+            None,
+            &[("lix-replica-id", "old")],
+            None,
+        )
+        .await;
+        assert_eq!(opened.status(), StatusCode::OK);
+        let reconnected = response_json(opened).await["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let rebound = request_with_headers(
+            &app.router,
+            "GET",
+            "/lix/v1",
+            Some(&reconnected),
+            &[("lix-replica-id", "new")],
+            None,
+        )
+        .await;
+        assert_eq!(
+            rebound.status(),
+            StatusCode::BAD_REQUEST,
+            "resuming a handshake cannot change its replica"
+        );
+        let write = json!({"sql":"INSERT INTO lix_key_value (key,value) VALUES ('retired-write','forbidden')"});
+        let rejected = request_with_headers(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&reconnected),
+            &[
+                ("lix-replica-id", "old"),
+                (IDEMPOTENCY_KEY_HEADER, "retired-write"),
+            ],
+            Some(write.clone()),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(rejected).await["error"]["code"],
+            "LIX_REPLICA_RETIRED"
+        );
+        let omitted = request_with_headers(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&reconnected),
+            &[(IDEMPOTENCY_KEY_HEADER, "retired-write")],
+            Some(write.clone()),
+        )
+        .await;
+        assert_eq!(
+            omitted.status(),
+            StatusCode::CONFLICT,
+            "omitting the header cannot unbind an admitted replica session"
+        );
+        let changed = request_with_headers(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&reconnected),
+            &[
+                ("lix-replica-id", "new"),
+                (IDEMPOTENCY_KEY_HEADER, "retired-write"),
+            ],
+            Some(write),
+        )
+        .await;
+        assert_eq!(changed.status(), StatusCode::BAD_REQUEST);
+        let lease = app
+            .server
+            .lease(&reconnected, &ServerProtocolPrincipal::Anonymous, None)
+            .await
+            .unwrap();
+        let mut retired = lease.clone();
+        retired.replica_publication = Some((
+            Arc::clone(&app.server.inner.replica_publication_gate),
+            "old".to_owned(),
+        ));
+        let executed = Arc::new(AtomicBool::new(false));
+        let seen = executed.clone();
+        let error = retired
+            .run_durable(move |_| async move {
+                seen.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "LIX_REPLICA_RETIRED");
+        assert!(!executed.load(Ordering::SeqCst));
+        let mut active = lease;
+        active.replica_publication = Some((
+            Arc::clone(&app.server.inner.replica_publication_gate),
+            "new".to_owned(),
+        ));
+        active.run_durable(|_| async { Ok(()) }).await.unwrap();
     }
 
     #[tokio::test]

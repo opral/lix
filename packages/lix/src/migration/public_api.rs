@@ -201,10 +201,35 @@ where
     } else if before.format == Some(79) {
         let adapter = super::epoch::inspect_existing_epoch_adapter(storage).await?;
         let read = super::MigrationPlanningRead::new(&adapter).await?;
-        let plan = super::incorporation::preservation_plan(&read, options).await?;
+        let mut plan = super::incorporation::preservation_plan(&read, options).await?;
+        if before.role == RepositoryRole::Authority {
+            plan.put_mutable(
+                crate::sync::SYNC_AUTHORITY_STATE_SPACE,
+                vec![(
+                    crate::sync::authority_state_key().0.to_vec(),
+                    crate::sync::AUTHORITY_STATE_VALUE.to_vec(),
+                )],
+            )?;
+        }
         read.finish()?;
         (
             "v79-canonical-plan-v1",
+            content_digest_with_plan(storage, Some(plan)).await?,
+        )
+    } else if before.role == RepositoryRole::Authority && !before.current {
+        let mut plan = super::publish::PublicationPlan::bounded(
+            options.max_changes,
+            options.max_preflight_bytes,
+        );
+        plan.put_mutable(
+            crate::sync::SYNC_AUTHORITY_STATE_SPACE,
+            vec![(
+                crate::sync::authority_state_key().0.to_vec(),
+                crate::sync::AUTHORITY_STATE_VALUE.to_vec(),
+            )],
+        )?;
+        (
+            "authority-capability-marker-v1",
             content_digest_with_plan(storage, Some(plan)).await?,
         )
     } else {
@@ -406,7 +431,8 @@ mod tests {
         let reopened = crate::open_lix()
             .with_storage(storage.clone())
             .on_progress(move |event| observed.lock().unwrap().push(event))
-            .await.unwrap();
+            .await
+            .unwrap();
         assert_eq!(reopened.lix_id(), original_id);
         assert_eq!(
             reopened.open_report().migrations,
@@ -621,7 +647,11 @@ mod tests {
         // Seed historical metadata through the fixture's migration writer;
         // ordinary partial writer capabilities remain sync-private.
         use crate::storage_adapter::StorageWrite as _;
-        let mut write = installed.adapter.begin_migration_write(Default::default()).await.unwrap();
+        let mut write = installed
+            .adapter
+            .begin_migration_write(Default::default())
+            .await
+            .unwrap();
         writes.lower_into(&mut write).await.unwrap();
         write.commit().await.unwrap();
         super::super::epoch::stage_v80_repository_for_test(&storage, true)
@@ -691,6 +721,70 @@ mod tests {
             content_digest(&storage).await.unwrap(),
             report.expected_content_digest,
             "an unplanned user-record mutation must never pass the canonical witness"
+        );
+    }
+
+    #[tokio::test]
+    async fn v5_authority_upgrade_changes_only_the_capability_marker() {
+        verify_v5_authority_upgrade(false).await;
+        verify_v5_authority_upgrade(true).await;
+    }
+
+    async fn verify_v5_authority_upgrade(from_v79: bool) {
+        let storage = StorageSession::acquire(crate::Memory::new()).await.unwrap();
+        let lix = crate::open_lix()
+            .with_storage(storage.clone())
+            .await
+            .unwrap();
+        lix.execute(
+            "INSERT INTO lix_key_value (key,value) VALUES ('preserved','yes')",
+            &[],
+        )
+        .await
+        .unwrap();
+        lix.close().await.unwrap();
+        let adapter = super::super::epoch::inspect_existing_epoch_adapter(&storage)
+            .await
+            .unwrap();
+        let mut write = adapter
+            .begin_migration_write(Default::default())
+            .await
+            .unwrap();
+        write
+            .put_many(
+                crate::sync::SYNC_AUTHORITY_STATE_SPACE,
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: crate::sync::authority_state_key(),
+                        value: StorageValue {
+                            bytes: Bytes::from_static(
+                                b"certified-authority-v5-native-baseline-leases",
+                            ),
+                        },
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        write.commit().await.unwrap();
+        drop(adapter);
+        if from_v79 {
+            super::super::epoch::stage_repository_format_for_test(&storage, false, 79)
+                .await
+                .unwrap();
+        }
+        let report = migrate_repository(storage.clone()).await.unwrap();
+        assert_eq!(report.before.role, RepositoryRole::Authority);
+        assert!(!report.before.current);
+        assert!(report.after.current);
+        assert!(report.semantic_preservation_verified);
+        assert_eq!(
+            report.preservation_basis,
+            if from_v79 { "v79-canonical-plan-v1" } else { "authority-capability-marker-v1" }
+        );
+        assert_eq!(
+            content_digest(&storage).await.unwrap(),
+            report.expected_content_digest
         );
     }
 

@@ -371,7 +371,9 @@ pub(super) fn hydrate_demand<'a, S: Storage + Clone + Send + Sync + 'static, C: 
                 Err(error)
             }
             Err(error) => match required {
-                Some(required) => hydrate_exact_demand(storage, state, transport, required, true).await,
+                Some(required) => {
+                    hydrate_exact_demand(storage, state, transport, required, true).await
+                }
                 None => Err(error),
             },
         }
@@ -1466,6 +1468,7 @@ fn is_terminal_partial_transport_error(error: &LixError) -> bool {
             | super::SYNC_REPOSITORY_ID_MISMATCH_CODE
             | super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE
             | "LIX_PARTIAL_MERGE_PROOF_UNAVAILABLE"
+            | "LIX_REPLICA_RETIRED"
     )
 }
 
@@ -1479,6 +1482,50 @@ mod tests {
     use crate::sync::native_metadata::native_metadata_is_resident;
     use crate::{Memory, open_lix};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn retired_replica_stops_worker_and_resolves_queued_demands() {
+        let (storage, state, _, _, address) = fixture(false).await;
+        let (_shutdown, shutdown_rx) = tokio::sync::watch::channel(SyncShutdown::Running);
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        let connects = Arc::new(AtomicUsize::new(0));
+        let connect = {
+            let connects = connects.clone();
+            move || -> SyncTransportFuture<'static, HttpSyncTransport<Client>> {
+                connects.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Err(LixError::new("LIX_REPLICA_RETIRED", "replaced")) })
+            }
+        };
+        let mut responses = Vec::new();
+        for _ in 0..2 {
+            let (response, done) = tokio::sync::oneshot::channel();
+            sender
+                .send(SyncDemand {
+                    request: SyncDemandRequest::NativeMetadata(
+                        vec![address.clone()],
+                        LixError::unknown("missing"),
+                    ),
+                    response,
+                })
+                .await
+                .unwrap();
+            responses.push(done);
+        }
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_partial_worker_connecting(storage, state, None, connect, shutdown_rx, receiver),
+        )
+        .await
+        .expect("retired worker must stop instead of retrying");
+        assert_eq!(result.unwrap_err().code, "LIX_REPLICA_RETIRED");
+        for response in responses {
+            assert_eq!(
+                response.await.unwrap().unwrap_err().code,
+                "LIX_REPLICA_RETIRED"
+            );
+        }
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+    }
 
     #[tokio::test]
     async fn queued_resident_demand_succeeds_offline_without_connecting() {
@@ -1630,7 +1677,10 @@ mod tests {
         impl RawHttpClient for FaultClient {
             fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
                 Box::pin(async move {
-                    assert!(!request.url.ends_with("/sync/native-metadata-walk"), "optional graph records must not launch nested metadata prefetch");
+                    assert!(
+                        !request.url.ends_with("/sync/native-metadata-walk"),
+                        "optional graph records must not launch nested metadata prefetch"
+                    );
                     let metadata = request.url.ends_with("/sync/native-metadata");
                     if !metadata && !request.url.ends_with("/sync/native-objects") {
                         return self.inner.send(request).await;
@@ -1712,9 +1762,13 @@ mod tests {
                     let addresses = vec![
                         address.clone(),
                         if optional_graph {
-                            NativeMetadataRef::CommitGraphRecord("00000000-0000-7000-8000-000000000598".into())
+                            NativeMetadataRef::CommitGraphRecord(
+                                "00000000-0000-7000-8000-000000000598".into(),
+                            )
                         } else {
-                            NativeMetadataRef::CommitStateHeader("00000000-0000-7000-8000-000000000598".into())
+                            NativeMetadataRef::CommitStateHeader(
+                                "00000000-0000-7000-8000-000000000598".into(),
+                            )
                         },
                     ];
                     let error = NativeMetadataRef::annotate_missing_batch(
@@ -1724,7 +1778,9 @@ mod tests {
                     SyncDemandRequest::NativeMetadata(
                         addresses,
                         NativeHistoryFrontier::annotate_optional_suffix(
-                            NativeMetadataRef::annotate_history_demand(error, true), 1),
+                            NativeMetadataRef::annotate_history_demand(error, true),
+                            1,
+                        ),
                     )
                 };
                 assert!(

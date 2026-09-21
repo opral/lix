@@ -584,11 +584,14 @@ pub(crate) const SYNC_REPLICA_STATE_SPACE: StorageSpace = StorageSpace::declare(
 // roles, so their distinct keys share the existing private sync-control space.
 // Keeping the marker here avoids expanding the public registered-space list.
 pub(crate) const SYNC_AUTHORITY_STATE_SPACE: StorageSpace = SYNC_REPLICA_STATE_SPACE;
+pub(crate) const SYNC_REPLICA_RETIREMENT_SPACE: StorageSpace = StorageSpace::declare(
+    StorageSpaceId(0x0007_0022), "sync.replica_retirement.v1", ValueSemantics::Mutable,
+);
 
 const SEQUENCE_KEY: &[u8] = b"repository";
 const REPLICA_STATE_KEY: &[u8] = b"repository";
 const AUTHORITY_STATE_KEY: &[u8] = b"authority";
-pub(crate) const AUTHORITY_STATE_VALUE: &[u8] = b"certified-authority-v5-native-baseline-leases";
+pub(crate) const AUTHORITY_STATE_VALUE: &[u8] = b"certified-authority-v6-replica-retirement";
 const AMBIGUOUS_REPLICA_STATE_CODE: &str = "LIX_ERROR_SYNC_REPLICA_STATE_AMBIGUOUS";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

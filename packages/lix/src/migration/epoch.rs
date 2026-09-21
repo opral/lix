@@ -1431,7 +1431,7 @@ where
             .await?
             .value;
             if matches!(marker.first(), Some(Some(ProjectedValue::FullValue(value)))
-                if value.as_ref() == b"certified-authority-v4")
+                if super::authority_baseline_fence::is_previous_authority_marker(value.as_ref()))
             {
                 plan.get_or_insert_with(|| {
                     super::publish::PublicationPlan::bounded(

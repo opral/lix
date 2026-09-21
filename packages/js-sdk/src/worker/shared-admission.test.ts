@@ -104,3 +104,10 @@ test("admission bounds retries for non-migration service unavailability", async 
   await expect(requestAdmission(url, headers, transport)).rejects.toMatchObject({code: "LIX_ADMISSION_UNAVAILABLE", details: {admissionRetryExhausted: true}});
   expect(transport).toHaveBeenCalledTimes(5);
 }, 15_000);
+
+test("replica routing preserves offline proof while credential rotation does not", async () => {
+  const cache = new SharedAdmissionCache();
+  cache.record(url, headers, identity);
+  expect(await cache.verify(url, [...headers, ["lix-replica-id", "replica-a"]], identity, offline)).toEqual({identity, online: false});
+  await expect(cache.verify(url, [["Authorization", "Bearer rotated"], ["lix-replica-id", "replica-a"]], identity, offline)).rejects.toMatchObject({code: "LIX_IDENTITY_UNVERIFIED_OFFLINE"});
+});

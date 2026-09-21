@@ -15,7 +15,10 @@ const ANONYMOUS_ACCOUNT_ID = "00000000-0000-7000-8000-000000000002";
 
 export function sharedCredentialKey(url: string, headers: [string, string][]): string {
   const entries: [string, string][] = [];
-  new Headers(headers).forEach((value, key) => entries.push([key, value]));
+  // Replica routing is not an authentication credential. Preserve pre-routing offline proofs.
+  new Headers(headers).forEach((value, key) => {
+    if (key !== "lix-replica-id") entries.push([key, value]);
+  });
   return JSON.stringify([url, entries]);
 }
 export function sameAdmission(a: AdmissionIdentity, b: AdmissionIdentity): boolean {

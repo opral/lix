@@ -845,6 +845,7 @@ pub struct SlateDB {
     immutable_value_store: ImmutableValueStore,
     write_gate: WriteGate,
     sessions: Arc<StorageSessionGate>,
+    authority_owner: Arc<lix::storage::StorageOwnerGate>,
     write_pipeline: WritePipeline,
     point_cache: SnapshotPointCache,
     startup_immutable_gc: StartupImmutableGc,
@@ -2481,6 +2482,7 @@ impl SlateDB {
             path: PathBuf::from(db_path),
             write_gate: WriteGate::new(),
             sessions: Arc::new(StorageSessionGate::default()),
+            authority_owner: Arc::new(lix::storage::StorageOwnerGate::default()),
             write_pipeline: WritePipeline::new(),
             point_cache: SnapshotPointCache::new(),
             startup_immutable_gc: StartupImmutableGc::default(),
@@ -2566,6 +2568,15 @@ impl Storage for SlateDB {
             let _writer_permit = self.write_gate.acquire(false).await;
             self.sessions.acquire()
         }
+    }
+
+    async fn acquire_authority_owner(
+        &self,
+        session: StorageSessionToken,
+    ) -> Result<lix::storage::StorageOwnerLease, StorageError> {
+        let _session = self.sessions.validate(Some(session))?;
+        self.write_pipeline.terminal_error()?;
+        self.authority_owner.try_acquire()
     }
 
     fn begin_read(
@@ -7467,6 +7478,31 @@ mod tests {
         let mut values = [None];
         cache.get_many(7, &keys, &mut values);
         assert_eq!(values, [Some(Some(Bytes::from_static(b"value")))]);
+    }
+
+    #[test]
+    fn authority_owner_excludes_cloned_servers_until_last_lease_drops() {
+        let storage = SlateDB::open_object_store_with_options(
+            "test-authority-owner",
+            Arc::new(InMemory::new()),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .unwrap();
+        let token = block_on(storage.acquire_session()).unwrap();
+        let lease = block_on(storage.acquire_authority_owner(token)).unwrap();
+        let retained = lease.clone();
+        let other = storage.clone();
+        assert!(matches!(
+            block_on(other.acquire_authority_owner(token)),
+            Err(StorageError::InUse)
+        ));
+        drop(lease);
+        assert!(matches!(
+            block_on(other.acquire_authority_owner(token)),
+            Err(StorageError::InUse)
+        ));
+        drop(retained);
+        let _next = block_on(other.acquire_authority_owner(token)).unwrap();
     }
 
     #[test]

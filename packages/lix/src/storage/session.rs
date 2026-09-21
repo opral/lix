@@ -88,6 +88,16 @@ where
         self.storage.acquire_partial_replica_owner(self.token).await
     }
 
+    async fn acquire_authority_owner(
+        &self,
+        session: StorageSessionToken,
+    ) -> Result<crate::storage::StorageOwnerLease, StorageError> {
+        if session != self.token {
+            return Err(StorageError::Fenced);
+        }
+        self.storage.acquire_authority_owner(self.token).await
+    }
+
     fn begin_read(
         &self,
         mut opts: ReadOptions,

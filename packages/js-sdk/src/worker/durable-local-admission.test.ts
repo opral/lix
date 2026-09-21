@@ -70,3 +70,11 @@ test("storage failures are explicit rather than authorizing an offline open", as
   await expect(proof.record(headers, identity)).rejects.toThrow("quota");
   await expect(proof.remove(headers)).rejects.toThrow("unavailable");
 });
+
+test("adding replica routing preserves an existing durable offline proof", async () => {
+  const { store } = memory();
+  await new DurableLocalAdmission("physical-A", url, store).record(headers, identity);
+  const reopened = new DurableLocalAdmission("physical-A", url, store);
+  expect(await reopened.read([...headers, ["lix-replica-id", "replica-a"]])).toEqual(identity);
+  expect(await reopened.read([["Authorization", "Bearer rotated"], ["lix-replica-id", "replica-a"]])).toBeUndefined();
+});
