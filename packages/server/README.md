@@ -162,3 +162,18 @@ repository commits are separate attributes, never substitutes for trace IDs.
 `lix.runtime.wait_open` and `lix.runtime.wait_cleanup` identify blocked waits.
 One manager-owned `lix.runtime.open` span describes actual shared opening work;
 callers joining an in-progress open link their acquire span to that shared span.
+
+The optional cross-repository trace test uses LixRay's real JavaScript client
+against an in-memory Rust server over localhost TCP (no S3 or Docker needed).
+After installing LixRay's dependencies and building its pinned JS SDK, run this
+one test separately; it installs the process-global tracing subscriber just as
+production does:
+
+```sh
+LIX_TRACE_NODE_FIXTURE=/absolute/path/to/lixray/web-app/scripts/trace-integration.mjs \
+  cargo test -p lix-server --lib node_client_trace_integration -- --ignored --nocapture
+```
+
+It checks the exact JS client → Rust server parent IDs for handshake, account
+provisioning, transaction execution/commit, checkpoint, and session cleanup,
+plus SQL and checkpoint trace identity.

@@ -44,7 +44,7 @@ use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tokio::sync::{Mutex, OnceCell, OwnedRwLockReadGuard, RwLock, watch};
 use tokio::task::JoinSet;
-use tracing::{Instrument, info, info_span};
+use tracing::{Instrument, info, info_span, instrument::WithSubscriber as _};
 
 #[cfg(test)]
 fn test_telemetry_sink() -> Arc<dyn lix_sdk::telemetry::TelemetrySink> {
@@ -811,7 +811,8 @@ impl LixRuntimeManager {
                     }
                 }
             }
-            .instrument(span),
+            .instrument(span)
+            .with_current_subscriber(),
         );
     }
 
@@ -836,8 +837,11 @@ impl LixRuntimeManager {
         let manager = Arc::clone(self);
         let runtime = Handle::current();
         let span = tracing::Span::current();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         tokio::task::spawn_blocking(move || {
-            runtime.block_on(manager.open_lix(&lix_id, &opened).instrument(span))
+            tracing::dispatcher::with_default(&dispatch, || {
+                runtime.block_on(manager.open_lix(&lix_id, &opened).instrument(span))
+            })
         })
         .await
         .context("join lix runtime initialization")?
@@ -2340,6 +2344,117 @@ mod tests {
         });
         manager.provision_test_repositories().await;
         manager
+    }
+
+    #[tokio::test]
+    async fn shared_open_exports_one_work_span_and_joiner_link() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
+        use tracing::instrument::WithSubscriber as _;
+        use tracing_subscriber::{Layer, layer::SubscriberExt};
+
+        #[derive(Clone, Debug, Default)]
+        struct Exporter(Arc<std::sync::Mutex<Vec<SpanData>>>);
+        impl SpanExporter for Exporter {
+            async fn export(
+                &self,
+                batch: Vec<SpanData>,
+            ) -> opentelemetry_sdk::error::OTelSdkResult {
+                self.0.lock().unwrap().extend(batch);
+                Ok(())
+            }
+        }
+        struct Waits(tokio::sync::mpsc::UnboundedSender<()>);
+        impl<S: tracing::Subscriber> Layer<S> for Waits {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                _: &tracing::span::Id,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if attrs.metadata().name() == "lix.runtime.wait_open" {
+                    let _ = self.0.send(());
+                }
+            }
+        }
+        let exporter = Exporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let (wait_tx, mut wait_rx) = tokio::sync::mpsc::unbounded_channel();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry()
+                .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")))
+                .with(Waits(wait_tx)),
+        );
+        // This is a current-thread runtime: keep the subscriber installed through
+        // task destruction as well as polling so tracing closes parent references.
+        let _subscriber = tracing::dispatcher::set_default(&dispatch);
+        let gate = TestOpenGate {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+            starts: Arc::new(AtomicUsize::new(0)),
+            fail_next: Arc::new(AtomicBool::new(false)),
+        };
+        let manager = memory_manager_with_open_gate(1, gate.clone()).await;
+        let run = |manager: Arc<LixRuntimeManager>| {
+            let dispatch = dispatch.clone();
+            tokio::spawn(
+                async move {
+                    drop(manager.get(LIX_A).await.unwrap());
+                }
+                .with_subscriber(dispatch),
+            )
+        };
+        let first = run(manager.clone());
+        tokio::time::timeout(Duration::from_secs(5), wait_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = run(manager.clone());
+        tokio::time::timeout(Duration::from_secs(5), wait_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        gate.release.notify_one();
+        first.await.unwrap();
+        second.await.unwrap();
+        manager.shutdown().await.unwrap();
+        provider.force_flush().unwrap();
+        let spans = exporter.0.lock().unwrap().clone();
+        let opens: Vec<_> = spans
+            .iter()
+            .filter(|s| s.name == "lix.runtime.open")
+            .collect();
+        let acquires: Vec<_> = spans
+            .iter()
+            .filter(|s| s.name == "lix.runtime.acquire")
+            .collect();
+        assert_eq!(opens.len(), 1);
+        assert_eq!(
+            acquires.len(),
+            2,
+            "all spans: {:?}",
+            spans
+                .iter()
+                .map(|s| (
+                    s.name.as_ref(),
+                    s.span_context.span_id().to_string(),
+                    s.parent_span_id.to_string()
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(
+            acquires[0].span_context.trace_id(),
+            acquires[1].span_context.trace_id()
+        );
+        let joiner = acquires
+            .iter()
+            .find(|s| s.span_context.trace_id() != opens[0].span_context.trace_id())
+            .unwrap();
+        assert_eq!(joiner.links.links.len(), 1);
+        assert_eq!(joiner.links.links[0].span_context, opens[0].span_context);
+        assert_eq!(gate.starts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -306,7 +306,7 @@ async fn protocol_requests_export_remote_parents_without_cross_request_context()
         request("00-33333333333333333333333333333333-cccccccccccccccc-00"),
     );
     provider.force_flush().unwrap();
-    let spans = exporter.0.lock().unwrap();
+    let spans = exporter.0.lock().unwrap().clone();
     let requests: Vec<_> = spans
         .iter()
         .filter(|s| s.name == "Lix protocol request")
@@ -415,7 +415,7 @@ async fn protocol_handshake_and_sql_remain_in_remote_trace() {
     .await;
     provider.force_flush().unwrap();
     {
-        let spans = exporter.0.lock().unwrap();
+        let spans = exporter.0.lock().unwrap().clone();
         let sql = spans
             .iter()
             .find(|s| s.name == "lix.sql.query")
@@ -430,6 +430,125 @@ async fn protocol_handshake_and_sql_remain_in_remote_trace() {
             parent_id = parent.parent_span_id;
         }
         assert_eq!(parent_id.to_string(), "eeeeeeeeeeeeeeee");
+    }
+    manager.shutdown().await.unwrap();
+}
+
+/// Opt-in cross-repository contract: LIX_TRACE_NODE_FIXTURE points to LixRay's
+/// web-app/scripts/trace-integration.mjs. It uses the real JS SDK over TCP.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires LixRay checkout with installed Node dependencies and built SDK"]
+async fn node_client_trace_integration() {
+    use tracing::instrument::WithSubscriber as _;
+    let fixture = env::var("LIX_TRACE_NODE_FIXTURE").expect("set LIX_TRACE_NODE_FIXTURE");
+    let exporter = RecordingExporter::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("integration"))),
+    );
+    tracing::dispatcher::set_global_default(dispatch.clone()).expect("run this opt-in test alone");
+    let manager = crate::LixRuntimeManager::new_in_memory_with_telemetry(
+        1,
+        Arc::new(OpenTelemetryTracingSink::new(dispatch.clone())),
+    );
+    manager.provision_test_repositories().await;
+    let app = crate::router(
+        manager.clone(),
+        Some("test-internal-token".into()),
+        Duration::from_secs(60),
+        InFlightSqlRegistry::default(),
+    )
+    .layer(axum::middleware::from_fn(
+        move |request: Request<Body>, next: axum::middleware::Next| {
+            next.run(request).with_subscriber(dispatch.clone())
+        },
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("node")
+            .arg("--experimental-strip-types")
+            .arg(fixture)
+            .env("LIX_TRACE_SERVER_URL", address)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    server.abort();
+    assert!(
+        output.status.success(),
+        "Node fixture failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let client_spans: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
+    provider.force_flush().unwrap();
+    {
+        let spans = exporter.0.lock().unwrap().clone();
+        let requests: Vec<_> = spans
+            .iter()
+            .filter(|s| s.name == "Lix protocol request")
+            .collect();
+        assert!(
+            requests.len() >= 8,
+            "expected handshake, provisioning, SQL, transaction and close; got: {:?}",
+            requests.iter().map(|s| &s.attributes).collect::<Vec<_>>()
+        );
+        for path in [
+            "",
+            "transaction/begin",
+            "transaction/execute",
+            "transaction/commit",
+            "session",
+        ] {
+            assert!(
+                requests.iter().any(|s| s
+                    .attributes
+                    .iter()
+                    .any(|a| a.key.as_str() == "lix.protocol.path" && a.value.as_str() == path)),
+                "missing protocol phase {path}"
+            );
+        }
+        assert_eq!(
+            requests.len(),
+            client_spans
+                .iter()
+                .filter(|s| s["name"] == "lix.client.rpc")
+                .count()
+        );
+        for request in &requests {
+            let client = client_spans
+                .iter()
+                .find(|s| s["spanId"] == request.parent_span_id.to_string())
+                .expect("every Rust server span is parented by a real JS CLIENT span");
+            assert_eq!(client["name"], "lix.client.rpc");
+            assert_eq!(
+                client["traceId"],
+                request.span_context.trace_id().to_string()
+            );
+            assert!(request.parent_span_is_remote);
+        }
+        let tool = client_spans
+            .iter()
+            .find(|s| s["name"] == "integration.mcp.tool")
+            .unwrap();
+        for request in &requests {
+            assert_eq!(tool["traceId"], request.span_context.trace_id().to_string());
+        }
+        assert!(spans.iter().any(|s| s.name == "lix.sql.query"
+            && s.span_context.trace_id().to_string() == tool["traceId"].as_str().unwrap()));
+        assert!(spans.iter().any(|s| s.name.contains("checkpoint")
+            && s.span_context.trace_id().to_string() == tool["traceId"].as_str().unwrap()));
+        eprintln!(
+            "Connected {} JS spans and {} Rust spans ({} protocol requests)",
+            client_spans.len(),
+            spans.len(),
+            requests.len()
+        );
     }
     manager.shutdown().await.unwrap();
 }
