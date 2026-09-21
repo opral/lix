@@ -170,9 +170,9 @@ impl TransactionSchemaResolver {
     }
 }
 
-struct TransactionSchemaHotStateReader<'a, S: StagedHotStateRows + Sync + ?Sized> {
-    base: &'a dyn HotStateReader,
-    staged: &'a S,
+pub(super) struct TransactionSchemaHotStateReader<'a, S: StagedHotStateRows + Sync + ?Sized> {
+    pub(super) base: &'a dyn HotStateReader,
+    pub(super) staged: &'a S,
 }
 
 #[async_trait]

@@ -314,3 +314,41 @@ fn official_migrations_all_validate() {
     }
     assert_eq!(count, 23);
 }
+
+#[test]
+fn deletion_policy_defaults_roundtrips_and_is_not_a_safe_amendment() {
+    let mut json = serde_json::json!({
+        "$schema":"https://lix.dev/schema-v1.json", "key":"child",
+        "columns":[{"name":"id","type":"text","nullable":false}], "primary_key":["id"],
+        "foreign_keys":[{"columns":["id"],"references":{"schema_key":"parent","columns":["id"]}}]
+    });
+    let previous = from_json(&json.to_string()).unwrap();
+    assert_eq!(
+        previous.foreign_keys[0].on_delete,
+        lix_schema::DeleteAction::NoAction
+    );
+    // Old repository schema JSON preserves its canonical representation.
+    assert!(
+        serde_json::to_value(&previous).unwrap()["foreign_keys"][0]
+            .get("on_delete")
+            .is_none()
+    );
+    json["foreign_keys"][0]["on_delete"] = "no_action".into();
+    assert_eq!(previous, from_json(&json.to_string()).unwrap());
+    json["foreign_keys"][0]["on_delete"] = "cascade".into();
+    let cascade = from_json(&json.to_string()).unwrap();
+    assert!(
+        lix_schema::to_postgres_ddl(&cascade)
+            .unwrap()
+            .contains("REFERENCES parent (id) ON DELETE CASCADE")
+    );
+    assert!(validate_amendment(&previous, &cascade).is_err());
+    assert_eq!(
+        from_json(&serde_json::to_string(&cascade).unwrap()).unwrap(),
+        cascade
+    );
+    for invalid in ["restrict", "set_null", "CASCADE", ""] {
+        json["foreign_keys"][0]["on_delete"] = invalid.into();
+        assert!(from_json(&json.to_string()).is_err());
+    }
+}

@@ -8748,3 +8748,26 @@ async fn excalidraw_sql_defaults_metadata_ordering_and_cold_edits() {
     assert_eq!(read_file(&reopened, path).await.unwrap().unwrap(), accepted);
     reopened.close().await.unwrap();
 }
+
+/// A plugin-produced tombstone enters the same FK action planner as SQL DELETE.
+#[tokio::test]
+async fn plugin_deletion_cascades_declared_dependents() {
+    let lix = open_lix().await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix, "plugin_markdown", &build_markdown_plugin_archive(), &["markdown_node"],
+    ).await;
+    lix.execute("INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)", &[Value::Jsonb(serde_json::json!({
+        "$schema":"https://lix.dev/schema-v1.json", "key":"node_annotation",
+        "columns":[{"name":"id","type":"text","nullable":false},{"name":"node_id","type":"uuid","nullable":false}],
+        "primary_key":["id"], "foreign_keys":[{"columns":["node_id"],"references":{"schema_key":"markdown_node","columns":["id"]},"on_delete":"cascade"}]
+    }).into())]).await.unwrap();
+    lix.execute("INSERT INTO lix_file(path,content) VALUES ('/cascade.md',$1)", &[Value::Blob(b"# Title\n\nDelete this paragraph.\n".to_vec().into())]).await.unwrap();
+    let nodes = lix.execute("SELECT id,lixcol_file_id FROM markdown_node WHERE kind='paragraph'", &[]).await.unwrap();
+    let node = nodes.rows().first().expect("paragraph node");
+    let id = node.get::<String>("id").unwrap();
+    let file = node.get::<String>("lixcol_file_id").unwrap();
+    lix.execute("INSERT INTO node_annotation(id,node_id,lixcol_file_id) VALUES ('note',$1,$2)", &[Value::Text(id), Value::Text(file)]).await.unwrap();
+    lix.execute("UPDATE lix_file SET content=$1 WHERE path='/cascade.md'", &[Value::Blob(b"# Title\n".to_vec().into())]).await.unwrap();
+    assert!(lix.execute("SELECT id FROM node_annotation", &[]).await.unwrap().rows().is_empty());
+    lix.close().await.unwrap();
+}

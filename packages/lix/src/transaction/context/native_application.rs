@@ -3,6 +3,491 @@ use super::*;
 use crate::filesystem::{FileDeleteInput, plan_file_delete};
 
 impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
+    /// Apply deletion events to the resolved candidate, including target-only
+    /// tombstones which are absent from the incoming pick list.
+    pub(crate) async fn stage_merge_delete_actions(
+        &mut self,
+        analysis: &crate::session::MergeAnalysis,
+        picks: &[crate::tracked_state::TrackedStateMergePick],
+        resolved_deletes: &BTreeSet<TrackedStateKey>,
+    ) -> Result<BTreeSet<TrackedStateKey>, LixError> {
+        let branch = self.active_branch_id().to_owned();
+        let read = self.opening_read();
+        let base = self.hot_state.reader(&read);
+        let staged = self.staged_writes.staging_overlay()?;
+        let incoming_schemas = picks
+            .iter()
+            .any(|pick| pick.identity.schema_key() == REGISTERED_SCHEMA_KEY)
+            || self
+                .staged_writes
+                .has_staged_schema_catalog_change(&Domain::schema_catalog(branch.clone(), true))?;
+        // Inspect only incoming schema declarations to bound generation
+        // expansion. An unrelated registration must not expand an unrelated
+        // collection delete into individual row tombstones.
+        let mut incoming_fk_targets = BTreeSet::new();
+        let mut schema_groups = BTreeMap::<CommitId, Vec<TrackedStateKey>>::new();
+        for pick in picks.iter().filter(|pick| {
+            pick.identity.schema_key() == REGISTERED_SCHEMA_KEY && !pick.selected_row.deleted
+        }) {
+            schema_groups
+                .entry(pick.selected_row.commit_id)
+                .or_default()
+                .push(TrackedStateKey {
+                    schema_key: REGISTERED_SCHEMA_KEY.into(),
+                    file_id: pick.identity.file_id().map(str::to_owned),
+                    row_pk: pick.identity.row_pk().clone(),
+                });
+        }
+        if !schema_groups.is_empty() {
+            let mut reader = self.tracked_state_reader().await?;
+            for (commit, keys) in schema_groups {
+                let rows = reader
+                    .load_projected_batch_at_commit(
+                        &commit.to_string(),
+                        &keys,
+                        &ChangeRecordProjection::full(),
+                    )
+                    .await?;
+                for slot in 0..keys.len() {
+                    let row = rows
+                        .row(slot)
+                        .ok_or_else(|| LixError::unknown("incoming schema selection is missing"))?;
+                    let snapshot = native_file_descriptor_json(row)?;
+                    if let Some(foreign_keys) = snapshot
+                        .get("value")
+                        .and_then(|schema| schema.get("foreign_keys"))
+                        .and_then(JsonValue::as_array)
+                    {
+                        for foreign_key in foreign_keys {
+                            if let Some(target) = foreign_key
+                                .get("references")
+                                .and_then(|reference| reference.get("schema_key"))
+                                .and_then(JsonValue::as_str)
+                            {
+                                incoming_fk_targets.insert(target.to_owned());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if incoming_schemas {
+            self.schema_resolver.clear_cached_catalogs();
+        }
+        let (_, catalog) = self
+            .schema_resolver
+            .catalogs_for_validation(
+                &base,
+                &staged,
+                &Domain::schema_catalog(branch.clone(), true),
+            )
+            .await?;
+        let has_action = |schema: &str| {
+            catalog
+                .delete_plan_for_key(schema)
+                .foreign_key_references
+                .iter()
+                .any(|reference| {
+                    reference.foreign_key.on_delete == lix_schema::DeleteAction::Cascade
+                })
+        };
+        let mut seed_keys = analysis
+            .target_diff
+            .entries
+            .iter()
+            .chain(analysis.source_diff.entries.iter())
+            .filter(|entry| {
+                // Collection-generation deletion can remove an identity without
+                // retaining an individual after-row tombstone in the diff.
+                entry.after.as_ref().is_none_or(|row| row.deleted)
+                    && (incoming_schemas || has_action(entry.identity.schema_key()))
+            })
+            .map(|entry| TrackedStateKey {
+                schema_key: entry.identity.schema_key().into(),
+                file_id: entry.identity.file_id().map(str::to_owned),
+                row_pk: entry.identity.row_pk().clone(),
+            })
+            .collect::<BTreeSet<_>>();
+        seed_keys.extend(
+            resolved_deletes
+                .iter()
+                .filter(|key| incoming_schemas || has_action(&key.schema_key))
+                .cloned(),
+        );
+
+        // `diff_commit_members` deliberately suppresses the physical member
+        // tombstones produced by a collection-generation delete. The marker
+        // itself remains in the merge diff, so use those marker identities as
+        // a finite index into the ordinary effective diff. This recovers the
+        // deleted parent identities needed by a newly arriving FK without
+        // scanning unrelated schemas, files, or the whole database.
+        let mut generation_scopes = BTreeMap::<String, BTreeSet<Option<String>>>::new();
+        for entry in analysis
+            .target_diff
+            .entries
+            .iter()
+            .chain(analysis.source_diff.entries.iter())
+            .filter(|entry| {
+                entry.identity.schema_key()
+                    == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+            })
+        {
+            let (schema_key, file_id) = crate::collection_generation::collection_scope_from_row_pk(
+                entry.identity.row_pk(),
+            )?;
+            if incoming_fk_targets.contains(&schema_key)
+                || !catalog
+                    .delete_plan_for_key(&schema_key)
+                    .foreign_key_references
+                    .is_empty()
+            {
+                generation_scopes
+                    .entry(schema_key)
+                    .or_default()
+                    .insert(file_id);
+            }
+        }
+        let selected_generation_scopes = picks
+            .iter()
+            .filter(|pick| {
+                pick.identity.schema_key()
+                    == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+                    && !pick.selected_row.deleted
+                    && analysis.source_diff.entries.iter().any(|entry| {
+                        entry.identity == pick.identity
+                            && entry
+                                .after
+                                .as_ref()
+                                .is_some_and(|row| row.change_id == pick.selected_row.change_id)
+                    })
+            })
+            .map(|pick| {
+                crate::collection_generation::collection_scope_from_row_pk(pick.identity.row_pk())
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let mut incoming_generation_deletes = BTreeSet::new();
+        if seed_keys.is_empty() && generation_scopes.is_empty() && !incoming_schemas {
+            return Ok(BTreeSet::new());
+        }
+        let mut relevant_schemas = seed_keys
+            .iter()
+            .map(|key| key.schema_key.clone())
+            .chain(generation_scopes.keys().cloned())
+            .collect::<BTreeSet<_>>();
+        if incoming_schemas {
+            relevant_schemas.extend(
+                picks
+                    .iter()
+                    .map(|pick| pick.identity.schema_key().to_owned()),
+            );
+        }
+        let mut schema_frontier = relevant_schemas.iter().cloned().collect::<Vec<_>>();
+        while let Some(schema) = schema_frontier.pop() {
+            for reference in catalog.delete_plan_for_key(&schema).foreign_key_references {
+                if reference.foreign_key.on_delete == lix_schema::DeleteAction::Cascade
+                    && relevant_schemas.insert(reference.source_key.schema_key.clone())
+                {
+                    schema_frontier.push(reference.source_key.schema_key.clone());
+                }
+            }
+        }
+        if !generation_scopes.is_empty() {
+            let mut reader = self.tracked_state_reader().await?;
+            let base_commit = analysis.commits.base_commit_id.to_string();
+            for (schema_key, file_ids) in generation_scopes {
+                let request = TrackedStateDiffRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec![schema_key],
+                        file_ids: file_ids
+                            .into_iter()
+                            .map(|file_id| {
+                                file_id.map_or(NullableKeyFilter::Null, NullableKeyFilter::Value)
+                            })
+                            .collect(),
+                        include_tombstones: true,
+                        ..TrackedStateFilter::default()
+                    },
+                    retain_payloads: false,
+                };
+                for head_commit in [
+                    analysis.commits.target_commit_id,
+                    analysis.commits.source_commit_id,
+                ] {
+                    let diff = reader
+                        .diff_commits(&base_commit, &head_commit.to_string(), &request)
+                        .await?;
+                    for entry in diff.entries.iter().filter(|entry| {
+                        entry.before.as_ref().is_some_and(|row| !row.deleted)
+                            && entry.after.as_ref().is_none_or(|row| row.deleted)
+                    }) {
+                        let key = TrackedStateKey {
+                            schema_key: entry.identity.schema_key().into(),
+                            file_id: entry.identity.file_id().map(str::to_owned),
+                            row_pk: entry.identity.row_pk().clone(),
+                        };
+                        if head_commit == analysis.commits.source_commit_id
+                            && selected_generation_scopes
+                                .contains(&(key.schema_key.clone(), key.file_id.clone()))
+                        {
+                            incoming_generation_deletes.insert(key.clone());
+                        }
+                        seed_keys.insert(key);
+                    }
+                }
+            }
+        }
+        let seed_keys = seed_keys.into_iter().collect::<Vec<_>>();
+        // Hydrate sparse picks in one batch per historical commit, not one
+        // storage read per row. The staged semantic resolutions take precedence.
+        let mut groups = BTreeMap::<CommitId, Vec<TrackedStateKey>>::new();
+        for pick in picks.iter().filter(|pick| {
+            incoming_schemas || relevant_schemas.contains(pick.identity.schema_key())
+        }) {
+            groups
+                .entry(pick.selected_row.commit_id)
+                .or_default()
+                .push(TrackedStateKey {
+                    schema_key: pick.identity.schema_key().into(),
+                    file_id: pick.identity.file_id().map(str::to_owned),
+                    row_pk: pick.identity.row_pk().clone(),
+                });
+        }
+        let mut raw = RawWriteBatch::new();
+        // A selected generation marker retires these proven predecessors, but
+        // the row overlay itself does not interpret markers. Project explicit
+        // tombstones before selected rows; a selected/staged resurrection wins.
+        for key in &incoming_generation_deletes {
+            raw.push_parts(
+                Some(key.row_pk.clone()),
+                key.schema_key.as_str().into(),
+                key.file_id.as_deref().map(Into::into),
+                None,
+                None,
+                None,
+                None,
+                None,
+                branch == GLOBAL_BRANCH_ID,
+                None,
+                None,
+                false,
+                branch.as_str().into(),
+            );
+        }
+        let mut reader = self.tracked_state_reader().await?;
+        for (commit, keys) in groups {
+            let rows = reader
+                .load_projected_batch_at_commit(
+                    &commit.to_string(),
+                    &keys,
+                    &ChangeRecordProjection::full(),
+                )
+                .await?;
+            for slot in 0..keys.len() {
+                let row = rows.row(slot).ok_or_else(|| {
+                    LixError::unknown("cascade candidate selected row is missing")
+                })?;
+                raw.push_parts(
+                    Some(row.row_pk().clone()),
+                    row.schema_key_shared(),
+                    row.file_id_shared(),
+                    if row.deleted() {
+                        None
+                    } else {
+                        row.snapshot_content()
+                            .cloned()
+                            .map(TransactionJson::from_unvalidated_shared_normalized_content)
+                    },
+                    row.metadata()
+                        .cloned()
+                        .map(TransactionJson::from_unvalidated_shared_normalized_content),
+                    None,
+                    Some(row.created_at().to_string().into()),
+                    Some(row.updated_at().to_string().into()),
+                    branch == GLOBAL_BRANCH_ID,
+                    None,
+                    None,
+                    false,
+                    branch.as_str().into(),
+                );
+                if !row.deleted()
+                    && let Some(snapshot) = row.decoded_snapshot()
+                {
+                    raw.set_decoded_snapshot(raw.len() - 1, Some(snapshot.clone()));
+                }
+            }
+        }
+        let previous = reader
+            .load_projected_batch_at_commit(
+                &analysis.commits.base_commit_id.to_string(),
+                &seed_keys,
+                &ChangeRecordProjection::full(),
+            )
+            .await?;
+        let target_previous = reader
+            .load_projected_batch_at_commit(
+                &analysis.commits.target_commit_id.to_string(),
+                &seed_keys,
+                &ChangeRecordProjection::full(),
+            )
+            .await?;
+        let source_previous = reader
+            .load_projected_batch_at_commit(
+                &analysis.commits.source_commit_id.to_string(),
+                &seed_keys,
+                &ChangeRecordProjection::full(),
+            )
+            .await?;
+        drop(reader);
+        let prepared = self.prepare_transaction_rows(raw).await?;
+        let selected = super::super::staging::PreparedSchemaOverlay::all_rows(&prepared);
+        let base = self.hot_state.reader(&read);
+        let selected_candidate = super::super::schema_resolver::TransactionSchemaHotStateReader {
+            base: &base,
+            staged: &selected,
+        };
+        let candidate = super::super::schema_resolver::TransactionSchemaHotStateReader {
+            base: &selected_candidate,
+            staged: &staged,
+        };
+        let current = candidate
+            .load_exact_batch(&HotStateExactBatchRequest {
+                rows: seed_keys
+                    .iter()
+                    .map(|key| HotStateExactRowRequest {
+                        schema_key: key.schema_key.clone(),
+                        file_id: key.file_id.clone(),
+                        row_pk: key.row_pk.clone(),
+                        branch_id: branch.clone(),
+                    })
+                    .collect(),
+                projection: Default::default(),
+                untracked: Some(false),
+                include_tombstones: false,
+            })
+            .await?;
+        let mut seeds = Vec::new();
+        let mut generation_deletes = RawWriteBatch::new();
+        for slot in 0..seed_keys.len() {
+            // A winning resurrection cancels the historical deletion event.
+            if current.row(slot).is_some() {
+                continue;
+            }
+            let key = &seed_keys[slot];
+            if incoming_generation_deletes.contains(key) {
+                generation_deletes.push_parts(
+                    Some(key.row_pk.clone()),
+                    key.schema_key.as_str().into(),
+                    key.file_id.as_deref().map(Into::into),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    branch == GLOBAL_BRANCH_ID,
+                    None,
+                    None,
+                    false,
+                    branch.as_str().into(),
+                );
+            }
+            // A winning delete can conflict with a changed referenced unique
+            // key. Both branch-live images can have valid incoming dependents.
+            let live = [target_previous.row(slot), source_previous.row(slot)]
+                .into_iter()
+                .flatten()
+                .filter(|row| !row.deleted())
+                .collect::<Vec<_>>();
+            let images = if live.is_empty() {
+                previous
+                    .row(slot)
+                    .filter(|row| !row.deleted())
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            } else {
+                live
+            };
+            for row in images {
+                seeds.push(MaterializedHotStateRow {
+                    row_pk: row.row_pk().clone(),
+                    schema_key: row.schema_key().into(),
+                    file_id: row.file_id().map(str::to_owned),
+                    snapshot_content: Some(native_file_descriptor_json(row)?.to_string().into()),
+                    metadata: None,
+                    deleted: false,
+                    created_at: row.created_at(),
+                    updated_at: row.updated_at(),
+                    global: branch == GLOBAL_BRANCH_ID,
+                    change_id: None,
+                    commit_id: None,
+                    untracked: false,
+                    branch_id: branch.as_str().into(),
+                });
+            }
+        }
+        // Normal staging uses the tracked catalog; load both durability
+        // catalogs from the candidate so selected registrations remain native
+        // historical references while generated rows can resolve their schemas.
+        if incoming_schemas {
+            self.schema_resolver.clear_cached_catalogs();
+        }
+        let (_, catalog) = self
+            .schema_resolver
+            .catalogs_for_validation(
+                &selected_candidate,
+                &staged,
+                &Domain::schema_catalog(branch.clone(), false),
+            )
+            .await?;
+        let mut deletes =
+            super::super::validation::plan_delete_actions(&candidate, catalog, seeds).await?;
+        deletes.append(generation_deletes);
+        // Current state has one physical key across durability modes. A
+        // cascaded untracked delete cannot also install a tracked selection at
+        // that key in one publication. Preserve the ordinary merge conflict
+        // contract instead of discarding the selection or emitting duplicate
+        // physical mutations.
+        let untracked_deletes = deletes
+            .iter()
+            .filter(|row| row.untracked)
+            .map(|row| TrackedStateKey {
+                schema_key: row.schema_key.to_string(),
+                file_id: row.file_id.map(ToString::to_string),
+                row_pk: row.row_pk.expect("cascade has an identity").clone(),
+            })
+            .collect::<BTreeSet<_>>();
+        if !untracked_deletes.is_empty() {
+            for pick in picks {
+                let identity = TrackedStateKey {
+                    schema_key: pick.identity.schema_key().into(),
+                    file_id: pick.identity.file_id().map(str::to_owned),
+                    row_pk: pick.identity.row_pk().clone(),
+                };
+                if untracked_deletes.contains(&identity) {
+                    return Err(
+                        commit::selected_tracked_ref_untracked_collision_error(
+                            &branch,
+                            &identity,
+                        ),
+                    );
+                }
+            }
+        }
+        // Untracked cleanup does not replace historical picks or count as
+        // tracked merge changes.
+        let identities = deletes
+            .iter()
+            .filter(|row| !row.untracked)
+            .map(|row| TrackedStateKey {
+                schema_key: row.schema_key.to_string(),
+                file_id: row.file_id.map(ToString::to_string),
+                row_pk: row.row_pk.expect("cascade has an identity").clone(),
+            })
+            .collect();
+        if !deletes.is_empty() {
+            self.stage_planned_cascade_deletes(deletes).await?;
+        }
+        Ok(identities)
+    }
     /// Native file lifecycle is resolved before ordinary row reconciliation.
     /// A later file edit revives its complete captured source incarnation;
     /// a later delete uses the current target's ordinary deletion closure.

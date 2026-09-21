@@ -5317,7 +5317,7 @@ fn apply_pending_untracked_identities(
     }
 }
 
-fn selected_tracked_ref_untracked_collision_error(
+pub(super) fn selected_tracked_ref_untracked_collision_error(
     branch_id: &str,
     identity: &TrackedStateKey,
 ) -> LixError {

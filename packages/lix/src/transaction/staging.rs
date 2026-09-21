@@ -3642,6 +3642,10 @@ pub(crate) struct PreparedSchemaOverlay<'a> {
 }
 
 impl<'a> PreparedSchemaOverlay<'a> {
+    pub(crate) fn all_rows(rows: &'a PreparedStateBatch) -> Self {
+        Self { rows: rows.iter().collect() }
+    }
+
     pub(crate) fn new(rows: &'a PreparedStateBatch) -> Self {
         Self {
             rows: rows

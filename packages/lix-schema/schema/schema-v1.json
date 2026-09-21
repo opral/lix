@@ -75,6 +75,7 @@
           "uniqueItems": true,
           "items": { "$ref": "#/$defs/identifier" }
         },
+        "on_delete": { "enum": ["no_action", "cascade"], "default": "no_action" },
         "references": {
           "type": "object",
           "additionalProperties": false,
