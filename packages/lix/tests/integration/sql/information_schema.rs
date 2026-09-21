@@ -1969,8 +1969,8 @@ simulation_test!(nullable_columns_are_optional_on_insert, |sim| async move {
                 &[],
             )
             .await
-            .expect("typed JSON null should read as SQL NULL"),
-        vec![vec![Value::Null]],
+            .expect("typed JSON null should remain distinct from SQL NULL"),
+        vec![vec![Value::Jsonb(serde_json::Value::Null.into())]],
     );
     assert_rows_eq(
         session
@@ -1983,7 +1983,7 @@ simulation_test!(nullable_columns_are_optional_on_insert, |sim| async move {
             .await
             .expect("DELETE RETURNING should match SELECT null semantics"),
         vec![vec![
-            Value::Null,
+            Value::Jsonb(serde_json::Value::Null.into()),
             Value::Jsonb(serde_json::Value::Null.into()),
         ]],
     );

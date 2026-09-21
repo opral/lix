@@ -32,10 +32,14 @@ pub fn to_postgres_ddl(schema: &Schema) -> Result<String, Error> {
     );
     declarations.extend(schema.foreign_keys.iter().map(|foreign_key| {
         format!(
-            "  FOREIGN KEY ({}) REFERENCES {} ({})",
+            "  FOREIGN KEY ({}) REFERENCES {} ({}){}",
             foreign_key.columns.join(", "),
             foreign_key.references.schema_key,
-            foreign_key.references.columns.join(", ")
+            foreign_key.references.columns.join(", "),
+            match foreign_key.on_delete {
+                crate::DeleteAction::NoAction => "",
+                crate::DeleteAction::Cascade => " ON DELETE CASCADE",
+            }
         )
     }));
     Ok(format!(

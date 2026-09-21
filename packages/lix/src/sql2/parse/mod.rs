@@ -1,8 +1,8 @@
 use datafusion::sql::parser::{DFParserBuilder, Statement as DataFusionStatement};
 use datafusion::sql::sqlparser::ast::{
     BinaryOperator, DataType as SqlDataType, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart, Value, VisitMut,
-    VisitorMut,
+    FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart, TimezoneInfo,
+    UnaryOperator, Value, VisitMut, VisitorMut,
 };
 use datafusion::sql::sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 use serde_json::json;
@@ -190,6 +190,25 @@ fn rewrite_postgresql_expressions(statement: &mut DataFusionStatement) {
                 return ControlFlow::Continue(());
             }
             if let Expr::Cast {
+                kind,
+                expr: inner,
+                data_type: SqlDataType::Text,
+                array: false,
+                format: None,
+                ..
+            } = expr
+                && matches!(
+                    kind,
+                    datafusion::sql::sqlparser::ast::CastKind::Cast
+                        | datafusion::sql::sqlparser::ast::CastKind::DoubleColon
+                )
+            {
+                let placeholder = Box::new(Expr::Value(Value::Boolean(false).into()));
+                let inner = std::mem::replace(inner, placeholder);
+                *expr = private_function("__lix_text_cast", vec![*inner]);
+                return ControlFlow::Continue(());
+            }
+            if let Expr::Cast {
                 expr: inner,
                 data_type: SqlDataType::Uuid,
                 array: false,
@@ -200,6 +219,67 @@ fn rewrite_postgresql_expressions(statement: &mut DataFusionStatement) {
                 let placeholder = Box::new(Expr::Value(Value::Boolean(false).into()));
                 let inner = std::mem::replace(inner, placeholder);
                 *expr = private_function("__lix_uuid_cast", vec![*inner]);
+                return ControlFlow::Continue(());
+            }
+            if let Expr::Cast {
+                kind,
+                expr: inner,
+                data_type: SqlDataType::Timestamp(_, timezone),
+                array: false,
+                format: None,
+                ..
+            } = expr
+                && matches!(
+                    kind,
+                    datafusion::sql::sqlparser::ast::CastKind::Cast
+                        | datafusion::sql::sqlparser::ast::CastKind::DoubleColon
+                )
+                && matches!(timezone, TimezoneInfo::Tz | TimezoneInfo::WithTimeZone)
+            {
+                let placeholder = Box::new(Expr::Value(Value::Boolean(false).into()));
+                let inner = std::mem::replace(inner, placeholder);
+                *expr = private_function("__lix_timestamptz_cast", vec![*inner]);
+                return ControlFlow::Continue(());
+            }
+            if let Expr::BinaryOp { left, op, right } = expr
+                && matches!(
+                    op,
+                    BinaryOperator::Eq
+                        | BinaryOperator::NotEq
+                        | BinaryOperator::Gt
+                        | BinaryOperator::GtEq
+                        | BinaryOperator::Lt
+                        | BinaryOperator::LtEq
+                        | BinaryOperator::Spaceship
+                )
+            {
+                mark_numeric_literal_unless_explicit_float_cast(left, right);
+                mark_numeric_literal_unless_explicit_float_cast(right, left);
+                return ControlFlow::Continue(());
+            }
+            if let Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) = expr {
+                mark_numeric_literal_unless_explicit_float_cast(left, right);
+                mark_numeric_literal_unless_explicit_float_cast(right, left);
+                return ControlFlow::Continue(());
+            }
+            if let Expr::InList { expr, list, .. } = expr {
+                if !explicit_float_cast(expr) {
+                    for value in list {
+                        mark_numeric_literal(value);
+                    }
+                    mark_numeric_literal(expr);
+                }
+                return ControlFlow::Continue(());
+            }
+            if let Expr::Between {
+                expr, low, high, ..
+            } = expr
+            {
+                if !explicit_float_cast(expr) {
+                    mark_numeric_literal(low);
+                    mark_numeric_literal(high);
+                    mark_numeric_literal(expr);
+                }
                 return ControlFlow::Continue(());
             }
             let Expr::BinaryOp { left, op, right } = expr else {
@@ -219,6 +299,66 @@ fn rewrite_postgresql_expressions(statement: &mut DataFusionStatement) {
             let right = std::mem::replace(right, placeholder());
             *expr = private_function(name, vec![*left, *right]);
             ControlFlow::Continue(())
+        }
+    }
+
+    fn mark_numeric_literal(expr: &mut Expr) {
+        let raw = numeric_literal_raw(expr);
+        let Some(raw) = raw else {
+            return;
+        };
+        if !raw.contains('.') && !raw.contains(['e', 'E']) {
+            return;
+        }
+        *expr = private_function(
+            "__lix_numeric_literal",
+            vec![Expr::Value(Value::SingleQuotedString(raw).into())],
+        );
+    }
+
+    fn mark_numeric_literal_unless_explicit_float_cast(expr: &mut Expr, other: &Expr) {
+        if !explicit_float_cast(other) {
+            mark_numeric_literal(expr);
+        }
+    }
+
+    fn explicit_float_cast(expr: &Expr) -> bool {
+        match expr {
+            Expr::Cast { data_type, .. } => matches!(
+                data_type,
+                SqlDataType::Float(_)
+                    | SqlDataType::Float4
+                    | SqlDataType::Float8
+                    | SqlDataType::Float32
+                    | SqlDataType::Float64
+                    | SqlDataType::Real
+                    | SqlDataType::Double(_)
+                    | SqlDataType::DoublePrecision
+            ),
+            Expr::Nested(expr) => explicit_float_cast(expr),
+            _ => false,
+        }
+    }
+
+    fn numeric_literal_raw(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Value(value) => match &value.value {
+                Value::Number(raw, _) => Some(raw.clone()),
+                _ => None,
+            },
+            Expr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr,
+            } => numeric_literal_raw(expr).map(|raw| {
+                raw.strip_prefix('-')
+                    .map_or_else(|| format!("-{raw}"), str::to_string)
+            }),
+            Expr::UnaryOp {
+                op: UnaryOperator::Plus,
+                expr,
+            } => numeric_literal_raw(expr),
+            Expr::Nested(expr) => numeric_literal_raw(expr),
+            _ => None,
         }
     }
 

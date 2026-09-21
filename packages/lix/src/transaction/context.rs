@@ -37,7 +37,7 @@ use crate::changelog::{
 use crate::checkpoint::CHECKPOINT_SCHEMA_KEY;
 use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
 use crate::common::{LixTimestamp, SharedStr};
-use crate::domain::Domain;
+use crate::domain::{Domain, DomainRowIdentity};
 use crate::filesystem::{
     BlobRefRowInput, FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
     FilesystemPathIndexRequest, FilesystemPathKind, FilesystemRowContext, load_path_index_revision,
@@ -150,6 +150,7 @@ use crate::{LixError, NullableKeyFilter, SqlQueryResult, Value};
 
 mod cohort;
 mod native_application;
+mod referential_actions;
 mod schema_amendment;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -759,6 +760,7 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// this transaction's file rows and history. Resumable media finalization
     /// uses this lane for its completed manifest and upload receipt.
     native_migration_validation: bool,
+    planned_cascade_deletes: BTreeSet<DomainRowIdentity>,
     /// Authority-validated existing checkpoint selected with a native merge.
     native_merge_checkpoints: BTreeMap<String, CommitId>,
     native_migration_branch_bridges: BTreeMap<String, CheckpointRecoveryRef>,
@@ -866,6 +868,7 @@ pub(crate) struct SqlStatementCheckpoint {
     pending_checkpoint_gc_sequence: Option<u64>,
     pending_undo_baseline: Option<commit::UndoBaselinePublication>,
     successful_undo_redo: bool,
+    native_migration_validation: bool,
 }
 
 #[derive(Clone)]
@@ -1244,95 +1247,109 @@ where
         let mut raw = RawWriteBatch::new();
         let mut native = TrackedStateContext::new().reader(read);
         for (branch, refs) in &prepared.commit_change_refs_by_branch {
+            let mut groups = BTreeMap::<CommitId, Vec<_>>::new();
             for selected in refs.selected_changes() {
-                if !identities.insert((
-                    branch.clone(),
-                    false,
-                    selected.schema_key().to_owned(),
-                    selected.file_id().map(str::to_owned),
-                    selected.row_pk().clone(),
-                )) {
-                    return Err(LixError::new(
-                        "LIX_MIGRATION_MERGE_SCOPE_UNSUPPORTED",
-                        "native historical selection overlaps a materialized semantic row",
-                    ));
-                }
-                let key = crate::tracked_state::TrackedStateKeyRef {
-                    schema_key: selected.schema_key(),
-                    file_id: selected.file_id(),
-                    row_pk: selected.row_pk(),
-                };
+                groups
+                    .entry(selected.source_commit_id)
+                    .or_default()
+                    .push(selected);
+            }
+            for (source_commit, selections) in groups {
+                let keys = selections
+                    .iter()
+                    .map(|selected| crate::tracked_state::TrackedStateKeyRef {
+                        schema_key: selected.schema_key(),
+                        file_id: selected.file_id(),
+                        row_pk: selected.row_pk(),
+                    })
+                    .collect::<Vec<_>>();
                 let rows = native
                     .load_projected_batch_at_commit_refs(
-                        &selected.source_commit_id.to_string(),
-                        &[key],
+                        &source_commit.to_string(),
+                        &keys,
                         &ChangeRecordProjection::full(),
                     )
                     .await?;
-                let row = rows.row(0).ok_or_else(|| {
-                    LixError::unknown("selected migration row missing from canonical native source")
-                })?;
-                if row.change_id() != selected.change_id || row.deleted() != selected.deleted {
-                    return Err(LixError::unknown(
-                        "migration native selection changed identity",
-                    ));
-                }
-                let metadata = row
-                    .metadata()
-                    .cloned()
-                    .map(TransactionJson::from_unvalidated_shared_normalized_content);
-                let created = Some(SharedStr::from(selected.created_at.to_string()));
-                let updated = Some(SharedStr::from(selected.updated_at.to_string()));
-                if selected.deleted {
-                    raw.push_parts(
-                        Some(selected.row_pk().clone()),
-                        row.schema_key_shared(),
-                        row.file_id_shared(),
-                        None,
-                        metadata,
-                        None,
-                        created,
-                        updated,
-                        branch.as_str() == GLOBAL_BRANCH_ID,
-                        Some(SharedStr::from(selected.change_id.to_string())),
-                        Some(SharedStr::from(selected.source_commit_id.to_string())),
+                for (slot, selected) in selections.into_iter().enumerate() {
+                    if !identities.insert((
+                        branch.clone(),
                         false,
-                        SharedStr::from(branch.as_str()),
-                    );
-                } else if let Some(decoded) = row.decoded_snapshot().cloned() {
-                    raw.push_typed_parts(
-                        Some(selected.row_pk().clone()),
-                        row.schema_key_shared(),
-                        row.file_id_shared(),
-                        Some(decoded),
-                        metadata,
-                        None,
-                        created,
-                        updated,
-                        branch.as_str() == GLOBAL_BRANCH_ID,
-                        Some(SharedStr::from(selected.change_id.to_string())),
-                        Some(SharedStr::from(selected.source_commit_id.to_string())),
-                        false,
-                        SharedStr::from(branch.as_str()),
-                    );
-                } else {
-                    raw.push_parts(
-                        Some(selected.row_pk().clone()),
-                        row.schema_key_shared(),
-                        row.file_id_shared(),
-                        row.snapshot_content()
-                            .cloned()
-                            .map(TransactionJson::from_unvalidated_shared_normalized_content),
-                        metadata,
-                        None,
-                        created,
-                        updated,
-                        branch.as_str() == GLOBAL_BRANCH_ID,
-                        Some(SharedStr::from(selected.change_id.to_string())),
-                        Some(SharedStr::from(selected.source_commit_id.to_string())),
-                        false,
-                        SharedStr::from(branch.as_str()),
-                    );
+                        selected.schema_key().to_owned(),
+                        selected.file_id().map(str::to_owned),
+                        selected.row_pk().clone(),
+                    )) {
+                        return Err(LixError::new(
+                            "LIX_MIGRATION_MERGE_SCOPE_UNSUPPORTED",
+                            "native historical selection overlaps a materialized semantic row",
+                        ));
+                    }
+                    let row = rows.row(slot).ok_or_else(|| {
+                        LixError::unknown(
+                            "selected migration row missing from canonical native source",
+                        )
+                    })?;
+                    if row.change_id() != selected.change_id || row.deleted() != selected.deleted {
+                        return Err(LixError::unknown(
+                            "migration native selection changed identity",
+                        ));
+                    }
+                    let metadata = row
+                        .metadata()
+                        .cloned()
+                        .map(TransactionJson::from_unvalidated_shared_normalized_content);
+                    let created = Some(SharedStr::from(selected.created_at.to_string()));
+                    let updated = Some(SharedStr::from(selected.updated_at.to_string()));
+                    if selected.deleted {
+                        raw.push_parts(
+                            Some(selected.row_pk().clone()),
+                            row.schema_key_shared(),
+                            row.file_id_shared(),
+                            None,
+                            metadata,
+                            None,
+                            created,
+                            updated,
+                            branch.as_str() == GLOBAL_BRANCH_ID,
+                            Some(SharedStr::from(selected.change_id.to_string())),
+                            Some(SharedStr::from(selected.source_commit_id.to_string())),
+                            false,
+                            SharedStr::from(branch.as_str()),
+                        );
+                    } else if let Some(decoded) = row.decoded_snapshot().cloned() {
+                        raw.push_typed_parts(
+                            Some(selected.row_pk().clone()),
+                            row.schema_key_shared(),
+                            row.file_id_shared(),
+                            Some(decoded),
+                            metadata,
+                            None,
+                            created,
+                            updated,
+                            branch.as_str() == GLOBAL_BRANCH_ID,
+                            Some(SharedStr::from(selected.change_id.to_string())),
+                            Some(SharedStr::from(selected.source_commit_id.to_string())),
+                            false,
+                            SharedStr::from(branch.as_str()),
+                        );
+                    } else {
+                        raw.push_parts(
+                            Some(selected.row_pk().clone()),
+                            row.schema_key_shared(),
+                            row.file_id_shared(),
+                            row.snapshot_content()
+                                .cloned()
+                                .map(TransactionJson::from_unvalidated_shared_normalized_content),
+                            metadata,
+                            None,
+                            created,
+                            updated,
+                            branch.as_str() == GLOBAL_BRANCH_ID,
+                            Some(SharedStr::from(selected.change_id.to_string())),
+                            Some(SharedStr::from(selected.source_commit_id.to_string())),
+                            false,
+                            SharedStr::from(branch.as_str()),
+                        );
+                    }
                 }
             }
         }
@@ -1348,7 +1365,6 @@ where
             .resize_rows(projection.state_rows.len());
         Ok(projection)
     }
-
     // Compose the immutable outcome and exact source guards with native M/ref
     // publication in one durable transaction.
     pub(crate) fn stage_partial_authority_merge_receipt(
@@ -2460,6 +2476,7 @@ where
             origin_key: None,
             idempotency_receipt: None,
             native_migration_validation: false,
+            planned_cascade_deletes: BTreeSet::new(),
             native_merge_checkpoints: BTreeMap::new(),
             native_migration_branch_bridges: BTreeMap::new(),
             idempotency_receipt_source: None,
@@ -2883,6 +2900,9 @@ where
                         "lix.perf.transaction_reconcile_stale"
                     ))
                     .await?;
+                if prepared_writes.state_rows.iter().any(|row| row.is_deleted()) {
+                    Box::pin(transaction.reconcile_delete_actions(&mut prepared_writes)).await?;
+                }
                 let branch_checkpoint_bridges = transaction
                     .resolve_pending_branch_checkpoint_replacements(&read, &prepared_writes)
                     .await?;
@@ -2907,7 +2927,11 @@ where
                 )
                 .await?;
                 if transaction.native_migration_validation {
-                    let mut projection = transaction.native_migration_validation_projection(&read, &prepared_writes).await?;
+                    let mut projection = Box::pin(
+                        transaction
+                            .native_migration_validation_projection(&read, &prepared_writes),
+                    )
+                    .await?;
                     transaction.validate_prepared_writes_by_branch(&read, &mut projection).await?;
                     prepared_writes.state_rows.set_staged_index_values(projection.state_rows.staged_index_values().clone());
                 } else {
@@ -3250,6 +3274,7 @@ where
             pending_checkpoint_gc_sequence: self.pending_checkpoint_gc_sequence,
             pending_undo_baseline: self.pending_undo_baseline.clone(),
             successful_undo_redo: self.successful_undo_redo,
+            native_migration_validation: self.native_migration_validation,
         })
     }
 
@@ -3267,6 +3292,7 @@ where
             pending_checkpoint_gc_sequence,
             pending_undo_baseline,
             successful_undo_redo,
+            native_migration_validation,
         } = checkpoint;
         self.staged_writes.restore(staged_writes)?;
         self.filesystem_path_index_epoch
@@ -3279,6 +3305,7 @@ where
         self.pending_checkpoint_gc_sequence = pending_checkpoint_gc_sequence;
         self.pending_undo_baseline = pending_undo_baseline;
         self.successful_undo_redo = successful_undo_redo;
+        self.native_migration_validation = native_migration_validation;
         // A failed statement may have chained a predecessor actor successor.
         // Its prior document can no longer be restored byte-for-byte, so
         // conservatively discard all unpublished actor cache work. The staged
@@ -3476,7 +3503,7 @@ where
                     .certified_preparation()
                     .is_some_and(|certificate| certificate.fileless_typed_sql_rows)
         );
-        if certified_fileless_typed_sql {
+        if certified_fileless_typed_sql && !matches!(&write, TransactionWrite::Rows { rows, .. } if rows.iter().any(|row| row.snapshot.is_none())) {
             let TransactionWrite::Rows { mode, rows } = write else {
                 unreachable!("certified fileless SQL writes contain only rows")
             };
@@ -3657,6 +3684,10 @@ where
         &mut self,
         mut rows: RawWriteBatch,
     ) -> Result<TransactionWriteOutcome, LixError> {
+        if rows.iter().any(|row| row.snapshot.is_none()) {
+            return Box::pin(self.stage_write_inner(TransactionWrite::Rows { mode: TransactionWriteMode::Replace, rows }, None)).await;
+        }
+
         let row_count = rows.len();
         if row_count == 0 {
             return Ok(TransactionWriteOutcome { count: 0 });
@@ -3729,7 +3760,8 @@ where
         &mut self,
         write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError> {
-        Box::pin(self.stage_write_inner_with_recovery(write, None, true, BTreeSet::new())).await
+        self.stage_write_inner_with_recovery(write, None, true, BTreeSet::new())
+            .await
     }
 
     async fn stage_write_inner(
@@ -3737,15 +3769,8 @@ where
         write: TransactionWrite,
         statement_indices: Option<Vec<u32>>,
     ) -> Result<TransactionWriteOutcome, LixError> {
-        // Keep the large staging future out of each caller's async frame.
-        // Migration and history replay already have deep transactional futures.
-        Box::pin(self.stage_write_inner_with_recovery(
-            write,
-            statement_indices,
-            false,
-            BTreeSet::new(),
-        ))
-        .await
+        self.stage_write_inner_with_recovery(write, statement_indices, false, BTreeSet::new())
+            .await
     }
 
     /// Complete file lifecycle diffs come from validated immutable history, not
@@ -3765,7 +3790,24 @@ where
         .await
     }
 
-    async fn stage_write_inner_with_recovery(
+    fn stage_write_inner_with_recovery(
+        &mut self,
+        write: TransactionWrite,
+        statement_indices: Option<Vec<u32>>,
+        retained_recovery: bool,
+        historical_files: BTreeSet<String>,
+    ) -> futures_util::future::BoxFuture<'_, Result<TransactionWriteOutcome, LixError>> {
+        // Construct outside the caller's poll frame. Boxing at an await site
+        // still reserves the full future temporary on debug-build undo stacks.
+        Box::pin(self.stage_write_inner_with_recovery_impl(
+            write,
+            statement_indices,
+            retained_recovery,
+            historical_files,
+        ))
+    }
+
+    async fn stage_write_inner_with_recovery_impl(
         &mut self,
         write: TransactionWrite,
         statement_indices: Option<Vec<u32>>,
@@ -3871,72 +3913,120 @@ where
         } else {
             Vec::new()
         };
-        let (affects_filesystem_path_index, mut filesystem_delta_rows) =
-            prepared_transaction_write_filesystem_index_impact(&write)?;
-        let stage_result = tracing::debug_span!(
-            target: "lix_perf",
-            "lix.perf.transaction_buffer_stage"
-        )
-        .in_scope(|| match statement_indices {
-            Some(indices) => self
-                .staged_writes
-                .stage_parameter_batch_insert(write, indices),
-            None => self.staged_writes.stage_write(write),
-        });
-        let outcome = match stage_result {
-            Ok(outcome) => outcome,
+        let deletion_seeds = match if prepared_transaction_write_rows(&write)
+            .iter()
+            .any(|row| row.is_deleted())
+        {
+            Box::pin(
+                self.capture_delete_action_seeds(prepared_transaction_write_rows(&write), None),
+            )
+            .await
+        } else {
+            Ok(Vec::new())
+        } {
+            Ok(seeds) => seeds,
             Err(error) => {
                 discard_plugin_actor_publications(actor_publications).await;
                 return Err(error);
             }
         };
-        if affects_filesystem_path_index {
-            let tracked_branch_ids = filesystem_delta_rows
-                .iter()
-                .filter(|row| !row.untracked)
-                .map(|row| row.branch_id.to_string())
-                .collect::<BTreeSet<_>>();
-            let mut commit_ids = BTreeMap::new();
-            for branch_id in tracked_branch_ids {
-                commit_ids.insert(
-                    branch_id.clone(),
-                    self.staged_writes.commit_id_for_branch(&branch_id)?,
-                );
+        let cascade_checkpoint = match (!deletion_seeds.is_empty())
+            .then(|| self.begin_sql_statement_checkpoint().map(Box::new))
+            .transpose()
+        {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                discard_plugin_actor_publications(actor_publications).await;
+                return Err(error);
             }
-            for row in &mut filesystem_delta_rows {
-                row.commit_id = if row.untracked {
-                    None
-                } else {
-                    commit_ids.get(row.branch_id.as_ref()).copied().flatten()
+        };
+        let result = Box::pin(async {
+            let (affects_filesystem_path_index, mut filesystem_delta_rows) =
+                match prepared_transaction_write_filesystem_index_impact(&write) {
+                    Ok(impact) => impact,
+                    Err(error) => {
+                        discard_plugin_actor_publications(actor_publications).await;
+                        return Err(error);
+                    }
                 };
+            let stage_result = tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.transaction_buffer_stage"
+            )
+            .in_scope(|| match statement_indices {
+                Some(indices) => self
+                    .staged_writes
+                    .stage_parameter_batch_insert(write, indices),
+                None => self.staged_writes.stage_write(write),
+            });
+            let outcome = match stage_result {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    discard_plugin_actor_publications(actor_publications).await;
+                    return Err(error);
+                }
+            };
+            if affects_filesystem_path_index {
+                let tracked_branch_ids = filesystem_delta_rows
+                    .iter()
+                    .filter(|row| !row.untracked)
+                    .map(|row| row.branch_id.to_string())
+                    .collect::<BTreeSet<_>>();
+                let mut commit_ids = BTreeMap::new();
+                for branch_id in tracked_branch_ids {
+                    let commit_id = match self.staged_writes.commit_id_for_branch(&branch_id) {
+                        Ok(commit_id) => commit_id,
+                        Err(error) => {
+                            discard_plugin_actor_publications(actor_publications).await;
+                            return Err(error);
+                        }
+                    };
+                    commit_ids.insert(branch_id, commit_id);
+                }
+                for row in &mut filesystem_delta_rows {
+                    row.commit_id = if row.untracked {
+                        None
+                    } else {
+                        commit_ids.get(row.branch_id.as_ref()).copied().flatten()
+                    };
+                }
+                let previous_epoch = self
+                    .filesystem_path_index_epoch
+                    .fetch_add(1, Ordering::SeqCst);
+                let next_epoch = previous_epoch.wrapping_add(1);
+                if incremental_filesystem_index_enabled() && !filesystem_delta_rows.is_empty() {
+                    self.filesystem_path_index_cache.advance_revisions(
+                        &filesystem_delta_rows,
+                        |revision| {
+                            advance_transaction_path_index_cache_revision(
+                                revision,
+                                previous_epoch,
+                                next_epoch,
+                            )
+                        },
+                    );
+                }
             }
-            let previous_epoch = self
-                .filesystem_path_index_epoch
-                .fetch_add(1, Ordering::SeqCst);
-            let next_epoch = previous_epoch.wrapping_add(1);
-            if incremental_filesystem_index_enabled() && !filesystem_delta_rows.is_empty() {
-                self.filesystem_path_index_cache.advance_revisions(
-                    &filesystem_delta_rows,
-                    |revision| {
-                        advance_transaction_path_index_cache_revision(
-                            revision,
-                            previous_epoch,
-                            next_epoch,
-                        )
-                    },
-                );
+            self.pending_file_view_mutations.extend(file_view_mutations);
+            self.pending_plugin_actor_publications
+                .extend(actor_publications);
+            if !deletion_seeds.is_empty() {
+                Box::pin(self.stage_delete_actions(deletion_seeds)).await?;
             }
+            if !plugin_schema_defaults.is_empty() {
+                self.materialize_schema_defaults(&plugin_schema_defaults)
+                    .await?;
+            }
+            Ok(outcome)
+        })
+        .await;
+        if result.is_err()
+            && let Some(checkpoint) = cascade_checkpoint
+        {
+            Box::pin(self.rollback_sql_statement_checkpoint(*checkpoint)).await?;
         }
-        self.pending_file_view_mutations.extend(file_view_mutations);
-        self.pending_plugin_actor_publications
-            .extend(actor_publications);
-        if !plugin_schema_defaults.is_empty() {
-            self.materialize_schema_defaults(&plugin_schema_defaults)
-                .await?;
-        }
-        Ok(outcome)
+        result
     }
-
     fn reject_write_after_collection_replacement(
         &self,
         write: &TransactionWrite,
@@ -5472,7 +5562,7 @@ where
             SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
         let base = self.hot_state.reader(read.clone());
 
-        let registry_rows = overlay_load_exact_batch(
+        let registry_rows = Box::pin(overlay_load_exact_batch(
             &base,
             &staged,
             &HotStateExactBatchRequest {
@@ -5489,7 +5579,7 @@ where
                 untracked: Some(false),
                 include_tombstones: false,
             },
-        )
+        ))
         .await?;
         let mut registries = BTreeMap::<String, PluginRegistry>::new();
         let mut changed_registry_branches = BTreeSet::<String>::new();
@@ -5718,7 +5808,7 @@ where
             if lane_keys.is_empty() {
                 continue;
             }
-            let owner_rows = overlay_load_exact_batch(
+            let owner_rows = Box::pin(overlay_load_exact_batch(
                 &base,
                 &staged,
                 &HotStateExactBatchRequest {
@@ -5735,7 +5825,7 @@ where
                     untracked: Some(lane),
                     include_tombstones: false,
                 },
-            )
+            ))
             .await?;
             for row in (0..owner_rows.len()).filter_map(|slot| owner_rows.row(slot)) {
                 let branch_id = row.branch_id().to_string();
@@ -8657,6 +8747,13 @@ where
         }
         let program = Arc::clone(program);
         let primary_key = program.primary_key(params)?;
+        let schema_catalog = Arc::clone(&self.sql_schema_snapshot);
+        let schema_plan = schema_catalog.plan(program.schema_plan_id).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "prepared mutation lost its schema plan",
+            )
+        })?;
         if self
             .mutation_journal
             .as_ref()
@@ -8715,8 +8812,13 @@ where
             Some(false) => return Ok(Some(crate::sql2::SqlWriteResult::affected(0))),
             Some(true) => None,
             None => {
-                let Some(row) =
-                    crate::sql2::prepare_path_value_replacement_row(self, &program, params).await?
+                let Some(row) = crate::sql2::prepare_path_value_replacement_row(
+                    self,
+                    &program,
+                    params,
+                    schema_plan,
+                )
+                .await?
                 else {
                     return Ok(Some(crate::sql2::SqlWriteResult::affected(0)));
                 };
@@ -8748,17 +8850,20 @@ where
         let snapshot_offset = match fallback_row {
             Some(row) => {
                 let start = journal.snapshot_arena.len();
-                journal
-                    .snapshot_arena
-                    .extend_from_slice(row.snapshot.normalized().as_bytes());
+                journal.snapshot_arena.extend_from_slice(&row.snapshot);
                 (start, journal.snapshot_arena.len())
             }
-            None => crate::sql2::append_path_value_replacement_snapshot(
-                &program,
-                primary_key,
-                params,
-                &mut journal.snapshot_arena,
-            )?,
+            None => {
+                let start = journal.snapshot_arena.len();
+                crate::sql2::append_path_value_replacement_payload(
+                    &program,
+                    primary_key,
+                    params,
+                    schema_plan,
+                    &mut journal.snapshot_arena,
+                )?;
+                (start, journal.snapshot_arena.len())
+            }
         };
         let timestamp = *timestamp_slot.get_or_insert_with(|| functions.call_timestamp());
         journal.append_identity(primary_key);
@@ -8806,6 +8911,19 @@ where
                 program.replacement_value_text(params)?,
             )
         };
+        let schema_plan_id = self
+            .prepared_mutation_program
+            .as_ref()
+            .expect("prepared literal mutation retains its prepared program")
+            .1
+            .schema_plan_id;
+        let schema_catalog = Arc::clone(&self.sql_schema_snapshot);
+        let schema_plan = schema_catalog.plan(schema_plan_id).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "prepared literal mutation lost its schema plan",
+            )
+        })?;
 
         let same_origin = self
             .mutation_journal
@@ -8899,11 +9017,14 @@ where
                 timestamp: None,
             });
         debug_assert_eq!(journal.origin_key, origin_key);
-        let snapshot_offset = crate::sql2::append_path_value_replacement_snapshot_text(
+        let snapshot_start = journal.snapshot_arena.len();
+        crate::sql2::append_path_value_replacement_payload_text(
+            schema_plan,
             primary_key,
             Some(replacement_value),
             &mut journal.snapshot_arena,
         )?;
+        let snapshot_offset = (snapshot_start, journal.snapshot_arena.len());
         journal.append_identity(primary_key);
         journal.snapshot_offsets.push(snapshot_offset);
         #[cfg(feature = "storage-benches")]
@@ -9179,16 +9300,7 @@ where
                 "non-empty transaction mutation journal has no lifecycle timestamp",
             )
         })?;
-        let schema_plan = self
-            .sql_schema_snapshot
-            .plan(journal.program.schema_plan_id)
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "immutable mutation journal lost its schema plan",
-                )
-            })?;
-        let mut chunk = ImmutableMutationJournalChunk::try_new_single_string_identities(
+        let mut chunk = ImmutableMutationJournalChunk::try_new_typed_single_string_identities(
             journal.program.schema_plan_id,
             journal.program.schema_key.as_str().into(),
             self.active_branch_id.clone().into(),
@@ -9197,7 +9309,6 @@ where
             journal.identity_offsets,
             journal.snapshot_arena,
             journal.snapshot_offsets,
-            schema_plan,
             None,
             timestamp,
         )?;
@@ -9564,17 +9675,33 @@ where
     }
 
     pub(crate) fn stage_merge_commit(
-        &self,
+        &mut self,
         branch_id: String,
         source_parent_commit_id: CommitId,
         selected_changes: StagedCommitChangeBatch,
     ) -> Result<String, LixError> {
+        self.native_migration_validation = true;
         let commit_id = self
             .staged_writes
             .stage_selected_commit_change_refs(branch_id.clone(), selected_changes)?;
         self.staged_writes
             .add_commit_parent(branch_id, source_parent_commit_id)?;
         Ok(commit_id)
+    }
+
+    pub(crate) async fn validate_staged_merge_candidate(&mut self) -> Result<(), LixError> {
+        let checkpoint = self.staged_writes.checkpoint()?;
+        let prepared = self.staged_writes.drain()?;
+        let read = self.opening_read();
+        let result = async {
+            let mut projection = Box::pin(
+                self.native_migration_validation_projection(&read, &prepared),
+            )
+            .await?;
+            self.validate_prepared_writes_by_branch(&read, &mut projection).await
+        }.await;
+        self.staged_writes.restore(checkpoint)?;
+        result
     }
 
     /// Stages the constant-work checkpoint boundary used by the SDK API.

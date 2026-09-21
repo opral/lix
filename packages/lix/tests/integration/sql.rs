@@ -91,6 +91,7 @@ macro_rules! simulation_test {
 }
 
 mod checkpoint;
+mod bigint_predicate;
 mod delete_returning;
 mod diff_commands;
 mod diff_relation;
@@ -98,6 +99,7 @@ mod errors;
 mod history_conformance;
 mod index_lifecycle;
 mod information_schema;
+mod jsonb_projection;
 mod lix_branch;
 mod lix_change;
 mod lix_commit;
@@ -110,6 +112,7 @@ mod lix_key_value;
 mod lix_registered_schema;
 mod mainline;
 mod metadata;
+mod prepared_path_value;
 mod read_only;
 mod recovery_functions;
 mod recovery_regressions;
@@ -121,6 +124,7 @@ mod state_at;
 mod subquery_reads;
 mod subquery_writes;
 mod temporal_arguments;
+mod text_cast_metadata;
 mod udfs;
 mod untracked_current_state;
 mod write_returning;
@@ -153,3 +157,5 @@ fn rows_from_result(result: ExecuteResult) -> Vec<Vec<Value>> {
 }
 
 mod index_schema_amendment;
+
+mod typed_value_contract;

@@ -108,33 +108,38 @@ pub(crate) async fn prepare_path_value_replacement_row(
     ctx: &mut dyn crate::sql2::SqlWriteExecutionContext,
     program: &bound_public_write::PreparedPathValueReplacementProgram,
     params: &[crate::Value],
+    schema_plan: &crate::catalog::SchemaPlan,
 ) -> Result<Option<bound_public_write::PreparedPathValueReplacementRow>, crate::LixError> {
-    bound_public_write::prepare_path_value_replacement_row(ctx, program, params).await
+    bound_public_write::prepare_path_value_replacement_row(ctx, program, params, schema_plan).await
 }
 
-pub(crate) fn append_path_value_replacement_snapshot(
+pub(crate) fn append_path_value_replacement_payload(
     program: &bound_public_write::PreparedPathValueReplacementProgram,
     primary_key: &str,
     params: &[crate::Value],
-    normalized: &mut Vec<u8>,
-) -> Result<(usize, usize), crate::LixError> {
-    bound_public_write::append_path_value_replacement_snapshot(
+    schema_plan: &crate::catalog::SchemaPlan,
+    output: &mut Vec<u8>,
+) -> Result<(), crate::LixError> {
+    bound_public_write::append_path_value_replacement_payload(
         program,
         primary_key,
         params,
-        normalized,
+        schema_plan,
+        output,
     )
 }
 
-pub(crate) fn append_path_value_replacement_snapshot_text(
+pub(crate) fn append_path_value_replacement_payload_text(
+    schema_plan: &crate::catalog::SchemaPlan,
     primary_key: &str,
     replacement_value: Option<&str>,
-    normalized: &mut Vec<u8>,
-) -> Result<(usize, usize), crate::LixError> {
-    bound_public_write::append_path_value_replacement_snapshot_text(
+    output: &mut Vec<u8>,
+) -> Result<(), crate::LixError> {
+    bound_public_write::append_path_value_replacement_payload_text(
+        schema_plan,
         primary_key,
         replacement_value,
-        normalized,
+        output,
     )
 }
 

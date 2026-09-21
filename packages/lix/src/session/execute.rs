@@ -10901,7 +10901,7 @@ mod tests {
             .unwrap();
 
         sql2::take_row_update_parameter_batch_executions();
-        let sql = "UPDATE parameter_batch_error_probe SET value = CAST($1 AS JSONB) WHERE id = $2";
+        let sql = "UPDATE parameter_batch_error_probe SET value = CAST(CAST($1 AS JSONB) AS TEXT) WHERE id = $2";
         let error = session
             .execute_batch(&[
                 ExecuteBatchStatement {

@@ -208,6 +208,8 @@ jobs:
         with:
           context: .
           file: packages/server/Dockerfile
+          build-args: |
+            LIX_SOURCE_REVISION=${{ needs.release-version.outputs.release_sha }}
           platforms: linux/amd64
           push: true
           tags: ${{ steps.image-tags.outputs.tags }}

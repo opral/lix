@@ -355,6 +355,35 @@ simulation_test!(
             "lixcol_metadata",
         );
 
+        session
+            .execute(
+                "UPDATE lix_key_value \
+                 SET lixcol_metadata = value \
+                 WHERE key = 'metadata-row-update'",
+                &[],
+            )
+            .await
+            .expect("SQL NULL in a visible JSONB column remains SQL NULL metadata");
+        assert_metadata_null(
+            session
+                .execute(
+                    "SELECT lixcol_metadata FROM lix_key_value \
+                     WHERE key = 'metadata-row-update'",
+                    &[],
+                )
+                .await
+                .expect("metadata copied from SQL NULL should read as NULL"),
+            "lixcol_metadata",
+        );
+        session
+            .execute(
+                "UPDATE lix_key_value SET value = CAST('null' AS JSONB) \
+                 WHERE key = 'metadata-row-update'",
+                &[],
+            )
+            .await
+            .expect("the visible JSONB column should retain actual JSON null");
+
         assert_invalid_metadata_error(
             session
                 .execute(

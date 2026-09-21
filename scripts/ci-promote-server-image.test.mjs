@@ -11,6 +11,7 @@ const revision = "2".repeat(40);
 const manifest = { schemaVersion: 1, kind: "lix-server-image", target: "linux-x64",
   sourceRevision, image: `lix-server-ci:${sourceRevision}` };
 const source = { Os: "linux", Architecture: "amd64", Config: {
+  Env: ["TEST_VALUE=preserved", `LIX_SOURCE_REVISION=${sourceRevision}`],
   Labels: { "org.opencontainers.image.revision": sourceRevision } }, RootFS: { Layers: ["sha256:tested"] } };
 
 test("rejects mismatched manifest or OCI provenance before promotion", () => {
@@ -21,6 +22,9 @@ test("rejects mismatched manifest or OCI provenance before promotion", () => {
   }
   for (const patch of [{ Architecture: "arm64" }, { Os: "windows" },
     { Config: { Labels: { "org.opencontainers.image.revision": revision } } },
+    { Config: { ...source.Config, Env: ["TEST_VALUE=preserved"] } },
+    { Config: { ...source.Config, Env: [`LIX_SOURCE_REVISION=${revision}`] } },
+    { Config: { ...source.Config, Env: [...source.Config.Env, `LIX_SOURCE_REVISION=${sourceRevision}`] } },
     { Config: { ...source.Config, OnBuild: ["RUN unexpected-command"] } }]) {
     assert.throws(() => validateServerImage(manifest, { ...source, ...patch }, sourceRevision));
   }
@@ -35,9 +39,11 @@ test("promotion retains tested layers and rewrites both receipt and image identi
       assert.equal(command, "docker"); calls.push(args);
       if (args[0] === "build") {
         assert.equal(readFileSync(join(args.at(-1), "Dockerfile"), "utf8"),
-          `FROM ${manifest.image}\nLABEL org.opencontainers.image.revision=${revision}\n`);
+          `FROM ${manifest.image}\nLABEL org.opencontainers.image.revision=${revision}\nENV LIX_SOURCE_REVISION=${revision}\n`);
       }
       if (args[0] === "image") return JSON.stringify([{ ...source, Config: {
+        ...source.Config,
+        Env: ["TEST_VALUE=preserved", `LIX_SOURCE_REVISION=${args.at(-1).endsWith(revision) ? revision : sourceRevision}`],
         Labels: { "org.opencontainers.image.revision": args.at(-1).endsWith(revision) ? revision : sourceRevision } } }]);
     };
     const result = promoteServerImage({ directory, sourceRevision, revision, sourceRun: "42", run });
@@ -57,7 +63,7 @@ test("changed filesystem layers fail without publishing a replacement receipt", 
     const run = (_command, args) => {
       assert.notEqual(args[0], "save");
       if (args[0] === "image") return JSON.stringify([args.at(-1).endsWith(revision)
-        ? { ...source, Config: { Labels: { "org.opencontainers.image.revision": revision } }, RootFS: { Layers: ["different"] } } : source]);
+        ? { ...source, Config: { ...source.Config, Env: ["TEST_VALUE=preserved", `LIX_SOURCE_REVISION=${revision}`], Labels: { "org.opencontainers.image.revision": revision } }, RootFS: { Layers: ["different"] } } : source]);
     };
     assert.throws(() => promoteServerImage({ directory, sourceRevision, revision, sourceRun: "42", run }), /filesystem layers/);
     assert.deepEqual(JSON.parse(readFileSync(join(directory, "server-linux-x64.json"), "utf8")), manifest);
@@ -69,7 +75,7 @@ test("real Docker archive loads with landed revision and unchanged layers", { sk
   const docker = args => execFileSync("docker", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   try {
     writeFileSync(join(directory, "marker"), "tested bytes\n");
-    writeFileSync(join(directory, "Dockerfile"), `FROM scratch\nCOPY marker /marker\nENV TEST_VALUE=preserved\nCMD ["do-not-run"]\nLABEL org.opencontainers.image.revision=${sourceRevision}\n`);
+    writeFileSync(join(directory, "Dockerfile"), `FROM scratch\nCOPY marker /marker\nENV TEST_VALUE=preserved LIX_SOURCE_REVISION=${sourceRevision}\nCMD ["do-not-run"]\nLABEL org.opencontainers.image.revision=${sourceRevision}\n`);
     docker(["build", "--tag", manifest.image, directory]);
     docker(["save", "--output", join(directory, "lix-server-image.tar"), manifest.image]);
     writeFileSync(join(directory, "server-linux-x64.json"), JSON.stringify(manifest));
@@ -81,9 +87,25 @@ test("real Docker archive loads with landed revision and unchanged layers", { sk
     const original = JSON.parse(docker(["image", "inspect", manifest.image]))[0];
     assert.deepEqual(loaded.RootFS.Layers, original.RootFS.Layers);
     assert.deepEqual(loaded.Config.Cmd, ["do-not-run"]);
-    assert.deepEqual(loaded.Config.Env, original.Config.Env);
+    assert.deepEqual(loaded.Config.Env, original.Config.Env.map(value => value.startsWith("LIX_SOURCE_REVISION=") ? `LIX_SOURCE_REVISION=${revision}` : value));
   } finally {
     docker(["image", "rm", "--force", manifest.image, `lix-server-ci:${revision}`]);
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("promotion rejects unrelated environment changes before saving", () => {
+  const directory = mkdtempSync(join(tmpdir(), "server-promotion-test-"));
+  try {
+    writeFileSync(join(directory, "server-linux-x64.json"), JSON.stringify(manifest));
+    const run = (_command, args) => {
+      assert.notEqual(args[0], "save");
+      if (args[0] === "image") return JSON.stringify([args.at(-1).endsWith(revision)
+        ? { ...source, Config: { ...source.Config,
+          Env: ["TEST_VALUE=changed", `LIX_SOURCE_REVISION=${revision}`],
+          Labels: { "org.opencontainers.image.revision": revision } } } : source]);
+    };
+    assert.throws(() => promoteServerImage({ directory, sourceRevision, revision, sourceRun: "42", run }), /runtime configuration: Env/);
+    assert.deepEqual(JSON.parse(readFileSync(join(directory, "server-linux-x64.json"), "utf8")), manifest);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
 });

@@ -234,3 +234,8 @@ wasm-bindgen-futures = "0.4"
 name = "plugin_api_compatibility"
 path = "tests/plugin_api_compatibility.rs"
 required-features = ["default_wasm_runtime"]
+
+[[bench]]
+name = "sql_value_handling"
+path = "benches/sql_value_handling.rs"
+harness = false

@@ -2983,6 +2983,191 @@ fn pending_foreign_key_reference_target_description(
     }
 }
 
+pub(super) fn delete_action_seed(
+    row: MaterializedHotStateRowRef<'_>,
+) -> Result<crate::hot_state::MaterializedHotStateRow, LixError> {
+    let mut seed = row.to_owned();
+    seed.snapshot_content = row
+        .snapshot_json_value()?
+        .map(|value| value.to_string().into());
+    Ok(seed)
+}
+
+/// Expand only proven deletion events, never arbitrary dangling references.
+/// Each queue frontier probes each referencing collection once; the existing
+/// declared-column index handles scalar fan-out and safely falls back to scans.
+#[tracing::instrument(skip_all, name = "lix.perf.referential_actions", fields(seeds = seeds.len()))]
+pub(super) async fn plan_delete_actions(
+    candidate: &dyn HotStateReader,
+    catalog: &CatalogSnapshot,
+    seeds: Vec<crate::hot_state::MaterializedHotStateRow>,
+) -> Result<crate::transaction_types::RawWriteBatch, LixError> {
+    let mut indexed_probes = 0usize;
+    let mut scan_probes = 0usize;
+    let mut candidates = 0usize;
+    let mut levels = 0usize;
+    let mut frontier = seeds;
+    let mut enqueued = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    let mut output = crate::transaction_types::RawWriteBatch::new();
+    while !frontier.is_empty() {
+        levels += 1;
+        let mut batches =
+            BTreeMap::<NormalDeleteRestrictionBatchKey, BTreeSet<UniqueConstraintValue>>::new();
+        for parent in std::mem::take(&mut frontier) {
+            let identity = DomainRowIdentity::new(
+                Domain::exact_file(
+                    parent.branch_id.to_string(),
+                    parent.untracked,
+                    parent.file_id.clone(),
+                ),
+                parent.schema_key.clone(),
+                parent.row_pk.clone(),
+            );
+            let first_visit = visited.insert(identity.clone());
+            // Merge seeds may contain both branch-live images of one deleted
+            // identity when a referenced unique key changed. Expand both values
+            // on the initial frontier; discovered descendants remain unique.
+            if !first_visit && levels != 1 {
+                continue;
+            }
+            let Some(snapshot) = parent.snapshot_content.as_ref() else {
+                continue;
+            };
+            let snapshot: JsonValue = serde_json::from_str(snapshot.as_str()).map_err(|error| {
+                LixError::new(LixError::CODE_SCHEMA_VALIDATION, error.to_string())
+            })?;
+            for reference in catalog
+                .delete_plan_for_key(&parent.schema_key)
+                .foreign_key_references
+            {
+                if reference.foreign_key.on_delete != lix_schema::DeleteAction::Cascade {
+                    continue;
+                }
+                let Some(value) = UniqueConstraintValue::from_snapshot_non_null(
+                    &snapshot,
+                    &reference.foreign_key.referenced_properties,
+                ) else {
+                    continue;
+                };
+                for domain in
+                    delete_restriction_source_domains(&identity, &reference.source_key.schema_key)
+                {
+                    batches
+                        .entry(NormalDeleteRestrictionBatchKey {
+                            source_key: reference.source_key.clone(),
+                            source_domain: domain,
+                            local_properties: reference.foreign_key.local_properties.clone(),
+                        })
+                        .or_default()
+                        .insert(value.clone());
+                }
+            }
+        }
+        for (batch, values) in batches {
+            let probe = delete_action_probe(catalog, &batch, &values);
+            let rows = match probe {
+                Some(probe) => {
+                    indexed_probes += 1;
+                    scan_committed_constraint_rows_by_declared_column(
+                        candidate,
+                        &batch.source_domain,
+                        &batch.source_key.schema_key,
+                        probe,
+                    )
+                    .await?
+                }
+                None => {
+                    scan_probes += 1;
+                    scan_committed_constraint_rows(
+                        candidate,
+                        &batch.source_domain,
+                        vec![batch.source_key.schema_key.clone()],
+                        Vec::new(),
+                        false,
+                    )
+                    .await?
+                }
+            };
+            candidates += rows.len();
+            for row in rows.iter() {
+                let identity = DomainRowIdentity::new(
+                    Domain::for_live_row_ref(row),
+                    row.schema_key(),
+                    row.row_pk().clone(),
+                );
+                if visited.contains(&identity)
+                    || !committed_constraint_value(row, &batch.local_properties, true)?
+                        .is_some_and(|value| values.contains(&value))
+                {
+                    continue;
+                }
+                // Mark at enqueue time as well, so diamonds cannot emit duplicate deletes.
+                if !enqueued.insert(identity) {
+                    continue;
+                }
+                output.push_parts(
+                    Some(row.row_pk().clone()),
+                    row.schema_key().into(),
+                    row.file_id().map(Into::into),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    row.global(),
+                    None,
+                    None,
+                    row.untracked(),
+                    row.branch_id().into(),
+                );
+                if catalog
+                    .delete_plan_for_key(row.schema_key())
+                    .foreign_key_references
+                    .iter()
+                    .any(|reference| {
+                        reference.foreign_key.on_delete == lix_schema::DeleteAction::Cascade
+                    })
+                {
+                    frontier.push(delete_action_seed(row)?);
+                }
+            }
+        }
+    }
+    tracing::debug!(target: "lix_perf", indexed_probes, scan_probes, candidates, levels, generated = output.len(), "referential action closure");
+    Ok(output)
+}
+
+fn delete_action_probe(
+    catalog: &CatalogSnapshot,
+    batch: &NormalDeleteRestrictionBatchKey,
+    values: &BTreeSet<UniqueConstraintValue>,
+) -> Option<crate::hot_state::DeclaredColumnEq> {
+    let [path] = batch.local_properties.as_slice() else {
+        return None;
+    };
+    let [column] = path.as_slice() else {
+        return None;
+    };
+    let spec = crate::sql2::derive_schema_surface_spec_from_schema(
+        catalog.schema(&batch.source_key.schema_key)?,
+    )
+    .ok()?;
+    let ordinal = spec
+        .indexed_columns
+        .iter()
+        .find(|entry| entry.name == *column)?
+        .ordinal;
+    Some(crate::hot_state::DeclaredColumnEq {
+        schema_key: batch.source_key.schema_key.clone(),
+        ordinal,
+        values: values
+            .iter()
+            .map(UniqueConstraintValue::exact_hot_index_value)
+            .collect::<Option<Vec<_>>>()?,
+    })
+}
+
 async fn validate_committed_delete_restrictions(
     input: &TransactionValidationInput<'_>,
     schema_catalog: &CatalogSnapshot,
@@ -3029,6 +3214,7 @@ async fn validate_committed_delete_restrictions(
     validate_committed_normal_delete_restriction_batches(
         input.hot_state,
         pending_constraints,
+        delete_schema_catalog,
         normal_batches,
     )
     .await?;
@@ -3082,20 +3268,35 @@ struct NormalDeleteRestrictionBatchKey {
 async fn validate_committed_normal_delete_restriction_batches(
     hot_state: &dyn HotStateReader,
     pending_constraints: &PendingConstraintIndexes,
+    catalog: &CatalogSnapshot,
     batches: BTreeMap<
         NormalDeleteRestrictionBatchKey,
         BTreeMap<UniqueConstraintValue, Vec<DomainRowIdentity>>,
     >,
 ) -> Result<(), LixError> {
     for (batch, tombstones_by_value) in batches {
-        let rows = scan_committed_constraint_rows(
-            hot_state,
-            &batch.source_domain,
-            vec![batch.source_key.schema_key.clone()],
-            Vec::new(),
-            false,
-        )
-        .await?;
+        let values = tombstones_by_value.keys().cloned().collect();
+        let rows = match delete_action_probe(catalog, &batch, &values) {
+            Some(probe) => {
+                scan_committed_constraint_rows_by_declared_column(
+                    hot_state,
+                    &batch.source_domain,
+                    &batch.source_key.schema_key,
+                    probe,
+                )
+                .await?
+            }
+            None => {
+                scan_committed_constraint_rows(
+                    hot_state,
+                    &batch.source_domain,
+                    vec![batch.source_key.schema_key.clone()],
+                    Vec::new(),
+                    false,
+                )
+                .await?
+            }
+        };
 
         for row in rows.iter() {
             if pending_constraints.tombstones_identity(row)
@@ -3160,21 +3361,6 @@ fn committed_delete_restriction_error(
     ))
 }
 
-fn parse_committed_snapshot(
-    row: MaterializedHotStateRowRef<'_>,
-    snapshot_content: &str,
-) -> Result<JsonValue, LixError> {
-    serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
-        LixError::new(
-            LixError::CODE_SCHEMA_VALIDATION,
-            format!(
-                "committed snapshot_content for schema '{}' is invalid JSON: {error}",
-                row.schema_key()
-            ),
-        )
-    })
-}
-
 fn committed_snapshot_json(
     row: MaterializedHotStateRowRef<'_>,
 ) -> Result<Option<JsonValue>, LixError> {
@@ -3203,17 +3389,15 @@ fn committed_constraint_value(
             paths,
             reject_null,
         )),
-        None if row.snapshot_content().is_none() => Ok(None),
         None => {
-            let snapshot = row
-                .snapshot_content()
-                .expect("matched committed JSON projection presence");
-            let snapshot = parse_committed_snapshot(row, snapshot.as_str())?;
-            Ok(UniqueConstraintValue::from_payload(
-                ValidatedRowPayload::Json(&snapshot),
-                paths,
-                reject_null,
-            ))
+            let snapshot = if let Some(snapshot) = row.snapshot_content() {
+                Some(serde_json::from_str::<JsonValue>(snapshot.as_str()).map_err(|error| LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    format!("committed snapshot_content for schema '{}' is invalid JSON: {error}", row.schema_key()),
+                ))?)
+            } else { row.snapshot_json_value()? };
+            let Some(snapshot) = snapshot else { return Ok(None); };
+            Ok(UniqueConstraintValue::from_payload(ValidatedRowPayload::Json(&snapshot), paths, reject_null))
         }
     }
 }
@@ -7380,6 +7564,7 @@ mod tests {
         validate_committed_normal_delete_restriction_batches(
             &hot_state,
             &PendingConstraintIndexes::default(),
+            CatalogSnapshot::builtin(),
             batches,
         )
         .await

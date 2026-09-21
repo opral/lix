@@ -81,6 +81,8 @@ and will remain red until that one-time setting is complete.
 | `S3_PREFIX` | empty | Explicit object key prefix |
 | `S3_ALLOW_HTTP` | `false` | Allow an insecure object-store endpoint |
 | `SLATEDB_CACHE_DIR` | `/tmp/lix-server-slatedb-cache` | Local cache root |
+| `LIX_SOURCE_REVISION` | `RAILWAY_GIT_COMMIT_SHA` when available | Source Git revision recorded as `vcs.ref.head.revision` |
+| `OTEL_SERVICE_INSTANCE_ID` | Generated process UUID | Instance recorded as `service.instance.id` |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | unset | Optional OTLP/HTTP trace endpoint |
 | `OTEL_EXPORTER_OTLP_TRACES_HEADERS` | unset | Collector authentication headers, for example `Authorization=Bearer%20token` |
 
@@ -150,3 +152,28 @@ late or crashed writer cannot leave unreachable data. An operation is limited to
 its staging catalog. Uploads are streamed with a 16 GiB limit.
 
 Idle runtimes are checked every five seconds (or the configured idle timeout, if shorter). The idle interval starts when a sweep first observes no request leases or live protocol sessions, and admitted requests reset it. Requests carrying unknown, expired, or incorrectly authenticated session IDs are rejected before storage admission: they neither open a runtime nor reset its idle clock. Session deletion remains idempotent when its runtime is absent. Live protocol sessions retain their existing session lifetime (including the protocol’s 30-minute idle-session timeout), so the runtime idle period begins only after those sessions end or expire. Expiry closes the protocol and SlateDB workers even below the runtime capacity limit, stopping their background object-store polling. Reopening waits for close and cache cleanup to finish. Shutdown also waits for expiry cleanup; the recovery close deadline applies to eviction closes.
+
+Protocol request spans extract standard W3C `traceparent` and `tracestate`
+headers, including the remote sampling decision. Missing or invalid context
+starts a new trace. Callers should inject the active HTTP client span context;
+repository commits are separate attributes, never substitutes for trace IDs.
+
+`lix.runtime.acquire` measures each caller's acquisition latency.
+`lix.runtime.wait_open` and `lix.runtime.wait_cleanup` identify blocked waits.
+One manager-owned `lix.runtime.open` span describes actual shared opening work;
+callers joining an in-progress open link their acquire span to that shared span.
+
+The optional cross-repository trace test uses LixRay's real JavaScript client
+against an in-memory Rust server over localhost TCP (no S3 or Docker needed).
+After installing LixRay's dependencies and building its pinned JS SDK, run this
+one test separately; it installs the process-global tracing subscriber just as
+production does:
+
+```sh
+LIX_TRACE_NODE_FIXTURE=/absolute/path/to/lixray/web-app/scripts/trace-integration.mjs \
+  cargo test -p lix-server --lib node_client_trace_integration -- --ignored --nocapture
+```
+
+It checks the exact JS client → Rust server parent IDs for handshake, account
+provisioning, transaction execution/commit, checkpoint, and session cleanup,
+plus SQL and checkpoint trace identity.

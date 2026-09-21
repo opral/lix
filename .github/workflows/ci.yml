@@ -866,6 +866,8 @@ jobs:
         with:
           context: .
           file: packages/server/Dockerfile
+          build-args: |
+            LIX_SOURCE_REVISION=${{ env.LIX_SOURCE_SHA }}
           tags: lix-server-ci:${{ env.LIX_SOURCE_SHA }}
           outputs: type=docker,dest=${{ runner.temp }}/lix-server-image.tar
           labels: |
@@ -881,6 +883,16 @@ jobs:
             "lix-server-ci:$LIX_SOURCE_SHA" \
             --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
           test "$revision" = "$LIX_SOURCE_SHA"
+          docker image inspect "lix-server-ci:$LIX_SOURCE_SHA" \
+            --format '{{json .Config.Env}}' | node -e '
+              let input = "";
+              process.stdin.on("data", chunk => input += chunk);
+              process.stdin.on("end", () => {
+                if (!JSON.parse(input).includes(`LIX_SOURCE_REVISION=${process.env.LIX_SOURCE_SHA}`)) {
+                  throw new Error("server telemetry source revision is missing or incorrect");
+                }
+              });
+            '
           echo "Built reusable Lix server image for $revision"
 
       - name: Describe reusable server image artifact

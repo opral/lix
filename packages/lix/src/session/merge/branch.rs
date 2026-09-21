@@ -151,39 +151,24 @@ where
                 }
                 .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_analysis"))
                 .await?;
-                let derived_blob_files = async {
-                    let mut reader = transaction.tracked_state_reader().await?;
-                    derived_plugin_blob_conflicts(&mut reader, &analysis).await
-                }
-                .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_derived_blob_detection"))
-                .await?;
-
-                let plugin_resolution_stats = if analysis.outcome == MergeOutcome::MergeCommitted {
-                    let semantic_branch_id = SharedStr::from(active_branch_id.as_str());
-                    let resolved_plugin_rows = resolve_row_merge_conflicts(
-                        transaction,
-                        &analysis,
-                        &derived_blob_files,
-                        &semantic_branch_id,
-                    )
-                    .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_plugin_conflict_resolve"))
-                    .await?;
-                    async {
-                        let mut reader = transaction.tracked_state_reader().await?;
-                        plugin_resolution_change_stats(&mut reader, &analysis, &resolved_plugin_rows).await
-                    }
-                    .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_plugin_resolution_stats"))
-                    .await?
+                if analysis.outcome == MergeOutcome::MergeCommitted {
+                    let checkpoint = transaction.begin_sql_statement_checkpoint()?;
+                    let result = async {
+                        let receipt = Box::pin(stage_native_change_application(transaction, source_branch_id.clone(), &analysis)).await?;
+                        Box::pin(transaction.validate_staged_merge_candidate()).await?;
+                        Ok(MergeBranchPreview {
+                            outcome: receipt.outcome, target_branch_id: receipt.target_branch_id,
+                            source_branch_id: receipt.source_branch_id, base_commit_id: receipt.base_commit_id,
+                            target_head_commit_id: analysis.commits.target_commit_id.to_string(),
+                            source_head_commit_id: analysis.commits.source_commit_id.to_string(),
+                            change_stats: receipt.change_stats,
+                        })
+                    }.await;
+                    transaction.rollback_sql_statement_checkpoint(checkpoint).await?;
+                    result
                 } else {
-                    MergeChangeStats::default()
-                };
-
-                preview_from_analysis(
-                    &active_branch_id,
-                    &source_branch_id,
-                    &analysis,
-                    &plugin_resolution_stats,
-                )
+                    preview_from_analysis(&active_branch_id, &source_branch_id, &analysis, &MergeChangeStats::default())
+                }
         })
         .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_preview_total"))
         .await
@@ -292,7 +277,7 @@ where
                 });
             }
 
-            stage_native_change_application(transaction, source_branch_id, &analysis).await
+            Box::pin(stage_native_change_application(transaction, source_branch_id, &analysis)).await
         })
         .instrument(tracing::debug_span!(
             target: "lix_perf",

@@ -90,7 +90,8 @@ pub(crate) async fn stage_native_change_application<S: Storage + Clone + Send + 
         "lix.perf.merge_plugin_conflict_resolve"
     ))
     .await?;
-    let plugin_resolution_stats = async {
+    let mut resolved_stats_rows = resolved_plugin_rows.clone();
+    let mut plugin_resolution_stats = async {
         let mut reader = transaction.tracked_state_reader().await?;
         plugin_resolution_change_stats(&mut reader, &analysis, &resolved_plugin_rows).await
     }
@@ -116,6 +117,17 @@ pub(crate) async fn stage_native_change_application<S: Storage + Clone + Send + 
         "lix.perf.merge_materialized_rows"
     ))
     .await?;
+    // A conflict resolver may author a deletion even when neither diff is a
+    // tombstone. Preserve that winning event for incoming dependent picks.
+    let resolved_deletes = semantic_rows
+        .iter()
+        .filter(|row| row.snapshot.is_none())
+        .map(|row| TrackedStateKey {
+            schema_key: row.schema_key.to_string(),
+            file_id: row.file_id.map(ToString::to_string),
+            row_pk: row.row_pk.expect("resolved merge row identity").clone(),
+        })
+        .collect::<BTreeSet<_>>();
     transaction
         .retire_incoming_file_path_occupants(analysis, &semantic_rows)
         .await?;
@@ -157,6 +169,27 @@ pub(crate) async fn stage_native_change_application<S: Storage + Clone + Send + 
             ))
             .await?;
     }
+    let candidate_picks = merge_plan
+        .picks
+        .iter()
+        .filter(|pick| !pick_is_derived_plugin_state(pick, &derived_blob_files))
+        .cloned()
+        .chain(source_equal_picks.iter().cloned())
+        .collect::<Vec<_>>();
+    let cascaded = Box::pin(transaction.stage_merge_delete_actions(
+        analysis,
+        &candidate_picks,
+        &resolved_deletes,
+    ))
+    .await?;
+    let is_cascaded = |identity: &TrackedStateDiffIdentity| {
+        let key = TrackedStateKey {
+            schema_key: identity.schema_key().into(),
+            file_id: identity.file_id().map(str::to_owned),
+            row_pk: identity.row_pk().clone(),
+        };
+        cascaded.contains(&key)
+    };
     let created_merge_commit_id = tracing::debug_span!(
         target: "lix_perf",
         "lix.perf.merge_stage_commit"
@@ -164,11 +197,9 @@ pub(crate) async fn stage_native_change_application<S: Storage + Clone + Send + 
     .in_scope(|| {
         let mut selected_changes =
             StagedCommitChangeBatchBuilder::with_capacity(merge_plan.picks.len());
-        for pick in merge_plan
-            .picks
-            .iter()
-            .filter(|pick| !pick_is_derived_plugin_state(pick, &derived_blob_files))
-        {
+        for pick in merge_plan.picks.iter().filter(|pick| {
+            !pick_is_derived_plugin_state(pick, &derived_blob_files) && !is_cascaded(&pick.identity)
+        }) {
             selected_changes.push(
                 pick.identity.clone(),
                 pick.selected_row.commit_id,
@@ -178,7 +209,10 @@ pub(crate) async fn stage_native_change_application<S: Storage + Clone + Send + 
                 pick.selected_row.updated_at,
             );
         }
-        for pick in source_equal_picks {
+        for pick in source_equal_picks
+            .into_iter()
+            .filter(|pick| !is_cascaded(&pick.identity))
+        {
             selected_changes.push(
                 pick.identity,
                 pick.selected_row.commit_id,
@@ -194,6 +228,73 @@ pub(crate) async fn stage_native_change_application<S: Storage + Clone + Send + 
             selected_changes.finish(),
         )
     })?;
+    let mut change_stats =
+        merge_change_stats_with_plugin_resolutions(&analysis.stats, &plugin_resolution_stats);
+    if !cascaded.is_empty() {
+        let resolved_keys = resolved_stats_rows
+            .iter()
+            .map(|row| TrackedStateKey {
+                schema_key: row.schema_key.to_string(),
+                file_id: row.file_id.map(ToString::to_string),
+                row_pk: row.row_pk.expect("resolved identity").clone(),
+            })
+            .collect::<Vec<_>>();
+        if resolved_keys.iter().any(|key| cascaded.contains(key)) {
+            for (index, key) in resolved_keys.iter().enumerate() {
+                if cascaded.contains(key) {
+                    resolved_stats_rows.set_snapshot(index, None);
+                }
+            }
+            let mut reader = transaction.tracked_state_reader().await?;
+            plugin_resolution_stats =
+                plugin_resolution_change_stats(&mut reader, analysis, &resolved_stats_rows).await?;
+        }
+        let resolved_keys = resolved_keys.into_iter().collect::<BTreeSet<_>>();
+        let picked_keys = merge_plan
+            .picks
+            .iter()
+            .map(|pick| TrackedStateKey {
+                schema_key: pick.identity.schema_key().into(),
+                file_id: pick.identity.file_id().map(str::to_owned),
+                row_pk: pick.identity.row_pk().clone(),
+            })
+            .collect::<BTreeSet<_>>();
+        let source_kinds = analysis
+            .source_diff
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    TrackedStateKey {
+                        schema_key: entry.identity.schema_key().into(),
+                        file_id: entry.identity.file_id().map(str::to_owned),
+                        row_pk: entry.identity.row_pk().clone(),
+                    },
+                    entry.kind,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        change_stats =
+            merge_change_stats_with_plugin_resolutions(&analysis.stats, &plugin_resolution_stats);
+        for key in &cascaded {
+            if resolved_keys.contains(key) {
+                continue;
+            }
+            if picked_keys.contains(key)
+                && let Some(kind) = source_kinds.get(key)
+            {
+                use crate::tracked_state::TrackedStateDiffKind;
+                match kind {
+                    TrackedStateDiffKind::Added => change_stats.added -= 1,
+                    TrackedStateDiffKind::Modified => change_stats.modified -= 1,
+                    TrackedStateDiffKind::Removed => change_stats.removed -= 1,
+                }
+            } else {
+                change_stats.total += 1;
+            }
+            change_stats.removed += 1;
+        }
+    }
     Ok(MergeBranchReceipt {
         outcome: MergeBranchOutcome::MergeCommitted,
         target_branch_id: active_branch_id,
@@ -203,10 +304,7 @@ pub(crate) async fn stage_native_change_application<S: Storage + Clone + Send + 
         target_head_before_commit_id: analysis.commits.target_commit_id.to_string(),
         source_head_before_commit_id: analysis.commits.source_commit_id.to_string(),
         created_merge_commit_id: Some(created_merge_commit_id),
-        change_stats: merge_change_stats_with_plugin_resolutions(
-            &analysis.stats,
-            &plugin_resolution_stats,
-        ),
+        change_stats,
     })
 }
 

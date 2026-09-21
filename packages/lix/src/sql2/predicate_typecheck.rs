@@ -38,11 +38,20 @@ pub(crate) fn validate_json_predicate_expr_with_dfschema(
     schema: &DFSchema,
     expr: &Expr,
 ) -> Result<(), LixError> {
+    validate_json_predicate_expr_with_dfschemas(&[schema], expr)
+}
+
+pub(crate) fn validate_json_predicate_expr_with_dfschemas(
+    schemas: &[&DFSchema],
+    expr: &Expr,
+) -> Result<(), LixError> {
     validate_expr(expr, &|column| {
-        schema
-            .field_with_name(column.relation.as_ref(), &column.name)
-            .ok()
-            .map(AsRef::as_ref)
+        schemas.iter().find_map(|schema| {
+            schema
+                .field_with_name(column.relation.as_ref(), &column.name)
+                .ok()
+                .map(AsRef::as_ref)
+        })
     })
 }
 
@@ -50,12 +59,21 @@ pub(crate) fn json_predicate_placeholder_indexes_with_dfschema(
     schema: &DFSchema,
     expr: &Expr,
 ) -> BTreeSet<usize> {
+    json_predicate_placeholder_indexes_with_dfschemas(&[schema], expr)
+}
+
+pub(crate) fn json_predicate_placeholder_indexes_with_dfschemas(
+    schemas: &[&DFSchema],
+    expr: &Expr,
+) -> BTreeSet<usize> {
     let mut indexes = BTreeSet::new();
     collect_json_predicate_placeholder_indexes(expr, &mut indexes, &|column| {
-        schema
-            .field_with_name(column.relation.as_ref(), &column.name)
-            .ok()
-            .map(AsRef::as_ref)
+        schemas.iter().find_map(|schema| {
+            schema
+                .field_with_name(column.relation.as_ref(), &column.name)
+                .ok()
+                .map(AsRef::as_ref)
+        })
     });
     indexes
 }
@@ -236,6 +254,34 @@ fn validate_expr<'a>(
             }
             Ok(())
         }
+        Expr::InSubquery(in_subquery) => {
+            validate_expr(&in_subquery.expr, lookup_field)?;
+            validate_subquery_operand(
+                &in_subquery.expr,
+                in_subquery
+                    .subquery
+                    .subquery
+                    .schema()
+                    .fields()
+                    .first()
+                    .map(AsRef::as_ref),
+                lookup_field,
+            )
+        }
+        Expr::SetComparison(set_comparison) => {
+            validate_expr(&set_comparison.expr, lookup_field)?;
+            validate_subquery_operand(
+                &set_comparison.expr,
+                set_comparison
+                    .subquery
+                    .subquery
+                    .schema()
+                    .fields()
+                    .first()
+                    .map(AsRef::as_ref),
+                lookup_field,
+            )
+        }
         Expr::WindowFunction(function) => {
             for arg in &function.params.args {
                 validate_expr(arg, lookup_field)?;
@@ -327,6 +373,32 @@ fn collect_json_predicate_placeholder_indexes<'a>(
             }
             if let Some(expr) = &case.else_expr {
                 collect_json_predicate_placeholder_indexes(expr, indexes, lookup_field);
+            }
+        }
+        Expr::InSubquery(in_subquery) => {
+            collect_json_predicate_placeholder_indexes(&in_subquery.expr, indexes, lookup_field);
+            if in_subquery
+                .subquery
+                .subquery
+                .schema()
+                .fields()
+                .first()
+                .is_some_and(|field| field_is_json(field))
+            {
+                collect_placeholder_indexes(&in_subquery.expr, indexes);
+            }
+        }
+        Expr::SetComparison(set_comparison) => {
+            collect_json_predicate_placeholder_indexes(&set_comparison.expr, indexes, lookup_field);
+            if set_comparison
+                .subquery
+                .subquery
+                .schema()
+                .fields()
+                .first()
+                .is_some_and(|field| field_is_json(field))
+            {
+                collect_placeholder_indexes(&set_comparison.expr, indexes);
             }
         }
         _ => {}
@@ -459,19 +531,46 @@ fn is_json_expr<'a>(
             function.name(),
             "__lix_json_get" | "__lix_json_path_get" | "__lix_jsonb"
         ),
+        Expr::ScalarSubquery(subquery) => subquery
+            .subquery
+            .schema()
+            .fields()
+            .first()
+            .is_some_and(|field| field_is_json(field)),
         Expr::Alias(alias) => is_json_expr(&alias.expr, lookup_field),
-        Expr::Cast(cast) => is_json_expr(&cast.expr, lookup_field),
-        Expr::TryCast(cast) => is_json_expr(&cast.expr, lookup_field),
+        // PostgreSQL JSONB casts are lowered to the typed `__lix_jsonb` UDF
+        // before DataFusion planning. A remaining Cast/TryCast therefore has
+        // the target SQL type of the cast (TEXT, BYTEA, etc.), even when its
+        // input is a physical UTF8 JSONB column.
+        Expr::Cast(_) | Expr::TryCast(_) => false,
         _ => false,
     }
+}
+
+fn validate_subquery_operand<'a>(
+    expr: &'a Expr,
+    subquery_field: Option<&'a Field>,
+    lookup_field: &impl Fn(&datafusion::common::Column) -> Option<&'a Field>,
+) -> Result<(), LixError> {
+    let Some(subquery_field) = subquery_field else {
+        return Ok(());
+    };
+    if is_null_literal(expr) {
+        return Ok(());
+    }
+    if matches!(expr, Expr::Placeholder(_)) {
+        return Ok(());
+    }
+    if is_json_expr(expr, lookup_field) != field_is_json(subquery_field) {
+        return Err(json_predicate_type_error(expr));
+    }
+    Ok(())
 }
 
 fn is_identity_json_expr(expr: &Expr) -> bool {
     match expr {
         Expr::Column(column) => column.name == "row_pk",
         Expr::Alias(alias) => is_identity_json_expr(&alias.expr),
-        Expr::Cast(cast) => is_identity_json_expr(&cast.expr),
-        Expr::TryCast(cast) => is_identity_json_expr(&cast.expr),
         _ => false,
     }
 }
