@@ -25,6 +25,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp /app/target/release/lix-server /usr/local/bin/lix-server
 
 FROM debian:bookworm-slim AS runtime
+ARG LIX_SOURCE_REVISION
+ENV LIX_SOURCE_REVISION=${LIX_SOURCE_REVISION}
 LABEL org.opencontainers.image.title="Lix reference server" \
       org.opencontainers.image.description="Reference implementation of the Lix Server Protocol" \
       org.opencontainers.image.source="https://github.com/opral/lix"

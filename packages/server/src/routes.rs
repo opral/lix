@@ -564,6 +564,7 @@ async fn lix_protocol_route(
         "lix.error.code" = tracing::field::Empty,
         "otel.status_code" = tracing::field::Empty,
     );
+    crate::telemetry::set_request_parent(&span, request.headers());
     let response = lix_protocol_inner(state, lix_id, protocol_path, request_id, request)
         .instrument(span.clone())
         .await;

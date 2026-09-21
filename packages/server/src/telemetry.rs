@@ -1,6 +1,10 @@
 use anyhow::{Context, Result};
 use lix_sdk::telemetry::{OpenTelemetryTracingSink, TelemetrySink};
-use opentelemetry::{KeyValue, trace::TracerProvider as _};
+use opentelemetry::{
+    KeyValue,
+    propagation::{Extractor, TextMapPropagator},
+    trace::TracerProvider as _,
+};
 use opentelemetry_otlp::{Compression, Protocol, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::{
     runtime,
@@ -16,12 +20,52 @@ use std::{
     time::Duration,
 };
 use tracing::{Subscriber, field::Visit, span::Attributes};
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use tracing_subscriber::{
     EnvFilter, Layer,
     fmt::format::FmtSpan,
     layer::{Context as LayerContext, SubscriberExt},
     registry::LookupSpan,
 };
+
+/// Extract only W3C trace context. Invalid or missing headers deliberately start
+/// a new trace instead of inheriting an unrelated ambient task context.
+pub(crate) fn set_request_parent(span: &tracing::Span, headers: &http::HeaderMap) {
+    struct Headers<'a>(&'a http::HeaderMap);
+    impl Extractor for Headers<'_> {
+        fn get(&self, key: &str) -> Option<&str> {
+            self.0.get(key)?.to_str().ok()
+        }
+        fn keys(&self) -> Vec<&str> {
+            self.0.keys().map(http::HeaderName::as_str).collect()
+        }
+    }
+    let parent = opentelemetry_sdk::propagation::TraceContextPropagator::new()
+        .extract_with_context(&opentelemetry::Context::new(), &Headers(headers));
+    let _ = span.set_parent(parent);
+}
+
+fn service_resource() -> opentelemetry_sdk::Resource {
+    let mut resource = opentelemetry_sdk::Resource::builder()
+        .with_service_name("lix-server")
+        .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
+        .with_attribute(KeyValue::new(
+            "service.instance.id",
+            env::var("OTEL_SERVICE_INSTANCE_ID")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        ));
+    if let Some(revision) = env::var("LIX_SOURCE_REVISION")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| env::var("RAILWAY_GIT_COMMIT_SHA").ok())
+        .filter(|v| !v.is_empty())
+    {
+        resource = resource.with_attribute(KeyValue::new("vcs.ref.head.revision", revision));
+    }
+    resource.build()
+}
 
 const PERF_SPAN_EVENTS_ENV: &str = "LIX_SERVER_PERF_SPANS";
 const OTEL_TELEMETRY_FILTER: &str = "lix_server=info,lix=info,lix_sql=info";
@@ -299,7 +343,9 @@ fn provider_from_env() -> Result<SdkTracerProvider> {
 
 fn provider_from_endpoint(endpoint: Option<String>) -> Result<SdkTracerProvider> {
     let Some(endpoint) = endpoint else {
-        return Ok(SdkTracerProvider::builder().build());
+        return Ok(SdkTracerProvider::builder()
+            .with_resource(service_resource())
+            .build());
     };
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
@@ -309,12 +355,8 @@ fn provider_from_endpoint(endpoint: Option<String>) -> Result<SdkTracerProvider>
         .with_compression(Compression::Gzip)
         .build()
         .context("build OTLP HTTP exporter")?;
-    let resource = opentelemetry_sdk::Resource::builder()
-        .with_service_name("lix-server")
-        .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
-        .build();
     Ok(SdkTracerProvider::builder()
-        .with_resource(resource)
+        .with_resource(service_resource())
         .with_span_processor(batch_span_processor(exporter))
         .build())
 }
