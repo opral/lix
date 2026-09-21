@@ -104,12 +104,12 @@ pub(super) fn text_like_value(array: &dyn Array, row: usize) -> Result<Option<St
     }
     if let Some(array) = array.as_any().downcast_ref::<BinaryArray>() {
         return (!array.is_null(row))
-            .then(|| strict_json_utf8(array.value(row)))
+            .then(|| utf8_text(array.value(row)).map(str::to_owned))
             .transpose();
     }
     if let Some(array) = array.as_any().downcast_ref::<LargeBinaryArray>() {
         return (!array.is_null(row))
-            .then(|| strict_json_utf8(array.value(row)))
+            .then(|| utf8_text(array.value(row)).map(str::to_owned))
             .transpose();
     }
     Err(DataFusionError::Execution(format!(
@@ -118,12 +118,15 @@ pub(super) fn text_like_value(array: &dyn Array, row: usize) -> Result<Option<St
     )))
 }
 
-fn strict_json_utf8(bytes: &[u8]) -> Result<String> {
-    std::str::from_utf8(bytes)
-        .map(str::to_owned)
-        .map_err(|error| {
-            DataFusionError::Execution(format!("JSON input is not valid UTF-8: {error}"))
-        })
+pub(crate) fn utf8_text(bytes: &[u8]) -> Result<&str> {
+    std::str::from_utf8(bytes).map_err(|error| {
+        DataFusionError::Execution(format!("binary text input is not valid UTF-8: {error}"))
+    })
+}
+
+pub(crate) fn parse_uuid(raw: &str) -> Result<uuid::Uuid> {
+    uuid::Uuid::parse_str(raw)
+        .map_err(|error| DataFusionError::Execution(format!("invalid UUID value: {error}")))
 }
 
 pub(super) fn numeric_value(array: &dyn Array, row: usize) -> Result<Option<String>> {

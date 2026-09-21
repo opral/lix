@@ -344,3 +344,36 @@ simulation_test!(
         }
     }
 );
+
+simulation_test!(binary_uuid_casts_share_conversion_rules, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    session
+        .execute(
+            "INSERT INTO lix_key_value(key,value) VALUES ('uuid-cast',NULL)",
+            &[],
+        )
+        .await
+        .unwrap();
+    let uuid = "00000000-0000-4000-8000-000000000001";
+    for bytes in [uuid.as_bytes(), b"invalid-uuid", &[255]] {
+        for sql in [
+            "SELECT CAST($1 AS UUID)",
+            "UPDATE lix_key_value SET value=value WHERE key='uuid-cast' RETURNING CAST($1 AS UUID)",
+            "UPDATE lix_key_value SET value=value WHERE key LIKE 'uuid-cast' RETURNING CAST($1 AS UUID)",
+        ] {
+            let result = session
+                .execute(sql, &[Value::Blob(bytes.to_vec().into())])
+                .await;
+            if bytes == uuid.as_bytes() {
+                assert_eq!(
+                    result.unwrap().rows()[0].values(),
+                    &[Value::Text(uuid.into())],
+                    "{sql}"
+                );
+            } else {
+                assert!(result.is_err(), "invalid UUID input must fail: {sql}");
+            }
+        }
+    }
+});

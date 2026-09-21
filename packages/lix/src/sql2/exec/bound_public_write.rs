@@ -5896,14 +5896,13 @@ fn cast_row_eval_value(
         return match value {
             RowEvalValue::SqlNull => Ok(RowEvalValue::SqlNull),
             RowEvalValue::Uuid(value) => Ok(RowEvalValue::Uuid(value)),
-            RowEvalValue::SqlText(value) => uuid::Uuid::parse_str(&value)
+            RowEvalValue::SqlText(value) => crate::sql2::udfs::common::parse_uuid(&value)
                 .map(RowEvalValue::Uuid)
-                .map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_TYPE_MISMATCH,
-                        format!("CAST AS UUID failed: {error}"),
-                    )
-                }),
+                .map_err(crate::sql2::error::datafusion_error_to_lix_error),
+            RowEvalValue::Blob(value) => crate::sql2::udfs::common::utf8_text(value.as_ref())
+                .and_then(crate::sql2::udfs::common::parse_uuid)
+                .map(RowEvalValue::Uuid)
+                .map_err(crate::sql2::error::datafusion_error_to_lix_error),
             _ => Err(LixError::new(
                 LixError::CODE_TYPE_MISMATCH,
                 "CAST AS UUID requires a text UUID value",
