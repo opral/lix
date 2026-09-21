@@ -1121,3 +1121,27 @@ async fn admission_network_exhaustion_preserves_offline_error_and_abort_is_termi
     );
     assert!(http.sleeps.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn admission_retries_oversized_gateway_pages_without_accepting_oversized_metadata() {
+    let http = ScriptHttp::default();
+    for status in [502, 503, 504] {
+        http.push_stream(status, &"x".repeat(16 * 1024 + 1));
+    }
+    http.push_json(200, admission_identity());
+    super::admit_protocol_client(http.clone(), ADMISSION_URL, None)
+        .await
+        .unwrap();
+    assert_eq!(http.requests().len(), 4);
+    assert_eq!(http.stream_cancellations.load(Ordering::SeqCst), 3);
+    let http = ScriptHttp::default();
+    http.push_stream(200, &"x".repeat(16 * 1024 + 1));
+    assert_eq!(
+        super::admit_protocol_client(http.clone(), ADMISSION_URL, None)
+            .await
+            .unwrap_err()
+            .code,
+        "LIX_ADMISSION_PROTOCOL"
+    );
+    assert_eq!(http.requests().len(), 1);
+}

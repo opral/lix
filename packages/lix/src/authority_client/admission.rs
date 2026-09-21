@@ -208,6 +208,15 @@ async fn admission_response<H: ProtocolHttp>(
     while let Some(chunk) = response.body.next().await {
         let chunk = chunk?;
         if body.len().saturating_add(chunk.len()) > 16 * 1024 {
+            // Gateway HTML is not admission metadata. Cancel the oversized
+            // body while retaining the status for bounded transient retries.
+            if matches!(response.status, 502 | 503 | 504) {
+                return Ok(ProtocolHttpResponse {
+                    status: response.status,
+                    headers: response.headers,
+                    body: Bytes::new(),
+                });
+            }
             return Err(admission_protocol_error());
         }
         body.extend_from_slice(&chunk);
