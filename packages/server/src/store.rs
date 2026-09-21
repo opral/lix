@@ -1,3 +1,5 @@
+use opentelemetry::trace::TraceContextExt as _;
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 #[cfg(feature = "offline-migration")]
 mod adoption;
 #[cfg(feature = "offline-migration")]
@@ -233,6 +235,7 @@ impl Drop for CacheRootLeaseDropProbe {
 }
 
 struct RuntimeEntry {
+    open_context: opentelemetry::trace::SpanContext,
     runtime: Arc<OnceCell<Arc<LixRuntime>>>,
     opened: watch::Receiver<RuntimeOpenState>,
     last_used: u64,
@@ -522,6 +525,7 @@ impl LixRuntimeManager {
         STORAGE_LAYOUT
     }
 
+    #[tracing::instrument(name = "lix.runtime.acquire", skip_all, fields(lix.id = %lix_id))]
     pub(crate) async fn get(
         self: &Arc<Self>,
         lix_id: &str,
@@ -557,6 +561,9 @@ impl LixRuntimeManager {
                         .expect("entry was present when updating Lix recency");
                     entry.last_used = now;
                     entry.idle_since = None;
+                    if entry.runtime.get().is_none() {
+                        tracing::Span::current().add_link(entry.open_context.clone());
+                    }
                     GetRuntimeAction::WaitForOpen {
                         runtime: Arc::clone(&entry.runtime),
                         opened: entry.opened.clone(),
@@ -604,9 +611,11 @@ impl LixRuntimeManager {
                     let now = state.clock;
                     let runtime = Arc::new(OnceCell::new());
                     let (done, opened) = watch::channel(RuntimeOpenState::Opening);
+                    let open_span = info_span!("lix.runtime.open", lix.id = %lix_id, storage.backend = STORAGE_BACKEND);
                     state.entries.insert(
                         lix_id.to_string(),
                         RuntimeEntry {
+                            open_context: open_span.context().span().span_context().clone(),
                             runtime: Arc::clone(&runtime),
                             opened: opened.clone(),
                             last_used: now,
@@ -616,12 +625,15 @@ impl LixRuntimeManager {
                     // The manager, rather than this request, owns opening.
                     // `get` callers may be cancelled without leaving an
                     // empty entry or detaching a second same-ID opener.
-                    self.spawn_runtime_open(PendingRuntimeOpen {
-                        lifecycle: lifecycle_guard.take().expect("opener owns lifecycle guard"),
-                        lix_id: lix_id.to_string(),
-                        runtime: Arc::clone(&runtime),
-                        done,
-                    });
+                    self.spawn_runtime_open(
+                        open_span,
+                        PendingRuntimeOpen {
+                            lifecycle: lifecycle_guard.take().expect("opener owns lifecycle guard"),
+                            lix_id: lix_id.to_string(),
+                            runtime: Arc::clone(&runtime),
+                            done,
+                        },
+                    );
                     GetRuntimeAction::WaitForOpen { runtime, opened }
                 }
             };
@@ -632,14 +644,18 @@ impl LixRuntimeManager {
                     // and its cache child has been retired and deleted.
                     // `watch` makes this wait immune to a completion racing
                     // with receiver registration.
-                    self.wait_for_cleanup(&mut cleanup).await?;
+                    self.wait_for_cleanup(&mut cleanup)
+                        .instrument(info_span!("lix.runtime.wait_cleanup"))
+                        .await?;
                 }
                 GetRuntimeAction::EvictAndWait {
                     evicted,
                     mut cleanup,
                 } => {
                     self.spawn_eviction_cleanup(evicted);
-                    self.wait_for_cleanup(&mut cleanup).await?;
+                    self.wait_for_cleanup(&mut cleanup)
+                        .instrument(info_span!("lix.runtime.wait_cleanup"))
+                        .await?;
                 }
                 GetRuntimeAction::WaitForOpen {
                     runtime,
@@ -677,7 +693,12 @@ impl LixRuntimeManager {
                             return Err(LixRuntimeError::UpgradeFailed(diagnostic));
                         }
                         RuntimeOpenState::Opening => {
-                            if opened.changed().await.is_err() {
+                            if opened
+                                .changed()
+                                .instrument(info_span!("lix.runtime.wait_open"))
+                                .await
+                                .is_err()
+                            {
                                 return Err(LixRuntimeError::Open(anyhow::anyhow!(
                                     "lix runtime opener stopped before completing"
                                 )));
@@ -700,13 +721,8 @@ impl LixRuntimeManager {
         }
     }
 
-    fn spawn_runtime_open(self: &Arc<Self>, opener: PendingRuntimeOpen) {
+    fn spawn_runtime_open(self: &Arc<Self>, span: tracing::Span, opener: PendingRuntimeOpen) {
         let manager = Arc::clone(self);
-        let span = info_span!(
-            "lix.runtime.open",
-            lix.id = %opener.lix_id,
-            storage.backend = STORAGE_BACKEND,
-        );
         tokio::spawn(
             async move {
                 let _lifecycle = opener.lifecycle;
@@ -2384,6 +2400,7 @@ mod tests {
         manager.state.lock().await.entries.insert(
             LIX_A.to_string(),
             RuntimeEntry {
+                open_context: opentelemetry::trace::SpanContext::empty_context(),
                 runtime,
                 opened,
                 last_used: 1,
@@ -2638,6 +2655,7 @@ mod tests {
         manager.state.lock().await.entries.insert(
             LIX_A.to_owned(),
             RuntimeEntry {
+                open_context: opentelemetry::trace::SpanContext::empty_context(),
                 runtime,
                 opened,
                 last_used: 1,
