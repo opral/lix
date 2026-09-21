@@ -110,7 +110,7 @@ jobs:
     needs: merge-reuse
     if: needs.merge-reuse.outputs.reuse == 'true'
     runs-on: ubicloud-standard-2-ubuntu-2404
-    timeout-minutes: 5
+    timeout-minutes: 15
     permissions:
       actions: read
       contents: read
@@ -125,11 +125,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - uses: actions/download-artifact@v4
-        with:
-          name: lix-browser-sdk-${{ needs.merge-reuse.outputs.revision }}
-          run-id: ${{ needs.merge-reuse.outputs.run_id }}
-          github-token: ${{ github.token }}
+      - name: Download and verify complete browser artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REVISION: ${{ needs.merge-reuse.outputs.revision }}
+          SOURCE_RUN: ${{ needs.merge-reuse.outputs.run_id }}
+        run: node scripts/release-browser-artifact.mjs download-merged
       - name: Validate browser binaries for main cache
         id: cache-payload
         env:

@@ -1,9 +1,62 @@
 import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, cpSync, openSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { binaryManifest, cacheKey, restoreBinaries, saveBinaries } from "./ci-sdk-cache.mjs";
 import { findReusableRun, readArtifactJson } from "./ci-merge-reuse.mjs";
+
+export function downloadVerifiedArchive(repository, runId, name, staged, run = execFileSync) {
+    const metadata = JSON.parse(run("gh", ["api", `repos/${repository}/actions/runs/${runId}/artifacts?per_page=100`], { encoding: "utf8", timeout: 30_000 }));
+    const artifact = metadata.artifacts.find(item => item.name === name && !item.expired);
+    if (!artifact || !/^sha256:[a-f0-9]{64}$/.test(artifact.digest)) throw new Error("Missing artifact or archive digest");
+    const archive = join(staged, "download.zip");
+    const descriptor = openSync(archive, "w");
+    try {
+        run("gh", ["api", `repos/${repository}/actions/artifacts/${artifact.id}/zip`], { stdio: ["ignore", descriptor, "inherit"], timeout: 180_000 });
+    } finally { closeSync(descriptor); }
+    const digest = `sha256:${createHash("sha256").update(readFileSync(archive)).digest("hex")}`;
+    if (digest !== artifact.digest) throw new Error("Artifact archive checksum mismatch");
+    run("python3", ["-m", "zipfile", "-e", archive, staged], { stdio: "inherit", timeout: 60_000 });
+    rmSync(archive);
+}
+
+// Stage each attempt separately: a downloader may exit successfully without
+// materializing the complete archive. Never promote such a partial download.
+export function downloadMergedBrowser(root, revision, runId, repository, download = downloadVerifiedArchive) {
+    if (!/^[a-f0-9]{40}$/.test(revision) || !/^\d+$/.test(String(runId))) {
+        throw new Error("Invalid browser artifact source");
+    }
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        const staged = mkdtempSync(join(tmpdir(), "lix-browser-download-"));
+        try {
+            download(repository, runId, `lix-browser-sdk-${revision}`, staged);
+            const manifest = JSON.parse(readFileSync(join(staged, "ci-artifact/browser.json"), "utf8"));
+            if (manifest.schemaVersion !== 1 || manifest.kind !== "lix-browser-sdk" ||
+                manifest.sourceRevision !== revision || manifest.target !== "wasm32-unknown-unknown") {
+                throw new Error("Unexpected source artifact provenance");
+            }
+            const binaries = binaryManifest(join(staged, "packages/js-sdk"), "browser", manifest.releaseBuild?.binaries?.key);
+            if (JSON.stringify(binaries) !== JSON.stringify(manifest.releaseBuild?.binaries)) {
+                throw new Error("Browser artifact checksum mismatch");
+            }
+            for (const path of ["packages/js-sdk/dist/index.js", "packages/storage-opfs/dist/index.js"]) {
+                readFileSync(join(staged, path));
+            }
+            for (const path of ["packages/js-sdk/dist", "packages/storage-opfs/dist", "ci-artifact"]) {
+                mkdirSync(join(root, path), { recursive: true });
+                cpSync(join(staged, path), join(root, path), { recursive: true });
+            }
+            return;
+        } catch (error) {
+            if (attempt === 3) throw new Error("Browser artifact download failed verification after 3 attempts", { cause: error });
+            console.log(`Browser artifact attempt ${attempt} incomplete or invalid; retrying.`);
+        } finally {
+            rmSync(staged, { recursive: true, force: true });
+        }
+    }
+}
 
 function sourceTree(root) {
 	return execFileSync("git", ["rev-parse", "HEAD^{tree}"], { cwd: root, encoding: "utf8" }).trim();
@@ -84,7 +137,9 @@ export function prepareMergedBrowserCache(root, revision, env = process.env) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
 	const [command, downloaded, revision] = process.argv.slice(2);
-	if (command === "describe") {
+	if (command === "download-merged") {
+        downloadMergedBrowser(process.cwd(), process.env.SOURCE_REVISION, process.env.SOURCE_RUN, process.env.GITHUB_REPOSITORY);
+    } else if (command === "describe") {
 		mkdirSync("ci-artifact", { recursive: true });
 		writeFileSync("ci-artifact/browser.json", JSON.stringify(describeBrowser(process.cwd(), process.env.LIX_SOURCE_SHA)));
 	} else if (command === "prepare-merged-cache") {

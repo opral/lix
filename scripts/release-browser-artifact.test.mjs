@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { cacheKey, validCache } from "./ci-sdk-cache.mjs";
-import { describeBrowser, prepareMergedBrowserCache, matchesBrowserBuild, restoreReleaseBrowser, selectReleaseBrowser } from "./release-browser-artifact.mjs";
+import { downloadVerifiedArchive, downloadMergedBrowser, describeBrowser, prepareMergedBrowserCache, matchesBrowserBuild, restoreReleaseBrowser, selectReleaseBrowser } from "./release-browser-artifact.mjs";
 
 function fixture(t) {
 	const root = mkdtempSync(join(tmpdir(), "release-browser-"));
@@ -130,4 +130,45 @@ test("identical-tree promotion seeds validated binaries without compiling or cop
   assert.throws(() => prepareMergedBrowserCache(f.root, f.revision, { LIX_WASM_PROFILE: "dev" }), /does not match/);
   f.write("packages/js-sdk/dist/migration-wasm/lix_js_sdk_bg.wasm", "corrupt");
   assert.throws(() => prepareMergedBrowserCache(f.root, f.revision, {}), /checksum/);
+});
+
+for (const failure of ["empty", "corrupt", "wrong-revision", "transport"]) {
+    test(`merged download retries ${failure} without publishing partial contents`, t => {
+        const f = fixture(t);
+        f.write("download/packages/js-sdk/dist/index.js", "sdk");
+        f.write("download/packages/storage-opfs/dist/index.js", "opfs");
+        const destination = join(f.root, "promoted");
+        let attempts = 0;
+        downloadMergedBrowser(destination, f.revision, "123", "opral/lix", (_repository, _runId, _name, staged) => {
+            attempts++;
+            if (attempts === 1 && failure === "transport") throw new Error("network interrupted");
+            if (attempts === 1 && failure === "empty") return;
+            cpSync(f.downloaded, staged, { recursive: true });
+            if (attempts === 1 && failure === "corrupt") writeFileSync(join(staged, "packages/js-sdk/dist/wasm/lix_js_sdk_bg.wasm"), "corrupt");
+            if (attempts === 1 && failure === "wrong-revision") writeFileSync(join(staged, "ci-artifact/browser.json"), JSON.stringify({...f.manifest, sourceRevision: "0".repeat(40)}));
+        });
+        assert.equal(attempts, 2);
+        assert.equal(readFileSync(join(destination, "packages/storage-opfs/dist/index.js"), "utf8"), "opfs");
+    });
+}
+
+test("merged download fails closed after three incomplete attempts", t => {
+    const f = fixture(t);
+    let attempts = 0;
+    assert.throws(() => downloadMergedBrowser(join(f.root, "promoted"), f.revision, "123", "opral/lix", () => { attempts++; }), /after 3 attempts/);
+    assert.equal(attempts, 3);
+    assert.throws(() => readFileSync(join(f.root, "promoted/ci-artifact/browser.json")), /ENOENT/);
+});
+
+test("archive integrity rejects an incomplete OPFS payload before extraction", t => {
+    const f = fixture(t);
+    const staged = join(f.root, "archive-stage");
+    mkdirSync(staged);
+    let extracted = false;
+    assert.throws(() => downloadVerifiedArchive("opral/lix", "123", "browser", staged, (command, args, options) => {
+        if (command === "python3") { extracted = true; return; }
+        if (args[1].includes("?")) return JSON.stringify({artifacts:[{name:"browser",id:1,digest:`sha256:${"0".repeat(64)}`} ]});
+        writeFileSync(options.stdio[1], "truncated zip missing OPFS modules");
+    }), /archive checksum mismatch/);
+    assert.equal(extracted, false);
 });
