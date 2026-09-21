@@ -794,7 +794,7 @@ async fn discover_with_read(
                         ))
                     })
             } else {
-                PointReadPlan::new(space, &[key.clone()])
+                PointReadPlan::new(space, std::slice::from_ref(&key))
                     .materialize(&read, Default::default())
                     .await?
                     .value
