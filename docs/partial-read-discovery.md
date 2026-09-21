@@ -47,7 +47,9 @@ select canonical chunks for the requested range instead of exporting an
 unrelated physical base. Discovery prepares plugin dependencies without
 executing plugin code. The closure also includes logically derived change
 locators and owning commit inventories, even when a selected row has no
-physical locator record. Internal plugin-registry and file-owner reads belong
+physical locator record. Admitted head/checkpoint mutation inventories are retained even for empty
+checkpoints, so warmed replicas can still publish local writes offline.
+Internal plugin-registry and file-owner reads belong
 to that same closure; otherwise a later local preparation step would restart
 the network waterfall. Foreground registry and owner loading uses the same
 correlated exact lookups as discovery. A client collection scan for an already
@@ -128,9 +130,9 @@ content equality with the authority. Restore and bootstrap are outside timing.
 | --- | ---: | ---: |
 | Cold HTTP requests | 51 | 1 |
 | SQL attempts | 47 | 2 |
-| Cold median, no added delay | 73.225 ms | 26.190 ms |
-| Cold median, 100 ms added per request | 5,328.101 ms | 130.794 ms |
-| Response bytes | 261,386 | 290,685 |
+| Cold median, no added delay | 75.151 ms | 27.239 ms |
+| Cold median, 100 ms added per request | 5,345.896 ms | 130.996 ms |
+| Response bytes | 261,386 | 291,658 |
 | Warm HTTP requests | 0 | 0 |
 
 Request counts and response bytes were identical across all cold samples for
@@ -139,12 +141,12 @@ attempts. The shared exact-lookup corrections reduce the final pointer
 comparator to 51 requests; operation discovery then reduces 51 to one, a 98.0%
 reduction in the same binary. The original-to-final reduction is 53 to one.
 
-This exchanges more authority-local work and 11.2% more response bytes for fewer
-network rounds and SQL restarts. The operation response contains 69 inputs and
-207,095 decoded payload bytes. Discovery performs 603 authority storage calls
-and observes 593,909 storage bytes. With no added delay, median server handling
-increases from 6.877 ms to 15.065 ms while total read time falls. Warm reads stay
-local (medians approximately 1.7–1.8 ms).
+This exchanges more authority-local work and 11.6% more response bytes for fewer
+network rounds and SQL restarts. The operation response contains 71 inputs and
+207,391 decoded payload bytes. Discovery performs 610 authority storage calls
+and observes 597,128 storage bytes. With no added delay, median server handling
+increases from 7.014 ms to 15.693 ms while total read time falls. Warm reads stay
+local (medians approximately 1.7–1.9 ms).
 
 These are native, unoptimized Linux measurements using the real HTTP protocol
 dispatcher in-process, without TCP, browser/OPFS, or background watchers. The
@@ -153,7 +155,7 @@ production UI timing claim. Large closures may require multiple bounded pages.
 
 ## Validation
 
-The implementation passed 4,586 tests (86 skipped), including the base and
+The implementation passed 4,653 tests (86 skipped), including the base and
 tracked-state rebuild simulations, RocksDB conformance, and both normal and
 cached SlateDB conformance:
 
@@ -178,3 +180,6 @@ corruption and omission rejection, continuation integrity, lease validation,
 and rejection of historical-diff recipes at this endpoint. Two GPT-5.6 Luna
 reviews at extra-high reasoning examined discovery and installation independently;
 their scope, owner-representation, and receipt findings were addressed.
+
+CI follow-up also passes all 28 sync E2E tests (3 ignored), including offline
+folder moves and checkpoint publication after ordinary read warmup.

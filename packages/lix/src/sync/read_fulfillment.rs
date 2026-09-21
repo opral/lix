@@ -830,6 +830,12 @@ async fn discover_with_read(
             if super::partial_replica::commit_roots(&read, commit).await? != *roots {
                 return Err(invalid("requested roots disagree with immutable authority"));
             }
+            // An admitted checkpoint can have no selected rows and therefore
+            // no returned-row owner to close its mutation inventory. Local
+            // publication still reads that inventory, including an empty one.
+            // Retain it with the root header rather than depending on an
+            // incidental per-pointer metadata bundle during read warmup.
+            let _ = crate::tracked_state::load_commit_state_manifest(&read, commit).await?;
         }
     }
     let state = PartialReplicaState::from_leased(
