@@ -564,7 +564,6 @@ class Observation implements AsyncIterableIterator<ObserveEvent> {
 
 class ObservationLifecycle {
 	private readonly stopped = new Set<() => void>();
-	private readonly pendingReads = new Set<Promise<void>>();
 	private readonly abort = () => this.stop();
 	private readonly setup: { error?: unknown } = {};
 	private closed = false;
@@ -603,12 +602,6 @@ class ObservationLifecycle {
 				if (binding === undefined) throw this.setup.error;
 				return await binding.next();
 			})();
-			const settledRead = pendingRead.then(
-				() => undefined,
-				() => undefined,
-			);
-			this.pendingReads.add(settledRead);
-			void settledRead.then(() => this.pendingReads.delete(settledRead));
 			const event = await Promise.race([pendingRead, stopped]);
 			if (this.closed || event == null) {
 				this.stop();
@@ -650,10 +643,9 @@ class ObservationLifecycle {
 				() => undefined,
 				() => undefined,
 			);
-		this.drainPromise ??= Promise.all([
-			...this.pendingReads,
-			this.bindingClosePromise,
-		]).then(() => undefined);
+		// The binding's close is the observer resource barrier. Waiting directly on
+		// a `next()` promise can hang forever for bindings that don't reject pending reads.
+		this.drainPromise ??= this.bindingClosePromise;
 		this.onClose(this.drainPromise);
 	}
 }
