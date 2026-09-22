@@ -287,3 +287,131 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    logical_metadata_survives_nullif_and_value_windows,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+
+        let json_value = Value::Jsonb(serde_json::json!({"a": 1}).into());
+        let nullif_json = session
+            .execute(
+                "SELECT NULLIF('{\"a\":1}'::jsonb, '{\"a\":2}'::jsonb) AS v",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(nullif_json.column_types(), &[ResultColumnType::Jsonb]);
+        assert_rows_eq(nullif_json, vec![vec![json_value.clone()]]);
+
+        let nullif_json_null = session
+            .execute(
+                "SELECT NULLIF('{\"a\":1}'::jsonb, '{\"a\":1}'::jsonb) AS v",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(nullif_json_null.column_types(), &[ResultColumnType::Jsonb]);
+        assert_rows_eq(nullif_json_null, vec![vec![Value::Null]]);
+
+        let nullif_untyped_null = session
+            .execute("SELECT NULLIF(NULL, '{}'::jsonb) AS v", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            nullif_untyped_null.column_types(),
+            &[ResultColumnType::Jsonb]
+        );
+        assert_rows_eq(nullif_untyped_null, vec![vec![Value::Null]]);
+
+        let nullif_row_ref = session
+            .execute(
+                "SELECT NULLIF(\
+                    lix_row_ref('lix_key_value', NULL, 'left'), \
+                    lix_row_ref('lix_key_value', NULL, 'right')\
+                ) AS v",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(nullif_row_ref.column_types(), &[ResultColumnType::RowRef]);
+        assert!(matches!(
+            nullif_row_ref.rows()[0].values()[0],
+            Value::RowRef(_)
+        ));
+
+        let row_ref_null = session
+            .execute(
+                "SELECT NULLIF(\
+                    lix_row_ref('lix_key_value', NULL, 'left'), \
+                    lix_row_ref('lix_key_value', NULL, 'left')\
+                ) AS v",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row_ref_null.column_types(), &[ResultColumnType::RowRef]);
+        assert_rows_eq(row_ref_null, vec![vec![Value::Null]]);
+
+        let row_ref_untyped_null = session
+            .execute(
+                "SELECT NULLIF(NULL, lix_row_ref('lix_key_value', NULL, 'left')) AS v",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            row_ref_untyped_null.column_types(),
+            &[ResultColumnType::RowRef]
+        );
+        assert_rows_eq(row_ref_untyped_null, vec![vec![Value::Null]]);
+
+        let windows = session
+            .execute(
+                "SELECT \
+                    FIRST_VALUE(v) OVER (ORDER BY id) AS first_v, \
+                    LAST_VALUE(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_v, \
+                    NTH_VALUE(v, 1) OVER (ORDER BY id) AS nth_v, \
+                    LAG(v) OVER (ORDER BY id) AS lag_v, \
+                    LEAD(v) OVER (ORDER BY id) AS lead_v \
+                 FROM (\
+                    SELECT 1 AS id, '{\"a\":1}'::jsonb AS v \
+                    UNION ALL \
+                    SELECT 2 AS id, NULL::jsonb AS v\
+                 ) q",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            windows.column_types(),
+            &[
+                ResultColumnType::Jsonb,
+                ResultColumnType::Jsonb,
+                ResultColumnType::Jsonb,
+                ResultColumnType::Jsonb,
+                ResultColumnType::Jsonb,
+            ]
+        );
+        assert_rows_eq(
+            windows,
+            vec![
+                vec![
+                    json_value.clone(),
+                    Value::Null,
+                    json_value.clone(),
+                    Value::Null,
+                    Value::Null,
+                ],
+                vec![
+                    json_value.clone(),
+                    Value::Null,
+                    json_value.clone(),
+                    json_value,
+                    Value::Null,
+                ],
+            ],
+        );
+    }
+);

@@ -56,6 +56,27 @@ pub(crate) fn propagate_lix_value_metadata(
                 union.schema = replace_schema_fields(&union.schema, fields)?;
                 LogicalPlan::Union(union)
             }
+            LogicalPlan::Window(mut window) => {
+                let input_schema = window.input.schema();
+                let input_len = input_schema.fields().len();
+                let fields = window
+                    .schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, field)| {
+                        let Some(expr_index) = index.checked_sub(input_len) else {
+                            return field.as_ref().clone();
+                        };
+                        let Some(expr) = window.window_expr.get(expr_index) else {
+                            return field.as_ref().clone();
+                        };
+                        field_with_expr_kind(field.as_ref(), expr, input_schema)
+                    })
+                    .collect::<Vec<_>>();
+                window.schema = replace_schema_fields(&window.schema, fields)?;
+                LogicalPlan::Window(window)
+            }
             other => other,
         };
         Ok(Transformed::yes(node))
@@ -90,13 +111,36 @@ pub(crate) fn expr_lix_value_kind(expr: &Expr, schema: &DFSchema) -> Option<&'st
                 .chain(case.else_expr.iter().map(AsRef::as_ref)),
             schema,
         ),
-        Expr::ScalarFunction(ScalarFunction { func, args })
+        Expr::ScalarFunction(ScalarFunction { func, args }) => {
+            match func.name().to_ascii_lowercase().as_str() {
+                "coalesce" | "ifnull" | "nvl" => common_expr_kind(args.iter(), schema),
+                // NULLIF returns its first argument, or SQL NULL when the
+                // arguments compare equal. Its logical type is therefore the
+                // first argument's logical type.
+                "nullif" => args.first().and_then(|first| {
+                    expr_lix_value_kind(first, schema).or_else(|| {
+                        is_sql_null_literal(first)
+                            .then(|| args.get(1).and_then(|expr| expr_lix_value_kind(expr, schema)))
+                            .flatten()
+                    })
+                }),
+                _ => expr
+                    .to_field(schema)
+                    .ok()
+                    .and_then(|(_, field)| field_lix_value_kind(field.as_ref())),
+            }
+        }
+        Expr::WindowFunction(window)
             if matches!(
-                func.name().to_ascii_lowercase().as_str(),
-                "coalesce" | "ifnull" | "nvl"
+                window.fun.name().to_ascii_lowercase().as_str(),
+                "first_value" | "last_value" | "nth_value" | "lead" | "lag"
             ) =>
         {
-            common_expr_kind(args.iter(), schema)
+            window
+                .params
+                .args
+                .first()
+                .and_then(|expr| expr_lix_value_kind(expr, schema))
         }
         // DataFusion's Cast schema preserves input metadata even when the
         // target type is no longer the UTF-8 representation used by Lix's
