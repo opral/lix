@@ -58,8 +58,6 @@ export type {
 	OpenAnotherSessionOptions,
 	LixTelemetryOptions,
 	LixTelemetryParentContext,
-	LixTelemetrySpan,
-	LixTelemetrySpanLink,
 	LixOpenMigrationReport,
 	LixOpenMigration,
 	LixOpenPhase,

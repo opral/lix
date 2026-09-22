@@ -9,6 +9,8 @@ macro_rules! define_production_spans {
         $ident:ident {
             name: $name:literal,
             class: $class:ident,
+            kind: $kind:ident,
+            otel_kind: $otel_kind:literal,
             target: $target:literal,
             attributes: [$($attr:literal),* $(,)?]
         }
@@ -20,6 +22,8 @@ macro_rules! define_production_spans {
                     tracing::info_span!(
                         target: $target,
                         $name,
+                        otel.kind = $otel_kind,
+                        otel.name = tracing::field::Empty,
                         $($attr = tracing::field::Empty,)*
                         "error.type" = tracing::field::Empty,
                         "lix.operation.cancelled" = tracing::field::Empty,
@@ -30,9 +34,10 @@ macro_rules! define_production_spans {
                 pub static $ident: TelemetrySpanDescriptor = TelemetrySpanDescriptor {
                     name: $name,
                     class: TelemetrySpanClass::$class,
-                    kind: SpanKind::Internal,
+                    kind: SpanKind::$kind,
                     allowed_attributes: &[
                         $($attr,)*
+                        "otel.name",
                         "error.type",
                         "lix.operation.cancelled",
                     ],
@@ -49,24 +54,32 @@ define_production_spans! {
     ENGINE_OPEN {
         name: "lix.engine.open",
         class: Lifecycle,
+        kind: Internal,
+        otel_kind: "internal",
         target: "lix",
         attributes: []
     }
     SESSION_OPEN {
         name: "lix.session.open",
         class: Lifecycle,
+        kind: Internal,
+        otel_kind: "internal",
         target: "lix",
         attributes: []
     }
     REPOSITORY_OPENED {
         name: "lix.repository.opened",
         class: Lifecycle,
+        kind: Internal,
+        otel_kind: "internal",
         target: "lix",
         attributes: ["lix.id", "lix.branch_id", "lix.account_id"]
     }
     SQL_QUERY {
         name: "lix.sql.query",
         class: Sql,
+        kind: Client,
+        otel_kind: "client",
         target: "lix_sql",
         attributes: [
             "db.system.name",
@@ -74,6 +87,8 @@ define_production_spans! {
             "db.query.summary",
             "db.query.text",
             "lix.sql.fingerprint",
+            "lix.sql.query_text_truncated",
+            "otel.name",
             "lix.execution.kind",
             "lix.batch.index",
             "db.response.returned_rows",
@@ -83,50 +98,76 @@ define_production_spans! {
     SQL_BATCH {
         name: "lix.sql.batch",
         class: Sql,
+        kind: Client,
+        otel_kind: "client",
         target: "lix_sql",
         attributes: [
             "db.system.name",
             "db.operation.batch.size",
             "lix.execution.kind",
+            "db.operation.name",
+            "db.query.summary",
+            "db.query.text",
+            "lix.sql.fingerprint",
+            "lix.sql.query_text_truncated",
+            "otel.name",
         ]
     }
     SQL_COHERENT_READ_BATCH {
         name: "lix.sql.coherent_read_batch",
         class: Sql,
+        kind: Client,
+        otel_kind: "client",
         target: "lix_sql",
         attributes: [
             "db.system.name",
             "db.operation.batch.size",
             "lix.execution.kind",
+            "db.operation.name",
+            "db.query.summary",
+            "db.query.text",
+            "lix.sql.fingerprint",
+            "lix.sql.query_text_truncated",
+            "otel.name",
         ]
     }
     CHECKPOINT_CREATE {
         name: "lix.checkpoint.create",
         class: Lifecycle,
+        kind: Internal,
+        otel_kind: "internal",
         target: "lix",
         attributes: ["lix.commit_id", "lix.parent_commit_id"]
     }
     TRANSACTION_WAIT {
         name: "lix.transaction.wait",
         class: Performance,
+        kind: Internal,
+        otel_kind: "internal",
         target: "lix_sql",
         attributes: ["lix.commit_cohort_id", "lix.wait.reason"]
     }
     TRANSACTION_MATERIALIZE {
         name: "lix.transaction.materialize",
         class: Performance,
+        kind: Internal,
+        otel_kind: "internal",
         target: "lix_sql",
         attributes: ["lix.commit_cohort_id", "lix.transaction.count"]
     }
     TRANSACTION_STORAGE {
         name: "lix.transaction.storage",
         class: Performance,
+        kind: Internal,
+        otel_kind: "internal",
         target: "lix_sql",
         attributes: ["lix.commit_cohort_id", "lix.transaction.count"]
     }
     TRANSACTION_NOTIFY {
         name: "lix.transaction.notify",
         class: Performance,
+        kind: Internal,
+        otel_kind: "internal",
         target: "lix_sql",
         attributes: ["lix.commit_cohort_id", "lix.transaction.count"]
     }

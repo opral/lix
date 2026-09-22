@@ -16,7 +16,6 @@ import type {
 import type {
 	LixOpenProgress,
 	LixOpenReport,
-	LixTelemetrySpan,
 } from "../types.js";
 import {
 	deserializeWorkerError,
@@ -305,8 +304,8 @@ export function startWorkerHost(
 						const opened = await openBinding(
 							operation.storage,
 							operation.telemetryEnabled
-								? (span: LixTelemetrySpan) =>
-										endpoint.postMessage({ kind: "telemetry", span })
+								? (request: Uint8Array) =>
+										endpoint.postMessage({ kind: "telemetry", request })
 								: undefined,
 							telemetryParent,
 							createSyncServerBridge(operation.server),

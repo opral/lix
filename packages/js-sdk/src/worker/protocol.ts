@@ -10,7 +10,6 @@ import type {
 	LixBatchOptions,
 	MergeBranchOptions,
 	SwitchBranchOptions,
-	LixTelemetrySpan,
 	LixTelemetryParentContext,
 	LixOpenProgress,
 	LixOpenReport,
@@ -192,7 +191,7 @@ export type WorkerResponse =
 			context?: { branchId: string; accountId: string };
 	  }
 	| { id: number; ok: false; error: SerializedWorkerError }
-	| { kind: "telemetry"; span: LixTelemetrySpan }
+	| { kind: "telemetry"; request: Uint8Array }
 	| { kind: "open.progress"; progress: LixOpenProgress }
 	| { kind: "sync.headers"; requestId: number; transportScope?: number }
 	| {

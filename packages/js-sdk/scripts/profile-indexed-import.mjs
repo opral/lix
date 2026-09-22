@@ -15,7 +15,7 @@ assert(sizes.every((n) => Number.isSafeInteger(n) && n > 0));
 assert(Number.isSafeInteger(rounds) && rounds > 0);
 assert(Number.isSafeInteger(warmups) && warmups >= 0);
 const samples = [];
-const spans = [];
+const otlpExportBytes = [];
 async function measure(bundleCount, round, operation, fn) {
   const start = performance.now();
   const result = await fn();
@@ -32,7 +32,7 @@ for (let round = -warmups; round < rounds; round++) {
   for (const count of rotated) {
     const lix = await openLix(
       process.env.LIX_PROFILE_TRACE === "1"
-        ? { telemetry: { onSpan: (span) => spans.push(span) } }
+        ? { telemetry: { onExport: (request) => otlpExportBytes.push(request.byteLength) } }
         : undefined,
     );
     try {
@@ -175,7 +175,7 @@ console.log(
       warmups,
       summary,
       samples,
-      spans,
+      otlpExportBytes,
     },
     null,
     2,

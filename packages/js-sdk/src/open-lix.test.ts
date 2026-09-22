@@ -21,7 +21,6 @@ import {
 	Value,
 	type ExecuteResult,
 	type Lix,
-	type LixTelemetrySpan,
 } from "./index.js";
 import { FilesystemStorage } from "../../storage-filesystem/dist/index.js";
 import { registerMemoryStorageContract } from "../tests/memory-storage-contract.js";
@@ -426,76 +425,89 @@ test("legacy sync mode is unsupported", async () => {
 
 test("openLix forwards opt-in SQL telemetry from the engine", async () => {
 	let activeParent = {
-		traceId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		spanId: "aaaaaaaaaaaaaaaa",
-		traceFlags: 1,
+		traceparent: "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-aaaaaaaaaaaaaaaa-01",
 	};
-	let resolveSpan!: (span: LixTelemetrySpan) => void;
-	const received = new Promise<LixTelemetrySpan>((resolve) => {
-		resolveSpan = resolve;
+	let resolveRequest!: (request: Uint8Array) => void;
+	const received = new Promise<Uint8Array>((resolve) => {
+		resolveRequest = resolve;
 	});
 	const lix = await openLix({
 		telemetry: {
 			parentContext: () => activeParent,
-			onSpan(span) {
-				if (
-					span.name === "lix.sql.query" &&
-					span.attributes["db.query.text"] ===
-						"SELECT ? AS value, ? AS number"
-				) {
-					resolveSpan(span);
-				}
+			onExport(request) {
+				if (request.byteLength > 0) resolveRequest(request);
 			},
 		},
 	});
 
 	activeParent = {
-		traceId: "0123456789abcdef0123456789abcdef",
-		spanId: "0123456789abcdef",
-		traceFlags: 1,
+		traceparent: "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
 	};
 	await lix.execute("SELECT 'private-value' AS value, 42 AS number");
-	const span = await received;
-	expect(span).toMatchObject({
-		schemaVersion: 3,
-		name: "lix.sql.query",
-		kind: "internal",
-		traceFlags: 1,
-		status: { code: "unset" },
-	});
-	expect(span.durationMs).toBeGreaterThanOrEqual(0);
-	expect(span.traceId).toMatch(/^[0-9a-f]{32}$/u);
-	expect(span.traceId).toBe("0123456789abcdef0123456789abcdef");
-	expect(span.parentSpanId).toBe("0123456789abcdef");
-	expect(span.spanId).toMatch(/^[0-9a-f]{16}$/u);
-	expect(span.attributes["db.query.text"]).toBe(
-		"SELECT ? AS value, ? AS number",
-	);
+	const request = await received;
+	expect(request).toBeInstanceOf(Uint8Array);
+	expect(request.byteLength).toBeGreaterThan(0);
 	await lix.close();
+});
+
+test("invalid telemetry context cannot fail engine operations", async () => {
+	const lix = await openLix({
+		telemetry: {
+			parentContext: () => {
+				throw new Error("broken context provider");
+			},
+			onExport() {},
+		},
+	});
+	const result = await lix.execute("SELECT 1 AS value");
+	expect(result.rows[0]?.value).toBe(1);
+	await lix.close();
+});
+
+test("close drains queued telemetry after stopping the engine", async () => {
+	let startFlush!: () => void;
+	let finishFlush!: () => void;
+	let flushed = false;
+	const flushStarted = new Promise<void>((resolve) => {
+		startFlush = resolve;
+	});
+	const flushGate = new Promise<void>((resolve) => {
+		finishFlush = resolve;
+	});
+	const lix = await openLix({
+		telemetry: {
+			onExport() {},
+			async flush() {
+				startFlush();
+				await flushGate;
+				flushed = true;
+			},
+		},
+	});
+	const closing = lix.close();
+	await flushStarted;
+	expect(flushed).toBe(false);
+	finishFlush();
+	await closing;
+	expect(flushed).toBe(true);
 });
 
 test("observe.next samples its own telemetry parent", async () => {
 	const nextParent = {
-		traceId: "fedcba9876543210fedcba9876543210",
-		spanId: "fedcba9876543210",
-		traceFlags: 1,
+		traceparent: "00-fedcba9876543210fedcba9876543210-fedcba9876543210-01",
 	};
 	let activeParent = {
-		traceId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		spanId: "aaaaaaaaaaaaaaaa",
-		traceFlags: 1,
+		traceparent: "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-aaaaaaaaaaaaaaaa-01",
 	};
-	let resolveSpan!: (span: LixTelemetrySpan) => void;
-	const received = new Promise<LixTelemetrySpan>((resolve) => {
-		resolveSpan = resolve;
+	let resolveRequest!: (request: Uint8Array) => void;
+	const received = new Promise<Uint8Array>((resolve) => {
+		resolveRequest = resolve;
 	});
 	const lix = await openLix({
 		telemetry: {
 			parentContext: () => activeParent,
-			onSpan(span) {
-				if (span.name === "lix.sql.query" && span.traceId === nextParent.traceId) {
-					resolveSpan(span);
-				}
+			onExport(request) {
+				if (request.byteLength > 0) resolveRequest(request);
 			},
 		},
 	});
@@ -504,30 +516,24 @@ test("observe.next samples its own telemetry parent", async () => {
 	await observation
 		.next()
 		.then((result) => (result.done ? undefined : result.value));
-	const span = await received;
-	expect(span.parentSpanId).toBe(nextParent.spanId);
+	expect(await received).toBeInstanceOf(Uint8Array);
 	observation.return?.();
 	await lix.close();
 });
 
-test("openLix forwards production commit phases through onSpan", async () => {
-	const names = new Set<string>();
-	const pendingNames = new Set([
-		"lix.sql.query",
-		"lix.transaction.materialize",
-		"lix.transaction.storage",
-		"lix.transaction.notify",
-	]);
-	let resolveSpans!: () => void;
+test("openLix exports production commit phases as OTLP protobuf", async () => {
+	let exports = 0;
+	let resolveExport!: () => void;
 	const received = new Promise<void>((resolve) => {
-		resolveSpans = resolve;
+		resolveExport = resolve;
 	});
 	const lix = await openLix({
 		telemetry: {
-			onSpan(span) {
-				names.add(span.name);
-				pendingNames.delete(span.name);
-				if (pendingNames.size === 0) resolveSpans();
+			onExport(request) {
+				if (request.byteLength > 0) {
+					exports += 1;
+					resolveExport();
+				}
 			},
 		},
 	});
@@ -536,20 +542,45 @@ test("openLix forwards production commit phases through onSpan", async () => {
 	);
 	// Native telemetry callbacks are queued independently of execute's promise.
 	await received;
-	expect(names.has("lix.sql.query")).toBe(true);
-	expect(names.has("lix.transaction.materialize")).toBe(true);
-	expect(names.has("lix.transaction.storage")).toBe(true);
-	expect(names.has("lix.transaction.notify")).toBe(true);
-	expect(names.has("SELECT")).toBe(false);
-	expect(names.has("SQL batch")).toBe(false);
-	expect(names.has("lix.opened")).toBe(false);
+	expect(exports).toBeGreaterThan(0);
 	await lix.close();
+});
+
+test("failed storage setup drains native spans before the host flush", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "lix-telemetry-open-failure-"));
+	const storage = new FilesystemStorage({ path: dir });
+	const connect = storage.lixStorage.connect.bind(storage.lixStorage);
+	const setupFailure = new Error("storage setup failed");
+	const order: string[] = [];
+	storage.lixStorage.connect = (connection) => {
+		if (connection) throw setupFailure;
+		connect(undefined);
+	};
+	try {
+		await expect(
+			openLix({
+				storage,
+				telemetry: {
+					onExport(request) {
+						if (request.byteLength > 0) order.push("native span delivered");
+					},
+					flush() {
+						order.push("host queue flushed");
+					},
+				},
+			}),
+		).rejects.toBe(setupFailure);
+		expect(order.at(-1)).toBe("host queue flushed");
+		expect(order.slice(0, -1).length).toBeGreaterThan(0);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });
 
 test("native telemetry preserves its receiver and cannot fail commands", async () => {
 	const telemetry = {
 		calls: 0,
-		onSpan() {
+		onExport() {
 			this.calls += 1;
 			throw new Error("telemetry failure");
 		},

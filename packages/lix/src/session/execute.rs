@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::atomic::Ordering;
 
 use crate::binary_cas::BlobId;
 use crate::branch::BranchRefReader;
@@ -2360,6 +2360,7 @@ where
             self.telemetry.as_ref(),
             &crate::telemetry::SQL_BATCH,
             statements.len(),
+            statements.iter().map(|statement| statement.sql.as_str()),
         );
         let operation = self.execute_batch_with_options_inner(
             statements,
@@ -2538,8 +2539,6 @@ where
         idempotency: Option<ExecuteIdempotency>,
     ) -> Result<Vec<ExecuteResult>, LixError> {
         let telemetry_sink = self.telemetry.clone();
-        let parameter_route = Arc::new(AtomicBool::new(false));
-        let transaction_parameter_route = Arc::clone(&parameter_route);
         let transaction_telemetry_sink = telemetry_sink.clone();
         // Only a batch that writes reports a span. Read-only batches also run
         // on this lane when a statement is nondeterministic; they commit
@@ -2553,7 +2552,6 @@ where
                     &parsed,
                     &options,
                     &statement_metadata,
-                    &transaction_parameter_route,
                 )
                 .await?
                 {
@@ -2679,13 +2677,6 @@ where
                     .map(|result| result.with_commit(commit.clone()))
                     .collect::<Vec<_>>()
             });
-        if parameter_route.load(Ordering::Relaxed) {
-            finish_parameter_batch_statement_telemetry(
-                telemetry_sink.as_ref(),
-                statements,
-                &result,
-            );
-        }
         result
     }
 
@@ -2942,6 +2933,7 @@ where
             self.telemetry.as_ref(),
             &crate::telemetry::SQL_COHERENT_READ_BATCH,
             statements.len(),
+            statements.iter().map(|(sql, _)| *sql),
         );
         let operation = self.execute_coherent_read_batch_inner(statements);
         let result = match telemetry.as_ref() {
@@ -4356,7 +4348,6 @@ async fn try_execute_transaction_parameter_batch<StorageImpl>(
     parsed: &TransactionBatchStatements,
     options: &ExecuteOptions,
     statement_metadata: &[ExecuteStatementMetadata],
-    parameter_route: &AtomicBool,
 ) -> Result<Option<Vec<ExecuteResult>>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -4450,48 +4441,7 @@ where
                 with_batch_statement_index(error, 0)
             }
         });
-    if !matches!(result, Ok(None)) {
-        parameter_route.store(true, Ordering::Relaxed);
-    }
     result
-}
-
-fn finish_parameter_batch_statement_telemetry(
-    telemetry_sink: Option<&Arc<dyn crate::telemetry::TelemetrySink>>,
-    statements: &[ExecuteBatchStatement],
-    result: &Result<Vec<ExecuteResult>, LixError>,
-) {
-    match result {
-        Ok(results) => {
-            for (statement_index, (statement, result)) in statements.iter().zip(results).enumerate()
-            {
-                let Some(telemetry) = SqlStatementTelemetry::start(
-                    telemetry_sink,
-                    &statement.sql,
-                    "batch",
-                    Some(statement_index),
-                ) else {
-                    continue;
-                };
-                telemetry.finish(&Ok(result.clone()));
-            }
-        }
-        Err(error) => {
-            let statement_index = batch_statement_index(error).unwrap_or(0);
-            let Some(statement) = statements.get(statement_index) else {
-                return;
-            };
-            let Some(telemetry) = SqlStatementTelemetry::start(
-                telemetry_sink,
-                &statement.sql,
-                "batch",
-                Some(statement_index),
-            ) else {
-                return;
-            };
-            telemetry.finish(&Err(error.clone()));
-        }
-    }
 }
 
 fn batch_statement_index(error: &LixError) -> Option<usize> {
@@ -8362,14 +8312,12 @@ mod tests {
             statement: sql2::parse_statement(sql).unwrap(),
             len: statements.len(),
         };
-        let parameter_route = AtomicBool::new(false);
         let staged = try_execute_transaction_parameter_batch(
             transaction.transaction_mut().unwrap(),
             &statements,
             &parsed,
             &ExecuteOptions::default(),
             &vec![ExecuteStatementMetadata::default(); statements.len()],
-            &parameter_route,
         )
         .await
         .expect("parameter batch should be revalidated");
@@ -8540,7 +8488,6 @@ mod tests {
             &parsed,
             &ExecuteOptions::default(),
             &vec![ExecuteStatementMetadata::default(); statements.len()],
-            &AtomicBool::new(false),
         )
         .await
         .expect("replacement batch should be revalidated");
@@ -8618,7 +8565,6 @@ mod tests {
                     &parsed,
                     &ExecuteOptions::default(),
                     &vec![ExecuteStatementMetadata::default(); statements.len()],
-                    &AtomicBool::new(false),
                 )
                 .await
                 .unwrap();
@@ -8751,14 +8697,12 @@ mod tests {
             len: first_statements.len(),
         };
         let mut first_transaction = first.begin_transaction().await.unwrap();
-        let parameter_route = AtomicBool::new(false);
         let staged = try_execute_transaction_parameter_batch(
             first_transaction.transaction_mut().unwrap(),
             &first_statements,
             &parsed,
             &ExecuteOptions::default(),
             &vec![ExecuteStatementMetadata::default(); first_statements.len()],
-            &parameter_route,
         )
         .await
         .unwrap();
@@ -8880,14 +8824,12 @@ mod tests {
                 statement: sql2::parse_statement(sql).unwrap(),
                 len: statements.len(),
             };
-            let parameter_route = AtomicBool::new(false);
             let staged = try_execute_transaction_parameter_batch(
                 transaction.transaction_mut().unwrap(),
                 statements,
                 &parsed,
                 &ExecuteOptions::default(),
                 &vec![ExecuteStatementMetadata::default(); statements.len()],
-                &parameter_route,
             )
             .await;
             if batch_index == 0 {
@@ -10609,7 +10551,6 @@ mod tests {
             &parsed,
             &ExecuteOptions::default(),
             &vec![ExecuteStatementMetadata::default(); updates.len()],
-            &AtomicBool::new(false),
         )
         .await
         .unwrap()
@@ -10986,7 +10927,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_batch_parameter_batch_emits_statement_telemetry() {
+    async fn execute_batch_parameter_batch_measures_the_real_query_shape() {
         let spans = Arc::new(std::sync::Mutex::new(Vec::new()));
         let session = open_session_with_telemetry(Arc::clone(&spans)).await;
         let schema = serde_json::json!({
@@ -11047,31 +10988,20 @@ mod tests {
             .iter()
             .filter(|span| span.start.name == "lix.sql.query")
             .collect::<Vec<_>>();
-        assert_eq!(query_spans.len(), 2);
-        for (index, span) in query_spans.into_iter().enumerate() {
-            assert_eq!(
-                span.span_context.trace_id(),
-                batch_span.span_context.trace_id()
-            );
-            assert_eq!(
-                span.start
-                    .parent_span_context
-                    .as_ref()
-                    .map(crate::telemetry::SpanContext::span_id),
-                Some(batch_span.span_context.span_id())
-            );
-            assert!(span.start.attributes.iter().any(|attribute| {
-                attribute.key == "lix.sql.fingerprint"
-                    && matches!(&attribute.value, TelemetryValue::String(value) if !value.is_empty())
-            }));
-            assert!(span.start.attributes.iter().any(|attribute| {
-                attribute.key == "lix.batch.index"
-                    && attribute.value == TelemetryValue::I64(index as i64)
-            }));
-            assert!(span.end.attributes.iter().any(|attribute| {
-                attribute.key == "lix.rows_affected" && attribute.value == TelemetryValue::I64(1)
-            }));
-        }
+        assert!(query_spans.is_empty());
+        assert!(batch_span.end.duration_ns > 0);
+        assert!(batch_span.start.attributes.iter().any(|attribute| {
+            attribute.key == "lix.sql.fingerprint"
+                && matches!(&attribute.value, TelemetryValue::String(value) if !value.is_empty())
+        }));
+        assert!(batch_span.start.attributes.iter().any(|attribute| {
+            attribute.key == "db.query.text"
+                && matches!(&attribute.value, TelemetryValue::String(value) if value == "UPDATE parameter_batch_telemetry_probe SET value = $1 WHERE id = $2")
+        }));
+        assert!(batch_span.start.attributes.iter().any(|attribute| {
+            attribute.key == "db.operation.batch.size"
+                && attribute.value == TelemetryValue::I64(2)
+        }));
     }
 
     #[tokio::test]

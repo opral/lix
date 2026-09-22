@@ -560,28 +560,16 @@ async fn open_browser_storage(
 ) -> Result<WasmLix, JsValue> {
     let durability = crate::parse_durability(durability.as_deref()).map_err(lix_error_to_js)?;
     console_error_panic_hook::set_once();
-    let telemetry_parent = telemetry_parent
-        .map(|value| {
-            js_sys::JSON::stringify(&value)
-                .map_err(|_| JsValue::from_str("telemetry parent context must be serializable"))?
-                .as_string()
-                .ok_or_else(|| JsValue::from_str("telemetry parent context must be an object"))
-        })
-        .transpose()?
-        .map(|json| crate::telemetry::parse_parent_context_json(Some(json)))
-        .transpose()
-        .map_err(|error| JsValue::from_str(&error))?
-        .flatten();
+    let telemetry_parent = parse_parent_context(telemetry_parent);
     let telemetry_parent_source = telemetry_dispatch
         .as_ref()
         .map(|_| Rc::new(RefCell::new(None)));
     let telemetry = telemetry_dispatch.map(|dispatch| {
         let dispatch = BrowserTelemetryDispatch(dispatch);
         let sink = CallbackTelemetrySink::new(move |span| {
-            let Ok(span) = to_js(&crate::telemetry::TelemetrySpanDto::from(span)) else {
-                return;
-            };
-            let _ = dispatch.0.call1(&JsValue::UNDEFINED, &span);
+            let request =
+                js_sys::Uint8Array::from(crate::telemetry::encode_otlp_request(span).as_slice());
+            let _ = dispatch.0.call1(&JsValue::UNDEFINED, &request);
         });
         let sink: Arc<dyn TelemetrySink> = Arc::new(sink);
         sink
@@ -709,6 +697,13 @@ impl WasmLix {
             future.into_future(),
         )
     }
+}
+
+fn parse_parent_context(value: Option<JsValue>) -> Option<SpanContext> {
+    let json = value
+        .and_then(|value| js_sys::JSON::stringify(&value).ok())
+        .and_then(|json| json.as_string());
+    crate::telemetry::parse_parent_context_json(json)
 }
 
 #[derive(Serialize)]
@@ -896,20 +891,7 @@ impl WasmLix {
         let Some(parent_source) = &self.telemetry_parent else {
             return Ok(());
         };
-        let parent = parent
-            .map(|value| {
-                js_sys::JSON::stringify(&value)
-                    .map_err(|_| {
-                        JsValue::from_str("telemetry parent context must be serializable")
-                    })?
-                    .as_string()
-                    .ok_or_else(|| JsValue::from_str("telemetry parent context must be an object"))
-            })
-            .transpose()?
-            .map(|json| crate::telemetry::parse_parent_context_json(Some(json)))
-            .transpose()
-            .map_err(|error| JsValue::from_str(&error))?
-            .flatten();
+        let parent = parse_parent_context(parent);
         *parent_source.borrow_mut() = parent;
         Ok(())
     }
@@ -932,10 +914,10 @@ impl WasmLix {
         let inner = if let Some(dispatch) = telemetry_dispatch {
             let dispatch = BrowserTelemetryDispatch(dispatch);
             let sink = CallbackTelemetrySink::new(move |span| {
-                let Ok(span) = to_js(&crate::telemetry::TelemetrySpanDto::from(span)) else {
-                    return;
-                };
-                let _ = dispatch.0.call1(&JsValue::UNDEFINED, &span);
+                let request = js_sys::Uint8Array::from(
+                    crate::telemetry::encode_otlp_request(span).as_slice(),
+                );
+                let _ = dispatch.0.call1(&JsValue::UNDEFINED, &request);
             });
             inner
                 .with_session_telemetry(Some(Arc::new(sink)))
@@ -1139,20 +1121,7 @@ impl WasmObserveEvents {
         let Some(parent_source) = &self.telemetry_parent else {
             return Ok(());
         };
-        let parent = parent
-            .map(|value| {
-                js_sys::JSON::stringify(&value)
-                    .map_err(|_| {
-                        JsValue::from_str("telemetry parent context must be serializable")
-                    })?
-                    .as_string()
-                    .ok_or_else(|| JsValue::from_str("telemetry parent context must be an object"))
-            })
-            .transpose()?
-            .map(|json| crate::telemetry::parse_parent_context_json(Some(json)))
-            .transpose()
-            .map_err(|error| JsValue::from_str(&error))?
-            .flatten();
+        let parent = parse_parent_context(parent);
         *parent_source.borrow_mut() = parent;
         Ok(())
     }

@@ -27,42 +27,17 @@ export type DeleteLixOptions = {
 	server: Pick<LixServerOptions, "url" | "headers">;
 };
 
-export type LixTelemetrySpanLink = {
-	traceId: string;
-	spanId: string;
-	traceFlags: number;
-	traceState?: string;
-};
-
-/** W3C/OpenTelemetry context used as the remote parent of engine root spans. */
+/** W3C Trace Context headers used to parent engine spans to a host span. */
 export type LixTelemetryParentContext = {
-	traceId: string;
-	spanId: string;
-	traceFlags: number;
-	traceState?: string;
-};
-
-export type LixTelemetrySpan = {
-	schemaVersion: 3;
-	name: string;
-	kind: "internal" | "server" | "client" | "producer" | "consumer";
-	traceId: string;
-	spanId: string;
-	traceFlags: number;
-	traceState?: string;
-	parentSpanId?: string;
-	links?: LixTelemetrySpanLink[];
-	startedAtUnixMs: number;
-	durationMs: number;
-	status: {
-		code: "unset" | "error" | "ok";
-		description?: string;
-	};
-	attributes: Record<string, string | number | boolean>;
+	traceparent: string;
+	tracestate?: string;
 };
 
 export type LixTelemetryOptions = {
-	onSpan(span: LixTelemetrySpan): void;
+	/** Called for each span with one OTLP ExportTraceServiceRequest (protobuf). */
+	onExport(request: Uint8Array): void;
+	/** Flush queued exports after the Lix handle has closed. Errors are ignored. */
+	flush?(): void | Promise<void>;
 	/** Read immediately before each serialized engine operation. */
 	parentContext?(): LixTelemetryParentContext | undefined;
 };

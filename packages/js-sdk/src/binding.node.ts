@@ -23,7 +23,7 @@ type NativeAddon = {
 	deleteHosted(url: string, headers: [string, string][]): Promise<void>;
 	Lix: {
 		openMemory(
-			telemetry?: (spanJson: string) => void,
+			telemetry?: (request: Uint8Array) => void,
 			telemetryParentJson?: string,
 			serverUrl?: string,
 			serverHeaders?: [string, string][],
@@ -32,7 +32,7 @@ type NativeAddon = {
 			durability?: import("./types.js").Durability,
 		): Promise<NativeLixBinding>;
 		openMemoryFromSnapshot(
-			telemetry?: (spanJson: string) => void,
+			telemetry?: (request: Uint8Array) => void,
 			telemetryParentJson?: string,
 			openProgress?: (progressJson: string) => void,
 			componentDispatch?: ComponentDispatch,
@@ -41,7 +41,7 @@ type NativeAddon = {
 		openFilesystemStorage(
 			path: string,
 			syncAllFiles: boolean,
-			telemetry?: (spanJson: string) => void,
+			telemetry?: (request: Uint8Array) => void,
 			telemetryParentJson?: string,
 			serverUrl?: string,
 			serverHeaders?: [string, string][],
@@ -52,7 +52,7 @@ type NativeAddon = {
 		openFilesystemStorageFromSnapshot(
 			path: string,
 			syncAllFiles: boolean,
-			telemetry?: (spanJson: string) => void,
+			telemetry?: (request: Uint8Array) => void,
 			telemetryParentJson?: string,
 			openProgress?: (progressJson: string) => void,
 			componentDispatch?: ComponentDispatch,
@@ -251,7 +251,9 @@ export async function openNativeLixBinding(
 		case "memory": {
 			const nativeAddon = loadAddon();
 			const nativeTelemetry = telemetry
-				? (spanJson: string) => telemetry(JSON.parse(spanJson))
+				? (request: Uint8Array) => {
+						if (request.byteLength > 0) telemetry(request);
+					}
 				: undefined;
 			if (snapshot) {
 				const restore = nativeAddon.Lix.openMemoryFromSnapshot(
@@ -295,7 +297,9 @@ export async function openNativeLixBinding(
 		case "filesystem": {
 			const nativeAddon = loadAddon();
 			const nativeTelemetry = telemetry
-				? (spanJson: string) => telemetry(JSON.parse(spanJson))
+				? (request: Uint8Array) => {
+						if (request.byteLength > 0) telemetry(request);
+					}
 				: undefined;
 			if (snapshot) {
 				const restore = nativeAddon.Lix.openFilesystemStorageFromSnapshot(

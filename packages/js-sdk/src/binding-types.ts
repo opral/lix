@@ -10,7 +10,6 @@ import type {
 	MergeBranchReceipt,
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
-	LixTelemetrySpan,
 	LixTelemetryParentContext,
 	LixOpenProgress,
 	LixOpenReport,
@@ -103,6 +102,8 @@ export type LixBinding = {
 	syncDiskToLix(): Promise<void>;
 	exportSnapshot(): SnapshotExportBinding;
 	close(): Promise<void>;
+	/** Wait until native telemetry callbacks already queued have reached JS. */
+	flushTelemetry?(): Promise<void>;
 };
 
 export type LixTransactionBinding = {
@@ -121,7 +122,7 @@ export type ObserveEventsBinding = {
 	close(): void;
 };
 
-export type TelemetryDispatch = (span: LixTelemetrySpan) => void;
+export type TelemetryDispatch = (request: Uint8Array) => void;
 export type OpenProgressDispatch = (progress: LixOpenProgress) => void;
 export type TelemetryParentContext = LixTelemetryParentContext;
 

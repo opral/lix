@@ -201,9 +201,9 @@ async function openLixWorkerBindingInner(
 ): Promise<LixBinding> {
 	if (openDirectLixBinding) {
 		const telemetryDispatch = telemetry
-			? (span: Parameters<LixTelemetryOptions["onSpan"]>[0]) => {
+			? (request: Uint8Array) => {
 					try {
-						telemetry.onSpan(span);
+						telemetry.onExport(request);
 					} catch {
 						// Telemetry is observational and must not fail engine commands.
 					}
@@ -212,7 +212,7 @@ async function openLixWorkerBindingInner(
 		const binding = await openDirectLixBinding(
 			storage,
 			telemetryDispatch,
-			telemetry?.parentContext?.(),
+			readTelemetryParent(telemetry?.parentContext),
 			await resolveDirectSyncServer(server),
 			onProgress,
 			snapshot,
@@ -247,7 +247,8 @@ function wrapTelemetryParentBinding(
 	binding: LixBinding,
 	parentContext: NonNullable<LixTelemetryOptions["parentContext"]>,
 ): LixBinding {
-	const prepareOperation = () => binding.setTelemetryParent(parentContext());
+	const prepareOperation = () =>
+		binding.setTelemetryParent(readTelemetryParent(parentContext));
 	return new Proxy(binding, {
 		get(target, property, receiver) {
 			if (property === "setTelemetryParent") {
@@ -303,7 +304,7 @@ function wrapTelemetryParentObserve(
 	return {
 		setTelemetryParent: (parent) => events.setTelemetryParent(parent),
 		next: () => {
-			events.setTelemetryParent(parentContext());
+			events.setTelemetryParent(readTelemetryParent(parentContext));
 			return events.next();
 		},
 		close: () => events.close(),
@@ -315,7 +316,8 @@ function wrapTelemetryParentTransaction(
 	binding: LixBinding,
 	parentContext: NonNullable<LixTelemetryOptions["parentContext"]>,
 ): LixTransactionBinding {
-	const prepareOperation = () => binding.setTelemetryParent(parentContext());
+	const prepareOperation = () =>
+		binding.setTelemetryParent(readTelemetryParent(parentContext));
 	return {
 		execute: (sql, params, options) => {
 			prepareOperation();
@@ -330,6 +332,17 @@ function wrapTelemetryParentTransaction(
 			return transaction.rollback();
 		},
 	};
+}
+
+function readTelemetryParent(
+	parentContext: LixTelemetryOptions["parentContext"],
+) {
+	try {
+		return parentContext?.();
+	} catch {
+		// Context is observational. A broken provider must not fail SQL calls.
+		return undefined;
+	}
 }
 
 /** @internal Exported only for worker lifecycle tests. */
@@ -633,7 +646,7 @@ export class LixWorkerClient {
 				this.connection.postMessage({
 					id,
 					sessionId,
-					telemetryParent: this.telemetry?.parentContext?.(),
+					telemetryParent: readTelemetryParent(this.telemetry?.parentContext),
 					operation,
 				});
 			} catch (error) {
@@ -684,7 +697,7 @@ export class LixWorkerClient {
 		switch (message.kind) {
 			case "telemetry":
 				try {
-					this.telemetry?.onSpan(message.span);
+					this.telemetry?.onExport(message.request);
 				} catch {
 					// Telemetry callbacks are isolated from Lix operation results.
 				}
