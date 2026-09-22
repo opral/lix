@@ -927,9 +927,27 @@ where
                     "partial replica base ID is invalid",
                 )
             })?;
-            if control.tracked_generation != expected.serving_generation(&branch.branch_id)?
-                || !matches!(marker, Some(crate::storage_adapter::StorageProjectedValue::FullValue(ref bytes)) if bytes.as_ref() == base.as_uuid().as_bytes())
-            {
+            let root = match &marker {
+                Some(crate::storage_adapter::StorageProjectedValue::FullValue(bytes)) => {
+                    uuid::Uuid::from_slice(bytes).ok().map(crate::changelog::CommitId::from)
+                }
+                _ => None,
+            };
+            let admitted_root = control.tracked_generation
+                == expected.serving_generation(&branch.branch_id)? && root == Some(base);
+            // Undo can publish a complete local native root and rotate its HOT
+            // generation without changing the remote admission or upload cursor.
+            // Such a root is owned by the local first-parent interval. Reopening
+            // must retain that interval, rather than require its root to remain
+            // the original remote head (or replace it and lose pending edits).
+            let local_root = if !admitted_root
+                && control.tracked_generation != expected.serving_generation(&branch.branch_id)?
+                && root.is_some_and(|root| root != base) {
+                partial_local_root_is_owned(&read, control.head_commit_id, root.unwrap(), base).await?
+            } else {
+                false
+            };
+            if !admitted_root && !local_root {
                 let (root_commit_id, root_bytes) = match &marker {
                     Some(crate::storage_adapter::StorageProjectedValue::FullValue(bytes)) => (
                         uuid::Uuid::from_slice(bytes).ok().map(|id| id.to_string()),
@@ -954,6 +972,41 @@ where
         Ok(Arc::from(expected.repository_id()))
     })
     .await
+}
+
+/// Verify only the resident local interval, stopping at the admitted remote
+/// head. Never hydrate remote history during admission. The marker must name
+/// a native root on that interval, not merely any readable historical commit.
+async fn partial_local_root_is_owned(
+    read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+    head: crate::changelog::CommitId,
+    root: crate::changelog::CommitId,
+    base: crate::changelog::CommitId,
+) -> Result<bool, LixError> {
+    let headers = crate::tracked_state::load_commit_state_authority_ids(read, &[root]).await?;
+    if headers.into_iter().all(|header| header.is_none()) {
+        return Ok(false);
+    }
+    let context = CommitGraphContext::new();
+    let mut graph = context.reader(read);
+    let mut cursor = head;
+    let mut previous_generation = None;
+    let mut saw_root = false;
+    while cursor != base {
+        let Some(node) = graph.load_node(&cursor).await? else {
+            return Ok(false);
+        };
+        if previous_generation.is_some_and(|generation| node.generation >= generation) {
+            return Ok(false);
+        }
+        saw_root |= cursor == root;
+        let Some(parent) = node.parent_commit_ids.first() else {
+            return Ok(false);
+        };
+        previous_generation = Some(node.generation);
+        cursor = *parent;
+    }
+    Ok(saw_root)
 }
 
 async fn repository_has_changelog_commit(
@@ -3002,7 +3055,13 @@ mod tests {
             .iter()
             .filter(|entry| crate::hot_state::hot_index_key_is_witness(entry.key.0.as_ref()))
             .count();
-        (witnesses, entries.iter().filter(|entry| crate::hot_state::hot_index_key_is_entry(entry.key.0.as_ref())).count())
+        (
+            witnesses,
+            entries
+                .iter()
+                .filter(|entry| crate::hot_state::hot_index_key_is_entry(entry.key.0.as_ref()))
+                .count(),
+        )
     }
 
     /// The witness carries how many entries the plane has published, which is
