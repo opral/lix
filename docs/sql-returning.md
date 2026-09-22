@@ -18,6 +18,8 @@ RETURNING id, OLD.content AS before, NEW.content AS after;
 
 For a mixed upsert, each inserted row has a null old image and each updated row has its own old image. Absent images retain the column's SQL type. An empty file is an empty BYTEA, not SQL NULL. A statement affecting zero rows still returns the declared columns and types.
 
+RETURNING supports searched and simple `CASE` expressions, including `OLD` and `NEW` values in conditions and result branches. `CASE` and `COALESCE` retain JSONB and row-reference types when their value branches share that logical type; a SQL NULL branch does not change it.
+
 These image semantics follow PostgreSQL 18. Custom image aliases using `RETURNING WITH (OLD AS ..., NEW AS ...)` are not supported.
 
 Returning rows describe a statement, including no-op updates. Two statements that change A to B and then B to A return both transitions, while an endpoint diff can be empty. Use the committed operation's `commit` receipt with `lix_diff` for the transaction's net changes. Rows returned inside an explicit transaction are provisional until commit succeeds. A failing RETURNING expression rolls back that statement's writes.

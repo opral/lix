@@ -287,7 +287,7 @@ impl DmlReturning {
         self.project_images(old.as_ref(), Some(batch))
     }
 
-    pub(super) fn project_images(
+    pub(crate) fn project_images(
         &self,
         old: Option<&RecordBatch>,
         new: Option<&RecordBatch>,

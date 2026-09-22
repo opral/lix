@@ -1086,6 +1086,13 @@ simulation_test!(
                     Value::Text("{\"phase\":\"update\"}".to_string()),
                     Value::Jsonb(serde_json::json!({"phase": "update"}).into()),
                 ),
+                "timestamp_value" => (
+                    Value::Text("2026-01-01T00:00:00Z".into()),
+                    Value::Timestamptz(1_767_225_600_000_000),
+                    Value::Timestamptz(1_767_225_600_000_000),
+                    Value::Text("2026-01-02T01:00:00+01:00".into()),
+                    Value::Timestamptz(1_767_312_000_000_000),
+                ),
                 "content" => (
                     Value::Text("before".to_string()),
                     Value::Blob(b"before".to_vec().into()),
@@ -1110,7 +1117,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                   CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_scalar_cast_contract\",\"columns\":[{\"name\":\"id\",\"type\":\"uuid\",\"nullable\":false,\"default_expression\":\"uuidv7()\"},{\"name\":\"text_value\",\"type\":\"text\",\"nullable\":false},{\"name\":\"integer_value\",\"type\":\"int8\",\"nullable\":false},{\"name\":\"number_value\",\"type\":\"float8\",\"nullable\":false},{\"name\":\"boolean_value\",\"type\":\"boolean\",\"nullable\":false},{\"name\":\"json_value\",\"type\":\"jsonb\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
+                   CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_scalar_cast_contract\",\"columns\":[{\"name\":\"id\",\"type\":\"uuid\",\"nullable\":false,\"default_expression\":\"uuidv7()\"},{\"name\":\"text_value\",\"type\":\"text\",\"nullable\":false},{\"name\":\"integer_value\",\"type\":\"int8\",\"nullable\":false},{\"name\":\"number_value\",\"type\":\"float8\",\"nullable\":false},{\"name\":\"boolean_value\",\"type\":\"boolean\",\"nullable\":false},{\"name\":\"json_value\",\"type\":\"jsonb\",\"nullable\":false},{\"name\":\"timestamp_value\",\"type\":\"timestamptz\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                    false,\
                    false\
                  )",
@@ -1127,7 +1134,7 @@ simulation_test!(
                    table_name = 'engine_scalar_cast_contract' \
                    AND column_name IN (\
                      'id', 'text_value', 'integer_value', 'number_value', \
-                     'boolean_value', 'json_value'\
+                     'boolean_value', 'json_value', 'timestamp_value'\
                    )\
                  ) OR (table_name = 'lix_file' AND column_name = 'content') \
                  ORDER BY table_name, column_name",
@@ -1156,8 +1163,8 @@ simulation_test!(
             .collect::<Vec<_>>();
         assert_eq!(
             contracts.len(),
-            7,
-            "expected UUID, five row types, plus BYTEA"
+            8,
+            "expected UUID, six row types, plus BYTEA"
         );
 
         for contract in &contracts {
@@ -1165,6 +1172,7 @@ simulation_test!(
                 "id" => "UUID",
                 "text_value" => "TEXT",
                 "json_value" => "JSONB",
+                "timestamp_value" => "TIMESTAMPTZ",
                 "integer_value" => "BIGINT",
                 "number_value" => "DOUBLE PRECISION",
                 "boolean_value" => "BOOLEAN",
@@ -2556,7 +2564,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    scalar_row_insert_and_upsert_remain_atomically_unsupported,
+    scalar_row_insert_values_and_upsert_remain_atomically_unsupported,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
@@ -2569,7 +2577,6 @@ simulation_test!(
             .await
             .unwrap();
         for sql in [
-            "INSERT INTO expression_rows (id, value) VALUES ('two', 'new') RETURNING upper(value)",
             "INSERT INTO expression_rows (id, value) VALUES ('one', 'changed'), ('two', 'new') ON CONFLICT (id) DO UPDATE SET value = upper(excluded.value)",
             "INSERT INTO expression_rows (id, value) VALUES ('two', concat('new', '-row'))",
         ] {

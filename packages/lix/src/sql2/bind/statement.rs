@@ -743,23 +743,32 @@ fn bind_predicate(
     expr: &Expr,
     params: &mut ParamBinder,
 ) -> Result<BoundPredicate, LixError> {
+    bind_predicate_context(table, expr, params, false)
+}
+
+fn bind_predicate_context(
+    table: &BoundTable,
+    expr: &Expr,
+    params: &mut ParamBinder,
+    returning: bool,
+) -> Result<BoundPredicate, LixError> {
     match expr {
-        Expr::Nested(expr) => bind_predicate(table, expr, params),
+        Expr::Nested(expr) => bind_predicate_context(table, expr, params, returning),
         Expr::BinaryOp { left, op, right } if *op == BinaryOperator::And => {
             let mut predicates = Vec::new();
-            flatten_and_predicate(table, left, params, &mut predicates)?;
-            flatten_and_predicate(table, right, params, &mut predicates)?;
+            flatten_and_predicate_context(table, left, params, returning, &mut predicates)?;
+            flatten_and_predicate_context(table, right, params, returning, &mut predicates)?;
             Ok(BoundPredicate::And(predicates))
         }
         Expr::BinaryOp { left, op, right } if *op == BinaryOperator::Or => {
             let mut predicates = Vec::new();
-            flatten_or_predicate(table, left, params, &mut predicates)?;
-            flatten_or_predicate(table, right, params, &mut predicates)?;
+            flatten_or_predicate_context(table, left, params, returning, &mut predicates)?;
+            flatten_or_predicate_context(table, right, params, returning, &mut predicates)?;
             Ok(BoundPredicate::Or(predicates))
         }
         Expr::BinaryOp { left, op, right } if *op == BinaryOperator::Eq => Ok(BoundPredicate::Eq(
-            bind_expr(table, left, params)?,
-            bind_expr(table, right, params)?,
+            bind_expr_context(table, left, params, returning)?,
+            bind_expr_context(table, right, params, returning)?,
         )),
         Expr::Like {
             negated,
@@ -767,7 +776,7 @@ fn bind_predicate(
             expr,
             pattern,
             escape_char,
-        } => bind_like_predicate(
+        } => bind_like_predicate_context(
             table,
             *negated,
             *any,
@@ -775,6 +784,7 @@ fn bind_predicate(
             pattern,
             escape_char.as_ref(),
             false,
+            returning,
             params,
         ),
         Expr::ILike {
@@ -783,7 +793,7 @@ fn bind_predicate(
             expr,
             pattern,
             escape_char,
-        } => bind_like_predicate(
+        } => bind_like_predicate_context(
             table,
             *negated,
             *any,
@@ -791,10 +801,15 @@ fn bind_predicate(
             pattern,
             escape_char.as_ref(),
             true,
+            returning,
             params,
         ),
-        Expr::IsNull(expr) => Ok(BoundPredicate::IsNull(bind_expr(table, expr, params)?)),
-        Expr::IsNotNull(expr) => Ok(BoundPredicate::IsNotNull(bind_expr(table, expr, params)?)),
+        Expr::IsNull(expr) => Ok(BoundPredicate::IsNull(bind_expr_context(
+            table, expr, params, returning,
+        )?)),
+        Expr::IsNotNull(expr) => Ok(BoundPredicate::IsNotNull(bind_expr_context(
+            table, expr, params, returning,
+        )?)),
         Expr::InList {
             expr,
             list,
@@ -806,10 +821,10 @@ fn bind_predicate(
                 ));
             }
             Ok(BoundPredicate::In {
-                expr: bind_expr(table, expr, params)?,
+                expr: bind_expr_context(table, expr, params, returning)?,
                 values: list
                     .iter()
-                    .map(|value| bind_expr(table, value, params))
+                    .map(|value| bind_expr_context(table, value, params, returning))
                     .collect::<Result<Vec<_>, _>>()?,
             })
         }
@@ -822,7 +837,7 @@ fn bind_predicate(
 }
 
 #[expect(clippy::too_many_arguments)]
-fn bind_like_predicate(
+fn bind_like_predicate_context(
     table: &BoundTable,
     negated: bool,
     any: bool,
@@ -830,6 +845,7 @@ fn bind_like_predicate(
     pattern: &Expr,
     escape_char: Option<&Value>,
     case_insensitive: bool,
+    returning: bool,
     params: &mut ParamBinder,
 ) -> Result<BoundPredicate, LixError> {
     if any {
@@ -851,34 +867,36 @@ fn bind_like_predicate(
         None => None,
     };
     Ok(BoundPredicate::Like {
-        expr: bind_expr(table, expr, params)?,
-        pattern: bind_expr(table, pattern, params)?,
+        expr: bind_expr_context(table, expr, params, returning)?,
+        pattern: bind_expr_context(table, pattern, params, returning)?,
         negated,
         case_insensitive,
         escape_char,
     })
 }
 
-fn flatten_and_predicate(
+fn flatten_and_predicate_context(
     table: &BoundTable,
     expr: &Expr,
     params: &mut ParamBinder,
+    returning: bool,
     predicates: &mut Vec<BoundPredicate>,
 ) -> Result<(), LixError> {
-    match bind_predicate(table, expr, params)? {
+    match bind_predicate_context(table, expr, params, returning)? {
         BoundPredicate::And(items) => predicates.extend(items),
         predicate => predicates.push(predicate),
     }
     Ok(())
 }
 
-fn flatten_or_predicate(
+fn flatten_or_predicate_context(
     table: &BoundTable,
     expr: &Expr,
     params: &mut ParamBinder,
+    returning: bool,
     predicates: &mut Vec<BoundPredicate>,
 ) -> Result<(), LixError> {
-    match bind_predicate(table, expr, params)? {
+    match bind_predicate_context(table, expr, params, returning)? {
         BoundPredicate::Or(items) => predicates.extend(items),
         predicate => predicates.push(predicate),
     }
@@ -953,6 +971,19 @@ fn bind_expr_context(
         Expr::Function(function) => bind_function(function, params, |expr, params| {
             bind_expr_context(table, expr, params, returning)
         }),
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } if returning => bind_case_expr(
+            table,
+            operand.as_deref(),
+            conditions,
+            else_result.as_deref(),
+            params,
+            returning,
+        ),
         Expr::BinaryOp { left, op, right }
             if matches!(op, BinaryOperator::Arrow | BinaryOperator::LongArrow) =>
         {
@@ -978,6 +1009,105 @@ fn bind_expr_context(
             "unsupported SQL expression '{expr}'"
         ))),
     }
+}
+
+fn bind_case_expr(
+    table: &BoundTable,
+    operand: Option<&Expr>,
+    conditions: &[datafusion::sql::sqlparser::ast::CaseWhen],
+    else_result: Option<&Expr>,
+    params: &mut ParamBinder,
+    returning: bool,
+) -> Result<BoundExpr, LixError> {
+    let operand = operand
+        .map(|expr| bind_expr_context(table, expr, params, returning))
+        .transpose()?
+        .map(Box::new);
+    let conditions = conditions
+        .iter()
+        .map(|case_when| {
+            let condition =
+                bind_case_condition_expr(table, &case_when.condition, params, returning)?;
+            let result = bind_expr_context(table, &case_when.result, params, returning)?;
+            Ok((condition, result))
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    let else_result = else_result
+        .map(|expr| bind_expr_context(table, expr, params, returning))
+        .transpose()?
+        .map(Box::new);
+    Ok(BoundExpr::Case {
+        operand,
+        conditions,
+        else_result,
+    })
+}
+
+fn bind_case_condition_expr(
+    table: &BoundTable,
+    expr: &Expr,
+    params: &mut ParamBinder,
+    returning: bool,
+) -> Result<BoundExpr, LixError> {
+    match expr {
+        Expr::Nested(expr) => bind_case_condition_expr(table, expr, params, returning),
+        Expr::BinaryOp { left, op, right }
+            if matches!(
+                op,
+                BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+                    | BinaryOperator::And
+                    | BinaryOperator::Or
+            ) =>
+        {
+            Ok(BoundExpr::Binary {
+                left: Box::new(bind_case_condition_expr(table, left, params, returning)?),
+                op: bind_condition_binary_operator(op)?,
+                right: Box::new(bind_case_condition_expr(table, right, params, returning)?),
+            })
+        }
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr,
+        } => Ok(BoundExpr::Not(Box::new(bind_case_condition_expr(
+            table, expr, params, returning,
+        )?))),
+        Expr::Value(value) if matches!(&value.value, Value::Boolean(_)) => {
+            Ok(BoundExpr::Predicate(Box::new(bind_predicate_context(
+                table, expr, params, returning,
+            )?)))
+        }
+        Expr::Like { .. }
+        | Expr::ILike { .. }
+        | Expr::IsNull(_)
+        | Expr::IsNotNull(_)
+        | Expr::InList { .. } => Ok(BoundExpr::Predicate(Box::new(bind_predicate_context(
+            table, expr, params, returning,
+        )?))),
+        _ => bind_expr_context(table, expr, params, returning),
+    }
+}
+
+fn bind_condition_binary_operator(op: &BinaryOperator) -> Result<BoundBinaryOperator, LixError> {
+    Ok(match op {
+        BinaryOperator::Eq => BoundBinaryOperator::Eq,
+        BinaryOperator::NotEq => BoundBinaryOperator::NotEq,
+        BinaryOperator::Lt => BoundBinaryOperator::Lt,
+        BinaryOperator::LtEq => BoundBinaryOperator::LtEq,
+        BinaryOperator::Gt => BoundBinaryOperator::Gt,
+        BinaryOperator::GtEq => BoundBinaryOperator::GtEq,
+        BinaryOperator::And => BoundBinaryOperator::And,
+        BinaryOperator::Or => BoundBinaryOperator::Or,
+        _ => {
+            return Err(super::error::unsupported(format!(
+                "unsupported SQL CASE condition operator '{op}'"
+            )));
+        }
+    })
 }
 
 fn bind_conflict_expr(

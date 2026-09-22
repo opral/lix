@@ -2463,6 +2463,9 @@ test("information_schema.columns SELECT * exposes the Lix column contract", asyn
 	expect(result.columns.some((column) => column.name === "lix_value_kind")).toBe(
 		false,
 	);
+	expect(
+		result.rows.find((row) => row.column_name === "content")?.data_type,
+	).toBe("BYTEA");
 	expect(result.columns.some((column) => column.name === "lix_insert_policy")).toBe(
 		true,
 	);
@@ -2493,6 +2496,91 @@ test("discovered JSONB types preserve native SELECT and RETURNING values", async
 	);
 	expect(selected.columns).toEqual([{ name: "value", type: "jsonb" }]);
 	expect(get(selected, "value")).toEqual(payload);
+	await lix.close();
+});
+
+test("INSERT SELECT preserves JSONB through CASE RETURNING", async () => {
+	const lix = await openLix();
+	try {
+		const payload = { nested: [true, 42, null] };
+		await lix.execute(
+			"INSERT INTO lix_key_value (key, value) VALUES ('case-source', $1)",
+			[Value.jsonb(payload)],
+		);
+		const copied = await lix.execute(
+			"INSERT INTO lix_key_value (key, value) " +
+				"SELECT key || '-copy', value FROM lix_key_value WHERE key = 'case-source' " +
+				"RETURNING CASE WHEN key = 'case-source-copy' THEN value ELSE NULL END AS payload",
+		);
+		expect(copied.columns).toEqual([{ name: "payload", type: "jsonb" }]);
+		expect(copied.rows).toEqual([{ payload }]);
+		expect(
+			(await lix.execute("SELECT key FROM lix_key_value WHERE key LIKE 'case-source%' ORDER BY key")).rows,
+		).toEqual([{ key: "case-source" }, { key: "case-source-copy" }]);
+	} finally {
+		await lix.close();
+	}
+});
+
+test("information_schema.columns reports logical JSONB and TIMESTAMPTZ types", async () => {
+	const lix = await openLix();
+
+	await lix.execute(
+		"INSERT INTO lix_registered_schema (value) VALUES (CAST($1 AS JSONB))",
+		[
+			JSON.stringify({
+				$schema: "https://lix.dev/schema-v1.json",
+				key: "sdk_information_schema_types",
+				columns: [
+					{ name: "id", type: "text", nullable: false },
+					{ name: "payload", type: "jsonb", nullable: false },
+					{ name: "created_at", type: "timestamptz", nullable: false },
+				],
+				primary_key: ["id"],
+			}),
+		],
+	);
+
+	const result = await lix.execute(
+		"SELECT column_name, data_type FROM information_schema.columns " +
+			"WHERE table_name = 'sdk_information_schema_types' " +
+			"AND column_name IN ('payload', 'created_at') " +
+			"ORDER BY ordinal_position",
+	);
+
+	expect(result.rows).toEqual([
+		{ column_name: "payload", data_type: "JSONB" },
+		{ column_name: "created_at", data_type: "TIMESTAMPTZ" },
+	]);
+
+	const tableFunctionColumns = await lix.execute(
+		"SELECT column_name FROM information_schema.columns " +
+			"WHERE table_schema = 'information_schema' " +
+			"AND table_name = 'table_functions'",
+	);
+	expect(
+		tableFunctionColumns.rows.some(
+			(row) => row.column_name === "lix_value_kind",
+		),
+	).toBe(false);
+
+	const diffContract = await lix.execute(
+		"SELECT result_column, data_type FROM information_schema.table_functions " +
+			"WHERE function_name = 'lix_diff' " +
+			"AND source_relation = 'sdk_information_schema_types' " +
+			"AND result_column IN ('row_ref', 'from_payload', 'to_payload', " +
+			"'from_created_at', 'to_created_at') " +
+			"ORDER BY ordinal_position",
+	);
+
+	expect(diffContract.rows).toEqual([
+		{ result_column: "row_ref", data_type: "ROW_REF" },
+		{ result_column: "from_payload", data_type: "JSONB" },
+		{ result_column: "to_payload", data_type: "JSONB" },
+		{ result_column: "from_created_at", data_type: "TIMESTAMPTZ" },
+		{ result_column: "to_created_at", data_type: "TIMESTAMPTZ" },
+	]);
+
 	await lix.close();
 });
 

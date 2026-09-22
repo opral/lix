@@ -218,14 +218,10 @@ impl LixInformationSchemaProvider {
                             &relation.name,
                         )?
                     } else {
-                        self.public_catalog
-                            .surface_schema(&relation.name)
-                            .ok_or_else(|| {
-                                DataFusionError::Execution(format!(
-                                    "state relation '{}' is missing its result schema",
-                                    relation.name
-                                ))
-                            })?
+                        super::providers::relation_state_schema(
+                            self.public_catalog.as_ref(),
+                            &relation.name,
+                        )?
                     };
                     for (position, field) in provider_schema.fields().iter().enumerate() {
                         function_catalog.push(self.public_catalog_name.clone());
@@ -265,14 +261,16 @@ impl LixInformationSchemaProvider {
                 ),
                 PublicSurfaceKind::RecoveryFunction => (
                     match surface.name.as_str() {
-                        "lix_undo" => "() | (target_commit_id TEXT) | (target_commit_id TEXT, row_refs ROW_REF[])",
-                        "lix_redo" => "() | (undo_commit_id TEXT) | (undo_commit_id TEXT, row_refs ROW_REF[])",
+                        "lix_undo" => {
+                            "() | (target_commit_id TEXT) | (target_commit_id TEXT, row_refs ROW_REF[])"
+                        }
+                        "lix_redo" => {
+                            "() | (undo_commit_id TEXT) | (undo_commit_id TEXT, row_refs ROW_REF[])"
+                        }
                         "lix_restore" => {
                             "(source_commit_id TEXT) | (source_commit_id TEXT, row_refs ROW_REF[])"
                         }
-                        "lix_revert" => {
-                            "(commit_id TEXT) | (commit_id TEXT, row_refs ROW_REF[])"
-                        }
+                        "lix_revert" => "(commit_id TEXT) | (commit_id TEXT, row_refs ROW_REF[])",
                         "lix_revert_range" | "lix_apply" => {
                             "(before_commit_id TEXT, after_commit_id TEXT) | (before_commit_id TEXT, after_commit_id TEXT, row_refs ROW_REF[])"
                         }

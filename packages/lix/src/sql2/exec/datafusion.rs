@@ -10,8 +10,12 @@
 
 use crate::branch::BranchHead;
 use crate::functions::FunctionContext;
-use crate::sql2::bind::expr::{BoundBinaryOperator, BoundCastType, BoundExpr, BoundLiteral};
-use crate::sql2::bind::write::{BoundInsertValues, BoundReturning, FileWriteSurface};
+use crate::sql2::bind::expr::{
+    BoundBinaryOperator, BoundCastType, BoundColumnRef, BoundExpr, BoundLiteral, ReturningImage,
+};
+use crate::sql2::bind::write::{
+    BoundInsertValues, BoundReturning, BoundReturningItem, FileWriteSurface, RowWriteSurface,
+};
 use crate::sql2::bind::write::{
     BoundWriteInput, BoundWriteOp, BoundWriteTarget, DirectoryWriteSurface,
 };
@@ -30,7 +34,7 @@ use datafusion::common::metadata::{FieldMetadata, ScalarAndMetadata};
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::common::{Column, DFSchema, DFSchemaRef, ParamValues, ScalarValue};
 use datafusion::datasource::{empty::EmptyTable, provider_as_source};
-use datafusion::logical_expr::expr::{BinaryExpr, Cast, InList, Like, ScalarFunction};
+use datafusion::logical_expr::expr::{BinaryExpr, Case, Cast, InList, Like, ScalarFunction};
 use datafusion::logical_expr::registry::FunctionRegistry;
 use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, LogicalPlanBuilder, Operator};
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -50,6 +54,7 @@ use std::ops::ControlFlow;
 use std::time::Instant;
 
 use crate::catalog::CatalogFingerprint;
+use crate::sql2::logical_value_metadata::propagate_lix_value_metadata;
 use crate::sql2::predicate_typecheck::{
     json_predicate_placeholder_indexes_with_dfschema,
     json_predicate_placeholder_indexes_with_dfschemas, validate_json_predicate_expr_with_dfschema,
@@ -715,11 +720,12 @@ async fn create_logical_plan_from_statement(
         .statement_to_plan(statement)
         .await
         .map_err(datafusion_error_to_lix_error)?;
-    if normalize_numeric_literals {
-        normalize_bigint_numeric_predicates(plan)
+    let plan = if normalize_numeric_literals {
+        normalize_bigint_numeric_predicates(plan)?
     } else {
-        Ok(plan)
-    }
+        plan
+    };
+    propagate_lix_value_metadata(plan).map_err(datafusion_error_to_lix_error)
 }
 
 fn statement_has_numeric_literal_candidate(statement: &DataFusionStatement) -> bool {
@@ -1419,7 +1425,7 @@ fn bind_plan_param_values(plan: LogicalPlan, params: &[Value]) -> Result<Logical
                 .collect::<Result<Vec<_>, _>>()?,
         ))
         .map_err(datafusion_error_to_lix_error)?;
-    Ok(plan)
+    propagate_lix_value_metadata(plan).map_err(datafusion_error_to_lix_error)
 }
 
 async fn execute_logical_plan(
@@ -1450,16 +1456,18 @@ async fn execute_logical_plan(
     // parameters on the plan directly against the statement's pooled state.
     let plan = bind_runtime_plan_param_values(plan, params)?;
 
-    let result_fields = plan
+    let logical_fields = plan
         .inner()
         .schema()
         .fields()
         .iter()
         .map(|field| field.as_ref().clone())
         .collect::<Vec<_>>();
-    let batches = crate::sql2::runtime::collect_plan(&state, plan, physical_planning_cache)
-        .await
-        .map_err(datafusion_error_to_lix_error)?;
+    let (schema, batches) =
+        crate::sql2::runtime::collect_plan_with_schema(&state, plan, physical_planning_cache)
+            .await
+            .map_err(datafusion_error_to_lix_error)?;
+    let result_fields = resolved_result_fields(&logical_fields, &schema);
     // This is a benchmark-only causal ceiling probe. It keeps DataFusion's
     // RecordBatch owners alive through execution, counts the rows/batches,
     // and deliberately omits public scalar/row conversion. No production
@@ -1534,6 +1542,7 @@ async fn execute_logical_plan_stream<'session>(
     let stream = crate::sql2::runtime::stream_plan(&state, plan, physical_planning_cache)
         .await
         .map_err(datafusion_error_to_lix_error)?;
+    let fields = resolved_result_fields(&fields, &stream.schema());
     Ok(SessionReadBatchStreamResult {
         fields,
         stream,
@@ -1690,6 +1699,23 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
         matches!(plan.bound.op, BoundWriteOp::Delete),
     )?;
 
+    // Some row providers deliberately expose only the mutation API without
+    // provider-side INSERT/DELETE RETURNING support.  Keep the mutation on
+    // the certified row path, capture the images needed by the original
+    // RETURNING expression, and evaluate that expression through the same
+    // DataFusion projector used by provider RETURNING.
+    if plan.bound.returning.as_ref().is_some_and(|returning| {
+        returning
+            .items
+            .iter()
+            .any(|item| bound_expr_requires_datafusion(&item.expr))
+    }) && let Some(result) =
+        execute_bound_returning_bridge(ctx, plan, params, table_schema.as_ref(), returning.as_ref())
+            .await?
+    {
+        return Ok(result);
+    }
+
     let exec = match plan.bound.op {
         BoundWriteOp::Insert => {
             let input =
@@ -1815,7 +1841,7 @@ pub(super) async fn row_insert_query_stream(
     plan: &LogicalWritePlan,
     params: &[Value],
 ) -> Result<SendableRecordBatchStream, LixError> {
-    let BoundWriteTarget::Row(crate::sql2::bind::write::RowWriteSurface::Base { schema_key }) =
+    let BoundWriteTarget::Row(RowWriteSurface::Base { schema_key }) =
         &plan.bound.target
     else {
         return Err(LixError::new(
@@ -1838,6 +1864,239 @@ pub(super) async fn row_insert_query_stream(
         insert_query_input_plan(&session, table.schema(), query, columns, params, false).await?;
     crate::sql2::runtime::stream_input_plan(input, session.task_ctx())
         .map_err(datafusion_error_to_lix_error)
+}
+
+struct BoundReturningBridgeCapture {
+    old_positions: Vec<Option<usize>>,
+    new_positions: Vec<Option<usize>>,
+    width: usize,
+}
+
+/// Execute a row mutation through the bound writer while retaining enough
+/// pre/post-image columns to evaluate a DataFusion-only RETURNING expression.
+///
+/// This is intentionally a best-effort bridge: if the mutation itself cannot
+/// use the bound writer, the normal provider path remains responsible for
+/// reporting its existing unsupported behavior.
+async fn execute_bound_returning_bridge(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    params: &[Value],
+    table_schema: &Schema,
+    returning: Option<&crate::sql2::providers::DmlReturning>,
+) -> Result<Option<SqlWriteResult>, LixError> {
+    let Some(returning) = returning else {
+        return Ok(None);
+    };
+    if !matches!(plan.bound.target, BoundWriteTarget::Row(_)) {
+        return Ok(None);
+    }
+    let Some(original_returning) = plan.bound.returning.as_ref() else {
+        return Ok(None);
+    };
+    let Some((projection_plan, capture)) =
+        bound_returning_bridge_plan(plan, table_schema, original_returning)
+    else {
+        return Ok(None);
+    };
+
+    let execution = super::bound_public_write::try_execute_bound_public_write(
+        ctx,
+        &projection_plan,
+        params,
+        &crate::common::ExecuteStatementMetadata::default(),
+    )
+    .await?;
+    let super::bound_public_write::BoundPublicWriteExecution::Executed(mut result) = execution
+    else {
+        return Ok(None);
+    };
+    let captured = result.returning.take().ok_or_else(|| {
+        LixError::unknown("bound RETURNING bridge did not capture its image columns")
+    })?;
+    if captured.rows.iter().any(|row| row.len() != capture.width) {
+        return Err(LixError::unknown(
+            "bound RETURNING bridge captured an unexpected column count",
+        ));
+    }
+
+    let old_batch = match plan.bound.op {
+        BoundWriteOp::Insert | BoundWriteOp::Update | BoundWriteOp::Delete => Some(
+            bridge_image_batch(&captured, table_schema, &capture.old_positions)?,
+        ),
+    };
+    let new_batch = match plan.bound.op {
+        BoundWriteOp::Delete => None,
+        BoundWriteOp::Insert | BoundWriteOp::Update => Some(bridge_image_batch(
+            &captured,
+            table_schema,
+            &capture.new_positions,
+        )?),
+    };
+    let projected = returning
+        .project_images(old_batch.as_ref(), new_batch.as_ref())
+        .map_err(datafusion_error_to_lix_error)?;
+    let fields = returning
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    let mut query = query_result_from_batches(&fields, &[projected])?;
+    query.notices = captured.notices;
+    let mut bridged = SqlWriteResult::returning(result.rows_affected, query);
+    bridged.checkpoint_telemetry = result.checkpoint_telemetry;
+    Ok(Some(bridged))
+}
+
+fn bound_returning_bridge_plan(
+    plan: &LogicalWritePlan,
+    table_schema: &Schema,
+    returning: &BoundReturning,
+) -> Option<(LogicalWritePlan, BoundReturningBridgeCapture)> {
+    let BoundWriteTarget::Row(RowWriteSurface::Base { schema_key }) = &plan.bound.target else {
+        return None;
+    };
+    let delete = plan.bound.op == BoundWriteOp::Delete;
+    let old_columns = returning_image_columns(returning, delete, ReturningImage::Old);
+    let new_columns = returning_image_columns(returning, delete, ReturningImage::New);
+    let mut items = Vec::new();
+    let mut old_positions = vec![None; table_schema.fields().len()];
+    let mut new_positions = vec![None; table_schema.fields().len()];
+
+    for (field_index, field) in table_schema.fields().iter().enumerate() {
+        if old_columns.contains(field.name()) {
+            push_bridge_column(
+                &mut items,
+                &mut old_positions,
+                field_index,
+                field.name(),
+                schema_key,
+                ReturningImage::Old,
+            );
+        }
+        if new_columns.contains(field.name()) {
+            push_bridge_column(
+                &mut items,
+                &mut new_positions,
+                field_index,
+                field.name(),
+                schema_key,
+                ReturningImage::New,
+            );
+        }
+    }
+
+    // A constant RETURNING expression still needs one image column to retain
+    // the affected row count.  Prefer the image that supplies unqualified
+    // columns for this operation.
+    if items.is_empty() {
+        let Some(field) = table_schema.fields().first() else {
+            return None;
+        };
+        let image = if delete {
+            ReturningImage::Old
+        } else {
+            ReturningImage::New
+        };
+        let positions = match image {
+            ReturningImage::Old => &mut old_positions,
+            ReturningImage::New => &mut new_positions,
+        };
+        push_bridge_column(&mut items, positions, 0, field.name(), schema_key, image);
+    }
+
+    let width = items.len();
+    let mut projection_plan = plan.clone();
+    projection_plan.bound.returning = Some(BoundReturning { items });
+    Some((
+        projection_plan,
+        BoundReturningBridgeCapture {
+            old_positions,
+            new_positions,
+            width,
+        },
+    ))
+}
+
+fn push_bridge_column(
+    items: &mut Vec<BoundReturningItem>,
+    positions: &mut [Option<usize>],
+    field_index: usize,
+    field_name: &str,
+    schema_key: &str,
+    image: ReturningImage,
+) {
+    let position = items.len();
+    positions[field_index] = Some(position);
+    items.push(BoundReturningItem {
+        expr: BoundExpr::Column(BoundColumnRef {
+            image: Some(image),
+            table: schema_key.to_string(),
+            column_id: field_index,
+            name: field_name.to_string(),
+        }),
+        output_name: format!(
+            "__lix_returning_bridge_{}_{}",
+            image.qualifier(),
+            field_name
+        ),
+    });
+}
+
+fn bridge_image_batch(
+    result: &SqlQueryResult,
+    table_schema: &Schema,
+    positions: &[Option<usize>],
+) -> Result<RecordBatch, LixError> {
+    let row_count = result.rows.len();
+    let mut columns = Vec::with_capacity(table_schema.fields().len());
+    for (field_index, field) in table_schema.fields().iter().enumerate() {
+        let Some(position) = positions[field_index] else {
+            columns.push(datafusion::arrow::array::new_null_array(
+                field.data_type(),
+                row_count,
+            ));
+            continue;
+        };
+        if row_count == 0 {
+            columns.push(datafusion::arrow::array::new_empty_array(field.data_type()));
+            continue;
+        }
+        let scalars = result
+            .rows
+            .iter()
+            .map(|row| {
+                let value = row.get(position).ok_or_else(|| {
+                    LixError::unknown("bound RETURNING bridge row is missing an image value")
+                })?;
+                if matches!(value, Value::Null) {
+                    ScalarValue::try_from(field.data_type()).map_err(datafusion_error_to_lix_error)
+                } else {
+                    scalar_value_from_lix_value(value)?
+                        .value
+                        .cast_to(field.data_type())
+                        .map_err(datafusion_error_to_lix_error)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        columns.push(ScalarValue::iter_to_array(scalars).map_err(|error| {
+            LixError::unknown(format!(
+                "failed to construct bound RETURNING image column {}: {error}",
+                field.name()
+            ))
+        })?);
+    }
+    let fields = table_schema
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone().with_nullable(true))
+        .collect::<Vec<_>>();
+    RecordBatch::try_new(std::sync::Arc::new(Schema::new(fields)), columns).map_err(|error| {
+        LixError::unknown(format!(
+            "failed to construct bound RETURNING image batch: {error}"
+        ))
+    })
 }
 
 async fn insert_input_plan(
@@ -1964,7 +2223,7 @@ async fn insert_query_input_plan(
     session: &SessionContext,
     schema: SchemaRef,
     query: &crate::sql2::bind::read::BoundRead,
-    columns: &[crate::sql2::bind::expr::BoundColumnRef],
+    columns: &[BoundColumnRef],
     params: &[Value],
     coerce: bool,
 ) -> Result<std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>, LixError> {
@@ -2241,10 +2500,8 @@ fn datafusion_dml_returning(
     let mut required_columns = BTreeSet::new();
 
     for item in &returning.items {
-        let expr = prepare_write_expr(
-            session,
-            &df_schema,
-            datafusion_expr_from_bound_expr(session, &item.expr, params)?
+        let expr =
+            datafusion_expr_from_bound_expr_with_schema(session, &item.expr, params, table_schema)?
                 .transform_up(|expr| {
                     Ok(match expr {
                         Expr::Column(mut column) if column.relation.is_none() => {
@@ -2256,19 +2513,17 @@ fn datafusion_dml_returning(
                     })
                 })
                 .map_err(datafusion_error_to_lix_error)?
-                .data,
-        )?;
+                .data;
+        validate_json_predicate_expr_with_dfschema(&df_schema, &expr)?;
+        let kind = crate::sql2::logical_value_metadata::expr_lix_value_kind(&expr, &df_schema);
+        let expr = prepare_write_expr(session, &df_schema, expr)?;
         let (_, inferred_field) = expr
             .to_field(&df_schema)
             .map_err(datafusion_error_to_lix_error)?;
-        fields.push(
-            Field::new(
-                &item.output_name,
-                inferred_field.data_type().clone(),
-                inferred_field.is_nullable(),
-            )
-            .with_metadata(inferred_field.metadata().clone()),
-        );
+        fields.push(crate::sql2::logical_value_metadata::field_with_kind(
+            &inferred_field.as_ref().clone().with_name(&item.output_name),
+            kind,
+        ));
         expressions.push(
             datafusion::physical_expr::create_physical_expr(&expr, &df_schema, &props)
                 .map_err(datafusion_error_to_lix_error)?,
@@ -2282,25 +2537,16 @@ fn datafusion_dml_returning(
         required_columns,
         std::sync::Arc::new(table_schema.clone()),
         delete,
-        returning_image_columns(
-            returning,
-            delete,
-            crate::sql2::bind::expr::ReturningImage::Old,
-        ),
-        returning_image_columns(
-            returning,
-            delete,
-            crate::sql2::bind::expr::ReturningImage::New,
-        ),
+        returning_image_columns(returning, delete, ReturningImage::Old),
+        returning_image_columns(returning, delete, ReturningImage::New),
     )))
 }
 
 fn returning_image_columns(
     returning: &BoundReturning,
     delete: bool,
-    image: crate::sql2::bind::expr::ReturningImage,
+    image: ReturningImage,
 ) -> BTreeSet<String> {
-    use crate::sql2::bind::expr::ReturningImage;
     fn visit(
         expr: &BoundExpr,
         default: ReturningImage,
@@ -2321,7 +2567,57 @@ fn returning_image_columns(
                 visit(left, default, image, columns);
                 visit(right, default, image, columns);
             }
+            BoundExpr::Not(expr) => visit(expr, default, image, columns),
+            BoundExpr::Predicate(predicate) => visit_predicate(predicate, default, image, columns),
+            BoundExpr::Case {
+                operand,
+                conditions,
+                else_result,
+            } => {
+                if let Some(operand) = operand {
+                    visit(operand, default, image, columns);
+                }
+                for (condition, result) in conditions {
+                    visit(condition, default, image, columns);
+                    visit(result, default, image, columns);
+                }
+                if let Some(else_result) = else_result {
+                    visit(else_result, default, image, columns);
+                }
+            }
             _ => {}
+        }
+    }
+    fn visit_predicate(
+        predicate: &BoundPredicate,
+        default: ReturningImage,
+        image: ReturningImage,
+        columns: &mut BTreeSet<String>,
+    ) {
+        match predicate {
+            BoundPredicate::Eq(left, right) => {
+                visit(left, default, image, columns);
+                visit(right, default, image, columns);
+            }
+            BoundPredicate::Like { expr, pattern, .. } => {
+                visit(expr, default, image, columns);
+                visit(pattern, default, image, columns);
+            }
+            BoundPredicate::IsNull(expr) | BoundPredicate::IsNotNull(expr) => {
+                visit(expr, default, image, columns);
+            }
+            BoundPredicate::In { expr, values } => {
+                visit(expr, default, image, columns);
+                for value in values {
+                    visit(value, default, image, columns);
+                }
+            }
+            BoundPredicate::And(predicates) | BoundPredicate::Or(predicates) => {
+                for predicate in predicates {
+                    visit_predicate(predicate, default, image, columns);
+                }
+            }
+            BoundPredicate::True | BoundPredicate::False => {}
         }
     }
     let mut columns = BTreeSet::new();
@@ -2347,6 +2643,7 @@ fn bound_expr_column_names(expr: &BoundExpr, columns: &mut BTreeSet<String>) {
         }
         BoundExpr::ExcludedColumn(_) | BoundExpr::Param(_) | BoundExpr::Literal(_) => {}
         BoundExpr::Cast { expr, .. } => bound_expr_column_names(expr, columns),
+        BoundExpr::Not(expr) => bound_expr_column_names(expr, columns),
         BoundExpr::Function { args, .. } => {
             for arg in args {
                 bound_expr_column_names(arg, columns);
@@ -2356,6 +2653,51 @@ fn bound_expr_column_names(expr: &BoundExpr, columns: &mut BTreeSet<String>) {
             bound_expr_column_names(left, columns);
             bound_expr_column_names(right, columns);
         }
+        BoundExpr::Predicate(predicate) => bound_predicate_column_names(predicate, columns),
+        BoundExpr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            if let Some(operand) = operand {
+                bound_expr_column_names(operand, columns);
+            }
+            for (condition, result) in conditions {
+                bound_expr_column_names(condition, columns);
+                bound_expr_column_names(result, columns);
+            }
+            if let Some(else_result) = else_result {
+                bound_expr_column_names(else_result, columns);
+            }
+        }
+    }
+}
+
+fn bound_predicate_column_names(predicate: &BoundPredicate, columns: &mut BTreeSet<String>) {
+    match predicate {
+        BoundPredicate::Eq(left, right) => {
+            bound_expr_column_names(left, columns);
+            bound_expr_column_names(right, columns);
+        }
+        BoundPredicate::Like { expr, pattern, .. } => {
+            bound_expr_column_names(expr, columns);
+            bound_expr_column_names(pattern, columns);
+        }
+        BoundPredicate::IsNull(expr) | BoundPredicate::IsNotNull(expr) => {
+            bound_expr_column_names(expr, columns);
+        }
+        BoundPredicate::In { expr, values } => {
+            bound_expr_column_names(expr, columns);
+            for value in values {
+                bound_expr_column_names(value, columns);
+            }
+        }
+        BoundPredicate::And(predicates) | BoundPredicate::Or(predicates) => {
+            for predicate in predicates {
+                bound_predicate_column_names(predicate, columns);
+            }
+        }
+        BoundPredicate::True | BoundPredicate::False => {}
     }
 }
 
@@ -2417,6 +2759,7 @@ fn assignment_source_expr(
     expr: &BoundExpr,
     params: &[Value],
     field: &Field,
+    schema: &Schema,
 ) -> Result<Expr, LixError> {
     if field.data_type() == &DataType::Int64
         && let Some(value) =
@@ -2424,7 +2767,7 @@ fn assignment_source_expr(
     {
         return Ok(Expr::Literal(ScalarValue::Int64(Some(value)), None));
     }
-    datafusion_expr_from_bound_expr(session, expr, params)
+    datafusion_expr_from_bound_expr_with_schema(session, expr, params, schema)
 }
 
 fn coerce_assignment_expr(expr: Expr, field: &Field, schema: &DFSchema) -> Result<Expr, LixError> {
@@ -2466,7 +2809,7 @@ fn datafusion_assignments(
             let expr = prepare_write_expr(
                 session,
                 &df_schema,
-                assignment_source_expr(session, &assignment.value, params, field)?,
+                assignment_source_expr(session, &assignment.value, params, field, schema)?,
             )?;
             let expr = coerce_assignment_expr(expr, field, &df_schema)?;
             Ok((assignment.column.name.clone(), expr))
@@ -2503,7 +2846,7 @@ fn datafusion_conflict_assignments(
         ));
     }
     let augmented = Schema::new(fields);
-    let df_schema = DFSchema::try_from(augmented).map_err(datafusion_error_to_lix_error)?;
+    let df_schema = DFSchema::try_from(augmented.clone()).map_err(datafusion_error_to_lix_error)?;
     let props = session.state_ref().read().execution_props().clone();
 
     assignments
@@ -2515,7 +2858,7 @@ fn datafusion_conflict_assignments(
             let expr = prepare_write_expr(
                 session,
                 &df_schema,
-                assignment_source_expr(session, &assignment.value, params, field)?,
+                assignment_source_expr(session, &assignment.value, params, field, &augmented)?,
             )?;
             let expr = coerce_assignment_expr(expr, field, &df_schema)?;
             let physical =
@@ -2795,10 +3138,15 @@ fn datafusion_exact_bigint_marker(
     column_expr: &BoundExpr,
     schema: &Schema,
 ) -> Result<Option<Expr>, LixError> {
-    let BoundExpr::Column(column) = column_expr else {
+    let (BoundExpr::Column(column) | BoundExpr::ExcludedColumn(column)) = column_expr else {
         return Ok(None);
     };
-    let Some(field) = schema.field_with_name(&column.name).ok() else {
+    let field = schema.field_with_name(&column.name).ok().or_else(|| {
+        schema
+            .field_with_name(&crate::sql2::providers::excluded_field_name(&column.name))
+            .ok()
+    });
+    let Some(field) = field else {
         return Ok(None);
     };
     if field.data_type() != &DataType::Int64 {
@@ -2810,10 +3158,41 @@ fn datafusion_exact_bigint_marker(
     )
 }
 
+fn is_comparison_bound_binary_operator(op: &BoundBinaryOperator) -> bool {
+    matches!(
+        op,
+        BoundBinaryOperator::Eq
+            | BoundBinaryOperator::NotEq
+            | BoundBinaryOperator::Lt
+            | BoundBinaryOperator::LtEq
+            | BoundBinaryOperator::Gt
+            | BoundBinaryOperator::GtEq
+    )
+}
+
 fn datafusion_expr_from_bound_expr(
     session: &SessionContext,
     expr: &BoundExpr,
     params: &[Value],
+) -> Result<Expr, LixError> {
+    let schema = Schema::empty();
+    datafusion_expr_from_bound_expr_inner(session, expr, params, &schema)
+}
+
+fn datafusion_expr_from_bound_expr_with_schema(
+    session: &SessionContext,
+    expr: &BoundExpr,
+    params: &[Value],
+    schema: &Schema,
+) -> Result<Expr, LixError> {
+    datafusion_expr_from_bound_expr_inner(session, expr, params, schema)
+}
+
+fn datafusion_expr_from_bound_expr_inner(
+    session: &SessionContext,
+    expr: &BoundExpr,
+    params: &[Value],
+    schema: &Schema,
 ) -> Result<Expr, LixError> {
     match expr {
         BoundExpr::Column(column) => Ok(Expr::Column(match column.image {
@@ -2840,7 +3219,7 @@ fn datafusion_expr_from_bound_expr(
             Ok(Expr::Literal(value, metadata))
         }
         BoundExpr::Cast { expr, data_type } => {
-            let expr = datafusion_expr_from_bound_expr(session, expr, params)?;
+            let expr = datafusion_expr_from_bound_expr_inner(session, expr, params, schema)?;
             if *data_type == BoundCastType::Text {
                 let udf = session
                     .udf("__lix_text_cast")
@@ -2884,22 +3263,102 @@ fn datafusion_expr_from_bound_expr(
             let udf = session.udf(name).map_err(datafusion_error_to_lix_error)?;
             let args = args
                 .iter()
-                .map(|arg| datafusion_expr_from_bound_expr(session, arg, params))
+                .map(|arg| datafusion_expr_from_bound_expr_inner(session, arg, params, schema))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Expr::ScalarFunction(ScalarFunction::new_udf(udf, args)))
         }
-        BoundExpr::Binary { left, op, right } => Ok(Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(datafusion_expr_from_bound_expr(session, left, params)?),
-            match op {
-                BoundBinaryOperator::Add => Operator::Plus,
-                BoundBinaryOperator::Subtract => Operator::Minus,
-                BoundBinaryOperator::Multiply => Operator::Multiply,
-                BoundBinaryOperator::Divide => Operator::Divide,
-                BoundBinaryOperator::Modulo => Operator::Modulo,
-                BoundBinaryOperator::StringConcat => Operator::StringConcat,
-            },
-            Box::new(datafusion_expr_from_bound_expr(session, right, params)?),
-        ))),
+        BoundExpr::Binary { left, op, right } => {
+            let left_expr = if is_comparison_bound_binary_operator(op) {
+                datafusion_exact_bigint_marker(left, right, schema)?.unwrap_or(
+                    datafusion_expr_from_bound_expr_inner(session, left, params, schema)?,
+                )
+            } else {
+                datafusion_expr_from_bound_expr_inner(session, left, params, schema)?
+            };
+            let right_expr = if is_comparison_bound_binary_operator(op) {
+                datafusion_exact_bigint_marker(right, left, schema)?.unwrap_or(
+                    datafusion_expr_from_bound_expr_inner(session, right, params, schema)?,
+                )
+            } else {
+                datafusion_expr_from_bound_expr_inner(session, right, params, schema)?
+            };
+            Ok(Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(left_expr),
+                match op {
+                    BoundBinaryOperator::Add => Operator::Plus,
+                    BoundBinaryOperator::Subtract => Operator::Minus,
+                    BoundBinaryOperator::Multiply => Operator::Multiply,
+                    BoundBinaryOperator::Divide => Operator::Divide,
+                    BoundBinaryOperator::Modulo => Operator::Modulo,
+                    BoundBinaryOperator::StringConcat => Operator::StringConcat,
+                    BoundBinaryOperator::Eq => Operator::Eq,
+                    BoundBinaryOperator::NotEq => Operator::NotEq,
+                    BoundBinaryOperator::Lt => Operator::Lt,
+                    BoundBinaryOperator::LtEq => Operator::LtEq,
+                    BoundBinaryOperator::Gt => Operator::Gt,
+                    BoundBinaryOperator::GtEq => Operator::GtEq,
+                    BoundBinaryOperator::And => Operator::And,
+                    BoundBinaryOperator::Or => Operator::Or,
+                },
+                Box::new(right_expr),
+            )))
+        }
+        BoundExpr::Not(expr) => Ok(Expr::Not(Box::new(datafusion_expr_from_bound_expr_inner(
+            session, expr, params, schema,
+        )?))),
+        BoundExpr::Predicate(predicate) => {
+            datafusion_single_filter_from_predicate(session, schema, predicate, params)
+        }
+        BoundExpr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            let operand_bound = operand.as_deref();
+            let operand = operand
+                .as_deref()
+                .map(|expr| {
+                    let exact = conditions
+                        .iter()
+                        .map(|(condition, _)| {
+                            datafusion_exact_bigint_marker(expr, condition, schema)
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .flatten()
+                        .next();
+                    exact.map_or_else(
+                        || datafusion_expr_from_bound_expr_inner(session, expr, params, schema),
+                        Ok,
+                    )
+                })
+                .transpose()?
+                .map(Box::new);
+            let when_then_expr = conditions
+                .iter()
+                .map(|(condition, result)| {
+                    let condition_expr = operand_bound
+                        .map(|operand| datafusion_exact_bigint_marker(condition, operand, schema))
+                        .transpose()?
+                        .flatten()
+                        .unwrap_or(datafusion_expr_from_bound_expr_inner(
+                            session, condition, params, schema,
+                        )?);
+                    Ok((
+                        Box::new(condition_expr),
+                        Box::new(datafusion_expr_from_bound_expr_inner(
+                            session, result, params, schema,
+                        )?),
+                    ))
+                })
+                .collect::<Result<Vec<_>, LixError>>()?;
+            let else_expr = else_result
+                .as_deref()
+                .map(|expr| datafusion_expr_from_bound_expr_inner(session, expr, params, schema))
+                .transpose()?
+                .map(Box::new);
+            Ok(Expr::Case(Case::new(operand, when_then_expr, else_expr)))
+        }
     }
 }
 
@@ -2950,9 +3409,9 @@ fn is_identity_json_bound_expr(expr: &BoundExpr) -> bool {
 
 fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> {
     match &plan.bound.target {
-        BoundWriteTarget::Row(crate::sql2::bind::write::RowWriteSurface::Base { schema_key })
+        BoundWriteTarget::Row(RowWriteSurface::Base { schema_key })
             if bound_predicate_contains_like(&plan.bound.predicate)
-                || bound_update_requires_datafusion(plan) =>
+                || bound_write_requires_datafusion(plan) =>
         {
             Ok(schema_key.clone())
         }
@@ -2966,25 +3425,28 @@ fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> 
     }
 }
 
-fn bound_update_requires_datafusion(plan: &LogicalWritePlan) -> bool {
-    matches!(plan.bound.op, BoundWriteOp::Update)
+fn bound_write_requires_datafusion(plan: &LogicalWritePlan) -> bool {
+    (matches!(plan.bound.op, BoundWriteOp::Update)
         && (plan
             .bound
             .assignments
             .iter()
             .any(|assignment| bound_expr_requires_datafusion(&assignment.value))
-            || bound_predicate_requires_datafusion(&plan.bound.predicate)
-            || plan.bound.returning.as_ref().is_some_and(|returning| {
-                returning
-                    .items
-                    .iter()
-                    .any(|item| bound_expr_requires_datafusion(&item.expr))
-            }))
+            || bound_predicate_requires_datafusion(&plan.bound.predicate)))
+        || plan.bound.returning.as_ref().is_some_and(|returning| {
+            returning
+                .items
+                .iter()
+                .any(|item| bound_expr_requires_datafusion(&item.expr))
+        })
 }
 
 fn bound_expr_requires_datafusion(expr: &BoundExpr) -> bool {
     match expr {
-        BoundExpr::Binary { .. } => true,
+        BoundExpr::Binary { .. }
+        | BoundExpr::Not(_)
+        | BoundExpr::Predicate(_)
+        | BoundExpr::Case { .. } => true,
         BoundExpr::Cast { expr, .. } => bound_expr_requires_datafusion(expr),
         BoundExpr::Function { name, args } => {
             !matches!(
@@ -3405,6 +3867,20 @@ pub(crate) fn query_result_from_batches(
         column_types,
         notices: Vec::new(),
     })
+}
+
+fn resolved_result_fields(logical: &[Field], physical: &Schema) -> Vec<Field> {
+    logical
+        .iter()
+        .zip(physical.fields())
+        .map(|(logical, physical)| {
+            physical
+                .as_ref()
+                .clone()
+                .with_name(logical.name())
+                .with_metadata(logical.metadata().clone())
+        })
+        .collect()
 }
 
 /// Materializes Arrow batches into one row-major value arena.

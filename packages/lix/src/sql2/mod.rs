@@ -11,6 +11,7 @@ mod error;
 mod exec;
 mod file_view;
 mod information_schema;
+mod logical_value_metadata;
 mod parse;
 mod plan;
 mod planning_cache;

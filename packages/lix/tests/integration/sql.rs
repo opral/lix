@@ -90,8 +90,10 @@ macro_rules! simulation_test {
     };
 }
 
-mod checkpoint;
 mod bigint_predicate;
+mod case_returning;
+mod case_returning_types;
+mod checkpoint;
 mod delete_returning;
 mod diff_commands;
 mod diff_relation;
@@ -160,3 +162,5 @@ fn rows_from_result(result: ExecuteResult) -> Vec<Vec<Value>> {
 mod index_schema_amendment;
 
 mod typed_value_contract;
+
+mod logical_value_types;
