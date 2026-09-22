@@ -10,7 +10,7 @@ import {
 } from "./repository-protocol.js";
 
 // One candidate per repository per document, retained by all local SDK handles.
-const hubs = new Map<string, { worker: Worker; references: number }>();
+const hubs = new Map<string, { worker: Worker; references: number; buildId?: string }>();
 export function createRepositoryConnection(key: string): WorkerConnection {
 	if (!navigator.locks || typeof BroadcastChannel === "undefined") {
 		throw repositoryError(
@@ -32,6 +32,8 @@ export function createRepositoryConnection(key: string): WorkerConnection {
 		hubs.set(key, hub);
 		const created = hub;
 		worker.addEventListener("message", (event) => {
+			if (event.data?.kind === "build" && typeof event.data.buildId === "string")
+				created.buildId = event.data.buildId;
 			if (event.data?.kind === "retired" && hubs.get(key) === created)
 				hubs.delete(key);
 		});
@@ -74,7 +76,7 @@ export function createRepositoryConnection(key: string): WorkerConnection {
 		fail,
 	);
 	const discover = () => {
-		if (closed || !leased || failure) return;
+		if (closed || !leased || failure || !retained.buildId) return;
 		nonce = crypto.randomUUID();
 		send({ kind: "discover", client, nonce });
 	};
@@ -140,6 +142,17 @@ export function createRepositoryConnection(key: string): WorkerConnection {
 		}
 		if (!("client" in message) || message.client !== client) return;
 		if (message.kind === "owner" && message.nonce === nonce) {
+			// The worker asset URL fingerprints its bundled engine too. An older
+			// tab must not silently execute this page's operations with old code.
+			if (message.buildId !== retained.buildId) {
+				fail(
+					repositoryError(
+						"LIX_OWNER_VERSION_MISMATCH",
+						"Another tab is running a different Lix version. Close all other lixray.com tabs and app windows, then retry. Your saved local changes are preserved.",
+					),
+				);
+				return;
+			}
 			if (generation && generation !== message.generation) {
 				connected = false;
 				session.lost();

@@ -6,7 +6,7 @@ import type {
 
 export type RepositoryMessage =
 	| { kind: "discover"; client: string; nonce: string }
-	| { kind: "owner"; client: string; nonce: string; generation: string }
+	| { kind: "owner"; client: string; nonce: string; generation: string; buildId?: string }
 	| { kind: "available" }
 	| { kind: "gone"; generation: string }
 	| { kind: "connect"; client: string; generation: string; lease: string }

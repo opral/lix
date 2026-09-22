@@ -9,6 +9,8 @@ let initialized = false;
 onmessage = (event) => {
 	if (initialized || event.data?.kind !== "start") return;
 	initialized = true;
+	const buildId = location.href;
+	postMessage({ kind: "build", buildId });
 	const { key, channelName } = event.data as {
 		key: string;
 		channelName: string;
@@ -52,6 +54,7 @@ onmessage = (event) => {
 				client: message.client,
 				nonce: message.nonce,
 				generation,
+				buildId,
 			});
 			return;
 		}
