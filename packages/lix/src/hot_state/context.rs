@@ -2171,6 +2171,12 @@ impl<S> FilesystemPathIndexReader for HotStateContextReader<S>
 where
     S: StorageAdapterRead + Send + Sync,
 {
+    fn historical_cache(
+        &self,
+    ) -> Option<std::sync::Arc<crate::filesystem::HistoricalPathIndexCache>> {
+        Some(self.filesystem_path_index_cache.historical.clone())
+    }
+
     async fn path_index(
         &self,
         request: &FilesystemPathIndexRequest,

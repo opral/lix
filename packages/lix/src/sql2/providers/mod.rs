@@ -79,6 +79,7 @@ where
             Arc::clone(&catalog),
             ctx.read_interest_registry(),
             ctx.blob_reader(),
+            ctx.filesystem_path_index().historical_cache(),
         );
     }
     if catalog
@@ -640,6 +641,7 @@ where
             Arc::clone(&catalog),
             read_ctx.read_interest_registry(),
             read_ctx.blob_reader(),
+            read_ctx.filesystem_path_index().historical_cache(),
         );
     }
     if catalog

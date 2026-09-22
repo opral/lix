@@ -1249,3 +1249,55 @@ mod historical_projection_tests {
         }
     }
 }
+
+/// Build an endpoint path index from descriptor batches only. Overlay tombstones
+/// and collection replacements use the same visibility rules as lix_as_of.
+pub(super) async fn historical_path_index<S: StorageAdapterRead + Clone>(
+    store: S,
+    commit: &str,
+    branch: &str,
+) -> Result<Arc<crate::filesystem::FilesystemPathIndex>> {
+    let descriptor = commit_state_descriptor(store.clone(), commit).await?;
+    let mut tracked = TrackedStateContext::new().reader(store);
+    let request = tracked_request(
+        vec![
+            FILE_DESCRIPTOR_SCHEMA_KEY.into(),
+            DIRECTORY_DESCRIPTOR_SCHEMA_KEY.into(),
+        ],
+        None,
+        None,
+        None,
+    );
+    let local = tracked
+        .scan_batch_at_commit(commit, &request)
+        .await
+        .map_err(lix_error_to_datafusion_error)?;
+    let base = if let Some(base) = descriptor.base_commit_id {
+        vec![
+            tracked
+                .scan_batch_at_commit(&base.to_string(), &request)
+                .await
+                .map_err(lix_error_to_datafusion_error)?,
+        ]
+    } else {
+        Vec::new()
+    };
+    let replacements = if descriptor.base_commit_id.is_some() {
+        load_local_replacement_scopes(&mut tracked, commit).await?
+    } else {
+        Default::default()
+    };
+    let rows = tracked_to_hot(
+        &[local],
+        Vec::new(),
+        &base,
+        Vec::new(),
+        branch,
+        descriptor.global_scope,
+        &replacements,
+    )?;
+    Ok(Arc::new(
+        crate::filesystem::FilesystemPathIndex::from_live_batch(&rows)
+            .map_err(lix_error_to_datafusion_error)?,
+    ))
+}

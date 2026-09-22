@@ -1,4 +1,5 @@
 mod interest;
+mod paths;
 pub(crate) use interest::prepare_native_diff_interest;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -56,12 +57,14 @@ pub(super) fn register_diff_function<S>(
     catalog: Arc<PublicCatalog>,
     read_interests: Option<Arc<crate::hot_state::ReadInterestRegistry>>,
     blob_reader: Arc<dyn crate::binary_cas::BlobDataReader>,
+    path_cache: Option<Arc<crate::filesystem::HistoricalPathIndexCache>>,
 ) where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     session.register_udtf(
         "lix_diff",
         Arc::new(DiffFunction {
+            path_cache,
             store: query_source.store,
             read_interests,
             catalog,
@@ -78,6 +81,7 @@ pub(super) enum DiffMode {
 }
 
 struct DiffFunction<S> {
+    path_cache: Option<Arc<crate::filesystem::HistoricalPathIndexCache>>,
     store: S,
     read_interests: Option<Arc<crate::hot_state::ReadInterestRegistry>>,
     catalog: Arc<PublicCatalog>,
@@ -153,6 +157,7 @@ where
         let relation_name = text_argument(relation, 1, "relation name", None)?;
         let relation = DiffRelation::from_catalog(&self.catalog, &relation_name)?;
         Ok(Arc::new(SpecTableProvider::new(Arc::new(DiffSpec {
+            path_cache: self.path_cache.clone(),
             blob_reader: Arc::clone(&self.blob_reader),
             store: self.store.clone(),
             read_interests: self.read_interests.clone(),
@@ -308,6 +313,7 @@ impl DiffRelation {
 }
 
 pub(super) struct DiffSpec<S> {
+    pub(super) path_cache: Option<Arc<crate::filesystem::HistoricalPathIndexCache>>,
     pub(super) blob_reader: Arc<dyn crate::binary_cas::BlobDataReader>,
     pub(super) store: S,
     pub(super) read_interests: Option<Arc<crate::hot_state::ReadInterestRegistry>>,
@@ -443,6 +449,11 @@ where
             .map(|filter| create_physical_expr(filter, &df_schema, props))
             .collect::<Result<Vec<_>>>()?;
         let route = DiffRoute::from_filters(filters, &self.relation, &filter_schema);
+        let paths = (self.mode == DiffMode::General
+            && self.relation.kind == DiffRelationKind::File
+            && route.request.filter.file_ids.is_empty())
+        .then(|| paths::PathRoute::from_filters(filters))
+        .flatten();
         if let (Some(registry), Some((from, to))) = (&self.read_interests, &self.interest_endpoints)
         {
             registry
@@ -469,6 +480,8 @@ where
                 Arc::clone(&schema),
                 (
                     self.store.clone(),
+                    paths,
+                    self.path_cache.clone(),
                     self.relation.clone(),
                     schema,
                     route,
@@ -482,9 +495,11 @@ where
                 ),
                 move |(
                     store,
+                    paths,
+                    path_cache,
                     relation,
                     schema,
-                    route,
+                    mut route,
                     from_commit_id,
                     to_commit_id,
                     active_branch_id,
@@ -530,6 +545,41 @@ where
                     } else {
                         None
                     };
+                    if let Some(paths) = paths {
+                        let ids = paths
+                            .resolve(
+                                store.clone(),
+                                &from_commit_id,
+                                &to_commit_id,
+                                active_branch_id
+                                    .as_deref()
+                                    .unwrap_or(crate::GLOBAL_BRANCH_ID),
+                                path_cache.as_deref(),
+                            )
+                            .await?;
+                        let mut ids = ids.into_iter().collect::<Vec<_>>();
+                        if !route.request.filter.file_ids.is_empty() {
+                            ids.retain(|id| {
+                                route
+                                    .request
+                                    .filter
+                                    .file_ids
+                                    .contains(&NullableKeyFilter::Value(id.clone()))
+                            });
+                        }
+                        if ids.is_empty() {
+                            return diff_record_batch(
+                                schema,
+                                &[],
+                                &relation,
+                                &from_commit_id,
+                                &to_commit_id,
+                            );
+                        }
+                        route.request.filter.file_ids =
+                            ids.into_iter().map(NullableKeyFilter::Value).collect();
+                        route.request.filter.file_ids.push(NullableKeyFilter::Null);
+                    }
                     // Global provenance must come from the composite overlay
                     // resolution: the HOT epoch diff carries effective rows
                     // but not which side an inherited global row supplied, so
@@ -1520,6 +1570,9 @@ struct FileDiffGroup<'a> {
     descriptor: Option<&'a TrackedStateDiffEntry>,
 }
 
+#[cfg(test)]
+thread_local! { static PATH_EXPANSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 /// Find path-only rows independently of the requested output columns. Exact
 /// filesystem identity predicates stay point reads; unfiltered directory changes
 /// enumerate descriptor identities, never file contents or all tracked atoms.
@@ -1533,6 +1586,8 @@ async fn path_changed_descriptors<S: StorageAdapterRead>(
     from_descriptor: &CommitStateDescriptor,
     to_descriptor: &CommitStateDescriptor,
 ) -> Result<Vec<(String, DiffSide, DiffSide)>> {
+    #[cfg(test)]
+    PATH_EXPANSIONS.with(|n| n.set(n.get() + 1));
     let schema_key = if directory {
         DIRECTORY_DESCRIPTOR_SCHEMA_KEY
     } else {
@@ -1688,11 +1743,12 @@ where
         }
     }
 
-    if diff
-        .entries
-        .iter()
-        .any(|entry| entry.identity.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
-    {
+    // Adding a directory cannot change the path of a surviving, unchanged file.
+    // New files and files reparented into it are already direct diff candidates.
+    if diff.entries.iter().any(|entry| {
+        entry.identity.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+            && entry.kind != TrackedStateDiffKind::Added
+    }) {
         let exact_ids = file_filter
             .iter()
             .filter_map(|filter| match filter {
@@ -2572,6 +2628,7 @@ mod tests {
             .register_table(
                 "changes",
                 Arc::new(SpecTableProvider::new(Arc::new(DiffSpec {
+                    path_cache: None,
                     store: store.clone(),
                     blob_reader: blob_reader.clone(),
                     read_interests: None,
@@ -2835,6 +2892,148 @@ mod tests {
             assert_eq!(rows[0].get::<String>("to_path").unwrap(), "/renamed/nested");
         }
         lix.close().await.expect("close repository");
+    }
+
+    #[tokio::test]
+    async fn historical_path_pushdown_uses_both_endpoints_and_reuses_indexes() {
+        use crate::{Value, open_lix};
+        let lix = open_lix()
+            .with_storage(crate::storage::Memory::new())
+            .await
+            .unwrap();
+        for path in ["/old/a.txt", "/replace.txt", "/unrelated.txt"] {
+            lix.execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+                &[
+                    Value::Text(path.into()),
+                    Value::Blob(b"original".to_vec().into()),
+                ],
+            )
+            .await
+            .unwrap();
+        }
+        let before = lix
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("commit_id")
+            .unwrap();
+        lix.execute(
+            "UPDATE lix_directory SET path = '/new' WHERE path = '/old'",
+            &[],
+        )
+        .await
+        .unwrap();
+        lix.execute("DELETE FROM lix_file WHERE path = '/replace.txt'", &[])
+            .await
+            .unwrap();
+        lix.execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/replace.txt', $1)",
+            &[Value::Blob(b"replacement".to_vec().into())],
+        )
+        .await
+        .unwrap();
+        let after = lix
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("commit_id")
+            .unwrap();
+        // Make current paths disagree with both historical endpoints.
+        lix.execute(
+            "UPDATE lix_directory SET path = '/later' WHERE path = '/new'",
+            &[],
+        )
+        .await
+        .unwrap();
+        lix.execute("DELETE FROM lix_file WHERE path = '/replace.txt'", &[])
+            .await
+            .unwrap();
+        let source = format!("lix_diff('lix_file', '{before}', '{after}')");
+        paths::INDEX_BUILDS.with(|n| n.set(0));
+        for (predicate, expected) in [
+            (
+                "from_path IN ('/old/a.txt', '/replace.txt') OR to_path IN ('/new/a.txt', '/replace.txt')",
+                3,
+            ),
+            ("from_path = '/old/a.txt' AND to_path = '/new/a.txt'", 1),
+            ("from_path = '/old/a.txt' AND to_path = '/replace.txt'", 0),
+            ("from_path = '/replace.txt' OR to_path = '/replace.txt'", 2),
+            ("from_path = '/missing' OR to_path = '/missing'", 0),
+            ("from_path = '/old/a.txt' OR diff_type = 'added'", 2),
+            ("to_path IN ('/new/a.txt', NULL)", 1),
+        ] {
+            let result = lix.execute(&format!("SELECT id, from_path, to_path, from_content, to_content FROM {source} WHERE {predicate}"), &[]).await.unwrap();
+            assert_eq!(result.rows().len(), expected, "{predicate}");
+        }
+        let parameterized = lix.execute(
+            "SELECT id FROM lix_diff('lix_file', $1, $2) WHERE from_path IN ($3) OR to_path IN ($4)",
+            &[Value::Text(before.clone()), Value::Text(after.clone()),
+              Value::Text("/old/a.txt".into()), Value::Text("/replace.txt".into())],
+        ).await.unwrap();
+        assert_eq!(parameterized.rows().len(), 2);
+        // Two indexes, independent of the number of predicates or projections.
+        assert_eq!(paths::INDEX_BUILDS.with(|n| n.get()), 2);
+        let result = lix
+            .execute(
+                &format!("SELECT from_path, to_path FROM {source} WHERE from_path = '/old/a.txt'"),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.rows()[0].get::<String>("to_path").unwrap(),
+            "/new/a.txt"
+        );
+        lix.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn added_directory_does_not_expand_unchanged_file_paths() {
+        use crate::{Value, open_lix};
+        let lix = open_lix()
+            .with_storage(crate::storage::Memory::new())
+            .await
+            .unwrap();
+        lix.execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/existing/a.txt', $1)",
+            &[Value::Blob(b"old".to_vec().into())],
+        )
+        .await
+        .unwrap();
+        let before = lix
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("commit_id")
+            .unwrap();
+        lix.execute(
+            "INSERT INTO lix_file (path, content) VALUES ('/archive/b.txt', $1)",
+            &[Value::Blob(b"new".to_vec().into())],
+        )
+        .await
+        .unwrap();
+        let after = lix
+            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("commit_id")
+            .unwrap();
+        PATH_EXPANSIONS.with(|n| n.set(0));
+        let result = lix
+            .execute(
+                &format!("SELECT count(*) AS n FROM lix_diff('lix_file', '{before}', '{after}')"),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.rows()[0].get::<i64>("n").unwrap(), 1);
+        assert_eq!(PATH_EXPANSIONS.with(|n| n.get()), 0);
+        lix.close().await.unwrap();
     }
 
     #[test]

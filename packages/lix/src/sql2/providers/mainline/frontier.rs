@@ -191,6 +191,7 @@ mod tests {
                 DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_file").unwrap();
             let projection = vec![relation.schema.index_of("to_path").unwrap()];
             let diff = DiffSpec {
+                path_cache: None,
                 blob_reader: Arc::new(
                     crate::binary_cas::BinaryCasContext::new().reader(store.clone()),
                 ),
@@ -287,6 +288,7 @@ mod tests {
             DiffRelation::from_catalog(PublicCatalog::fixed_system(), "lix_file").unwrap();
         let projection = vec![relation.schema.index_of("to_path").unwrap()];
         let diff = DiffSpec {
+            path_cache: None,
             blob_reader: Arc::new(crate::binary_cas::BinaryCasContext::new().reader(store.clone())),
             store,
             read_interests: None,
@@ -334,6 +336,7 @@ mod tests {
         let store =
             SharedStorageAdapterRead::new(adapter.begin_read(Default::default()).await.unwrap());
         let graph_diff = DiffSpec {
+            path_cache: None,
             blob_reader: Arc::new(crate::binary_cas::BinaryCasContext::new().reader(store.clone())),
             store,
             ..diff
