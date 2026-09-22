@@ -80,19 +80,7 @@ fn statement_end(
     result: &Result<ExecuteResult, LixError>,
 ) -> (Status, Vec<TelemetryAttribute>) {
     match result {
-        Ok(result) => (
-            Status::Unset,
-            vec![
-                TelemetryAttribute::i64(
-                    "db.response.returned_rows",
-                    i64::try_from(result.len()).unwrap_or(i64::MAX),
-                ),
-                TelemetryAttribute::i64(
-                    "lix.rows_affected",
-                    i64::try_from(result.rows_affected()).unwrap_or(i64::MAX),
-                ),
-            ],
-        ),
+        Ok(result) => (Status::Unset, statement_result_attributes(result)),
         Err(error) => (
             Status::error(error.code.clone()),
             vec![
@@ -102,11 +90,24 @@ fn statement_end(
     }
 }
 
+fn statement_result_attributes(result: &ExecuteResult) -> Vec<TelemetryAttribute> {
+    vec![
+        TelemetryAttribute::i64(
+            "db.response.returned_rows",
+            i64::try_from(result.len()).unwrap_or(i64::MAX),
+        ),
+        TelemetryAttribute::i64(
+            "lix.rows_affected",
+            i64::try_from(result.rows_affected()).unwrap_or(i64::MAX),
+        ),
+    ]
+}
+
 pub(crate) fn start_batch<'a>(
     sink: Option<&Arc<dyn TelemetrySink>>,
     descriptor: &'static crate::telemetry::TelemetrySpanDescriptor,
     statement_count: usize,
-    statements: impl Iterator<Item = &'a str>,
+    mut statements: impl Iterator<Item = &'a str>,
 ) -> Option<ActiveTelemetrySpan> {
     let sink = sink?;
     let execution_kind = if descriptor == &SQL_BATCH {
@@ -116,9 +117,19 @@ pub(crate) fn start_batch<'a>(
     } else {
         return None;
     };
-    // The execution path already creates a per-statement query span. For a
-    // one-statement batch, that span carries the batch execution kind and
-    // index, so an outer SQL_QUERY here would double-count the operation.
+    if statement_count == 1 && descriptor == &SQL_BATCH {
+        // The query span must cover the complete operation so commit and
+        // storage spans remain its children. The caller suppresses the inner
+        // statement span for this case.
+        if !sink.enabled(&SQL_QUERY) {
+            return None;
+        }
+        let sql = statements.next()?;
+        return Some(ActiveTelemetrySpan::start(
+            sink,
+            statement_start(sql, execution_kind, Some(0)),
+        ));
+    }
     if statement_count == 1 || !sink.enabled(descriptor) {
         return None;
     }
@@ -236,6 +247,25 @@ pub(crate) fn finish_operation<T>(span: ActiveTelemetrySpan, result: &Result<T, 
             vec![
                 TelemetryAttribute::string("error.type", error.code.clone()),
             ],
+        ),
+    }
+}
+
+pub(crate) fn finish_single_statement_batch(
+    span: ActiveTelemetrySpan,
+    result: &Result<Vec<ExecuteResult>, LixError>,
+) {
+    match result {
+        Ok(results) => span.finish(
+            Status::Unset,
+            results
+                .first()
+                .map(statement_result_attributes)
+                .unwrap_or_default(),
+        ),
+        Err(error) => span.finish(
+            Status::error(error.code.clone()),
+            vec![TelemetryAttribute::string("error.type", error.code.clone())],
         ),
     }
 }
@@ -607,6 +637,15 @@ mod tests {
         })
     }
 
+    fn i64_attribute(span: &TelemetrySpanStart, key: &str) -> Option<i64> {
+        span.attributes.iter().find_map(|attribute| {
+            (attribute.key == key).then_some(&attribute.value).and_then(|value| match value {
+                crate::telemetry::TelemetryValue::I64(value) => Some(*value),
+                _ => None,
+            })
+        })
+    }
+
     #[test]
     fn absent_sink_disables_statement_telemetry() {
         assert!(SqlStatementTelemetry::start(None, "SELECT 'private'", "execute", None).is_none());
@@ -634,17 +673,17 @@ mod tests {
     }
 
     #[test]
-    fn one_statement_batch_uses_its_execution_query_span() {
+    fn one_statement_batch_uses_query_span_for_the_full_operation() {
+        let span = batch_start(&SQL_BATCH, 1, &["SELECT 'private' AS value"]);
+        assert_eq!(span.name, "lix.sql.query");
+        assert_eq!(string_attribute(&span, "lix.execution.kind"), Some("batch"));
+        assert_eq!(i64_attribute(&span, "lix.batch.index"), Some(0));
+        assert_eq!(i64_attribute(&span, "db.operation.batch.size"), None);
+        assert_eq!(string_attribute(&span, "otel.name"), Some("SELECT"));
+
         let sink: Arc<dyn TelemetrySink> = Arc::new(
             crate::telemetry::CallbackTelemetrySink::new(|_| {}),
         );
-        assert!(start_batch(
-            Some(&sink),
-            &SQL_BATCH,
-            1,
-            std::iter::once("SELECT 'private' AS value"),
-        )
-        .is_none());
         assert!(start_batch(
             Some(&sink),
             &SQL_COHERENT_READ_BATCH,

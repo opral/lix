@@ -8,7 +8,9 @@ use crate::binary_cas::BlobId;
 use crate::branch::BranchRefReader;
 use crate::common::{ExecuteStatementMetadata, ExpiredReadRetryState};
 use crate::functions::{FunctionContext, FunctionProviderHandle};
-use crate::sql_telemetry::{SqlStatementTelemetry, finish_operation, start_batch};
+use crate::sql_telemetry::{
+    SqlStatementTelemetry, finish_operation, finish_single_statement_batch, start_batch,
+};
 use crate::sql2;
 use crate::sql2::{
     ExactFilesystemRead, ExactLixFileReadColumn, ExactLixFileReadSelector,
@@ -2362,19 +2364,25 @@ where
             statements.len(),
             statements.iter().map(|statement| statement.sql.as_str()),
         );
+        let outer_query_span_covers_operation = statements.len() == 1 && telemetry.is_some();
         let operation = self.execute_batch_with_options_inner(
             statements,
             options,
             statement_metadata,
             idempotency,
             require_idempotency_for_writes,
+            outer_query_span_covers_operation,
         );
         let result = match telemetry.as_ref() {
             Some(telemetry) => telemetry.instrument(operation).await,
             None => operation.await,
         };
         if let Some(telemetry) = telemetry {
-            finish_operation(telemetry, &result);
+            if outer_query_span_covers_operation {
+                finish_single_statement_batch(telemetry, &result);
+            } else {
+                finish_operation(telemetry, &result);
+            }
         }
         result
     }
@@ -2415,6 +2423,7 @@ where
         statement_metadata: Vec<ExecuteStatementMetadata>,
         idempotency: Option<ExecuteIdempotency>,
         require_idempotency_for_writes: bool,
+        outer_query_span_covers_operation: bool,
     ) -> Result<Vec<ExecuteResult>, LixError> {
         self.ensure_open()?;
         if statements.is_empty() {
@@ -2451,7 +2460,12 @@ where
 
         match classify_execute_batch(statements, &self.sql_planning_cache)? {
             ExecuteBatchExecution::ReadOnly(parsed) => {
-                self.execute_read_only_batch(statements, parsed).await
+                self.execute_read_only_batch(
+                    statements,
+                    parsed,
+                    outer_query_span_covers_operation,
+                )
+                .await
             }
             ExecuteBatchExecution::Transaction(parsed) => {
                 let contains_write = parsed.contains_write()?;
@@ -2462,6 +2476,7 @@ where
                             parsed,
                             options,
                             statement_metadata,
+                            outer_query_span_covers_operation,
                         )
                         .await;
                 }
@@ -2478,6 +2493,7 @@ where
                             parsed,
                             options,
                             statement_metadata,
+                            outer_query_span_covers_operation,
                         )
                         .await;
                 };
@@ -2492,6 +2508,7 @@ where
                             options.clone(),
                             statement_metadata.clone(),
                             Some(idempotency.clone()),
+                            outer_query_span_covers_operation,
                         )
                     },
                 )
@@ -2506,6 +2523,7 @@ where
         parsed: TransactionBatchStatements,
         options: ExecuteOptions,
         statement_metadata: Vec<ExecuteStatementMetadata>,
+        outer_query_span_covers_operation: bool,
     ) -> Result<Vec<ExecuteResult>, LixError> {
         let mut retries = AutoCommitRetries::new(options.max_auto_commit_retries);
         loop {
@@ -2516,6 +2534,7 @@ where
                     options.clone(),
                     statement_metadata.clone(),
                     None,
+                    outer_query_span_covers_operation,
                 )
                 .await;
             match result {
@@ -2537,6 +2556,7 @@ where
         options: ExecuteOptions,
         statement_metadata: Vec<ExecuteStatementMetadata>,
         idempotency: Option<ExecuteIdempotency>,
+        outer_query_span_covers_operation: bool,
     ) -> Result<Vec<ExecuteResult>, LixError> {
         let telemetry_sink = self.telemetry.clone();
         let transaction_telemetry_sink = telemetry_sink.clone();
@@ -2580,12 +2600,16 @@ where
                                 .map_err(|error| {
                                     with_batch_statement_index(error, statement_index)
                                 })?;
-                            let telemetry = SqlStatementTelemetry::start(
-                                transaction_telemetry_sink.as_ref(),
-                                &statement.sql,
-                                "batch",
-                                Some(statement_index),
-                            );
+                            let telemetry = (!outer_query_span_covers_operation)
+                                .then(|| {
+                                    SqlStatementTelemetry::start(
+                                        transaction_telemetry_sink.as_ref(),
+                                        &statement.sql,
+                                        "batch",
+                                        Some(statement_index),
+                                    )
+                                })
+                                .flatten();
                             // Keep the large statement executor behind a heap boundary. The
                             // lending transaction closure already carries the whole parsed batch;
                             // embedding this future in it makes debug poll stacks exceed the
@@ -2621,12 +2645,16 @@ where
                             .zip(statement_metadata)
                             .enumerate()
                         {
-                            let telemetry = SqlStatementTelemetry::start(
-                                transaction_telemetry_sink.as_ref(),
-                                &statement.sql,
-                                "batch",
-                                Some(statement_index),
-                            );
+                            let telemetry = (!outer_query_span_covers_operation)
+                                .then(|| {
+                                    SqlStatementTelemetry::start(
+                                        transaction_telemetry_sink.as_ref(),
+                                        &statement.sql,
+                                        "batch",
+                                        Some(statement_index),
+                                    )
+                                })
+                                .flatten();
                             // See the auto-parameterized branch above. Both batch routes need the
                             // same bounded poll-stack boundary.
                             let operation = Box::pin(execute_transaction_statement(
@@ -2684,13 +2712,19 @@ where
         &self,
         statements: &[ExecuteBatchStatement],
         parsed: Vec<datafusion::sql::parser::Statement>,
+        outer_query_span_covers_operation: bool,
     ) -> Result<Vec<ExecuteResult>, LixError> {
         let statements = statements
             .iter()
             .map(|statement| (statement.sql.as_str(), statement.params.as_slice()))
             .collect::<Vec<_>>();
         Ok(self
-            .execute_read_batch(&statements, parsed, ReadBatchKind::Ordinary)
+            .execute_read_batch(
+                &statements,
+                parsed,
+                ReadBatchKind::Ordinary,
+                outer_query_span_covers_operation,
+            )
             .await?
             .results)
     }
@@ -2700,6 +2734,7 @@ where
         statements: &[(&str, &[Value])],
         parsed: Vec<datafusion::sql::parser::Statement>,
         kind: ReadBatchKind,
+        outer_query_span_covers_operation: bool,
     ) -> Result<ReadBatchResult, LixError> {
         let acknowledge_file_views = parsed.iter().zip(statements).any(|(parsed, (_, params))| {
             is_acknowledgeable_file_content_read(parsed, params)
@@ -2805,12 +2840,16 @@ where
                             if let Some(collector) = &file_view_collector {
                                 collector.clear();
                             }
-                            let telemetry = SqlStatementTelemetry::start(
-                                self.telemetry.as_ref(),
-                                sql,
-                                kind.telemetry_name(),
-                                Some(statement_index),
-                            );
+                            let telemetry = (!outer_query_span_covers_operation)
+                                .then(|| {
+                                    SqlStatementTelemetry::start(
+                                        self.telemetry.as_ref(),
+                                        sql,
+                                        kind.telemetry_name(),
+                                        Some(statement_index),
+                                    )
+                                })
+                                .flatten();
                             let operation = async {
                                 if let Some(plan) = late_materialized_lix_file_content_read(&parsed)
                                 {
@@ -2991,7 +3030,7 @@ where
             .collect::<Result<Vec<_>, LixError>>()?;
         self.refresh_active_branch_base_if_stale().await?;
         let ReadBatchResult { results, snapshot } = self
-            .execute_read_batch(statements, parsed, ReadBatchKind::Coherent)
+            .execute_read_batch(statements, parsed, ReadBatchKind::Coherent, false)
             .await?;
         let snapshot = snapshot.expect("coherent read batch captures snapshot metadata");
         Ok(CoherentReadBatch {
