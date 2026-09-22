@@ -242,6 +242,96 @@ async fn checkpoint_undo_hydrates_partial_history_and_preserves_unrelated_rows()
         .get::<String>("working_base_commit_id")
         .unwrap();
     assert_eq!(baseline, before_checkpoint);
+    let storage = engine.storage();
+    for edited_after_undo in [false, true] {
+        if edited_after_undo {
+            execute_hydrating(
+                &session,
+                &storage,
+                &state,
+                &authority,
+                "UPDATE lix_key_value SET value='pending' WHERE key='undo-unrelated'",
+                &[],
+                &mut Fetches::default(),
+            )
+            .await
+            .unwrap();
+        }
+        let (reopened_engine, reopened) =
+            Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &state)
+                .await
+                .expect("partial replica with a local undo must reopen");
+        reopened_engine.sync_mode().admit_partial_replica(
+            state.clone(),
+            crate::sync::partial_replica_write_capability(),
+        );
+        assert!(
+            value(
+                reopened
+                    .execute(
+                        "SELECT value FROM lix_key_value WHERE key='undo-target'",
+                        &[],
+                    )
+                    .await
+                    .unwrap()
+            )
+            .contains("before")
+        );
+        assert!(
+            value(
+                reopened
+                    .execute(
+                        "SELECT value FROM lix_key_value WHERE key='undo-unrelated'",
+                        &[],
+                    )
+                    .await
+                    .unwrap()
+            )
+            .contains(if edited_after_undo { "pending" } else { "keep" })
+        );
+        let read = storage.begin_read(Default::default()).await.unwrap();
+        assert_eq!(
+            crate::sync::load_partial_replica_state(&read)
+                .await
+                .unwrap()
+                .unwrap()
+                .0,
+            *state
+        );
+    }
+    // A valid local interval is not permission to accept missing or foreign
+    // roots. Keep rejecting malformed markers without replacing local data.
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let branch_id = &state.descriptor().selected_branch.branch_id;
+    let control = crate::branch::BranchHeadControlContext::new()
+        .reader(&read)
+        .load(branch_id)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(read);
+    let foreign_root =
+        crate::changelog::CommitId::parse(&state.descriptor().global_branch.head.commit_id)
+            .unwrap();
+    for marker in [Vec::new(), foreign_root.as_uuid().as_bytes().to_vec()] {
+        let mut writes = storage.new_write_set();
+        writes.put(
+            crate::hot_state::ROOT_CURRENT_BASE_SPACE,
+            crate::hot_state::hot_generation_scope_prefix(branch_id, control.tracked_generation),
+            marker,
+        );
+        storage
+            .commit_write_set(writes, Default::default())
+            .await
+            .unwrap();
+        let error = match Engine::new_partial_replica(storage.clone(), EngineOptions::new(), &state)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("invalid local root was admitted"),
+        };
+        assert_eq!(error.code, "LIX_PARTIAL_REPLICA_ADMISSION_MISMATCH");
+    }
     assert!(
         value(
             authority
