@@ -440,12 +440,12 @@ impl LixRuntimeManager {
             .with_access_key_id(&storage.access_key_id)
             .with_secret_access_key(&storage.secret_access_key)
             .with_region(&storage.region)
-            .with_virtual_hosted_style_request(false)
-            .with_allow_http(storage.allow_http);
+            .with_virtual_hosted_style_request(false);
         let reads: Arc<dyn ObjectStore> = Arc::new(
             builder
                 .clone()
                 .with_client_options(s3_client_options(request_budget))
+                .with_allow_http(storage.allow_http)
                 .with_retry(s3_retry_config(request_budget))
                 .build()
                 .context("build S3 object store")?,
@@ -453,6 +453,7 @@ impl LixRuntimeManager {
         let uploads: Arc<dyn ObjectStore> = Arc::new(
             builder
                 .with_client_options(s3_client_options(S3_UPLOAD_BUDGET))
+                .with_allow_http(storage.allow_http)
                 .with_retry(s3_retry_config(S3_UPLOAD_BUDGET))
                 .build()
                 .context("build S3 upload object store")?,

@@ -119,8 +119,8 @@ mod tests {
                     .with_access_key_id("test")
                     .with_secret_access_key("test")
                     .with_region("auto")
-                    .with_allow_http(true)
                     .with_client_options(s3_client_options(budget))
+                    .with_allow_http(true)
                     .with_retry(s3_retry_config(budget))
                     .build()
                     .unwrap(),
