@@ -1045,6 +1045,55 @@ simulation_test!(
             )
             .await
             .unwrap();
+        let advertised = session.execute(
+            "SELECT result_column, data_type, is_nullable FROM information_schema.table_functions \
+             WHERE function_name = 'lix_as_of' AND source_relation = 'historical_amendment' \
+             AND result_column IN ('id', 'body', 'literal', 'optional', 'generated_id', 'generated_at') \
+             ORDER BY ordinal_position", &[]).await.unwrap();
+        assert_rows_eq(
+            advertised,
+            vec![
+                vec![
+                    Value::Text("id".into()),
+                    Value::Text("TEXT".into()),
+                    Value::Text("NO".into()),
+                ],
+                vec![
+                    Value::Text("body".into()),
+                    Value::Text("TEXT".into()),
+                    Value::Text("YES".into()),
+                ],
+                vec![
+                    Value::Text("literal".into()),
+                    Value::Text("TEXT".into()),
+                    Value::Text("YES".into()),
+                ],
+                vec![
+                    Value::Text("optional".into()),
+                    Value::Text("BIGINT".into()),
+                    Value::Text("YES".into()),
+                ],
+                vec![
+                    Value::Text("generated_id".into()),
+                    Value::Text("UUID".into()),
+                    Value::Text("YES".into()),
+                ],
+                vec![
+                    Value::Text("generated_at".into()),
+                    Value::Text("TIMESTAMPTZ".into()),
+                    Value::Text("YES".into()),
+                ],
+            ],
+        );
+        let current_contract = session
+            .execute(
+                "SELECT is_nullable FROM information_schema.columns \
+             WHERE table_name = 'historical_amendment' AND column_name = 'literal'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_rows_eq(current_contract, vec![vec![Value::Text("NO".into())]]);
         for predicate in ["", " WHERE id='old'", " WHERE literal IS NULL"] {
             let rows = session.execute(&format!(
                 "SELECT id, body, literal, optional, generated_id, generated_at FROM lix_as_of('historical_amendment', $1){predicate}"),

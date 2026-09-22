@@ -119,6 +119,18 @@ pub(crate) async fn collect_plan(
     logical_plan: RuntimeReadPlan,
     physical_planning_cache: Option<PhysicalPlanningCache>,
 ) -> Result<Vec<RecordBatch>> {
+    collect_plan_with_schema(state, logical_plan, physical_planning_cache)
+        .await
+        .map(|(_, batches)| batches)
+}
+
+/// Return the physical schema even for an empty result. Logical plans before
+/// coercion can still advertise NULL for the first input of a UNION.
+pub(crate) async fn collect_plan_with_schema(
+    state: &SessionState,
+    logical_plan: RuntimeReadPlan,
+    physical_planning_cache: Option<PhysicalPlanningCache>,
+) -> Result<(SchemaRef, Vec<RecordBatch>)> {
     let task_ctx = execution_task_context(state);
     #[cfg(feature = "storage-benches")]
     let started = crate::sql_profile::is_active().then(Instant::now);
@@ -133,6 +145,7 @@ pub(crate) async fn collect_plan(
     }
     #[cfg(feature = "storage-benches")]
     let started = crate::sql_profile::is_active().then(Instant::now);
+    let schema = plan.schema();
     let result = collect_bounded_read_output(plan, task_ctx).await;
     #[cfg(feature = "storage-benches")]
     if let Some(started) = started {
@@ -141,7 +154,7 @@ pub(crate) async fn collect_plan(
             started.elapsed(),
         );
     }
-    result
+    result.map(|batches| (schema, batches))
 }
 
 /// Create a pull-based stream from a DataFusion physical plan without

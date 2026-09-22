@@ -340,11 +340,17 @@ await lix.close();
 ## Discover the SQL contract
 
 Lix extends the standard `information_schema.columns` relation with
-`lix_value_kind` and `lix_insert_policy`. Inspect it before generating writes:
+`lix_insert_policy`. Its `data_type` column reports the executable logical SQL
+type, including `JSONB` and `TIMESTAMPTZ`; the related
+`information_schema.table_functions` catalog uses the same names for function
+results, including opaque `ROW_REF` values. Inspect it before generating
+writes. `ROW_REF` is constructor-produced and opaque; pass values returned by
+`lix_row_ref` or a row-producing function to APIs that accept row references
+rather than casting arbitrary text.
 
 ```sql
 SELECT table_name, column_name, data_type, is_nullable, column_default,
-       lix_value_kind, lix_insert_policy
+       lix_insert_policy
 FROM information_schema.columns
 WHERE table_name = 'lix_file'
 ORDER BY ordinal_position;

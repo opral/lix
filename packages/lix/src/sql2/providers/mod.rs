@@ -26,6 +26,7 @@ pub(crate) fn log_schema() -> datafusion::arrow::datatypes::SchemaRef {
 }
 mod schema;
 mod state_at;
+pub(crate) use state_at::relation_state_schema;
 #[cfg(test)]
 pub(crate) use state_at::{arm_state_at_traversal_probe, take_state_at_traversal_probe};
 mod spec;

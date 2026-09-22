@@ -253,7 +253,7 @@ simulation_test!(
 
         let columns = session
             .execute(
-                "SELECT source_relation, result_column, data_type, is_nullable, lix_value_kind \
+                "SELECT source_relation, result_column, data_type, is_nullable \
              FROM information_schema.table_functions \
              WHERE function_name = 'lix_diff' \
                AND source_relation IN ('lix_file', 'lix_key_value') \
@@ -273,72 +273,62 @@ simulation_test!(
                 vec![
                     Value::Text("lix_file".to_string()),
                     Value::Text("row_ref".to_string()),
-                    Value::Text("TEXT".to_string()),
-                    Value::Text("NO".to_string()),
                     Value::Text("ROW_REF".to_string()),
+                    Value::Text("NO".to_string()),
                 ],
                 vec![
                     Value::Text("lix_file".to_string()),
                     Value::Text("id".to_string()),
                     Value::Text("TEXT".to_string()),
                     Value::Text("NO".to_string()),
-                    Value::Null,
                 ],
                 vec![
                     Value::Text("lix_file".to_string()),
                     Value::Text("diff_type".to_string()),
                     Value::Text("TEXT".to_string()),
                     Value::Text("NO".to_string()),
-                    Value::Null,
                 ],
                 vec![
                     Value::Text("lix_file".to_string()),
                     Value::Text("from_path".to_string()),
                     Value::Text("TEXT".to_string()),
                     Value::Text("YES".to_string()),
-                    Value::Null,
                 ],
                 vec![
                     Value::Text("lix_file".to_string()),
                     Value::Text("to_path".to_string()),
                     Value::Text("TEXT".to_string()),
                     Value::Text("YES".to_string()),
-                    Value::Null,
                 ],
                 vec![
                     Value::Text("lix_key_value".to_string()),
                     Value::Text("row_ref".to_string()),
-                    Value::Text("TEXT".to_string()),
-                    Value::Text("NO".to_string()),
                     Value::Text("ROW_REF".to_string()),
+                    Value::Text("NO".to_string()),
                 ],
                 vec![
                     Value::Text("lix_key_value".to_string()),
                     Value::Text("key".to_string()),
                     Value::Text("TEXT".to_string()),
                     Value::Text("NO".to_string()),
-                    Value::Null,
                 ],
                 vec![
                     Value::Text("lix_key_value".to_string()),
                     Value::Text("diff_type".to_string()),
                     Value::Text("TEXT".to_string()),
                     Value::Text("NO".to_string()),
-                    Value::Null,
                 ],
                 vec![
                     Value::Text("lix_key_value".to_string()),
                     Value::Text("from_value".to_string()),
-                    Value::Text("TEXT".to_string()),
-                    Value::Text("YES".to_string()),
                     Value::Text("JSONB".to_string()),
+                    Value::Text("YES".to_string()),
                 ],
                 vec![
                     Value::Text("lix_key_value".to_string()),
                     Value::Text("to_value".to_string()),
-                    Value::Text("TEXT".to_string()),
-                    Value::Text("YES".to_string()),
                     Value::Text("JSONB".to_string()),
+                    Value::Text("YES".to_string()),
                 ],
             ],
         );
@@ -519,7 +509,7 @@ simulation_test!(
             .expect("the complete lix_file column contract should be readable");
         assert!(!result.rows().is_empty());
         assert!(
-            result
+            !result
                 .columns()
                 .iter()
                 .any(|column| column == "lix_value_kind")
@@ -769,7 +759,7 @@ simulation_test!(
         let result = session
             .execute(
                 "SELECT column_name, data_type, is_nullable, column_default, \
-                        lix_value_kind, lix_insert_policy \
+                        lix_insert_policy \
                  FROM information_schema.columns \
                  WHERE table_name = 'engine_column_contract' \
                    AND column_name IN ('active', 'count', 'id', 'metadata', 'note', 'ratio', 'title') \
@@ -787,14 +777,12 @@ simulation_test!(
                     Value::Text("BOOLEAN".to_string()),
                     Value::Text("NO".to_string()),
                     Value::Null,
-                    Value::Null,
                     Value::Text("REQUIRED".to_string()),
                 ],
                 vec![
                     Value::Text("count".to_string()),
                     Value::Text("BIGINT".to_string()),
                     Value::Text("NO".to_string()),
-                    Value::Null,
                     Value::Null,
                     Value::Text("REQUIRED".to_string()),
                 ],
@@ -803,22 +791,19 @@ simulation_test!(
                     Value::Text("UUID".to_string()),
                     Value::Text("NO".to_string()),
                     Value::Text("uuidv7()".to_string()),
-                    Value::Null,
                     Value::Text("DEFAULT".to_string()),
                 ],
                 vec![
                     Value::Text("metadata".to_string()),
-                    Value::Text("TEXT".to_string()),
+                    Value::Text("JSONB".to_string()),
                     Value::Text("NO".to_string()),
                     Value::Null,
-                    Value::Text("JSONB".to_string()),
                     Value::Text("REQUIRED".to_string()),
                 ],
                 vec![
                     Value::Text("note".to_string()),
                     Value::Text("TEXT".to_string()),
                     Value::Text("YES".to_string()),
-                    Value::Null,
                     Value::Null,
                     Value::Text("OPTIONAL".to_string()),
                 ],
@@ -827,14 +812,12 @@ simulation_test!(
                     Value::Text("DOUBLE PRECISION".to_string()),
                     Value::Text("NO".to_string()),
                     Value::Null,
-                    Value::Null,
                     Value::Text("REQUIRED".to_string()),
                 ],
                 vec![
                     Value::Text("title".to_string()),
                     Value::Text("TEXT".to_string()),
                     Value::Text("NO".to_string()),
-                    Value::Null,
                     Value::Null,
                     Value::Text("REQUIRED".to_string()),
                 ],
@@ -1057,57 +1040,60 @@ simulation_test!(
             table_name: String,
             column_name: String,
             data_type: String,
-            value_kind: Option<String>,
         }
 
         fn values_for_contract(contract: &CastContract) -> (Value, Value, Value, Value, Value) {
-            match (
-                contract.column_name.as_str(),
-                contract.value_kind.as_deref(),
-            ) {
-                ("id", None) => (
+            match contract.column_name.as_str() {
+                "id" => (
                     Value::Text("00000000-0000-7000-8000-000000000001".to_string()),
                     Value::Text("00000000-0000-7000-8000-000000000001".to_string()),
                     Value::Text("00000000-0000-7000-8000-000000000001".to_string()),
                     Value::Text("00000000-0000-7000-8000-000000000002".to_string()),
                     Value::Text("00000000-0000-7000-8000-000000000002".to_string()),
                 ),
-                ("text_value", None) => (
+                "text_value" => (
                     Value::Integer(101),
                     Value::Text("101".to_string()),
                     Value::Text("101".to_string()),
                     Value::Integer(202),
                     Value::Text("202".to_string()),
                 ),
-                ("integer_value", None) => (
+                "integer_value" => (
                     Value::Text("41".to_string()),
                     Value::Integer(41),
                     Value::Integer(41),
                     Value::Text("42".to_string()),
                     Value::Integer(42),
                 ),
-                ("number_value", None) => (
+                "number_value" => (
                     Value::Text("1.25".to_string()),
                     Value::Real(1.25),
                     Value::Real(1.25),
                     Value::Text("2.5".to_string()),
                     Value::Real(2.5),
                 ),
-                ("boolean_value", None) => (
+                "boolean_value" => (
                     Value::Text("true".to_string()),
                     Value::Boolean(true),
                     Value::Boolean(true),
                     Value::Text("false".to_string()),
                     Value::Boolean(false),
                 ),
-                ("json_value", Some("JSONB")) => (
+                "json_value" => (
                     Value::Text("{\"phase\":\"insert\"}".to_string()),
-                    Value::Text("{\"phase\":\"insert\"}".to_string()),
+                    Value::Jsonb(serde_json::json!({"phase": "insert"}).into()),
                     Value::Jsonb(serde_json::json!({"phase": "insert"}).into()),
                     Value::Text("{\"phase\":\"update\"}".to_string()),
                     Value::Jsonb(serde_json::json!({"phase": "update"}).into()),
                 ),
-                ("content", None) => (
+                "timestamp_value" => (
+                    Value::Text("2026-01-01T00:00:00Z".into()),
+                    Value::Timestamptz(1_767_225_600_000_000),
+                    Value::Timestamptz(1_767_225_600_000_000),
+                    Value::Text("2026-01-02T01:00:00+01:00".into()),
+                    Value::Timestamptz(1_767_312_000_000_000),
+                ),
+                "content" => (
                     Value::Text("before".to_string()),
                     Value::Blob(b"before".to_vec().into()),
                     Value::Blob(b"before".to_vec().into()),
@@ -1131,7 +1117,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
                  VALUES (\
-                   CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_scalar_cast_contract\",\"columns\":[{\"name\":\"id\",\"type\":\"uuid\",\"nullable\":false,\"default_expression\":\"uuidv7()\"},{\"name\":\"text_value\",\"type\":\"text\",\"nullable\":false},{\"name\":\"integer_value\",\"type\":\"int8\",\"nullable\":false},{\"name\":\"number_value\",\"type\":\"float8\",\"nullable\":false},{\"name\":\"boolean_value\",\"type\":\"boolean\",\"nullable\":false},{\"name\":\"json_value\",\"type\":\"jsonb\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
+                   CAST('{\"$schema\":\"https://lix.dev/schema-v1.json\",\"key\":\"engine_scalar_cast_contract\",\"columns\":[{\"name\":\"id\",\"type\":\"uuid\",\"nullable\":false,\"default_expression\":\"uuidv7()\"},{\"name\":\"text_value\",\"type\":\"text\",\"nullable\":false},{\"name\":\"integer_value\",\"type\":\"int8\",\"nullable\":false},{\"name\":\"number_value\",\"type\":\"float8\",\"nullable\":false},{\"name\":\"boolean_value\",\"type\":\"boolean\",\"nullable\":false},{\"name\":\"json_value\",\"type\":\"jsonb\",\"nullable\":false},{\"name\":\"timestamp_value\",\"type\":\"timestamptz\",\"nullable\":false}],\"primary_key\":[\"id\"]}' AS JSONB),\
                    false,\
                    false\
                  )",
@@ -1142,13 +1128,13 @@ simulation_test!(
 
         let contract_rows = session
             .execute(
-                "SELECT table_name, column_name, data_type, lix_value_kind \
+                "SELECT table_name, column_name, data_type \
                  FROM information_schema.columns \
                  WHERE (\
                    table_name = 'engine_scalar_cast_contract' \
                    AND column_name IN (\
                      'id', 'text_value', 'integer_value', 'number_value', \
-                     'boolean_value', 'json_value'\
+                     'boolean_value', 'json_value', 'timestamp_value'\
                    )\
                  ) OR (table_name = 'lix_file' AND column_name = 'content') \
                  ORDER BY table_name, column_name",
@@ -1164,34 +1150,29 @@ simulation_test!(
                     Value::Text(table_name),
                     Value::Text(column_name),
                     Value::Text(data_type),
-                    value_kind,
                 ] = row.values()
                 else {
                     panic!("unexpected information_schema cast row: {:?}", row.values());
-                };
-                let value_kind = match value_kind {
-                    Value::Null => None,
-                    Value::Text(value) => Some(value.clone()),
-                    other => panic!("unexpected lix_value_kind: {other:?}"),
                 };
                 CastContract {
                     table_name: table_name.clone(),
                     column_name: column_name.clone(),
                     data_type: data_type.clone(),
-                    value_kind,
                 }
             })
             .collect::<Vec<_>>();
         assert_eq!(
             contracts.len(),
-            7,
-            "expected UUID, five row types, plus BYTEA"
+            8,
+            "expected UUID, six row types, plus BYTEA"
         );
 
         for contract in &contracts {
             let expected_type = match contract.column_name.as_str() {
                 "id" => "UUID",
-                "text_value" | "json_value" => "TEXT",
+                "text_value" => "TEXT",
+                "json_value" => "JSONB",
+                "timestamp_value" => "TIMESTAMPTZ",
                 "integer_value" => "BIGINT",
                 "number_value" => "DOUBLE PRECISION",
                 "boolean_value" => "BOOLEAN",
@@ -1199,10 +1180,6 @@ simulation_test!(
                 other => panic!("unexpected contract column {other}"),
             };
             assert_eq!(contract.data_type, expected_type);
-            assert_eq!(
-                contract.value_kind.as_deref(),
-                (contract.column_name == "json_value").then_some("JSONB")
-            );
 
             let (insert_param, select_expected, _, _, _) = values_for_contract(contract);
             let select_cast = session
@@ -2587,7 +2564,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    scalar_row_insert_and_upsert_remain_atomically_unsupported,
+    scalar_row_insert_values_and_upsert_remain_atomically_unsupported,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
@@ -2600,7 +2577,6 @@ simulation_test!(
             .await
             .unwrap();
         for sql in [
-            "INSERT INTO expression_rows (id, value) VALUES ('two', 'new') RETURNING upper(value)",
             "INSERT INTO expression_rows (id, value) VALUES ('one', 'changed'), ('two', 'new') ON CONFLICT (id) DO UPDATE SET value = upper(excluded.value)",
             "INSERT INTO expression_rows (id, value) VALUES ('two', concat('new', '-row'))",
         ] {

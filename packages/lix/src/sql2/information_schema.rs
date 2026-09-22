@@ -21,16 +21,6 @@ use super::catalog::{
 };
 use super::result_metadata::{field_is_json, field_is_row_ref};
 
-const LIX_VALUE_KIND_JSONB: &str = "JSONB";
-const LIX_VALUE_KIND_ROW_REF: &str = "ROW_REF";
-
-fn field_value_kind(field: &Field) -> Option<String> {
-    if field_is_row_ref(field) {
-        Some(LIX_VALUE_KIND_ROW_REF.to_owned())
-    } else {
-        field_is_json(field).then(|| LIX_VALUE_KIND_JSONB.to_owned())
-    }
-}
 const TABLE_FUNCTIONS: &str = "table_functions";
 const LIX_SURFACES: &str = "lix_surfaces";
 
@@ -185,7 +175,6 @@ impl LixInformationSchemaProvider {
         let mut ordinal_position = Vec::new();
         let mut is_nullable = Vec::new();
         let mut data_type = Vec::new();
-        let mut lix_value_kind = Vec::new();
 
         for history in self.public_catalog.history_relations() {
             let provider_schema = super::providers::relation_history_schema(
@@ -203,7 +192,6 @@ impl LixInformationSchemaProvider {
                 ordinal_position.push((position + 1) as u64);
                 is_nullable.push(if field.is_nullable() { "YES" } else { "NO" }.to_string());
                 data_type.push(public_sql_type(field));
-                lix_value_kind.push(field_value_kind(field));
             }
         }
 
@@ -230,14 +218,10 @@ impl LixInformationSchemaProvider {
                             &relation.name,
                         )?
                     } else {
-                        self.public_catalog
-                            .surface_schema(&relation.name)
-                            .ok_or_else(|| {
-                                DataFusionError::Execution(format!(
-                                    "state relation '{}' is missing its result schema",
-                                    relation.name
-                                ))
-                            })?
+                        super::providers::relation_state_schema(
+                            self.public_catalog.as_ref(),
+                            &relation.name,
+                        )?
                     };
                     for (position, field) in provider_schema.fields().iter().enumerate() {
                         function_catalog.push(self.public_catalog_name.clone());
@@ -254,7 +238,6 @@ impl LixInformationSchemaProvider {
                         is_nullable
                             .push(if field.is_nullable() { "YES" } else { "NO" }.to_string());
                         data_type.push(public_sql_type(field));
-                        lix_value_kind.push(field_value_kind(field));
                     }
                 }
                 continue;
@@ -278,14 +261,16 @@ impl LixInformationSchemaProvider {
                 ),
                 PublicSurfaceKind::RecoveryFunction => (
                     match surface.name.as_str() {
-                        "lix_undo" => "() | (target_commit_id TEXT) | (target_commit_id TEXT, row_refs ROW_REF[])",
-                        "lix_redo" => "() | (undo_commit_id TEXT) | (undo_commit_id TEXT, row_refs ROW_REF[])",
+                        "lix_undo" => {
+                            "() | (target_commit_id TEXT) | (target_commit_id TEXT, row_refs ROW_REF[])"
+                        }
+                        "lix_redo" => {
+                            "() | (undo_commit_id TEXT) | (undo_commit_id TEXT, row_refs ROW_REF[])"
+                        }
                         "lix_restore" => {
                             "(source_commit_id TEXT) | (source_commit_id TEXT, row_refs ROW_REF[])"
                         }
-                        "lix_revert" => {
-                            "(commit_id TEXT) | (commit_id TEXT, row_refs ROW_REF[])"
-                        }
+                        "lix_revert" => "(commit_id TEXT) | (commit_id TEXT, row_refs ROW_REF[])",
                         "lix_revert_range" | "lix_apply" => {
                             "(before_commit_id TEXT, after_commit_id TEXT) | (before_commit_id TEXT, after_commit_id TEXT, row_refs ROW_REF[])"
                         }
@@ -325,7 +310,6 @@ impl LixInformationSchemaProvider {
                 ordinal_position.push((position + 1) as u64);
                 is_nullable.push(if field.is_nullable() { "YES" } else { "NO" }.to_string());
                 data_type.push(public_sql_type(field));
-                lix_value_kind.push(field_value_kind(field));
             }
         }
 
@@ -341,7 +325,6 @@ impl LixInformationSchemaProvider {
                 Arc::new(UInt64Array::from(ordinal_position)),
                 Arc::new(StringArray::from(is_nullable)),
                 Arc::new(StringArray::from(data_type)),
-                Arc::new(StringArray::from(lix_value_kind)),
             ],
         )?;
         Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
@@ -467,7 +450,6 @@ fn table_functions_schema() -> SchemaRef {
         Field::new("ordinal_position", DataType::UInt64, false),
         Field::new("is_nullable", DataType::Utf8, false),
         Field::new("data_type", DataType::Utf8, false),
-        Field::new("lix_value_kind", DataType::Utf8, true),
     ]))
 }
 
@@ -504,7 +486,6 @@ fn columns_schema() -> SchemaRef {
         Field::new("numeric_scale", DataType::UInt64, true),
         Field::new("datetime_precision", DataType::UInt64, true),
         Field::new("interval_type", DataType::Utf8, true),
-        Field::new("lix_value_kind", DataType::Utf8, true),
         Field::new("lix_insert_policy", DataType::Utf8, false),
         Field::new("description", DataType::Utf8, true),
     ]))
@@ -527,7 +508,6 @@ struct ColumnsRows {
     numeric_scale: Vec<Option<u64>>,
     datetime_precision: Vec<Option<u64>>,
     interval_type: Vec<Option<String>>,
-    lix_value_kind: Vec<Option<String>>,
     lix_insert_policy: Vec<String>,
     description: Vec<Option<String>>,
 }
@@ -590,7 +570,6 @@ impl ColumnsRows {
             self.numeric_scale.push(numeric_scale);
             self.datetime_precision.push(None);
             self.interval_type.push(None);
-            self.lix_value_kind.push(field_value_kind(field));
             self.lix_insert_policy
                 .push(insert_policy.as_str().to_string());
             self.description.push(
@@ -618,7 +597,6 @@ impl ColumnsRows {
             Arc::new(UInt64Array::from(self.numeric_scale)),
             Arc::new(UInt64Array::from(self.datetime_precision)),
             Arc::new(StringArray::from(self.interval_type)),
-            Arc::new(StringArray::from(self.lix_value_kind)),
             Arc::new(StringArray::from(self.lix_insert_policy)),
             Arc::new(StringArray::from(self.description)),
         ];
@@ -627,6 +605,12 @@ impl ColumnsRows {
 }
 
 fn public_sql_type(field: &Field) -> String {
+    if field_is_row_ref(field) {
+        return "ROW_REF".to_string();
+    }
+    if field_is_json(field) {
+        return "JSONB".to_string();
+    }
     if field
         .metadata()
         .get(SCHEMA_V1_TYPE_METADATA_KEY)
@@ -660,7 +644,8 @@ fn public_arrow_sql_type(data_type: &DataType) -> String {
             format!("DECIMAL({precision},{scale})")
         }
         DataType::Date32 | DataType::Date64 => "DATE".to_string(),
-        DataType::Timestamp(_, _) => "TIMESTAMP".to_string(),
+        DataType::Timestamp(_, Some(_)) => "TIMESTAMPTZ".to_string(),
+        DataType::Timestamp(_, None) => "TIMESTAMP".to_string(),
         DataType::Null => "NULL".to_string(),
         other => other.to_string(),
     }

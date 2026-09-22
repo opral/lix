@@ -2158,6 +2158,26 @@ fn bound_expr_references_active_branch_commit_id(expr: &BoundExpr) -> bool {
             bound_expr_references_active_branch_commit_id(left)
                 || bound_expr_references_active_branch_commit_id(right)
         }
+        BoundExpr::Not(expr) => bound_expr_references_active_branch_commit_id(expr),
+        BoundExpr::Predicate(predicate) => {
+            bound_predicate_references_active_branch_commit_id(predicate)
+        }
+        BoundExpr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(bound_expr_references_active_branch_commit_id)
+                || conditions.iter().any(|(condition, result)| {
+                    bound_expr_references_active_branch_commit_id(condition)
+                        || bound_expr_references_active_branch_commit_id(result)
+                })
+                || else_result
+                    .as_deref()
+                    .is_some_and(bound_expr_references_active_branch_commit_id)
+        }
         BoundExpr::Column(_)
         | BoundExpr::ExcludedColumn(_)
         | BoundExpr::Param(_)
@@ -3660,6 +3680,9 @@ fn returning_expr_column_type(
                 Some(crate::ResultColumnType::Integer)
             }
         }
+        BoundExpr::Not(_) | BoundExpr::Predicate(_) => Some(crate::ResultColumnType::Boolean),
+        // CASE is evaluated by DataFusion, which resolves a common branch type.
+        BoundExpr::Case { .. } => None,
         BoundExpr::Param(param) => {
             params
                 .get(param.index.saturating_sub(1))
@@ -6026,6 +6049,10 @@ fn eval_expr_value(
             let value = eval_expr_value(expr, context, ctx, params, active_branch_commit_id)?;
             cast_row_eval_value(value, *data_type)
         }
+        BoundExpr::Not(_) => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "bound row write evaluates CASE conditions through DataFusion",
+        )),
         BoundExpr::Function { name, args } if name == "uuidv7" && args.is_empty() => {
             Ok(RowEvalValue::Uuid(ctx.functions().call_uuid_v7()))
         }
@@ -6174,6 +6201,10 @@ fn eval_expr_value(
         BoundExpr::Function { name, .. } => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             format!("bound row write does not support function '{name}' yet"),
+        )),
+        BoundExpr::Predicate(_) | BoundExpr::Case { .. } => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "bound row write evaluates CASE expressions through DataFusion",
         )),
         BoundExpr::Binary { .. } => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
@@ -6490,10 +6521,52 @@ fn returning_expr_requires_staged_postimage(expr: &BoundExpr) -> bool {
             returning_expr_requires_staged_postimage(left)
                 || returning_expr_requires_staged_postimage(right)
         }
+        BoundExpr::Not(expr) => returning_expr_requires_staged_postimage(expr),
+        BoundExpr::Predicate(predicate) => bound_predicate_requires_staged_postimage(predicate),
+        BoundExpr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(returning_expr_requires_staged_postimage)
+                || conditions.iter().any(|(condition, result)| {
+                    returning_expr_requires_staged_postimage(condition)
+                        || returning_expr_requires_staged_postimage(result)
+                })
+                || else_result
+                    .as_deref()
+                    .is_some_and(returning_expr_requires_staged_postimage)
+        }
         BoundExpr::Column(_)
         | BoundExpr::ExcludedColumn(_)
         | BoundExpr::Param(_)
         | BoundExpr::Literal(_) => false,
+    }
+}
+
+fn bound_predicate_requires_staged_postimage(predicate: &BoundPredicate) -> bool {
+    match predicate {
+        BoundPredicate::Eq(left, right) => {
+            returning_expr_requires_staged_postimage(left)
+                || returning_expr_requires_staged_postimage(right)
+        }
+        BoundPredicate::Like { expr, pattern, .. } => {
+            returning_expr_requires_staged_postimage(expr)
+                || returning_expr_requires_staged_postimage(pattern)
+        }
+        BoundPredicate::IsNull(expr) | BoundPredicate::IsNotNull(expr) => {
+            returning_expr_requires_staged_postimage(expr)
+        }
+        BoundPredicate::In { expr, values } => {
+            returning_expr_requires_staged_postimage(expr)
+                || values.iter().any(returning_expr_requires_staged_postimage)
+        }
+        BoundPredicate::And(predicates) | BoundPredicate::Or(predicates) => predicates
+            .iter()
+            .any(bound_predicate_requires_staged_postimage),
+        BoundPredicate::True | BoundPredicate::False => false,
     }
 }
 
@@ -6720,6 +6793,10 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
         BoundExpr::Binary { .. } => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             "bound row write evaluates binary expressions through DataFusion",
+        )),
+        BoundExpr::Not(_) | BoundExpr::Predicate(_) | BoundExpr::Case { .. } => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "bound row write evaluates CASE expressions through DataFusion",
         )),
         BoundExpr::Function { name, args } => {
             match name.as_str() {
