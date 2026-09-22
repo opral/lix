@@ -4303,6 +4303,7 @@ impl LixRuntimeManager {
         }
     }
 
+    #[cfg(test)]
     async fn repository_exists(&self, id: &str) -> Result<bool> {
         Ok(self
             .repository_record(id)

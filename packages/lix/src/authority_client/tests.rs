@@ -984,6 +984,25 @@ fn admission_identity() -> serde_json::Value {
 const ADMISSION_URL: &str = "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc";
 
 #[tokio::test]
+async fn admission_epoch_errors_report_actual_and_expected_versions() {
+    let http = ScriptHttp::default();
+    let mut identity = admission_identity();
+    identity["storageEpoch"] = serde_json::json!(81);
+    http.push_json(200, identity);
+    let error = super::admit_protocol_client(http, ADMISSION_URL, None).await.unwrap_err();
+    assert_eq!(error.code, "LIX_ADMISSION_EPOCH");
+    let details = error.details.unwrap();
+    assert_eq!(details["storageEpoch"], 81);
+    assert_eq!(details["expectedStorageEpoch"], crate::CURRENT_STORAGE_FORMAT_VERSION);
+    for status in [409, 426] {
+        let http = ScriptHttp::default();
+        http.push_json(status, serde_json::json!({}));
+        let error = super::admit_protocol_client(http, ADMISSION_URL, None).await.unwrap_err();
+        assert_eq!(error.details.unwrap()["httpStatus"], status);
+    }
+}
+
+#[tokio::test]
 async fn admission_recovers_from_gateway_and_network_failures_without_mutations() {
     let http = ScriptHttp::default();
     http.push_json(502, serde_json::json!({}));

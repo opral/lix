@@ -108,7 +108,11 @@ pub async fn admit_protocol_client<H: ProtocolHttp + Clone + 'static>(
                 409 | 426 => LixError::new(
                     "LIX_ADMISSION_EPOCH",
                     "Repository is incompatible with this client version",
-                ),
+                ).with_details(serde_json::json!({
+                    "httpStatus": response.status,
+                    "expectedStorageEpoch": crate::CURRENT_STORAGE_FORMAT_VERSION,
+                    "expectedProtocolEpoch": crate::SYNC_PROTOCOL_VERSION,
+                })),
                 status => LixError::new(
                     "LIX_ADMISSION_HTTP",
                     format!("Authority admission returned HTTP {status}"),
@@ -132,7 +136,12 @@ pub async fn admit_protocol_client<H: ProtocolHttp + Clone + 'static>(
             return Err(LixError::new(
                 "LIX_ADMISSION_EPOCH",
                 "Repository is incompatible with this client version",
-            ));
+            ).with_details(serde_json::json!({
+                "storageEpoch": identity.storage_epoch,
+                "protocolEpoch": identity.protocol_epoch,
+                "expectedStorageEpoch": crate::CURRENT_STORAGE_FORMAT_VERSION,
+                "expectedProtocolEpoch": crate::SYNC_PROTOCOL_VERSION,
+            })));
         }
         break identity;
     };

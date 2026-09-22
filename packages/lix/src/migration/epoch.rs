@@ -1082,7 +1082,11 @@ where
                 ))
                 .await?;
             } else {
-                let _ = copy_repository(&migration_source, &target, from_format >= 79).await?;
+                let _ = copy_repository(
+                    &migration_source,
+                    &target,
+                    (79..crate::init::CURRENT_FORMAT_VERSION).contains(&from_format),
+                ).await?;
                 write_candidate_page(
                     &target,
                     crate::init::REPOSITORY_PROTOCOL_SPACE,
@@ -1311,7 +1315,11 @@ where
                 ))
                 .await?;
             } else {
-                let _ = copy_repository(&migration_source, &target, from_format >= 79).await?;
+                let _ = copy_repository(
+                    &migration_source,
+                    &target,
+                    (79..crate::init::CURRENT_FORMAT_VERSION).contains(&from_format),
+                ).await?;
                 // Keep the multi-version migration state machine off this
                 // candidate frame. Its inactive repair phases otherwise inflate
                 // the stack while an older migration runs ordinary SQL.
@@ -1816,7 +1824,7 @@ where
         .await
         .map_err(storage_error)?;
     drop(read);
-    // On v79+ migration paths the declared-column index is disposable derived
+    // On v79-v81 migration paths the declared-column index is disposable derived
     // state. It is rebuilt from authoritative current rows below, so copying
     // the old index only adds a full scan and a write before publication
     // deletes it.
