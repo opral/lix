@@ -10,6 +10,8 @@ mod retained_tombstone;
 pub use maintenance::AuthorityMigrationReport;
 mod auto_migration;
 mod inventory;
+#[cfg(test)]
+mod migration_profile;
 mod request_budget;
 pub use inventory::{AuthorityInventory, AuthorityInventoryEntry};
 
@@ -331,6 +333,7 @@ fn is_repository_upgrade_failure(error: &anyhow::Error) -> bool {
 struct PendingRuntimeOpen {
     lifecycle: OwnedRwLockReadGuard<()>,
     lix_id: String,
+    record: RepositoryRecord,
     runtime: Arc<OnceCell<Arc<LixRuntime>>>,
     done: watch::Sender<RuntimeOpenState>,
 }
@@ -558,11 +561,14 @@ impl LixRuntimeManager {
 
         let lifecycle = self.lifecycle_lock(lix_id).await;
         let mut lifecycle_guard = Some(lifecycle.read_owned().await);
-        if !self
-            .repository_exists(lix_id)
+        // Keep the catalog record fetched under the lifecycle read lease. A
+        // cold open used to fetch the same record again in open_lix, adding
+        // one remote catalog GET to every migration/open attempt.
+        let mut record = self
+            .repository_record(lix_id)
             .await
-            .map_err(LixRuntimeError::Open)?
-        {
+            .map_err(LixRuntimeError::Open)?;
+        if !record.as_ref().is_some_and(|record| record.state == "live") {
             return Err(LixRuntimeError::NotFound);
         }
         let runtime_cell = 'select_runtime: loop {
@@ -652,6 +658,9 @@ impl LixRuntimeManager {
                         PendingRuntimeOpen {
                             lifecycle: lifecycle_guard.take().expect("opener owns lifecycle guard"),
                             lix_id: lix_id.to_string(),
+                            record: record
+                                .take()
+                                .expect("live catalog record was checked above"),
                             runtime: Arc::clone(&runtime),
                             done,
                         },
@@ -749,7 +758,7 @@ impl LixRuntimeManager {
             async move {
                 let _lifecycle = opener.lifecycle;
                 let opened = manager
-                    .open_lix_for_handler(opener.lix_id.clone(), opener.done.clone())
+                    .open_lix_for_handler(opener.lix_id.clone(), opener.record, opener.done.clone())
                     .await;
                 match opened {
                     Ok(runtime) => {
@@ -841,6 +850,7 @@ impl LixRuntimeManager {
     async fn open_lix_for_handler(
         self: &Arc<Self>,
         lix_id: String,
+        record: RepositoryRecord,
         opened: watch::Sender<RuntimeOpenState>,
     ) -> Result<Arc<LixRuntime>> {
         #[cfg(test)]
@@ -862,7 +872,7 @@ impl LixRuntimeManager {
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         tokio::task::spawn_blocking(move || {
             tracing::dispatcher::with_default(&dispatch, || {
-                runtime.block_on(manager.open_lix(&lix_id, &opened).instrument(span))
+                runtime.block_on(manager.open_lix(&lix_id, &record, &opened).instrument(span))
             })
         })
         .await
@@ -910,13 +920,10 @@ impl LixRuntimeManager {
     async fn open_lix(
         &self,
         lix_id: &str,
+        record: &RepositoryRecord,
         opened: &watch::Sender<RuntimeOpenState>,
     ) -> Result<Arc<LixRuntime>> {
-        let record = self
-            .repository_record(lix_id)
-            .await?
-            .filter(|record| record.state == "live")
-            .context("live repository catalog entry is missing")?;
+        debug_assert_eq!(record.state, "live");
         if !valid_lix_id(&record.storage_id) {
             anyhow::bail!("catalogued physical storage identifier is invalid");
         }
@@ -4296,6 +4303,7 @@ impl LixRuntimeManager {
         }
     }
 
+    #[cfg(test)]
     async fn repository_exists(&self, id: &str) -> Result<bool> {
         Ok(self
             .repository_record(id)

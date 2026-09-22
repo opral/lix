@@ -293,7 +293,10 @@ async fn repository_admission(
             "LIX_PROTOCOL_VERSION_MISMATCH",
             "Reload with the current Lix client before repository admission.",
             None,
-            None,
+            Some(serde_json::json!({
+                "storageEpoch": lix_sdk::CURRENT_STORAGE_FORMAT_VERSION,
+                "protocolEpoch": lix_sdk::SYNC_PROTOCOL_VERSION,
+            })),
         );
     }
     let principal = match take_trusted_principal(&mut request, state.internal_token.is_some()) {
@@ -1254,6 +1257,20 @@ mod tests {
     const LIX_B: &str = "22222222-2222-4222-8222-222222222222";
     const LIX_MARKDOWN: &str = "33333333-3333-4333-8333-333333333333";
     static TEST_IDEMPOTENCY_KEY_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+    #[tokio::test]
+    async fn admission_version_rejection_reports_authority_epochs() {
+        let manager = LixRuntimeManager::new_in_memory(4);
+        let app = router(manager, None, TEST_PROTOCOL_TIMEOUT, InFlightSqlRegistry::default());
+        let response = app.oneshot(Request::builder()
+            .uri(format!("/lix/v1/{LIX_A}/admission"))
+            .header("lix-sync-protocol-version", "0")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["details"]["storageEpoch"], lix_sdk::CURRENT_STORAGE_FORMAT_VERSION);
+        assert_eq!(body["error"]["details"]["protocolEpoch"], lix_sdk::SYNC_PROTOCOL_VERSION);
+    }
 
     #[tokio::test]
     async fn host_provisioning_requires_configured_internal_token_and_is_idempotent() {

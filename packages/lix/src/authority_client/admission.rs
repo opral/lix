@@ -105,10 +105,25 @@ pub async fn admit_protocol_client<H: ProtocolHttp + Clone + 'static>(
                     "LIX_ADMISSION_AUTH_REJECTED",
                     "Authority rejected repository admission",
                 ),
-                409 | 426 => LixError::new(
-                    "LIX_ADMISSION_EPOCH",
-                    "Repository is incompatible with this client version",
-                ),
+                409 | 426 => {
+                    let mut details = serde_json::json!({
+                        "httpStatus": response.status,
+                        "expectedStorageEpoch": crate::CURRENT_STORAGE_FORMAT_VERSION,
+                        "expectedProtocolEpoch": crate::SYNC_PROTOCOL_VERSION,
+                    });
+                    for field in ["storageEpoch", "protocolEpoch"] {
+                        if let Some(value) = error.details.as_ref()
+                            .and_then(|details| details.get(field))
+                            .and_then(serde_json::Value::as_u64)
+                        {
+                            details[field] = serde_json::json!(value);
+                        }
+                    }
+                    LixError::new(
+                        "LIX_ADMISSION_EPOCH",
+                        "Repository is incompatible with this client version",
+                    ).with_details(details)
+                },
                 status => LixError::new(
                     "LIX_ADMISSION_HTTP",
                     format!("Authority admission returned HTTP {status}"),
@@ -132,7 +147,12 @@ pub async fn admit_protocol_client<H: ProtocolHttp + Clone + 'static>(
             return Err(LixError::new(
                 "LIX_ADMISSION_EPOCH",
                 "Repository is incompatible with this client version",
-            ));
+            ).with_details(serde_json::json!({
+                "storageEpoch": identity.storage_epoch,
+                "protocolEpoch": identity.protocol_epoch,
+                "expectedStorageEpoch": crate::CURRENT_STORAGE_FORMAT_VERSION,
+                "expectedProtocolEpoch": crate::SYNC_PROTOCOL_VERSION,
+            })));
         }
         break identity;
     };

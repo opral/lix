@@ -984,6 +984,33 @@ fn admission_identity() -> serde_json::Value {
 const ADMISSION_URL: &str = "https://lix.test/lix/01936f4e-7b6c-7c3d-8f9a-123456789abc";
 
 #[tokio::test]
+async fn admission_epoch_errors_report_actual_and_expected_versions() {
+    let http = ScriptHttp::default();
+    let mut identity = admission_identity();
+    identity["storageEpoch"] = serde_json::json!(81);
+    http.push_json(200, identity);
+    let error = super::admit_protocol_client(http, ADMISSION_URL, None).await.unwrap_err();
+    assert_eq!(error.code, "LIX_ADMISSION_EPOCH");
+    let details = error.details.unwrap();
+    assert_eq!(details["storageEpoch"], 81);
+    assert_eq!(details["expectedStorageEpoch"], crate::CURRENT_STORAGE_FORMAT_VERSION);
+    for status in [409, 426] {
+        let http = ScriptHttp::default();
+        http.push_json(status, serde_json::json!({ "error": {
+            "code": "LIX_PROTOCOL_VERSION_MISMATCH",
+            "details": { "storageEpoch": 83, "protocolEpoch": 21, "private": "excluded" }
+        }}));
+        let error = super::admit_protocol_client(http, ADMISSION_URL, None).await.unwrap_err();
+        let details = error.details.unwrap();
+        assert_eq!(details["httpStatus"], status);
+        assert_eq!(details["storageEpoch"], 83);
+        assert_eq!(details["protocolEpoch"], 21);
+        assert_eq!(details["expectedStorageEpoch"], crate::CURRENT_STORAGE_FORMAT_VERSION);
+        assert!(details.get("private").is_none());
+    }
+}
+
+#[tokio::test]
 async fn admission_recovers_from_gateway_and_network_failures_without_mutations() {
     let http = ScriptHttp::default();
     http.push_json(502, serde_json::json!({}));
