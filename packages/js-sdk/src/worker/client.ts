@@ -202,6 +202,7 @@ async function openLixWorkerBindingInner(
 	if (openDirectLixBinding) {
 		const telemetryDispatch = telemetry
 			? (request: Uint8Array) => {
+					if (request.byteLength === 0) return;
 					try {
 						telemetry.onExport(request);
 					} catch {
@@ -427,7 +428,7 @@ export function workerBinding(
 				sql,
 				params,
 			});
-			return workerObserveBinding(request, notify, observeId);
+			return workerObserveBinding(request, observeId);
 		},
 		beginTransaction: async () => {
 			const transactionId = await request<number>({
@@ -511,13 +512,12 @@ function workerTransactionBinding(
 
 function workerObserveBinding(
 	request: RequestWorker,
-	notify: NotifyWorker,
 	observeId: number,
 ): ObserveEventsBinding {
 	return {
 		setTelemetryParent: () => {},
 		next: () => request({ kind: "observe.next", observeId }),
-		close: () => notify({ kind: "observe.close", observeId }),
+		close: () => request({ kind: "observe.close", observeId }).then(() => undefined),
 	};
 }
 

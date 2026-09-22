@@ -73,6 +73,25 @@ fn attribute<'a>(span: &'a Span, key: &str) -> Option<&'a str> {
         })
 }
 
+fn is_select_span(span: &Span) -> bool {
+    span.name == "SELECT"
+        && attribute(span, "db.system.name") == Some("lix")
+        && attribute(span, "db.operation.name") == Some("SELECT")
+}
+
+fn is_select_span_data(span: &opentelemetry_sdk::trace::SpanData) -> bool {
+    let has_attribute = |key: &str| {
+        span.attributes
+            .iter()
+            .any(|attribute| attribute.key.as_str() == key && attribute.value.as_str() == "SELECT")
+    };
+    span.name == "SELECT"
+        && span.attributes.iter().any(|attribute| {
+            attribute.key.as_str() == "db.system.name" && attribute.value.as_str() == "lix"
+        })
+        && has_attribute("db.operation.name")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authenticated_protocol_bind_reaches_otlp() {
     let spans = Arc::new(Mutex::new(Vec::<Span>::new()));
@@ -186,7 +205,7 @@ async fn authenticated_protocol_bind_reaches_otlp() {
             assert_eq!(span.span_id.len(), 8);
             assert!(span.start_time_unix_nano > 0);
         }
-        assert!(spans.iter().any(|s| s.name == "lix.sql.query"));
+        assert!(spans.iter().any(is_select_span));
     }
     manager.shutdown().await.unwrap();
     tokio::task::spawn_blocking(move || provider.shutdown())
@@ -418,7 +437,7 @@ async fn protocol_handshake_and_sql_remain_in_remote_trace() {
         let spans = exporter.0.lock().unwrap().clone();
         let sql = spans
             .iter()
-            .find(|s| s.name == "lix.sql.query")
+            .find(|span| is_select_span_data(span))
             .expect("engine SQL span");
         assert_eq!(
             sql.span_context.trace_id().to_string(),
@@ -539,8 +558,8 @@ async fn node_client_trace_integration() {
         for request in &requests {
             assert_eq!(tool["traceId"], request.span_context.trace_id().to_string());
         }
-        assert!(spans.iter().any(|s| s.name == "lix.sql.query"
-            && s.span_context.trace_id().to_string() == tool["traceId"].as_str().unwrap()));
+        assert!(spans.iter().any(|span| is_select_span_data(span)
+            && span.span_context.trace_id().to_string() == tool["traceId"].as_str().unwrap()));
         assert!(spans.iter().any(|s| s.name.contains("checkpoint")
             && s.span_context.trace_id().to_string() == tool["traceId"].as_str().unwrap()));
         eprintln!(

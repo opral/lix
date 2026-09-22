@@ -28,8 +28,9 @@ Local and partial-replica handles can export engine spans as standard OTLP
 protobuf. Each callback receives a valid `ExportTraceServiceRequest` containing
 one completed span. Enqueue these bytes in a host-owned batch exporter; do not
 start a network request per callback. `flush` runs after `lix.close()` has
-stopped the engine and dispatched its final spans. Provide W3C headers to make
-engine spans children of the active host span.
+stopped the engine and after every asynchronous `onExport` callback has settled.
+Delivery or flush errors reject `lix.close()` so the host can report missing
+telemetry. Provide W3C headers to make engine spans children of the active host span.
 Without a parent, Lix starts a sampled root trace. With a W3C parent, Lix honors
 its sampled flag; a parent with sampling flag `00` intentionally suppresses
 export. Hosts that need every query must provide a sampled parent or omit an

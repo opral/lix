@@ -53,6 +53,7 @@ async function openLixInternal(
 			"openLix() telemetry parentContext must be a context provider function",
 		);
 	}
+	const telemetry = withTelemetryDrain(options.telemetry);
 	if (
 		options.onProgress !== undefined &&
 		typeof options.onProgress !== "function"
@@ -115,23 +116,23 @@ async function openLixInternal(
 			binding = await openLixWorkerBinding(
 				{ kind: "memory", durability: options.durability ?? "durable" },
 				undefined,
-				options.telemetry,
+				telemetry,
 				syncServer,
 				options.onProgress,
 				snapshot,
 			);
-			return new Lix(binding, options.telemetry?.flush);
+			return new Lix(binding, telemetry?.flush);
 		} catch (error) {
-			await closeAndDrainFailedBinding(binding);
-			await flushTelemetryOnFailure(options.telemetry?.flush);
-			throw error;
+			const cleanupFailures = await closeAndDrainFailedBinding(binding);
+			cleanupFailures.push(...(await flushTelemetryOnFailure(telemetry?.flush)));
+			throw openFailureWithCleanupErrors(error, cleanupFailures);
 		}
 	}
 	if (isJsProviderLixStorage(options.storage)) {
 		return openJsProviderStorage(
 			options.storage,
 			options.durability ?? "durable",
-			options.telemetry,
+			telemetry,
 			syncServer,
 			options.onProgress,
 			snapshot,
@@ -152,7 +153,7 @@ async function openLixInternal(
 			binding = await openLixWorkerBinding(
 				{ ...storage.lixStorage.config, durability: options.durability ?? "durable" },
 				disconnect,
-				options.telemetry,
+				telemetry,
 				syncServer,
 				options.onProgress,
 				snapshot,
@@ -163,12 +164,12 @@ async function openLixInternal(
 					routed.current().importFilesystemPaths(paths),
 				syncDiskToLix: () => routed.current().syncDiskToLix(),
 			});
-			return new Lix(routed.binding, options.telemetry?.flush);
+			return new Lix(routed.binding, telemetry?.flush);
 		} catch (error) {
 			disconnect();
-			await closeAndDrainFailedBinding(binding);
-			await flushTelemetryOnFailure(options.telemetry?.flush);
-			throw error;
+			const cleanupFailures = await closeAndDrainFailedBinding(binding);
+			cleanupFailures.push(...(await flushTelemetryOnFailure(telemetry?.flush)));
+			throw openFailureWithCleanupErrors(error, cleanupFailures);
 		}
 	}
 	throw new TypeError("openLix() requires a Lix storage adapter");
@@ -247,35 +248,96 @@ async function openJsProviderStorage(
 		return new Lix(opened, telemetry?.flush);
 	} catch (error) {
 		openStorages.delete(storage);
-		await closeAndDrainFailedBinding(binding);
-		await flushTelemetryOnFailure(telemetry?.flush);
-		throw error;
+		const cleanupFailures = await closeAndDrainFailedBinding(binding);
+		cleanupFailures.push(...(await flushTelemetryOnFailure(telemetry?.flush)));
+		throw openFailureWithCleanupErrors(error, cleanupFailures);
 	}
 }
 
 async function closeAndDrainFailedBinding(
 	binding: LixBinding | undefined,
-): Promise<void> {
+	): Promise<unknown[]> {
+	const failures: unknown[] = [];
 	try {
 		await binding?.close();
-	} catch {
-		// Preserve the original open/setup failure.
+	} catch (error) {
+		failures.push(error);
 	}
 	try {
 		await binding?.flushTelemetry?.();
-	} catch {
-		// Preserve the original open/setup failure.
+	} catch (error) {
+		failures.push(error);
 	}
+	return failures;
 }
 
 async function flushTelemetryOnFailure(
 	flush: (() => void | Promise<void>) | undefined,
-): Promise<void> {
+	): Promise<unknown[]> {
 	try {
 		await flush?.();
-	} catch {
-		// Telemetry delivery cannot replace the open failure.
+		return [];
+	} catch (error) {
+		return [error];
 	}
+}
+
+function openFailureWithCleanupErrors(
+	openError: unknown,
+	cleanupErrors: unknown[],
+): unknown {
+	if (cleanupErrors.length === 0) return openError;
+	const flattenedCleanupErrors = cleanupErrors.flatMap((error) =>
+		error instanceof AggregateError ? error.errors : [error],
+	);
+	return new AggregateError(
+		[openError, ...flattenedCleanupErrors],
+		"Lix open failed and telemetry cleanup also failed",
+		{ cause: openError },
+	);
+}
+
+function withTelemetryDrain(
+	telemetry: OpenLixOptions["telemetry"],
+): OpenLixOptions["telemetry"] {
+	if (!telemetry) return undefined;
+	const pending = new Set<Promise<void>>();
+	const failures: unknown[] = [];
+	const onExport = (request: Uint8Array): void => {
+		try {
+			const delivery = telemetry.onExport(request);
+			if (delivery !== undefined) {
+				let tracked!: Promise<void>;
+				tracked = Promise.resolve(delivery)
+					.then(
+						() => undefined,
+						(error: unknown) => {
+							failures.push(error);
+						},
+					)
+					.finally(() => pending.delete(tracked));
+				pending.add(tracked);
+			}
+		} catch (error) {
+			failures.push(error);
+		}
+	};
+	const flush = async (): Promise<void> => {
+		await Promise.all([...pending]);
+		try {
+			await telemetry.flush?.();
+		} catch (error) {
+			failures.push(error);
+		}
+		await Promise.all([...pending]);
+		if (failures.length > 0) {
+			throw new AggregateError(
+				failures.splice(0),
+				"Lix telemetry export failed",
+			);
+		}
+	};
+	return { ...telemetry, onExport, flush };
 }
 
 export namespace openLix {

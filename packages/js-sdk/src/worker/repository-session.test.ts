@@ -160,6 +160,78 @@ test("recovers acknowledged contexts and observations without replaying writes o
 	});
 	expect(f.fatal).not.toHaveBeenCalled();
 });
+
+test("acknowledged observation close translates the logical handle and releases it", async () => {
+	const f = fixture();
+	await f.open();
+	const observationRequest = f.request({
+		kind: "observe",
+		sql: "SELECT 1",
+		params: [],
+	});
+	await tick();
+	const observeId = f.result(observationRequest).value as number;
+	const closeRequest = f.request({ kind: "observe.close", observeId });
+	await tick();
+	const close = f.sent.at(-1) as WorkerRequest;
+	expect(close.operation).toEqual({ kind: "observe.close", observeId: 10 });
+	expect(f.result(closeRequest)).toMatchObject({ ok: true });
+	const nextRequest = f.request({ kind: "observe.next", observeId });
+	expect(f.result(nextRequest)).toMatchObject({ ok: true, value: undefined });
+});
+
+test("observation close waits for recovery to close the recreated remote handle", async () => {
+	const f = fixture();
+	await f.open();
+	const observationRequest = f.request({
+		kind: "observe",
+		sql: "SELECT 1",
+		params: [],
+	});
+	await tick();
+	const observeId = f.result(observationRequest).value as number;
+	f.session.lost();
+	const closeRequest = f.request({ kind: "observe.close", observeId });
+	expect(f.result(closeRequest)).toBeUndefined();
+	f.session.connected();
+	await tick();
+	expect(f.result(closeRequest)).toMatchObject({ ok: true });
+	expect(f.sent.map((message) =>
+		"id" in message ? message.operation.kind : message.kind,
+	)).toContain("observe.close");
+});
+
+test("an in-flight close during owner loss cancels pending reads and is not replayed", async () => {
+	const f = fixture();
+	await f.open();
+	const observationRequest = f.request({
+		kind: "observe",
+		sql: "SELECT 1",
+		params: [],
+	});
+	await tick();
+	const observeId = f.result(observationRequest).value as number;
+	f.pause();
+	const previous = f.sent.length;
+	const nextRequest = f.request({ kind: "observe.next", observeId });
+	const closeRequest = f.request({ kind: "observe.close", observeId });
+	f.session.lost();
+	expect(f.result(closeRequest)).toMatchObject({ ok: true });
+	expect(f.result(nextRequest)).toMatchObject({ ok: true, value: undefined });
+	f.resume();
+	f.session.connected();
+	await tick();
+	const recovered = f.sent.slice(previous).filter((m): m is WorkerRequest => "id" in m);
+	expect(recovered.map((m) => m.operation.kind)).toEqual([
+		"observe.next",
+		"observe.close",
+		"open",
+		"openAnotherSession",
+		"close",
+	]);
+	expect(recovered.some((m) => m.operation.kind === "observe")).toBe(false);
+});
+
 test("fences stale credential callbacks across owner generations", async () => {
 	const f = fixture();
 	await f.open();

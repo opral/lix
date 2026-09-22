@@ -406,7 +406,10 @@ pub struct WasmLixTransaction {
 pub struct WasmObserveEvents {
     inner: RefCell<Option<BrowserObserveEvents>>,
     closed: Cell<bool>,
+    close_finished: Cell<bool>,
+    close_waiters: RefCell<Vec<async_channel::Sender<()>>>,
     next_abort: RefCell<Option<AbortHandle>>,
+    next_complete: RefCell<Option<async_channel::Receiver<()>>>,
     telemetry_parent: Option<PendingTelemetryParent>,
 }
 
@@ -996,7 +999,10 @@ impl WasmLix {
         Ok(WasmObserveEvents {
             inner: RefCell::new(Some(inner)),
             closed: Cell::new(false),
+            close_finished: Cell::new(false),
+            close_waiters: RefCell::new(Vec::new()),
             next_abort: RefCell::new(None),
+            next_complete: RefCell::new(None),
             telemetry_parent: self
                 .telemetry_parent
                 .as_ref()
@@ -1138,6 +1144,8 @@ impl WasmObserveEvents {
             .ok_or_else(observe_next_in_flight_error)?;
         let (abort, registration) = AbortHandle::new_pair();
         self.next_abort.borrow_mut().replace(abort);
+        let (next_complete_sender, next_complete) = async_channel::bounded(1);
+        self.next_complete.borrow_mut().replace(next_complete);
         let telemetry_parent = self
             .telemetry_parent
             .as_ref()
@@ -1148,12 +1156,19 @@ impl WasmObserveEvents {
         self.next_abort.borrow_mut().take();
         let result = match result {
             Ok(result) if !self.closed.get() => result,
-            Ok(_) | Err(_) => {
-                inner.close();
-                Ok(None)
-            }
+            Ok(_) | Err(_) => Ok(None),
         };
-        self.inner.borrow_mut().replace(inner);
+        let finished = matches!(&result, Ok(None)) && !self.closed.get();
+        if finished {
+            self.closed.set(true);
+            inner.close();
+            self.close_finished.set(true);
+        }
+        if !finished {
+            self.inner.borrow_mut().replace(inner);
+        }
+        self.next_complete.borrow_mut().take();
+        let _ = next_complete_sender.try_send(());
         let Some(event) = result.map_err(lix_error_to_js)? else {
             return Ok(JsValue::UNDEFINED);
         };
@@ -1166,12 +1181,35 @@ impl WasmObserveEvents {
     }
 
     #[wasm_bindgen(js_name = close)]
-    pub fn close(&self) {
-        self.closed.set(true);
-        if let Some(abort) = self.next_abort.borrow_mut().take() {
-            abort.abort();
-        } else if let Some(inner) = self.inner.borrow_mut().as_mut() {
-            inner.close();
+    pub async fn close(&self) {
+        if self.close_finished.get() {
+            return;
+        }
+        let (waiter, close_completion) = async_channel::bounded(1);
+        if self.close_finished.get() {
+            return;
+        }
+        self.close_waiters.borrow_mut().push(waiter);
+        let owns_close = !self.closed.replace(true);
+        if owns_close {
+            if let Some(abort) = self.next_abort.borrow_mut().take() {
+                abort.abort();
+            }
+        }
+        let next_completion = self.next_complete.borrow().as_ref().cloned();
+        if owns_close {
+            if let Some(next_complete) = next_completion {
+                let _ = next_complete.recv().await;
+            }
+            if let Some(mut inner) = self.inner.borrow_mut().take() {
+                inner.close();
+            }
+            self.close_finished.set(true);
+            for waiter in self.close_waiters.borrow_mut().drain(..) {
+                let _ = waiter.try_send(());
+            }
+        } else {
+            let _ = close_completion.recv().await;
         }
     }
 }

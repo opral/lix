@@ -74,6 +74,7 @@ export function startWorkerHost(
 	const syncStreamCleanup = new Map<number, () => void>();
 	let finiteQueue = Promise.resolve();
 	const registrations = new Set<Promise<void>>();
+	const observationClosures = new Set<Promise<void>>();
 
 	endpoint.onMessage((message: WorkerInput) => {
 		if (closed && "id" in message) return;
@@ -97,6 +98,7 @@ export function startWorkerHost(
 		}
 		if (
 			message.operation.kind === "observe.next" ||
+			message.operation.kind === "observe.close" ||
 			message.operation.kind === "exportSnapshot.next" ||
 			message.operation.kind === "exportSnapshot.cancel"
 		) {
@@ -105,6 +107,11 @@ export function startWorkerHost(
 				void respond(message, () =>
 					handleObserveNext(observeId, message.telemetryParent),
 				);
+			} else if (message.operation.kind === "observe.close") {
+				const observeId = message.operation.observeId;
+				const closure = respond(message, () => handleObserveClose(observeId));
+				observationClosures.add(closure);
+				void closure.finally(() => observationClosures.delete(closure));
 			} else if (message.operation.kind === "exportSnapshot.next") {
 				const exportId = message.operation.exportId;
 				void respond(message, () => handleSnapshotNext(exportId));
@@ -167,12 +174,6 @@ export function startWorkerHost(
 		message: Exclude<WorkerInput, WorkerRequest>,
 	): void {
 		switch (message.kind) {
-			case "observe.close": {
-				const events = observations.get(message.observeId);
-				observations.delete(message.observeId);
-				events?.close();
-				break;
-			}
 			case "openSnapshot.cancel": {
 				const input = snapshotInputs.get(message.snapshotId);
 				snapshotInputs.delete(message.snapshotId);
@@ -423,6 +424,8 @@ export function startWorkerHost(
 			}
 			case "observe.next":
 				throw workerStateError("observe.next must use the observation lane");
+			case "observe.close":
+				throw workerStateError("observe.close must use the observation lane");
 		}
 	}
 
@@ -493,8 +496,13 @@ export function startWorkerHost(
         syncStreamCleanup.clear();
         for (const pending of pendingSyncStreamPulls.values()) { pending.controller.error(failure); pending.reject(failure); }
         pendingSyncStreamPulls.clear();
-        for (const observation of observations.values()) observation.close();
+        await Promise.allSettled(
+          Array.from(observations.values(), (observation) =>
+            Promise.resolve(observation.close()),
+          ),
+        );
         observations.clear();
+        await Promise.allSettled([...observationClosures]);
         for (const snapshot of snapshotExports.values()) await Promise.resolve(snapshot.cancel()).catch(() => undefined);
         snapshotExports.clear();
         await finiteQueue.catch(() => undefined);
@@ -675,6 +683,12 @@ export function startWorkerHost(
 		return events.next();
 	}
 
+	async function handleObserveClose(observeId: number): Promise<void> {
+		const events = observations.get(observeId);
+		observations.delete(observeId);
+		await events?.close();
+	}
+
 	async function handleObserveRegistration(
 		sessionId: number,
 		sql: string,
@@ -684,7 +698,10 @@ export function startWorkerHost(
 		// serialized finite lane. Each `observe.next` supplies telemetry directly
 		// to its observation binding.
 		const events = await requiredLix(sessionId).observe(sql, params);
-        if (closed) { events.close(); throw workerStateError("Worker client disconnected"); }
+		if (closed) {
+			await events.close();
+			throw workerStateError("Worker client disconnected");
+		}
 		const observeId = nextObserveId++;
 		observations.set(observeId, events);
 		return observeId;

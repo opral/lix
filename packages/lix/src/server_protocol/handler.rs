@@ -14782,18 +14782,29 @@ mod tests {
 
         let spans = spans.lock().expect("capture spans");
         assert_info_plane(&spans);
-        let batch = require_span(&spans, "lix.sql.batch");
         let query = require_span(&spans, "lix.sql.query");
         assert_eq!(
             query.fields.get("db.operation.name").map(String::as_str),
             Some("INSERT")
         );
+        assert_eq!(
+            query.fields.get("lix.execution.kind").map(String::as_str),
+            Some("batch")
+        );
+        assert_eq!(
+            spans
+                .iter()
+                .filter(|span| span.name == "lix.sql.query")
+                .count(),
+            1,
+            "a single-statement batch exports exactly one query span"
+        );
         let materialize = require_span(&spans, "lix.transaction.materialize");
         let storage_commit = require_span(&spans, "lix.transaction.storage");
         let notify = require_span(&spans, "lix.transaction.notify");
-        assert_eq!(materialize.parent.as_ref(), Some(&batch.id));
-        assert_eq!(storage_commit.parent.as_ref(), Some(&batch.id));
-        assert_eq!(notify.parent.as_ref(), Some(&batch.id));
+        assert_eq!(materialize.parent.as_ref(), Some(&query.id));
+        assert_eq!(storage_commit.parent.as_ref(), Some(&query.id));
+        assert_eq!(notify.parent.as_ref(), Some(&query.id));
         let cohort_id = materialize
             .fields
             .get("lix.commit_cohort_id")

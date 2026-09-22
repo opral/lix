@@ -492,6 +492,47 @@ test("close drains queued telemetry after stopping the engine", async () => {
 	expect(flushed).toBe(true);
 });
 
+test("close waits for async span delivery before flushing the host exporter", async () => {
+	let startDelivery!: () => void;
+	let finishDelivery!: () => void;
+	let hostFlushed = false;
+	const deliveryStarted = new Promise<void>((resolve) => {
+		startDelivery = resolve;
+	});
+	const deliveryGate = new Promise<void>((resolve) => {
+		finishDelivery = resolve;
+	});
+	const lix = await openLix({
+		telemetry: {
+			async onExport() {
+				startDelivery();
+				await deliveryGate;
+			},
+			flush() {
+				hostFlushed = true;
+			},
+		},
+	});
+	await lix.execute("SELECT 1 AS value");
+	const closing = lix.close();
+	await deliveryStarted;
+	let closeSettled = false;
+	void closing.then(
+		() => {
+			closeSettled = true;
+		},
+		() => {
+			closeSettled = true;
+		},
+	);
+	for (let i = 0; i < 20; i++) await Promise.resolve();
+	expect(closeSettled).toBe(false);
+	expect(hostFlushed).toBe(false);
+	finishDelivery();
+	await closing;
+	expect(hostFlushed).toBe(true);
+});
+
 test("observe.next samples its own telemetry parent", async () => {
 	const nextParent = {
 		traceparent: "00-fedcba9876543210fedcba9876543210-fedcba9876543210-01",
@@ -577,6 +618,42 @@ test("failed storage setup drains native spans before the host flush", async () 
 	}
 });
 
+test("failed open reports telemetry flush failure with the original open error", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "lix-telemetry-open-failure-"));
+	const storage = new FilesystemStorage({ path: dir });
+	const connect = storage.lixStorage.connect.bind(storage.lixStorage);
+	const setupFailure = new Error("storage setup failed");
+	const telemetryFailure = new Error("host telemetry flush failed");
+	storage.lixStorage.connect = (connection) => {
+		if (connection) throw setupFailure;
+		connect(undefined);
+	};
+	try {
+		let caught: unknown;
+		try {
+			await openLix({
+				storage,
+				telemetry: {
+					onExport() {},
+					flush() {
+						throw telemetryFailure;
+					},
+				},
+			});
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(AggregateError);
+		expect((caught as AggregateError).errors).toEqual([
+			setupFailure,
+			telemetryFailure,
+		]);
+		expect((caught as AggregateError).cause).toBe(setupFailure);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("native telemetry preserves its receiver and cannot fail commands", async () => {
 	const telemetry = {
 		calls: 0,
@@ -590,7 +667,7 @@ test("native telemetry preserves its receiver and cannot fail commands", async (
 	await expect(lix.execute("SELECT 1 AS value")).resolves.toBeDefined();
 	await new Promise((resolve) => setTimeout(resolve, 20));
 	expect(telemetry.calls).toBeGreaterThan(0);
-	await lix.close();
+	await expect(lix.close()).rejects.toThrow("Lix telemetry export failed");
 });
 
 test("openLix opens native storage without telemetry", async () => {

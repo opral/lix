@@ -128,11 +128,11 @@ export type WorkerOperation =
 	| { kind: "exportSnapshot.cancel"; exportId: number }
 	| { kind: "observe"; sql: string; params: BindingParam[] }
 	| { kind: "observe.next"; observeId: number }
+	| { kind: "observe.close"; observeId: number }
 	| { kind: "close" };
 
 export type WorkerNotification =
 	| { kind: "transaction.abandon"; transactionId: number }
-	| { kind: "observe.close"; observeId: number }
 	| { kind: "openSnapshot.cancel"; snapshotId: number }
 	| {
 			kind: "sync.headers.result";

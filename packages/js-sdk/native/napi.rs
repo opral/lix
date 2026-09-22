@@ -2545,7 +2545,42 @@ pub struct NativeObserveEvents {
     closed: Arc<AtomicBool>,
     close_signal: watch::Sender<bool>,
     next_in_flight: Arc<AtomicBool>,
+    close_completion: Arc<NativeObserveCompletion>,
     telemetry_parent: Option<PendingTelemetryParent>,
+}
+
+#[derive(Default)]
+struct NativeObserveCompletion {
+    state: Mutex<NativeObserveCompletionState>,
+}
+
+#[derive(Default)]
+struct NativeObserveCompletionState {
+    completed: bool,
+    waiters: Vec<NativeUnitDeferred>,
+}
+
+impl NativeObserveCompletion {
+    fn register(&self, deferred: NativeUnitDeferred) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if !state.completed {
+            state.waiters.push(deferred);
+            return;
+        }
+        drop(state);
+        settle_deferred(deferred, Ok(()));
+    }
+
+    fn finish(&self) {
+        let waiters = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.completed = true;
+            std::mem::take(&mut state.waiters)
+        };
+        for waiter in waiters {
+            settle_deferred(waiter, Ok(()));
+        }
+    }
 }
 
 #[napi]
@@ -2558,10 +2593,12 @@ impl NativeObserveEvents {
         let closed = Arc::new(AtomicBool::new(false));
         let (close_signal, actor_close_signal) = watch::channel(false);
         let next_in_flight = Arc::new(AtomicBool::new(false));
+        let close_completion = Arc::new(NativeObserveCompletion::default());
         let telemetry_parent = telemetry_parent.map(|_| Arc::new(Mutex::new(None)));
 
         let actor_closed = Arc::clone(&closed);
         let actor_next_in_flight = Arc::clone(&next_in_flight);
+        let actor_close_completion = Arc::clone(&close_completion);
         thread::Builder::new()
             .name("lix-observe-events".to_string())
             .stack_size(NATIVE_ENGINE_ACTOR_STACK_SIZE)
@@ -2572,6 +2609,7 @@ impl NativeObserveEvents {
                     actor_closed,
                     actor_close_signal,
                     actor_next_in_flight,
+                    actor_close_completion,
                 );
             })
             .map_err(to_napi_error)?;
@@ -2581,6 +2619,7 @@ impl NativeObserveEvents {
             closed,
             close_signal,
             next_in_flight,
+            close_completion,
             telemetry_parent,
         })
     }
@@ -2647,8 +2686,11 @@ impl NativeObserveEvents {
     }
 
     #[napi]
-    pub fn close(&self) {
+    pub fn close<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeUnitDeferred, Object<'env>) = env.create_deferred()?;
+        self.close_completion.register(deferred);
         close_observe_events(&self.commands, &self.closed, &self.close_signal);
+        Ok(promise)
     }
 }
 
@@ -2676,20 +2718,22 @@ fn run_observe_actor(
     closed: Arc<AtomicBool>,
     mut close_signal: watch::Receiver<bool>,
     next_in_flight: Arc<AtomicBool>,
+    close_completion: Arc<NativeObserveCompletion>,
 ) {
     let rt = match Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(error) => {
             closed.store(true, Ordering::SeqCst);
-            while let Ok(command) = receiver.recv() {
+            while let Ok(command) = receiver.try_recv() {
                 match command {
                     ObserveCommand::Next { deferred, .. } => {
                         next_in_flight.store(false, Ordering::SeqCst);
                         deferred.reject(to_napi_error(&error));
                     }
-                    ObserveCommand::Close => break,
+                    ObserveCommand::Close => {}
                 }
             }
+            close_completion.finish();
             return;
         }
     };
@@ -2735,6 +2779,7 @@ fn run_observe_actor(
         }
     }
     closed.store(true, Ordering::SeqCst);
+    close_completion.finish();
 }
 
 async fn observe_next(

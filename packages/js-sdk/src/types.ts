@@ -34,9 +34,12 @@ export type LixTelemetryParentContext = {
 };
 
 export type LixTelemetryOptions = {
-	/** Called for each span with one OTLP ExportTraceServiceRequest (protobuf). */
-	onExport(request: Uint8Array): void;
-	/** Flush queued exports after the Lix handle has closed. Errors are ignored. */
+	/**
+	 * Called for each span with one OTLP ExportTraceServiceRequest (protobuf).
+	 * Return a promise when delivery is asynchronous; close() waits for it.
+	 */
+	onExport(request: Uint8Array): void | Promise<void>;
+	/** Flush queued exports after span callbacks settle. Errors reject close(). */
 	flush?(): void | Promise<void>;
 	/** Read immediately before each serialized engine operation. */
 	parentContext?(): LixTelemetryParentContext | undefined;

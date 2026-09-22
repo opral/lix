@@ -116,25 +116,12 @@ pub(crate) fn start_batch<'a>(
     } else {
         return None;
     };
-    let enabled_descriptor = if statement_count == 1 {
-        &SQL_QUERY
-    } else {
-        descriptor
-    };
-    if !sink.enabled(enabled_descriptor) {
+    // The execution path already creates a per-statement query span. For a
+    // one-statement batch, that span carries the batch execution kind and
+    // index, so an outer SQL_QUERY here would double-count the operation.
+    if statement_count == 1 || !sink.enabled(descriptor) {
         return None;
     }
-    let mut statements = statements;
-    if statement_count == 1 {
-        let Some(sql) = statements.next() else {
-            return None;
-        };
-        return Some(ActiveTelemetrySpan::start(
-            sink,
-            statement_start(sql, execution_kind, None),
-        ));
-    }
-
     let mut attributes = vec![
         TelemetryAttribute::string("db.system.name", "lix"),
         TelemetryAttribute::i64(
@@ -639,24 +626,32 @@ mod tests {
         start_batch(
             Some(&sink),
             &SQL_COHERENT_READ_BATCH,
-            1,
-            std::iter::once("SELECT 'private' AS value"),
+            2,
+            ["SELECT 'private' AS value", "SELECT 42 AS value"].into_iter(),
         )
         .expect("coherent read telemetry span")
         .finish(Status::Unset, Vec::new());
     }
 
     #[test]
-    fn one_statement_batch_is_a_query_span_without_batch_size() {
-        let span = batch_start(&SQL_BATCH, 1, &["SELECT 'private' AS value"]);
-        assert_eq!(span.name, "lix.sql.query");
-        assert_eq!(string_attribute(&span, "otel.name"), Some("SELECT"));
-        assert_eq!(string_attribute(&span, "db.query.summary"), Some("SELECT"));
-        assert_eq!(string_attribute(&span, "db.query.text"), Some("SELECT ? AS value"));
-        assert!(!span
-            .attributes
-            .iter()
-            .any(|attribute| attribute.key == "db.operation.batch.size"));
+    fn one_statement_batch_uses_its_execution_query_span() {
+        let sink: Arc<dyn TelemetrySink> = Arc::new(
+            crate::telemetry::CallbackTelemetrySink::new(|_| {}),
+        );
+        assert!(start_batch(
+            Some(&sink),
+            &SQL_BATCH,
+            1,
+            std::iter::once("SELECT 'private' AS value"),
+        )
+        .is_none());
+        assert!(start_batch(
+            Some(&sink),
+            &SQL_COHERENT_READ_BATCH,
+            1,
+            std::iter::once("SELECT 'private' AS value"),
+        )
+        .is_none());
     }
 
     #[test]
@@ -716,7 +711,13 @@ mod tests {
 
     #[test]
     fn batch_query_text_is_bounded_and_marks_truncation() {
-        let first = format!("SELECT '{}'", "a".repeat(MAX_QUERY_TEXT_CHARS));
+        let first = format!(
+            "SELECT {}",
+            (0..600)
+                .map(|index| format!("column_{index:04}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         let second = "UPDATE item SET value = 'private'";
         let span = batch_start(&SQL_BATCH, 2, &[&first, second]);
         let text = string_attribute(&span, "db.query.text").expect("query text");

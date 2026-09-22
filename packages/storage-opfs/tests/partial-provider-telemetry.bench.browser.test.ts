@@ -1,10 +1,15 @@
-import {openLix,type LixTelemetrySpan} from "@lix-js/sdk";
+import {openLix} from "@lix-js/sdk";
 import {OpfsStorage} from "@lix-js/storage-opfs";
 import {expect,test} from "vitest";
 
 type Fixture={dimension:string;size:number;url:string;key:string;headers?:Record<string,string>};
 const readSql="SELECT value FROM lix_key_value WHERE key = $1";
 const writeSql="UPDATE lix_key_value SET value = $1 WHERE key = $2";
+function encodeBase64(bytes:Uint8Array):string {
+ let binary="";
+ for(let offset=0;offset<bytes.length;offset+=0x8000)binary+=String.fromCharCode(...bytes.subarray(offset,offset+0x8000));
+ return btoa(binary);
+}
 
 test("attributes partial OPFS local provider calls and production SQL spans",async()=>{
  const fixtures=(await(await fetch("/__partial_sync_profile.json")).json() as Fixture[]).filter(f=>/^rows_(16|16000)$/.test(f.dimension));
@@ -13,10 +18,10 @@ test("attributes partial OPFS local provider calls and production SQL spans",asy
  for(const fixture of fixtures) {
   // Reverse order at the second scale to expose order/system warm-up effects.
   for(const mode of (fixture.size===16?["complete","partial"]:["partial","complete"])) {
-   const spans:LixTelemetrySpan[]=[];
+   const otlpRequests:string[]=[];
    const operations:{kind:string;iteration:number;traceId:string;wallMs:number}[]=[];
    let traceId=crypto.randomUUID().replaceAll("-","");
-   const telemetry={onSpan:(span:LixTelemetrySpan)=>spans.push(span),parentContext:()=>({traceId,spanId:"0123456789abcdef",traceFlags:1})};
+   const telemetry={onExport:(request:Uint8Array)=>{otlpRequests.push(encodeBase64(request));},parentContext:()=>({traceparent:`00-${traceId}-0123456789abcdef-01`})};
    const underlying=new OpfsStorage({name:`paired-${mode}-${crypto.randomUUID()}`});
    const registration=underlying.lixStorage;
    const channelName=`partial-provider-profile-${crypto.randomUUID()}`;
@@ -54,7 +59,7 @@ test("attributes partial OPFS local provider calls and production SQL spans",asy
     await lix.execute(writeSql,["paired preparation",fixture.key]);
     offline=true;for(const controller of controllers)controller.abort();
     const selectMs:number[]=[],updateMs:number[]=[];
-    spans.length=0;
+    otlpRequests.length=0;
     for(let i=0;i<15;i++) {
      await setTrace();
      let begin=performance.now();
@@ -68,9 +73,9 @@ test("attributes partial OPFS local provider calls and production SQL spans",asy
      if(i>=5){updateMs.push(writeMs);operations.push({kind:"update",iteration:i,traceId,wallMs:writeMs});}
     }
     expect(attempts.filter(a=>/\/sync\/native-(objects|object-range|metadata)$/.test(a.path)||(a.method==="GET"&&/\/sync\/(blob|chunk)$/.test(a.path)))).toHaveLength(0);
-    // SDK telemetry messages are ordered on the worker channel. Closing later
-    // drains the worker; keep this array by reference for late callback delivery.
-    results.push({mode,rows:fixture.size,selectMs,updateMs,operations,spans,io,offlineNetworkAttempts:attempts,excludedWarmups:5});
+    // Each entry is a base64 encoded OTLP ExportTraceServiceRequest. Closing
+    // drains the worker before the artifact is serialized.
+    results.push({mode,rows:fixture.size,selectMs,updateMs,operations,otlpRequests,io,offlineNetworkAttempts:attempts,excludedWarmups:5});
    }finally{await lix.close();channel.close();}
   }
  }

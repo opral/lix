@@ -62,8 +62,27 @@ export class RepositorySession {
 		this.transactions.clear();
 		this.exports.clear();
 		const replay: WorkerInput[] = [];
+		const closingObservations = new Set(
+			Array.from(this.requests.values()).flatMap((request) =>
+				request.operation.kind === "observe.close"
+					? [request.operation.observeId]
+					: [],
+			),
+		);
 		for (const request of this.requests.values()) {
 			const kind = request.operation.kind;
+			if (kind === "observe.close") {
+				this.observations.delete(request.operation.observeId);
+				this.output({ id: request.id, ok: true });
+				continue;
+			}
+			if (
+				kind === "observe.next" &&
+				closingObservations.has(request.operation.observeId)
+			) {
+				this.output({ id: request.id, ok: true, value: undefined });
+				continue;
+			}
 			if (
 				[
 					"open",
@@ -154,7 +173,10 @@ export class RepositorySession {
 					await this.call(observation.operation, session.remote)
 				).value as number;
 				if (!this.observations.has(id))
-					this.send({ kind: "observe.close", observeId: observation.remote });
+					await this.call(
+						{ kind: "observe.close", observeId: observation.remote },
+						0,
+					);
 			}
 		}
 	}
@@ -192,29 +214,37 @@ export class RepositorySession {
 				}
 				return;
 			}
-			if (message.kind === "observe.close") {
-				const observation = this.observations.get(message.observeId);
-				this.observations.delete(message.observeId);
-				if (this.ready && observation)
-					this.send({ ...message, observeId: observation.remote });
-				this.queue = this.queue.filter((input) => {
-					if (
-						"id" in input &&
-						input.operation.kind === "observe.next" &&
-						input.operation.observeId === message.observeId
-					) {
-						this.output({ id: input.id, ok: true, value: undefined });
-						return false;
-					}
-					return true;
-				});
-			} else if (message.kind === "transaction.abandon") {
+			if (message.kind === "transaction.abandon") {
 				const transactionId = this.transactions.get(message.transactionId);
 				this.transactions.delete(message.transactionId);
 				if (this.ready && transactionId !== undefined)
 					this.send({ ...message, transactionId });
 			}
 			return;
+		}
+		let observationCloseLogicalId: number | undefined;
+		let trackedMessage = message;
+		if (message.operation.kind === "observe.close") {
+			observationCloseLogicalId = message.operation.observeId;
+			const observeId = message.operation.observeId;
+			const observation = this.observations.get(observeId);
+			if (!this.ready) {
+				if (!observation) {
+					this.output({ id: message.id, ok: true });
+					return;
+				}
+				this.queue.push(message);
+				return;
+			}
+			if (!observation) {
+				this.output({ id: message.id, ok: true });
+				return;
+			}
+			trackedMessage = message;
+			message = {
+				...message,
+				operation: { ...message.operation, observeId: observation.remote },
+			};
 		}
 		if (!this.ready) {
 			this.queue.push(message);
@@ -241,12 +271,14 @@ export class RepositorySession {
 				operation.exportId = remote;
 			}
 			if ("observeId" in operation) {
-				const remote = this.observations.get(operation.observeId);
-				if (!remote) {
-					this.output({ id: message.id, ok: true, value: undefined });
-					return;
+				if (operation.kind !== "observe.close") {
+					const remote = this.observations.get(operation.observeId);
+					if (!remote) {
+						this.output({ id: message.id, ok: true, value: undefined });
+						return;
+					}
+					operation.observeId = remote.remote;
 				}
-				operation.observeId = remote.remote;
 			}
 			const session = this.sessions.get(message.sessionId);
 			if (
@@ -265,8 +297,10 @@ export class RepositorySession {
 				);
 			const sessionId = session?.remote ?? 0;
 			const id = this.nextWire++;
-			this.requests.set(id, message);
+			this.requests.set(id, trackedMessage);
 			this.send({ ...message, id, sessionId, operation });
+			if (observationCloseLogicalId !== undefined)
+				this.observations.delete(observationCloseLogicalId);
 		} catch (error) {
 			this.output({
 				id: message.id,

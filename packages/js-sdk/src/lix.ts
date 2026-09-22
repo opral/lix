@@ -480,22 +480,27 @@ export class Lix {
 				const results = await Promise.allSettled([
 					Promise.resolve().then(() => this.binding.close()),
 				]);
+				const failures: unknown[] = results.flatMap((result) =>
+					result.status === "rejected" ? [result.reason] : [],
+				);
 				try {
 					await this.binding.flushTelemetry?.();
-				} catch {
-					// Native callback delivery is observational and cannot change close semantics.
+				} catch (error) {
+					failures.push(error);
 				}
 				try {
 					await this.flushTelemetry?.();
-				} catch {
-					// Export delivery is observational and cannot change close semantics.
+				} catch (error) {
+					failures.push(error);
 				}
 				this.#activeBranchListeners.clear();
-				const failure = results.find(
-					(result): result is PromiseRejectedResult =>
-						result.status === "rejected",
-				);
-				if (failure) throw failure.reason;
+				if (failures.length === 1) throw failures[0];
+				if (failures.length > 1) {
+					throw new AggregateError(
+						failures,
+						"Lix close or telemetry export failed",
+					);
+				}
 			})();
 		}
 		await this.closePromise;
