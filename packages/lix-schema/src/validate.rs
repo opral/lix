@@ -80,6 +80,32 @@ pub(crate) fn validate_schema(schema: &Schema) -> Result<(), Error> {
             return definition(path, "local and referenced column counts must match");
         }
     }
+    let mut row_ref_columns = BTreeSet::new();
+    for (index, row_ref) in schema.row_refs.iter().enumerate() {
+        let path = format!("/row_refs/{index}");
+        let Some(column) = schema
+            .columns
+            .iter()
+            .find(|candidate| candidate.name == row_ref.column)
+        else {
+            return definition(
+                format!("{path}/column"),
+                format!("unknown column '{}'", row_ref.column),
+            );
+        };
+        if !row_ref_columns.insert(row_ref.column.as_str()) {
+            return definition(
+                format!("{path}/column"),
+                "duplicates an earlier row-reference constraint",
+            );
+        }
+        if column.data_type != DataType::Text {
+            return definition(
+                format!("{path}/column"),
+                format!("row-reference column '{}' must use text", row_ref.column),
+            );
+        }
+    }
     Ok(())
 }
 

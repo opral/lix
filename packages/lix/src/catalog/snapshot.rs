@@ -19,6 +19,7 @@ pub(crate) struct CatalogSnapshot {
     by_key: BTreeMap<SchemaCatalogKey, SchemaPlanId>,
     by_identity: BTreeMap<DomainSchemaIdentity, SchemaPlanId>,
     delete_references_by_target: BTreeMap<SchemaCatalogKey, Vec<DeleteReferencePlan>>,
+    row_ref_references: Vec<RowRefReferencePlan>,
     fingerprint: CatalogFingerprint,
 }
 
@@ -155,6 +156,7 @@ impl CatalogSnapshot {
             by_key: self.by_key.clone(),
             by_identity: self.by_identity.clone(),
             delete_references_by_target: BTreeMap::new(),
+            row_ref_references: Vec::new(),
             fingerprint: CatalogFingerprint::default(),
         };
         let plan_id = candidate.remember_schema_identity(identity, key, schema)?;
@@ -239,6 +241,7 @@ impl CatalogSnapshot {
             .collect::<Result<Vec<_>, _>>()?;
         self.plans = plans;
         self.rebuild_delete_plans();
+        self.rebuild_row_ref_references();
         self.fingerprint = self.compute_fingerprint()?;
         Ok(())
     }
@@ -258,6 +261,23 @@ impl CatalogSnapshot {
             }
         }
         self.delete_references_by_target = delete_references_by_target;
+    }
+
+    fn rebuild_row_ref_references(&mut self) {
+        self.row_ref_references = self
+            .plans
+            .iter()
+            .flat_map(|source_plan| {
+                source_plan
+                    .row_refs
+                    .iter()
+                    .cloned()
+                    .map(|row_ref| RowRefReferencePlan {
+                        source_key: source_plan.key.clone(),
+                        row_ref,
+                    })
+            })
+            .collect();
     }
 
     fn compute_fingerprint(&self) -> Result<CatalogFingerprint, LixError> {
@@ -322,6 +342,22 @@ impl CatalogSnapshot {
                 .map(Vec::as_slice)
                 .unwrap_or(&[]),
         }
+    }
+
+    /// Returns declared row-reference sources without expanding them against
+    /// every possible target relation. The target schema, optional file scope,
+    /// and typed primary key are carried by each row value and resolved later.
+    pub(crate) fn row_ref_references(&self) -> &[RowRefReferencePlan] {
+        &self.row_ref_references
+    }
+
+    pub(crate) fn has_row_ref_cascades(&self) -> bool {
+        self.row_ref_references.iter().any(|reference| {
+            matches!(
+                reference.row_ref.on_delete,
+                lix_schema::DeleteAction::Cascade
+            )
+        })
     }
 }
 
@@ -460,6 +496,7 @@ pub(crate) struct SchemaPlan {
     pub(crate) primary_key_component_types: Option<Vec<crate::row_pk::RowPkComponentType>>,
     pub(crate) uniques: Vec<PointerGroup>,
     pub(crate) foreign_keys: Vec<ForeignKeyPlan>,
+    pub(crate) row_refs: Vec<RowRefPlan>,
 }
 
 impl SchemaPlan {
@@ -484,6 +521,7 @@ impl SchemaPlan {
             && self.primary_key_component_types.is_some()
             && self.uniques.is_empty()
             && self.foreign_keys.is_empty()
+            && self.row_refs.is_empty()
     }
 
     /// Compiles one standalone plan for tests that need the same constraint
@@ -532,6 +570,14 @@ impl SchemaPlan {
             key_index,
             schema_index,
         )?;
+        let row_refs = parsed_schema
+            .row_refs
+            .into_iter()
+            .map(|row_ref| RowRefPlan {
+                column: row_ref.column,
+                on_delete: row_ref.on_delete,
+            })
+            .collect();
         Ok(Self {
             key,
             schema: Arc::new(schema),
@@ -543,6 +589,7 @@ impl SchemaPlan {
             primary_key_component_types,
             uniques,
             foreign_keys,
+            row_refs,
         })
     }
 }
@@ -851,6 +898,18 @@ pub(crate) struct ForeignKeyPlan {
 pub(crate) struct DeleteReferencePlan {
     pub(crate) source_key: SchemaCatalogKey,
     pub(crate) foreign_key: ForeignKeyPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RowRefPlan {
+    pub(crate) column: String,
+    pub(crate) on_delete: lix_schema::DeleteAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RowRefReferencePlan {
+    pub(crate) source_key: SchemaCatalogKey,
+    pub(crate) row_ref: RowRefPlan,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1445,6 +1504,35 @@ mod tests {
             "child_schema"
         );
         assert!(!child_delete_plan.has_committed_checks());
+    }
+
+    #[test]
+    fn row_ref_references_remain_source_scoped_until_value_resolution() {
+        let catalog = CatalogSnapshot::from_schema_facts(&[SchemaCatalogFact::new(
+            Domain::schema_catalog("main", false),
+            SchemaKey::new("row_ref_source"),
+            json!({
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "row_ref_source",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "target", "type": "text", "nullable": true }
+                ],
+                "primary_key": ["id"],
+                "row_refs": [{ "column": "target", "on_delete": "cascade" }]
+            }),
+        )])
+        .expect("row-reference schema should compile");
+
+        let references = catalog.row_ref_references();
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].source_key.schema_key, "row_ref_source");
+        assert_eq!(references[0].row_ref.column, "target");
+        assert_eq!(
+            references[0].row_ref.on_delete,
+            lix_schema::DeleteAction::Cascade
+        );
+        assert!(catalog.has_row_ref_cascades());
     }
 
     fn schema_json(schema_key: &str) -> JsonValue {

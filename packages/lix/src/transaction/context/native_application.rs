@@ -11,7 +11,42 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
         picks: &[crate::tracked_state::TrackedStateMergePick],
         resolved_deletes: &BTreeSet<TrackedStateKey>,
     ) -> Result<BTreeSet<TrackedStateKey>, LixError> {
+        const MAX_FILE_DELETE_ROWS: usize = 65_536;
         let branch = self.active_branch_id().to_owned();
+        let mut file_delete_ids = analysis
+            .target_diff
+            .entries
+            .iter()
+            .chain(analysis.source_diff.entries.iter())
+            .filter(|entry| {
+                entry.identity.schema_key() == "lix_file_descriptor"
+                    && entry.after.as_ref().is_some_and(|row| row.deleted)
+            })
+            .filter_map(|entry| entry.identity.file_id().map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        let resurrected_file_ids = picks
+            .iter()
+            .filter(|pick| {
+                pick.identity.schema_key() == "lix_file_descriptor" && !pick.selected_row.deleted
+            })
+            .filter_map(|pick| pick.identity.file_id().map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        file_delete_ids.retain(|id| !resurrected_file_ids.contains(id));
+        let historical_file_schema_keys = if file_delete_ids.is_empty() {
+            BTreeSet::new()
+        } else {
+            let source = self
+                .tracked_catalog_at_commit(&analysis.commits.source_commit_id.to_string())
+                .await?;
+            let base = self
+                .tracked_catalog_at_commit(&analysis.commits.base_commit_id.to_string())
+                .await?;
+            source
+                .plans()
+                .chain(base.plans())
+                .map(|plan| plan.key.schema_key.to_string())
+                .collect()
+        };
         let read = self.opening_read();
         let base = self.hot_state.reader(&read);
         let staged = self.staged_writes.staging_overlay()?;
@@ -25,6 +60,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
         // expansion. An unrelated registration must not expand an unrelated
         // collection delete into individual row tombstones.
         let mut incoming_fk_targets = BTreeSet::new();
+        let mut incoming_row_refs = false;
+        let mut incoming_schema_keys = BTreeSet::new();
         let mut schema_groups = BTreeMap::<CommitId, Vec<TrackedStateKey>>::new();
         for pick in picks.iter().filter(|pick| {
             pick.identity.schema_key() == REGISTERED_SCHEMA_KEY && !pick.selected_row.deleted
@@ -53,6 +90,18 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
                         .row(slot)
                         .ok_or_else(|| LixError::unknown("incoming schema selection is missing"))?;
                     let snapshot = native_file_descriptor_json(row)?;
+                    incoming_row_refs |= snapshot
+                        .get("value")
+                        .and_then(|schema| schema.get("row_refs"))
+                        .and_then(JsonValue::as_array)
+                        .is_some_and(|references| !references.is_empty());
+                    if let Some(schema_key) = snapshot
+                        .get("schema_key")
+                        .or_else(|| snapshot.get("value").and_then(|schema| schema.get("key")))
+                        .and_then(JsonValue::as_str)
+                    {
+                        incoming_schema_keys.insert(schema_key.to_owned());
+                    }
                     if let Some(foreign_keys) = snapshot
                         .get("value")
                         .and_then(|schema| schema.get("foreign_keys"))
@@ -83,14 +132,31 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
             )
             .await?;
         let has_action = |schema: &str| {
-            catalog
-                .delete_plan_for_key(schema)
-                .foreign_key_references
-                .iter()
-                .any(|reference| {
-                    reference.foreign_key.on_delete == lix_schema::DeleteAction::Cascade
-                })
+            catalog.has_row_ref_cascades()
+                || catalog
+                    .delete_plan_for_key(schema)
+                    .foreign_key_references
+                    .iter()
+                    .any(|reference| {
+                        reference.foreign_key.on_delete == lix_schema::DeleteAction::Cascade
+                    })
         };
+        let file_delete_scopes_enabled = !file_delete_ids.is_empty()
+            && (incoming_row_refs
+                || !catalog.row_ref_references().is_empty()
+                || catalog.has_row_ref_cascades());
+        let mut file_delete_schema_keys = self
+            .sql_schema_snapshot
+            .plans()
+            .map(|plan| plan.key.schema_key.to_string())
+            .chain(historical_file_schema_keys)
+            .chain(incoming_schema_keys)
+            .collect::<BTreeSet<_>>();
+        file_delete_schema_keys.extend([
+            "lix_file_descriptor".to_owned(),
+            "lix_binary_blob_ref".to_owned(),
+            "lix_key_value".to_owned(),
+        ]);
         let mut seed_keys = analysis
             .target_diff
             .entries
@@ -135,7 +201,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
             let (schema_key, file_id) = crate::collection_generation::collection_scope_from_row_pk(
                 entry.identity.row_pk(),
             )?;
-            if incoming_fk_targets.contains(&schema_key)
+            if incoming_row_refs
+                || !catalog.row_ref_references().is_empty()
+                || incoming_fk_targets.contains(&schema_key)
                 || !catalog
                     .delete_plan_for_key(&schema_key)
                     .foreign_key_references
@@ -166,7 +234,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
             })
             .collect::<Result<BTreeSet<_>, _>>()?;
         let mut incoming_generation_deletes = BTreeSet::new();
-        if seed_keys.is_empty() && generation_scopes.is_empty() && !incoming_schemas {
+        if seed_keys.is_empty()
+            && generation_scopes.is_empty()
+            && !incoming_schemas
+            && !file_delete_scopes_enabled
+        {
             return Ok(BTreeSet::new());
         }
         let mut relevant_schemas = seed_keys
@@ -181,6 +253,18 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
                     .map(|pick| pick.identity.schema_key().to_owned()),
             );
         }
+        // Dynamic references can point at any winning deletion, including a
+        // target in another file. Hydrate their incoming source selections so
+        // the shared planner sees the complete candidate, not only local rows.
+        relevant_schemas.extend(
+            catalog
+                .row_ref_references()
+                .iter()
+                .filter(|reference| {
+                    reference.row_ref.on_delete == lix_schema::DeleteAction::Cascade
+                })
+                .map(|reference| reference.source_key.schema_key.clone()),
+        );
         let mut schema_frontier = relevant_schemas.iter().cloned().collect::<Vec<_>>();
         while let Some(schema) = schema_frontier.pop() {
             for reference in catalog.delete_plan_for_key(&schema).foreign_key_references {
@@ -236,6 +320,129 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
                 }
             }
         }
+        let mut file_delete_keys = BTreeSet::new();
+        if file_delete_scopes_enabled {
+            let request = TrackedStateDiffRequest {
+                filter: TrackedStateFilter {
+                    schema_keys: file_delete_schema_keys.iter().cloned().collect(),
+                    file_ids: file_delete_ids
+                        .iter()
+                        .cloned()
+                        .map(NullableKeyFilter::Value)
+                        .collect(),
+                    include_tombstones: true,
+                    ..TrackedStateFilter::default()
+                },
+                retain_payloads: false,
+            };
+            let base_commit = analysis.commits.base_commit_id.to_string();
+            let mut reader = self.tracked_state_reader().await?;
+            let mut rows_per_file = BTreeMap::<String, usize>::new();
+            for head_commit in [
+                analysis.commits.target_commit_id,
+                analysis.commits.source_commit_id,
+            ] {
+                let diff = reader
+                    .diff_commits(&base_commit, &head_commit.to_string(), &request)
+                    .await?;
+                for entry in diff.entries {
+                    let Some(file_id) = entry.identity.file_id() else {
+                        continue;
+                    };
+                    if !file_delete_ids.contains(file_id)
+                        || matches!(
+                            entry.identity.schema_key(),
+                            "lix_file_descriptor"
+                                | "lix_binary_blob_ref"
+                                | "lix_collection_generation"
+                                | REGISTERED_SCHEMA_KEY
+                        )
+                        || entry.before.as_ref().is_none_or(|row| row.deleted)
+                            && entry.after.as_ref().is_none_or(|row| row.deleted)
+                    {
+                        continue;
+                    }
+                    let key = TrackedStateKey {
+                        schema_key: entry.identity.schema_key().into(),
+                        file_id: Some(file_id.to_owned()),
+                        row_pk: entry.identity.row_pk().clone(),
+                    };
+                    if file_delete_keys.insert(key) {
+                        let count = rows_per_file.entry(file_id.to_owned()).or_default();
+                        *count += 1;
+                        if *count > MAX_FILE_DELETE_ROWS {
+                            return Err(LixError::new(
+                                "LIX_PARTIAL_MERGE_PREPARATION_LIMIT",
+                                "deleted file semantic closure exceeds the bounded row closure",
+                            ));
+                        }
+                    }
+                }
+            }
+            // The endpoint diff only reports identities whose values changed
+            // after the merge base. A row that was already present at the
+            // base and unchanged on both endpoints is still retired by the
+            // winning file delete. Recover those identities with bounded
+            // exact (schema,file) key scans; payloads are deliberately not
+            // requested because the historical point reads below hydrate
+            // only the proven seeds that the planner needs.
+            for file_id in &file_delete_ids {
+                for schema_key in &file_delete_schema_keys {
+                    if matches!(
+                        schema_key.as_str(),
+                        "lix_file_descriptor"
+                            | "lix_binary_blob_ref"
+                            | "lix_collection_generation"
+                            | REGISTERED_SCHEMA_KEY
+                    ) {
+                        continue;
+                    }
+                    let rows = reader
+                        .scan_batch_at_commit_page(
+                            &base_commit,
+                            &TrackedStateScanRequest {
+                                filter: TrackedStateFilter {
+                                    schema_keys: vec![schema_key.clone()],
+                                    file_ids: vec![NullableKeyFilter::Value(file_id.clone())],
+                                    include_tombstones: false,
+                                    ..TrackedStateFilter::default()
+                                },
+                                read_columns: crate::tracked_state::TrackedStateReadColumns {
+                                    columns: Vec::new(),
+                                },
+                                limit: Some(MAX_FILE_DELETE_ROWS + 1),
+                            },
+                            None,
+                        )
+                        .await?;
+                    if rows.len() > MAX_FILE_DELETE_ROWS {
+                        return Err(LixError::new(
+                            "LIX_PARTIAL_MERGE_PREPARATION_LIMIT",
+                            "deleted file semantic closure exceeds the bounded row closure",
+                        ));
+                    }
+                    for slot in 0..rows.len() {
+                        let row = rows.row(slot);
+                        let key = TrackedStateKey {
+                            schema_key: row.schema_key().into(),
+                            file_id: row.file_id().map(str::to_owned),
+                            row_pk: row.row_pk().clone(),
+                        };
+                        if file_delete_keys.insert(key) {
+                            let count = rows_per_file.entry(file_id.clone()).or_default();
+                            *count += 1;
+                            if *count > MAX_FILE_DELETE_ROWS {
+                                return Err(LixError::new(
+                                    "LIX_PARTIAL_MERGE_PREPARATION_LIMIT",
+                                    "deleted file semantic closure exceeds the bounded row closure",
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        seed_keys.extend(file_delete_keys.iter().cloned());
         let seed_keys = seed_keys.into_iter().collect::<Vec<_>>();
         // Hydrate sparse picks in one batch per historical commit, not one
         // storage read per row. The staged semantic resolutions take precedence.
@@ -315,6 +522,42 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
                     raw.set_decoded_snapshot(raw.len() - 1, Some(snapshot.clone()));
                 }
             }
+        }
+        // A winning descriptor deletion retires every proven semantic row in
+        // its file.  Append these after selected rows so a target-side edit
+        // cannot resurrect a row whose owner file was deleted on source.
+        let mut file_delete_deletes = RawWriteBatch::new();
+        for key in &file_delete_keys {
+            raw.push_parts(
+                Some(key.row_pk.clone()),
+                key.schema_key.as_str().into(),
+                key.file_id.as_deref().map(Into::into),
+                None,
+                None,
+                None,
+                None,
+                None,
+                branch == GLOBAL_BRANCH_ID,
+                None,
+                None,
+                false,
+                branch.as_str().into(),
+            );
+            file_delete_deletes.push_parts(
+                Some(key.row_pk.clone()),
+                key.schema_key.as_str().into(),
+                key.file_id.as_deref().map(Into::into),
+                None,
+                None,
+                None,
+                None,
+                None,
+                branch == GLOBAL_BRANCH_ID,
+                None,
+                None,
+                false,
+                branch.as_str().into(),
+            );
         }
         let previous = reader
             .load_projected_batch_at_commit(
@@ -463,12 +706,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
                     row_pk: pick.identity.row_pk().clone(),
                 };
                 if untracked_deletes.contains(&identity) {
-                    return Err(
-                        commit::selected_tracked_ref_untracked_collision_error(
-                            &branch,
-                            &identity,
-                        ),
-                    );
+                    return Err(commit::selected_tracked_ref_untracked_collision_error(
+                        &branch, &identity,
+                    ));
                 }
             }
         }
@@ -476,6 +716,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
         // tracked merge changes.
         let identities = deletes
             .iter()
+            .chain(file_delete_deletes.iter())
             .filter(|row| !row.untracked)
             .map(|row| TrackedStateKey {
                 schema_key: row.schema_key.to_string(),
@@ -483,6 +724,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
                 row_pk: row.row_pk.expect("cascade has an identity").clone(),
             })
             .collect();
+        if !file_delete_deletes.is_empty() {
+            self.stage_file_delete_semantic_tombstones(file_delete_deletes)
+                .await?;
+        }
         if !deletes.is_empty() {
             self.stage_planned_cascade_deletes(deletes).await?;
         }
@@ -563,6 +808,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
         if deletes.is_empty() && restores.is_empty() {
             return Ok(None);
         }
+
         let handled = deletes.union(&restores).cloned().collect::<BTreeSet<_>>();
         let plan = analysis
             .merge_plan()
@@ -582,7 +828,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
             let rows = reader
                 .scan_batch_at_commit_page(
                     &source_id,
-                    &crate::tracked_state::TrackedStateScanRequest {
+                    &TrackedStateScanRequest {
                         filter: TrackedStateFilter {
                             schema_keys: source_schemas.clone(),
                             file_ids: vec![NullableKeyFilter::Value(id.clone())],
@@ -728,9 +974,15 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
             .filter(|conflict| keep(&conflict.identity))
             .cloned()
             .collect();
-        next.source_diff
-            .entries
-            .retain(|entry| keep(&entry.identity));
+        next.source_diff.entries.retain(|entry| {
+            keep(&entry.identity)
+                || (entry.identity.schema_key() == "lix_file_descriptor"
+                    && entry
+                        .identity
+                        .file_id()
+                        .is_some_and(|id| deletes.contains(id))
+                    && entry.after.as_ref().is_some_and(|row| row.deleted))
+        });
         next.target_diff
             .entries
             .retain(|entry| keep(&entry.identity));

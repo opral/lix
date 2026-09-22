@@ -3,9 +3,9 @@ use crate::LixError;
 #[cfg(test)]
 use crate::hot_state::MaterializedHotStateRow;
 use crate::hot_state::{
-    HotStateExactBatchRequest, HotStateExactRowRequest, HotStateReader, HotStateRowIdentityRef,
-    HotStateScanRequest, MaterializedHotStateBatch, MaterializedHotStateBatchBuilder,
-    MaterializedHotStateExactBatch, MaterializedHotStateRowRef,
+    HotStateExactBatchRequest, HotStateExactRowRequest, HotStateReadDomain, HotStateReader,
+    HotStateRowIdentityRef, HotStateScanRequest, MaterializedHotStateBatch,
+    MaterializedHotStateBatchBuilder, MaterializedHotStateExactBatch, MaterializedHotStateRowRef,
 };
 
 // Scanned-vs-returned accounting for the single-row `lix_binary_blob_ref`
@@ -208,6 +208,80 @@ where
             .with(|rows| rows.set(rows.get().saturating_add(resolved.len())));
     }
     Ok(resolved)
+}
+
+/// Overlays transaction writes on a correlated indexed declared-column read.
+///
+/// The indexed reader returns candidate identities from the committed state;
+/// staged writes still have to participate in the same branch/global and
+/// collection-generation visibility resolution as an ordinary scan. Keep the
+/// request's predicate and projection intact so staged rows remain candidates
+/// for the caller's existing typed-value recheck. `None` is propagated when
+/// the committed reader cannot prove that its index serves this request.
+pub(crate) async fn overlay_scan_indexed_declared_column_batch<S>(
+    base: &dyn HotStateReader,
+    staged: &S,
+    request: &HotStateScanRequest,
+    domain: HotStateReadDomain,
+) -> Result<Option<MaterializedHotStateBatch>, LixError>
+where
+    S: StagedHotStateRows + ?Sized,
+{
+    let mut visible_branch_ids = request.filter.branch_ids.clone();
+    if let [schema_key] = request.filter.schema_keys.as_slice() {
+        let mut retained = Vec::with_capacity(visible_branch_ids.len());
+        for branch_id in visible_branch_ids {
+            if branch_id == GLOBAL_BRANCH_ID
+                || !staged.collection_replaced(&branch_id, schema_key, None)?
+            {
+                retained.push(branch_id);
+            }
+        }
+        visible_branch_ids = retained;
+    }
+    if !request.filter.branch_ids.is_empty() && visible_branch_ids.is_empty() {
+        return Ok(Some(MaterializedHotStateBatch::default()));
+    }
+
+    // Match overlay_scan_batch: read tombstones and remove limits while
+    // resolving staged overrides. Expand global candidates for the staged
+    // overlay; the durable reader also performs this expansion internally.
+    let mut candidate_request = request.clone();
+    candidate_request.limit = None;
+    candidate_request.filter.include_tombstones = true;
+    candidate_request.filter.branch_ids = expanded_branch_ids(&visible_branch_ids);
+    candidate_request.filter.untracked = match domain {
+        HotStateReadDomain::Tracked => Some(false),
+        HotStateReadDomain::Untracked => Some(true),
+        HotStateReadDomain::Combined => candidate_request.filter.untracked,
+    };
+
+    let Some(base_rows) = base
+        .scan_indexed_declared_column_batch(&candidate_request, domain)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let staged_rows = staged.staged_batch(&candidate_request)?;
+    let resolved = resolve_visible_batch(
+        base_rows,
+        staged_rows,
+        &VisibilityRequest {
+            branch_scope: VisibilityBranchScope::BranchIds {
+                branch_ids: visible_branch_ids,
+            },
+            include_tombstones: request.filter.include_tombstones,
+            limit: request.limit,
+        },
+    );
+    // The durable indexed implementation selects the explicit `domain` for
+    // its exact hydration. A lightweight reader may implement the optional
+    // method with a combined read, though, so retain the request lane here as
+    // the ordinary overlay path does.
+    Ok(Some(match request.filter.untracked {
+        Some(untracked) => resolved.filter(|row| row.untracked() == untracked, None),
+        None => resolved,
+    }))
 }
 
 pub(crate) async fn overlay_scan_tracked_batch<S>(

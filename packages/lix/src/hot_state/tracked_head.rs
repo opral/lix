@@ -16,8 +16,11 @@ pub(crate) use crate::row_state::{
 pub(crate) use hot::hot_decode_row_pk_probe;
 #[cfg(test)]
 pub(crate) use hot::root_exact_profile;
+#[cfg(test)]
+pub(crate) use hot::hot_index_key_is_witness;
 
 pub(crate) use crate::hot_state::HotStateReadDomain;
+pub(crate) use hot::HOT_INDEX_PROBE_VALUE_LIMIT;
 #[cfg(test)]
 pub(crate) use hot::WORKING_DIFF_PATH_HITS;
 #[cfg(test)]
@@ -678,7 +681,11 @@ fn tracked_head_duplicate_insert_error(key: &TrackedStateKey) -> LixError {
     tracked_head_duplicate_insert_error_ref(&key.schema_key, key.file_id.as_deref(), &key.row_pk)
 }
 
-fn tracked_head_duplicate_insert_error_ref(schema_key: &str, file_id: Option<&str>, row_pk: &RowPk) -> LixError {
+fn tracked_head_duplicate_insert_error_ref(
+    schema_key: &str,
+    file_id: Option<&str>,
+    row_pk: &RowPk,
+) -> LixError {
     LixError::new(
         LixError::CODE_UNIQUE,
         format!(

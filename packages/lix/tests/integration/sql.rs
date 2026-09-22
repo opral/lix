@@ -117,6 +117,7 @@ mod read_only;
 mod recovery_functions;
 mod recovery_regressions;
 mod row_ref;
+mod row_refs;
 mod schema_expression_amendment;
 mod schema_history;
 mod schema_view;

@@ -8,6 +8,11 @@ use crate::{DataType, Error, ErrorKind, Schema};
 /// testable instead of relying on a resemblance between two JSON formats.
 pub fn to_postgres_ddl(schema: &Schema) -> Result<String, Error> {
     schema.validate()?;
+    if !schema.row_refs.is_empty() {
+        return Err(ddl_error(
+            "row-reference constraints cannot be represented in PostgreSQL DDL",
+        ));
+    }
     let mut declarations = Vec::new();
     for column in &schema.columns {
         let mut declaration = format!("  {} {}", column.name, column.data_type.postgres_name());

@@ -1713,6 +1713,7 @@ fn hot_index_writes_for_commit(
                 schema_key: row.schema_key.as_str().to_owned(),
                 ordinal: *ordinal,
                 value: value.clone(),
+                file_id: row.file_id.as_ref().map(ToString::to_string),
                 row_pk: row.row_pk.clone(),
             });
         }

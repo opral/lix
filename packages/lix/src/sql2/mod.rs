@@ -46,7 +46,7 @@ pub(crate) use bind::{
 };
 pub(crate) use catalog::{
     PublicCatalog, PublicSurfaceKind, SchemaColumnType, SchemaIndexedColumn, SchemaSurfaceSpec,
-    derive_schema_surface_spec_from_schema, row_visible_fields,
+    derive_schema_surface_spec_from_schema, row_visible_fields, schema_exposed_as_schema_surface,
 };
 pub(crate) use checkpoint_function::{
     CheckpointFunctionPlan, RecoveryCommand, checkpoint_function_plan,

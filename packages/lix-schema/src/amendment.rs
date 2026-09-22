@@ -13,10 +13,11 @@ pub fn validate_amendment(previous: &Schema, next: &Schema) -> Result<(), Error>
     if previous.primary_key != next.primary_key
         || previous.unique != next.unique
         || previous.foreign_keys != next.foreign_keys
+        || previous.row_refs != next.row_refs
     {
         return amendment(
             "/",
-            "primary-key, unique, and foreign-key constraints cannot change",
+            "primary-key, unique, foreign-key, and row-reference constraints cannot change",
         );
     }
     if next.columns.len() < previous.columns.len() {

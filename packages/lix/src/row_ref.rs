@@ -1,11 +1,13 @@
 //! Canonical opaque encoding for public relation- and file-qualified row
 //! addresses.
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::Bytes;
 use smallvec::SmallVec;
 
+use crate::catalog::CatalogSnapshot;
+use crate::domain::{Domain, DomainRowIdentity};
 use crate::row_pk::RowPkComponentType;
 use crate::row_pk::{RowPk, RowPkComponent};
 use crate::sql2::{PublicCatalog, PublicSurfaceKind};
@@ -70,11 +72,7 @@ pub(crate) fn encode(
         None => bytes.push(FILE_NULL_TAG),
         Some(file_id) => {
             bytes.push(FILE_PRESENT_TAG);
-            bytes.extend_from_slice(
-                &file_len
-                    .expect("file id length was computed")
-                    .to_be_bytes(),
-            );
+            bytes.extend_from_slice(&file_len.expect("file id length was computed").to_be_bytes());
             bytes.extend_from_slice(file_id.as_bytes());
         }
     }
@@ -192,7 +190,7 @@ pub(crate) fn decode_str(encoded: &str) -> Result<ResolvedRowRef, LixError> {
             _ => {
                 return Err(invalid(
                     "lix_row_ref contains an unknown key component type",
-                ))
+                ));
             }
         });
     }
@@ -218,6 +216,110 @@ pub(crate) fn decode_str(encoded: &str) -> Result<ResolvedRowRef, LixError> {
         return Err(invalid("lix_row_ref is not canonically encoded"));
     }
     Ok(decoded)
+}
+
+/// Resolves a decoded public row reference to the physical identity used by
+/// validation and storage. The branch and durability come from the source
+/// row's domain; only the file scope is carried by the reference itself.
+///
+/// `lix_file` and `lix_directory` are public logical relations. Their
+/// descriptor rows are physical engine identities: a file descriptor is
+/// scoped to its own id, while a directory descriptor is fileless.
+pub(crate) fn resolve_catalog_target(
+    catalog: &CatalogSnapshot,
+    source_domain: &Domain,
+    resolved: &ResolvedRowRef,
+) -> Result<DomainRowIdentity, LixError> {
+    let (schema_key, file_id) = match resolved.relation.as_str() {
+        "lix_file" => {
+            if resolved.file_id.is_some() {
+                return Err(invalid(
+                    "lix_file row references must use a null file scope",
+                ));
+            }
+            let [RowPkComponent::Uuid(bytes)] = resolved.row_pk.components.as_slice() else {
+                return Err(invalid(
+                    "lix_file row references require one UUID primary-key component",
+                ));
+            };
+            (
+                "lix_file_descriptor",
+                Some(crate::storage_codec::id_string::uuid_string_from_bytes(
+                    *bytes,
+                )),
+            )
+        }
+        "lix_directory" => {
+            if resolved.file_id.is_some() {
+                return Err(invalid(
+                    "lix_directory row references must use a null file scope",
+                ));
+            }
+            if !matches!(
+                resolved.row_pk.components.as_slice(),
+                [RowPkComponent::Uuid(_)]
+            ) {
+                return Err(invalid(
+                    "lix_directory row references require one UUID primary-key component",
+                ));
+            }
+            ("lix_directory_descriptor", None)
+        }
+        relation => {
+            if relation == "lix_commit_edge"
+                || !crate::sql2::schema_exposed_as_schema_surface(relation)
+            {
+                return Err(invalid(format!(
+                    "lix_row_ref relation '{relation}' is not a public schema relation"
+                )));
+            }
+            (relation, resolved.file_id.clone())
+        }
+    };
+
+    let (_, plan) = catalog.plan_for_key(schema_key).ok_or_else(|| {
+        invalid(format!(
+            "lix_row_ref relation '{}' does not exist in the schema catalog",
+            resolved.relation
+        ))
+    })?;
+    let expected = plan
+        .primary_key_component_types
+        .as_deref()
+        .ok_or_else(|| invalid(format!("relation '{schema_key}' has no primary key")))?;
+    if resolved.row_pk.components.len() != expected.len()
+        || !resolved
+            .row_pk
+            .components
+            .iter()
+            .zip(expected)
+            .all(|(component, expected)| component_matches_type(component, *expected))
+    {
+        return Err(invalid(format!(
+            "lix_row_ref primary key for relation '{}' has the wrong arity or component types",
+            resolved.relation
+        )));
+    }
+
+    Ok(DomainRowIdentity::new(
+        Domain::exact_file(
+            source_domain.branch_id().to_owned(),
+            source_domain.untracked(),
+            file_id,
+        ),
+        schema_key,
+        resolved.row_pk.clone(),
+    ))
+}
+
+fn component_matches_type(component: &RowPkComponent, expected: RowPkComponentType) -> bool {
+    matches!(
+        (component, expected),
+        (RowPkComponent::Uuid(_), RowPkComponentType::Uuid)
+            | (RowPkComponent::Integer(_), RowPkComponentType::Integer)
+            | (RowPkComponent::String(_), RowPkComponentType::String)
+            | (RowPkComponent::Bytes(_), RowPkComponentType::Bytes)
+    )
 }
 
 fn validate_relation(relation: &str) -> Result<(), LixError> {
@@ -408,5 +510,104 @@ mod tests {
                 row_pk,
             }
         );
+    }
+
+    #[test]
+    fn resolves_public_filesystem_aliases_to_exact_physical_scopes() {
+        let source = Domain::exact_file("branch-a", false, Some("source-file".to_owned()));
+        let file_id = RowPk::uuid_from_canonical("01950000-0000-7000-8000-000000000002").unwrap();
+        let file_target = resolve_catalog_target(
+            CatalogSnapshot::builtin(),
+            &source,
+            &ResolvedRowRef {
+                relation: "lix_file".to_owned(),
+                file_id: None,
+                row_pk: file_id.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(file_target.schema_key(), "lix_file_descriptor");
+        assert_eq!(file_target.domain().branch_id(), "branch-a");
+        assert!(!file_target.domain().untracked());
+        assert_eq!(
+            file_target.domain().file_filters(),
+            vec![crate::NullableKeyFilter::Value(
+                "01950000-0000-7000-8000-000000000002".to_owned()
+            )]
+        );
+        assert_eq!(file_target.row_pk(), &file_id);
+
+        let directory_id =
+            RowPk::uuid_from_canonical("01950000-0000-7000-8000-000000000003").unwrap();
+        let directory_target = resolve_catalog_target(
+            CatalogSnapshot::builtin(),
+            &source,
+            &ResolvedRowRef {
+                relation: "lix_directory".to_owned(),
+                file_id: None,
+                row_pk: directory_id.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(directory_target.schema_key(), "lix_directory_descriptor");
+        assert_eq!(
+            directory_target.domain().file_filters(),
+            vec![crate::NullableKeyFilter::Null]
+        );
+        assert_eq!(directory_target.row_pk(), &directory_id);
+    }
+
+    #[test]
+    fn rejects_filesystem_alias_file_scope_and_wrong_primary_key_shape() {
+        let source = Domain::exact_file("branch-a", false, None);
+        let file_id = RowPk::uuid_from_canonical("01950000-0000-7000-8000-000000000004").unwrap();
+        let scoped_file_alias = ResolvedRowRef {
+            relation: "lix_file".to_owned(),
+            file_id: Some("file-a".to_owned()),
+            row_pk: file_id,
+        };
+        assert!(
+            resolve_catalog_target(CatalogSnapshot::builtin(), &source, &scoped_file_alias)
+                .is_err()
+        );
+
+        let catalog = CatalogSnapshot::from_visible_schemas(&[serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "typed_target",
+            "columns": [
+                { "name": "id", "type": "uuid", "nullable": false },
+                { "name": "value", "type": "text", "nullable": true }
+            ],
+            "primary_key": ["id"]
+        })])
+        .unwrap();
+        let wrong_type = ResolvedRowRef {
+            relation: "typed_target".to_owned(),
+            file_id: None,
+            row_pk: RowPk::single("not-a-uuid"),
+        };
+        assert!(resolve_catalog_target(&catalog, &source, &wrong_type).is_err());
+
+        let wrong_arity = ResolvedRowRef {
+            relation: "typed_target".to_owned(),
+            file_id: None,
+            row_pk: RowPk::from_components(smallvec::smallvec![
+                RowPkComponent::Uuid([7; 16]),
+                RowPkComponent::Uuid([8; 16]),
+            ])
+            .unwrap(),
+        };
+        assert!(resolve_catalog_target(&catalog, &source, &wrong_arity).is_err());
+    }
+
+    #[test]
+    fn rejects_hidden_catalog_schema_targets() {
+        let source = Domain::exact_file("branch-a", false, None);
+        let hidden = ResolvedRowRef {
+            relation: "lix_branch_descriptor".to_owned(),
+            file_id: None,
+            row_pk: RowPk::uuid_from_canonical("01950000-0000-7000-8000-000000000005").unwrap(),
+        };
+        assert!(resolve_catalog_target(CatalogSnapshot::builtin(), &source, &hidden).is_err());
     }
 }

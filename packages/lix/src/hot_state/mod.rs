@@ -6,8 +6,8 @@ mod reader;
 #[allow(unused_imports)]
 pub(crate) use read_interests::{
     DiffInterestEndpoint, ExactReadIdentity, FilePathInterest, FilePathInterestComparison,
-    InterestDomain, LogicalReadInterest, MovingReadInterestSnapshot, ReadInterestOperation, ReadInterestPublication,
-    ReadInterestRegistry, ReadInterestSnapshot,
+    InterestDomain, LogicalReadInterest, MovingReadInterestSnapshot, ReadInterestOperation,
+    ReadInterestPublication, ReadInterestRegistry, ReadInterestSnapshot,
 };
 mod row_columnar_cache;
 mod row_decoded_column_cache;
@@ -16,6 +16,8 @@ mod tracked_head;
 pub(crate) use tracked_head::root_exact_profile;
 #[cfg(test)]
 pub(crate) use tracked_head::{head_decode_row_pk_probe, hot_decode_row_pk_probe};
+#[cfg(test)]
+pub(crate) use tracked_head::hot_index_key_is_witness;
 mod types;
 pub(crate) mod visibility;
 
@@ -69,8 +71,8 @@ pub(crate) use tracked_head::{
     COLLECTION_CONTROL_SPACE, CertifiedCurrentStatePredecessor,
     CertifiedCurrentStatePredecessorRef, CertifiedRowBatchFileRef, ColumnarBaseCoordinate,
     CompleteWorkingDiffMode, CurrentStateDeltaRef, DETERMINISTIC_IDENTITY_WITNESS_SPACE,
-    DIFF_SPACE, FILE_SPACE, HotIndexEntry, HotIndexValue, HotTrackedSnapshot, INDEX_SPACE,
-    PACKED_CURRENT_BASE_CONTROL_SPACE, PACKED_CURRENT_BASE_SPACE,
+    DIFF_SPACE, FILE_SPACE, HOT_INDEX_PROBE_VALUE_LIMIT, HotIndexEntry, HotIndexValue,
+    HotTrackedSnapshot, INDEX_SPACE, PACKED_CURRENT_BASE_CONTROL_SPACE, PACKED_CURRENT_BASE_SPACE,
     PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE,
     ROW_SPACE, RowColumnarOverlayRow, TRACKED_WORKING_DIFF_MARKER_SPACE, TrackedHeadContext,
     TrackedWorkingDiff, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
@@ -88,8 +90,8 @@ pub(crate) use types::{
 #[allow(unused_imports)]
 pub(crate) use visibility::{
     StagedHotStateRows, VisibilityBranchScope, VisibilityRequest, expanded_branch_ids,
-    overlay_load_exact_batch, overlay_scan_batch, overlay_scan_tracked_batch,
-    resolve_visible_batch,
+    overlay_load_exact_batch, overlay_scan_batch, overlay_scan_indexed_declared_column_batch,
+    overlay_scan_tracked_batch, resolve_visible_batch,
 };
 #[cfg(test)]
 pub(crate) use visibility::{blob_ref_probe_stats, reset_blob_ref_probe_stats};

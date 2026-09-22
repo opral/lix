@@ -27,6 +27,7 @@ use datafusion::logical_expr::ScalarUDF;
 use crate::functions::FunctionProviderHandle;
 
 pub(crate) use execution_slots::{ExecutionSlots, execution_slots};
+pub(crate) use lix_row_ref::construct_row_ref;
 
 pub(crate) fn register_row_ref_function(
     ctx: &SessionContext,

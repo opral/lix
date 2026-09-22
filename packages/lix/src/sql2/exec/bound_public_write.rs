@@ -2033,6 +2033,7 @@ async fn row_delete_collection(
     if catalog
         .delete_plan_for_key(&spec.schema_key)
         .has_committed_checks()
+        || !catalog.row_ref_references().is_empty()
     {
         return Ok(None);
     }
@@ -3384,6 +3385,10 @@ fn assigned_columns_preserve_constraints(
             .iter()
             .flat_map(|foreign_key| &foreign_key.local_properties)
             .any(|path| touches(path))
+        && !schema_plan
+            .row_refs
+            .iter()
+            .any(|row_ref| assigned.contains(row_ref.column.as_str()))
 }
 
 fn append_row_update_row<'a>(
@@ -3627,6 +3632,9 @@ fn returning_expr_column_type(
         BoundExpr::Function { name, .. } if name == "__lix_timestamptz_cast" => {
             Some(crate::ResultColumnType::Timestamptz)
         }
+        BoundExpr::Function { name, .. } if name == "lix_row_ref" => {
+            Some(crate::ResultColumnType::RowRef)
+        }
         BoundExpr::Function { name, .. } if name == "__lix_current_timestamp" => {
             Some(crate::ResultColumnType::Timestamptz)
         }
@@ -3857,6 +3865,7 @@ fn certify_fileless_typed_sql_rows(
         delete_catalog
             .delete_plan_for_key(&spec.schema_key)
             .has_committed_checks()
+            || !delete_catalog.row_ref_references().is_empty()
     } else {
         false
     };
@@ -6020,6 +6029,25 @@ fn eval_expr_value(
         BoundExpr::Function { name, args } if name == "uuidv7" && args.is_empty() => {
             Ok(RowEvalValue::Uuid(ctx.functions().call_uuid_v7()))
         }
+        BoundExpr::Function { name, args } if name == "lix_row_ref" && args.len() >= 3 => {
+            let catalog = ctx.public_catalog()?;
+            let relation =
+                eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?.scalar();
+            let file_id =
+                eval_expr_value(&args[1], context, ctx, params, active_branch_commit_id)?.scalar();
+            crate::sql2::udfs::construct_row_ref(
+                &catalog,
+                &relation,
+                &file_id,
+                args[2..].iter().map(|arg| {
+                    eval_expr_value(arg, context, ctx, params, active_branch_commit_id)
+                        .map(RowEvalValue::scalar)
+                        .map_err(crate::sql2::error::lix_error_to_datafusion_error)
+                }),
+            )
+            .map(RowEvalValue::RowRef)
+            .map_err(crate::sql2::error::datafusion_error_to_lix_error)
+        }
         BoundExpr::Function { name, args } if name == "lix_order_between" && args.len() == 2 => {
             let mut bounds = Vec::with_capacity(2);
             for arg in args {
@@ -6708,6 +6736,7 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
                 | "__lix_json_exists"
                 | "lix_order_between"
                     if args.len() == 2 => {}
+                "lix_row_ref" if args.len() >= 3 => {}
                 "__lix_jsonb"
                 | "__lix_uuid_cast"
                 | "__lix_text_cast"
@@ -7909,6 +7938,7 @@ mod constraints_unchanged_tests {
                 { "name": "id", "type": "text", "nullable": false },
                 { "name": "slug", "type": "text", "nullable": false },
                 { "name": "parent_id", "type": "text", "nullable": false },
+                { "name": "target_ref", "type": "text", "nullable": true },
                 { "name": "payload", "type": "text", "nullable": false },
             ],
             "primary_key": ["id"],
@@ -7917,6 +7947,7 @@ mod constraints_unchanged_tests {
                 "columns": ["parent_id"],
                 "references": { "schema_key": "constraint_probe_parent", "columns": ["id"] }
             }],
+            "row_refs": [{"column": "target_ref"}],
         })
     }
 
@@ -7939,7 +7970,7 @@ mod constraints_unchanged_tests {
                 .iter()
                 .map(|column| column.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["parent_id", "slug"],
+            vec!["parent_id", "slug", "target_ref"],
             "the probe schema must actually declare indexed columns"
         );
         let parent = json!({

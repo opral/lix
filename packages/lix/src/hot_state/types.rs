@@ -1533,9 +1533,9 @@ pub(crate) struct HotStateFilter {
     pub(crate) constraints: Vec<ScanConstraint>,
     /// Equality on a declared column, to be served by the hot index plane.
     ///
-    /// Resolved into [`Self::row_pks`] before any scan route is chosen, so
-    /// no route below this ever sees it. The predicate is *not* removed from
-    /// the caller's own filtering when this is set: index entries are
+    /// Resolved into correlated exact identities, or into [`Self::row_pks`]
+    /// for readers that only expose the legacy scan route. The predicate is
+    /// *not* removed from the caller's own filtering: index entries are
     /// candidates, so the caller's predicate is what rejects stale ones.
     #[serde(default)]
     pub(crate) declared_column_eq: Option<DeclaredColumnEq>,

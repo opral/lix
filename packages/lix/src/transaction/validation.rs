@@ -24,7 +24,6 @@ use crate::common::format_json_pointer;
 #[cfg(test)]
 use crate::common::parse_json_pointer;
 use crate::common::{json_pointer_get, validate_row_metadata};
-#[cfg(test)]
 use crate::domain::DomainFileScope;
 use crate::domain::{Domain, DomainRowIdentity, committed_row_ref_is_exact_branch_scoped};
 use crate::hot_state::{
@@ -35,6 +34,7 @@ use crate::hot_state::{
 use crate::plugin::runtime::PLUGIN_OWNER_KEY;
 use crate::row_payload::TypedRow as WasmTypedRow;
 use crate::row_pk::{RowPk, RowPkError, canonical_json_text};
+use crate::row_ref;
 #[cfg(test)]
 use crate::schema::{SchemaKey, validate_lix_schema, validate_lix_schema_definition};
 use crate::schema::{schema_from_registered_snapshot, validate_schema_amendment};
@@ -297,16 +297,21 @@ async fn scan_committed_constraint_rows_by_declared_column(
         },
         ..Default::default()
     };
-    let batch = hot_state
-        .scan_domain_batch(
-            &request,
-            if domain.untracked() {
-                HotStateReadDomain::Untracked
-            } else {
-                HotStateReadDomain::Tracked
-            },
-        )
-        .await?;
+    let read_domain = if domain.untracked() {
+        HotStateReadDomain::Untracked
+    } else {
+        HotStateReadDomain::Tracked
+    };
+    let batch = match hot_state
+        .scan_indexed_declared_column_batch(&request, read_domain)
+        .await?
+    {
+        Some(batch) => batch,
+        // The indexed reader already batches wide predicates. If it declines
+        // an unwitnessed or overly broad probe, scan once: splitting this
+        // fallback would repeatedly scan the same collection.
+        None => hot_state.scan_domain_batch(&request, read_domain).await?,
+    };
     CommittedHotStateRows::select(batch, |row| {
         domain.contains_ref(row) && row.schema_key() == schema_key
     })
@@ -317,6 +322,39 @@ async fn scan_committed_canonical_rows(
     domain: &Domain,
     schema_key: &str,
     row_pks: Vec<RowPk>,
+) -> Result<CommittedHotStateRows, LixError> {
+    scan_committed_canonical_rows_with_lane(hot_state, domain, schema_key, row_pks, None).await
+}
+
+/// Resolves canonical identities in one requested durability lane.
+///
+/// Most canonical identity validation is intentionally retention-agnostic:
+/// callers use the combined serving plane and then apply their own identity
+/// semantics. Row-reference targets are different because the target domain
+/// itself includes the tracked/untracked lane, so those callers pass the lane
+/// explicitly to avoid an untracked overlay hiding a tracked target.
+async fn scan_committed_canonical_rows_in_domain(
+    hot_state: &dyn HotStateReader,
+    domain: &Domain,
+    schema_key: &str,
+    row_pks: Vec<RowPk>,
+) -> Result<CommittedHotStateRows, LixError> {
+    scan_committed_canonical_rows_with_lane(
+        hot_state,
+        domain,
+        schema_key,
+        row_pks,
+        Some(domain.untracked()),
+    )
+    .await
+}
+
+async fn scan_committed_canonical_rows_with_lane(
+    hot_state: &dyn HotStateReader,
+    domain: &Domain,
+    schema_key: &str,
+    row_pks: Vec<RowPk>,
+    untracked: Option<bool>,
 ) -> Result<CommittedHotStateRows, LixError> {
     let file_id = match domain.file_filters().as_slice() {
         [] => None,
@@ -329,7 +367,7 @@ async fn scan_committed_canonical_rows(
             ));
         }
     };
-    let requested_row_pks = row_pks.clone();
+    let requested_row_pks = row_pks.iter().cloned().collect::<HashSet<_>>();
     let rows = row_pks
         .into_iter()
         .map(|row_pk| HotStateExactRowRequest {
@@ -348,15 +386,16 @@ async fn scan_committed_canonical_rows(
             "untracked".to_string(),
         ],
     };
-    // One plane means one row per identity, so a single retention-agnostic
-    // probe already returns whichever member owns the identity. The request is
-    // exactly K identities and therefore remains bounded by the directory
-    // point-read path; no schema or `All` expansion is permitted here.
+    // The ordinary wrapper leaves retention unspecified so canonical identity
+    // callers retain the combined serving-plane semantics. Row-reference
+    // validation supplies a lane through the domain-specific wrapper above.
+    // Either way, the request is exactly K identities and remains bounded by
+    // the directory point-read path; no schema or `All` expansion is allowed.
     let batch = hot_state
         .load_exact_batch(&HotStateExactBatchRequest {
             rows,
             projection,
-            untracked: None,
+            untracked,
             include_tombstones: false,
         })
         .await?
@@ -423,9 +462,10 @@ pub(crate) async fn validate_prepared_writes(
         // Extraction is skipped here, and that is sound rather than lucky.
         // Every row on this path carries `!requires_transaction_validation`,
         // which `normalization.rs` grants only when the schema declares no
-        // uniques and no foreign keys — precisely the schemas whose
-        // `indexed_columns` is empty — or when `constraints_unchanged` proves
-        // an UPDATE assigned none of the primary key, uniques, or foreign-key
+        // uniques, foreign keys, or row-reference sources — precisely the
+        // schemas whose `indexed_columns` is empty — or when
+        // `constraints_unchanged` proves an UPDATE assigned none of the
+        // primary key, uniques, foreign-key, or row-reference source columns
         // local properties, a strict superset of the indexed columns. See
         // `declared_column_rows_never_bypass_extraction`.
         return Ok(StagedIndexValues::default());
@@ -480,6 +520,12 @@ pub(crate) async fn validate_prepared_writes(
                     schema_plan,
                     ValidatedRowPayload::Json(snapshot),
                 )?;
+                pending_constraints.remember_row_ref_references(
+                    input.schema_catalog,
+                    row,
+                    schema_plan,
+                    ValidatedRowPayload::Json(snapshot),
+                )?;
                 // The hot index plane's values are lifted out here, where the
                 // snapshot is already a parsed `JsonValue` that validation owns.
                 // Commit therefore receives them pre-extracted and never decodes a
@@ -507,6 +553,12 @@ pub(crate) async fn validate_prepared_writes(
                     schema_plan,
                     ValidatedRowPayload::Typed(typed.clone()),
                 )?;
+                pending_constraints.remember_row_ref_references(
+                    input.schema_catalog,
+                    row,
+                    schema_plan,
+                    ValidatedRowPayload::Typed(typed.clone()),
+                )?;
                 index_extractor.observe_typed(row, &typed.row);
                 staged_constraint_rows.push((row, schema_plan, ValidatedRowPayload::Typed(typed)));
             }
@@ -514,6 +566,8 @@ pub(crate) async fn validate_prepared_writes(
     }
     let unresolved_foreign_keys =
         validate_pending_foreign_keys(&input, &pending_constraints, &staged_constraint_rows)?;
+    let unresolved_row_refs =
+        validate_pending_row_refs(&pending_constraints, &staged_constraint_rows)?;
     validate_pending_delete_restrictions(input.schema_catalog, &pending_constraints)?;
     let unresolved_foreign_keys =
         validate_committed_foreign_keys(&input, &pending_constraints, &unresolved_foreign_keys)
@@ -523,6 +577,14 @@ pub(crate) async fn validate_prepared_writes(
             ))
             .await?;
     reject_unresolved_foreign_keys(&unresolved_foreign_keys)?;
+    let unresolved_row_refs =
+        validate_committed_row_refs(&input, &pending_constraints, &unresolved_row_refs)
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.validation.committed_row_refs"
+            ))
+            .await?;
+    reject_unresolved_row_refs(&unresolved_row_refs)?;
     validate_committed_delete_restrictions(&input, input.schema_catalog, &pending_constraints)
         .instrument(tracing::debug_span!(
             target: "lix_perf",
@@ -622,6 +684,7 @@ impl<'a> StagedIndexExtractor<'a> {
         self.values.rows.push(StagedIndexRow {
             branch_id: state_row.branch_id.clone(),
             schema_key: state_row.schema_key.clone(),
+            file_id: state_row.file_id.cloned(),
             row_pk: state_row.row_pk.clone(),
             columns: spec
                 .indexed_columns
@@ -670,6 +733,7 @@ impl<'a> StagedIndexExtractor<'a> {
         self.values.rows.push(StagedIndexRow {
             branch_id: state_row.branch_id.clone(),
             schema_key: state_row.schema_key.clone(),
+            file_id: state_row.file_id.cloned(),
             row_pk: state_row.row_pk.clone(),
             columns: spec
                 .indexed_columns
@@ -958,6 +1022,12 @@ fn certify_complete_native_file_constraints(
             return false;
         };
         if plan_id != row.schema_plan_id {
+            return false;
+        }
+        // Dynamic targets can be outside this file or batch. The generic
+        // validator resolves their complete addresses against pending/stored
+        // state; this native-file certificate proves only declared FKs.
+        if !plan.row_refs.is_empty() {
             return false;
         }
         let Some(typed) = row.materialize_decoded_snapshot().ok().flatten() else {
@@ -2610,6 +2680,8 @@ struct PendingConstraintIndexes {
     identity_targets: HashSet<DomainRowIdentity>,
     fk_targets: BTreeMap<PendingForeignKeyTargetKey, Vec<PendingForeignKeyTarget>>,
     fk_references: BTreeMap<PendingForeignKeyReferenceTarget, Vec<PendingForeignKeyReference>>,
+    row_ref_references: BTreeMap<DomainRowIdentity, Vec<PendingRowRefReference>>,
+    row_ref_targets: BTreeMap<DomainRowIdentity, Vec<PendingRowRefTarget>>,
     tombstones: Vec<PendingTombstone>,
     tombstone_identities: HashSet<DomainRowIdentity>,
 }
@@ -2743,6 +2815,46 @@ impl PendingConstraintIndexes {
         Ok(())
     }
 
+    fn remember_row_ref_references<'a>(
+        &mut self,
+        catalog: &CatalogSnapshot,
+        row: PreparedValidationRow<'_>,
+        schema_plan: &SchemaPlan,
+        payload: impl Into<ValidatedRowPayload<'a>>,
+    ) -> Result<(), LixError> {
+        let payload = payload.into();
+        for row_ref in &schema_plan.row_refs {
+            let Some(encoded) =
+                row_ref_text_from_payload(payload.clone(), &row_ref.column, row.schema_key())?
+            else {
+                continue;
+            };
+            let target = resolve_row_ref_target(
+                catalog,
+                &row.domain(),
+                &encoded,
+                row.schema_key(),
+                &row_ref.column,
+            )?;
+            self.row_ref_references
+                .entry(target.clone())
+                .or_default()
+                .push(PendingRowRefReference {
+                    identity: row.domain_row_identity(),
+                    column: row_ref.column.clone(),
+                });
+            self.row_ref_targets
+                .entry(row.domain_row_identity())
+                .or_default()
+                .push(PendingRowRefTarget {
+                    column: row_ref.column.clone(),
+                    encoded_target: encoded,
+                    target: target.clone(),
+                });
+        }
+        Ok(())
+    }
+
     fn tombstones_identity(&self, row: MaterializedHotStateRowRef<'_>) -> bool {
         !self.tombstone_identities.is_empty()
             && committed_row_ref_is_exact_branch_scoped(row, row.branch_id())
@@ -2810,6 +2922,44 @@ impl PendingConstraintIndexes {
         references
     }
 
+    fn has_reachable_row_ref_target(&self, target: &DomainRowIdentity) -> bool {
+        target
+            .domain()
+            .fk_target_domains()
+            .into_iter()
+            .any(|domain| {
+                let identity = DomainRowIdentity::new(
+                    domain,
+                    target.schema_key_owned(),
+                    target.row_pk_owned(),
+                );
+                self.identity_targets.contains(&identity)
+                    && !self.tombstone_identities.contains(&identity)
+            })
+    }
+
+    fn active_row_ref_references_to(
+        &self,
+        deleted: &DomainRowIdentity,
+    ) -> Vec<&PendingRowRefReference> {
+        deleted
+            .domain()
+            .fk_source_domains_for_target()
+            .into_iter()
+            .flat_map(|domain| {
+                self.row_ref_references
+                    .get(&DomainRowIdentity::new(
+                        domain,
+                        deleted.schema_key_owned(),
+                        deleted.row_pk_owned(),
+                    ))
+                    .into_iter()
+                    .flat_map(|references| references.iter())
+            })
+            .filter(|reference| !self.tombstones_target_identity(&reference.identity))
+            .collect()
+    }
+
     #[cfg(test)]
     fn has_fk_reference_to_key(
         &self,
@@ -2870,6 +3020,19 @@ struct PendingForeignKeyReference {
     identity: DomainRowIdentity,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingRowRefReference {
+    identity: DomainRowIdentity,
+    column: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingRowRefTarget {
+    column: String,
+    encoded_target: String,
+    target: DomainRowIdentity,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PendingUniqueKey {
     schema_key: String,
@@ -2912,7 +3075,9 @@ fn validate_pending_delete_restrictions(
     schema_catalog: &CatalogSnapshot,
     pending_constraints: &PendingConstraintIndexes,
 ) -> Result<(), LixError> {
-    if pending_constraints.fk_references.is_empty() {
+    if pending_constraints.fk_references.is_empty()
+        && pending_constraints.row_ref_references.is_empty()
+    {
         return Ok(());
     }
 
@@ -2941,6 +3106,21 @@ fn validate_pending_delete_restrictions(
                 &targets,
                 pending_constraints.active_references_to_any(&targets),
             )?;
+        }
+        let row_ref_references =
+            pending_constraints.active_row_ref_references_to(&tombstone.identity);
+        if let Some(reference) = row_ref_references.first() {
+            return Err(LixError::new(
+                LixError::CODE_FOREIGN_KEY,
+                format!(
+                    "cannot delete '{}' row '{}' in branch '{}' because pending row '{}' references it through row-reference column '{}'",
+                    tombstone.identity.schema_key(),
+                    tombstone.identity.row_pk().as_json_array_text()?,
+                    tombstone.identity.domain().branch_id(),
+                    reference.identity.row_pk().as_json_array_text()?,
+                    reference.column,
+                ),
+            ));
         }
     }
     Ok(())
@@ -3014,6 +3194,8 @@ pub(super) async fn plan_delete_actions(
         levels += 1;
         let mut batches =
             BTreeMap::<NormalDeleteRestrictionBatchKey, BTreeSet<UniqueConstraintValue>>::new();
+        let mut row_ref_batches =
+            BTreeMap::<RowRefDeleteActionBatchKey, BTreeSet<UniqueConstraintValue>>::new();
         for parent in std::mem::take(&mut frontier) {
             let identity = DomainRowIdentity::new(
                 Domain::exact_file(
@@ -3061,6 +3243,27 @@ pub(super) async fn plan_delete_actions(
                         })
                         .or_default()
                         .insert(value.clone());
+                }
+            }
+            if let Ok(target) = row_ref::encode_schema_identity(
+                &parent.schema_key,
+                parent.file_id.as_deref(),
+                &parent.row_pk,
+            ) {
+                let target = UniqueConstraintValue::from_row_ref(target.as_str());
+                for reference in catalog.row_ref_references().iter().filter(|reference| {
+                    reference.row_ref.on_delete == lix_schema::DeleteAction::Cascade
+                }) {
+                    for domain in row_ref_source_domains(&identity) {
+                        row_ref_batches
+                            .entry(RowRefDeleteActionBatchKey {
+                                source_key: reference.source_key.clone(),
+                                source_domain: domain,
+                                column: reference.row_ref.column.clone(),
+                            })
+                            .or_default()
+                            .insert(target.clone());
+                    }
                 }
             }
         }
@@ -3121,13 +3324,88 @@ pub(super) async fn plan_delete_actions(
                     row.untracked(),
                     row.branch_id().into(),
                 );
-                if catalog
-                    .delete_plan_for_key(row.schema_key())
-                    .foreign_key_references
-                    .iter()
-                    .any(|reference| {
-                        reference.foreign_key.on_delete == lix_schema::DeleteAction::Cascade
-                    })
+                if catalog.has_row_ref_cascades()
+                    || catalog
+                        .delete_plan_for_key(row.schema_key())
+                        .foreign_key_references
+                        .iter()
+                        .any(|reference| {
+                            reference.foreign_key.on_delete == lix_schema::DeleteAction::Cascade
+                        })
+                {
+                    frontier.push(delete_action_seed(row)?);
+                }
+            }
+        }
+        for (batch, values) in row_ref_batches {
+            let normal_batch = NormalDeleteRestrictionBatchKey {
+                source_key: batch.source_key.clone(),
+                source_domain: batch.source_domain.clone(),
+                local_properties: vec![vec![batch.column.clone()]],
+            };
+            let probe = delete_action_probe(catalog, &normal_batch, &values);
+            let rows = match probe {
+                Some(probe) => {
+                    indexed_probes += 1;
+                    scan_committed_constraint_rows_by_declared_column(
+                        candidate,
+                        &batch.source_domain,
+                        &batch.source_key.schema_key,
+                        probe,
+                    )
+                    .await?
+                }
+                None => {
+                    scan_probes += 1;
+                    scan_committed_constraint_rows(
+                        candidate,
+                        &batch.source_domain,
+                        vec![batch.source_key.schema_key.clone()],
+                        Vec::new(),
+                        false,
+                    )
+                    .await?
+                }
+            };
+            candidates += rows.len();
+            for row in rows.iter() {
+                let identity = DomainRowIdentity::new(
+                    Domain::for_live_row_ref(row),
+                    row.schema_key(),
+                    row.row_pk().clone(),
+                );
+                if visited.contains(&identity)
+                    || !committed_constraint_value(row, &[vec![batch.column.clone()]], true)?
+                        .is_some_and(|value| values.contains(&value))
+                {
+                    continue;
+                }
+                if !enqueued.insert(identity) {
+                    continue;
+                }
+                output.push_parts(
+                    Some(row.row_pk().clone()),
+                    row.schema_key().into(),
+                    row.file_id().map(Into::into),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    row.global(),
+                    None,
+                    None,
+                    row.untracked(),
+                    row.branch_id().into(),
+                );
+                if catalog.has_row_ref_cascades()
+                    || catalog
+                        .delete_plan_for_key(row.schema_key())
+                        .foreign_key_references
+                        .iter()
+                        .any(|reference| {
+                            reference.foreign_key.on_delete == lix_schema::DeleteAction::Cascade
+                        })
                 {
                     frontier.push(delete_action_seed(row)?);
                 }
@@ -3181,7 +3459,9 @@ async fn validate_committed_delete_restrictions(
     for tombstone in &pending_constraints.tombstones {
         let delete_plan =
             delete_schema_catalog.delete_plan_for_key(tombstone.identity.schema_key());
-        if !delete_plan.has_committed_checks() {
+        if !delete_plan.has_committed_checks()
+            && delete_schema_catalog.row_ref_references().is_empty()
+        {
             continue;
         }
         for reference in delete_plan.foreign_key_references {
@@ -3208,6 +3488,33 @@ async fn validate_committed_delete_restrictions(
                     .entry(deleted_value.clone())
                     .or_default()
                     .push(tombstone.identity.clone());
+            }
+        }
+        let DomainFileScope::Exact(file_id) = tombstone.identity.domain().file_scope() else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "row deletion requires an exact file scope",
+            ));
+        };
+        if let Ok(encoded) = row_ref::encode_schema_identity(
+            tombstone.identity.schema_key(),
+            file_id.as_deref(),
+            tombstone.identity.row_pk(),
+        ) {
+            let value = UniqueConstraintValue::from_row_ref(encoded.as_str());
+            for reference in delete_schema_catalog.row_ref_references() {
+                for source_domain in row_ref_source_domains(&tombstone.identity) {
+                    normal_batches
+                        .entry(NormalDeleteRestrictionBatchKey {
+                            source_key: reference.source_key.clone(),
+                            source_domain,
+                            local_properties: vec![vec![reference.row_ref.column.clone()]],
+                        })
+                        .or_default()
+                        .entry(value.clone())
+                        .or_default()
+                        .push(tombstone.identity.clone());
+                }
             }
         }
     }
@@ -3263,6 +3570,21 @@ struct NormalDeleteRestrictionBatchKey {
     source_key: SchemaCatalogKey,
     source_domain: Domain,
     local_properties: Vec<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RowRefDeleteActionBatchKey {
+    source_key: SchemaCatalogKey,
+    source_domain: Domain,
+    column: String,
+}
+
+fn row_ref_source_domains(identity: &DomainRowIdentity) -> Vec<Domain> {
+    Domain::any_file(
+        identity.domain().branch_id().to_owned(),
+        identity.domain().untracked(),
+    )
+    .fk_source_domains_for_target()
 }
 
 async fn validate_committed_normal_delete_restriction_batches(
@@ -3395,9 +3717,17 @@ fn committed_constraint_value(
                     LixError::CODE_SCHEMA_VALIDATION,
                     format!("committed snapshot_content for schema '{}' is invalid JSON: {error}", row.schema_key()),
                 ))?)
-            } else { row.snapshot_json_value()? };
-            let Some(snapshot) = snapshot else { return Ok(None); };
-            Ok(UniqueConstraintValue::from_payload(ValidatedRowPayload::Json(&snapshot), paths, reject_null))
+            } else {
+                row.snapshot_json_value()?
+            };
+            let Some(snapshot) = snapshot else {
+                return Ok(None);
+            };
+            Ok(UniqueConstraintValue::from_payload(
+                ValidatedRowPayload::Json(&snapshot),
+                paths,
+                reject_null,
+            ))
         }
     }
 }
@@ -3408,6 +3738,183 @@ struct UnresolvedForeignKeyCheck {
     source_schema_key: String,
     source_pointer_group: Vec<Vec<String>>,
     target: PendingForeignKeyTargetKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UnresolvedRowRefCheck {
+    source_identity: DomainRowIdentity,
+    source_schema_key: String,
+    source_column: String,
+    encoded_target: String,
+    target: DomainRowIdentity,
+}
+
+fn row_ref_text_from_payload(
+    payload: ValidatedRowPayload<'_>,
+    column: &str,
+    source_schema_key: &str,
+) -> Result<Option<String>, LixError> {
+    let path = vec![vec![column.to_owned()]];
+    let Some(value) = UniqueConstraintValue::from_payload(payload, &path, true) else {
+        return Ok(None);
+    };
+    let [encoded] = value.0.as_slice() else {
+        return Err(row_ref_constraint_error(
+            source_schema_key,
+            column,
+            "row-reference columns must contain one text value",
+        ));
+    };
+    serde_json::from_str::<String>(encoded)
+        .map(Some)
+        .map_err(|_| {
+            row_ref_constraint_error(
+                source_schema_key,
+                column,
+                "row-reference value is not valid text",
+            )
+        })
+}
+
+fn row_ref_constraint_error(
+    source_schema_key: &str,
+    column: &str,
+    detail: impl std::fmt::Display,
+) -> LixError {
+    LixError::new(
+        LixError::CODE_FOREIGN_KEY,
+        format!(
+            "row-reference constraint on schema '{source_schema_key}' column '{column}' is invalid: {detail}"
+        ),
+    )
+}
+
+fn resolve_row_ref_target(
+    catalog: &CatalogSnapshot,
+    source_domain: &Domain,
+    encoded: &str,
+    source_schema_key: &str,
+    source_column: &str,
+) -> Result<DomainRowIdentity, LixError> {
+    let decoded = row_ref::decode_str(encoded)
+        .map_err(|error| row_ref_constraint_error(source_schema_key, source_column, error))?;
+    row_ref::resolve_catalog_target(catalog, source_domain, &decoded)
+        .map_err(|error| row_ref_constraint_error(source_schema_key, source_column, error))
+}
+
+fn validate_pending_row_refs(
+    pending_constraints: &PendingConstraintIndexes,
+    staged_rows: &[(
+        PreparedValidationRow<'_>,
+        &SchemaPlan,
+        ValidatedRowPayload<'_>,
+    )],
+) -> Result<Vec<UnresolvedRowRefCheck>, LixError> {
+    let mut unresolved = Vec::new();
+    for (row, _, _) in staged_rows {
+        let Some(targets) = pending_constraints
+            .row_ref_targets
+            .get(&row.domain_row_identity())
+        else {
+            continue;
+        };
+        for target in targets {
+            if pending_constraints.has_reachable_row_ref_target(&target.target) {
+                continue;
+            }
+            unresolved.push(UnresolvedRowRefCheck {
+                source_identity: row.domain_row_identity(),
+                source_schema_key: row.schema_key().to_owned(),
+                source_column: target.column.clone(),
+                encoded_target: target.encoded_target.clone(),
+                target: target.target.clone(),
+            });
+        }
+    }
+    Ok(unresolved)
+}
+
+async fn validate_committed_row_refs(
+    input: &TransactionValidationInput<'_>,
+    pending_constraints: &PendingConstraintIndexes,
+    unresolved_checks: &[UnresolvedRowRefCheck],
+) -> Result<Vec<UnresolvedRowRefCheck>, LixError> {
+    let mut batches = BTreeMap::<(Domain, String), BTreeSet<RowPk>>::new();
+    let mut unresolved = Vec::new();
+    for check in unresolved_checks {
+        if pending_constraints.has_reachable_row_ref_target(&check.target) {
+            continue;
+        }
+        for domain in check.target.domain().fk_target_domains() {
+            batches
+                .entry((domain, check.target.schema_key_owned()))
+                .or_default()
+                .insert(check.target.row_pk_owned());
+        }
+    }
+
+    let mut present = HashSet::<DomainRowIdentity>::new();
+    for ((domain, schema_key), row_pks) in batches {
+        let rows = scan_committed_canonical_rows_in_domain(
+            input.hot_state,
+            &domain,
+            &schema_key,
+            row_pks.into_iter().collect(),
+        )
+        .await?;
+        for row in rows.iter() {
+            // Row-ref target reachability is lane-sensitive: a tracked source
+            // may resolve only a tracked target, while an untracked source
+            // may fall back to tracked state. Keep this domain check even
+            // though the exact read is lane-qualified, since the reader may
+            // retain stale or over-inclusive index candidates.
+            if pending_constraints.tombstones_identity(row) || !domain.contains_ref(row) {
+                continue;
+            }
+            present.insert(DomainRowIdentity::new(
+                domain.clone(),
+                row.schema_key(),
+                row.row_pk().clone(),
+            ));
+        }
+    }
+    for check in unresolved_checks {
+        if pending_constraints.has_reachable_row_ref_target(&check.target)
+            || check
+                .target
+                .domain()
+                .fk_target_domains()
+                .into_iter()
+                .any(|domain| {
+                    present.contains(&DomainRowIdentity::new(
+                        domain,
+                        check.target.schema_key_owned(),
+                        check.target.row_pk_owned(),
+                    ))
+                })
+        {
+            continue;
+        }
+        unresolved.push(check.clone());
+    }
+    Ok(unresolved)
+}
+
+fn reject_unresolved_row_refs(unresolved_checks: &[UnresolvedRowRefCheck]) -> Result<(), LixError> {
+    let Some(check) = unresolved_checks.first() else {
+        return Ok(());
+    };
+    Err(LixError::new(
+        LixError::CODE_FOREIGN_KEY,
+        format!(
+            "row-reference constraint on schema '{}' row '{}' column '{}' has no matching target '{}' in branch '{}'",
+            check.source_schema_key,
+            check.source_identity.row_pk().as_json_array_text()?,
+            check.source_column,
+            check.encoded_target,
+            check.source_identity.domain().branch_id(),
+        ),
+    ))
 }
 
 fn validate_pending_foreign_keys(
@@ -3866,6 +4373,12 @@ impl UniqueConstraintValue {
                 .map(|component| format!("{:?}", component.external_json()))
                 .collect(),
         )
+    }
+
+    fn from_row_ref(encoded: &str) -> Self {
+        Self(vec![stable_unique_value(&JsonValue::String(
+            encoded.to_owned(),
+        ))])
     }
 
     fn from_snapshot(snapshot: &JsonValue, pointers: &[Vec<String>]) -> Option<Self> {
@@ -6593,6 +7106,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unwitnessed_wide_declared_column_probe_falls_back_to_one_scan() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let file_id = "01920000-0000-7000-8000-0000000000a2";
+        let mut other_file = unique_row("post-other", "other-slug", "other");
+        other_file.file_id = Some("01920000-0000-7000-8000-0000000000b2".into());
+        let hot_state = CountingStaticHotStateReader {
+            rows: vec![
+                committed_unique_row("post-1", "slug-1", "first"),
+                MaterializedHotStateRow::from(other_file),
+            ],
+            scan_count: AtomicUsize::new(0),
+        };
+        let values = (0..65)
+            .map(|index| crate::hot_state::HotIndexValue::String(format!("slug-{index}")))
+            .collect();
+
+        let rows = scan_committed_constraint_rows_by_declared_column(
+            &hot_state,
+            &Domain::exact_file(branch_id, false, Some(file_id.into())),
+            "unique_schema",
+            crate::hot_state::DeclaredColumnEq {
+                schema_key: "unique_schema".into(),
+                ordinal: 1,
+                values,
+            },
+        )
+        .await
+        .expect("an unwitnessed wide probe should use the ordinary scan");
+
+        assert_eq!(hot_state.scan_count.load(Ordering::Relaxed), 1);
+        assert_eq!(rows.len(), 1, "the exact file scope must survive fallback");
+        assert_eq!(
+            rows.first().map(|row| row
+                .row_pk()
+                .as_single_string_owned()
+                .expect("text primary key")),
+            Some("post-1".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn validation_batches_committed_unique_scans_by_constraint_group() {
         let visible_schemas = vec![unique_schema()];
         let mut staged_one = unique_row("post-3", "new-slug-3", "third");
@@ -6964,6 +7518,60 @@ mod tests {
         .expect(
             "tracked FK should resolve against tracked storage target behind untracked overlay",
         );
+    }
+
+    #[tokio::test]
+    async fn validation_allows_tracked_row_ref_target_committed_behind_untracked_overlay() {
+        let visible_schemas = vec![row_ref_parent_schema(), row_ref_child_schema()];
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
+            state_rows: prepared_rows![row_ref_child_row("child-1", "parent-1", branch_id)],
+            ..empty_staged_write_set()
+        };
+        let tracked_parent =
+            MaterializedHotStateRow::from(row_ref_parent_row("parent-1", branch_id));
+        let mut untracked_overlay = tracked_parent.clone();
+        mark_live_row_untracked(&mut untracked_overlay);
+        let hot_state = OverlayingStaticHotStateReader {
+            rows: vec![tracked_parent, untracked_overlay],
+        };
+
+        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+            &staged_writes,
+            &visible_schemas,
+            &hot_state,
+        ))
+        .await
+        .expect("tracked row-ref should resolve behind an untracked overlay");
+    }
+
+    #[tokio::test]
+    async fn validation_allows_tracked_row_ref_target_behind_untracked_tombstone() {
+        let visible_schemas = vec![row_ref_parent_schema(), row_ref_child_schema()];
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
+            state_rows: prepared_rows![row_ref_child_row("child-1", "parent-1", branch_id)],
+            ..empty_staged_write_set()
+        };
+        let tracked_parent =
+            MaterializedHotStateRow::from(row_ref_parent_row("parent-1", branch_id));
+        let mut untracked_tombstone = tracked_parent.clone();
+        untracked_tombstone.snapshot_content = None;
+        untracked_tombstone.deleted = true;
+        mark_live_row_untracked(&mut untracked_tombstone);
+        let hot_state = OverlayingStaticHotStateReader {
+            rows: vec![tracked_parent, untracked_tombstone],
+        };
+
+        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+            &staged_writes,
+            &visible_schemas,
+            &hot_state,
+        ))
+        .await
+        .expect("untracked tombstone must not hide a tracked row-ref target");
     }
 
     #[tokio::test]
@@ -8445,6 +9053,30 @@ mod tests {
         })
     }
 
+    fn row_ref_parent_schema() -> JsonValue {
+        json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "row_ref_parent_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
+        })
+    }
+
+    fn row_ref_child_schema() -> JsonValue {
+        json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "row_ref_child_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "target", "type": "text", "nullable": true },
+            ],
+            "primary_key": ["id"],
+            "row_refs": [{ "column": "target" }],
+        })
+    }
+
     fn unique_row(row_pk: &str, slug: &str, title: &str) -> TestPreparedStateRow {
         let mut row = staged_row(
             "unique_schema",
@@ -8502,6 +9134,30 @@ mod tests {
         );
         retarget_test_row(&mut row, RowPk::single(row_pk));
         row.file_id = Some("01920000-0000-7000-8000-0000000000a2".into());
+        row.branch_id = branch_id.into();
+        row.global = false;
+        row
+    }
+
+    fn row_ref_parent_row(row_pk: &str, branch_id: &str) -> TestPreparedStateRow {
+        let mut row = staged_row(
+            "row_ref_parent_schema",
+            Some(json!({ "id": row_pk }).to_string()),
+        );
+        retarget_test_row(&mut row, RowPk::single(row_pk));
+        row.branch_id = branch_id.into();
+        row.global = false;
+        row
+    }
+
+    fn row_ref_child_row(row_pk: &str, target_pk: &str, branch_id: &str) -> TestPreparedStateRow {
+        let target = row_ref::encode("row_ref_parent_schema", None, &RowPk::single(target_pk))
+            .expect("row-ref test target should encode");
+        let mut row = staged_row(
+            "row_ref_child_schema",
+            Some(json!({ "id": row_pk, "target": target }).to_string()),
+        );
+        retarget_test_row(&mut row, RowPk::single(row_pk));
         row.branch_id = branch_id.into();
         row.global = false;
         row
@@ -9132,6 +9788,59 @@ mod tests {
         );
 
         assert!(!certify_complete_native_file_constraints(&rows, &catalog));
+    }
+
+    #[test]
+    fn complete_native_file_constraints_decline_malformed_or_dangling_row_refs() {
+        let parent = json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "native_row_ref_parent",
+            "columns": [{ "name": "id", "type": "text", "nullable": false }],
+            "primary_key": ["id"]
+        });
+        let child = json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "native_row_ref_child",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "target", "type": "text", "nullable": true }
+            ],
+            "primary_key": ["id"],
+            "row_refs": [{ "column": "target" }]
+        });
+        let catalog = CatalogSnapshot::from_visible_schemas(&[parent, child])
+            .expect("native row-reference catalog should build");
+        let dangling = row_ref::encode(
+            "native_row_ref_parent",
+            None,
+            &RowPk::single("missing-parent"),
+        )
+        .expect("dangling fixture reference should be canonical")
+        .as_str()
+        .to_owned();
+
+        for (id, target) in [
+            ("malformed", "not-a-row-ref"),
+            ("dangling", dangling.as_str()),
+        ] {
+            let rows = native_constraint_batch(
+                &catalog,
+                vec![(
+                    "native_row_ref_child",
+                    lix_schema::Row::from([
+                        ("id".to_owned(), lix_schema::Value::Text(id.to_owned())),
+                        (
+                            "target".to_owned(),
+                            lix_schema::Value::Text(target.to_owned()),
+                        ),
+                    ]),
+                )],
+            );
+            assert!(
+                !certify_complete_native_file_constraints(&rows, &catalog),
+                "native plugin certificate must decline {id} row reference"
+            );
+        }
     }
 
     #[test]

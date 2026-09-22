@@ -12,7 +12,8 @@ Schema v1 uses PostgreSQL 18 semantics for:
 - literal and expression defaults;
 - ordered, composite primary keys;
 - ordered, composite unique constraints; and
-- ordered, composite foreign keys.
+- ordered, composite foreign keys; and
+- Lix logical row-reference constraints.
 
 Omitted foreign-key options mean PostgreSQL's defaults: `MATCH SIMPLE`,
 `ON DELETE NO ACTION`, `ON UPDATE NO ACTION`, and `NOT DEFERRABLE`.
@@ -33,6 +34,7 @@ The restriction avoids PostgreSQL identifier truncation and quoting ambiguity.
 | `primary_key` | ordered `PRIMARY KEY (...)` |
 | `unique[]` | ordered `UNIQUE (...)` |
 | `foreign_keys[]` | `FOREIGN KEY (...) REFERENCES ... (...)` |
+| `row_refs[]` | Lix row-reference constraint (no direct PostgreSQL DDL equivalent) |
 
 `primary_key` is required and must contain at least one column. Primary-key
 columns must be non-null and use `text`, `uuid`, or `int8`, the identity
@@ -74,6 +76,13 @@ currently accepts `uuidv7()` on `uuid` columns and `CURRENT_TIMESTAMP` on
 `timestamptz` columns. This deliberately small
 PostgreSQL expression dialect can be extended in later schema versions.
 
+`row_refs` declares a Lix logical row-reference constraint for each listed
+column. The column must exist and use `text`; its `nullable` setting determines
+whether SQL `NULL` is accepted. The row-reference value carries the target
+relation, optional file scope, and typed primary-key values, so this constraint
+has no direct PostgreSQL `FOREIGN KEY` representation. `on_delete` defaults to
+`no_action` and may be set to `cascade`.
+
 ## JSONB
 
 `jsonb` stores semantic JSON. It does not preserve whitespace, object-key order,
@@ -91,7 +100,9 @@ A document with an existing `key` is an amendment. Schema v1 permits:
 - appending a nullable column or a column with a default.
 
 It rejects removal, rename, reorder, type/nullability/default changes, and all
-primary-key, unique, or foreign-key changes. Incompatible evolution requires an
+primary-key, unique, foreign-key, or row-reference constraints. A
+row-reference deletion policy is part of constraint semantics and cannot be
+changed by a safe append-only amendment. Incompatible evolution requires an
 explicit future migration facility or a new schema key.
 
 Foreign keys may declare `"on_delete": "cascade"` to delete referencing rows

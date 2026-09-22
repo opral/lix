@@ -5,7 +5,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use datafusion::arrow::array::StringArray;
 use datafusion::arrow::datatypes::{DataType, FieldRef};
-use datafusion::common::{plan_err, DataFusionError, Result, ScalarValue};
+use datafusion::common::{DataFusionError, Result, ScalarValue, plan_err};
 use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
@@ -75,49 +75,18 @@ impl ScalarUDFImpl for LixRowRef {
         let mut output = Vec::with_capacity(len);
         for row in 0..len {
             let relation_value = ScalarValue::try_from_array(arrays[0].as_ref(), row)?;
-            let relation = scalar_text(&relation_value).ok_or_else(|| {
-                DataFusionError::Execution("lix_row_ref relation must be non-null text".to_string())
-            })?;
             let file_id_value = ScalarValue::try_from_array(arrays[1].as_ref(), row)?;
-            let file_id = scalar_optional_text(&file_id_value)
-                .ok_or_else(|| {
-                    DataFusionError::Execution(
-                        "lix_row_ref file id must be null or text".to_string(),
-                    )
-                })?
-                .map(str::to_owned);
-            let component_types =
-                crate::row_ref::primary_key_component_types(&self.catalog, relation)
-                    .map_err(crate::sql2::error::lix_error_to_datafusion_error)?;
-            if component_types.len() != arrays.len() - 2 {
-                return Err(DataFusionError::Execution(format!(
-                    "lix_row_ref relation '{relation}' requires {} primary-key values, got {}",
-                    component_types.len(),
-                    arrays.len() - 2,
-                )));
-            }
-            let parts = arrays[2..]
-                .iter()
-                .zip(&component_types)
-                .enumerate()
-                .map(|(index, (array, expected))| {
-                    external_component(
-                        &ScalarValue::try_from_array(array.as_ref(), row)?,
-                        *expected,
-                        index,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let row_pk = RowPk::from_external_parts(parts, &component_types).map_err(|error| {
-                DataFusionError::Execution(format!(
-                    "lix_row_ref relation '{relation}' has an invalid primary key: {error}"
-                ))
-            })?;
             output.push(
-                crate::row_ref::encode(relation, file_id.as_deref(), &row_pk)
-                    .map_err(crate::sql2::error::lix_error_to_datafusion_error)?
-                    .as_str()
-                    .to_owned(),
+                construct_row_ref(
+                    &self.catalog,
+                    &relation_value,
+                    &file_id_value,
+                    arrays[2..]
+                        .iter()
+                        .map(|array| ScalarValue::try_from_array(array.as_ref(), row)),
+                )?
+                .as_str()
+                .to_owned(),
             );
         }
         if scalar {
@@ -128,6 +97,42 @@ impl ScalarUDFImpl for LixRowRef {
             Ok(ColumnarValue::Array(Arc::new(StringArray::from(output))))
         }
     }
+}
+
+/// Shared constructor for SELECT UDF evaluation and native INSERT/UPDATE expressions.
+pub(crate) fn construct_row_ref(
+    catalog: &PublicCatalog,
+    relation_value: &ScalarValue,
+    file_id_value: &ScalarValue,
+    components: impl ExactSizeIterator<Item = Result<ScalarValue>>,
+) -> Result<crate::RowRef> {
+    let relation = scalar_text(relation_value).ok_or_else(|| {
+        DataFusionError::Execution("lix_row_ref relation must be non-null text".to_string())
+    })?;
+    let file_id = scalar_optional_text(file_id_value).ok_or_else(|| {
+        DataFusionError::Execution("lix_row_ref file id must be null or text".to_string())
+    })?;
+    let component_types = crate::row_ref::primary_key_component_types(catalog, relation)
+        .map_err(crate::sql2::error::lix_error_to_datafusion_error)?;
+    if component_types.len() != components.len() {
+        return Err(DataFusionError::Execution(format!(
+            "lix_row_ref relation '{relation}' requires {} primary-key values, got {}",
+            component_types.len(),
+            components.len(),
+        )));
+    }
+    let parts = components
+        .zip(&component_types)
+        .enumerate()
+        .map(|(index, (value, expected))| external_component(&value?, *expected, index))
+        .collect::<Result<Vec<_>>>()?;
+    let row_pk = RowPk::from_external_parts(parts, &component_types).map_err(|error| {
+        DataFusionError::Execution(format!(
+            "lix_row_ref relation '{relation}' has an invalid primary key: {error}"
+        ))
+    })?;
+    crate::row_ref::encode(relation, file_id, &row_pk)
+        .map_err(crate::sql2::error::lix_error_to_datafusion_error)
 }
 
 fn external_component(
