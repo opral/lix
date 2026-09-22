@@ -996,9 +996,17 @@ async fn admission_epoch_errors_report_actual_and_expected_versions() {
     assert_eq!(details["expectedStorageEpoch"], crate::CURRENT_STORAGE_FORMAT_VERSION);
     for status in [409, 426] {
         let http = ScriptHttp::default();
-        http.push_json(status, serde_json::json!({}));
+        http.push_json(status, serde_json::json!({ "error": {
+            "code": "LIX_PROTOCOL_VERSION_MISMATCH",
+            "details": { "storageEpoch": 83, "protocolEpoch": 21, "private": "excluded" }
+        }}));
         let error = super::admit_protocol_client(http, ADMISSION_URL, None).await.unwrap_err();
-        assert_eq!(error.details.unwrap()["httpStatus"], status);
+        let details = error.details.unwrap();
+        assert_eq!(details["httpStatus"], status);
+        assert_eq!(details["storageEpoch"], 83);
+        assert_eq!(details["protocolEpoch"], 21);
+        assert_eq!(details["expectedStorageEpoch"], crate::CURRENT_STORAGE_FORMAT_VERSION);
+        assert!(details.get("private").is_none());
     }
 }
 

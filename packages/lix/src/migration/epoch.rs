@@ -1785,26 +1785,12 @@ async fn clear_bank<S>(adapter: &StorageAdapter<S>) -> Result<(), LixError>
 where
     S: Storage,
 {
-    // The candidate bank is fenced by the exact migration claim, so all
-    // range deletes can share one durable transaction. The previous loop
-    // issued one backend commit per registered space.
-    let mut write = adapter
-        .begin_migration_write(durable_candidate_write_options())
-        .await
-        .map_err(storage_error)?;
     for space in epoch_data_spaces() {
-        write
-            .delete_range(
-                space,
-                KeyRange {
-                    lower: Bound::Unbounded,
-                    upper: Bound::Unbounded,
-                },
-            )
+        adapter
+            .clear_space(space, durable_candidate_write_options())
             .await
             .map_err(storage_error)?;
     }
-    write.commit().await.map_err(storage_error)?;
     Ok(())
 }
 
