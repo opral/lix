@@ -1082,7 +1082,7 @@ where
                 ))
                 .await?;
             } else {
-                let _ = copy_repository(&migration_source, &target).await?;
+                let _ = copy_repository(&migration_source, &target, from_format >= 79).await?;
                 write_candidate_page(
                     &target,
                     crate::init::REPOSITORY_PROTOCOL_SPACE,
@@ -1311,7 +1311,7 @@ where
                 ))
                 .await?;
             } else {
-                let _ = copy_repository(&migration_source, &target).await?;
+                let _ = copy_repository(&migration_source, &target, from_format >= 79).await?;
                 // Keep the multi-version migration state machine off this
                 // candidate frame. Its inactive repair phases otherwise inflate
                 // the stack while an older migration runs ordinary SQL.
@@ -1497,7 +1497,7 @@ where
     }
     drop(read);
     clear_bank(target).await?;
-    let _ = copy_repository(source, target).await?;
+    let _ = copy_repository(source, target, true).await?;
     if from_format == 79 {
         super::incorporation::migrate(target, options, true).await?;
     }
@@ -1777,18 +1777,33 @@ async fn clear_bank<S>(adapter: &StorageAdapter<S>) -> Result<(), LixError>
 where
     S: Storage,
 {
+    // The candidate bank is fenced by the exact migration claim, so all
+    // range deletes can share one durable transaction. The previous loop
+    // issued one backend commit per registered space.
+    let mut write = adapter
+        .begin_migration_write(durable_candidate_write_options())
+        .await
+        .map_err(storage_error)?;
     for space in epoch_data_spaces() {
-        adapter
-            .clear_space(space, durable_candidate_write_options())
+        write
+            .delete_range(
+                space,
+                KeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+            )
             .await
             .map_err(storage_error)?;
     }
+    write.commit().await.map_err(storage_error)?;
     Ok(())
 }
 
 async fn copy_repository<S>(
     source: &StorageAdapter<S>,
     target: &StorageAdapter<S>,
+    skip_derived_index: bool,
 ) -> Result<Option<Bytes>, LixError>
 where
     S: Storage,
@@ -1801,7 +1816,13 @@ where
         .await
         .map_err(storage_error)?;
     drop(read);
-    for space in epoch_data_spaces() {
+    // On v79+ migration paths the declared-column index is disposable derived
+    // state. It is rebuilt from authoritative current rows below, so copying
+    // the old index only adds a full scan and a write before publication
+    // deletes it.
+    for space in epoch_data_spaces().filter(|space| {
+        !skip_derived_index || *space != crate::hot_state::INDEX_SPACE
+    }) {
         let mut lower = Bound::Unbounded;
         loop {
             // The migration claim makes the source bank immutable. Reopen a
@@ -3424,7 +3445,7 @@ pub(super) mod tests {
         let target = StorageAdapter::for_epoch_migration(storage, EpochBank::B, migrating.clone());
 
         source.storage().expire_next_page();
-        copy_repository(&source, &target)
+        copy_repository(&source, &target, false)
             .await
             .expect("copy must reopen an expired source generation between target pages");
 

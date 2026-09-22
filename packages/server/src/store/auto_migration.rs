@@ -269,7 +269,8 @@ mod tests {
         drop(local);
         catalog(&manager, &physical, None).await;
         let (opened, _) = watch::channel(RuntimeOpenState::Opening);
-        let error = manager.open_lix(ID, &opened).await.err().unwrap();
+        let record = manager.repository_record(ID).await.unwrap().unwrap();
+        let error = manager.open_lix(ID, &record, &opened).await.err().unwrap();
         assert!(error.to_string().contains("not an existing authority"));
         assert_ne!(
             lix_sdk::migration::inspect_repository(storage)
