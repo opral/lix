@@ -323,6 +323,39 @@ async fn scan_committed_canonical_rows(
     schema_key: &str,
     row_pks: Vec<RowPk>,
 ) -> Result<CommittedHotStateRows, LixError> {
+    scan_committed_canonical_rows_with_lane(hot_state, domain, schema_key, row_pks, None).await
+}
+
+/// Resolves canonical identities in one requested durability lane.
+///
+/// Most canonical identity validation is intentionally retention-agnostic:
+/// callers use the combined serving plane and then apply their own identity
+/// semantics. Row-reference targets are different because the target domain
+/// itself includes the tracked/untracked lane, so those callers pass the lane
+/// explicitly to avoid an untracked overlay hiding a tracked target.
+async fn scan_committed_canonical_rows_in_domain(
+    hot_state: &dyn HotStateReader,
+    domain: &Domain,
+    schema_key: &str,
+    row_pks: Vec<RowPk>,
+) -> Result<CommittedHotStateRows, LixError> {
+    scan_committed_canonical_rows_with_lane(
+        hot_state,
+        domain,
+        schema_key,
+        row_pks,
+        Some(domain.untracked()),
+    )
+    .await
+}
+
+async fn scan_committed_canonical_rows_with_lane(
+    hot_state: &dyn HotStateReader,
+    domain: &Domain,
+    schema_key: &str,
+    row_pks: Vec<RowPk>,
+    untracked: Option<bool>,
+) -> Result<CommittedHotStateRows, LixError> {
     let file_id = match domain.file_filters().as_slice() {
         [] => None,
         [NullableKeyFilter::Null] => None,
@@ -353,15 +386,16 @@ async fn scan_committed_canonical_rows(
             "untracked".to_string(),
         ],
     };
-    // One plane means one row per identity, so a single retention-agnostic
-    // probe already returns whichever member owns the identity. The request is
-    // exactly K identities and therefore remains bounded by the directory
-    // point-read path; no schema or `All` expansion is permitted here.
+    // The ordinary wrapper leaves retention unspecified so canonical identity
+    // callers retain the combined serving-plane semantics. Row-reference
+    // validation supplies a lane through the domain-specific wrapper above.
+    // Either way, the request is exactly K identities and remains bounded by
+    // the directory point-read path; no schema or `All` expansion is allowed.
     let batch = hot_state
         .load_exact_batch(&HotStateExactBatchRequest {
             rows,
             projection,
-            untracked: None,
+            untracked,
             include_tombstones: false,
         })
         .await?
@@ -3821,7 +3855,7 @@ async fn validate_committed_row_refs(
 
     let mut present = HashSet::<DomainRowIdentity>::new();
     for ((domain, schema_key), row_pks) in batches {
-        let rows = scan_committed_canonical_rows(
+        let rows = scan_committed_canonical_rows_in_domain(
             input.hot_state,
             &domain,
             &schema_key,
@@ -3829,12 +3863,11 @@ async fn validate_committed_row_refs(
         )
         .await?;
         for row in rows.iter() {
-            // The canonical point-read deliberately leaves the durability
-            // lane unspecified so it can serve identity validation. Row-ref
-            // target reachability is lane-sensitive: a tracked source may
-            // resolve only a tracked target, while an untracked source may
-            // fall back to tracked state. Recheck the requested domain here
-            // before recording the returned row.
+            // Row-ref target reachability is lane-sensitive: a tracked source
+            // may resolve only a tracked target, while an untracked source
+            // may fall back to tracked state. Keep this domain check even
+            // though the exact read is lane-qualified, since the reader may
+            // retain stale or over-inclusive index candidates.
             if pending_constraints.tombstones_identity(row) || !domain.contains_ref(row) {
                 continue;
             }
@@ -7488,6 +7521,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validation_allows_tracked_row_ref_target_committed_behind_untracked_overlay() {
+        let visible_schemas = vec![row_ref_parent_schema(), row_ref_child_schema()];
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
+            state_rows: prepared_rows![row_ref_child_row("child-1", "parent-1", branch_id)],
+            ..empty_staged_write_set()
+        };
+        let tracked_parent =
+            MaterializedHotStateRow::from(row_ref_parent_row("parent-1", branch_id));
+        let mut untracked_overlay = tracked_parent.clone();
+        mark_live_row_untracked(&mut untracked_overlay);
+        let hot_state = OverlayingStaticHotStateReader {
+            rows: vec![tracked_parent, untracked_overlay],
+        };
+
+        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+            &staged_writes,
+            &visible_schemas,
+            &hot_state,
+        ))
+        .await
+        .expect("tracked row-ref should resolve behind an untracked overlay");
+    }
+
+    #[tokio::test]
+    async fn validation_allows_tracked_row_ref_target_behind_untracked_tombstone() {
+        let visible_schemas = vec![row_ref_parent_schema(), row_ref_child_schema()];
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
+            state_rows: prepared_rows![row_ref_child_row("child-1", "parent-1", branch_id)],
+            ..empty_staged_write_set()
+        };
+        let tracked_parent =
+            MaterializedHotStateRow::from(row_ref_parent_row("parent-1", branch_id));
+        let mut untracked_tombstone = tracked_parent.clone();
+        untracked_tombstone.snapshot_content = None;
+        untracked_tombstone.deleted = true;
+        mark_live_row_untracked(&mut untracked_tombstone);
+        let hot_state = OverlayingStaticHotStateReader {
+            rows: vec![tracked_parent, untracked_tombstone],
+        };
+
+        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+            &staged_writes,
+            &visible_schemas,
+            &hot_state,
+        ))
+        .await
+        .expect("untracked tombstone must not hide a tracked row-ref target");
+    }
+
+    #[tokio::test]
     async fn validation_rejects_deleting_tracked_fk_target_referenced_behind_untracked_overlay() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let mut parent_delete = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
@@ -8966,6 +9053,30 @@ mod tests {
         })
     }
 
+    fn row_ref_parent_schema() -> JsonValue {
+        json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "row_ref_parent_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+            ],
+            "primary_key": ["id"],
+        })
+    }
+
+    fn row_ref_child_schema() -> JsonValue {
+        json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "row_ref_child_schema",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "target", "type": "text", "nullable": true },
+            ],
+            "primary_key": ["id"],
+            "row_refs": [{ "column": "target" }],
+        })
+    }
+
     fn unique_row(row_pk: &str, slug: &str, title: &str) -> TestPreparedStateRow {
         let mut row = staged_row(
             "unique_schema",
@@ -9023,6 +9134,30 @@ mod tests {
         );
         retarget_test_row(&mut row, RowPk::single(row_pk));
         row.file_id = Some("01920000-0000-7000-8000-0000000000a2".into());
+        row.branch_id = branch_id.into();
+        row.global = false;
+        row
+    }
+
+    fn row_ref_parent_row(row_pk: &str, branch_id: &str) -> TestPreparedStateRow {
+        let mut row = staged_row(
+            "row_ref_parent_schema",
+            Some(json!({ "id": row_pk }).to_string()),
+        );
+        retarget_test_row(&mut row, RowPk::single(row_pk));
+        row.branch_id = branch_id.into();
+        row.global = false;
+        row
+    }
+
+    fn row_ref_child_row(row_pk: &str, target_pk: &str, branch_id: &str) -> TestPreparedStateRow {
+        let target = row_ref::encode("row_ref_parent_schema", None, &RowPk::single(target_pk))
+            .expect("row-ref test target should encode");
+        let mut row = staged_row(
+            "row_ref_child_schema",
+            Some(json!({ "id": row_pk, "target": target }).to_string()),
+        );
+        retarget_test_row(&mut row, RowPk::single(row_pk));
         row.branch_id = branch_id.into();
         row.global = false;
         row
