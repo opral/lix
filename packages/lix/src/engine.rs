@@ -987,7 +987,7 @@ async fn partial_local_root_is_owned(
     if headers.into_iter().all(|header| header.is_none()) {
         return Ok(false);
     }
-    let context = crate::commit_graph::CommitGraphContext::new();
+    let context = CommitGraphContext::new();
     let mut graph = context.reader(read);
     let mut cursor = head;
     let mut previous_generation = None;
