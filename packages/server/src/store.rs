@@ -10,6 +10,7 @@ mod retained_tombstone;
 pub use maintenance::AuthorityMigrationReport;
 mod auto_migration;
 mod inventory;
+mod request_budget;
 pub use inventory::{AuthorityInventory, AuthorityInventoryEntry};
 
 use crate::{Config, config::SlateDBCacheConfig};
@@ -61,6 +62,15 @@ const S3_REQUEST_BUDGET: S3RequestBudget = S3RequestBudget {
     request_timeout: Duration::from_secs(15),
     connect_timeout: Duration::from_secs(3),
     retry_timeout: Duration::from_secs(30),
+    max_retries: 1,
+};
+
+// Immutable segments are uploaded whole and may contain 64 MiB. They need
+// more time than the 2 MiB cache reads above, especially during migration.
+const S3_UPLOAD_BUDGET: S3RequestBudget = S3RequestBudget {
+    request_timeout: Duration::from_secs(120),
+    connect_timeout: Duration::from_secs(3),
+    retry_timeout: Duration::from_secs(240),
     max_retries: 1,
 };
 
@@ -421,23 +431,34 @@ impl LixRuntimeManager {
         );
         prepare_cache_namespace(owner_root, &namespace_root)?;
         let cache = cache_options(&storage.cache, config.max_open_lixes, namespace_root);
-        let object_store: Arc<dyn ObjectStore> = Arc::new(
-            AmazonS3Builder::new()
-                .with_http_connector(object_store::client::SpawnedReqwestConnector::new(
-                    io_runtime,
-                ))
-                .with_endpoint(&storage.endpoint)
-                .with_bucket_name(&storage.bucket)
-                .with_access_key_id(&storage.access_key_id)
-                .with_secret_access_key(&storage.secret_access_key)
-                .with_region(&storage.region)
-                .with_virtual_hosted_style_request(false)
+        let builder = AmazonS3Builder::new()
+            .with_http_connector(object_store::client::SpawnedReqwestConnector::new(
+                io_runtime,
+            ))
+            .with_endpoint(&storage.endpoint)
+            .with_bucket_name(&storage.bucket)
+            .with_access_key_id(&storage.access_key_id)
+            .with_secret_access_key(&storage.secret_access_key)
+            .with_region(&storage.region)
+            .with_virtual_hosted_style_request(false)
+            .with_allow_http(storage.allow_http);
+        let reads: Arc<dyn ObjectStore> = Arc::new(
+            builder
+                .clone()
                 .with_client_options(s3_client_options(request_budget))
                 .with_retry(s3_retry_config(request_budget))
-                .with_allow_http(storage.allow_http)
                 .build()
                 .context("build S3 object store")?,
         );
+        let uploads: Arc<dyn ObjectStore> = Arc::new(
+            builder
+                .with_client_options(s3_client_options(S3_UPLOAD_BUDGET))
+                .with_retry(s3_retry_config(S3_UPLOAD_BUDGET))
+                .build()
+                .context("build S3 upload object store")?,
+        );
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(request_budget::UploadBudgetStore { reads, uploads });
         let backend = StorageBackend::S3 {
             object_store,
             prefix: storage.prefix.clone(),
