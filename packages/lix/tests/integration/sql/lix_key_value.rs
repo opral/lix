@@ -51,7 +51,7 @@ simulation_test!(
         let phases = [
         ("SELECT 1".to_owned(), 4),
         ("UPDATE lix_key_value SET value = 'updated' WHERE key = 'packed-key-0010'".to_owned(), 4),
-        ("SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_key_value', 'packed-key-0010')])".to_owned(), 4),
+        ("SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_key_value', NULL, 'packed-key-0010')])".to_owned(), 4),
         ("DELETE FROM lix_key_value WHERE key = 'packed-key-0200'".to_owned(), 3),
         ("SELECT commit_id FROM lix_create_checkpoint()".to_owned(), 3),
         (format!("INSERT INTO lix_key_value (key, value) VALUES {second_values}"), 3),

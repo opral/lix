@@ -69,7 +69,7 @@ async fn unchanged_catalog_checkpoints_do_not_rotate_revision_or_warm() {
         .await
         .unwrap();
     main.execute(
-        "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_key_value', 'a')])",
+        "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_key_value', NULL, 'a')])",
         &[],
     )
     .await

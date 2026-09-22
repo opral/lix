@@ -1838,7 +1838,7 @@ where
                     serde_json::json!({
                         "change_id": row.change_id().to_string(),
                         "commit_id": commit_id.to_string(),
-                        "row_ref": crate::row_ref::schema_identity_detail(row.schema_key(), row.row_pk()),
+                        "row_ref": crate::row_ref::schema_identity_detail(row.schema_key(), row.file_id(), row.row_pk()),
                         "file_id": row.file_id(),
                         "row_deleted": row.deleted(),
                         "row_updated_at": row.updated_at().to_string(),
@@ -9234,7 +9234,7 @@ mod tests {
         assert_eq!(details["commit_id"], commit_id.to_string());
         assert_eq!(
             details["row_ref"],
-            crate::row_ref::schema_identity_detail(&row.schema_key, &row.row_pk)
+            crate::row_ref::schema_identity_detail(&row.schema_key, row.file_id.as_deref(), &row.row_pk)
         );
     }
 

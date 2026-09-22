@@ -139,9 +139,9 @@ simulation_test!(
             .execute(
                 "SELECT commit_id FROM lix_restore(\
                    (SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()), \
-                   ARRAY(SELECT lix_row_ref('lix_key_value', 'b') \
+                   ARRAY(SELECT lix_row_ref('lix_key_value', NULL, 'b') \
                          UNION ALL \
-                         SELECT lix_row_ref('lix_key_value', 'b')))",
+                         SELECT lix_row_ref('lix_key_value', NULL, 'b')))",
                 &[],
             )
             .await
@@ -297,7 +297,7 @@ simulation_test!(
             .execute(
                 "SELECT commit_id FROM lix_restore(\
                    (SELECT working_base_commit_id FROM lix_branch WHERE id = lix_active_branch_id()), \
-                   ARRAY(SELECT lix_row_ref('lix_key_value', 'recycled')))",
+                   ARRAY(SELECT lix_row_ref('lix_key_value', NULL, 'recycled')))",
                 &[],
             )
             .await

@@ -107,7 +107,7 @@ simulation_test!(
 
         let restored = receipt(
             &target,
-            "SELECT commit_id FROM lix_restore($1, ARRAY[lix_row_ref('lix_key_value','a')])",
+            "SELECT commit_id FROM lix_restore($1, ARRAY[lix_row_ref('lix_key_value',NULL,'a')])",
             &[Value::Text(source_commit)],
         )
         .await
@@ -362,7 +362,7 @@ simulation_test!(
 
         let applied = receipt(
             &target,
-            "SELECT commit_id FROM lix_apply($1,$2,ARRAY[lix_row_ref('lix_key_value','b')])",
+            "SELECT commit_id FROM lix_apply($1,$2,ARRAY[lix_row_ref('lix_key_value',NULL,'b')])",
             &[Value::Text(before), Value::Text(after)],
         )
         .await

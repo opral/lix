@@ -76,8 +76,8 @@ async fn fixture(sim: &Simulation) -> (Lix, String, String) {
 }
 const UNDO: &str = "SELECT commit_id FROM lix_undo($1)";
 const REDO: &str = "SELECT commit_id FROM lix_redo($1)";
-const UNDO_ROW: &str = "SELECT commit_id FROM lix_undo($1, ARRAY[lix_row_ref('lix_key_value',$2)])";
-const REDO_ROW: &str = "SELECT commit_id FROM lix_redo($1, ARRAY[lix_row_ref('lix_key_value',$2)])";
+const UNDO_ROW: &str = "SELECT commit_id FROM lix_undo($1, ARRAY[lix_row_ref('lix_key_value',NULL,$2)])";
+const REDO_ROW: &str = "SELECT commit_id FROM lix_redo($1, ARRAY[lix_row_ref('lix_key_value',NULL,$2)])";
 
 simulation_test!(
     successful_explicit_undo_owns_transaction_mutation_slot,

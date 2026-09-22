@@ -91,7 +91,7 @@ To undo one commit, use `lix_revert`, which resolves that commit's actual first 
 ```sql
 SELECT commit_id FROM lix_revert(
   $1,
-  ARRAY[lix_row_ref('acme_task', $2)]
+  ARRAY[lix_row_ref('acme_task', $2, $3)]
 );
 ```
 
@@ -125,7 +125,7 @@ FROM lix_undo(
 SELECT commit_id
 FROM lix_redo(
   $1,
-  ARRAY[lix_row_ref('acme_task', $2)]
+  ARRAY[lix_row_ref('acme_task', $2, $3)]
 );
 ```
 

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use datafusion::arrow::array::StringArray;
 use datafusion::arrow::datatypes::{DataType, FieldRef};
-use datafusion::common::{DataFusionError, Result, ScalarValue, plan_err};
+use datafusion::common::{plan_err, DataFusionError, Result, ScalarValue};
 use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
@@ -47,17 +47,27 @@ impl LixRowRef {
 }
 
 impl ScalarUDFImpl for LixRowRef {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &'static str { "lix_row_ref" }
-    fn signature(&self) -> &Signature { &self.signature }
-    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> { Ok(DataType::Utf8) }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &'static str {
+        "lix_row_ref"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Utf8)
+    }
     fn return_field_from_args(&self, _args: ReturnFieldArgs) -> Result<FieldRef> {
         Ok(Arc::new(row_ref_field(self.name(), false)))
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        if args.args.len() < 2 {
-            return plan_err!("lix_row_ref requires a relation and at least one primary-key value");
+        if args.args.len() < 3 {
+            return plan_err!(
+                "lix_row_ref requires a relation, a nullable file id, and at least one primary-key value"
+            );
         }
         let scalar = scalar_inputs(&args.args);
         let arrays = ColumnarValue::values_to_arrays(&args.args)?;
@@ -65,21 +75,28 @@ impl ScalarUDFImpl for LixRowRef {
         let mut output = Vec::with_capacity(len);
         for row in 0..len {
             let relation_value = ScalarValue::try_from_array(arrays[0].as_ref(), row)?;
-            let relation = scalar_text(&relation_value)
-                .ok_or_else(|| DataFusionError::Execution(
-                    "lix_row_ref relation must be non-null text".to_string(),
-                ))?;
-            let component_types = crate::row_ref::primary_key_component_types(
-                &self.catalog,
-                relation,
-            ).map_err(crate::sql2::error::lix_error_to_datafusion_error)?;
-            if component_types.len() != arrays.len() - 1 {
+            let relation = scalar_text(&relation_value).ok_or_else(|| {
+                DataFusionError::Execution("lix_row_ref relation must be non-null text".to_string())
+            })?;
+            let file_id_value = ScalarValue::try_from_array(arrays[1].as_ref(), row)?;
+            let file_id = scalar_optional_text(&file_id_value)
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "lix_row_ref file id must be null or text".to_string(),
+                    )
+                })?
+                .map(str::to_owned);
+            let component_types =
+                crate::row_ref::primary_key_component_types(&self.catalog, relation)
+                    .map_err(crate::sql2::error::lix_error_to_datafusion_error)?;
+            if component_types.len() != arrays.len() - 2 {
                 return Err(DataFusionError::Execution(format!(
                     "lix_row_ref relation '{relation}' requires {} primary-key values, got {}",
-                    component_types.len(), arrays.len() - 1,
+                    component_types.len(),
+                    arrays.len() - 2,
                 )));
             }
-            let parts = arrays[1..]
+            let parts = arrays[2..]
                 .iter()
                 .zip(&component_types)
                 .enumerate()
@@ -96,12 +113,17 @@ impl ScalarUDFImpl for LixRowRef {
                     "lix_row_ref relation '{relation}' has an invalid primary key: {error}"
                 ))
             })?;
-            output.push(crate::row_ref::encode(relation, &row_pk)
-                .map_err(crate::sql2::error::lix_error_to_datafusion_error)?
-                .as_str().to_owned());
+            output.push(
+                crate::row_ref::encode(relation, file_id.as_deref(), &row_pk)
+                    .map_err(crate::sql2::error::lix_error_to_datafusion_error)?
+                    .as_str()
+                    .to_owned(),
+            );
         }
         if scalar {
-            Ok(ColumnarValue::Scalar(ScalarValue::Utf8(output.into_iter().next())))
+            Ok(ColumnarValue::Scalar(ScalarValue::Utf8(
+                output.into_iter().next(),
+            )))
         } else {
             Ok(ColumnarValue::Array(Arc::new(StringArray::from(output))))
         }
@@ -120,23 +142,25 @@ fn external_component(
         RowPkComponentType::Bytes => match value {
             ScalarValue::Binary(Some(value))
             | ScalarValue::LargeBinary(Some(value))
-            | ScalarValue::BinaryView(Some(value)) => Some(
-                base64::engine::general_purpose::STANDARD.encode(value),
-            ),
+            | ScalarValue::BinaryView(Some(value)) => {
+                Some(base64::engine::general_purpose::STANDARD.encode(value))
+            }
             _ => scalar_text(value).map(str::to_owned),
         },
         RowPkComponentType::Integer => scalar_integer(value).map(|value| value.to_string()),
     };
-    value.ok_or_else(|| DataFusionError::Execution(format!(
-        "lix_row_ref primary-key value {} must be a non-null {}",
-        index + 1,
-        match expected {
-            RowPkComponentType::Uuid => "UUID string",
-            RowPkComponentType::Integer => "integer",
-            RowPkComponentType::String => "text value",
-            RowPkComponentType::Bytes => "base64 string",
-        }
-    )))
+    value.ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "lix_row_ref primary-key value {} must be a non-null {}",
+            index + 1,
+            match expected {
+                RowPkComponentType::Uuid => "UUID string",
+                RowPkComponentType::Integer => "integer",
+                RowPkComponentType::String => "text value",
+                RowPkComponentType::Bytes => "base64 string",
+            }
+        ))
+    })
 }
 
 fn scalar_text(value: &ScalarValue) -> Option<&str> {
@@ -145,6 +169,16 @@ fn scalar_text(value: &ScalarValue) -> Option<&str> {
         | ScalarValue::LargeUtf8(Some(value))
         | ScalarValue::Utf8View(Some(value)) => Some(value),
         _ => None,
+    }
+}
+
+fn scalar_optional_text(value: &ScalarValue) -> Option<Option<&str>> {
+    match value {
+        ScalarValue::Null => Some(None),
+        ScalarValue::Utf8(None) | ScalarValue::LargeUtf8(None) | ScalarValue::Utf8View(None) => {
+            Some(None)
+        }
+        _ => scalar_text(value).map(Some),
     }
 }
 

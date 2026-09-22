@@ -283,7 +283,7 @@ mod tests {
             Some(CheckpointFunctionPlan::Empty)
         );
         assert!(matches!(
-            plan("SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_file', $1)])")
+            plan("SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_file', NULL, $1)])")
                 .unwrap(),
             Some(CheckpointFunctionPlan::SelectionQuery(_))
         ));
@@ -303,7 +303,7 @@ mod tests {
                 && *selection == CheckpointFunctionPlan::Full
         ));
         assert!(matches!(
-            plan("SELECT commit_id FROM lix_revert_range($1, $2, ARRAY[lix_row_ref('lix_file', $3)])").unwrap(),
+            plan("SELECT commit_id FROM lix_revert_range($1, $2, ARRAY[lix_row_ref('lix_file', NULL, $3)])").unwrap(),
             Some(CheckpointFunctionPlan::Recovery {
                 command: RecoveryCommand::RevertRange,
                 commits_query,

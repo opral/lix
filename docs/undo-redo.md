@@ -13,11 +13,11 @@ not move a branch ref to an earlier commit or erase the commit graph.
 ```sql
 SELECT commit_id FROM lix_undo();
 SELECT commit_id FROM lix_undo($target_commit_id);
-SELECT commit_id FROM lix_undo($target_commit_id, ARRAY[lix_row_ref('acme_task', $task_id)]);
+SELECT commit_id FROM lix_undo($target_commit_id, ARRAY[lix_row_ref('acme_task', $file_id, $task_id)]);
 
 SELECT commit_id FROM lix_redo();
 SELECT commit_id FROM lix_redo($undo_commit_id);
-SELECT commit_id FROM lix_redo($undo_commit_id, ARRAY[lix_row_ref('acme_task', $task_id)]);
+SELECT commit_id FROM lix_redo($undo_commit_id, ARRAY[lix_row_ref('acme_task', $file_id, $task_id)]);
 ```
 
 The signatures below use `row_refs` to mean an `ARRAY[...]` or `ARRAY(SELECT ...)` SQL expression:
@@ -61,7 +61,7 @@ SELECT commit_id FROM lix_undo($original_commit);
 SELECT commit_id
 FROM lix_redo(
   $undo_receipt,
-  ARRAY[lix_row_ref('acme_task', $task_id)]
+  ARRAY[lix_row_ref('acme_task', $file_id, $task_id)]
 );
 ```
 

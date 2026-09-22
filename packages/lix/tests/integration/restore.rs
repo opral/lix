@@ -228,7 +228,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT commit_id FROM lix_restore($1, ARRAY[lix_row_ref('lix_key_value', 'selected')])",
+                "SELECT commit_id FROM lix_restore($1, ARRAY[lix_row_ref('lix_key_value', NULL, 'selected')])",
                 &[Value::Text(source)],
             )
             .await

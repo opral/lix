@@ -59,7 +59,7 @@ simulation_test!(
         let before_revert = head(&session).await;
         let inverse = commit(
             &session,
-            "SELECT commit_id FROM lix_revert($1, ARRAY[lix_row_ref('lix_key_value', 'a')])",
+            "SELECT commit_id FROM lix_revert($1, ARRAY[lix_row_ref('lix_key_value', NULL, 'a')])",
             &[Value::Text(change.clone())],
         )
         .await;
@@ -91,7 +91,7 @@ simulation_test!(
         // A restored version has a new change identity; use its actual endpoint for replay.
         commit(
             &session,
-            "SELECT commit_id FROM lix_apply($1, $2, ARRAY[lix_row_ref('lix_key_value', 'a')])",
+            "SELECT commit_id FROM lix_apply($1, $2, ARRAY[lix_row_ref('lix_key_value', NULL, 'a')])",
             &[Value::Text(inverse), Value::Text(change.clone())],
         )
         .await;
@@ -121,7 +121,7 @@ simulation_test!(
         );
         for sql in [
             "SELECT commit_id FROM lix_restore($1)",
-            "SELECT commit_id FROM lix_restore($1, ARRAY[lix_row_ref('lix_key_value', 'a')])",
+            "SELECT commit_id FROM lix_restore($1, ARRAY[lix_row_ref('lix_key_value', NULL, 'a')])",
             "SELECT commit_id FROM lix_revert($1, ARRAY[])",
             "SELECT commit_id FROM lix_apply($1, $1, ARRAY[])",
             "SELECT commit_id FROM lix_revert_range($1, $1)",
@@ -137,7 +137,7 @@ simulation_test!(
         }
         let receipt = session
             .execute(
-                "SELECT commit_id FROM lix_restore($2, ARRAY[lix_row_ref('lix_key_value', $1)])",
+                "SELECT commit_id FROM lix_restore($2, ARRAY[lix_row_ref('lix_key_value', NULL, $1)])",
                 &[Value::Text("a".into()), Value::Text(restored.clone())],
             )
             .await
@@ -209,8 +209,8 @@ simulation_test!(
             "SELECT commit_id FROM lix_restore($1) WHERE false",
             "SELECT commit_id FROM lix_restore($1) LIMIT 0",
             "INSERT INTO lix_restore(commit_id) VALUES ($1)",
-            "INSERT INTO lix_revert(row_ref) VALUES (lix_row_ref('lix_key_value','a'))",
-            "INSERT INTO lix_apply(row_ref) VALUES (lix_row_ref('lix_key_value','a'))",
+            "INSERT INTO lix_revert(row_ref) VALUES (lix_row_ref('lix_key_value',NULL,'a'))",
+            "INSERT INTO lix_apply(row_ref) VALUES (lix_row_ref('lix_key_value',NULL,'a'))",
         ] {
             let previous = head(&session).await;
             session
@@ -407,7 +407,7 @@ simulation_test!(
         ).await.unwrap();
         let source_commit = head(&source).await;
         let row_ref = select_rows(&source,
-            "SELECT lix_row_ref('recovery_source_only', '01930000-0000-7000-8000-000000000063') AS row_ref"
+            "SELECT lix_row_ref('recovery_source_only', NULL, '01930000-0000-7000-8000-000000000063') AS row_ref"
         ).await[0][0].clone();
         let target = sim.wrap_session(engine.open_session_at(target_id).await.unwrap(), &engine);
         commit(

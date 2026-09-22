@@ -1903,8 +1903,8 @@ mod tests {
     #[test]
     fn bind_statement_rejects_retired_recovery_insert_sinks() {
         for sql in [
-            "INSERT INTO lix_revert (row_ref) SELECT lix_row_ref('lix_key_value', 'test')",
-            "INSERT INTO lix_apply (row_ref) SELECT lix_row_ref('lix_key_value', 'test')",
+            "INSERT INTO lix_revert (row_ref) SELECT lix_row_ref('lix_key_value', NULL, 'test')",
+            "INSERT INTO lix_apply (row_ref) SELECT lix_row_ref('lix_key_value', NULL, 'test')",
             "INSERT INTO lix_restore (commit_id) VALUES ($1)",
         ] {
             let error = bind_statement(&parse_statement(sql), &[], "branch1")

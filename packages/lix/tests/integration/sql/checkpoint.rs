@@ -353,7 +353,7 @@ simulation_test!(
         let checkpoint = session
             .execute(
                 "SELECT commit_id FROM lix_create_checkpoint(ARRAY[\
-                    lix_row_ref('checkpoint_child', 'child-a')\
+                    lix_row_ref('checkpoint_child', NULL, 'child-a')\
                  ])",
                 &[],
             )
@@ -437,7 +437,7 @@ simulation_test!(
             .expect("swapped rows should insert together");
         session
             .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('checkpoint_unique_swap', 'a')])",
+                "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('checkpoint_unique_swap', NULL, 'a')])",
                 &[],
             )
             .await
@@ -498,8 +498,8 @@ simulation_test!(
             .expect("file-owned semantic row should insert");
         session
             .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('checkpoint_file_member', 'member')])",
-                &[],
+                "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('checkpoint_file_member', $1, 'member')])",
+                &[Value::Text(file_id.into())],
             )
             .await
             .expect("direct semantic selection should include its file descriptor");
@@ -557,7 +557,7 @@ simulation_test!(scoped_checkpoint_closes_file_path_swaps, |sim| async move {
         .expect("swapped files should insert together");
     session
         .execute(
-            "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_file', $1)])",
+            "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_file', NULL, $1)])",
             &[Value::Text(first_id.into())],
         )
         .await
@@ -612,7 +612,7 @@ simulation_test!(
         session
             .execute(
                 "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref(\
-                 'lix_file', '01950000-0000-7000-8000-000000000043')])",
+                 'lix_file', NULL, '01950000-0000-7000-8000-000000000043')])",
                 &[],
             )
             .await
@@ -696,7 +696,7 @@ simulation_test!(
             .expect("file should take the former directory name");
         session
             .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_file', $1)])",
+                "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_file', NULL, $1)])",
                 &[Value::Text(file_id.into())],
             )
             .await
@@ -752,8 +752,8 @@ simulation_test!(
         session
             .execute(
                 "SELECT commit_id FROM lix_create_checkpoint(ARRAY[\
-                    lix_row_ref('lix_directory', '01950000-0000-7000-8000-000000000011'),\
-                    lix_row_ref('lix_key_value', 'mixed-row')\
+                    lix_row_ref('lix_directory', NULL, '01950000-0000-7000-8000-000000000011'),\
+                    lix_row_ref('lix_key_value', NULL, 'mixed-row')\
                  ])",
                 &[],
             )
@@ -854,7 +854,7 @@ simulation_test!(
         session
             .execute(
                 "SELECT commit_id FROM lix_create_checkpoint(ARRAY[\
-                    lix_row_ref('checkpoint_delete_parent', 'parent-a')\
+                    lix_row_ref('checkpoint_delete_parent', NULL, 'parent-a')\
                  ])",
                 &[],
             )

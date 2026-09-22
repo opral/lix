@@ -10021,7 +10021,7 @@ where
                     "expectedChangeId": expected,
                     "currentChangeId": current.as_ref().and_then(|row| row.change_id),
                     "currentCommitId": current.as_ref().and_then(|row| row.commit_id),
-                    "rowRef": crate::row_ref::encode_schema_identity(&schema_key, &row_pk)?
+                    "rowRef": crate::row_ref::encode_schema_identity(&schema_key, file_id.as_deref(), &row_pk)?
                         .as_str(),
                 })));
             }
@@ -10146,7 +10146,7 @@ where
     ) -> Result<Vec<String>, LixError> {
         let mut unique = BTreeSet::new();
         for selection in selections {
-            if !unique.insert((&selection.relation, &selection.row_pk)) {
+            if !unique.insert((&selection.relation, &selection.file_id, &selection.row_pk)) {
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
                     "diff command selection contains a duplicate row_ref",
@@ -10155,6 +10155,7 @@ where
                     "operation": "diff_command",
                     "rowRef": crate::row_ref::encode(
                         &selection.relation,
+                        selection.file_id.as_deref(),
                         &selection.row_pk,
                     )?.as_str(),
                 })));
@@ -10162,12 +10163,21 @@ where
         }
 
         let catalog = self.sql_public_catalog()?;
-        let mut schema_selections = BTreeMap::<&str, BTreeMap<RowPk, usize>>::new();
+        let mut schema_selections =
+            BTreeMap::<&str, BTreeMap<Option<&str>, BTreeMap<RowPk, usize>>>::new();
         let mut file_selections = BTreeMap::new();
         let mut directory_selections = BTreeMap::new();
         let mut file_descriptor_row_pks = Vec::new();
         let mut directory_descriptor_row_pks = Vec::new();
         for (index, selection) in selections.iter().enumerate() {
+            if selection.file_id.is_some()
+                && matches!(selection.relation.as_str(), "lix_file" | "lix_directory")
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    "public filesystem row references require a null file scope",
+                ));
+            }
             match selection.relation.as_str() {
                 "lix_file" => {
                     let file_id = selection.row_pk.as_single_string_owned().map_err(|_| {
@@ -10219,21 +10229,29 @@ where
                     schema_selections
                         .entry(relation)
                         .or_default()
+                        .entry(selection.file_id.as_deref())
+                        .or_default()
                         .insert(typed_row_pk, index);
                 }
             }
         }
         let mut requests = Vec::new();
-        for (relation, rows) in &schema_selections {
-            requests.push(TrackedStateDiffRequest {
-                filter: TrackedStateFilter {
-                    schema_keys: vec![(*relation).to_string()],
-                    row_pks: rows.keys().cloned().collect(),
-                    include_tombstones: true,
-                    ..TrackedStateFilter::default()
-                },
-                retain_payloads: false,
-            });
+        for (relation, scopes) in &schema_selections {
+            for (file_id, rows) in scopes {
+                requests.push(TrackedStateDiffRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec![(*relation).to_string()],
+                        row_pks: rows.keys().cloned().collect(),
+                        file_ids: vec![match file_id {
+                            Some(id) => NullableKeyFilter::Value((*id).to_string()),
+                            None => NullableKeyFilter::Null,
+                        }],
+                        include_tombstones: true,
+                        ..TrackedStateFilter::default()
+                    },
+                    retain_payloads: false,
+                });
+            }
         }
         if !file_selections.is_empty() {
             requests.push(TrackedStateDiffRequest {
@@ -10378,6 +10396,7 @@ where
             let mut selected = false;
             if let Some(index) = schema_selections
                 .get(entry.identity.schema_key())
+                .and_then(|scopes| scopes.get(&entry.identity.file_id()))
                 .and_then(|rows| rows.get(entry.identity.row_pk()))
             {
                 matched.insert(*index);
@@ -10725,7 +10744,7 @@ where
                         return Err(LixError::new(LixError::CODE_TYPE_MISMATCH, "selection must contain non-null row references"));
                     };
                     let decoded = crate::row_ref::decode(row_ref)?;
-                    scope.push(DiffCommandSelection { relation: decoded.relation, row_pk: decoded.row_pk, source_commits: None });
+                    scope.push(DiffCommandSelection { relation: decoded.relation, file_id: decoded.file_id, row_pk: decoded.row_pk, source_commits: None });
                 }
                 Some(scope)
             }
@@ -10874,6 +10893,7 @@ where
                     let resolved = crate::row_ref::decode(row_ref)?;
                     selections.push(DiffCommandSelection {
                         relation: resolved.relation,
+                        file_id: resolved.file_id,
                         row_pk: resolved.row_pk,
                         source_commits: Some((from.clone(), to.clone())),
                     });
@@ -11356,6 +11376,7 @@ where
             let resolved = crate::row_ref::decode(row_ref)?;
             selections.push(DiffCommandSelection {
                 relation: resolved.relation,
+                        file_id: resolved.file_id,
                 row_pk: resolved.row_pk,
                 source_commits: None,
             });
@@ -11764,6 +11785,7 @@ fn close_and_validate_diff_command_selection(
                     "operation": operation,
                     "rowRef": crate::row_ref::encode_schema_identity(
                         REGISTERED_SCHEMA_KEY,
+                        entry.identity.file_id(),
                         entry.identity.row_pk(),
                     )?.as_str(),
                 })));
@@ -11809,6 +11831,7 @@ fn close_and_validate_diff_command_selection(
                     "operation": operation,
                     "rowRef": crate::row_ref::encode_schema_identity(
                         REGISTERED_SCHEMA_KEY,
+                        registration.identity.file_id(),
                         registration.identity.row_pk(),
                     )?.as_str(),
                     "schemaKey": schema_key,
@@ -12116,11 +12139,13 @@ fn close_and_validate_diff_command_selection(
                             "operation": operation,
                             "rowRef": crate::row_ref::encode_schema_identity(
                                 child_entry.identity.schema_key(),
-                                child_entry.identity.row_pk(),
+                                child_entry.identity.file_id(),
+                        child_entry.identity.row_pk(),
                             )?.as_str(),
                             "dependencyRowRef": crate::row_ref::encode_schema_identity(
                                 target_entry.identity.schema_key(),
-                                target_entry.identity.row_pk(),
+                                target_entry.identity.file_id(),
+                        target_entry.identity.row_pk(),
                             )?.as_str(),
                         })));
                     }
@@ -12157,6 +12182,7 @@ fn close_and_validate_diff_command_selection(
                 "operation": operation,
                 "rowRef": crate::row_ref::encode_schema_identity(
                     schema_key,
+                    entry.identity.file_id(),
                     entry.identity.row_pk(),
                 )?.as_str(),
                 "schemaKey": schema_key,
@@ -12200,10 +12226,12 @@ fn close_and_validate_diff_command_selection(
                     "operation": operation,
                     "rowRef": crate::row_ref::encode_schema_identity(
                         left_entry.identity.schema_key(),
+                        left_entry.identity.file_id(),
                         left_entry.identity.row_pk(),
                     )?.as_str(),
                     "conflictingRowRef": crate::row_ref::encode_schema_identity(
                         right_entry.identity.schema_key(),
+                        right_entry.identity.file_id(),
                         right_entry.identity.row_pk(),
                     )?.as_str(),
                     "leftDiffId": left_diff_id,
@@ -12235,10 +12263,12 @@ fn close_and_validate_diff_command_selection(
                     "operation": operation,
                     "rowRef": crate::row_ref::encode_schema_identity(
                         left_entry.identity.schema_key(),
+                        left_entry.identity.file_id(),
                         left_entry.identity.row_pk(),
                     )?.as_str(),
                     "conflictingRowRef": crate::row_ref::encode_schema_identity(
                         right_entry.identity.schema_key(),
+                        right_entry.identity.file_id(),
                         right_entry.identity.row_pk(),
                     )?.as_str(),
                 })));

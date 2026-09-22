@@ -462,7 +462,7 @@ where
                     serde_json::json!({
                         "change_id": change_id.to_string(),
                         "commit_id": commit_id.to_string(),
-                        "row_ref": crate::row_ref::schema_identity_detail(&key.schema_key, &key.row_pk),
+                        "row_ref": crate::row_ref::schema_identity_detail(&key.schema_key, key.file_id.as_deref(), &key.row_pk),
                         "file_id": key.file_id,
                     }),
                 );
@@ -493,7 +493,7 @@ where
                     serde_json::json!({
                         "change_id": change_id.to_string(),
                         "commit_id": commit_id.to_string(),
-                        "row_ref": crate::row_ref::schema_identity_detail(&key.schema_key, &key.row_pk),
+                        "row_ref": crate::row_ref::schema_identity_detail(&key.schema_key, key.file_id.as_deref(), &key.row_pk),
                         "file_id": key.file_id,
                     }),
                 ));
@@ -647,7 +647,7 @@ fn shared_payload_fields(
             serde_json::json!({
                 "change_id": change_id.to_string(),
                 "commit_id": commit_id.to_string(),
-                "row_ref": crate::row_ref::schema_identity_detail(key.schema_key, key.row_pk),
+                "row_ref": crate::row_ref::schema_identity_detail(key.schema_key, key.file_id, key.row_pk),
                 "file_id": key.file_id,
             }),
         )
@@ -664,7 +664,7 @@ fn shared_payload_fields(
             serde_json::json!({
                 "change_id": change_id.to_string(),
                 "commit_id": commit_id.to_string(),
-                "row_ref": crate::row_ref::schema_identity_detail(key.schema_key, key.row_pk),
+                "row_ref": crate::row_ref::schema_identity_detail(key.schema_key, key.file_id, key.row_pk),
                 "file_id": key.file_id,
             }),
         ));
@@ -1315,7 +1315,7 @@ mod tests {
         assert_eq!(details["commit_id"], commit_id.to_string());
         assert_eq!(
             details["row_ref"],
-            crate::row_ref::schema_identity_detail(&key.schema_key, &key.row_pk)
+            crate::row_ref::schema_identity_detail(&key.schema_key, key.file_id.as_deref(), &key.row_pk)
         );
     }
 }

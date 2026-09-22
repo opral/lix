@@ -40,6 +40,7 @@ pub(crate) enum DiffCommand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DiffCommandSelection {
     pub(crate) relation: String,
+    pub(crate) file_id: Option<String>,
     pub(crate) row_pk: crate::row_pk::RowPk,
     pub(crate) source_commits: Option<(String, String)>,
 }

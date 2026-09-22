@@ -1998,7 +1998,7 @@ async fn detached_receipt_upgrade_preserves_pending_data_before_current_open() {
     .await
     .unwrap();
     let checkpoint = execute_hydrating(&session, &storage, &state, &authority,
-        "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_key_value','receipt-pending')])",
+        "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_key_value', NULL, 'receipt-pending')])",
         &[], &mut fetches,
     ).await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
     let read = storage.begin_read(Default::default()).await.unwrap();

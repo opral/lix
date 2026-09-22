@@ -469,7 +469,7 @@ fn benchmark_undo_redo(criterion: &mut Criterion) {
                                 .block_on(
                                     session
                                         .execute(
-                                            "SELECT commit_id FROM lix_undo($1, ARRAY[lix_row_ref('lix_key_value', 'checkpoint-0')])",
+                                            "SELECT commit_id FROM lix_undo($1, ARRAY[lix_row_ref('lix_key_value', NULL, 'checkpoint-0')])",
                                             &target_params,
                                         )
                                         .into_future(),
