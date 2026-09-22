@@ -33,6 +33,7 @@ pub(crate) use epoch::stage_legacy_partial_epoch_for_test;
 mod publish;
 mod registry;
 mod runtime_epoch;
+mod hot_indexes;
 
 pub use api::MigrationOptions;
 pub(crate) use api::migrate_lix_with_adapter;

@@ -3,8 +3,8 @@ import { initializeWasm } from "../wasm-init.js";
 import { emitOpenProgress } from "../open-progress.js";
 import type { LixOpenProgress, LixOpenReport } from "../types.js";
 
-export const ADMISSION_PROTOCOL_EPOCH = 19;
-export const ADMISSION_STORAGE_EPOCH = 81;
+export const ADMISSION_PROTOCOL_EPOCH = 20;
+export const ADMISSION_STORAGE_EPOCH = 82;
 export type AdmissionIdentity = {
   repositoryId: string;
   principalId: string;

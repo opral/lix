@@ -1,10 +1,10 @@
 import { expect, test, vi } from "vitest";
 import { HttpTransportError } from "../http-transport.js";
-import { SharedAdmissionCache, requestAdmission, type AdmissionIdentity } from "./shared-admission.js";
+import { ADMISSION_PROTOCOL_EPOCH, ADMISSION_STORAGE_EPOCH, SharedAdmissionCache, requestAdmission, type AdmissionIdentity } from "./shared-admission.js";
 const repositoryId = "00000000-0000-7000-8000-000000000004";
 const url = `https://example.test/lix/${repositoryId}`;
 const headers: [string, string][] = [["Authorization", "Bearer exact-token"]];
-const identity: AdmissionIdentity = {repositoryId, principalId: "00000000-0000-7000-8000-000000000003", protocolEpoch: 20, storageEpoch: 81};
+const identity: AdmissionIdentity = {repositoryId, principalId: "00000000-0000-7000-8000-000000000003", protocolEpoch: 20, storageEpoch: 82};
 const offline = async (): Promise<AdmissionIdentity> => {throw new HttpTransportError("LIX_TRANSPORT_NETWORK", "offline");};
 
 test("new ports verify principal even with previously admitted credentials", async () => {
@@ -28,9 +28,11 @@ test("invisible credentials or different repository/epoch cannot reuse a proof",
   const cache = new SharedAdmissionCache(); cache.record(url, [], identity);
   await expect(cache.verify(url, [], identity, offline)).rejects.toMatchObject({code: "LIX_IDENTITY_UNVERIFIED_OFFLINE"});
   cache.record(url, headers, identity);
-  await expect(cache.verify(url, headers, {...identity, storageEpoch: 82}, offline)).rejects.toMatchObject({code: "LIX_IDENTITY_UNVERIFIED_OFFLINE"});
+  await expect(cache.verify(url, headers, {...identity, storageEpoch: 83}, offline)).rejects.toMatchObject({code: "LIX_IDENTITY_UNVERIFIED_OFFLINE"});
 });
 test("metadata admission uses bounded GET and explicit credentials without SQL opening", async () => {
+  expect(identity.protocolEpoch).toBe(ADMISSION_PROTOCOL_EPOCH);
+  expect(identity.storageEpoch).toBe(ADMISSION_STORAGE_EPOCH);
   const transport = vi.fn(async () => Response.json(identity));
   expect(await requestAdmission(url, headers, transport)).toEqual(identity);
   const request = transport.mock.calls[0]![0] as any;
@@ -96,7 +98,7 @@ test("admission waits in Rust and retains authority progress and report", async 
   expect(await requestAdmission(url, headers, transport, { onProgress: progress, onReport: report })).toEqual(identity);
   expect(transport).toHaveBeenCalledTimes(2);
   expect(progress.mock.calls.some(([event]) => event.phase === "migrating" && event.scope === "authority")).toBe(true);
-  expect(report.mock.calls[0]?.[0].migrations).toEqual([{ scope: "authority", fromFormat: 80, toFormat: 81 }]);
+  expect(report.mock.calls[0]?.[0].migrations).toEqual([{ scope: "authority", fromFormat: 80, toFormat: 82 }]);
 });
 
 test("admission bounds retries for non-migration service unavailability", async () => {

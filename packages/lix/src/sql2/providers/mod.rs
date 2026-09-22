@@ -26,11 +26,14 @@ pub(crate) fn log_schema() -> datafusion::arrow::datatypes::SchemaRef {
 }
 mod schema;
 mod state_at;
+pub(crate) use state_at::relation_state_schema;
 #[cfg(test)]
 pub(crate) use state_at::{arm_state_at_traversal_probe, take_state_at_traversal_probe};
 mod spec;
 pub(crate) use spec::{PhysicalScanKey, SpecScanExec, StatementScanKey};
 mod upsert;
+#[cfg(test)]
+pub(crate) use upsert::take_upsert_source_batches;
 mod values;
 
 use crate::sql2::catalog::{PublicCatalog, PublicSurfaceContract, PublicSurfaceKind};
@@ -79,6 +82,7 @@ where
             Arc::clone(&catalog),
             ctx.read_interest_registry(),
             ctx.blob_reader(),
+            ctx.filesystem_path_index().historical_cache(),
         );
     }
     if catalog
@@ -640,6 +644,7 @@ where
             Arc::clone(&catalog),
             read_ctx.read_interest_registry(),
             read_ctx.blob_reader(),
+            read_ctx.filesystem_path_index().historical_cache(),
         );
     }
     if catalog

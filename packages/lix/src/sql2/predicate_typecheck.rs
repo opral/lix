@@ -242,6 +242,9 @@ fn validate_expr<'a>(
             for (when, then) in &case.when_then_expr {
                 validate_expr(when, lookup_field)?;
                 validate_expr(then, lookup_field)?;
+                if let Some(operand) = &case.expr {
+                    validate_comparison_operands(operand, when, lookup_field)?;
+                }
             }
             if let Some(expr) = &case.else_expr {
                 validate_expr(expr, lookup_field)?;
@@ -301,11 +304,10 @@ fn collect_json_predicate_placeholder_indexes<'a>(
         Expr::BinaryExpr(binary) if is_comparison_operator(binary.op) => {
             collect_json_predicate_placeholder_indexes(&binary.left, indexes, lookup_field);
             collect_json_predicate_placeholder_indexes(&binary.right, indexes, lookup_field);
-            if is_json_expr(&binary.left, lookup_field) {
-                collect_placeholder_indexes(&binary.right, indexes);
-            }
-            if is_json_expr(&binary.right, lookup_field) {
+            if is_json_expr(&binary.left, lookup_field) || is_json_expr(&binary.right, lookup_field)
+            {
                 collect_placeholder_indexes(&binary.left, indexes);
+                collect_placeholder_indexes(&binary.right, indexes);
             }
         }
         Expr::BinaryExpr(binary) => {
@@ -318,12 +320,14 @@ fn collect_json_predicate_placeholder_indexes<'a>(
                 collect_json_predicate_placeholder_indexes(item, indexes, lookup_field);
             }
             if is_json_expr(&in_list.expr, lookup_field) {
+                collect_placeholder_indexes(&in_list.expr, indexes);
                 for item in &in_list.list {
                     collect_placeholder_indexes(item, indexes);
                 }
             }
             for item in &in_list.list {
                 if is_json_expr(item, lookup_field) {
+                    collect_placeholder_indexes(item, indexes);
                     collect_placeholder_indexes(&in_list.expr, indexes);
                 }
             }
@@ -332,7 +336,11 @@ fn collect_json_predicate_placeholder_indexes<'a>(
             collect_json_predicate_placeholder_indexes(&between.expr, indexes, lookup_field);
             collect_json_predicate_placeholder_indexes(&between.low, indexes, lookup_field);
             collect_json_predicate_placeholder_indexes(&between.high, indexes, lookup_field);
-            if is_json_expr(&between.expr, lookup_field) {
+            if [&between.expr, &between.low, &between.high]
+                .iter()
+                .any(|value| is_json_expr(value, lookup_field))
+            {
+                collect_placeholder_indexes(&between.expr, indexes);
                 collect_placeholder_indexes(&between.low, indexes);
                 collect_placeholder_indexes(&between.high, indexes);
             }
@@ -370,6 +378,12 @@ fn collect_json_predicate_placeholder_indexes<'a>(
             for (when, then) in &case.when_then_expr {
                 collect_json_predicate_placeholder_indexes(when, indexes, lookup_field);
                 collect_json_predicate_placeholder_indexes(then, indexes, lookup_field);
+                if let Some(operand) = &case.expr
+                    && (is_json_expr(operand, lookup_field) || is_json_expr(when, lookup_field))
+                {
+                    collect_placeholder_indexes(operand, indexes);
+                    collect_placeholder_indexes(when, indexes);
+                }
             }
             if let Some(expr) = &case.else_expr {
                 collect_json_predicate_placeholder_indexes(expr, indexes, lookup_field);
@@ -405,15 +419,65 @@ fn collect_json_predicate_placeholder_indexes<'a>(
     }
 }
 
+// Collect only value-producing branches. CASE conditions and explicit casts
+// have their own type contracts and must not constrain boolean/text parameters.
 fn collect_placeholder_indexes(expr: &Expr, indexes: &mut BTreeSet<usize>) {
-    if let Expr::Placeholder(placeholder) = expr {
-        if let Some(index) = placeholder
-            .id
-            .strip_prefix('$')
-            .and_then(|value| value.parse::<usize>().ok())
-        {
-            indexes.insert(index);
+    match expr {
+        Expr::Placeholder(placeholder) => {
+            if let Some(index) = placeholder
+                .id
+                .strip_prefix('$')
+                .and_then(|value| value.parse::<usize>().ok())
+            {
+                indexes.insert(index);
+            }
         }
+        Expr::Alias(alias) => collect_placeholder_indexes(&alias.expr, indexes),
+        Expr::Case(case) => {
+            for (_, value) in &case.when_then_expr {
+                collect_placeholder_indexes(value, indexes);
+            }
+            if let Some(value) = &case.else_expr {
+                collect_placeholder_indexes(value, indexes);
+            }
+        }
+        Expr::ScalarFunction(function) if is_coalesce(function.name()) => {
+            for value in &function.args {
+                collect_placeholder_indexes(value, indexes);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_coalesce(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "coalesce" | "ifnull" | "nvl"
+    )
+}
+
+fn is_json_operand_compatible<'a>(
+    expr: &'a Expr,
+    lookup_field: &impl Fn(&datafusion::common::Column) -> Option<&'a Field>,
+) -> bool {
+    if is_json_expr(expr, lookup_field) || is_null_literal(expr) {
+        return true;
+    }
+    match expr {
+        Expr::Placeholder(_) => true,
+        Expr::Alias(alias) => is_json_operand_compatible(&alias.expr, lookup_field),
+        Expr::Case(case) => case
+            .when_then_expr
+            .iter()
+            .map(|(_, value)| value.as_ref())
+            .chain(case.else_expr.iter().map(AsRef::as_ref))
+            .all(|value| is_json_operand_compatible(value, lookup_field)),
+        Expr::ScalarFunction(function) if is_coalesce(function.name()) => function
+            .args
+            .iter()
+            .all(|value| is_json_operand_compatible(value, lookup_field)),
+        _ => false,
     }
 }
 
@@ -463,7 +527,11 @@ fn validate_between<'a>(
     validate_expr(&between.low, lookup_field)?;
     validate_expr(&between.high, lookup_field)?;
 
-    if is_json_expr(&between.expr, lookup_field) {
+    if [&between.expr, &between.low, &between.high]
+        .iter()
+        .any(|value| is_json_expr(value, lookup_field))
+    {
+        require_json_comparison_operand(&between.expr, lookup_field)?;
         require_json_comparison_operand(&between.low, lookup_field)?;
         require_json_comparison_operand(&between.high, lookup_field)?;
     }
@@ -507,10 +575,7 @@ fn require_json_comparison_operand<'a>(
     expr: &'a Expr,
     lookup_field: &impl Fn(&datafusion::common::Column) -> Option<&'a Field>,
 ) -> Result<(), LixError> {
-    if is_json_expr(expr, lookup_field)
-        || is_null_literal(expr)
-        || matches!(expr, Expr::Placeholder(_))
-    {
+    if is_json_operand_compatible(expr, lookup_field) {
         return Ok(());
     }
 
@@ -527,9 +592,19 @@ fn is_json_expr<'a>(
             .inner()
             .get(LIX_VALUE_TYPE_METADATA_KEY)
             .is_some_and(|value| value == LIX_VALUE_TYPE_JSONB),
-        Expr::ScalarFunction(function) => matches!(
-            function.name(),
-            "__lix_json_get" | "__lix_json_path_get" | "__lix_jsonb"
+        Expr::ScalarFunction(function) => {
+            matches!(
+                function.name(),
+                "__lix_json_get" | "__lix_json_path_get" | "__lix_jsonb"
+            ) || (is_coalesce(function.name())
+                && common_json_expr(function.args.iter(), lookup_field))
+        }
+        Expr::Case(case) => common_json_expr(
+            case.when_then_expr
+                .iter()
+                .map(|(_, then_expr)| then_expr.as_ref())
+                .chain(case.else_expr.iter().map(AsRef::as_ref)),
+            lookup_field,
         ),
         Expr::ScalarSubquery(subquery) => subquery
             .subquery
@@ -547,6 +622,23 @@ fn is_json_expr<'a>(
     }
 }
 
+fn common_json_expr<'a>(
+    expressions: impl IntoIterator<Item = &'a Expr>,
+    lookup_field: &impl Fn(&datafusion::common::Column) -> Option<&'a Field>,
+) -> bool {
+    let mut saw_json = false;
+    for expr in expressions {
+        if is_null_literal(expr) || matches!(expr, Expr::Placeholder(_)) {
+            continue;
+        }
+        if !is_json_expr(expr, lookup_field) {
+            return false;
+        }
+        saw_json = true;
+    }
+    saw_json
+}
+
 fn validate_subquery_operand<'a>(
     expr: &'a Expr,
     subquery_field: Option<&'a Field>,
@@ -561,10 +653,13 @@ fn validate_subquery_operand<'a>(
     if matches!(expr, Expr::Placeholder(_)) {
         return Ok(());
     }
-    if is_json_expr(expr, lookup_field) != field_is_json(subquery_field) {
-        return Err(json_predicate_type_error(expr));
+    if field_is_json(subquery_field) {
+        require_json_comparison_operand(expr, lookup_field)
+    } else if is_json_expr(expr, lookup_field) {
+        Err(json_predicate_type_error(expr))
+    } else {
+        Ok(())
     }
-    Ok(())
 }
 
 fn is_identity_json_expr(expr: &Expr) -> bool {

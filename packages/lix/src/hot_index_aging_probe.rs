@@ -2,9 +2,8 @@
 //!
 //! Not a product module. It measures how many *candidates* a single-value
 //! lookup on an indexed column resolves, versus how many rows actually match,
-//! after the collection has churned inside one generation. Entries are
-//! put-only and a generation spans a branch's lifetime, so the question is
-//! whether the wasted candidate resolutions stay a small constant or grow.
+//! after the collection has churned inside one generation. Reverse membership
+//! maintenance should keep candidate resolutions tied to current references.
 
 use serde_json::json;
 use std::time::{Duration, Instant};
@@ -71,7 +70,7 @@ async fn index_record_counts(storage: &Memory) -> (usize, usize) {
         .iter()
         .filter(|entry| crate::hot_state::hot_index_key_is_witness(entry.key.0.as_ref()))
         .count();
-    (witnesses, entries.len() - witnesses)
+    (witnesses, entries.iter().filter(|entry| crate::hot_state::hot_index_key_is_entry(entry.key.0.as_ref())).count())
 }
 
 fn probe_schemas(parent: &str, child: &str) -> [serde_json::Value; 2] {

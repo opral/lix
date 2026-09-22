@@ -119,6 +119,18 @@ pub(crate) async fn collect_plan(
     logical_plan: RuntimeReadPlan,
     physical_planning_cache: Option<PhysicalPlanningCache>,
 ) -> Result<Vec<RecordBatch>> {
+    collect_plan_with_schema(state, logical_plan, physical_planning_cache)
+        .await
+        .map(|(_, batches)| batches)
+}
+
+/// Return the physical schema even for an empty result. Logical plans before
+/// coercion can still advertise NULL for the first input of a UNION.
+pub(crate) async fn collect_plan_with_schema(
+    state: &SessionState,
+    logical_plan: RuntimeReadPlan,
+    physical_planning_cache: Option<PhysicalPlanningCache>,
+) -> Result<(SchemaRef, Vec<RecordBatch>)> {
     let task_ctx = execution_task_context(state);
     #[cfg(feature = "storage-benches")]
     let started = crate::sql_profile::is_active().then(Instant::now);
@@ -133,6 +145,7 @@ pub(crate) async fn collect_plan(
     }
     #[cfg(feature = "storage-benches")]
     let started = crate::sql_profile::is_active().then(Instant::now);
+    let schema = plan.schema();
     let result = collect_bounded_read_output(plan, task_ctx).await;
     #[cfg(feature = "storage-benches")]
     if let Some(started) = started {
@@ -141,7 +154,7 @@ pub(crate) async fn collect_plan(
             started.elapsed(),
         );
     }
-    result
+    result.map(|batches| (schema, batches))
 }
 
 /// Create a pull-based stream from a DataFusion physical plan without
@@ -519,6 +532,21 @@ impl ExecutionPlan for DetachedSpecScanExec {
     }
 }
 
+/// Pulls one partition at a time. Sinks consume and release each source batch
+/// before requesting the next; they publish writes only after the source ends.
+pub(crate) fn stream_input_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    task_ctx: Arc<TaskContext>,
+) -> Result<SendableRecordBatchStream> {
+    let plan = adapt_runtime_plan(plan)?;
+    let schema = plan.schema();
+    let partitions = plan.output_partitioning().partition_count();
+    let stream = stream::iter(0..partitions)
+        .map(move |partition| plan.execute(partition, Arc::clone(&task_ctx)))
+        .try_flatten();
+    Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+}
+
 pub(crate) async fn collect_input_plan(
     plan: Arc<dyn ExecutionPlan>,
     task_ctx: Arc<TaskContext>,
@@ -716,14 +744,6 @@ fn adapt_runtime_plan_inner(
         coalesce.fetch(),
     )))
 }
-
-/// Distinct probe keys one join may carry into its scan.
-///
-/// Each key becomes its own index bucket lookup, so a wide build side is
-/// cheaper to answer with the collection scan the join already had. The
-/// storage plane applies the same cap independently and declines above it, so
-/// exceeding this number costs a scan, never a wrong answer.
-const MAX_PROBE_KEYS: usize = 64;
 
 /// Wraps a hash join whose probe side is a scan that can seek on the join key.
 ///
@@ -967,8 +987,31 @@ fn probe_keys(
     batches: &[RecordBatch],
     key: &Arc<dyn PhysicalExpr>,
 ) -> Result<Option<Vec<ScalarValue>>> {
+    probe_keys_with_byte_budget(batches, key, PROBE_KEY_BYTE_BUDGET)
+}
+
+// Restricting the probe is optional. Account for both retained ScalarValue
+// copies, container spare capacity, and the downstream IN literal expression
+// nodes before retaining a distinct key. Large build relations keep the normal
+// join rather than constructing an unbounded auxiliary filter.
+const PROBE_KEY_BYTE_BUDGET: usize = 4 * 1024 * 1024;
+
+fn probe_key_bytes(value: &ScalarValue) -> usize {
+    value.size().saturating_mul(4).saturating_add(
+        size_of::<datafusion::logical_expr::Expr>()
+            .saturating_mul(2)
+            .saturating_add(32),
+    )
+}
+
+fn probe_keys_with_byte_budget(
+    batches: &[RecordBatch],
+    key: &Arc<dyn PhysicalExpr>,
+    byte_budget: usize,
+) -> Result<Option<Vec<ScalarValue>>> {
     let mut seen = HashSet::new();
     let mut values = Vec::new();
+    let mut retained_bytes = 0usize;
     for batch in batches {
         if batch.num_rows() == 0 {
             continue;
@@ -978,16 +1021,88 @@ fn probe_keys(
             if array.is_null(index) {
                 continue;
             }
-            let value = ScalarValue::try_from_array(&array, index)?;
-            if seen.insert(value.clone()) {
-                if values.len() == MAX_PROBE_KEYS {
-                    return Ok(None);
-                }
-                values.push(value);
+            // Arrow strings borrow the build batch. Check their payload before
+            // ScalarValue materialization would allocate a potentially huge copy.
+            let string_bytes = array
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .map(|strings| strings.value(index).len())
+                .or_else(|| {
+                    array
+                        .as_any()
+                        .downcast_ref::<datafusion::arrow::array::LargeStringArray>()
+                        .map(|strings| strings.value(index).len())
+                })
+                .or_else(|| {
+                    array.as_any()
+                        .downcast_ref::<datafusion::arrow::array::StringViewArray>()
+                        .map(|strings| strings.value(index).len())
+                });
+            if string_bytes.is_some_and(|bytes| bytes > byte_budget / 4) {
+                return Ok(None);
             }
+            let value = ScalarValue::try_from_array(&array, index)?;
+            if seen.contains(&value) {
+                continue;
+            }
+            let Some(next_bytes) = retained_bytes.checked_add(probe_key_bytes(&value)) else {
+                return Ok(None);
+            };
+            if next_bytes > byte_budget {
+                return Ok(None);
+            }
+            retained_bytes = next_bytes;
+            seen.insert(value.clone());
+            values.push(value);
         }
     }
     Ok((!values.is_empty()).then_some(values))
+}
+
+#[cfg(test)]
+mod probe_key_budget_tests {
+    use super::*;
+    use datafusion::arrow::{
+        array::{Int64Array, StringArray},
+        datatypes::{DataType, Field, Schema},
+    };
+
+    #[test]
+    fn byte_budget_preserves_seventy_keys_and_deduplicates_before_charging() {
+        let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(
+                (0..70).chain(0..70).collect::<Vec<i64>>(),
+            ))],
+        )
+        .unwrap();
+        let key: Arc<dyn PhysicalExpr> = Arc::new(PhysicalColumn::new("key", 0));
+        let exact_budget = 70 * probe_key_bytes(&ScalarValue::Int64(Some(0)));
+        assert_eq!(
+            probe_keys_with_byte_budget(std::slice::from_ref(&batch), &key, exact_budget)
+                .unwrap()
+                .unwrap()
+                .len(),
+            70
+        );
+        assert!(
+            probe_keys_with_byte_budget(std::slice::from_ref(&batch), &key, exact_budget - 1)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(probe_keys(&[batch], &key).unwrap().unwrap().len(), 70);
+    }
+
+    #[test]
+    fn byte_budget_limits_large_string_keys_not_just_key_count() {
+        let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Utf8, false)]));
+        let text = "x".repeat(PROBE_KEY_BYTE_BUDGET / 2);
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec![text]))]).unwrap();
+        let key: Arc<dyn PhysicalExpr> = Arc::new(PhysicalColumn::new("key", 0));
+        assert!(probe_keys(&[batch], &key).unwrap().is_none());
+    }
 }
 
 #[derive(Debug)]

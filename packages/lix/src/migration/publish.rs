@@ -148,6 +148,33 @@ impl Default for PublicationPlan {
     }
 }
 
+/// Project exactly the owned sparse metadata rewrites used by epoch migration.
+/// Both public reports and activation witnesses share this source-derived plan.
+pub(super) async fn append_partial_metadata_upgrade(
+    read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+    plan: &mut PublicationPlan,
+) -> Result<(), LixError> {
+    if let Some((_, writes, _)) = crate::sync::prepare_owned_partial_metadata_upgrade(read).await? {
+        for space in [
+            crate::sync::PARTIAL_REPLICA_STATE_SPACE,
+            crate::sync::PARTIAL_BRANCH_PUSH_SPACE,
+            crate::sync::PARTIAL_BRANCH_MERGE_SPACE,
+        ] {
+            let values = writes.staged_values_in_space(space);
+            if !values.is_empty() {
+                plan.put_mutable(
+                    space,
+                    values
+                        .into_iter()
+                        .map(|(key, value)| (key.to_vec(), value.to_vec()))
+                        .collect(),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Publishes one already-complete migration plan in a single durable backend
 /// transaction. The marker precondition fences concurrent writers and the
 /// marker update shares the same atomic commit as every authority rewrite.

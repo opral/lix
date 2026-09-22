@@ -503,6 +503,7 @@ pub(crate) async fn validate_prepared_writes(
         match validated.payload {
             ValidatedRowPayload::Deleted => {
                 pending_constraints.remember_tombstone(row);
+                index_extractor.observe(row, &JsonValue::Null);
             }
             ValidatedRowPayload::Json(snapshot) => {
                 file_owner_validator
@@ -653,6 +654,11 @@ impl<'a> StagedIndexExtractor<'a> {
             // column carries the schema document itself.
             let registered = snapshot.get("value").unwrap_or(snapshot);
             if let Ok(spec) = crate::sql2::derive_schema_surface_spec_from_schema(registered) {
+                self.values.registered_collections.extend(
+                    spec.indexed_groups
+                        .iter()
+                        .map(|(ordinal, _)| (spec.schema_key.clone(), *ordinal)),
+                );
                 for column in &spec.indexed_columns {
                     self.values
                         .registered_collections
@@ -677,11 +683,12 @@ impl<'a> StagedIndexExtractor<'a> {
         let Some(spec) = spec else {
             return;
         };
-        if spec.indexed_columns.is_empty() {
+        if spec.indexed_columns.is_empty() && spec.indexed_groups.is_empty() {
             return;
         }
         let PreparedValidationRow::State(state_row) = row;
         self.values.rows.push(StagedIndexRow {
+            untracked: state_row.untracked,
             branch_id: state_row.branch_id.clone(),
             schema_key: state_row.schema_key.clone(),
             file_id: state_row.file_id.cloned(),
@@ -690,6 +697,17 @@ impl<'a> StagedIndexExtractor<'a> {
                 .indexed_columns
                 .iter()
                 .map(|column| (column.ordinal, hot_index_value(snapshot, column)))
+                .chain(spec.indexed_groups.iter().map(|(ordinal, columns)| {
+                    let paths = columns
+                        .iter()
+                        .map(|column| vec![column.clone()])
+                        .collect::<Vec<_>>();
+                    (
+                        *ordinal,
+                        UniqueConstraintValue::from_snapshot_non_null(snapshot, &paths)
+                            .and_then(|value| value.exact_hot_index_value()),
+                    )
+                }))
                 .collect(),
         });
     }
@@ -702,6 +720,11 @@ impl<'a> StagedIndexExtractor<'a> {
             if let Ok(spec) =
                 crate::sql2::derive_schema_surface_spec_from_schema(registered.as_value())
             {
+                self.values.registered_collections.extend(
+                    spec.indexed_groups
+                        .iter()
+                        .map(|(ordinal, _)| (spec.schema_key.clone(), *ordinal)),
+                );
                 for column in &spec.indexed_columns {
                     self.values
                         .registered_collections
@@ -726,31 +749,146 @@ impl<'a> StagedIndexExtractor<'a> {
         let Some(spec) = spec else {
             return;
         };
-        if spec.indexed_columns.is_empty() {
+        if spec.indexed_columns.is_empty() && spec.indexed_groups.is_empty() {
             return;
         }
         let PreparedValidationRow::State(state_row) = row;
         self.values.rows.push(StagedIndexRow {
+            untracked: state_row.untracked,
             branch_id: state_row.branch_id.clone(),
             schema_key: state_row.schema_key.clone(),
             file_id: state_row.file_id.cloned(),
             row_pk: state_row.row_pk.clone(),
-            columns: spec
-                .indexed_columns
-                .iter()
-                .map(|column| {
-                    (
-                        column.ordinal,
-                        typed_hot_index_value(typed.get(&column.name)),
-                    )
-                })
-                .collect(),
+            columns: typed_hot_index_columns(&spec, typed),
         });
     }
 
     fn finish(self) -> StagedIndexValues {
         self.values
     }
+}
+
+/// Shared by current writes and offline rebuilds so typed constraint keys
+/// retain the same encoding (especially timestamps and composite groups).
+fn typed_hot_index_columns(
+    spec: &crate::sql2::SchemaSurfaceSpec,
+    typed: &lix_schema::Row,
+) -> Vec<(u16, Option<crate::hot_state::HotIndexValue>)> {
+    spec.indexed_columns
+        .iter()
+        .map(|column| {
+            (
+                column.ordinal,
+                typed_hot_index_value(typed.get(&column.name)),
+            )
+        })
+        .chain(spec.indexed_groups.iter().map(|(ordinal, columns)| {
+            let values = columns
+                .iter()
+                .map(|column| {
+                    let value = typed.get(column)?;
+                    if matches!(value, lix_schema::Value::Null) {
+                        return None;
+                    }
+                    stable_typed_constraint_value(value)
+                })
+                .collect::<Option<Vec<_>>>();
+            (
+                *ordinal,
+                values.and_then(|values| UniqueConstraintValue(values).exact_hot_index_value()),
+            )
+        }))
+        .collect()
+}
+
+/// Migration-only extraction from authoritative materialized rows. Current
+/// writes extract these values during validation instead of reparsing rows.
+pub(crate) fn hot_index_entries_for_migration(
+    plan: &SchemaPlan,
+    row: MaterializedHotStateRowRef<'_>,
+) -> Result<Vec<crate::hot_state::HotIndexEntry>, LixError> {
+    let spec = crate::sql2::derive_schema_surface_spec_from_schema(&plan.schema)?;
+    let typed = resolved_constraint_row(plan, row)?;
+    let columns = typed_hot_index_columns(&spec, &typed.row).into_iter();
+    Ok(columns
+        .map(|(ordinal, value)| crate::hot_state::HotIndexEntry {
+            untracked: row.untracked(),
+            schema_key: row.schema_key().to_owned(),
+            ordinal,
+            value,
+            file_id: row.file_id().map(ToString::to_string),
+            row_pk: row.row_pk().clone(),
+        })
+        .collect())
+}
+
+fn resolved_constraint_row(
+    plan: &SchemaPlan,
+    row: MaterializedHotStateRowRef<'_>,
+) -> Result<Arc<WasmTypedRow>, LixError> {
+    let typed = match row.materialize_decoded_snapshot()? {
+        Some(typed)
+            if typed.schema_fingerprint != plan.fingerprint().bytes()
+                && CatalogSnapshot::builtin()
+                    .plan_for_key(row.schema_key())
+                    .is_none() =>
+        {
+            // Match SQL amendment reads: only custom schemas are rebound.
+            // Historical built-ins retain their validated native values even
+            // when descriptive schema metadata changed their fingerprint.
+            let schema = crate::schema::parse_lix_schema(&plan.schema)?;
+            Arc::new(typed.revalidate_resolved_schema(
+                row.schema_key(),
+                row.row_pk(),
+                &schema,
+                &plan.compiled_schema,
+                plan.fingerprint().bytes(),
+            )?)
+        }
+        Some(typed) => typed,
+        None => {
+            // Historical/root-backed reads can expose only canonical JSON.
+            // Resolve compatible literal-default amendments transiently, just
+            // as typed reads do. Never generate expression defaults or rewrite
+            // authoritative rows while building a derived index.
+            let mut snapshot = row.snapshot_json_value()?.ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_MIGRATION_FAILED",
+                    format!(
+                        "index rebuild row in schema '{}' has no snapshot",
+                        row.schema_key()
+                    ),
+                )
+            })?;
+            let schema = crate::schema::parse_lix_schema(&plan.schema)?;
+            if let Some(object) = snapshot.as_object_mut() {
+                for column in &schema.columns {
+                    if object.contains_key(&column.name) {
+                        continue;
+                    }
+                    if column.default_expression.is_some() {
+                        return Err(LixError::new(
+                            LixError::CODE_SCHEMA_VALIDATION,
+                            format!(
+                                "index rebuild for schema '{}' requires durable schema-amendment materialization for missing expression default '{}'",
+                                row.schema_key(),
+                                column.name
+                            ),
+                        ));
+                    }
+                    if let Some(value) = &column.default_value {
+                        object.insert(column.name.clone(), value.clone());
+                    }
+                }
+            }
+            Arc::new(WasmTypedRow::from_normalized_json(
+                plan,
+                row.row_pk(),
+                &snapshot,
+            )?)
+        }
+    };
+    Ok(typed)
 }
 
 /// The two JSON scalar shapes the index plane has an order-preserving key
@@ -3219,6 +3357,14 @@ pub(super) async fn plan_delete_actions(
             let snapshot: JsonValue = serde_json::from_str(snapshot.as_str()).map_err(|error| {
                 LixError::new(LixError::CODE_SCHEMA_VALIDATION, error.to_string())
             })?;
+            // Seeds retain JSON snapshots across breadth-first levels. Restore
+            // native schema kinds before probing typed constraint indexes;
+            // timestamp strings otherwise differ from indexed microseconds.
+            let seed_batch = MaterializedHotStateBatch::from_rows(vec![parent.clone()]);
+            let typed = catalog
+                .plan_for_key(&parent.schema_key)
+                .map(|(_, plan)| resolved_constraint_row(plan, seed_batch.row(0)))
+                .transpose()?;
             for reference in catalog
                 .delete_plan_for_key(&parent.schema_key)
                 .foreign_key_references
@@ -3226,9 +3372,14 @@ pub(super) async fn plan_delete_actions(
                 if reference.foreign_key.on_delete != lix_schema::DeleteAction::Cascade {
                     continue;
                 }
-                let Some(value) = UniqueConstraintValue::from_snapshot_non_null(
-                    &snapshot,
+                let Some(value) = UniqueConstraintValue::from_payload(
+                    typed
+                        .as_ref()
+                        .map_or(ValidatedRowPayload::Json(&snapshot), |typed| {
+                            ValidatedRowPayload::Typed(Arc::clone(typed))
+                        }),
                     &reference.foreign_key.referenced_properties,
+                    true,
                 ) else {
                     continue;
                 };
@@ -3300,7 +3451,7 @@ pub(super) async fn plan_delete_actions(
                     row.row_pk().clone(),
                 );
                 if visited.contains(&identity)
-                    || !committed_constraint_value(row, &batch.local_properties, true)?
+                    || !committed_constraint_value(catalog, row, &batch.local_properties, true)?
                         .is_some_and(|value| values.contains(&value))
                 {
                     continue;
@@ -3375,8 +3526,13 @@ pub(super) async fn plan_delete_actions(
                     row.row_pk().clone(),
                 );
                 if visited.contains(&identity)
-                    || !committed_constraint_value(row, &[vec![batch.column.clone()]], true)?
-                        .is_some_and(|value| values.contains(&value))
+                    || !committed_constraint_value(
+                        catalog,
+                        row,
+                        &[vec![batch.column.clone()]],
+                        true,
+                    )?
+                    .is_some_and(|value| values.contains(&value))
                 {
                     continue;
                 }
@@ -3421,21 +3577,31 @@ fn delete_action_probe(
     batch: &NormalDeleteRestrictionBatchKey,
     values: &BTreeSet<UniqueConstraintValue>,
 ) -> Option<crate::hot_state::DeclaredColumnEq> {
-    let [path] = batch.local_properties.as_slice() else {
-        return None;
-    };
-    let [column] = path.as_slice() else {
-        return None;
-    };
     let spec = crate::sql2::derive_schema_surface_spec_from_schema(
         catalog.schema(&batch.source_key.schema_key)?,
     )
     .ok()?;
-    let ordinal = spec
-        .indexed_columns
+    let columns = batch
+        .local_properties
         .iter()
-        .find(|entry| entry.name == *column)?
-        .ordinal;
+        .map(|path| {
+            let [column] = path.as_slice() else {
+                return None;
+            };
+            Some(column.clone())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let ordinal = if let [column] = columns.as_slice() {
+        spec.indexed_columns
+            .iter()
+            .find(|entry| entry.name == *column)?
+            .ordinal
+    } else {
+        spec.indexed_groups
+            .iter()
+            .find(|(_, group)| *group == columns)?
+            .0
+    };
     Some(crate::hot_state::DeclaredColumnEq {
         schema_key: batch.source_key.schema_key.clone(),
         ordinal,
@@ -3467,6 +3633,7 @@ async fn validate_committed_delete_restrictions(
         for reference in delete_plan.foreign_key_references {
             let Some(deleted_value) = committed_deleted_row_value(
                 input.hot_state,
+                delete_schema_catalog,
                 tombstone,
                 &reference.foreign_key.referenced_properties,
             )
@@ -3626,7 +3793,8 @@ async fn validate_committed_normal_delete_restriction_batches(
             {
                 continue;
             }
-            let Some(value) = committed_constraint_value(row, &batch.local_properties, true)?
+            let Some(value) =
+                committed_constraint_value(catalog, row, &batch.local_properties, true)?
             else {
                 continue;
             };
@@ -3648,6 +3816,7 @@ async fn validate_committed_normal_delete_restriction_batches(
 
 async fn committed_deleted_row_value(
     hot_state: &dyn HotStateReader,
+    catalog: &CatalogSnapshot,
     tombstone: &PendingTombstone,
     referenced_properties: &[Vec<String>],
 ) -> Result<Option<UniqueConstraintValue>, LixError> {
@@ -3662,7 +3831,7 @@ async fn committed_deleted_row_value(
     let Some(row) = rows.first() else {
         return Ok(None);
     };
-    committed_constraint_value(row, referenced_properties, false)
+    committed_constraint_value(catalog, row, referenced_properties, false)
 }
 
 fn committed_delete_restriction_error(
@@ -3701,35 +3870,25 @@ fn committed_snapshot_json(
 }
 
 fn committed_constraint_value(
+    catalog: &CatalogSnapshot,
     row: MaterializedHotStateRowRef<'_>,
     paths: &[Vec<String>],
     reject_null: bool,
 ) -> Result<Option<UniqueConstraintValue>, LixError> {
-    match row.decoded_snapshot() {
-        Some(typed) => Ok(UniqueConstraintValue::from_payload(
-            ValidatedRowPayload::Typed(typed.clone()),
-            paths,
-            reject_null,
-        )),
-        None => {
-            let snapshot = if let Some(snapshot) = row.snapshot_content() {
-                Some(serde_json::from_str::<JsonValue>(snapshot.as_str()).map_err(|error| LixError::new(
-                    LixError::CODE_SCHEMA_VALIDATION,
-                    format!("committed snapshot_content for schema '{}' is invalid JSON: {error}", row.schema_key()),
-                ))?)
-            } else {
-                row.snapshot_json_value()?
-            };
-            let Some(snapshot) = snapshot else {
-                return Ok(None);
-            };
-            Ok(UniqueConstraintValue::from_payload(
-                ValidatedRowPayload::Json(&snapshot),
-                paths,
-                reject_null,
-            ))
-        }
+    if row.deleted() {
+        return Ok(None);
     }
+    let (_, plan) = catalog.plan_for_key(row.schema_key()).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!("constraint row schema '{}' is missing", row.schema_key()),
+        )
+    })?;
+    Ok(UniqueConstraintValue::from_payload(
+        ValidatedRowPayload::Typed(resolved_constraint_row(plan, row)?),
+        paths,
+        reject_null,
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4095,7 +4254,8 @@ async fn committed_normal_foreign_key_target_exists(
             if row.schema_key() != target.schema_key {
                 continue;
             }
-            if committed_constraint_value(row, &target.pointer_group, false)?.as_ref()
+            if committed_constraint_value(schema_catalog, row, &target.pointer_group, false)?
+                .as_ref()
                 == Some(&target.value)
             {
                 return Ok(true);
@@ -4143,7 +4303,13 @@ async fn validate_committed_unique_constraints(
             can_skip_unchanged && pending_unique_owner_is_insert(input, key, pending_row_pk);
         if can_skip_unchanged
             && !is_insert
-            && committed_unique_value_is_unchanged(input.hot_state, key, pending_row_pk).await?
+            && committed_unique_value_is_unchanged(
+                input.hot_state,
+                input.schema_catalog,
+                key,
+                pending_row_pk,
+            )
+            .await?
         {
             continue;
         }
@@ -4170,6 +4336,7 @@ async fn validate_committed_unique_constraints(
                 )
                 .await?;
                 reject_committed_unique_conflicts(
+                    input.schema_catalog,
                     &committed_rows,
                     &scope,
                     &pending_values,
@@ -4186,6 +4353,7 @@ async fn validate_committed_unique_constraints(
                 )
                 .await?;
                 reject_committed_unique_conflicts(
+                    input.schema_catalog,
                     &committed_rows,
                     &scope,
                     &pending_values,
@@ -4245,6 +4413,7 @@ fn declared_column_probe(
 /// The committed-row half of the unique check, shared by the probe and scan
 /// routes so both reject exactly the same conflicts.
 fn reject_committed_unique_conflicts(
+    catalog: &CatalogSnapshot,
     committed_rows: &CommittedHotStateRows,
     scope: &PendingUniqueConstraintScope,
     pending_values: &BTreeMap<UniqueConstraintValue, Vec<&RowPk>>,
@@ -4258,7 +4427,7 @@ fn reject_committed_unique_conflicts(
             continue;
         }
         let Some(committed_value) =
-            committed_constraint_value(committed_row, &scope.pointer_group, false)?
+            committed_constraint_value(catalog, committed_row, &scope.pointer_group, false)?
         else {
             continue;
         };
@@ -4321,6 +4490,7 @@ fn pending_unique_owner_is_insert(
 
 async fn committed_unique_value_is_unchanged(
     hot_state: &dyn HotStateReader,
+    catalog: &CatalogSnapshot,
     key: &PendingUniqueKey,
     row_pk: &RowPk,
 ) -> Result<bool, LixError> {
@@ -4336,7 +4506,7 @@ async fn committed_unique_value_is_unchanged(
         return Ok(false);
     };
     Ok(
-        committed_constraint_value(committed, &key.pointer_group, false)?.as_ref()
+        committed_constraint_value(catalog, committed, &key.pointer_group, false)?.as_ref()
             == Some(&key.value),
     )
 }
@@ -4442,7 +4612,11 @@ impl UniqueConstraintValue {
     /// instead of assumed.
     fn exact_hot_index_value(&self) -> Option<crate::hot_state::HotIndexValue> {
         let [encoded] = self.0.as_slice() else {
-            return None;
+            return (self.0.len() > 1).then(|| {
+                crate::hot_state::HotIndexValue::String(
+                    serde_json::to_string(&self.0).expect("string tuple encoding"),
+                )
+            });
         };
         if let Ok(text) = serde_json::from_str::<String>(encoded)
             && stable_unique_value(&JsonValue::String(text.clone())) == *encoded
@@ -4691,6 +4865,177 @@ mod tests {
     use crate::transaction_types::{
         LogicalPrimaryKey, StageJson, TestPreparedStateRow, TransactionJson, shared_origin_surface,
     };
+
+    #[test]
+    fn migration_preserves_indexed_values_of_historical_builtin_payloads() {
+        let (_, plan) = CatalogSnapshot::builtin()
+            .plan_for_key("lix_change")
+            .unwrap();
+        let mut historical = crate::schema::parse_lix_schema(&plan.schema).unwrap();
+        historical
+            .columns
+            .iter_mut()
+            .find(|column| column.name == "row_pk")
+            .unwrap()
+            .description = Some("Historical primary-key description".into());
+        let fingerprint = *historical.wire_fingerprint().unwrap().as_bytes();
+        assert_ne!(fingerprint, plan.fingerprint().bytes());
+        let compiled = lix_schema::CompiledSchema::compile(&historical).unwrap();
+        let id = uuid::Uuid::parse_str("00000000-0000-7000-8000-000000000001").unwrap();
+        let account = "00000000-0000-7000-8000-000000000002";
+        let row_pk = RowPk::from_schema_values(&[lix_schema::Value::Uuid(id)]).unwrap();
+        let snapshot = json!({"id":id.to_string(),"account_id":account,
+            "created_at":"2026-01-01T00:00:00Z","row_pk":["key"],
+            "schema_key":"lix_key_value","snapshot_content":{"key":"key","value":1}});
+        let typed = WasmTypedRow::from_compiled_normalized_json(
+            "lix_change",
+            &compiled,
+            fingerprint,
+            &row_pk,
+            &snapshot,
+        )
+        .unwrap();
+        let payload = Bytes::from_owner(typed.durable_payload().unwrap());
+        let timestamp =
+            crate::common::LixTimestamp::expect_parse("test timestamp", "2026-01-01T00:00:00Z");
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(1);
+        let slot = builder.push_materialized(
+            row_pk,
+            "lix_change".into(),
+            None,
+            None,
+            None,
+            false,
+            timestamp,
+            timestamp,
+            false,
+            None,
+            None,
+            false,
+            "branch",
+        );
+        builder.set_raw_snapshot(slot, Some(payload));
+        let batch = builder.finish();
+        let entries = hot_index_entries_for_migration(plan, batch.row(0)).unwrap();
+        assert!(
+            entries.iter().any(|entry| entry.value
+                == Some(crate::hot_state::HotIndexValue::String(account.into())))
+        );
+        assert_eq!(
+            batch
+                .row(0)
+                .materialize_decoded_snapshot()
+                .unwrap()
+                .unwrap()
+                .schema_fingerprint,
+            fingerprint
+        );
+    }
+
+    #[test]
+    fn migration_json_only_rows_reconstruct_native_timestamp_constraint_keys() {
+        let schema = json!({
+            "$schema":"https://lix.dev/schema-v1.json", "key":"migration_json_only",
+            "columns":[
+                {"name":"id","type":"text","nullable":false},
+                {"name":"moment","type":"timestamptz","nullable":false},
+                {"name":"label","type":"text","nullable":false},
+                {"name":"priority","type":"int8","nullable":false,"default_value":7}
+            ], "primary_key":["id"], "unique":[["moment","label"]]
+        });
+        let catalog = CatalogSnapshot::from_visible_schemas(&[schema.clone()]).unwrap();
+        let (_, plan) = catalog.plan_for_key("migration_json_only").unwrap();
+        let snapshot = json!({"id":"row","moment":"2026-01-02T04:04:05+01:00","label":"same"});
+        let row_pk = RowPk::single("row");
+        // Reproduce the pre-fix failure: current complete-row ingress rejects
+        // this legitimate old snapshot after the required literal amendment.
+        assert!(WasmTypedRow::from_normalized_json(plan, &row_pk, &snapshot).is_err());
+        let mut complete = snapshot.clone();
+        complete["priority"] = json!(7);
+        let typed = WasmTypedRow::from_normalized_json(plan, &row_pk, &complete).unwrap();
+        let timestamp =
+            crate::common::LixTimestamp::expect_parse("test timestamp", "2026-01-01T00:00:00Z");
+        let batch = MaterializedHotStateBatch::from_rows(vec![MaterializedHotStateRow {
+            row_pk,
+            schema_key: "migration_json_only".into(),
+            file_id: None,
+            snapshot_content: Some(snapshot.to_string().into()),
+            metadata: None,
+            deleted: false,
+            created_at: timestamp,
+            updated_at: timestamp,
+            global: false,
+            change_id: None,
+            commit_id: None,
+            untracked: false,
+            branch_id: Arc::from("branch"),
+        }]);
+        assert!(batch.row(0).decoded_snapshot().is_none());
+        assert!(batch.row(0).raw_snapshot().is_none());
+        let rebuilt = hot_index_entries_for_migration(plan, batch.row(0)).unwrap();
+        let spec = crate::sql2::derive_schema_surface_spec_from_schema(&schema).unwrap();
+        let expected = typed_hot_index_columns(&spec, &typed.row);
+        let paths = vec![vec!["moment".to_string()], vec!["label".to_string()]];
+        let expected_constraint = UniqueConstraintValue::from_payload(
+            ValidatedRowPayload::Typed(Arc::new(typed.clone())),
+            &paths,
+            true,
+        );
+        assert_eq!(
+            committed_constraint_value(&catalog, batch.row(0), &paths, true).unwrap(),
+            expected_constraint,
+            "FK and uniqueness comparisons must use the rebuilt index's native timestamp encoding"
+        );
+
+        assert!(!expected.is_empty());
+        assert_eq!(
+            rebuilt
+                .into_iter()
+                .map(|entry| (entry.ordinal, entry.value))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            batch.row(0).snapshot_json_value().unwrap(),
+            Some(snapshot.clone()),
+            "index rebuild must not persist or mutate default materialization"
+        );
+
+        // Native old payloads must receive the same amendment normalization.
+        let mut old_schema = schema.clone();
+        old_schema["columns"].as_array_mut().unwrap().pop();
+        let old_catalog = CatalogSnapshot::from_visible_schemas(&[old_schema]).unwrap();
+        let (_, old_plan) = old_catalog.plan_for_key("migration_json_only").unwrap();
+        let old_typed =
+            WasmTypedRow::from_normalized_json(old_plan, batch.row(0).row_pk(), &snapshot).unwrap();
+        let mut builder = MaterializedHotStateBatchBuilder::with_capacity(1);
+        let slot = builder.push_ref(batch.row(0), None);
+        builder.set_decoded_snapshot(slot, Some(Arc::new(old_typed)));
+        let native_batch = builder.finish();
+        let native = hot_index_entries_for_migration(plan, native_batch.row(0)).unwrap();
+        assert_eq!(
+            native
+                .into_iter()
+                .map(|entry| (entry.ordinal, entry.value))
+                .collect::<Vec<_>>(),
+            expected
+        );
+
+        // Expression defaults are deliberately never evaluated during rebuild.
+        let mut expression_schema = schema;
+        expression_schema["columns"][3] = json!({"name":"priority","type":"timestamptz","nullable":false,"default_expression":"CURRENT_TIMESTAMP"});
+        let expression_catalog =
+            CatalogSnapshot::from_visible_schemas(&[expression_schema]).unwrap();
+        let (_, expression_plan) = expression_catalog
+            .plan_for_key("migration_json_only")
+            .unwrap();
+        let error = hot_index_entries_for_migration(expression_plan, batch.row(0)).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("durable schema-amendment materialization")
+        );
+    }
 
     macro_rules! prepared_rows {
         ($($row:expr),* $(,)?) => {
@@ -8172,7 +8517,7 @@ mod tests {
         validate_committed_normal_delete_restriction_batches(
             &hot_state,
             &PendingConstraintIndexes::default(),
-            CatalogSnapshot::builtin(),
+            &catalog,
             batches,
         )
         .await

@@ -1657,10 +1657,8 @@ fn tracked_commit_delta_from_selected_change_ref<'a>(
 
 /// Builds this commit's index entries, plus witnesses for schemas it registers.
 ///
-/// Put-only: rows whose indexed value changed publish a new entry and leave the
-/// superseded one behind, and deleted rows publish nothing. Both cases are
-/// resolved on read by re-checking candidates against the row, which is what
-/// lets this stay one pass over the commit's own rows with no reads.
+/// Rows carry every declared ordinal, including nulls and tombstones, so the
+/// index publisher can retire predecessor membership in the same atomic write.
 ///
 /// The values arrive **pre-extracted** on the batch. Transaction validation
 /// already parses every staged snapshot, and `StageJson::value()` panics once
@@ -1706,10 +1704,8 @@ fn hot_index_writes_for_commit(
             if collection_starts_here {
                 witnesses.insert((row.schema_key.as_str().to_owned(), *ordinal));
             }
-            let Some(value) = value else {
-                continue;
-            };
             entries.push(crate::hot_state::HotIndexEntry {
+                untracked: row.untracked,
                 schema_key: row.schema_key.as_str().to_owned(),
                 ordinal: *ordinal,
                 value: value.clone(),

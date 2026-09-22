@@ -15,12 +15,12 @@ where
     let (source, target) = if partial {
         (
             crate::init::PARTIAL_REPOSITORY_PROTOCOL_V80,
-            crate::init::PARTIAL_REPOSITORY_PROTOCOL_VALUE,
+            crate::init::PARTIAL_REPOSITORY_PROTOCOL_V81,
         )
     } else {
         (
             crate::init::REPOSITORY_PROTOCOL_V80,
-            crate::init::REPOSITORY_PROTOCOL_VALUE,
+            crate::init::REPOSITORY_PROTOCOL_V81,
         )
     };
     super::publish::publish(

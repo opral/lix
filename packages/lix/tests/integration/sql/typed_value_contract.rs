@@ -377,3 +377,52 @@ simulation_test!(binary_uuid_casts_share_conversion_rules, |sim| async move {
         }
     }
 });
+
+simulation_test!(
+    registered_insert_select_preserves_types_and_defaults,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        let schema = json!({"$schema":"https://lix.dev/schema-v1.json","key":"select_contract",
+        "columns":[{"name":"id","type":"text","nullable":false},
+            {"name":"stamp","type":"timestamptz","nullable":true},
+            {"name":"n","type":"int8","nullable":true},
+            {"name":"active","type":"boolean","nullable":true},
+            {"name":"payload","type":"jsonb","nullable":true},
+            {"name":"label","type":"text","nullable":false,"default_value":"default label"}],"primary_key":["id"]});
+        session.execute("INSERT INTO lix_registered_schema (schema_key,value) VALUES ('select_contract',$1)", &[Value::Jsonb(schema.into())]).await.unwrap();
+        let stamp = Value::Timestamptz(1_735_787_045_123_456);
+        let payload = Value::Jsonb(json!({"nested":[true,null,3]}).into());
+        session.execute("INSERT INTO select_contract (id,stamp,n,active,payload) VALUES ('a',$1,$2,true,$3)", &[stamp.clone(), Value::Integer(i64::MAX), payload.clone()]).await.unwrap();
+        let result = session.execute("INSERT INTO select_contract (id,stamp,n,active,payload) SELECT id || '-copy',stamp,n,active,payload FROM select_contract RETURNING stamp,n,active,payload,label", &[]).await.unwrap();
+        assert_eq!(
+            result.rows()[0].values(),
+            &[
+                stamp,
+                Value::Integer(i64::MAX),
+                Value::Boolean(true),
+                payload,
+                Value::Text("default label".into())
+            ]
+        );
+        session
+            .execute(
+                "INSERT INTO select_contract (id,n) SELECT 'fraction',1.5",
+                &[],
+            )
+            .await
+            .expect_err("fractional BIGINT assignment must fail");
+        session
+            .execute(
+                "INSERT INTO select_contract (id,n) SELECT 'json',CAST('1' AS JSONB)",
+                &[],
+            )
+            .await
+            .expect_err("JSONB cannot implicitly become BIGINT");
+        let text = session.execute("INSERT INTO select_contract (id,payload) SELECT 'text','plain text' RETURNING payload", &[]).await.unwrap();
+        assert_eq!(
+            text.rows()[0].values(),
+            &[Value::Jsonb(json!("plain text").into())]
+        );
+    }
+);

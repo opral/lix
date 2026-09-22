@@ -1,6 +1,7 @@
 use datafusion::sql::sqlparser::ast::{CastKind, DataType as SqlDataType, Expr};
 
 use crate::LixError;
+use crate::sql2::plan::predicate::BoundPredicate;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BoundExpr {
@@ -21,6 +22,13 @@ pub(crate) enum BoundExpr {
         op: BoundBinaryOperator,
         right: Box<Self>,
     },
+    Not(Box<Self>),
+    Predicate(Box<BoundPredicate>),
+    Case {
+        operand: Option<Box<Self>>,
+        conditions: Vec<(Self, Self)>,
+        else_result: Option<Box<Self>>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,6 +39,14 @@ pub(crate) enum BoundBinaryOperator {
     Divide,
     Modulo,
     StringConcat,
+    Eq,
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+    And,
+    Or,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,7 +159,45 @@ impl BoundExpr {
             Self::Binary { left, right, .. } => {
                 left.references_image(image) || right.references_image(image)
             }
+            Self::Not(expr) => expr.references_image(image),
+            Self::Predicate(predicate) => predicate_references_image(predicate, image),
+            Self::Case {
+                operand,
+                conditions,
+                else_result,
+            } => {
+                operand
+                    .as_deref()
+                    .is_some_and(|expr| expr.references_image(image))
+                    || conditions.iter().any(|(condition, result)| {
+                        condition.references_image(image) || result.references_image(image)
+                    })
+                    || else_result
+                        .as_deref()
+                        .is_some_and(|expr| expr.references_image(image))
+            }
             _ => false,
         }
+    }
+}
+
+fn predicate_references_image(predicate: &BoundPredicate, image: ReturningImage) -> bool {
+    match predicate {
+        BoundPredicate::Eq(left, right) => {
+            left.references_image(image) || right.references_image(image)
+        }
+        BoundPredicate::Like { expr, pattern, .. } => {
+            expr.references_image(image) || pattern.references_image(image)
+        }
+        BoundPredicate::IsNull(expr) | BoundPredicate::IsNotNull(expr) => {
+            expr.references_image(image)
+        }
+        BoundPredicate::In { expr, values } => {
+            expr.references_image(image) || values.iter().any(|value| value.references_image(image))
+        }
+        BoundPredicate::And(predicates) | BoundPredicate::Or(predicates) => predicates
+            .iter()
+            .any(|predicate| predicate_references_image(predicate, image)),
+        BoundPredicate::True | BoundPredicate::False => false,
     }
 }

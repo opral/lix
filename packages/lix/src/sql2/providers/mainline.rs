@@ -395,6 +395,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
             let stream_schema = schema.clone();
             let include_state_headers = relation.is_some();
             let stream = async_stream::try_stream! {
+                let path_cache = Arc::new(crate::filesystem::HistoricalPathIndexCache::default());
                 let mut graph = CommitGraphContext::new().reader(store.clone());
                 let mut next = Some(anchor);
                 let mut position = 0i64;
@@ -416,7 +417,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
                         let Some(parent) = next else { continue; }; // root is a baseline, not a synthetic change
                         let diff_projection = schema.fields().iter().filter_map(|field| relation.schema.index_of(field.name()).ok()).collect::<Vec<_>>();
                         record_work(true);
-                        let diff = DiffSpec { blob_reader: Arc::clone(&blob_reader), store: store.clone(), read_interests: None, interest_endpoints: None, relation: relation.clone(), from_commit_id: parent.to_string(),
+                        let diff = DiffSpec { path_cache: Some(path_cache.clone()), blob_reader: Arc::clone(&blob_reader), store: store.clone(), read_interests: None, interest_endpoints: None, relation: relation.clone(), from_commit_id: parent.to_string(),
                             to_commit_id: id.to_string(), active_branch_id: active_branch_id.clone(), mode: DiffMode::General };
                         let plan = diff.plan_scan(Some(&diff_projection), &row_filters, None, &ExecutionProps::new()).await?;
                         let mut batches = plan.source.open(0, context.clone())?;

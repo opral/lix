@@ -39,6 +39,26 @@ server-protocol-client = [
   "tokio/sync",
 ]
 [[test]]
+name = "limited_scan_reads"
+path = "tests/limited_scan_reads.rs"
+required-features = ["storage-benches"]
+
+[[test]]
+name = "delete_reference_scaling"
+path = "tests/delete_reference_scaling.rs"
+required-features = ["storage-benches"]
+
+[[test]]
+name = "collection_reference_guard"
+path = "tests/collection_reference_guard.rs"
+required-features = ["storage-benches"]
+
+[[test]]
+name = "hot_index_wide_equality"
+path = "tests/hot_index_wide_equality.rs"
+required-features = ["storage-benches"]
+
+[[test]]
 name = "preimage_route_census"
 path = "tests/preimage_route_census.rs"
 

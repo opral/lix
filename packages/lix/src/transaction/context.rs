@@ -12974,6 +12974,10 @@ impl<R> FilesystemPathIndexReader for TransactionReadHotStateReader<R>
 where
     R: crate::storage_adapter::StorageRead + Send + 'static,
 {
+    fn historical_cache(&self) -> Option<Arc<crate::filesystem::HistoricalPathIndexCache>> {
+        Some(self.filesystem_path_index_cache.historical.clone())
+    }
+
     async fn path_index(
         &self,
         request: &FilesystemPathIndexRequest,

@@ -165,7 +165,7 @@ pub(super) async fn verify_v72_source_history<S: Storage + Clone + Send + Sync +
         ),
         Bytes::from_static(b"tracked-default-branch.v72"),
     );
-    let target = capture_adapter(target, options).await?;
+    let target_records = capture_adapter(target, options).await?;
     // The amendment may append commits, but never discard the original payload
     // chunks, file bytes, or source history. Descriptor comparison below also
     // verifies every original commit and manifest through codec conversion.
@@ -177,12 +177,42 @@ pub(super) async fn verify_v72_source_history<S: Storage + Clone + Send + Sync +
             crate::binary_cas::BINARY_CAS_CHUNK_SPACE.id.0,
         ]
         .contains(space)
-            && target.get(&(*space, key.clone())) != Some(value)
+            && target_records.get(&(*space, key.clone())) != Some(value)
         {
             return Err(failure("v72 amendment dropped original historical payload"));
         }
     }
-    descriptors(&source, &target, options).await
+    descriptors(&source, &target_records, options).await?;
+    // v72 legitimately appends amendment commits, so its whole candidate is
+    // not byte-identical to a detached replay. After validating retained
+    // source history and descriptors, independently derive its index from
+    // authoritative typed rows; never trust candidate index entries/witnesses.
+    verify_rebuilt_indexes(target, &target_records, options).await
+}
+
+async fn verify_rebuilt_indexes<S: Storage + Clone + Send + Sync + 'static>(
+    target: &StorageAdapter<S>,
+    records: &Records,
+    options: MigrationOptions,
+) -> Result<(), LixError> {
+    let mut plan =
+        super::publish::PublicationPlan::bounded(options.max_changes, options.max_preflight_bytes);
+    Box::pin(super::hot_indexes::append_plan(target, options, &mut plan)).await?;
+    let (mut overlay, _) = plan.into_preservation_overlay();
+    let expected = overlay
+        .remove(&crate::hot_state::INDEX_SPACE.id.0)
+        .unwrap_or_default();
+    let actual = records
+        .iter()
+        .filter(|((space, _), _)| *space == crate::hot_state::INDEX_SPACE.id.0)
+        .map(|((_, key), value)| (key.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if expected != actual {
+        return Err(failure(
+            "v72 candidate hot index differs from its authoritative typed rows",
+        ));
+    }
+    Ok(())
 }
 
 impl Witness {
@@ -242,6 +272,7 @@ fn independent_invariants(source: &Records, target: &Records) -> Result<(), LixE
     // Derived metadata is checked below or by the canonical bounded plan. All
     // remaining spaces, including every receipt and pending state, are exact.
     let derived = [
+        crate::hot_state::INDEX_SPACE.id.0,
         crate::changelog::COMMIT_SPACE.id.0,
         crate::tracked_state::TRACKED_STATE_COMMIT_STATE_MANIFEST_SPACE
             .id
@@ -1025,6 +1056,29 @@ mod tests {
         let adapter = super::super::epoch::inspect_existing_epoch_adapter(&storage)
             .await
             .unwrap();
+        verify_rebuilt_indexes(&adapter, &candidate, options)
+            .await
+            .unwrap();
+        let mut missing_indexes = candidate.clone();
+        missing_indexes.retain(|(space, _), _| *space != crate::hot_state::INDEX_SPACE.id.0);
+        assert!(
+            verify_rebuilt_indexes(&adapter, &missing_indexes, options)
+                .await
+                .is_err()
+        );
+        let mut invented_indexes = candidate.clone();
+        invented_indexes.insert(
+            (
+                crate::hot_state::INDEX_SPACE.id.0,
+                Bytes::from_static(b"invented-witness"),
+            ),
+            Bytes::from_static(b"complete"),
+        );
+        assert!(
+            verify_rebuilt_indexes(&adapter, &invented_indexes, options)
+                .await
+                .is_err()
+        );
         let read = adapter.begin_read(Default::default()).await.unwrap();
         let id = crate::changelog::CommitId::parse_lix(
             "01a03bf7-c29f-7fd2-a9c1-1b4000000000",

@@ -138,6 +138,9 @@ pub(crate) async fn migrate_headers_for_test<S: Storage + Clone + Send + Sync + 
     super::runtime_epoch::migrate(adapter, partial)
         .await
         .unwrap();
+    super::hot_indexes::migrate(adapter, MigrationOptions::default(), partial)
+        .await
+        .unwrap();
 }
 
 #[cfg(test)]

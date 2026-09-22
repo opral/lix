@@ -35,7 +35,7 @@ Column-resolution errors retain DataFusion's discovery guidance: close misses ge
 
 ```sql
 SELECT column_name, data_type, is_nullable, column_default,
-       lix_value_kind, lix_insert_policy, description
+       lix_insert_policy, description
 FROM information_schema.columns
 WHERE table_name = 'lix_file'
 ORDER BY ordinal_position;
@@ -43,7 +43,9 @@ ORDER BY ordinal_position;
 
 `description` is what the column means, in prose: a registered schema's own `description` annotations for its table and columns, and the engine's words for the composed views and the `lixcol_*` bookkeeping columns. It is NULL where nothing was written. `information_schema.lix_surfaces` carries the same for each relation, so a tool can present a table and its columns the way the schema author explained them.
 
-Lix reports the canonical SQL types `TEXT`, `UUID`, `BYTEA`, `BIGINT`, `DOUBLE PRECISION`, and `BOOLEAN`. UUID columns retain their logical schema type in SQL metadata even though the Arrow execution representation is UTF-8. The reported scalar type name is executable as an explicit `CAST` in `SELECT`, `INSERT`, and `UPDATE`. Bound Lix writes use those canonical names; read expressions accept DataFusion's wider cast dialect.
+Lix reports logical SQL types through `data_type`, including `TEXT`, `UUID`, `BYTEA`, `BIGINT`, `DOUBLE PRECISION`, `BOOLEAN`, `JSONB`, `TIMESTAMPTZ`, and `ROW_REF`. JSONB, UUID, and row references retain their logical types even though their execution representation is UTF-8. Scalar types other than the opaque `ROW_REF` are executable as explicit `CAST` targets in `SELECT`, `INSERT`, and `UPDATE`. Construct row references with `lix_row_ref(...)` or consume typed references returned by Lix functions. Bound Lix writes use those canonical names; read expressions accept DataFusion's wider cast dialect.
+
+Historical `lix_as_of` results expose custom non-key columns as nullable because an older commit can predate a required column added later. Current-state relation nullability continues to follow its schema.
 
 History functions are discoverable through `information_schema.table_functions`, which reports their argument signature and result columns. They do not appear in `information_schema.tables` or `information_schema.columns`.
 
@@ -68,7 +70,7 @@ Standard SQL value expressions such as `CURRENT_TIMESTAMP` are supported SQL syn
 
 Classify by SQL shape, not merely by whether data is computed dynamically. Unparameterized, table-shaped projections are views. Row producers invoked in the `FROM` clause with function syntax are table functions. Apply, restore, revert, revert-range, checkpoint creation, undo, and redo are top-level mutating table functions and use the exact `SELECT commit_id FROM ...` command shape.
 
-JSON-backed columns are SQL `TEXT` and are marked with `lix_value_kind = 'JSONB'`. `is_nullable` describes values returned by reads; `column_default` and `lix_insert_policy` separately describe whether a write may omit a column. A defaulted ID, for example, is non-null when read, may be omitted on insert, and rejects an explicit `NULL`.
+JSON-backed columns report `data_type = 'JSONB'`; row references report `ROW_REF`, and timezone-aware timestamps report `TIMESTAMPTZ`. JSONB values return as native JSON in SELECT and RETURNING results. The `lix_value_kind` extension has been removed from both `information_schema.columns` and `information_schema.table_functions`. `is_nullable` describes values returned by reads; `column_default` and `lix_insert_policy` separately describe whether a write may omit a column. A defaulted ID, for example, is non-null when read, may be omitted on insert, and rejects an explicit `NULL`.
 
 `lix_insert_policy` describes omission on `INSERT`:
 

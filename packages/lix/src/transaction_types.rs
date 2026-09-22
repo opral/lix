@@ -2997,6 +2997,7 @@ impl TestPreparedStateRow {
 /// cost this carrier removes.
 #[derive(Debug, Clone)]
 pub(crate) struct StagedIndexRow {
+    pub(crate) untracked: bool,
     pub(crate) branch_id: SharedStr,
     pub(crate) schema_key: SharedStr,
     pub(crate) file_id: Option<SharedStr>,

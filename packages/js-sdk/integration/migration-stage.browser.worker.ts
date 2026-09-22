@@ -19,7 +19,7 @@ self.onmessage=async({data})=>{
    const [entry]=await read.getMany([{space:epoch,keys:[encode('active')],options:{projection:'fullValue'}}]);
    if(entry?.kind!=='fullValue')throw new Error('Missing active epoch');
    const fields=new TextDecoder().decode(entry.value).split('|');
-   if(fields[1]!=='active'||fields[4]!=='81')throw new Error('Expected current repository');
+   if(fields[1]!=='active'||fields[4]!=='82')throw new Error('Expected current repository');
    // Fresh partial stores use legacy physical bank; support A/B if the runtime changes allocation.
    const prefix=fields[2]==='legacy'?0:fields[2]==='a'?0x40000000:fields[2]==='b'?0x80000000:NaN;
    if(!Number.isFinite(prefix))throw new Error(`Unsupported fixture bank ${fields[2]}`);

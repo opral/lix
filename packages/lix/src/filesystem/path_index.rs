@@ -1197,6 +1197,10 @@ impl FilesystemPathIndexRequest {
 
 #[async_trait]
 pub(crate) trait FilesystemPathIndexReader: Send + Sync {
+    fn historical_cache(&self) -> Option<Arc<HistoricalPathIndexCache>> {
+        None
+    }
+
     async fn path_index(
         &self,
         request: &FilesystemPathIndexRequest,
@@ -1352,6 +1356,7 @@ struct CachedIndex {
 #[derive(Debug, Default)]
 pub(crate) struct FilesystemPathIndexCache {
     entries: Mutex<Vec<CachedIndex>>,
+    pub(crate) historical: Arc<HistoricalPathIndexCache>,
 }
 
 impl FilesystemPathIndexCache {
@@ -1359,6 +1364,7 @@ impl FilesystemPathIndexCache {
     /// write checkpoint. Rebuilding from the restored overlay is cheaper and
     /// safer than cloning potentially large path indexes for an error path.
     pub(crate) fn clear(&self) {
+        self.historical.entries.lock().expect("historical path cache poisoned").clear();
         self.entries
             .lock()
             .expect("filesystem path cache lock poisoned")
@@ -2407,6 +2413,42 @@ mod tests {
             commit_id: Some(CommitId::for_test_label(id)),
             untracked: false,
             branch_id: branch_id.into(),
+        }
+    }
+}
+
+/// Repository-owned, bounded indexes for immutable historical endpoints. Never
+/// share these with the live revision cache or between different repositories.
+#[derive(Debug, Default)]
+pub(crate) struct HistoricalPathIndexCache {
+    entries: Mutex<VecDeque<(String, String, Arc<FilesystemPathIndex>)>>,
+}
+impl HistoricalPathIndexCache {
+    pub(crate) fn get(&self, commit: &str, branch: &str) -> Option<Arc<FilesystemPathIndex>> {
+        let mut entries = self.entries.lock().expect("historical path cache poisoned");
+        let position = entries
+            .iter()
+            .position(|(c, b, _)| c == commit && b == branch)?;
+        let entry = entries.remove(position)?;
+        let index = entry.2.clone();
+        entries.push_back(entry);
+        Some(index)
+    }
+    pub(crate) fn insert(&self, commit: &str, branch: &str, index: Arc<FilesystemPathIndex>) {
+        const BUDGET: usize = 16 * 1024 * 1024;
+        if index.estimated_heap_bytes() > BUDGET {
+            return;
+        }
+        let mut entries = self.entries.lock().expect("historical path cache poisoned");
+        entries.retain(|(c, b, _)| c != commit || b != branch);
+        entries.push_back((commit.into(), branch.into(), index));
+        while entries
+            .iter()
+            .map(|(c, b, i)| c.capacity() + b.capacity() + i.estimated_heap_bytes())
+            .sum::<usize>()
+            > BUDGET
+        {
+            entries.pop_front();
         }
     }
 }

@@ -4170,3 +4170,28 @@ simulation_test!(
             .expect("retry transaction rollback should succeed");
     }
 );
+
+simulation_test!(query_upsert_duplicate_paths_are_atomic, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    for table in ["lix_file", "lix_directory"] {
+        session.execute(&format!("INSERT INTO {table} (path) VALUES ('/existing')"), &[]).await.unwrap();
+        for returning in ["", " RETURNING id"] {
+            for (path, lane, expected) in [
+                ("/missing", false, LixError::CODE_UNIQUE),
+                ("/missing", true, LixError::CODE_UNIQUE),
+                ("/existing", true, LixError::CODE_CONSTRAINT_VIOLATION),
+            ] {
+                let sql = format!("INSERT INTO {table} (path,lixcol_untracked) (SELECT '/fresh',false UNION ALL SELECT '{path}',false UNION ALL SELECT '{path}',{lane}) ON CONFLICT (path) DO NOTHING{returning}");
+                let error = session.execute(&sql, &[]).await.expect_err("invalid duplicate must reject the complete statement");
+                assert_eq!(error.code, expected, "{sql}: {error}");
+                assert_rows_eq(session.execute(&format!("SELECT count(*) AS n FROM {table} WHERE path IN ('/fresh','/missing')"), &[]).await.unwrap(), vec![vec![Value::Integer(0)]]);
+            }
+            let sql = format!("INSERT INTO {table} (path) (SELECT '/existing' UNION ALL SELECT '/existing') ON CONFLICT (path) DO NOTHING{returning}");
+            let result = session.execute(&sql, &[]).await.unwrap();
+            assert_eq!(result.rows_affected(), 0);
+            if !returning.is_empty() { assert!(result.rows().is_empty()); }
+        }
+        session.execute(&format!("DELETE FROM {table} WHERE path = '/existing'"), &[]).await.unwrap();
+    }
+});

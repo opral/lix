@@ -1,3 +1,4 @@
+use futures_util::TryStreamExt;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -1984,7 +1985,7 @@ async fn execute_row_write(
     match plan.bound.op {
         BoundWriteOp::Insert => {
             if no_op {
-                row_insert_batch(ctx, plan, spec, params, active_branch_commit_id.as_ref())?;
+                row_insert_batch(ctx, plan, spec, params, active_branch_commit_id.as_ref()).await?;
                 return Ok(empty_row_returning_result(plan, spec, params));
             }
             if plan.bound.conflict.is_some() {
@@ -2033,9 +2034,47 @@ async fn row_delete_collection(
     if catalog
         .delete_plan_for_key(&spec.schema_key)
         .has_committed_checks()
-        || !catalog.row_ref_references().is_empty()
     {
         return Ok(None);
+    }
+    // Dynamic references can target any schema. A declaration alone is not a
+    // live reference, but absence must hold in both durability lanes and both
+    // visible branches, across every file and the transaction's pending rows.
+    let source_schemas = catalog
+        .row_ref_references()
+        .iter()
+        .map(|reference| reference.source_key.schema_key.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let active_branch = ctx.active_branch_id().to_string();
+    for schema_key in source_schemas {
+        for branch_id in [active_branch.as_str(), crate::GLOBAL_BRANCH_ID] {
+            if ctx.has_staged_collection_rows(
+                branch_id,
+                CollectionScopeRef {
+                    schema_key: &schema_key,
+                    file_id: None,
+                },
+            )? {
+                return Ok(None);
+            }
+            for untracked in [false, true] {
+                let rows = ctx
+                    .scan_hot_state_batch(&HotStateScanRequest {
+                        filter: HotStateFilter {
+                            schema_keys: vec![schema_key.clone()],
+                            branch_ids: vec![branch_id.to_owned()],
+                            untracked: Some(untracked),
+                            ..Default::default()
+                        },
+                        limit: Some(1),
+                        ..Default::default()
+                    })
+                    .await?;
+                if !rows.is_empty() {
+                    return Ok(None);
+                }
+            }
+        }
     }
 
     let scope = CollectionScopeRef {
@@ -2091,9 +2130,8 @@ fn plan_references_active_branch_commit_id(plan: &LogicalWritePlan) -> bool {
             .iter()
             .flatten()
             .any(bound_expr_references_active_branch_commit_id),
-        // Query input does not use this executor today. Keep the old eager
-        // behavior if a future supported shape reaches it without a complete
-        // expression traversal for `BoundRead`.
+        // Query expressions are planned by DataFusion, which binds the active
+        // branch head while building the source session.
         BoundWriteInput::Query { .. } => true,
         BoundWriteInput::None => false,
     };
@@ -2157,6 +2195,26 @@ fn bound_expr_references_active_branch_commit_id(expr: &BoundExpr) -> bool {
         BoundExpr::Binary { left, right, .. } => {
             bound_expr_references_active_branch_commit_id(left)
                 || bound_expr_references_active_branch_commit_id(right)
+        }
+        BoundExpr::Not(expr) => bound_expr_references_active_branch_commit_id(expr),
+        BoundExpr::Predicate(predicate) => {
+            bound_predicate_references_active_branch_commit_id(predicate)
+        }
+        BoundExpr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(bound_expr_references_active_branch_commit_id)
+                || conditions.iter().any(|(condition, result)| {
+                    bound_expr_references_active_branch_commit_id(condition)
+                        || bound_expr_references_active_branch_commit_id(result)
+                })
+                || else_result
+                    .as_deref()
+                    .is_some_and(bound_expr_references_active_branch_commit_id)
         }
         BoundExpr::Column(_)
         | BoundExpr::ExcludedColumn(_)
@@ -2575,7 +2633,7 @@ async fn row_insert(
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<SqlWriteResult, LixError> {
-    let write_rows = row_insert_batch(ctx, plan, spec, params, active_branch_commit_id)?;
+    let write_rows = row_insert_batch(ctx, plan, spec, params, active_branch_commit_id).await?;
     stage_rows_with_postimage_returning(
         ctx,
         plan,
@@ -2603,7 +2661,8 @@ async fn row_upsert(
     })?;
     validate_insert_conflict_target(plan, spec, conflict)?;
 
-    let mut insert_rows = row_insert_batch(ctx, plan, spec, params, active_branch_commit_id)?;
+    let mut insert_rows =
+        row_insert_batch(ctx, plan, spec, params, active_branch_commit_id).await?;
     let candidates = scan_row_conflict_candidates(ctx, spec, &insert_rows).await?;
     let mut write_rows = RawWriteBatch::with_capacity(insert_rows.len());
     let mut new_identities = std::collections::BTreeSet::new();
@@ -2611,6 +2670,21 @@ async fn row_upsert(
     for index in 0..insert_rows.len() {
         let insert_row = insert_rows.row(index);
         let inserted_row_pk = insert_row_pk(insert_row, spec)?;
+        let identity = (
+            inserted_row_pk.clone(),
+            insert_row.file_id.cloned(),
+            insert_row.branch_id.clone(),
+            insert_row.global,
+        );
+        if !new_identities.insert(identity) {
+            if matches!(conflict.action, BoundConflictAction::DoNothing) {
+                continue;
+            }
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                "ON CONFLICT DO UPDATE cannot affect the same row twice",
+            ));
+        }
         let matching_candidate = find_conflict_candidate(insert_row, &inserted_row_pk, &candidates);
         match (matching_candidate, &conflict.action) {
             // DO NOTHING on a conflicting row: leave the existing row untouched.
@@ -2628,17 +2702,7 @@ async fn row_upsert(
                 )?;
             }
             (None, BoundConflictAction::DoNothing) => {
-                // SQL conflict identity excludes retention. Keep the first new
-                // row for each canonical identity, including within this input.
-                let identity = (
-                    inserted_row_pk,
-                    insert_row.file_id.cloned(),
-                    insert_row.branch_id.clone(),
-                    insert_row.global,
-                );
-                if new_identities.insert(identity) {
-                    write_rows.append_taken_row(&mut insert_rows, index);
-                }
+                write_rows.append_taken_row(&mut insert_rows, index);
             }
             (None, _) => write_rows.append_taken_row(&mut insert_rows, index),
         }
@@ -2663,17 +2727,74 @@ async fn row_upsert(
     .await
 }
 
-fn row_insert_batch(
+async fn row_insert_batch(
     ctx: &mut dyn SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     spec: &SchemaSurfaceSpec,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<RawWriteBatch, LixError> {
+    if let BoundWriteInput::Query { columns, .. } = &plan.bound.input {
+        let values = BoundInsertValues {
+            columns: columns.clone(),
+            rows: Vec::new(),
+        };
+        let layout = InsertRowLayout::from_values(spec, &values)?;
+        let expressions = (0..columns.len())
+            .map(|index| {
+                BoundExpr::Param(crate::sql2::bind::expr::BoundParamRef { index: index + 1 })
+            })
+            .collect::<Vec<_>>();
+        let mut stream = super::datafusion::row_insert_query_stream(ctx, plan, params).await?;
+        let mut write_rows = RawWriteBatch::with_capacity(0);
+        while let Some(batch) = stream
+            .try_next()
+            .await
+            .map_err(crate::sql2::error::datafusion_error_to_lix_error)?
+        {
+            let schema = batch.schema();
+            let indexes = columns
+                .iter()
+                .map(|column| {
+                    schema.index_of(&column.name).map_err(|error| {
+                        LixError::new(LixError::CODE_TYPE_MISMATCH, error.to_string())
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let cursors = indexes
+                .iter()
+                .map(|&index| {
+                    super::datafusion::column_cursor(
+                        Some(schema.field(index)),
+                        batch.column(index).as_ref(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            for row in 0..batch.num_rows() {
+                let parameters = cursors
+                    .iter()
+                    .map(|cursor| cursor.value(row))
+                    .collect::<Result<Vec<_>, _>>()?;
+                append_row_insert_row(
+                    &mut write_rows,
+                    ctx,
+                    plan,
+                    spec,
+                    &layout,
+                    &expressions,
+                    &parameters,
+                    active_branch_commit_id,
+                )?;
+            }
+        }
+        convert_sql_row_snapshots_to_typed(ctx, spec, &mut write_rows)?;
+        certify_fileless_typed_sql_rows(ctx, spec, &mut write_rows)?;
+        return Ok(write_rows);
+    }
     let BoundWriteInput::Values(values) = &plan.bound.input else {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
-            "bound row INSERT supports VALUES only",
+            "INSERT source is required",
         ));
     };
     let layout = InsertRowLayout::from_values(spec, values)?;
@@ -3660,6 +3781,9 @@ fn returning_expr_column_type(
                 Some(crate::ResultColumnType::Integer)
             }
         }
+        BoundExpr::Not(_) | BoundExpr::Predicate(_) => Some(crate::ResultColumnType::Boolean),
+        // CASE is evaluated by DataFusion, which resolves a common branch type.
+        BoundExpr::Case { .. } => None,
         BoundExpr::Param(param) => {
             params
                 .get(param.index.saturating_sub(1))
@@ -6026,6 +6150,10 @@ fn eval_expr_value(
             let value = eval_expr_value(expr, context, ctx, params, active_branch_commit_id)?;
             cast_row_eval_value(value, *data_type)
         }
+        BoundExpr::Not(_) => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "bound row write evaluates CASE conditions through DataFusion",
+        )),
         BoundExpr::Function { name, args } if name == "uuidv7" && args.is_empty() => {
             Ok(RowEvalValue::Uuid(ctx.functions().call_uuid_v7()))
         }
@@ -6174,6 +6302,10 @@ fn eval_expr_value(
         BoundExpr::Function { name, .. } => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             format!("bound row write does not support function '{name}' yet"),
+        )),
+        BoundExpr::Predicate(_) | BoundExpr::Case { .. } => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "bound row write evaluates CASE expressions through DataFusion",
         )),
         BoundExpr::Binary { .. } => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
@@ -6490,10 +6622,52 @@ fn returning_expr_requires_staged_postimage(expr: &BoundExpr) -> bool {
             returning_expr_requires_staged_postimage(left)
                 || returning_expr_requires_staged_postimage(right)
         }
+        BoundExpr::Not(expr) => returning_expr_requires_staged_postimage(expr),
+        BoundExpr::Predicate(predicate) => bound_predicate_requires_staged_postimage(predicate),
+        BoundExpr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            operand
+                .as_deref()
+                .is_some_and(returning_expr_requires_staged_postimage)
+                || conditions.iter().any(|(condition, result)| {
+                    returning_expr_requires_staged_postimage(condition)
+                        || returning_expr_requires_staged_postimage(result)
+                })
+                || else_result
+                    .as_deref()
+                    .is_some_and(returning_expr_requires_staged_postimage)
+        }
         BoundExpr::Column(_)
         | BoundExpr::ExcludedColumn(_)
         | BoundExpr::Param(_)
         | BoundExpr::Literal(_) => false,
+    }
+}
+
+fn bound_predicate_requires_staged_postimage(predicate: &BoundPredicate) -> bool {
+    match predicate {
+        BoundPredicate::Eq(left, right) => {
+            returning_expr_requires_staged_postimage(left)
+                || returning_expr_requires_staged_postimage(right)
+        }
+        BoundPredicate::Like { expr, pattern, .. } => {
+            returning_expr_requires_staged_postimage(expr)
+                || returning_expr_requires_staged_postimage(pattern)
+        }
+        BoundPredicate::IsNull(expr) | BoundPredicate::IsNotNull(expr) => {
+            returning_expr_requires_staged_postimage(expr)
+        }
+        BoundPredicate::In { expr, values } => {
+            returning_expr_requires_staged_postimage(expr)
+                || values.iter().any(returning_expr_requires_staged_postimage)
+        }
+        BoundPredicate::And(predicates) | BoundPredicate::Or(predicates) => predicates
+            .iter()
+            .any(bound_predicate_requires_staged_postimage),
+        BoundPredicate::True | BoundPredicate::False => false,
     }
 }
 
@@ -6504,6 +6678,7 @@ fn bound_public_write_shape_supported(plan: &LogicalWritePlan) -> bool {
             .iter()
             .flatten()
             .all(|expr| validate_expr_supported(expr).is_ok()),
+        (BoundWriteOp::Insert, BoundWriteInput::Query { .. }) => true,
         (BoundWriteOp::Update | BoundWriteOp::Delete, BoundWriteInput::None) => true,
         _ => false,
     };
@@ -6720,6 +6895,10 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
         BoundExpr::Binary { .. } => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             "bound row write evaluates binary expressions through DataFusion",
+        )),
+        BoundExpr::Not(_) | BoundExpr::Predicate(_) | BoundExpr::Case { .. } => Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "bound row write evaluates CASE expressions through DataFusion",
         )),
         BoundExpr::Function { name, args } => {
             match name.as_str() {

@@ -1257,3 +1257,86 @@ simulation_test!(foreign_key_cascade_merge_rejects_tracked_untracked_identity_co
     assert_rows_eq(main.execute("SELECT id,parent_id,lixcol_untracked FROM lane_child", &[]).await.unwrap(), vec![vec![Value::Text("c".into()), Value::Text("q".into()), Value::Boolean(false)]]);
     assert_rows_eq(main.execute("SELECT id FROM lane_parent ORDER BY id", &[]).await.unwrap(), vec![vec![Value::Text("q".into())], vec![Value::Text("target-only".into())]]);
 });
+
+simulation_test!(
+    registered_insert_select_streams_typed_rows_and_self_reads,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        register_pushdown_note_schema(&session).await;
+        insert_pushdown_note(
+            &session,
+            "a",
+            "todo",
+            "First",
+            "7.5",
+            "CAST('{\"ok\":true}' AS JSONB)",
+        )
+        .await;
+        let result = session.execute(
+            "INSERT INTO pushdown_note (id,kind,title,score,optional) SELECT id || '-copy',kind,title,score,optional FROM pushdown_note RETURNING id,score,optional", &[]
+        ).await.expect("registered self-copy should succeed");
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(result.rows()[0].get::<String>("id").unwrap(), "a-copy");
+        assert_eq!(result.rows()[0].get::<f64>("score").unwrap(), 7.5);
+        assert_rows_eq(
+            session
+                .execute("SELECT count(*) AS n FROM pushdown_note", &[])
+                .await
+                .unwrap(),
+            vec![vec![Value::Integer(2)]],
+        );
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT optional FROM pushdown_note WHERE id = 'a-copy'",
+                    &[],
+                )
+                .await
+                .unwrap(),
+            vec![vec![Value::Jsonb(serde_json::json!({"ok": true}).into())]],
+        );
+        let duplicate = session.execute(
+            "INSERT INTO pushdown_note (id,kind,title,score) (SELECT 'new','todo','First',1 UNION ALL SELECT 'new','todo','Second',2) ON CONFLICT (id) DO NOTHING RETURNING id", &[]
+        ).await.expect("DO NOTHING should suppress statement duplicates");
+        assert_eq!(duplicate.rows().len(), 1);
+        session.execute(
+            "INSERT INTO pushdown_note (id,kind,title,score) (SELECT 'other','todo','First',1 UNION ALL SELECT 'other','todo','Second',2) ON CONFLICT (id) DO UPDATE SET score = excluded.score", &[]
+        ).await.expect_err("DO UPDATE must reject duplicate statement identities");
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT count(*) AS n FROM pushdown_note WHERE id = 'other'",
+                    &[],
+                )
+                .await
+                .unwrap(),
+            vec![vec![Value::Integer(0)]],
+        );
+    }
+);
+
+simulation_test!(
+    registered_insert_select_late_failure_is_atomic,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        register_pushdown_note_schema(&session).await;
+        session.execute("INSERT INTO pushdown_note (id,kind,title,score) SELECT 'a','todo','First',1 UNION ALL SELECT 'b','todo',NULL,2", &[])
+            .await.expect_err("a late invalid row must fail the complete statement");
+        assert_rows_eq(
+            session
+                .execute("SELECT count(*) AS n FROM pushdown_note", &[])
+                .await
+                .unwrap(),
+            vec![vec![Value::Integer(0)]],
+        );
+        session
+            .execute(
+                "INSERT INTO pushdown_note (id,kind,title,score) SELECT 'a','todo','First',1",
+                &[],
+            )
+            .await
+            .unwrap();
+    }
+);

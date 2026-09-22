@@ -3002,7 +3002,7 @@ mod tests {
             .iter()
             .filter(|entry| crate::hot_state::hot_index_key_is_witness(entry.key.0.as_ref()))
             .count();
-        (witnesses, entries.len() - witnesses)
+        (witnesses, entries.iter().filter(|entry| crate::hot_state::hot_index_key_is_entry(entry.key.0.as_ref())).count())
     }
 
     /// The witness carries how many entries the plane has published, which is
@@ -3060,9 +3060,8 @@ mod tests {
             4,
             "the count must span commits, not restart at each one"
         );
-        // A delete publishes no entry — the plane is put-only — so the count
-        // stands still while the collection shrinks. That divergence is
-        // exactly what the budget measures.
+        // The witness is a monotone publication upper bound. Removing an
+        // entry does not shrink this safe candidate-budget estimate.
         session
             .execute("DELETE FROM counted_child WHERE id = 'child-0'", &[])
             .await
@@ -3108,8 +3107,8 @@ mod tests {
             )
             .await
             .expect("children should insert");
-        // Move half off `parent-0` and delete a quarter, so the `parent-0`
-        // bucket holds every identity while only a quarter still match.
+        // Move half off `parent-0` and delete a quarter. The remaining bucket
+        // and authoritative query must both retain only the final quarter.
         let moved = (0..ROWS / 2)
             .map(|index| format!("'child-{index}'"))
             .collect::<Vec<_>>()
@@ -3170,10 +3169,8 @@ mod tests {
         assert_eq!(ids(&session, "parent-1").await, expected_one);
     }
 
-    /// Entries are candidates, never answers. A row whose indexed value moves
-    /// leaves its old entry behind, and the caller's own predicate is what
-    /// rejects it — so the moved row must disappear from the old value's
-    /// result and appear under the new one.
+    /// Updating index membership must move the row between equality buckets;
+    /// deleting it must remove it from both the index and authoritative result.
     #[tokio::test]
     async fn superseded_index_entries_are_rejected_and_no_match_is_ever_lost() {
         let (_storage, session) = open_index_probe_session().await;
