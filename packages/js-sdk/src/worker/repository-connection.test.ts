@@ -1,6 +1,7 @@
 import { afterEach, expect, test, vi } from "vitest";
 import { createRepositoryConnection } from "./factory.browser.js";
 
+const currentBuild = "https://example.test/assets/current-worker.js";
 const connections: Array<ReturnType<typeof createRepositoryConnection>> = [];
 afterEach(async () => {
 	for (const c of connections.splice(0)) await c.terminate().catch(() => {});
@@ -41,6 +42,12 @@ function connection() {
 				callback(),
 		},
 	});
+	worker.postMessage.mockImplementation((message: any) => {
+		if (message.kind === "start") {
+			const listener = worker.addEventListener.mock.calls.find(([kind]) => kind === "message")?.[1];
+			listener?.({ data: { kind: "build", buildId: currentBuild } });
+		}
+	});
 	const result = createRepositoryConnection(crypto.randomUUID());
 	connections.push(result);
 	const listener = vi.fn(),
@@ -54,9 +61,10 @@ function connection() {
 		const query = discover();
 		receive({
 			kind: "owner",
-			client: query.client,
-			nonce: query.nonce,
-			generation,
+		client: query.client,
+		nonce: query.nonce,
+		generation,
+		buildId: currentBuild,
 		});
 		receive({ kind: "connected", client: query.client, generation });
 		return query.client;
@@ -164,6 +172,7 @@ test("resuming a suspended page probes before declaring its owner lost", async (
 		kind: "owner",
 		client,
 		nonce: resumedProbe.nonce,
+		buildId: currentBuild,
 		generation: "owner-1",
 	});
 	const closing = c.result.terminate();
@@ -185,3 +194,26 @@ test("a silent owner still times out after the page resumes", async () => {
 	await c.result.terminate();
 	expect(failedOnResume).toBe(0);
 });
+
+for (const buildId of [undefined, "https://example.test/assets/old-worker.js"]) {
+	test(
+		`rejects ${buildId ? "different-build" : "legacy"} owners before sending operations`,
+		async () => {
+			const c = connection();
+			const query = c.discover();
+			c.receive({
+				kind: "owner",
+				client: query.client,
+				nonce: query.nonce,
+				generation: "old",
+				buildId,
+			});
+			expect(c.fatal).toHaveBeenCalledWith(
+				expect.objectContaining({ code: "LIX_OWNER_VERSION_MISMATCH" }),
+			);
+			expect(c.sent.some((m) => m.kind === "connect" || m.kind === "input")).toBe(false);
+			expect(c.worker.terminate).not.toHaveBeenCalled();
+			await c.result.terminate();
+		},
+	);
+}
