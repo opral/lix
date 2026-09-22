@@ -55,7 +55,7 @@ pub(crate) const DIFF_SPACE: StorageSpace = StorageSpace::declare(
     DIFF_NAMESPACE,
     ValueSemantics::Mutable,
 );
-/// Declared-column access path over the hot rows: `value -> row_pk`.
+/// Declared-column access path over the hot rows: `value -> (file_id, row_pk)`.
 ///
 /// A predicate on a non-primary-key column has no access path in the hot row
 /// key, whose only searchable dimensions are `(branch, generation, schema,
@@ -4727,8 +4727,8 @@ where
         Ok(dependencies)
     }
 
-    /// Candidate row primary keys whose indexed column equals any of
-    /// `values`.
+    /// Candidate `(row_pk, file_id)` identities whose indexed column equals
+    /// any of `values`.
     ///
     /// Returns `None` when the caller must not use the index and must fall
     /// back to its ordinary scan, which happens for three reasons: the
@@ -4746,14 +4746,14 @@ where
     /// the budget bounds the *total* candidate count, so a multi-value probe
     /// can never read more index entries than a single-value probe was already
     /// allowed to.
-    pub(crate) async fn scan_hot_index_candidates(
+    pub(crate) async fn scan_hot_index_identity_candidates(
         &self,
         branch_id: &str,
         generation: CommitId,
         schema_key: &str,
         ordinal: u16,
         values: &[HotIndexValue],
-    ) -> Result<Option<Vec<RowPk>>, LixError> {
+    ) -> Result<Option<Vec<(RowPk, Option<String>)>>, LixError> {
         if values.is_empty() || values.len() > HOT_INDEX_PROBE_VALUE_LIMIT {
             return Ok(None);
         }
@@ -4798,12 +4798,8 @@ where
                     let StorageProjectedValue::FullValue(value) = &entry.value else {
                         continue;
                     };
-                    let text = std::str::from_utf8(value).map_err(|error| {
-                        head_value_error(format!("hot index entry is not utf-8: {error}"))
-                    })?;
-                    candidates.push(RowPk::from_json_array_text(text).map_err(|error| {
-                        head_value_error(format!("hot index entry has an invalid row pk: {error}"))
-                    })?);
+                    let candidate = decode_hot_index_candidate(value)?;
+                    candidates.push((candidate.row_pk, candidate.file_id));
                 }
                 if candidates.len() > budget {
                     return Ok(None);
@@ -4814,6 +4810,24 @@ where
             }
         }
         Ok(Some(candidates))
+    }
+
+    /// Compatibility-shaped equality result for callers that only need a
+    /// logical row-PK candidate. The identity-aware reader above is the source
+    /// of truth; collapsing file scopes here is safe because those callers
+    /// still use the ordinary scan/recheck path.
+    pub(crate) async fn scan_hot_index_candidates(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+        schema_key: &str,
+        ordinal: u16,
+        values: &[HotIndexValue],
+    ) -> Result<Option<Vec<RowPk>>, LixError> {
+        Ok(self
+            .scan_hot_index_identity_candidates(branch_id, generation, schema_key, ordinal, values)
+            .await?
+            .map(|candidates| candidates.into_iter().map(|(row_pk, _)| row_pk).collect()))
     }
 
     /// Candidate row primary keys whose indexed column falls in a range.
@@ -4918,12 +4932,7 @@ where
                 let StorageProjectedValue::FullValue(value) = &entry.value else {
                     continue;
                 };
-                let text = std::str::from_utf8(value).map_err(|error| {
-                    head_value_error(format!("hot index entry is not utf-8: {error}"))
-                })?;
-                candidates.push(RowPk::from_json_array_text(text).map_err(|error| {
-                    head_value_error(format!("hot index entry has an invalid row pk: {error}"))
-                })?);
+                candidates.push(decode_hot_index_candidate(value)?.row_pk);
             }
             if candidates.len() > budget {
                 #[cfg(feature = "storage-benches")]
@@ -13091,19 +13100,51 @@ fn decode_hot_row_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIden
 /// Distinguishes the two record kinds sharing [`INDEX_SPACE`]: entries and
 /// the per-collection completeness witness. Each witness probe is a point
 /// read; entry scans use their distinct tag and never include witnesses.
-// Legacy tag 0x00 could certify an index missing packed or untracked rows.
-// A distinct key keeps reads and incremental writes from trusting that claim.
+// Legacy tags could certify an index missing packed or untracked rows. A
+// distinct key keeps reads and incremental writes from trusting that claim.
 // Existing collections use canonical scans until completeness is reestablished.
-const HOT_INDEX_WITNESS_TAG: u8 = 0x02;
-const HOT_INDEX_ENTRY_TAG: u8 = 0x01;
+// The candidate payload and suffix now retain the correlated file identity.
+// Keep both records in a fresh namespace: a generation containing the old
+// row-PK-only plane has no witness here and therefore conservatively uses the
+// authoritative row scan until a complete new generation is published.
+const HOT_INDEX_ENTRY_TAG: u8 = 0x03;
+const HOT_INDEX_WITNESS_TAG: u8 = 0x04;
 const HOT_INDEX_CANDIDATE_PAGE: usize = 256;
+
+/// Test/measurement support for inspecting the two record kinds that share
+/// [`INDEX_SPACE`].  The value bytes are deliberately opaque to callers: a
+/// candidate is a binary encoded `(row_pk, file_id)` identity, so payload
+/// shape cannot distinguish it from the eight-byte witness count.
+#[cfg(test)]
+pub(crate) fn hot_index_key_is_witness(key: &[u8]) -> bool {
+    let mut offset = 0;
+    let Ok((_, branch_terminator)) = read_key_string(key, &mut offset, "branch id") else {
+        return false;
+    };
+    if branch_terminator != KEY_PART_FINAL {
+        return false;
+    }
+    let Some(generation_end) = offset.checked_add(16) else {
+        return false;
+    };
+    if key.get(offset..generation_end).is_none() {
+        return false;
+    }
+    offset = generation_end;
+    let Ok((_, schema_terminator)) = read_key_string(key, &mut offset, "schema key") else {
+        return false;
+    };
+    schema_terminator == KEY_PART_FINAL
+        && key.get(offset).copied() == Some(HOT_INDEX_WITNESS_TAG)
+}
+
 /// Distinct values one indexed-column probe may resolve.
 ///
 /// Each value costs its own range scan, so a very wide `IN` list — or a very
 /// wide join build side — is cheaper to answer with the ordinary collection
 /// scan. Declining above the limit keeps the probe route weakly better than
 /// the scan route it replaces.
-const HOT_INDEX_PROBE_VALUE_LIMIT: usize = 64;
+pub(crate) const HOT_INDEX_PROBE_VALUE_LIMIT: usize = 64;
 
 /// One index entry to publish: the row's indexed value and its identity.
 #[derive(Debug, Clone)]
@@ -13111,7 +13152,16 @@ pub(crate) struct HotIndexEntry {
     pub(crate) schema_key: String,
     pub(crate) ordinal: u16,
     pub(crate) value: HotIndexValue,
+    pub(crate) file_id: Option<String>,
     pub(crate) row_pk: RowPk,
+}
+
+#[derive(Debug, Clone, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct HotIndexCandidateValue {
+    row_pk: RowPk,
+    #[musli(with = storage_codec::option)]
+    file_id: Option<String>,
 }
 
 /// Stages index entries and, optionally, the collection witnesses that make
@@ -13138,19 +13188,24 @@ pub(crate) async fn stage_hot_index_entries(
             &entry.schema_key,
             entry.ordinal,
             &entry.value,
+            entry.file_id.as_deref(),
             &entry.row_pk,
         );
         if !staged.insert(key.clone()) {
             continue;
         }
-        let identity = entry.row_pk.as_json_array_text().map_err(|error| {
-            head_value_error(format!("hot index row pk is not encodable: {error}"))
-        })?;
+        let identity = storage_codec::encode(
+            "hot index candidate identity",
+            &HotIndexCandidateValue {
+                row_pk: entry.row_pk.clone(),
+                file_id: entry.file_id.clone(),
+            },
+        )?;
         writes.put(
             INDEX_SPACE,
             StorageKey(Bytes::from(key)),
             StorageValue {
-                bytes: Bytes::from(identity.into_bytes()),
+                bytes: Bytes::from(identity),
             },
         );
         *published_by_collection
@@ -13228,6 +13283,10 @@ fn decode_hot_index_witness(value: &[u8]) -> Option<u64> {
     value.try_into().ok().map(u64::from_be_bytes)
 }
 
+fn decode_hot_index_candidate(value: &[u8]) -> Result<HotIndexCandidateValue, LixError> {
+    storage_codec::decode("hot index candidate identity", value)
+}
+
 /// How many candidates one value lookup may collect before the collection scan
 /// becomes the cheaper route.
 ///
@@ -13284,16 +13343,18 @@ impl HotIndexValue {
     }
 }
 
-/// `scope | schema | ENTRY | ordinal | value | row_pk`.
+/// `scope | schema | ENTRY | ordinal | value | file_id | row_pk`.
 pub(crate) fn encode_hot_index_entry_key(
     branch_id: &str,
     generation: CommitId,
     schema_key: &str,
     ordinal: u16,
     value: &HotIndexValue,
+    file_id: Option<&str>,
     row_pk: &RowPk,
 ) -> Vec<u8> {
     let mut key = hot_index_value_prefix(branch_id, generation, schema_key, ordinal, value);
+    write_file_id(&mut key, file_id);
     write_row_pk(&mut key, row_pk);
     key
 }
@@ -13332,7 +13393,7 @@ pub(crate) fn hot_index_column_prefix(
 /// The least key strictly greater than every key having `prefix` as a prefix.
 ///
 /// This is the whole of inclusive-upper-bound correctness. Entries for value
-/// `v` are `prefix_v ++ row_pk`, so they all sort **after** `prefix_v`
+/// `v` are `prefix_v ++ file_id ++ row_pk`, so they all sort **after** `prefix_v`
 /// itself. An upper bound of `Excluded(prefix_v)` therefore excludes every row
 /// equal to `v` — right for `< v`, and silently wrong for `<= v`, which is the
 /// one place a range seek loses rows while still returning a plausible answer.
@@ -17676,6 +17737,7 @@ mod tests {
                         schema_key: "schema".into(),
                         ordinal: 0,
                         value: HotIndexValue::String("fresh".into()),
+                        file_id: None,
                         row_pk: RowPk::single("fresh"),
                     }],
                     &BTreeSet::new(),
@@ -17740,6 +17802,7 @@ mod tests {
                 schema_key: "new_schema".into(),
                 ordinal: 0,
                 value: value.clone(),
+                file_id: None,
                 row_pk: RowPk::single("present"),
             }],
             &BTreeSet::from([("new_schema".into(), 0)]),
@@ -17764,6 +17827,72 @@ mod tests {
                 .await
                 .unwrap(),
             Some(vec![RowPk::single("present")])
+        );
+    }
+
+    #[tokio::test]
+    async fn indexed_candidates_retain_same_pk_across_file_scopes() {
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = CommitId::for_test_label("identity-index-generation");
+        let value = HotIndexValue::String("shared".into());
+        let row_pk = RowPk::single("same");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let mut writes = StorageWriteSet::new();
+        stage_hot_index_entries(
+            &read,
+            &mut writes,
+            "branch",
+            generation,
+            &[
+                HotIndexEntry {
+                    schema_key: "schema".into(),
+                    ordinal: 0,
+                    value: value.clone(),
+                    file_id: Some("file-a".into()),
+                    row_pk: row_pk.clone(),
+                },
+                HotIndexEntry {
+                    schema_key: "schema".into(),
+                    ordinal: 0,
+                    value: value.clone(),
+                    file_id: Some("file-b".into()),
+                    row_pk: row_pk.clone(),
+                },
+            ],
+            &BTreeSet::from([("schema".into(), 0)]),
+        )
+        .await
+        .unwrap();
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let reader = HotStateStoreReader {
+            store: storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .unwrap(),
+            transaction_cache: None,
+            root_base_cache: None,
+        };
+        assert_eq!(
+            reader
+                .scan_hot_index_identity_candidates(
+                    "branch",
+                    generation,
+                    "schema",
+                    0,
+                    std::slice::from_ref(&value),
+                )
+                .await
+                .unwrap(),
+            Some(vec![
+                (row_pk.clone(), Some("file-a".into())),
+                (row_pk, Some("file-b".into())),
+            ])
         );
     }
 

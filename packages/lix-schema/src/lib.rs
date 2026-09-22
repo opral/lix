@@ -20,7 +20,9 @@ pub use jsonb::{
     Jsonb, JsonbError, binary_to_json_string, validate_binary, validate_canonical_json_text,
     validated_binary_to_json_string,
 };
-pub use model::{Column, DataType, DeleteAction, ForeignKey, ForeignKeyReference, Schema};
+pub use model::{
+    Column, DataType, DeleteAction, ForeignKey, ForeignKeyReference, RowRefConstraint, Schema,
+};
 pub use row::{CompiledSchema, Row, Value};
 
 /// Canonical identifier for the first Lix relational schema language.

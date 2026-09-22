@@ -3000,10 +3000,7 @@ mod tests {
         let entries = scan_test_space(&read, crate::hot_state::INDEX_SPACE).await;
         let witnesses = entries
             .iter()
-            .filter(|entry| match &entry.value {
-                crate::storage::ProjectedValue::FullValue(bytes) => !bytes.starts_with(b"["),
-                crate::storage::ProjectedValue::KeyOnly => true,
-            })
+            .filter(|entry| crate::hot_state::hot_index_key_is_witness(entry.key.0.as_ref()))
             .count();
         (witnesses, entries.len() - witnesses)
     }
@@ -3023,7 +3020,7 @@ mod tests {
             let crate::storage::ProjectedValue::FullValue(bytes) = &entry.value else {
                 continue;
             };
-            if bytes.starts_with(b"[") {
+            if !crate::hot_state::hot_index_key_is_witness(entry.key.0.as_ref()) {
                 continue;
             }
             let count: [u8; 8] = bytes.as_ref().try_into().expect("witness carries a u64");

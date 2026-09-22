@@ -2970,6 +2970,7 @@ fn bound_expr_requires_datafusion(expr: &BoundExpr) -> bool {
                     | "__lix_jsonb"
                     | "__lix_numeric_literal"
                     | "lix_order_between"
+                    | "lix_row_ref"
             ) || args.iter().any(bound_expr_requires_datafusion)
         }
         BoundExpr::Column(_)

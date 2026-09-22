@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 
 use crate::engine::Engine;
 use crate::session::SessionContext;
-use crate::storage::ProjectedValue;
 use crate::storage_adapter::{
     Memory, StorageAdapter, StorageAdapterRead, StorageBeginScanOptions, StoragePrefix,
     StorageReadOptions,
@@ -70,10 +69,7 @@ async fn index_record_counts(storage: &Memory) -> (usize, usize) {
     let entries = cursor.collect_all().await.expect("collect index entries");
     let witnesses = entries
         .iter()
-        .filter(|entry| match &entry.value {
-            ProjectedValue::FullValue(bytes) => !bytes.starts_with(b"["),
-            ProjectedValue::KeyOnly => true,
-        })
+        .filter(|entry| crate::hot_state::hot_index_key_is_witness(entry.key.0.as_ref()))
         .count();
     (witnesses, entries.len() - witnesses)
 }

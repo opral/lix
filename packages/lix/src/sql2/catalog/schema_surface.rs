@@ -63,13 +63,14 @@ pub(crate) struct SchemaSurfaceSpec {
     pub(crate) primary_key_component_types: Vec<RowPkComponentType>,
     pub(crate) columns: Vec<SchemaSurfaceColumn>,
     pub(crate) defaults: crate::catalog::DefaultPlan,
-    /// Columns this schema already declares as a foreign key or as unique,
-    /// which are therefore the columns the hot index plane can serve.
+    /// Columns this schema already declares as a foreign key, unique, or
+    /// row-reference source, which are therefore the columns the hot index
+    /// plane can serve.
     ///
-    /// Derived from `x-lix-foreign-keys` and `x-lix-unique` so indexing adds no
-    /// user-facing concept. Order is stable and defines each column's ordinal
-    /// in the index key, so it must not be reordered without retiring the
-    /// index namespace.
+    /// Derived from `x-lix-foreign-keys`, `x-lix-unique`, and `row_refs` so
+    /// indexing adds no user-facing concept. Order is stable and defines each
+    /// column's ordinal in the index key, so it must not be reordered without
+    /// retiring the index namespace.
     pub(crate) indexed_columns: Vec<SchemaIndexedColumn>,
     /// Whether changing one row can invalidate another row.
     ///
@@ -286,7 +287,9 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
         indexed_columns,
         columns,
         defaults: crate::catalog::DefaultPlan::from_schema(schema),
-        has_inter_row_constraints: !parsed.unique.is_empty() || !parsed.foreign_keys.is_empty(),
+        has_inter_row_constraints: !parsed.unique.is_empty()
+            || !parsed.foreign_keys.is_empty()
+            || !parsed.row_refs.is_empty(),
         certifies_path_value_replacement,
         columnar_snapshot_bijective,
     })
@@ -308,9 +311,12 @@ pub(crate) struct SchemaIndexedColumn {
 /// - single-column groups only — a composite group needs a composite key
 ///   encoding and no measured workload asks for one yet;
 /// - `String` and `Integer` only — those are the types with an order-preserving
-///   key encoding;
-/// - primary-key columns are skipped — the hot row key already indexes them,
-///   and a second access path to the same rows would be a second mechanism.
+///   key encoding. Row-reference declarations are validated as `text`, so
+///   their source columns always use the `String` encoding;
+/// - primary-key columns are skipped — the hot row key already indexes them —
+///   unless a row-reference declaration names the column. A row-reference
+///   source needs a reverse lookup by its encoded value, including when that
+///   column is part of a composite primary key.
 fn derive_indexed_columns(
     schema: &lix_schema::Schema,
     columns: &[SchemaSurfaceColumn],
@@ -331,10 +337,19 @@ fn derive_indexed_columns(
             push(name);
         }
     }
+    for row_ref in &schema.row_refs {
+        push(&row_ref.column);
+    }
     names.sort();
     names
         .into_iter()
-        .filter(|name| !schema.primary_key.contains(name))
+        .filter(|name| {
+            !schema.primary_key.contains(name)
+                || schema
+                    .row_refs
+                    .iter()
+                    .any(|row_ref| row_ref.column == *name)
+        })
         .filter_map(|name| {
             let column = columns.iter().find(|column| column.name == name)?;
             matches!(
@@ -377,7 +392,8 @@ pub(crate) fn schema_exposed_as_schema_surface(schema_key: &str) -> bool {
             | "lix_checkpoint"
             | "lix_directory_descriptor"
             | "lix_file_descriptor"
-            | "lix_undo_redo_marker" | "lix_undo_state"
+            | "lix_undo_redo_marker"
+            | "lix_undo_state"
             | "lix_collection_generation"
     )
 }
@@ -474,8 +490,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        SCHEMA_V1_TYPE_METADATA_KEY, SchemaSurfaceShape, derive_schema_surface_spec_from_schema,
-        schema_surface_schema,
+        SCHEMA_V1_TYPE_METADATA_KEY, SchemaColumnType, SchemaIndexedColumn, SchemaSurfaceShape,
+        derive_schema_surface_spec_from_schema, schema_surface_schema,
     };
 
     fn path_value_schema(value_type: &str) -> serde_json::Value {
@@ -656,9 +672,9 @@ mod tests {
     }
 
     /// The load-bearing bridge under every certificate fast path: a column is
-    /// only indexable because the schema declared it through `x-lix-unique` or
-    /// `x-lix-foreign-keys`, and those are exactly the declarations that set
-    /// `has_inter_row_constraints`.
+    /// only indexable because the schema declared it through `x-lix-unique`,
+    /// `x-lix-foreign-keys`, or `row_refs`, and those are exactly the
+    /// declarations that set `has_inter_row_constraints`.
     ///
     /// Four write certificates in `bound_public_write.rs` decline outright on
     /// `has_inter_row_constraints`. This implication is what turns those four
@@ -711,6 +727,16 @@ mod tests {
                 "primary_key": ["id"],
                 "unique": [["a", "b"]],
             }),
+            json!({
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "bypass_row_ref",
+                "columns": [
+                    { "name": "id", "type": "text", "nullable": false },
+                    { "name": "target", "type": "text", "nullable": true },
+                ],
+                "primary_key": ["id"],
+                "row_refs": [{ "column": "target" }],
+            }),
         ];
         for schema in cases {
             let spec = derive_schema_surface_spec_from_schema(&schema).expect("spec");
@@ -736,6 +762,47 @@ mod tests {
             unique.indexed_columns.len(),
             1,
             "a single-column unique group is the indexable shape this relies on"
+        );
+
+        let row_ref = derive_schema_surface_spec_from_schema(&json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "row_ref_index",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "target", "type": "text", "nullable": true },
+            ],
+            "primary_key": ["id"],
+            "row_refs": [{ "column": "target" }],
+        }))
+        .expect("row-reference spec");
+        assert_eq!(
+            row_ref.indexed_columns,
+            vec![SchemaIndexedColumn {
+                name: "target".to_owned(),
+                ordinal: 0,
+                column_type: SchemaColumnType::String,
+            }]
+        );
+        assert!(row_ref.has_inter_row_constraints);
+
+        let row_ref_primary_key = derive_schema_surface_spec_from_schema(&json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "row_ref_primary_key_index",
+            "columns": [
+                { "name": "target", "type": "text", "nullable": false },
+                { "name": "ordinal", "type": "int8", "nullable": false },
+            ],
+            "primary_key": ["target", "ordinal"],
+            "row_refs": [{ "column": "target" }],
+        }))
+        .expect("row-reference primary-key spec");
+        assert_eq!(
+            row_ref_primary_key
+                .indexed_columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["target"]
         );
     }
 }

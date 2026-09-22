@@ -34,6 +34,10 @@
       "type": "array",
       "items": { "$ref": "#/$defs/foreign_key" }
     },
+    "row_refs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/row_ref" }
+    },
     "examples": { "type": "array" },
     "deprecated": { "type": "boolean", "default": false }
   },
@@ -90,6 +94,15 @@
             }
           }
         }
+      }
+    },
+    "row_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["column"],
+      "properties": {
+        "column": { "$ref": "#/$defs/identifier" },
+        "on_delete": { "enum": ["no_action", "cascade"], "default": "no_action" }
       }
     }
   }

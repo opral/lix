@@ -18,6 +18,8 @@ pub struct Schema {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub foreign_keys: Vec<ForeignKey>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub row_refs: Vec<RowRefConstraint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub examples: Vec<Value>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deprecated: bool,
@@ -99,6 +101,20 @@ pub struct ForeignKey {
 pub struct ForeignKeyReference {
     pub schema_key: String,
     pub columns: Vec<String>,
+}
+
+/// A Lix logical row-reference constraint.
+///
+/// Unlike a [`ForeignKey`], a row reference can target any schema key at
+/// runtime, so the constrained value is represented by a text column and the
+/// target relation, optional file scope, and typed primary key are carried by
+/// the row-reference value itself. PostgreSQL has no direct DDL equivalent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RowRefConstraint {
+    pub column: String,
+    #[serde(default, skip_serializing_if = "DeleteAction::is_no_action")]
+    pub on_delete: DeleteAction,
 }
 
 /// Action executed when a referenced row is deleted.

@@ -2999,6 +2999,7 @@ impl TestPreparedStateRow {
 pub(crate) struct StagedIndexRow {
     pub(crate) branch_id: SharedStr,
     pub(crate) schema_key: SharedStr,
+    pub(crate) file_id: Option<SharedStr>,
     pub(crate) row_pk: RowPk,
     /// **Every** indexed ordinal the row's schema declares, carrying `None`
     /// where this row has no indexable value for it.

@@ -104,7 +104,7 @@ use crate::telemetry::{
 };
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateDiffEntry, TrackedStateDiffKind, TrackedStateDiffRequest,
-    TrackedStateFilter, TrackedStateKey, TrackedStateStoreReader,
+    TrackedStateFilter, TrackedStateKey, TrackedStateScanRequest, TrackedStateStoreReader,
 };
 use crate::transaction::commit;
 use crate::transaction::normalization::{
@@ -2202,9 +2202,11 @@ where
                     &TrackedStateDiffRequest::default(),
                 )
                 .await?;
-            if let Some(entry) = diff.entries.iter().find(|entry| {
-                !crate::undo_redo::is_undo_metadata(entry.identity.schema_key())
-            }) {
+            if let Some(entry) = diff
+                .entries
+                .iter()
+                .find(|entry| !crate::undo_redo::is_undo_metadata(entry.identity.schema_key()))
+            {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!(
@@ -3503,7 +3505,9 @@ where
                     .certified_preparation()
                     .is_some_and(|certificate| certificate.fileless_typed_sql_rows)
         );
-        if certified_fileless_typed_sql && !matches!(&write, TransactionWrite::Rows { rows, .. } if rows.iter().any(|row| row.snapshot.is_none())) {
+        if certified_fileless_typed_sql
+            && !matches!(&write, TransactionWrite::Rows { rows, .. } if rows.iter().any(|row| row.snapshot.is_none()))
+        {
             let TransactionWrite::Rows { mode, rows } = write else {
                 unreachable!("certified fileless SQL writes contain only rows")
             };
@@ -3685,7 +3689,14 @@ where
         mut rows: RawWriteBatch,
     ) -> Result<TransactionWriteOutcome, LixError> {
         if rows.iter().any(|row| row.snapshot.is_none()) {
-            return Box::pin(self.stage_write_inner(TransactionWrite::Rows { mode: TransactionWriteMode::Replace, rows }, None)).await;
+            return Box::pin(self.stage_write_inner(
+                TransactionWrite::Rows {
+                    mode: TransactionWriteMode::Replace,
+                    rows,
+                },
+                None,
+            ))
+            .await;
         }
 
         let row_count = rows.len();
@@ -3913,7 +3924,10 @@ where
         } else {
             Vec::new()
         };
-        let deletion_seeds = match if prepared_transaction_write_rows(&write)
+        let file_delete_descriptors = referential_actions::file_delete_descriptors_from_prepared(
+            prepared_transaction_write_rows(&write),
+        );
+        let mut deletion_seeds = match if prepared_transaction_write_rows(&write)
             .iter()
             .any(|row| row.is_deleted())
         {
@@ -3930,9 +3944,10 @@ where
                 return Err(error);
             }
         };
-        let cascade_checkpoint = match (!deletion_seeds.is_empty())
-            .then(|| self.begin_sql_statement_checkpoint().map(Box::new))
-            .transpose()
+        let cascade_checkpoint = match (!deletion_seeds.is_empty()
+            || !file_delete_descriptors.is_empty())
+        .then(|| self.begin_sql_statement_checkpoint().map(Box::new))
+        .transpose()
         {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
@@ -4010,6 +4025,10 @@ where
             self.pending_file_view_mutations.extend(file_view_mutations);
             self.pending_plugin_actor_publications
                 .extend(actor_publications);
+            let file_delete_seeds = self
+                .stage_file_delete_semantic_rows_for_descriptors(&file_delete_descriptors)
+                .await?;
+            deletion_seeds.extend(file_delete_seeds);
             if !deletion_seeds.is_empty() {
                 Box::pin(self.stage_delete_actions(deletion_seeds)).await?;
             }
@@ -8500,9 +8519,11 @@ where
         // in this transaction. A final registered-schema write changes both
         // the narrow source catalog and the branch-visible catalog used for
         // delete-side FK planning, so rebuild both from the final overlay.
-        if prepared_writes.state_rows.iter().any(|row| {
-            row.schema_key.as_str() == REGISTERED_SCHEMA_KEY
-        }) {
+        if prepared_writes
+            .state_rows
+            .iter()
+            .any(|row| row.schema_key.as_str() == REGISTERED_SCHEMA_KEY)
+        {
             self.schema_resolver.clear_cached_catalogs();
         }
         let staged_commit_ids = prepared_writes
@@ -9640,12 +9661,20 @@ where
         source_branch_id: &str,
     ) -> Result<(), LixError> {
         let mut command = BranchHeadWrite::new(branch_id, Some(commit_id));
-        command.source_branch_id = Some(uuid::Uuid::parse_str(source_branch_id).map_err(|error| {
-            LixError::new(LixError::CODE_INVALID_PARAM, format!("invalid merge source branch: {error}"))
-        })?);
+        command.source_branch_id =
+            Some(uuid::Uuid::parse_str(source_branch_id).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INVALID_PARAM,
+                    format!("invalid merge source branch: {error}"),
+                )
+            })?);
         let mut rows = RawWriteBatch::with_capacity(1);
         rows.push_branch_head(command);
-        self.stage_write(TransactionWrite::Rows { mode: TransactionWriteMode::Replace, rows }).await?;
+        self.stage_write(TransactionWrite::Rows {
+            mode: TransactionWriteMode::Replace,
+            rows,
+        })
+        .await?;
         Ok(())
     }
 
@@ -9694,12 +9723,12 @@ where
         let prepared = self.staged_writes.drain()?;
         let read = self.opening_read();
         let result = async {
-            let mut projection = Box::pin(
-                self.native_migration_validation_projection(&read, &prepared),
-            )
-            .await?;
-            self.validate_prepared_writes_by_branch(&read, &mut projection).await
-        }.await;
+            let mut projection =
+                Box::pin(self.native_migration_validation_projection(&read, &prepared)).await?;
+            self.validate_prepared_writes_by_branch(&read, &mut projection)
+                .await
+        }
+        .await;
         self.staged_writes.restore(checkpoint)?;
         result
     }
@@ -9810,6 +9839,114 @@ where
             .reader(SharedStorageAdapterRead::new(read)))
     }
 
+    /// Compiles the schema catalog visible at a historical tracked-state
+    /// endpoint. Recovery commands may receive a source commit whose schema
+    /// registrations are no longer present in the transaction's live catalog;
+    /// dependency closure must still use the declarations that governed that
+    /// endpoint.
+    async fn tracked_catalog_at_commit(
+        &mut self,
+        commit_id: &str,
+    ) -> Result<Arc<CatalogSnapshot>, LixError> {
+        let endpoint = CommitId::parse_lix(commit_id, "historical catalog commit id")?;
+        let mut graph = CommitGraphContext::new().reader(self.opening_read());
+        let node = graph
+            .load_node(&endpoint)
+            .await?
+            .ok_or_else(|| crate::commit_graph::missing_commit_graph_error(&endpoint))?;
+        let request = TrackedStateScanRequest {
+            filter: TrackedStateFilter {
+                schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
+                file_ids: vec![NullableKeyFilter::Null],
+                include_tombstones: false,
+                ..TrackedStateFilter::default()
+            },
+            read_columns: crate::tracked_state::TrackedStateReadColumns {
+                columns: vec!["snapshot_content".to_string()],
+            },
+            ..TrackedStateScanRequest::default()
+        };
+        let mut tracked = self.tracked_state_reader().await?;
+        // Local tracked roots are physical overlays and do not contain their
+        // global base. Compose the source catalog in the same order as live
+        // visibility: global base first, then local rows (including local
+        // tombstones that suppress an inherited registration).
+        let base_rows = if let Some(base_commit_id) = node.base_commit_id {
+            Some(
+                tracked
+                    .scan_batch_at_commit(&base_commit_id.to_string(), &request)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let mut local_request = request.clone();
+        local_request.filter.include_tombstones = true;
+        let local_rows = tracked
+            .scan_batch_at_commit(commit_id, &local_request)
+            .await?;
+
+        // Engine schemas are immutable authority. Historical registration
+        // projections for them are intentionally ignored, matching the live
+        // catalog compiler.
+        let mut definitions = BTreeMap::new();
+        for schema in CatalogSnapshot::builtin().schema_jsons() {
+            let Some(key) = schema.get("key").and_then(JsonValue::as_str) else {
+                continue;
+            };
+            definitions.insert(key.to_owned(), schema);
+        }
+        let add_live_definition = |definitions: &mut BTreeMap<String, JsonValue>,
+                                   row: crate::tracked_state::MaterializedTrackedStateRowRef<
+            '_,
+        >| {
+            let snapshot = row.snapshot_content().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "historical registered schema '{:?}' has no snapshot content",
+                        row.row_pk()
+                    ),
+                )
+            })?;
+            let snapshot: JsonValue = serde_json::from_str(snapshot.as_ref()).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_DEFINITION,
+                    format!("historical registered schema snapshot is invalid JSON: {error}"),
+                )
+            })?;
+            let (schema_key, definition) =
+                crate::schema::schema_from_registered_snapshot(&snapshot)?;
+            if crate::schema::seed_schema_definition(&schema_key.schema_key).is_none() {
+                definitions.insert(schema_key.schema_key, definition);
+            }
+            Ok::<_, LixError>(())
+        };
+        if let Some(base_rows) = base_rows {
+            for row in base_rows.iter().filter(|row| !row.deleted()) {
+                add_live_definition(&mut definitions, row)?;
+            }
+        }
+        for row in local_rows.iter() {
+            if row.deleted() {
+                let schema_key = row.row_pk().as_single_string_owned().map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "historical registered schema tombstone has an invalid primary key",
+                    )
+                })?;
+                if crate::schema::seed_schema_definition(&schema_key).is_none() {
+                    definitions.remove(&schema_key);
+                }
+                continue;
+            }
+            add_live_definition(&mut definitions, row)?;
+        }
+        Ok(Arc::new(CatalogSnapshot::from_visible_schemas(
+            &definitions.into_values().collect::<Vec<_>>(),
+        )?))
+    }
+
     pub(crate) async fn is_current_checkpoint_commit(
         &mut self,
         branch_id: &str,
@@ -9843,17 +9980,25 @@ where
         diff_ids: Vec<String>,
         selected_files: BTreeSet<String>,
     ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
-        self.execute_recovery_patch_inner(command, diff_ids, selected_files, false).await
+        self.execute_recovery_patch_inner(command, diff_ids, selected_files, false)
+            .await
     }
 
     pub(crate) async fn execute_undo_patch(
-        &mut self, diff_ids: Vec<String>, selected_files: BTreeSet<String>,
+        &mut self,
+        diff_ids: Vec<String>,
+        selected_files: BTreeSet<String>,
     ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
-        self.execute_recovery_patch_inner(DiffCommand::Apply, diff_ids, selected_files, true).await
+        self.execute_recovery_patch_inner(DiffCommand::Apply, diff_ids, selected_files, true)
+            .await
     }
 
     async fn execute_recovery_patch_inner(
-        &mut self, command: DiffCommand, diff_ids: Vec<String>, selected_files: BTreeSet<String>, causal_replay: bool,
+        &mut self,
+        command: DiffCommand,
+        diff_ids: Vec<String>,
+        selected_files: BTreeSet<String>,
+        causal_replay: bool,
     ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
         let selections = diff_ids
             .iter()
@@ -9979,19 +10124,39 @@ where
         let mut replay_provenance = BTreeMap::new();
         let mut hidden_files = BTreeSet::new();
         for ((_, (schema, pk, _), expected, _), row) in plans.iter().zip(&current) {
-            if schema != FILE_DESCRIPTOR_SCHEMA_KEY { continue; }
+            if schema != FILE_DESCRIPTOR_SCHEMA_KEY {
+                continue;
+            }
             let id = pk.as_single_string_owned()?;
-            if !selected_files.contains(&id) || row.as_ref().is_some_and(|row| !row.deleted) { continue; }
+            if !selected_files.contains(&id) || row.as_ref().is_some_and(|row| !row.deleted) {
+                continue;
+            }
             let mut matches = match expected {
                 Some(expected) => row.as_ref().and_then(|row| row.change_id) == Some(*expected),
                 None => true,
             };
             if !matches && causal_replay {
-                if let (Some(expected), Some(writer)) = (expected, row.as_ref().and_then(|row| row.change_id.and_then(crate::tracked_state::direct_change_locator).map(|locator| locator.commit_id).or(row.commit_id))) {
-                    matches = crate::undo_redo::replayed_change_matches(self, writer, *expected, &mut replay_provenance).await?;
+                if let (Some(expected), Some(writer)) = (
+                    expected,
+                    row.as_ref().and_then(|row| {
+                        row.change_id
+                            .and_then(crate::tracked_state::direct_change_locator)
+                            .map(|locator| locator.commit_id)
+                            .or(row.commit_id)
+                    }),
+                ) {
+                    matches = crate::undo_redo::replayed_change_matches(
+                        self,
+                        writer,
+                        *expected,
+                        &mut replay_provenance,
+                    )
+                    .await?;
                 }
             }
-            if matches { hidden_files.insert(id); }
+            if matches {
+                hidden_files.insert(id);
+            }
         }
         let mut target_change_ids = Vec::new();
         let mut historical_files = BTreeSet::new();
@@ -10011,8 +10176,22 @@ where
                 }
             };
             if !current_matches && causal_replay {
-                if let (Some(expected), Some(commit_id)) = (expected, current.as_ref().and_then(|row| row.change_id.and_then(crate::tracked_state::direct_change_locator).map(|locator| locator.commit_id).or(row.commit_id))) {
-                    current_matches = crate::undo_redo::replayed_change_matches(self, commit_id, expected, &mut replay_provenance).await?;
+                if let (Some(expected), Some(commit_id)) = (
+                    expected,
+                    current.as_ref().and_then(|row| {
+                        row.change_id
+                            .and_then(crate::tracked_state::direct_change_locator)
+                            .map(|locator| locator.commit_id)
+                            .or(row.commit_id)
+                    }),
+                ) {
+                    current_matches = crate::undo_redo::replayed_change_matches(
+                        self,
+                        commit_id,
+                        expected,
+                        &mut replay_provenance,
+                    )
+                    .await?;
                 }
             }
             if !current_matches {
@@ -10322,6 +10501,7 @@ where
             ));
         }
         let mut entries = Vec::new();
+        let mut source_endpoint_catalog = None;
         if command == DiffCommand::Apply {
             let (from_commit_id, to_commit_id) =
                 source.into_iter().next().cloned().ok_or_else(|| {
@@ -10330,6 +10510,11 @@ where
                         "lix_apply requires explicit source commit endpoints",
                     )
                 })?;
+            // Apply is allowed to name schemas which are present only in its
+            // historical source endpoint. Build the closure catalog from
+            // that endpoint before resolving dependencies; the live catalog
+            // may have since removed or amended the registration.
+            source_endpoint_catalog = Some(self.tracked_catalog_at_commit(&to_commit_id).await?);
             let mut tracked = self.tracked_state_reader().await?;
             for request in &requests {
                 entries.extend(
@@ -10433,7 +10618,7 @@ where
         }
         resolved.sort();
         resolved.dedup();
-        self.close_recovery_selection(command, &entries, resolved)
+        self.close_recovery_selection(command, &entries, resolved, source_endpoint_catalog)
             .await
     }
 
@@ -10442,19 +10627,23 @@ where
         command: DiffCommand,
         entries: &[TrackedStateDiffEntry],
         requested: Vec<String>,
+        source_endpoint_catalog: Option<Arc<CatalogSnapshot>>,
     ) -> Result<Vec<String>, LixError> {
         if command == DiffCommand::CreateCheckpoint {
             return Ok(requested);
         }
+        let closure_catalog =
+            source_endpoint_catalog.unwrap_or_else(|| Arc::clone(&self.tracked_schema_snapshot));
         let requested = requested.into_iter().collect::<BTreeSet<_>>();
         let source_requested = requested.clone();
-        let (before_snapshots, after_snapshots) =
-            self.checkpoint_dependency_snapshots(entries).await?;
+        let (before_snapshots, after_snapshots) = self
+            .checkpoint_dependency_snapshots(entries, closure_catalog.as_ref())
+            .await?;
         let mut closed = close_and_validate_diff_command_selection(
             command,
             entries,
             requested,
-            self.tracked_schema_snapshot.as_ref(),
+            closure_catalog.as_ref(),
             &before_snapshots,
             &after_snapshots,
         )?
@@ -10653,8 +10842,13 @@ where
         params: Vec<Value>,
     ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
         match plan {
-            crate::sql2::CheckpointFunctionPlan::UndoRedo { redo, target_query, selection } => {
-                self.execute_undo_redo_function(redo, target_query, *selection, params).await
+            crate::sql2::CheckpointFunctionPlan::UndoRedo {
+                redo,
+                target_query,
+                selection,
+            } => {
+                self.execute_undo_redo_function(redo, target_query, *selection, params)
+                    .await
             }
             crate::sql2::CheckpointFunctionPlan::Recovery {
                 command,
@@ -10681,17 +10875,29 @@ where
         }
     }
 
-    pub(crate) async fn stage_undo_baseline(&mut self, expected: CommitId, target: CommitId) -> Result<(), LixError> {
+    pub(crate) async fn stage_undo_baseline(
+        &mut self,
+        expected: CommitId,
+        target: CommitId,
+    ) -> Result<(), LixError> {
         let branch = self.active_branch_id.clone();
         if self.load_branch_working_base(&branch).await? != Some(expected) {
-            return Err(LixError::new("LIX_UNDO_BASELINE_CONFLICT", "working baseline changed during undo/redo"));
+            return Err(LixError::new(
+                "LIX_UNDO_BASELINE_CONFLICT",
+                "working baseline changed during undo/redo",
+            ));
         }
-        self.pending_undo_baseline = Some(commit::UndoBaselinePublication { branch_id: branch, expected, target });
+        self.pending_undo_baseline = Some(commit::UndoBaselinePublication {
+            branch_id: branch,
+            expected,
+            target,
+        });
         Ok(())
     }
 
     pub(crate) fn staged_undo_commit_id(&self) -> Result<CommitId, LixError> {
-        self.staged_writes.commit_id_for_branch(&self.active_branch_id)?
+        self.staged_writes
+            .commit_id_for_branch(&self.active_branch_id)?
             .ok_or_else(|| LixError::unknown("undo/redo did not stage a commit"))
     }
 
@@ -10704,47 +10910,97 @@ where
     ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
         use crate::sql2::CheckpointFunctionPlan;
         self.ensure_sql_mutation_allowed_after_undo_redo()?;
-        if self.staged_writes.has_staged_state_rows()? || self.active_branch_id == GLOBAL_BRANCH_ID {
-            return Err(LixError::new("LIX_INVALID_TRANSACTION_STATE",
-                "undo/redo requires a non-global branch and cannot follow another write"));
+        if self.staged_writes.has_staged_state_rows()? || self.active_branch_id == GLOBAL_BRANCH_ID
+        {
+            return Err(LixError::new(
+                "LIX_INVALID_TRANSACTION_STATE",
+                "undo/redo requires a non-global branch and cannot follow another write",
+            ));
         }
-        let target_statement = target_query.as_ref().map(|query| crate::sql2::parse_statement(query)).transpose()?;
-        let target_params = target_statement.as_ref().map(|statement| recovery_query_params(statement, &params)).transpose()?.unwrap_or_default();
+        let target_statement = target_query
+            .as_ref()
+            .map(|query| crate::sql2::parse_statement(query))
+            .transpose()?;
+        let target_params = target_statement
+            .as_ref()
+            .map(|statement| recovery_query_params(statement, &params))
+            .transpose()?
+            .unwrap_or_default();
         let selection_statement = match &selection {
-            CheckpointFunctionPlan::SelectionQuery(query) => Some(crate::sql2::parse_statement(query)?),
+            CheckpointFunctionPlan::SelectionQuery(query) => {
+                Some(crate::sql2::parse_statement(query)?)
+            }
             _ => None,
         };
-        let selection_params = selection_statement.as_ref().map(|statement| recovery_query_params(statement, &params)).transpose()?.unwrap_or_default();
+        let selection_params = selection_statement
+            .as_ref()
+            .map(|statement| recovery_query_params(statement, &params))
+            .transpose()?
+            .unwrap_or_default();
         let expected = target_params.len().max(selection_params.len());
         if params.len() != expected {
-            return Err(LixError::new(LixError::CODE_INVALID_PARAM,
-                format!("SQL expected {expected} parameter(s), but {} parameter(s) were provided", params.len())));
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!(
+                    "SQL expected {expected} parameter(s), but {} parameter(s) were provided",
+                    params.len()
+                ),
+            ));
         }
         let target = if let Some(query) = target_query {
-            let result = Box::pin(self.execute_read_sql_statement(query, target_statement.expect("parsed target"), target_params)).await?;
+            let result = Box::pin(self.execute_read_sql_statement(
+                query,
+                target_statement.expect("parsed target"),
+                target_params,
+            ))
+            .await?;
             let [row] = result.rows.as_slice() else {
-                return Err(LixError::new(LixError::CODE_TYPE_MISMATCH, "undo/redo target must produce one row"));
+                return Err(LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    "undo/redo target must produce one row",
+                ));
             };
             let [Value::Text(id)] = row.as_slice() else {
-                return Err(LixError::new(LixError::CODE_TYPE_MISMATCH, "undo/redo target must be non-null text"));
+                return Err(LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    "undo/redo target must be non-null text",
+                ));
             };
             Some(CommitId::parse_lix(id, "undo/redo target")?)
-        } else { None };
+        } else {
+            None
+        };
         let scope = match selection {
             CheckpointFunctionPlan::Full => None,
             CheckpointFunctionPlan::Empty => Some(Vec::new()),
             CheckpointFunctionPlan::SelectionQuery(query) => {
-                let result = Box::pin(self.execute_read_sql_statement(query, selection_statement.expect("parsed selection"), selection_params)).await?;
+                let result = Box::pin(self.execute_read_sql_statement(
+                    query,
+                    selection_statement.expect("parsed selection"),
+                    selection_params,
+                ))
+                .await?;
                 if result.columns.len() != 1 {
-                    return Err(LixError::new(LixError::CODE_TYPE_MISMATCH, "selection must return one row_ref column"));
+                    return Err(LixError::new(
+                        LixError::CODE_TYPE_MISMATCH,
+                        "selection must return one row_ref column",
+                    ));
                 }
                 let mut scope = Vec::with_capacity(result.rows.len());
                 for row in result.rows {
                     let [Value::RowRef(row_ref)] = row.as_slice() else {
-                        return Err(LixError::new(LixError::CODE_TYPE_MISMATCH, "selection must contain non-null row references"));
+                        return Err(LixError::new(
+                            LixError::CODE_TYPE_MISMATCH,
+                            "selection must contain non-null row references",
+                        ));
                     };
                     let decoded = crate::row_ref::decode(row_ref)?;
-                    scope.push(DiffCommandSelection { relation: decoded.relation, file_id: decoded.file_id, row_pk: decoded.row_pk, source_commits: None });
+                    scope.push(DiffCommandSelection {
+                        relation: decoded.relation,
+                        file_id: decoded.file_id,
+                        row_pk: decoded.row_pk,
+                        source_commits: None,
+                    });
                 }
                 Some(scope)
             }
@@ -10918,8 +11174,7 @@ where
                 let mut diff_ids = Vec::new();
                 let mut selected_files = BTreeSet::new();
                 for entry in entries {
-                    if crate::undo_redo::is_undo_metadata(entry.identity.schema_key())
-                    {
+                    if crate::undo_redo::is_undo_metadata(entry.identity.schema_key()) {
                         continue;
                     }
                     if let Some(file_id) = entry.identity.file_id() {
@@ -11096,8 +11351,10 @@ where
                         "scoped checkpoint selection cannot be empty",
                     ));
                 }
-                let (before_snapshots, after_snapshots) =
-                    self.checkpoint_dependency_snapshots(&diff.entries).await?;
+                let tracked_catalog = Arc::clone(&self.tracked_schema_snapshot);
+                let (before_snapshots, after_snapshots) = self
+                    .checkpoint_dependency_snapshots(&diff.entries, tracked_catalog.as_ref())
+                    .await?;
                 let closed = close_and_validate_diff_command_selection(
                     DiffCommand::CreateCheckpoint,
                     &diff.entries,
@@ -11233,6 +11490,7 @@ where
     async fn checkpoint_dependency_snapshots(
         &mut self,
         entries: &[TrackedStateDiffEntry],
+        catalog: &CatalogSnapshot,
     ) -> Result<(BTreeMap<String, JsonValue>, BTreeMap<String, JsonValue>), LixError> {
         // Row identity alone is sufficient for ordinary relations. Snapshot
         // payloads are needed only where closure must inspect a declared
@@ -11243,8 +11501,11 @@ where
             FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
         ]);
-        for plan in self.tracked_schema_snapshot.plans() {
-            if !plan.uniques.is_empty() || !plan.foreign_keys.is_empty() {
+        for plan in catalog.plans() {
+            if !plan.uniques.is_empty()
+                || !plan.foreign_keys.is_empty()
+                || !plan.row_refs.is_empty()
+            {
                 dependency_schema_keys.insert(plan.key.schema_key.clone());
             }
             dependency_schema_keys.extend(
@@ -11376,7 +11637,7 @@ where
             let resolved = crate::row_ref::decode(row_ref)?;
             selections.push(DiffCommandSelection {
                 relation: resolved.relation,
-                        file_id: resolved.file_id,
+                file_id: resolved.file_id,
                 row_pk: resolved.row_pk,
                 source_commits: None,
             });
@@ -11768,6 +12029,22 @@ fn close_and_validate_diff_command_selection(
         return Err(stale_or_unknown_diff_id());
     }
 
+    let row_ref_targets = if catalog.row_ref_references().is_empty() {
+        BTreeMap::new()
+    } else {
+        by_diff_id
+            .iter()
+            .map(|(diff_id, entry)| {
+                crate::row_ref::encode_schema_identity(
+                    entry.identity.schema_key(),
+                    entry.identity.file_id(),
+                    entry.identity.row_pk(),
+                )
+                .map(|reference| (reference.as_str().to_owned(), diff_id.clone()))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?
+    };
+
     let mut closed = requested;
     loop {
         for diff_id in &closed {
@@ -11974,6 +12251,29 @@ fn close_and_validate_diff_command_selection(
             let Some((_, source_plan)) = catalog.plan_for_key(entry.identity.schema_key()) else {
                 continue;
             };
+            for reference in &source_plan.row_refs {
+                let Some(target) = snapshot.get(&reference.column).and_then(JsonValue::as_str)
+                else {
+                    continue;
+                };
+                if let Some(target_diff_id) = row_ref_targets.get(target) {
+                    let target_entry = by_diff_id
+                        .get(target_diff_id)
+                        .expect("row-reference target index is coherent");
+                    if target_entry.after.as_ref().is_none_or(|row| row.deleted) {
+                        return Err(LixError::new(
+                            LixError::CODE_CONSTRAINT_VIOLATION,
+                            format!("{operation} selection references a removed row"),
+                        )
+                        .with_details(serde_json::json!({
+                            "operation": operation,
+                            "column": reference.column,
+                            "dependencyRowRef": target,
+                        })));
+                    }
+                    changed |= closed.insert(target_diff_id.clone());
+                }
+            }
             for foreign_key in &source_plan.foreign_keys {
                 let Some((_, target_plan)) =
                     catalog.plan_for_key(&foreign_key.referenced_schema.schema_key)
@@ -12074,6 +12374,39 @@ fn close_and_validate_diff_command_selection(
                 else {
                     continue;
                 };
+                if !child_plan.row_refs.is_empty()
+                    && target_entry.after.as_ref().is_none_or(|row| row.deleted)
+                {
+                    let target = crate::row_ref::encode_schema_identity(
+                        target_entry.identity.schema_key(),
+                        target_entry.identity.file_id(),
+                        target_entry.identity.row_pk(),
+                    )?;
+                    for reference in &child_plan.row_refs {
+                        let points_to_target = |snapshot: &JsonValue| {
+                            snapshot.get(&reference.column).and_then(JsonValue::as_str)
+                                == Some(target.as_str())
+                        };
+                        if !before_snapshots
+                            .get(child_diff_id)
+                            .is_some_and(points_to_target)
+                        {
+                            continue;
+                        }
+                        if after_snapshots
+                            .get(child_diff_id)
+                            .is_some_and(points_to_target)
+                        {
+                            return Err(LixError::new(
+                                LixError::CODE_CONSTRAINT_VIOLATION,
+                                format!(
+                                    "{operation} selection would retain a row that references a removed dependency"
+                                ),
+                            ));
+                        }
+                        changed |= closed.insert(child_diff_id.clone());
+                    }
+                }
                 for foreign_key in &child_plan.foreign_keys {
                     if foreign_key.referenced_schema.schema_key
                         != target_entry.identity.schema_key()
@@ -12204,6 +12537,33 @@ fn close_and_validate_diff_command_selection(
             Some((diff_id, *entry, snapshot))
         })
         .collect::<Vec<_>>();
+    for (_, entry, snapshot) in &candidate_snapshots {
+        let Some((_, plan)) = catalog.plan_for_key(entry.identity.schema_key()) else {
+            continue;
+        };
+        for reference in &plan.row_refs {
+            let Some(target) = snapshot.get(&reference.column).and_then(JsonValue::as_str) else {
+                continue;
+            };
+            if let Some(target_diff_id) = row_ref_targets.get(target) {
+                let target_entry = by_diff_id
+                    .get(target_diff_id)
+                    .expect("row-reference target index is coherent");
+                let present = if closed.contains(target_diff_id) {
+                    target_entry.after.as_ref()
+                } else {
+                    target_entry.before.as_ref()
+                }
+                .is_some_and(|row| !row.deleted);
+                if !present {
+                    return Err(LixError::new(
+                        LixError::CODE_CONSTRAINT_VIOLATION,
+                        format!("{operation} closure violates a row-reference constraint"),
+                    ));
+                }
+            }
+        }
+    }
     for (index, (left_diff_id, left_entry, left_snapshot)) in candidate_snapshots.iter().enumerate()
     {
         for (right_diff_id, right_entry, right_snapshot) in

@@ -35,6 +35,28 @@ candidate state. Construction validates the relation and key types without
 requiring the target row to exist. References are opaque; store and pass them
 unchanged. The v2 encoding rejects legacy v1 references.
 
+To enforce a stored reference, declare a `text` column and a schema-level
+`row_refs` constraint:
+
+```json
+"row_refs": [{"column": "target", "on_delete": "cascade"}]
+```
+
+The referenced row must exist in the current branch, including pending writes.
+The target may belong to another file or relation. SQL NULL is allowed when the
+column is nullable. Omitting `on_delete` uses `no_action`, which rejects an
+invalid final relationship. `cascade` deletes referencing rows as part of the
+modifying statement, so subsequent statements see the deletion and rollback
+restores both rows. Merge preview and execution apply the same actions to the
+candidate state. Merely constructing a reference does not enable enforcement.
+
+Construct references directly in writes as well as queries:
+
+```sql
+INSERT INTO acme_link (id, target)
+VALUES ($1, lix_row_ref('acme_task', $2, $3));
+```
+
 ## Row ordering
 
 Use `lix_order_between($1, NULL)` to append after the last key, or pass both neighbors to insert between them. Two NULL bounds allocate the first key. Read rows with `ORDER BY order_key, id`: concurrent allocations may tie, and UUID identity supplies deterministic tie ordering. See [Plugin ordering](./plugin-ordering.md) for batch allocation, validation, and concurrency behavior.

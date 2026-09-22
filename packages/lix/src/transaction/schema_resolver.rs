@@ -7,9 +7,10 @@ use crate::LixError;
 use crate::catalog::{CatalogContext, CatalogSnapshot, TransactionCatalog};
 use crate::domain::Domain;
 use crate::hot_state::{
-    HotStateExactBatchRequest, HotStateReader, HotStateScanRequest, MaterializedHotStateBatch,
-    MaterializedHotStateExactBatch, StagedHotStateRows, overlay_load_exact_batch,
-    overlay_scan_batch, overlay_scan_tracked_batch,
+    HotStateExactBatchRequest, HotStateReadDomain, HotStateReader, HotStateScanRequest,
+    MaterializedHotStateBatch, MaterializedHotStateExactBatch, StagedHotStateRows,
+    overlay_load_exact_batch, overlay_scan_batch, overlay_scan_indexed_declared_column_batch,
+    overlay_scan_tracked_batch,
 };
 use crate::transaction::staging::PreparedStateRowOverlay;
 
@@ -192,6 +193,14 @@ where
         request: &HotStateScanRequest,
     ) -> Result<MaterializedHotStateBatch, LixError> {
         overlay_scan_tracked_batch(self.base, self.staged, request).await
+    }
+
+    async fn scan_indexed_declared_column_batch(
+        &self,
+        request: &HotStateScanRequest,
+        domain: HotStateReadDomain,
+    ) -> Result<Option<MaterializedHotStateBatch>, LixError> {
+        overlay_scan_indexed_declared_column_batch(self.base, self.staged, request, domain).await
     }
 
     async fn load_exact_batch(

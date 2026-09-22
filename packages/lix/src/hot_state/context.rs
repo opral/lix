@@ -857,6 +857,118 @@ where
         self.scan_batch_with_schema_presence(request, false).await
     }
 
+    /// Resolves a declared-column equality to correlated hot-row identities
+    /// and hydrates those identities in one exact batch. The ordinary scan
+    /// route remains the fallback whenever the index lacks a completeness
+    /// witness or the request carries dimensions this path cannot preserve.
+    async fn scan_indexed_declared_column_batch(
+        &self,
+        request: &HotStateScanRequest,
+        domain: HotStateReadDomain,
+    ) -> Result<Option<MaterializedHotStateBatch>, LixError> {
+        let Some(predicate) = request.filter.declared_column_eq.as_ref() else {
+            return Ok(None);
+        };
+        let [schema_key] = request.filter.schema_keys.as_slice() else {
+            return Ok(None);
+        };
+        let requested_branch_id = match request.filter.branch_ids.as_slice() {
+            [requested_branch_id] => requested_branch_id,
+            [requested_branch_id, global] if global == GLOBAL_BRANCH_ID => requested_branch_id,
+            _ => return Ok(None),
+        };
+        if predicate.schema_key.as_str() != schema_key
+            || !request.filter.row_pks.is_empty()
+            || request.filter.row_pk_lower.is_some()
+            || request.filter.row_pk_upper.is_some()
+            || !request.filter.file_ids.is_empty()
+            || !matches!(request.filter.rows, HotStateRowFilter::All)
+            || request.filter.declared_column_range.is_some()
+            || !request.filter.constraints.is_empty()
+            || request.limit.is_some()
+            || request_may_include_derived(request)
+        {
+            return Ok(None);
+        }
+        if let Some(operation) = &self.read_interest_registry {
+            operation.register(super::LogicalReadInterest::scan(request, domain))?;
+        }
+        if let Some(policy) = self.effective_partial_scope_policy().await? {
+            policy.validate(&request.filter.branch_ids)?;
+        }
+        let scope = scan_scope(
+            &self.store,
+            request,
+            true,
+            self.branch_head_control_cache.as_deref(),
+        )
+        .await?;
+        ensure_partial_projection_complete(
+            request,
+            &scope,
+            self.partial_scope_policy.is_some() || self.partial_scope_source.is_some(),
+        )?;
+
+        let mut identities = std::collections::BTreeSet::new();
+        for branch_id in &scope.storage_branch_ids {
+            let Some(control) = scope.branch_heads.get(branch_id).copied() else {
+                return Ok(None);
+            };
+            if !control.may_have_schema(schema_key) {
+                continue;
+            }
+            for values in predicate
+                .values
+                .chunks(crate::hot_state::HOT_INDEX_PROBE_VALUE_LIMIT)
+            {
+                let Some(candidates) = self
+                    .tracked_head
+                    .reader(&self.store)
+                    .scan_hot_index_identity_candidates(
+                        branch_id,
+                        control.tracked_generation,
+                        schema_key,
+                        predicate.ordinal,
+                        values,
+                    )
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                let exact_branch_id =
+                    if branch_id == GLOBAL_BRANCH_ID && requested_branch_id != GLOBAL_BRANCH_ID {
+                        requested_branch_id.to_owned()
+                    } else {
+                        branch_id.clone()
+                    };
+                identities.extend(candidates.into_iter().map(|(row_pk, file_id)| {
+                    crate::hot_state::HotStateExactRowRequest {
+                        schema_key: schema_key.to_owned(),
+                        branch_id: exact_branch_id.clone(),
+                        row_pk,
+                        file_id,
+                    }
+                }));
+            }
+        }
+        if identities.is_empty() {
+            return Ok(Some(MaterializedHotStateBatch::default()));
+        }
+        let exact = HotStateExactBatchRequest {
+            rows: identities.into_iter().collect(),
+            projection: request.projection.clone(),
+            untracked: match domain {
+                HotStateReadDomain::Tracked => Some(false),
+                HotStateReadDomain::Untracked => Some(true),
+                HotStateReadDomain::Combined => None,
+            },
+            include_tombstones: request.filter.include_tombstones,
+        };
+        Ok(Some(
+            self.load_exact_batch(&exact).await?.into_present_batch(),
+        ))
+    }
+
     async fn scan_batch_with_schema_presence(
         &self,
         request: &HotStateScanRequest,
@@ -1006,11 +1118,8 @@ where
                     return Ok(Some(rewritten));
                 };
                 // A branch the control proves holds no row of this schema
-                // contributes no candidates, so it needs no witness. The bloom has
-                // no false negatives, so this skip cannot hide a row. Without it a
-                // branch that never stores the schema — the global branch, for
-                // every ordinary user collection — would be permanently
-                // unwitnessed and would veto the index for everyone.
+                // contributes no candidates, so it needs no witness. The bloom
+                // summarizes both retention lanes for the serving generation.
                 if !control.may_have_schema(&predicate.schema_key) {
                     continue;
                 }
@@ -1989,6 +2098,14 @@ where
             self.scan_batch_with_schema_presence(request, request.filter.untracked.is_some())
                 .await
         }
+    }
+
+    async fn scan_indexed_declared_column_batch(
+        &self,
+        request: &HotStateScanRequest,
+        domain: HotStateReadDomain,
+    ) -> Result<Option<MaterializedHotStateBatch>, LixError> {
+        Self::scan_indexed_declared_column_batch(self, request, domain).await
     }
 
     async fn scan_batch(

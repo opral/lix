@@ -274,6 +274,7 @@ impl SqlValue {
         // Fast identity conversions avoid Arrow's one-element array allocation.
         let value = match (self, target) {
             (Self::SqlText(v), T::Text) => return Ok(V::Text(v)),
+            (Self::RowRef(v), T::Text) => return Ok(V::Text(v.as_str().to_owned())),
             (Self::Uuid(v), T::Uuid) => return Ok(V::Uuid(v)),
             (Self::Integer(v), T::Int8) => return Ok(V::Int8(v)),
             (Self::Real(v), T::Int8) => return exact_real_bigint(v).map(V::Int8),

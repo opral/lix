@@ -129,8 +129,9 @@ pub(crate) fn normalize_raw_write_row_in_place(
             rows.set_decoded_snapshot(row_index, Some(typed));
             let row = rows.row(row_index);
             validate_normalized_row_content(row, None, schema_plan)?;
-            let requires_transaction_validation =
-                !schema_plan.uniques.is_empty() || !schema_plan.foreign_keys.is_empty();
+            let requires_transaction_validation = !schema_plan.uniques.is_empty()
+                || !schema_plan.foreign_keys.is_empty()
+                || !schema_plan.row_refs.is_empty();
             canonicalize_descriptor_file_id(rows, row_index)?;
             return Ok(NormalizedRowFacts {
                 schema_plan_id,
@@ -235,8 +236,9 @@ pub(crate) fn normalize_raw_write_row_in_place(
         rows.set_decoded_snapshot(row_index, Some(typed));
         let row = rows.row(row_index);
         validate_normalized_row_content(row, None, schema_plan)?;
-        let requires_transaction_validation =
-            !schema_plan.uniques.is_empty() || !schema_plan.foreign_keys.is_empty();
+        let requires_transaction_validation = !schema_plan.uniques.is_empty()
+            || !schema_plan.foreign_keys.is_empty()
+            || !schema_plan.row_refs.is_empty();
         canonicalize_descriptor_file_id(rows, row_index)?;
         return Ok(NormalizedRowFacts {
             schema_plan_id,
@@ -280,7 +282,9 @@ pub(crate) fn normalize_raw_write_row_in_place(
             schema_plan_id,
             facts: PreparedRowFacts {
                 row_content_validated: true,
-                requires_transaction_validation: false,
+                requires_transaction_validation: !schema_plan.uniques.is_empty()
+                    || !schema_plan.foreign_keys.is_empty()
+                    || !schema_plan.row_refs.is_empty(),
             },
         });
     }
@@ -338,7 +342,9 @@ pub(crate) fn normalize_raw_write_row_in_place(
     let row = rows.row(row_index);
     validate_normalized_row_content(row, normalized_snapshot.as_ref(), schema_plan)?;
     let requires_transaction_validation = if normalized_snapshot.is_some() {
-        !schema_plan.uniques.is_empty() || !schema_plan.foreign_keys.is_empty()
+        !schema_plan.uniques.is_empty()
+            || !schema_plan.foreign_keys.is_empty()
+            || !schema_plan.row_refs.is_empty()
     } else {
         // The row-normalization catalog is scoped to the row's durability
         // lane. A tracked target may still have incoming references from an

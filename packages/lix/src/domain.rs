@@ -1,7 +1,7 @@
-use crate::row_pk::RowPk;
 #[cfg(test)]
 use crate::hot_state::MaterializedHotStateRow;
 use crate::hot_state::MaterializedHotStateRowRef;
+use crate::row_pk::RowPk;
 use crate::{GLOBAL_BRANCH_ID, NullableKeyFilter};
 
 /// Validation/storage coordinate for repository facts.
@@ -82,7 +82,6 @@ impl Domain {
         format!("{}|{}|{}", self.branch_id, self.untracked, file_scope)
     }
 
-    #[cfg(test)]
     pub(crate) fn file_scope(&self) -> &DomainFileScope {
         &self.file_scope
     }
@@ -230,11 +229,7 @@ impl DomainRowIdentity {
         )
     }
 
-    pub(crate) fn in_domain(
-        domain: Domain,
-        schema_key: impl Into<String>,
-        row_pk: RowPk,
-    ) -> Self {
+    pub(crate) fn in_domain(domain: Domain, schema_key: impl Into<String>, row_pk: RowPk) -> Self {
         Self::new(domain, schema_key, row_pk)
     }
 

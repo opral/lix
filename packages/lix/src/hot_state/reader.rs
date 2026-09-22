@@ -74,6 +74,20 @@ pub(crate) trait HotStateReader: Send + Sync {
         }
     }
 
+    /// Serves a declared-column equality through a correlated identity index
+    /// when the reader owns one. `Some` is a complete candidate superset for
+    /// the selected predicate (including an empty result); stale entries are
+    /// still rechecked by the caller. `None` asks the caller to use its
+    /// ordinary scan path. The default keeps lightweight test and overlay
+    /// readers conservative.
+    async fn scan_indexed_declared_column_batch(
+        &self,
+        _request: &HotStateScanRequest,
+        _domain: HotStateReadDomain,
+    ) -> Result<Option<MaterializedHotStateBatch>, LixError> {
+        Ok(None)
+    }
+
     /// Scans the immutable tracked head selected by the current branch ref.
     ///
     /// Normal SQL reads use [`Self::scan_batch`] and therefore see exactly one
