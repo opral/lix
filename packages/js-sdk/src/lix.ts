@@ -634,6 +634,7 @@ class ObservationLifecycle {
 
 	async return(): Promise<IteratorResult<ObserveEvent>> {
 		this.stop();
+		await this.drainPromise;
 		return { done: true, value: undefined };
 	}
 
@@ -644,9 +645,7 @@ class ObservationLifecycle {
 		for (const stop of this.stopped) stop();
 		this.stopped.clear();
 		this.bindingClosePromise ??= this.observeBinding
-			.then((binding) => {
-				binding?.close();
-			})
+			.then((binding) => binding?.close())
 			.then(
 				() => undefined,
 				() => undefined,

@@ -140,8 +140,8 @@ test.each(["return", "abort"] as const)(
 	async (cancel) => {
 		const order: string[] = [];
 		let startRead!: () => void;
-	let finishRead!: () => void;
-	let finishClose!: () => void;
+		let finishRead!: () => void;
+		let finishClose!: () => void;
 		const readStarted = new Promise<void>((resolve) => {
 			startRead = resolve;
 		});
@@ -180,16 +180,25 @@ test.each(["return", "abort"] as const)(
 		});
 		const pendingNext = observation.next();
 		await readStarted;
-		if (cancel === "return") await observation.return?.();
-		else controller.abort();
+		let returnSettled = false;
+		let returning: Promise<unknown> | undefined;
+		if (cancel === "return") {
+			returning = observation.return?.().then((result) => {
+				returnSettled = true;
+				return result;
+			});
+		} else controller.abort();
 		await expect(pendingNext).resolves.toMatchObject({ done: true });
 
 		const closing = lix.close();
 		await Promise.resolve();
 		expect(order).toEqual(["observation close requested"]);
+		if (cancel === "return") expect(returnSettled).toBe(false);
 		finishRead();
 		finishClose();
+		await returning;
 		await closing;
+		if (cancel === "return") expect(returnSettled).toBe(true);
 		expect(order).toEqual([
 			"observation close requested",
 			"observation read finished",
@@ -291,7 +300,10 @@ test.each(["commit", "rollback"] as const)(
 		const completion = deferred<void>();
 		const transactionBinding = {
 			execute: vi.fn(),
-			commit: vi.fn(async () => { await completion.promise; return { commit: null }; }),
+			commit: vi.fn(async () => {
+				await completion.promise;
+				return { commit: null };
+			}),
 			rollback: vi.fn(async () => completion.promise),
 		};
 		const binding = {
@@ -353,7 +365,8 @@ test("batch and explicit transaction receipts survive the public boundary", asyn
 	const statement = { columns: [], rows: [], rowsAffected: 1, notices: [] };
 	const binding = {
 		executeBatch: vi.fn(async () => ({
-			results: [{ ...statement, statementIndex: 0, commit: span }], commit: span,
+			results: [{ ...statement, statementIndex: 0, commit: span }],
+			commit: span,
 		})),
 		beginTransaction: vi.fn(async () => ({
 			execute: vi.fn(async () => statement),
@@ -362,19 +375,32 @@ test("batch and explicit transaction receipts survive the public boundary", asyn
 		close: vi.fn(async () => undefined),
 	} as unknown as LixBinding;
 	const lix = new Lix(binding);
-	const batch = await lix.executeBatch([{ sql: "INSERT INTO example VALUES (1)" }]);
+	const batch = await lix.executeBatch([
+		{ sql: "INSERT INTO example VALUES (1)" },
+	]);
 	expect(batch.commit).toEqual(span);
 	expect(batch.results).toHaveLength(1);
 	expect(batch.results[0]).not.toHaveProperty("commit");
 	const tx = await lix.beginTransaction();
-	expect(await tx.execute("INSERT INTO example VALUES (2)")).not.toHaveProperty("commit");
+	expect(await tx.execute("INSERT INTO example VALUES (2)")).not.toHaveProperty(
+		"commit",
+	);
 	expect(await tx.commit()).toEqual({ commit: span });
 	await lix.close();
 });
 
 test("sync health reads the worker snapshot without issuing SQL", async () => {
-	const health = { state: "stalled", appliedCursor: 492, observedCursor: 543, failures: { descriptor: { code: "OFFLINE", message: "unavailable" } }, terminalError: null };
-	const binding = { syncHealth: vi.fn(async () => health), execute: vi.fn() } as unknown as LixBinding;
+	const health = {
+		state: "stalled",
+		appliedCursor: 492,
+		observedCursor: 543,
+		failures: { descriptor: { code: "OFFLINE", message: "unavailable" } },
+		terminalError: null,
+	};
+	const binding = {
+		syncHealth: vi.fn(async () => health),
+		execute: vi.fn(),
+	} as unknown as LixBinding;
 	const lix = new Lix(binding);
 	await expect(lix.syncHealth()).resolves.toEqual(health);
 	expect(binding.execute).not.toHaveBeenCalled();
