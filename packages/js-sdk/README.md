@@ -340,11 +340,11 @@ await lix.close();
 ## Discover the SQL contract
 
 Lix extends the standard `information_schema.columns` relation with
-`lix_value_kind` and `lix_insert_policy`. Inspect it before generating writes:
+logical SQL `data_type` and `lix_insert_policy`. Inspect it before generating writes:
 
 ```sql
 SELECT table_name, column_name, data_type, is_nullable, column_default,
-       lix_value_kind, lix_insert_policy
+       lix_insert_policy
 FROM information_schema.columns
 WHERE table_name = 'lix_file'
 ORDER BY ordinal_position;

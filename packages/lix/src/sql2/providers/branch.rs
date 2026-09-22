@@ -1,3 +1,4 @@
+use futures_util::TryStreamExt;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -171,7 +172,7 @@ impl TableSpec for BranchSpec {
     async fn stage_insert(
         &self,
         write_ctx: &SqlWriteContext,
-        batches: Vec<RecordBatch>,
+        mut batches: datafusion::physical_plan::SendableRecordBatchStream,
     ) -> Result<u64> {
         let default_commit_id = self
             .branch_ref
@@ -184,14 +185,9 @@ impl TableSpec for BranchSpec {
                     "INSERT into lix_branch could not resolve active branch head".to_string(),
                 )
             })?;
-        let row_capacity = batches
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum::<usize>()
-            .saturating_mul(2);
-        let mut rows = RawWriteBatch::with_capacity(row_capacity);
+        let mut rows = RawWriteBatch::with_capacity(0);
         let mut count = 0u64;
-        for batch in batches {
+        while let Some(batch) = batches.try_next().await? {
             let branch_rows = branch_insert_rows_from_batch(&batch, &default_commit_id)?;
             count = count
                 .checked_add(u64::try_from(branch_rows.len()).map_err(|_| {
@@ -223,7 +219,7 @@ impl TableSpec for BranchSpec {
         returning: DmlReturning,
     ) -> Result<InsertApply> {
         let branch_ref = Arc::clone(&self.branch_ref);
-        Ok(Arc::new(move |batches| {
+        Ok(Arc::new(move |mut batches| {
             let write_ctx = write_ctx.clone();
             let branch_ref = Arc::clone(&branch_ref);
             let returning = returning.clone();
@@ -239,15 +235,10 @@ impl TableSpec for BranchSpec {
                                 .to_string(),
                         )
                     })?;
-                let row_capacity = batches
-                    .iter()
-                    .map(RecordBatch::num_rows)
-                    .sum::<usize>()
-                    .saturating_mul(2);
-                let mut stage_rows = RawWriteBatch::with_capacity(row_capacity);
+                let mut stage_rows = RawWriteBatch::with_capacity(0);
                 let mut post_rows = Vec::new();
                 let mut count = 0u64;
-                for batch in batches {
+                while let Some(batch) = batches.try_next().await? {
                     let branch_rows = branch_insert_rows_from_batch(&batch, &default_commit_id)?;
                     count = count
                         .checked_add(u64::try_from(branch_rows.len()).map_err(|_| {

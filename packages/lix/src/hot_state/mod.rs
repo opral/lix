@@ -17,7 +17,7 @@ pub(crate) use tracked_head::root_exact_profile;
 #[cfg(test)]
 pub(crate) use tracked_head::{head_decode_row_pk_probe, hot_decode_row_pk_probe};
 #[cfg(test)]
-pub(crate) use tracked_head::hot_index_key_is_witness;
+pub(crate) use tracked_head::{hot_index_key_is_witness, hot_index_key_is_entry};
 mod types;
 pub(crate) mod visibility;
 
@@ -71,13 +71,13 @@ pub(crate) use tracked_head::{
     COLLECTION_CONTROL_SPACE, CertifiedCurrentStatePredecessor,
     CertifiedCurrentStatePredecessorRef, CertifiedRowBatchFileRef, ColumnarBaseCoordinate,
     CompleteWorkingDiffMode, CurrentStateDeltaRef, DETERMINISTIC_IDENTITY_WITNESS_SPACE,
-    DIFF_SPACE, FILE_SPACE, HOT_INDEX_PROBE_VALUE_LIMIT, HotIndexEntry, HotIndexValue,
+    DIFF_SPACE, FILE_SPACE, HotIndexEntry, HotIndexValue,
     HotTrackedSnapshot, INDEX_SPACE, PACKED_CURRENT_BASE_CONTROL_SPACE, PACKED_CURRENT_BASE_SPACE,
     PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE, PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE,
     ROW_SPACE, RowColumnarOverlayRow, TRACKED_WORKING_DIFF_MARKER_SPACE, TrackedHeadContext,
     TrackedWorkingDiff, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
     stage_certified_row_batches, stage_deterministic_identity_witness_migration,
-    stage_hot_index_entries, stage_tracked_working_diff_epoch,
+    stage_hot_index_entries, stage_hot_index_entries_rebuild, stage_tracked_working_diff_epoch,
 };
 #[allow(unused_imports)]
 pub(crate) use types::{

@@ -35,7 +35,7 @@ Column-resolution errors retain DataFusion's discovery guidance: close misses ge
 
 ```sql
 SELECT column_name, data_type, is_nullable, column_default,
-       lix_value_kind, lix_insert_policy, description
+       lix_insert_policy, description
 FROM information_schema.columns
 WHERE table_name = 'lix_file'
 ORDER BY ordinal_position;
@@ -68,7 +68,7 @@ Standard SQL value expressions such as `CURRENT_TIMESTAMP` are supported SQL syn
 
 Classify by SQL shape, not merely by whether data is computed dynamically. Unparameterized, table-shaped projections are views. Row producers invoked in the `FROM` clause with function syntax are table functions. Apply, restore, revert, revert-range, checkpoint creation, undo, and redo are top-level mutating table functions and use the exact `SELECT commit_id FROM ...` command shape.
 
-JSON-backed columns are SQL `TEXT` and are marked with `lix_value_kind = 'JSONB'`. `is_nullable` describes values returned by reads; `column_default` and `lix_insert_policy` separately describe whether a write may omit a column. A defaulted ID, for example, is non-null when read, may be omitted on insert, and rejects an explicit `NULL`.
+`data_type` advertises the logical SQL type directly, including `JSONB`, `ROW_REF`, and `UUID`. JSONB values are returned as native JSON in SELECT and RETURNING results; casting to the advertised type preserves that contract. `is_nullable` describes values returned by reads; `column_default` and `lix_insert_policy` separately describe whether a write may omit a column. A defaulted ID, for example, is non-null when read, may be omitted on insert, and rejects an explicit `NULL`.
 
 `lix_insert_policy` describes omission on `INSERT`:
 

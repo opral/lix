@@ -17,10 +17,9 @@ pub(crate) use hot::hot_decode_row_pk_probe;
 #[cfg(test)]
 pub(crate) use hot::root_exact_profile;
 #[cfg(test)]
-pub(crate) use hot::hot_index_key_is_witness;
+pub(crate) use hot::{hot_index_key_is_witness, hot_index_key_is_entry};
 
 pub(crate) use crate::hot_state::HotStateReadDomain;
-pub(crate) use hot::HOT_INDEX_PROBE_VALUE_LIMIT;
 #[cfg(test)]
 pub(crate) use hot::WORKING_DIFF_PATH_HITS;
 #[cfg(test)]
@@ -43,7 +42,7 @@ pub(crate) use hot::{
     PACKED_CURRENT_BASE_SPACE, PACKED_CURRENT_EXCLUSIVE_SCHEMA_BASE_SPACE,
     PackedIdentityMembership, ROOT_CURRENT_BASE_SPACE, ROW_SPACE, RootBaseBatchCache,
     RowColumnarOverlayRow, stage_certified_row_batches,
-    stage_deterministic_identity_witness_migration, stage_hot_index_entries,
+    stage_deterministic_identity_witness_migration, stage_hot_index_entries, stage_hot_index_entries_rebuild,
     stage_retire_hot_generation,
 };
 

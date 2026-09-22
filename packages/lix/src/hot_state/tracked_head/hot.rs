@@ -7,6 +7,7 @@
 //! the physical mutation unit, and stores each value only in the authoritative
 //! file-first row index.
 
+mod limited;
 mod root_exact_cache;
 #[cfg(test)]
 #[path = "root_exact_profile.rs"]
@@ -70,16 +71,11 @@ pub(crate) const DIFF_SPACE: StorageSpace = StorageSpace::declare(
 /// the only authority for content, and dropping the plane costs nothing but
 /// speed.
 ///
-/// **Maintenance is put-only, and the invariant is "never a false negative".**
-/// An entry is written when a row's indexed value is written and is never
-/// deleted when that value is superseded, exactly as [`FILE_SPACE`]
-/// markers behave. A superseded or deleted row therefore leaves a stale entry
-/// behind, so a lookup returns *candidates*, never answers. Candidates are
-/// resolved through the ordinary exact-row-pk read and re-checked by the
-/// caller's own predicate. That is what makes maintenance one key-only put per
-/// changed row with no pre-image read, which is in turn what keeps write cost
-/// flat in collection size — the property this whole plane exists to buy on
-/// the read side.
+/// Each source identity and durability lane owns a reverse membership key.
+/// Updating a value atomically removes its old forward entry and publishes its
+/// new one; tombstones and nulls remove membership. This keeps probes bounded
+/// by current references rather than obsolete source history. Candidates are
+/// still hydrated and rechecked through the authoritative row reader.
 pub(crate) const INDEX_SPACE: StorageSpace = StorageSpace::declare(
     StorageSpaceId(0x0004_0033),
     INDEX_NAMESPACE,
@@ -4731,16 +4727,10 @@ where
     /// any of `values`.
     ///
     /// Returns `None` when the caller must not use the index and must fall
-    /// back to its ordinary scan, which happens for three reasons: the
-    /// collection has no completeness witness for the generation, the witness
-    /// says the plane has degraded far enough that resolving its candidates
-    /// would cost more than the scan (see [`hot_index_candidate_budget`]), or
-    /// the caller asked for more distinct values than
-    /// [`HOT_INDEX_PROBE_VALUE_LIMIT`]. `Some` is a candidate set, not an
-    /// answer: entries are never deleted within a generation, so a candidate
-    /// may name a row that has since changed value or been deleted. Callers
-    /// resolve candidates through the exact-row-pk read and re-apply their
-    /// own predicate. The set never *omits* a live matching row.
+    /// back to its ordinary scan when completeness is unavailable or the
+    /// current candidate fanout exceeds the shared cost budget. Entries track
+    /// current lane membership; callers still hydrate authoritative rows and
+    /// reapply their own visibility and value predicates.
     ///
     /// The witness read and the candidate budget are shared across `values`:
     /// the budget bounds the *total* candidate count, so a multi-value probe
@@ -4754,7 +4744,7 @@ where
         ordinal: u16,
         values: &[HotIndexValue],
     ) -> Result<Option<Vec<(RowPk, Option<String>)>>, LixError> {
-        if values.is_empty() || values.len() > HOT_INDEX_PROBE_VALUE_LIMIT {
+        if values.is_empty() {
             return Ok(None);
         }
         let witness = StorageKey(Bytes::from(encode_hot_index_witness_key(
@@ -4775,6 +4765,11 @@ where
         let Some(entries_published) = decode_hot_index_witness(&witness_value) else {
             return Ok(None);
         };
+        // Empty buckets still cost a range seek. Decide before opening any
+        // ranges whether the whole probe is competitive with a collection scan.
+        if values.len() > hot_index_seek_budget(entries_published) {
+            return Ok(None);
+        }
         let budget = hot_index_candidate_budget(entries_published);
         let mut candidates = Vec::new();
         for value in values {
@@ -13100,15 +13095,11 @@ fn decode_hot_row_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIden
 /// Distinguishes the two record kinds sharing [`INDEX_SPACE`]: entries and
 /// the per-collection completeness witness. Each witness probe is a point
 /// read; entry scans use their distinct tag and never include witnesses.
-// Legacy tags could certify an index missing packed or untracked rows. A
-// distinct key keeps reads and incremental writes from trusting that claim.
-// Existing collections use canonical scans until completeness is reestablished.
-// The candidate payload and suffix now retain the correlated file identity.
-// Keep both records in a fresh namespace: a generation containing the old
-// row-PK-only plane has no witness here and therefore conservatively uses the
-// authoritative row scan until a complete new generation is published.
-const HOT_INDEX_ENTRY_TAG: u8 = 0x03;
-const HOT_INDEX_WITNESS_TAG: u8 = 0x04;
+// Repository migration rebuilds the old put-only plane into the mandatory
+// current-membership format, including composite equality groups.
+const HOT_INDEX_ENTRY_TAG: u8 = 0x05;
+const HOT_INDEX_WITNESS_TAG: u8 = 0x06;
+const HOT_INDEX_MEMBERSHIP_TAG: u8 = 0x07;
 const HOT_INDEX_CANDIDATE_PAGE: usize = 256;
 
 /// Test/measurement support for inspecting the two record kinds that share
@@ -13117,6 +13108,16 @@ const HOT_INDEX_CANDIDATE_PAGE: usize = 256;
 /// shape cannot distinguish it from the eight-byte witness count.
 #[cfg(test)]
 pub(crate) fn hot_index_key_is_witness(key: &[u8]) -> bool {
+    hot_index_key_has_tag(key, HOT_INDEX_WITNESS_TAG)
+}
+
+#[cfg(test)]
+pub(crate) fn hot_index_key_is_entry(key: &[u8]) -> bool {
+    hot_index_key_has_tag(key, HOT_INDEX_ENTRY_TAG)
+}
+
+#[cfg(test)]
+fn hot_index_key_has_tag(key: &[u8], tag: u8) -> bool {
     let mut offset = 0;
     let Ok((_, branch_terminator)) = read_key_string(key, &mut offset, "branch id") else {
         return false;
@@ -13134,24 +13135,16 @@ pub(crate) fn hot_index_key_is_witness(key: &[u8]) -> bool {
     let Ok((_, schema_terminator)) = read_key_string(key, &mut offset, "schema key") else {
         return false;
     };
-    schema_terminator == KEY_PART_FINAL
-        && key.get(offset).copied() == Some(HOT_INDEX_WITNESS_TAG)
+    schema_terminator == KEY_PART_FINAL && key.get(offset).copied() == Some(tag)
 }
-
-/// Distinct values one indexed-column probe may resolve.
-///
-/// Each value costs its own range scan, so a very wide `IN` list — or a very
-/// wide join build side — is cheaper to answer with the ordinary collection
-/// scan. Declining above the limit keeps the probe route weakly better than
-/// the scan route it replaces.
-pub(crate) const HOT_INDEX_PROBE_VALUE_LIMIT: usize = 64;
 
 /// One index entry to publish: the row's indexed value and its identity.
 #[derive(Debug, Clone)]
 pub(crate) struct HotIndexEntry {
+    pub(crate) untracked: bool,
     pub(crate) schema_key: String,
     pub(crate) ordinal: u16,
-    pub(crate) value: HotIndexValue,
+    pub(crate) value: Option<HotIndexValue>,
     pub(crate) file_id: Option<String>,
     pub(crate) row_pk: RowPk,
 }
@@ -13167,10 +13160,8 @@ struct HotIndexCandidateValue {
 /// Stages index entries and, optionally, the collection witnesses that make
 /// them selectable.
 ///
-/// Put-only by construction: there is no delete path, which is what keeps this
-/// O(changed rows) with no reads. Duplicate `(space, key)` mutations are
-/// rejected by the write set, so identical entries staged twice in one commit
-/// are collapsed here rather than at lowering time.
+/// The forward and reverse mutations share the row publication write set.
+/// Predecessor lookups are batched, one per changed source identity and lane.
 pub(crate) async fn stage_hot_index_entries(
     read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
@@ -13179,17 +13170,102 @@ pub(crate) async fn stage_hot_index_entries(
     entries: &[HotIndexEntry],
     witnessed_collections: &BTreeSet<(String, u16)>,
 ) -> Result<(), LixError> {
+    stage_hot_index_entries_inner(
+        read,
+        writes,
+        branch_id,
+        generation,
+        entries,
+        witnessed_collections,
+        false,
+    )
+    .await
+}
+
+pub(crate) async fn stage_hot_index_entries_rebuild(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    generation: CommitId,
+    entries: &[HotIndexEntry],
+    witnessed_collections: &BTreeSet<(String, u16)>,
+) -> Result<(), LixError> {
+    stage_hot_index_entries_inner(
+        read,
+        writes,
+        branch_id,
+        generation,
+        entries,
+        witnessed_collections,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stage_hot_index_entries_inner(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    generation: CommitId,
+    entries: &[HotIndexEntry],
+    witnessed_collections: &BTreeSet<(String, u16)>,
+    rebuild: bool,
+) -> Result<(), LixError> {
+    // Membership records make removal proportional to changed rows, without
+    // hydrating predecessors or scanning historical value buckets. Lane is
+    // part of both keys: an untracked overlay must not retire tracked values.
+    let mut latest = BTreeMap::new();
+    for entry in entries {
+        let mut key = hot_scope_prefix(branch_id, generation);
+        write_key_string(&mut key, &entry.schema_key, KEY_PART_FINAL);
+        key.push(HOT_INDEX_MEMBERSHIP_TAG);
+        key.extend_from_slice(&entry.ordinal.to_be_bytes());
+        write_file_id(&mut key, entry.file_id.as_deref());
+        write_row_pk(&mut key, &entry.row_pk);
+        key.push(u8::from(entry.untracked));
+        latest.insert(StorageKey(Bytes::from(key)), entry);
+    }
+    let membership_keys = latest.keys().cloned().collect::<Vec<_>>();
+    let previous = if rebuild {
+        vec![None; membership_keys.len()]
+    } else {
+        PointReadPlan::new(INDEX_SPACE, &membership_keys)
+            .materialize(read, StorageGetOptions::default())
+            .await?
+            .value
+    };
     let mut staged = BTreeSet::new();
     let mut published_by_collection: BTreeMap<(String, u16), u64> = BTreeMap::new();
-    for entry in entries {
-        let key = encode_hot_index_entry_key(
-            branch_id,
-            generation,
-            &entry.schema_key,
-            entry.ordinal,
-            &entry.value,
-            entry.file_id.as_deref(),
-            &entry.row_pk,
+    for ((membership, entry), previous) in latest.into_iter().zip(previous) {
+        let next_key = entry.value.as_ref().map(|value| {
+            let mut key = encode_hot_index_entry_key(
+                branch_id,
+                generation,
+                &entry.schema_key,
+                entry.ordinal,
+                value,
+                entry.file_id.as_deref(),
+                &entry.row_pk,
+            );
+            key.push(u8::from(entry.untracked));
+            key
+        });
+        if let Some(StorageProjectedValue::FullValue(old)) = previous {
+            if next_key.as_deref() != Some(old.as_ref()) {
+                writes.delete(INDEX_SPACE, StorageKey(old));
+            }
+        }
+        let Some(key) = next_key else {
+            writes.delete(INDEX_SPACE, membership);
+            continue;
+        };
+        writes.put(
+            INDEX_SPACE,
+            membership,
+            StorageValue {
+                bytes: Bytes::from(key.clone()),
+            },
         );
         if !staged.insert(key.clone()) {
             continue;
@@ -13231,10 +13307,14 @@ pub(crate) async fn stage_hot_index_entries(
             )))
         })
         .collect::<Vec<_>>();
-    let previous = PointReadPlan::new(INDEX_SPACE, &witness_keys)
-        .materialize(read, StorageGetOptions::default())
-        .await?
-        .value;
+    let previous = if rebuild {
+        vec![None; witness_keys.len()]
+    } else {
+        PointReadPlan::new(INDEX_SPACE, &witness_keys)
+            .materialize(read, StorageGetOptions::default())
+            .await?
+            .value
+    };
     for ((collection, published), (key, previous)) in published_by_collection
         .into_iter()
         .zip(witness_keys.into_iter().zip(previous.into_iter()))
@@ -13320,6 +13400,14 @@ fn decode_hot_index_candidate(value: &[u8]) -> Result<HotIndexCandidateValue, Li
 /// measurement's own noise floor — a 64-candidate bucket resolves in ≈47 µs —
 /// so flipping tiny collections to a scan would trade a real access path for
 /// no measurable gain.
+/// Range opens need a separate budget: absent values consume no candidates.
+/// The floor keeps modest IN/join probes useful, while the collection estimate
+/// allows wider probes on larger planes. A ceiling bounds work even when the
+/// monotone witness overestimates a collection after extensive churn.
+fn hot_index_seek_budget(entries_published: u64) -> usize {
+    (entries_published / 2).clamp(128, 16_384) as usize
+}
+
 fn hot_index_candidate_budget(entries_published: u64) -> usize {
     const MIN_CANDIDATE_BUDGET: u64 = 64;
     usize::try_from((entries_published / 2).max(MIN_CANDIDATE_BUDGET)).unwrap_or(usize::MAX)
@@ -17683,6 +17771,59 @@ mod tests {
     }
 
     #[test]
+    fn equality_seek_budget_scales_with_plane_and_caps_stale_estimates() {
+        assert_eq!(hot_index_seek_budget(0), 128);
+        assert_eq!(hot_index_seek_budget(100), 128);
+        assert_eq!(hot_index_seek_budget(2_000), 1_000);
+        assert_eq!(hot_index_seek_budget(u64::MAX), 16_384);
+    }
+
+    #[cfg(feature = "storage-benches")]
+    #[tokio::test]
+    async fn oversized_absent_equality_probe_opens_no_index_ranges() {
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = CommitId::for_test_label("seek-budget");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .unwrap();
+        let mut writes = StorageWriteSet::new();
+        stage_hot_index_entries(
+            &read,
+            &mut writes,
+            "branch",
+            generation,
+            &[],
+            &BTreeSet::from([("schema".into(), 0)]),
+        )
+        .await
+        .unwrap();
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .unwrap();
+        let reader = HotStateStoreReader {
+            store: storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .unwrap(),
+            transaction_cache: None,
+            root_base_cache: None,
+        };
+        for count in [256, 4096] {
+            let values = (0..count).map(HotIndexValue::Integer).collect::<Vec<_>>();
+            let (result, census) = crate::storage_bench::measure_checkpoint_foreground(
+                reader
+                    .scan_hot_index_identity_candidates("branch", generation, "schema", 0, &values),
+            )
+            .await;
+            assert!(result.unwrap().is_none());
+            assert_eq!(census.scan_starts, 0, "budget must precede range opens");
+            assert_eq!(census.point_keys, 1, "only the collection witness is read");
+        }
+    }
+
+    #[test]
     fn a_witness_round_trips_its_published_count() {
         assert_eq!(
             decode_hot_index_witness(&encode_hot_index_witness(0)),
@@ -17734,9 +17875,10 @@ mod tests {
                     "branch",
                     generation,
                     &[HotIndexEntry {
+                        untracked: false,
                         schema_key: "schema".into(),
                         ordinal: 0,
-                        value: HotIndexValue::String("fresh".into()),
+                        value: Some(HotIndexValue::String("fresh".into())),
                         file_id: None,
                         row_pk: RowPk::single("fresh"),
                     }],
@@ -17799,9 +17941,10 @@ mod tests {
             "branch",
             generation,
             &[HotIndexEntry {
+                untracked: false,
                 schema_key: "new_schema".into(),
                 ordinal: 0,
-                value: value.clone(),
+                value: Some(value.clone()),
                 file_id: None,
                 row_pk: RowPk::single("present"),
             }],
@@ -17848,16 +17991,18 @@ mod tests {
             generation,
             &[
                 HotIndexEntry {
+                    untracked: false,
                     schema_key: "schema".into(),
                     ordinal: 0,
-                    value: value.clone(),
+                    value: Some(value.clone()),
                     file_id: Some("file-a".into()),
                     row_pk: row_pk.clone(),
                 },
                 HotIndexEntry {
+                    untracked: false,
                     schema_key: "schema".into(),
                     ordinal: 0,
-                    value: value.clone(),
+                    value: Some(value.clone()),
                     file_id: Some("file-b".into()),
                     row_pk: row_pk.clone(),
                 },
@@ -17894,6 +18039,77 @@ mod tests {
                 (row_pk, Some("file-b".into())),
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn reverse_membership_retires_values_without_erasing_other_lanes_or_files() {
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = CommitId::for_test_label("reverse-membership");
+        let entry = |untracked, file: &str, value: Option<&str>| HotIndexEntry {
+            schema_key: "schema".into(),
+            ordinal: 0,
+            untracked,
+            file_id: Some(file.into()),
+            row_pk: RowPk::single("same"),
+            value: value.map(|value| HotIndexValue::String(value.into())),
+        };
+        for (entries, witnesses) in [
+            (
+                vec![
+                    entry(false, "a", Some("old")),
+                    entry(true, "a", Some("old")),
+                    entry(false, "b", Some("old")),
+                ],
+                BTreeSet::from([("schema".into(), 0)]),
+            ),
+            (
+                vec![entry(false, "a", Some("new")), entry(false, "b", None)],
+                BTreeSet::new(),
+            ),
+        ] {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .unwrap();
+            let mut writes = StorageWriteSet::new();
+            stage_hot_index_entries(
+                &read,
+                &mut writes,
+                "branch",
+                generation,
+                &entries,
+                &witnesses,
+            )
+            .await
+            .unwrap();
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .unwrap();
+        }
+        let reader = HotStateStoreReader {
+            store: storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .unwrap(),
+            transaction_cache: None,
+            root_base_cache: None,
+        };
+        for value in ["old", "new"] {
+            assert_eq!(
+                reader
+                    .scan_hot_index_identity_candidates(
+                        "branch",
+                        generation,
+                        "schema",
+                        0,
+                        &[HotIndexValue::String(value.into())]
+                    )
+                    .await
+                    .unwrap(),
+                Some(vec![(RowPk::single("same"), Some("a".into()))])
+            );
+        }
     }
 
     #[tokio::test]

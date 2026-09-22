@@ -917,39 +917,34 @@ where
             if !control.may_have_schema(schema_key) {
                 continue;
             }
-            for values in predicate
-                .values
-                .chunks(crate::hot_state::HOT_INDEX_PROBE_VALUE_LIMIT)
-            {
-                let Some(candidates) = self
-                    .tracked_head
-                    .reader(&self.store)
-                    .scan_hot_index_identity_candidates(
-                        branch_id,
-                        control.tracked_generation,
-                        schema_key,
-                        predicate.ordinal,
-                        values,
-                    )
-                    .await?
-                else {
-                    return Ok(None);
+            let Some(candidates) = self
+                .tracked_head
+                .reader(&self.store)
+                .scan_hot_index_identity_candidates(
+                    branch_id,
+                    control.tracked_generation,
+                    schema_key,
+                    predicate.ordinal,
+                    &predicate.values,
+                )
+                .await?
+            else {
+                return Ok(None);
+            };
+            let exact_branch_id =
+                if branch_id == GLOBAL_BRANCH_ID && requested_branch_id != GLOBAL_BRANCH_ID {
+                    requested_branch_id.to_owned()
+                } else {
+                    branch_id.clone()
                 };
-                let exact_branch_id =
-                    if branch_id == GLOBAL_BRANCH_ID && requested_branch_id != GLOBAL_BRANCH_ID {
-                        requested_branch_id.to_owned()
-                    } else {
-                        branch_id.clone()
-                    };
-                identities.extend(candidates.into_iter().map(|(row_pk, file_id)| {
-                    crate::hot_state::HotStateExactRowRequest {
-                        schema_key: schema_key.to_owned(),
-                        branch_id: exact_branch_id.clone(),
-                        row_pk,
-                        file_id,
-                    }
-                }));
-            }
+            identities.extend(candidates.into_iter().map(|(row_pk, file_id)| {
+                crate::hot_state::HotStateExactRowRequest {
+                    schema_key: schema_key.to_owned(),
+                    branch_id: exact_branch_id.clone(),
+                    row_pk,
+                    file_id,
+                }
+            }));
         }
         if identities.is_empty() {
             return Ok(Some(MaterializedHotStateBatch::default()));
@@ -1017,6 +1012,9 @@ where
             None => request,
         };
         if let Some(rows) = self.scan_direct_row_pk_batch(request, &scope).await? {
+            return Ok(rows);
+        }
+        if let Some(rows) = self.try_scan_limited_single_branch(request, &scope).await? {
             return Ok(rows);
         }
         let derived_rows = MaterializedHotStateBatch::from_rows(
@@ -2013,6 +2011,39 @@ where
                 limit: request.limit,
             },
         ))
+    }
+
+    async fn try_scan_limited_single_branch(
+        &self,
+        request: &HotStateScanRequest,
+        scope: &HotStateScanScope,
+    ) -> Result<Option<MaterializedHotStateBatch>, LixError> {
+        if request.limit.is_none()
+            || !request.filter.row_pks.is_empty()
+            || request_may_include_derived(request)
+            || self.partial_scope_policy.is_some()
+            || self.partial_scope_source.is_some()
+            || !matches!(request.filter.rows, HotStateRowFilter::All)
+        {
+            return Ok(None);
+        }
+        let [schema_key] = request.filter.schema_keys.as_slice() else { return Ok(None) };
+        let [branch_id] = scope.projection_branch_ids.as_slice() else { return Ok(None) };
+        // A limit cannot precede cross-branch shadow resolution. A negative
+        // schema bloom proves that no other branch can contribute or shadow.
+        if scope.storage_branch_ids.iter().any(|other| {
+            other != branch_id && scope.branch_heads.get(other)
+                .is_none_or(|control| control.may_have_schema(schema_key))
+        }) {
+            return Ok(None);
+        }
+        let Some(control) = scope.branch_heads.get(branch_id) else { return Ok(None) };
+        let mut tracked = tracked_scan_request_from_live(request);
+        tracked.limit = request.limit;
+        tracked.filter.include_tombstones = request.filter.include_tombstones;
+        self.tracked_head.reader(&self.store)
+            .try_scan_limited_live_batch(branch_id, *control, &tracked, request.filter.untracked)
+            .await
     }
 
     async fn scan_hot_branch_rows(

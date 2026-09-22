@@ -141,7 +141,7 @@ test.runIf(import.meta.env.LIX_ADMISSION_REGRESSION === true)(
 				server:{url,headers:[],dynamicHeaders:true},
 			});
 			expect(report.migrations).toEqual([
-				{ scope: "authority", fromFormat: 80, toFormat: 81 },
+				{ scope: "authority", fromFormat: 80, toFormat: 82 },
 			]);
 			expect(
 				events.some(

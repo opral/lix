@@ -10,6 +10,7 @@ mod staged_commit_changes;
 mod staging;
 mod stale_commit;
 mod validation;
+pub(crate) use validation::hot_index_entries_for_migration;
 
 #[cfg(feature = "storage-benches")]
 pub mod bench {

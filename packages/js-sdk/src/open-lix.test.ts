@@ -2461,7 +2461,7 @@ test("information_schema.columns SELECT * exposes the Lix column contract", asyn
 
 	expect(result.rows.length).toBeGreaterThan(0);
 	expect(result.columns.some((column) => column.name === "lix_value_kind")).toBe(
-		true,
+		false,
 	);
 	expect(result.columns.some((column) => column.name === "lix_insert_policy")).toBe(
 		true,
@@ -2471,6 +2471,28 @@ test("information_schema.columns SELECT * exposes the Lix column contract", asyn
 			?.character_octet_length,
 	).toBeNull();
 
+	await lix.close();
+});
+
+test("discovered JSONB types preserve native SELECT and RETURNING values", async () => {
+	const lix = await openLix();
+	const contract = await lix.execute(
+		"SELECT data_type FROM information_schema.columns WHERE table_name = 'lix_key_value' AND column_name = 'value'",
+	);
+	const dataType = get(contract, "data_type");
+	expect(dataType).toBe("JSONB");
+	const payload = { nested: [true, 42, null] };
+	const inserted = await lix.execute(
+		`INSERT INTO lix_key_value (key, value) VALUES ('discovered-type', CAST($1 AS ${dataType})) RETURNING value`,
+		[Value.jsonb(payload)],
+	);
+	expect(inserted.columns).toEqual([{ name: "value", type: "jsonb" }]);
+	expect(get(inserted, "value")).toEqual(payload);
+	const selected = await lix.execute(
+		`SELECT CAST(value AS ${dataType}) AS value FROM lix_key_value WHERE key = 'discovered-type'`,
+	);
+	expect(selected.columns).toEqual([{ name: "value", type: "jsonb" }]);
+	expect(get(selected, "value")).toEqual(payload);
 	await lix.close();
 });
 

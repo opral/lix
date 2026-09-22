@@ -211,7 +211,12 @@ where
                 )],
             )?;
         }
+        super::publish::append_partial_metadata_upgrade(&read, &mut plan).await?;
         read.finish()?;
+        Box::pin(super::hot_indexes::append_plan(
+            &adapter, options, &mut plan,
+        ))
+        .await?;
         (
             "v79-canonical-plan-v1",
             content_digest_with_plan(storage, Some(plan)).await?,
@@ -228,8 +233,34 @@ where
                 crate::sync::AUTHORITY_STATE_VALUE.to_vec(),
             )],
         )?;
+        let adapter = super::epoch::inspect_existing_epoch_adapter(storage).await?;
+        // A current-format authority capability upgrade does not rebuild
+        // storage indexes; project only mutations the migration will execute.
+        if before.format != Some(crate::init::CURRENT_FORMAT_VERSION) {
+            Box::pin(super::hot_indexes::append_plan(
+                &adapter, options, &mut plan,
+            ))
+            .await?;
+        }
         (
             "authority-capability-marker-v1",
+            content_digest_with_plan(storage, Some(plan)).await?,
+        )
+    } else if matches!(before.format, Some(80 | 81)) {
+        let adapter = super::epoch::inspect_existing_epoch_adapter(storage).await?;
+        let mut plan = super::publish::PublicationPlan::bounded(
+            options.max_changes,
+            options.max_preflight_bytes,
+        );
+        let read = super::MigrationPlanningRead::new(&adapter).await?;
+        super::publish::append_partial_metadata_upgrade(&read, &mut plan).await?;
+        read.finish()?;
+        Box::pin(super::hot_indexes::append_plan(
+            &adapter, options, &mut plan,
+        ))
+        .await?;
+        (
+            "v82-hot-index-plan-v1",
             content_digest_with_plan(storage, Some(plan)).await?,
         )
     } else {
@@ -301,7 +332,8 @@ where
 }
 
 /// Domain-separated digest of every logical persisted record except the format
-/// marker and mutation revision, the two intended v81 migration publications.
+/// marker and mutation revision. Derived index changes are projected through
+/// a source-derived bounded v82 rebuild plan.
 /// Includes pending operations, blobs, history, and all deduplication receipts.
 pub(super) async fn content_digest<S>(storage: &S) -> Result<String, LixError>
 where
@@ -404,6 +436,24 @@ mod tests {
     use super::*;
     use crate::storage_adapter::{PutBatch, PutEntry, StorageValue, StorageWrite};
 
+    async fn expected_v82_digest<S>(storage: &S) -> String
+    where
+        S: Storage + Clone + Send + Sync + 'static,
+    {
+        let adapter = super::super::epoch::inspect_existing_epoch_adapter(storage)
+            .await
+            .unwrap();
+        let options = super::super::MigrationOptions::default();
+        let mut plan = super::super::publish::PublicationPlan::bounded(
+            options.max_changes,
+            options.max_preflight_bytes,
+        );
+        super::super::hot_indexes::append_plan(&adapter, options, &mut plan)
+            .await
+            .unwrap();
+        content_digest_with_plan(storage, Some(plan)).await.unwrap()
+    }
+
     #[tokio::test]
     async fn normal_open_upgrades_v80_preserves_all_records_and_reports_progress() {
         let storage = StorageSession::acquire(crate::Memory::new()).await.unwrap();
@@ -422,7 +472,7 @@ mod tests {
         super::super::epoch::stage_v80_repository_for_test(&storage, false)
             .await
             .unwrap();
-        let before = content_digest(&storage).await.unwrap();
+        let before = expected_v82_digest(&storage).await;
         let inspection = inspect_repository(storage.clone()).await.unwrap();
         assert_eq!(inspection.format, Some(80));
         assert!(!inspection.current);
@@ -519,7 +569,7 @@ mod tests {
         );
         lix.close().await.unwrap();
 
-        let before = content_digest(&storage).await.unwrap();
+        let before = expected_v82_digest(&storage).await;
         super::super::epoch::stage_v80_repository_for_test(&storage, false)
             .await
             .unwrap();
@@ -614,67 +664,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_v80_migration_preserves_admission_and_resident_records_offline() {
-        let authority = crate::open_lix().await.unwrap();
-        let state = crate::sync::PartialReplicaState::new(
-            format!("https://example.test/lix/{}", authority.lix_id()),
-            authority.active_account_id().to_owned(),
-            "00000000-0000-7000-8000-000000000599".into(),
-            authority.partial_replica_descriptor(None).await.unwrap(),
-        )
-        .unwrap();
-        authority.close().await.unwrap();
-        let memory = crate::Memory::new();
-        let storage = StorageSession::acquire(crate::sync::durable_memory_for_test(memory))
-            .await
+    async fn partial_v79_to_v81_migration_preserves_admission_and_resident_records_offline() {
+        for format in [79, 80, 81] {
+            let authority = crate::open_lix().await.unwrap();
+            let state = crate::sync::PartialReplicaState::new(
+                format!("https://example.test/lix/{}", authority.lix_id()),
+                authority.active_account_id().to_owned(),
+                "00000000-0000-7000-8000-000000000599".into(),
+                authority.partial_replica_descriptor(None).await.unwrap(),
+            )
             .unwrap();
-        let installed = super::super::epoch::install_fresh_partial_epoch(storage.clone(), &state)
-            .await
-            .unwrap();
-        let expected = content_digest(&storage).await.unwrap();
-        let mut legacy_receipt = serde_json::to_value(&state).unwrap();
-        legacy_receipt["version"] = serde_json::json!(1);
-        legacy_receipt
-            .as_object_mut()
-            .unwrap()
-            .remove("archivedBranchIds");
-        let mut writes = installed.adapter.new_write_set();
-        writes.put(
-            crate::sync::PARTIAL_REPLICA_STATE_SPACE,
-            crate::sync::partial_replica_state_key(),
-            serde_json::to_vec(&legacy_receipt).unwrap(),
-        );
-        // Seed historical metadata through the fixture's migration writer;
-        // ordinary partial writer capabilities remain sync-private.
-        use crate::storage_adapter::StorageWrite as _;
-        let mut write = installed
-            .adapter
-            .begin_migration_write(Default::default())
-            .await
-            .unwrap();
-        writes.lower_into(&mut write).await.unwrap();
-        write.commit().await.unwrap();
-        super::super::epoch::stage_v80_repository_for_test(&storage, true)
-            .await
-            .unwrap();
-        assert!(
-            super::super::epoch::admit_partial_epoch(&storage)
+            authority.close().await.unwrap();
+            let memory = crate::Memory::new();
+            let storage = StorageSession::acquire(crate::sync::durable_memory_for_test(memory))
                 .await
-                .is_err()
-        );
-        assert_ne!(content_digest(&storage).await.unwrap(), expected);
-        let lix = crate::open_lix()
-            .with_storage(storage.clone())
-            .await
-            .unwrap();
-        assert_eq!(lix.lix_id(), state.repository_id());
-        assert_eq!(lix.open_report().migration.unwrap().from_format, 80);
-        lix.close().await.unwrap();
-        assert_eq!(content_digest(&storage).await.unwrap(), expected);
-        let admitted = super::super::epoch::admit_partial_epoch(&storage)
-            .await
-            .unwrap();
-        assert_eq!(admitted.state, state);
+                .unwrap();
+            let installed =
+                super::super::epoch::install_fresh_partial_epoch(storage.clone(), &state)
+                    .await
+                    .unwrap();
+            let expected = content_digest(&storage).await.unwrap();
+            let mut legacy_receipt = serde_json::to_value(&state).unwrap();
+            legacy_receipt["version"] = serde_json::json!(1);
+            legacy_receipt
+                .as_object_mut()
+                .unwrap()
+                .remove("archivedBranchIds");
+            let mut writes = installed.adapter.new_write_set();
+            // A sparse cache cannot certify whole-collection completeness. The
+            // upgrade retires all old index records without requesting hydration.
+            writes.put(
+                crate::hot_state::INDEX_SPACE,
+                b"old-untrusted-index".as_slice(),
+                b"partial-cache".as_slice(),
+            );
+            writes.put(
+                crate::sync::PARTIAL_REPLICA_STATE_SPACE,
+                crate::sync::partial_replica_state_key(),
+                serde_json::to_vec(&legacy_receipt).unwrap(),
+            );
+            // Seed historical metadata through the fixture's migration writer;
+            // ordinary partial writer capabilities remain sync-private.
+            use crate::storage_adapter::StorageWrite as _;
+            let mut write = installed
+                .adapter
+                .begin_migration_write(Default::default())
+                .await
+                .unwrap();
+            writes.lower_into(&mut write).await.unwrap();
+            write.commit().await.unwrap();
+            super::super::epoch::stage_repository_format_for_test(&storage, true, format)
+                .await
+                .unwrap();
+            assert!(
+                super::super::epoch::admit_partial_epoch(&storage)
+                    .await
+                    .is_err()
+            );
+            assert_ne!(content_digest(&storage).await.unwrap(), expected);
+            let report = migrate_repository(storage.clone()).await.unwrap();
+            assert!(report.semantic_preservation_verified);
+            assert_eq!(report.expected_content_digest, report.after_content_digest);
+            assert_eq!(report.after_content_digest, expected);
+            let lix = crate::open_lix()
+                .with_storage(storage.clone())
+                .await
+                .unwrap();
+            assert_eq!(lix.lix_id(), state.repository_id());
+            assert_eq!(report.before.format, Some(format));
+            lix.close().await.unwrap();
+            assert_eq!(content_digest(&storage).await.unwrap(), expected);
+            let admitted = super::super::epoch::admit_partial_epoch(&storage)
+                .await
+                .unwrap();
+            assert_eq!(admitted.state, state);
+        }
     }
 
     #[tokio::test]
@@ -780,7 +844,11 @@ mod tests {
         assert!(report.semantic_preservation_verified);
         assert_eq!(
             report.preservation_basis,
-            if from_v79 { "v79-canonical-plan-v1" } else { "authority-capability-marker-v1" }
+            if from_v79 {
+                "v79-canonical-plan-v1"
+            } else {
+                "authority-capability-marker-v1"
+            }
         );
         assert_eq!(
             content_digest(&storage).await.unwrap(),

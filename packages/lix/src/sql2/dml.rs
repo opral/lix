@@ -18,11 +18,14 @@ use futures_util::stream;
 
 use super::runtime;
 
+/// Consume source batches incrementally into statement-owned mutation state.
+/// Implementations must exhaust the input successfully before publishing writes:
+/// later partitions may read the target, or fail after earlier batches succeeded.
 #[async_trait]
 pub(crate) trait InsertSink: Debug + DisplayAs + Send + Sync {
     async fn write_batches(
         &self,
-        batches: Vec<RecordBatch>,
+        batches: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
     ) -> Result<u64>;
 }
@@ -119,7 +122,7 @@ impl ExecutionPlan for InsertExec {
         let stream_schema = Arc::clone(&self.result_schema);
         let result_schema = Arc::clone(&self.result_schema);
         let stream = stream::once(async move {
-            let batches = runtime::collect_input_plan(input, Arc::clone(&context)).await?;
+            let batches = runtime::stream_input_plan(input, Arc::clone(&context))?;
             let count = sink.write_batches(batches, &context).await?;
             dml_count_batch(stream_schema, count)
         });
@@ -146,4 +149,128 @@ fn dml_count_batch(schema: SchemaRef, count: u64) -> Result<RecordBatch> {
         vec![Arc::new(UInt64Array::from(vec![count])) as ArrayRef],
     )
     .map_err(DataFusionError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::{StreamExt, TryStreamExt};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Each next batch is available only after the sink consumed the previous
+    /// one. An eager collector therefore fails instead of merely using more RAM.
+    #[derive(Debug)]
+    struct PullInput {
+        consumed: Arc<AtomicUsize>,
+        properties: Arc<PlanProperties>,
+    }
+
+    impl DisplayAs for PullInput {
+        fn fmt_as(
+            &self,
+            _: DisplayFormatType,
+            f: &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result {
+            write!(f, "PullInput")
+        }
+    }
+
+    impl ExecutionPlan for PullInput {
+        fn name(&self) -> &'static str {
+            "PullInput"
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.properties
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            _: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+        fn execute(
+            &self,
+            partition: usize,
+            _: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            let consumed = Arc::clone(&self.consumed);
+            let schema = dml_count_schema();
+            let batch_schema = Arc::clone(&schema);
+            Ok(Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                stream::iter(0..3).map(move |index| {
+                    if consumed.load(Ordering::SeqCst) != partition * 3 + index {
+                        return Err(DataFusionError::Execution(
+                            "source was drained ahead of sink".into(),
+                        ));
+                    }
+                    dml_count_batch(Arc::clone(&batch_schema), index as u64)
+                }),
+            )))
+        }
+    }
+
+    #[derive(Debug)]
+    struct PullSink(Arc<AtomicUsize>);
+    impl DisplayAs for PullSink {
+        fn fmt_as(
+            &self,
+            _: DisplayFormatType,
+            f: &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result {
+            write!(f, "PullSink")
+        }
+    }
+    #[async_trait]
+    impl InsertSink for PullSink {
+        async fn write_batches(
+            &self,
+            mut batches: SendableRecordBatchStream,
+            _: &Arc<TaskContext>,
+        ) -> Result<u64> {
+            let mut count = 0;
+            while let Some(batch) = batches.try_next().await? {
+                count += batch.num_rows() as u64;
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(count)
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_sink_pulls_batches_across_partitions() {
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let input = Arc::new(PullInput {
+            consumed: Arc::clone(&consumed),
+            properties: Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(dml_count_schema()),
+                Partitioning::UnknownPartitioning(2),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            )),
+        });
+        let exec = InsertExec::new(input, Arc::new(PullSink(Arc::clone(&consumed))));
+        let batches = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(consumed.load(Ordering::SeqCst), 6);
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(0),
+            6
+        );
+    }
 }

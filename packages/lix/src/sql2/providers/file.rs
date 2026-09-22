@@ -37,7 +37,7 @@ use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPu
 use datafusion::physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use datafusion::prelude::SessionContext;
-use futures_util::{FutureExt, future::try_join_all};
+use futures_util::{FutureExt, TryStreamExt, future::try_join_all};
 use serde::Deserialize;
 
 use crate::binary_cas::{BlobDataReader, BlobId, BlobRangeBytes};
@@ -1437,20 +1437,15 @@ impl TableSpec for LixFileSpec {
         let include_data_writes =
             self.schema.field_with_name("content").is_ok() && data_is_explicit;
         let spec = self.clone();
-        Ok(Arc::new(move |batches| {
+        Ok(Arc::new(move |mut batches| {
             let write_ctx = write_ctx.clone();
             let spec = spec.clone();
             let returning = returning.clone();
             async move {
-                let row_capacity = batches
-                    .iter()
-                    .map(RecordBatch::num_rows)
-                    .sum::<usize>()
-                    .saturating_mul(3);
-                let mut staged = LixFileStagedBatch::with_row_capacity(row_capacity);
+                let mut staged = LixFileStagedBatch::with_row_capacity(0);
                 let mut path_resolvers = None;
                 let mut keys = Vec::new();
-                for batch in batches {
+                while let Some(batch) = batches.try_next().await? {
                     let batch = spec.materialize_returning_insert_defaults(&batch)?;
                     for row_index in 0..batch.num_rows() {
                         keys.push(spec.returning_key_from_batch(&batch, row_index)?);
@@ -2042,6 +2037,23 @@ impl UpsertSupport for LixFileSpec {
             .await
     }
 
+    fn validate_duplicate_proposed(
+        &self,
+        proposed: &RecordBatch,
+        row: usize,
+        target: &UpsertConflictTarget,
+        matches_existing: bool,
+    ) -> Result<()> {
+        if target.kind() == UpsertConflictKind::Path && !matches_existing {
+            let path = required_string_value(proposed, row, "path")?;
+            return Err(lix_error_to_datafusion_error(LixError::new(
+                LixError::CODE_UNIQUE,
+                format!("INSERT into lix_file contains duplicate missing path {path:?}"),
+            )));
+        }
+        Ok(())
+    }
+
     fn validate_conflict_pair(
         &self,
         existing: &RecordBatch,
@@ -2271,17 +2283,12 @@ impl DisplayAs for LixFileInsertSink {
 impl InsertSink for LixFileInsertSink {
     async fn write_batches(
         &self,
-        batches: Vec<RecordBatch>,
+        mut batches: datafusion::physical_plan::SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> Result<u64> {
-        let row_capacity = batches
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum::<usize>()
-            .saturating_mul(3);
-        let mut staged = LixFileStagedBatch::with_row_capacity(row_capacity);
+        let mut staged = LixFileStagedBatch::with_row_capacity(0);
         let mut path_resolvers = None;
-        for batch in batches {
+        while let Some(batch) = batches.try_next().await? {
             if path_resolvers.is_none() {
                 path_resolvers = Some(
                     directory_path_resolvers_from_hot_state(
@@ -11475,7 +11482,15 @@ mod tests {
         );
 
         let count = sink
-            .write_batches(vec![batch], &Arc::new(TaskContext::default()))
+            .write_batches(
+                Box::pin(
+                    datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                        batch.schema(),
+                        futures_util::stream::iter([Ok(batch)]),
+                    ),
+                ),
+                &Arc::new(TaskContext::default()),
+            )
             .await
             .expect("file insert sink should stage");
 
@@ -12487,7 +12502,15 @@ mod tests {
         );
 
         let count = sink
-            .write_batches(vec![batch], &Arc::new(TaskContext::default()))
+            .write_batches(
+                Box::pin(
+                    datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                        batch.schema(),
+                        futures_util::stream::iter([Ok(batch)]),
+                    ),
+                ),
+                &Arc::new(TaskContext::default()),
+            )
             .await
             .expect("file insert sink should stage data");
 
@@ -12553,7 +12576,15 @@ mod tests {
         );
 
         let count = sink
-            .write_batches(vec![batch], &Arc::new(TaskContext::default()))
+            .write_batches(
+                Box::pin(
+                    datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                        batch.schema(),
+                        futures_util::stream::iter([Ok(batch)]),
+                    ),
+                ),
+                &Arc::new(TaskContext::default()),
+            )
             .await
             .expect("file insert sink should stage path data");
 

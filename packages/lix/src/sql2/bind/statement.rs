@@ -580,7 +580,7 @@ fn bind_assignment_target(
 }
 
 fn bind_insert_input(
-    surface_kind: &PublicSurfaceKind,
+    _surface_kind: &PublicSurfaceKind,
     columns: &[super::expr::BoundColumnRef],
     source: Option<&Query>,
     params: &mut ParamBinder,
@@ -592,11 +592,6 @@ fn bind_insert_input(
         reject_unsupported_insert_values_query_clauses(source)?;
     }
     let SetExpr::Values(values) = source.body.as_ref() else {
-        if matches!(surface_kind, PublicSurfaceKind::SchemaBase { .. }) {
-            return Err(super::error::unsupported(
-                "INSERT ... SELECT is not supported for schema SQL surfaces yet",
-            ));
-        }
         if columns
             .iter()
             .any(|column| column.table == "lix_file" && column.name == "content")
@@ -1513,9 +1508,9 @@ mod tests {
     }
 
     #[test]
-    fn bind_statement_rejects_row_insert_select() {
+    fn bind_statement_accepts_row_insert_select() {
         let statement = parse_statement("INSERT INTO test_state_schema (value) SELECT 'A'");
-        let error = bind_statement(
+        let bound = bind_statement(
             &statement,
             &[serde_json::json!({
                 "$schema": "https://lix.dev/schema-v1.json",
@@ -1527,14 +1522,8 @@ mod tests {
             })],
             "branch1",
         )
-        .expect_err("row INSERT SELECT should fail closed at binding");
-
-        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert!(
-            error
-                .message
-                .contains("INSERT ... SELECT is not supported for schema SQL surfaces yet")
-        );
+        .expect("row INSERT SELECT should bind");
+        assert!(matches!(bound.input, BoundWriteInput::Query { .. }));
     }
 
     #[test]

@@ -33,7 +33,6 @@ use datafusion::datasource::{empty::EmptyTable, provider_as_source};
 use datafusion::logical_expr::expr::{BinaryExpr, Cast, InList, Like, ScalarFunction};
 use datafusion::logical_expr::registry::FunctionRegistry;
 use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, LogicalPlanBuilder, Operator};
-#[cfg(any(feature = "storage-benches", test))]
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::Statement as DataFusionStatement;
@@ -1709,11 +1708,10 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
                     .validate_upsert_target(&input, &target_columns)
                     .await
                     .map_err(datafusion_error_to_lix_error)?;
-                let proposed_batches = crate::sql2::runtime::collect_input_plan(
+                let proposed_batches = crate::sql2::runtime::stream_input_plan(
                     std::sync::Arc::clone(&input),
                     session.task_ctx(),
                 )
-                .await
                 .map_err(datafusion_error_to_lix_error)?;
                 let action = match &conflict.action {
                     crate::sql2::bind::write::BoundConflictAction::DoNothing => {
@@ -1812,6 +1810,36 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
     }
 }
 
+pub(super) async fn row_insert_query_stream(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    params: &[Value],
+) -> Result<SendableRecordBatchStream, LixError> {
+    let BoundWriteTarget::Row(crate::sql2::bind::write::RowWriteSurface::Base { schema_key }) =
+        &plan.bound.target
+    else {
+        return Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "expected registered INSERT target",
+        ));
+    };
+    let table_name = schema_key.clone();
+    let selection = write_provider_selection(plan, &table_name);
+    let session =
+        build_write_session_with_options(ctx, write_session_options(plan), &selection).await?;
+    let table = session
+        .table_provider(&table_name)
+        .await
+        .map_err(datafusion_error_to_lix_error)?;
+    let BoundWriteInput::Query { query, columns } = &plan.bound.input else {
+        unreachable!()
+    };
+    let input =
+        insert_query_input_plan(&session, table.schema(), query, columns, params, false).await?;
+    crate::sql2::runtime::stream_input_plan(input, session.task_ctx())
+        .map_err(datafusion_error_to_lix_error)
+}
+
 async fn insert_input_plan(
     session: &SessionContext,
     schema: SchemaRef,
@@ -1823,7 +1851,7 @@ async fn insert_input_plan(
             insert_values_input_plan(session, schema, plan, params, values).await
         }
         BoundWriteInput::Query { query, columns } => {
-            insert_query_input_plan(session, schema, query, columns, params).await
+            insert_query_input_plan(session, schema, query, columns, params, true).await
         }
         BoundWriteInput::None => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
@@ -1938,6 +1966,7 @@ async fn insert_query_input_plan(
     query: &crate::sql2::bind::read::BoundRead,
     columns: &[crate::sql2::bind::expr::BoundColumnRef],
     params: &[Value],
+    coerce: bool,
 ) -> Result<std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>, LixError> {
     let mut statement = DataFusionStatement::Statement(Box::new(
         datafusion::sql::sqlparser::ast::Statement::Query(query.query.clone()),
@@ -1977,7 +2006,13 @@ async fn insert_query_input_plan(
                 .unwrap_or_else(|| {
                     Expr::Literal(ScalarValue::try_new_null(field.data_type()).unwrap(), None)
                 });
-            Ok(coerce_assignment_expr(expr, field, input_schema.as_ref())?.alias(field.name()))
+            if coerce {
+                Ok(coerce_assignment_expr(expr, field, input_schema.as_ref())?.alias(field.name()))
+            } else {
+                // The native writer applies schema assignment rules. Preserve
+                // source logical types, especially JSONB versus SQL text.
+                Ok(expr.alias(field.name()))
+            }
         })
         .collect::<Result<Vec<_>, LixError>>()?;
     let mut dataframe = session
@@ -3488,7 +3523,7 @@ pub(crate) fn row_values_from_batch(
 /// one dynamic downcast plus one owned allocation for every cell of every scan.
 /// The batch is uniform by construction, so the downcast is hoisted here and
 /// the row loop reads straight out of the typed array into `Value`.
-enum ColumnCursor<'a> {
+pub(super) enum ColumnCursor<'a> {
     Null,
     Boolean(&'a BooleanArray),
     Int8(&'a Int8Array),
@@ -3512,13 +3547,13 @@ enum ColumnCursor<'a> {
 /// Whether a string column carries JSON payloads, decided once per batch from
 /// the result field metadata rather than re-tested per cell.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum TextKind {
+pub(super) enum TextKind {
     Text,
     Jsonb,
     RowRef,
 }
 
-fn column_cursor<'a>(
+pub(super) fn column_cursor<'a>(
     field: Option<&Field>,
     array: &'a dyn Array,
 ) -> Result<ColumnCursor<'a>, LixError> {
@@ -3578,7 +3613,7 @@ fn downcast_column<'a, ArrayType: 'static>(
 }
 
 impl ColumnCursor<'_> {
-    fn value(&self, row_index: usize) -> Result<Value, LixError> {
+    pub(super) fn value(&self, row_index: usize) -> Result<Value, LixError> {
         let value = match self {
             Self::Null => Value::Null,
             Self::Boolean(values) => {
@@ -7412,6 +7447,89 @@ mod tests {
                 .deltas
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn query_upsert_duplicate_paths_validate_every_source_batch() {
+        for table in ["lix_file", "lix_directory"] {
+            for returning in ["", " RETURNING id"] {
+                for (existing, opposite_lane, expected) in [
+                    (false, false, LixError::CODE_UNIQUE),
+                    (false, true, LixError::CODE_UNIQUE),
+                    (true, true, LixError::CODE_CONSTRAINT_VIOLATION),
+                ] {
+                    let rows = if existing {
+                        vec![if table == "lix_file" {
+                            live_file_row(
+                                "01920000-0000-7000-8000-000000000322",
+                                "01920000-0000-7000-8000-0000000000a1",
+                                None,
+                                "dupe",
+                            )
+                        } else {
+                            live_directory_row(
+                                "01920000-0000-7000-8000-000000000322",
+                                "01920000-0000-7000-8000-0000000000a1",
+                                None,
+                                "dupe",
+                            )
+                        }]
+                    } else {
+                        vec![]
+                    };
+                    let (mut ctx, staged, _) = counting_write_context(rows);
+                    let sql = format!(
+                        "INSERT INTO {table} (path,lixcol_untracked) (SELECT '/fresh',false UNION ALL SELECT '/dupe',false UNION ALL SELECT '/dupe',{opposite_lane}) ON CONFLICT (path) DO NOTHING{returning}"
+                    );
+                    crate::sql2::providers::take_upsert_source_batches();
+                    let error = execute_write_sql_trace(
+                        &mut ctx,
+                        &sql,
+                        &[],
+                        WriteExecutorMode::ForceDataFusion,
+                    )
+                    .await
+                    .expect_err("duplicate missing paths and lane collisions must fail");
+                    assert_eq!(error.code, expected, "{sql}: {error}");
+                    assert!(
+                        crate::sql2::providers::take_upsert_source_batches() >= 3,
+                        "test must consume separate source batches: {sql}"
+                    );
+                    assert!(
+                        staged.lock().unwrap().deltas.is_empty(),
+                        "late failure must not stage the fresh prefix: {sql}"
+                    );
+                }
+                let rows = vec![if table == "lix_file" {
+                    live_file_row(
+                        "01920000-0000-7000-8000-000000000322",
+                        "01920000-0000-7000-8000-0000000000a1",
+                        None,
+                        "dupe",
+                    )
+                } else {
+                    live_directory_row(
+                        "01920000-0000-7000-8000-000000000322",
+                        "01920000-0000-7000-8000-0000000000a1",
+                        None,
+                        "dupe",
+                    )
+                }];
+                let (mut ctx, staged, _) = counting_write_context(rows);
+                let sql = format!(
+                    "INSERT INTO {table} (path) (SELECT '/dupe' UNION ALL SELECT '/dupe') ON CONFLICT (path) DO NOTHING{returning}"
+                );
+                crate::sql2::providers::take_upsert_source_batches();
+                execute_write_sql_trace(&mut ctx, &sql, &[], WriteExecutorMode::ForceDataFusion)
+                    .await
+                    .expect("same-lane existing duplicates remain valid DO NOTHING");
+                assert!(
+                    crate::sql2::providers::take_upsert_source_batches() >= 2,
+                    "expected separate source batches"
+                );
+                assert!(staged.lock().unwrap().deltas.is_empty());
+            }
+        }
     }
 
     #[tokio::test]

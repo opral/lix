@@ -442,10 +442,10 @@ impl DmlPlanOptions {
     }
 }
 
-/// Exec-time INSERT handler: receives the collected input batches, stages
+/// Exec-time INSERT handler: pulls source input batches, stages
 /// the resulting transaction writes, and returns the inserted-row count.
 pub(super) type InsertApply =
-    Arc<dyn Fn(Vec<RecordBatch>) -> BoxFuture<'static, Result<u64>> + Send + Sync>;
+    Arc<dyn Fn(SendableRecordBatchStream) -> BoxFuture<'static, Result<u64>> + Send + Sync>;
 
 /// A planned read: the (projected) output schema plus the loader that
 /// materializes it during execution.
@@ -563,7 +563,7 @@ pub(super) trait TableSpec: Send + Sync + 'static {
     async fn stage_insert(
         &self,
         _write_ctx: &SqlWriteContext,
-        _batches: Vec<RecordBatch>,
+        _batches: SendableRecordBatchStream,
     ) -> Result<u64> {
         Err(DataFusionError::Execution(format!(
             "INSERT into {} is not supported",
@@ -574,7 +574,7 @@ pub(super) trait TableSpec: Send + Sync + 'static {
     /// Plan-time INSERT hook for specs that must inspect or validate the
     /// physical input plan (e.g. lix_file's insert-column intent detection
     /// and binary-cast rejection). Returning `Some` bypasses `stage_insert`
-    /// and routes the collected input batches to the returned handler.
+    /// and routes the source batch stream to the returned handler.
     async fn plan_insert(
         &self,
         _write_ctx: SqlWriteContext,
@@ -850,7 +850,7 @@ impl SpecWriteTarget {
     pub(crate) async fn execute_upsert(
         &self,
         input: &Arc<dyn ExecutionPlan>,
-        proposed_batches: Vec<RecordBatch>,
+        proposed_batches: SendableRecordBatchStream,
         target_columns: &[String],
         action: &upsert::UpsertAction,
     ) -> Result<u64> {
@@ -864,7 +864,7 @@ impl SpecWriteTarget {
     pub(crate) async fn execute_upsert_with_returning(
         &self,
         input: &Arc<dyn ExecutionPlan>,
-        proposed_batches: Vec<RecordBatch>,
+        proposed_batches: SendableRecordBatchStream,
         target_columns: &[String],
         action: &upsert::UpsertAction,
         returning: DmlReturning,
@@ -1234,13 +1234,17 @@ impl DisplayAs for SpecInsertSink {
 impl InsertSink for SpecInsertSink {
     async fn write_batches(
         &self,
-        batches: Vec<RecordBatch>,
+        batches: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> Result<u64> {
-        let batches = batches
-            .into_iter()
-            .map(|batch| mark_omitted_insert_columns(batch, &self.omitted_insert_columns))
-            .collect::<Result<Vec<_>>>()?;
+        let omitted = self.omitted_insert_columns.clone();
+        let schema = batches.schema();
+        let batches = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            batches.and_then(move |batch| {
+                futures_util::future::ready(mark_omitted_insert_columns(batch, &omitted))
+            }),
+        ));
         self.spec.stage_insert(&self.write_ctx, batches).await
     }
 }
@@ -1270,13 +1274,17 @@ impl DisplayAs for PlannedInsertSink {
 impl InsertSink for PlannedInsertSink {
     async fn write_batches(
         &self,
-        batches: Vec<RecordBatch>,
+        batches: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> Result<u64> {
-        let batches = batches
-            .into_iter()
-            .map(|batch| mark_omitted_insert_columns(batch, &self.omitted_insert_columns))
-            .collect::<Result<Vec<_>>>()?;
+        let omitted = self.omitted_insert_columns.clone();
+        let schema = batches.schema();
+        let batches = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            batches.and_then(move |batch| {
+                futures_util::future::ready(mark_omitted_insert_columns(batch, &omitted))
+            }),
+        ));
         (self.apply)(batches).await
     }
 }

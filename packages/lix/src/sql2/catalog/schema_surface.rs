@@ -72,6 +72,8 @@ pub(crate) struct SchemaSurfaceSpec {
     /// column's ordinal in the index key, so it must not be reordered without
     /// retiring the index namespace.
     pub(crate) indexed_columns: Vec<SchemaIndexedColumn>,
+    /// Composite equality indices share the ordinal space with scalar indices.
+    pub(crate) indexed_groups: Vec<(u16, Vec<String>)>,
     /// Whether changing one row can invalidate another row.
     ///
     /// Homogeneous point updates may be lowered into one physical write batch
@@ -265,6 +267,13 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
                 && column.default_expression.is_none()
         });
     let indexed_columns = derive_indexed_columns(&parsed, &columns);
+    let mut groups = parsed.unique.iter().chain(parsed.foreign_keys.iter().map(|fk| &fk.columns))
+        .filter(|group| group.len() > 1).cloned().collect::<Vec<_>>();
+    groups.sort();
+    groups.dedup();
+    let indexed_groups = groups.into_iter().enumerate().map(|(index, group)| {
+        (u16::try_from(indexed_columns.len() + index).expect("schema index ordinal overflow"), group)
+    }).collect();
     let columnar_snapshot_bijective = columns.iter().all(|column| {
         !column.read_nullable
             && column.default_expression.is_none()
@@ -285,6 +294,7 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
         primary_key_paths,
         primary_key_component_types,
         indexed_columns,
+        indexed_groups,
         columns,
         defaults: crate::catalog::DefaultPlan::from_schema(schema),
         has_inter_row_constraints: !parsed.unique.is_empty()

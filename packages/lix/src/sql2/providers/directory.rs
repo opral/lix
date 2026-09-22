@@ -7,6 +7,7 @@
 )]
 
 use super::values::{optional_metadata_value, update_optional_metadata_value};
+use futures_util::TryStreamExt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
@@ -601,18 +602,13 @@ impl TableSpec for LixDirectorySpec {
     async fn stage_insert(
         &self,
         write_ctx: &SqlWriteContext,
-        batches: Vec<RecordBatch>,
+        mut batches: datafusion::physical_plan::SendableRecordBatchStream,
     ) -> Result<u64> {
         let surface_name = lix_directory_surface_name(&self.branch_binding);
         let mut path_resolvers = None;
-        let row_capacity = batches
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum::<usize>()
-            .saturating_mul(3);
-        let mut rows = RawWriteBatch::with_capacity(row_capacity);
+        let mut rows = RawWriteBatch::with_capacity(0);
         let mut count = 0_u64;
-        for batch in batches {
+        while let Some(batch) = batches.try_next().await? {
             if path_resolvers.is_none() {
                 path_resolvers = Some(self.path_resolvers_for_write(write_ctx).await?);
             }
@@ -665,22 +661,17 @@ impl TableSpec for LixDirectorySpec {
         returning: DmlReturning,
     ) -> Result<InsertApply> {
         let spec = self.clone();
-        Ok(Arc::new(move |batches| {
+        Ok(Arc::new(move |mut batches| {
             let write_ctx = write_ctx.clone();
             let spec = spec.clone();
             let returning = returning.clone();
             async move {
                 let surface_name = lix_directory_surface_name(&spec.branch_binding);
-                let row_capacity = batches
-                    .iter()
-                    .map(RecordBatch::num_rows)
-                    .sum::<usize>()
-                    .saturating_mul(3);
-                let mut rows = RawWriteBatch::with_capacity(row_capacity);
+                let mut rows = RawWriteBatch::with_capacity(0);
                 let mut path_resolvers = None;
                 let mut keys = Vec::new();
                 let mut count = 0_u64;
-                for batch in batches {
+                while let Some(batch) = batches.try_next().await? {
                     let batch = spec.materialize_returning_insert_defaults(&batch)?;
                     for row_index in 0..batch.num_rows() {
                         keys.push(spec.returning_key_from_batch(&batch, row_index)?);
@@ -1130,6 +1121,23 @@ impl UpsertSupport for LixDirectorySpec {
             .await
             .map_err(lix_error_to_datafusion_error)?;
         lix_directory_record_batch(&self.schema, &rows).map_err(lix_error_to_datafusion_error)
+    }
+
+    fn validate_duplicate_proposed(
+        &self,
+        proposed: &RecordBatch,
+        row: usize,
+        target: &UpsertConflictTarget,
+        matches_existing: bool,
+    ) -> Result<()> {
+        if target.kind() == UpsertConflictKind::Path && !matches_existing {
+            let path = required_string_value(proposed, row, "path")?;
+            return Err(lix_error_to_datafusion_error(LixError::new(
+                LixError::CODE_UNIQUE,
+                format!("INSERT into lix_directory contains duplicate missing path {path:?}"),
+            )));
+        }
+        Ok(())
     }
 
     fn validate_conflict_pair(
@@ -2403,7 +2411,16 @@ mod tests {
             branch_ref,
             test_functions(),
         );
-        spec.stage_insert(&write_ctx, vec![batch]).await
+        spec.stage_insert(
+            &write_ctx,
+            Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    batch.schema(),
+                    futures_util::stream::iter([Ok(batch)]),
+                ),
+            ),
+        )
+        .await
     }
 
     /// Stage one active-branch INSERT with an injected path-index reader so a
@@ -2427,7 +2444,16 @@ mod tests {
             branch_ref,
             test_functions(),
         );
-        spec.stage_insert(&write_ctx, vec![batch]).await
+        spec.stage_insert(
+            &write_ctx,
+            Box::pin(
+                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                    batch.schema(),
+                    futures_util::stream::iter([Ok(batch)]),
+                ),
+            ),
+        )
+        .await
     }
 
     #[derive(Default)]

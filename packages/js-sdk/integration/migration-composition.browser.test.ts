@@ -11,7 +11,7 @@ async function stored(name:string,downgrade=false,phase="inspect",format=80,part
 }
 test('detached WASM and built OPFS migrator preserve offline work through owner loss and v80 cutover',async()=>{
  const sourceName=`migration-composition-${crypto.randomUUID()}`;
- const destinationName=`${sourceName}-v81`;
+ const destinationName=`${sourceName}-v82`;
  const url=`${location.origin}/lix/00000000-0000-7000-8000-000000000004`;
  const headers:[string,string][]=[['Authorization','Bearer migration-fixture']];
  let offline=false;
@@ -50,7 +50,7 @@ test('detached WASM and built OPFS migrator preserve offline work through owner 
 
 test('actual OPFS migrator accepts a fresh empty profile without migration work',async()=>{
  const suffix=crypto.randomUUID();
- const result=await migrateOpfsReplica({sourceName:`migration-empty-${suffix}`,destinationName:`migration-empty-${suffix}-v81`,server:{url:`${location.origin}/lix/00000000-0000-7000-8000-000000000004`,headers:[]}});
+ const result=await migrateOpfsReplica({sourceName:`migration-empty-${suffix}`,destinationName:`migration-empty-${suffix}-v82`,server:{url:`${location.origin}/lix/00000000-0000-7000-8000-000000000004`,headers:[]}});
  expect(result.empty).toBe(true);
 },30000);
 

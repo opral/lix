@@ -31,6 +31,8 @@ pub(crate) use state_at::{arm_state_at_traversal_probe, take_state_at_traversal_
 mod spec;
 pub(crate) use spec::{PhysicalScanKey, SpecScanExec, StatementScanKey};
 mod upsert;
+#[cfg(test)]
+pub(crate) use upsert::take_upsert_source_batches;
 mod values;
 
 use crate::sql2::catalog::{PublicCatalog, PublicSurfaceContract, PublicSurfaceKind};

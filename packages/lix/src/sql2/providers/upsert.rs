@@ -13,7 +13,8 @@
 //! builders — via [`UpsertSupport`]. The loop, matching, and the `excluded`
 //! batch augmentation live here once.
 
-use std::collections::{BTreeSet, HashMap};
+use futures_util::TryStreamExt;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -128,20 +129,20 @@ pub(super) struct UpsertReturningRow {
 }
 
 impl UpsertReturningRow {
-    fn proposed(batch: &RecordBatch, row_index: usize) -> Self {
-        Self {
+    fn proposed(batch: &RecordBatch, row_index: usize) -> Result<Self> {
+        Ok(Self {
             existed: false,
-            batch: batch.clone(),
-            row_index,
-        }
+            batch: take_rows(batch, &[row_index as u64])?,
+            row_index: 0,
+        })
     }
 
-    fn existing(batch: &RecordBatch, row_index: usize) -> Self {
-        Self {
+    fn existing(batch: &RecordBatch, row_index: usize) -> Result<Self> {
+        Ok(Self {
             existed: true,
-            batch: batch.clone(),
-            row_index,
-        }
+            batch: take_rows(batch, &[row_index as u64])?,
+            row_index: 0,
+        })
     }
 
     pub(super) fn old_batch(&self) -> Option<&RecordBatch> {
@@ -275,6 +276,18 @@ pub(super) trait UpsertSupport: Send + Sync {
         Ok(())
     }
 
+    /// Validate a repeated proposed identity before conflict handling can skip
+    /// it. Filesystem providers reject repeated missing paths even for DO NOTHING.
+    fn validate_duplicate_proposed(
+        &self,
+        _proposed: &RecordBatch,
+        _row: usize,
+        _target: &UpsertConflictTarget,
+        _matches_existing: bool,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Apply the `DO UPDATE` assignments to an augmented batch — this table's
     /// columns (carrying the existing row) plus `excluded.*` columns (carrying
     /// the proposed row) — producing the staged replacement rows.
@@ -286,36 +299,27 @@ pub(super) trait UpsertSupport: Send + Sync {
     ) -> Result<StagedUpsert>;
 }
 
-/// Run an upsert over the collected proposed input batches and return the
+/// Run an upsert over a proposed input stream and return the
 /// affected-row count (the number of logical rows inserted or updated).
 pub(super) async fn execute_upsert<S: UpsertSupport + ?Sized>(
     spec: &S,
     write_ctx: &SqlWriteContext,
-    proposed_batches: Vec<RecordBatch>,
+    mut proposed_batches: datafusion::physical_plan::SendableRecordBatchStream,
     target: &UpsertConflictTarget,
     action: &UpsertAction,
 ) -> Result<u64> {
     let conflict_columns = target.columns();
+    let mut seen = HashSet::new();
     let mut staged = StagedUpsert::default();
     let mut affected: u64 = 0;
-    let proposed_batches = proposed_batches
-        .into_iter()
-        .map(|batch| {
-            let Some(explicit_columns) = write_ctx.explicit_insert_columns() else {
-                return Ok(batch);
-            };
-            let omitted_columns = batch
-                .schema()
-                .fields()
-                .iter()
-                .filter(|field| !explicit_columns.contains(field.name().as_str()))
-                .map(|field| field.name().clone())
-                .collect::<BTreeSet<_>>();
-            mark_omitted_insert_columns(batch, &omitted_columns)
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    for batch in &proposed_batches {
+    while let Some(batch) = proposed_batches.try_next().await? {
+        #[cfg(test)]
+        UPSERT_SOURCE_BATCHES.with(|count| count.set(count.get() + 1));
+        let batch = mark_proposed_columns(write_ctx, batch)?;
+        let batch = spec
+            .materialize_returning_insert_defaults(write_ctx, &batch)
+            .await?;
+        let batch = &batch;
         spec.validate_proposed_batch(batch)?;
         let existing = spec
             .scan_conflict_candidates_for_write(write_ctx, batch, target, action, None)
@@ -327,10 +331,24 @@ pub(super) async fn execute_upsert<S: UpsertSupport + ?Sized>(
         let mut unmatched_proposed = Vec::new();
         for row in 0..batch.num_rows() {
             let key = identity_key(batch, row, conflict_columns)?;
-            if let Some(existing_rows) = existing_by_identity.get(&key) {
+            let existing_rows = existing_by_identity.get(&key);
+            // Validate every proposed row, including repeated DO NOTHING rows:
+            // a later proposal can violate the provider's tracked/untracked lane.
+            if let Some(existing_rows) = existing_rows {
                 for &existing_row in existing_rows {
                     spec.validate_conflict_pair(&existing, existing_row, batch, row, target)?;
                 }
+            }
+            if !seen.insert(key.clone()) {
+                spec.validate_duplicate_proposed(batch, row, target, existing_rows.is_some())?;
+                if matches!(action, UpsertAction::DoNothing) {
+                    continue;
+                }
+                return Err(DataFusionError::Execution(
+                    "ON CONFLICT DO UPDATE cannot affect the same row twice".into(),
+                ));
+            }
+            if let Some(existing_rows) = existing_rows {
                 let existing_row = existing_rows[0];
                 matched_proposed.push(row as u64);
                 matched_existing.push(existing_row as u64);
@@ -375,37 +393,24 @@ pub(super) async fn execute_upsert<S: UpsertSupport + ?Sized>(
 pub(super) async fn execute_upsert_with_returning<S: UpsertSupport + ?Sized>(
     spec: &S,
     write_ctx: &SqlWriteContext,
-    proposed_batches: Vec<RecordBatch>,
+    mut proposed_batches: datafusion::physical_plan::SendableRecordBatchStream,
     target: &UpsertConflictTarget,
     action: &UpsertAction,
     returning: DmlReturning,
 ) -> Result<u64> {
     let conflict_columns = target.columns();
+    let mut seen = HashSet::new();
     let mut staged = StagedUpsert::default();
     let mut affected = 0_u64;
     let mut returning_rows = Vec::new();
-    let mut normalized_batches = Vec::with_capacity(proposed_batches.len());
-
-    for batch in proposed_batches {
-        let batch = if let Some(explicit_columns) = write_ctx.explicit_insert_columns() {
-            let omitted_columns = batch
-                .schema()
-                .fields()
-                .iter()
-                .filter(|field| !explicit_columns.contains(field.name().as_str()))
-                .map(|field| field.name().clone())
-                .collect::<BTreeSet<_>>();
-            mark_omitted_insert_columns(batch, &omitted_columns)?
-        } else {
-            batch
-        };
-        normalized_batches.push(
-            spec.materialize_returning_insert_defaults(write_ctx, &batch)
-                .await?,
-        );
-    }
-
-    for batch in &normalized_batches {
+    while let Some(batch) = proposed_batches.try_next().await? {
+        #[cfg(test)]
+        UPSERT_SOURCE_BATCHES.with(|count| count.set(count.get() + 1));
+        let batch = mark_proposed_columns(write_ctx, batch)?;
+        let batch = spec
+            .materialize_returning_insert_defaults(write_ctx, &batch)
+            .await?;
+        let batch = &batch;
         spec.validate_proposed_batch(batch)?;
         let existing = spec
             .scan_conflict_candidates_for_write(write_ctx, batch, target, action, Some(&returning))
@@ -418,10 +423,24 @@ pub(super) async fn execute_upsert_with_returning<S: UpsertSupport + ?Sized>(
         let mut existing_for_proposed = vec![None; batch.num_rows()];
         for row in 0..batch.num_rows() {
             let key = identity_key(batch, row, conflict_columns)?;
-            if let Some(existing_rows) = existing_by_identity.get(&key) {
+            let existing_rows = existing_by_identity.get(&key);
+            // Validate every proposed row, including repeated DO NOTHING rows:
+            // a later proposal can violate the provider's tracked/untracked lane.
+            if let Some(existing_rows) = existing_rows {
                 for &existing_row in existing_rows {
                     spec.validate_conflict_pair(&existing, existing_row, batch, row, target)?;
                 }
+            }
+            if !seen.insert(key.clone()) {
+                spec.validate_duplicate_proposed(batch, row, target, existing_rows.is_some())?;
+                if matches!(action, UpsertAction::DoNothing) {
+                    continue;
+                }
+                return Err(DataFusionError::Execution(
+                    "ON CONFLICT DO UPDATE cannot affect the same row twice".into(),
+                ));
+            }
+            if let Some(existing_rows) = existing_rows {
                 let existing_row = existing_rows[0];
                 existing_for_proposed[row] = Some(existing_row);
                 matched_proposed.push(row as u64);
@@ -469,9 +488,12 @@ pub(super) async fn execute_upsert_with_returning<S: UpsertSupport + ?Sized>(
         // kept in SQL input order; the existing row owns an update identity.
         for (row, existing_row) in existing_for_proposed.into_iter().enumerate() {
             match (existing_row, action) {
-                (None, _) => returning_rows.push(UpsertReturningRow::proposed(batch, row)),
+                (None, _) if unmatched_proposed.binary_search(&(row as u64)).is_ok() => {
+                    returning_rows.push(UpsertReturningRow::proposed(batch, row)?)
+                }
+                (None, _) => {}
                 (Some(existing_row), UpsertAction::DoUpdate { .. }) => {
-                    returning_rows.push(UpsertReturningRow::existing(&existing, existing_row));
+                    returning_rows.push(UpsertReturningRow::existing(&existing, existing_row)?);
                 }
                 (Some(_), UpsertAction::DoNothing) => {}
             }
@@ -681,4 +703,28 @@ fn augment_with_excluded(existing: &RecordBatch, proposed: &RecordBatch) -> Resu
     let schema: SchemaRef = Arc::new(Schema::new(fields));
     let options = RecordBatchOptions::new().with_row_count(Some(existing.num_rows()));
     RecordBatch::try_new_with_options(schema, columns, &options).map_err(DataFusionError::from)
+}
+
+fn mark_proposed_columns(write_ctx: &SqlWriteContext, batch: RecordBatch) -> Result<RecordBatch> {
+    let Some(explicit_columns) = write_ctx.explicit_insert_columns() else {
+        return Ok(batch);
+    };
+    let omitted_columns = batch
+        .schema()
+        .fields()
+        .iter()
+        .filter(|field| !explicit_columns.contains(field.name().as_str()))
+        .map(|field| field.name().clone())
+        .collect::<BTreeSet<_>>();
+    mark_omitted_insert_columns(batch, &omitted_columns)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static UPSERT_SOURCE_BATCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_upsert_source_batches() -> usize {
+    UPSERT_SOURCE_BATCHES.with(|count| count.replace(0))
 }

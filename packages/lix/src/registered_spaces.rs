@@ -77,22 +77,11 @@ pub const TRACKED_STATE_COMMIT_HISTORY_DEFERRED_SPACE: StorageSpace =
 pub const CURRENT_STATE_DATA_PART_SPACE: StorageSpace =
     crate::tracked_state::CURRENT_STATE_DATA_PART_SPACE;
 pub const SCOPED_RANGE_NODE_SPACE: StorageSpace = crate::tracked_state::SCOPED_RANGE_NODE_SPACE;
-/// Declared-column access path over the hot rows. Disposable, and genuinely
-/// reclaimed with its generation: `INDEX_SPACE` is the first entry in
-/// `GENERATION_SCOPED_SPACES` (`hot_state/tracked_head/hot.rs`), so
-/// `stage_retire_hot_generation` deletes every entry *and* witness under the
-/// retired `(branch_id, generation)` prefix, and the sole writer of this plane
-/// (`stage_hot_index_entries`, called from `transaction/commit.rs`) is not
-/// reached on any lifecycle republication route. Tombstones do not change this:
-/// a deleted row never mints an index entry at all, because the extractor runs
-/// only in the live-snapshot arm of transaction validation.
-///
-/// "Derived from the hot rows" is the one imprecise part, so do not rely on it:
-/// nothing reconstructs this plane *from* `ROW_SPACE`. Entries are extracted
-/// from snapshot JSON during transaction validation and carried on the prepared
-/// batch, so the plane is rebuildable from canonical records but not from the
-/// hot rows it indexes. Once a generation is retired, the surviving hot rows
-/// cannot rebuild it.
+/// Declared scalar and composite equality access paths over current HOT rows.
+/// Forward entries, per-lane reverse membership, and completeness witnesses
+/// share the generation prefix and retire together. Validation extracts values
+/// for normal publication; repository migration rebuilds this derived plane
+/// from authoritative materialized rows. Tombstones retire prior membership.
 pub const HOT_INDEX_SPACE: StorageSpace = crate::hot_state::INDEX_SPACE;
 pub const BINARY_CAS_MANIFEST_SPACE: StorageSpace = crate::binary_cas::BINARY_CAS_MANIFEST_SPACE;
 pub const BINARY_CAS_MANIFEST_CHUNK_SPACE: StorageSpace =
