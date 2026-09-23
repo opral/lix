@@ -308,6 +308,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pointerless_partial_repository_migrates_with_partial_role() {
+        let state = state().await;
+        for from_format in [79, crate::init::CURRENT_FORMAT_VERSION] {
+            let storage = crate::sync::durable_memory_for_test(crate::Memory::new());
+            let initial = install_fresh_partial_epoch(storage.clone(), &state)
+                .await
+                .unwrap();
+            if from_format == 79 {
+                crate::migration::downgrade_headers_for_test(&initial.adapter, true).await;
+                let mut writes = crate::storage_adapter::StorageWriteSet::new();
+                writes.put(
+                    EpochBank::Legacy.map_space(crate::init::REPOSITORY_PROTOCOL_SPACE),
+                    crate::init::REPOSITORY_PROTOCOL_KEY,
+                    crate::init::PARTIAL_REPOSITORY_PROTOCOL_V79,
+                );
+                writes
+                    .commit(&storage, WriteOptions::default())
+                    .await
+                    .unwrap();
+            }
+            let (_, pointer) = durable_pointer(&storage).await.unwrap().unwrap();
+            delete_pointer(&storage, &pointer).await.unwrap();
+
+            assert!(matches!(
+                crate::migration::inspect_lix(&storage).await.unwrap(),
+                crate::migration::MigrationStatus::Malformed
+            ));
+            let source = inspect_partial_replacement(&storage).await.unwrap();
+            assert!(source.is_partial());
+            assert_eq!(source.format(), from_format);
+
+            let migrated = admit_partial_repository(&storage, None).await.unwrap();
+            assert_eq!(migrated.report.migration.unwrap().from_format, from_format);
+            let reopened = admit_partial_epoch(&storage).await.unwrap();
+            assert_eq!(reopened.state, state);
+            let read = reopened
+                .adapter
+                .begin_read(ReadOptions::default())
+                .await
+                .unwrap();
+            assert!(crate::init::is_partial_repository_protocol(&read)
+                .await
+                .unwrap());
+        }
+    }
+
+    #[tokio::test]
     async fn fresh_partial_epoch_is_atomic_durable_and_reopens_fenced() {
         let state = state().await;
         let backing = crate::Memory::new();

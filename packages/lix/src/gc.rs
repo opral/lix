@@ -909,8 +909,8 @@ where
 struct AuthenticatedServingDependencyClosure {
     expired_upload_attempts: Vec<StorageKey>,
     more_expired_upload_attempts: bool,
-    expired_baseline_leases: Vec<StorageKey>,
-    more_expired_baseline_leases: bool,
+    baseline_lease_cleanup_keys: Vec<StorageKey>,
+    more_baseline_lease_cleanup_keys: bool,
     chronology_roots: BTreeSet<CommitId>,
     physical_authorities: BTreeSet<CommitId>,
     physical_dependencies: BTreeSet<CommitId>,
@@ -1248,8 +1248,8 @@ where
     mutation_nodes.extend(proof.mutation_nodes);
     scoped_nodes.extend(proof.scoped_nodes);
     Ok(AuthenticatedServingDependencyClosure {
-        expired_baseline_leases: Vec::new(),
-        more_expired_baseline_leases: false,
+        baseline_lease_cleanup_keys: Vec::new(),
+        more_baseline_lease_cleanup_keys: false,
         expired_upload_attempts: Vec::new(),
         more_expired_upload_attempts: false,
         chronology_roots,
@@ -1339,8 +1339,8 @@ where
     .await?;
     closure.expired_upload_attempts = uploads.expired_keys;
     closure.more_expired_upload_attempts = uploads.more_expired;
-    closure.expired_baseline_leases = leases.expired_keys;
-    closure.more_expired_baseline_leases = leases.more_expired;
+    closure.baseline_lease_cleanup_keys = leases.cleanup_keys;
+    closure.more_baseline_lease_cleanup_keys = leases.more_cleanup_keys;
     Ok(closure)
 }
 
@@ -1466,8 +1466,8 @@ where
         .scan()
         .await?;
     let AuthenticatedServingDependencyClosure {
-        expired_baseline_leases,
-        more_expired_baseline_leases,
+        baseline_lease_cleanup_keys,
+        more_baseline_lease_cleanup_keys,
         expired_upload_attempts,
         more_expired_upload_attempts,
         chronology_roots: active_roots,
@@ -1623,13 +1623,14 @@ where
         Default::default()
     } else {
         let mut auxiliary_writes = StorageWriteSet::new();
-        // Expired pins were discovered during the existing root scan. Deletes
-        // share the GC revision fence, so a concurrent renewal cannot be erased.
+        // Obsolete pins were discovered during the existing root scan. V2
+        // roots remain in this sweep's closure, and deletes share the GC
+        // revision fence, so a concurrent renewal cannot be erased.
         for key in expired_upload_attempts {
             auxiliary_writes.delete(NATIVE_UPLOAD_ATTEMPT_SPACE, key);
         }
-        for key in expired_baseline_leases {
-            auxiliary_writes.delete(NATIVE_BASELINE_LEASE_SPACE, key);
+        for key in &baseline_lease_cleanup_keys {
+            auxiliary_writes.delete(NATIVE_BASELINE_LEASE_SPACE, key.clone());
         }
 
         let mut auxiliary_preconditions = Vec::new();
@@ -1669,11 +1670,13 @@ where
             staged_preconditions.extend(auxiliary_preconditions);
             has_more |= auxiliary_has_more
                 || tombstones_have_more
-                || more_expired_baseline_leases
+                || !baseline_lease_cleanup_keys.is_empty()
+                || more_baseline_lease_cleanup_keys
                 || more_expired_upload_attempts;
             if auxiliary_has_more
                 || tombstones_have_more
-                || more_expired_baseline_leases
+                || !baseline_lease_cleanup_keys.is_empty()
+                || more_baseline_lease_cleanup_keys
                 || more_expired_upload_attempts
             {
                 Default::default()

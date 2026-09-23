@@ -12,6 +12,7 @@ pub(crate) const NATIVE_BASELINE_LEASE_SPACE: StorageSpace =
     StorageSpace::mutable(StorageSpaceId(0x0008_000a), "gc.native_baseline_lease.v1");
 pub(crate) const NATIVE_BASELINE_LEASE_TTL_MS: u64 = 300_000;
 const MAX_LEASE_BYTES: usize = 1024;
+const NATIVE_BASELINE_LEASE_VERSION: u32 = 2;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct NativeBaselineLease {
@@ -39,7 +40,10 @@ impl NativeBaselineLease {
     pub(crate) fn validate(&self) -> Result<(), LixError> {
         key(&self.lease_id)?;
         key(&self.account_id)?;
-        if self.version != 1
+        // Version 1 rows remain decodable so local partial-replica state can
+        // reopen and GC can revoke and remove persisted legacy rows. They are
+        // never accepted as server-side read or renewal authority.
+        if !matches!(self.version, 1 | NATIVE_BASELINE_LEASE_VERSION)
             || self.roots.is_empty()
             || self.roots.len() > 4
             || self.expires_at_ms == 0
@@ -142,7 +146,7 @@ pub(crate) async fn stage_acquire_native_baseline_lease(
         ));
     }
     let lease = NativeBaselineLease {
-        version: 1,
+        version: NATIVE_BASELINE_LEASE_VERSION,
         lease_id: lease_id.into(),
         account_id: account_id.into(),
         roots: roots.into_iter().map(|root| root.to_string()).collect(),
@@ -167,7 +171,7 @@ pub(crate) async fn require_native_baseline_lease(
     if lease.account_id != account_id {
         return Err(invalid("baseline lease belongs to another account"));
     }
-    if lease.expires_at_ms <= now_ms {
+    if lease.version != NATIVE_BASELINE_LEASE_VERSION || lease.expires_at_ms <= now_ms {
         return Err(expired());
     }
     Ok(lease)
@@ -183,7 +187,7 @@ pub(crate) async fn stage_renew_native_baseline_lease(
     if lease.account_id != account_id {
         return Err(invalid("baseline lease belongs to another account"));
     }
-    if lease.expires_at_ms <= now_ms {
+    if lease.version != NATIVE_BASELINE_LEASE_VERSION || lease.expires_at_ms <= now_ms {
         return Err(expired());
     }
     lease.expires_at_ms = lease.expires_at_ms.max(
@@ -191,7 +195,6 @@ pub(crate) async fn stage_renew_native_baseline_lease(
             .checked_add(NATIVE_BASELINE_LEASE_TTL_MS)
             .ok_or_else(|| invalid("lease clock overflow"))?,
     );
-    let revision = crate::storage_adapter::load_repository_mutation_revision(read).await?;
     stage(writes, &lease)?;
     Ok((
         lease,
@@ -201,14 +204,13 @@ pub(crate) async fn stage_renew_native_baseline_lease(
                 key: key(lease_id)?,
                 expected: raw,
             },
-            crate::storage_adapter::repository_mutation_revision_precondition(revision),
         ],
     ))
 }
 pub(super) struct NativeBaselineRetention {
     pub(super) roots: BTreeSet<CommitId>,
-    pub(super) expired_keys: Vec<StorageKey>,
-    pub(super) more_expired: bool,
+    pub(super) cleanup_keys: Vec<StorageKey>,
+    pub(super) more_cleanup_keys: bool,
 }
 pub(super) async fn load_native_baseline_retention(
     read: &(impl StorageAdapterRead + ?Sized),
@@ -225,8 +227,8 @@ pub(super) async fn load_native_baseline_retention(
         )
         .await?;
     let mut roots = BTreeSet::new();
-    let mut expired_keys = Vec::new();
-    let mut more_expired = false;
+    let mut cleanup_keys = Vec::new();
+    let mut more_cleanup_keys = false;
     while let Some(entries) = cursor.next_chunk().await? {
         for entry in entries {
             let StorageProjectedValue::FullValue(bytes) = entry.value else {
@@ -241,26 +243,33 @@ pub(super) async fn load_native_baseline_retention(
             if entry.key != key(&lease.lease_id)? {
                 return Err(invalid("GC lease key identity mismatch"));
             }
-            if lease.expires_at_ms > now_ms {
+            if lease.version == NATIVE_BASELINE_LEASE_VERSION {
+                // A v2 row owns its complete authenticated serving closure
+                // until its deletion commits. Keep roots in this sweep even
+                // when expiry cleanup is selected or omitted by a bounded
+                // write slice; a following sweep can then reclaim them.
                 for root in lease.roots {
                     roots.insert(CommitId::parse_lix(&root, "GC baseline lease")?);
                 }
-            } else if expired_keys.len() < 128 {
-                expired_keys.push(entry.key);
-            } else {
-                more_expired = true;
+            }
+            if lease.version == 1 || lease.expires_at_ms <= now_ms {
+                if cleanup_keys.len() < 128 {
+                    cleanup_keys.push(entry.key);
+                } else {
+                    more_cleanup_keys = true;
+                }
             }
         }
     }
     Ok(NativeBaselineRetention {
         roots,
-        expired_keys,
-        more_expired,
+        cleanup_keys,
+        more_cleanup_keys,
     })
 }
 
 #[cfg(test)]
-pub(super) async fn live_native_baseline_roots(
+pub(super) async fn retained_native_baseline_roots(
     read: &(impl StorageAdapterRead + ?Sized),
     now_ms: u64,
 ) -> Result<BTreeSet<CommitId>, LixError> {
@@ -315,7 +324,10 @@ mod tests {
             .await
             .unwrap();
         let read = adapter.begin_read(Default::default()).await.unwrap();
-        assert_eq!(live_native_baseline_roots(&read, now).await.unwrap(), roots);
+        assert_eq!(
+            retained_native_baseline_roots(&read, now).await.unwrap(),
+            roots
+        );
         assert!(
             require_native_baseline_lease(&read, &lease.lease_id, crate::SYSTEM_ACCOUNT_ID, now)
                 .await
@@ -393,15 +405,16 @@ mod tests {
             .await
             .unwrap();
         assert!(roots.is_subset(&retained.chronology_roots));
-        assert!(
-            live_native_baseline_roots(&read, renewed.expires_at_ms)
+        assert_eq!(
+            retained_native_baseline_roots(&read, renewed.expires_at_ms)
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+                roots,
+            "expired v2 rows retain roots until GC commits their deletion"
         );
     }
     #[tokio::test]
-    async fn baseline_lease_alone_retains_deleted_branch_native_authority_until_expiry() {
+    async fn baseline_lease_alone_retains_deleted_branch_native_authority_until_gc_retirement() {
         let lix = crate::open_lix().await.unwrap();
         let branch = lix
             .create_branch(crate::CreateBranchOptions {
@@ -482,7 +495,7 @@ mod tests {
                     .await
                     .unwrap();
             }
-            for _ in 0..3 {
+            for pass in 0..3 {
                 let read = crate::storage_adapter::SharedStorageAdapterRead::new(
                     adapter.begin_read(Default::default()).await.unwrap(),
                 );
@@ -497,8 +510,8 @@ mod tests {
                         .unwrap();
                 assert_eq!(
                     closure.chronology_roots.contains(&leased_head),
-                    !expired,
-                    "lease must be the deleted ordinary head's sole root"
+                    !expired || pass == 0,
+                    "an expired v2 row retains the deleted ordinary head until its deletion commits"
                 );
                 let mut writes = adapter.new_write_set();
                 let mut guards = Vec::new();
@@ -535,7 +548,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn baseline_lease_retains_deleted_branch_file_manifest_and_chunks_until_expiry() {
+    async fn baseline_lease_retains_deleted_branch_file_manifest_and_chunks_until_gc_retirement() {
         let lix = crate::open_lix().await.unwrap();
         let branch = lix
             .create_branch(crate::CreateBranchOptions {
@@ -631,7 +644,7 @@ mod tests {
                     .await
                     .unwrap();
             }
-            for _ in 0..3 {
+            for pass in 0..3 {
                 let read = crate::storage_adapter::SharedStorageAdapterRead::new(
                     adapter.begin_read(Default::default()).await.unwrap(),
                 );
@@ -646,8 +659,8 @@ mod tests {
                         .unwrap();
                 assert_eq!(
                     closure.chronology_roots.contains(&leased_head),
-                    !expired,
-                    "lease must be the deleted ordinary head's sole root"
+                    !expired || pass == 0,
+                    "an expired v2 row retains the deleted ordinary head until its deletion commits"
                 );
                 let mut writes = adapter.new_write_set();
                 let mut guards = Vec::new();
@@ -703,7 +716,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delayed_renewal_cannot_resurrect_a_baseline_after_gc() {
+    async fn revoked_legacy_lease_cannot_renew_after_gc_reclaims_its_root() {
         let lix = crate::open_lix().await.unwrap();
         let branch = lix
             .create_branch(crate::CreateBranchOptions {
@@ -743,9 +756,9 @@ mod tests {
         let adapter = lix.storage_adapter();
         let read = adapter.begin_read(Default::default()).await.unwrap();
         let mut writes = adapter.new_write_set();
-        // The explicit clock models a renewal begun before expiration and delayed
-        // until after GC. The durable lease bytes remain identical throughout.
-        let (lease, guards) = stage_acquire_native_baseline_lease(
+        // A v1 row from an older binary remains parseable for local-state
+        // reopening, while the generation boundary denies server authority.
+        let (mut lease, guards) = stage_acquire_native_baseline_lease(
             &read,
             &mut writes,
             "ffffffff-ffff-7fff-bfff-ffffffffffff",
@@ -767,6 +780,18 @@ mod tests {
             )
             .await
             .unwrap();
+        // Simulate a row left by the pre-v2 protocol. It remains parseable for
+        // local state migration and GC cleanup, but is never read or renewed.
+        lease.version = 1;
+        lease
+            .validate_for_roots(lix.active_account_id(), &roots)
+            .unwrap();
+        let mut legacy_write = adapter.new_write_set();
+        stage(&mut legacy_write, &lease).unwrap();
+        adapter
+            .commit_write_set(legacy_write, Default::default())
+            .await
+            .unwrap();
         writer.close().await.unwrap();
         drop(writer);
         lix.execute(
@@ -775,9 +800,9 @@ mod tests {
         )
         .await
         .unwrap();
-        // Three bounded GC slices delete these 384 earlier lease keys first.
-        // The target token remains byte-for-byte present after native GC, so
-        // its own key CAS cannot detect the destructive intervening sweep.
+        // Three bounded GC slices delete these 384 earlier legacy lease rows.
+        // The target remains present while its root is reclaimed, exercising
+        // the persisted legacy generation boundary.
         let mut preceding = adapter.new_write_set();
         for _ in 0..384 {
             let mut earlier = lease.clone();
@@ -790,16 +815,32 @@ mod tests {
             .unwrap();
         let read = adapter.begin_read(Default::default()).await.unwrap();
         let mut renewal = adapter.new_write_set();
-        let (_, renew_guards) = stage_renew_native_baseline_lease(
+        assert_eq!(
+            stage_renew_native_baseline_lease(
             &read,
             &mut renewal,
             &lease.lease_id,
             lix.active_account_id(),
             2,
         )
-        .await
-        .unwrap();
+            .await
+            .unwrap_err()
+            .code,
+            "LIX_PARTIAL_BASELINE_EXPIRED",
+            "a v1 lease cannot be renewed, even when a caller clock rolls back"
+        );
         let original = load(&read, &lease.lease_id).await.unwrap().unwrap().1;
+        assert!(
+            require_native_baseline_lease(
+                &read,
+                &lease.lease_id,
+                lix.active_account_id(),
+                2,
+            )
+            .await
+            .is_err(),
+            "legacy leases cannot authorize reads"
+        );
         drop(read);
         for _ in 0..3 {
             let read = crate::storage_adapter::SharedStorageAdapterRead::new(
@@ -831,11 +872,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            remaining.expired_keys.len(),
+            remaining.cleanup_keys.len(),
             1,
-            "three bounded slices must reclaim 384 earlier expired lease records"
+            "three bounded slices must remove 384 earlier legacy lease records"
         );
-        assert!(!remaining.more_expired);
+        assert!(!remaining.more_cleanup_keys);
         assert!(
             crate::tracked_state::load_commit_state_authority_ids(&read, &[head])
                 .await
@@ -843,18 +884,182 @@ mod tests {
                 .is_none()
         );
         drop(read);
+        assert_eq!(
+            stage_renew_native_baseline_lease(
+                &adapter.begin_read(Default::default()).await.unwrap(),
+                &mut renewal,
+                &lease.lease_id,
+                lix.active_account_id(),
+                2,
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "LIX_PARTIAL_BASELINE_EXPIRED",
+            "a previously reclaimed legacy root cannot be resurrected by renewal"
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_lease_keeps_roots_when_expiry_delete_is_beyond_the_scan_page() {
+        let lix = crate::open_lix().await.unwrap();
+        let branch = lix
+            .create_branch(crate::CreateBranchOptions {
+                id: None,
+                name: "v2-expired-renew-race".into(),
+                from_commit_id: None,
+            })
+            .await
+            .unwrap();
+        let writer = lix
+            .open_another_session()
+            .with_branch(branch.id.clone())
+            .await
+            .unwrap();
+        writer
+            .execute(
+                "INSERT INTO lix_key_value (key,value) VALUES ('v2-expired-lease-only','row')",
+                &[],
+            )
+            .await
+            .unwrap();
+        let descriptor = lix
+            .partial_replica_descriptor(Some(&branch.id))
+            .await
+            .unwrap();
+        let head = CommitId::parse_lix(&descriptor.selected_branch.head.commit_id, "v2 race head")
+            .unwrap();
+        let roots = [
+            &descriptor.selected_branch.head,
+            &descriptor.selected_branch.checkpoint,
+            &descriptor.global_branch.head,
+            &descriptor.global_branch.checkpoint,
+        ]
+        .into_iter()
+        .map(|root| CommitId::parse_lix(&root.commit_id, "v2 race root").unwrap())
+        .collect::<BTreeSet<_>>();
+        let adapter = lix.storage_adapter();
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let mut acquire = adapter.new_write_set();
+        let (lease, guards) = stage_acquire_native_baseline_lease(
+            &read,
+            &mut acquire,
+            "ffffffff-ffff-7fff-bfff-ffffffffffff",
+            lix.active_account_id(),
+            &[branch.id.clone(), crate::GLOBAL_BRANCH_ID.into()],
+            &roots,
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(lease.version, NATIVE_BASELINE_LEASE_VERSION);
+        drop(read);
+        adapter
+            .commit_write_set(
+                acquire,
+                crate::storage_adapter::StorageWriteOptions {
+                    preconditions: guards,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+        drop(writer);
+        lix.execute(
+            "DELETE FROM lix_branch WHERE id=$1",
+            &[crate::Value::Text(branch.id)],
+        )
+        .await
+        .unwrap();
+
+        // The selected expired page contains 128 keys. The target sorts after
+        // them and remains in storage during this sweep.
+        let mut preceding = adapter.new_write_set();
+        for _ in 0..128 {
+            let mut earlier = lease.clone();
+            earlier.lease_id = uuid::Uuid::now_v7().to_string();
+            earlier.expires_at_ms = 1;
+            stage(&mut preceding, &earlier).unwrap();
+        }
+        adapter
+            .commit_write_set(preceding, Default::default())
+            .await
+            .unwrap();
+
+        // This renewal was planned while the lease was live. An unrelated GC
+        // commit rotates the global revision, but the target row is omitted
+        // from the bounded delete page and its exact-byte CAS remains valid.
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let mut renewal = adapter.new_write_set();
+        let (_, renew_guards) = stage_renew_native_baseline_lease(
+            &read,
+            &mut renewal,
+            &lease.lease_id,
+            lix.active_account_id(),
+            2,
+        )
+        .await
+        .unwrap();
+        drop(read);
+
+        let read = crate::storage_adapter::SharedStorageAdapterRead::new(
+            adapter.begin_read(Default::default()).await.unwrap(),
+        );
+        let mut gc = adapter.new_write_set();
+        let mut gc_guards = Vec::new();
+        let plan = super::super::stage_repository_gc_with_preconditions(
+            read,
+            &mut gc,
+            &mut gc_guards,
+        )
+            .await
+            .unwrap();
+        assert!(plan.sweep.has_more, "lease cleanup keeps GC debt due");
+        adapter
+            .commit_write_set(
+                gc,
+                crate::storage_adapter::StorageWriteOptions {
+                    preconditions: gc_guards,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let retained = load_native_baseline_retention(&read, u64::MAX).await.unwrap();
+        assert!(retained.roots.contains(&head));
         assert!(
-            adapter
-                .commit_write_set(
-                    renewal,
-                    crate::storage_adapter::StorageWriteOptions {
-                        preconditions: renew_guards,
-                        ..Default::default()
-                    }
-                )
+            crate::tracked_state::load_commit_state_authority_ids(&read, &[head])
                 .await
-                .is_err(),
-            "mutation revision must reject renewal after GC"
+                .unwrap()[0]
+                .is_some(),
+            "an extant v2 lease must retain its root even after expiry"
+        );
+        assert!(load(&read, &lease.lease_id).await.unwrap().is_some());
+        drop(read);
+
+        adapter
+            .commit_write_set(
+                renewal,
+                crate::storage_adapter::StorageWriteOptions {
+                    preconditions: renew_guards,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let read = adapter.begin_read(Default::default()).await.unwrap();
+        let renewed = require_native_baseline_lease(&read, &lease.lease_id, lix.active_account_id(), 2)
+            .await
+            .unwrap();
+        assert!(renewed.expires_at_ms > lease.expires_at_ms);
+        assert!(
+            retained_native_baseline_roots(&read, 2)
+                .await
+                .unwrap()
+                .contains(&head)
         );
     }
 }
@@ -881,7 +1086,7 @@ impl NativeBaselineLease {
     #[cfg(test)]
     pub(crate) fn for_test(account_id: &str, roots: &BTreeSet<CommitId>) -> Self {
         Self {
-            version: 1,
+            version: NATIVE_BASELINE_LEASE_VERSION,
             lease_id: uuid::Uuid::now_v7().to_string(),
             account_id: account_id.into(),
             roots: roots.iter().map(ToString::to_string).collect(),

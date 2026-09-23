@@ -360,6 +360,11 @@ async fn qualify_binary_payload_chunk<B: DurableBackend>() {
         .await
         .expect("open binary-payload fixture");
     let storage = lix.storage_adapter();
+    let preexisting_chunk_keys = inventory(&storage, BINARY_CHUNK_SPACE)
+        .await
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect::<std::collections::BTreeSet<_>>();
     let payload = vec![b'x'; 2 * 1024 * 1024];
     let hash = write_binary_cas_for_bench(&storage, &payload)
         .await
@@ -383,7 +388,13 @@ async fn qualify_binary_payload_chunk<B: DurableBackend>() {
         Some(payload)
     );
     let chunks = inventory(&storage, BINARY_CHUNK_SPACE).await;
-    let target = chunks.first().expect("binary payload should own a chunk");
+    // Initialization stores its own binary-CAS content, so the first chunk in
+    // the repository-wide inventory may not belong to this payload. Corrupt a
+    // chunk introduced by the payload write so the read below must encounter it.
+    let target = chunks
+        .iter()
+        .find(|(key, _)| !preexisting_chunk_keys.contains(key))
+        .expect("binary payload should add at least one chunk");
     lix.close()
         .await
         .expect("close healthy binary-payload reopen");

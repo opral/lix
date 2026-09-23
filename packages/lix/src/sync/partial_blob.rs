@@ -12,12 +12,14 @@ use super::partial_state::{
 use super::{SyncBlobManifest, SyncBlobRegistration};
 use crate::LixError;
 use crate::binary_cas::{
-    BINARY_CAS_MANIFEST_SPACE, BlobId, ChunkHash, load_metadata_many,
+    BINARY_CAS_CHUNK_DEMAND_SPACE, BINARY_CAS_CHUNK_SPACE, BINARY_CAS_MANIFEST_SPACE, BlobId,
+    CanonicalBlobManifest, ChunkHash, load_metadata_many,
     stage_deferred_canonical_manifest, stage_transfer_publication_fence,
     stage_verified_inline_canonical_blob, stage_verified_raw_chunk,
 };
 use crate::storage_adapter::{
-    Storage, StorageAdapter, StorageKey, StoragePrecondition, StorageWriteOptions,
+    Storage, StorageAdapter, StorageAdapterRead, StorageKey, StoragePrecondition,
+    StorageWriteOptions, StorageWriteSet,
 };
 
 fn mismatch() -> LixError {
@@ -41,6 +43,44 @@ fn is_precondition_failure(error: &crate::storage_adapter::StorageWriteSetError)
             crate::storage_adapter::StorageError::PreconditionFailed(_)
         )
     )
+}
+
+async fn prepare_manifest_install(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    requested: BlobId,
+    receipt: Bytes,
+    manifest: &CanonicalBlobManifest,
+    inline: Option<&[u8]>,
+) -> Result<(Vec<StoragePrecondition>, Vec<ChunkHash>), LixError> {
+    check_manifest_chunk_presence(read, manifest).await?;
+    let missing_chunk_hashes = if let Some(bytes) = inline {
+        stage_verified_inline_canonical_blob(writes, manifest, bytes)?;
+        Vec::new()
+    } else {
+        stage_deferred_canonical_manifest(read, writes, manifest).await?
+    };
+    let mut preconditions = vec![
+        StoragePrecondition::KeyAbsent {
+            space: BINARY_CAS_MANIFEST_SPACE,
+            key: StorageKey(Bytes::copy_from_slice(requested.as_bytes())),
+        },
+        StoragePrecondition::KeyValueEquals {
+            space: PARTIAL_REPLICA_STATE_SPACE,
+            key: partial_replica_state_key(),
+            expected: receipt,
+        },
+    ];
+    // Demand rows are mutable hints, so every payload that appeared missing
+    // in this snapshot must remain absent through the atomic marker write.
+    for hash in &missing_chunk_hashes {
+        preconditions.push(StoragePrecondition::KeyAbsent {
+            space: BINARY_CAS_CHUNK_SPACE,
+            key: StorageKey(Bytes::copy_from_slice(hash.as_bytes())),
+        });
+    }
+    stage_transfer_publication_fence(read, writes, &mut preconditions).await?;
+    Ok((preconditions, missing_chunk_hashes))
 }
 
 pub(super) async fn manifest_is_resident<S>(
@@ -80,7 +120,7 @@ where
 }
 
 async fn checked_chunk_resident(
-    read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+    read: &(impl StorageAdapterRead + ?Sized),
     requested: ChunkHash,
 ) -> Result<bool, LixError> {
     let value = crate::binary_cas::load_verified_chunk(read, requested).await?;
@@ -94,7 +134,7 @@ async fn checked_chunk_resident(
     if !present {
         use crate::storage_adapter::{PointReadPlan, StorageCoreProjection, StorageGetOptions};
         let key = StorageKey(Bytes::copy_from_slice(requested.as_bytes()));
-        let marker = PointReadPlan::new(crate::binary_cas::BINARY_CAS_CHUNK_DEMAND_SPACE, &[key])
+        let marker = PointReadPlan::new(BINARY_CAS_CHUNK_DEMAND_SPACE, &[key])
             .materialize(
                 read,
                 StorageGetOptions {
@@ -116,8 +156,8 @@ async fn checked_chunk_resident(
 }
 
 pub(super) async fn check_manifest_chunk_presence(
-    read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
-    manifest: &crate::binary_cas::CanonicalBlobManifest,
+    read: &(impl StorageAdapterRead + ?Sized),
+    manifest: &CanonicalBlobManifest,
 ) -> Result<(), LixError> {
     use crate::storage_adapter::{PointReadPlan, StorageCoreProjection, StorageGetOptions};
     let keys = manifest
@@ -125,7 +165,7 @@ pub(super) async fn check_manifest_chunk_presence(
         .iter()
         .map(|chunk| StorageKey(Bytes::copy_from_slice(chunk.hash.as_bytes())))
         .collect::<Vec<_>>();
-    let payloads = PointReadPlan::new(crate::binary_cas::BINARY_CAS_CHUNK_SPACE, &keys)
+    let payloads = PointReadPlan::new(BINARY_CAS_CHUNK_SPACE, &keys)
         .materialize(
             read,
             StorageGetOptions {
@@ -177,66 +217,62 @@ where
         ));
     }
     let inline = super::blob::decode_inline_bytes(wire)?;
-    let read = storage.begin_read(Default::default()).await?;
-    let (actual, raw) = load_partial_replica_state(&read)
-        .await?
-        .ok_or_else(mismatch)?;
-    if !same_admission(&actual, expected) {
-        return Err(mismatch());
-    }
-    // Decoding existing metadata must still surface corruption.
-    if load_metadata_many(&read, &[requested]).await?.into_vec()[0].is_some() {
-        return Ok(SyncBlobRegistration {
-            missing_chunk_ids: Vec::new(),
-        });
-    }
-    check_manifest_chunk_presence(&read, &manifest).await?;
-    let mut writes = storage.new_write_set();
-    let missing_chunk_ids = if let Some(bytes) = inline {
-        stage_verified_inline_canonical_blob(&mut writes, &manifest, &bytes)?;
-        Vec::new()
-    } else {
-        stage_deferred_canonical_manifest(&read, &mut writes, &manifest)
+    loop {
+        let read = storage.begin_read(Default::default()).await?;
+        let (actual, raw) = load_partial_replica_state(&read)
             .await?
-            .into_iter()
-            .map(|hash| hash.to_hex())
-            .collect()
-    };
-    let mut preconditions = vec![
-        StoragePrecondition::KeyAbsent {
-            space: BINARY_CAS_MANIFEST_SPACE,
-            key: StorageKey(Bytes::copy_from_slice(requested.as_bytes())),
-        },
-        StoragePrecondition::KeyValueEquals {
-            space: PARTIAL_REPLICA_STATE_SPACE,
-            key: partial_replica_state_key(),
-            expected: raw,
-        },
-    ];
-    stage_transfer_publication_fence(&read, &mut writes, &mut preconditions).await?;
-    drop(read);
-    let installed = storage
-        .commit_partial_replica_write_set(
-            super::partial_replica_write_capability(),
-            writes,
-            StorageWriteOptions {
-                preconditions,
-                await_durable: true,
-                ..Default::default()
-            },
-        )
-        .await;
-    if let Err(error) = installed {
-        if is_precondition_failure(&error)
-            && manifest_is_resident(storage, expected, requested).await?
-        {
+            .ok_or_else(mismatch)?;
+        if !same_admission(&actual, expected) {
+            return Err(mismatch());
+        }
+        // Decoding existing metadata must still surface corruption.
+        if load_metadata_many(&read, &[requested]).await?.into_vec()[0].is_some() {
             return Ok(SyncBlobRegistration {
                 missing_chunk_ids: Vec::new(),
             });
         }
-        return Err(error.into());
+        let mut writes = storage.new_write_set();
+        let (preconditions, missing_chunk_hashes) = prepare_manifest_install(
+            &read,
+            &mut writes,
+            requested,
+            raw,
+            &manifest,
+            inline.as_deref(),
+        )
+        .await?;
+        drop(read);
+        match storage
+            .commit_partial_replica_write_set(
+                super::partial_replica_write_capability(),
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    await_durable: true,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Err(error) if is_precondition_failure(&error) => {
+                if manifest_is_resident(storage, expected, requested).await? {
+                    return Ok(SyncBlobRegistration {
+                        missing_chunk_ids: Vec::new(),
+                    });
+                }
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => {
+                return Ok(SyncBlobRegistration {
+                    missing_chunk_ids: missing_chunk_hashes
+                        .into_iter()
+                        .map(|hash| hash.to_hex())
+                        .collect(),
+                });
+            }
+        }
     }
-    Ok(SyncBlobRegistration { missing_chunk_ids })
 }
 
 /// Installs a hash-checked raw chunk only while its explicit demand marker is
