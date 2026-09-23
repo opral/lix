@@ -410,13 +410,48 @@ impl Json {
 
 impl From<serde_json::Value> for Json {
     fn from(value: serde_json::Value) -> Self {
-        Self(SharedStr::from(value.to_string()))
+        Self(SharedStr::from(canonical_json_text(value)))
     }
 }
 
 impl From<&serde_json::Value> for Json {
     fn from(value: &serde_json::Value) -> Self {
-        Self(SharedStr::from(value.to_string()))
+        let text = if has_canonical_object_order(value) {
+            value.to_string()
+        } else {
+            canonical_json_text(value.clone())
+        };
+        Self(SharedStr::from(text))
+    }
+}
+
+/// DataFusion enables serde_json's `preserve_order` feature, which changes
+/// `Value` object serialization from sorted keys to insertion order. Keep the
+/// persisted/wire representation stable regardless of workspace feature
+/// unification by sorting every object before serialization.
+fn canonical_json_text(mut value: serde_json::Value) -> String {
+    if has_canonical_object_order(&value) {
+        return value.to_string();
+    }
+    value.sort_all_objects();
+    value.to_string()
+}
+
+fn has_canonical_object_order(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(values) => values.iter().all(has_canonical_object_order),
+        serde_json::Value::Object(values) => {
+            let mut previous_key: Option<&str> = None;
+            values.iter().all(|(key, value)| {
+                let ordered = previous_key.is_none_or(|previous| previous < key.as_str());
+                previous_key = Some(key);
+                ordered && has_canonical_object_order(value)
+            })
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => true,
     }
 }
 
@@ -436,7 +471,7 @@ impl Eq for Json {}
 
 impl PartialEq<serde_json::Value> for Json {
     fn eq(&self, other: &serde_json::Value) -> bool {
-        &self.to_value() == other
+        self.as_str() == Self::from(other).as_str()
     }
 }
 
@@ -657,6 +692,30 @@ mod tests {
     fn json_deserialization_canonicalizes_noncanonical_input() {
         let decoded = serde_json::from_str::<Json>(r#"{ "b" : 2 , "a" : 1 }"#).expect("decodes");
         assert_eq!(decoded.as_str(), r#"{"a":1,"b":2}"#);
+    }
+
+    #[test]
+    fn json_canonicalization_sorts_nested_objects() {
+        let decoded = serde_json::from_str::<Json>(
+            r#"{"z":{"b":2,"a":1},"a":[{"d":4,"c":3}]}"#,
+        )
+        .expect("decodes");
+
+        assert_eq!(
+            decoded.as_str(),
+            r#"{"a":[{"c":3,"d":4}],"z":{"a":1,"b":2}}"#
+        );
+    }
+
+    #[test]
+    fn json_equality_ignores_object_insertion_order() {
+        let left = Json::parse(r#"{"a":1,"nested":{"b":2,"c":3}}"#).unwrap();
+        let right = serde_json::from_str::<serde_json::Value>(
+            r#"{"nested":{"c":3,"b":2},"a":1}"#,
+        )
+        .unwrap();
+
+        assert_eq!(left, right);
     }
 
     #[test]

@@ -4415,9 +4415,7 @@ pub(super) fn row_f64_value(
 }
 
 fn json_to_string(value: &JsonValue) -> Result<String> {
-    serde_json::to_string(value).map_err(|error| {
-        DataFusionError::Execution(format!("failed to render JSON value: {error}"))
-    })
+    Ok(crate::common::Json::from(value).to_string())
 }
 
 #[cfg(test)]
