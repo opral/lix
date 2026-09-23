@@ -3630,24 +3630,11 @@ fn bind_table_function_parameters(
             ]
             .into_iter()
             .find(|candidate| crate::sql2::parse::object_name_is_public_function(name, candidate));
-            let is_history = public_function_name == Some("lix_history");
             if let Some(function_name) = public_function_name {
                 // DataFusion's table-function registry is case-sensitive and
                 // global rather than schema-scoped. Normalize the public SQL
                 // spelling after preserving quoted-identifier semantics.
                 *name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(function_name))]);
-            }
-            if is_history
-                && !matches!(
-                    arguments.args.first(),
-                    Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Value(value))))
-                        if matches!(value.value, SqlValue::SingleQuotedString(_))
-                )
-            {
-                return ControlFlow::Break(Box::new(LixError::new(
-                    LixError::CODE_UNSUPPORTED_SQL,
-                    "lix_history relation argument must be a non-null text literal known at plan time",
-                )));
             }
             for argument in &mut arguments.args {
                 let FunctionArg::Unnamed(FunctionArgExpr::Expr(expression)) = argument else {

@@ -395,18 +395,37 @@ fn collect_dynamic_relation_literals(
             else {
                 return ControlFlow::Continue(());
             };
+            let is_history =
+                crate::sql2::parse::object_name_is_public_function(name, "lix_history");
             if !crate::sql2::parse::object_name_is_public_function(name, "lix_diff")
                 && !crate::sql2::parse::object_name_is_public_function(name, "lix_as_of")
+                && !is_history
             {
                 return ControlFlow::Continue(());
             }
             let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Value(value)))) =
                 arguments.args.first()
             else {
+                *self.requires_visible_schemas = true;
                 return ControlFlow::Continue(());
             };
             if let SqlValue::SingleQuotedString(relation_name) = &value.value {
-                self.relations.insert(relation_name.clone());
+                // History functions consume their relation name through the
+                // separate history provider selection. Only runtime relation
+                // schemas need to load the visible catalog here.
+                if !is_history
+                    || PublicCatalog::fixed_system()
+                        .history_relation(relation_name)
+                        .is_none()
+                {
+                    self.relations.insert(relation_name.clone());
+                }
+            } else {
+                // The table function's schema is fixed during DataFusion
+                // planning. Bound relation names are substituted before
+                // planning, but provider selection runs before that bind, so
+                // a non-literal relation must load the visible schema catalog.
+                *self.requires_visible_schemas = true;
             }
             ControlFlow::Continue(())
         }
@@ -905,6 +924,19 @@ mod tests {
         assert!(
             selection_for_sql(&["SELECT * FROM lix_diff('runtime_note', $1, $2)"])
                 .requires_visible_schemas()
+        );
+        assert_eq!(
+            selection_for_sql(&["SELECT * FROM lix_diff($1, $2, $3)"]),
+            selected_names_with_visible_schemas(&["lix_diff"]),
+            "a bound relation name must load the visible catalog before planning",
+        );
+        assert_eq!(
+            selection_for_sql(&["SELECT * FROM lix_as_of($1, $2)"]),
+            selected_names_with_visible_schemas(&["lix_as_of"]),
+        );
+        assert_eq!(
+            selection_for_sql(&["SELECT * FROM lix_history($1)"]),
+            selected_names_with_visible_schemas(&["lix_history"]),
         );
     }
 

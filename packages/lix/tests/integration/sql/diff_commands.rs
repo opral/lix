@@ -150,6 +150,59 @@ simulation_test!(
     }
 );
 
+simulation_test!(diff_accepts_a_bound_runtime_relation_name, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    let relation = "qa_bound_diff_relation";
+    let schema = json!({
+        "$schema": "https://lix.dev/schema-v1.json",
+        "key": relation,
+        "columns": [{"name":"id","type":"text","nullable":false}],
+        "primary_key": ["id"]
+    });
+    session
+        .execute(
+            "INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)",
+            &[Value::Text(schema.to_string())],
+        )
+        .await
+        .expect("runtime relation schema should register");
+    let before = engine
+        .load_branch_head_commit_id(sim.main_branch_id())
+        .await
+        .expect("branch head should load")
+        .expect("branch head should exist")
+        .to_string();
+    session
+        .execute(
+            "INSERT INTO qa_bound_diff_relation(id) VALUES ('row')",
+            &[],
+        )
+        .await
+        .expect("runtime relation row should insert");
+    let after = engine
+        .load_branch_head_commit_id(sim.main_branch_id())
+        .await
+        .expect("branch head should load")
+        .expect("branch head should exist")
+        .to_string();
+
+    assert_rows_eq(
+        session
+            .execute(
+                "SELECT count(*) AS count FROM lix_diff($1, $2, $3)",
+                &[
+                    Value::Text(relation.to_string()),
+                    Value::Text(before),
+                    Value::Text(after),
+                ],
+            )
+            .await
+            .expect("bound runtime relation should be present while planning lix_diff"),
+        vec![vec![Value::Integer(1)]],
+    );
+});
+
 simulation_test!(
     diff_commands_resolve_the_actual_working_baseline,
     |sim| async move {
