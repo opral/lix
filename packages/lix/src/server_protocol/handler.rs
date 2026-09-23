@@ -6528,7 +6528,7 @@ mod tests {
 
     #[test]
     fn storage_io_is_retryable_service_failure_and_corruption_is_server_failure() {
-        let io = ApiError::from(LixError::from(crate::storage::StorageError::Unavailable(
+        let io = ApiError::from(LixError::from(StorageError::Unavailable(
             "object store PUT failed".to_string(),
         )))
         .into_response();
@@ -6536,7 +6536,7 @@ mod tests {
         assert!(!is_terminal_storage_response(&io));
 
         let corruption = ApiError::from(LixError::from(
-            crate::storage::StorageError::Corruption("segment hash mismatch".to_string()),
+            StorageError::Corruption("segment hash mismatch".to_string()),
         ))
         .into_response();
         assert_eq!(corruption.status(), StatusCode::INTERNAL_SERVER_ERROR);
