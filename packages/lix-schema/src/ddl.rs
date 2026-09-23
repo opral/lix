@@ -44,6 +44,7 @@ pub fn to_postgres_ddl(schema: &Schema) -> Result<String, Error> {
             match foreign_key.on_delete {
                 crate::DeleteAction::NoAction => "",
                 crate::DeleteAction::Cascade => " ON DELETE CASCADE",
+                crate::DeleteAction::SetNull => " ON DELETE SET NULL",
             }
         )
     }));

@@ -81,7 +81,12 @@ column. The column must exist and use `text`; its `nullable` setting determines
 whether SQL `NULL` is accepted. The row-reference value carries the target
 relation, optional file scope, and typed primary-key values, so this constraint
 has no direct PostgreSQL `FOREIGN KEY` representation. `on_delete` defaults to
-`no_action` and may be set to `cascade`.
+`no_action` and may be set to `cascade` or `set_null`. `set_null` requires a
+nullable column: deleting the target keeps the referencing row and clears the
+reference. With `set_null`, `detached_column` optionally names another nullable
+`text` column that receives the cleared reference, so the row records what it
+was attached to. A row may not set both columns: re-attaching writes the
+reference and clears the detached column.
 
 ## JSONB
 

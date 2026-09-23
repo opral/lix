@@ -115,6 +115,12 @@ pub struct RowRefConstraint {
     pub column: String,
     #[serde(default, skip_serializing_if = "DeleteAction::is_no_action")]
     pub on_delete: DeleteAction,
+    /// With [`DeleteAction::SetNull`], a nullable text column that receives
+    /// the reference cleared by the delete action. The source row then records
+    /// what it was attached to; writing a non-null `column` requires this
+    /// column to be `NULL`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detached_column: Option<String>,
 }
 
 /// Action executed when a referenced row is deleted.
@@ -124,6 +130,9 @@ pub enum DeleteAction {
     #[default]
     NoAction,
     Cascade,
+    /// Clear the referencing column and keep the referencing row. Supported
+    /// for row references only.
+    SetNull,
 }
 
 impl DeleteAction {

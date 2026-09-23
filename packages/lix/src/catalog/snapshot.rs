@@ -351,13 +351,12 @@ impl CatalogSnapshot {
         &self.row_ref_references
     }
 
-    pub(crate) fn has_row_ref_cascades(&self) -> bool {
-        self.row_ref_references.iter().any(|reference| {
-            matches!(
-                reference.row_ref.on_delete,
-                lix_schema::DeleteAction::Cascade
-            )
-        })
+    /// Whether any row reference declares a delete action (`cascade` or
+    /// `set_null`) that the referential-action planner must expand.
+    pub(crate) fn has_row_ref_delete_actions(&self) -> bool {
+        self.row_ref_references
+            .iter()
+            .any(|reference| !reference.row_ref.on_delete.is_no_action())
     }
 }
 
@@ -576,6 +575,7 @@ impl SchemaPlan {
             .map(|row_ref| RowRefPlan {
                 column: row_ref.column,
                 on_delete: row_ref.on_delete,
+                detached_column: row_ref.detached_column,
             })
             .collect();
         Ok(Self {
@@ -904,6 +904,8 @@ pub(crate) struct DeleteReferencePlan {
 pub(crate) struct RowRefPlan {
     pub(crate) column: String,
     pub(crate) on_delete: lix_schema::DeleteAction,
+    /// Column that records the reference cleared by `set_null`.
+    pub(crate) detached_column: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1536,7 +1538,7 @@ mod tests {
             references[0].row_ref.on_delete,
             lix_schema::DeleteAction::Cascade
         );
-        assert!(catalog.has_row_ref_cascades());
+        assert!(catalog.has_row_ref_delete_actions());
     }
 
     fn schema_json(schema_key: &str) -> JsonValue {
