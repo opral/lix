@@ -30,7 +30,7 @@ use tokio::sync::watch;
 
 use crate::component_runtime::{self, platform::JsDispatch};
 
-type JsTelemetryDispatch = ThreadsafeFunction<String, (), String, Status, false>;
+type JsTelemetryDispatch = ThreadsafeFunction<Buffer, (), Buffer, Status, false>;
 type SharedJsTelemetryDispatch = Arc<JsTelemetryDispatch>;
 type JsOpenProgressDispatch = ThreadsafeFunction<String, (), String, Status, false>;
 type SharedJsOpenProgressDispatch = Arc<JsOpenProgressDispatch>;
@@ -42,7 +42,7 @@ const NATIVE_ENGINE_ACTOR_STACK_SIZE: usize = 32 * 1024 * 1024;
 const NATIVE_SNAPSHOT_EXPORT_HANDOFF_CAPACITY: usize = 1;
 
 fn optional_telemetry_dispatch(
-    dispatch: Option<Function<'_, String, ()>>,
+    dispatch: Option<Function<'_, Buffer, ()>>,
 ) -> Result<Option<SharedJsTelemetryDispatch>> {
     dispatch
         .map(|dispatch| dispatch.build_threadsafe_function().build().map(Arc::new))
@@ -62,6 +62,7 @@ fn optional_open_progress_dispatch(
 pub struct NativeLix {
     actor: NativeLixActor,
     telemetry_parent: Option<PendingTelemetryParent>,
+    telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
     open_report: NativeOpenReport,
 }
 
@@ -306,6 +307,7 @@ enum LixCommand {
     OpenAnotherSession {
         options: NativeOpenAnotherSessionOptions,
         telemetry_parent: Option<PendingTelemetryParent>,
+        telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
         deferred: NativeLixDeferred,
     },
 
@@ -543,6 +545,27 @@ pub struct NativeSnapshotExport {
 pub struct NativeSnapshotNextTask {
     receiver: async_channel::Receiver<NativeSnapshotMessage>,
     completion: Arc<NativeSnapshotExportCompletion>,
+}
+
+#[expect(missing_debug_implementations)]
+pub struct NativeTelemetryBarrierTask {
+    dispatch: Option<SharedJsTelemetryDispatch>,
+}
+
+impl Task for NativeTelemetryBarrierTask {
+    type Output = Result<()>;
+    type JsValue = ();
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let Some(dispatch) = &self.dispatch else {
+            return Ok(Ok(()));
+        };
+        Ok(wait_for_telemetry_dispatch(dispatch))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        output
+    }
 }
 
 impl Task for NativeSnapshotNextTask {
@@ -1010,10 +1033,11 @@ fn handle_lix_command(
         LixCommand::OpenAnotherSession {
             options,
             telemetry_parent,
+            telemetry_dispatch,
             deferred,
         } => {
             let result = block_on!(state.lix.open_another_session(options))
-                .and_then(|lix| NativeLix::new(lix, telemetry_parent));
+                .and_then(|lix| NativeLix::new(lix, telemetry_parent, telemetry_dispatch));
             settle_deferred(deferred, result);
             None
         }
@@ -1809,13 +1833,41 @@ fn telemetry_sink(
 ) -> (Arc<dyn TelemetrySink>, PendingTelemetryParent) {
     let parent_source = Arc::new(Mutex::new(None));
     let sink = CallbackTelemetrySink::new(move |span| {
-        let Ok(json) = serde_json::to_string(&crate::telemetry::TelemetrySpanDto::from(span))
-        else {
-            return;
-        };
-        let _ = dispatch.call(json, ThreadsafeFunctionCallMode::NonBlocking);
+        let request = Buffer::from(crate::telemetry::encode_otlp_request(span));
+        let _ = dispatch.call(request, ThreadsafeFunctionCallMode::NonBlocking);
     });
     (Arc::new(sink), parent_source)
+}
+
+fn wait_for_telemetry_dispatch(dispatch: &SharedJsTelemetryDispatch) -> Result<()> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let status = dispatch.call_with_return_value(
+        Buffer::from(Vec::new()),
+        ThreadsafeFunctionCallMode::NonBlocking,
+        move |_result, _env| {
+            let _ = sender.send(());
+            Ok(())
+        },
+    );
+    if status != Status::Ok {
+        return Err(Error::from_status(status));
+    }
+    receiver
+        .recv()
+        .map_err(|_| Error::from_reason("native telemetry callback barrier was canceled"))?;
+    Ok(())
+}
+
+fn wait_for_telemetry_dispatch_after_error<T>(
+    result: std::result::Result<T, LixError>,
+    dispatch: Option<&SharedJsTelemetryDispatch>,
+) -> std::result::Result<T, LixError> {
+    if result.is_err() {
+        if let Some(dispatch) = dispatch {
+            let _ = wait_for_telemetry_dispatch(dispatch);
+        }
+    }
+    result
 }
 
 struct NativeOpenProgressSink {
@@ -1864,6 +1916,7 @@ fn open_memory_native(
         .enable_all()
         .build()
         .map_err(|error| LixError::unknown(format!("failed to create tokio runtime: {error}")))?;
+    let telemetry_dispatch_for_flush = telemetry_dispatch.clone();
     let (telemetry, telemetry_parent_source) = telemetry_dispatch
         .map(telemetry_sink)
         .map_or((None, None), |(sink, parent)| (Some(sink), Some(parent)));
@@ -1886,8 +1939,15 @@ fn open_memory_native(
             None => builder.await,
         }
     }));
-    let lix = lix?;
-    NativeLix::new(NativeLixInner::Memory(lix), telemetry_parent_source)
+    let lix = wait_for_telemetry_dispatch_after_error(lix, telemetry_dispatch_for_flush.as_ref())?;
+    wait_for_telemetry_dispatch_after_error(
+        NativeLix::new(
+            NativeLixInner::Memory(lix),
+            telemetry_parent_source,
+            telemetry_dispatch_for_flush.clone(),
+        ),
+        telemetry_dispatch_for_flush.as_ref(),
+    )
 }
 
 fn open_filesystem_storage_native(
@@ -1909,6 +1969,7 @@ fn open_filesystem_storage_native(
     let storage = FilesystemStorage::new(path)
         .sync_all_files(sync_all_files)
         .open()?;
+    let telemetry_dispatch_for_flush = telemetry_dispatch.clone();
     let (telemetry, telemetry_parent_source) = telemetry_dispatch
         .map(telemetry_sink)
         .map_or((None, None), |(sink, parent)| (Some(sink), Some(parent)));
@@ -1931,11 +1992,21 @@ fn open_filesystem_storage_native(
             None => builder.await,
         }
     }));
-    let lix = lix?;
-    rt.block_on(storage.start_sync(&lix))?;
-    NativeLix::new(
-        NativeLixInner::FilesystemStorage(lix, storage, Arc::new(AtomicUsize::new(1))),
-        telemetry_parent_source,
+    let lix = wait_for_telemetry_dispatch_after_error(lix, telemetry_dispatch_for_flush.as_ref())?;
+    if let Err(error) = rt.block_on(storage.start_sync(&lix)) {
+        drop(lix);
+        if let Some(dispatch) = &telemetry_dispatch_for_flush {
+            let _ = wait_for_telemetry_dispatch(dispatch);
+        }
+        return Err(error);
+    }
+    wait_for_telemetry_dispatch_after_error(
+        NativeLix::new(
+            NativeLixInner::FilesystemStorage(lix, storage, Arc::new(AtomicUsize::new(1))),
+            telemetry_parent_source,
+            telemetry_dispatch_for_flush.clone(),
+        ),
+        telemetry_dispatch_for_flush.as_ref(),
     )
 }
 
@@ -2037,15 +2108,14 @@ impl NativeLix {
             *parent_source
                 .lock()
                 .unwrap_or_else(|error| error.into_inner()) =
-                crate::telemetry::parse_parent_context_json(parent_json)
-                    .map_err(Error::from_reason)?;
+                crate::telemetry::parse_parent_context_json(parent_json);
         }
         Ok(())
     }
 
     #[napi(js_name = "openMemory")]
     pub fn open_memory(
-        telemetry_dispatch: Option<Function<'_, String, ()>>,
+        telemetry_dispatch: Option<Function<'_, Buffer, ()>>,
         telemetry_parent_json: Option<String>,
         server_url: Option<String>,
         server_headers: Option<Vec<Vec<String>>>,
@@ -2062,8 +2132,7 @@ impl NativeLix {
                 .map_err(|error| Error::from_reason(error.to_string()))?,
             component_runtime,
             telemetry_dispatch: optional_telemetry_dispatch(telemetry_dispatch)?,
-            telemetry_parent: crate::telemetry::parse_parent_context_json(telemetry_parent_json)
-                .map_err(Error::from_reason)?,
+            telemetry_parent: crate::telemetry::parse_parent_context_json(telemetry_parent_json),
             open_progress_dispatch: optional_open_progress_dispatch(open_progress_dispatch)?,
             server_url,
             server_headers: parse_server_headers(server_headers)?,
@@ -2073,7 +2142,7 @@ impl NativeLix {
 
     #[napi(js_name = "openMemoryFromSnapshot")]
     pub fn open_memory_from_snapshot(
-        telemetry_dispatch: Option<Function<'_, String, ()>>,
+        telemetry_dispatch: Option<Function<'_, Buffer, ()>>,
         telemetry_parent_json: Option<String>,
         open_progress_dispatch: Option<Function<'_, String, ()>>,
         component_dispatch: Option<JsDispatch<'_>>,
@@ -2084,8 +2153,7 @@ impl NativeLix {
                 .ok_or_else(|| Error::from_reason("JavaScript component host is required"))?,
         )?);
         let telemetry_dispatch = optional_telemetry_dispatch(telemetry_dispatch)?;
-        let telemetry_parent = crate::telemetry::parse_parent_context_json(telemetry_parent_json)
-            .map_err(Error::from_reason)?;
+        let telemetry_parent = crate::telemetry::parse_parent_context_json(telemetry_parent_json);
         let open_progress_dispatch = optional_open_progress_dispatch(open_progress_dispatch)?;
         let durability = crate::parse_durability(durability.as_deref())
             .map_err(|error| Error::from_reason(error.to_string()))?;
@@ -2107,7 +2175,7 @@ impl NativeLix {
     pub fn open_filesystem_storage(
         path: String,
         sync_all_files: bool,
-        telemetry_dispatch: Option<Function<'_, String, ()>>,
+        telemetry_dispatch: Option<Function<'_, Buffer, ()>>,
         telemetry_parent_json: Option<String>,
         server_url: Option<String>,
         server_headers: Option<Vec<Vec<String>>>,
@@ -2126,8 +2194,7 @@ impl NativeLix {
             sync_all_files,
             component_runtime,
             telemetry_dispatch: optional_telemetry_dispatch(telemetry_dispatch)?,
-            telemetry_parent: crate::telemetry::parse_parent_context_json(telemetry_parent_json)
-                .map_err(Error::from_reason)?,
+            telemetry_parent: crate::telemetry::parse_parent_context_json(telemetry_parent_json),
             open_progress_dispatch: optional_open_progress_dispatch(open_progress_dispatch)?,
             server_url,
             server_headers: parse_server_headers(server_headers)?,
@@ -2139,7 +2206,7 @@ impl NativeLix {
     pub fn open_filesystem_storage_from_snapshot(
         path: String,
         sync_all_files: bool,
-        telemetry_dispatch: Option<Function<'_, String, ()>>,
+        telemetry_dispatch: Option<Function<'_, Buffer, ()>>,
         telemetry_parent_json: Option<String>,
         open_progress_dispatch: Option<Function<'_, String, ()>>,
         component_dispatch: Option<JsDispatch<'_>>,
@@ -2150,8 +2217,7 @@ impl NativeLix {
                 .ok_or_else(|| Error::from_reason("JavaScript component host is required"))?,
         )?);
         let telemetry_dispatch = optional_telemetry_dispatch(telemetry_dispatch)?;
-        let telemetry_parent = crate::telemetry::parse_parent_context_json(telemetry_parent_json)
-            .map_err(Error::from_reason)?;
+        let telemetry_parent = crate::telemetry::parse_parent_context_json(telemetry_parent_json);
         let open_progress_dispatch = optional_open_progress_dispatch(open_progress_dispatch)?;
         let durability = crate::parse_durability(durability.as_deref())
             .map_err(|error| Error::from_reason(error.to_string()))?;
@@ -2185,9 +2251,17 @@ impl NativeLix {
                     account_id: None,
                 }),
                 telemetry_parent: self.telemetry_parent.clone(),
+                telemetry_dispatch: self.telemetry_dispatch.clone(),
                 deferred,
             });
         Ok(promise)
+    }
+
+    #[napi(js_name = "flushTelemetry")]
+    pub fn flush_telemetry(&self) -> AsyncTask<NativeTelemetryBarrierTask> {
+        AsyncTask::new(NativeTelemetryBarrierTask {
+            dispatch: self.telemetry_dispatch.clone(),
+        })
     }
 
     #[napi]
@@ -2471,7 +2545,42 @@ pub struct NativeObserveEvents {
     closed: Arc<AtomicBool>,
     close_signal: watch::Sender<bool>,
     next_in_flight: Arc<AtomicBool>,
+    close_completion: Arc<NativeObserveCompletion>,
     telemetry_parent: Option<PendingTelemetryParent>,
+}
+
+#[derive(Default)]
+struct NativeObserveCompletion {
+    state: Mutex<NativeObserveCompletionState>,
+}
+
+#[derive(Default)]
+struct NativeObserveCompletionState {
+    completed: bool,
+    waiters: Vec<NativeUnitDeferred>,
+}
+
+impl NativeObserveCompletion {
+    fn register(&self, deferred: NativeUnitDeferred) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if !state.completed {
+            state.waiters.push(deferred);
+            return;
+        }
+        drop(state);
+        settle_deferred(deferred, Ok(()));
+    }
+
+    fn finish(&self) {
+        let waiters = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.completed = true;
+            std::mem::take(&mut state.waiters)
+        };
+        for waiter in waiters {
+            settle_deferred(waiter, Ok(()));
+        }
+    }
 }
 
 #[napi]
@@ -2484,10 +2593,12 @@ impl NativeObserveEvents {
         let closed = Arc::new(AtomicBool::new(false));
         let (close_signal, actor_close_signal) = watch::channel(false);
         let next_in_flight = Arc::new(AtomicBool::new(false));
+        let close_completion = Arc::new(NativeObserveCompletion::default());
         let telemetry_parent = telemetry_parent.map(|_| Arc::new(Mutex::new(None)));
 
         let actor_closed = Arc::clone(&closed);
         let actor_next_in_flight = Arc::clone(&next_in_flight);
+        let actor_close_completion = Arc::clone(&close_completion);
         thread::Builder::new()
             .name("lix-observe-events".to_string())
             .stack_size(NATIVE_ENGINE_ACTOR_STACK_SIZE)
@@ -2498,6 +2609,7 @@ impl NativeObserveEvents {
                     actor_closed,
                     actor_close_signal,
                     actor_next_in_flight,
+                    actor_close_completion,
                 );
             })
             .map_err(to_napi_error)?;
@@ -2507,6 +2619,7 @@ impl NativeObserveEvents {
             closed,
             close_signal,
             next_in_flight,
+            close_completion,
             telemetry_parent,
         })
     }
@@ -2567,15 +2680,17 @@ impl NativeObserveEvents {
             *parent_source
                 .lock()
                 .unwrap_or_else(|error| error.into_inner()) =
-                crate::telemetry::parse_parent_context_json(parent_json)
-                    .map_err(Error::from_reason)?;
+                crate::telemetry::parse_parent_context_json(parent_json);
         }
         Ok(())
     }
 
     #[napi]
-    pub fn close(&self) {
+    pub fn close<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
+        let (deferred, promise): (NativeUnitDeferred, Object<'env>) = env.create_deferred()?;
+        self.close_completion.register(deferred);
         close_observe_events(&self.commands, &self.closed, &self.close_signal);
+        Ok(promise)
     }
 }
 
@@ -2603,20 +2718,22 @@ fn run_observe_actor(
     closed: Arc<AtomicBool>,
     mut close_signal: watch::Receiver<bool>,
     next_in_flight: Arc<AtomicBool>,
+    close_completion: Arc<NativeObserveCompletion>,
 ) {
     let rt = match Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(error) => {
             closed.store(true, Ordering::SeqCst);
-            while let Ok(command) = receiver.recv() {
+            while let Ok(command) = receiver.try_recv() {
                 match command {
                     ObserveCommand::Next { deferred, .. } => {
                         next_in_flight.store(false, Ordering::SeqCst);
                         deferred.reject(to_napi_error(&error));
                     }
-                    ObserveCommand::Close => break,
+                    ObserveCommand::Close => {}
                 }
             }
+            close_completion.finish();
             return;
         }
     };
@@ -2662,6 +2779,7 @@ fn run_observe_actor(
         }
     }
     closed.store(true, Ordering::SeqCst);
+    close_completion.finish();
 }
 
 async fn observe_next(
@@ -2744,6 +2862,7 @@ impl NativeLix {
     fn new(
         lix: NativeLixInner,
         telemetry_parent: Option<PendingTelemetryParent>,
+        telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
     ) -> std::result::Result<Self, LixError> {
         let open_report = NativeOpenReport::from(lix.open_report());
         let actor = NativeLixActor::start(lix, telemetry_parent.clone())
@@ -2751,6 +2870,7 @@ impl NativeLix {
         Ok(Self {
             actor,
             telemetry_parent,
+            telemetry_dispatch,
             open_report,
         })
     }

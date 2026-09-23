@@ -14755,6 +14755,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_single_read_batch_exports_one_query_span() {
+        let capture = CaptureLayer::default();
+        let spans = Arc::clone(&capture.spans);
+        let (_provider, _subscriber) = set_otel_capture_default(capture);
+        let app = app_with_tracing_telemetry().await;
+        let (session_id, _) = new_session(&app.router).await;
+        spans.lock().expect("capture spans").clear();
+
+        let response = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute-batch",
+            Some(&session_id),
+            Some(json!({
+                "statements": [{ "sql": "SELECT 1", "params": [] }]
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let spans = spans.lock().expect("capture spans");
+        assert_info_plane(&spans);
+        let query_spans = spans
+            .iter()
+            .filter(|span| span.name == "lix.sql.query")
+            .collect::<Vec<_>>();
+        assert_eq!(query_spans.len(), 1);
+        assert_eq!(
+            query_spans[0]
+                .fields
+                .get("lix.execution.kind")
+                .map(String::as_str),
+            Some("batch")
+        );
+        assert_eq!(
+            query_spans[0]
+                .fields
+                .get("lix.batch.index")
+                .map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[tokio::test]
     async fn execute_batch_write_exports_materialize_storage_and_notify() {
         let capture = CaptureLayer::default();
         let spans = Arc::clone(&capture.spans);
@@ -14782,18 +14826,35 @@ mod tests {
 
         let spans = spans.lock().expect("capture spans");
         assert_info_plane(&spans);
-        let batch = require_span(&spans, "lix.sql.batch");
         let query = require_span(&spans, "lix.sql.query");
         assert_eq!(
             query.fields.get("db.operation.name").map(String::as_str),
             Some("INSERT")
         );
+        assert_eq!(
+            query.fields.get("lix.execution.kind").map(String::as_str),
+            Some("batch")
+        );
+        assert_eq!(
+            query.fields.get("lix.rows_affected").map(String::as_str),
+            Some("1")
+        );
+        assert!(query.fields.contains_key("db.response.returned_rows"));
+        assert!(!query.fields.contains_key("db.operation.batch.size"));
+        assert_eq!(
+            spans
+                .iter()
+                .filter(|span| span.name == "lix.sql.query")
+                .count(),
+            1,
+            "a single-statement batch exports exactly one query span"
+        );
         let materialize = require_span(&spans, "lix.transaction.materialize");
         let storage_commit = require_span(&spans, "lix.transaction.storage");
         let notify = require_span(&spans, "lix.transaction.notify");
-        assert_eq!(materialize.parent.as_ref(), Some(&batch.id));
-        assert_eq!(storage_commit.parent.as_ref(), Some(&batch.id));
-        assert_eq!(notify.parent.as_ref(), Some(&batch.id));
+        assert_eq!(materialize.parent.as_ref(), Some(&query.id));
+        assert_eq!(storage_commit.parent.as_ref(), Some(&query.id));
+        assert_eq!(notify.parent.as_ref(), Some(&query.id));
         let cohort_id = materialize
             .fields
             .get("lix.commit_cohort_id")

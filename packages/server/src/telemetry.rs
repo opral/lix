@@ -338,10 +338,21 @@ fn perf_span_events_enabled() -> bool {
 }
 
 fn provider_from_env() -> Result<SdkTracerProvider> {
-    provider_from_endpoint(optional_nonempty_env("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")?)
+    provider_from_endpoint_and_headers(
+        optional_nonempty_env("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")?,
+        exporter_headers_from_env()?,
+    )
 }
 
+#[cfg(test)]
 fn provider_from_endpoint(endpoint: Option<String>) -> Result<SdkTracerProvider> {
+    provider_from_endpoint_and_headers(endpoint, HashMap::new())
+}
+
+fn provider_from_endpoint_and_headers(
+    endpoint: Option<String>,
+    headers: HashMap<String, String>,
+) -> Result<SdkTracerProvider> {
     let Some(endpoint) = endpoint else {
         return Ok(SdkTracerProvider::builder()
             .with_resource(service_resource())
@@ -351,6 +362,7 @@ fn provider_from_endpoint(endpoint: Option<String>) -> Result<SdkTracerProvider>
         .with_http()
         .with_protocol(Protocol::HttpBinary)
         .with_endpoint(endpoint)
+        .with_headers(headers)
         .with_timeout(Duration::from_secs(5))
         .with_compression(Compression::Gzip)
         .build()
@@ -359,6 +371,32 @@ fn provider_from_endpoint(endpoint: Option<String>) -> Result<SdkTracerProvider>
         .with_resource(service_resource())
         .with_span_processor(batch_span_processor(exporter))
         .build())
+}
+
+fn exporter_headers_from_env() -> Result<HashMap<String, String>> {
+    let Some(raw_headers) = optional_nonempty_env("OTEL_EXPORTER_OTLP_TRACES_HEADERS")? else {
+        return Ok(HashMap::new());
+    };
+    let mut headers = HashMap::new();
+    for header in raw_headers.split(',') {
+        let (name, value) = header
+            .split_once('=')
+            .with_context(|| "OTEL_EXPORTER_OTLP_TRACES_HEADERS entries must be key=value")?;
+        let name = percent_encoding::percent_decode_str(name)
+            .decode_utf8()
+            .context("OTEL_EXPORTER_OTLP_TRACES_HEADERS contains invalid UTF-8 in a name")?
+            .trim()
+            .to_owned();
+        let value = percent_encoding::percent_decode_str(value)
+            .decode_utf8()
+            .context("OTEL_EXPORTER_OTLP_TRACES_HEADERS contains invalid UTF-8 in a value")?
+            .into_owned();
+        if name.is_empty() {
+            anyhow::bail!("OTEL_EXPORTER_OTLP_TRACES_HEADERS header names must not be empty");
+        }
+        headers.insert(name, value);
+    }
+    Ok(headers)
 }
 
 fn batch_span_processor<T>(exporter: T) -> BatchSpanProcessor<runtime::Tokio>

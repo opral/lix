@@ -92,7 +92,7 @@ test("actual shared-worker ports isolate IDs and survive abrupt client-context l
       result: { rows: unknown[][] };
     };
     expect(event.result.rows).toEqual([["survivor-offline"]]);
-    first.port.postMessage({ kind: "observe.close", observeId: observation });
+    await call({ kind: "observe.close", observeId: observation });
     await call({ kind: "close" });
   } finally {
     frame.remove();

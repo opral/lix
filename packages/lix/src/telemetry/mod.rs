@@ -124,7 +124,7 @@ pub struct TelemetrySpanStart {
     pub parent_span_context: Option<SpanContext>,
     /// OpenTelemetry span links for causal parents that are not the tree parent.
     pub links: Vec<SpanContext>,
-    pub started_at_unix_ms: u64,
+    pub started_at_unix_ns: u64,
     pub attributes: Vec<TelemetryAttribute>,
     descriptor: &'static TelemetrySpanDescriptor,
 }
@@ -141,7 +141,7 @@ impl TelemetrySpanStart {
             kind: descriptor.kind.clone(),
             parent_span_context: None,
             links: Vec::new(),
-            started_at_unix_ms: unix_time_ms(),
+            started_at_unix_ns: unix_time_ns(),
             attributes,
             descriptor,
         }
@@ -805,12 +805,16 @@ where
     }
 }
 
-pub(crate) fn unix_time_ms() -> u64 {
+pub(crate) fn unix_time_ns() -> u64 {
     web_time::SystemTime::now()
         .duration_since(web_time::SystemTime::UNIX_EPOCH)
         .ok()
-        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
         .unwrap_or(0)
+}
+
+pub(crate) fn unix_time_ms() -> u64 {
+    unix_time_ns() / 1_000_000
 }
 
 /// Records that a client session has bound to a Lix.

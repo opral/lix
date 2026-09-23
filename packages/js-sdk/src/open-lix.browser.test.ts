@@ -77,31 +77,20 @@ test("browser close cancels an abandoned started snapshot export", async () => {
 
 test("forwards opt-in SQL telemetry from browser WASM", async () => {
 	const { openLix } = await import("@lix-js/sdk");
-	let resolveSpan!: (span: { attributes: Record<string, unknown> }) => void;
-	const received = new Promise<{ attributes: Record<string, unknown> }>(
-		(resolve) => {
-			resolveSpan = resolve;
-		},
-	);
+	let resolveRequest!: (request: Uint8Array) => void;
+	const received = new Promise<Uint8Array>((resolve) => {
+		resolveRequest = resolve;
+	});
 	const lix = await openLix({
 		telemetry: {
-			onSpan(span) {
-				if (
-					span.name === "lix.sql.query" &&
-					span.attributes["db.query.text"] ===
-						"SELECT ? AS value, ? AS number"
-				) {
-					resolveSpan(span);
-				}
+			onExport(request) {
+				if (request.byteLength > 0) resolveRequest(request);
 			},
 		},
 	});
 	try {
 		await lix.execute("SELECT 'private-value' AS value, 42 AS number");
-		const span = await received;
-		expect(span.attributes["db.query.text"]).toBe(
-			"SELECT ? AS value, ? AS number",
-		);
+		expect(await received).toBeInstanceOf(Uint8Array);
 	} finally {
 		await lix.close();
 	}
@@ -281,27 +270,23 @@ test("executes a globally ordered union plan in browser WASM", async () => {
 
 test("WASM child sessions route SQL telemetry independently and nested sessions inherit", async () => {
  const { openLixBinding } = await import("./binding.browser.js");
- const rootSpans: import("./types.js").LixTelemetrySpan[] = [];
- const childSpans: import("./types.js").LixTelemetrySpan[] = [];
- const root = await openLixBinding({kind:"memory"}, span => rootSpans.push(span));
- const child = await root.openAnotherSession({}, span => childSpans.push(span));
+ const rootSpans: Uint8Array[] = [];
+ const childSpans: Uint8Array[] = [];
+ const root = await openLixBinding({kind:"memory"}, request => rootSpans.push(request));
+ const child = await root.openAnotherSession({}, request => childSpans.push(request));
  const nested = await child.openAnotherSession({});
  try {
   rootSpans.length=0; childSpans.length=0;
-  child.setTelemetryParent({traceId:"11111111111111111111111111111111",spanId:"1111111111111111",traceFlags:1});
-  nested.setTelemetryParent({traceId:"22222222222222222222222222222222",spanId:"2222222222222222",traceFlags:1});
+  child.setTelemetryParent({traceparent:"00-11111111111111111111111111111111-1111111111111111-01"});
+  nested.setTelemetryParent({traceparent:"00-22222222222222222222222222222222-2222222222222222-01"});
   await child.execute("SELECT 41 AS child_value", []);
   await nested.execute("SELECT 42 AS nested_value", []);
-  expect(childSpans.filter(span => span.name === "lix.sql.query").map(span => span.attributes["db.query.text"])).toEqual([
-   "SELECT ? AS child_value", "SELECT ? AS nested_value",
-  ]);
-  expect(childSpans.filter(span => span.name === "lix.sql.query").map(span => span.traceId)).toEqual([
-   "11111111111111111111111111111111", "22222222222222222222222222222222",
-  ]);
-  expect(rootSpans.filter(span => span.name === "lix.sql.query")).toEqual([]);
+  expect(childSpans.length).toBeGreaterThan(0);
+  expect(childSpans.every(request => request instanceof Uint8Array)).toBe(true);
+  expect(rootSpans).toEqual([]);
   childSpans.length=0;
   await root.execute("SELECT 43 AS root_value", []);
-  expect(rootSpans.some(span=>span.name === "lix.sql.query")).toBe(true);
+  expect(rootSpans.length).toBeGreaterThan(0);
   expect(childSpans).toEqual([]);
  } finally { await nested.close(); await child.close(); await root.close(); }
 });

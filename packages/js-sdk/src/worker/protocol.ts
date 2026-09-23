@@ -10,7 +10,6 @@ import type {
 	LixBatchOptions,
 	MergeBranchOptions,
 	SwitchBranchOptions,
-	LixTelemetrySpan,
 	LixTelemetryParentContext,
 	LixOpenProgress,
 	LixOpenReport,
@@ -129,11 +128,11 @@ export type WorkerOperation =
 	| { kind: "exportSnapshot.cancel"; exportId: number }
 	| { kind: "observe"; sql: string; params: BindingParam[] }
 	| { kind: "observe.next"; observeId: number }
+	| { kind: "observe.close"; observeId: number }
 	| { kind: "close" };
 
 export type WorkerNotification =
 	| { kind: "transaction.abandon"; transactionId: number }
-	| { kind: "observe.close"; observeId: number }
 	| { kind: "openSnapshot.cancel"; snapshotId: number }
 	| {
 			kind: "sync.headers.result";
@@ -192,7 +191,7 @@ export type WorkerResponse =
 			context?: { branchId: string; accountId: string };
 	  }
 	| { id: number; ok: false; error: SerializedWorkerError }
-	| { kind: "telemetry"; span: LixTelemetrySpan }
+	| { kind: "telemetry"; request: Uint8Array }
 	| { kind: "open.progress"; progress: LixOpenProgress }
 	| { kind: "sync.headers"; requestId: number; transportScope?: number }
 	| {

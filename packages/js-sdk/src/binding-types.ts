@@ -10,7 +10,6 @@ import type {
 	MergeBranchReceipt,
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
-	LixTelemetrySpan,
 	LixTelemetryParentContext,
 	LixOpenProgress,
 	LixOpenReport,
@@ -76,7 +75,10 @@ export type LixBinding = {
 	): Promise<import("./types.js").HostedLix>;
 	openReport?(): LixOpenReport | undefined;
 	setTelemetryParent(parent?: TelemetryParentContext): void;
-	openAnotherSession(options: OpenAnotherSessionOptions, telemetry?: TelemetryDispatch): Promise<LixBinding>;
+	openAnotherSession(
+		options: OpenAnotherSessionOptions,
+		telemetry?: TelemetryDispatch,
+	): Promise<LixBinding>;
 	execute(
 		sql: string,
 		params: BindingParam[],
@@ -91,7 +93,10 @@ export type LixBinding = {
 	replicaRecoverySources(): Promise<ReplicaRecoverySource[]>;
 	exportReplicaRecovery(id: string): Promise<ReplicaRecoveryExport>;
 	recoverReplica(id: string): Promise<ReplicaRecoveryReceipt>;
-	recoverReplicaWithServer(id: string, server: SyncServerBindingOptions): Promise<ReplicaRecoveryReceipt>;
+	recoverReplicaWithServer(
+		id: string,
+		server: SyncServerBindingOptions,
+	): Promise<ReplicaRecoveryReceipt>;
 	syncHealth(): Promise<import("./types.js").SyncHealth>;
 	activeBranchId(): Promise<string>;
 	activeAccountId(): Promise<string>;
@@ -103,6 +108,8 @@ export type LixBinding = {
 	syncDiskToLix(): Promise<void>;
 	exportSnapshot(): SnapshotExportBinding;
 	close(): Promise<void>;
+	/** Wait until native telemetry callbacks already queued have reached JS. */
+	flushTelemetry?(): Promise<void>;
 };
 
 export type LixTransactionBinding = {
@@ -118,10 +125,10 @@ export type LixTransactionBinding = {
 export type ObserveEventsBinding = {
 	setTelemetryParent(parent?: TelemetryParentContext): void;
 	next(): Promise<BindingObserveEvent | null | undefined>;
-	close(): void;
+	close(): void | Promise<void>;
 };
 
-export type TelemetryDispatch = (span: LixTelemetrySpan) => void;
+export type TelemetryDispatch = (request: Uint8Array) => void;
 export type OpenProgressDispatch = (progress: LixOpenProgress) => void;
 export type TelemetryParentContext = LixTelemetryParentContext;
 
@@ -129,7 +136,9 @@ export type LixStorageProviderModule = {
 	createLixStorageProvider(options: unknown): Promise<LixStorageProvider>;
 };
 
-export type LixStorageConfig = { durability?: import("./types.js").Durability } & (
+export type LixStorageConfig = {
+	durability?: import("./types.js").Durability;
+} & (
 	| { kind: "memory" }
 	| {
 			kind: "jsStorage";
@@ -140,7 +149,8 @@ export type LixStorageConfig = { durability?: import("./types.js").Durability } 
 			kind: "filesystem";
 			path: string;
 			syncAllFiles: boolean;
-	  });
+	  }
+);
 
 export type HostedServerBindingOptions = {
 	idempotencyKey?: string;

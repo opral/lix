@@ -303,7 +303,7 @@ test("conversion-first and reopened roots use the current opener's context", asy
     await new Promise<void>(resolve => { release = resolve; });
   });
   await Promise.resolve();
-  const first = { ...f.client(), parent: { traceId: "first", spanId: "first", traceFlags: 1 }, progress: vi.fn() };
+  const first = { ...f.client(), parent: { traceparent: "00-11111111111111111111111111111111-1111111111111111-01" }, progress: vi.fn() };
   const queued = owner.attach(first);
   release();
   await conversion;
@@ -311,7 +311,7 @@ test("conversion-first and reopened roots use the current opener's context", asy
   expect(parents).toEqual([first.parent]);
   expect(first.progress).toHaveBeenCalledTimes(1);
   await owner.detach(first);
-  const second = { ...f.client(), parent: { traceId: "second", spanId: "second", traceFlags: 1 }, progress: vi.fn() };
+  const second = { ...f.client(), parent: { traceparent: "00-22222222222222222222222222222222-2222222222222222-01" }, progress: vi.fn() };
   await owner.attach(second);
   expect(parents).toEqual([first.parent, second.parent]);
   expect(second.progress).toHaveBeenCalledTimes(1);

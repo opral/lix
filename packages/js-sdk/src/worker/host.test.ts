@@ -91,7 +91,12 @@ test("observation setup bypasses a blocked finite operation", async () => {
 	await vi.waitFor(() =>
 		expect(responses).toContainEqual({ id: 4, ok: true, value: 2 }),
 	);
-	receive({ kind: "observe.close", observeId: 2 });
+	receive({
+		id: 9,
+		sessionId: 0,
+		operation: { kind: "observe.close", observeId: 2 },
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 9, ok: true }));
 	expect(closedObservations).toEqual([2]);
 	receive({
 		id: 5,
@@ -128,36 +133,183 @@ test("observation setup bypasses a blocked finite operation", async () => {
 	await vi.waitFor(() => expect(executeCalls).toBe(2));
 });
 
+test("observation close acknowledges only after the binding drains its active read", async () => {
+	const closeBarrier = deferred<void>();
+	const responses: WorkerResponse[] = [];
+	let receive!: (message: WorkerInput) => void;
+	const events: ObserveEventsBinding = {
+		setTelemetryParent() {},
+		next: async () => undefined,
+		close: () => closeBarrier.promise,
+	};
+	const binding = {
+		setTelemetryParent() {},
+		observe: async () => events,
+	} as unknown as LixBinding;
+	startWorkerHost(
+		{
+			postMessage: (message) => responses.push(message),
+			onMessage: (listener) => (receive = listener),
+		},
+		async () => binding,
+	);
+	receive({
+		id: 1,
+		sessionId: 0,
+		operation: {
+			kind: "open",
+			storage: { kind: "memory" },
+			telemetryEnabled: false,
+			progressEnabled: false,
+		},
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 1, ok: true }));
+	receive({
+		id: 2,
+		sessionId: 0,
+		operation: { kind: "observe", sql: "SELECT 1", params: [] },
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 2, ok: true, value: 1 }));
+	receive({
+		id: 3,
+		sessionId: 0,
+		operation: { kind: "observe.close", observeId: 1 },
+	});
+	await Promise.resolve();
+	expect(responses).not.toContainEqual({ id: 3, ok: true });
+	closeBarrier.resolve();
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 3, ok: true }));
+});
+
+test("worker shutdown also waits for an observation close RPC already in flight", async () => {
+	const closeBarrier = deferred<void>();
+	const responses: WorkerResponse[] = [];
+	let receive!: (message: WorkerInput) => void;
+	const closeSession = vi.fn(async () => {});
+	const events: ObserveEventsBinding = {
+		setTelemetryParent() {},
+		next: async () => undefined,
+		close: () => closeBarrier.promise,
+	};
+	const binding = {
+		setTelemetryParent() {},
+		close: closeSession,
+		observe: async () => events,
+	} as unknown as LixBinding;
+	const controller = startWorkerHost(
+		{
+			postMessage: (message) => responses.push(message),
+			onMessage: (listener) => (receive = listener),
+		},
+		async () => binding,
+	);
+	receive({
+		id: 1,
+		sessionId: 0,
+		operation: {
+			kind: "open",
+			storage: { kind: "memory" },
+			telemetryEnabled: false,
+			progressEnabled: false,
+		},
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 1, ok: true }));
+	receive({
+		id: 2,
+		sessionId: 0,
+		operation: { kind: "observe", sql: "SELECT 1", params: [] },
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 2, ok: true, value: 1 }));
+	receive({
+		id: 3,
+		sessionId: 0,
+		operation: { kind: "observe.close", observeId: 1 },
+	});
+	const shutdown = controller.close();
+	await Promise.resolve();
+	expect(closeSession).not.toHaveBeenCalled();
+	closeBarrier.resolve();
+	await shutdown;
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 3, ok: true }));
+	expect(closeSession).toHaveBeenCalledOnce();
+});
+
 test("disconnect drains active work but rejects queued writes and closes late observers", async () => {
 	const active = deferred<void>();
-	const observed=deferred<ObserveEventsBinding>();
+	const observed = deferred<ObserveEventsBinding>();
+	const observationCloseBarrier = deferred<void>();
 	const responses: WorkerResponse[] = [];
 	let receive!: (message: WorkerInput) => void;
 	const writes: string[] = [];
 	const closed = vi.fn(async () => {});
-	const observationClose = vi.fn();
-	const binding={setTelemetryParent(){},close:closed,
-  execute:async(sql:string)=>{writes.push(sql);await active.promise;return {columns:[],rows:[],rowsAffected:0,notices:[]};},
-  observe:async()=>observed.promise,
- } as unknown as LixBinding;
-	const controller = startWorkerHost({
-		postMessage: (message) => responses.push(message),
-		onMessage: (listener) => { receive = listener; },
-	}, async () => binding);
-	receive({id:1,sessionId:0,operation:{kind:"open",storage:{kind:"memory"},telemetryEnabled:false,progressEnabled:false}});
-	await vi.waitFor(()=>expect(responses).toContainEqual(expect.objectContaining({id:1,ok:true})));
-	receive({id:2,sessionId:0,operation:{kind:"execute",sql:"active write",params:[]}});
-	await vi.waitFor(()=>expect(writes).toEqual(["active write"]));
-	receive({id:3,sessionId:0,operation:{kind:"execute",sql:"queued write",params:[]}});
-	receive({id:4,sessionId:0,operation:{kind:"observe",sql:"SELECT value",params:[]}});
+	const observationClose = vi.fn(() => observationCloseBarrier.promise);
+	const binding = {
+		setTelemetryParent() {},
+		close: closed,
+		async execute(sql: string) {
+			writes.push(sql);
+			await active.promise;
+			return { columns: [], rows: [], rowsAffected: 0, notices: [] };
+		},
+		observe: async () => observed.promise,
+	} as unknown as LixBinding;
+	const controller = startWorkerHost(
+		{
+			postMessage: (message) => responses.push(message),
+			onMessage: (listener) => {
+				receive = listener;
+			},
+		},
+		async () => binding,
+	);
+	receive({
+		id: 1,
+		sessionId: 0,
+		operation: {
+			kind: "open",
+			storage: { kind: "memory" },
+			telemetryEnabled: false,
+			progressEnabled: false,
+		},
+	});
+	await vi.waitFor(() => expect(responses).toContainEqual({ id: 1, ok: true }));
+	receive({
+		id: 2,
+		sessionId: 0,
+		operation: { kind: "execute", sql: "active write", params: [] },
+	});
+	await vi.waitFor(() => expect(writes).toEqual(["active write"]));
+	receive({
+		id: 3,
+		sessionId: 0,
+		operation: { kind: "execute", sql: "queued write", params: [] },
+	});
+	receive({
+		id: 4,
+		sessionId: 0,
+		operation: { kind: "observe", sql: "SELECT value", params: [] },
+	});
 	const closing = controller.close();
 	expect(closed).not.toHaveBeenCalled();
-	observed.resolve({setTelemetryParent(){},next:async()=>undefined,close:observationClose});
+	let closeFinished = false;
+	void closing.then(() => {
+		closeFinished = true;
+	});
+	observed.resolve({
+		setTelemetryParent() {},
+		next: async () => undefined,
+		close: observationClose,
+	});
 	active.resolve();
+	await vi.waitFor(() => expect(observationClose).toHaveBeenCalledOnce());
+	for (let i = 0; i < 20; i++) await Promise.resolve();
+	expect(closeFinished).toBe(false);
+	expect(closed).not.toHaveBeenCalled();
+	observationCloseBarrier.resolve();
 	await closing;
 	expect(writes).toEqual(["active write"]);
-	expect(responses).toContainEqual(expect.objectContaining({id:3,ok:false}));
-	expect(responses).toContainEqual(expect.objectContaining({id:4,ok:false}));
+	expect(responses).toContainEqual(expect.objectContaining({ id: 3, ok: false }));
+	expect(responses).toContainEqual(expect.objectContaining({ id: 4, ok: false }));
 	expect(observationClose).toHaveBeenCalledTimes(1);
 	expect(closed).toHaveBeenCalledTimes(1);
 });

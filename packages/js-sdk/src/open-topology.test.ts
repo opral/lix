@@ -68,7 +68,7 @@ test.each(["sync", "replica", "unknown"])("unsupported mode %s fails before open
 
 test("remote execution rejects local-only options before opening", async () => {
 	await expect(
-		openLix({ server, telemetry: { onSpan() {} } } as never),
+		openLix({ server, telemetry: { onExport() {} } } as never),
 	).rejects.toThrow("does not accept local telemetry");
 	expect(mocks.remote).not.toHaveBeenCalled();
 });

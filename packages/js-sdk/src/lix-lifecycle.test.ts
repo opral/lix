@@ -72,6 +72,144 @@ test("managed Lix close rejects new work and drains an in-flight branch switch",
 	]);
 });
 
+test("close waits for native telemetry callbacks before flushing the host queue", async () => {
+	const order: string[] = [];
+	const binding = {
+		close: async () => order.push("engine closed"),
+		flushTelemetry: async () => order.push("native callbacks drained"),
+	} as unknown as LixBinding;
+	const lix = new Lix(binding, async () => {
+		order.push("host queue flushed");
+	});
+
+	await lix.close();
+	expect(order).toEqual([
+		"engine closed",
+		"native callbacks drained",
+		"host queue flushed",
+	]);
+});
+
+test("close drains an in-flight observation before native telemetry and host flush", async () => {
+	const order: string[] = [];
+	let startRead!: () => void;
+	let finishRead!: () => void;
+	const readStarted = new Promise<void>((resolve) => {
+		startRead = resolve;
+	});
+	const readFinished = new Promise<null>((resolve) => {
+		finishRead = () => {
+			order.push("observation read finished");
+			resolve(null);
+		};
+	});
+	const binding = {
+		observe: async () => ({
+			next: () => {
+				startRead();
+				return readFinished;
+			},
+			close: () => {
+				order.push("observation closed");
+				finishRead();
+			},
+		}),
+		close: async () => order.push("engine closed"),
+		flushTelemetry: async () => order.push("native callbacks drained"),
+	} as unknown as LixBinding;
+	const lix = new Lix(binding, async () => {
+		order.push("host queue flushed");
+	});
+	const observation = lix.observe("SELECT 1");
+	const pendingNext = observation.next();
+	await readStarted;
+
+	await lix.close();
+	await expect(pendingNext).resolves.toMatchObject({ done: true });
+	expect(order).toEqual([
+		"observation closed",
+		"observation read finished",
+		"engine closed",
+		"native callbacks drained",
+		"host queue flushed",
+	]);
+});
+
+test.each(["return", "abort"] as const)(
+	"close drains an observation canceled by %s before native telemetry",
+	async (cancel) => {
+		const order: string[] = [];
+		let startRead!: () => void;
+		let finishRead!: () => void;
+		let finishClose!: () => void;
+		const readStarted = new Promise<void>((resolve) => {
+			startRead = resolve;
+		});
+		const readFinished = new Promise<null>((resolve) => {
+			finishRead = () => {
+				order.push("observation read finished");
+				resolve(null);
+			};
+		});
+		const closeFinished = new Promise<void>((resolve) => {
+			finishClose = () => {
+				order.push("observation close finished");
+				resolve();
+			};
+		});
+		const binding = {
+			observe: async () => ({
+				next: () => {
+					startRead();
+					return readFinished;
+				},
+				close: async () => {
+					order.push("observation close requested");
+					await closeFinished;
+				},
+			}),
+			close: async () => order.push("engine closed"),
+			flushTelemetry: async () => order.push("native callbacks drained"),
+		} as unknown as LixBinding;
+		const lix = new Lix(binding, async () => {
+			order.push("host queue flushed");
+		});
+		const controller = new AbortController();
+		const observation = lix.observe("SELECT 1", [], {
+			signal: cancel === "abort" ? controller.signal : undefined,
+		});
+		const pendingNext = observation.next();
+		await readStarted;
+		let returnSettled = false;
+		let returning: Promise<unknown> | undefined;
+		if (cancel === "return") {
+			returning = observation.return?.().then((result) => {
+				returnSettled = true;
+				return result;
+			});
+		} else controller.abort();
+		await expect(pendingNext).resolves.toMatchObject({ done: true });
+
+		const closing = lix.close();
+		await Promise.resolve();
+		expect(order).toEqual(["observation close requested"]);
+		if (cancel === "return") expect(returnSettled).toBe(false);
+		finishRead();
+		finishClose();
+		await returning;
+		await closing;
+		if (cancel === "return") expect(returnSettled).toBe(true);
+		expect(order).toEqual([
+			"observation close requested",
+			"observation read finished",
+			"observation close finished",
+			"engine closed",
+			"native callbacks drained",
+			"host queue flushed",
+		]);
+	},
+);
+
 test("an active-transaction close preflight preserves the Lix and observations", async () => {
 	const observationClose = vi.fn();
 	const binding = {
@@ -162,7 +300,10 @@ test.each(["commit", "rollback"] as const)(
 		const completion = deferred<void>();
 		const transactionBinding = {
 			execute: vi.fn(),
-			commit: vi.fn(async () => { await completion.promise; return { commit: null }; }),
+			commit: vi.fn(async () => {
+				await completion.promise;
+				return { commit: null };
+			}),
 			rollback: vi.fn(async () => completion.promise),
 		};
 		const binding = {
@@ -224,7 +365,8 @@ test("batch and explicit transaction receipts survive the public boundary", asyn
 	const statement = { columns: [], rows: [], rowsAffected: 1, notices: [] };
 	const binding = {
 		executeBatch: vi.fn(async () => ({
-			results: [{ ...statement, statementIndex: 0, commit: span }], commit: span,
+			results: [{ ...statement, statementIndex: 0, commit: span }],
+			commit: span,
 		})),
 		beginTransaction: vi.fn(async () => ({
 			execute: vi.fn(async () => statement),
@@ -233,19 +375,32 @@ test("batch and explicit transaction receipts survive the public boundary", asyn
 		close: vi.fn(async () => undefined),
 	} as unknown as LixBinding;
 	const lix = new Lix(binding);
-	const batch = await lix.executeBatch([{ sql: "INSERT INTO example VALUES (1)" }]);
+	const batch = await lix.executeBatch([
+		{ sql: "INSERT INTO example VALUES (1)" },
+	]);
 	expect(batch.commit).toEqual(span);
 	expect(batch.results).toHaveLength(1);
 	expect(batch.results[0]).not.toHaveProperty("commit");
 	const tx = await lix.beginTransaction();
-	expect(await tx.execute("INSERT INTO example VALUES (2)")).not.toHaveProperty("commit");
+	expect(await tx.execute("INSERT INTO example VALUES (2)")).not.toHaveProperty(
+		"commit",
+	);
 	expect(await tx.commit()).toEqual({ commit: span });
 	await lix.close();
 });
 
 test("sync health reads the worker snapshot without issuing SQL", async () => {
-	const health = { state: "stalled", appliedCursor: 492, observedCursor: 543, failures: { descriptor: { code: "OFFLINE", message: "unavailable" } }, terminalError: null };
-	const binding = { syncHealth: vi.fn(async () => health), execute: vi.fn() } as unknown as LixBinding;
+	const health = {
+		state: "stalled",
+		appliedCursor: 492,
+		observedCursor: 543,
+		failures: { descriptor: { code: "OFFLINE", message: "unavailable" } },
+		terminalError: null,
+	};
+	const binding = {
+		syncHealth: vi.fn(async () => health),
+		execute: vi.fn(),
+	} as unknown as LixBinding;
 	const lix = new Lix(binding);
 	await expect(lix.syncHealth()).resolves.toEqual(health);
 	expect(binding.execute).not.toHaveBeenCalled();

@@ -22,6 +22,42 @@ console.log(result.rows[0]?.message);
 await lix.close();
 ```
 
+## OpenTelemetry spans
+
+Local and partial-replica handles can export engine spans as standard OTLP
+protobuf. Each callback receives a valid `ExportTraceServiceRequest` containing
+one completed span. Enqueue these bytes in a host-owned batch exporter; do not
+start a network request per callback. `flush` runs after `lix.close()` has
+stopped the engine and after every asynchronous `onExport` callback has settled.
+Delivery or flush errors reject `lix.close()` so the host can report missing
+telemetry. Provide W3C headers to make engine spans children of the active host span.
+Without a parent, Lix starts a sampled root trace. With a W3C parent, Lix honors
+its sampled flag; a parent with sampling flag `00` intentionally suppresses
+export. Hosts that need every query must provide a sampled parent or omit an
+unsampled parent so Lix can start its own trace.
+
+```ts
+const lix = await openLix({
+	storage,
+	server: { mode: "partial_replica", url: repositoryUrl },
+	telemetry: {
+		parentContext: () => ({ traceparent, tracestate }),
+		onExport: (request) => otlpBatchExporter.enqueue(request),
+		flush: () => otlpBatchExporter.flush(),
+	},
+});
+```
+
+The Lix SDK does not install a global tracer provider or exporter. The host
+owns trace resources, credentials, batching, and delivery. Lix omits OTLP
+resource identity so the host can attach its `service.name`, version, and
+deployment attributes to engine spans.
+
+SQL text is normalized and literal values are redacted. `lix.sql.fingerprint`
+hashes the full normalized statement, including when the exported text is
+truncated. Bound parameter values are not exported, so traces identify and
+group the query shape without sending potentially sensitive row data.
+
 ### File-qualified row references
 
 Construct row references in SQL with the relation, file scope, and typed
