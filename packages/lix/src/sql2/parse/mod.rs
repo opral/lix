@@ -160,18 +160,9 @@ fn rewrite_postgresql_expressions(statement: &mut DataFusionStatement) {
 
         fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
             if let Expr::Function(function) = expr {
-                let is_transaction_timestamp = function
-                    .name
-                    .0
-                    .last()
-                    .and_then(|part| match part {
-                        ObjectNamePart::Identifier(ident) => Some(ident.value.as_str()),
-                        ObjectNamePart::Function(_) => None,
-                    })
-                    .is_some_and(|name| {
-                        name.eq_ignore_ascii_case("current_timestamp")
-                            || name.eq_ignore_ascii_case("now")
-                    });
+                let is_transaction_timestamp =
+                    object_name_is_public_function(&function.name, "current_timestamp")
+                        || object_name_is_public_function(&function.name, "now");
                 let no_args = matches!(function.args, FunctionArguments::None)
                     || matches!(&function.args, FunctionArguments::List(list) if list.args.is_empty());
                 if is_transaction_timestamp && no_args {
@@ -331,6 +322,35 @@ mod tests {
     fn parses_postgresql_values_table_expression() {
         parse_statement("SELECT value FROM (VALUES ($1)) AS selected(value)")
             .expect("PostgreSQL VALUES table expression should parse");
+    }
+
+    #[test]
+    fn rewrites_only_postgresql_public_timestamp_function_names() {
+        for sql in [
+            "SELECT now()",
+            "SELECT NOW()",
+            "SELECT public.now()",
+            "SELECT \"now\"()",
+            "SELECT current_timestamp()",
+        ] {
+            let statement = parse_statement(sql).expect("timestamp expression should parse");
+            assert!(
+                statement.to_string().contains("__lix_current_timestamp"),
+                "{sql} should use the transaction timestamp"
+            );
+        }
+
+        for sql in [
+            "SELECT private.now()",
+            "SELECT \"NOW\"()",
+            "SELECT private.current_timestamp()",
+        ] {
+            let statement = parse_statement(sql).expect("qualified expression should parse");
+            assert!(
+                !statement.to_string().contains("__lix_current_timestamp"),
+                "{sql} should retain its PostgreSQL identifier"
+            );
+        }
     }
 
     #[test]
