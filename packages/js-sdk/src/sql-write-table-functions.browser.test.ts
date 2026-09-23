@@ -31,6 +31,38 @@ test("uses native SQL table functions in browser writes", async () => {
 		);
 		expect(inserted.rows[0]?.key).toBe("wasm-diff-copy");
 
+		const changeInserted = await lix.execute(
+			`INSERT INTO lix_key_value (key, value)
+				 SELECT 'wasm-change-copy-' || id, schema_key
+				 FROM lix_change
+				 WHERE schema_key = 'lix_key_value'
+				 ORDER BY created_at DESC
+				 LIMIT 1
+				 RETURNING key`,
+		);
+		expect(String(changeInserted.rows[0]?.key)).toMatch(
+			/^wasm-change-copy-/,
+		);
+
+		const beforeUpdateCount = Number(
+			(
+				await lix.execute(
+					"SELECT COUNT(*) AS n FROM lix_change WHERE schema_key = 'lix_key_value'",
+				)
+			).rows[0]?.n,
+		);
+		const returnedSubquery = await lix.execute(
+			`UPDATE lix_key_value SET value = 'updated-in-wasm'
+				 WHERE key = 'wasm-diff-source'
+				 RETURNING key,
+					 (SELECT COUNT(*) FROM lix_change
+					  WHERE schema_key = 'lix_key_value') AS visible_changes`,
+		);
+		expect(returnedSubquery.rows[0]?.key).toBe("wasm-diff-source");
+		expect(Number(returnedSubquery.rows[0]?.visible_changes)).toBe(
+			beforeUpdateCount,
+		);
+
 		const nullRowRef = await lix.execute(
 			"SELECT lix_row_ref('lix_key_value', NULL, NULL) AS row_ref",
 		);
