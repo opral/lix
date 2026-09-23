@@ -94,7 +94,7 @@ async fn child_session_preserves_real_storage_errors_and_parent_lifecycle() {
         .await
         .err()
         .expect("real storage failure must escape");
-    assert_eq!(error.code, LixError::CODE_STORAGE_ERROR);
+    assert_eq!(error.code, LixError::CODE_STORAGE_CORRUPTION);
     assert!(error.message.contains("admission-corrupt"));
     assert_eq!(storage.read_calls.load(Ordering::SeqCst), 1);
     assert_eq!(Arc::strong_count(&root.engine), baseline);
