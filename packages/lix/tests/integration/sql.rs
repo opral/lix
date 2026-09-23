@@ -119,6 +119,7 @@ mod prepared_path_value;
 mod read_only;
 mod recovery_functions;
 mod recovery_regressions;
+mod recursive_ctes;
 mod row_ref;
 mod row_refs;
 mod sql_expression_fuzz;
