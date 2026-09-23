@@ -4288,6 +4288,7 @@ where
                 Ok(result)
             }
             .await;
+            transaction.finish_sql_statement_reads();
             if result.is_err() {
                 if let Some(function_checkpoint) = function_checkpoint {
                     transaction

@@ -5,6 +5,7 @@ mod commit;
 mod commit_coordinator;
 mod context;
 mod normalization;
+mod read_set;
 mod schema_resolver;
 mod staged_commit_changes;
 mod staging;

@@ -274,7 +274,9 @@ Each handle permits one opening or active explicit transaction at a time. Use `o
 
 Commit or roll back the transaction before closing the original handle. Closing with an opening or active transaction still fails with `LIX_INVALID_TRANSACTION_STATE`.
 
-SQL `UPDATE` and `DELETE` decisions, and successful explicit SQL reads used to decide later writes, are protected until commit. If another transaction changes active-branch or shared/global state after this transaction opens, committing its writes fails with `LIX_TRANSACTION_CONFLICT`. Read-only transactions can still commit successfully and return `{ commit: null }`. Start a new transaction and rerun its statements against current state. This is a conservative branch check, including untracked rows: even changes to unrelated rows can require a retry. A successfully planned update or delete retains this check if it matches no rows or subsequently fails and the transaction continues with other writes.
+SQL `UPDATE` and `DELETE` decisions, and successful explicit SQL reads used to decide later writes, are protected until commit. When another commit lands on the branch after this transaction opens, Lix re-checks exactly what those decisions depended on: every row an explicit read or `UPDATE`/`DELETE` predicate returned or could have matched, and every row the transaction writes. Commits that touched none of them are rebased onto the new head and the transaction commits normally, so concurrent writes to unrelated rows, other files, or other tables do not interfere. If a concurrent commit changed, inserted, or deleted one of those rows, committing fails with `LIX_TRANSACTION_CONFLICT` and nothing is published; this prevents lost updates and write skew on rows the transaction read. `lix_file` statements that select files by `id` are checked per file; a `path` predicate is resolved through the branch's whole path index and still conflicts with concurrent file writes. Plugin-backed file content is checked per file: a plugin re-derives all of a file's rows from its content, so any concurrent change to the same file conflicts. Reads of branch, history, change, or checkpoint state (`lix_branch`, `lix_change`, `lix_history`, `lix_diff`, `lix_as_of`, `lix_commit_ancestry`, `lix_active_branch_commit_id()`, `lix_root_commit_id()`, `lix_working_diff_checkpoint_commit_id()`, checkpoint functions) cannot be validated row by row; a transaction that read them conflicts with any concurrent change to its branch or to shared/global state. A concurrent schema registration or change also conflicts, because the transaction's statements were planned against the previous schema catalog. Constraint checks (uniqueness, row references) and `ON DELETE` actions are re-evaluated against the latest state when a transaction is rebased. Read-only transactions always commit successfully and return `{ commit: null }`. A successfully planned update or delete keeps its rows protected even if it matches no rows or subsequently fails and the transaction continues with other writes.
+
+A conflict error's `details` say what overlapped: `reason` is `readSetChanged` or `writeSetChanged` with `overlaps` listing up to eight `{ branchId, schemaKey, fileId, rowPk }` identities (and `overlapCount` the total), `unvalidatedReadChanged` with `source` naming the read that has no row-level validation (including a concurrent schema catalog change), `staleSnapshotNotRebased` when the transaction's writes (for example untracked or global rows) cannot be rebased onto a newer head, or `commitRaced` when another commit won the final atomic publication. `retryable` is `true` in every case. Start a new transaction and rerun its statements against current state, or use `lix.transaction()` to do that automatically.
 
 Rows returned by `RETURNING` inside a transaction are provisional. Report a publication as successful only after `commit()` succeeds. Automatic `execute()` and `executeBatch()` can rerun the whole statement or batch after a known failed transaction. Explicit transactions remain caller-controlled.
 
@@ -308,6 +310,29 @@ try {
   throw error;
 }
 ```
+
+### transaction()
+
+```ts
+const { value, commit, retries } = await lix.transaction(
+  async (tx) => {
+    const { rows } = await tx.execute(
+      "SELECT value FROM lix_key_value WHERE key = 'counter'",
+    );
+    const next = (rows[0]?.value as number) + 1;
+    await tx.execute(
+      "UPDATE lix_key_value SET value = $1 WHERE key = 'counter'",
+      [next],
+    );
+    return next;
+  },
+  { maxRetries: 3 },
+);
+```
+
+Runs the callback in an explicit transaction and commits it. If the commit (or a statement) fails with `LIX_TRANSACTION_CONFLICT`, the transaction is rolled back and the callback runs again on a fresh transaction, up to `maxRetries` times (default `3`; `0` never reruns). Any other error rolls the transaction back and rejects immediately. After the last allowed rerun, the conflict rejects with `details.transactionRetryCount` and `details.maxTransactionRetries` added.
+
+Returns `{ value, commit, retries }`: the callback's return value from the attempt that committed, that attempt's `CommitSpan` (or `null` for a read-only transaction), and how many reruns were needed. The callback must not commit or roll back `tx` itself, and side effects outside the transaction must tolerate being repeated.
 
 ### activeBranchId()
 

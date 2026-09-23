@@ -74,7 +74,7 @@ These are the named categories defined on [LixError](../packages/lix/src/common/
 | `LIX_IDEMPOTENCY_KEY_REQUIRED` | A server SQL mutation did not provide the required replay identity. |
 | `LIX_IDEMPOTENCY_KEY_REUSED` | A replay identity was reused for a different logical mutation. |
 | `LIX_IDEMPOTENCY_RESPONSE_TOO_LARGE` | A mutation response cannot be retained safely for idempotent replay. |
-| `LIX_TRANSACTION_CONFLICT` | Optimistic transaction publication lost a race with a newer commit. |
+| `LIX_TRANSACTION_CONFLICT` | Optimistic transaction publication lost a race with a newer commit that changed rows the transaction read for a decision or writes. `details.reason` and `details.overlaps` describe the overlap; `details.retryable` is `true`. |
 | `LIX_INTERNAL_ERROR` | An internal engine invariant failed. |
 | `LIX_ERROR_INVALID_PLUGIN` | A plugin ZIP package or manifest is malformed, unsafe, or exceeds the static resource bounds accepted by the engine. Invalid embedded Lix schema definitions retain `CODE_SCHEMA_DEFINITION`. |
 | `LIX_ERROR_PLUGIN_UNAVAILABLE` | A file is materialized as durable plugin state, but the plugin needed to render that state is not installed on the file's branch. |
