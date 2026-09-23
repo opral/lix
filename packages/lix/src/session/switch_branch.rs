@@ -54,8 +54,18 @@ where
             // the branch shared by session clones untouched, so ordinary writes
             // can continue on the old branch and cannot commit to a target that
             // this switch later abandons.
-            let candidate = self.branch_switch_candidate(branch_id.clone());
+            let candidate = self.branch_switch_candidate(branch_id.clone())?;
             candidate.refresh_active_branch_base_if_stale().await?;
+            let prepared_global_head = candidate
+                .observed_global_head
+                .read()
+                .map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "session global-head observation is poisoned",
+                    )
+                })?
+                .clone();
 
             // Take write access only at publication. This drains operations
             // still using the old selector, then the final validation fences
@@ -77,37 +87,22 @@ where
             self.ensure_open()?;
 
             // A global commit can race the gap between target refresh and
-            // selector publication. Recheck under write access and prepare
-            // again if the target's pinned base became stale in that gap.
+            // selector publication. Recheck the session's freshness watermark
+            // under write access and prepare again if global advanced. The
+            // target's pinned base can intentionally predate the observed head;
+            // comparing the two directly would create an unnecessary commit
+            // every time the session switches back to that branch.
             let target_is_current = if branch_id == crate::GLOBAL_BRANCH_ID
                 || self.sync_mode.role() == crate::sync::SyncRole::PartialReplica
             {
                 true
             } else {
-                let target_head = reader.load_head_commit_id(&branch_id).await?;
-                let global_head = reader
-                    .load_head_commit_id(crate::GLOBAL_BRANCH_ID)
-                    .await?;
-                match (target_head, global_head) {
-                    (Some(target_head), Some(global_head)) => {
-                        let target_node = crate::commit_graph::CommitGraphContext::new()
-                            .reader(&read)
-                            .load_node(&target_head)
-                            .await?
-                            .ok_or_else(|| {
-                                LixError::new(
-                                    LixError::CODE_COMMIT_NOT_FOUND,
-                                    format!("active branch head '{target_head}' does not exist"),
-                                )
-                            })?;
-                        // A branch head with no local base is a direct global
-                        // root; reads resolve its base to the current global
-                        // head. Only a pinned local overlay can be stale here.
-                        target_node.base_commit_id.is_none()
-                            || target_node.base_commit_id == Some(global_head)
-                    }
-                    // The refresh path also treats an absent target/global
-                    // head as a no-op, so there is no stale base to retry.
+                let global_head = reader.load_head_commit_id(crate::GLOBAL_BRANCH_ID).await?;
+                match (prepared_global_head.as_ref(), global_head.as_ref()) {
+                    (Some(prepared), Some(current)) => prepared == current,
+                    // A missing observation means the candidate had no global
+                    // head to refresh against. The refresh path treats an
+                    // absent target/global head as a no-op.
                     _ => true,
                 }
             };
@@ -126,7 +121,7 @@ where
                 )
             })?;
             self.branch.set(branch_id.clone())?;
-            *observed_global_head = None;
+            *observed_global_head = prepared_global_head;
             self.observe_invalidation.bump();
             drop(observed_global_head);
             drop(reader);
@@ -698,19 +693,19 @@ mod tests {
                 .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            write.await.expect("cloned write task").expect("cloned write");
+            write
+                .await
+                .expect("cloned write task")
+                .expect("cloned write");
         })
         .await
         .expect("write can finish against the still-published branch");
 
         storage.gate.release_with_failure();
-        let switch_result = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            switch,
-        )
-        .await
-        .expect("switch finishes after refresh fails")
-        .expect("switch task");
+        let switch_result = tokio::time::timeout(std::time::Duration::from_secs(30), switch)
+            .await
+            .expect("switch finishes after refresh fails")
+            .expect("switch task");
         switch_result.expect_err("refresh read was injected to fail");
 
         assert_eq!(
@@ -743,7 +738,10 @@ mod tests {
             .rows()[0]
             .get::<i64>("n")
             .expect("target count");
-        assert_eq!(target_count, 0, "failed switch must not leak writes to target");
+        assert_eq!(
+            target_count, 0,
+            "failed switch must not leak writes to target"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
