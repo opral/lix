@@ -2917,7 +2917,7 @@ fn sql2_row_provider_registration_is_catalog_driven() {
     let read_registration = source_between(
         relative,
         &source,
-        "pub(crate) async fn register_row_providers",
+        "pub(crate) fn register_row_providers",
         "pub(crate) async fn register_row_write_providers",
     );
     let write_registration = source_between(
