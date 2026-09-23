@@ -752,26 +752,20 @@ fn wide_offsets_are_engaged_only_past_the_u16_boundary() {
 fn canonicality_jsonb_key_order_mechanism_is_pinned() {
     // MUTATION FINDING (run nonce vlayout-8813): deleting the explicit
     // `entries.sort_by(...)` from the JSONB normaliser left the whole
-    // canonicality suite GREEN. The sort is currently redundant, because
-    // `serde_json::Map` without the `preserve_order` feature IS a
-    // `BTreeMap<String, Value>`, which serialises in sorted key order already.
+    // canonicality suite GREEN. DataFusion enables `serde_json/preserve_order`
+    // workspace-wide, so source insertion order survives in `serde_json::Map`.
     //
-    // So key-order canonicality rests on TWO independent mechanisms, and a test
-    // that only exercises the encoder cannot tell which one is carrying it.
-    // This test pins the one that lives outside our code: if any crate in the
-    // workspace ever turns on `serde_json/preserve_order` (cargo unifies
-    // features across the whole graph), raw serde_json stops sorting and this
-    // assertion fails loudly — pointing at the fact that the normaliser's sort
-    // has become load-bearing, rather than letting it change silently.
+    // Pin that dependency behavior here so this test makes the explicit
+    // normalizer sort load-bearing. If DataFusion or another dependency stops
+    // enabling preserve_order, reevaluate the test rather than assuming the
+    // normalizer sort is independently covered.
     let raw = serde_json::from_str::<serde_json::Value>(r#"{"b":1,"a":2,"C":3}"#)
         .unwrap()
         .to_string();
     assert_eq!(
-        raw, r#"{"C":3,"a":2,"b":1}"#,
-        "serde_json is expected to be built WITHOUT `preserve_order`, so its Map \
-         sorts keys by byte order. If this fails, `preserve_order` was enabled \
-         somewhere in the workspace and JSONB key-order canonicality now depends \
-         solely on normalise_jsonb's sort_by."
+        raw, r#"{"b":1,"a":2,"C":3}"#,
+        "serde_json is expected to retain object insertion order with DataFusion's \
+         `preserve_order` feature, so JSONB canonicality depends on normalise_jsonb's sort_by."
     );
 
     // Independently of which mechanism carries it, the encoder must be

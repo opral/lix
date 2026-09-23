@@ -26,7 +26,7 @@ test("serializes SQL integers and JSONB numbers as JavaScript numbers", async ()
 
 		await expect(
 			lix.execute("SELECT 9007199254740992::BIGINT AS value"),
-		).rejects.toThrow(/safe integer range/);
+		).rejects.toThrow(/safe (?:integer|numeric) range/);
 	} finally {
 		await lix.close();
 	}
