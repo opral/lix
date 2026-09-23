@@ -3037,6 +3037,27 @@ impl PendingConstraintIndexes {
         })
     }
 
+    fn has_global_fk_target_key(&self, key: &PendingForeignKeyTargetKey) -> bool {
+        global_scope_domain(&key.domain)
+            .fk_target_domains()
+            .into_iter()
+            .any(|domain| {
+                let global_key = PendingForeignKeyTargetKey {
+                    domain: domain.clone(),
+                    ..key.clone()
+                };
+                self.fk_targets.get(&global_key).is_some_and(|targets| {
+                    targets.iter().any(|target| {
+                        !self.tombstones_target_identity(&DomainRowIdentity::new(
+                            domain.clone(),
+                            key.schema_key.clone(),
+                            target.row_pk.clone(),
+                        ))
+                    })
+                })
+            })
+    }
+
     fn active_references_to(
         &self,
         target: &PendingForeignKeyReferenceTarget,
@@ -3063,6 +3084,21 @@ impl PendingConstraintIndexes {
     fn has_reachable_row_ref_target(&self, target: &DomainRowIdentity) -> bool {
         target
             .domain()
+            .fk_target_domains()
+            .into_iter()
+            .any(|domain| {
+                let identity = DomainRowIdentity::new(
+                    domain,
+                    target.schema_key_owned(),
+                    target.row_pk_owned(),
+                );
+                self.identity_targets.contains(&identity)
+                    && !self.tombstone_identities.contains(&identity)
+            })
+    }
+
+    fn has_global_row_ref_target(&self, target: &DomainRowIdentity) -> bool {
+        global_scope_domain(target.domain())
             .fk_target_domains()
             .into_iter()
             .any(|domain| {
@@ -3897,6 +3933,7 @@ struct UnresolvedForeignKeyCheck {
     source_schema_key: String,
     source_pointer_group: Vec<Vec<String>>,
     target: PendingForeignKeyTargetKey,
+    target_exists_in_global_scope: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3906,6 +3943,7 @@ struct UnresolvedRowRefCheck {
     source_column: String,
     encoded_target: String,
     target: DomainRowIdentity,
+    target_exists_in_global_scope: bool,
 }
 
 fn row_ref_text_from_payload(
@@ -3987,6 +4025,7 @@ fn validate_pending_row_refs(
                 source_column: target.column.clone(),
                 encoded_target: target.encoded_target.clone(),
                 target: target.target.clone(),
+                target_exists_in_global_scope: false,
             });
         }
     }
@@ -4056,24 +4095,124 @@ async fn validate_committed_row_refs(
         }
         unresolved.push(check.clone());
     }
+
+    let global_matches = match committed_global_row_ref_targets(
+        input,
+        pending_constraints,
+        &unresolved,
+    )
+    .await
+    {
+        Ok(matches) => matches,
+        Err(error) => {
+            tracing::debug!(
+                target: "lix.validation",
+                ?error,
+                "global row-reference diagnostic lookup failed; retaining the exact-scope rejection"
+            );
+            HashSet::new()
+        }
+    };
+    for check in &mut unresolved {
+        check.target_exists_in_global_scope = global_matches.contains(&check.target);
+    }
     Ok(unresolved)
+}
+
+/// Finds global rows that match already-unresolved local row-reference targets.
+///
+/// This is deliberately a diagnostic-only pass. The local lookup above remains
+/// authoritative, so a global row can explain a rejection but never satisfy a
+/// branch-local row reference. Exact identities are grouped by global domain
+/// and schema before probing, which keeps one point-read batch per scope.
+async fn committed_global_row_ref_targets(
+    input: &TransactionValidationInput<'_>,
+    pending_constraints: &PendingConstraintIndexes,
+    unresolved_checks: &[UnresolvedRowRefCheck],
+) -> Result<HashSet<DomainRowIdentity>, LixError> {
+    let mut matched = HashSet::new();
+    let mut batches = BTreeMap::<(Domain, String), BTreeSet<RowPk>>::new();
+    let mut targets_by_identity =
+        BTreeMap::<(Domain, String, RowPk), Vec<DomainRowIdentity>>::new();
+
+    for check in unresolved_checks {
+        if check.source_identity.domain().branch_id() == crate::GLOBAL_BRANCH_ID {
+            continue;
+        }
+        if pending_constraints.has_global_row_ref_target(&check.target) {
+            matched.insert(check.target.clone());
+            continue;
+        }
+        for domain in global_scope_domain(check.target.domain()).fk_target_domains() {
+            targets_by_identity
+                .entry((
+                    domain.clone(),
+                    check.target.schema_key_owned(),
+                    check.target.row_pk_owned(),
+                ))
+                .or_default()
+                .push(check.target.clone());
+            batches
+                .entry((domain, check.target.schema_key_owned()))
+                .or_default()
+                .insert(check.target.row_pk_owned());
+        }
+    }
+
+    for ((domain, schema_key), row_pks) in batches {
+        let rows = scan_committed_canonical_rows_in_domain(
+            input.hot_state,
+            &domain,
+            &schema_key,
+            row_pks.into_iter().collect(),
+        )
+        .await?;
+        for row in rows.iter() {
+            if pending_constraints.tombstones_identity(row)
+                || pending_constraints.replaces_committed_identity(row)
+                || !domain.contains_ref(row)
+            {
+                continue;
+            }
+            if let Some(targets) = targets_by_identity.get(&(
+                domain.clone(),
+                row.schema_key().to_owned(),
+                row.row_pk().clone(),
+            )) {
+                matched.extend(targets.iter().cloned());
+            }
+        }
+    }
+    Ok(matched)
 }
 
 fn reject_unresolved_row_refs(unresolved_checks: &[UnresolvedRowRefCheck]) -> Result<(), LixError> {
     let Some(check) = unresolved_checks.first() else {
         return Ok(());
     };
-    Err(LixError::new(
+    let mut error = LixError::new(
         LixError::CODE_FOREIGN_KEY,
         format!(
-            "row-reference constraint on schema '{}' row '{}' column '{}' has no matching target '{}' in branch '{}'",
+            "row-reference constraint on schema '{}' row '{}' column '{}' has no matching target '{}' in branch '{}'{}",
             check.source_schema_key,
             check.source_identity.row_pk().as_json_array_text()?,
             check.source_column,
             check.encoded_target,
             check.source_identity.domain().branch_id(),
+            if check.target_exists_in_global_scope {
+                "; a matching target exists in global scope, but branch-local row references require the target to use the source row's scope"
+            } else {
+                ""
+            },
         ),
-    ))
+    );
+    if check.target_exists_in_global_scope {
+        error = error.with_hint(format!(
+            "The source row is local to branch '{}'. Create the target in that branch, or make the source row global so both rows use the same scope.",
+            check.source_identity.domain().branch_id(),
+        ));
+    }
+    Err(error)
 }
 
 fn validate_pending_foreign_keys(
@@ -4161,6 +4300,7 @@ fn validate_pending_normal_foreign_key(
         source_schema_key: row.schema_key().to_string(),
         source_pointer_group: foreign_key.local_properties.clone(),
         target: key,
+        target_exists_in_global_scope: false,
     }))
 }
 
@@ -4175,6 +4315,11 @@ fn foreign_key_target_domain(
     } else {
         row.domain()
     }
+}
+
+fn global_scope_domain(domain: &Domain) -> Domain {
+    Domain::exact_file(crate::GLOBAL_BRANCH_ID, domain.untracked(), None)
+        .with_file_scope(domain.file_scope().clone())
 }
 
 async fn validate_committed_foreign_keys(
@@ -4195,6 +4340,27 @@ async fn validate_committed_foreign_keys(
             still_unresolved.push(check.clone());
         }
     }
+
+    let global_matches = match committed_global_foreign_key_targets(
+        input,
+        pending_constraints,
+        &still_unresolved,
+    )
+    .await
+    {
+        Ok(matches) => matches,
+        Err(error) => {
+            tracing::debug!(
+                target: "lix.validation",
+                ?error,
+                "global foreign-key diagnostic lookup failed; retaining the exact-scope rejection"
+            );
+            BTreeSet::new()
+        }
+    };
+    for check in &mut still_unresolved {
+        check.target_exists_in_global_scope = global_matches.contains(&check.target);
+    }
     Ok(still_unresolved)
 }
 
@@ -4204,17 +4370,29 @@ fn reject_unresolved_foreign_keys(
     let Some(check) = unresolved_checks.first() else {
         return Ok(());
     };
-    Err(LixError::new(
+    let mut error = LixError::new(
         LixError::CODE_FOREIGN_KEY,
         format!(
-            "foreign key on schema '{}' row '{}' via {} has no matching target in branch '{}'{}",
+            "foreign key on schema '{}' row '{}' via {} has no matching target in branch '{}'{}{}",
             check.source_schema_key,
             check.source_identity.row_pk().as_json_array_text()?,
             format_pointer_group(&check.source_pointer_group),
             check.source_identity.domain().branch_id(),
-            unresolved_foreign_key_target_description(&check.target)?
+            unresolved_foreign_key_target_description(&check.target)?,
+            if check.target_exists_in_global_scope {
+                "; a matching target exists in global scope, but branch-local foreign keys require the target to use the source row's scope"
+            } else {
+                ""
+            },
         ),
-    ))
+    );
+    if check.target_exists_in_global_scope {
+        error = error.with_hint(format!(
+            "The source row is local to branch '{}'. Create the target in that branch, or make the source row global so both rows use the same scope.",
+            check.source_identity.domain().branch_id(),
+        ));
+    }
+    Err(error)
 }
 
 fn unresolved_foreign_key_target_description(
@@ -4248,7 +4426,9 @@ async fn committed_normal_foreign_key_target_exists(
         .await?;
 
         for row in rows.iter() {
-            if pending_constraints.tombstones_identity(row) {
+            if pending_constraints.tombstones_identity(row)
+                || pending_constraints.replaces_committed_identity(row)
+            {
                 continue;
             }
             if row.schema_key() != target.schema_key {
@@ -4263,6 +4443,96 @@ async fn committed_normal_foreign_key_target_exists(
         }
     }
     Ok(false)
+}
+
+/// Finds global rows matching already-unresolved local foreign-key targets.
+///
+/// This pass only supplies a scope-mismatch diagnostic. The exact source-scope
+/// lookup remains authoritative, so a global match is never returned as a
+/// successful foreign-key resolution. Targets are grouped by global domain,
+/// schema, and referenced property group. Only primary-key groups are probed:
+/// each gets one bounded point-read batch. Non-primary-key groups are omitted
+/// here because a diagnostic-only fallback scan could turn a missing target
+/// into an unbounded collection read.
+async fn committed_global_foreign_key_targets(
+    input: &TransactionValidationInput<'_>,
+    pending_constraints: &PendingConstraintIndexes,
+    unresolved_checks: &[UnresolvedForeignKeyCheck],
+) -> Result<BTreeSet<PendingForeignKeyTargetKey>, LixError> {
+    let mut matched = BTreeSet::new();
+    let mut batches = BTreeMap::<
+        (Domain, String, Vec<Vec<String>>),
+        BTreeMap<UniqueConstraintValue, Vec<PendingForeignKeyTargetKey>>,
+    >::new();
+
+    for check in unresolved_checks {
+        if check.source_identity.domain().branch_id() == crate::GLOBAL_BRANCH_ID {
+            continue;
+        }
+        if pending_constraints.has_global_fk_target_key(&check.target) {
+            matched.insert(check.target.clone());
+            continue;
+        }
+        for domain in global_scope_domain(&check.target.domain).fk_target_domains() {
+            batches
+                .entry((
+                    domain,
+                    check.target.schema_key.clone(),
+                    check.target.pointer_group.clone(),
+                ))
+                .or_default()
+                .entry(check.target.value.clone())
+                .or_default()
+                .push(check.target.clone());
+        }
+    }
+
+    for ((domain, schema_key, pointer_group), values) in batches {
+        let mut row_pks = Vec::with_capacity(values.len());
+        for value in values.keys() {
+            let target = PendingForeignKeyTargetKey {
+                schema_key: schema_key.clone(),
+                domain: domain.clone(),
+                pointer_group: pointer_group.clone(),
+                value: value.clone(),
+            };
+            let Some(row_pk) = primary_key_row_pk_for_target(input.schema_catalog, &target) else {
+                row_pks.clear();
+                break;
+            };
+            row_pks.push(row_pk);
+        }
+        if row_pks.len() != values.len() {
+            continue;
+        }
+
+        let rows = scan_committed_constraint_rows(
+            input.hot_state,
+            &domain,
+            vec![schema_key.clone()],
+            row_pks,
+            false,
+        )
+        .await?;
+        for row in rows.iter() {
+            if pending_constraints.tombstones_identity(row)
+                || pending_constraints.replaces_committed_identity(row)
+                || row.schema_key() != schema_key
+                || !domain.contains_ref(row)
+            {
+                continue;
+            }
+            let Some(value) =
+                committed_constraint_value(input.schema_catalog, row, &pointer_group, false)?
+            else {
+                continue;
+            };
+            if let Some(targets) = values.get(&value) {
+                matched.extend(targets.iter().cloned());
+            }
+        }
+    }
+    Ok(matched)
 }
 
 fn primary_key_row_pk_for_target(
@@ -7592,6 +7862,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validation_reports_global_foreign_key_scope_mismatch() {
+        let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
+        let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
+            state_rows: prepared_rows![fk_child_row(
+                "child-1",
+                "parent-1",
+                "01920000-0000-7000-8000-0000000000a1",
+            )],
+            ..empty_staged_write_set()
+        };
+        let mut global_parent = fk_parent_row("parent-1", crate::GLOBAL_BRANCH_ID);
+        global_parent.global = true;
+        let hot_state = StaticHotStateReader {
+            rows: vec![MaterializedHotStateRow::from(global_parent)],
+        };
+
+        let error =
+            validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+                &staged_writes,
+                &visible_schemas,
+                &hot_state,
+            ))
+            .await
+            .expect_err("a global FK target must not satisfy a local source");
+
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+        assert!(
+            error
+                .message
+                .contains("matching target exists in global scope")
+        );
+        assert!(error.message.contains(
+            "branch-local foreign keys require the target to use the source row's scope"
+        ));
+        assert_eq!(
+            error.hint.as_deref(),
+            Some(
+                "The source row is local to branch '01920000-0000-7000-8000-0000000000a1'. Create the target in that branch, or make the source row global so both rows use the same scope."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn global_fk_diagnostic_ignores_replaced_committed_identity() {
+        let visible_schemas = vec![fk_parent_schema()];
+        let staged_writes = empty_staged_write_set();
+        let mut replacement = fk_parent_row("parent-2", crate::GLOBAL_BRANCH_ID);
+        replacement.global = true;
+        retarget_test_row(&mut replacement, RowPk::single("parent-1"));
+        let replacement_snapshot = test_snapshot_json(&replacement);
+        let mut pending_constraints = PendingConstraintIndexes::default();
+        pending_constraints
+            .remember_row(
+                PreparedValidationRow::State(replacement.borrowed()),
+                test_plan_from_schema(fk_parent_schema()),
+                &replacement_snapshot,
+            )
+            .expect("replacement should index as a pending target");
+
+        let target = PendingForeignKeyTargetKey {
+            schema_key: "fk_parent_schema".into(),
+            domain: Domain::exact_file(
+                "01920000-0000-7000-8000-0000000000a1",
+                false,
+                Some("01920000-0000-7000-8000-0000000000a2".into()),
+            ),
+            pointer_group: vec![vec!["id".into()]],
+            value: UniqueConstraintValue::string_values(["parent-1"]),
+        };
+        let check = UnresolvedForeignKeyCheck {
+            source_identity: DomainRowIdentity::exact(
+                "01920000-0000-7000-8000-0000000000a1",
+                false,
+                Some("01920000-0000-7000-8000-0000000000a2".into()),
+                "fk_child_schema",
+                RowPk::single("child-1"),
+            ),
+            source_schema_key: "fk_child_schema".into(),
+            source_pointer_group: vec![vec!["parent_id".into()]],
+            target,
+            target_exists_in_global_scope: false,
+        };
+        let committed_global_parent =
+            MaterializedHotStateRow::from(fk_parent_row("parent-1", crate::GLOBAL_BRANCH_ID));
+        let hot_state = StrictStaticHotStateReader {
+            rows: vec![committed_global_parent],
+        };
+        let input = TransactionValidationInput::from_visible_schemas_for_tests(
+            &staged_writes,
+            &visible_schemas,
+            &hot_state,
+        );
+
+        let matches = committed_global_foreign_key_targets(&input, &pending_constraints, &[check])
+            .await
+            .expect("global diagnostic lookup should succeed");
+
+        assert!(
+            matches.is_empty(),
+            "a committed target replaced by a staged row must not produce a global hint"
+        );
+    }
+
+    #[tokio::test]
     async fn validation_allows_foreign_key_target_in_same_branch() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
@@ -7917,6 +8292,44 @@ mod tests {
         ))
         .await
         .expect("untracked tombstone must not hide a tracked row-ref target");
+    }
+
+    #[tokio::test]
+    async fn validation_reports_global_row_ref_scope_mismatch() {
+        let visible_schemas = vec![row_ref_parent_schema(), row_ref_child_schema()];
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let staged_writes = PreparedWriteSet {
+            branch_heads: Default::default(),
+            state_rows: prepared_rows![row_ref_child_row("child-1", "parent-1", branch_id)],
+            ..empty_staged_write_set()
+        };
+        let mut global_parent = row_ref_parent_row("parent-1", crate::GLOBAL_BRANCH_ID);
+        global_parent.global = true;
+        let hot_state = StaticHotStateReader {
+            rows: vec![MaterializedHotStateRow::from(global_parent)],
+        };
+
+        let error =
+            validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+                &staged_writes,
+                &visible_schemas,
+                &hot_state,
+            ))
+            .await
+            .expect_err("a global row-ref target must not satisfy a local source");
+
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+        assert!(
+            error
+                .message
+                .contains("matching target exists in global scope")
+        );
+        assert_eq!(
+            error.hint.as_deref(),
+            Some(
+                "The source row is local to branch '01920000-0000-7000-8000-0000000000a1'. Create the target in that branch, or make the source row global so both rows use the same scope."
+            )
+        );
     }
 
     #[tokio::test]
@@ -9153,6 +9566,54 @@ mod tests {
         assert!(
             still_unresolved.is_empty(),
             "same-branch committed parent should satisfy unresolved FK"
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_fk_lookup_ignores_replaced_non_primary_key_target() {
+        let mut indexes = PendingConstraintIndexes::default();
+        let mut replacement = unique_row("post-2", "new-slug", "replacement");
+        retarget_test_row(&mut replacement, RowPk::single("post-1"));
+        let replacement_snapshot = test_snapshot_json(&replacement);
+        indexes
+            .remember_row(
+                PreparedValidationRow::State(replacement.borrowed()),
+                test_plan_from_schema(unique_schema()),
+                &replacement_snapshot,
+            )
+            .expect("replacement should index as a pending unique target");
+
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let file_id = "01920000-0000-7000-8000-0000000000a2";
+        let target = PendingForeignKeyTargetKey {
+            schema_key: "unique_schema".into(),
+            domain: Domain::exact_file(branch_id, false, Some(file_id.into())),
+            pointer_group: vec![vec!["slug".into()]],
+            value: UniqueConstraintValue::string_values(["old-slug"]),
+        };
+        let hot_state = StaticHotStateReader {
+            rows: vec![committed_unique_row("post-1", "old-slug", "committed")],
+        };
+        let visible_schemas = vec![unique_schema()];
+        let staged_writes = empty_staged_write_set();
+        let input = TransactionValidationInput::from_visible_schemas_for_tests(
+            &staged_writes,
+            &visible_schemas,
+            &hot_state,
+        );
+
+        let exists = committed_normal_foreign_key_target_exists(
+            input.hot_state,
+            input.schema_catalog,
+            &indexes,
+            &target,
+        )
+        .await
+        .expect("committed FK lookup should scan the exact scope");
+
+        assert!(
+            !exists,
+            "a committed non-primary-key value replaced by a staged row must not satisfy the FK"
         );
     }
 

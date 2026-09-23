@@ -197,9 +197,18 @@ where
                 branch_ids: visible_branch_ids,
             },
             include_tombstones: request.filter.include_tombstones,
-            limit: request.limit,
+            limit: if request.filter.global.is_some() {
+                None
+            } else {
+                request.limit
+            },
         },
     );
+    let resolved = if let Some(global) = request.filter.global {
+        resolved.filter(|row| row.global() == global, request.limit)
+    } else {
+        resolved
+    };
     #[cfg(test)]
     if is_single_row_blob_ref_probe(request) {
         BLOB_REF_PROBE_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));

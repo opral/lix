@@ -11,6 +11,10 @@ pub(crate) struct LogicalWritePlan {
 impl LogicalWritePlan {
     pub(crate) fn requires_current_write_snapshot(&self) -> bool {
         matches!(self.bound.op, BoundWriteOp::Update | BoundWriteOp::Delete)
+            || matches!(
+                self.bound.input,
+                crate::sql2::bind::write::BoundWriteInput::Query { .. }
+            )
     }
 }
 

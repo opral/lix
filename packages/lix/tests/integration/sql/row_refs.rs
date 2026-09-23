@@ -26,6 +26,19 @@ async fn register(session: &crate::support::simulation_test::engine::SimSession,
         .expect("schema registration should succeed");
 }
 
+async fn register_global(
+    session: &crate::support::simulation_test::engine::SimSession,
+    value: JsonValue,
+) {
+    session
+        .execute(
+            "INSERT INTO lix_registered_schema(value,lixcol_global) VALUES ($1::jsonb,true)",
+            &[Value::Text(value.to_string())],
+        )
+        .await
+        .expect("global schema registration should succeed");
+}
+
 async fn register_untracked(
     session: &crate::support::simulation_test::engine::SimSession,
     value: JsonValue,
@@ -1257,6 +1270,186 @@ simulation_test!(
     row_ref_cascade_merge_incoming_generation_source_delete,
     |sim| async move {
         assert_row_ref_incoming_generation_merge(&sim, false).await;
+    }
+);
+
+simulation_test!(
+    global_row_ref_source_does_not_expand_local_generation_delete_on_merge,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        let global = sim.wrap_session(
+            engine.open_session_at(lix::GLOBAL_BRANCH_ID).await.unwrap(),
+            &engine,
+        );
+
+        register_global(&global, parent_schema("rr_global_probe_parent")).await;
+        register_global(
+            &global,
+            row_ref_child_schema("rr_global_probe_child", "cascade"),
+        )
+        .await;
+        register(&main, parent_schema("rr_local_generation_probe")).await;
+
+        global
+            .execute(
+            "INSERT INTO rr_global_probe_parent(id,lixcol_global) VALUES ('global-parent',true)",
+            &[],
+        )
+        .await
+        .expect("global target row should insert");
+        global
+            .execute(
+            "INSERT INTO rr_global_probe_child(id,target,lixcol_global) \
+             VALUES ('global-child',lix_row_ref('rr_global_probe_parent',NULL,'global-parent'),true)",
+            &[],
+        )
+        .await
+        .expect("global row-ref source should insert");
+        main.execute(
+            "INSERT INTO rr_local_generation_probe(id) VALUES ('local-a'),('local-b')",
+            &[],
+        )
+        .await
+        .expect("local collection rows should insert");
+
+        let branch = main
+            .create_branch(CreateBranchOptions {
+                id: None,
+                name: "local-generation-with-global-row-ref".into(),
+                from_commit_id: None,
+            })
+            .await
+            .unwrap();
+        let source = sim.wrap_session(
+            engine.open_session_at(branch.id.clone()).await.unwrap(),
+            &engine,
+        );
+        source
+            .execute("DELETE FROM rr_local_generation_probe", &[])
+            .await
+            .expect("local collection should be deleted on the branch");
+
+        let preview = main
+            .merge_branch_preview(MergeBranchPreviewOptions {
+                source_branch_id: branch.id.clone(),
+            })
+            .await
+            .unwrap();
+        let receipt = main
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: branch.id,
+            })
+            .await
+            .unwrap();
+        assert_eq!(preview.change_stats, receipt.change_stats);
+
+        assert_rows_eq(
+            main.execute("SELECT id FROM rr_local_generation_probe", &[])
+                .await
+                .unwrap(),
+            vec![],
+        );
+        assert_rows_eq(
+            main.execute("SELECT id FROM rr_global_probe_child", &[])
+                .await
+                .unwrap(),
+            vec![vec![Value::Text("global-child".into())]],
+        );
+        let member_tombstones = main
+            .execute(
+                "SELECT count(*) AS n FROM lix_change \
+                 WHERE schema_key = 'rr_local_generation_probe' \
+                   AND row_pk IN (CAST('[\"local-a\"]' AS JSONB), CAST('[\"local-b\"]' AS JSONB)) \
+                   AND snapshot_content IS NULL",
+                &[],
+            )
+            .await
+            .expect("lix_change should expose collection row tombstones")
+            .rows()[0]
+            .get::<i64>("n")
+            .unwrap();
+        assert_eq!(
+            member_tombstones, 0,
+            "collection deletion should stay a generation marker"
+        );
+    }
+);
+
+simulation_test!(
+    local_row_ref_source_is_not_hidden_by_an_earlier_global_source,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let main = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        let global = sim.wrap_session(
+            engine.open_session_at(lix::GLOBAL_BRANCH_ID).await.unwrap(),
+            &engine,
+        );
+
+        register_global(&global, parent_schema("rr_mixed_global_parent")).await;
+        register_global(
+            &global,
+            row_ref_child_schema("rr_mixed_scope_child", "cascade"),
+        )
+        .await;
+        register(&main, parent_schema("rr_mixed_local_parent")).await;
+        register(
+            &main,
+            row_ref_child_schema("rr_mixed_scope_child", "cascade"),
+        )
+        .await;
+        global
+            .execute(
+                "INSERT INTO rr_mixed_global_parent(id,lixcol_global) \
+                 VALUES ('global-target',true)",
+                &[],
+            )
+            .await
+            .expect("global parent should insert");
+        global
+            .execute(
+                "INSERT INTO rr_mixed_scope_child(id,target,lixcol_global) \
+                 VALUES ('a-global-source',lix_row_ref('rr_mixed_global_parent',NULL,'global-target'),true)",
+                &[],
+            )
+            .await
+            .expect("global source should insert");
+        main.execute(
+            "INSERT INTO rr_mixed_local_parent(id) VALUES ('local-target')",
+            &[],
+        )
+        .await
+        .expect("local parent should insert");
+        main.execute(
+            "INSERT INTO rr_mixed_scope_child(id,target) \
+             VALUES ('z-local-source',lix_row_ref('rr_mixed_local_parent',NULL,'local-target'))",
+            &[],
+        )
+        .await
+        .expect("local source should insert");
+
+        main.execute("DELETE FROM rr_mixed_local_parent", &[])
+            .await
+            .expect("local parent deletion should cascade its local source");
+        assert_rows_eq(
+            main.execute("SELECT id FROM rr_mixed_local_parent", &[])
+                .await
+                .unwrap(),
+            vec![],
+        );
+        assert_rows_eq(
+            main.execute("SELECT id FROM rr_mixed_scope_child", &[])
+                .await
+                .unwrap(),
+            vec![vec![Value::Text("a-global-source".into())]],
+        );
+        assert_rows_eq(
+            global
+                .execute("SELECT id FROM rr_mixed_global_parent", &[])
+                .await
+                .unwrap(),
+            vec![vec![Value::Text("global-target".into())]],
+        );
     }
 );
 
