@@ -1616,6 +1616,7 @@ fn is_terminal_partial_transport_error(error: &LixError) -> bool {
     matches!(
         error.code.as_str(),
         super::SYNC_PROTOCOL_MISMATCH_CODE
+            | LixError::CODE_STORAGE_CORRUPTION
             | super::SYNC_REPOSITORY_ID_MISMATCH_CODE
             | super::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE
             | "LIX_PARTIAL_MERGE_PROOF_UNAVAILABLE"
@@ -1633,6 +1634,18 @@ mod tests {
     use crate::sync::native_metadata::native_metadata_is_resident;
     use crate::{Memory, open_lix};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn storage_io_keeps_partial_upload_retryable_but_corruption_stops_it() {
+        assert!(!is_terminal_partial_transport_error(&LixError::new(
+            LixError::CODE_STORAGE_IO_UNAVAILABLE,
+            "object store PUT failed",
+        )));
+        assert!(is_terminal_partial_transport_error(&LixError::new(
+            LixError::CODE_STORAGE_CORRUPTION,
+            "segment hash mismatch",
+        )));
+    }
 
     #[tokio::test]
     async fn retired_replica_stops_worker_and_resolves_queued_demands() {

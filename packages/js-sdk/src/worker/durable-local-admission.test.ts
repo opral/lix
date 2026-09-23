@@ -39,7 +39,7 @@ test.each([
   (v: any) => { v.schemaVersion = 2; },
   (v: any) => { v.key = "wrong"; },
   (v: any) => { v.identity.storageEpoch = 80; },
-  (v: any) => { v.identity.protocolEpoch = 15; },
+  (v: any) => { v.identity.protocolEpoch = 20; },
   (v: any) => { v.identity.repositoryId = "other"; },
   (v: any) => { v.identity.principalId = "bad\nidentity"; },
   (v: any) => { v.identity.unrecognized = true; },

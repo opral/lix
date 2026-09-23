@@ -4858,7 +4858,33 @@ fn commit_outcome_unknown(error: StorageError) -> StorageError {
 }
 
 fn object_store_error(error: object_store::Error) -> StorageError {
-    StorageError::Io(format!("slatedb object store: {error}"))
+    match error {
+        // Object-store Generic wraps transport failures such as the S3 PUT
+        // request failing before a response. Immutable uploads use stable
+        // object identities, so the same request is safe to retry.
+        error @ object_store::Error::Generic { .. } => {
+            StorageError::Unavailable(format!("slatedb object store: {error}"))
+        }
+        error => StorageError::Io(format!("slatedb object store: {error}")),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn object_store_transport_error_is_distinct_from_missing_object() {
+    let transient = object_store_error(object_store::Error::Generic {
+        store: "S3",
+        source: Box::new(std::io::Error::other("error sending request")),
+    });
+    assert!(
+        matches!(transient, StorageError::Unavailable(message) if message.contains("error sending request"))
+    );
+
+    let missing = object_store_error(object_store::Error::NotFound {
+        path: "immutable-segment".to_string(),
+        source: Box::new(std::io::Error::from(std::io::ErrorKind::NotFound)),
+    });
+    assert!(matches!(missing, StorageError::Io(_)));
 }
 
 #[derive(Clone, Default)]

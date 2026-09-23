@@ -91,6 +91,14 @@ impl LixError {
     /// A storage operation failed.
     pub const CODE_STORAGE_ERROR: &'static str = "LIX_STORAGE_ERROR";
 
+    /// The storage service could not complete an I/O operation. A connected
+    /// replica may retry its idempotent sync request after the backend recovers.
+    pub const CODE_STORAGE_IO_UNAVAILABLE: &'static str = "LIX_STORAGE_IO_UNAVAILABLE";
+
+    /// Stored data failed an integrity check. Retrying the same sync request
+    /// cannot repair the repository and must not hide the failure.
+    pub const CODE_STORAGE_CORRUPTION: &'static str = "LIX_STORAGE_CORRUPTION";
+
     /// A coherent storage read was invalidated by a concurrent commit.
     /// Auto-commit read surfaces consume this internally by reopening the
     /// complete read/query against a fresh snapshot.
@@ -502,6 +510,14 @@ impl From<crate::storage_adapter::StorageError> for LixError {
             .with_details(json!({
                 "retryable": true,
             })),
+            crate::storage_adapter::StorageError::Unavailable(message) => Self::new(
+                Self::CODE_STORAGE_IO_UNAVAILABLE,
+                format!("storage unavailable: {message}"),
+            ),
+            crate::storage_adapter::StorageError::Corruption(message) => Self::new(
+                Self::CODE_STORAGE_CORRUPTION,
+                format!("storage corruption: {message}"),
+            ),
             error => Self::new(Self::CODE_STORAGE_ERROR, error.to_string()),
         }
     }
@@ -651,5 +667,24 @@ mod tests {
                 "outcome": "unknown",
             }))
         );
+    }
+
+    #[test]
+    fn storage_io_and_corruption_keep_distinct_sync_error_codes() {
+        let io = LixError::from(crate::storage::StorageError::Unavailable(
+            "object store PUT failed".to_string(),
+        ));
+        assert_eq!(io.code, LixError::CODE_STORAGE_IO_UNAVAILABLE);
+        assert!(!io.automatic_retry_is_forbidden());
+
+        let deterministic_io = LixError::from(crate::storage::StorageError::Io(
+            "read discovery byte limit exceeded".to_string(),
+        ));
+        assert_eq!(deterministic_io.code, LixError::CODE_STORAGE_ERROR);
+
+        let corruption = LixError::from(crate::storage::StorageError::Corruption(
+            "segment hash mismatch".to_string(),
+        ));
+        assert_eq!(corruption.code, LixError::CODE_STORAGE_CORRUPTION);
     }
 }

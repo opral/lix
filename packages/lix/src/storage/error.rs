@@ -23,6 +23,8 @@ pub enum StorageError {
     /// definitive result.
     CommitOutcomeUnknown(String),
     Corruption(String),
+    /// A storage service or transport is temporarily unavailable.
+    Unavailable(String),
     Io(String),
 }
 
@@ -105,6 +107,7 @@ impl fmt::Display for StorageError {
                 write!(f, "storage commit outcome is unknown: {message}")
             }
             Self::Corruption(message) => write!(f, "storage corruption: {message}"),
+            Self::Unavailable(message) => write!(f, "storage unavailable: {message}"),
             Self::Io(message) => write!(f, "io error: {message}"),
         }
     }

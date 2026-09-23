@@ -948,6 +948,7 @@ fn is_terminal_sync_error(error: &LixError) -> bool {
     matches!(
         error.code.as_str(),
         "LIX_REPLICA_RETIRED"
+            | LixError::CODE_STORAGE_CORRUPTION
             | SYNC_ITEM_TOO_LARGE_CODE
             | "LIX_ERROR_SYNC_WRITE_REJECTED"
             | SYNC_SNAPSHOT_TOO_LARGE_CODE
@@ -974,7 +975,7 @@ fn is_permanent_push_rejection(error: &LixError) -> bool {
 }
 
 fn is_retryable_sync_transport_error(error: &LixError) -> bool {
-    if error.automatic_retry_is_forbidden() {
+    if error.automatic_retry_is_forbidden() || is_terminal_sync_error(error) {
         return false;
     }
 
@@ -4310,6 +4311,14 @@ mod tests {
         assert!(is_retryable_sync_transport_error(
             &LixError::new("LIX_REMOTE_OVERLOADED", "try later")
                 .with_details(serde_json::json!({ "httpStatus": 503 })),
+        ));
+        assert!(is_retryable_sync_transport_error(
+            &LixError::new(LixError::CODE_STORAGE_IO_UNAVAILABLE, "object store PUT failed")
+                .with_details(serde_json::json!({ "httpStatus": 503 })),
+        ));
+        assert!(!is_retryable_sync_transport_error(
+            &LixError::new(LixError::CODE_STORAGE_CORRUPTION, "segment hash mismatch")
+                .with_details(serde_json::json!({ "httpStatus": 500 })),
         ));
         assert!(!is_retryable_sync_transport_error(
             &LixError::new(LixError::CODE_COMMIT_NOT_FOUND, "missing history")

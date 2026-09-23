@@ -1261,15 +1261,32 @@ mod tests {
     #[tokio::test]
     async fn admission_version_rejection_reports_authority_epochs() {
         let manager = LixRuntimeManager::new_in_memory(4);
-        let app = router(manager, None, TEST_PROTOCOL_TIMEOUT, InFlightSqlRegistry::default());
-        let response = app.oneshot(Request::builder()
-            .uri(format!("/lix/v1/{LIX_A}/admission"))
-            .header("lix-sync-protocol-version", "0")
-            .body(Body::empty()).unwrap()).await.unwrap();
+        let app = router(
+            manager,
+            None,
+            TEST_PROTOCOL_TIMEOUT,
+            InFlightSqlRegistry::default(),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/lix/v1/{LIX_A}/admission"))
+                    .header("lix-sync-protocol-version", "20")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let body = json_body(response).await;
-        assert_eq!(body["error"]["details"]["storageEpoch"], lix_sdk::CURRENT_STORAGE_FORMAT_VERSION);
-        assert_eq!(body["error"]["details"]["protocolEpoch"], lix_sdk::SYNC_PROTOCOL_VERSION);
+        assert_eq!(
+            body["error"]["details"]["storageEpoch"],
+            lix_sdk::CURRENT_STORAGE_FORMAT_VERSION
+        );
+        assert_eq!(
+            body["error"]["details"]["protocolEpoch"],
+            lix_sdk::SYNC_PROTOCOL_VERSION
+        );
     }
 
     #[tokio::test]

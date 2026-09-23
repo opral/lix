@@ -93,7 +93,7 @@ Sync is Lix-scoped: the immutable ID in the path selects the Lix. Connected part
 - `GET /lix/v1/{lix_id}/sync/chunk?chunkId=...` and
   `PUT /lix/v1/{lix_id}/sync/chunk?chunkId=...` transfer raw chunks. Both identities are 64-character lowercase BLAKE3 hex digests; chunks are at most 4 MiB.
 
-All sync routes require exactly one `lix-sync-protocol-version: 20` header. Missing, duplicate, malformed, or incompatible versions are rejected before reading or publishing sync data. The handshake advertises `syncCheckpointInventory: true`. Commit bodies and headers both carry immutable `isCheckpoint` metadata; membership is preserved independently of branch refs.
+All sync routes require exactly one `lix-sync-protocol-version: 21` header. Missing, duplicate, malformed, or incompatible versions are rejected before reading or publishing sync data. The handshake advertises `syncCheckpointInventory: true`. Commit bodies and headers both carry immutable `isCheckpoint` metadata; membership is preserved independently of branch refs.
 
 Bootstrap installs checkpoint headers alongside current branch heads and working bases. Historical checkpoint state remains deferred until an explicit history or snapshot read requests it; bootstrap does not scan every checkpoint state or fetch its binary content.
 
@@ -101,7 +101,7 @@ The live pull protocol has one repository cursor. It has no schema or branch fil
 
 ### Partial replica with on-demand sync
 
-Sync protocol 20 defines the native transport for a partial replica with on-demand sync. SDK callers opt in with `server.mode: "partial_replica"` and local storage. The default server mode is `remote`.
+Sync protocol 21 defines the native transport for a partial replica with on-demand sync. SDK callers opt in with `server.mode: "partial_replica"` and local storage. The default server mode is `remote`.
 
 The exact partial-attempt restart request accepts `abandon: true`. Lix uses this during automatic recovery to fence an unsupported active merge before adopting the server working set. An already committed merge receipt wins; otherwise the authority durably prevents delayed requests from reviving the abandoned attempt. Ordinary restarts omit this field and still require expiry.
 
