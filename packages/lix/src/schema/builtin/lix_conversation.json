@@ -14,6 +14,12 @@
       "type": "text",
       "nullable": true,
       "description": "Canonical row reference to an existing target in the same branch and compatible durability scope. Null for a standalone conversation."
+    },
+    {
+      "name": "title",
+      "type": "text",
+      "nullable": true,
+      "description": "Optional human-readable conversation title."
     }
   ],
   "primary_key": [

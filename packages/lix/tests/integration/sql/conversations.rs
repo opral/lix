@@ -158,7 +158,7 @@ simulation_test!(
                 "SELECT table_name,column_name,data_type,is_nullable
              FROM information_schema.columns
              WHERE table_name IN ('lix_comment','lix_conversation')
-               AND column_name IN ('id','target','conversation_id','body','author_id','order_key')
+               AND column_name IN ('id','target','title','conversation_id','body','author_id','order_key')
              ORDER BY table_name,ordinal_position",
                 &[],
             )
@@ -197,11 +197,37 @@ simulation_test!(
                     Value::Text("TEXT".into()),
                     Value::Text("YES".into()),
                 ],
+                vec![
+                    Value::Text("lix_conversation".into()),
+                    Value::Text("title".into()),
+                    Value::Text("TEXT".into()),
+                    Value::Text("YES".into()),
+                ],
             ],
         );
 
         install_local_targets(&session).await;
         insert_local_conversations_and_comments(&session).await;
+        session
+            .execute(
+                "UPDATE lix_conversation SET title='Launch plan' WHERE id=$1",
+                &[Value::Text(LOCAL_PARAGRAPH_CONVERSATION.into())],
+            )
+            .await
+            .expect("title should be writable");
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT title FROM lix_conversation WHERE id IN ($1,$2) ORDER BY id",
+                    &[
+                        Value::Text(LOCAL_PARAGRAPH_CONVERSATION.into()),
+                        Value::Text(LOCAL_CSV_CONVERSATION.into()),
+                    ],
+                )
+                .await
+                .unwrap(),
+            vec![vec![Value::Text("Launch plan".into())], vec![Value::Null]],
+        );
         assert_rows_eq(
             session
                 .execute(

@@ -8,7 +8,7 @@ description: "SQL conversations and comments on rows and commits, with same-scop
 
 | Relation | Payload columns |
 | --- | --- |
-| `lix_conversation` | `id UUID PRIMARY KEY`, `target TEXT NULL` |
+| `lix_conversation` | `id UUID PRIMARY KEY`, `target TEXT NULL`, `title TEXT NULL` |
 | `lix_comment` | `id UUID PRIMARY KEY`, `conversation_id UUID NOT NULL`, `body JSONB NOT NULL` |
 
 `target` is a canonical `lix_row_ref` constrained to an existing row in the conversation's scope. It is nullable for standalone conversations. Deleting the target cascades its conversations; deleting a conversation cascades its comments. Scope and durability follow the ordinary FK and row-reference rules. Global rows remain visible through the normal branch read overlay, but visibility does not allow cross-scope references.
@@ -50,8 +50,8 @@ A repository-wide commit discussion stores both conversation and comments global
 ```sql
 BEGIN;
 
-INSERT INTO lix_conversation (id, target, lixcol_global)
-VALUES ($1, lix_row_ref('lix_commit', NULL, $3), true);
+INSERT INTO lix_conversation (id, target, title, lixcol_global)
+VALUES ($1, lix_row_ref('lix_commit', NULL, $3), 'Commit discussion', true);
 
 INSERT INTO lix_comment (id, conversation_id, body, lixcol_global)
 VALUES ($2, $1, $4::jsonb, true);
