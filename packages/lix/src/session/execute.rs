@@ -114,8 +114,7 @@ impl CommitReceipt {
     pub(crate) fn annotate_completion_error(&self, error: LixError) -> LixError {
         let mut error = super::context::non_retryable_after_commit(error);
         error
-            .details
-            .as_mut()
+            .details_mut()
             .and_then(serde_json::Value::as_object_mut)
             .expect("completion error has object details")
             .insert("commit".into(), serde_json::json!(self.commit));
@@ -4485,8 +4484,7 @@ where
 
 fn batch_statement_index(error: &LixError) -> Option<usize> {
     error
-        .details
-        .as_ref()
+        .details()
         .and_then(JsonValue::as_object)
         .and_then(|details| details.get("statementIndex"))
         .and_then(JsonValue::as_u64)
@@ -4770,7 +4768,7 @@ fn idempotency_outcome_unknown() -> LixError {
 }
 
 fn with_batch_statement_index(mut error: LixError, statement_index: usize) -> LixError {
-    let mut details = match error.details.take() {
+    let mut details = match error.details.take().map(|details| *details) {
         Some(JsonValue::Object(details)) => details,
         Some(details) => {
             let mut wrapped = JsonMap::new();
@@ -4783,7 +4781,7 @@ fn with_batch_statement_index(mut error: LixError, statement_index: usize) -> Li
         "statementIndex".to_string(),
         JsonValue::from(statement_index),
     );
-    error.details = Some(JsonValue::Object(details));
+    error.details = Some(Box::new(JsonValue::Object(details)));
     error
 }
 
@@ -4897,7 +4895,7 @@ impl AutoCommitRetries {
 
     fn annotate(&self, mut error: LixError) -> LixError {
         let forbidden = error.automatic_retry_is_forbidden();
-        let mut details = match error.details.take() {
+        let mut details = match error.details.take().map(|details| *details) {
             Some(JsonValue::Object(details)) => details,
             Some(cause) => JsonMap::from_iter([("cause".to_owned(), cause)]),
             None => JsonMap::new(),
@@ -4925,7 +4923,7 @@ impl AutoCommitRetries {
         if let Some(limit) = self.limit {
             details.insert("maxAutoCommitRetries".into(), limit.into());
         }
-        error.details = Some(JsonValue::Object(details));
+        error.details = Some(Box::new(JsonValue::Object(details)));
         error
     }
 }

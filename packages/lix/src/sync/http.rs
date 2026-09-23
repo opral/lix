@@ -2093,8 +2093,8 @@ mod tests {
         .expect_err("an incompatible sync protocol must fail before transfer");
         assert_eq!(error.code, crate::sync::SYNC_PROTOCOL_MISMATCH_CODE);
         assert_eq!(
-            error.details,
-            Some(serde_json::json!({
+            error.details(),
+            Some(&serde_json::json!({
                 "clientSyncProtocolVersion": crate::sync::SYNC_PROTOCOL_VERSION,
                 "serverSyncProtocolVersion": 999,
             }))
@@ -2111,8 +2111,8 @@ mod tests {
         .expect_err("a legacy server must fail before transfer");
         assert_eq!(error.code, crate::sync::SYNC_PROTOCOL_MISMATCH_CODE);
         assert_eq!(
-            error.details,
-            Some(serde_json::json!({
+            error.details(),
+            Some(&serde_json::json!({
                 "clientSyncProtocolVersion": crate::sync::SYNC_PROTOCOL_VERSION,
                 "serverSyncProtocolVersion": null,
             }))
@@ -2129,8 +2129,8 @@ mod tests {
         .expect_err("a legacy server must fail before transfer");
         assert_eq!(error.code, crate::sync::SYNC_PROTOCOL_MISMATCH_CODE);
         assert_eq!(
-            error.details,
-            Some(serde_json::json!({ "missingField": "lixId" }))
+            error.details(),
+            Some(&serde_json::json!({ "missingField": "lixId" }))
         );
     }
 
@@ -2179,8 +2179,8 @@ mod tests {
             Some("Retry after the migration completes.")
         );
         assert_eq!(
-            error.details,
-            Some(serde_json::json!({
+            error.details(),
+            Some(&serde_json::json!({
                 "fromVersion": 68,
                 "toVersion": 71,
                 "retryable": true,

@@ -46,7 +46,9 @@ impl Walk {
     ) -> Result<LixError, LixError> {
         self.pending.push(edge);
         if NativeMetadataRef::from_missing_error(&error)?.is_some() {
-            let details = error.details.get_or_insert_with(|| serde_json::json!({}));
+            let details = error
+                .details
+                .get_or_insert_with(|| Box::new(serde_json::json!({})));
             details[MARKER] = serde_json::json!({
                 "ancestor": self.ancestor.commit_id.to_string(),
                 "descendant": self.descendant.to_string(),

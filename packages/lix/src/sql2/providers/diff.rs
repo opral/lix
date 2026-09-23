@@ -3111,8 +3111,8 @@ mod tests {
         let error = datafusion_error_to_lix_error(error);
         assert_eq!(error.code, "LIX_SYNC_CHUNKS_REQUIRED");
         assert_eq!(
-            error.details,
-            Some(serde_json::json!({ "chunkIds": ["a".repeat(64)] }))
+            error.details(),
+            Some(&serde_json::json!({ "chunkIds": ["a".repeat(64)] }))
         );
     }
 
@@ -3128,7 +3128,7 @@ mod tests {
             ));
             let error = datafusion_error_to_lix_error(error);
             assert_eq!(error.code, code);
-            assert_eq!(error.details, Some(serde_json::json!({ "retry": true })));
+            assert_eq!(error.details(), Some(&serde_json::json!({ "retry": true })));
         }
     }
 

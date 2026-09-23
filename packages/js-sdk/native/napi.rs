@@ -3429,7 +3429,7 @@ fn create_lix_error<'env>(env: &'env Env, error: &LixError) -> Result<Object<'en
         js_error.set_named_property("hint", hint.clone())?;
     }
     if let Some(details) = &error.details {
-        js_error.set_named_property("details", details.clone())?;
+        js_error.set_named_property("details", details.as_ref().clone())?;
     }
     Ok(js_error)
 }

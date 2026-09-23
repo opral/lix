@@ -26,7 +26,7 @@ pub struct LixError {
     pub code: String,
     pub message: String,
     pub hint: Option<String>,
-    pub details: Option<JsonValue>,
+    pub details: Option<Box<JsonValue>>,
 }
 
 impl LixError {
@@ -419,7 +419,7 @@ impl LixError {
 
     /// Attach machine-readable details to this error.
     pub fn with_details(mut self, details: JsonValue) -> Self {
-        self.details = Some(details);
+        self.details = Some(Box::new(details));
         self
     }
 
@@ -441,6 +441,16 @@ impl LixError {
     /// ```
     pub fn hint(&self) -> Option<&str> {
         self.hint.as_deref()
+    }
+
+    /// Return the attached structured details, if any.
+    pub fn details(&self) -> Option<&JsonValue> {
+        self.details.as_deref()
+    }
+
+    /// Return the attached structured details mutably, if any.
+    pub fn details_mut(&mut self) -> Option<&mut JsonValue> {
+        self.details.as_deref_mut()
     }
 
     pub fn format(&self) -> String {
@@ -616,8 +626,8 @@ mod tests {
 
         assert_eq!(error.code, LixError::CODE_STORAGE_FENCED);
         assert_eq!(
-            error.details,
-            Some(serde_json::json!({
+            error.details(),
+            Some(&serde_json::json!({
                 "retryable": false,
                 "outcome": "unknown",
             }))
@@ -632,8 +642,8 @@ mod tests {
 
         assert_eq!(error.code, LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN);
         assert_eq!(
-            error.details,
-            Some(serde_json::json!({
+            error.details(),
+            Some(&serde_json::json!({
                 "retryable": false,
                 "outcome": "unknown",
             }))
@@ -661,8 +671,8 @@ mod tests {
 
         assert_eq!(error.code, LixError::CODE_STORAGE_CLOSED);
         assert_eq!(
-            error.details,
-            Some(serde_json::json!({
+            error.details(),
+            Some(&serde_json::json!({
                 "retryable": false,
                 "outcome": "unknown",
             }))

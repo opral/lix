@@ -8350,7 +8350,7 @@ where
         if error.code != LixError::CODE_SCHEMA_DEFINITION {
             return error;
         }
-        let Some(details) = error.details.as_mut().and_then(JsonValue::as_object_mut) else {
+        let Some(details) = error.details_mut().and_then(JsonValue::as_object_mut) else {
             return error;
         };
         let Some(schema_key) = details

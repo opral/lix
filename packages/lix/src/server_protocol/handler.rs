@@ -5234,7 +5234,7 @@ struct ErrorBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    details: Option<serde_json::Value>,
+    details: Option<Box<serde_json::Value>>,
 }
 
 impl ErrorEnvelope {
@@ -5243,7 +5243,7 @@ impl ErrorEnvelope {
             error.code.clone(),
             error.message.clone(),
             error.hint.clone(),
-            error.details.clone(),
+            error.details().cloned(),
         )
     }
 
@@ -5258,7 +5258,7 @@ impl ErrorEnvelope {
                 code: code.into(),
                 message: message.into(),
                 hint,
-                details,
+                details: details.map(Box::new),
             },
         }
     }
@@ -9738,8 +9738,8 @@ mod tests {
         let error = require_sync_protocol_version(&headers)
             .expect_err("mismatched client version must be rejected");
         assert_eq!(
-            error.body.error.details,
-            Some(serde_json::json!({
+            error.body.error.details.as_deref(),
+            Some(&serde_json::json!({
                 "clientSyncProtocolVersion": 999,
                 "serverSyncProtocolVersion": crate::sync::SYNC_PROTOCOL_VERSION,
             }))

@@ -1761,7 +1761,7 @@ fn bound_single_text_primary_key_param(
 }
 
 fn with_parameter_batch_statement_index(mut error: LixError, statement_index: usize) -> LixError {
-    let mut details = match error.details.take() {
+    let mut details = match error.details.take().map(|details| *details) {
         Some(JsonValue::Object(details)) => details,
         Some(details) => {
             let mut wrapped = serde_json::Map::new();
@@ -1774,7 +1774,7 @@ fn with_parameter_batch_statement_index(mut error: LixError, statement_index: us
         "statementIndex".to_string(),
         JsonValue::from(statement_index),
     );
-    error.details = Some(JsonValue::Object(details));
+    error.details = Some(Box::new(JsonValue::Object(details)));
     error
 }
 
@@ -6766,7 +6766,6 @@ fn staged_row_image<'a>(
         .map(|value| value.map(CandidateRowImage::Json))
 }
 
-#[expect(clippy::too_many_arguments)]
 fn set_owned_row_image_eval_value(
     ctx: &dyn SqlWriteExecutionContext,
     image: &mut OwnedRowImage,

@@ -937,7 +937,7 @@ where
 /// Marks operation completion failures after durable mutation. Preserve the
 /// original diagnostics for reporting, but never replay the operation for them.
 pub(super) fn non_retryable_after_commit(mut error: LixError) -> LixError {
-    let details = error.details.take();
+    let details = error.details.take().map(|details| *details);
     let mut details = match details {
         Some(serde_json::Value::Object(object)) => object,
         Some(value) => serde_json::Map::from_iter([("originalDetails".to_owned(), value)]),
@@ -952,7 +952,7 @@ pub(super) fn non_retryable_after_commit(mut error: LixError) -> LixError {
 
 /// Completed SQL must not be replayed because its later local journal flush failed.
 pub(super) fn non_retryable_after_execution(mut error: LixError) -> LixError {
-    let details = error.details.take();
+    let details = error.details.take().map(|details| *details);
     let mut details = match details {
         Some(serde_json::Value::Object(object)) => object,
         Some(value) => serde_json::Map::from_iter([("originalDetails".to_owned(), value)]),

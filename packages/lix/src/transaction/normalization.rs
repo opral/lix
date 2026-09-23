@@ -752,8 +752,8 @@ mod tests {
 
         assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
         assert_eq!(
-            error.details,
-            Some(serde_json::json!({
+            error.details(),
+            Some(&serde_json::json!({
                 "schema_key": "lix_file_descriptor",
                 "entity_commit_id": "01a04058-entity",
                 "base_commit_id": "01a04058-base",

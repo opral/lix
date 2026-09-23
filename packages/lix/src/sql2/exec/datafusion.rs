@@ -6256,8 +6256,8 @@ mod tests {
             "SQL expected 1 parameter(s), but 2 parameter(s) were provided"
         );
         assert_eq!(
-            error.details,
-            Some(json!({
+            error.details(),
+            Some(&json!({
                 "operation": "execute",
                 "expected_param_count": 1,
                 "provided_param_count": 2,

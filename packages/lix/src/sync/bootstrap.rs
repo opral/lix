@@ -769,8 +769,8 @@ mod tests {
         .await;
         assert_eq!(error.code, LixError::CODE_STORAGE_READ_EXPIRED);
         assert_eq!(
-            error.details,
-            Some(serde_json::json!({ "retryable": true }))
+            error.details(),
+            Some(&serde_json::json!({ "retryable": true }))
         );
     }
 
@@ -793,8 +793,8 @@ mod tests {
         .await;
         assert_eq!(error.code, LixError::CODE_STORAGE_READ_EXPIRED);
         assert_eq!(
-            error.details,
-            Some(serde_json::json!({ "retryable": true }))
+            error.details(),
+            Some(&serde_json::json!({ "retryable": true }))
         );
     }
 
@@ -822,8 +822,8 @@ mod tests {
         .await;
         assert_eq!(error.code, LixError::CODE_STORAGE_READ_EXPIRED);
         assert_eq!(
-            error.details,
-            Some(serde_json::json!({ "retryable": true }))
+            error.details(),
+            Some(&serde_json::json!({ "retryable": true }))
         );
     }
 }

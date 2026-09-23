@@ -2243,7 +2243,7 @@ fn with_insert_statement_index(mut error: LixError, statement_index: Option<usiz
     let Some(statement_index) = statement_index else {
         return error;
     };
-    let mut details = match error.details.take() {
+    let mut details = match error.details.take().map(|details| *details) {
         Some(serde_json::Value::Object(details)) => details,
         Some(details) => {
             let mut wrapped = serde_json::Map::new();
@@ -2256,7 +2256,7 @@ fn with_insert_statement_index(mut error: LixError, statement_index: Option<usiz
         "statementIndex".to_string(),
         serde_json::Value::from(statement_index),
     );
-    error.details = Some(serde_json::Value::Object(details));
+    error.details = Some(Box::new(serde_json::Value::Object(details)));
     error
 }
 
