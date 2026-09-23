@@ -2038,41 +2038,41 @@ async fn row_delete_collection(
         return Ok(None);
     }
     // Dynamic references can target any schema. A declaration alone is not a
-    // live reference, but absence must hold in both durability lanes and both
-    // visible branches, across every file and the transaction's pending rows.
+    // live reference, but absence must hold in both durability lanes and the
+    // target's scope, across every file and the transaction's pending rows.
     let source_schemas = catalog
         .row_ref_references()
         .iter()
         .map(|reference| reference.source_key.schema_key.clone())
         .collect::<std::collections::BTreeSet<_>>();
     let active_branch = ctx.active_branch_id().to_string();
+    let expected_global = active_branch == crate::GLOBAL_BRANCH_ID;
     for schema_key in source_schemas {
-        for branch_id in [active_branch.as_str(), crate::GLOBAL_BRANCH_ID] {
-            if ctx.has_staged_collection_rows(
-                branch_id,
-                CollectionScopeRef {
-                    schema_key: &schema_key,
-                    file_id: None,
-                },
-            )? {
-                return Ok(None);
-            }
-            for untracked in [false, true] {
-                let rows = ctx
-                    .scan_hot_state_batch(&HotStateScanRequest {
-                        filter: HotStateFilter {
-                            schema_keys: vec![schema_key.clone()],
-                            branch_ids: vec![branch_id.to_owned()],
-                            untracked: Some(untracked),
-                            ..Default::default()
-                        },
-                        limit: Some(1),
+        if ctx.has_staged_collection_rows(
+            &active_branch,
+            CollectionScopeRef {
+                schema_key: &schema_key,
+                file_id: None,
+            },
+        )? {
+            return Ok(None);
+        }
+        for untracked in [false, true] {
+            let rows = ctx
+                .scan_hot_state_batch(&HotStateScanRequest {
+                    filter: HotStateFilter {
+                        schema_keys: vec![schema_key.clone()],
+                        branch_ids: vec![active_branch.clone()],
+                        untracked: Some(untracked),
+                        global: Some(expected_global),
                         ..Default::default()
-                    })
-                    .await?;
-                if !rows.is_empty() {
-                    return Ok(None);
-                }
+                    },
+                    limit: Some(1),
+                    ..Default::default()
+                })
+                .await?;
+            if !rows.is_empty() {
+                return Ok(None);
             }
         }
     }

@@ -1529,6 +1529,10 @@ pub(crate) struct HotStateFilter {
     pub(crate) file_ids: Vec<NullableKeyFilter<String>>,
     #[serde(default)]
     pub(crate) untracked: Option<bool>,
+    /// Restrict visible rows to local (`false`) or global (`true`) storage
+    /// scope. Applied after visibility resolution and before `limit`.
+    #[serde(default)]
+    pub(crate) global: Option<bool>,
     #[serde(default)]
     pub(crate) constraints: Vec<ScanConstraint>,
     /// Equality on a declared column, to be served by the hot index plane.

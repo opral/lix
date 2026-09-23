@@ -1011,10 +1011,15 @@ where
             }
             None => request,
         };
-        if let Some(rows) = self.scan_direct_row_pk_batch(request, &scope).await? {
+        let filter_global_scope = request.filter.global;
+        if filter_global_scope.is_none()
+            && let Some(rows) = self.scan_direct_row_pk_batch(request, &scope).await?
+        {
             return Ok(rows);
         }
-        if let Some(rows) = self.try_scan_limited_single_branch(request, &scope).await? {
+        if filter_global_scope.is_none()
+            && let Some(rows) = self.try_scan_limited_single_branch(request, &scope).await?
+        {
             return Ok(rows);
         }
         let derived_rows = MaterializedHotStateBatch::from_rows(
@@ -1045,7 +1050,8 @@ where
                 );
             }
         }
-        if derived_rows.is_empty()
+        if filter_global_scope.is_none()
+            && derived_rows.is_empty()
             && let Some(index) =
                 ordered_unique_branch_row_index(&hot_branch_rows, &scope.projection_branch_ids)
         {
@@ -1062,7 +1068,7 @@ where
                     .map(|branch_rows| branch_rows.rows),
             ),
         );
-        Ok(resolve_visible_batch(
+        let rows = resolve_visible_batch(
             rows,
             MaterializedHotStateBatch::default(),
             &VisibilityRequest {
@@ -1070,9 +1076,17 @@ where
                     branch_ids: scope.projection_branch_ids.clone(),
                 },
                 include_tombstones: request.filter.include_tombstones,
-                limit: request.limit,
+                limit: if filter_global_scope.is_some() {
+                    None
+                } else {
+                    request.limit
+                },
             },
-        ))
+        );
+        if let Some(global) = filter_global_scope {
+            return Ok(rows.filter(|row| row.global() == global, request.limit));
+        }
+        Ok(rows)
     }
 
     /// Rewrites a declared-column equality into a row-pk request.
@@ -2027,21 +2041,31 @@ where
         {
             return Ok(None);
         }
-        let [schema_key] = request.filter.schema_keys.as_slice() else { return Ok(None) };
-        let [branch_id] = scope.projection_branch_ids.as_slice() else { return Ok(None) };
+        let [schema_key] = request.filter.schema_keys.as_slice() else {
+            return Ok(None);
+        };
+        let [branch_id] = scope.projection_branch_ids.as_slice() else {
+            return Ok(None);
+        };
         // A limit cannot precede cross-branch shadow resolution. A negative
         // schema bloom proves that no other branch can contribute or shadow.
         if scope.storage_branch_ids.iter().any(|other| {
-            other != branch_id && scope.branch_heads.get(other)
-                .is_none_or(|control| control.may_have_schema(schema_key))
+            other != branch_id
+                && scope
+                    .branch_heads
+                    .get(other)
+                    .is_none_or(|control| control.may_have_schema(schema_key))
         }) {
             return Ok(None);
         }
-        let Some(control) = scope.branch_heads.get(branch_id) else { return Ok(None) };
+        let Some(control) = scope.branch_heads.get(branch_id) else {
+            return Ok(None);
+        };
         let mut tracked = tracked_scan_request_from_live(request);
         tracked.limit = request.limit;
         tracked.filter.include_tombstones = request.filter.include_tombstones;
-        self.tracked_head.reader(&self.store)
+        self.tracked_head
+            .reader(&self.store)
             .try_scan_limited_live_batch(branch_id, *control, &tracked, request.filter.untracked)
             .await
     }

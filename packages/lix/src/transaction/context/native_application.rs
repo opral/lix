@@ -131,6 +131,89 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
                 &Domain::schema_catalog(branch.clone(), true),
             )
             .await?;
+        let row_ref_source_schema_keys = catalog
+            .row_ref_references()
+            .iter()
+            .map(|reference| reference.source_key.schema_key.as_str())
+            .collect::<BTreeSet<_>>();
+        // A collection-generation marker is safe to apply without member
+        // expansion when the catalog merely declares a row-ref source but
+        // there are no source rows participating in this merge. A source row
+        // selected by the merge, or one visible in the destination overlay,
+        // changes that: the marker must be expanded so the shared delete
+        // planner can cascade it. The overlay probe covers unchanged
+        // destination rows and staged rows without expanding any source
+        // collection. Incoming picks carry no scope, so compare candidate
+        // picks against exact rows in the global domain by identity and
+        // change id. This distinguishes a projected global pick from a local
+        // row with the same schema/key without hydrating document payloads.
+        let expected_global = branch == GLOBAL_BRANCH_ID;
+        let incoming_row_ref_picks = picks
+            .iter()
+            .filter(|pick| {
+                !pick.selected_row.deleted
+                    && row_ref_source_schema_keys.contains(pick.identity.schema_key())
+            })
+            .collect::<Vec<_>>();
+        let incoming_row_ref_sources = if incoming_row_ref_picks.is_empty() {
+            false
+        } else if expected_global {
+            true
+        } else {
+            let global_rows = base
+                .load_exact_batch(&HotStateExactBatchRequest {
+                    rows: incoming_row_ref_picks
+                        .iter()
+                        .map(|pick| HotStateExactRowRequest {
+                            schema_key: pick.identity.schema_key().to_owned(),
+                            file_id: pick.identity.file_id().map(str::to_owned),
+                            row_pk: pick.identity.row_pk().clone(),
+                            branch_id: GLOBAL_BRANCH_ID.to_owned(),
+                        })
+                        .collect(),
+                    projection: Default::default(),
+                    untracked: Some(false),
+                    include_tombstones: false,
+                })
+                .await?;
+            incoming_row_ref_picks
+                .iter()
+                .enumerate()
+                .any(|(slot, pick)| {
+                    !global_rows.row(slot).is_some_and(|row| {
+                        row.global() && row.change_id() == Some(pick.selected_row.change_id)
+                    })
+                })
+        };
+        let live_row_ref_sources = if row_ref_source_schema_keys.is_empty() {
+            false
+        } else {
+            let mut found = false;
+            for schema_key in &row_ref_source_schema_keys {
+                let rows = overlay_scan_batch(
+                    &base,
+                    &staged,
+                    &HotStateScanRequest {
+                        filter: HotStateFilter {
+                            schema_keys: vec![(*schema_key).to_owned()],
+                            branch_ids: vec![branch.clone()],
+                            global: Some(expected_global),
+                            include_tombstones: false,
+                            ..Default::default()
+                        },
+                        limit: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                if !rows.is_empty() {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        let row_ref_sources_present = incoming_row_ref_sources || live_row_ref_sources;
         let has_action = |schema: &str| {
             catalog.has_row_ref_cascades()
                 || catalog
@@ -202,7 +285,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
                 entry.identity.row_pk(),
             )?;
             if incoming_row_refs
-                || !catalog.row_ref_references().is_empty()
+                || row_ref_sources_present
                 || incoming_fk_targets.contains(&schema_key)
                 || !catalog
                     .delete_plan_for_key(&schema_key)
