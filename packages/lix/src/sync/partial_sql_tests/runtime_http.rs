@@ -497,32 +497,32 @@ async fn lost_wave_with_pending_edit(
 
 #[tokio::test]
 async fn file_checkpoint_upload_retries_lost_ack_with_original_content() {
-    file_checkpoint_upload_case(false, 1024 * 1024, false, None).await;
+    Box::pin(file_checkpoint_upload_case(false, 1024 * 1024, false, None)).await;
 }
 
 #[tokio::test]
 async fn file_checkpoint_upload_pages_offline_edits_and_repeated_checkpoints() {
-    file_checkpoint_upload_case(true, 1024 * 1024, false, None).await;
+    Box::pin(file_checkpoint_upload_case(true, 1024 * 1024, false, None)).await;
 }
 
 #[tokio::test]
 async fn file_checkpoint_upload_pages_aggregate_wire_bytes() {
-    file_checkpoint_upload_case(true, 8 * 1024, false, None).await;
+    Box::pin(file_checkpoint_upload_case(true, 8 * 1024, false, None)).await;
 }
 
 #[tokio::test]
 async fn file_ordinary_upload_pages_aggregate_wire_bytes() {
-    file_checkpoint_upload_case(true, 8 * 1024, true, None).await;
+    Box::pin(file_checkpoint_upload_case(true, 8 * 1024, true, None)).await;
 }
 
 #[tokio::test]
 async fn checkpoint_publishes_cold_authority_blobs_without_hydrating_content() {
-    file_checkpoint_upload_case(false, 1024 * 1024, false, Some(false)).await;
+    Box::pin(file_checkpoint_upload_case(false, 1024 * 1024, false, Some(false))).await;
 }
 
 #[tokio::test]
 async fn checkpoint_publishes_deferred_authority_blobs_without_hydrating_content() {
-    file_checkpoint_upload_case(false, 1024 * 1024, false, Some(true)).await;
+    Box::pin(file_checkpoint_upload_case(false, 1024 * 1024, false, Some(true))).await;
 }
 
 async fn file_checkpoint_upload_case(
