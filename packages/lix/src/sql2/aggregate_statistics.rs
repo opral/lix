@@ -20,7 +20,7 @@ use datafusion::physical_plan::expressions;
 use datafusion::physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion::physical_plan::udaf::{AggregateFunctionExpr, StatisticsArgs};
-use datafusion::physical_plan::{ExecutionPlan, Statistics};
+use datafusion::physical_plan::{ExecutionPlan, Statistics, StatisticsContext};
 
 #[derive(Debug, Default)]
 pub(crate) struct ExactAggregateStatistics;
@@ -35,7 +35,11 @@ impl PhysicalOptimizerRule for ExactAggregateStatistics {
             let aggregate = partial
                 .downcast_ref::<AggregateExec>()
                 .expect("optimizable partial aggregate is AggregateExec");
-            let statistics = aggregate.input().partition_statistics(None)?;
+            let statistics = StatisticsContext::new()
+                .compute(
+                    aggregate.input().as_ref(),
+                    &datafusion::physical_plan::StatisticsArgs::new(),
+                )?;
             let mut projections = Vec::with_capacity(aggregate.aggr_expr().len());
             for expression in aggregate.aggr_expr() {
                 let Some(value) = exact_aggregate_value(&statistics, expression) else {

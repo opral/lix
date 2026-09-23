@@ -18,7 +18,7 @@ use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
 
 use super::expr::{
-    BoundBinaryOperator, BoundCastType, BoundExpr, BoundLiteral, BoundParamRef, ReturningImage,
+    BoundBinaryOperator, BoundCastType, BoundExpr, BoundLiteral, BoundParamRef,
     bind_public_cast_type,
 };
 use super::read::BoundRead;
@@ -1464,7 +1464,7 @@ fn bind_exact_column_name(name: &ObjectName) -> Result<String, LixError> {
         .ok_or_else(|| super::error::unsupported("unsupported SQL column name"))
 }
 
-fn normalize_identifier(ident: &datafusion::sql::sqlparser::ast::Ident) -> String {
+fn normalize_identifier(ident: &Ident) -> String {
     if ident.quote_style.is_some() {
         ident.value.clone()
     } else {

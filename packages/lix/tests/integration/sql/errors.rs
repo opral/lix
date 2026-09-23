@@ -399,9 +399,9 @@ simulation_test!(
         super::assert_rows_eq(
             result,
             vec![
-                vec![lix::Value::Integer(1)],
-                vec![lix::Value::Integer(2)],
-                vec![lix::Value::Integer(3)],
+                vec![Value::Integer(1)],
+                vec![Value::Integer(2)],
+                vec![Value::Integer(3)],
             ],
         );
     }

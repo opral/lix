@@ -84,12 +84,12 @@ use datafusion::execution::SessionState;
 pub(crate) const LIX_INSERT_COLUMN_OMITTED_METADATA_KEY: &str = "lix_insert_column_omitted";
 
 pub(crate) struct DataFusionLogicalPlan {
-    pub(super) state: std::sync::Arc<SessionState>,
+    pub(super) state: Arc<SessionState>,
     pub(super) plan: crate::sql2::runtime::RuntimeReadPlan,
     pub(super) notices: Vec<LixNotice>,
     pub(super) expected_parameter_count: usize,
     pub(super) physical_planning_cache: Option<(
-        std::sync::Arc<SqlPlanningCache<CatalogFingerprint>>,
+        Arc<SqlPlanningCache<CatalogFingerprint>>,
         PhysicalReadPlanCacheKey<CatalogFingerprint>,
     )>,
 }
@@ -114,7 +114,7 @@ pub(crate) struct SessionReadBatchStreamResult<'session> {
 #[cfg(feature = "storage-benches")]
 pub(crate) struct SessionReadCollectedBatchResult {
     pub(crate) fields: Vec<Field>,
-    pub(crate) batches: std::sync::Arc<[RecordBatch]>,
+    pub(crate) batches: Arc<[RecordBatch]>,
     pub(crate) notices: Vec<LixNotice>,
 }
 
@@ -225,7 +225,7 @@ pub(crate) enum SessionReadResult {
     Rows(SqlQueryResult),
     Columnar {
         fields: Vec<Field>,
-        batches: std::sync::Arc<[RecordBatch]>,
+        batches: Arc<[RecordBatch]>,
         notices: Vec<LixNotice>,
     },
 }
@@ -251,7 +251,7 @@ impl SessionReadResult {
 pub(crate) struct ReadSqlSession<'ctx> {
     session: Option<PooledReadSession>,
     planning_environment: Option<(
-        std::sync::Arc<SqlPlanningCache<CatalogFingerprint>>,
+        Arc<SqlPlanningCache<CatalogFingerprint>>,
         CatalogFingerprint,
     )>,
     _context: PhantomData<&'ctx ()>,
@@ -268,7 +268,7 @@ impl ReadSqlSession<'_> {
         self.pooled().context()
     }
 
-    fn state(&self) -> &std::sync::Arc<SessionState> {
+    fn state(&self) -> &Arc<SessionState> {
         self.pooled().state()
     }
 }
@@ -433,7 +433,7 @@ async fn create_logical_plan_in_session_from_parsed(
         && let Some(cached) = cache.read_plan(sql, params, catalog)
     {
         let physical_planning_cache = PhysicalReadPlanCacheKey::new(sql, params, catalog.clone())
-            .map(|key| (std::sync::Arc::clone(cache), key));
+            .map(|key| (Arc::clone(cache), key));
         // With a physical-cache key the runtime rebinds scan providers lazily:
         // a warm template execution never touches the logical plan, so eagerly
         // resolving providers into it here would be pure per-statement waste.
@@ -445,7 +445,7 @@ async fn create_logical_plan_in_session_from_parsed(
             )
         };
         return Ok(SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
-            state: std::sync::Arc::clone(session.state()),
+            state: Arc::clone(session.state()),
             plan,
             notices: Vec::new(),
             expected_parameter_count: cached.expected_parameter_count,
@@ -477,14 +477,14 @@ async fn create_logical_plan_in_session_from_parsed(
             .as_ref()
             .and_then(|(cache, catalog)| {
                 PhysicalReadPlanCacheKey::new(sql, params, catalog.clone())
-                    .map(|key| (std::sync::Arc::clone(cache), key))
+                    .map(|key| (Arc::clone(cache), key))
             })
     } else {
         None
     };
 
     Ok(SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
-        state: std::sync::Arc::clone(session.state()),
+        state: Arc::clone(session.state()),
         plan: crate::sql2::runtime::RuntimeReadPlan::Bound(plan),
         notices: Vec::new(),
         expected_parameter_count,
@@ -498,7 +498,7 @@ fn detach_cached_read_plan(plan: LogicalPlan) -> Result<LogicalPlan, LixError> {
             return Ok(Transformed::no(node));
         };
         scan.source =
-            provider_as_source(std::sync::Arc::new(EmptyTable::new(scan.source.schema())));
+            provider_as_source(Arc::new(EmptyTable::new(scan.source.schema())));
         Ok(Transformed::yes(LogicalPlan::TableScan(scan)))
     })
     .map(|transformed| transformed.data)
@@ -682,7 +682,7 @@ async fn create_transaction_read_logical_plan_from_parsed(
 
     Ok((
         SqlLogicalPlan::DataFusion(SqlDataFusionLogicalPlan {
-            state: std::sync::Arc::clone(session.state()),
+            state: Arc::clone(session.state()),
             plan: crate::sql2::runtime::RuntimeReadPlan::Bound(plan),
             notices: Vec::new(),
             expected_parameter_count,
@@ -1001,14 +1001,14 @@ async fn execute_logical_plan(
         crate::sql_profile::record_result_count_only(rows, batches.len());
         return Ok(SessionReadResult::Columnar {
             fields: result_fields,
-            batches: std::sync::Arc::from(batches),
+            batches: Arc::from(batches),
             notices,
         });
     }
     if retain_columnar_result(&result_fields, &batches) {
         return Ok(SessionReadResult::Columnar {
             fields: result_fields,
-            batches: std::sync::Arc::from(batches),
+            batches: Arc::from(batches),
             notices,
         });
     }
@@ -1110,7 +1110,7 @@ async fn execute_logical_plan_collected_batches(
         .map_err(datafusion_error_to_lix_error)?;
     Ok(SessionReadCollectedBatchResult {
         fields,
-        batches: std::sync::Arc::from(batches),
+        batches: Arc::from(batches),
         notices,
     })
 }
@@ -1474,7 +1474,7 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
     let exec = match plan.bound.op {
         BoundWriteOp::Insert => {
             let input =
-                insert_input_plan(&session, std::sync::Arc::clone(&table_schema), plan, params)
+                insert_input_plan(&session, Arc::clone(&table_schema), plan, params)
                     .await?;
             if plan.bound.branch_scope == BranchScope::Empty {
                 return sql_write_empty_returning_result(
@@ -1499,7 +1499,7 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
                     .await
                     .map_err(datafusion_error_to_lix_error)?;
                 let proposed_batches = crate::sql2::runtime::stream_input_plan(
-                    std::sync::Arc::clone(&input),
+                    Arc::clone(&input),
                     session.task_ctx(),
                 )
                 .map_err(datafusion_error_to_lix_error)?;
@@ -1788,7 +1788,7 @@ async fn datafusion_returning_projection(
     if source_fields.is_empty() {
         const ROW_MARKER: &str = "__lix_returning_row_marker";
         source_fields.push(Field::new(ROW_MARKER, DataType::UInt64, false));
-        source_arrays.push(std::sync::Arc::new(UInt64Array::from(vec![0_u64; count])));
+        source_arrays.push(Arc::new(UInt64Array::from(vec![0_u64; count])));
     }
 
     let input_batch = RecordBatch::try_new_with_options(
@@ -2111,8 +2111,8 @@ fn returning_table_factor_range_variables(
 
 fn push_returning_source_column(
     fields: &mut Vec<Field>,
-    arrays: &mut Vec<std::sync::Arc<dyn Array>>,
-    null_arrays: &mut HashMap<DataType, std::sync::Arc<dyn Array>>,
+    arrays: &mut Vec<Arc<dyn Array>>,
+    null_arrays: &mut HashMap<DataType, Arc<dyn Array>>,
     field: &datafusion::arrow::datatypes::FieldRef,
     source_name: &str,
     batch: Option<&RecordBatch>,
@@ -2141,7 +2141,7 @@ async fn insert_input_plan(
     schema: SchemaRef,
     plan: &LogicalWritePlan,
     params: &[Value],
-) -> Result<std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>, LixError> {
+) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>, LixError> {
     match &plan.bound.input {
         BoundWriteInput::Values(values) => {
             insert_values_input_plan(session, schema, plan, params, values).await
@@ -2162,7 +2162,7 @@ async fn insert_values_input_plan(
     plan: &LogicalWritePlan,
     params: &[Value],
     values: &BoundInsertValues,
-) -> Result<std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>, LixError> {
+) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>, LixError> {
     if values.rows.is_empty() {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
@@ -2178,7 +2178,7 @@ async fn insert_values_input_plan(
     // aliases below. DataFusion can eliminate the identity projection while
     // optimizing an INSERT, but it preserves the VALUES schema at the table
     // provider boundary.
-    let nullable_schema = std::sync::Arc::new(Schema::new(
+    let nullable_schema = Arc::new(Schema::new(
         schema
             .fields()
             .iter()
@@ -2200,7 +2200,7 @@ async fn insert_values_input_plan(
             })
             .collect::<Vec<_>>(),
     ));
-    let df_schema = std::sync::Arc::new(
+    let df_schema = Arc::new(
         DFSchema::try_from(nullable_schema).map_err(datafusion_error_to_lix_error)?,
     );
     let rows = values
@@ -2266,7 +2266,7 @@ async fn insert_query_input_plan(
     columns: &[BoundColumnRef],
     params: &[Value],
     coerce: bool,
-) -> Result<std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>, LixError> {
+) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>, LixError> {
     let mut statement = DataFusionStatement::Statement(Box::new(
         datafusion::sql::sqlparser::ast::Statement::Query(query.query.clone()),
     ));
@@ -2547,10 +2547,11 @@ fn prepare_write_expr(
 
     let state = session.state();
     let config = state.config_options();
-    let context = SimplifyContext::default()
-        .with_schema(std::sync::Arc::new(schema.clone()))
-        .with_config_options(std::sync::Arc::clone(config))
-        .with_query_execution_start_time(state.execution_props().query_execution_start_time);
+    let context = SimplifyContext::builder()
+        .with_schema(Arc::new(schema.clone()))
+        .with_config_options(Arc::clone(config))
+        .with_query_execution_start_time(state.execution_props().query_execution_start_time)
+        .build();
     let simplifier = ExprSimplifier::new(context);
     let mut expr = simplifier
         .coerce(expr, schema)
@@ -2593,7 +2594,7 @@ async fn datafusion_dml_returning(
             .cloned()
             .collect::<BTreeSet<_>>();
         return Ok(Some(crate::sql2::providers::DmlReturning::new_deferred(
-            std::sync::Arc::new(table_schema.clone()),
+            Arc::new(table_schema.clone()),
             required_columns,
             delete,
             images.old,
@@ -2605,7 +2606,7 @@ async fn datafusion_dml_returning(
         for field in table_schema.fields() {
             input_fields.push((
                 Some(datafusion::common::TableReference::bare(qualifier)),
-                std::sync::Arc::new(field.as_ref().clone().with_nullable(true)),
+                Arc::new(field.as_ref().clone().with_nullable(true)),
             ));
         }
     }
@@ -2660,10 +2661,10 @@ async fn datafusion_dml_returning(
     }
 
     Ok(Some(crate::sql2::providers::DmlReturning::new(
-        std::sync::Arc::new(Schema::new(fields)),
+        Arc::new(Schema::new(fields)),
         expressions,
         required_columns,
-        std::sync::Arc::new(table_schema.clone()),
+        Arc::new(table_schema.clone()),
         delete,
         returning_image_columns(returning, delete, ReturningImage::Old),
         returning_image_columns(returning, delete, ReturningImage::New),
@@ -2944,7 +2945,7 @@ async fn sql_write_empty_returning_result(
         let bound_returning = bound_returning.ok_or_else(|| {
             LixError::unknown("deferred RETURNING plan lost its bound SQL expressions")
         })?;
-        let empty = RecordBatch::new_empty(std::sync::Arc::new(table_schema.clone()));
+        let empty = RecordBatch::new_empty(Arc::new(table_schema.clone()));
         let (fields, _) = datafusion_returning_projection(
             session,
             table_schema,
@@ -3106,7 +3107,7 @@ fn datafusion_conflict_assignments(
 ) -> Result<
     Vec<(
         String,
-        std::sync::Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        Arc<dyn datafusion::physical_expr::PhysicalExpr>,
     )>,
     LixError,
 > {

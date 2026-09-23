@@ -26,8 +26,9 @@ use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSe
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
-    SendableRecordBatchStream, Statistics,
+    ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties,
+    PlanProperties, ReplaceChildrenOptions, SendableRecordBatchStream, Statistics,
+    StatisticsArgs, StatisticsContext,
 };
 use futures_util::{StreamExt, TryStreamExt, stream};
 use tokio::sync::OnceCell;
@@ -413,7 +414,11 @@ fn rebuild_template_node(
                 .with_preserve_partitioning(sort.preserve_partitioning()),
         ));
     }
-    plan.with_new_children(children).ok()
+    plan.replace_children(
+        children,
+        ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+    )
+    .ok()
 }
 
 /// The structural identity a replacement scan must reproduce before a detached
@@ -715,7 +720,10 @@ fn adapt_runtime_plan_inner(
         children.push(adapted);
     }
     let plan = if children_changed {
-        plan.with_new_children(children)?
+        plan.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )?
     } else {
         plan
     };
@@ -845,7 +853,10 @@ fn replace_probe_scan(
         return internal_err!("probe side lost its scan");
     };
     let child = replace_probe_scan(child, replacement)?;
-    Arc::clone(plan).with_new_children(vec![child])
+    Arc::clone(plan).replace_children(
+        vec![child],
+        ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+    )
 }
 
 /// A hash join that reads its build side first and replans its probe scan
@@ -960,7 +971,10 @@ impl ExecutionPlan for ProbeKeyJoinExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.join.partition_statistics(partition)
+        StatisticsContext::new().compute(
+            self.join.as_ref(),
+            &StatisticsArgs::new().with_partition(partition),
+        )
     }
 }
 
@@ -1263,7 +1277,10 @@ impl ExecutionPlan for StatementScanCacheExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.state.input.partition_statistics(partition)
+        StatisticsContext::new().compute(
+            self.state.input.as_ref(),
+            &StatisticsArgs::new().with_partition(partition),
+        )
     }
 }
 
@@ -1385,8 +1402,8 @@ impl ExecutionPlan for SerialCoalescePartitionsExec {
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.input
-            .partition_statistics(None)?
+        StatisticsContext::new()
+            .compute(self.input.as_ref(), &StatisticsArgs::new())?
             .as_ref()
             .clone()
             .with_fetch(self.fetch, 0, 1)

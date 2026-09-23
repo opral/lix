@@ -2082,6 +2082,16 @@ mod scan_source_tests {
 
     use super::*;
 
+    fn scan_statistics(
+        plan: &dyn ExecutionPlan,
+        partition: Option<usize>,
+    ) -> Result<Arc<Statistics>> {
+        datafusion::physical_plan::StatisticsContext::new().compute(
+            plan,
+            &datafusion::physical_plan::StatisticsArgs::new().with_partition(partition),
+        )
+    }
+
     fn int_schema(name: &str) -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, false)]))
     }
@@ -2527,13 +2537,13 @@ mod scan_source_tests {
         );
 
         assert_eq!(
-            exec.partition_statistics(Some(0))
+            scan_statistics(&exec, Some(0))
                 .expect("partition statistics")
                 .num_rows,
             Precision::Exact(2)
         );
         assert_eq!(
-            exec.partition_statistics(None)
+            scan_statistics(&exec, None)
                 .expect("merged statistics")
                 .num_rows,
             Precision::Exact(5)
@@ -2573,13 +2583,13 @@ mod scan_source_tests {
         );
 
         assert_eq!(
-            exec.partition_statistics(Some(0))
+            scan_statistics(&exec, Some(0))
                 .expect("partition statistics")
                 .num_rows,
             Precision::Absent
         );
         assert_eq!(
-            exec.partition_statistics(None)
+            scan_statistics(&exec, None)
                 .expect("source statistics")
                 .num_rows,
             Precision::Exact(7)
@@ -2646,18 +2656,18 @@ mod scan_source_tests {
             assert_eq!(actual, expected);
         }
         assert_eq!(
-            exec.partition_statistics(Some(0))
+            scan_statistics(&exec, Some(0))
                 .expect("first grouped statistics")
                 .num_rows,
             Precision::Exact(2)
         );
         assert_eq!(
-            exec.partition_statistics(Some(1))
+            scan_statistics(&exec, Some(1))
                 .expect("second grouped statistics")
                 .num_rows,
             Precision::Exact(3)
         );
-        assert!(exec.partition_statistics(Some(2)).is_err());
+        assert!(scan_statistics(&exec, Some(2)).is_err());
     }
 
     #[test]

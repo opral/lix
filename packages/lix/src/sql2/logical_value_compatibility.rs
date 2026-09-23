@@ -39,7 +39,6 @@ enum ValueIdentity {
 enum UnionIdentity {
     Plain,
     Null,
-    Unknown,
     Jsonb,
     RowRef,
     List(Box<UnionIdentity>),
@@ -51,7 +50,7 @@ impl UnionIdentity {
         match self {
             Self::Jsonb | Self::RowRef => true,
             Self::List(element) => element.contains_lix_type(),
-            Self::Plain | Self::Null | Self::Unknown | Self::Mixed => false,
+            Self::Plain | Self::Null | Self::Mixed => false,
         }
     }
 }
@@ -209,10 +208,10 @@ fn union_array_depth(depth: usize, mut identity: UnionIdentity) -> UnionIdentity
 }
 
 fn combine_union_identity(left: UnionIdentity, right: UnionIdentity) -> UnionIdentity {
-    use UnionIdentity::{Jsonb, List, Mixed, Null, Plain, RowRef, Unknown};
+    use UnionIdentity::{Jsonb, List, Mixed, Null, Plain, RowRef};
     match (left, right) {
         (Mixed, _) | (_, Mixed) => Mixed,
-        (Null, value) | (value, Null) | (Unknown, value) | (value, Unknown) => value,
+        (Null, value) | (value, Null) => value,
         (Plain, Plain) => Plain,
         (Jsonb, Jsonb) => Jsonb,
         (RowRef, RowRef) => RowRef,
