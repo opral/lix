@@ -269,7 +269,7 @@ pub(super) async fn load_native_baseline_retention(
 }
 
 #[cfg(test)]
-pub(super) async fn live_native_baseline_roots(
+pub(super) async fn retained_native_baseline_roots(
     read: &(impl StorageAdapterRead + ?Sized),
     now_ms: u64,
 ) -> Result<BTreeSet<CommitId>, LixError> {
@@ -324,7 +324,10 @@ mod tests {
             .await
             .unwrap();
         let read = adapter.begin_read(Default::default()).await.unwrap();
-        assert_eq!(live_native_baseline_roots(&read, now).await.unwrap(), roots);
+        assert_eq!(
+            retained_native_baseline_roots(&read, now).await.unwrap(),
+            roots
+        );
         assert!(
             require_native_baseline_lease(&read, &lease.lease_id, crate::SYSTEM_ACCOUNT_ID, now)
                 .await
@@ -402,15 +405,16 @@ mod tests {
             .await
             .unwrap();
         assert!(roots.is_subset(&retained.chronology_roots));
-        assert!(
-            live_native_baseline_roots(&read, renewed.expires_at_ms)
+        assert_eq!(
+            retained_native_baseline_roots(&read, renewed.expires_at_ms)
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+                roots,
+            "expired v2 rows retain roots until GC commits their deletion"
         );
     }
     #[tokio::test]
-    async fn baseline_lease_alone_retains_deleted_branch_native_authority_until_expiry() {
+    async fn baseline_lease_alone_retains_deleted_branch_native_authority_until_gc_retirement() {
         let lix = crate::open_lix().await.unwrap();
         let branch = lix
             .create_branch(crate::CreateBranchOptions {
@@ -491,7 +495,7 @@ mod tests {
                     .await
                     .unwrap();
             }
-            for _ in 0..3 {
+            for pass in 0..3 {
                 let read = crate::storage_adapter::SharedStorageAdapterRead::new(
                     adapter.begin_read(Default::default()).await.unwrap(),
                 );
@@ -506,8 +510,8 @@ mod tests {
                         .unwrap();
                 assert_eq!(
                     closure.chronology_roots.contains(&leased_head),
-                    !expired,
-                    "lease must be the deleted ordinary head's sole root"
+                    !expired || pass == 0,
+                    "an expired v2 row retains the deleted ordinary head until its deletion commits"
                 );
                 let mut writes = adapter.new_write_set();
                 let mut guards = Vec::new();
@@ -544,7 +548,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn baseline_lease_retains_deleted_branch_file_manifest_and_chunks_until_expiry() {
+    async fn baseline_lease_retains_deleted_branch_file_manifest_and_chunks_until_gc_retirement() {
         let lix = crate::open_lix().await.unwrap();
         let branch = lix
             .create_branch(crate::CreateBranchOptions {
@@ -640,7 +644,7 @@ mod tests {
                     .await
                     .unwrap();
             }
-            for _ in 0..3 {
+            for pass in 0..3 {
                 let read = crate::storage_adapter::SharedStorageAdapterRead::new(
                     adapter.begin_read(Default::default()).await.unwrap(),
                 );
@@ -655,8 +659,8 @@ mod tests {
                         .unwrap();
                 assert_eq!(
                     closure.chronology_roots.contains(&leased_head),
-                    !expired,
-                    "lease must be the deleted ordinary head's sole root"
+                    !expired || pass == 0,
+                    "an expired v2 row retains the deleted ordinary head until its deletion commits"
                 );
                 let mut writes = adapter.new_write_set();
                 let mut guards = Vec::new();
@@ -1051,7 +1055,12 @@ mod tests {
             .await
             .unwrap();
         assert!(renewed.expires_at_ms > lease.expires_at_ms);
-        assert!(live_native_baseline_roots(&read, 2).await.unwrap().contains(&head));
+        assert!(
+            retained_native_baseline_roots(&read, 2)
+                .await
+                .unwrap()
+                .contains(&head)
+        );
     }
 }
 
