@@ -4,7 +4,7 @@ description: Git is a CLI for source code. Lix is a library that versions any fi
 
 # How Lix compares to Git
 
-Git is a CLI designed for source code. It assumes a local POSIX filesystem, tracks whole files, and diffs text lines. Lix is a library you embed in a product. It versions any file format with row-level diffs, runs on pluggable storage, and stores files, app tables, and history as rows in one SQL database.
+Git versions files, but application data usually lives in a separate database. You can commit a SQLite database file to Git, but Git sees its bytes rather than queryable rows. Database changes are hard to review or merge, and successive versions grow the repository. Lix stores files and application data as SQL tables in one versioned repository. File plugins provide structured diffs for supported formats.
 
 ## When to use which
 

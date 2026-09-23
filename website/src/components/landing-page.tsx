@@ -255,7 +255,7 @@ const pillars = [
   {
     title: "Any format",
     description:
-      "Text, binaries, large blobs. Plugins diff and merge DOCX, XLSX, or JSON by clause, cell, or row.",
+      "Store text, binaries, and large files. Plugins provide structured diffs for supported formats, including Markdown and CSV.",
   },
   {
     title: "Embeddable",
@@ -289,11 +289,11 @@ function LandingPage({ readmeHtml }: { readmeHtml?: string }) {
               Open source · MIT
             </p>
             <h1 className="text-balance text-[30px] font-bold leading-[1.1] tracking-[-0.03em] sm:text-[40px]">
-              Universal version control system
+              Version control system for files and application data
             </h1>
             <p className="mt-4 max-w-[620px] text-base leading-[1.6] text-ink-secondary">
-              Versions any file format. Runs in-process on pluggable storage.
-              Designed as a database.
+              Store files and SQL tables in one repository. Branch, diff,
+              merge, and roll back changes to both.
             </p>
             <div className="mt-6 flex flex-wrap items-center gap-5">
               <span className="flex items-center gap-1.5 border-b-2 border-ink pb-0.5 text-[13px] font-semibold text-ink">

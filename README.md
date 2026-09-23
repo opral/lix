@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/opral/lix/main/website/public/logo.svg" alt="Lix" height="60">
 </p>
 
-<h3 align="center">Universal version control system</h3>
+<h3 align="center">Version control system for files and application data</h3>
 
 <p align="center">
   <a href="https://www.npmjs.com/package/@lix-js/sdk"><img src="https://img.shields.io/npm/dw/%40lix-js%2Fsdk?logo=npm&logoColor=red&label=npm%20downloads" alt="weekly downloads on NPM"></a>
@@ -11,11 +11,11 @@
   <a href="https://x.com/lixCCS"><img src="https://img.shields.io/badge/Follow-@lixCCS-black?logo=x&logoColor=white" alt="X (Twitter)"></a>
 </p>
 
-Lix is a version control system for any file format: code, documents, spreadsheets, design files, video, datasets. It runs in-process on pluggable storage. Files, app tables, and history are rows in one ACID database. Agents read and write normal files. Your product queries SQL. You branch, diff, merge, and roll back all of it together:
+Lix is a version control system for files and application data. Store files of any format alongside SQL tables in one repository. Branch, diff, merge, and roll back changes to both. Lix runs inside your app or connects to a server:
 
 <img src="./website/public/assets/one-lix-repo.svg" alt="One Lix repository holding files of every format and the application's own database tables" width="760" />
 
-- 📄 **Any format.** Text, binaries, large blobs. Plugins make formats like DOCX, XLSX, and JSON diffable and mergeable by clause, cell, or row.
+- 📄 **Any format.** Store text, binaries, and large files. Plugins provide structured diffs and merges for supported formats, including Markdown and CSV.
 - 🧩 **Embeddable.** Runs in-process as a library. Storage is pluggable: memory, filesystem, browser OPFS, or S3.
 - 🗄️ **Designed as a database.** File content, app tables, and history are rows in one ACID OLTP database. Query millions of rows with SQL.
 - ⚡ **Real-time collaboration.** People and agents share a repository and see changes as they happen.
@@ -23,15 +23,15 @@ Lix is a version control system for any file format: code, documents, spreadshee
 
 ## Why not Git?
 
-Git is a CLI designed for source code. It assumes a local POSIX filesystem, tracks whole files, and diffs text lines. Keep software engineering in Git. Use Lix when your product stores files and data for its users.
+Git versions files well, but application data usually lives in a separate database. Committing a SQLite database to Git versions its bytes, not its rows: changes are hard to review or merge, and each database revision adds to the repository. Lix stores queryable tables alongside files and versions changes to both.
 
 |                   | Git                  | Lix                             |
 | ----------------- | -------------------- | ------------------------------- |
 | Process model     | Separate CLI process | Library in your process         |
 | Storage           | Local disk           | Memory · filesystem · OPFS · S3 |
 | Application data  | Separate database    | SQL rows, ACID, with the files  |
-| Recording changes | Manual commits       | Every write, automatically      |
-| Formats           | Text lines           | Any, by clause, cell, or row    |
+| Recording changes | Manual commits       | Tracked writes commit automatically |
+| Formats           | Text lines           | Structured diffs with plugins for supported formats |
 | Collaboration     | Push and pull        | Real time                       |
 
 ## Getting started
