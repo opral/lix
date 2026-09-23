@@ -13484,17 +13484,16 @@ where
         self.opening_active_branch_head.map(|commit_id| commit_id.to_string())
     }
 
-    async fn register_sql_read_table_functions(
+    async fn register_sql_read_dependencies(
         &mut self,
         session: &datafusion::prelude::SessionContext,
         catalog: Arc<crate::sql2::PublicCatalog>,
         selection: &crate::sql2::ProviderSelection,
-        statement: datafusion::sql::parser::Statement,
+        requirements: crate::sql2::SqlWriteReadRequirements,
         active_branch_commit_id: Option<String>,
-        needs_read_table_functions: bool,
     ) -> Result<crate::sql2::ExecutionFunctionBindings, LixError> {
         let read_store = self.opening_read();
-        if needs_read_table_functions {
+        if requirements.needs_read_table_functions {
             let read_ctx =
                 self.sql_read_execution_context(read_store.clone(), Arc::clone(&self.hot_state))?;
             crate::sql2::register_read_table_functions(
@@ -13506,23 +13505,18 @@ where
             )?;
         }
 
-        let needs_root = crate::sql2::statement_uses_execution_function(
-            &statement,
-            "lix_root_commit_id",
-        );
-        let needs_working_checkpoint = crate::sql2::statement_uses_execution_function(
-            &statement,
-            "lix_working_diff_checkpoint_commit_id",
-        );
         let active_branch_id = self.active_branch_id.clone();
-        let root_graph: Option<Box<dyn crate::commit_graph::CommitGraphReader>> = if needs_root {
+        let root_graph: Option<Box<dyn crate::commit_graph::CommitGraphReader>> =
+            if requirements.needs_root_commit_id {
             Some(Box::new(
                 CommitGraphContext::new().reader(read_store.clone()),
             ))
         } else {
             None
         };
-        let working_diff_store = needs_working_checkpoint.then_some(read_store);
+        let working_diff_store = requirements
+            .needs_working_diff_checkpoint_commit_id
+            .then_some(read_store);
         let root_commit_id = if let Some(root_graph) = root_graph {
             crate::sql2::resolve_root_commit_id_from_graph(root_graph, active_branch_commit_id.clone())
                 .await?

@@ -203,17 +203,6 @@ impl ProviderSelection {
     }
 }
 
-pub(crate) fn selection_uses_read_table_functions(
-    catalog: &PublicCatalog,
-    selection: &ProviderSelection,
-) -> bool {
-    READ_TABLE_FUNCTION_NAMES.iter().any(|name| {
-        catalog
-            .surface(name)
-            .is_some_and(|surface| selection.includes(surface))
-    })
-}
-
 /// Install read-only table functions shared by ordinary reads, transaction
 /// reads, and INSERT query sources. Relation providers are registered
 /// separately so write sessions can keep their transaction-overlay sources.

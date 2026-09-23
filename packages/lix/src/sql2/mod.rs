@@ -31,8 +31,8 @@ mod runtime;
 pub(crate) mod script;
 mod session;
 pub(crate) use session::{
-    ExecutionFunctionBindings, resolve_root_commit_id_from_graph,
-    resolve_working_diff_checkpoint_commit_id_from_store, statement_uses_execution_function,
+    ExecutionFunctionBindings, SqlWriteReadRequirements, resolve_root_commit_id_from_graph,
+    resolve_working_diff_checkpoint_commit_id_from_store,
 };
 #[cfg(test)]
 mod test_support;

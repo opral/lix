@@ -5879,6 +5879,89 @@ mod tests {
         assert!(missing.is_empty());
     }
 
+    #[tokio::test]
+    async fn parameterized_history_reads_runtime_registered_relation_rows() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameterized_history_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false }
+            ],
+            "primary_key": ["id"]
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("runtime relation schema should register");
+        session
+            .execute(
+                "INSERT INTO parameterized_history_probe (id, value) VALUES ('row-a', 'history-value')",
+                &[],
+            )
+            .await
+            .expect("runtime relation row should insert");
+
+        let history = session
+            .execute(
+                "SELECT id, to_value FROM lix_history($1) WHERE id = 'row-a'",
+                &[Value::Text("parameterized_history_probe".into())],
+            )
+            .await
+            .expect("parameterized history should resolve runtime relation metadata");
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.rows()[0].get::<String>("id").unwrap(), "row-a");
+        assert_eq!(
+            history.rows()[0].get::<String>("to_value").unwrap(),
+            "history-value"
+        );
+    }
+
+    #[tokio::test]
+    async fn returning_subqueries_read_relations_and_parameterized_lix_table_functions() {
+        let session = open_session().await;
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('returning-dependency', 'related-value')",
+                &[],
+            )
+            .await
+            .expect("related row should insert");
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ('/returning-dependency.md', $1)",
+                &[Value::Blob(b"before".to_vec().into())],
+            )
+            .await
+            .expect("write target row should insert");
+
+        let result = session
+            .execute(
+                "UPDATE lix_file SET path = '/returning-dependency-after.md' \
+                 WHERE path = '/returning-dependency.md' \
+                 RETURNING \
+                     (SELECT value FROM lix_key_value WHERE key = 'returning-dependency') AS related_value, \
+                     (SELECT COUNT(*) FROM lix_history($1)) AS history_rows",
+                &[Value::Text("lix_key_value".into())],
+            )
+            .await
+            .expect("RETURNING subqueries should discover and plan their dependencies");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result.rows()[0]
+                .get::<serde_json::Value>("related_value")
+                .unwrap(),
+            serde_json::json!("related-value")
+        );
+        assert!(result.rows()[0].get::<i64>("history_rows").unwrap() > 0);
+    }
+
     async fn assert_typed_lifecycle_current(
         session: &SessionContext<Memory>,
         row_count: usize,

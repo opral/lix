@@ -2,8 +2,10 @@ use datafusion::catalog::CatalogProviderList;
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::sql::parser::Statement as DataFusionStatement;
+use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, TableFactor, Visit, Visitor};
 use std::collections::BTreeSet;
 use std::ops::Deref;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use crate::LixError;
@@ -172,6 +174,12 @@ pub(crate) struct ExecutionFunctionBindings {
     pub(crate) root_commit_id: Option<String>,
 }
 
+pub(crate) struct SqlWriteReadRequirements {
+    pub(crate) needs_read_table_functions: bool,
+    pub(crate) needs_root_commit_id: bool,
+    pub(crate) needs_working_diff_checkpoint_commit_id: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SqlWriteSessionOptions {
     pub(crate) omitted_insert_columns: BTreeSet<String>,
@@ -207,44 +215,58 @@ pub(crate) async fn build_write_session_with_options(
 ) -> Result<SqlWriteSession, LixError> {
     let session = ctx.datafusion_session();
     let table_name = super::exec::datafusion::write_target_table_name(plan)?;
-    let provider_selection = super::exec::datafusion::write_provider_selection(
-        &session.state(),
-        plan,
-        &table_name,
-    );
+    let (provider_selection, needs_read_table_functions) =
+        super::exec::datafusion::write_read_dependencies(&session.state(), plan, &table_name)?;
     let catalog = ctx.public_catalog()?;
-    let (source_statement, needs_read_table_functions) = match &plan.bound.input {
+    let source_statement = match &plan.bound.input {
         super::bind::write::BoundWriteInput::Query { query, .. } => {
-            let statement = DataFusionStatement::Statement(Box::new(
+            Some(DataFusionStatement::Statement(Box::new(
                 datafusion::sql::sqlparser::ast::Statement::Query(query.query.clone()),
-            ));
-            let needs_table_functions = match &provider_selection {
-                providers::ProviderSelection::All
-                | providers::ProviderSelection::AllWithHistory(_) => {
-                    super::exec::datafusion::write_source_uses_read_table_functions(plan)
-                }
-                _ => providers::selection_uses_read_table_functions(&catalog, &provider_selection),
-            };
-            (Some(statement), needs_table_functions)
+            )))
         }
-        _ => (None, false),
+        _ => None,
+    };
+    let returning_expressions = plan
+        .bound
+        .returning
+        .iter()
+        .flat_map(|returning| returning.items.iter())
+        .filter_map(|item| item.sql_expr.as_ref());
+    let needs_root_commit_id = source_statement
+        .as_ref()
+        .is_some_and(|statement| {
+            statement_uses_execution_function(statement, "lix_root_commit_id")
+        })
+        || returning_expressions
+            .clone()
+            .any(|expression| expression_uses_execution_function(expression, "lix_root_commit_id"));
+    let needs_working_diff_checkpoint_commit_id = source_statement
+        .as_ref()
+        .is_some_and(|statement| {
+            statement_uses_execution_function(statement, "lix_working_diff_checkpoint_commit_id")
+        })
+        || returning_expressions.clone().any(|expression| {
+            expression_uses_execution_function(
+                expression,
+                "lix_working_diff_checkpoint_commit_id",
+            )
+        });
+    let read_requirements = SqlWriteReadRequirements {
+        needs_read_table_functions,
+        needs_root_commit_id,
+        needs_working_diff_checkpoint_commit_id,
     };
     let read_active_branch_commit_id = ctx.sql_read_active_branch_commit_id();
-    let execution_bindings = if let Some(statement) = source_statement.as_ref()
-        && (needs_read_table_functions
-            || statement_uses_execution_function(statement, "lix_root_commit_id")
-            || statement_uses_execution_function(
-                statement,
-                "lix_working_diff_checkpoint_commit_id",
-            ))
+    let execution_bindings = if read_requirements.needs_read_table_functions
+        || read_requirements.needs_root_commit_id
+        || read_requirements.needs_working_diff_checkpoint_commit_id
     {
-        ctx.register_sql_read_table_functions(
+        ctx.register_sql_read_dependencies(
             &session,
             Arc::clone(&catalog),
             &provider_selection,
-            statement.clone(),
+            read_requirements,
             read_active_branch_commit_id.clone(),
-            needs_read_table_functions,
         )
         .await?
     } else {
@@ -300,56 +322,6 @@ pub(crate) fn statement_uses_execution_function(
     statement: &DataFusionStatement,
     function_name: &str,
 ) -> bool {
-    use datafusion::sql::sqlparser::ast::{Expr, TableFactor, Visit, Visitor};
-    use std::ops::ControlFlow;
-
-    struct ExecutionFunctionVisitor<'a> {
-        function_name: &'a str,
-    }
-
-    impl Visitor for ExecutionFunctionVisitor<'_> {
-        type Break = ();
-
-        fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
-            if let Expr::Function(function) = expression
-                && crate::sql2::parse::object_name_is_public_function(
-                    &function.name,
-                    self.function_name,
-                )
-            {
-                return ControlFlow::Break(());
-            }
-            ControlFlow::Continue(())
-        }
-
-        fn pre_visit_table_factor(&mut self, table: &TableFactor) -> ControlFlow<Self::Break> {
-            if self.function_name == "lix_root_commit_id"
-                && let TableFactor::Table {
-                    name,
-                    args: Some(_),
-                    ..
-                } = table
-                && crate::sql2::parse::object_name_is_public_function(name, "lix_as_of")
-            {
-                return ControlFlow::Break(());
-            }
-            if matches!(
-                self.function_name,
-                "lix_active_branch_commit_id" | "lix_working_diff_checkpoint_commit_id"
-            ) && let TableFactor::Table {
-                name,
-                args: Some(arguments),
-                ..
-            } = table
-                && crate::sql2::parse::object_name_is_public_function(name, "lix_diff")
-                && arguments.args.len() == 1
-            {
-                return ControlFlow::Break(());
-            }
-            ControlFlow::Continue(())
-        }
-    }
-
     match statement {
         DataFusionStatement::Statement(statement) => statement
             .visit(&mut ExecutionFunctionVisitor { function_name })
@@ -358,6 +330,62 @@ pub(crate) fn statement_uses_execution_function(
             statement_uses_execution_function(explain.statement.as_ref(), function_name)
         }
         _ => false,
+    }
+}
+
+pub(crate) fn expression_uses_execution_function(
+    expression: &SqlExpr,
+    function_name: &str,
+) -> bool {
+    expression
+        .visit(&mut ExecutionFunctionVisitor { function_name })
+        .is_break()
+}
+
+struct ExecutionFunctionVisitor<'a> {
+    function_name: &'a str,
+}
+
+impl Visitor for ExecutionFunctionVisitor<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expression: &SqlExpr) -> ControlFlow<Self::Break> {
+        if let SqlExpr::Function(function) = expression
+            && crate::sql2::parse::object_name_is_public_function(
+                &function.name,
+                self.function_name,
+            )
+        {
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, table: &TableFactor) -> ControlFlow<Self::Break> {
+        if self.function_name == "lix_root_commit_id"
+            && let TableFactor::Table {
+                name,
+                args: Some(_),
+                ..
+            } = table
+            && crate::sql2::parse::object_name_is_public_function(name, "lix_as_of")
+        {
+            return ControlFlow::Break(());
+        }
+        if matches!(
+            self.function_name,
+            "lix_active_branch_commit_id" | "lix_working_diff_checkpoint_commit_id"
+        ) && let TableFactor::Table {
+            name,
+            args: Some(arguments),
+            ..
+        } = table
+            && crate::sql2::parse::object_name_is_public_function(name, "lix_diff")
+            && arguments.args.len() == 1
+        {
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
     }
 }
 
