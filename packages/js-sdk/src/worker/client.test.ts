@@ -40,6 +40,57 @@ function fakeConnection(options: { terminate?: () => Promise<void> } = {}) {
 	};
 }
 
+test("worker observation keeps its creation parent for only the first frame", async () => {
+	const transport = fakeConnection();
+	const creationParent = {
+		traceparent: "00-11111111111111111111111111111111-1111111111111111-01",
+	};
+	const laterParent = {
+		traceparent: "00-22222222222222222222222222222222-2222222222222222-01",
+	};
+	let activeParent: typeof creationParent | undefined = creationParent;
+	const client = new LixWorkerClient(transport.connection);
+	client.beginLease(undefined, {
+		onExport() {},
+		parentContext: () => activeParent,
+	});
+	const binding = workerBinding(client, new BindingLease(() => undefined), 0);
+	const opening = binding.observe("SELECT 1", []);
+	const registration = transport.sent.at(-1);
+	if (!registration || !("id" in registration))
+		throw new Error("expected observer registration");
+	expect(registration.telemetryParent).toEqual(creationParent);
+	transport.emit({ id: registration.id, ok: true, value: 7 });
+	const observation = await opening;
+
+	activeParent = undefined;
+	const first = observation.next();
+	const firstRequest = transport.sent.at(-1);
+	if (!firstRequest || !("id" in firstRequest))
+		throw new Error("expected first observation frame");
+	expect(firstRequest.telemetryParent).toEqual(creationParent);
+	transport.emit({ id: firstRequest.id, ok: true, value: undefined });
+	await first;
+
+	activeParent = laterParent;
+	const second = observation.next();
+	const secondRequest = transport.sent.at(-1);
+	if (!secondRequest || !("id" in secondRequest))
+		throw new Error("expected second observation frame");
+	expect(secondRequest.telemetryParent).toEqual(laterParent);
+	transport.emit({ id: secondRequest.id, ok: true, value: undefined });
+	await second;
+
+	activeParent = undefined;
+	const third = observation.next();
+	const thirdRequest = transport.sent.at(-1);
+	if (!thirdRequest || !("id" in thirdRequest))
+		throw new Error("expected third observation frame");
+	expect(thirdRequest.telemetryParent).toBeUndefined();
+	transport.emit({ id: thirdRequest.id, ok: true, value: undefined });
+	await third;
+});
+
 test("failed close terminates the worker before releasing its binding", async () => {
 	const termination = deferred<void>();
 	const events: string[] = [];
