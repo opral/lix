@@ -1,4 +1,4 @@
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use datafusion::arrow::array::StringArray;
 use datafusion::arrow::datatypes::{DataType, FieldRef};
@@ -21,10 +21,7 @@ impl LixJsonb {
 }
 
 impl ScalarUDFImpl for LixJsonb {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn name(&self) -> &'static str {
+        fn name(&self) -> &'static str {
         "__lix_jsonb"
     }
     fn signature(&self) -> &Signature {

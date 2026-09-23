@@ -92,7 +92,6 @@ pub(crate) fn take_certified_single_path_value_replacements() -> usize {
     CERTIFIED_SINGLE_PATH_VALUE_REPLACEMENTS.with(|executions| executions.replace(0))
 }
 
-#[cfg(test)]
 pub(crate) fn supports_bound_public_write(plan: &LogicalWritePlan) -> bool {
     match &plan.bound.target {
         BoundWriteTarget::Row(_) => bound_public_write_shape_supported(plan),
@@ -278,7 +277,7 @@ async fn try_execute_row_insert_batch(
     if spec.has_inter_row_constraints {
         return Ok(None);
     }
-    validate_bound_write_supported(plan, &spec)?;
+    validate_bound_write_supported(plan)?;
     let active_branch_commit_id = if plan_references_active_branch_commit_id(plan) {
         Some(load_active_branch_commit_id(ctx).await?)
     } else {
@@ -511,7 +510,7 @@ async fn try_execute_row_update_batch(
     {
         return Ok(None);
     }
-    validate_bound_write_supported(plan, &spec)?;
+    validate_bound_write_supported(plan)?;
 
     let direct_primary_key_param =
         bound_single_text_primary_key_param(&spec, &plan.bound.predicate);
@@ -835,7 +834,7 @@ async fn try_execute_direct_path_value_replacement_batch(
     {
         return Ok(None);
     }
-    validate_bound_write_supported(plan, &spec)?;
+    validate_bound_write_supported(plan)?;
     let Some(primary_key_param_index) =
         bound_single_text_primary_key_param(&spec, &plan.bound.predicate)
     else {
@@ -1762,7 +1761,7 @@ fn bound_single_text_primary_key_param(
 }
 
 fn with_parameter_batch_statement_index(mut error: LixError, statement_index: usize) -> LixError {
-    let mut details = match error.details.take() {
+    let mut details = match error.details.take().map(|details| *details) {
         Some(JsonValue::Object(details)) => details,
         Some(details) => {
             let mut wrapped = serde_json::Map::new();
@@ -1775,7 +1774,7 @@ fn with_parameter_batch_statement_index(mut error: LixError, statement_index: us
         "statementIndex".to_string(),
         JsonValue::from(statement_index),
     );
-    error.details = Some(JsonValue::Object(details));
+    error.details = Some(Box::new(JsonValue::Object(details)));
     error
 }
 
@@ -1970,7 +1969,7 @@ async fn execute_row_write(
             format!("schema surface '{schema_key}' is not visible"),
         )
     })?;
-    validate_bound_write_supported(plan, spec)?;
+    validate_bound_write_supported(plan)?;
     // Only `lix_active_branch_commit_id()` needs the current branch head.
     // Normal row mutations already stage against the transaction's active
     // branch, so eagerly opening another read here makes the common write
@@ -2153,7 +2152,11 @@ fn plan_references_active_branch_commit_id(plan: &LogicalWritePlan) -> bool {
             returning
                 .items
                 .iter()
-                .any(|item| bound_expr_references_active_branch_commit_id(&item.expr))
+                .any(|item| {
+                    item.expr
+                        .as_ref()
+                        .is_some_and(bound_expr_references_active_branch_commit_id)
+                })
         })
 }
 
@@ -3223,8 +3226,9 @@ async fn stage_rows_with_postimage_returning(
 ) -> Result<SqlWriteResult, LixError> {
     let needs_old = plan.bound.returning.as_ref().is_some_and(|r| {
         r.items.iter().any(|item| {
-            item.expr
-                .references_image(crate::sql2::bind::expr::ReturningImage::Old)
+            item.expr.as_ref().is_some_and(|expr| {
+                expr.references_image(crate::sql2::bind::expr::ReturningImage::Old)
+            })
         })
     });
     let before = if needs_old
@@ -3248,7 +3252,11 @@ async fn stage_rows_with_postimage_returning(
             returning
                 .items
                 .iter()
-                .any(|item| returning_expr_requires_staged_postimage(&item.expr))
+                .any(|item| {
+                    item.expr
+                        .as_ref()
+                        .is_none_or(returning_expr_requires_staged_postimage)
+                })
         });
     let returning_rows = if returning_requires_staged_postimage {
         None
@@ -3551,10 +3559,8 @@ fn append_row_update_row<'a>(
                 ctx,
                 &mut updated,
                 &column.name,
-                &assignment.value,
                 value,
                 column.column_type,
-                column.read_nullable,
                 &spec.schema_key,
             )?;
         } else if assignment.column.name == "lixcol_metadata" {
@@ -3677,7 +3683,10 @@ fn returning_column_types(
         .iter()
         .enumerate()
         .map(|(index, item)| {
-            returning_expr_column_type(&item.expr, spec, params).unwrap_or_else(|| {
+            item.expr
+                .as_ref()
+                .and_then(|expr| returning_expr_column_type(expr, spec, params))
+                .unwrap_or_else(|| {
                 rows.iter()
                     .filter_map(|row| row.get(index))
                     .find(|value| !matches!(value, Value::Null))
@@ -3815,8 +3824,14 @@ fn row_returning_row(
         .items
         .iter()
         .map(|item| {
+            let expr = item.expr.as_ref().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_UNSUPPORTED_SQL,
+                    "RETURNING expression requires DataFusion projection",
+                )
+            })?;
             row_returning_value(
-                &item.expr,
+                expr,
                 context,
                 spec,
                 ctx,
@@ -3892,10 +3907,8 @@ fn append_row_conflict_update_row<'a>(
                 ctx,
                 &mut updated,
                 &column.name,
-                &assignment.value,
                 value,
                 column.column_type,
-                column.read_nullable,
                 &spec.schema_key,
             )?;
         } else if assignment.column.name == "lixcol_metadata" {
@@ -4920,12 +4933,8 @@ fn certified_direct_parameter_insert_batch(
                 typed_row.insert(
                     column.name.clone(),
                     typed_value_from_eval(
-                        &row[column.layout_index],
                         eval_value,
                         data_type,
-                        column.read_nullable,
-                        &layout.schema_key,
-                        &column.name,
                     )?,
                 );
             }
@@ -5536,18 +5545,14 @@ fn append_row_insert_row(
                 typed_row.insert(
                     name.clone(),
                     typed_value_from_eval(
-                        expr,
                         eval_value,
                         data_type,
-                        *read_nullable,
-                        &layout.schema_key,
-                        name,
                     )?,
                 );
             } else {
                 snapshot.insert(
                     name.clone(),
-                    row_json_value(expr, eval_value, *column_type, &layout.schema_key, name)?,
+                    row_json_value(eval_value, *column_type)?,
                 );
             }
             continue;
@@ -6173,7 +6178,7 @@ fn eval_expr_value(
                         .map_err(crate::sql2::error::lix_error_to_datafusion_error)
                 }),
             )
-            .map(RowEvalValue::RowRef)
+            .map(|row_ref| row_ref.map_or(RowEvalValue::SqlNull, RowEvalValue::RowRef))
             .map_err(crate::sql2::error::datafusion_error_to_lix_error)
         }
         BoundExpr::Function { name, args } if name == "lix_order_between" && args.len() == 2 => {
@@ -6230,22 +6235,6 @@ fn eval_expr_value(
         BoundExpr::Function { name, args } if name == "__lix_jsonb" && args.len() == 1 => {
             let value = eval_expr_value(&args[0], context, ctx, params, active_branch_commit_id)?;
             cast_row_eval_value(value, BoundCastType::Jsonb)
-        }
-        BoundExpr::Function { name, args }
-            if name == "__lix_numeric_literal" && args.len() == 1 =>
-        {
-            let BoundExpr::Literal(BoundLiteral::Text(raw)) = &args[0] else {
-                return Err(LixError::new(
-                    LixError::CODE_TYPE_MISMATCH,
-                    "numeric literal marker requires a text argument",
-                ));
-            };
-            raw.parse::<f64>().map(RowEvalValue::Real).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_TYPE_MISMATCH,
-                    format!("invalid numeric literal '{raw}': {error}"),
-                )
-            })
         }
         BoundExpr::Function { name, args }
             if matches!(
@@ -6360,7 +6349,7 @@ fn predicate_matches(
             let left_value = eval_expr_value(left, context, ctx, params, active_branch_commit_id)?;
             let right_value =
                 eval_expr_value(right, context, ctx, params, active_branch_commit_id)?;
-            comparison_values_equal(left, left_value, right, right_value, spec)
+            comparison_values_equal(left_value, right_value)
         }
         BoundPredicate::Like { .. } => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
@@ -6382,7 +6371,7 @@ fn predicate_matches(
             for value_expr in values {
                 let value =
                     eval_expr_value(value_expr, context, ctx, params, active_branch_commit_id)?;
-                if comparison_values_equal(expr, candidate.clone(), value_expr, value, spec)? {
+                if comparison_values_equal(candidate.clone(), value)? {
                     return Ok(true);
                 }
             }
@@ -6392,41 +6381,18 @@ fn predicate_matches(
 }
 
 fn comparison_values_equal(
-    left_expr: &BoundExpr,
     left_value: RowEvalValue,
-    right_expr: &BoundExpr,
     right_value: RowEvalValue,
-    spec: &SchemaSurfaceSpec,
 ) -> Result<bool, LixError> {
     // SQL NULL never matches equality. JSON null remains a JSONB value.
     if matches!(left_value, RowEvalValue::SqlNull) || matches!(right_value, RowEvalValue::SqlNull) {
         return Ok(false);
     }
-    if matches!(left_value, RowEvalValue::Json(_))
-        || matches!(right_value, RowEvalValue::Json(_))
-        || bound_expr_is_json(left_expr, spec)
-        || bound_expr_is_json(right_expr, spec)
-    {
-        let (left, right) =
-            normalize_comparison_operands(left_expr, left_value, right_expr, right_value, spec)?;
-        return Ok(left == right);
-    }
-    let normalize = |column_expr: &BoundExpr, value_expr: &BoundExpr, value: RowEvalValue| {
-        if let Some(column) = visible_row_column(column_expr, spec)
-            && column.column_type == SchemaColumnType::Integer
-            && let Some(exact) = bigint_number_literal(value_expr, &spec.schema_key, &column.name)?
-        {
-            return Ok(RowEvalValue::Integer(exact));
-        }
-        Ok::<_, LixError>(value)
-    };
-    let left = normalize(right_expr, left_expr, left_value)?;
-    let right = normalize(left_expr, right_expr, right_value)?;
-    if let Some(equal) = left.same_type_equal(&right) {
+    if let Some(equal) = left_value.same_type_equal(&right_value) {
         return Ok(equal);
     }
-    let left = left.scalar();
-    let right = right.scalar();
+    let left = left_value.scalar();
+    let right = right_value.scalar();
     if left.data_type() == right.data_type() {
         return Ok(left == right);
     }
@@ -6449,111 +6415,8 @@ fn comparison_values_equal(
     Ok(left == right)
 }
 
-fn normalize_comparison_operands(
-    left_expr: &BoundExpr,
-    left_value: RowEvalValue,
-    right_expr: &BoundExpr,
-    right_value: RowEvalValue,
-    spec: &SchemaSurfaceSpec,
-) -> Result<(JsonValue, JsonValue), LixError> {
-    let left_is_json = bound_expr_is_json(left_expr, spec);
-    let right_is_json = bound_expr_is_json(right_expr, spec);
-    Ok((
-        normalize_json_comparison_value(
-            left_expr,
-            left_value,
-            right_is_json,
-            is_identity_json_expr(right_expr),
-        )?,
-        normalize_json_comparison_value(
-            right_expr,
-            right_value,
-            left_is_json,
-            is_identity_json_expr(left_expr),
-        )?,
-    ))
-}
-
-fn normalize_json_comparison_value(
-    expr: &BoundExpr,
-    value: RowEvalValue,
-    other_side_is_json: bool,
-    other_side_is_identity_json: bool,
-) -> Result<JsonValue, LixError> {
-    // Explicit JSONB strings are already JSON values, not encoded JSON text.
-    let is_sql_text = matches!(value, RowEvalValue::SqlText(_));
-    let mut value = value.into_json()?;
-    crate::sql2::udfs::common::normalize_jsonb(&mut value)
-        .map_err(|error| LixError::new(LixError::CODE_TYPE_MISMATCH, error))?;
-    if !other_side_is_json {
-        return Ok(value);
-    }
-    let should_parse = (is_sql_text && matches!(expr, BoundExpr::Param(_)))
-        || (other_side_is_identity_json
-            && matches!(expr, BoundExpr::Literal(BoundLiteral::Text(_))));
-    if !should_parse {
-        return Ok(value);
-    }
-    let JsonValue::String(raw) = value else {
-        return Ok(value);
-    };
-    crate::sql2::udfs::common::parse_jsonb(&raw).map_err(|error| {
-        LixError::new(
-            LixError::CODE_TYPE_MISMATCH,
-            format!("JSON comparison parameter is not valid JSON: {error}"),
-        )
-    })
-}
-
-/// Validate source-spelled integer operands before row evaluation or optimizer
-/// short-circuiting can skip an invalid member of a predicate.
-pub(super) fn validate_bigint_predicate_literals(
-    predicate: &BoundPredicate,
-    is_bigint_column: &impl Fn(&str) -> bool,
-) -> Result<(), LixError> {
-    let validate_pair = |value: &BoundExpr, column: &BoundExpr| -> Result<(), LixError> {
-        if let BoundExpr::Column(column) = column
-            && is_bigint_column(&column.name)
-        {
-            bigint_number_literal(value, "predicate", &column.name)?;
-        }
-        Ok(())
-    };
-    match predicate {
-        BoundPredicate::Eq(left, right) => {
-            validate_pair(left, right)?;
-            validate_pair(right, left)?;
-        }
-        BoundPredicate::In { expr, values } => {
-            for value in values {
-                validate_pair(value, expr)?;
-                validate_pair(expr, value)?;
-            }
-        }
-        BoundPredicate::And(predicates) | BoundPredicate::Or(predicates) => {
-            for predicate in predicates {
-                validate_bigint_predicate_literals(predicate, is_bigint_column)?;
-            }
-        }
-        BoundPredicate::True
-        | BoundPredicate::False
-        | BoundPredicate::Like { .. }
-        | BoundPredicate::IsNull(_)
-        | BoundPredicate::IsNotNull(_) => {}
-    }
-    Ok(())
-}
-
-fn validate_bound_write_supported(
-    plan: &LogicalWritePlan,
-    spec: &SchemaSurfaceSpec,
-) -> Result<(), LixError> {
+fn validate_bound_write_supported(plan: &LogicalWritePlan) -> Result<(), LixError> {
     validate_predicate_supported(&plan.bound.predicate)?;
-    validate_bigint_predicate_literals(&plan.bound.predicate, &|name| {
-        spec.visible_column(name)
-            .is_some_and(|column| column.column_type == SchemaColumnType::Integer)
-    })?;
-    validate_json_predicate_types(&plan.bound.predicate, spec)?;
     match &plan.bound.input {
         BoundWriteInput::Values(values) => {
             for row in &values.rows {
@@ -6574,7 +6437,13 @@ fn validate_bound_write_supported(
     }
     if let Some(returning) = &plan.bound.returning {
         for item in &returning.items {
-            validate_expr_supported(&item.expr)?;
+            let expr = item.expr.as_ref().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_UNSUPPORTED_SQL,
+                    "RETURNING expression requires DataFusion projection",
+                )
+            })?;
+            validate_expr_supported(expr)?;
         }
     }
     Ok(())
@@ -6598,7 +6467,11 @@ pub(crate) fn row_returning_projects_before_stage(plan: &LogicalWritePlan) -> bo
                 returning
                     .items
                     .iter()
-                    .all(|item| !returning_expr_requires_staged_postimage(&item.expr))
+                    .all(|item| {
+                        item.expr.as_ref().is_some_and(|expr| {
+                            !returning_expr_requires_staged_postimage(expr)
+                        })
+                    })
             })
         }
     }
@@ -6700,7 +6573,11 @@ fn bound_public_write_shape_supported(plan: &LogicalWritePlan) -> bool {
             returning
                 .items
                 .iter()
-                .all(|item| validate_expr_supported(&item.expr).is_ok())
+                .all(|item| {
+                    item.expr
+                        .as_ref()
+                        .is_some_and(|expr| validate_expr_supported(expr).is_ok())
+                })
         })
 }
 
@@ -6735,120 +6612,6 @@ fn validate_predicate_supported(predicate: &BoundPredicate) -> Result<(), LixErr
             }
             Ok(())
         }
-    }
-}
-
-fn validate_json_predicate_types(
-    predicate: &BoundPredicate,
-    spec: &SchemaSurfaceSpec,
-) -> Result<(), LixError> {
-    use crate::sql2::plan::predicate::BoundPredicate;
-    match predicate {
-        BoundPredicate::True
-        | BoundPredicate::False
-        | BoundPredicate::Like { .. }
-        | BoundPredicate::IsNull(_)
-        | BoundPredicate::IsNotNull(_) => Ok(()),
-        BoundPredicate::And(predicates) | BoundPredicate::Or(predicates) => {
-            for predicate in predicates {
-                validate_json_predicate_types(predicate, spec)?;
-            }
-            Ok(())
-        }
-        BoundPredicate::Eq(left, right) => validate_json_comparison_operands(left, right, spec),
-        BoundPredicate::In { expr, values } => {
-            if bound_expr_is_json(expr, spec) {
-                for value in values {
-                    if is_identity_json_expr(expr) && is_parseable_json_text_literal(value) {
-                        continue;
-                    }
-                    require_json_comparison_operand(value, spec)?;
-                }
-            }
-            for value in values {
-                if bound_expr_is_json(value, spec) {
-                    if is_identity_json_expr(value) && is_parseable_json_text_literal(expr) {
-                        continue;
-                    }
-                    require_json_comparison_operand(expr, spec)?;
-                }
-            }
-            Ok(())
-        }
-    }
-}
-
-fn validate_json_comparison_operands(
-    left: &BoundExpr,
-    right: &BoundExpr,
-    spec: &SchemaSurfaceSpec,
-) -> Result<(), LixError> {
-    if bound_expr_is_json(left, spec) {
-        if is_identity_json_expr(left) && is_parseable_json_text_literal(right) {
-            return Ok(());
-        }
-        require_json_comparison_operand(right, spec)?;
-    }
-    if bound_expr_is_json(right, spec) {
-        if is_identity_json_expr(right) && is_parseable_json_text_literal(left) {
-            return Ok(());
-        }
-        require_json_comparison_operand(left, spec)?;
-    }
-    Ok(())
-}
-
-fn require_json_comparison_operand(
-    expr: &BoundExpr,
-    spec: &SchemaSurfaceSpec,
-) -> Result<(), LixError> {
-    if bound_expr_is_json(expr, spec)
-        || matches!(expr, BoundExpr::Param(_))
-        || matches!(expr, BoundExpr::Literal(BoundLiteral::Null))
-    {
-        return Ok(());
-    }
-    Err(LixError::new(
-        LixError::CODE_TYPE_MISMATCH,
-        "JSON columns can only be compared with JSON expressions",
-    )
-    .with_hint("Cast JSON text with ::jsonb, use PostgreSQL -> or ->> for JSON access, or use IS NULL for null checks."))
-}
-
-fn is_identity_json_expr(expr: &BoundExpr) -> bool {
-    matches!(
-        expr,
-        BoundExpr::Column(column) | BoundExpr::ExcludedColumn(column)
-            if column.name == "row_pk"
-    )
-}
-
-fn is_parseable_json_text_literal(expr: &BoundExpr) -> bool {
-    match expr {
-        BoundExpr::Literal(BoundLiteral::Text(value)) => {
-            serde_json::from_str::<JsonValue>(value).is_ok()
-        }
-        _ => false,
-    }
-}
-
-fn bound_expr_is_json(expr: &BoundExpr, spec: &SchemaSurfaceSpec) -> bool {
-    match expr {
-        BoundExpr::Column(column) | BoundExpr::ExcludedColumn(column) => {
-            spec.visible_column(&column.name)
-                .is_some_and(|column| column.column_type == SchemaColumnType::Jsonb)
-                || column.name == "lixcol_metadata"
-        }
-        BoundExpr::Literal(BoundLiteral::Json(_))
-        | BoundExpr::Cast {
-            data_type: BoundCastType::Jsonb,
-            ..
-        } => true,
-        BoundExpr::Function { name, .. } => matches!(
-            name.as_str(),
-            "__lix_json_get" | "__lix_json_path_get" | "__lix_jsonb"
-        ),
-        _ => false,
     }
 }
 
@@ -6921,7 +6684,6 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
                 | "__lix_text_cast"
                 | "__lix_timestamptz_cast"
                     if args.len() == 1 => {}
-                "__lix_numeric_literal" if args.len() == 1 => {}
                 _ => {
                     return Err(LixError::new(
                         LixError::CODE_UNSUPPORTED_SQL,
@@ -7004,15 +6766,12 @@ fn staged_row_image<'a>(
         .map(|value| value.map(CandidateRowImage::Json))
 }
 
-#[expect(clippy::too_many_arguments)]
 fn set_owned_row_image_eval_value(
     ctx: &dyn SqlWriteExecutionContext,
     image: &mut OwnedRowImage,
     column_name: &str,
-    expr: &BoundExpr,
     value: RowEvalValue,
     column_type: SchemaColumnType,
-    read_nullable: bool,
     schema_key: &str,
 ) -> Result<(), LixError> {
     match image {
@@ -7025,7 +6784,7 @@ fn set_owned_row_image_eval_value(
             })?;
             object.insert(
                 column_name.to_owned(),
-                row_json_value(expr, value, column_type, schema_key, column_name)?,
+                row_json_value(value, column_type)?,
             );
         }
         OwnedRowImage::Typed(typed) => {
@@ -7053,14 +6812,7 @@ fn set_owned_row_image_eval_value(
                 })?;
             typed.row.insert(
                 column_name.to_owned(),
-                typed_value_from_eval(
-                    expr,
-                    value,
-                    data_type,
-                    read_nullable,
-                    schema_key,
-                    column_name,
-                )?,
+                typed_value_from_eval(value, data_type)?,
             );
         }
     }
@@ -7068,20 +6820,9 @@ fn set_owned_row_image_eval_value(
 }
 
 fn typed_value_from_eval(
-    expr: &BoundExpr,
     value: RowEvalValue,
     data_type: lix_schema::DataType,
-    _nullable: bool,
-    schema_key: &str,
-    column_name: &str,
 ) -> Result<lix_schema::Value, LixError> {
-    let value = if data_type == lix_schema::DataType::Int8 {
-        bigint_number_literal(expr, schema_key, column_name)?
-            .map(RowEvalValue::Integer)
-            .unwrap_or(value)
-    } else {
-        value
-    };
     value.assign(data_type)
 }
 
@@ -7175,11 +6916,8 @@ fn finalize_typed_row_with_plan(
 }
 
 fn row_json_value(
-    expr: &BoundExpr,
     value: RowEvalValue,
     column_type: SchemaColumnType,
-    schema_key: &str,
-    column_name: &str,
 ) -> Result<JsonValue, LixError> {
     let target = match column_type {
         SchemaColumnType::String => lix_schema::DataType::Text,
@@ -7189,158 +6927,8 @@ fn row_json_value(
         SchemaColumnType::Boolean => lix_schema::DataType::Boolean,
         SchemaColumnType::Timestamptz => lix_schema::DataType::Timestamptz,
     };
-    let native = typed_value_from_eval(expr, value, target, true, schema_key, column_name)?;
+    let native = typed_value_from_eval(value, target)?;
     RowEvalValue::from_schema(&native).into_json()
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BigintNumberLiteral {
-    Exact(i64),
-    NonIntegral,
-}
-
-pub(super) fn bigint_number_literal(
-    expr: &BoundExpr,
-    schema_key: &str,
-    column_name: &str,
-) -> Result<Option<i64>, LixError> {
-    let raw = match expr {
-        BoundExpr::Literal(BoundLiteral::Number { raw, .. }) => raw,
-        BoundExpr::Function { name, args } if name == "__lix_numeric_literal" => {
-            let [BoundExpr::Literal(BoundLiteral::Text(raw))] = args.as_slice() else {
-                return Ok(None);
-            };
-            raw
-        }
-        _ => return Ok(None),
-    };
-    exact_bigint_literal(raw, schema_key, column_name).map(Some)
-}
-
-pub(super) fn exact_bigint_literal(
-    raw: &str,
-    schema_key: &str,
-    column_name: &str,
-) -> Result<i64, LixError> {
-    let Some(BigintNumberLiteral::Exact(value)) = classify_bigint_literal(raw) else {
-        return Err(LixError::new(
-            LixError::CODE_TYPE_MISMATCH,
-            format!(
-                "typed SQL surface '{schema_key}' column '{column_name}' cannot represent SQL numeric literal {raw} as BIGINT"
-            ),
-        )
-        .with_hint(
-            "Use an exact integer between -9223372036854775808 and 9223372036854775807.",
-        ));
-    };
-    Ok(value)
-}
-
-fn classify_bigint_literal(raw: &str) -> Option<BigintNumberLiteral> {
-    let (negative, unsigned) = raw.strip_prefix('-').map_or_else(
-        || (false, raw.strip_prefix('+').unwrap_or(raw)),
-        |unsigned| (true, unsigned),
-    );
-    let (mantissa, exponent) = if let Some((mantissa, exponent)) = unsigned.split_once(['e', 'E']) {
-        if exponent.contains(['e', 'E']) {
-            return None;
-        }
-        (mantissa, exponent.parse::<i64>().ok()?)
-    } else {
-        (unsigned, 0)
-    };
-    let (integer_digits, fractional_digits) =
-        if let Some((integer_digits, fractional_digits)) = mantissa.split_once('.') {
-            if fractional_digits.contains('.') {
-                return None;
-            }
-            (integer_digits, fractional_digits)
-        } else {
-            (mantissa, "")
-        };
-    if integer_digits.is_empty() && fractional_digits.is_empty() {
-        return None;
-    }
-    if !integer_digits.bytes().all(|byte| byte.is_ascii_digit())
-        || !fractional_digits.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-
-    let mut digits = String::with_capacity(integer_digits.len() + fractional_digits.len());
-    digits.push_str(integer_digits);
-    digits.push_str(fractional_digits);
-    if digits.bytes().all(|byte| byte == b'0') {
-        return Some(BigintNumberLiteral::Exact(0));
-    }
-
-    let fractional_len = i64::try_from(fractional_digits.len()).ok()?;
-    let decimal_shift = exponent.checked_sub(fractional_len)?;
-    if decimal_shift >= 0 {
-        let significant = digits.trim_start_matches('0');
-        let trailing_zeros = usize::try_from(decimal_shift).ok()?;
-        if significant.len().checked_add(trailing_zeros)? > 19 {
-            return None;
-        }
-        let mut magnitude = String::with_capacity(significant.len() + trailing_zeros);
-        magnitude.push_str(significant);
-        magnitude.extend(std::iter::repeat_n('0', trailing_zeros));
-        return signed_bigint_magnitude(&magnitude, negative).map(BigintNumberLiteral::Exact);
-    }
-
-    let removed_digits = usize::try_from(decimal_shift.unsigned_abs()).ok()?;
-    if removed_digits > digits.len() {
-        return Some(BigintNumberLiteral::NonIntegral);
-    }
-    let split = digits.len() - removed_digits;
-    let integer_magnitude = digits[..split].trim_start_matches('0');
-    let fractional_is_zero = digits[split..].bytes().all(|byte| byte == b'0');
-    if fractional_is_zero {
-        let integer_magnitude = if integer_magnitude.is_empty() {
-            "0"
-        } else {
-            integer_magnitude
-        };
-        return signed_bigint_magnitude(integer_magnitude, negative)
-            .map(BigintNumberLiteral::Exact);
-    }
-    if non_integral_magnitude_is_in_bigint_range(integer_magnitude, negative) {
-        Some(BigintNumberLiteral::NonIntegral)
-    } else {
-        None
-    }
-}
-
-fn signed_bigint_magnitude(magnitude: &str, negative: bool) -> Option<i64> {
-    let maximum = if negative {
-        "9223372036854775808"
-    } else {
-        "9223372036854775807"
-    };
-    if magnitude.len() > maximum.len() || (magnitude.len() == maximum.len() && magnitude > maximum)
-    {
-        return None;
-    }
-    let magnitude = magnitude.parse::<u64>().ok()?;
-    if negative {
-        if magnitude == 9_223_372_036_854_775_808_u64 {
-            Some(i64::MIN)
-        } else {
-            i64::try_from(magnitude).ok().map(|value| -value)
-        }
-    } else {
-        i64::try_from(magnitude).ok()
-    }
-}
-
-fn non_integral_magnitude_is_in_bigint_range(magnitude: &str, negative: bool) -> bool {
-    let maximum_integer_part = if negative {
-        "9223372036854775807"
-    } else {
-        "9223372036854775806"
-    };
-    magnitude.len() < maximum_integer_part.len()
-        || (magnitude.len() == maximum_integer_part.len() && magnitude <= maximum_integer_part)
 }
 
 fn reject_direct_blob_json_value(

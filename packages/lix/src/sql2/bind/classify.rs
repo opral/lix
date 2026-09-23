@@ -69,14 +69,6 @@ fn validate_supported_ast_statement(statement: &SqlStatement) -> Result<(), LixE
 }
 
 fn validate_supported_query(query: &Query) -> Result<(), LixError> {
-    if query.with.as_ref().is_some_and(|with| with.recursive) {
-        return Err(
-            unsupported_sql_error("recursive CTEs are not supported by Lix SQL").with_hint(
-                "Use lix_commit_ancestry() for transitive commit traversal, lix_commit.parent_commit_ids for direct ordered parents, or a typed history surface instead of WITH RECURSIVE.",
-            ),
-        );
-    }
-
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
             validate_supported_query(&cte.query)?;

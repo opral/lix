@@ -80,7 +80,8 @@ simulation_test!(
 
         let row = session
             .execute(
-                "SELECT created_at, CURRENT_TIMESTAMP AS first, CURRENT_TIMESTAMP AS second \
+                "SELECT created_at, CURRENT_TIMESTAMP AS first, CURRENT_TIMESTAMP AS second, \
+                        now() AS now_alias \
              FROM timestamp_probe WHERE id = 1",
                 &[],
             )
@@ -89,6 +90,7 @@ simulation_test!(
         assert!(matches!(row.rows()[0].values()[0], Value::Timestamptz(_)));
         assert!(matches!(row.rows()[0].values()[1], Value::Timestamptz(_)));
         assert_eq!(row.rows()[0].values()[1], row.rows()[0].values()[2]);
+        assert_eq!(row.rows()[0].values()[1], row.rows()[0].values()[3]);
     }
 );
 
@@ -169,15 +171,225 @@ simulation_test!(
             &engine,
         );
 
+        for (statement, expected) in [
+            (
+                "SELECT '{\"user\":{\"names\":[\"Ada\"]}}'::jsonb #>> '{user,names,0}' AS name",
+                Value::Text("Ada".to_string()),
+            ),
+            (
+                "SELECT '{\"user\":{\"names\":[\"Ada\"]}}'::jsonb #> ARRAY['user','names','0'] AS name",
+                Value::Jsonb(json!("Ada").into()),
+            ),
+            (
+                "SELECT doc #> path AS name FROM (VALUES ('{\"user\":{\"names\":[\"Ada\"]}}'::jsonb, ARRAY['user','names','0'])) t(doc, path)",
+                Value::Jsonb(json!("Ada").into()),
+            ),
+        ] {
+            let result = session
+                .execute(statement, &[])
+                .await
+                .unwrap_or_else(|error| panic!("{statement}: {error:?}"));
+            assert_rows_eq(result, vec![vec![expected]]);
+        }
+    }
+);
+
+simulation_test!(
+    postgres_jsonb_operator_rejects_wrong_operand_types,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+
+        for statement in [
+            "SELECT '[\"1\"]'::jsonb ? 1",
+            "SELECT '{}'::jsonb ? true",
+            "SELECT '{}'::jsonb ? '{}'::jsonb",
+            "SELECT '{}'::jsonb @> '{\"a\":1}'::TEXT",
+            "SELECT '{\"a\":1}'::jsonb -> '\"a\"'::jsonb",
+            "SELECT '{}'::jsonb #> ARRAY['a'::jsonb]",
+        ] {
+            let error = session
+                .execute(statement, &[])
+                .await
+                .expect_err("JSONB operators must enforce their PostgreSQL operand types");
+            assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH, "{statement}: {error:?}");
+        }
+    }
+);
+
+simulation_test!(
+    postgres_jsonb_operator_infers_text_parameter_operands,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT '{\"a\":1}'::jsonb ? $1",
+                    &[Value::Text("a".into())],
+                )
+                .await
+                .expect("JSONB existence operator should accept a text parameter"),
+            vec![vec![Value::Boolean(true)]],
+        );
+
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT '{\"a\":1}'::jsonb -> CAST('a' AS VARCHAR)",
+                    &[],
+                )
+                .await
+                .expect("JSONB path operators should consume DataFusion Utf8View values"),
+            vec![vec![Value::Jsonb(json!(1).into())]],
+        );
+
+        let error = session
+            .execute(
+                "SELECT '{\"a\":1}'::jsonb ? $1",
+                &[Value::Integer(1)],
+            )
+            .await
+            .expect_err("JSONB existence operator should reject a non-text parameter");
+        assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH);
+    }
+);
+
+simulation_test!(
+    postgres_jsonb_path_operator_parses_quoted_array_elements,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+
+        for (statement, expected) in [
+            (
+                "SELECT '{\"a,b\":42}'::jsonb #> '{\"a,b\"}'",
+                Value::Jsonb(json!(42).into()),
+            ),
+            (
+                "SELECT '{\"a,b\":42}'::jsonb #>> '{a\\,b}'",
+                Value::Text("42".into()),
+            ),
+            (
+                "SELECT '{\"a}b\":42}'::jsonb #>> '{\"a}b\"}'",
+                Value::Text("42".into()),
+            ),
+            (
+                "SELECT '{\"\":42}'::jsonb #>> '{\"\"}'",
+                Value::Text("42".into()),
+            ),
+            (
+                "SELECT '{\"a\\\"b\":42}'::jsonb #>> '{\"a\\\"b\"}'",
+                Value::Text("42".into()),
+            ),
+            (
+                "SELECT '{\"a\\\\b\":42}'::jsonb #>> '{\"a\\\\b\"}'",
+                Value::Text("42".into()),
+            ),
+            (
+                "SELECT '{\"NULL\":9}'::jsonb #> '{NULL}'",
+                Value::Null,
+            ),
+            (
+                "SELECT '{\"NULL\":9}'::jsonb #>> '{\"NULL\"}'",
+                Value::Text("9".into()),
+            ),
+        ] {
+            let result = session.execute(statement, &[]).await.unwrap();
+            assert_rows_eq(result, vec![vec![expected]]);
+        }
+
+        for statement in [
+            "SELECT '{\"a,b\":42}'::jsonb #> '{\"a,b}'",
+            "SELECT '{\"a,b\":42}'::jsonb #> '{\"a\"junk}'",
+        ] {
+            session
+                .execute(statement, &[])
+                .await
+                .expect_err("malformed PostgreSQL array path syntax must be rejected");
+        }
+    }
+);
+
+simulation_test!(
+    jsonb_array_containment_preserves_nesting_levels,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
         let result = session
             .execute(
-                "SELECT '{\"user\":{\"names\":[\"Ada\"]}}'::jsonb #>> '{user,names,0}' AS name",
+                "SELECT \
+                    '[1,2,[1,3]]'::jsonb @> '[1,3]'::jsonb, \
+                    '[[1,2]]'::jsonb @> '[1,2]'::jsonb, \
+                    '[[1,2]]'::jsonb @> '1'::jsonb, \
+                    '[1,2]'::jsonb @> '1'::jsonb, \
+                    '[1,2,[1,3]]'::jsonb @> '[[1,3]]'::jsonb",
                 &[],
             )
             .await
-            .expect("select should succeed");
+            .unwrap();
+        assert_rows_eq(
+            result,
+            vec![vec![
+                Value::Boolean(false),
+                Value::Boolean(false),
+                Value::Boolean(false),
+                Value::Boolean(true),
+                Value::Boolean(true),
+            ]],
+        );
+    }
+);
 
-        assert_rows_eq(result, vec![vec![Value::Text("Ada".to_string())]]);
+simulation_test!(
+    jsonb_numeric_equality_preserves_decimal_precision,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        let result = session
+            .execute(
+                "SELECT \
+                    '1.0000000000000000000000001'::jsonb = '1'::jsonb, \
+                    '1e-1000'::jsonb = '0'::jsonb, \
+                    '9007199254740993.0'::jsonb = '9007199254740993'::jsonb, \
+                    '1.0'::jsonb = ANY(ARRAY['1'::jsonb]), \
+                    '{\"n\":1.0}'::jsonb = '{\"n\":1}'::jsonb",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_rows_eq(
+            result,
+            vec![vec![
+                Value::Boolean(false),
+                Value::Boolean(false),
+                Value::Boolean(true),
+                Value::Boolean(true),
+                Value::Boolean(true),
+            ]],
+        );
+
+        let large_number = session
+            .execute("SELECT '9007199254740993.0'::jsonb", &[])
+            .await
+            .unwrap();
+        assert_rows_eq(
+            large_number,
+            vec![vec![Value::Jsonb(json!(9_007_199_254_740_993_u64).into())]],
+        );
+
+        let set_operations = session
+            .execute(
+                "SELECT \
+                    (SELECT COUNT(*) FROM (SELECT '1'::jsonb AS v UNION SELECT '1.0'::jsonb) u) AS union_count, \
+                    (SELECT COUNT(*) FROM (SELECT '1'::jsonb AS v INTERSECT SELECT '1.0'::jsonb) i) AS intersect_count, \
+                    (SELECT COUNT(*) FROM (SELECT '1'::jsonb AS v EXCEPT SELECT '1.0'::jsonb) e) AS except_count",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_rows_eq(set_operations, vec![vec![Value::Integer(1), Value::Integer(1), Value::Integer(0)]]);
     }
 );
 

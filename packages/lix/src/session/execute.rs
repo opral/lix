@@ -114,8 +114,7 @@ impl CommitReceipt {
     pub(crate) fn annotate_completion_error(&self, error: LixError) -> LixError {
         let mut error = super::context::non_retryable_after_commit(error);
         error
-            .details
-            .as_mut()
+            .details_mut()
             .and_then(serde_json::Value::as_object_mut)
             .expect("completion error has object details")
             .insert("commit".into(), serde_json::json!(self.commit));
@@ -4485,8 +4484,7 @@ where
 
 fn batch_statement_index(error: &LixError) -> Option<usize> {
     error
-        .details
-        .as_ref()
+        .details()
         .and_then(JsonValue::as_object)
         .and_then(|details| details.get("statementIndex"))
         .and_then(JsonValue::as_u64)
@@ -4770,7 +4768,7 @@ fn idempotency_outcome_unknown() -> LixError {
 }
 
 fn with_batch_statement_index(mut error: LixError, statement_index: usize) -> LixError {
-    let mut details = match error.details.take() {
+    let mut details = match error.details.take().map(|details| *details) {
         Some(JsonValue::Object(details)) => details,
         Some(details) => {
             let mut wrapped = JsonMap::new();
@@ -4783,7 +4781,7 @@ fn with_batch_statement_index(mut error: LixError, statement_index: usize) -> Li
         "statementIndex".to_string(),
         JsonValue::from(statement_index),
     );
-    error.details = Some(JsonValue::Object(details));
+    error.details = Some(Box::new(JsonValue::Object(details)));
     error
 }
 
@@ -4897,7 +4895,7 @@ impl AutoCommitRetries {
 
     fn annotate(&self, mut error: LixError) -> LixError {
         let forbidden = error.automatic_retry_is_forbidden();
-        let mut details = match error.details.take() {
+        let mut details = match error.details.take().map(|details| *details) {
             Some(JsonValue::Object(details)) => details,
             Some(cause) => JsonMap::from_iter([("cause".to_owned(), cause)]),
             None => JsonMap::new(),
@@ -4925,7 +4923,7 @@ impl AutoCommitRetries {
         if let Some(limit) = self.limit {
             details.insert("maxAutoCommitRetries".into(), limit.into());
         }
-        error.details = Some(JsonValue::Object(details));
+        error.details = Some(Box::new(JsonValue::Object(details)));
         error
     }
 }
@@ -5879,6 +5877,89 @@ mod tests {
             .await
             .unwrap();
         assert!(missing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn parameterized_history_reads_runtime_registered_relation_rows() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://lix.dev/schema-v1.json",
+            "key": "parameterized_history_probe",
+            "columns": [
+                { "name": "id", "type": "text", "nullable": false },
+                { "name": "value", "type": "text", "nullable": false }
+            ],
+            "primary_key": ["id"]
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (schema_key, value) VALUES (CAST($1 AS JSONB) ->> 'key', CAST($1 AS JSONB))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("runtime relation schema should register");
+        session
+            .execute(
+                "INSERT INTO parameterized_history_probe (id, value) VALUES ('row-a', 'history-value')",
+                &[],
+            )
+            .await
+            .expect("runtime relation row should insert");
+
+        let history = session
+            .execute(
+                "SELECT id, to_value FROM lix_history($1) WHERE id = 'row-a'",
+                &[Value::Text("parameterized_history_probe".into())],
+            )
+            .await
+            .expect("parameterized history should resolve runtime relation metadata");
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history.rows()[0].get::<String>("id").unwrap(), "row-a");
+        assert_eq!(
+            history.rows()[0].get::<String>("to_value").unwrap(),
+            "history-value"
+        );
+    }
+
+    #[tokio::test]
+    async fn returning_subqueries_read_relations_and_parameterized_lix_table_functions() {
+        let session = open_session().await;
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('returning-dependency', 'related-value')",
+                &[],
+            )
+            .await
+            .expect("related row should insert");
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ('/returning-dependency.md', $1)",
+                &[Value::Blob(b"before".to_vec().into())],
+            )
+            .await
+            .expect("write target row should insert");
+
+        let result = session
+            .execute(
+                "UPDATE lix_file SET path = '/returning-dependency-after.md' \
+                 WHERE path = '/returning-dependency.md' \
+                 RETURNING \
+                     (SELECT value FROM lix_key_value WHERE key = 'returning-dependency') AS related_value, \
+                     (SELECT COUNT(*) FROM lix_history($1)) AS history_rows",
+                &[Value::Text("lix_key_value".into())],
+            )
+            .await
+            .expect("RETURNING subqueries should discover and plan their dependencies");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result.rows()[0]
+                .get::<serde_json::Value>("related_value")
+                .unwrap(),
+            serde_json::json!("related-value")
+        );
+        assert!(result.rows()[0].get::<i64>("history_rows").unwrap() > 0);
     }
 
     async fn assert_typed_lifecycle_current(

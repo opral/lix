@@ -50,7 +50,9 @@ impl NativeObjectRef {
         };
         let mut error = first.annotate_missing(error);
         if selected.len() > 1 {
-            let details = error.details.get_or_insert_with(|| serde_json::json!({}));
+            let details = error
+                .details
+                .get_or_insert_with(|| Box::new(serde_json::json!({})));
             details
                 .as_object_mut()
                 .expect("native diagnostic details are object")
@@ -262,8 +264,8 @@ impl NativeObjectRef {
             Self::MutationCatalog { .. } | Self::CommitDeltaPart { .. }
         ) {
             let mut details = error
-                .details
-                .clone()
+                .details()
+                .cloned()
                 .unwrap_or_else(|| serde_json::json!({}));
             if let Some(object) = details.as_object_mut() {
                 object.insert(
@@ -282,8 +284,8 @@ impl NativeObjectRef {
         // Keep original code/message so a missing object in an ordinary full
         // repository remains a corruption failure, never an automatic retry.
         let mut details = error
-            .details
-            .clone()
+            .details()
+            .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
         if let Some(object) = details.as_object_mut() {
             object.insert(
@@ -304,7 +306,9 @@ impl NativeObjectRef {
 pub(crate) struct NativeHistoryFrontier;
 impl NativeHistoryFrontier {
     pub(crate) fn annotate_optional_suffix(mut error: LixError, required: usize) -> LixError {
-        let details = error.details.get_or_insert_with(|| serde_json::json!({}));
+        let details = error
+            .details
+            .get_or_insert_with(|| Box::new(serde_json::json!({})));
         if let Some(details) = details.as_object_mut() {
             details.insert(
                 "nativeHistoryFrontier".into(),
@@ -414,7 +418,9 @@ impl NativeMetadataRef {
         if !has_graph {
             return error;
         }
-        let details = error.details.get_or_insert_with(|| serde_json::json!({}));
+        let details = error
+            .details
+            .get_or_insert_with(|| Box::new(serde_json::json!({})));
         if let Some(details) = details.as_object_mut() {
             details.insert(
                 "nativeHistoryDemand".into(),
@@ -448,7 +454,9 @@ impl NativeMetadataRef {
         };
         let mut error = first.annotate_missing(error);
         if selected.len() > 1 {
-            let details = error.details.get_or_insert_with(|| serde_json::json!({}));
+            let details = error
+                .details
+                .get_or_insert_with(|| Box::new(serde_json::json!({})));
             details
                 .as_object_mut()
                 .expect("native diagnostic details are object")
@@ -521,8 +529,8 @@ impl NativeMetadataRef {
 
     pub(crate) fn annotate_missing(self, error: LixError) -> LixError {
         let mut details = error
-            .details
-            .clone()
+            .details()
+            .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
         if let Some(object) = details.as_object_mut() {
             object.insert(
@@ -714,7 +722,7 @@ mod tests {
         ] {
             let mut error =
                 LixError::new(LixError::CODE_UNKNOWN, "tracked-state chunk hash mismatch");
-            error.details = details;
+            error.details = details.map(Box::new);
             assert_eq!(NativeObjectRef::from_missing_error(&error).unwrap(), None);
         }
     }
@@ -908,7 +916,7 @@ mod metadata_batch_tests {
             vec![address(2), address(3)],
         ] {
             let error = address(1).annotate_missing(LixError::unknown("missing"));
-            let mut details = error.details.clone().unwrap();
+            let mut details = *error.details.clone().unwrap();
             details["missingNativeMetadataBatch"] =
                 serde_json::json!({"version":1,"addresses":addresses});
             assert!(

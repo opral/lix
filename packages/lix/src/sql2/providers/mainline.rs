@@ -365,7 +365,7 @@ impl<S: StorageAdapterRead + Clone + Send + Sync + 'static> TableSpec for Mainli
         let df_meta_schema = DFSchema::try_from(meta_schema.as_ref().clone())?;
         let metadata_filters = metadata_filters
             .iter()
-            .map(|f| create_physical_expr(f, &df_meta_schema, &ExecutionProps::new()))
+            .map(|f| create_physical_expr(f, &df_meta_schema, &ExecutionProps::new(), &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default()))
             .collect::<Result<Vec<_>>>()?;
         let relation = self.relation.clone();
         let store = self.store.clone();

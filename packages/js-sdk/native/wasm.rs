@@ -1348,11 +1348,152 @@ impl From<lix::MergeChangeStats> for MergeChangeStatsDto {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 struct LixValueDto {
     kind: String,
     value: Option<serde_json::Value>,
     blob: Option<ByteBuf>,
+}
+
+impl Serialize for LixValueDto {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut dto = serializer.serialize_struct("LixValueDto", 3)?;
+        dto.serialize_field("kind", &self.kind)?;
+        let value = self.value.as_ref().map(|value| WasmJsonValue {
+            value,
+            allow_integral_float: self.kind == "real",
+            unsafe_number_as_string: false,
+        });
+        dto.serialize_field("value", &value)?;
+        dto.serialize_field("blob", &self.blob)?;
+        dto.end()
+    }
+}
+
+/// Serialize JSON values as native JavaScript primitives. With serde_json's
+/// `arbitrary_precision` feature, `Number` normally serializes as an internal
+/// map intended for serde_json deserialization. That representation leaks
+/// through serde-wasm-bindgen unless numbers are emitted directly.
+struct WasmJsonValue<'a> {
+    value: &'a serde_json::Value,
+    allow_integral_float: bool,
+    unsafe_number_as_string: bool,
+}
+
+fn serialize_unrepresentable_number<S>(
+    serializer: S,
+    number: &serde_json::Number,
+    as_string: bool,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if as_string {
+        serializer.serialize_str(&number.to_string())
+    } else {
+        Err(serde::ser::Error::custom(
+            "JSON number is outside the JavaScript safe numeric range",
+        ))
+    }
+}
+
+impl Serialize for WasmJsonValue<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self.value {
+            serde_json::Value::Null => serializer.serialize_unit(),
+            serde_json::Value::Bool(value) => serializer.serialize_bool(*value),
+            serde_json::Value::Number(number) => {
+                if self.allow_integral_float {
+                    let value = number.as_f64().ok_or_else(|| {
+                        serde::ser::Error::custom(
+                            "REAL value cannot be represented as a JavaScript number",
+                        )
+                    })?;
+                    return serializer.serialize_f64(value);
+                }
+                if let Some(value) = number.as_i64() {
+                    if !(-9_007_199_254_740_991..=9_007_199_254_740_991).contains(&value) {
+                        return serialize_unrepresentable_number(
+                            serializer,
+                            number,
+                            self.unsafe_number_as_string,
+                        );
+                    }
+                    return serializer.serialize_i64(value);
+                }
+                if let Some(value) = number.as_u64() {
+                    if value > 9_007_199_254_740_991 {
+                        return serialize_unrepresentable_number(
+                            serializer,
+                            number,
+                            self.unsafe_number_as_string,
+                        );
+                    }
+                    return serializer.serialize_u64(value);
+                }
+                if !number.is_f64() {
+                    return serialize_unrepresentable_number(
+                        serializer,
+                        number,
+                        self.unsafe_number_as_string,
+                    );
+                }
+                let value = number.as_f64().ok_or_else(|| {
+                    serde::ser::Error::custom(
+                        "JSON number cannot be represented as a JavaScript number",
+                    )
+                })?;
+                if !value.is_finite()
+                    || (value.fract() == 0.0 && value.abs() > 9_007_199_254_740_991.0)
+                {
+                    return serialize_unrepresentable_number(
+                        serializer,
+                        number,
+                        self.unsafe_number_as_string,
+                    );
+                }
+                serializer.serialize_f64(value)
+            }
+            serde_json::Value::String(value) => serializer.serialize_str(value),
+            serde_json::Value::Array(values) => {
+                use serde::ser::SerializeSeq;
+
+                let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    sequence.serialize_element(&WasmJsonValue {
+                        value,
+                        allow_integral_float: false,
+                        unsafe_number_as_string: self.unsafe_number_as_string,
+                    })?;
+                }
+                sequence.end()
+            }
+            serde_json::Value::Object(values) => {
+                use serde::ser::SerializeMap;
+
+                let mut map = serializer.serialize_map(Some(values.len()))?;
+                for (key, value) in values {
+                    map.serialize_entry(
+                        key,
+                        &WasmJsonValue {
+                            value,
+                            allow_integral_float: false,
+                            unsafe_number_as_string: self.unsafe_number_as_string,
+                        },
+                    )?;
+                }
+                map.end()
+            }
+        }
+    }
 }
 
 pub(super) fn values_from_js(value: JsValue) -> Result<Vec<Value>, JsValue> {
@@ -1630,6 +1771,17 @@ pub(super) fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
         .map_err(|error| js_bridge_error(format!("could not encode JavaScript value: {error}")))
 }
 
+fn to_js_json_value(value: &serde_json::Value) -> Result<JsValue, JsValue> {
+    to_js(&WasmJsonValue {
+        value,
+        allow_integral_float: false,
+        // Error details have no SQL type contract. Keep large JSON numbers
+        // lossless as decimal strings instead of dropping all details or
+        // silently rounding them to a JavaScript Number.
+        unsafe_number_as_string: true,
+    })
+}
+
 fn js_bridge_error(message: impl AsRef<str>) -> JsValue {
     js_sys::Error::new(message.as_ref()).into()
 }
@@ -1656,7 +1808,7 @@ pub(super) fn lix_error_to_js(error: LixError) -> JsValue {
             let _ = Reflect::set(object, &JsValue::from_str("status"), &status);
             let _ = Reflect::set(object, &JsValue::from_str("httpStatus"), &status);
         }
-        if let Ok(details) = to_js(&details) {
+        if let Ok(details) = to_js_json_value(&details) {
             let _ = Reflect::set(object, &JsValue::from_str("details"), &details);
         }
     }

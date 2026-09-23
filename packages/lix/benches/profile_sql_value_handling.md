@@ -7,12 +7,13 @@ numeric kind. Results are converted to the public `Value` contract without a
 JSON round trip.
 
 Direct and DataFusion execution share physical scalar conversion and assignment
-validation. Like-type direct assignments and comparisons avoid Arrow scalar
-array allocation. Floating-point equality follows Arrow's total-order semantics, including signed
-zero. Cross-type casts use Arrow's conversion rules. BIGINT
-assignment additionally requires an exact, in-range integer; an explicit CAST
-remains a cast. Decimal/exponent predicate literals retain their source spelling
-until BIGINT type resolution, so they cannot silently round through `f64`.
+validation. Like-type direct assignments and comparisons avoid Arrow scalar array
+allocation. Floating-point equality in direct predicates matches DataFusion's
+comparison behavior, including signed zero and identical NaN payloads. Cross-type
+casts and BIGINT assignment use DataFusion/Arrow conversion rules, including
+Float64 precision loss and truncation when casting to BIGINT. Decimal and exponent
+literals use DataFusion's type resolution and casts; Lix does not retain a second
+numeric literal representation for SQL evaluation.
 Numeric values cannot be implicitly assigned to TIMESTAMPTZ.
 JSONB-to-scalar assignments require an explicit CAST. JSONB assignment accepts
 SQL text as JSON text when valid, or as a JSON string otherwise; explicit
@@ -45,7 +46,32 @@ Cases: direct UPDATE, direct UPDATE with RETURNING, generic UPDATE forced by
 LIKE, and timestamp-predicate UPDATE. Report compiler/profile and host with
 results; debug/test builds are diagnostic comparisons, not release throughput.
 
-### Paired diagnostic run (2026-09-21)
+### Latest-main comparison (2026-09-23)
+
+Linux x86_64, AMD Ryzen 9 9950X, Rust nightly 2026-05-21. Release benchmark
+binaries were run on CPU 0, latest `main` (`657b81881`, DataFusion 53.1.0)
+first and this branch (DataFusion 55.1.0) second. Each binary reports the
+median of nine measured samples per case.
+
+| Statement, 500 affected rows | Latest main | This branch | Change |
+| --- | ---: | ---: | ---: |
+| Direct UPDATE | 2.933 ms | 3.169 ms | +8.1% |
+| Direct UPDATE with RETURNING | 3.137 ms | 3.384 ms | +7.9% |
+| Generic UPDATE using LIKE | 3.865 ms | 3.991 ms | +3.3% |
+| Timestamp-predicate UPDATE | 3.316 ms | 3.509 ms | +5.8% |
+
+The branch profile showed `serde_json::Map` `IndexMap` insertion and clone work
+that does not appear in the baseline. DataFusion 55 enables
+`serde_json/preserve_order` for ordered PostgreSQL JSON plan display, which
+changes the map implementation across the resolved dependency graph. JSONB
+normalization now sorts maps in place instead of rebuilding them, removing the
+observed `IndexMap::insert_full` hotspot. This reduced allocation work but did
+not erase the measured end-to-end difference. Treat the remaining difference
+as a correctness-related DataFusion upgrade cost: DataFusion 55 provides the
+SQL planning APIs used to delegate full `RETURNING` projections to DataFusion.
+The measurements are diagnostic and come from one paired run on a shared host.
+
+### Historical paired diagnostic run (2026-09-21)
 
 Linux x86_64, AMD Ryzen 9 9950X, Rust nightly 2026-05-21. The driver was
 linked to the test-profile engine libraries (engine opt-level 0, dependency

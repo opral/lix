@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
@@ -25,9 +24,6 @@ impl LixOctetLength {
 }
 
 impl ScalarUDFImpl for LixOctetLength {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "octet_length"

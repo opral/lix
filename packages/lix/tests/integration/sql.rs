@@ -91,6 +91,7 @@ macro_rules! simulation_test {
 }
 
 mod bigint_predicate;
+mod array_any;
 mod case_returning;
 mod case_returning_types;
 mod checkpoint;
@@ -118,8 +119,10 @@ mod prepared_path_value;
 mod read_only;
 mod recovery_functions;
 mod recovery_regressions;
+mod recursive_ctes;
 mod row_ref;
 mod row_refs;
+mod sql_expression_fuzz;
 mod schema_expression_amendment;
 mod schema_history;
 mod schema_view;

@@ -38,9 +38,6 @@ use crate::plugin::runtime::{is_plugin_storage_path, reject_normal_plugin_storag
 use crate::sql2::branch_scope::{
     BranchBinding, resolve_provider_branch_ids, resolve_write_branch_scope,
 };
-use crate::sql2::predicate_typecheck::{
-    canonicalize_json_identity_text_filters, validate_json_predicate_filters,
-};
 use crate::sql2::write_normalization::{
     InsertCell, SqlCell, UpdateAssignmentValues, defaultable_bool_insert_value,
     defaultable_text_insert_value, insert_column_is_omitted,
@@ -152,7 +149,7 @@ pub(crate) async fn execute_exact_lix_directory_root_listing(
     })
 }
 
-pub(super) async fn register_lix_directory_active_provider(
+pub(super) fn register_lix_directory_active_provider(
     session: &SessionContext,
     surface_name: &str,
     active_branch_id: &str,
@@ -533,10 +530,9 @@ impl TableSpec for LixDirectorySpec {
             ));
         }
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
-        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_filters = filters
             .iter()
-            .map(|expr| create_physical_expr(expr, &df_schema, props))
+            .map(|expr| create_physical_expr(expr, &df_schema, props, &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default()))
             .collect::<Result<Vec<_>>>()?;
 
         let ordering = indexed_matches.as_ref().map(|_| "path".to_string());
@@ -737,8 +733,6 @@ impl TableSpec for LixDirectorySpec {
     }
 
     fn prepare_write_filters(&self, filters: Vec<Expr>) -> Result<Vec<Expr>> {
-        let filters = canonicalize_json_identity_text_filters(self.schema.as_ref(), &filters)?;
-        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         Ok(filters)
     }
 

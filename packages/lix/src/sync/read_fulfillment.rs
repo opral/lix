@@ -207,7 +207,9 @@ pub(crate) fn annotate_capture(
         .iter()
         .map(|value| value.as_ref())
         .collect();
-    let details = error.details.get_or_insert_with(|| serde_json::json!({}));
+    let details = error
+        .details
+        .get_or_insert_with(|| Box::new(serde_json::json!({})));
     if let Some(details) = details.as_object_mut() {
         details.insert(MARKER.into(), serde_json::json!({"interests": interests}));
     }

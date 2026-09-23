@@ -1,6 +1,6 @@
 use crate::{Json, LixError, LixNotice, ResultColumnType, SqlQueryResult, Value};
 use base64::Engine as _;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -8,13 +8,28 @@ pub enum WireValue {
     Null { value: () },
     Bool { value: bool },
     Int { value: i64 },
-    Float { value: f64 },
+    Float {
+        #[serde(deserialize_with = "deserialize_wire_float")]
+        value: f64,
+    },
     Text { value: String },
     Jsonb { value: Json },
     #[serde(rename = "row_ref")]
     RowRef { value: String },
     Timestamptz { value: String },
     Blob { base64: String },
+}
+
+/// Reads a JSON float through `Number` so serde_json's `arbitrary_precision`
+/// representation is handled consistently for tagged wire values.
+pub(crate) fn deserialize_wire_float<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let number = serde_json::Number::deserialize(deserializer)?;
+    number
+        .as_f64()
+        .ok_or_else(|| serde::de::Error::custom("float value is out of range"))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

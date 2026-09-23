@@ -4,8 +4,8 @@ use std::ops::ControlFlow;
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use datafusion::sql::sqlparser::ast::{
     AssignmentTarget, BinaryOperator, CastKind, ConflictTarget, DataType as SqlDataType, Delete,
-    Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Insert, ObjectName,
-    ObjectNamePart, OnConflictAction, OnInsert, Query, SelectItem, SetExpr,
+    Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, Insert,
+    ObjectName, ObjectNamePart, OnConflictAction, OnInsert, Query, SelectItem, SetExpr,
     Statement as SqlStatement, TableFactor, TableObject, TableWithJoins, UnaryOperator, Update,
     Value, Visit, Visitor, WildcardAdditionalOptions,
 };
@@ -106,6 +106,16 @@ pub(super) fn bind_insert_bound(
     let mut target_columns = BTreeSet::new();
     let mut columns = Vec::new();
     for column in &insert.columns {
+        let [column_part] = column.0.as_slice() else {
+            return Err(super::error::unsupported(
+                "qualified INSERT target columns are not supported",
+            ));
+        };
+        let Some(column) = column_part.as_ident() else {
+            return Err(super::error::unsupported(
+                "function expressions are not supported as INSERT target columns",
+            ));
+        };
         let column_name = normalize_identifier(column);
         reject_duplicate_target_column(&mut target_columns, &column_name)?;
         columns.push(require_writable_column(
@@ -261,8 +271,13 @@ fn bind_returning(
                     .filter(|column| column.is_public())
                 {
                     items.push(BoundReturningItem {
-                        expr: BoundExpr::Column(bind_public_column_ref(table, &column.name)?),
+                        expr: Some(BoundExpr::Column(bind_public_column_ref(
+                            table,
+                            &column.name,
+                        )?)),
+                        sql_expr: Some(Expr::Identifier(Ident::new(&column.name))),
                         output_name: column.name.clone(),
+                        output_alias: None,
                     });
                 }
             }
@@ -295,25 +310,49 @@ fn bind_returning(
                 {
                     let mut reference = bind_public_column_ref(table, &column.name)?;
                     reference.image = image;
+                    let sql_expr = match image {
+                        Some(image) => Expr::CompoundIdentifier(vec![
+                            Ident::new(image.qualifier()),
+                            Ident::new(&column.name),
+                        ]),
+                        None => Expr::CompoundIdentifier(vec![
+                            Ident::new(&table.name),
+                            Ident::new(&column.name),
+                        ]),
+                    };
                     items.push(BoundReturningItem {
-                        expr: BoundExpr::Column(reference),
+                        expr: Some(BoundExpr::Column(reference)),
+                        sql_expr: Some(sql_expr),
                         output_name: column.name.clone(),
+                        output_alias: None,
                     });
                 }
             }
             SelectItem::UnnamedExpr(sql_expr) => {
-                let expr = bind_expr_context(table, sql_expr, params, true)?;
-                let output_name = match &expr {
-                    BoundExpr::Column(column) => column.name.clone(),
+                let expr = bind_returning_expr(table, sql_expr, params)?;
+                let output_name = match expr.as_ref() {
+                    Some(BoundExpr::Column(column)) => column.name.clone(),
                     _ => sql_expr.to_string(),
                 };
-                items.push(BoundReturningItem { expr, output_name });
+                items.push(BoundReturningItem {
+                    expr,
+                    sql_expr: Some(sql_expr.clone()),
+                    output_name,
+                    output_alias: None,
+                });
             }
             SelectItem::ExprWithAlias { expr, alias } => {
                 items.push(BoundReturningItem {
-                    expr: bind_expr_context(table, expr, params, true)?,
+                    expr: bind_returning_expr(table, expr, params)?,
+                    sql_expr: Some(expr.clone()),
                     output_name: normalize_identifier(alias),
+                    output_alias: Some(normalize_identifier(alias)),
                 });
+            }
+            SelectItem::ExprWithAliases { .. } => {
+                return Err(super::error::unsupported(
+                    "multiple aliases in RETURNING are not supported",
+                ));
             }
         }
     }
@@ -325,6 +364,31 @@ fn bind_returning(
     }
 
     Ok(Some(BoundReturning { items }))
+}
+
+fn bind_returning_expr(
+    table: &BoundTable,
+    expr: &Expr,
+    params: &mut ParamBinder,
+) -> Result<Option<BoundExpr>, LixError> {
+    match bind_expr_context(table, expr, params, true) {
+        Ok(expr) => Ok(Some(expr)),
+        Err(_) => {
+            // The BoundExpr tree is a fast-path representation, not the SQL
+            // expression language. Preserve unsupported shapes for DataFusion
+            // instead of expanding this binder into a second expression planner.
+            bind_returning_expr_params(expr, params)?;
+            Ok(None)
+        }
+    }
+}
+
+fn bind_returning_expr_params(expr: &Expr, params: &mut ParamBinder) -> Result<(), LixError> {
+    let mut visitor = QueryParamVisitor { params };
+    match expr.visit(&mut visitor) {
+        ControlFlow::Continue(()) => Ok(()),
+        ControlFlow::Break(error) => Err(*error),
+    }
 }
 
 fn bind_insert_returning(
@@ -353,7 +417,7 @@ fn reject_returning_wildcard_options(
 }
 
 fn reject_unsupported_insert_clauses(insert: &Insert) -> Result<(), LixError> {
-    if insert.optimizer_hint.is_some() {
+    if !insert.optimizer_hints.is_empty() {
         return Err(super::error::unsupported(
             "INSERT optimizer hints are not supported",
         ));
@@ -464,7 +528,7 @@ fn bind_insert_conflict(
 }
 
 fn reject_unsupported_update_clauses(update: &Update) -> Result<(), LixError> {
-    if update.optimizer_hint.is_some() {
+    if !update.optimizer_hints.is_empty() {
         return Err(super::error::unsupported(
             "UPDATE optimizer hints are not supported",
         ));
@@ -484,7 +548,7 @@ fn reject_unsupported_update_clauses(update: &Update) -> Result<(), LixError> {
 }
 
 fn reject_unsupported_delete_clauses(delete: &Delete) -> Result<(), LixError> {
-    if delete.optimizer_hint.is_some() {
+    if !delete.optimizer_hints.is_empty() {
         return Err(super::error::unsupported(
             "DELETE optimizer hints are not supported",
         ));
@@ -782,7 +846,7 @@ fn bind_predicate_context(
             *any,
             expr,
             pattern,
-            escape_char.as_ref(),
+            escape_char.as_ref().map(|value| &value.value),
             false,
             returning,
             params,
@@ -799,7 +863,7 @@ fn bind_predicate_context(
             *any,
             expr,
             pattern,
-            escape_char.as_ref(),
+            escape_char.as_ref().map(|value| &value.value),
             true,
             returning,
             params,
@@ -1332,7 +1396,7 @@ fn validate_bound_function_arity(name: &str, actual: usize) -> Result<(), LixErr
         | "__lix_json_contains"
         | "__lix_json_exists"
         | "lix_order_between" => expect_exact_function_arity(name, actual, 2),
-        "__lix_jsonb" | "__lix_text_cast" | "__lix_timestamptz_cast" | "__lix_numeric_literal" => {
+        "__lix_jsonb" | "__lix_text_cast" | "__lix_timestamptz_cast" => {
             expect_exact_function_arity(name, actual, 1)
         }
         // DataFusion validates the signatures of its scalar functions.
@@ -1400,7 +1464,7 @@ fn bind_exact_column_name(name: &ObjectName) -> Result<String, LixError> {
         .ok_or_else(|| super::error::unsupported("unsupported SQL column name"))
 }
 
-fn normalize_identifier(ident: &datafusion::sql::sqlparser::ast::Ident) -> String {
+fn normalize_identifier(ident: &Ident) -> String {
     if ident.quote_style.is_some() {
         ident.value.clone()
     } else {
@@ -1992,7 +2056,7 @@ mod tests {
         );
         assert!(matches!(
             returning.items.last().expect("aliased item").expr,
-            BoundExpr::Column(ref column) if column.name == "path"
+            Some(BoundExpr::Column(ref column)) if column.name == "path"
         ));
     }
 
@@ -2013,8 +2077,9 @@ mod tests {
                 .items
                 .as_slice(),
             [BoundReturningItem {
-                expr: BoundExpr::Param(param),
+                expr: Some(BoundExpr::Param(param)),
                 output_name,
+                ..
             }] if param.index == 2 && output_name == "marker"
         ));
     }

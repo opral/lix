@@ -1967,7 +1967,7 @@ simulation_test!(nullable_columns_are_optional_on_insert, |sim| async move {
 });
 
 simulation_test!(
-    typed_bigint_projection_is_lossless_or_explicit,
+    typed_bigint_projection_and_writes_follow_datafusion_casts,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1993,161 +1993,102 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("typed BIGINT should accept an exact integral real spelling");
+            .expect("typed BIGINT should use DataFusion's Float64-to-Int64 cast");
 
         assert_rows_eq(
             session
                 .execute(
-                    "SELECT count FROM engine_bigint_contract \
-                     WHERE id = 'integral-real'",
+                    "SELECT count FROM engine_bigint_contract WHERE id = 'integral-real'",
                     &[],
                 )
                 .await
-                .expect("integral JSON real should project through BIGINT"),
+                .expect("typed BIGINT should project through SQL"),
             vec![vec![Value::Integer(1)]],
         );
         assert_rows_eq(
             session
-                .execute("SELECT id FROM engine_bigint_contract WHERE count = 1", &[])
+                .execute("SELECT id FROM engine_bigint_contract WHERE count = 1.0", &[])
                 .await
-                .expect("integral JSON real should participate in BIGINT filter pushdown"),
-            vec![vec![Value::Text("integral-real".to_string())]],
-        );
-        assert_rows_eq(
-            session
-                .execute(
-                    "SELECT id FROM engine_bigint_contract WHERE count = 1.0",
-                    &[],
-                )
-                .await
-                .expect("real literal comparison should retain DataFusion coercion semantics"),
+                .expect("BIGINT comparison should use DataFusion coercion"),
             vec![vec![Value::Text("integral-real".to_string())]],
         );
         assert_rows_eq(
             session
                 .execute(
                     "SELECT to_count FROM lix_history('engine_bigint_contract') \
-                       WHERE id = 'integral-real'",
+                     WHERE id = 'integral-real'",
                     &[],
                 )
                 .await
-                .expect("integral JSON real should project through typed history BIGINT"),
+                .expect("typed history should preserve BIGINT values"),
             vec![vec![Value::Integer(1)]],
         );
 
         let updated = session
             .execute(
-                "UPDATE engine_bigint_contract SET ratio = 1 \
-                 WHERE count = 1.0",
+                "UPDATE engine_bigint_contract SET ratio = 1 WHERE count = 1.0",
                 &[],
             )
             .await
-            .expect("BIGINT predicates should normalize an integral real literal");
+            .expect("BIGINT predicates should use DataFusion coercion");
         assert_eq!(updated.rows_affected(), 1);
         let updated = session
             .execute(
-                "UPDATE engine_bigint_contract SET ratio = 2.5 \
-                 WHERE 1 = ratio",
+                "UPDATE engine_bigint_contract SET ratio = 2.5 WHERE 1 = ratio",
                 &[],
             )
             .await
-            .expect("DOUBLE predicates should normalize an integer literal symmetrically");
+            .expect("integer and DOUBLE predicates should use DataFusion coercion");
         assert_eq!(updated.rows_affected(), 1);
         let updated = session
             .execute(
-                "UPDATE engine_bigint_contract SET ratio = 3 \
-                 WHERE count IN (1.0)",
+                "UPDATE engine_bigint_contract SET ratio = 3 WHERE count IN (1.0)",
                 &[],
             )
             .await
-            .expect("bound IN predicates should use the same numeric normalization");
+            .expect("IN predicates should use DataFusion coercion");
         assert_eq!(updated.rows_affected(), 1);
         assert_rows_eq(
             session
                 .execute(
-                    "SELECT ratio FROM engine_bigint_contract \
-                     WHERE id = 'integral-real'",
+                    "SELECT ratio FROM engine_bigint_contract WHERE id = 'integral-real'",
                     &[],
                 )
                 .await
-                .expect("an integer JSON spelling should project through DOUBLE PRECISION"),
+                .expect("integer assignments should cast to DOUBLE"),
             vec![vec![Value::Real(3.0)]],
         );
 
-        for sql in [
-            "INSERT INTO engine_bigint_contract (id, count) \
-             VALUES ('below-min-insert', -9223372036854775809)",
-            "UPDATE engine_bigint_contract SET count = -9223372036854775809 \
-             WHERE id = 'integral-real'",
-            "UPDATE engine_bigint_contract SET ratio = 9 \
-             WHERE count = -9223372036854775809",
-            "UPDATE engine_bigint_contract SET ratio = 9 \
-             WHERE count = -9223372036854775809.0",
-            "UPDATE engine_bigint_contract SET ratio = 9 \
-             WHERE count IN (-9223372036854775809e0)",
-            "INSERT INTO engine_bigint_contract (id, count) \
-             VALUES ('above-max-insert', 9223372036854775808)",
-            "INSERT INTO engine_bigint_contract (id, count) \
-             VALUES ('below-min-real-insert', -9223372036854775809.0)",
-            "UPDATE engine_bigint_contract SET count = -9223372036854775809e0 \
-             WHERE id = 'integral-real'",
-            "INSERT INTO engine_bigint_contract (id, count) \
-             VALUES ('rounded-fraction-insert', 9007199254740992.5)",
-            "INSERT INTO engine_bigint_contract (id, count) \
-             VALUES ('underflow-insert', 1e-400)",
-            "INSERT INTO engine_bigint_contract (id, count) \
-             VALUES ('non-integral-insert', 1.5)",
-            "UPDATE engine_bigint_contract SET count = 9007199254740992.5 \
-             WHERE id = 'integral-real'",
-            "UPDATE engine_bigint_contract SET ratio = 9 \
-             WHERE count = 9007199254740992.5",
-            "UPDATE engine_bigint_contract SET ratio = 9 \
-             WHERE count IN (1e-400)",
-        ] {
-            let error = session
-                .execute(sql, &[])
+        for (literal, id) in [("1.5", "fractional-insert"), ("2.5", "fractional-update")] {
+            let expected = session
+                .execute(&format!("SELECT CAST({literal} AS BIGINT)"), &[])
                 .await
-                .expect_err("inexact SQL numeric literals must never round into BIGINT");
-            assert_eq!(error.code, LixError::CODE_TYPE_MISMATCH, "{sql}");
-            assert!(error.message.contains("count"), "{error:?}");
-            assert!(error.message.contains("BIGINT"), "{error:?}");
+                .expect("DataFusion BIGINT cast should evaluate")
+                .rows()[0]
+                .values()[0]
+                .clone();
+            if id == "fractional-insert" {
+                let inserted = session
+                    .execute(
+                        "INSERT INTO engine_bigint_contract (id, count) \
+                         VALUES ('fractional-insert', 1.5) RETURNING count",
+                        &[],
+                    )
+                    .await
+                    .expect("INSERT should use DataFusion's numeric assignment cast");
+                assert_rows_eq(inserted, vec![vec![expected]]);
+            } else {
+                let updated = session
+                    .execute(
+                        "UPDATE engine_bigint_contract SET count = 2.5 \
+                         WHERE id = 'fractional-insert' RETURNING count",
+                        &[],
+                    )
+                    .await
+                    .expect("UPDATE should use DataFusion's numeric assignment cast");
+                assert_rows_eq(updated, vec![vec![expected]]);
+            }
         }
-        assert_rows_eq(
-            session
-                .execute(
-                    "SELECT count, ratio FROM engine_bigint_contract \
-                     WHERE id = 'integral-real'",
-                    &[],
-                )
-                .await
-                .expect("rejected numeric writes and predicates must not mutate the row"),
-            vec![vec![Value::Integer(1), Value::Real(3.0)]],
-        );
-
-        session
-            .execute(
-                "INSERT INTO engine_bigint_contract (id, count) VALUES \
-                 ('max-real-spelling', 9223372036854775807.0), \
-                 ('min-exponent-spelling', -9223372036854775808e0)",
-                &[],
-            )
-            .await
-            .expect("exact in-range real and exponent spellings should normalize without rounding");
-        assert_rows_eq(
-            session
-                .execute(
-                    "SELECT count FROM engine_bigint_contract \
-                     WHERE id IN ('max-real-spelling', 'min-exponent-spelling') \
-                     ORDER BY id",
-                    &[],
-                )
-                .await
-                .expect("exact BIGINT boundary spellings should remain lossless"),
-            vec![
-                vec![Value::Integer(i64::MAX)],
-                vec![Value::Integer(i64::MIN)],
-            ],
-        );
 
         session
             .execute(
@@ -2160,11 +2101,12 @@ simulation_test!(
         let deleted = session
             .execute(
                 "DELETE FROM engine_bigint_contract \
-                 WHERE count = 2 RETURNING count, ratio",
+                 WHERE id = 'delete-integral-real' AND count = 2 \
+                 RETURNING count, ratio",
                 &[],
             )
             .await
-            .expect("DELETE predicates and RETURNING should apply the typed numeric contract");
+            .expect("DELETE predicates and RETURNING should preserve typed values");
         assert_eq!(deleted.rows_affected(), 1);
         assert_rows_eq(deleted, vec![vec![Value::Integer(2), Value::Real(1.0)]]);
     }

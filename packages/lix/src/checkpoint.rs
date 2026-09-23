@@ -27,7 +27,7 @@ pub(crate) type CheckpointCommitRecords = HashMap<CommitId, CommitGraphNode>;
 /// searching checkpoint history.
 pub(crate) async fn checkpoint_commit_id_at_head<S>(
     store: S,
-    branch_id: &str,
+    branch_id: String,
     head_commit_id: CommitId,
 ) -> Result<CommitId, LixError>
 where
@@ -35,9 +35,11 @@ where
 {
     let control = BranchHeadControlContext::new()
         .reader(store)
-        .load(branch_id)
+        .load(&branch_id)
         .await?
-        .ok_or_else(|| LixError::branch_not_found(branch_id, "load checkpoint cursor", "branch"))?;
+        .ok_or_else(|| {
+            LixError::branch_not_found(branch_id.clone(), "load checkpoint cursor", "branch")
+        })?;
     if control.head_commit_id != head_commit_id {
         return Err(LixError::new(
             LixError::CODE_TRANSACTION_CONFLICT,

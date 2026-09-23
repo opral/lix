@@ -20,7 +20,7 @@ use datafusion::physical_plan::expressions;
 use datafusion::physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion::physical_plan::udaf::{AggregateFunctionExpr, StatisticsArgs};
-use datafusion::physical_plan::{ExecutionPlan, Statistics};
+use datafusion::physical_plan::{ExecutionPlan, Statistics, StatisticsContext};
 
 #[derive(Debug, Default)]
 pub(crate) struct ExactAggregateStatistics;
@@ -33,10 +33,13 @@ impl PhysicalOptimizerRule for ExactAggregateStatistics {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if let Some(partial) = optimizable_partial_aggregate(plan.as_ref()) {
             let aggregate = partial
-                .as_any()
                 .downcast_ref::<AggregateExec>()
                 .expect("optimizable partial aggregate is AggregateExec");
-            let statistics = aggregate.input().partition_statistics(None)?;
+            let statistics = StatisticsContext::new()
+                .compute(
+                    aggregate.input().as_ref(),
+                    &datafusion::physical_plan::StatisticsArgs::new(),
+                )?;
             let mut projections = Vec::with_capacity(aggregate.aggr_expr().len());
             for expression in aggregate.aggr_expr() {
                 let Some(value) = exact_aggregate_value(&statistics, expression) else {
@@ -68,7 +71,7 @@ impl PhysicalOptimizerRule for ExactAggregateStatistics {
 }
 
 fn optimizable_partial_aggregate(plan: &dyn ExecutionPlan) -> Option<Arc<dyn ExecutionPlan>> {
-    let final_aggregate = plan.as_any().downcast_ref::<AggregateExec>()?;
+    let final_aggregate = plan.downcast_ref::<AggregateExec>()?;
     if final_aggregate.mode().input_mode() != AggregateInputMode::Partial
         || !final_aggregate.group_expr().is_empty()
     {
@@ -76,7 +79,7 @@ fn optimizable_partial_aggregate(plan: &dyn ExecutionPlan) -> Option<Arc<dyn Exe
     }
     let mut child = Arc::clone(final_aggregate.input());
     loop {
-        if let Some(partial) = child.as_any().downcast_ref::<AggregateExec>()
+        if let Some(partial) = child.downcast_ref::<AggregateExec>()
             && partial.mode().input_mode() == AggregateInputMode::Raw
             && partial.group_expr().is_empty()
             && partial.filter_expr().iter().all(Option::is_none)
@@ -114,12 +117,12 @@ fn exact_aggregate_value(
     if expression.is_distinct() || arguments.len() != 1 {
         return None;
     }
-    let column = arguments[0].as_any().downcast_ref::<Column>()?;
+    let column = arguments[0].downcast_ref::<Column>()?;
     let column_statistics = statistics.column_statistics.get(column.index())?;
-    if expression.fun().inner().as_any().is::<Sum>() {
+    if expression.fun().inner().is::<Sum>() {
         exact_scalar(&column_statistics.sum_value)
             .and_then(|value| value.cast_to(field.data_type()).ok())
-    } else if expression.fun().inner().as_any().is::<Avg>() {
+    } else if expression.fun().inner().is::<Avg>() {
         let row_count = *exact_usize(&statistics.num_rows)?;
         let null_count = *exact_usize(&column_statistics.null_count)?;
         let count = row_count.checked_sub(null_count)?;
@@ -156,7 +159,6 @@ fn exact_usize(value: &Precision<usize>) -> Option<&usize> {
 
 #[cfg(test)]
 mod tests {
-    use std::any::Any;
 
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::stats::ColumnStatistics;
@@ -275,9 +277,6 @@ mod tests {
     }
 
     impl AggregateUDFImpl for CustomNamedSum {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
 
         fn name(&self) -> &str {
             "sum"

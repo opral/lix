@@ -11,11 +11,11 @@ mod error;
 mod exec;
 mod file_view;
 mod information_schema;
+mod logical_value_compatibility;
 mod logical_value_metadata;
 mod parse;
 mod plan;
 mod planning_cache;
-mod predicate_typecheck;
 mod providers;
 #[cfg(test)]
 pub(crate) use providers::take_mainline_work;
@@ -30,6 +30,10 @@ mod runtime;
 // Host-side script inspection; execution remains the native single-statement path.
 pub(crate) mod script;
 mod session;
+pub(crate) use session::{
+    ExecutionFunctionBindings, SqlWriteReadRequirements, resolve_root_commit_id_from_graph,
+    resolve_working_diff_checkpoint_commit_id_from_store,
+};
 #[cfg(test)]
 mod test_support;
 mod udfs;
@@ -99,6 +103,8 @@ pub(crate) use planning_cache::{
 };
 pub(crate) use providers::{
     ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
+    ProviderSelection, register_read_table_functions,
+    register_write_read_relations,
     execute_exact_lix_directory_root_listing, execute_exact_lix_file_batch_read,
     execute_exact_lix_file_id_manifest_batch_read, execute_exact_lix_file_read,
     execute_exact_lix_file_root_listing, execute_exact_schema_batch_read,

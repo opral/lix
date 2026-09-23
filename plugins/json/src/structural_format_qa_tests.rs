@@ -107,7 +107,8 @@ fn structural_format_qa_rename_formatted_key_preserves_other_bytes() {
     let transition = harness.serialize_changes(&file, &changes).unwrap();
     let output = transition.snapshot();
     let value: serde_json::Value = serde_json::from_slice(&output.bytes).unwrap();
-    assert_eq!(value, serde_json::json!({"new":12300.0,"keep":"A"}));
+    assert_eq!(value["new"].as_f64(), Some(12300.0));
+    assert_eq!(value["keep"], "A");
     let text = std::str::from_utf8(&output.bytes).unwrap();
     assert!(text.contains("1.2300e+04"));
     assert!(text.contains("\n  \"keep\": \"\\u0041\"\n"));

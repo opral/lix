@@ -166,6 +166,45 @@ pub(crate) trait SqlWriteExecutionContext: Send {
     fn datafusion_session(&self) -> datafusion::prelude::SessionContext {
         super::session::new_sql_session_context()
     }
+    /// Commit head for the retained read snapshot used by SQL query sources.
+    fn sql_read_active_branch_commit_id(&self) -> Option<String> {
+        None
+    }
+    /// Register read-only Lix table functions and resolve execution facts
+    /// required by the write's source query or RETURNING projection. A real
+    /// transaction binds these to its retained read snapshot.
+    async fn register_sql_read_dependencies(
+        &mut self,
+        session: &datafusion::prelude::SessionContext,
+        catalog: Arc<PublicCatalog>,
+        selection: super::providers::ProviderSelection,
+        requirements: super::session::SqlWriteReadRequirements,
+        _active_branch_commit_id: Option<String>,
+    ) -> Result<super::session::ExecutionFunctionBindings, LixError> {
+        if requirements.needs_read_table_functions {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "read-only Lix table functions require a transaction read snapshot",
+            ));
+        }
+        if !requirements.read_relation_names.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "read-only Lix relation providers require a transaction read snapshot",
+            ));
+        }
+        if requirements.needs_root_commit_id
+            || requirements.needs_working_diff_checkpoint_commit_id
+        {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "Lix execution facts require a transaction read snapshot",
+            ));
+        }
+        let _ = session;
+        let _ = (catalog, selection, requirements);
+        Ok(super::session::ExecutionFunctionBindings::default())
+    }
     fn active_account_id(&self) -> &str {
         crate::ANONYMOUS_ACCOUNT_ID
     }

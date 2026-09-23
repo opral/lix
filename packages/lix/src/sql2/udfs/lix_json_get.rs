@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::sync::Arc;
 
 use crate::sql2::result_metadata::json_field;
@@ -9,7 +8,7 @@ use datafusion::logical_expr::{
     ColumnarValue, ReturnFieldArgs, ScalarFunctionArgs, ScalarUDFImpl, Signature, Volatility,
 };
 
-use super::common::{extract_json_path, json_json_value, scalar_inputs};
+use super::common::{constant_text_array_path, extract_json_path, json_json_value, scalar_inputs};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct LixJsonGet {
@@ -27,9 +26,6 @@ impl LixJsonGet {
 }
 
 impl ScalarUDFImpl for LixJsonGet {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         self.name
@@ -48,17 +44,27 @@ impl ScalarUDFImpl for LixJsonGet {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        if args.args.len() < 2 {
+        if args.args.len() != 2 {
             return plan_err!("JSONB -> requires 2 arguments");
         }
 
         let scalar_inputs = scalar_inputs(&args.args);
+        let constant_path = if self.name().contains("path_get") {
+            constant_text_array_path(&args.args[1])?
+        } else {
+            None
+        };
         let arrays = ColumnarValue::values_to_arrays(&args.args)?;
         let len = arrays.first().map(|array| array.len()).unwrap_or(1);
 
         let mut values = Vec::with_capacity(len);
         for row in 0..len {
-            values.push(match extract_json_path(self.name(), &arrays, row)? {
+            values.push(match extract_json_path(
+                self.name(),
+                &arrays,
+                row,
+                constant_path.as_deref(),
+            )? {
                 None => None,
                 Some(value) => Some(json_json_value(&value)?),
             });

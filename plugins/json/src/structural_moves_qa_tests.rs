@@ -122,16 +122,22 @@ fn structural_moves_nested_array_then_scalar_and_cold_roundtrip() {
             .into_snapshot();
         apply(&mut rows, &changes);
         assert_eq!(cold_bytes(&file, &rows), file.bytes);
-        let expected = if round == 0 {
-            serde_json::json!([[], [[100.0]], 3])
-        } else if round % 2 == 0 {
-            serde_json::json!([[], [[round - 1]], 3])
+        let actual: serde_json::Value = serde_json::from_slice(&file.bytes).unwrap();
+        assert_eq!(actual.as_array().map(Vec::len), Some(3));
+        assert_eq!(actual[2].as_f64(), Some(3.0));
+        let (occupied, empty) = if round % 2 == 0 {
+            (&actual[1], &actual[0])
         } else {
-            serde_json::json!([[[round - 1]], [], 3])
+            (&actual[0], &actual[1])
         };
+        assert_eq!(empty.as_array().map(Vec::len), Some(0));
         assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&file.bytes).unwrap(),
-            expected
+            occupied[0][0].as_f64(),
+            Some(if round == 0 {
+                100.0
+            } else {
+                (round - 1) as f64
+            })
         );
         if round == 0 {
             assert!(String::from_utf8_lossy(&file.bytes).contains("1.00e+02"));

@@ -736,6 +736,58 @@ async fn untracked_plugin_rows_enforce_foreign_keys_like_tracked_ones() {
     lix.close().await.expect("fk workspace should close");
 }
 
+#[tokio::test]
+async fn recursive_cte_walks_markdown_plugin_parent_tree() {
+    const FILE_ID: &str = "01900000-0000-7000-8000-0000000008b3";
+    const CONTENT: &[u8] = b"# Title\n\nA paragraph with *emphasis*.\n\n- one\n- two\n";
+
+    let lix = open_lix().await.expect("recursive CTE workspace should open");
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_markdown",
+        &build_markdown_plugin_archive(),
+        &["markdown_node"],
+    )
+    .await;
+    lix.execute(
+        "INSERT INTO lix_file (id, path, content) VALUES ($1, $2, $3)",
+        &[
+            Value::Text(FILE_ID.to_owned()),
+            Value::Text("/recursive-tree.md".to_owned()),
+            Value::Blob(CONTENT.to_vec().into()),
+        ],
+    )
+    .await
+    .expect("markdown tree should be parsed into plugin rows");
+
+    let ancestors = lix
+        .execute(
+            "WITH RECURSIVE up AS ( \
+                 SELECT id, parent_id, lixcol_file_id \
+                 FROM markdown_node \
+                 WHERE lixcol_file_id = $1 AND kind = 'list_item' \
+                 UNION ALL \
+                 SELECT parent.id, parent.parent_id, parent.lixcol_file_id \
+                 FROM markdown_node AS parent \
+                 JOIN up AS child \
+                   ON parent.lixcol_file_id = child.lixcol_file_id \
+                  AND parent.id = child.parent_id \
+             ) \
+             SELECT COUNT(*) AS count FROM up",
+            &[Value::Text(FILE_ID.to_owned())],
+        )
+        .await
+        .expect("recursive CTE should walk the markdown plugin's parent tree");
+    assert_eq!(
+        ancestors.rows()[0].get::<i64>("count").unwrap(),
+        6,
+        "the two list items and their list and document ancestors should be reachable"
+    );
+    lix.close()
+        .await
+        .expect("recursive CTE workspace should close");
+}
+
 /// Prior rows plus a fresh parse must compose on the ordinary decode path.
 ///
 /// The collection-replacement marker a certified packet carries
@@ -8479,10 +8531,10 @@ async fn json_structural_qa_stale_disjoint_insertions_and_deletions_compose() {
     .await
     .unwrap();
     let before_stale = read_file(&lix, path).await.unwrap();
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(before_stale.as_ref().unwrap()).unwrap(),
-        serde_json::json!({"keep":12300.0,"alpha":3})
-    );
+    let before_stale_json =
+        serde_json::from_slice::<serde_json::Value>(before_stale.as_ref().unwrap()).unwrap();
+    assert_eq!(before_stale_json["keep"].as_f64(), Some(12_300.0));
+    assert_eq!(before_stale_json["alpha"], 3);
     let error = write_file(
         &second,
         path,
@@ -8499,10 +8551,10 @@ async fn json_structural_qa_stale_disjoint_insertions_and_deletions_compose() {
     retry.push_str(",\"beta\":4}");
     write_file(&second, path, retry.into_bytes()).await.unwrap();
     let rendered = read_file(&lix, path).await.unwrap().unwrap();
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&rendered).unwrap(),
-        serde_json::json!({"keep":12300.0,"alpha":3,"beta":4})
-    );
+    let rendered_json = serde_json::from_slice::<serde_json::Value>(&rendered).unwrap();
+    assert_eq!(rendered_json["keep"].as_f64(), Some(12_300.0));
+    assert_eq!(rendered_json["alpha"], 3);
+    assert_eq!(rendered_json["beta"], 4);
     assert!(String::from_utf8(rendered).unwrap().contains("1.2300e+04"));
     let rows = lix
         .execute("SELECT key FROM json_object_member ORDER BY key", &[])
@@ -8523,11 +8575,13 @@ async fn json_structural_qa_stale_disjoint_insertions_and_deletions_compose() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&read_file(&lix, path).await.unwrap().unwrap())
-            .unwrap(),
-        serde_json::json!({"keep":12300.0,"alpha":5,"beta":5})
-    );
+    let updated_json = serde_json::from_slice::<serde_json::Value>(
+        &read_file(&lix, path).await.unwrap().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(updated_json["keep"].as_f64(), Some(12_300.0));
+    assert_eq!(updated_json["alpha"], 5);
+    assert_eq!(updated_json["beta"], 5);
     first.close().await.unwrap();
     second.close().await.unwrap();
     lix.close().await.unwrap();

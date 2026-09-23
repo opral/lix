@@ -105,7 +105,6 @@ simulation_test!(
                 "SELECT lix_row_ref('lix_file', NULL, 'not-a-uuid')",
                 "invalid primary key",
             ),
-            ("SELECT lix_row_ref('lix_file', NULL, NULL)", "non-null"),
             (
                 "SELECT lix_row_ref('lix_file', NULL, 'a', 'b')",
                 "requires 1 primary-key values",
@@ -209,7 +208,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    row_ref_union_preserves_safe_text_and_canonical_refs,
+    row_ref_union_preserves_identity_and_rejects_plain_text,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -231,15 +230,8 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("mixed row-ref and text UNION should remain safe text");
-        assert_eq!(mixed.column_types(), &[ResultColumnType::Text]);
-        assert_eq!(mixed.rows().len(), 2);
-        assert!(mixed.rows().iter().any(|row| {
-            matches!(row.values(), [Value::Text(value)] if value.starts_with("lix_row_ref:v2:"))
-        }));
-        assert!(mixed.rows().iter().any(|row| {
-            row.values() == [Value::Text("plain text".into())]
-        }));
+            .expect_err("ROW_REF must not be coerced to text by set operations");
+        assert_eq!(mixed.code, lix::LixError::CODE_TYPE_MISMATCH);
 
         let valid = session
             .execute(
@@ -255,6 +247,29 @@ simulation_test!(
             .rows()
             .iter()
             .all(|row| matches!(row.values(), [Value::RowRef(_)])));
+
+        let nested = session
+            .execute(
+                "SELECT unnest(unnest(ARRAY[ARRAY[lix_row_ref('lix_key_value', NULL, 'union-row-ref')]])) \
+                 AS row_ref",
+                &[],
+            )
+            .await
+            .expect("nested arrays should retain ROW_REF identity through each UNNEST depth");
+        assert_eq!(nested.column_types(), &[ResultColumnType::RowRef]);
+        assert_eq!(nested.rows().len(), 1);
+        assert!(matches!(nested.rows()[0].values(), [Value::RowRef(_)]));
+
+        let mixed_nested = session
+            .execute(
+                "SELECT unnest(unnest(ARRAY[ARRAY['{}'::jsonb]])) AS v \
+                 UNION ALL \
+                 SELECT unnest(unnest(ARRAY[ARRAY[lix_row_ref('lix_key_value', NULL, 'union-row-ref')]])) AS v",
+                &[],
+            )
+            .await
+            .expect_err("set operations must reject nested arrays with different Lix value kinds");
+        assert_eq!(mixed_nested.code, lix::LixError::CODE_TYPE_MISMATCH);
     }
 );
 

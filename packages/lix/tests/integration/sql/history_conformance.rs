@@ -156,7 +156,7 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_rows_eq(session.execute("SELECT to_value FROM lix_history('lix_key_value') WHERE key = 'ordered' AND to_value <> '\"m\"'::jsonb ORDER BY to_value LIMIT 1", &[]).await.unwrap(), vec![vec![Value::Jsonb(serde_json::json!("a").into())]]);
+        assert_rows_eq(session.execute("SELECT to_value FROM lix_history('lix_key_value') WHERE key = 'ordered' AND to_value <> '\"m\"'::jsonb ORDER BY CAST(to_value AS TEXT) LIMIT 1", &[]).await.unwrap(), vec![vec![Value::Jsonb(serde_json::json!("a").into())]]);
         assert!(session.execute("SELECT key FROM lix_history('lix_key_value') WHERE key = 'ordered' AND to_value = '\"a\"'::jsonb AND to_value = '\"z\"'::jsonb", &[]).await.unwrap().is_empty());
     }
 );
@@ -227,14 +227,74 @@ simulation_test!(
         ] {
             assert!(session.execute(sql, &[]).await.is_err(), "{sql}");
         }
-        assert!(
+        for (sql, params) in [
+            (
+                "SELECT * FROM lix_history($1) LIMIT 0",
+                vec![Value::Text("lix_file".into())],
+            ),
+            (
+                "SELECT * FROM lix_history(CAST('lix_file' AS TEXT)) LIMIT 0",
+                Vec::new(),
+            ),
+        ] {
             session
-                .execute(
-                    "SELECT * FROM lix_history($1)",
-                    &[Value::Text("lix_file".into())]
-                )
+                .execute(sql, &params)
                 .await
-                .is_err()
+                .unwrap_or_else(|error| panic!("DataFusion-supported table function args should work: {sql}: {error}"));
+        }
+    }
+);
+
+simulation_test!(
+    history_parameter_resolves_runtime_registered_relation,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES ($1)",
+                &[Value::Jsonb(
+                    serde_json::json!({
+                        "$schema": "https://lix.dev/schema-v1.json",
+                        "key": "history_runtime_relation",
+                        "columns": [
+                            {"name": "key", "type": "text", "nullable": false},
+                            {"name": "value", "type": "text", "nullable": true}
+                        ],
+                        "primary_key": ["key"]
+                    })
+                    .into(),
+                )],
+            )
+            .await
+            .expect("runtime relation schema should register");
+        session
+            .execute(
+                "INSERT INTO history_runtime_relation (key, value) \
+                 VALUES ('runtime-history-key', 'runtime-history-value')",
+                &[],
+            )
+            .await
+            .expect("runtime relation row should insert");
+
+        let result = session
+            .execute(
+                "SELECT key, diff_type, to_value FROM lix_history($1) WHERE key = $2",
+                &[
+                    Value::Text("history_runtime_relation".to_string()),
+                    Value::Text("runtime-history-key".to_string()),
+                ],
+            )
+            .await
+            .expect("bound history relation should resolve its runtime schema and rows");
+
+        assert_rows_eq(
+            result,
+            vec![vec![
+                Value::Text("runtime-history-key".to_string()),
+                Value::Text("added".to_string()),
+                Value::Text("runtime-history-value".to_string()),
+            ]],
         );
     }
 );

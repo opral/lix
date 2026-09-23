@@ -138,7 +138,7 @@ impl FilesystemPathEntry {
             }
             .to_string(),
             file_id: self.key.file_id().map(str::to_string),
-            snapshot_content: Some(snapshot_content.to_string().into()),
+            snapshot_content: Some(crate::Json::from(snapshot_content).to_string().into()),
             metadata: self.metadata.clone().map(Into::into),
             deleted: false,
             created_at: LixTimestamp::expect_parse(
@@ -344,20 +344,13 @@ impl FilesystemPathIndex {
                     "live lix_binary_blob_ref row has no payload",
                 )
             })?;
-            let snapshot_content = snapshot.to_string();
             let id = snapshot
                 .get("id")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| {
                     LixError::unknown("lix_binary_blob_ref snapshot is missing string id")
                 })?;
-            let mut owned = row.to_owned();
-            // The persistent filesystem index is an API projection boundary.
-            // Preserve a transient JSON projection for the existing eager-CAS
-            // cache without putting JSON back into durable row storage.
-            if owned.snapshot_content.is_none() {
-                owned.snapshot_content = Some(snapshot_content.into());
-            }
+            let owned = canonical_blob_ref_projection(&row.to_owned(), &snapshot);
             blob_rows.insert(
                 FilesystemBlobRefKey::from_live_row_ref(row, id.to_string()),
                 owned,
@@ -768,7 +761,24 @@ impl FilesystemPathIndex {
         if row.deleted {
             next.blob_ref = None;
         } else {
-            next.blob_ref = Some(row.clone());
+            let snapshot = row
+                .snapshot_content
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()
+                .map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        format!("invalid lix_binary_blob_ref snapshot JSON: {error}"),
+                    )
+                })?
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_STORAGE_ERROR,
+                        "live lix_binary_blob_ref row has no payload",
+                    )
+                })?;
+            next.blob_ref = Some(canonical_blob_ref_projection(row, &snapshot));
         }
         next.cached_blob_data = None;
         self.insert_entry(Arc::new(next));
@@ -1062,6 +1072,18 @@ impl FilesystemPathIndex {
     pub(crate) fn estimated_heap_bytes(&self) -> usize {
         self.estimated_heap_bytes
     }
+}
+
+/// The filesystem index is a read projection over hot-state rows. Keep its
+/// transient blob snapshot canonical even when dependency feature unification
+/// changes serde_json's map ordering; this does not rewrite the stored row.
+fn canonical_blob_ref_projection(
+    row: &MaterializedHotStateRow,
+    snapshot: &serde_json::Value,
+) -> MaterializedHotStateRow {
+    let mut owned = row.to_owned();
+    owned.snapshot_content = Some(crate::Json::from(snapshot).to_string().into());
+    owned
 }
 
 fn for_each_committed_row_projection(

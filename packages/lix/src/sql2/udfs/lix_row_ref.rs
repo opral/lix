@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -47,10 +46,7 @@ impl LixRowRef {
 }
 
 impl ScalarUDFImpl for LixRowRef {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn name(&self) -> &'static str {
+        fn name(&self) -> &'static str {
         "lix_row_ref"
     }
     fn signature(&self) -> &Signature {
@@ -60,7 +56,7 @@ impl ScalarUDFImpl for LixRowRef {
         Ok(DataType::Utf8)
     }
     fn return_field_from_args(&self, _args: ReturnFieldArgs) -> Result<FieldRef> {
-        Ok(Arc::new(row_ref_field(self.name(), false)))
+        Ok(Arc::new(row_ref_field(self.name(), true)))
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
@@ -85,13 +81,12 @@ impl ScalarUDFImpl for LixRowRef {
                         .iter()
                         .map(|array| ScalarValue::try_from_array(array.as_ref(), row)),
                 )?
-                .as_str()
-                .to_owned(),
+                .map(|row_ref| row_ref.as_str().to_owned()),
             );
         }
         if scalar {
             Ok(ColumnarValue::Scalar(ScalarValue::Utf8(
-                output.into_iter().next(),
+                output.into_iter().next().flatten(),
             )))
         } else {
             Ok(ColumnarValue::Array(Arc::new(StringArray::from(output))))
@@ -105,7 +100,7 @@ pub(crate) fn construct_row_ref(
     relation_value: &ScalarValue,
     file_id_value: &ScalarValue,
     components: impl ExactSizeIterator<Item = Result<ScalarValue>>,
-) -> Result<crate::RowRef> {
+) -> Result<Option<crate::RowRef>> {
     let relation = scalar_text(relation_value).ok_or_else(|| {
         DataFusionError::Execution("lix_row_ref relation must be non-null text".to_string())
     })?;
@@ -121,17 +116,21 @@ pub(crate) fn construct_row_ref(
             components.len(),
         )));
     }
-    let parts = components
-        .zip(&component_types)
-        .enumerate()
-        .map(|(index, (value, expected))| external_component(&value?, *expected, index))
-        .collect::<Result<Vec<_>>>()?;
+    let mut parts = Vec::with_capacity(component_types.len());
+    for (index, (value, expected)) in components.zip(&component_types).enumerate() {
+        let value = value?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        parts.push(external_component(&value, *expected, index)?);
+    }
     let row_pk = RowPk::from_external_parts(parts, &component_types).map_err(|error| {
         DataFusionError::Execution(format!(
             "lix_row_ref relation '{relation}' has an invalid primary key: {error}"
         ))
     })?;
     crate::row_ref::encode(relation, file_id, &row_pk)
+        .map(Some)
         .map_err(crate::sql2::error::lix_error_to_datafusion_error)
 }
 

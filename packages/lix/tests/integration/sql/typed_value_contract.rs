@@ -78,15 +78,14 @@ simulation_test!(typed_sql_values_survive_all_write_paths, |sim| async move {
     let upsert=session.execute("INSERT INTO typed_contract (id,stamp) VALUES ('a',$1) ON CONFLICT (id) DO UPDATE SET stamp = excluded.stamp RETURNING stamp", &[stamp.clone()]).await.unwrap();
     assert_eq!(upsert.rows()[0].values(), &[stamp.clone()]);
     for filter in ["id = 'a'", "id LIKE 'a'"] {
-        assert!(
-            session
-                .execute(
-                    &format!("UPDATE typed_contract SET n = $1 WHERE {filter}"),
-                    &[Value::Real(1.5)]
-                )
-                .await
-                .is_err()
-        );
+        let fractional = session
+            .execute(
+                &format!("UPDATE typed_contract SET n = $1 WHERE {filter} RETURNING n"),
+                &[Value::Real(1.5)],
+            )
+            .await
+            .expect("BIGINT assignment should use DataFusion's Float64-to-Int64 cast");
+        assert_eq!(fractional.rows()[0].values(), &[Value::Integer(1)]);
         assert!(
             session
                 .execute(
@@ -97,6 +96,13 @@ simulation_test!(typed_sql_values_survive_all_write_paths, |sim| async move {
                 .is_err()
         );
         for literal in ["9007199254740993.0", "-9223372036854775808.0"] {
+            let expected = session
+                .execute(&format!("SELECT CAST({literal} AS BIGINT)"), &[])
+                .await
+                .unwrap()
+                .rows()[0]
+                .values()[0]
+                .clone();
             let updated = session
                 .execute(
                     &format!("UPDATE typed_contract SET n = {literal} WHERE {filter} RETURNING n"),
@@ -104,12 +110,7 @@ simulation_test!(typed_sql_values_survive_all_write_paths, |sim| async move {
                 )
                 .await
                 .unwrap();
-            assert_eq!(
-                updated.rows()[0].values(),
-                &[Value::Integer(
-                    literal.trim_end_matches(".0").parse().unwrap()
-                )]
-            );
+            assert_eq!(updated.rows()[0].values(), &[expected]);
         }
         assert!(
             session
@@ -258,9 +259,10 @@ simulation_test!(
             .await
             .unwrap();
         for (left, right, matches) in [
-            (0.0, -0.0, false),
+            (0.0, -0.0, true),
             (-0.0, -0.0, true),
             (f64::NAN, f64::NAN, true),
+            (f64::from_bits(0x7ff8_0000_0000_0001), f64::NAN, false),
             (f64::INFINITY, f64::INFINITY, true),
         ] {
             let params = [Value::Real(left), Value::Real(right)];
@@ -405,13 +407,14 @@ simulation_test!(
                 Value::Text("default label".into())
             ]
         );
-        session
+        let fractional = session
             .execute(
-                "INSERT INTO select_contract (id,n) SELECT 'fraction',1.5",
+                "INSERT INTO select_contract (id,n) SELECT 'fraction',1.5 RETURNING n",
                 &[],
             )
             .await
-            .expect_err("fractional BIGINT assignment must fail");
+            .expect("BIGINT assignment should use DataFusion's Float64-to-Int64 cast");
+        assert_eq!(fractional.rows()[0].values(), &[Value::Integer(1)]);
         session
             .execute(
                 "INSERT INTO select_contract (id,n) SELECT 'json',CAST('1' AS JSONB)",

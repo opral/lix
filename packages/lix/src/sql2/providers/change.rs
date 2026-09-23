@@ -26,7 +26,7 @@ use crate::storage_adapter::StorageAdapterRead;
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, scan_row_source};
 
-pub(super) async fn register_lix_change_read_provider<S>(
+pub(super) fn register_lix_change_read_provider<S>(
     session: &datafusion::prelude::SessionContext,
     surface_name: &str,
     query_source: SqlChangelogQuerySource<S>,

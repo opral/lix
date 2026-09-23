@@ -4,7 +4,7 @@
 //! type is not a public Lix result type, so TIMESTAMPTZ casts go through this
 //! private scalar UDF, whose schema is always the same type used by native
 //! timestamptz parameters and registered columns.
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use datafusion::arrow::{
     compute::cast_with_options,
@@ -25,9 +25,6 @@ impl LixTimestamptzCast {
 }
 
 impl ScalarUDFImpl for LixTimestamptzCast {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "__lix_timestamptz_cast"

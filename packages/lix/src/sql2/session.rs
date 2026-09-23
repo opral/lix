@@ -2,8 +2,10 @@ use datafusion::catalog::CatalogProviderList;
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::sql::parser::Statement as DataFusionStatement;
+use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, TableFactor, Visit, Visitor};
 use std::collections::BTreeSet;
 use std::ops::Deref;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use crate::LixError;
@@ -76,14 +78,14 @@ where
         .iter()
         .any(|statement| statement_uses_execution_function(statement, "lix_root_commit_id"))
     {
-        resolve_root_commit_id(ctx, active_branch_commit_id.as_deref()).await?
+        resolve_root_commit_id(ctx, active_branch_commit_id.clone()).await?
     } else {
         None
     };
     let working_diff_checkpoint_commit_id = if statements.iter().any(|statement| {
         statement_uses_execution_function(statement, "lix_working_diff_checkpoint_commit_id")
     }) {
-        resolve_working_diff_checkpoint_commit_id(ctx, active_branch_commit_id.as_deref()).await?
+        resolve_working_diff_checkpoint_commit_id(ctx, active_branch_commit_id.clone()).await?
     } else {
         None
     };
@@ -126,13 +128,13 @@ where
         .await?
         .map(|head| head.commit_id.to_string());
     let root_commit_id = if statement_uses_execution_function(statement, "lix_root_commit_id") {
-        resolve_root_commit_id(read_ctx, active_branch_commit_id.as_deref()).await?
+        resolve_root_commit_id(read_ctx, active_branch_commit_id.clone()).await?
     } else {
         None
     };
     let working_diff_checkpoint_commit_id =
         if statement_uses_execution_function(statement, "lix_working_diff_checkpoint_commit_id") {
-            resolve_working_diff_checkpoint_commit_id(read_ctx, active_branch_commit_id.as_deref())
+            resolve_working_diff_checkpoint_commit_id(read_ctx, active_branch_commit_id.clone())
                 .await?
         } else {
             None
@@ -166,6 +168,19 @@ where
     Ok(pooled)
 }
 
+#[derive(Default)]
+pub(crate) struct ExecutionFunctionBindings {
+    pub(crate) working_diff_checkpoint_commit_id: Option<String>,
+    pub(crate) root_commit_id: Option<String>,
+}
+
+pub(crate) struct SqlWriteReadRequirements {
+    pub(crate) needs_read_table_functions: bool,
+    pub(crate) read_relation_names: BTreeSet<String>,
+    pub(crate) needs_root_commit_id: bool,
+    pub(crate) needs_working_diff_checkpoint_commit_id: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SqlWriteSessionOptions {
     pub(crate) omitted_insert_columns: BTreeSet<String>,
@@ -197,9 +212,77 @@ impl Deref for SqlWriteSession {
 pub(crate) async fn build_write_session_with_options(
     ctx: &mut dyn SqlWriteExecutionContext,
     options: SqlWriteSessionOptions,
-    provider_selection: &providers::ProviderSelection,
+    plan: &super::plan::LogicalWritePlan,
 ) -> Result<SqlWriteSession, LixError> {
     let session = ctx.datafusion_session();
+    let table_name = super::exec::datafusion::write_target_table_name(plan)?;
+    let (provider_selection, needs_read_table_functions, relation_names) =
+        super::exec::datafusion::write_read_dependencies(&session.state(), plan, &table_name)?;
+    let catalog = ctx.public_catalog()?;
+    let read_relation_names = providers::write_read_relation_selection(
+        &catalog,
+        &provider_selection,
+        relation_names.as_ref(),
+    );
+    let source_statement = match &plan.bound.input {
+        super::bind::write::BoundWriteInput::Query { query, .. } => {
+            Some(DataFusionStatement::Statement(Box::new(
+                datafusion::sql::sqlparser::ast::Statement::Query(query.query.clone()),
+            )))
+        }
+        _ => None,
+    };
+    let returning_expressions = plan
+        .bound
+        .returning
+        .iter()
+        .flat_map(|returning| returning.items.iter())
+        .filter_map(|item| item.sql_expr.as_ref());
+    let needs_root_commit_id = source_statement
+        .as_ref()
+        .is_some_and(|statement| {
+            statement_uses_execution_function(statement, "lix_root_commit_id")
+        })
+        || returning_expressions
+            .clone()
+            .any(|expression| expression_uses_execution_function(expression, "lix_root_commit_id"));
+    let needs_working_diff_checkpoint_commit_id = source_statement
+        .as_ref()
+        .is_some_and(|statement| {
+            statement_uses_execution_function(statement, "lix_working_diff_checkpoint_commit_id")
+        })
+        || returning_expressions.clone().any(|expression| {
+            expression_uses_execution_function(
+                expression,
+                "lix_working_diff_checkpoint_commit_id",
+            )
+        });
+    let read_requirements = SqlWriteReadRequirements {
+        needs_read_table_functions,
+        read_relation_names,
+        needs_root_commit_id,
+        needs_working_diff_checkpoint_commit_id,
+    };
+    let read_active_branch_commit_id = ctx.sql_read_active_branch_commit_id();
+    let execution_bindings = if read_requirements.needs_read_table_functions
+        || !read_requirements.read_relation_names.is_empty()
+        || read_requirements.needs_root_commit_id
+        || read_requirements.needs_working_diff_checkpoint_commit_id
+    {
+        ctx.register_sql_read_dependencies(
+            &session,
+            Arc::clone(&catalog),
+            provider_selection.clone(),
+            read_requirements,
+            read_active_branch_commit_id.clone(),
+        )
+        .await?
+    } else {
+        ExecutionFunctionBindings::default()
+    };
+
+    // SqlWriteContext keeps a forged 'static pointer to the borrowed context.
+    // Finish all context access above before creating it.
     let write_ctx = SqlWriteContext::new(ctx)
         .with_explicit_insert_columns(options.explicit_insert_columns.clone());
     let write_targets = write_ctx.write_targets()?;
@@ -224,10 +307,18 @@ pub(crate) async fn build_write_session_with_options(
         &write_ctx.active_account_id(),
         Some(&active_branch_id),
         Some(&active_branch_commit_id.commit_id.to_string()),
-        None,
-        None,
+        execution_bindings.working_diff_checkpoint_commit_id.as_deref(),
+        execution_bindings.root_commit_id.as_deref(),
     );
-    providers::register_write(&session, write_ctx, branch_ref, options, provider_selection).await?;
+    providers::register_write(
+        &session,
+        write_ctx,
+        branch_ref,
+        options,
+        catalog,
+        &provider_selection,
+    )
+    .await?;
 
     Ok(SqlWriteSession {
         datafusion: session,
@@ -235,57 +326,10 @@ pub(crate) async fn build_write_session_with_options(
     })
 }
 
-fn statement_uses_execution_function(statement: &DataFusionStatement, function_name: &str) -> bool {
-    use datafusion::sql::sqlparser::ast::{Expr, TableFactor, Visit, Visitor};
-    use std::ops::ControlFlow;
-
-    struct ExecutionFunctionVisitor<'a> {
-        function_name: &'a str,
-    }
-
-    impl Visitor for ExecutionFunctionVisitor<'_> {
-        type Break = ();
-
-        fn pre_visit_expr(&mut self, expression: &Expr) -> ControlFlow<Self::Break> {
-            if let Expr::Function(function) = expression
-                && crate::sql2::parse::object_name_is_public_function(
-                    &function.name,
-                    self.function_name,
-                )
-            {
-                return ControlFlow::Break(());
-            }
-            ControlFlow::Continue(())
-        }
-
-        fn pre_visit_table_factor(&mut self, table: &TableFactor) -> ControlFlow<Self::Break> {
-            if self.function_name == "lix_root_commit_id"
-                && let TableFactor::Table {
-                    name,
-                    args: Some(_),
-                    ..
-                } = table
-                && crate::sql2::parse::object_name_is_public_function(name, "lix_as_of")
-            {
-                return ControlFlow::Break(());
-            }
-            if matches!(
-                self.function_name,
-                "lix_active_branch_commit_id" | "lix_working_diff_checkpoint_commit_id"
-            ) && let TableFactor::Table {
-                name,
-                args: Some(arguments),
-                ..
-            } = table
-                && crate::sql2::parse::object_name_is_public_function(name, "lix_diff")
-                && arguments.args.len() == 1
-            {
-                return ControlFlow::Break(());
-            }
-            ControlFlow::Continue(())
-        }
-    }
-
+pub(crate) fn statement_uses_execution_function(
+    statement: &DataFusionStatement,
+    function_name: &str,
+) -> bool {
     match statement {
         DataFusionStatement::Statement(statement) => statement
             .visit(&mut ExecutionFunctionVisitor { function_name })
@@ -297,12 +341,82 @@ fn statement_uses_execution_function(statement: &DataFusionStatement, function_n
     }
 }
 
+pub(crate) fn expression_uses_execution_function(
+    expression: &SqlExpr,
+    function_name: &str,
+) -> bool {
+    expression
+        .visit(&mut ExecutionFunctionVisitor { function_name })
+        .is_break()
+}
+
+struct ExecutionFunctionVisitor<'a> {
+    function_name: &'a str,
+}
+
+impl Visitor for ExecutionFunctionVisitor<'_> {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expression: &SqlExpr) -> ControlFlow<Self::Break> {
+        if let SqlExpr::Function(function) = expression
+            && crate::sql2::parse::object_name_is_public_function(
+                &function.name,
+                self.function_name,
+            )
+        {
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_table_factor(&mut self, table: &TableFactor) -> ControlFlow<Self::Break> {
+        if self.function_name == "lix_root_commit_id"
+            && let TableFactor::Table {
+                name,
+                args: Some(_),
+                ..
+            } = table
+            && crate::sql2::parse::object_name_is_public_function(name, "lix_as_of")
+        {
+            return ControlFlow::Break(());
+        }
+        if matches!(
+            self.function_name,
+            "lix_active_branch_commit_id" | "lix_working_diff_checkpoint_commit_id"
+        ) && let TableFactor::Table {
+            name,
+            args: Some(arguments),
+            ..
+        } = table
+            && crate::sql2::parse::object_name_is_public_function(name, "lix_diff")
+            && arguments.args.len() == 1
+        {
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 async fn resolve_working_diff_checkpoint_commit_id<C>(
     context: &C,
-    active_branch_commit_id: Option<&str>,
+    active_branch_commit_id: Option<String>,
 ) -> Result<Option<String>, LixError>
 where
     C: SqlExecutionContext + ?Sized,
+{
+    let store = context.changelog_query_source().store;
+    let branch_id = context.active_branch_id().to_string();
+    resolve_working_diff_checkpoint_commit_id_from_store(store, branch_id, active_branch_commit_id)
+        .await
+}
+
+pub(crate) async fn resolve_working_diff_checkpoint_commit_id_from_store<S>(
+    store: S,
+    branch_id: String,
+    active_branch_commit_id: Option<String>,
+) -> Result<Option<String>, LixError>
+where
+    S: crate::storage_adapter::StorageAdapterRead,
 {
     let Some(active_branch_commit_id) = active_branch_commit_id else {
         return Ok(None);
@@ -312,27 +426,30 @@ where
         .map_err(|error| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                format!(
+        format!(
                     "active branch commit ID is invalid while resolving the working-diff checkpoint: {error}",
                 ),
             )
         })?;
-    checkpoint_commit_id_at_head(
-        context.changelog_query_source().store,
-        context.active_branch_id(),
-        head_commit_id,
-    )
-    .await
-    .map(|checkpoint_commit_id| Some(checkpoint_commit_id.to_string()))
+    checkpoint_commit_id_at_head(store, branch_id, head_commit_id)
+        .await
+        .map(|checkpoint_commit_id| Some(checkpoint_commit_id.to_string()))
 }
 
 async fn resolve_root_commit_id<C>(
     context: &C,
-    active_branch_commit_id: Option<&str>,
+    active_branch_commit_id: Option<String>,
 ) -> Result<Option<String>, LixError>
 where
     C: SqlExecutionContext + ?Sized,
 {
+    resolve_root_commit_id_from_graph(context.commit_graph(), active_branch_commit_id).await
+}
+
+pub(crate) async fn resolve_root_commit_id_from_graph(
+    mut commit_graph: Box<dyn crate::commit_graph::CommitGraphReader>,
+    active_branch_commit_id: Option<String>,
+) -> Result<Option<String>, LixError> {
     let Some(active_branch_commit_id) = active_branch_commit_id else {
         return Ok(None);
     };
@@ -344,7 +461,6 @@ where
                 format!("active branch commit ID is invalid while resolving the root: {error}"),
             )
         })?;
-    let mut commit_graph = context.commit_graph();
     loop {
         let node = commit_graph
             .load_node(&current)

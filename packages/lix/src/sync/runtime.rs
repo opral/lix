@@ -2018,8 +2018,8 @@ mod tests {
             .expect_err("different lixId must stop before sync iteration");
         assert_eq!(error.code, super::super::SYNC_REPOSITORY_ID_MISMATCH_CODE);
         assert_eq!(
-            error.details,
-            Some(serde_json::json!({
+            error.details(),
+            Some(&serde_json::json!({
                 "localLixId": "local",
                 "authorityLixId": "other",
             }))
@@ -4684,7 +4684,7 @@ mod metadata_batch_demand_tests {
             let mut details = original.details.clone().unwrap();
             details[marker] = serde_json::json!(true);
             assert!(
-                native_sync_demand_request_for_error(&original.clone().with_details(details))
+                native_sync_demand_request_for_error(&original.clone().with_details(*details))
                     .unwrap()
                     .is_none()
             );

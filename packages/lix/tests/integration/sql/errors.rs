@@ -375,7 +375,7 @@ simulation_test!(sql_create_table_returns_error, |sim| async move {
 });
 
 simulation_test!(
-    sql_recursive_cte_over_commit_views_returns_error,
+    sql_recursive_cte_uses_datafusion_native_planning,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -386,28 +386,23 @@ simulation_test!(
             &engine,
         );
 
-        let error = session
+        let result = session
             .execute(
-                "WITH RECURSIVE commit_walk(id) AS ( \
-                 SELECT id FROM lix_commit \
-                 UNION ALL \
-                 SELECT lix_commit.id \
-                 FROM lix_commit \
-                 JOIN commit_walk ON lix_commit.parent_commit_ids ->> 0 = commit_walk.id \
-                 ) \
-                 SELECT id FROM commit_walk",
+                "WITH RECURSIVE t(n) AS ( \
+                 SELECT 1 UNION ALL SELECT n + 1 FROM t WHERE n < 3 \
+                 ) SELECT n FROM t ORDER BY n",
                 &[],
             )
             .await
-            .expect_err("recursive CTE should return an error, not panic");
+            .expect("DataFusion-supported recursive CTE should execute");
 
-        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL, "{error:?}");
-        assert!(
-            error
-                .hint
-                .as_deref()
-                .is_some_and(|hint| hint.contains("parent_commit_ids")),
-            "recursive graph errors should teach the supported direct-parent accessor"
+        super::assert_rows_eq(
+            result,
+            vec![
+                vec![Value::Integer(1)],
+                vec![Value::Integer(2)],
+                vec![Value::Integer(3)],
+            ],
         );
     }
 );

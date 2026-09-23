@@ -1070,8 +1070,8 @@ fn apply_observe_delta(
 
 fn with_http_status(error: LixError, status: u16) -> LixError {
     let mut details = error
-        .details
-        .clone()
+        .details()
+        .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     if let Some(object) = details.as_object_mut() {
         object.insert("httpStatus".to_owned(), serde_json::json!(status));

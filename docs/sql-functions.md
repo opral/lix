@@ -35,6 +35,9 @@ candidate state. Construction validates the relation and key types without
 requiring the target row to exist. References are opaque; store and pass them
 unchanged. The v2 encoding rejects legacy v1 references.
 
+ROW_REF values support identity equality with other ROW_REF values. Cast a
+reference to `TEXT` explicitly to compare or order its encoded representation.
+
 To enforce a stored reference, declare a `text` column and a schema-level
 `row_refs` constraint:
 
@@ -74,6 +77,14 @@ WHERE value @> '{"deprecated":false}'::jsonb;
 ```
 
 Supported syntax includes `->`, `->>`, `#>`, `#>>`, `@>`, `?`, equality, and `'…'::jsonb`. Missing paths return SQL `NULL`; `->` preserves JSONB `null`, while `->>` converts JSONB `null` to SQL `NULL`. Negative array indexes follow PostgreSQL behavior.
+
+JSONB identity is distinct from plain text. Equality, `IN`, `ANY`, `ALL`, and
+set operations compare canonical JSONB values; cast text with `::jsonb` before
+comparing it. `CONCAT` and `CONCAT_WS` consume Lix's compact canonical JSONB
+text and return `TEXT`. Lix does not currently implement PostgreSQL's JSONB
+ordering, so range comparisons, `BETWEEN`, `ORDER BY`, `MIN`, and `MAX` reject
+JSONB values. Cast to `TEXT` explicitly when DataFusion's lexical text behavior
+is intended.
 
 The SDK accepts structured JSON parameters directly. If a parameter contains JSON text, cast it explicitly:
 

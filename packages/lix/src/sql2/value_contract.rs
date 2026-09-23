@@ -175,8 +175,11 @@ impl SqlValue {
             (Self::Boolean(a), Self::Boolean(b)) => a == b,
             (Self::Integer(a), Self::Integer(b)) => a == b,
             (Self::Unsigned(a), Self::Unsigned(b)) => a == b,
-            // Match Arrow total-order equality, including signed zero and NaN bits.
-            (Self::Real(a), Self::Real(b)) => a.to_bits() == b.to_bits(),
+            // Match DataFusion's float equality contract: signed zero compares
+            // equal, and NaNs with the same payload compare equal.
+            (Self::Real(a), Self::Real(b)) => {
+                a == b || (a.is_nan() && b.is_nan() && a.to_bits() == b.to_bits())
+            }
             (Self::Timestamptz(a), Self::Timestamptz(b)) => a == b,
             (Self::RowRef(a), Self::RowRef(b)) => a == b,
             (Self::Blob(a), Self::Blob(b)) => a == b,
@@ -277,7 +280,6 @@ impl SqlValue {
             (Self::RowRef(v), T::Text) => return Ok(V::Text(v.as_str().to_owned())),
             (Self::Uuid(v), T::Uuid) => return Ok(V::Uuid(v)),
             (Self::Integer(v), T::Int8) => return Ok(V::Int8(v)),
-            (Self::Real(v), T::Int8) => return exact_real_bigint(v).map(V::Int8),
             (Self::Real(v), T::Float8) if v.is_finite() => return Ok(V::Float8(v)),
             (Self::Boolean(v), T::Boolean) => return Ok(V::Boolean(v)),
             (Self::Json(v), T::Jsonb) => return Ok(V::Jsonb(v.into())),
@@ -346,23 +348,6 @@ pub(crate) fn public_scalar(
     value: &crate::Value,
 ) -> Result<datafusion::common::ScalarValue, LixError> {
     Ok(SqlValue::from_public(value)?.scalar())
-}
-
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "checked integral and i64 bounds"
-)]
-pub(crate) fn exact_real_bigint(value: f64) -> Result<i64, LixError> {
-    if value.fract() == 0.0
-        && (I64_LOWER_INCLUSIVE_AS_F64..I64_UPPER_EXCLUSIVE_AS_F64).contains(&value)
-    {
-        Ok(value as i64)
-    } else {
-        Err(LixError::new(
-            LixError::CODE_TYPE_MISMATCH,
-            "BIGINT assignment requires an exact in-range integer",
-        ))
-    }
 }
 
 pub(crate) fn unsigned_integer_result(value: u64) -> Result<crate::Value, LixError> {

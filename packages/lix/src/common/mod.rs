@@ -54,12 +54,7 @@ pub(crate) fn json_value_to_string(value: &serde_json::Value) -> Result<Option<S
         serde_json::Value::Bool(value) => Some(value.to_string()),
         serde_json::Value::Number(value) => Some(value.to_string()),
         serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-            Some(serde_json::to_string(value).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("failed to render JSON string value: {error}"),
-                )
-            })?)
+            Some(Json::from(value).to_string())
         }
     })
 }

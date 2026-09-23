@@ -1,4 +1,4 @@
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use datafusion::arrow::array::BooleanArray;
 use datafusion::arrow::datatypes::DataType;
@@ -40,9 +40,6 @@ impl LixJsonPredicate {
 }
 
 impl ScalarUDFImpl for LixJsonPredicate {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         match self.kind {
@@ -95,12 +92,22 @@ fn contains(left: &Value, right: &Value) -> bool {
         (Value::Object(left), Value::Object(right)) => right
             .iter()
             .all(|(key, value)| left.get(key).is_some_and(|left| contains(left, value))),
-        (Value::Array(left), Value::Array(right)) => right
+        (Value::Array(left), Value::Array(right)) => right.iter().all(|right| {
+            left.iter()
+                .any(|left| contains_direct_array_element(left, right))
+        }),
+        (Value::Array(left), right) => left
             .iter()
-            .all(|value| left.iter().any(|left| contains(left, value))),
-        (Value::Array(left), right) => left.iter().any(|left| contains(left, right)),
+            .any(|left| contains_direct_array_element(left, right)),
         _ => left == right,
     }
+}
+
+fn contains_direct_array_element(left: &Value, right: &Value) -> bool {
+    if matches!(left, Value::Array(_)) != matches!(right, Value::Array(_)) {
+        return false;
+    }
+    contains(left, right)
 }
 
 fn exists(value: &Value, key: &str) -> bool {

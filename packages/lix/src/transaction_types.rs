@@ -257,9 +257,7 @@ impl TransactionJson {
         match &self.storage {
             TransactionJsonStorage::Decoded { value, normalized } => normalized
                 .get_or_init(|| {
-                    serde_json::to_string(value.as_ref())
-                        .expect("serializing serde_json::Value should not fail")
-                        .into()
+                    crate::Json::from(value.as_ref()).to_string().into()
                 })
                 .as_ref(),
             TransactionJsonStorage::CertifiedShared { normalized, .. } => normalized.as_str(),

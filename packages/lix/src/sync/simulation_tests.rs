@@ -904,7 +904,7 @@ async fn sparse_partial_checkpoint_uses_hot_working_diff(_sim: Simulation) {
             .expect("working head id should be canonical");
     let checkpoint_commit_id = crate::checkpoint::checkpoint_commit_id_at_head(
         &checkpoint_read,
-        &branch_id,
+        branch_id.clone(),
         head_commit_id,
     )
     .await
@@ -1720,7 +1720,7 @@ async fn partial_checkpoint_after_partial_checkpoint_snapshot_stays_hot(_sim: Si
         .unwrap();
     let checkpoint_commit_id = crate::checkpoint::checkpoint_commit_id_at_head(
         &read,
-        &branch_id,
+        branch_id.clone(),
         crate::changelog::CommitId::parse_lix(&head_commit_id, "partial snapshot head").unwrap(),
     )
     .await

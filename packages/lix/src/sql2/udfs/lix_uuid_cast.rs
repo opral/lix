@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::array::StringArray;
@@ -20,9 +19,6 @@ impl LixUuidCast {
 }
 
 impl ScalarUDFImpl for LixUuidCast {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "__lix_uuid_cast"

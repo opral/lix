@@ -4,7 +4,7 @@ use serde_json::json;
 use super::assert_rows_eq;
 
 simulation_test!(
-    case_returning_preserves_exact_bigint_comparisons_and_json_contract,
+    case_returning_uses_datafusion_numeric_coercion_and_json_contract,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
@@ -44,13 +44,16 @@ simulation_test!(
             .await
             .expect("CASE type fixture rows should insert");
 
+        // DataFusion parses a decimal literal as Float64 and coerces BIGINT
+        // operands to Float64 for comparison. Above 2^53, the adjacent values
+        // therefore compare equal just as they do in a generic SELECT.
         for (operator, wide_matches, neighbor_matches) in [
-            ("=", true, false),
-            ("<>", false, true),
-            ("<", false, true),
+            ("=", true, true),
+            ("<>", false, false),
+            ("<", false, false),
             ("<=", true, true),
             (">", false, false),
-            (">=", true, false),
+            (">=", true, true),
         ] {
             let sql = format!(
                 "UPDATE case_returning_types SET n = n WHERE id = $1 \
@@ -83,12 +86,12 @@ simulation_test!(
             (
                 "CASE n WHEN 9007199254740993.0 THEN 'hit' ELSE 'miss' END",
                 true,
-                false,
+                true,
             ),
             (
                 "CASE 9007199254740993.0 WHEN n THEN 'hit' ELSE 'miss' END",
                 true,
-                false,
+                true,
             ),
         ] {
             let sql = format!(
@@ -130,8 +133,8 @@ simulation_test!(
         assert_rows_eq(
             images,
             vec![vec![
-                Value::Text("old-miss".into()),
-                Value::Text("new-hit".into()),
+                Value::Text("old-hit".into()),
+                Value::Text("new-miss".into()),
             ]],
         );
 

@@ -72,15 +72,21 @@ async fn slatedb_current_untracked_blob_survives_sweep_and_cold_reopen() {
 #[tokio::test]
 async fn rocksdb_shared_blob_survives_replace_rollback_delete_gc_and_reopen() {
     let temp = tempfile::tempdir().expect("create RocksDB shared-blob fixture");
-    shared_blob_replacement_lifecycle(&temp.path().join("database"), |path| RocksDB::open(path))
-        .await;
+    Box::pin(shared_blob_replacement_lifecycle(
+        &temp.path().join("database"),
+        |path| RocksDB::open(path),
+    ))
+    .await;
 }
 
 #[tokio::test]
 async fn slatedb_shared_blob_survives_replace_rollback_delete_gc_and_reopen() {
     let temp = tempfile::tempdir().expect("create SlateDB shared-blob fixture");
-    shared_blob_replacement_lifecycle(&temp.path().join("database"), |path| SlateDB::open(path))
-        .await;
+    Box::pin(shared_blob_replacement_lifecycle(
+        &temp.path().join("database"),
+        |path| SlateDB::open(path),
+    ))
+    .await;
 }
 
 async fn shared_blob_replacement_lifecycle<S, O>(path: &std::path::Path, open: O)

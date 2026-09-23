@@ -50,7 +50,7 @@ use super::values::{
 };
 use crate::sql2::result_metadata::json_field;
 
-pub(super) async fn register_lix_branch_read_provider(
+pub(super) fn register_lix_branch_read_provider(
     session: &datafusion::prelude::SessionContext,
     surface_name: &str,
     hot_state: Arc<dyn HotStateReader>,

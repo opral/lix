@@ -34,6 +34,7 @@ impl<'de> Deserialize<'de> for RequestWireValue {
                 value: i64,
             },
             Float {
+                #[serde(deserialize_with = "crate::common::wire::deserialize_wire_float")]
                 value: f64,
             },
             Text {
@@ -81,7 +82,6 @@ mod tests {
             json!({"kind":"null","value":null}),
             json!({"kind":"bool","value":true}),
             json!({"kind":"int","value":i64::MIN}),
-            json!({"kind":"float","value":-0.0}),
             json!({"kind":"text","value":"\u{feff}\r\n\"λ😀\\\0".repeat(16_384)}),
             json!({"kind":"jsonb","value":{"b":[null,42],"a":"text"}}),
             json!({"kind":"row_ref","value":"validated by the engine"}),
@@ -96,6 +96,17 @@ mod tests {
             };
             assert_eq!(actual, expected);
         }
+
+        // Construct raw JSON for floating point values. serde_json's
+        // `arbitrary_precision` feature represents Numbers through its
+        // private deserializer token when serializing a Value; network
+        // requests contain ordinary JSON number tokens instead.
+        let encoded = br#"{"kind":"float","value":-0.0}"#;
+        let expected: WireValue = serde_json::from_slice(encoded).unwrap();
+        let RequestWireValue::Value(actual) = serde_json::from_slice(encoded).unwrap() else {
+            panic!("ordinary value became a splice")
+        };
+        assert_eq!(actual, expected);
     }
 
     #[test]

@@ -446,7 +446,7 @@ where
         let df_schema = DFSchema::try_from(filter_schema.as_ref().clone())?;
         let metadata_filters = metadata_filters
             .iter()
-            .map(|filter| create_physical_expr(filter, &df_schema, props))
+            .map(|filter| create_physical_expr(filter, &df_schema, props, &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default()))
             .collect::<Result<Vec<_>>>()?;
         let route = DiffRoute::from_filters(filters, &self.relation, &filter_schema);
         let paths = (self.mode == DiffMode::General
@@ -3111,8 +3111,8 @@ mod tests {
         let error = datafusion_error_to_lix_error(error);
         assert_eq!(error.code, "LIX_SYNC_CHUNKS_REQUIRED");
         assert_eq!(
-            error.details,
-            Some(serde_json::json!({ "chunkIds": ["a".repeat(64)] }))
+            error.details(),
+            Some(&serde_json::json!({ "chunkIds": ["a".repeat(64)] }))
         );
     }
 
@@ -3128,7 +3128,7 @@ mod tests {
             ));
             let error = datafusion_error_to_lix_error(error);
             assert_eq!(error.code, code);
-            assert_eq!(error.details, Some(serde_json::json!({ "retry": true })));
+            assert_eq!(error.details(), Some(&serde_json::json!({ "retry": true })));
         }
     }
 

@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::DataType;
@@ -35,9 +34,6 @@ impl std::fmt::Debug for UuidV7 {
 }
 
 impl ScalarUDFImpl for UuidV7 {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "uuidv7"
