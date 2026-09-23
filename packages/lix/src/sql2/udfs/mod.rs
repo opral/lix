@@ -12,6 +12,7 @@ mod lix_octet_length;
 mod lix_order_between;
 mod lix_root_commit_id;
 mod lix_row_ref;
+mod lix_row_ref_parts;
 mod lix_text_cast;
 mod lix_timestamptz_cast;
 mod lix_uuid_cast;
@@ -59,6 +60,7 @@ pub(crate) fn register_static_sql2_functions(ctx: &SessionContext) {
         lix_json_predicate::LixJsonPredicate::exists(),
     ));
     ctx.register_udf(ScalarUDF::from(lix_jsonb::LixJsonb::new()));
+    ctx.register_udf(ScalarUDF::from(lix_row_ref_parts::LixRowRefParts::new()));
     ctx.register_udf(ScalarUDF::from(lix_uuid_cast::LixUuidCast::new()));
     ctx.register_udf(ScalarUDF::from(lix_text_cast::LixTextCast::new()));
     ctx.register_udf(ScalarUDF::from(

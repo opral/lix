@@ -13,6 +13,7 @@ Lix exposes a small set of runtime functions. JSON uses PostgreSQL casts and ope
 | `lix_active_branch_commit_id()`         | text        | Active branch head pinned for the statement.                                      |
 | `lix_root_commit_id()`                  | text        | Repository bootstrap root.                                                        |
 | `lix_row_ref(relation, file_id, primary_key...)` | row_ref     | Opaque address of one relation row, including file scope and composite keys.       |
+| `lix_row_ref_parts(ref)`            | jsonb       | Read a canonical row reference as relation, file ID, and typed primary-key parts. |
 | `lix_order_between(previous, next)`     | text        | Allocate a plugin row order key between exclusive bounds; NULL means an open end. |
 | `uuidv7()`                              | uuid        | Generate a UUIDv7 value.                                                          |
 | `CURRENT_TIMESTAMP`                     | timestamptz | Transaction-start instant at microsecond precision.                               |
@@ -34,6 +35,18 @@ does not contain a branch: operations resolve it in their current branch or
 candidate state. Construction validates the relation and key types without
 requiring the target row to exist. References are opaque; store and pass them
 unchanged. The v2 encoding rejects legacy v1 references.
+
+`lix_row_ref_parts` reads a reference without changing its stored identity. It
+returns `{"relation": ..., "file_id": ..., "primary_key": [{"type": ..., "value": ...}]}`.
+The key components stay in primary-key order; every `value` is a string, including
+integer and byte keys. A fileless reference has JSON `null` for `file_id`.
+SQL `NULL` returns SQL `NULL`, while a malformed reference raises an error.
+Use PostgreSQL JSON operators to read individual parts:
+
+```sql
+SELECT lix_row_ref_parts(COALESCE(target, detached_target)) ->> 'relation'
+FROM lix_conversation WHERE id = $1;
+```
 
 ROW_REF values support identity equality with other ROW_REF values. Cast a
 reference to `TEXT` explicitly to compare or order its encoded representation.

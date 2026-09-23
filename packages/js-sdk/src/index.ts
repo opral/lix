@@ -28,7 +28,6 @@ export {
 	type BundledPluginArchive,
 } from "./bundled-plugins.js";
 export { Value } from "./value.js";
-export { decodeRowRef, type RowRefParts } from "./row-ref.js";
 export type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
