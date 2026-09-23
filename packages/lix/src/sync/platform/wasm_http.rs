@@ -599,7 +599,10 @@ impl RawHttpClient for BrowserHttpClient {
     }
 }
 
-fn replace_trace_headers(headers: &mut Vec<(String, String)>, trace_headers: Vec<(String, String)>) {
+fn replace_trace_headers(
+    headers: &mut Vec<(String, String)>,
+    trace_headers: Vec<(String, String)>,
+) {
     if trace_headers.is_empty() {
         return;
     }
