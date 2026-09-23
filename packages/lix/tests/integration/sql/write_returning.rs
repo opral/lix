@@ -797,3 +797,175 @@ simulation_test!(returning_old_new_directory_and_branch, |sim| async move {
         vec![vec![Value::Text("new-images".into()), Value::Null]],
     );
 });
+
+simulation_test!(
+    returning_delegates_generic_expressions_to_datafusion,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        session
+            .execute(
+                r#"INSERT INTO lix_registered_schema (value) VALUES (CAST('{"$schema":"https://lix.dev/schema-v1.json","key":"datafusion_returning","columns":[{"name":"id","type":"text","nullable":false},{"name":"n","type":"int8","nullable":false},{"name":"label","type":"text","nullable":false}],"primary_key":["id"]}' AS JSONB))"#,
+                &[],
+            )
+            .await
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO datafusion_returning (id, n, label) VALUES ('a', 10, 'not-an-int')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let inserted = session
+            .execute(
+                "INSERT INTO datafusion_returning (id, n, label) VALUES ('b', 5, 'five') \
+                 RETURNING (SELECT old.n FROM (SELECT 7 AS n) old) AS local_old, \
+                           (SELECT new.n FROM (SELECT 8 AS n) new) AS local_new, \
+                           OLD.n AS before, NEW.n AS after",
+                &[],
+            )
+            .await
+            .expect("deferred RETURNING should keep registered-row INSERT support");
+        assert_rows_eq(
+            inserted,
+            vec![vec![
+                Value::Integer(7),
+                Value::Integer(8),
+                Value::Null,
+                Value::Integer(5),
+            ]],
+        );
+
+        let result = session
+            .execute(
+                "UPDATE datafusion_returning SET n = 11 WHERE id = $1 \
+                 RETURNING (SELECT 1) AS scalar, \
+                           id IS NOT NULL AS present, -length(id) + $2 AS adjusted_length, \
+                           CAST('7' AS INTEGER) AS casted, \
+                           OLD.n AS before, NEW.n AS after",
+                &[Value::Text("a".into()), Value::Integer(10)],
+            )
+            .await
+            .expect("DataFusion-supported expressions should work in RETURNING");
+        assert_eq!(
+            result.columns(),
+            [
+                "scalar",
+                "present",
+                "adjusted_length",
+                "casted",
+                "before",
+                "after",
+            ]
+        );
+        assert_rows_eq(
+            result,
+            vec![vec![
+                Value::Integer(1),
+                Value::Boolean(true),
+                Value::Integer(9),
+                Value::Integer(7),
+                Value::Integer(10),
+                Value::Integer(11),
+            ]],
+        );
+
+        session
+            .execute(
+                "UPDATE datafusion_returning SET n = 12 WHERE id = 'a' \
+                 RETURNING CAST(label AS INTEGER)",
+                &[],
+            )
+            .await
+            .expect_err("a failing DataFusion RETURNING projection should fail the statement");
+        let after_error = session
+            .execute("SELECT n FROM datafusion_returning WHERE id = 'a'", &[])
+            .await
+            .unwrap();
+        assert_rows_eq(after_error, vec![vec![Value::Integer(11)]]);
+    }
+);
+
+simulation_test!(
+    returning_unnamed_expression_names_match_select,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ('/returning-names.txt', CAST('x' AS BYTEA))",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let selected = session
+            .execute("SELECT 1 + 2, lower('A'), 1, 'x' AS named", &[])
+            .await
+            .unwrap();
+        let returned = session
+            .execute(
+                "UPDATE lix_file SET path = '/returning-names.txt' WHERE path = '/returning-names.txt' \
+                 RETURNING 1 + 2, lower('A'), 1, 'x' AS named",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected.columns(), returned.columns());
+
+        let selected_old = session
+            .execute(
+                "SELECT lower(old.path) FROM (SELECT path FROM lix_file WHERE path = '/returning-names.txt') old",
+                &[],
+            )
+            .await
+            .unwrap();
+        let returned_old = session
+            .execute(
+                "UPDATE lix_file SET path = '/returning-names.txt' WHERE path = '/returning-names.txt' RETURNING lower(OLD.path)",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected_old.columns(), returned_old.columns());
+    }
+);
+
+simulation_test!(
+    returning_subqueries_respect_nested_local_columns,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        let path = "/returning-local-content.txt";
+        let original_content = Value::Blob(b"stored file content".to_vec().into());
+
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+                &[Value::Text(path.into()), original_content.clone()],
+            )
+            .await
+            .unwrap();
+
+        let returned = session
+            .execute(
+                "UPDATE lix_file SET path = path WHERE path = $1 \
+                 RETURNING (SELECT content FROM (SELECT 'local' AS content) nested) AS local_content, path",
+                &[Value::Text(path.into())],
+            )
+            .await
+            .unwrap();
+        assert_rows_eq(
+            returned,
+            vec![vec![Value::Text("local".into()), Value::Text(path.into())]],
+        );
+
+        let stored = session
+            .execute("SELECT content FROM lix_file WHERE path = $1", &[Value::Text(path.into())])
+            .await
+            .unwrap();
+        assert_rows_eq(stored, vec![vec![original_content]]);
+    }
+);

@@ -90,7 +90,7 @@ fn simple_single_table_select(
         return None;
     };
     if select.flavor != SelectFlavor::Standard
-        || select.optimizer_hint.is_some()
+        || !select.optimizer_hints.is_empty()
         || select.distinct.is_some()
         || select.select_modifiers.is_some()
         || select.top.is_some()
@@ -219,7 +219,9 @@ pub(crate) fn late_materialized_lix_file_content_read(
             | SelectItem::ExprWithAlias {
                 expr: expression, ..
             } => expression,
-            SelectItem::QualifiedWildcard(..) | SelectItem::Wildcard(..) => return None,
+            SelectItem::QualifiedWildcard(..)
+            | SelectItem::Wildcard(..)
+            | SelectItem::ExprWithAliases { .. } => return None,
         };
         let projected_column = direct_projection_identifier(expression)?;
         if identifier_matches(projected_column, "content") {
@@ -278,7 +280,9 @@ fn replaceable_lix_file_content_projection(
             (expression, output_name)
         }
         SelectItem::ExprWithAlias { expr, alias } => (expr, alias.clone()),
-        SelectItem::QualifiedWildcard(..) | SelectItem::Wildcard(..) => return None,
+        SelectItem::QualifiedWildcard(..)
+        | SelectItem::Wildcard(..)
+        | SelectItem::ExprWithAliases { .. } => return None,
     };
     let path_expression = direct_file_content_path_expression(expression, qualifier)?;
     Some((path_expression, output_name))

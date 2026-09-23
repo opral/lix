@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
@@ -28,8 +27,7 @@ impl std::fmt::Debug for CurrentTimestamp {
 }
 
 impl ScalarUDFImpl for CurrentTimestamp {
-    fn as_any(&self) -> &dyn Any { self }
-    fn name(&self) -> &'static str { "__lix_current_timestamp" }
+        fn name(&self) -> &'static str { "__lix_current_timestamp" }
     fn signature(&self) -> &Signature {
         static SIGNATURE: std::sync::LazyLock<Signature> =
             std::sync::LazyLock::new(|| Signature::nullary(Volatility::Stable));

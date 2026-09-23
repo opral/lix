@@ -11,11 +11,11 @@ mod error;
 mod exec;
 mod file_view;
 mod information_schema;
+mod logical_value_compatibility;
 mod logical_value_metadata;
 mod parse;
 mod plan;
 mod planning_cache;
-mod predicate_typecheck;
 mod providers;
 #[cfg(test)]
 pub(crate) use providers::take_mainline_work;

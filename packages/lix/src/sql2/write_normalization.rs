@@ -54,7 +54,7 @@ impl InsertColumnIntents {
             };
         }
 
-        let Some(projection) = input.as_any().downcast_ref::<ProjectionExec>() else {
+        let Some(projection) = input.downcast_ref::<ProjectionExec>() else {
             return Self {
                 explicit_columns: None,
             };
@@ -393,11 +393,11 @@ pub(crate) fn optional_scalar_value(
 }
 
 fn is_generated_null_default(expr: &dyn PhysicalExpr) -> bool {
-    if let Some(literal) = expr.as_any().downcast_ref::<Literal>() {
+    if let Some(literal) = expr.downcast_ref::<Literal>() {
         return literal.value().is_null();
     }
 
-    if let Some(cast) = expr.as_any().downcast_ref::<CastExpr>() {
+    if let Some(cast) = expr.downcast_ref::<CastExpr>() {
         return is_generated_null_default(cast.expr().as_ref());
     }
 

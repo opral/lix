@@ -56,6 +56,29 @@ fn classify_datafusion_error(error: &DataFusionError) -> LixError {
             .with_hint("Use PostgreSQL JSONB operators -> for JSON values or ->> for text.");
     }
 
+    if lower.contains("table not found")
+        || (lower.contains("table") && lower.contains("not found"))
+        || lower.contains("no table named")
+        || lower.contains("failed to resolve table")
+        || lower.contains("could not find table")
+        || (lower.contains("relation") && lower.contains("not found"))
+    {
+        return LixError::new(LixError::CODE_TABLE_NOT_FOUND, message)
+            .with_hint("Use information_schema.tables to inspect available Lix SQL tables.");
+    }
+
+    if (lower.contains("column") || lower.contains("field"))
+        && (lower.contains("not found")
+            || lower.contains("does not exist")
+            || lower.contains("no field named"))
+    {
+        let error = LixError::new(LixError::CODE_COLUMN_NOT_FOUND, message);
+        if lower.contains("no field named metadata.") && lower.contains("lixcol_metadata") {
+            return error.with_hint("Did you mean lixcol_metadata?");
+        }
+        return error;
+    }
+
     if looks_like_unsupported_dialect(&lower) {
         return LixError::new(LixError::CODE_DIALECT_UNSUPPORTED, message)
             .with_hint("Use PostgreSQL JSONB operators -> and ->> for JSON access, and placeholders like ?, ? or $1, $2, ...");
@@ -78,29 +101,6 @@ fn classify_datafusion_error(error: &DataFusionError) -> LixError {
     {
         return LixError::new(LixError::CODE_PARSE_ERROR, message)
             .with_hint("Use placeholders like ?, ? or numbered placeholders like $1, $2, ...");
-    }
-
-    if lower.contains("table not found")
-        || (lower.contains("table") && lower.contains("not found"))
-        || lower.contains("no table named")
-        || lower.contains("failed to resolve table")
-        || lower.contains("could not find table")
-        || (lower.contains("relation") && lower.contains("not found"))
-    {
-        return LixError::new(LixError::CODE_TABLE_NOT_FOUND, message)
-            .with_hint("Use information_schema.tables to inspect available Lix SQL tables.");
-    }
-
-    if (lower.contains("column") || lower.contains("field"))
-        && (lower.contains("not found")
-            || lower.contains("does not exist")
-            || lower.contains("no field named"))
-    {
-        let error = LixError::new(LixError::CODE_COLUMN_NOT_FOUND, message);
-        if lower.contains("no field named metadata.") && lower.contains("lixcol_metadata") {
-            return error.with_hint("Did you mean lixcol_metadata?");
-        }
-        return error;
     }
 
     if lower.contains("schema validation") {

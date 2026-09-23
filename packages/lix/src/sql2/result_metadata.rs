@@ -5,6 +5,9 @@ use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
 use crate::{LixError, ResultColumnType};
 
 pub(crate) const LIX_VALUE_TYPE_METADATA_KEY: &str = "lix.value_type";
+pub(crate) const LIX_ARRAY_ELEMENT_VALUE_TYPE_METADATA_KEY: &str =
+    "lix.array_element_value_type";
+pub(crate) const LIX_VALUE_SHAPE_METADATA_KEY: &str = "lix.value_shape";
 pub(crate) const LIX_VALUE_TYPE_JSONB: &str = "jsonb";
 pub(crate) const LIX_VALUE_TYPE_ROW_REF: &str = "row_ref";
 
@@ -36,6 +39,68 @@ pub(crate) fn field_is_json(field: &Field) -> bool {
         .metadata()
         .get(LIX_VALUE_TYPE_METADATA_KEY)
         .is_some_and(|value| value == LIX_VALUE_TYPE_JSONB)
+}
+
+pub(crate) fn field_array_element_value_kind(field: &Field) -> Option<&'static str> {
+    // New plans carry recursive shape in root metadata, outside the nested
+    // Arrow DataType. Read former root/child tags for old stored schemas.
+    if let Some((1, kind)) = field_array_value_shape(field) {
+        return Some(kind);
+    }
+    let legacy_kind = field
+        .metadata()
+        .get(LIX_ARRAY_ELEMENT_VALUE_TYPE_METADATA_KEY)
+        .and_then(|value| match value.as_str() {
+            LIX_VALUE_TYPE_JSONB => Some(LIX_VALUE_TYPE_JSONB),
+            LIX_VALUE_TYPE_ROW_REF => Some(LIX_VALUE_TYPE_ROW_REF),
+            _ => None,
+        });
+    legacy_kind.or_else(|| match field.data_type() {
+        DataType::List(item)
+        | DataType::LargeList(item)
+        | DataType::FixedSizeList(item, _)
+        | DataType::ListView(item)
+        | DataType::LargeListView(item) => {
+            if matches!(
+                item.data_type(),
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+            ) {
+                field_lix_value_kind(item)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    })
+}
+
+pub(crate) fn field_array_value_shape(field: &Field) -> Option<(usize, &'static str)> {
+    let value = field.metadata().get(LIX_VALUE_SHAPE_METADATA_KEY)?;
+    let mut parts = value.split(':');
+    if parts.next()? != "v1" {
+        return None;
+    }
+    let depth = parts.next()?.parse::<usize>().ok()?;
+    let kind = match parts.next()? {
+        LIX_VALUE_TYPE_JSONB => LIX_VALUE_TYPE_JSONB,
+        LIX_VALUE_TYPE_ROW_REF => LIX_VALUE_TYPE_ROW_REF,
+        _ => return None,
+    };
+    if parts.next().is_some() || depth == 0 {
+        return None;
+    }
+    Some((depth, kind))
+}
+
+pub(crate) fn field_lix_value_kind(field: &Field) -> Option<&'static str> {
+    field
+        .metadata()
+        .get(LIX_VALUE_TYPE_METADATA_KEY)
+        .and_then(|value| match value.as_str() {
+            LIX_VALUE_TYPE_JSONB => Some(LIX_VALUE_TYPE_JSONB),
+            LIX_VALUE_TYPE_ROW_REF => Some(LIX_VALUE_TYPE_ROW_REF),
+            _ => None,
+        })
 }
 
 pub(crate) fn result_column_type(field: &Field) -> Result<ResultColumnType, LixError> {

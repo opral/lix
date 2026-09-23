@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -47,10 +46,7 @@ impl LixRowRef {
 }
 
 impl ScalarUDFImpl for LixRowRef {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn name(&self) -> &'static str {
+        fn name(&self) -> &'static str {
         "lix_row_ref"
     }
     fn signature(&self) -> &Signature {

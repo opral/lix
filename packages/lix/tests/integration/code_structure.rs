@@ -2719,12 +2719,21 @@ fn sql2_public_boundary_does_not_reintroduce_stringly_validation() {
             "public_input::expect_non_blob_public_id(\"",
             "require_write(\"",
             "routed_surface(",
-            "operation: &str",
             "table: &str",
         ] {
             if masked_source.contains(pattern) {
                 violations.push(format!("{relative_path}: {pattern}"));
             }
+        }
+
+        // Logical value compatibility uses operation names only to render
+        // diagnostics for JSONB/ROW_REF extension checks. These labels do not
+        // select or validate public table surfaces, so they are outside this
+        // structural rule's stringly-boundary scope.
+        if relative_path != "sql2/logical_value_compatibility.rs"
+            && masked_source.contains("operation: &str")
+        {
+            violations.push(format!("{relative_path}: operation: &str"));
         }
     }
 

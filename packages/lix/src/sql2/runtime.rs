@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -197,6 +196,7 @@ fn execution_task_context(state: &SessionState) -> Arc<TaskContext> {
         HashMap::new(),
         HashMap::new(),
         HashMap::new(),
+        HashMap::new(),
         Arc::clone(state.runtime_env()),
     ))
 }
@@ -304,7 +304,7 @@ async fn plan_cached_spec_scans(
             .with_limit(scan.fetch);
         let result = provider.scan_with_args(state, args).await?;
         let plan = Arc::clone(result.plan());
-        let Some(spec_scan) = plan.as_any().downcast_ref::<SpecScanExec>() else {
+        let Some(spec_scan) = plan.downcast_ref::<SpecScanExec>() else {
             return Ok(None);
         };
         replacements
@@ -331,7 +331,6 @@ fn template_operator_is_reusable(plan: &dyn ExecutionPlan) -> bool {
         | "CoalescePartitionsExec"
         | "SortPreservingMergeExec" => true,
         "SortExec" => plan
-            .as_any()
             .downcast_ref::<SortExec>()
             .is_some_and(|sort| sort.fetch().is_none()),
         _ => false,
@@ -339,7 +338,7 @@ fn template_operator_is_reusable(plan: &dyn ExecutionPlan) -> bool {
 }
 
 fn detach_physical_plan_template(plan: Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
-    if let Some(scan) = plan.as_any().downcast_ref::<SpecScanExec>() {
+    if let Some(scan) = plan.downcast_ref::<SpecScanExec>() {
         return Some(Arc::new(DetachedSpecScanExec::new(scan)));
     }
     if !template_operator_is_reusable(plan.as_ref()) {
@@ -368,7 +367,7 @@ fn rebind_physical_plan_template_inner(
     plan: Arc<dyn ExecutionPlan>,
     replacements: &mut HashMap<PhysicalScanKey, VecDeque<Arc<dyn ExecutionPlan>>>,
 ) -> Option<Arc<dyn ExecutionPlan>> {
-    if let Some(detached) = plan.as_any().downcast_ref::<DetachedSpecScanExec>() {
+    if let Some(detached) = plan.downcast_ref::<DetachedSpecScanExec>() {
         let replacement = replacements.get_mut(&detached.key)?.pop_front()?;
         return detached
             .fingerprint
@@ -387,7 +386,7 @@ fn rebuild_template_node(
     plan: Arc<dyn ExecutionPlan>,
     children: Vec<Arc<dyn ExecutionPlan>>,
 ) -> Option<Arc<dyn ExecutionPlan>> {
-    if let Some(join) = plan.as_any().downcast_ref::<HashJoinExec>() {
+    if let Some(join) = plan.downcast_ref::<HashJoinExec>() {
         // `HashJoinExec::with_new_children` intentionally preserves its
         // `OnceAsync` build table and dynamic-filter state. A reusable operator
         // template must explicitly reset both or a later snapshot can observe
@@ -400,7 +399,7 @@ fn rebuild_template_node(
             .build_exec()
             .ok();
     }
-    if let Some(sort) = plan.as_any().downcast_ref::<SortExec>() {
+    if let Some(sort) = plan.downcast_ref::<SortExec>() {
         // `SortExec::with_new_children` clones the operator, which shares its
         // metrics set and top-k dynamic filter with the template. Build a fresh
         // sort instead; `template_operator_is_reusable` already excluded the
@@ -501,9 +500,6 @@ impl ExecutionPlan for DetachedSpecScanExec {
         "DetachedSpecScanExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
@@ -511,6 +507,13 @@ impl ExecutionPlan for DetachedSpecScanExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         Vec::new()
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -688,7 +691,6 @@ fn collect_statement_scan_counts(
     counts: &mut HashMap<StatementScanKey, usize>,
 ) {
     if let Some(key) = plan
-        .as_any()
         .downcast_ref::<SpecScanExec>()
         .and_then(SpecScanExec::statement_cache_key)
     {
@@ -719,7 +721,6 @@ fn adapt_runtime_plan_inner(
     };
 
     if let Some(key) = plan
-        .as_any()
         .downcast_ref::<SpecScanExec>()
         .and_then(SpecScanExec::statement_cache_key)
         .filter(|key| scan_counts.get(*key).copied().unwrap_or_default() > 1)
@@ -736,7 +737,7 @@ fn adapt_runtime_plan_inner(
         return Ok(probe_join);
     }
 
-    let Some(coalesce) = plan.as_any().downcast_ref::<CoalescePartitionsExec>() else {
+    let Some(coalesce) = plan.downcast_ref::<CoalescePartitionsExec>() else {
         return Ok(plan);
     };
     Ok(Arc::new(SerialCoalescePartitionsExec::new(
@@ -763,7 +764,7 @@ fn adapt_runtime_plan_inner(
 /// conservative: a row that matches must match on every key, so it survives the
 /// restriction on each of them individually.
 fn probe_key_join(plan: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-    let Some(join) = plan.as_any().downcast_ref::<HashJoinExec>() else {
+    let Some(join) = plan.downcast_ref::<HashJoinExec>() else {
         return Ok(None);
     };
     if join.mode != PartitionMode::CollectLeft
@@ -780,7 +781,7 @@ fn probe_key_join(plan: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn Execut
     let left_schema = join.left().schema();
     let right_schema = join.right().schema();
     for (left_key, right_key) in join.on() {
-        let Some(column) = right_key.as_any().downcast_ref::<PhysicalColumn>() else {
+        let Some(column) = right_key.downcast_ref::<PhysicalColumn>() else {
             continue;
         };
         if !scan.serves_probe_column(column.name()) {
@@ -811,7 +812,7 @@ fn probe_key_join(plan: &Arc<dyn ExecutionPlan>) -> Result<Option<Arc<dyn Execut
 /// subset of what the scan produced — which is what makes restricting the scan
 /// beneath them observationally identical to restricting the probe side.
 fn probe_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<&SpecScanExec> {
-    if let Some(scan) = plan.as_any().downcast_ref::<SpecScanExec>() {
+    if let Some(scan) = plan.downcast_ref::<SpecScanExec>() {
         return Some(scan);
     }
     if !probe_passthrough(plan.as_ref()) {
@@ -836,7 +837,7 @@ fn replace_probe_scan(
     plan: &Arc<dyn ExecutionPlan>,
     replacement: Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    if plan.as_any().downcast_ref::<SpecScanExec>().is_some() {
+    if plan.downcast_ref::<SpecScanExec>().is_some() {
         return Ok(replacement);
     }
     let children = plan.children();
@@ -891,9 +892,6 @@ impl ExecutionPlan for ProbeKeyJoinExec {
         "ProbeKeyJoinExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
@@ -901,6 +899,13 @@ impl ExecutionPlan for ProbeKeyJoinExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         self.join.children()
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        datafusion::physical_plan::apply_expression_roots([&self.left_key], f)
     }
 
     fn with_new_children(
@@ -954,7 +959,7 @@ impl ExecutionPlan for ProbeKeyJoinExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, restricted)))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         self.join.partition_statistics(partition)
     }
 }
@@ -968,7 +973,7 @@ fn rebuild_hash_join(
     join: &Arc<dyn ExecutionPlan>,
     children: Vec<Arc<dyn ExecutionPlan>>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let Some(hash_join) = join.as_any().downcast_ref::<HashJoinExec>() else {
+    let Some(hash_join) = join.downcast_ref::<HashJoinExec>() else {
         return internal_err!("probe-key join wraps a non-hash join");
     };
     hash_join
@@ -1169,9 +1174,6 @@ impl ExecutionPlan for StatementScanCacheExec {
         "StatementScanCacheExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
@@ -1179,6 +1181,13 @@ impl ExecutionPlan for StatementScanCacheExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.state.input]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -1253,7 +1262,7 @@ impl ExecutionPlan for StatementScanCacheExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, cached)))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         self.state.input.partition_statistics(partition)
     }
 }
@@ -1300,9 +1309,6 @@ impl ExecutionPlan for SerialCoalescePartitionsExec {
         "SerialCoalescePartitionsExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
@@ -1310,6 +1316,13 @@ impl ExecutionPlan for SerialCoalescePartitionsExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
@@ -1371,10 +1384,13 @@ impl ExecutionPlan for SerialCoalescePartitionsExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
         self.input
             .partition_statistics(None)?
+            .as_ref()
+            .clone()
             .with_fetch(self.fetch, 0, 1)
+            .map(Arc::new)
     }
 
     fn supports_limit_pushdown(&self) -> bool {

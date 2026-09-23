@@ -156,7 +156,7 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_rows_eq(session.execute("SELECT to_value FROM lix_history('lix_key_value') WHERE key = 'ordered' AND to_value <> '\"m\"'::jsonb ORDER BY to_value LIMIT 1", &[]).await.unwrap(), vec![vec![Value::Jsonb(serde_json::json!("a").into())]]);
+        assert_rows_eq(session.execute("SELECT to_value FROM lix_history('lix_key_value') WHERE key = 'ordered' AND to_value <> '\"m\"'::jsonb ORDER BY CAST(to_value AS TEXT) LIMIT 1", &[]).await.unwrap(), vec![vec![Value::Jsonb(serde_json::json!("a").into())]]);
         assert!(session.execute("SELECT key FROM lix_history('lix_key_value') WHERE key = 'ordered' AND to_value = '\"a\"'::jsonb AND to_value = '\"z\"'::jsonb", &[]).await.unwrap().is_empty());
     }
 );

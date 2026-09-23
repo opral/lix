@@ -2,6 +2,7 @@ use super::expr::{BoundColumnRef, BoundExpr, BoundParamRef};
 use super::read::BoundRead;
 use crate::sql2::plan::branch_scope::BranchScope;
 use crate::sql2::plan::predicate::BoundPredicate;
+use datafusion::sql::sqlparser::ast::Expr as SqlExpr;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -29,8 +30,13 @@ pub(crate) struct BoundReturning {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BoundReturningItem {
-    pub(crate) expr: BoundExpr,
+    /// The bound subset is retained for the existing fast paths. Expressions
+    /// outside that subset are planned from `sql_expr` by DataFusion.
+    pub(crate) expr: Option<BoundExpr>,
+    pub(crate) sql_expr: Option<SqlExpr>,
     pub(crate) output_name: String,
+    /// Explicit SQL alias, distinct from a label inferred for fast paths.
+    pub(crate) output_alias: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

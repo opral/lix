@@ -156,7 +156,7 @@ path = "tests/snapshot_untracked.rs"
 [dependencies]
 lix_schema.workspace = true
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["raw_value"] }
+serde_json = { version = "1", features = ["arbitrary_precision", "raw_value"] }
 
 [target.'cfg(any(not(target_arch = "wasm32"), all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))'.dependencies]
 wit-bindgen = "0.57"
@@ -173,7 +173,7 @@ wasm-bindgen-futures = "0.4"
 ahash = "0.8"
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "wasmbind"] }
-datafusion = { version = "53.0.0", default-features = false, features = [
+datafusion = { version = "55.1.0", default-features = false, features = [
     "sql",
     "nested_expressions",
     "datetime_expressions",

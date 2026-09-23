@@ -1,4 +1,4 @@
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use datafusion::arrow::{
     array::{Array, StringArray},
@@ -26,10 +26,7 @@ impl LixOrderBetween {
 }
 
 impl ScalarUDFImpl for LixOrderBetween {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn name(&self) -> &'static str {
+        fn name(&self) -> &'static str {
         "lix_order_between"
     }
     fn signature(&self) -> &Signature {

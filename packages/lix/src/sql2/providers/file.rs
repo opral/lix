@@ -66,9 +66,6 @@ use crate::sql2::branch_scope::{
     BranchBinding, resolve_provider_branch_ids, resolve_write_branch_scope,
 };
 use crate::sql2::dml::InsertSink;
-use crate::sql2::predicate_typecheck::{
-    canonicalize_json_identity_text_filters, validate_json_predicate_filters,
-};
 use crate::sql2::write_normalization::{
     InsertCell, InsertColumnIntents, LIX_FILE_CONTENT_CAST_HINT, SqlCell, UpdateAssignmentValues,
     UpdateCell, defaultable_bool_insert_value, defaultable_text_insert_value,
@@ -1218,10 +1215,9 @@ impl TableSpec for LixFileSpec {
             .map_err(lix_error_to_datafusion_error)?;
         }
         let df_schema = DFSchema::try_from(Arc::clone(&self.schema))?;
-        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         let physical_filters = filters
             .iter()
-            .map(|expr| create_physical_expr(expr, &df_schema, props))
+            .map(|expr| create_physical_expr(expr, &df_schema, props, &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default()))
             .collect::<Result<Vec<_>>>()?;
         let ordering = indexed_matches.as_ref().map(|_| "path".to_string());
         Ok(PlannedScan {
@@ -1531,8 +1527,6 @@ impl TableSpec for LixFileSpec {
     }
 
     fn prepare_write_filters(&self, filters: Vec<Expr>) -> Result<Vec<Expr>> {
-        let filters = canonicalize_json_identity_text_filters(self.schema.as_ref(), &filters)?;
-        validate_json_predicate_filters(self.schema.as_ref(), &filters)?;
         Ok(filters)
     }
 
@@ -2016,8 +2010,7 @@ impl UpsertSupport for LixFileSpec {
         returning: Option<&DmlReturning>,
     ) -> Result<RecordBatch> {
         fn reads_content(expr: &Arc<dyn PhysicalExpr>) -> bool {
-            expr.as_any()
-                .downcast_ref::<datafusion::physical_expr::expressions::Column>()
+            expr.downcast_ref::<datafusion::physical_expr::expressions::Column>()
                 .is_some_and(|column| column.name() == "content")
                 || expr.children().iter().any(|child| reads_content(child))
         }
@@ -6724,7 +6717,6 @@ fn contains_column(expr: &Expr, column_name: &str) -> bool {
 /// the already-compiled physical assignments).
 fn physical_expr_contains_column(expr: &Arc<dyn PhysicalExpr>, column_name: &str) -> bool {
     if let Some(column) = expr
-        .as_any()
         .downcast_ref::<datafusion::physical_expr::expressions::Column>()
     {
         if column.name() == column_name {

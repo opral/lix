@@ -9,7 +9,6 @@
 //! Dispatch through the spec happens per statement (plan + one execute), never
 //! per row, so the indirection has no effect on scan or write throughput.
 
-use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::ops::Range;
@@ -29,6 +28,7 @@ use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
 use datafusion::execution::context::ExecutionProps;
 use datafusion::logical_expr::expr::InList;
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown, lit};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{
@@ -249,6 +249,13 @@ pub(crate) struct DmlReturning {
     old_columns: BTreeSet<String>,
     new_columns: BTreeSet<String>,
     delete: bool,
+    deferred_projection: bool,
+    captured_images: Arc<Mutex<Option<DmlReturningImages>>>,
+}
+
+pub(crate) struct DmlReturningImages {
+    pub(crate) old: Option<RecordBatch>,
+    pub(crate) new: Option<RecordBatch>,
 }
 
 impl DmlReturning {
@@ -268,9 +275,33 @@ impl DmlReturning {
             old_columns,
             new_columns,
             delete,
+            deferred_projection: false,
             expressions,
             required_columns,
             captured: Arc::new(Mutex::new(None)),
+            captured_images: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn new_deferred(
+        input_schema: SchemaRef,
+        required_columns: BTreeSet<String>,
+        delete: bool,
+        old_columns: BTreeSet<String>,
+        new_columns: BTreeSet<String>,
+    ) -> Self {
+        Self {
+            schema: Arc::new(Schema::empty()),
+            expressions: Vec::new(),
+            required_columns,
+            captured: Arc::new(Mutex::new(None)),
+            input_schema,
+            old: Arc::new(Mutex::new(None)),
+            old_columns,
+            new_columns,
+            delete,
+            deferred_projection: true,
+            captured_images: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -299,6 +330,26 @@ impl DmlReturning {
             return Err(DataFusionError::Execution(
                 "RETURNING row images have different cardinalities".into(),
             ));
+        }
+        if self.deferred_projection {
+            let old = old
+                .map(|batch| select_returning_image(batch, &self.input_schema, &self.old_columns))
+                .transpose()?;
+            let new = new
+                .map(|batch| select_returning_image(batch, &self.input_schema, &self.new_columns))
+                .transpose()?;
+            *self
+                .captured_images
+                .lock()
+                .expect("DML RETURNING image capture mutex poisoned") =
+                Some(DmlReturningImages { old, new });
+            return RecordBatch::try_new_with_options(
+                Arc::new(Schema::empty()),
+                Vec::new(),
+                &datafusion::arrow::record_batch::RecordBatchOptions::new()
+                    .with_row_count(Some(count)),
+            )
+            .map_err(DataFusionError::from);
         }
         let mut fields = Vec::new();
         let mut arrays = Vec::new();
@@ -336,23 +387,43 @@ impl DmlReturning {
         RecordBatch::try_new(Arc::clone(&self.schema), columns).map_err(DataFusionError::from)
     }
 
-    pub(super) fn old_columns(&self) -> &BTreeSet<String> {
+    pub(crate) fn old_columns(&self) -> &BTreeSet<String> {
         &self.old_columns
     }
-    pub(super) fn new_columns(&self) -> &BTreeSet<String> {
+    pub(crate) fn new_columns(&self) -> &BTreeSet<String> {
         &self.new_columns
+    }
+
+    pub(crate) fn is_deferred_projection(&self) -> bool {
+        self.deferred_projection
+    }
+
+    pub(crate) fn take_captured_images(&self) -> Result<DmlReturningImages> {
+        self.captured_images
+            .lock()
+            .expect("DML RETURNING image capture mutex poisoned")
+            .take()
+            .ok_or_else(|| {
+                DataFusionError::Execution(
+                    "DML RETURNING execution completed without captured row images".to_string(),
+                )
+            })
     }
 
     pub(super) fn capture_upsert_old(&self, rows: &[upsert::UpsertReturningRow]) -> Result<()> {
         if self.old_columns.is_empty() {
             return Ok(());
         }
-        let columns = self
+        let fields = self
             .input_schema
             .fields()
             .iter()
+            .filter(|field| !self.deferred_projection || self.old_columns.contains(field.name()))
+            .collect::<Vec<_>>();
+        let columns = fields
+            .iter()
             .map(|field| {
-                if !self.old_columns.contains(field.name()) {
+                if !self.deferred_projection && !self.old_columns.contains(field.name()) {
                     return Ok(datafusion::arrow::array::new_null_array(
                         field.data_type(),
                         rows.len(),
@@ -386,10 +457,9 @@ impl DmlReturning {
             })
             .collect::<Result<Vec<_>>>()?;
         let schema = Arc::new(Schema::new(
-            self.input_schema
-                .fields()
+            fields
                 .iter()
-                .map(|f| f.as_ref().clone().with_nullable(true))
+                .map(|field| field.as_ref().clone().with_nullable(true))
                 .collect::<Vec<_>>(),
         ));
         *self.old.lock().expect("RETURNING preimage mutex poisoned") =
@@ -415,6 +485,37 @@ impl DmlReturning {
                 )
             })
     }
+}
+
+fn select_returning_image(
+    batch: &RecordBatch,
+    input_schema: &SchemaRef,
+    columns: &BTreeSet<String>,
+) -> Result<RecordBatch> {
+    let fields = input_schema
+        .fields()
+        .iter()
+        .filter(|field| columns.contains(field.name()))
+        .map(|field| field.as_ref().clone().with_nullable(true))
+        .collect::<Vec<_>>();
+    let arrays = fields
+        .iter()
+        .map(|field| {
+            batch.column_by_name(field.name()).cloned().ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "RETURNING image missing column {}",
+                    field.name()
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    RecordBatch::try_new_with_options(
+        Arc::new(Schema::new(fields)),
+        arrays,
+        &datafusion::arrow::record_batch::RecordBatchOptions::new()
+            .with_row_count(Some(batch.num_rows())),
+    )
+    .map_err(DataFusionError::from)
 }
 
 /// Extra planning inputs needed by a DML spec without making `RETURNING`
@@ -815,13 +916,25 @@ impl SpecWriteTarget {
             .map(|(column_name, expr)| {
                 Ok((
                     column_name.clone(),
-                    create_physical_expr(expr, &df_schema, state.execution_props())?,
+                    create_physical_expr(
+                        expr,
+                        &df_schema,
+                        state.execution_props(),
+                        &PhysicalPlanningContext::default(),
+                    )?,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
         let physical_filters = filters
             .iter()
-            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
+            .map(|expr| {
+                create_physical_expr(
+                    expr,
+                    &df_schema,
+                    state.execution_props(),
+                    &PhysicalPlanningContext::default(),
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
         let planned = self
             .spec
@@ -969,13 +1082,25 @@ impl SpecWriteTarget {
             .map(|(column_name, expr)| {
                 Ok((
                     column_name.clone(),
-                    create_physical_expr(expr, &df_schema, state.execution_props())?,
+                    create_physical_expr(
+                        expr,
+                        &df_schema,
+                        state.execution_props(),
+                        &PhysicalPlanningContext::default(),
+                    )?,
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
         let physical_filters = filters
             .iter()
-            .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
+            .map(|expr| {
+                create_physical_expr(
+                    expr,
+                    &df_schema,
+                    state.execution_props(),
+                    &PhysicalPlanningContext::default(),
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
         let planned = self
             .spec
@@ -1032,10 +1157,6 @@ impl std::fmt::Debug for SpecTableProvider {
 
 #[async_trait]
 impl TableProvider for SpecTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
@@ -1206,7 +1327,14 @@ fn physical_filters(
     let df_schema = DFSchema::try_from(Arc::clone(schema))?;
     filters
         .iter()
-        .map(|expr| create_physical_expr(expr, &df_schema, state.execution_props()))
+        .map(|expr| {
+            create_physical_expr(
+                expr,
+                &df_schema,
+                state.execution_props(),
+                &PhysicalPlanningContext::default(),
+            )
+        })
         .collect()
 }
 
@@ -1504,16 +1632,21 @@ impl ExecutionPlan for SpecScanExec {
         "SpecScanExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         Vec::new()
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn PhysicalExpr>,
+        ) -> Result<datafusion::common::tree_node::TreeNodeRecursion>,
+    ) -> Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -1591,7 +1724,7 @@ impl ExecutionPlan for SpecScanExec {
         Ok(Box::pin(stream))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         match partition {
             Some(partition) => {
                 let fragment_range = self.fragment_ranges.get(partition).ok_or_else(|| {
@@ -1605,11 +1738,13 @@ impl ExecutionPlan for SpecScanExec {
                     self.source.statistics[fragment_range.clone()].iter(),
                     self.schema.as_ref(),
                 )
+                .map(Arc::new)
             }
             None => match &self.source.source_statistics {
-                Some(statistics) => Ok(statistics.clone()),
+                Some(statistics) => Ok(Arc::new(statistics.clone())),
                 None => {
                     Statistics::try_merge_iter(self.source.statistics.iter(), self.schema.as_ref())
+                        .map(Arc::new)
                 }
             },
         }
@@ -1738,16 +1873,28 @@ impl ExecutionPlan for SpecDmlExec {
         "SpecDmlExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         Vec::new()
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(
+            &Arc<dyn PhysicalExpr>,
+        ) -> Result<datafusion::common::tree_node::TreeNodeRecursion>,
+    ) -> Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        let returning_expressions = self
+            .returning
+            .iter()
+            .flat_map(|returning| returning.expressions.iter());
+        datafusion::physical_plan::apply_expression_roots(
+            self.filters.iter().chain(returning_expressions),
+            f,
+        )
     }
 
     fn with_new_children(
@@ -2200,6 +2347,7 @@ mod scan_source_tests {
             None,
             "statement-scan-cache-memory-test".into(),
             SessionConfig::new(),
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
             HashMap::new(),

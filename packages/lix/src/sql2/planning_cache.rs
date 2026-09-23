@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -32,7 +31,6 @@ const READ_PLANNER_CONTRACT: u32 = 1;
 #[derive(Clone)]
 pub(crate) struct CachedReadPlan {
     pub(crate) plan: LogicalPlan,
-    pub(crate) json_predicate_params: std::collections::BTreeSet<usize>,
     pub(crate) expected_parameter_count: usize,
 }
 
@@ -148,9 +146,6 @@ impl StatementSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for StatementSchemaProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn table_names(&self) -> Vec<String> {
         self.tables().keys().cloned().collect()
@@ -311,7 +306,7 @@ where
         if let Some(catalog) = session.context.catalog("datafusion")
             && let Some(public) = catalog.schema("public")
         {
-            match public.as_any().downcast_ref::<StatementSchemaProvider>() {
+            match public.downcast_ref::<StatementSchemaProvider>() {
                 Some(statement_schema) => statement_schema.clear(),
                 None => {
                     // Sessions built by `datafusion_session` always carry a
@@ -1184,8 +1179,6 @@ fn decode_update_string_literals_with<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
-
     use crate::sql2::bind_statement;
     use crate::sql2::plan::branch_scope::BranchScope;
     use datafusion::arrow::datatypes::Schema;
@@ -1229,7 +1222,6 @@ mod tests {
         let cache = test_cache(2);
         let plan = || CachedReadPlan {
             plan: LogicalPlanBuilder::empty(false).build().unwrap(),
-            json_predicate_params: BTreeSet::new(),
             expected_parameter_count: 1,
         };
 

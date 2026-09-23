@@ -446,7 +446,7 @@ where
         let df_schema = DFSchema::try_from(filter_schema.as_ref().clone())?;
         let metadata_filters = metadata_filters
             .iter()
-            .map(|filter| create_physical_expr(filter, &df_schema, props))
+            .map(|filter| create_physical_expr(filter, &df_schema, props, &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default()))
             .collect::<Result<Vec<_>>>()?;
         let route = DiffRoute::from_filters(filters, &self.relation, &filter_schema);
         let paths = (self.mode == DiffMode::General

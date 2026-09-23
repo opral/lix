@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::DataType;
@@ -46,9 +45,6 @@ impl std::fmt::Debug for LixActiveAccountId {
 }
 
 impl ScalarUDFImpl for LixActiveAccountId {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 
     fn name(&self) -> &'static str {
         "lix_active_account_id"

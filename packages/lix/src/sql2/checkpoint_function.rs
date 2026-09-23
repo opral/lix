@@ -114,7 +114,7 @@ pub(crate) fn checkpoint_function_plan(
         || !index_hints.is_empty()
         || !projection_is_commit_id
         || select.flavor != SelectFlavor::Standard
-        || select.optimizer_hint.is_some()
+        || !select.optimizer_hints.is_empty()
         || select.distinct.is_some()
         || select.select_modifiers.is_some()
         || select.top.is_some()

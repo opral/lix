@@ -1,7 +1,7 @@
 //! A text cast has its own SQL result type even when its physical input is UTF-8.
 //! DataFusion's ordinary Cast retains input metadata and can remove a no-op
 //! UTF-8 cast before parameters are bound, leaking JSONB/RowRef semantics.
-use std::{any::Any, sync::Arc};
+use std::sync::Arc;
 
 use datafusion::arrow::{
     compute::cast_with_options,
@@ -22,10 +22,7 @@ impl LixTextCast {
 }
 
 impl ScalarUDFImpl for LixTextCast {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn name(&self) -> &'static str {
+        fn name(&self) -> &'static str {
         "__lix_text_cast"
     }
     fn signature(&self) -> &Signature {

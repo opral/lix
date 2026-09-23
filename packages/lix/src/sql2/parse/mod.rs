@@ -2,7 +2,7 @@ use datafusion::sql::parser::{DFParserBuilder, Statement as DataFusionStatement}
 use datafusion::sql::sqlparser::ast::{
     BinaryOperator, DataType as SqlDataType, Expr, Function, FunctionArg, FunctionArgExpr,
     FunctionArgumentList, FunctionArguments, Ident, ObjectName, ObjectNamePart, TimezoneInfo,
-    UnaryOperator, Value, VisitMut, VisitorMut,
+    Value, VisitMut, VisitorMut,
 };
 use datafusion::sql::sqlparser::tokenizer::{Token, TokenWithSpan, Tokenizer};
 use serde_json::json;
@@ -150,7 +150,7 @@ pub(crate) fn parse_statement(sql: &str) -> Result<DataFusionStatement, LixError
     Ok(statement)
 }
 
-/// DataFusion 53 parses PostgreSQL JSON operators but does not plan them yet.
+/// DataFusion 55 parses PostgreSQL JSON operators but does not plan them yet.
 /// Lower the public PostgreSQL syntax to private execution functions before
 /// either the read planner or bound-write planner sees the statement.
 fn rewrite_postgresql_expressions(statement: &mut DataFusionStatement) {
@@ -160,7 +160,7 @@ fn rewrite_postgresql_expressions(statement: &mut DataFusionStatement) {
 
         fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
             if let Expr::Function(function) = expr {
-                let is_current_timestamp = function
+                let is_transaction_timestamp = function
                     .name
                     .0
                     .last()
@@ -168,10 +168,13 @@ fn rewrite_postgresql_expressions(statement: &mut DataFusionStatement) {
                         ObjectNamePart::Identifier(ident) => Some(ident.value.as_str()),
                         ObjectNamePart::Function(_) => None,
                     })
-                    .is_some_and(|name| name.eq_ignore_ascii_case("current_timestamp"));
+                    .is_some_and(|name| {
+                        name.eq_ignore_ascii_case("current_timestamp")
+                            || name.eq_ignore_ascii_case("now")
+                    });
                 let no_args = matches!(function.args, FunctionArguments::None)
                     || matches!(&function.args, FunctionArguments::List(list) if list.args.is_empty());
-                if is_current_timestamp && no_args {
+                if is_transaction_timestamp && no_args {
                     *expr = private_function("__lix_current_timestamp", Vec::new());
                     return ControlFlow::Continue(());
                 }
@@ -241,47 +244,6 @@ fn rewrite_postgresql_expressions(statement: &mut DataFusionStatement) {
                 *expr = private_function("__lix_timestamptz_cast", vec![*inner]);
                 return ControlFlow::Continue(());
             }
-            if let Expr::BinaryOp { left, op, right } = expr
-                && matches!(
-                    op,
-                    BinaryOperator::Eq
-                        | BinaryOperator::NotEq
-                        | BinaryOperator::Gt
-                        | BinaryOperator::GtEq
-                        | BinaryOperator::Lt
-                        | BinaryOperator::LtEq
-                        | BinaryOperator::Spaceship
-                )
-            {
-                mark_numeric_literal_unless_explicit_float_cast(left, right);
-                mark_numeric_literal_unless_explicit_float_cast(right, left);
-                return ControlFlow::Continue(());
-            }
-            if let Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) = expr {
-                mark_numeric_literal_unless_explicit_float_cast(left, right);
-                mark_numeric_literal_unless_explicit_float_cast(right, left);
-                return ControlFlow::Continue(());
-            }
-            if let Expr::InList { expr, list, .. } = expr {
-                if !explicit_float_cast(expr) {
-                    for value in list {
-                        mark_numeric_literal(value);
-                    }
-                    mark_numeric_literal(expr);
-                }
-                return ControlFlow::Continue(());
-            }
-            if let Expr::Between {
-                expr, low, high, ..
-            } = expr
-            {
-                if !explicit_float_cast(expr) {
-                    mark_numeric_literal(low);
-                    mark_numeric_literal(high);
-                    mark_numeric_literal(expr);
-                }
-                return ControlFlow::Continue(());
-            }
             let Expr::BinaryOp { left, op, right } = expr else {
                 return ControlFlow::Continue(());
             };
@@ -299,66 +261,6 @@ fn rewrite_postgresql_expressions(statement: &mut DataFusionStatement) {
             let right = std::mem::replace(right, placeholder());
             *expr = private_function(name, vec![*left, *right]);
             ControlFlow::Continue(())
-        }
-    }
-
-    fn mark_numeric_literal(expr: &mut Expr) {
-        let raw = numeric_literal_raw(expr);
-        let Some(raw) = raw else {
-            return;
-        };
-        if !raw.contains('.') && !raw.contains(['e', 'E']) {
-            return;
-        }
-        *expr = private_function(
-            "__lix_numeric_literal",
-            vec![Expr::Value(Value::SingleQuotedString(raw).into())],
-        );
-    }
-
-    fn mark_numeric_literal_unless_explicit_float_cast(expr: &mut Expr, other: &Expr) {
-        if !explicit_float_cast(other) {
-            mark_numeric_literal(expr);
-        }
-    }
-
-    fn explicit_float_cast(expr: &Expr) -> bool {
-        match expr {
-            Expr::Cast { data_type, .. } => matches!(
-                data_type,
-                SqlDataType::Float(_)
-                    | SqlDataType::Float4
-                    | SqlDataType::Float8
-                    | SqlDataType::Float32
-                    | SqlDataType::Float64
-                    | SqlDataType::Real
-                    | SqlDataType::Double(_)
-                    | SqlDataType::DoublePrecision
-            ),
-            Expr::Nested(expr) => explicit_float_cast(expr),
-            _ => false,
-        }
-    }
-
-    fn numeric_literal_raw(expr: &Expr) -> Option<String> {
-        match expr {
-            Expr::Value(value) => match &value.value {
-                Value::Number(raw, _) => Some(raw.clone()),
-                _ => None,
-            },
-            Expr::UnaryOp {
-                op: UnaryOperator::Minus,
-                expr,
-            } => numeric_literal_raw(expr).map(|raw| {
-                raw.strip_prefix('-')
-                    .map_or_else(|| format!("-{raw}"), str::to_string)
-            }),
-            Expr::UnaryOp {
-                op: UnaryOperator::Plus,
-                expr,
-            } => numeric_literal_raw(expr),
-            Expr::Nested(expr) => numeric_literal_raw(expr),
-            _ => None,
         }
     }
 
@@ -391,7 +293,10 @@ fn rewrite_postgresql_expressions(statement: &mut DataFusionStatement) {
             _ => {}
         }
     }
-    visit(statement, &mut Rewriter);
+    visit(
+        statement,
+        &mut Rewriter,
+    );
 }
 
 pub(super) fn reject_sql_hex_literals(tokens: &[TokenWithSpan]) -> Result<(), LixError> {
