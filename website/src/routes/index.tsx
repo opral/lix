@@ -13,9 +13,9 @@ export const Route = createFileRoute("/")({
     return await loadReadmeContent();
   },
   head: () => {
-    const title = "Lix | Universal version control system";
+    const title = "Lix | Version control system for files and application data";
     const description =
-      "Lix versions any file format, runs in-process on pluggable storage, and stores files, app data, and history as rows in one ACID SQL database.";
+      "Lix stores files and application data in SQL tables in one repository. Branch, diff, merge, and roll back changes to both.";
     const canonicalUrl = buildCanonicalUrl("/");
     const ogImage = resolveOgImage();
     const jsonLd = buildWebSiteJsonLd({
