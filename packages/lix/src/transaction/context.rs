@@ -773,6 +773,9 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     await_durable_commit: bool,
     requires_individual_commit_span: bool,
     session_file_views: SessionFileViews,
+    /// Observations made by successful reads in this transaction. They are
+    /// private until commit and take precedence over the session's older view.
+    transaction_file_views: SessionFileViews,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
     pending_plugin_actor_publications: Vec<PendingPluginActorPublication>,
     pending_checkpoint_gc_sequence: Option<u64>,
@@ -1522,9 +1525,8 @@ where
             let mut keys = hydrated.keys.clone();
             let mut prefixes = Vec::new();
             for blob in &hydrated.blob_manifests {
-                let manifest_key = crate::storage_adapter::StorageKey(
-                    Bytes::copy_from_slice(blob.as_bytes()),
-                );
+                let manifest_key =
+                    crate::storage_adapter::StorageKey(Bytes::copy_from_slice(blob.as_bytes()));
                 let staged = self
                     .staged_writes
                     .load_staged_file_bytes_many(&[*blob])?
@@ -2491,6 +2493,7 @@ where
             await_durable_commit: false,
             requires_individual_commit_span: false,
             session_file_views,
+            transaction_file_views: SessionFileViews::default(),
             pending_file_view_mutations: BTreeMap::new(),
             pending_plugin_actor_publications: Vec::new(),
             pending_checkpoint_gc_sequence: None,
@@ -2707,6 +2710,9 @@ where
                         }
                     }
                 }
+                transaction
+                    .session_file_views
+                    .apply_mutations(transaction.transaction_file_views.plugin_file_mutations());
                 transaction.session_file_views.apply_mutations(
                     std::mem::take(&mut transaction.pending_file_view_mutations).into_values(),
                 );
@@ -2810,7 +2816,8 @@ where
                 let hydrated = retry
                     .hydrate_pinned_for_retry(Some(&sender), error.clone())
                     .await?;
-                self.refresh_hydrated_native_inputs(&error, &hydrated).await?;
+                self.refresh_hydrated_native_inputs(&error, &hydrated)
+                    .await?;
             }
         })
     }
@@ -3339,16 +3346,15 @@ where
     /// Releases private plugin actor leases after an explicit write statement.
     ///
     /// The durable semantic rows and checkpoints remain staged in this
-    /// transaction. Keeping the live actor leased until commit would serialize
-    /// another same-base transaction that edits the same file, so explicit
-    /// transactions retain only the cold-open marker between statements.
+    /// transaction. The validated successor stays in the actor Store, while
+    /// the mutex is released until the durable commit publishes that successor.
     pub(crate) async fn release_pending_plugin_actor_leases(&mut self) {
         let publications = std::mem::take(&mut self.pending_plugin_actor_publications);
-        let mut uncached = Vec::with_capacity(publications.len());
+        let mut detached = Vec::with_capacity(publications.len());
         for publication in publications {
-            uncached.push(publication.into_uncached().await);
+            detached.push(publication.detach_lease());
         }
-        self.pending_plugin_actor_publications = uncached;
+        self.pending_plugin_actor_publications = detached;
     }
 
     /// Stages one decoded write batch into this transaction.
@@ -4478,6 +4484,45 @@ where
             .transpose()
     }
 
+    /// Read the durable root outside the transaction's opening snapshot. This
+    /// is only used to classify a root mismatch after waiting for an actor.
+    async fn current_durable_materialization_root(
+        &mut self,
+        key: &PluginFileWriteKey,
+    ) -> Result<Option<String>, LixError> {
+        let read = SharedStorageAdapterRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
+        let rows = self
+            .hot_state
+            .reader(read)
+            .scan_batch(&HotStateScanRequest {
+                filter: HotStateFilter {
+                    schema_keys: vec![BLOB_REF_SCHEMA_KEY.to_string()],
+                    row_pks: vec![validated_uuid_row_pk(&key.file_id)?],
+                    branch_ids: vec![key.branch_id.clone()],
+                    file_ids: vec![NullableKeyFilter::Value(key.file_id.clone())],
+                    untracked: Some(key.untracked),
+                    ..Default::default()
+                },
+                projection: plugin_registry_hot_state_projection(),
+                ..Default::default()
+            })
+            .await?;
+        if rows.len() > 1 {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "current durable materialization lookup returned duplicate rows",
+            ));
+        }
+        rows.get(0)
+            .map(|row| decode_visible_materialization_ref(row, &key.file_id))
+            .transpose()
+            .map(|materialization| materialization.map(|value| value.semantic_root))
+    }
+
     async fn cold_open_semantic_actor(
         &mut self,
         actor_key: &PluginActorKey,
@@ -4697,6 +4742,17 @@ where
                 else {
                     return Err(error);
                 };
+                if self
+                    .current_durable_materialization_root(file_key)
+                    .await?
+                    .as_deref()
+                    != Some(visible_materialization.semantic_root.as_str())
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_TRANSACTION_CONFLICT,
+                        "SQL transaction snapshot is stale because branch state changed",
+                    ));
+                }
                 if visible_materialization.semantic_root != observation.semantic_root() {
                     return Err(error);
                 }
@@ -5210,6 +5266,18 @@ where
                     None
                 }
             };
+        }
+        if self
+            .transaction_file_views
+            .unfiltered_plugin_file_view(key)
+            .is_some()
+        {
+            return self.transaction_file_views.plugin_file_view(
+                key,
+                plugin.key(),
+                plugin.archive_blob_hash(),
+                owner_change_id,
+            );
         }
         self.session_file_views.plugin_file_view(
             key,
@@ -6884,6 +6952,9 @@ where
                         None => {
                             !self.pending_file_view_mutations.contains_key(&session_key)
                                 && !self
+                                    .transaction_file_views
+                                    .has_plugin_file_at_path(&actor_key.branch_id, &actor_key.path)
+                                && !self
                                     .session_file_views
                                     .has_plugin_file_at_path(&actor_key.branch_id, &actor_key.path)
                         }
@@ -7244,6 +7315,9 @@ where
                         },
                         None if self.pending_file_view_mutations.contains_key(&session_key)
                             || self
+                                .transaction_file_views
+                                .has_plugin_file_at_path(&actor_key.branch_id, &actor_key.path)
+                            || self
                                 .session_file_views
                                 .has_plugin_file_at_path(&actor_key.branch_id, &actor_key.path) =>
                         {
@@ -7338,7 +7412,38 @@ where
                         )
                         .with_hint("read the exact file bytes again before retrying the edit")
                     })?;
-                    lease.require_accepted_semantic_root(&visible_materialization.semantic_root)?;
+                    if lease.accepted_semantic_root() != visible_materialization.semantic_root {
+                        if observation.semantic_root() != visible_materialization.semantic_root {
+                            if self
+                                .plugin_host
+                                .actor_cache()
+                                .has_pending_publication(&actor_key)
+                                && !self
+                                    .pending_plugin_actor_publications
+                                    .iter()
+                                    .any(|publication| publication.key() == &actor_key)
+                            {
+                                return Err(LixError::new(
+                                    LixError::CODE_TRANSACTION_CONFLICT,
+                                    "SQL transaction overlapped a plugin actor publication",
+                                ));
+                            }
+                            return Err(LixError::new(
+                                LixError::CODE_PLUGIN_OBSERVATION_STALE,
+                                "the observed file version no longer matches this transaction's visible file",
+                            )
+                            .with_hint("read the exact file bytes again before retrying the edit"));
+                        }
+                        // Durable commit and actor publication are separate
+                        // steps. Either the snapshot or the actor may be behind
+                        // while another session is between those steps. Neither
+                        // case proves this actor is obsolete, so retain it and
+                        // retry the SQL write from a new transaction snapshot.
+                        return Err(LixError::new(
+                            LixError::CODE_TRANSACTION_CONFLICT,
+                            "SQL transaction snapshot is stale because branch state changed",
+                        ));
+                    }
                     let observation_is_current =
                         observation.semantic_root() == visible_materialization.semantic_root;
                     let observed_bytes = lease.observed_bytes();
@@ -7800,7 +7905,7 @@ where
                 prior_index.map(|index| self.pending_plugin_actor_publications.remove(index));
             let was_chained = prior_publication.is_some();
             let (lease, successor_key, publication_view) = match prior_publication {
-                Some(publication) => match publication.into_chainable(&actor_key) {
+                Some(publication) => match publication.into_chainable(&actor_key).await {
                     ChainablePublication::Chainable(lease, key, policy) => (lease, key, policy),
                     ChainablePublication::Pending(publication) => {
                         self.pending_plugin_actor_publications.push(publication);
@@ -9562,6 +9667,9 @@ where
             || Arc::clone(&self.hot_state),
             |(hot, _)| Arc::new(hot.clone()),
         );
+        let file_view_collector = crate::sql2::plan_read_statement(&statement, &params)
+            .acknowledge_file_views
+            .then(|| self.transaction_file_views.fork_for_read());
 
         if let Some((_, capture)) = &capture {
             crate::session::seed_foreground_filesystem_interest(
@@ -9572,7 +9680,8 @@ where
             )?;
         }
 
-        let read_ctx = self.sql_read_execution_context(read_store, hot_state)?;
+        let read_ctx =
+            self.sql_read_execution_context(read_store, hot_state, file_view_collector.clone())?;
         let result = crate::sql2::execute_transaction_read_statement_from_parsed(
             &read_ctx, self, &sql, statement, &params,
         )
@@ -9581,6 +9690,10 @@ where
             Ok(result) => {
                 if let Some((_, capture)) = capture {
                     capture.publish_capture()?;
+                }
+                if let Some(file_view_collector) = file_view_collector {
+                    self.transaction_file_views
+                        .apply_mutations(file_view_collector.plugin_file_mutations());
                 }
                 Ok(result)
             }
@@ -9599,6 +9712,7 @@ where
         &self,
         read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>,
         hot_state: Arc<HotStateContext>,
+        file_views: Option<SessionFileViews>,
     ) -> Result<
         TransactionSqlReadExecutionContext<StorageImpl::Read<'static>>,
         LixError,
@@ -9620,6 +9734,7 @@ where
             plugin_host: self.plugin_host.clone(),
             sql_planning_cache: Arc::clone(&self.sql_planning_cache),
             sql_catalog_fingerprint: self.sql_catalog_fingerprint().clone(),
+            file_views,
         })
     }
 
@@ -12758,6 +12873,7 @@ pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage_adapter::
     plugin_host: PluginRuntimeHost,
     sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     sql_catalog_fingerprint: CatalogFingerprint,
+    file_views: Option<SessionFileViews>,
 }
 
 #[async_trait]
@@ -12859,6 +12975,10 @@ where
 
     fn plugin_host(&self) -> PluginRuntimeHost {
         self.plugin_host.clone()
+    }
+
+    fn session_file_views(&self) -> Option<SessionFileViews> {
+        self.file_views.clone()
     }
 }
 
@@ -13495,7 +13615,11 @@ where
         let read_store = self.opening_read();
         if requirements.needs_read_table_functions || !requirements.read_relation_names.is_empty() {
             let read_ctx =
-                self.sql_read_execution_context(read_store.clone(), Arc::clone(&self.hot_state))?;
+                self.sql_read_execution_context(
+                    read_store.clone(),
+                    Arc::clone(&self.hot_state),
+                    None,
+                )?;
             if requirements.needs_read_table_functions {
                 crate::sql2::register_read_table_functions(
                     session,

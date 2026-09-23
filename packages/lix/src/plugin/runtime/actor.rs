@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use tokio::sync::{
     Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, TryAcquireError,
@@ -375,6 +375,7 @@ impl PluginActorSlot {
 
 struct PluginActorCacheState {
     actors: BTreeMap<PluginActorKey, Arc<PluginActorSlot>>,
+    pending_publications: BTreeMap<PluginActorKey, usize>,
     checkpoints: BTreeMap<(PluginActorKey, String), PluginActorCheckpoint>,
     pending_checkpoints: BTreeMap<u64, PluginActorPendingCheckpoint>,
     checkpoint_bytes: u64,
@@ -402,6 +403,26 @@ pub(crate) struct PluginActorCache {
     store_admission: Arc<Semaphore>,
     state: Arc<Mutex<PluginActorCacheState>>,
     cold_open_gate: Arc<AsyncMutex<()>>,
+}
+
+/// Tracks a cold successor from staging through publication or discard.
+/// Readers use this only to distinguish a commit/publication gap from an
+/// already settled stale observation.
+pub(crate) struct PluginActorPendingPublication {
+    cache: PluginActorCache,
+    key: PluginActorKey,
+}
+
+impl Drop for PluginActorPendingPublication {
+    fn drop(&mut self) {
+        let mut state = self.cache.lock();
+        if let Some(count) = state.pending_publications.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                state.pending_publications.remove(&self.key);
+            }
+        }
+    }
 }
 
 pub(crate) struct PluginActorStagedCheckpoint {
@@ -479,6 +500,7 @@ impl PluginActorCache {
             store_admission: Arc::new(Semaphore::new(capacity.get())),
             state: Arc::new(Mutex::new(PluginActorCacheState {
                 actors: BTreeMap::new(),
+                pending_publications: BTreeMap::new(),
                 checkpoints: BTreeMap::new(),
                 pending_checkpoints: BTreeMap::new(),
                 checkpoint_bytes: 0,
@@ -492,6 +514,22 @@ impl PluginActorCache {
 
     pub(crate) fn capacity(&self) -> usize {
         self.capacity.get()
+    }
+
+    pub(crate) fn has_pending_publication(&self, key: &PluginActorKey) -> bool {
+        self.lock().pending_publications.contains_key(key)
+    }
+
+    pub(crate) fn track_publication(&self, key: &PluginActorKey) -> PluginActorPendingPublication {
+        *self
+            .lock()
+            .pending_publications
+            .entry(key.clone())
+            .or_default() += 1;
+        PluginActorPendingPublication {
+            cache: self.clone(),
+            key: key.clone(),
+        }
     }
 
     /// Retains one decoded immutable arena root per actor identity. Unlike a
@@ -1302,6 +1340,136 @@ impl PluginActorPendingCall {
     }
 }
 
+/// A validated successor whose Store can be evicted while an explicit
+/// transaction is idle. The handle is usable only if the exact actor survives.
+pub(crate) struct PluginActorDetachedSuccessor {
+    cache: PluginActorCache,
+    key: PluginActorKey,
+    slot: Weak<PluginActorSlot>,
+    revision: u64,
+    observed_document: WasmDocumentHandle,
+    observed_bytes: Blob,
+    observed_bytes_sha256: Option<FileBytesSha256>,
+    successor: Option<PluginActorSuccessor>,
+    uncertain_guest_call: bool,
+    retire_on_drop: bool,
+}
+
+impl PluginActorDetachedSuccessor {
+    pub(crate) fn successor_checkpoint(
+        &self,
+    ) -> Option<(PluginActorCache, Arc<str>, Option<WasmDocumentCheckpoint>)> {
+        self.successor.as_ref().map(|successor| {
+            (
+                self.cache.clone(),
+                Arc::clone(&successor.semantic_root),
+                successor.checkpoint.clone(),
+            )
+        })
+    }
+
+    async fn into_lease(mut self) -> Result<PluginActorLease, LixError> {
+        let slot = self
+            .slot
+            .upgrade()
+            .ok_or_else(|| stale_observation("plugin actor was evicted before publication"))?;
+        let mut guard = Arc::clone(&slot.state).lock_owned().await;
+        if slot.retired.load(Ordering::Acquire) {
+            return Err(stale_observation(
+                "plugin actor was retired before publication",
+            ));
+        }
+        if slot.revision.load(Ordering::Acquire) != self.revision {
+            if let Some(successor) = self.successor.as_ref() {
+                self.uncertain_guest_call = true;
+                let result = guard
+                    .store
+                    .actor_mut()
+                    .drop_document(successor.document)
+                    .await;
+                self.uncertain_guest_call = false;
+                if result.is_err() {
+                    slot.retire();
+                }
+            }
+            self.successor.take();
+            return Err(stale_observation(
+                "plugin actor advanced before publication",
+            ));
+        }
+        Ok(PluginActorLease {
+            cache: self.cache.clone(),
+            key: self.key.clone(),
+            slot,
+            guard: Some(guard),
+            observed_document: self.observed_document,
+            observed_bytes: self.observed_bytes.clone(),
+            observed_bytes_sha256: self.observed_bytes_sha256,
+            uncertain_guest_call: false,
+            successor: self.successor.take(),
+        })
+    }
+
+    pub(crate) async fn chain(self) -> Result<PluginActorLease, LixError> {
+        self.into_lease().await
+    }
+
+    pub(crate) async fn publish(
+        mut self,
+        key: PluginActorKey,
+    ) -> Result<PluginObservation, LixError> {
+        // Durable storage has committed. Cancellation must invalidate an old actor.
+        self.retire_on_drop = true;
+        self.into_lease().await?.commit_successor_as(key).await
+    }
+
+    pub(crate) async fn discard(self) -> Result<(), LixError> {
+        match self.into_lease().await {
+            Ok(lease) => lease.discard_successor().await,
+            Err(_) => Ok(()),
+        }
+    }
+}
+
+impl Drop for PluginActorDetachedSuccessor {
+    fn drop(&mut self) {
+        let Some(successor) = self.successor.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let slot = self.slot.clone();
+        let cache = self.cache.clone();
+        let key = self.key.clone();
+        let uncertain = self.uncertain_guest_call;
+        let retire = self.retire_on_drop;
+        let revision = self.revision;
+        runtime.spawn(async move {
+            let Some(slot) = slot.upgrade() else {
+                return;
+            };
+            let mut guard = Arc::clone(&slot.state).lock_owned().await;
+            if slot.retired.load(Ordering::Acquire) {
+                return;
+            }
+            if uncertain || retire {
+                if slot.revision.load(Ordering::Acquire) == revision {
+                    cache.remove_if_same(&key, &slot);
+                }
+            } else if guard
+                .store
+                .actor_mut()
+                .drop_document(successor.document)
+                .await
+                .is_err()
+            {
+                cache.remove_if_same(&key, &slot);
+            }
+        });
+    }
+}
+
 /// Exclusive transition lease. Holding it across the durable commit point is
 /// intentional: one file actor is serialized while unrelated files continue.
 pub(crate) struct PluginActorLease {
@@ -1317,6 +1485,32 @@ pub(crate) struct PluginActorLease {
 }
 
 impl PluginActorLease {
+    pub(crate) fn pending_publication_marker(
+        &self,
+        key: &PluginActorKey,
+    ) -> PluginActorPendingPublication {
+        self.cache.track_publication(key)
+    }
+
+    /// Keep the validated successor in its Store without holding the actor
+    /// mutex while an explicit transaction waits for its next statement.
+    pub(crate) fn detach_successor(mut self) -> PluginActorDetachedSuccessor {
+        let detached = PluginActorDetachedSuccessor {
+            cache: self.cache.clone(),
+            key: self.key.clone(),
+            slot: Arc::downgrade(&self.slot),
+            revision: self.slot.revision.load(Ordering::Acquire),
+            observed_document: self.observed_document,
+            observed_bytes: self.observed_bytes.clone(),
+            observed_bytes_sha256: self.observed_bytes_sha256,
+            successor: self.successor.take(),
+            uncertain_guest_call: false,
+            retire_on_drop: false,
+        };
+        self.guard.take();
+        detached
+    }
+
     pub(crate) fn actor_mut(&mut self) -> &mut dyn WasmComponentActor {
         self.guard
             .as_deref_mut()

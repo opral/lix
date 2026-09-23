@@ -45,6 +45,411 @@ async fn semantic_edit<S: Storage + Clone + Send + Sync + 'static>(lix: &Lix<S>,
 }
 
 #[tokio::test]
+async fn transaction_read_refreshes_plugin_observation_after_two_foreign_edits() {
+    let lix = open_lix().with_storage(Memory::new()).await.unwrap();
+    install_markdown(&lix).await;
+    lix.execute(
+        "INSERT INTO lix_file(path,content) VALUES('/doc.md',$1)",
+        &[Value::Blob(
+            b"# Title\n\nAlpha.\n\nBravo.\n".to_vec().into(),
+        )],
+    )
+    .await
+    .unwrap();
+    let other = lix.open_another_session().await.unwrap();
+    let read = |result: &lix::ExecuteResult| {
+        String::from_utf8(result.rows()[0].get::<Vec<u8>>("content").unwrap()).unwrap()
+    };
+    let query = "SELECT content FROM lix_file WHERE path='/doc.md'";
+    let update = "UPDATE lix_file SET content=$1 WHERE path='/doc.md'";
+    read(&lix.execute(query, &[]).await.unwrap());
+    for suffix in ["1", "2"] {
+        let text = read(&other.execute(query, &[]).await.unwrap())
+            .replace("Bravo.", &format!("Bravo {suffix}."))
+            .replace("Bravo 1.", &format!("Bravo {suffix}."));
+        other
+            .execute(update, &[Value::Blob(text.into_bytes().into())])
+            .await
+            .unwrap();
+    }
+    let mut transaction = lix.begin_transaction().await.unwrap();
+    let text = read(&transaction.execute(query, &[]).await.unwrap()).replace("Alpha.", "Alpha A.");
+    transaction
+        .execute(update, &[Value::Blob(text.into_bytes().into())])
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+    assert_eq!(
+        read(&other.execute(query, &[]).await.unwrap()),
+        "# Title\n\nAlpha A.\n\nBravo 2.\n"
+    );
+    other.close().await.unwrap();
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn committed_transaction_read_refreshes_session_observation() {
+    let lix = open_lix().with_storage(Memory::new()).await.unwrap();
+    install_markdown(&lix).await;
+    lix.execute(
+        "INSERT INTO lix_file(path,content) VALUES('/doc.md',$1)",
+        &[Value::Blob(b"Original.\n".to_vec().into())],
+    )
+    .await
+    .unwrap();
+    let other = lix.open_another_session().await.unwrap();
+    let query = "SELECT content FROM lix_file WHERE path='/doc.md'";
+    let update = "UPDATE lix_file SET content=$1 WHERE path='/doc.md'";
+    lix.execute(query, &[]).await.unwrap();
+    for text in [b"Other 1.\n".as_slice(), b"Other 2.\n".as_slice()] {
+        other.execute(query, &[]).await.unwrap();
+        other
+            .execute(update, &[Value::Blob(text.to_vec().into())])
+            .await
+            .unwrap();
+    }
+    let mut transaction = lix.begin_transaction().await.unwrap();
+    let bytes = transaction.execute(query, &[]).await.unwrap().rows()[0]
+        .get::<Vec<u8>>("content")
+        .unwrap();
+    assert_eq!(bytes, b"Other 2.\n");
+    transaction.commit().await.unwrap();
+    lix.execute(update, &[Value::Blob(b"After commit.\n".to_vec().into())])
+        .await
+        .expect("the committed read must refresh the session's write base");
+    other.close().await.unwrap();
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn rolled_back_transaction_read_does_not_refresh_session_observation() {
+    let lix = open_lix().with_storage(Memory::new()).await.unwrap();
+    install_markdown(&lix).await;
+    lix.execute(
+        "INSERT INTO lix_file(path,content) VALUES('/doc.md',$1)",
+        &[Value::Blob(b"Original.\n".to_vec().into())],
+    )
+    .await
+    .unwrap();
+    let other = lix.open_another_session().await.unwrap();
+    let query = "SELECT content FROM lix_file WHERE path='/doc.md'";
+    let update = "UPDATE lix_file SET content=$1 WHERE path='/doc.md'";
+    lix.execute(query, &[]).await.unwrap();
+    for text in [b"Other 1.\n".as_slice(), b"Other 2.\n".as_slice()] {
+        other.execute(query, &[]).await.unwrap();
+        other
+            .execute(update, &[Value::Blob(text.to_vec().into())])
+            .await
+            .unwrap();
+    }
+    let mut transaction = lix.begin_transaction().await.unwrap();
+    transaction.execute(query, &[]).await.unwrap();
+    transaction.rollback().await.unwrap();
+    let error = lix
+        .execute(update, &[Value::Blob(b"Unseen.\n".to_vec().into())])
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, lix::LixError::CODE_PLUGIN_OBSERVATION_STALE);
+    other.close().await.unwrap();
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn transformed_transaction_read_does_not_acknowledge_plugin_bytes() {
+    let lix = open_lix().with_storage(Memory::new()).await.unwrap();
+    install_markdown(&lix).await;
+    lix.execute(
+        "INSERT INTO lix_file(path,content) VALUES('/doc.md',$1)",
+        &[Value::Blob(b"Original.\n".to_vec().into())],
+    )
+    .await
+    .unwrap();
+    let other = lix.open_another_session().await.unwrap();
+    lix.execute("SELECT content FROM lix_file WHERE path='/doc.md'", &[])
+        .await
+        .unwrap();
+    for text in [b"Other 1.\n".as_slice(), b"Other 2.\n".as_slice()] {
+        other
+            .execute("SELECT content FROM lix_file WHERE path='/doc.md'", &[])
+            .await
+            .unwrap();
+        other
+            .execute(
+                "UPDATE lix_file SET content=$1 WHERE path='/doc.md'",
+                &[Value::Blob(text.to_vec().into())],
+            )
+            .await
+            .unwrap();
+    }
+    let mut transaction = lix.begin_transaction().await.unwrap();
+    transaction
+        .execute(
+            "SELECT length(content) FROM lix_file WHERE path='/doc.md'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let error = transaction
+        .execute(
+            "UPDATE lix_file SET content=$1 WHERE path='/doc.md'",
+            &[Value::Blob(b"Unseen.\n".to_vec().into())],
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, lix::LixError::CODE_PLUGIN_OBSERVATION_STALE);
+    transaction.rollback().await.unwrap();
+    other.close().await.unwrap();
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn repeated_semantic_writes_chain_after_detaching_in_one_transaction() {
+    let lix = open_lix().with_storage(Memory::new()).await.unwrap();
+    install_markdown(&lix).await;
+    lix.execute(
+        "INSERT INTO lix_file(path,content) VALUES('/doc.md',$1)",
+        &[Value::Blob(b"Initial.\n".to_vec().into())],
+    )
+    .await
+    .unwrap();
+    let file_id: String = lix
+        .execute("SELECT id FROM lix_file WHERE path='/doc.md'", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get("id")
+        .unwrap();
+
+    let mut transaction = lix.begin_transaction().await.unwrap();
+    for text in ["First edit.", "Second edit."] {
+        transaction
+            .execute(
+                "UPDATE markdown_node SET payload_json=$1 WHERE kind='paragraph' AND lixcol_file_id=$2",
+                &[
+                    Value::Text(
+                        serde_json::json!({"inline": [{"type": "text", "value": text}]})
+                            .to_string(),
+                    ),
+                    Value::Text(file_id.clone()),
+                ],
+            )
+            .await
+            .expect("the second semantic statement should reattach and chain the detached actor");
+    }
+    transaction.commit().await.unwrap();
+
+    let content = lix
+        .execute("SELECT content FROM lix_file WHERE path='/doc.md'", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<Vec<u8>>("content")
+        .unwrap();
+    assert_eq!(content, b"Second edit.\n");
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn explicit_transaction_admits_semantic_writes_under_store_pressure() {
+    // The default repository actor budget is ten live Stores. Touch one more
+    // Markdown file than that, while each prior transaction statement has
+    // detached its completed publication.
+    let lix = open_lix().with_storage(Memory::new()).await.unwrap();
+    install_markdown(&lix).await;
+    let mut files = Vec::new();
+    for index in 0..11 {
+        let path = format!("/resource-{index}.md");
+        lix.execute(
+            "INSERT INTO lix_file(path,content) VALUES($1,$2)",
+            &[
+                Value::Text(path.clone()),
+                Value::Blob(format!("Initial {index}.\n").into_bytes().into()),
+            ],
+        )
+        .await
+        .unwrap();
+        let file_id: String = lix
+            .execute(
+                "SELECT id FROM lix_file WHERE path=$1",
+                &[Value::Text(path.clone())],
+            )
+            .await
+            .unwrap()
+            .rows()[0]
+            .get("id")
+            .unwrap();
+        files.push((path, file_id));
+    }
+
+    let mut transaction = lix.begin_transaction().await.unwrap();
+    for (index, (_, file_id)) in files.iter().enumerate() {
+        transaction
+            .execute(
+                "UPDATE markdown_node SET payload_json=$1 WHERE kind='paragraph' AND lixcol_file_id=$2",
+                &[
+                    Value::Text(
+                        serde_json::json!({"inline": [{"type": "text", "value": format!("Edited {index}.")}]})
+                            .to_string(),
+                    ),
+                    Value::Text(file_id.clone()),
+                ],
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("semantic edit {index} should fit through Store admission: {error}")
+            });
+    }
+    transaction.commit().await.unwrap();
+
+    for (index, (path, _)) in files.iter().enumerate() {
+        let content = lix
+            .execute(
+                "SELECT content FROM lix_file WHERE path=$1",
+                &[Value::Text(path.clone())],
+            )
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<Vec<u8>>("content")
+            .unwrap();
+        assert_eq!(content, format!("Edited {index}.\n").as_bytes());
+    }
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_plugin_writes_replay_auto_commit_snapshot_conflicts() {
+    let lix = open_lix().with_storage(Memory::new()).await.unwrap();
+    install_markdown(&lix).await;
+    lix.execute(
+        "INSERT INTO lix_file(path,content) VALUES('/doc.md',$1)",
+        &[Value::Blob(b"Alpha 0.\n\nBravo 0.\n".to_vec().into())],
+    )
+    .await
+    .unwrap();
+    let other = lix.open_another_session().await.unwrap();
+    let query = "SELECT content FROM lix_file WHERE path='/doc.md'";
+    let update = "UPDATE lix_file SET content=$1 WHERE path='/doc.md'";
+    for index in 1..=30 {
+        let a_text = String::from_utf8(
+            lix.execute(query, &[]).await.unwrap().rows()[0]
+                .get::<Vec<u8>>("content")
+                .unwrap(),
+        )
+        .unwrap();
+        let b_text = String::from_utf8(
+            other.execute(query, &[]).await.unwrap().rows()[0]
+                .get::<Vec<u8>>("content")
+                .unwrap(),
+        )
+        .unwrap();
+        let mut transaction = lix.begin_transaction().await.unwrap();
+        let a_text = a_text
+            .lines()
+            .map(|line| {
+                if line.starts_with("Alpha ") {
+                    format!("Alpha {index}.")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let b_text = b_text
+            .lines()
+            .map(|line| {
+                if line.starts_with("Bravo ") {
+                    format!("Bravo {index}.")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        transaction
+            .execute(update, &[Value::Blob(a_text.into_bytes().into())])
+            .await
+            .unwrap();
+        let b_params = [Value::Blob(b_text.into_bytes().into())];
+        let (commit, auto_commit) =
+            tokio::join!(transaction.commit(), other.execute(update, &b_params));
+        let committed_alpha = commit.is_ok();
+        if let Err(error) = commit {
+            assert_eq!(error.code, lix::LixError::CODE_TRANSACTION_CONFLICT);
+        }
+        auto_commit.expect("the auto-commit plugin edit must replay a snapshot conflict");
+        let current = String::from_utf8(
+            other.execute(query, &[]).await.unwrap().rows()[0]
+                .get::<Vec<u8>>("content")
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(current.contains(&format!("Bravo {index}.")));
+        if committed_alpha {
+            assert!(current.contains(&format!("Alpha {index}.")));
+        }
+    }
+    other.close().await.unwrap();
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn stale_transaction_snapshot_conflicts_and_keeps_current_actor_usable() {
+    let lix = open_lix().with_storage(Memory::new()).await.unwrap();
+    install_markdown(&lix).await;
+    lix.execute(
+        "INSERT INTO lix_file(path,content) VALUES('/doc.md',$1)",
+        &[Value::Blob(b"Alpha.\n\nBravo.\n".to_vec().into())],
+    )
+    .await
+    .unwrap();
+    let other = lix.open_another_session().await.unwrap();
+    let query = "SELECT content FROM lix_file WHERE path='/doc.md'";
+    let update = "UPDATE lix_file SET content=$1 WHERE path='/doc.md'";
+    let before = lix.execute(query, &[]).await.unwrap().rows()[0]
+        .get::<Vec<u8>>("content")
+        .unwrap();
+    let mut transaction = lix.begin_transaction().await.unwrap();
+    transaction.execute(query, &[]).await.unwrap();
+    other.execute(query, &[]).await.unwrap();
+    other
+        .execute(
+            update,
+            &[Value::Blob(b"Alpha.\n\nBravo 1.\n".to_vec().into())],
+        )
+        .await
+        .unwrap();
+    let attempted = String::from_utf8(before)
+        .unwrap()
+        .replace("Alpha.", "Alpha A.");
+    let write = transaction
+        .execute(update, &[Value::Blob(attempted.into_bytes().into())])
+        .await;
+    let error = match write {
+        Ok(_) => transaction.commit().await.unwrap_err(),
+        Err(error) => {
+            transaction.rollback().await.unwrap();
+            error
+        }
+    };
+    assert_eq!(error.code, lix::LixError::CODE_TRANSACTION_CONFLICT);
+    lix.execute(
+        update,
+        &[Value::Blob(b"Alpha A.\n\nBravo.\n".to_vec().into())],
+    )
+    .await
+    .expect("the stale observation must still rebase through the current actor");
+    let content = other.execute(query, &[]).await.unwrap().rows()[0]
+        .get::<Vec<u8>>("content")
+        .unwrap();
+    assert_eq!(content, b"Alpha A.\n\nBravo 1.\n");
+    other.close().await.unwrap();
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn mixed_read_batches_refresh_backing_session_plugin_observations() {
     for (coherent, files_first) in [(true, false), (true, true), (false, false), (false, true)] {
         let storage = Memory::new();

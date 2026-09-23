@@ -148,7 +148,8 @@ where
         working_diff_checkpoint_commit_id.as_deref(),
         root_commit_id.as_deref(),
     );
-    let write_ctx = SqlWriteContext::new(write_ctx);
+    let write_ctx =
+        SqlWriteContext::new(write_ctx).with_session_file_views(read_ctx.session_file_views());
     let write_branch_ref: Arc<dyn BranchRefReader> = Arc::new(CachingBranchRefReader::new(
         Arc::new(super::WriteContextBranchRefReader::new(write_ctx.clone())),
     ));

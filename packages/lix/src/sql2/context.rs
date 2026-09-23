@@ -533,6 +533,16 @@ impl SqlWriteContext {
         }
     }
 
+    /// Transaction SELECTs use writable providers for their staged overlay.
+    /// Give those providers the read's private observation collector rather
+    /// than the transaction's ordinary write context view.
+    pub(crate) fn with_session_file_views(mut self, views: Option<SessionFileViews>) -> Self {
+        Arc::get_mut(&mut self.shared)
+            .expect("new SQL write context has no shared clones")
+            .session_file_views = views;
+        self
+    }
+
     pub(crate) fn with_explicit_insert_columns(
         mut self,
         columns: Option<BTreeSet<String>>,
