@@ -156,7 +156,7 @@ where
         let admitted = if source.is_partial() {
             // Sparse upgrades retain both the authenticated admission and every
             // resident record, including pending work, without contacting a server.
-            crate::migration::admit_repository_with_server(&storage, progress, None).await?;
+            crate::migration::admit_partial_repository(&storage, progress).await?;
             crate::migration::admit_partial_epoch(&storage).await?
         } else {
             let configured = server.clone().ok_or_else(|| {
