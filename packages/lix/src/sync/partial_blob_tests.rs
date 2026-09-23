@@ -192,6 +192,87 @@ async fn duplicate_manifest_and_chunk_installs_are_idempotent_without_overwrite(
 }
 
 #[tokio::test]
+async fn deferred_manifest_replans_when_chunk_arrives_after_missing_snapshot() {
+    let (storage, state) = fixture().await;
+    let bytes = b"shared content that arrived during manifest admission";
+    let manifest = super::super::blob::decode_manifest(&wire(bytes)).unwrap();
+    let requested = manifest.blob_id;
+    let chunk = ChunkHash::from_content(bytes);
+
+    // An existing deferred reference supplied the demand that authorizes the
+    // concurrent chunk installer. A second manifest is planned while absent.
+    let mut demand = storage.new_write_set();
+    demand.put(
+        BINARY_CAS_CHUNK_DEMAND_SPACE,
+        StorageKey(Bytes::copy_from_slice(chunk.as_bytes())),
+        Vec::<u8>::new(),
+    );
+    storage
+        .commit_partial_replica_write_set(
+            super::super::partial_replica_write_capability(),
+            demand,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    let (_, receipt) = load_partial_replica_state(&read).await.unwrap().unwrap();
+    let mut stale_writes = storage.new_write_set();
+    let (preconditions, missing) = prepare_manifest_install(
+        &read,
+        &mut stale_writes,
+        requested,
+        receipt,
+        &manifest,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(missing, vec![chunk]);
+    drop(read);
+
+    install_chunk(&storage, &state, chunk, bytes).await.unwrap();
+    let stale_commit = storage
+        .commit_partial_replica_write_set(
+            super::super::partial_replica_write_capability(),
+            stale_writes,
+            StorageWriteOptions {
+                preconditions,
+                await_durable: true,
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(
+        stale_commit,
+        Err(crate::storage_adapter::StorageWriteSetError::Storage(
+            crate::storage_adapter::StorageError::PreconditionFailed(_)
+        ))
+    ));
+
+    let registration = install_manifest(&storage, &state, requested, &wire(bytes))
+        .await
+        .unwrap();
+    assert!(registration.missing_chunk_ids.is_empty());
+    let read = storage.begin_read(Default::default()).await.unwrap();
+    assert!(load_metadata_many(&read, &[requested])
+        .await
+        .unwrap()
+        .into_vec()[0]
+        .is_some());
+    assert!(crate::storage_adapter::PointReadPlan::new(
+        BINARY_CAS_CHUNK_DEMAND_SPACE,
+        &[StorageKey(Bytes::copy_from_slice(chunk.as_bytes()))],
+    )
+    .materialize(&read, Default::default())
+    .await
+    .unwrap()
+    .value[0]
+        .is_none());
+}
+
+#[tokio::test]
 async fn corrupt_resident_manifest_is_not_a_demand_or_a_repair() {
     let (storage, state) = fixture().await;
     let hash = BlobId::from_content(b"corrupted manifest");
