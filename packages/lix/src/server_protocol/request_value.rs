@@ -34,6 +34,7 @@ impl<'de> Deserialize<'de> for RequestWireValue {
                 value: i64,
             },
             Float {
+                #[serde(deserialize_with = "crate::common::wire::deserialize_wire_float")]
                 value: f64,
             },
             Text {
