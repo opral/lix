@@ -4,9 +4,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
+use opentelemetry::Context as OpenTelemetryContext;
 pub use opentelemetry::trace::{SpanContext, SpanKind, Status};
 use opentelemetry::trace::{TraceContextExt as _, TraceFlags, TraceState};
-use opentelemetry::Context as OpenTelemetryContext;
 use opentelemetry_sdk::trace::{IdGenerator as _, RandomIdGenerator};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
@@ -380,7 +380,10 @@ fn record_attribute(span: &tracing::Span, attribute: &TelemetryAttribute) {
     };
 }
 
-fn debug_assert_attributes(descriptor: &TelemetrySpanDescriptor, attributes: &[TelemetryAttribute]) {
+fn debug_assert_attributes(
+    descriptor: &TelemetrySpanDescriptor,
+    attributes: &[TelemetryAttribute],
+) {
     debug_assert!(
         attributes
             .iter()
@@ -464,6 +467,39 @@ fn current_context_for(sink: &Arc<dyn TelemetrySink>) -> Option<TelemetryContext
             .filter(|context| Arc::ptr_eq(&context.sink, sink))
             .cloned()
     })
+}
+
+/// W3C context of the operation currently being polled. Sync transports use
+/// this at request creation, before crossing a browser worker boundary.
+pub(crate) fn current_trace_context_headers() -> Vec<(String, String)> {
+    use opentelemetry::propagation::Injector;
+    use opentelemetry::propagation::TextMapPropagator as _;
+    use opentelemetry_sdk::propagation::TraceContextPropagator;
+
+    struct Headers(Vec<(String, String)>);
+    impl Injector for Headers {
+        fn set(&mut self, key: &str, value: String) {
+            self.0.push((key.to_owned(), value));
+        }
+    }
+    let parent = CURRENT_TELEMETRY
+        .with(|current| {
+            current
+                .borrow()
+                .last()
+                .map(|context| context.span_context.clone())
+        })
+        .filter(SpanContext::is_valid)
+        .or_else(|| CURRENT_REMOTE_PARENT.with(|current| current.borrow().last().cloned()));
+    let Some(parent) = parent.filter(SpanContext::is_valid) else {
+        return Vec::new();
+    };
+    let mut headers = Headers(Vec::new());
+    TraceContextPropagator::new().inject_context(
+        &OpenTelemetryContext::new().with_remote_span_context(parent),
+        &mut headers,
+    );
+    headers.0
 }
 
 pub(crate) fn current_telemetry_context() -> Option<TelemetryContext> {
@@ -585,8 +621,8 @@ impl ActiveTelemetrySpan {
         if let Some(parent_span_context) = parent.as_ref().and_then(TelemetryContext::as_link) {
             start.parent_span_context = Some(parent_span_context);
         } else if start.parent_span_context.is_none() {
-            start.parent_span_context = CURRENT_REMOTE_PARENT
-                .with(|current| current.borrow().last().cloned());
+            start.parent_span_context =
+                CURRENT_REMOTE_PARENT.with(|current| current.borrow().last().cloned());
         }
         debug_assert_attributes(start.descriptor, &start.attributes);
         let descriptor = start.descriptor;
@@ -644,11 +680,7 @@ impl ActiveTelemetrySpan {
         self.context.clone()
     }
 
-    pub(crate) fn finish(
-        mut self,
-        status: Status,
-        attributes: Vec<TelemetryAttribute>,
-    ) {
+    pub(crate) fn finish(mut self, status: Status, attributes: Vec<TelemetryAttribute>) {
         debug_assert_attributes(self.descriptor, &attributes);
         let duration_ns = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         if let Some(handle) = self.handle.take() {
@@ -929,6 +961,23 @@ mod tests {
     }
 
     #[test]
+    fn sync_headers_use_remote_parent_when_local_context_has_no_span() {
+        let parent = new_span_context(None);
+        let sink = Arc::new(RecordingSink::new(true)).into_sink();
+        let root = TelemetryContext::root(sink);
+        let _local = root.enter();
+        let _remote = enter_remote_parent(&parent);
+        let headers = current_trace_context_headers();
+        let traceparent = headers
+            .iter()
+            .find(|(key, _)| key == "traceparent")
+            .map(|(_, value)| value)
+            .expect("traceparent");
+        assert!(traceparent.contains(&parent.trace_id().to_string()));
+        assert!(traceparent.contains(&parent.span_id().to_string()));
+    }
+
+    #[test]
     fn production_contract_has_eleven_names_and_no_legacy_aliases() {
         assert_eq!(PRODUCTION_NAMES.len(), 11);
         assert_eq!(spans::ALL.len(), 11);
@@ -1029,18 +1078,11 @@ mod tests {
             true,
             TraceState::NONE,
         );
-        futures_lite::future::block_on(instrument_remote_parent(
-            Some(parent.clone()),
-            async {
-                let span = ActiveTelemetrySpan::start_if_enabled(
-                    &sink,
-                    &SQL_QUERY,
-                    Vec::new(),
-                )
+        futures_lite::future::block_on(instrument_remote_parent(Some(parent.clone()), async {
+            let span = ActiveTelemetrySpan::start_if_enabled(&sink, &SQL_QUERY, Vec::new())
                 .expect("query span");
-                span.finish(Status::Unset, Vec::new());
-            },
-        ));
+            span.finish(Status::Unset, Vec::new());
+        }));
         let outside = ActiveTelemetrySpan::start_if_enabled(&sink, &SQL_QUERY, Vec::new())
             .expect("outside query span");
         outside.finish(Status::Unset, Vec::new());
@@ -1048,7 +1090,10 @@ mod tests {
         let completed = completed.lock().expect("completed");
         assert_eq!(completed[0].start.parent_span_context, Some(parent));
         assert!(completed[1].start.parent_span_context.is_none());
-        assert_ne!(completed[0].span_context.trace_id(), completed[1].span_context.trace_id());
+        assert_ne!(
+            completed[0].span_context.trace_id(),
+            completed[1].span_context.trace_id()
+        );
     }
 
     #[test]
@@ -1133,10 +1178,8 @@ mod tests {
         let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new(move |span| {
             captured.lock().expect("completed").push(span);
         }));
-        let span = ActiveTelemetrySpan::start(
-            &sink,
-            TelemetrySpanStart::new(&SESSION_OPEN, Vec::new()),
-        );
+        let span =
+            ActiveTelemetrySpan::start(&sink, TelemetrySpanStart::new(&SESSION_OPEN, Vec::new()));
         drop(instrument_lix_result(
             Some(span),
             std::future::pending::<Result<(), crate::LixError>>(),
@@ -1213,15 +1256,11 @@ mod tests {
             .build();
         let tracer = provider.tracer("lix");
         let dispatch = tracing::Dispatch::new(
-            tracing_subscriber::registry()
-                .with(tracing_opentelemetry::layer().with_tracer(tracer)),
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer)),
         );
-        let sink: Arc<dyn TelemetrySink> =
-            Arc::new(OpenTelemetryTracingSink::new(dispatch));
-        let parent = ActiveTelemetrySpan::start(
-            &sink,
-            TelemetrySpanStart::new(&SQL_BATCH, Vec::new()),
-        );
+        let sink: Arc<dyn TelemetrySink> = Arc::new(OpenTelemetryTracingSink::new(dispatch));
+        let parent =
+            ActiveTelemetrySpan::start(&sink, TelemetrySpanStart::new(&SQL_BATCH, Vec::new()));
         let parent_context = parent.telemetry_context();
         let parent_span_context = parent_context.span_context.clone();
         let linked_context = new_span_context(None);
@@ -1247,7 +1286,10 @@ mod tests {
             .find(|span| span.name == "lix.transaction.materialize")
             .expect("child span");
         assert_eq!(parent.span_context, parent_span_context);
-        assert_eq!(child.span_context.trace_id(), parent.span_context.trace_id());
+        assert_eq!(
+            child.span_context.trace_id(),
+            parent.span_context.trace_id()
+        );
         assert_eq!(child.parent_span_id, parent.span_context.span_id());
         assert_eq!(child.links.len(), 1);
         assert_eq!(child.links[0].span_context, linked_context);

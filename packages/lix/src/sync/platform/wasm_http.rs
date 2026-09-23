@@ -104,6 +104,7 @@ impl AuthorityHttp {
         request: ProtocolHttpRequest,
         body: Option<ProtocolByteStream>,
     ) -> Result<ProtocolHttpResponse, LixError> {
+        let trace_headers = crate::telemetry::current_trace_context_headers();
         use futures_util::{
             StreamExt,
             future::{AbortHandle, Abortable},
@@ -223,6 +224,7 @@ impl AuthorityHttp {
         headers
             .retain(|(name, _)| !HttpSyncTransport::<BrowserHttpClient>::is_reserved_header(name));
         headers.extend(request.headers);
+        headers.extend(trace_headers);
         let pairs = Array::new();
         for (name, value) in headers {
             let pair = Array::new();
@@ -265,10 +267,16 @@ impl AuthorityHttp {
             global.into()
         };
         let response = JsFuture::from(
-            call_http_transport(&fetch, &this, &request.url, &init, Some(HOSTED_RESPONSE_LIMIT))
-                .map_err(js_transport_error)?
-                .dyn_into::<Promise>()
-                .map_err(js_transport_error)?,
+            call_http_transport(
+                &fetch,
+                &this,
+                &request.url,
+                &init,
+                Some(HOSTED_RESPONSE_LIMIT),
+            )
+            .map_err(js_transport_error)?
+            .dyn_into::<Promise>()
+            .map_err(js_transport_error)?,
         )
         .await
         .map_err(js_transport_error)?;
@@ -412,10 +420,12 @@ async fn authority_stream(
     client: &BrowserHttpClient,
     request: ProtocolHttpRequest,
 ) -> Result<ProtocolHttpStream, LixError> {
+    let trace_headers = crate::telemetry::current_trace_context_headers();
     let mut headers =
         resolve_request_headers(&client.headers, client.header_provider.as_ref()).await?;
     headers.retain(|(name, _)| !HttpSyncTransport::<BrowserHttpClient>::is_reserved_header(name));
     headers.extend(request.headers);
+    headers.extend(trace_headers);
 
     let init = Object::new();
     Reflect::set(&init, &"method".into(), &request.method.into()).map_err(js_transport_error)?;
@@ -563,6 +573,9 @@ fn browser_response_headers(response: &JsValue) -> Result<Vec<(String, String)>,
 
 impl RawHttpClient for BrowserHttpClient {
     fn send(&self, request: RawHttpRequest) -> SyncTransportFuture<'_, RawHttpResponse> {
+        // Capture the current Lix span while this operation is polled. The JS
+        // fetch bridge runs on a different event loop and cannot read it later.
+        let trace_headers = crate::telemetry::current_trace_context_headers();
         Box::pin(async move {
             let mut headers =
                 resolve_request_headers(&self.headers, self.header_provider.as_ref()).await?;
@@ -570,6 +583,7 @@ impl RawHttpClient for BrowserHttpClient {
                 !HttpSyncTransport::<BrowserHttpClient>::is_reserved_header(name)
             });
             headers.extend(request.headers);
+            headers.extend(trace_headers);
             fetch(
                 &request.url,
                 request.method.as_str(),
@@ -930,9 +944,15 @@ fn call_http_transport(
     match max_bytes {
         Some(limit) => {
             Reflect::set(&response, &"mode".into(), &"buffered".into())?;
-            Reflect::set(&response, &"maxBytes".into(), &JsValue::from_f64(limit as f64))?;
+            Reflect::set(
+                &response,
+                &"maxBytes".into(),
+                &JsValue::from_f64(limit as f64),
+            )?;
         }
-        None => { Reflect::set(&response, &"mode".into(), &"streaming".into())?; }
+        None => {
+            Reflect::set(&response, &"mode".into(), &"streaming".into())?;
+        }
     }
     Reflect::set(&request, &"response".into(), &response)?;
     transport.call1(&JsValue::UNDEFINED, &request)
