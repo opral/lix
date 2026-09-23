@@ -76,14 +76,14 @@ where
         .iter()
         .any(|statement| statement_uses_execution_function(statement, "lix_root_commit_id"))
     {
-        resolve_root_commit_id(ctx, active_branch_commit_id.as_deref()).await?
+        resolve_root_commit_id(ctx, active_branch_commit_id.clone()).await?
     } else {
         None
     };
     let working_diff_checkpoint_commit_id = if statements.iter().any(|statement| {
         statement_uses_execution_function(statement, "lix_working_diff_checkpoint_commit_id")
     }) {
-        resolve_working_diff_checkpoint_commit_id(ctx, active_branch_commit_id.as_deref()).await?
+        resolve_working_diff_checkpoint_commit_id(ctx, active_branch_commit_id.clone()).await?
     } else {
         None
     };
@@ -126,13 +126,13 @@ where
         .await?
         .map(|head| head.commit_id.to_string());
     let root_commit_id = if statement_uses_execution_function(statement, "lix_root_commit_id") {
-        resolve_root_commit_id(read_ctx, active_branch_commit_id.as_deref()).await?
+        resolve_root_commit_id(read_ctx, active_branch_commit_id.clone()).await?
     } else {
         None
     };
     let working_diff_checkpoint_commit_id =
         if statement_uses_execution_function(statement, "lix_working_diff_checkpoint_commit_id") {
-            resolve_working_diff_checkpoint_commit_id(read_ctx, active_branch_commit_id.as_deref())
+            resolve_working_diff_checkpoint_commit_id(read_ctx, active_branch_commit_id.clone())
                 .await?
         } else {
             None
@@ -166,6 +166,12 @@ where
     Ok(pooled)
 }
 
+#[derive(Default)]
+pub(crate) struct ExecutionFunctionBindings {
+    pub(crate) working_diff_checkpoint_commit_id: Option<String>,
+    pub(crate) root_commit_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SqlWriteSessionOptions {
     pub(crate) omitted_insert_columns: BTreeSet<String>,
@@ -197,9 +203,56 @@ impl Deref for SqlWriteSession {
 pub(crate) async fn build_write_session_with_options(
     ctx: &mut dyn SqlWriteExecutionContext,
     options: SqlWriteSessionOptions,
-    provider_selection: &providers::ProviderSelection,
+    plan: &super::plan::LogicalWritePlan,
 ) -> Result<SqlWriteSession, LixError> {
     let session = ctx.datafusion_session();
+    let table_name = super::exec::datafusion::write_target_table_name(plan)?;
+    let provider_selection = super::exec::datafusion::write_provider_selection(
+        &session.state(),
+        plan,
+        &table_name,
+    );
+    let catalog = ctx.public_catalog()?;
+    let (source_statement, needs_read_table_functions) = match &plan.bound.input {
+        super::bind::write::BoundWriteInput::Query { query, .. } => {
+            let statement = DataFusionStatement::Statement(Box::new(
+                datafusion::sql::sqlparser::ast::Statement::Query(query.query.clone()),
+            ));
+            let needs_table_functions = match &provider_selection {
+                providers::ProviderSelection::All
+                | providers::ProviderSelection::AllWithHistory(_) => {
+                    super::exec::datafusion::write_source_uses_read_table_functions(plan)
+                }
+                _ => providers::selection_uses_read_table_functions(&catalog, &provider_selection),
+            };
+            (Some(statement), needs_table_functions)
+        }
+        _ => (None, false),
+    };
+    let read_active_branch_commit_id = ctx.sql_read_active_branch_commit_id();
+    let execution_bindings = if let Some(statement) = source_statement.as_ref()
+        && (needs_read_table_functions
+            || statement_uses_execution_function(statement, "lix_root_commit_id")
+            || statement_uses_execution_function(
+                statement,
+                "lix_working_diff_checkpoint_commit_id",
+            ))
+    {
+        ctx.register_sql_read_table_functions(
+            &session,
+            Arc::clone(&catalog),
+            &provider_selection,
+            statement.clone(),
+            read_active_branch_commit_id.clone(),
+            needs_read_table_functions,
+        )
+        .await?
+    } else {
+        ExecutionFunctionBindings::default()
+    };
+
+    // SqlWriteContext keeps a forged 'static pointer to the borrowed context.
+    // Finish all context access above before creating it.
     let write_ctx = SqlWriteContext::new(ctx)
         .with_explicit_insert_columns(options.explicit_insert_columns.clone());
     let write_targets = write_ctx.write_targets()?;
@@ -224,10 +277,18 @@ pub(crate) async fn build_write_session_with_options(
         &write_ctx.active_account_id(),
         Some(&active_branch_id),
         Some(&active_branch_commit_id.commit_id.to_string()),
-        None,
-        None,
+        execution_bindings.working_diff_checkpoint_commit_id.as_deref(),
+        execution_bindings.root_commit_id.as_deref(),
     );
-    providers::register_write(&session, write_ctx, branch_ref, options, provider_selection).await?;
+    providers::register_write(
+        &session,
+        write_ctx,
+        branch_ref,
+        options,
+        catalog,
+        &provider_selection,
+    )
+    .await?;
 
     Ok(SqlWriteSession {
         datafusion: session,
@@ -235,7 +296,10 @@ pub(crate) async fn build_write_session_with_options(
     })
 }
 
-fn statement_uses_execution_function(statement: &DataFusionStatement, function_name: &str) -> bool {
+pub(crate) fn statement_uses_execution_function(
+    statement: &DataFusionStatement,
+    function_name: &str,
+) -> bool {
     use datafusion::sql::sqlparser::ast::{Expr, TableFactor, Visit, Visitor};
     use std::ops::ControlFlow;
 
@@ -299,10 +363,24 @@ fn statement_uses_execution_function(statement: &DataFusionStatement, function_n
 
 async fn resolve_working_diff_checkpoint_commit_id<C>(
     context: &C,
-    active_branch_commit_id: Option<&str>,
+    active_branch_commit_id: Option<String>,
 ) -> Result<Option<String>, LixError>
 where
     C: SqlExecutionContext + ?Sized,
+{
+    let store = context.changelog_query_source().store;
+    let branch_id = context.active_branch_id().to_string();
+    resolve_working_diff_checkpoint_commit_id_from_store(store, branch_id, active_branch_commit_id)
+        .await
+}
+
+pub(crate) async fn resolve_working_diff_checkpoint_commit_id_from_store<S>(
+    store: S,
+    branch_id: String,
+    active_branch_commit_id: Option<String>,
+) -> Result<Option<String>, LixError>
+where
+    S: crate::storage_adapter::StorageAdapterRead,
 {
     let Some(active_branch_commit_id) = active_branch_commit_id else {
         return Ok(None);
@@ -312,27 +390,30 @@ where
         .map_err(|error| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                format!(
+        format!(
                     "active branch commit ID is invalid while resolving the working-diff checkpoint: {error}",
                 ),
             )
         })?;
-    checkpoint_commit_id_at_head(
-        context.changelog_query_source().store,
-        context.active_branch_id(),
-        head_commit_id,
-    )
-    .await
-    .map(|checkpoint_commit_id| Some(checkpoint_commit_id.to_string()))
+    checkpoint_commit_id_at_head(store, branch_id, head_commit_id)
+        .await
+        .map(|checkpoint_commit_id| Some(checkpoint_commit_id.to_string()))
 }
 
 async fn resolve_root_commit_id<C>(
     context: &C,
-    active_branch_commit_id: Option<&str>,
+    active_branch_commit_id: Option<String>,
 ) -> Result<Option<String>, LixError>
 where
     C: SqlExecutionContext + ?Sized,
 {
+    resolve_root_commit_id_from_graph(context.commit_graph(), active_branch_commit_id).await
+}
+
+pub(crate) async fn resolve_root_commit_id_from_graph(
+    mut commit_graph: Box<dyn crate::commit_graph::CommitGraphReader>,
+    active_branch_commit_id: Option<String>,
+) -> Result<Option<String>, LixError> {
     let Some(active_branch_commit_id) = active_branch_commit_id else {
         return Ok(None);
     };
@@ -344,7 +425,6 @@ where
                 format!("active branch commit ID is invalid while resolving the root: {error}"),
             )
         })?;
-    let mut commit_graph = context.commit_graph();
     loop {
         let node = commit_graph
             .load_node(&current)

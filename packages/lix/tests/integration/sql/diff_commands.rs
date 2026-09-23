@@ -1,6 +1,87 @@
 use lix::{LixError, Value};
+use serde_json::json;
 
-use super::select_rows;
+use super::{assert_rows_eq, select_rows};
+
+simulation_test!(insert_select_can_read_from_lix_diff, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    let before = engine
+        .load_branch_head_commit_id(sim.main_branch_id())
+        .await
+        .expect("branch head should load")
+        .expect("branch head should exist")
+        .to_string();
+    session
+        .execute(
+            "INSERT INTO lix_key_value(key, value) VALUES ('diff-source', 'copied')",
+            &[],
+        )
+        .await
+        .expect("source row should insert");
+    let after = engine
+        .load_branch_head_commit_id(sim.main_branch_id())
+        .await
+        .expect("branch head should load")
+        .expect("branch head should exist")
+        .to_string();
+
+    let result = session
+        .execute(
+            "INSERT INTO lix_key_value(key, value) \
+             SELECT 'diff-copy', 'copied' \
+             FROM lix_diff($1, $2, $3) \
+             WHERE key = 'diff-source' \
+             RETURNING key, value",
+            &[
+                Value::Text("lix_key_value".to_string()),
+                Value::Text(before),
+                Value::Text(after),
+            ],
+        )
+        .await
+        .expect("INSERT SELECT should register and execute lix_diff");
+
+    assert_rows_eq(
+        result,
+        vec![vec![
+            Value::Text("diff-copy".to_string()),
+            Value::Jsonb(serde_json::json!("copied").into()),
+        ]],
+    );
+});
+
+simulation_test!(insert_select_can_read_default_range_from_lix_diff, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    session
+        .execute(
+            "INSERT INTO lix_key_value(key, value) VALUES ('default-diff-source', 'copied')",
+            &[],
+        )
+        .await
+        .expect("source row should insert");
+
+    let result = session
+        .execute(
+            "INSERT INTO lix_key_value(key, value) \
+             SELECT 'default-diff-copy', to_value \
+             FROM lix_diff('lix_key_value') \
+             WHERE key = 'default-diff-source' \
+             RETURNING key, value",
+            &[],
+        )
+        .await
+        .expect("INSERT SELECT should bind lix_diff's default range to the read snapshot");
+
+    assert_rows_eq(
+        result,
+        vec![vec![
+            Value::Text("default-diff-copy".to_string()),
+            Value::Jsonb(serde_json::json!("copied").into()),
+        ]],
+    );
+});
 
 simulation_test!(
     diff_commands_apply_revert_and_checkpoint_relation_selections,

@@ -40,6 +40,14 @@ use crate::sql2::catalog::{PublicCatalog, PublicSurfaceContract, PublicSurfaceKi
 use crate::sql2::session::SqlWriteSessionOptions;
 use crate::sql2::{SqlExecutionContext, SqlWriteContext};
 
+pub(crate) const READ_TABLE_FUNCTION_NAMES: &[&str] = &[
+    "lix_diff",
+    "lix_as_of",
+    "lix_log",
+    "lix_history",
+    "lix_commit_ancestry",
+];
+
 pub(crate) use directory::execute_exact_lix_directory_root_listing;
 pub(crate) use file::{
     ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
@@ -72,36 +80,17 @@ where
         Arc::clone(PublicCatalog::fixed_system_shared())
     };
     crate::sql2::udfs::register_row_ref_function(session, Arc::clone(&catalog));
-    if catalog
-        .surface("lix_diff")
-        .is_some_and(|surface| selection.includes(surface))
-    {
-        diff::register_diff_function(
-            session,
-            ctx.changelog_query_source(),
-            Arc::clone(&catalog),
-            ctx.read_interest_registry(),
-            ctx.blob_reader(),
-            ctx.filesystem_path_index().historical_cache(),
-        );
-    }
-    if catalog
-        .surface("lix_as_of")
-        .is_some_and(|surface| selection.includes(surface))
-    {
-        state_at::register_state_at_function(
-            session,
-            ctx.changelog_query_source(),
-            Arc::clone(&catalog),
-            ctx.active_branch_id().to_string(),
-            ctx.blob_reader(),
-        );
-    }
+    register_read_table_functions(
+        session,
+        ctx,
+        active_branch_commit_id.clone(),
+        Arc::clone(&catalog),
+        selection,
+    )?;
     register_read_from_catalog(
         session,
         ctx,
         branch_ref,
-        active_branch_commit_id,
         &catalog,
         ReadProviderScope::All,
         selection,
@@ -212,6 +201,88 @@ impl ProviderSelection {
             }
         }
     }
+}
+
+pub(crate) fn selection_uses_read_table_functions(
+    catalog: &PublicCatalog,
+    selection: &ProviderSelection,
+) -> bool {
+    READ_TABLE_FUNCTION_NAMES.iter().any(|name| {
+        catalog
+            .surface(name)
+            .is_some_and(|surface| selection.includes(surface))
+    })
+}
+
+/// Install read-only table functions shared by ordinary reads, transaction
+/// reads, and INSERT query sources. Relation providers are registered
+/// separately so write sessions can keep their transaction-overlay sources.
+pub(crate) fn register_read_table_functions<C>(
+    session: &SessionContext,
+    ctx: &C,
+    active_branch_commit_id: Option<String>,
+    catalog: Arc<PublicCatalog>,
+    selection: &ProviderSelection,
+) -> Result<(), LixError>
+where
+    C: SqlExecutionContext + ?Sized,
+{
+    if catalog
+        .surface("lix_diff")
+        .is_some_and(|surface| selection.includes(surface))
+    {
+        diff::register_diff_function(
+            session,
+            ctx.changelog_query_source(),
+            Arc::clone(&catalog),
+            ctx.read_interest_registry(),
+            ctx.blob_reader(),
+            ctx.filesystem_path_index().historical_cache(),
+        );
+    }
+    if catalog
+        .surface("lix_as_of")
+        .is_some_and(|surface| selection.includes(surface))
+    {
+        state_at::register_state_at_function(
+            session,
+            ctx.changelog_query_source(),
+            Arc::clone(&catalog),
+            ctx.active_branch_id().to_string(),
+            ctx.blob_reader(),
+        );
+    }
+    if ["lix_log", "lix_history"].iter().any(|name| {
+        catalog
+            .surface(name)
+            .is_some_and(|surface| selection.includes(surface))
+    }) {
+        mainline::register_functions(
+            session,
+            ctx.changelog_query_source(),
+            Arc::clone(&catalog),
+            ctx.blob_reader(),
+        );
+    }
+    if let Some(surface) = catalog
+        .surface("lix_commit_ancestry")
+        .filter(|surface| selection.includes(surface))
+    {
+        let active_branch_commit_id = active_branch_commit_id.ok_or_else(|| {
+            LixError::branch_not_found(
+                ctx.active_branch_id(),
+                "register lix_commit_ancestry",
+                "active branch",
+            )
+        })?;
+        commit_ancestry::register_commit_ancestry_function(
+            session,
+            &surface.name,
+            active_branch_commit_id,
+            ctx.commit_graph(),
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn read_provider_selection(
@@ -501,7 +572,6 @@ async fn register_read_from_catalog<C>(
     session: &SessionContext,
     ctx: &C,
     branch_ref: Arc<dyn BranchRefReader>,
-    active_branch_commit_id: Option<String>,
     catalog: &Arc<PublicCatalog>,
     scope: ReadProviderScope,
     selection: &ProviderSelection,
@@ -542,21 +612,7 @@ where
                 )
                 .await?;
             }
-            PublicSurfaceKind::CommitAncestryFunction => {
-                let active_branch_commit_id = active_branch_commit_id.clone().ok_or_else(|| {
-                    LixError::branch_not_found(
-                        ctx.active_branch_id(),
-                        "register lix_commit_ancestry",
-                        "active branch",
-                    )
-                })?;
-                commit_ancestry::register_commit_ancestry_function(
-                    session,
-                    &surface.name,
-                    active_branch_commit_id,
-                    ctx.commit_graph(),
-                );
-            }
+            PublicSurfaceKind::CommitAncestryFunction => {}
             PublicSurfaceKind::File => {
                 file::register_lix_file_active_provider(
                     session,
@@ -605,19 +661,6 @@ where
     )
     .await?;
 
-    if ["lix_log", "lix_history"].iter().any(|name| {
-        catalog
-            .surface(name)
-            .is_some_and(|surface| scope.includes(surface) && selection.includes(surface))
-    }) {
-        mainline::register_functions(
-            session,
-            ctx.changelog_query_source(),
-            Arc::clone(catalog),
-            ctx.blob_reader(),
-        );
-    }
-
     Ok(())
 }
 
@@ -626,9 +669,9 @@ pub(crate) async fn register_write(
     write_ctx: SqlWriteContext,
     branch_ref: Arc<dyn BranchRefReader>,
     options: SqlWriteSessionOptions,
+    catalog: Arc<PublicCatalog>,
     selection: &ProviderSelection,
 ) -> Result<(), LixError> {
-    let catalog = write_ctx.public_catalog()?;
     crate::sql2::udfs::register_row_ref_function(session, Arc::clone(&catalog));
     register_write_from_catalog(session, write_ctx, branch_ref, options, &catalog, selection)
         .await?;
@@ -653,36 +696,17 @@ where
     // committed read capability and writable providers from the overlay.
     let catalog = write_ctx.public_catalog()?;
     crate::sql2::udfs::register_row_ref_function(session, Arc::clone(&catalog));
-    if catalog
-        .surface("lix_diff")
-        .is_some_and(|surface| selection.includes(surface))
-    {
-        diff::register_diff_function(
-            session,
-            read_ctx.changelog_query_source(),
-            Arc::clone(&catalog),
-            read_ctx.read_interest_registry(),
-            read_ctx.blob_reader(),
-            read_ctx.filesystem_path_index().historical_cache(),
-        );
-    }
-    if catalog
-        .surface("lix_as_of")
-        .is_some_and(|surface| selection.includes(surface))
-    {
-        state_at::register_state_at_function(
-            session,
-            read_ctx.changelog_query_source(),
-            Arc::clone(&catalog),
-            read_ctx.active_branch_id().to_string(),
-            read_ctx.blob_reader(),
-        );
-    }
+    register_read_table_functions(
+        session,
+        read_ctx,
+        active_branch_commit_id.clone(),
+        Arc::clone(&catalog),
+        selection,
+    )?;
     register_read_from_catalog(
         session,
         read_ctx,
         read_branch_ref,
-        active_branch_commit_id,
         &catalog,
         ReadProviderScope::ReadOnly,
         selection,

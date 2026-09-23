@@ -166,6 +166,33 @@ pub(crate) trait SqlWriteExecutionContext: Send {
     fn datafusion_session(&self) -> datafusion::prelude::SessionContext {
         super::session::new_sql_session_context()
     }
+    /// Commit head for the retained read snapshot used by SQL query sources.
+    fn sql_read_active_branch_commit_id(&self) -> Option<String> {
+        None
+    }
+    /// Register read-only Lix table functions needed by an INSERT query
+    /// source. A real transaction overrides this to bind the functions to its
+    /// retained read snapshot; write contexts without that capability fail
+    /// explicitly when the source requests one.
+    async fn register_sql_read_table_functions(
+        &mut self,
+        session: &datafusion::prelude::SessionContext,
+        catalog: Arc<PublicCatalog>,
+        selection: &super::providers::ProviderSelection,
+        _statement: datafusion::sql::parser::Statement,
+        _active_branch_commit_id: Option<String>,
+        needs_read_table_functions: bool,
+    ) -> Result<super::session::ExecutionFunctionBindings, LixError> {
+        if needs_read_table_functions {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "read-only Lix table functions require a transaction read snapshot",
+            ));
+        }
+        let _ = session;
+        let _ = (catalog, selection);
+        Ok(super::session::ExecutionFunctionBindings::default())
+    }
     fn active_account_id(&self) -> &str {
         crate::ANONYMOUS_ACCOUNT_ID
     }

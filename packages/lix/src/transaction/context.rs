@@ -9557,24 +9557,11 @@ where
         params: Vec<Value>,
     ) -> Result<(SqlQueryResult, DataFusionStatement), LixError> {
         let read_store = self.opening_read();
-        let active_branch_id = self.active_branch_id.clone();
         let capture = self.hot_state.capture_foreground_read_interests();
         let hot_state = capture.as_ref().map_or_else(
             || Arc::clone(&self.hot_state),
             |(hot, _)| Arc::new(hot.clone()),
         );
-        let binary_cas = Arc::clone(&self.binary_cas);
-        let branch_ctx = Arc::clone(&self.branch_ctx);
-        let visible_schemas = self.sql_visible_schemas();
-        let functions = self.functions.clone();
-        let staged = self.staged_writes.staging_overlay()?;
-        let staged_writes = Arc::clone(&self.staged_writes);
-        let filesystem_path_index_cache = Arc::clone(&self.filesystem_path_index_cache);
-        let filesystem_path_index_epoch = Arc::clone(&self.filesystem_path_index_epoch);
-        let branch_head_control_cache = Arc::clone(&self.branch_head_control_cache);
-        let plugin_host = self.plugin_host.clone();
-        let sql_planning_cache = Arc::clone(&self.sql_planning_cache);
-        let sql_catalog_fingerprint = self.sql_catalog_fingerprint().clone();
 
         if let Some((_, capture)) = &capture {
             crate::session::seed_foreground_filesystem_interest(
@@ -9585,24 +9572,7 @@ where
             )?;
         }
 
-        let read_ctx = TransactionSqlReadExecutionContext {
-            active_branch_id,
-            active_account_id: self.active_account_id.clone(),
-            read_store,
-            hot_state,
-            binary_cas,
-            branch_ctx,
-            visible_schemas,
-            functions,
-            staged,
-            staged_writes,
-            filesystem_path_index_cache,
-            filesystem_path_index_epoch,
-            branch_head_control_cache,
-            plugin_host,
-            sql_planning_cache,
-            sql_catalog_fingerprint,
-        };
+        let read_ctx = self.sql_read_execution_context(read_store, hot_state)?;
         let result = crate::sql2::execute_transaction_read_statement_from_parsed(
             &read_ctx, self, &sql, statement, &params,
         )
@@ -9623,6 +9593,34 @@ where
 
     fn sql_visible_schemas(&self) -> Vec<JsonValue> {
         self.sql_schema_snapshot.schema_jsons()
+    }
+
+    fn sql_read_execution_context(
+        &self,
+        read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>,
+        hot_state: Arc<HotStateContext>,
+    ) -> Result<
+        TransactionSqlReadExecutionContext<StorageImpl::Read<'static>>,
+        LixError,
+    > {
+        Ok(TransactionSqlReadExecutionContext {
+            active_branch_id: self.active_branch_id.clone(),
+            active_account_id: self.active_account_id.clone(),
+            read_store,
+            hot_state,
+            binary_cas: Arc::clone(&self.binary_cas),
+            branch_ctx: Arc::clone(&self.branch_ctx),
+            visible_schemas: self.sql_visible_schemas(),
+            functions: self.functions.clone(),
+            staged: self.staged_writes.staging_overlay()?,
+            staged_writes: Arc::clone(&self.staged_writes),
+            filesystem_path_index_cache: Arc::clone(&self.filesystem_path_index_cache),
+            filesystem_path_index_epoch: Arc::clone(&self.filesystem_path_index_epoch),
+            branch_head_control_cache: Arc::clone(&self.branch_head_control_cache),
+            plugin_host: self.plugin_host.clone(),
+            sql_planning_cache: Arc::clone(&self.sql_planning_cache),
+            sql_catalog_fingerprint: self.sql_catalog_fingerprint().clone(),
+        })
     }
 
     /// Returns the immutable Schema v1 plan used by plugin merge admission.
@@ -13480,6 +13478,71 @@ where
 
     fn datafusion_session(&self) -> datafusion::prelude::SessionContext {
         self.sql_planning_cache.datafusion_session()
+    }
+
+    fn sql_read_active_branch_commit_id(&self) -> Option<String> {
+        self.opening_active_branch_head.map(|commit_id| commit_id.to_string())
+    }
+
+    async fn register_sql_read_table_functions(
+        &mut self,
+        session: &datafusion::prelude::SessionContext,
+        catalog: Arc<crate::sql2::PublicCatalog>,
+        selection: &crate::sql2::ProviderSelection,
+        statement: datafusion::sql::parser::Statement,
+        active_branch_commit_id: Option<String>,
+        needs_read_table_functions: bool,
+    ) -> Result<crate::sql2::ExecutionFunctionBindings, LixError> {
+        let read_store = self.opening_read();
+        if needs_read_table_functions {
+            let read_ctx =
+                self.sql_read_execution_context(read_store.clone(), Arc::clone(&self.hot_state))?;
+            crate::sql2::register_read_table_functions(
+                session,
+                &read_ctx,
+                active_branch_commit_id.clone(),
+                catalog,
+                selection,
+            )?;
+        }
+
+        let needs_root = crate::sql2::statement_uses_execution_function(
+            &statement,
+            "lix_root_commit_id",
+        );
+        let needs_working_checkpoint = crate::sql2::statement_uses_execution_function(
+            &statement,
+            "lix_working_diff_checkpoint_commit_id",
+        );
+        let active_branch_id = self.active_branch_id.clone();
+        let root_graph: Option<Box<dyn crate::commit_graph::CommitGraphReader>> = if needs_root {
+            Some(Box::new(
+                CommitGraphContext::new().reader(read_store.clone()),
+            ))
+        } else {
+            None
+        };
+        let working_diff_store = needs_working_checkpoint.then_some(read_store);
+        let root_commit_id = if let Some(root_graph) = root_graph {
+            crate::sql2::resolve_root_commit_id_from_graph(root_graph, active_branch_commit_id.clone())
+                .await?
+        } else {
+            None
+        };
+        let working_diff_checkpoint_commit_id = if let Some(store) = working_diff_store {
+            crate::sql2::resolve_working_diff_checkpoint_commit_id_from_store(
+                store,
+                active_branch_id,
+                active_branch_commit_id.clone(),
+            )
+            .await?
+        } else {
+            None
+        };
+        Ok(crate::sql2::ExecutionFunctionBindings {
+            working_diff_checkpoint_commit_id,
+            root_commit_id,
+        })
     }
 
     fn active_account_id(&self) -> &str {

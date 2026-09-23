@@ -42,7 +42,7 @@ use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use datafusion::sql::sqlparser::ast::{
     Expr as SqlExpr, FunctionArg, FunctionArgExpr, Ident, ObjectName, ObjectNamePart, TableFactor,
-    Value as SqlValue, Visit, VisitMut, Visitor, VisitorMut,
+    Statement as SqlStatement, Value as SqlValue, Visit, VisitMut, Visitor, VisitorMut,
 };
 #[cfg(any(feature = "storage-benches", test))]
 use futures_util::TryStreamExt;
@@ -1430,10 +1430,7 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
 ) -> Result<SqlWriteResult, LixError> {
     validate_bound_write_input(plan, params)?;
     let table_name = write_target_table_name(plan)?;
-    let provider_selection = write_provider_selection(plan, &table_name);
-    let session =
-        build_write_session_with_options(ctx, write_session_options(plan), &provider_selection)
-            .await?;
+    let session = build_write_session_with_options(ctx, write_session_options(plan), plan).await?;
     let table = session
         .table_provider(&table_name)
         .await
@@ -1655,9 +1652,7 @@ pub(super) async fn row_insert_query_stream(
         ));
     };
     let table_name = schema_key.clone();
-    let selection = write_provider_selection(plan, &table_name);
-    let session =
-        build_write_session_with_options(ctx, write_session_options(plan), &selection).await?;
+    let session = build_write_session_with_options(ctx, write_session_options(plan), plan).await?;
     let table = session
         .table_provider(&table_name)
         .await
@@ -2455,21 +2450,88 @@ fn write_session_options(plan: &LogicalWritePlan) -> SqlWriteSessionOptions {
     }
 }
 
-fn write_provider_selection(plan: &LogicalWritePlan, target_table_name: &str) -> ProviderSelection {
-    // Bound VALUES, UPDATE, and DELETE expressions can reference only the
-    // target surface. Query-backed inserts may read any visible surface, so
-    // keep their existing catalog-wide registration until source selection is
-    // derived from the bound query itself.
-    match (&plan.bound.op, &plan.bound.input) {
-        (BoundWriteOp::Insert, BoundWriteInput::Values(_))
-        | (BoundWriteOp::Update | BoundWriteOp::Delete, BoundWriteInput::None) => {
+pub(crate) fn write_provider_selection(
+    state: &SessionState,
+    plan: &LogicalWritePlan,
+    target_table_name: &str,
+) -> ProviderSelection {
+    let source = match (&plan.bound.op, &plan.bound.input) {
+        (BoundWriteOp::Insert, BoundWriteInput::Query { query, .. }) => {
+            let statement = DataFusionStatement::Statement(Box::new(SqlStatement::Query(
+                query.query.clone(),
+            )));
+            crate::sql2::providers::read_provider_selection(state, &[statement])
+        }
+        _ => ProviderSelection::Only {
+            names: BTreeSet::new(),
+            history_relations: BTreeSet::new(),
+        },
+    };
+
+    match source {
+        ProviderSelection::Only {
+            mut names,
+            history_relations,
+        } => {
+            names.insert(target_table_name.to_string());
             ProviderSelection::Only {
-                names: BTreeSet::from([target_table_name.to_string()]),
-                history_relations: BTreeSet::new(),
+                names,
+                history_relations,
             }
         }
-        _ => ProviderSelection::All,
+        ProviderSelection::OnlyWithVisibleSchemas {
+            mut names,
+            history_relations,
+        } => {
+            names.insert(target_table_name.to_string());
+            ProviderSelection::OnlyWithVisibleSchemas {
+                names,
+                history_relations,
+            }
+        }
+        ProviderSelection::All => ProviderSelection::All,
+        ProviderSelection::AllWithHistory(history_relations) => {
+            ProviderSelection::AllWithHistory(history_relations)
+        }
     }
+}
+
+pub(crate) fn write_source_uses_read_table_functions(plan: &LogicalWritePlan) -> bool {
+    let BoundWriteInput::Query { query, .. } = &plan.bound.input else {
+        return false;
+    };
+
+    struct ReadTableFunctionVisitor;
+
+    impl Visitor for ReadTableFunctionVisitor {
+        type Break = ();
+
+        fn pre_visit_table_factor(&mut self, table_factor: &TableFactor) -> ControlFlow<Self::Break> {
+            let TableFactor::Table {
+                name,
+                args: Some(_),
+                ..
+            } = table_factor
+            else {
+                return ControlFlow::Continue(());
+            };
+            if crate::sql2::providers::READ_TABLE_FUNCTION_NAMES
+                .iter()
+                .any(|function| {
+                    crate::sql2::parse::object_name_is_public_function(name, function)
+                })
+            {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+    }
+
+    matches!(
+        query.query.visit(&mut ReadTableFunctionVisitor),
+        ControlFlow::Break(())
+    )
 }
 
 /// Bound mutations bypass the SQL planner, so apply the same coercion and
@@ -3405,7 +3467,7 @@ fn bound_literal_metadata(literal: &BoundLiteral) -> Option<FieldMetadata> {
     }
 }
 
-fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> {
+pub(crate) fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> {
     match &plan.bound.target {
         BoundWriteTarget::Row(RowWriteSurface::Base { schema_key })
             if bound_predicate_contains_like(&plan.bound.predicate)
@@ -3424,7 +3486,9 @@ fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> 
 }
 
 fn bound_write_requires_datafusion(plan: &LogicalWritePlan) -> bool {
-    (matches!(plan.bound.op, BoundWriteOp::Update)
+    (matches!(plan.bound.op, BoundWriteOp::Insert)
+        && matches!(plan.bound.input, BoundWriteInput::Query { .. }))
+        || (matches!(plan.bound.op, BoundWriteOp::Update)
         && (plan
             .bound
             .assignments
@@ -5145,7 +5209,12 @@ mod tests {
                 panic!("target-only SQL should produce a write plan: {sql}");
             };
             let table_name = write_target_table_name(&plan.plan).expect("target should resolve");
-            let selection = write_provider_selection(&plan.plan, &table_name);
+            let planning_session = ctx.datafusion_session();
+            let selection = write_provider_selection(
+                &planning_session.state(),
+                &plan.plan,
+                &table_name,
+            );
 
             assert_eq!(
                 selection,
@@ -5159,7 +5228,7 @@ mod tests {
             let session = build_write_session_with_options(
                 &mut ctx,
                 write_session_options(&plan.plan),
-                &selection,
+                &plan.plan,
             )
             .await
             .unwrap_or_else(|error| {
@@ -5178,7 +5247,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_backed_insert_keeps_catalog_wide_provider_registration() {
+    async fn query_backed_insert_registers_only_resolved_source_and_target() {
         let (mut ctx, _, _) = counting_write_context(Vec::new());
         let insert_select = create_write_logical_plan(
             &mut ctx,
@@ -5191,14 +5260,25 @@ mod tests {
         };
         let table_name =
             write_target_table_name(&insert_select.plan).expect("target should resolve");
-        let selection = write_provider_selection(&insert_select.plan, &table_name);
+        let planning_session = ctx.datafusion_session();
+        let selection = write_provider_selection(
+            &planning_session.state(),
+            &insert_select.plan,
+            &table_name,
+        );
 
-        assert_eq!(selection, crate::sql2::providers::ProviderSelection::All,);
+        assert_eq!(
+            selection,
+            crate::sql2::providers::ProviderSelection::Only {
+                names: BTreeSet::from(["lix_file".to_string()]),
+                history_relations: BTreeSet::new(),
+            },
+        );
 
         let session = build_write_session_with_options(
             &mut ctx,
             write_session_options(&insert_select.plan),
-            &selection,
+            &insert_select.plan,
         )
         .await
         .expect("query-backed insert session should build");
@@ -5210,7 +5290,63 @@ mod tests {
         let mut table_names = public.table_names();
         table_names.sort();
 
-        assert_eq!(table_names, vec!["lix_branch", "lix_directory", "lix_file"]);
+        assert_eq!(table_names, vec!["lix_file"]);
+    }
+
+    #[tokio::test]
+    async fn insert_source_provider_selection_uses_datafusion_reference_resolution() {
+        for (sql, expected) in [
+            (
+                "INSERT INTO lix_file(id, path) \
+                 WITH source AS (SELECT id, path FROM lix_file) \
+                 SELECT source.id, source.path FROM source AS source",
+                crate::sql2::providers::ProviderSelection::Only {
+                    names: BTreeSet::from(["lix_file".to_string()]),
+                    history_relations: BTreeSet::new(),
+                },
+            ),
+            (
+                "INSERT INTO lix_file(id, path) \
+                 WITH source AS (SELECT id, to_path FROM lix_diff('lix_file')) \
+                 SELECT source.id, source.to_path FROM source AS source",
+                crate::sql2::providers::ProviderSelection::Only {
+                    names: BTreeSet::from(["lix_diff".to_string(), "lix_file".to_string()]),
+                    history_relations: BTreeSet::new(),
+                },
+            ),
+            (
+                "INSERT INTO lix_file(id, path) \
+                 SELECT id, to_path FROM lix_diff('lix_file')",
+                crate::sql2::providers::ProviderSelection::Only {
+                    names: BTreeSet::from([
+                        "lix_diff".to_string(),
+                        "lix_file".to_string(),
+                    ]),
+                    history_relations: BTreeSet::new(),
+                },
+            ),
+            (
+                "INSERT INTO lix_file(id, path) \
+                 SELECT table_name, table_type FROM information_schema.tables",
+                crate::sql2::providers::ProviderSelection::All,
+            ),
+        ] {
+            let (mut ctx, _, _) = counting_write_context(Vec::new());
+            let logical = create_write_logical_plan(&mut ctx, sql)
+                .await
+                .unwrap_or_else(|error| panic!("insert query should bind: {sql}: {error}"));
+            let crate::sql2::exec::SqlLogicalPlan::Write(plan) = logical else {
+                panic!("INSERT should produce a write plan: {sql}");
+            };
+            let table_name = write_target_table_name(&plan.plan).expect("target should resolve");
+            let planning_session = ctx.datafusion_session();
+            let actual = write_provider_selection(
+                &planning_session.state(),
+                &plan.plan,
+                &table_name,
+            );
+            assert_eq!(actual, expected, "{sql}");
+        }
     }
 
     #[tokio::test]
