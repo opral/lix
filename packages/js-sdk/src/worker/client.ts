@@ -244,12 +244,16 @@ async function openLixWorkerBindingInner(
 	);
 }
 
-function wrapTelemetryParentBinding(
+/** @internal Preserve operation context when async observation setup resumes. */
+export function wrapTelemetryParentBinding(
 	binding: LixBinding,
 	parentContext: NonNullable<LixTelemetryOptions["parentContext"]>,
 ): LixBinding {
-	const prepareOperation = () =>
-		binding.setTelemetryParent(readTelemetryParent(parentContext));
+	const prepareOperation = () => {
+		const parent = readTelemetryParent(parentContext);
+		binding.setTelemetryParent(parent);
+		return parent;
+	};
 	return new Proxy(binding, {
 		get(target, property, receiver) {
 			if (property === "setTelemetryParent") {
@@ -271,10 +275,11 @@ function wrapTelemetryParentBinding(
 					sql: Parameters<LixBinding["observe"]>[0],
 					params: Parameters<LixBinding["observe"]>[1],
 				) => {
-					prepareOperation();
+					const initialParent = prepareOperation();
 					return wrapTelemetryParentObserve(
 						await target.observe(sql, params),
 						parentContext,
+						initialParent,
 					);
 				};
 			}
@@ -301,11 +306,17 @@ function wrapTelemetryParentBinding(
 function wrapTelemetryParentObserve(
 	events: ObserveEventsBinding,
 	parentContext: NonNullable<LixTelemetryOptions["parentContext"]>,
+	initialParent: ReturnType<typeof readTelemetryParent>,
 ): ObserveEventsBinding {
+	let firstNext = true;
 	return {
 		setTelemetryParent: (parent) => events.setTelemetryParent(parent),
 		next: () => {
-			events.setTelemetryParent(readTelemetryParent(parentContext));
+			const activeParent = readTelemetryParent(parentContext);
+			events.setTelemetryParent(
+				activeParent ?? (firstNext ? initialParent : undefined),
+			);
+			firstNext = false;
 			return events.next();
 		},
 		close: () => events.close(),
