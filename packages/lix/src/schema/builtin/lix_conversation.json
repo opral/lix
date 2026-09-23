@@ -13,7 +13,13 @@
       "name": "target",
       "type": "text",
       "nullable": true,
-      "description": "Canonical row reference to an existing target in the same branch and compatible durability scope. Null for a standalone conversation."
+      "description": "Canonical row reference to an existing target in the same branch and compatible durability scope. Null for a standalone or detached conversation."
+    },
+    {
+      "name": "detached_target",
+      "type": "text",
+      "nullable": true,
+      "description": "Canonical row reference to the former target when the target row was deleted."
     },
     {
       "name": "title",
@@ -28,7 +34,8 @@
   "row_refs": [
     {
       "column": "target",
-      "on_delete": "cascade"
+      "on_delete": "set_null",
+      "detached_column": "detached_target"
     }
   ]
 }

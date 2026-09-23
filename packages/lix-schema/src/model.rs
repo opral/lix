@@ -124,7 +124,7 @@ pub struct RowRefConstraint {
 }
 
 /// Action executed when a referenced row is deleted.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeleteAction {
     #[default]

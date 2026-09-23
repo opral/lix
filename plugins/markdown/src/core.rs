@@ -271,6 +271,7 @@ fn reconcile_markdown_tree(
     minimum_ordinal: u32,
 ) -> Result<NodeTree, PluginError> {
     let generated_ids = collect_generated_ids(&after.root);
+    let old_ids = before_root.map(collect_generated_ids).unwrap_or_default();
     let mut replacements = BTreeMap::new();
     if let Some(before_root) = before_root {
         let old_hashes = SubtreeHashes::from_tree(before_root);
@@ -312,6 +313,7 @@ fn reconcile_markdown_tree(
     allocate_generated_ids(
         &mut after.root,
         &generated_ids,
+        &old_ids,
         &mut allocator,
         &mut replacements,
     );
@@ -364,6 +366,7 @@ fn collect_generated_ids(root: &NodeTree) -> BTreeSet<Uuid> {
 fn allocate_generated_ids(
     root: &mut NodeTree,
     generated: &BTreeSet<Uuid>,
+    old_ids: &BTreeSet<Uuid>,
     allocator: &mut IdAllocator,
     replacements: &mut BTreeMap<Uuid, Uuid>,
 ) {
@@ -449,6 +452,7 @@ fn allocate_generated_ids(
     }
 
     let mut reserved = replacements.values().cloned().collect::<BTreeSet<_>>();
+    reserved.extend(old_ids.iter().copied());
     collect_reserved_ids(root, generated, &mut reserved);
     for generated_id in generated {
         if replacements.contains_key(generated_id) {
@@ -518,63 +522,11 @@ fn reconcile_children(
     if old.node.kind == NodeKind::Table && new.node.kind == NodeKind::Table {
         match_table_columns(old, new, &mut old_for_new, &mut old_used, used_ids);
     }
-    for index in 0..new.children.len().min(old.children.len()) {
-        if old_for_new[index].is_none()
-            && !old_used[index]
-            && new.children[index].subtree_signature() == old.children[index].subtree_signature()
-        {
-            old_for_new[index] = Some(index);
-            old_used[index] = true;
-            used_ids.insert(old.children[index].node.id);
-        }
-    }
-    let mut exact = HashMap::<String, Vec<usize>>::new();
-    for (index, child) in old.children.iter().enumerate().rev() {
-        if old_used[index] {
-            continue;
-        }
-        exact
-            .entry(child.subtree_signature())
-            .or_default()
-            .push(index);
-    }
-    for (new_index, child) in new.children.iter().enumerate() {
-        if old_for_new[new_index].is_some() {
-            continue;
-        }
-        let signature = child.subtree_signature();
-        let Some(indices) = exact.get_mut(&signature) else {
-            continue;
-        };
-        while let Some(old_index) = indices.pop() {
-            if !old_used[old_index] {
-                old_for_new[new_index] = Some(old_index);
-                old_used[old_index] = true;
-                used_ids.insert(old.children[old_index].node.id);
-                break;
-            }
-        }
-    }
-
-    // Index unmatched siblings once. Scanning all old nodes for every new
-    // incompatible block makes insertions and replacements quadratic.
-    let compatible_kind = |kind| match kind {
-        NodeKind::Heading => NodeKind::Paragraph,
-        other => other,
-    };
-    let mut available = BTreeMap::<NodeKind, BTreeSet<usize>>::new();
-    for (index, child) in old.children.iter().enumerate() {
-        if !old_used[index] {
-            available
-                .entry(compatible_kind(child.node.kind))
-                .or_default()
-                .insert(index);
-        }
-    }
-    let mut search_start = 0;
-    for (new_index, child) in new.children.iter().enumerate() {
-        if old_for_new[new_index].is_some()
-            || has_available_unique_global_match(
+    let global_moves = new
+        .children
+        .iter()
+        .map(|child| {
+            has_available_unique_global_match(
                 child,
                 global_subtrees,
                 new_signature_counts,
@@ -582,24 +534,19 @@ fn reconcile_children(
                 new_hashes,
                 used_ids,
             )
-        {
-            continue;
-        }
-        let Some(indices) = available.get_mut(&compatible_kind(child.node.kind)) else {
-            continue;
-        };
-        let matching = indices
-            .range(search_start..)
-            .next()
-            .or_else(|| indices.first())
-            .copied();
-        if let Some(old_index) = matching {
-            indices.remove(&old_index);
-            old_for_new[new_index] = Some(old_index);
-            old_used[old_index] = true;
-            used_ids.insert(old.children[old_index].node.id);
-            search_start = old_index.saturating_add(1);
-        }
+        })
+        .collect::<Vec<_>>();
+    align_sibling_ids(
+        old,
+        new,
+        old_hashes,
+        new_hashes,
+        &global_moves,
+        &mut old_for_new,
+        &mut old_used,
+    );
+    for old_index in old_for_new.iter().flatten() {
+        used_ids.insert(old.children[*old_index].node.id);
     }
 
     let parent_id = new.node.id;
@@ -631,6 +578,298 @@ fn reconcile_children(
     } else {
         assign_sibling_order_keys(&mut new.children, &old_for_new, &old.children)
     }
+}
+
+fn align_sibling_ids(
+    old: &NodeTree,
+    new: &NodeTree,
+    old_hashes: &SubtreeHashes,
+    new_hashes: &SubtreeHashes,
+    global_moves: &[bool],
+    old_for_new: &mut [Option<usize>],
+    old_used: &mut [bool],
+) {
+    let old_signatures = old
+        .children
+        .iter()
+        .map(NodeTree::subtree_signature)
+        .collect::<Vec<_>>();
+    let new_signatures = new
+        .children
+        .iter()
+        .map(NodeTree::subtree_signature)
+        .collect::<Vec<_>>();
+    let old_fingerprints = old
+        .children
+        .iter()
+        .map(|child| old_hashes.get(child))
+        .collect::<Vec<_>>();
+    let new_fingerprints = new
+        .children
+        .iter()
+        .map(|child| new_hashes.get(child))
+        .collect::<Vec<_>>();
+    let anchors = unique_non_crossing_inline_anchors(&old_signatures, &new_signatures)
+        .into_iter()
+        .filter(|(old_index, new_index)| !old_used[*old_index] && old_for_new[*new_index].is_none())
+        .collect::<Vec<_>>();
+    for &(old_index, new_index) in &anchors {
+        old_for_new[new_index] = Some(old_index);
+        old_used[old_index] = true;
+    }
+    for_each_inline_gap(
+        old.children.len(),
+        new.children.len(),
+        &anchors,
+        |old_start, old_end, new_start, new_end| {
+            align_sibling_gap(
+                old,
+                new,
+                &old_signatures,
+                &new_signatures,
+                &old_fingerprints,
+                &new_fingerprints,
+                global_moves,
+                old_start..old_end,
+                new_start..new_end,
+                old_for_new,
+                old_used,
+            );
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn align_sibling_gap(
+    old: &NodeTree,
+    new: &NodeTree,
+    old_signatures: &[String],
+    new_signatures: &[String],
+    old_fingerprints: &[SubtreeHash],
+    new_fingerprints: &[SubtreeHash],
+    global_moves: &[bool],
+    old_range: Range<usize>,
+    new_range: Range<usize>,
+    old_for_new: &mut [Option<usize>],
+    old_used: &mut [bool],
+) {
+    let old_indices = old_range
+        .filter(|index| !old_used[*index])
+        .collect::<Vec<_>>();
+    let new_indices = new_range
+        .filter(|index| old_for_new[*index].is_none())
+        .collect::<Vec<_>>();
+    let (old_len, new_len) = (old_indices.len(), new_indices.len());
+    if old_len == 0 || new_len == 0 {
+        return;
+    }
+    let old_texts = old_indices
+        .iter()
+        .map(|index| single_text_value(&old.children[*index].node))
+        .collect::<Vec<_>>();
+    let new_texts = new_indices
+        .iter()
+        .map(|index| single_text_value(&new.children[*index].node))
+        .collect::<Vec<_>>();
+    let pair_score = |i: usize, j: usize| {
+        let old_index = old_indices[i];
+        let new_index = new_indices[j];
+        sibling_match_score(
+            &old.children[old_index],
+            &new.children[new_index],
+            &old_signatures[old_index],
+            &new_signatures[new_index],
+            old_fingerprints[old_index] == new_fingerprints[new_index],
+            global_moves[new_index],
+            old_texts[i].as_deref(),
+            new_texts[j].as_deref(),
+            old_len == 1 && new_len == 1,
+        )
+    };
+    // Divide and conquer keeps memory bounded for long runs without changing
+    // the alignment rule used for short runs.
+    if old_len.saturating_mul(new_len) > 250_000 {
+        let mut pairs = Vec::new();
+        align_large_sibling_gap(0..old_len, 0..new_len, &pair_score, &mut pairs);
+        for (i, j) in pairs {
+            let old_index = old_indices[i];
+            let new_index = new_indices[j];
+            old_for_new[new_index] = Some(old_index);
+            old_used[old_index] = true;
+        }
+        return;
+    }
+    let width = new_len + 1;
+    let mut scores = vec![0i32; (old_len + 1) * width];
+    for i in (0..old_len).rev() {
+        for j in (0..new_len).rev() {
+            let pair = pair_score(i, j);
+            let skip = scores[(i + 1) * width + j].max(scores[i * width + j + 1]);
+            scores[i * width + j] = if pair > 0 {
+                skip.max(pair + scores[(i + 1) * width + j + 1])
+            } else {
+                skip
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    while i < old_len && j < new_len {
+        let current = scores[i * width + j];
+        let skip_old = scores[(i + 1) * width + j];
+        let skip_new = scores[i * width + j + 1];
+        // On equal identical matches, retain the later old row. No file-only
+        // diff can identify which of two identical siblings the writer removed.
+        if skip_old == current && old_len - i > new_len - j {
+            i += 1;
+        } else if skip_new == current && new_len - j > old_len - i {
+            j += 1;
+        } else {
+            let old_index = old_indices[i];
+            let new_index = new_indices[j];
+            let pair = pair_score(i, j);
+            if pair > 0 && current == pair + scores[(i + 1) * width + j + 1] {
+                old_for_new[new_index] = Some(old_index);
+                old_used[old_index] = true;
+                i += 1;
+                j += 1;
+            } else if skip_old >= skip_new {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+    }
+}
+
+fn align_large_sibling_gap(
+    old: Range<usize>,
+    new: Range<usize>,
+    score: &impl Fn(usize, usize) -> i32,
+    output: &mut Vec<(usize, usize)>,
+) {
+    if old.is_empty() || new.is_empty() {
+        return;
+    }
+    if old.len() == 1 {
+        if let Some((j, value)) = new
+            .clone()
+            .map(|j| (j, score(old.start, j)))
+            .filter(|(_, value)| *value > 0)
+            .max_by_key(|(j, value)| (*value, *j))
+        {
+            debug_assert!(value > 0);
+            output.push((old.start, j));
+        }
+        return;
+    }
+    if new.len() == 1 {
+        if let Some((i, value)) = old
+            .clone()
+            .map(|i| (i, score(i, new.start)))
+            .filter(|(_, value)| *value > 0)
+            .max_by_key(|(i, value)| (*value, *i))
+        {
+            debug_assert!(value > 0);
+            output.push((i, new.start));
+        }
+        return;
+    }
+    let middle = old.start + old.len() / 2;
+    let forward = sibling_alignment_row(old.start..middle, new.clone(), score, false);
+    let backward = sibling_alignment_row(middle..old.end, new.clone(), score, true);
+    let split = (0..=new.len())
+        .max_by_key(|j| {
+            (
+                forward[*j] + backward[new.len() - *j],
+                std::cmp::Reverse(*j),
+            )
+        })
+        .expect("nonempty alignment range");
+    let new_middle = new.start + split;
+    align_large_sibling_gap(old.start..middle, new.start..new_middle, score, output);
+    align_large_sibling_gap(middle..old.end, new_middle..new.end, score, output);
+}
+
+fn sibling_alignment_row(
+    old: Range<usize>,
+    new: Range<usize>,
+    score: &impl Fn(usize, usize) -> i32,
+    reverse: bool,
+) -> Vec<i32> {
+    let mut previous = vec![0; new.len() + 1];
+    let mut current = vec![0; new.len() + 1];
+    for i in 0..old.len() {
+        let old_index = if reverse {
+            old.end - 1 - i
+        } else {
+            old.start + i
+        };
+        for j in 0..new.len() {
+            let new_index = if reverse {
+                new.end - 1 - j
+            } else {
+                new.start + j
+            };
+            let pair = score(old_index, new_index);
+            current[j + 1] = previous[j + 1].max(current[j]);
+            if pair > 0 {
+                current[j + 1] = current[j + 1].max(previous[j] + pair);
+            }
+        }
+        std::mem::swap(&mut previous, &mut current);
+        current.fill(0);
+    }
+    previous
+}
+
+fn sibling_match_score(
+    old: &NodeTree,
+    new: &NodeTree,
+    old_signature: &str,
+    new_signature: &str,
+    same_fingerprint: bool,
+    global_move: bool,
+    old_text: Option<&str>,
+    new_text: Option<&str>,
+    allow_positional: bool,
+) -> i32 {
+    if same_fingerprint && old_signature == new_signature {
+        return 1_000;
+    }
+    if global_move || !node_kinds_are_identity_compatible(old.node.kind, new.node.kind) {
+        return 0;
+    }
+    let similarity = match (old_text, new_text) {
+        (Some(left), Some(right)) => {
+            let prefix = left
+                .bytes()
+                .zip(right.bytes())
+                .take(128)
+                .take_while(|(a, b)| a == b)
+                .count();
+            let suffix = left
+                .bytes()
+                .rev()
+                .zip(right.bytes().rev())
+                .take(128)
+                .take_while(|(a, b)| a == b)
+                .count();
+            100 * (prefix + suffix).min(left.len().min(right.len()))
+                / left.len().max(right.len()).min(256).max(1)
+        }
+        _ => 0,
+    };
+    if similarity < 40
+        && !allow_positional
+        && !(old.node.kind == NodeKind::Heading && new.node.kind == NodeKind::Heading)
+    {
+        return 0;
+    }
+    10 + if old.node.kind == new.node.kind {
+        20
+    } else {
+        0
+    } + similarity as i32
 }
 
 fn node_kinds_are_identity_compatible(old: NodeKind, new: NodeKind) -> bool {
@@ -1037,38 +1276,50 @@ fn compare_sibling_positions(
 }
 
 fn reconcile_inline_payload(old: &NodeTree, new: &mut NodeTree) -> Result<(), PluginError> {
+    reconcile_inline_payload_with_status(old, new).map(|_| ())
+}
+
+fn reconcile_inline_payload_with_status(
+    old: &NodeTree,
+    new: &mut NodeTree,
+) -> Result<bool, PluginError> {
     if !matches!(
         new.node.kind,
         NodeKind::Paragraph | NodeKind::Heading | NodeKind::TableCell
     ) {
-        return Ok(());
+        return Ok(true);
     }
     let old_inlines = parse_inline_payload(&old.node.payload).map_err(PluginError::InvalidInput)?;
     let mut new_inlines =
         parse_inline_payload(&new.node.payload).map_err(PluginError::InvalidInput)?;
-    reconcile_inline_sequence(&old_inlines, &mut new_inlines);
+    let all_reused = reconcile_inline_sequence(&old_inlines, &mut new_inlines);
     new.node.payload["inline"] = serde_json::to_value(new_inlines).map_err(|error| {
         PluginError::Internal(format!("failed to serialize inline AST: {error}"))
     })?;
-    Ok(())
+    Ok(all_reused)
 }
 
-fn reconcile_inline_sequence(old: &[InlineNode], new: &mut [InlineNode]) {
-    if old.is_empty() || new.is_empty() {
-        return;
+fn reconcile_inline_sequence(old: &[InlineNode], new: &mut [InlineNode]) -> bool {
+    if new.is_empty() {
+        return true;
+    }
+    if old.is_empty() {
+        return false;
     }
     if let ([old_inline], [new_inline]) = (old, &mut *new) {
         if old_inline.signature() == new_inline.signature()
             || old_inline.kind_tag() == new_inline.kind_tag()
         {
             new_inline.id = old_inline.id;
-            if let (Some(old_children), Some(new_children)) =
-                (old_inline.children(), new_inline.children_mut())
-            {
-                reconcile_inline_sequence(old_children, new_children);
-            }
+            return match (old_inline.children(), new_inline.children_mut()) {
+                (Some(old_children), Some(new_children)) => {
+                    reconcile_inline_sequence(old_children, new_children)
+                }
+                (None, None) => true,
+                _ => false,
+            };
         }
-        return;
+        return false;
     }
 
     let old_signatures = old.iter().map(InlineNode::signature).collect::<Vec<_>>();
@@ -1143,17 +1394,22 @@ fn reconcile_inline_sequence(old: &[InlineNode], new: &mut [InlineNode]) {
         &mut old_used,
     );
 
+    let mut all_reused = true;
     for (new_index, inline) in new.iter_mut().enumerate() {
         let Some(old_index) = old_for_new[new_index] else {
+            all_reused = false;
             continue;
         };
         inline.id = old[old_index].id;
-        if let (Some(old_children), Some(new_children)) =
-            (old[old_index].children(), inline.children_mut())
-        {
-            reconcile_inline_sequence(old_children, new_children);
-        }
+        all_reused &= match (old[old_index].children(), inline.children_mut()) {
+            (Some(old_children), Some(new_children)) => {
+                reconcile_inline_sequence(old_children, new_children)
+            }
+            (None, None) => true,
+            _ => false,
+        };
     }
+    all_reused
 }
 
 fn unique_non_crossing_inline_anchors(
@@ -2980,11 +3236,19 @@ impl Document {
         new.node.id = old.node.id;
         new.node.parent_id = old.node.parent_id;
         new.node.order_key.clone_from(&old.node.order_key);
-        reconcile_inline_payload(&old, &mut new)?;
+        if !reconcile_inline_payload_with_status(&old, &mut new)? {
+            return Ok(None);
+        }
 
         let mut replacements = BTreeMap::from([(generated_node_id, new.node.id)]);
         let mut allocator = IdAllocator::new(namespace);
-        allocate_generated_ids(&mut new, &generated_ids, &mut allocator, &mut replacements);
+        allocate_generated_ids(
+            &mut new,
+            &generated_ids,
+            &collect_generated_ids(&old),
+            &mut allocator,
+            &mut replacements,
+        );
         replace_column_ids(&mut new.node.payload, &replacements);
         let detected = if old.node == new.node {
             Vec::new()
@@ -3104,6 +3368,10 @@ impl Document {
             old_block.node.kind,
             replacement.root.children[0].node.kind,
         ) {
+            return Ok(None);
+        }
+        let mut candidate_block = replacement.root.children[0].clone();
+        if !reconcile_inline_payload_with_status(&old_block, &mut candidate_block)? {
             return Ok(None);
         }
         let old_root = NodeTree {
@@ -3315,6 +3583,305 @@ fn chars_to_string(base: &[char], edits: &[TextReplacement]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reconciled_blocks(before: &str, after: &str) -> (Vec<NodeTree>, Vec<NodeTree>) {
+        let namespace = IdNamespace::from_halves(17, 29);
+        let (document, _) =
+            Document::open_file(before.as_bytes().to_vec(), Some("identity.md"), namespace)
+                .expect("parse original Markdown");
+        let old = document.tree.materialize();
+        let parsed = parse_markdown_source(after).expect("parse edited Markdown");
+        let new = reconcile_markdown_tree(Some(&old), parsed, namespace, 0)
+            .expect("reconcile edited Markdown");
+        (old.children, new.children)
+    }
+
+    #[test]
+    fn inserted_block_does_not_take_edited_block_identity() {
+        let (old, new) = reconciled_blocks(
+            "# D\n\nAlpha.\n\nOriginal paragraph.\n\nLast.\n",
+            "# D\n\nAlpha.\n\nNew paragraph.\n\nOriginal paragraph edited.\n\nLast.\n",
+        );
+        assert_ne!(new[2].node.id, old[2].node.id);
+        assert_eq!(new[3].node.id, old[2].node.id);
+        assert_eq!(new[4].node.id, old[3].node.id);
+    }
+
+    #[test]
+    fn simultaneous_heading_edit_and_intro_insert_keep_later_paragraph() {
+        let (old, new) = reconciled_blocks(
+            "# opral monorepo\n\nHome of Atelier.\n\nResearch moved to /old-archive.\n\n## Releases\n\nReleases are cut.\n",
+            "# New heading\n\nIntro inserted by agent.\n\nHome of Atelier.\n\nResearch moved to /archive.\n\n## Releases\n\nReleases are cut.\n",
+        );
+        assert_eq!(new[0].node.id, old[0].node.id);
+        assert_ne!(new[1].node.id, old[2].node.id);
+        assert_eq!(new[2].node.id, old[1].node.id);
+        assert_eq!(new[3].node.id, old[2].node.id);
+        assert_eq!(new[4].node.id, old[3].node.id);
+    }
+
+    #[test]
+    fn deleting_first_duplicate_preserves_later_identity() {
+        let (old, new) = reconciled_blocks(
+            "# D\n\nSame.\n\nSame.\n\nOther.\n",
+            "# D\n\nSame.\n\nOther.\n",
+        );
+        assert_eq!(new[1].node.id, old[2].node.id);
+        assert_eq!(new[2].node.id, old[3].node.id);
+    }
+
+    #[test]
+    fn inserting_duplicate_preserves_existing_identity() {
+        let (old, new) = reconciled_blocks("Before.\n\nSame.\n", "Before.\n\nSame.\n\nSame.\n");
+        assert_eq!(new[2].node.id, old[1].node.id);
+        assert_ne!(new[1].node.id, old[1].node.id);
+    }
+
+    #[test]
+    fn large_unanchored_insertion_keeps_edited_block_ids() {
+        let mut before = String::new();
+        let mut after = String::from("Unrelated insertion.\n\n");
+        for index in 0..501 {
+            before.push_str(&format!("block-{index:03} original.\n\n"));
+            after.push_str(&format!("block-{index:03} original edited.\n\n"));
+        }
+        let (old, new) = reconciled_blocks(&before, &after);
+        assert_ne!(new[0].node.id, old[0].node.id);
+        for index in 0..old.len() {
+            assert_eq!(new[index + 1].node.id, old[index].node.id, "block {index}");
+        }
+    }
+
+    #[test]
+    fn autolink_introduced_by_byte_edit_uses_a_document_unique_inline_id() {
+        fn collect_ids(tree: &NodeTree, output: &mut Vec<Uuid>) {
+            fn collect_payload_ids(value: &serde_json::Value, output: &mut Vec<Uuid>) {
+                match value {
+                    serde_json::Value::Object(object) => {
+                        if let Some(serde_json::Value::String(id)) = object.get("id")
+                            && let Ok(id) = Uuid::parse_str(id)
+                        {
+                            output.push(id);
+                        }
+                        for child in object.values() {
+                            collect_payload_ids(child, output);
+                        }
+                    }
+                    serde_json::Value::Array(array) => {
+                        for child in array {
+                            collect_payload_ids(child, output);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            output.push(tree.node.id);
+            collect_payload_ids(&tree.node.payload, output);
+            for child in &tree.children {
+                collect_ids(child, output);
+            }
+        }
+
+        let source = b"# Intro\n\nFirst paragraph.\n\nwvw.example.com\n\nTail.\n".to_vec();
+        let namespace = IdNamespace::from_halves(91, 17);
+        let (document, _) = Document::open_file(source.clone(), Some("links.md"), namespace)
+            .expect("parse original Markdown");
+        let old_root = document.tree.materialize();
+        let offset = source
+            .windows(b"wvw.example.com".len())
+            .position(|window| window == b"wvw.example.com")
+            .expect("target text offset")
+            + 1;
+        let block_index = document
+            .top_level_ranges
+            .iter()
+            .position(|range| range.start <= offset && offset < range.end)
+            .expect("target paragraph range exists");
+        let old_target = &old_root.children[block_index];
+        assert_eq!(
+            single_text_value(&old_target.node).as_deref(),
+            Some("wvw.example.com")
+        );
+
+        let (updated, _) = document
+            .file_changed(
+                &[FileEdit {
+                    offset: offset as u64,
+                    delete_len: 1,
+                    insert: b"w",
+                }],
+                namespace,
+            )
+            .expect("apply one-byte autolink edit");
+        assert_eq!(
+            updated.bytes(),
+            b"# Intro\n\nFirst paragraph.\n\nwww.example.com\n\nTail.\n"
+        );
+
+        let new_root = updated.tree.materialize();
+        let new_target = new_root
+            .children
+            .iter()
+            .find(|block| {
+                parse_inline_payload(&block.node.payload).is_ok_and(|inlines| {
+                    inlines.iter().any(|inline| inline.kind_tag() == "autolink")
+                })
+            })
+            .expect("edited paragraph becomes an autolink");
+        assert_eq!(new_target.node.id, old_target.node.id);
+
+        let mut ids = Vec::new();
+        collect_ids(&new_root, &mut ids);
+        let unique_ids = ids.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(
+            ids.len(),
+            unique_ids.len(),
+            "all document and inline IDs must be unique"
+        );
+    }
+
+    #[test]
+    fn seeded_block_edits_preserve_surviving_identity_and_order() {
+        #[derive(Clone)]
+        struct FuzzBlock {
+            marker: String,
+            text: String,
+        }
+
+        fn next_value(seed: &mut u64) -> u64 {
+            *seed = (*seed)
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *seed
+        }
+
+        for case in 0..32_u64 {
+            let namespace = IdNamespace::from_halves(case + 101, 73);
+            let initial = (0..12)
+                .map(|index| {
+                    let marker = format!("block-{case:02}-{index:03}");
+                    FuzzBlock {
+                        text: format!("{marker} original body."),
+                        marker,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let before = initial
+                .iter()
+                .map(|block| format!("{}\n\n", block.text))
+                .collect::<String>();
+            let (document, _) =
+                Document::open_file(before.as_bytes().to_vec(), Some("fuzz.md"), namespace)
+                    .expect("parse original fuzzed Markdown");
+            let old_root = document.tree.materialize();
+            let old_ids = old_root
+                .children
+                .iter()
+                .map(|block| block.node.id)
+                .collect::<Vec<_>>();
+            let old_index_by_marker = initial
+                .iter()
+                .enumerate()
+                .map(|(index, block)| (block.marker.clone(), index))
+                .collect::<HashMap<_, _>>();
+
+            let mut blocks = initial;
+            let mut seed = 0x9e37_79b9_7f4a_7c15_u64 ^ case;
+            let mut insertion = 0;
+            for step in 0..48 {
+                let choice = next_value(&mut seed) % 3;
+                if choice == 0 {
+                    let index = (next_value(&mut seed) as usize) % (blocks.len() + 1);
+                    let marker = format!("fresh-{case:02}-{insertion:03}");
+                    insertion += 1;
+                    blocks.insert(
+                        index,
+                        FuzzBlock {
+                            text: format!("{marker} inserted body."),
+                            marker,
+                        },
+                    );
+                } else if choice == 1 && blocks.len() > 3 {
+                    let index = (next_value(&mut seed) as usize) % blocks.len();
+                    blocks.remove(index);
+                } else {
+                    let index = (next_value(&mut seed) as usize) % blocks.len();
+                    let marker = blocks[index].marker.clone();
+                    blocks[index].text = format!("{marker} revision-{step:02}.");
+                }
+            }
+
+            let after = blocks
+                .iter()
+                .map(|block| format!("{}\n\n", block.text))
+                .collect::<String>();
+            let parsed = parse_markdown_source(&after).expect("parse fuzzed Markdown");
+            let parsed_for_anchors = parse_markdown_source(&after).expect("parse anchor Markdown");
+            let old_signatures = old_root
+                .children
+                .iter()
+                .map(NodeTree::subtree_signature)
+                .collect::<Vec<_>>();
+            let new_signatures = parsed_for_anchors
+                .root
+                .children
+                .iter()
+                .map(NodeTree::subtree_signature)
+                .collect::<Vec<_>>();
+            let anchors = unique_non_crossing_inline_anchors(&old_signatures, &new_signatures)
+                .into_iter()
+                .map(|(old_index, new_index)| {
+                    (
+                        old_index,
+                        single_text_value(&old_root.children[old_index].node).unwrap(),
+                        new_index,
+                        single_text_value(&parsed_for_anchors.root.children[new_index].node)
+                            .unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let new_root = reconcile_markdown_tree(Some(&old_root), parsed, namespace, 0)
+                .expect("reconcile fuzzed Markdown");
+
+            assert_eq!(new_root.children.len(), blocks.len(), "case {case}");
+            let mut seen_ids = BTreeSet::new();
+            let mut surviving_old_indices = Vec::new();
+            for (index, (node, expected)) in new_root.children.iter().zip(&blocks).enumerate() {
+                assert!(
+                    seen_ids.insert(node.node.id),
+                    "duplicate row ID in case {case}"
+                );
+                let actual = single_text_value(&node.node).expect("fuzz block has plain text");
+                assert_eq!(actual, expected.text, "content changed in case {case}");
+                if let Some(&old_index) = old_index_by_marker.get(&expected.marker) {
+                    assert_eq!(
+                        node.node.id, old_ids[old_index],
+                        "surviving block {} lost its row in case {case}",
+                        expected.marker
+                    );
+                    surviving_old_indices.push((index, old_index));
+                } else {
+                    let old_owner = old_ids.iter().position(|id| *id == node.node.id);
+                    assert!(
+                        old_owner.is_none(),
+                        "inserted block {} took old row {:?} at index {} in case {case}; blocks: {:?}; anchors: {:?}",
+                        expected.marker,
+                        old_owner,
+                        index,
+                        blocks.iter().map(|block| &block.text).collect::<Vec<_>>(),
+                        anchors
+                    );
+                }
+            }
+            assert!(
+                surviving_old_indices
+                    .windows(2)
+                    .all(|pair| pair[0].1 < pair[1].1),
+                "surviving old rows crossed in case {case}"
+            );
+        }
+    }
 
     fn paragraph_node(source: &str) -> NodeSnapshot {
         let (document, _) = Document::open_file(

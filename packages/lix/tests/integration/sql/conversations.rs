@@ -158,7 +158,7 @@ simulation_test!(
                 "SELECT table_name,column_name,data_type,is_nullable
              FROM information_schema.columns
              WHERE table_name IN ('lix_comment','lix_conversation')
-               AND column_name IN ('id','target','title','conversation_id','body','author_id','order_key')
+               AND column_name IN ('id','target','detached_target','title','conversation_id','body','author_id','order_key')
              ORDER BY table_name,ordinal_position",
                 &[],
             )
@@ -194,6 +194,12 @@ simulation_test!(
                 vec![
                     Value::Text("lix_conversation".into()),
                     Value::Text("target".into()),
+                    Value::Text("TEXT".into()),
+                    Value::Text("YES".into()),
+                ],
+                vec![
+                    Value::Text("lix_conversation".into()),
+                    Value::Text("detached_target".into()),
                     Value::Text("TEXT".into()),
                     Value::Text("YES".into()),
                 ],
@@ -512,12 +518,71 @@ simulation_test!(
 );
 
 simulation_test!(
-    conversation_target_conversation_comment_cascades_and_history,
+    conversation_retargeting_requires_clearing_detached_target,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        install_local_targets(&session).await;
+        session
+            .execute(
+                "INSERT INTO lix_conversation(id,target) VALUES
+                 ($1,lix_row_ref('conversation_custom_target',NULL,'custom-1'))",
+                &[Value::Text(TARGET_CONVERSATION.into())],
+            )
+            .await
+            .unwrap();
+        session
+            .execute(
+                "DELETE FROM conversation_custom_target WHERE id='custom-1'",
+                &[],
+            )
+            .await
+            .expect("deleting the target should detach the conversation");
+
+        let error = session
+            .execute(
+                "UPDATE lix_conversation
+                 SET target=lix_row_ref('lix_file',NULL,$2)
+                 WHERE id=$1",
+                &[
+                    Value::Text(TARGET_CONVERSATION.into()),
+                    Value::Text(FILE_TARGET.into()),
+                ],
+            )
+            .await
+            .expect_err("reattaching must clear the archived target in the same write");
+        assert_eq!(error.code, lix::LixError::CODE_FOREIGN_KEY);
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT target,detached_target IS NOT NULL
+                     FROM lix_conversation WHERE id=$1",
+                    &[Value::Text(TARGET_CONVERSATION.into())],
+                )
+                .await
+                .unwrap(),
+            vec![vec![Value::Null, Value::Boolean(true)]],
+        );
+    }
+);
+
+simulation_test!(
+    conversation_target_deletion_detaches_threads_and_preserves_comments,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
         install_local_targets(&session).await;
         insert_local_conversations_and_comments(&session).await;
+        let original_created_at = session
+            .execute(
+                "SELECT lixcol_created_at FROM lix_conversation WHERE id=$1",
+                &[Value::Text(LOCAL_FILE_CONVERSATION.into())],
+            )
+            .await
+            .unwrap()
+            .rows()[0]
+            .values()[0]
+            .clone();
 
         session
             .execute(
@@ -525,16 +590,34 @@ simulation_test!(
                 &[Value::Text(FILE_TARGET.into())],
             )
             .await
-            .expect("file target deletion should cascade");
+            .expect("file target deletion should detach its conversation");
         assert_rows_eq(
             session
                 .execute(
-                    "SELECT id FROM lix_conversation WHERE id=$1",
+                    "SELECT id,target IS NULL,detached_target=lix_row_ref('lix_file',NULL,$2)
+                     FROM lix_conversation WHERE id=$1",
+                    &[
+                        Value::Text(LOCAL_FILE_CONVERSATION.into()),
+                        Value::Text(FILE_TARGET.into()),
+                    ],
+                )
+                .await
+                .unwrap(),
+            vec![vec![
+                Value::Text(LOCAL_FILE_CONVERSATION.into()),
+                Value::Boolean(true),
+                Value::Boolean(true),
+            ]],
+        );
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT lixcol_created_at FROM lix_conversation WHERE id=$1",
                     &[Value::Text(LOCAL_FILE_CONVERSATION.into())],
                 )
                 .await
                 .unwrap(),
-            vec![],
+            vec![vec![original_created_at]],
         );
         assert_rows_eq(
             session
@@ -544,19 +627,21 @@ simulation_test!(
                 )
                 .await
                 .unwrap(),
-            vec![],
+            vec![vec![Value::Text(FILE_COMMENT.into())]],
         );
 
-        for (target_key, target_id, conversation_id, comment_id) in [
+        for (target_key, target_id, file_id, conversation_id, comment_id) in [
             (
                 "conversation_paragraph_target",
                 "paragraph-1",
+                FILE_PARAGRAPH,
                 LOCAL_PARAGRAPH_CONVERSATION,
                 PARAGRAPH_COMMENT,
             ),
             (
                 "conversation_csv_target",
                 "csv-row-1",
+                FILE_CSV,
                 LOCAL_CSV_CONVERSATION,
                 CSV_COMMENT,
             ),
@@ -567,16 +652,27 @@ simulation_test!(
                     &[Value::Text(target_id.into())],
                 )
                 .await
-                .expect("custom target deletion should cascade");
+                .expect("custom target deletion should detach the conversation");
             assert_rows_eq(
                 session
                     .execute(
-                        "SELECT id FROM lix_conversation WHERE id=$1",
-                        &[Value::Text(conversation_id.into())],
+                        "SELECT id,target IS NULL,
+                                detached_target=lix_row_ref($2,$3,$4)
+                         FROM lix_conversation WHERE id=$1",
+                        &[
+                            Value::Text(conversation_id.into()),
+                            Value::Text(target_key.into()),
+                            Value::Text(file_id.into()),
+                            Value::Text(target_id.into()),
+                        ],
                     )
                     .await
                     .unwrap(),
-                vec![],
+                vec![vec![
+                    Value::Text(conversation_id.into()),
+                    Value::Boolean(true),
+                    Value::Boolean(true),
+                ]],
             );
             assert_rows_eq(
                 session
@@ -586,7 +682,7 @@ simulation_test!(
                     )
                     .await
                     .unwrap(),
-                vec![],
+                vec![vec![Value::Text(comment_id.into())]],
             );
         }
         assert_rows_eq(
@@ -598,23 +694,6 @@ simulation_test!(
                 .await
                 .unwrap(),
             vec![vec![Value::Text(STANDALONE_CONVERSATION.into())]],
-        );
-
-        let history = session
-            .execute(
-                "SELECT id,diff_type FROM lix_history('lix_conversation') WHERE id=$1",
-                &[Value::Text(LOCAL_FILE_CONVERSATION.into())],
-            )
-            .await
-            .expect("conversation history should remain queryable after cascade deletion");
-        assert!(
-            history.rows().iter().any(|row| row.values()
-                == [
-                    Value::Text(LOCAL_FILE_CONVERSATION.into()),
-                    Value::Text("removed".into())
-                ]),
-            "deleted conversation history should contain a removal: {:?}",
-            history.rows()
         );
     }
 );
@@ -745,7 +824,7 @@ simulation_test!(conversation_branch_fork_delete_isolated, |sim| async move {
     .await
     .unwrap();
     assert_rows_eq(
-        main.execute("SELECT id FROM lix_conversation", &[])
+        main.execute("SELECT id FROM lix_conversation ORDER BY id", &[])
             .await
             .unwrap(),
         vec![vec![Value::Text(TARGET_CONVERSATION.into())]],
@@ -754,13 +833,13 @@ simulation_test!(conversation_branch_fork_delete_isolated, |sim| async move {
         fork.execute("SELECT id FROM lix_conversation", &[])
             .await
             .unwrap(),
-        vec![],
+        vec![vec![Value::Text(TARGET_CONVERSATION.into())]],
     );
     assert_rows_eq(
         fork.execute("SELECT id FROM lix_comment", &[])
             .await
             .unwrap(),
-        vec![],
+        vec![vec![Value::Text(TARGET_COMMENT.into())]],
     );
 });
 
@@ -779,14 +858,14 @@ simulation_test!(
 );
 
 simulation_test!(
-    conversation_generation_delete_cascades_incoming_reply_destination_delete,
+    conversation_generation_delete_detaches_incoming_reply_destination_delete,
     |sim| async move {
         assert_conversation_generation_delete_merge(&sim, true).await;
     }
 );
 
 simulation_test!(
-    conversation_generation_delete_cascades_incoming_reply_source_delete,
+    conversation_generation_delete_detaches_incoming_reply_source_delete,
     |sim| async move {
         assert_conversation_generation_delete_merge(&sim, false).await;
     }
@@ -870,16 +949,30 @@ async fn assert_conversation_merge_target_delete_and_reply(
         .unwrap();
     assert_eq!(preview.change_stats, receipt.change_stats);
     assert_rows_eq(
-        main.execute("SELECT id FROM lix_conversation", &[])
+        main.execute("SELECT id FROM lix_conversation ORDER BY id", &[])
             .await
             .unwrap(),
-        vec![],
+        vec![vec![Value::Text(TARGET_CONVERSATION.into())]],
     );
     assert_rows_eq(
-        main.execute("SELECT id FROM lix_comment", &[])
+        main.execute(
+            "SELECT target IS NULL,
+                    detached_target=lix_row_ref('conversation_custom_target',NULL,'custom-1')
+             FROM lix_conversation WHERE id=$1",
+            &[Value::Text(TARGET_CONVERSATION.into())],
+        )
+        .await
+        .unwrap(),
+        vec![vec![Value::Boolean(true), Value::Boolean(true)]],
+    );
+    assert_rows_eq(
+        main.execute("SELECT id FROM lix_comment ORDER BY id", &[])
             .await
             .unwrap(),
-        vec![],
+        vec![
+            vec![Value::Text(TARGET_COMMENT.into())],
+            vec![Value::Text("01950000-0000-7000-8000-000000000406".into())],
+        ],
     );
 }
 
@@ -964,15 +1057,26 @@ async fn assert_conversation_generation_delete_merge(
         vec![],
     );
     assert_rows_eq(
-        main.execute("SELECT id FROM lix_conversation", &[])
+        main.execute("SELECT id FROM lix_conversation ORDER BY id", &[])
             .await
             .unwrap(),
-        vec![],
+        vec![vec![Value::Text(GENERATION_CONVERSATION.into())]],
     );
     assert_rows_eq(
-        main.execute("SELECT id FROM lix_comment", &[])
+        main.execute(
+            "SELECT target IS NULL,
+                    detached_target=lix_row_ref('conversation_custom_target',NULL,'custom-1')
+             FROM lix_conversation WHERE id=$1",
+            &[Value::Text(GENERATION_CONVERSATION.into())],
+        )
+        .await
+        .unwrap(),
+        vec![vec![Value::Boolean(true), Value::Boolean(true)]],
+    );
+    assert_rows_eq(
+        main.execute("SELECT id FROM lix_comment ORDER BY id", &[])
             .await
             .unwrap(),
-        vec![],
+        vec![vec![Value::Text(GENERATION_COMMENT.into())]],
     );
 }
