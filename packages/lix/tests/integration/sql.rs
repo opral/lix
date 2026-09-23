@@ -94,6 +94,7 @@ mod bigint_predicate;
 mod case_returning;
 mod case_returning_types;
 mod checkpoint;
+mod conversations;
 mod delete_returning;
 mod diff_commands;
 mod diff_relation;

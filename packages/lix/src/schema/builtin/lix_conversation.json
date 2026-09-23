@@ -1,0 +1,28 @@
+{
+  "$schema": "https://lix.dev/schema-v1.json",
+  "key": "lix_conversation",
+  "description": "A discussion in the same scope as its target. A null target creates a standalone conversation.",
+  "columns": [
+    {
+      "name": "id",
+      "type": "uuid",
+      "nullable": false,
+      "description": "Stable conversation identifier."
+    },
+    {
+      "name": "target",
+      "type": "text",
+      "nullable": true,
+      "description": "Canonical row reference to an existing target in the same branch and compatible durability scope. Null for a standalone conversation."
+    }
+  ],
+  "primary_key": [
+    "id"
+  ],
+  "row_refs": [
+    {
+      "column": "target",
+      "on_delete": "cascade"
+    }
+  ]
+}
