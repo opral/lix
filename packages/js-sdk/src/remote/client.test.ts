@@ -87,7 +87,12 @@ test("remote exportSnapshot streams the canonical authenticated endpoint", async
 test("remote snapshots remain available on child and grandchild sessions", async () => {
 	let handshakes = 0;
 	let snapshots = 0;
-	let responseMode: "bytes" | "error" | "empty-error" | "stream" = "bytes";
+	let responseMode:
+		| "bytes"
+		| "error"
+		| "error-details"
+		| "empty-error"
+		| "stream" = "bytes";
 	const cancelled = vi.fn();
 	const lix = await openLix({
 		server: {
@@ -118,6 +123,15 @@ test("remote snapshots remain available on child and grandchild sessions", async
 							},
 						},
 						{ status: 403 },
+					);
+				}
+				if (responseMode === "error-details") {
+					return new Response(
+						'{"error":{"code":"LIX_SNAPSHOT_TEST_ERROR","message":"snapshot denied","details":{"safeNumber":403,"unsafeNumber":9007199254740993,"other":"preserved"}}}',
+						{
+							status: 403,
+							headers: { "content-type": "application/json" },
+						},
 					);
 				}
 				if (responseMode === "stream") {
@@ -156,6 +170,18 @@ test("remote snapshots remain available on child and grandchild sessions", async
 		).rejects.toMatchObject({
 			code: "LIX_REMOTE_REQUEST_FAILED",
 			details: { httpStatus: 403 },
+		});
+		responseMode = "error-details";
+		await expect(
+			new Response(child.exportSnapshot()).arrayBuffer(),
+		).rejects.toMatchObject({
+			code: "LIX_SNAPSHOT_TEST_ERROR",
+			details: {
+				httpStatus: 403,
+				safeNumber: 403,
+				unsafeNumber: "9007199254740993",
+				other: "preserved",
+			},
 		});
 		responseMode = "stream";
 		const reader = grandchild.exportSnapshot().getReader();

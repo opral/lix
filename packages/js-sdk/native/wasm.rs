@@ -1367,6 +1367,7 @@ impl Serialize for LixValueDto {
         let value = self.value.as_ref().map(|value| WasmJsonValue {
             value,
             allow_integral_float: self.kind == "real",
+            unsafe_number_as_string: false,
         });
         dto.serialize_field("value", &value)?;
         dto.serialize_field("blob", &self.blob)?;
@@ -1381,6 +1382,24 @@ impl Serialize for LixValueDto {
 struct WasmJsonValue<'a> {
     value: &'a serde_json::Value,
     allow_integral_float: bool,
+    unsafe_number_as_string: bool,
+}
+
+fn serialize_unrepresentable_number<S>(
+    serializer: S,
+    number: &serde_json::Number,
+    as_string: bool,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if as_string {
+        serializer.serialize_str(&number.to_string())
+    } else {
+        Err(serde::ser::Error::custom(
+            "JSON number is outside the JavaScript safe numeric range",
+        ))
+    }
 }
 
 impl Serialize for WasmJsonValue<'_> {
@@ -1402,24 +1421,30 @@ impl Serialize for WasmJsonValue<'_> {
                 }
                 if let Some(value) = number.as_i64() {
                     if !(-9_007_199_254_740_991..=9_007_199_254_740_991).contains(&value) {
-                        return Err(serde::ser::Error::custom(
-                            "JSON integer is outside the JavaScript safe integer range",
-                        ));
+                        return serialize_unrepresentable_number(
+                            serializer,
+                            number,
+                            self.unsafe_number_as_string,
+                        );
                     }
                     return serializer.serialize_i64(value);
                 }
                 if let Some(value) = number.as_u64() {
                     if value > 9_007_199_254_740_991 {
-                        return Err(serde::ser::Error::custom(
-                            "JSON integer is outside the JavaScript safe integer range",
-                        ));
+                        return serialize_unrepresentable_number(
+                            serializer,
+                            number,
+                            self.unsafe_number_as_string,
+                        );
                     }
                     return serializer.serialize_u64(value);
                 }
                 if !number.is_f64() {
-                    return Err(serde::ser::Error::custom(
-                        "JSON integer is outside the JavaScript safe integer range",
-                    ));
+                    return serialize_unrepresentable_number(
+                        serializer,
+                        number,
+                        self.unsafe_number_as_string,
+                    );
                 }
                 let value = number.as_f64().ok_or_else(|| {
                     serde::ser::Error::custom(
@@ -1429,9 +1454,11 @@ impl Serialize for WasmJsonValue<'_> {
                 if !value.is_finite()
                     || (value.fract() == 0.0 && value.abs() > 9_007_199_254_740_991.0)
                 {
-                    return Err(serde::ser::Error::custom(
-                        "JSON number is outside the JavaScript safe numeric range",
-                    ));
+                    return serialize_unrepresentable_number(
+                        serializer,
+                        number,
+                        self.unsafe_number_as_string,
+                    );
                 }
                 serializer.serialize_f64(value)
             }
@@ -1444,6 +1471,7 @@ impl Serialize for WasmJsonValue<'_> {
                     sequence.serialize_element(&WasmJsonValue {
                         value,
                         allow_integral_float: false,
+                        unsafe_number_as_string: self.unsafe_number_as_string,
                     })?;
                 }
                 sequence.end()
@@ -1458,6 +1486,7 @@ impl Serialize for WasmJsonValue<'_> {
                         &WasmJsonValue {
                             value,
                             allow_integral_float: false,
+                            unsafe_number_as_string: self.unsafe_number_as_string,
                         },
                     )?;
                 }
@@ -1742,6 +1771,17 @@ pub(super) fn to_js<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
         .map_err(|error| js_bridge_error(format!("could not encode JavaScript value: {error}")))
 }
 
+fn to_js_json_value(value: &serde_json::Value) -> Result<JsValue, JsValue> {
+    to_js(&WasmJsonValue {
+        value,
+        allow_integral_float: false,
+        // Error details have no SQL type contract. Keep large JSON numbers
+        // lossless as decimal strings instead of dropping all details or
+        // silently rounding them to a JavaScript Number.
+        unsafe_number_as_string: true,
+    })
+}
+
 fn js_bridge_error(message: impl AsRef<str>) -> JsValue {
     js_sys::Error::new(message.as_ref()).into()
 }
@@ -1768,7 +1808,7 @@ pub(super) fn lix_error_to_js(error: LixError) -> JsValue {
             let _ = Reflect::set(object, &JsValue::from_str("status"), &status);
             let _ = Reflect::set(object, &JsValue::from_str("httpStatus"), &status);
         }
-        if let Ok(details) = to_js(&details) {
+        if let Ok(details) = to_js_json_value(&details) {
             let _ = Reflect::set(object, &JsValue::from_str("details"), &details);
         }
     }
