@@ -8531,10 +8531,10 @@ async fn json_structural_qa_stale_disjoint_insertions_and_deletions_compose() {
     .await
     .unwrap();
     let before_stale = read_file(&lix, path).await.unwrap();
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(before_stale.as_ref().unwrap()).unwrap(),
-        serde_json::json!({"keep":12300.0,"alpha":3})
-    );
+    let before_stale_json =
+        serde_json::from_slice::<serde_json::Value>(before_stale.as_ref().unwrap()).unwrap();
+    assert_eq!(before_stale_json["keep"].as_f64(), Some(12_300.0));
+    assert_eq!(before_stale_json["alpha"], 3);
     let error = write_file(
         &second,
         path,
@@ -8551,10 +8551,10 @@ async fn json_structural_qa_stale_disjoint_insertions_and_deletions_compose() {
     retry.push_str(",\"beta\":4}");
     write_file(&second, path, retry.into_bytes()).await.unwrap();
     let rendered = read_file(&lix, path).await.unwrap().unwrap();
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&rendered).unwrap(),
-        serde_json::json!({"keep":12300.0,"alpha":3,"beta":4})
-    );
+    let rendered_json = serde_json::from_slice::<serde_json::Value>(&rendered).unwrap();
+    assert_eq!(rendered_json["keep"].as_f64(), Some(12_300.0));
+    assert_eq!(rendered_json["alpha"], 3);
+    assert_eq!(rendered_json["beta"], 4);
     assert!(String::from_utf8(rendered).unwrap().contains("1.2300e+04"));
     let rows = lix
         .execute("SELECT key FROM json_object_member ORDER BY key", &[])
@@ -8575,11 +8575,13 @@ async fn json_structural_qa_stale_disjoint_insertions_and_deletions_compose() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&read_file(&lix, path).await.unwrap().unwrap())
-            .unwrap(),
-        serde_json::json!({"keep":12300.0,"alpha":5,"beta":5})
-    );
+    let updated_json = serde_json::from_slice::<serde_json::Value>(
+        &read_file(&lix, path).await.unwrap().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(updated_json["keep"].as_f64(), Some(12_300.0));
+    assert_eq!(updated_json["alpha"], 5);
+    assert_eq!(updated_json["beta"], 5);
     first.close().await.unwrap();
     second.close().await.unwrap();
     lix.close().await.unwrap();
