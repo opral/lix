@@ -1348,11 +1348,123 @@ impl From<lix::MergeChangeStats> for MergeChangeStatsDto {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize)]
 struct LixValueDto {
     kind: String,
     value: Option<serde_json::Value>,
     blob: Option<ByteBuf>,
+}
+
+impl Serialize for LixValueDto {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut dto = serializer.serialize_struct("LixValueDto", 3)?;
+        dto.serialize_field("kind", &self.kind)?;
+        let value = self.value.as_ref().map(|value| WasmJsonValue {
+            value,
+            allow_integral_float: self.kind == "real",
+        });
+        dto.serialize_field("value", &value)?;
+        dto.serialize_field("blob", &self.blob)?;
+        dto.end()
+    }
+}
+
+/// Serialize JSON values as native JavaScript primitives. With serde_json's
+/// `arbitrary_precision` feature, `Number` normally serializes as an internal
+/// map intended for serde_json deserialization. That representation leaks
+/// through serde-wasm-bindgen unless numbers are emitted directly.
+struct WasmJsonValue<'a> {
+    value: &'a serde_json::Value,
+    allow_integral_float: bool,
+}
+
+impl Serialize for WasmJsonValue<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self.value {
+            serde_json::Value::Null => serializer.serialize_unit(),
+            serde_json::Value::Bool(value) => serializer.serialize_bool(*value),
+            serde_json::Value::Number(number) => {
+                if self.allow_integral_float {
+                    let value = number.as_f64().ok_or_else(|| {
+                        serde::ser::Error::custom(
+                            "REAL value cannot be represented as a JavaScript number",
+                        )
+                    })?;
+                    return serializer.serialize_f64(value);
+                }
+                if let Some(value) = number.as_i64() {
+                    if !(-9_007_199_254_740_991..=9_007_199_254_740_991).contains(&value) {
+                        return Err(serde::ser::Error::custom(
+                            "JSON integer is outside the JavaScript safe integer range",
+                        ));
+                    }
+                    return serializer.serialize_i64(value);
+                }
+                if let Some(value) = number.as_u64() {
+                    if value > 9_007_199_254_740_991 {
+                        return Err(serde::ser::Error::custom(
+                            "JSON integer is outside the JavaScript safe integer range",
+                        ));
+                    }
+                    return serializer.serialize_u64(value);
+                }
+                if !number.is_f64() {
+                    return Err(serde::ser::Error::custom(
+                        "JSON integer is outside the JavaScript safe integer range",
+                    ));
+                }
+                let value = number.as_f64().ok_or_else(|| {
+                    serde::ser::Error::custom(
+                        "JSON number cannot be represented as a JavaScript number",
+                    )
+                })?;
+                if !value.is_finite()
+                    || (value.fract() == 0.0 && value.abs() > 9_007_199_254_740_991.0)
+                {
+                    return Err(serde::ser::Error::custom(
+                        "JSON number is outside the JavaScript safe numeric range",
+                    ));
+                }
+                serializer.serialize_f64(value)
+            }
+            serde_json::Value::String(value) => serializer.serialize_str(value),
+            serde_json::Value::Array(values) => {
+                use serde::ser::SerializeSeq;
+
+                let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    sequence.serialize_element(&WasmJsonValue {
+                        value,
+                        allow_integral_float: false,
+                    })?;
+                }
+                sequence.end()
+            }
+            serde_json::Value::Object(values) => {
+                use serde::ser::SerializeMap;
+
+                let mut map = serializer.serialize_map(Some(values.len()))?;
+                for (key, value) in values {
+                    map.serialize_entry(
+                        key,
+                        &WasmJsonValue {
+                            value,
+                            allow_integral_float: false,
+                        },
+                    )?;
+                }
+                map.end()
+            }
+        }
+    }
 }
 
 pub(super) fn values_from_js(value: JsValue) -> Result<Vec<Value>, JsValue> {
