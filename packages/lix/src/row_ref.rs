@@ -139,6 +139,30 @@ pub(crate) fn decode(row_ref: &RowRef) -> Result<ResolvedRowRef, LixError> {
     decode_str(row_ref.as_str())
 }
 
+/// Lossless public read shape shared by SQL and the JS decoder fixtures.
+#[cfg(test)]
+pub(crate) fn parts_json(resolved: &ResolvedRowRef) -> serde_json::Value {
+    let primary_key = resolved
+        .row_pk
+        .components
+        .iter()
+        .map(|component| {
+            let kind = match component {
+                RowPkComponent::Uuid(_) => "uuid",
+                RowPkComponent::Integer(_) => "integer",
+                RowPkComponent::String(_) => "string",
+                RowPkComponent::Bytes(_) => "bytes",
+            };
+            serde_json::json!({ "type": kind, "value": component.external_string() })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "relation": resolved.relation,
+        "fileId": resolved.file_id,
+        "primaryKey": primary_key,
+    })
+}
+
 pub(crate) fn decode_str(encoded: &str) -> Result<ResolvedRowRef, LixError> {
     let payload = encoded
         .strip_prefix(PREFIX)
@@ -415,6 +439,56 @@ fn invalid(message: impl Into<String>) -> LixError {
 mod tests {
     use super::*;
     use crate::row_pk::RowPkComponent;
+
+    #[test]
+    fn js_decoder_fixtures_match_canonical_rust_decoder() {
+        let cases = [
+            (
+                "fileless",
+                "lix_file",
+                None,
+                RowPk::uuid_from_canonical("01950000-0000-7000-8000-000000000001").unwrap(),
+            ),
+            (
+                "scoped",
+                "markdown_node",
+                Some("01950000-0000-7000-8000-000000000002"),
+                RowPk::single("paragraph-1"),
+            ),
+            (
+                "typed",
+                "mixed_relation",
+                Some("file-a"),
+                RowPk::from_components(smallvec::smallvec![
+                    RowPkComponent::Uuid([7; 16]),
+                    RowPkComponent::Integer(i64::MAX),
+                    RowPkComponent::String("héllo".into()),
+                    RowPkComponent::Bytes(Bytes::from_static(b"\0binary\xff")),
+                ])
+                .unwrap(),
+            ),
+            (
+                "negative",
+                "numbers",
+                None,
+                RowPk::from_components(smallvec::smallvec![RowPkComponent::Integer(i64::MIN)])
+                    .unwrap(),
+            ),
+            (
+                "leading_bom",
+                "\u{feff}relation",
+                Some("\u{feff}file"),
+                RowPk::single("\u{feff}key"),
+            ),
+        ];
+        let fixtures = cases.into_iter().map(|(name, relation, file_id, row_pk)| {
+            let encoded = encode(relation, file_id, &row_pk).unwrap();
+            serde_json::json!({ "name": name, "ref": encoded.as_str(), "parts": parts_json(&decode(&encoded).unwrap()) })
+        }).collect::<Vec<_>>();
+        let committed: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/row_ref_v2.json")).unwrap();
+        assert_eq!(serde_json::Value::Array(fixtures), committed);
+    }
 
     #[test]
     fn round_trips_composite_typed_identity_without_json() {
