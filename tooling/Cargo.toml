@@ -18,7 +18,7 @@ documentation = "https://docs.rs/lix"
 readme = "../README.md"
 keywords = ["version-control", "ai-agents", "semantic-diff", "change-tracking", "embeddable"]
 categories = ["development-tools", "artificial-intelligence", "filesystem"]
-rust-version = "1.93"
+rust-version = "1.94"
 
 [workspace.dependencies]
 lix = { path = "../packages/lix", version = "=0.17.1", default-features = false }

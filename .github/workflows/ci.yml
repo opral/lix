@@ -427,15 +427,15 @@ jobs:
       - name: Verify stable Cargo can embed the local Rust SDK
         if: matrix.task == 'compatibility'
         run: |
-          rustup toolchain install 1.93.0 --profile minimal
-          rustup run 1.93.0 cargo metadata --locked --format-version 1 --no-deps --manifest-path packages/lix/Cargo.toml
+          rustup toolchain install 1.94.0 --profile minimal
+          rustup run 1.94.0 cargo metadata --locked --format-version 1 --no-deps --manifest-path packages/lix/Cargo.toml
           downstream="$(mktemp -d)"
-          rustup run 1.93.0 cargo init --bin --vcs none --name downstream_lix_sdk "$downstream"
-          rustup run 1.93.0 cargo add --manifest-path "$downstream/Cargo.toml" --path "$PWD/packages/lix" --no-default-features lix
+          rustup run 1.94.0 cargo init --bin --vcs none --name downstream_lix_sdk "$downstream"
+          rustup run 1.94.0 cargo add --manifest-path "$downstream/Cargo.toml" --path "$PWD/packages/lix" --no-default-features lix
           # Run from the consumer crate. Invoking Cargo from the Lix checkout
           # would inherit this repository's nightly-only `.cargo/config.toml`,
           # which a real external path dependency does not inherit.
-          (cd "$downstream" && rustup run 1.93.0 cargo check)
+          (cd "$downstream" && rustup run 1.94.0 cargo check)
 
       # `--all-features` is deliberate: it is the only thing that compiles
       # feature-gated sources such as `packages/lix/src/storage_bench.rs`
