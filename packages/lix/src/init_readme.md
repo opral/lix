@@ -1,6 +1,8 @@
 # The `.lix` directory
 
-This directory contains files used by Lix and applications built on Lix.
+Lix is a version control system that can store files and application data, with
+history, branching, and synchronization. This directory contains repository
+content used by Lix and applications built on Lix.
 
 - `app_data/`: application-owned repository content. Each app uses its own
   subdirectory, for example `app_data/atelier/extensions/` for Atelier extensions.
@@ -12,6 +14,26 @@ This directory contains files used by Lix and applications built on Lix.
 These files and directories are repository content: they participate in Lix
 history, branching, and synchronization. Apps should store their files under
 `app_data/<app-name>/` to avoid conflicts with other apps and Lix.
+New repositories may not have application data or plugins yet; apps add those
+files as needed.
+
+## Querying Lix with JavaScript
+
+Applications and agents can query Lix programmatically with the
+[Lix JavaScript SDK](https://www.npmjs.com/package/@lix-js/sdk). See the
+[Lix documentation](https://lix.dev/docs) for setup and API details.
+
+For example, open a filesystem-backed repository and list its files:
+
+```js
+import { openLix } from "@lix-js/sdk";
+import { FilesystemStorage } from "@lix-js/storage-filesystem";
+
+const lix = await openLix({ storage: new FilesystemStorage({ path: "." }) });
+const files = await lix.execute("SELECT path FROM lix_file ORDER BY path");
+console.log(files.rows.map((row) => row.path));
+await lix.close();
+```
 
 When using filesystem storage, Lix also manages local files in this directory:
 

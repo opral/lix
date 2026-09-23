@@ -42,6 +42,16 @@ simulation_test!(
             ]],
         );
 
+        let query_inserted = session
+            .execute(
+                "INSERT INTO case_returning (id, value) SELECT 'query-valid', 'after' \
+                 RETURNING CASE WHEN value = 'after' THEN upper(value) END",
+                &[],
+            )
+            .await
+            .expect("query INSERT RETURNING expressions should use the DataFusion bridge");
+        assert_rows_eq(query_inserted, vec![vec![Value::Text("AFTER".into())]]);
+
         session
             .execute(
                 "INSERT INTO case_returning (id, value) VALUES ('case-conflict', 'old')",

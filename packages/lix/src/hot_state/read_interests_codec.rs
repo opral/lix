@@ -106,6 +106,7 @@ struct NativeHotFilter {
     branch_ids: Vec<String>,
     file_ids: Vec<crate::NullableKeyFilter<String>>,
     untracked: Option<bool>,
+    global: Option<bool>,
     constraints: Vec<crate::hot_state::ScanConstraint>,
     declared_column_eq: Option<crate::hot_state::DeclaredColumnEq>,
     declared_column_range: Option<Box<crate::hot_state::DeclaredColumnRange>>,
