@@ -224,7 +224,7 @@ impl AuthorityHttp {
         headers
             .retain(|(name, _)| !HttpSyncTransport::<BrowserHttpClient>::is_reserved_header(name));
         headers.extend(request.headers);
-        headers.extend(trace_headers);
+        replace_trace_headers(&mut headers, trace_headers);
         let pairs = Array::new();
         for (name, value) in headers {
             let pair = Array::new();
@@ -425,7 +425,7 @@ async fn authority_stream(
         resolve_request_headers(&client.headers, client.header_provider.as_ref()).await?;
     headers.retain(|(name, _)| !HttpSyncTransport::<BrowserHttpClient>::is_reserved_header(name));
     headers.extend(request.headers);
-    headers.extend(trace_headers);
+    replace_trace_headers(&mut headers, trace_headers);
 
     let init = Object::new();
     Reflect::set(&init, &"method".into(), &request.method.into()).map_err(js_transport_error)?;
@@ -583,7 +583,7 @@ impl RawHttpClient for BrowserHttpClient {
                 !HttpSyncTransport::<BrowserHttpClient>::is_reserved_header(name)
             });
             headers.extend(request.headers);
-            headers.extend(trace_headers);
+            replace_trace_headers(&mut headers, trace_headers);
             fetch(
                 &request.url,
                 request.method.as_str(),
@@ -597,6 +597,16 @@ impl RawHttpClient for BrowserHttpClient {
             .await
         })
     }
+}
+
+fn replace_trace_headers(headers: &mut Vec<(String, String)>, trace_headers: Vec<(String, String)>) {
+    if trace_headers.is_empty() {
+        return;
+    }
+    headers.retain(|(name, _)| {
+        !name.eq_ignore_ascii_case("traceparent") && !name.eq_ignore_ascii_case("tracestate")
+    });
+    headers.extend(trace_headers);
 }
 
 async fn resolve_request_headers(
