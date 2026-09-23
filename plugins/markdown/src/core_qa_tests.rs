@@ -94,6 +94,45 @@ fn qa_semantic_edit_preserves_unrelated_source_format() {
 }
 
 #[test]
+fn qa_deleting_blocks_removes_their_boundaries() {
+    let cases: &[(&str, &[usize], &str)] = &[
+        ("# Title\n\nOne.\n\nTwo.\n", &[2], "# Title\n\nOne.\n"),
+        ("# Title\n\nOne.\n\nTwo.\n", &[1], "# Title\n\nTwo.\n"),
+        ("# Title\n\nOne.\n\nTwo.\n", &[0], "One.\n\nTwo.\n"),
+        ("\n\n# Title\n\nOne.\n", &[0], "One.\n"),
+        ("# Title\n\nOne.\n\nTwo.\n", &[0, 1, 2], ""),
+        ("# Title\n\nOne.\n\nTwo.\n", &[1, 2], "# Title\n"),
+        ("A.\n\nB.\n\nC.\n\nD.\n\nE.\n", &[1, 3], "A.\n\nC.\n\nE.\n"),
+        ("# Title\n\nOne.\n\nTwo.", &[2], "# Title\n\nOne."),
+        (
+            "#   Title ###\r\n\r\nOne.\r\n\r\nTwo.\r\n",
+            &[2],
+            "#   Title ###\r\n\r\nOne.\r\n",
+        ),
+    ];
+    for &(source, deleted, expected) in cases {
+        let (document, _) = Document::open_file(
+            source.as_bytes().to_vec(),
+            Some("delete.md"),
+            IdNamespace::from_halves(21, 11),
+        )
+        .unwrap();
+        let children = document.tree.materialize().children;
+        let changes = deleted
+            .iter()
+            .map(|&index| RowChange {
+                schema_key: NODE_SCHEMA_KEY.into(),
+                row_pk: vec![children[index].node.id],
+                row: None,
+                effect: ChangeEffect::Content,
+            })
+            .collect();
+        let (updated, _) = document.rows_changed(changes).unwrap();
+        assert_eq!(updated.bytes(), expected.as_bytes(), "source: {source:?}");
+    }
+}
+
+#[test]
 fn qa_replayed_unchanged_row_preserves_source_bytes() {
     let source = b"#   Unusual heading  ###\n\n*Counter:\n\nQA_TARGET\n".to_vec();
     let (document, _) = Document::open_file(

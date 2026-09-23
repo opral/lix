@@ -2997,7 +2997,6 @@ impl Document {
                 }
             }
             let Some(&new) = after_by_id.get(&old.node.id) else {
-                edits.push((range, Vec::new()));
                 continue;
             };
             if old == new {
@@ -3012,6 +3011,38 @@ impl Document {
             })?;
             edits.push((range, rendered));
         }
+        let mut index = 0;
+        while index < before.children.len() {
+            if after_by_id.contains_key(&before.children[index].node.id) {
+                index += 1;
+                continue;
+            }
+            let first = index;
+            while index < before.children.len()
+                && !after_by_id.contains_key(&before.children[index].node.id)
+            {
+                index += 1;
+            }
+            let left = first.checked_sub(1).map(|i| &parsed.top_level_ranges[i]);
+            let right = parsed.top_level_ranges.get(index);
+            let start = left.map_or(0, |range| range.end);
+            let end = right.map_or(source.len(), |range| range.start);
+            let separator = match (left, right) {
+                (Some(left), Some(_)) => source[left.end..parsed.top_level_ranges[first].start]
+                    .as_bytes()
+                    .to_vec(),
+                (Some(_), None) if after.node.format["final_newline"] == true => {
+                    if after.node.format["line_ending"] == "crlf" {
+                        b"\r\n".to_vec()
+                    } else {
+                        b"\n".to_vec()
+                    }
+                }
+                _ => Vec::new(),
+            };
+            edits.push((start..end, separator));
+        }
+        edits.sort_unstable_by_key(|(range, _)| range.start);
         let splices = edits
             .iter()
             .map(|(range, insert)| FileEdit {

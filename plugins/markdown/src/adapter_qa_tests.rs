@@ -183,6 +183,47 @@ fn accept_rows(
 }
 
 #[test]
+fn deleting_block_row_removes_separator_in_adapter_and_restore() {
+    let harness = Harness::<MarkdownPlugin>::default();
+    let creates = sdk::CreateContext::from_namespace_bytes([23; 12]);
+    let input = Snapshot {
+        file_id: "delete-block".into(),
+        path: "README.md".into(),
+        bytes: b"# Title\n\nOne.\n\nTwo.\n".to_vec(),
+        ..Snapshot::default()
+    };
+    let parsed = harness.parse(&input, creates).unwrap();
+    let mut rows = Vec::new();
+    accept_rows(&mut rows, &parsed.row_changes, creates);
+    let file = parsed.into_snapshot();
+    let target = rows
+        .iter()
+        .find(|row| {
+            matches!(row.row.get("payload_json"), Some(sdk::TypedValue::Jsonb(payload))
+                if payload.to_string().contains("Two."))
+        })
+        .expect("paragraph row")
+        .clone();
+    let deletion = sdk::TypedRowChange {
+        schema_key: target.schema_key.clone(),
+        schema_fingerprint: target.schema_fingerprint,
+        primary_key: target.primary_key.clone(),
+        row: None,
+        local_ref: None,
+        effect: sdk::ChangeEffect::Content,
+    };
+    let updated = harness
+        .serialize_changes(&file, &[deletion.clone()])
+        .unwrap();
+    assert_eq!(updated.snapshot().bytes, b"# Title\n\nOne.\n");
+    accept_rows(&mut rows, &[deletion], creates);
+    let restored = harness
+        .serialize(&file.file_id, &file.path, &rows, None)
+        .unwrap();
+    assert_eq!(restored.snapshot().bytes, updated.snapshot().bytes);
+}
+
+#[test]
 fn native_adapter_exercises_all_hooks_and_cold_reopen_without_stale_overlays() {
     let harness = Harness::<MarkdownPlugin>::default();
     let creates = sdk::CreateContext::from_namespace_bytes([9; 12]);
