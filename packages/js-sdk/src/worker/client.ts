@@ -11,6 +11,7 @@ import type {
 	LixStorageConfig,
 	LixTransactionBinding,
 	ObserveEventsBinding,
+	TelemetryParentContext,
 } from "../binding-types.js";
 import type {
 	LixTelemetryOptions,
@@ -39,7 +40,10 @@ type PendingRequest = {
 	reject(error: unknown): void;
 };
 
-type RequestWorker = <T>(operation: WorkerOperation) => Promise<T>;
+type RequestWorker = <T>(
+	operation: WorkerOperation,
+	telemetryParent?: TelemetryParentContext,
+) => Promise<T>;
 type NotifyWorker = (notification: WorkerNotification) => void;
 
 const MAX_IDLE_WORKERS = 1;
@@ -410,9 +414,9 @@ export function workerBinding(
 	sessionId: number,
 ): LixBinding {
 	let closed = false;
-	const request: RequestWorker = (operation) => {
+	const request: RequestWorker = (operation, telemetryParent) => {
 		if (closed) return Promise.reject(workerClosedError());
-		return client.request(operation, sessionId);
+		return client.request(operation, sessionId, telemetryParent);
 	};
 	const notify: NotifyWorker = (notification) => {
 		if (!closed) client.notify(notification);
@@ -434,12 +438,17 @@ export function workerBinding(
 		executeBatch: (statements, options) =>
 			request({ kind: "executeBatch", statements, options }),
 		observe: async (sql, params) => {
-			const observeId = await request<number>({
-				kind: "observe",
-				sql,
-				params,
-			});
-			return workerObserveBinding(request, observeId);
+			const initialParent = client.currentTelemetryParent();
+			const observeId = await request<number>(
+				{ kind: "observe", sql, params },
+				initialParent,
+			);
+			return workerObserveBinding(
+				request,
+				observeId,
+				initialParent,
+				() => client.currentTelemetryParent(),
+			);
 		},
 		beginTransaction: async () => {
 			const transactionId = await request<number>({
@@ -524,10 +533,17 @@ function workerTransactionBinding(
 function workerObserveBinding(
 	request: RequestWorker,
 	observeId: number,
+	initialParent: TelemetryParentContext | undefined,
+	currentParent: () => TelemetryParentContext | undefined,
 ): ObserveEventsBinding {
+	let firstNext = true;
 	return {
 		setTelemetryParent: () => {},
-		next: () => request({ kind: "observe.next", observeId }),
+		next: () => {
+			const parent = currentParent() ?? (firstNext ? initialParent : undefined);
+			firstNext = false;
+			return request({ kind: "observe.next", observeId }, parent);
+		},
 		close: () => request({ kind: "observe.close", observeId }).then(() => undefined),
 	};
 }
@@ -616,7 +632,15 @@ export class LixWorkerClient {
 		onDisposed?.();
 	}
 
-	request<T>(operation: WorkerOperation, sessionId = 0): Promise<T> {
+	currentTelemetryParent(): TelemetryParentContext | undefined {
+		return readTelemetryParent(this.telemetry?.parentContext);
+	}
+
+	request<T>(
+		operation: WorkerOperation,
+		sessionId = 0,
+		telemetryParent?: TelemetryParentContext,
+	): Promise<T> {
 		if (this.disposed || !this.leased) {
 			return Promise.reject(workerClosedError());
 		}
@@ -657,7 +681,7 @@ export class LixWorkerClient {
 				this.connection.postMessage({
 					id,
 					sessionId,
-					telemetryParent: readTelemetryParent(this.telemetry?.parentContext),
+					telemetryParent: telemetryParent ?? this.currentTelemetryParent(),
 					operation,
 				});
 			} catch (error) {

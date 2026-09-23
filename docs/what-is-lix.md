@@ -1,14 +1,14 @@
 ---
-description: Lix is a version control system for any file format. It runs in-process on pluggable storage and stores files, app tables, and history as rows in one ACID database.
+description: Lix is a version control system for files and application data. It stores files and SQL tables in one repository.
 ---
 
 # What is Lix?
 
-Lix is a version control system for any file format. It runs in-process on pluggable storage. Files, application tables, and history are rows in one ACID database that you query with SQL.
+Lix is a version control system for files and application data. It stores files of any format alongside application data in SQL tables. Files, tables, and history share one repository. Lix runs inside your app or connects to a server.
 
 Agents and tools read and write normal files. Your product queries and updates SQL rows. Both work on the same repository. Lix versions everything they write, with branches, history, review, rollback, and merge. Every tracked write becomes a commit automatically. You never run a commit command.
 
-Unlike Git, Lix tracks the rows inside files, not lines of text. See [How Lix compares to Git](./comparison-to-git.md).
+For supported formats, plugins track changes inside files as rows. Other files still have whole-file history. See [How Lix compares to Git](./comparison-to-git.md).
 
 <img src="../website/public/assets/one-lix-repo.svg" alt="One Lix repository holding files of every format and the application's own database tables" width="760" />
 
@@ -83,7 +83,7 @@ File plugins map parts of a file to rows. A row can represent a Markdown block, 
 
 Apps read and write these rows with SQL. Lix commits their history. With `FilesystemStorage`, it also writes changes back to normal files on disk.
 
-Diffs are row-level: review the clause, cell, or row that changed, not lines of text. See [Diffs](./diffs.md).
+With a suitable plugin, you can review the block, property, or row that changed. Files without a plugin have whole-file diffs. See [Diffs](./diffs.md).
 
 ## Pluggable storage
 

@@ -1,6 +1,6 @@
 use super::context::SessionContext;
 use crate::LixError;
-use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
+use crate::branch::{BranchLifecycle, BranchOperation, BranchRefReader, BranchReferenceRole};
 use crate::storage_adapter::{SharedStorageAdapterRead, Storage, StorageReadOptions};
 
 /// Options for switching a session to another branch.
@@ -28,16 +28,10 @@ where
         options: SwitchBranchOptions,
     ) -> Result<SwitchBranchReceipt, LixError> {
         let branch_id = options.branch_id;
-        // One switch at a time across session clones: the selector moves
-        // before the boundary refresh below (its staleness gate keys off the
-        // observer bump), and a refresh failure rolls the selector back —
-        // both steps must not interleave with another clone's switch.
+        // Serialize switches across session clones while the target is
+        // prepared and the shared selector is published.
         let _switch_serial = self.branch.begin_switch().await;
-        // Keep the existing session/collaboration lease so branch deletion
-        // cannot race target validation. A switch is normally session-local;
-        // when the selected local branch pins an older global head, the lazy
-        // auto-rebase below also publishes one metadata-only commit.
-        let write_access = self.begin_session_write_access().await?;
+        self.ensure_open()?;
         let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
@@ -51,23 +45,89 @@ where
                 BranchReferenceRole::Target,
             )
             .await?;
-        self.ensure_open()?;
-        let previous_branch_id = self.bound_branch_id()?;
-        self.branch.set(branch_id.clone())?;
-        self.observe_invalidation.bump();
         drop(reader);
         drop(read);
-        drop(write_access);
-        // Refresh at the explicit checkout boundary. This keeps observers and
-        // other read helpers from discovering that they need an internal write
-        // while already evaluating a stable snapshot. The selector must move
-        // before the bump so the refresh's staleness gate sees the switch;
-        // an error therefore restores the previous selector — a failed
-        // switch must not leave the session silently on the target branch.
-        if let Err(error) = self.refresh_active_branch_base_if_stale().await {
-            self.branch.set(previous_branch_id)?;
+        self.ensure_open()?;
+
+        loop {
+            // Refresh a private candidate bound to the target. A failure leaves
+            // the branch shared by session clones untouched, so ordinary writes
+            // can continue on the old branch and cannot commit to a target that
+            // this switch later abandons.
+            let candidate = self.branch_switch_candidate(branch_id.clone())?;
+            candidate.refresh_active_branch_base_if_stale().await?;
+            let prepared_global_head = candidate
+                .observed_global_head
+                .read()
+                .map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "session global-head observation is poisoned",
+                    )
+                })?
+                .clone();
+
+            // Take write access only at publication. This drains operations
+            // still using the old selector, then the final validation fences
+            // branch deletion before the new selector becomes visible.
+            let write_access = self.begin_session_write_access().await?;
+            let read = SharedStorageAdapterRead::new(
+                self.storage
+                    .begin_read(StorageReadOptions::default())
+                    .await?,
+            );
+            let reader = self.branch_ctx.ref_reader(&read);
+            BranchLifecycle::new(&reader)
+                .require_existing_commit_id(
+                    &branch_id,
+                    BranchOperation::SwitchBranch,
+                    BranchReferenceRole::Target,
+                )
+                .await?;
+            self.ensure_open()?;
+
+            // A global commit can race the gap between target refresh and
+            // selector publication. Recheck the session's freshness watermark
+            // under write access and prepare again if global advanced. The
+            // target's pinned base can intentionally predate the observed head;
+            // comparing the two directly would create an unnecessary commit
+            // every time the session switches back to that branch.
+            let target_is_current = if branch_id == crate::GLOBAL_BRANCH_ID
+                || self.sync_mode.role() == crate::sync::SyncRole::PartialReplica
+            {
+                true
+            } else {
+                let global_head = reader.load_head_commit_id(crate::GLOBAL_BRANCH_ID).await?;
+                match (prepared_global_head.as_ref(), global_head.as_ref()) {
+                    (Some(prepared), Some(current)) => prepared == current,
+                    // A missing observation means the candidate had no global
+                    // head to refresh against. The refresh path treats an
+                    // absent target/global head as a no-op.
+                    _ => true,
+                }
+            };
+
+            if !target_is_current {
+                drop(reader);
+                drop(read);
+                drop(write_access);
+                continue;
+            }
+
+            let mut observed_global_head = self.observed_global_head.write().map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "session global-head observation is poisoned",
+                )
+            })?;
+            self.branch.set(branch_id.clone())?;
+            *observed_global_head = prepared_global_head;
             self.observe_invalidation.bump();
-            return Err(error);
+            drop(observed_global_head);
+            drop(reader);
+            drop(read);
+            drop(write_access);
+            break;
         }
 
         Ok(SwitchBranchReceipt { branch_id })
@@ -381,6 +441,50 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn switching_to_a_direct_global_commit_does_not_retry_forever() {
+        let storage = Memory::new();
+        let receipt = Engine::initialize(storage.clone())
+            .await
+            .expect("initialize storage");
+        let engine = Engine::new(storage).await.expect("open engine");
+        let global = engine
+            .open_session_at(crate::GLOBAL_BRANCH_ID.to_owned())
+            .await
+            .expect("open global branch");
+        let global_head = global
+            .execute("SELECT lix_active_branch_commit_id()", &[])
+            .await
+            .expect("read global head");
+        let crate::Value::Text(global_head) = &global_head.rows()[0].values()[0] else {
+            panic!("global head should be text");
+        };
+
+        let session = engine
+            .open_session_at(&receipt.main_branch_id)
+            .await
+            .expect("open main session");
+        let branch = session
+            .create_branch(CreateBranchOptions {
+                id: Some("01990000-0000-7000-8000-00000000c005".to_owned()),
+                name: "direct-global-head".to_owned(),
+                from_commit_id: Some(global_head.clone()),
+            })
+            .await
+            .expect("create branch at global commit");
+
+        let switched = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            session.switch_branch(SwitchBranchOptions {
+                branch_id: branch.id.clone(),
+            }),
+        )
+        .await
+        .expect("direct global-root switch should terminate")
+        .expect("switch succeeds");
+        assert_eq!(switched.branch_id, branch.id);
+    }
+
     /// Fails every `begin_write` while armed; reads pass through.
     #[derive(Clone)]
     struct WriteFailStorage {
@@ -415,6 +519,73 @@ mod tests {
             if self.fail_writes.load(Ordering::SeqCst) {
                 return Err(StorageError::Corruption("injected write failure".into()));
             }
+            self.inner.begin_write(options).await
+        }
+    }
+
+    #[derive(Clone)]
+    struct RefreshReadFailStorage {
+        inner: Memory,
+        gate: Arc<RefreshReadGate>,
+    }
+
+    #[derive(Default)]
+    struct RefreshReadGate {
+        armed: std::sync::atomic::AtomicBool,
+        reads_after_arm: AtomicU64,
+        blocked: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl RefreshReadGate {
+        fn arm(&self) {
+            self.reads_after_arm.store(0, Ordering::SeqCst);
+            self.armed.store(true, Ordering::SeqCst);
+        }
+
+        async fn wait_until_blocked(&self) {
+            self.blocked.notified().await;
+        }
+
+        fn release_with_failure(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    impl Storage for RefreshReadFailStorage {
+        type Read<'a>
+            = MemoryRead
+        where
+            Self: 'a;
+        type Write<'a>
+            = MemoryWrite
+        where
+            Self: 'a;
+
+        async fn acquire_session(
+            &self,
+        ) -> Result<crate::storage::StorageSessionToken, StorageError> {
+            self.inner.acquire_session().await
+        }
+
+        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            if self.gate.armed.load(Ordering::SeqCst)
+                && self.gate.reads_after_arm.fetch_add(1, Ordering::SeqCst) == 1
+            {
+                self.gate.armed.store(false, Ordering::SeqCst);
+                self.gate.blocked.notify_one();
+                self.gate.release.notified().await;
+                return Err(StorageError::Corruption(
+                    "injected branch refresh read failure".into(),
+                ));
+            }
+            self.inner.begin_read(options).await
+        }
+
+        async fn begin_write(
+            &self,
+            options: WriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
             self.inner.begin_write(options).await
         }
     }
@@ -473,6 +644,104 @@ mod tests {
             .await
             .expect("retry succeeds once writes recover");
         assert_eq!(switched.branch_id, branch.id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cloned_write_during_failed_switch_stays_on_published_branch() {
+        let storage = RefreshReadFailStorage {
+            inner: Memory::new(),
+            gate: Arc::new(RefreshReadGate::default()),
+        };
+        let receipt = Engine::initialize(storage.clone())
+            .await
+            .expect("initialize storage");
+        let engine = Engine::new(storage.clone()).await.expect("open engine");
+        let session = engine
+            .open_session_at(&receipt.main_branch_id)
+            .await
+            .expect("open pinned main session");
+        let branch = session
+            .create_branch(CreateBranchOptions {
+                id: Some("01990000-0000-7000-8000-00000000c004".to_owned()),
+                name: "refresh-write-race".to_owned(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("create switch target");
+
+        storage.gate.arm();
+        let switch_session = session.clone();
+        let switch_branch_id = branch.id.clone();
+        let switch = tokio::spawn(async move {
+            switch_session
+                .switch_branch(SwitchBranchOptions {
+                    branch_id: switch_branch_id,
+                })
+                .await
+        });
+        storage.gate.wait_until_blocked().await;
+
+        // The refresh is paused before it can fail. A cloned handle remains
+        // bound to the currently published branch and can commit normally.
+        let write_session = session.clone();
+        let write = tokio::spawn(async move {
+            write_session
+                .execute(
+                    "INSERT INTO lix_key_value (key, value) VALUES ('switch-race', 'kept')",
+                    &[],
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            write
+                .await
+                .expect("cloned write task")
+                .expect("cloned write");
+        })
+        .await
+        .expect("write can finish against the still-published branch");
+
+        storage.gate.release_with_failure();
+        let switch_result = tokio::time::timeout(std::time::Duration::from_secs(30), switch)
+            .await
+            .expect("switch finishes after refresh fails")
+            .expect("switch task");
+        switch_result.expect_err("refresh read was injected to fail");
+
+        assert_eq!(
+            session.active_branch_id().await.expect("active branch"),
+            receipt.main_branch_id
+        );
+        let main_count = session
+            .execute(
+                "SELECT COUNT(*) AS n FROM lix_key_value WHERE key = 'switch-race'",
+                &[],
+            )
+            .await
+            .expect("read write from main")
+            .rows()[0]
+            .get::<i64>("n")
+            .expect("main count");
+        assert_eq!(main_count, 1);
+
+        let target_session = engine
+            .open_session_at(&branch.id)
+            .await
+            .expect("open target session");
+        let target_count = target_session
+            .execute(
+                "SELECT COUNT(*) AS n FROM lix_key_value WHERE key = 'switch-race'",
+                &[],
+            )
+            .await
+            .expect("read target")
+            .rows()[0]
+            .get::<i64>("n")
+            .expect("target count");
+        assert_eq!(
+            target_count, 0,
+            "failed switch must not leak writes to target"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

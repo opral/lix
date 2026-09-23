@@ -50,6 +50,22 @@ const MIGRATION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const MIGRATION_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(10);
 const MISSED_HEARTBEATS_BEFORE_RECOVERY: usize = 10;
 
+fn partial_repository_protocol(format: u32) -> Option<&'static [u8]> {
+    match format {
+        79 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V79),
+        80 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V80),
+        81 => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_V81),
+        crate::init::CURRENT_FORMAT_VERSION => Some(crate::init::PARTIAL_REPOSITORY_PROTOCOL_VALUE),
+        _ => None,
+    }
+}
+
+fn partial_repository_format(marker: &[u8]) -> Option<u32> {
+    [79, 80, 81, crate::init::CURRENT_FORMAT_VERSION]
+        .into_iter()
+        .find(|format| partial_repository_protocol(*format) == Some(marker))
+}
+
 fn durable_candidate_write_options() -> WriteOptions {
     WriteOptions {
         // A durable epoch pointer must never outlive candidate rows or the
@@ -358,6 +374,12 @@ enum PointerState {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionIntent {
+    FullRepository,
+    PartialReplica,
+}
+
 pub(super) async fn inspect_layout<S: Storage>(
     storage: &S,
 ) -> Result<(super::public_api::RepositoryLayout, Option<u32>), LixError> {
@@ -565,11 +587,51 @@ where
     .await
 }
 
+/// Admit or migrate an existing partial replica without interpreting its
+/// protocol marker as a full-layout repository marker. The partial opening
+/// path has already authenticated the receipt and role before calling here.
+pub(crate) async fn admit_partial_repository<S>(
+    storage: &S,
+    progress: Option<&Arc<dyn OpenProgressSink>>,
+) -> Result<EpochAdmission<S>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    admit_repository_with_intent(
+        storage,
+        progress,
+        None,
+        super::MigrationOptions::default(),
+        AdmissionIntent::PartialReplica,
+    )
+    .await
+}
+
 pub(crate) async fn admit_repository_with_options<S>(
     storage: &S,
     progress: Option<&Arc<dyn OpenProgressSink>>,
     server: Option<&crate::ServerOptions>,
     options: super::MigrationOptions,
+) -> Result<EpochAdmission<S>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    admit_repository_with_intent(
+        storage,
+        progress,
+        server,
+        options,
+        AdmissionIntent::FullRepository,
+    )
+    .await
+}
+
+async fn admit_repository_with_intent<S>(
+    storage: &S,
+    progress: Option<&Arc<dyn OpenProgressSink>>,
+    server: Option<&crate::ServerOptions>,
+    options: super::MigrationOptions,
+    intent: AdmissionIntent,
 ) -> Result<EpochAdmission<S>, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -596,6 +658,7 @@ where
                     // open future's stack, including for filesystem adapters.
                     return Box::pin(migrate_active(
                         storage, bank, generation, format, bytes, progress, server, options,
+                        intent,
                     ))
                     .await;
                 }
@@ -662,7 +725,7 @@ where
                 }
             }
             None => {
-                return Box::pin(admit_legacy(storage, progress, server, options)).await;
+                return Box::pin(admit_legacy(storage, progress, server, options, intent)).await;
             }
         }
     }
@@ -870,11 +933,27 @@ async fn admit_legacy<S>(
     progress: Option<&Arc<dyn OpenProgressSink>>,
     server: Option<&crate::ServerOptions>,
     options: super::MigrationOptions,
+    intent: AdmissionIntent,
 ) -> Result<EpochAdmission<S>, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    let legacy_status = super::inspect_lix(storage).await?;
+    let source_marker = load_storage_value(
+        storage,
+        crate::init::REPOSITORY_PROTOCOL_SPACE,
+        crate::init::REPOSITORY_PROTOCOL_KEY,
+    )
+    .await?;
+    let partial_source_format = (intent == AdmissionIntent::PartialReplica)
+        .then(|| source_marker.as_deref().and_then(partial_repository_format))
+        .flatten();
+    let legacy_status = match partial_source_format {
+        Some(from_version) => super::MigrationStatus::Required {
+            from_version,
+            to_version: crate::init::CURRENT_FORMAT_VERSION,
+        },
+        None => super::inspect_lix(storage).await?,
+    };
     if matches!(legacy_status, super::MigrationStatus::Missing) {
         let legacy = StorageAdapter::new(storage.clone());
         if legacy
@@ -895,8 +974,8 @@ where
         });
         if let Err(error) = publish_migration_claim_absent(storage, &migrating_bytes).await {
             if is_admission_race(&error) {
-                return Box::pin(admit_repository_with_options(
-                    storage, progress, server, options,
+                return Box::pin(admit_repository_with_intent(
+                    storage, progress, server, options, intent,
                 ))
                 .await;
             }
@@ -979,13 +1058,8 @@ where
             crate::init::CURRENT_FORMAT_VERSION
         )));
     }
-    let original_marker = load_storage_value(
-        storage,
-        crate::init::REPOSITORY_PROTOCOL_SPACE,
-        crate::init::REPOSITORY_PROTOCOL_KEY,
-    )
-    .await?
-    .ok_or_else(|| epoch_error("repository protocol marker disappeared during inspection"))?;
+    let original_marker = source_marker
+        .ok_or_else(|| epoch_error("repository protocol marker disappeared during inspection"))?;
     emit_migrating(progress, from_format);
     let source = StorageAdapter::new(storage.clone());
     let target_bank = if server.is_some() {
@@ -996,8 +1070,8 @@ where
     let source_revision = match source.load_mutation_revision().await {
         Ok(revision) => revision,
         Err(error) if is_admission_race(&error) => {
-            return Box::pin(admit_repository_with_options(
-                storage, progress, server, options,
+            return Box::pin(admit_repository_with_intent(
+                storage, progress, server, options, intent,
             ))
             .await;
         }
@@ -1015,8 +1089,8 @@ where
         claim_legacy(storage, source_revision, &original_marker, &migrating_bytes).await
     {
         if is_admission_race(&error) {
-            return Box::pin(admit_repository_with_options(
-                storage, progress, server, options,
+            return Box::pin(admit_repository_with_intent(
+                storage, progress, server, options, intent,
             ))
             .await;
         }
@@ -1052,6 +1126,7 @@ where
                 &target,
                 from_format,
                 options,
+                Some(&original_marker),
             ))
             .await?
             {
@@ -1178,6 +1253,7 @@ async fn migrate_active<S>(
     progress: Option<&Arc<dyn OpenProgressSink>>,
     server: Option<&crate::ServerOptions>,
     options: super::MigrationOptions,
+    intent: AdmissionIntent,
 ) -> Result<EpochAdmission<S>, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
@@ -1208,8 +1284,8 @@ where
     let source_revision = match source.load_mutation_revision().await {
         Ok(revision) => revision,
         Err(error) if is_admission_race(&error) => {
-            return Box::pin(admit_repository_with_options(
-                storage, progress, server, options,
+            return Box::pin(admit_repository_with_intent(
+                storage, progress, server, options, intent,
             ))
             .await;
         }
@@ -1235,8 +1311,8 @@ where
     {
         Ok(claim) => claim,
         Err(error) if is_admission_race(&error) => {
-            return Box::pin(admit_repository_with_options(
-                storage, progress, server, options,
+            return Box::pin(admit_repository_with_intent(
+                storage, progress, server, options, intent,
             ))
             .await;
         }
@@ -1252,8 +1328,8 @@ where
         resolve_exact_pointer_commit(storage, claim.commit().await, &migrating_bytes).await
     {
         if is_admission_race(&error) {
-            return Box::pin(admit_repository_with_options(
-                storage, progress, server, options,
+            return Box::pin(admit_repository_with_intent(
+                storage, progress, server, options, intent,
             ))
             .await;
         }
@@ -1285,6 +1361,7 @@ where
                 &target,
                 from_format,
                 options,
+                None,
             ))
             .await?
             {
@@ -1475,44 +1552,62 @@ async fn migrate_sparse_candidate<S>(
     target: &StorageAdapter<S>,
     from_format: u32,
     options: super::MigrationOptions,
+    source_marker_witness: Option<&Bytes>,
 ) -> Result<bool, LixError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    if !matches!(from_format, 79 | 80 | 81) {
+    let Some(expected) = partial_repository_protocol(from_format) else {
         return Ok(false);
-    }
-    let read = source.begin_read(ReadOptions::default()).await?;
-    let values = crate::storage_adapter::PointReadPlan::new(
-        crate::init::REPOSITORY_PROTOCOL_SPACE,
-        &[Key(Bytes::from_static(
-            crate::init::REPOSITORY_PROTOCOL_KEY,
-        ))],
-    )
-    .materialize(&read, Default::default())
-    .await?
-    .value;
-    let expected = if from_format == 79 {
-        crate::init::PARTIAL_REPOSITORY_PROTOCOL_V79
-    } else if from_format == 80 {
-        crate::init::PARTIAL_REPOSITORY_PROTOCOL_V80
-    } else {
-        crate::init::PARTIAL_REPOSITORY_PROTOCOL_V81
     };
-    if !matches!(values.first(), Some(Some(ProjectedValue::FullValue(value))) if value.as_ref() == expected)
-    {
+    let source_marker = match source_marker_witness {
+        Some(marker) => marker.clone(),
+        None => {
+            let read = source.begin_read(ReadOptions::default()).await?;
+            let values = crate::storage_adapter::PointReadPlan::new(
+                crate::init::REPOSITORY_PROTOCOL_SPACE,
+                &[Key(Bytes::from_static(
+                    crate::init::REPOSITORY_PROTOCOL_KEY,
+                ))],
+            )
+            .materialize(&read, Default::default())
+            .await?
+            .value;
+            drop(read);
+            match values.first() {
+                Some(Some(ProjectedValue::FullValue(marker))) => marker.clone(),
+                _ => return Ok(false),
+            }
+        }
+    };
+    if source_marker.as_ref() != expected {
         return Ok(false);
     }
-    drop(read);
     clear_bank(target).await?;
     let _ = copy_repository(source, target, true).await?;
+    // A pointerless legacy claim fences the source's live marker before copy.
+    // Restore the captured role marker in the isolated candidate so the
+    // partial migration steps and validator see the actual source layout.
+    if source_marker_witness.is_some() {
+        write_candidate_page(
+            target,
+            crate::init::REPOSITORY_PROTOCOL_SPACE,
+            single_put(
+                crate::init::REPOSITORY_PROTOCOL_KEY,
+                Bytes::from_static(expected),
+            ),
+        )
+        .await?;
+    }
     if from_format == 79 {
         super::incorporation::migrate(target, options, true).await?;
     }
     if from_format <= 80 {
         super::runtime_epoch::migrate(target, true).await?;
     }
-    super::hot_indexes::migrate(target, options, true).await?;
+    if from_format < crate::init::CURRENT_FORMAT_VERSION {
+        super::hot_indexes::migrate(target, options, true).await?;
+    }
     crate::sync::upgrade_owned_partial_receipt(target).await?;
     let state = crate::handle::retry_expired_read(|| async {
         let read = target.begin_read(ReadOptions::default()).await?;
@@ -3987,6 +4082,7 @@ pub(super) mod tests {
             None,
             None,
             super::super::MigrationOptions::default(),
+            AdmissionIntent::FullRepository,
         )
         .await
         .expect("a losing opener should join the winner's active epoch");
