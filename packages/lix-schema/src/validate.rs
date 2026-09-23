@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use serde_json::Value;
 
-use crate::{Column, DataType, Error, ErrorKind, SCHEMA_V1_URI, Schema};
+use crate::{Column, DataType, DeleteAction, Error, ErrorKind, SCHEMA_V1_URI, Schema};
 
 pub(crate) fn validate_schema(schema: &Schema) -> Result<(), Error> {
     if schema.schema != SCHEMA_V1_URI {
@@ -79,6 +79,12 @@ pub(crate) fn validate_schema(schema: &Schema) -> Result<(), Error> {
         if foreign_key.columns.len() != foreign_key.references.columns.len() {
             return definition(path, "local and referenced column counts must match");
         }
+        if foreign_key.on_delete == DeleteAction::SetNull {
+            return definition(
+                format!("{path}/on_delete"),
+                "set_null is supported only for row_refs",
+            );
+        }
     }
     let mut row_ref_columns = BTreeSet::new();
     for (index, row_ref) in schema.row_refs.iter().enumerate() {
@@ -104,6 +110,53 @@ pub(crate) fn validate_schema(schema: &Schema) -> Result<(), Error> {
                 format!("{path}/column"),
                 format!("row-reference column '{}' must use text", row_ref.column),
             );
+        }
+        if row_ref.on_delete == DeleteAction::SetNull && !column.nullable {
+            return definition(
+                format!("{path}/on_delete"),
+                format!(
+                    "set_null requires row-reference column '{}' to be nullable",
+                    row_ref.column
+                ),
+            );
+        }
+    }
+    let mut detached_columns = BTreeSet::new();
+    for (index, row_ref) in schema.row_refs.iter().enumerate() {
+        let Some(detached) = &row_ref.detached_column else {
+            continue;
+        };
+        let path = format!("/row_refs/{index}/detached_column");
+        if row_ref.on_delete != DeleteAction::SetNull {
+            return definition(path, "detached_column requires on_delete set_null");
+        }
+        let Some(column) = schema
+            .columns
+            .iter()
+            .find(|candidate| &candidate.name == detached)
+        else {
+            return definition(path, format!("unknown column '{detached}'"));
+        };
+        if column.data_type != DataType::Text || !column.nullable {
+            return definition(
+                path,
+                format!("detached column '{detached}' must be nullable text"),
+            );
+        }
+        if row_ref_columns.contains(detached.as_str()) {
+            return definition(
+                path,
+                format!("detached column '{detached}' must not be a row-reference column"),
+            );
+        }
+        if schema.primary_key.contains(detached) {
+            return definition(
+                path,
+                format!("detached column '{detached}' must not be part of the primary key"),
+            );
+        }
+        if !detached_columns.insert(detached.as_str()) {
+            return definition(path, "duplicates an earlier detached column");
         }
     }
     Ok(())

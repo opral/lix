@@ -102,7 +102,8 @@
       "required": ["column"],
       "properties": {
         "column": { "$ref": "#/$defs/identifier" },
-        "on_delete": { "enum": ["no_action", "cascade"], "default": "no_action" }
+        "on_delete": { "enum": ["no_action", "cascade", "set_null"], "default": "no_action" },
+        "detached_column": { "$ref": "#/$defs/identifier" }
       }
     }
   }

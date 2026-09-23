@@ -215,7 +215,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
         };
         let row_ref_sources_present = incoming_row_ref_sources || live_row_ref_sources;
         let has_action = |schema: &str| {
-            catalog.has_row_ref_cascades()
+            catalog.has_row_ref_delete_actions()
                 || catalog
                     .delete_plan_for_key(schema)
                     .foreign_key_references
@@ -227,7 +227,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
         let file_delete_scopes_enabled = !file_delete_ids.is_empty()
             && (incoming_row_refs
                 || !catalog.row_ref_references().is_empty()
-                || catalog.has_row_ref_cascades());
+                || catalog.has_row_ref_delete_actions());
         let mut file_delete_schema_keys = self
             .sql_schema_snapshot
             .plans()

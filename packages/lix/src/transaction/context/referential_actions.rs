@@ -389,7 +389,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
                 .schema_resolver
                 .catalogs_for_validation(&base, catalog_overlay, &domain)
                 .await?;
-            if catalog.has_row_ref_cascades()
+            if catalog.has_row_ref_delete_actions()
                 || catalog
                     .delete_plan_for_key(row.schema_key.as_str())
                     .foreign_key_references

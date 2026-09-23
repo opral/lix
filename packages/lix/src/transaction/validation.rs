@@ -3511,7 +3511,7 @@ pub(super) async fn plan_delete_actions(
                     row.untracked(),
                     row.branch_id().into(),
                 );
-                if catalog.has_row_ref_cascades()
+                if catalog.has_row_ref_delete_actions()
                     || catalog
                         .delete_plan_for_key(row.schema_key())
                         .foreign_key_references
@@ -3590,7 +3590,7 @@ pub(super) async fn plan_delete_actions(
                     row.untracked(),
                     row.branch_id().into(),
                 );
-                if catalog.has_row_ref_cascades()
+                if catalog.has_row_ref_delete_actions()
                     || catalog
                         .delete_plan_for_key(row.schema_key())
                         .foreign_key_references
