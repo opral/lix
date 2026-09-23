@@ -12,6 +12,7 @@ Lix exposes logical application data through typed SQL relations:
 | Files                           | `lix_file`                   | `lix_history('lix_file')`                   |
 | Directories                     | `lix_directory`              | `lix_history('lix_directory')`              |
 | Relation diffs                  | One row per changed relation row | `lix_diff(relation, from_commit, to_commit)` |
+| Conversations and comments | `lix_conversation`, `lix_comment` | `lix_history('lix_conversation')`, `lix_history('lix_comment')` |
 | Checkpoints | Internal tracked lifecycle | `lix_log()` filtered by `is_checkpoint` |
 | Commit graph                    | `lix_commit.parent_commit_ids` | `lix_commit_ancestry()` for active-head reachability |
 
@@ -26,6 +27,8 @@ The checkpoint and diff relations are read-only. `lix_diff()` exposes `row_ref`,
 For working changes, use `lix_diff(relation)`. Its actual baseline is exposed as `lix_branch.working_base_commit_id`; it can differ from the latest marked checkpoint after a fork.
 
 The rule is: `lixcol_` prefixes only engine-owned system metadata, while relation-specific payload always uses ordinary names such as `diff_type`, `from_path` and `to_path`. Registered user schemas reject column names beginning with `lixcol_` or containing `_lixcol_`; this keeps system metadata mechanically distinguishable even after `from_`/`to_` side prefixing.
+
+See [Conversations and comments](./conversations.md) for row/commit discussions, reply scope, and deletion behavior.
 
 ## The executable column contract
 
@@ -61,7 +64,7 @@ The fixed Lix surfaces are classified as follows. Every additional registered sc
 
 | Class | Fixed surfaces |
 | --- | --- |
-| Relation / base | `lix_account`, `lix_commit`, `lix_key_value`, `lix_registered_schema` |
+| Relation / base | `lix_account`, `lix_comment`, `lix_commit`, `lix_conversation`, `lix_key_value`, `lix_registered_schema` |
 | Relation / view | `lix_branch`, `lix_change`, `lix_directory`, `lix_file` |
 | Table function | `lix_apply` (mutating), `lix_commit_ancestry`, `lix_create_checkpoint` (mutating), `lix_diff`, `lix_history`, `lix_log`, `lix_as_of`, `lix_restore` (mutating), `lix_revert` (mutating), `lix_revert_range` (mutating), `lix_undo` (mutating), `lix_redo` (mutating) |
 | Scalar function | `lix_active_account_id`, `lix_active_branch_commit_id`, `lix_active_branch_id`, `lix_root_commit_id`, `lix_row_ref`, `uuidv7` |
@@ -108,7 +111,7 @@ Every public history read calls `lix_history` with a relation-name text literal 
 
 ## Schema discovery and interoperability
 
-`lix_registered_schema` is the authoritative schema registry:
+`lix_registered_schema` records persisted schema registrations. Built-in definitions also ship with the engine and are available without registration; an older database may not contain registry rows for built-ins added by a newer engine. Use `information_schema.lix_surfaces` and `information_schema.columns` to discover the executable SQL catalog, including those built-ins. For persisted application schema definitions:
 
 ```sql
 SELECT schema_key, value -> 'primary_key' AS primary_key

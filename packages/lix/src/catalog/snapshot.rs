@@ -1524,7 +1524,11 @@ mod tests {
         )])
         .expect("row-reference schema should compile");
 
-        let references = catalog.row_ref_references();
+        let references = catalog
+            .row_ref_references()
+            .iter()
+            .filter(|reference| reference.source_key.schema_key == "row_ref_source")
+            .collect::<Vec<_>>();
         assert_eq!(references.len(), 1);
         assert_eq!(references[0].source_key.schema_key, "row_ref_source");
         assert_eq!(references[0].row_ref.column, "target");

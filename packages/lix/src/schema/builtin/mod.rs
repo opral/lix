@@ -46,9 +46,19 @@ static LIX_UNDO_REDO_MARKER_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_UNDO_STATE_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static LIX_COLLECTION_GENERATION_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 
+const LIX_CONVERSATION_SCHEMA_KEY: &str = "lix_conversation";
+const LIX_CONVERSATION_SCHEMA_JSON: &str = include_str!("lix_conversation.json");
+static LIX_CONVERSATION_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
+
+const LIX_COMMENT_SCHEMA_KEY: &str = "lix_comment";
+const LIX_COMMENT_SCHEMA_JSON: &str = include_str!("lix_comment.json");
+static LIX_COMMENT_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
+
 const BUILTIN_SCHEMA_KEYS: &[&str] = &[
     LIX_REGISTERED_SCHEMA_KEY,
     LIX_KEY_VALUE_SCHEMA_KEY,
+    LIX_COMMENT_SCHEMA_KEY,
+    LIX_CONVERSATION_SCHEMA_KEY,
     LIX_ACCOUNT_SCHEMA_KEY,
     LIX_CHANGE_SCHEMA_KEY,
     LIX_COMMIT_SCHEMA_KEY,
@@ -79,11 +89,9 @@ pub(super) fn seed_schema_definitions() -> Vec<&'static JsonValue> {
 
 pub(super) fn seed_schema_definition(schema_key: &str) -> Option<&'static JsonValue> {
     match schema_key {
-        LIX_REGISTERED_SCHEMA_KEY => {
-            Some(LIX_REGISTERED_SCHEMA.get_or_init(|| {
-                parse_builtin_schema("lix_registered_schema.json", LIX_REGISTERED_SCHEMA_JSON)
-            }))
-        }
+        LIX_REGISTERED_SCHEMA_KEY => Some(LIX_REGISTERED_SCHEMA.get_or_init(|| {
+            parse_builtin_schema("lix_registered_schema.json", LIX_REGISTERED_SCHEMA_JSON)
+        })),
         LIX_KEY_VALUE_SCHEMA_KEY => {
             Some(LIX_KEY_VALUE_SCHEMA.get_or_init(|| {
                 parse_builtin_schema("lix_key_value.json", LIX_KEY_VALUE_SCHEMA_JSON)
@@ -133,7 +141,9 @@ pub(super) fn seed_schema_definition(schema_key: &str) -> Option<&'static JsonVa
                 LIX_UNDO_REDO_MARKER_SCHEMA_JSON,
             )
         })),
-        LIX_UNDO_STATE_SCHEMA_KEY => Some(LIX_UNDO_STATE_SCHEMA.get_or_init(|| parse_builtin_schema("lix_undo_state.json", LIX_UNDO_STATE_SCHEMA_JSON))),
+        LIX_UNDO_STATE_SCHEMA_KEY => Some(LIX_UNDO_STATE_SCHEMA.get_or_init(|| {
+            parse_builtin_schema("lix_undo_state.json", LIX_UNDO_STATE_SCHEMA_JSON)
+        })),
         LIX_COLLECTION_GENERATION_SCHEMA_KEY => {
             Some(LIX_COLLECTION_GENERATION_SCHEMA.get_or_init(|| {
                 parse_builtin_schema(
@@ -142,6 +152,13 @@ pub(super) fn seed_schema_definition(schema_key: &str) -> Option<&'static JsonVa
                 )
             }))
         }
+        LIX_CONVERSATION_SCHEMA_KEY => Some(LIX_CONVERSATION_SCHEMA.get_or_init(|| {
+            parse_builtin_schema("lix_conversation.json", LIX_CONVERSATION_SCHEMA_JSON)
+        })),
+        LIX_COMMENT_SCHEMA_KEY => Some(
+            LIX_COMMENT_SCHEMA
+                .get_or_init(|| parse_builtin_schema("lix_comment.json", LIX_COMMENT_SCHEMA_JSON)),
+        ),
         _ => None,
     }
 }
@@ -162,5 +179,4 @@ mod tests {
             seed_schema_definition(schema_key).expect("schema should exist");
         }
     }
-
 }
