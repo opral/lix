@@ -3,9 +3,18 @@ use crate::sync::partial_push_state::load_partial_push_state;
 use crate::sync::partial_upload_cycle::upload_partial_once;
 
 #[tokio::test]
-#[ignore = "manual descriptor-only upload recovery integration gate"]
 async fn descriptor_only_upload_retries_accepted_request_preserving_newer_local_edits() {
-    for width in [16usize, 1600] {
+    descriptor_only_upload_retries_at_width(&[16]).await;
+}
+
+#[tokio::test]
+#[ignore = "manual large descriptor-only upload recovery integration gate"]
+async fn descriptor_only_upload_retries_large_upload() {
+    descriptor_only_upload_retries_at_width(&[1600]).await;
+}
+
+async fn descriptor_only_upload_retries_at_width(widths: &[usize]) {
+    for &width in widths {
         let authority = open_lix().await.unwrap();
         let values = (0..width)
             .map(|index| format!("('upload-{index:06}', 'before')"))
@@ -74,6 +83,24 @@ async fn descriptor_only_upload_retries_accepted_request_preserving_newer_local_
         let remote = &authority;
         let account = state.active_account_id();
         let attempt = "00000000-0000-7000-8000-000000003400";
+        let unavailable = upload_partial_once(
+            &storage,
+            &state,
+            &branch,
+            attempt.into(),
+            32,
+            1024 * 1024,
+            |_request| async {
+                Err(LixError::new(
+                    LixError::CODE_STORAGE_IO_UNAVAILABLE,
+                    "object store PUT failed",
+                )
+                .with_details(serde_json::json!({ "httpStatus": 503 })))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unavailable.code, LixError::CODE_STORAGE_IO_UNAVAILABLE);
         let lost = upload_partial_once(
             &storage,
             &state,

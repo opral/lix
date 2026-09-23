@@ -5293,7 +5293,9 @@ fn status_for_lix_error(error: &LixError) -> StatusCode {
         crate::sync::SYNC_PROTOCOL_MISMATCH_CODE
         | crate::sync::SYNC_IMMUTABLE_OBJECT_MISMATCH_CODE => StatusCode::CONFLICT,
         LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
-        | LixError::CODE_STORAGE_DURABILITY_UNAVAILABLE => StatusCode::SERVICE_UNAVAILABLE,
+        | LixError::CODE_STORAGE_DURABILITY_UNAVAILABLE
+        | LixError::CODE_STORAGE_IO_UNAVAILABLE => StatusCode::SERVICE_UNAVAILABLE,
+        LixError::CODE_STORAGE_CORRUPTION => StatusCode::INTERNAL_SERVER_ERROR,
         LixError::CODE_IDEMPOTENCY_RESPONSE_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
         LixError::CODE_PLUGIN_OBSERVATION_STALE | "LIX_PARTIAL_BASELINE_EXPIRED" => {
             StatusCode::GONE
@@ -6522,6 +6524,23 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(!is_terminal_storage_response(&response));
+    }
+
+    #[test]
+    fn storage_io_is_retryable_service_failure_and_corruption_is_server_failure() {
+        let io = ApiError::from(LixError::from(crate::storage::StorageError::Unavailable(
+            "object store PUT failed".to_string(),
+        )))
+        .into_response();
+        assert_eq!(io.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!is_terminal_storage_response(&io));
+
+        let corruption = ApiError::from(LixError::from(
+            crate::storage::StorageError::Corruption("segment hash mismatch".to_string()),
+        ))
+        .into_response();
+        assert_eq!(corruption.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!is_terminal_storage_response(&corruption));
     }
 
     #[derive(Clone, Debug)]
@@ -9630,7 +9649,7 @@ mod tests {
     #[tokio::test]
     async fn sync_endpoint_requires_the_exact_sync_protocol_version() {
         let app = app().await;
-        for version in ["11", "13", "999", "not-a-number"] {
+        for version in ["11", "13", "20", "999", "not-a-number"] {
             let builder = Request::builder()
                 .uri("/lix/v1/sync/pull")
                 .header(SYNC_PROTOCOL_VERSION_HEADER, version);

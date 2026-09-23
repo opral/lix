@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // Public source-checkout contract. Runs before SDK/native/Wasm builds and has
 // no package dependencies. Protocol values are owned by the Rust engine.
-import { readFileSync } from "node:fs";
-import { pathToFileURL } from "node:url";
+import { readFileSync, realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 
 const root = new URL("../", import.meta.url);
@@ -31,6 +31,6 @@ export function getCompatibility() {
   });
 }
 
-if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
+if (process.argv[1] && realpathSync(resolve(process.argv[1])) === realpathSync(fileURLToPath(import.meta.url))) {
   process.stdout.write(`${JSON.stringify(getCompatibility())}\n`);
 }
