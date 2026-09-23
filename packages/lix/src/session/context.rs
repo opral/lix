@@ -373,6 +373,22 @@ where
         Ok(guard)
     }
 
+    /// Builds an isolated session view for preparing a branch switch.
+    ///
+    /// The target branch must not become visible through the shared selector
+    /// until its fallible boundary refresh has completed. The candidate shares
+    /// storage, commit coordination, and transaction admission with this
+    /// session, but owns its selector and branch-relative refresh observations.
+    pub(super) fn branch_switch_candidate(&self, branch_id: String) -> Self {
+        let mut candidate = self.clone();
+        candidate.branch = SessionBranch::new(branch_id);
+        candidate.base_refresh_generation = Arc::new(AtomicU64::new(
+            self.observe_invalidation.generation().wrapping_sub(1),
+        ));
+        candidate.observed_global_head = Arc::new(RwLock::new(None));
+        candidate
+    }
+
     pub(super) async fn begin_session_write_lease(&self) -> Result<SessionWriteLease, LixError> {
         self.transaction_manager.begin_write_lease().await
     }
