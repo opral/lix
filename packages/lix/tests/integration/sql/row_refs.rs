@@ -112,6 +112,58 @@ fn foreign_key_child_schema(key: &str, parent_key: &str, on_delete: &str) -> Jso
     value
 }
 
+simulation_test!(row_ref_null_primary_key_is_sql_null, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+
+    let valid_row_ref = session
+        .execute(
+            "SELECT lix_row_ref('lix_key_value', NULL, 'present') AS row_ref",
+            &[],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .value("row_ref")
+        .unwrap()
+        .clone();
+    assert_rows_eq(
+        session
+            .execute(
+                "SELECT lix_row_ref('lix_key_value', NULL, key) AS row_ref \
+                 FROM (VALUES ('present'::TEXT), (NULL::TEXT)) AS keys(key)",
+                &[],
+            )
+            .await
+            .unwrap(),
+        vec![vec![valid_row_ref], vec![Value::Null]],
+    );
+
+    assert_rows_eq(
+        session
+            .execute(
+                "SELECT lix_row_ref('lix_key_value', NULL, $1) AS row_ref",
+                &[Value::Null],
+            )
+            .await
+            .unwrap(),
+        vec![vec![Value::Null]],
+    );
+
+    assert_rows_eq(
+        session
+            .execute(
+                "SELECT lix_row_ref('lix_key_value', NULL, right_row.key) AS row_ref \
+                 FROM (VALUES (1)) AS left_row(id) \
+                 LEFT JOIN (SELECT 'missing'::TEXT AS key WHERE false) AS right_row ON true",
+                &[],
+            )
+            .await
+            .unwrap(),
+        vec![vec![Value::Null]],
+    );
+});
+
 simulation_test!(
     row_ref_cascade_pending_visibility_and_rollback,
     |sim| async move {

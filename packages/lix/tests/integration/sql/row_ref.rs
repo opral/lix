@@ -105,7 +105,6 @@ simulation_test!(
                 "SELECT lix_row_ref('lix_file', NULL, 'not-a-uuid')",
                 "invalid primary key",
             ),
-            ("SELECT lix_row_ref('lix_file', NULL, NULL)", "non-null"),
             (
                 "SELECT lix_row_ref('lix_file', NULL, 'a', 'b')",
                 "requires 1 primary-key values",

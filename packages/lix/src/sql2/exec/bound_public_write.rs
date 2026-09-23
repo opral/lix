@@ -6178,7 +6178,7 @@ fn eval_expr_value(
                         .map_err(crate::sql2::error::lix_error_to_datafusion_error)
                 }),
             )
-            .map(RowEvalValue::RowRef)
+            .map(|row_ref| row_ref.map_or(RowEvalValue::SqlNull, RowEvalValue::RowRef))
             .map_err(crate::sql2::error::datafusion_error_to_lix_error)
         }
         BoundExpr::Function { name, args } if name == "lix_order_between" && args.len() == 2 => {
