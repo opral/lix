@@ -176,6 +176,7 @@ pub(crate) struct ExecutionFunctionBindings {
 
 pub(crate) struct SqlWriteReadRequirements {
     pub(crate) needs_read_table_functions: bool,
+    pub(crate) read_relation_names: BTreeSet<String>,
     pub(crate) needs_root_commit_id: bool,
     pub(crate) needs_working_diff_checkpoint_commit_id: bool,
 }
@@ -215,9 +216,14 @@ pub(crate) async fn build_write_session_with_options(
 ) -> Result<SqlWriteSession, LixError> {
     let session = ctx.datafusion_session();
     let table_name = super::exec::datafusion::write_target_table_name(plan)?;
-    let (provider_selection, needs_read_table_functions) =
+    let (provider_selection, needs_read_table_functions, relation_names) =
         super::exec::datafusion::write_read_dependencies(&session.state(), plan, &table_name)?;
     let catalog = ctx.public_catalog()?;
+    let read_relation_names = providers::write_read_relation_selection(
+        &catalog,
+        &provider_selection,
+        relation_names.as_ref(),
+    );
     let source_statement = match &plan.bound.input {
         super::bind::write::BoundWriteInput::Query { query, .. } => {
             Some(DataFusionStatement::Statement(Box::new(
@@ -253,18 +259,20 @@ pub(crate) async fn build_write_session_with_options(
         });
     let read_requirements = SqlWriteReadRequirements {
         needs_read_table_functions,
+        read_relation_names,
         needs_root_commit_id,
         needs_working_diff_checkpoint_commit_id,
     };
     let read_active_branch_commit_id = ctx.sql_read_active_branch_commit_id();
     let execution_bindings = if read_requirements.needs_read_table_functions
+        || !read_requirements.read_relation_names.is_empty()
         || read_requirements.needs_root_commit_id
         || read_requirements.needs_working_diff_checkpoint_commit_id
     {
         ctx.register_sql_read_dependencies(
             &session,
             Arc::clone(&catalog),
-            &provider_selection,
+            provider_selection.clone(),
             read_requirements,
             read_active_branch_commit_id.clone(),
         )

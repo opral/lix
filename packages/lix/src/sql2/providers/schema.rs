@@ -171,7 +171,7 @@ pub(crate) async fn execute_exact_schema_batch_read(
     })
 }
 
-pub(crate) async fn register_row_providers(
+pub(crate) fn register_row_providers(
     ctx: &SessionContext,
     active_branch_id: &str,
     hot_state: Arc<dyn HotStateReader>,
@@ -186,7 +186,9 @@ pub(crate) async fn register_row_providers(
             continue;
         }
         match &surface.kind {
-            PublicSurfaceKind::SchemaBase { schema_key } if include_write_surfaces => {
+            PublicSurfaceKind::SchemaBase { schema_key }
+                if include_write_surfaces || !super::is_write_surface(surface) =>
+            {
                 let spec = catalog_schema_spec(catalog, schema_key)?;
                 register_spec_table(
                     ctx,
@@ -195,7 +197,7 @@ pub(crate) async fn register_row_providers(
                         spec,
                         Arc::clone(&hot_state),
                         Arc::clone(&branch_ref),
-                        active_branch_id.to_string(),
+                        active_branch_id.to_owned(),
                         row_snapshot_reader.clone(),
                     )),
                     WriteAccess::read_only(),
@@ -220,7 +222,7 @@ pub(crate) async fn register_row_write_providers(
             continue;
         }
         match &surface.kind {
-            PublicSurfaceKind::SchemaBase { schema_key } => {
+            PublicSurfaceKind::SchemaBase { schema_key } if super::is_write_surface(surface) => {
                 let spec = catalog_schema_spec(catalog, schema_key)?;
                 register_spec_table(
                     ctx,

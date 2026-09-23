@@ -13488,21 +13488,32 @@ where
         &mut self,
         session: &datafusion::prelude::SessionContext,
         catalog: Arc<crate::sql2::PublicCatalog>,
-        selection: &crate::sql2::ProviderSelection,
+        selection: crate::sql2::ProviderSelection,
         requirements: crate::sql2::SqlWriteReadRequirements,
         active_branch_commit_id: Option<String>,
     ) -> Result<crate::sql2::ExecutionFunctionBindings, LixError> {
         let read_store = self.opening_read();
-        if requirements.needs_read_table_functions {
+        if requirements.needs_read_table_functions || !requirements.read_relation_names.is_empty() {
             let read_ctx =
                 self.sql_read_execution_context(read_store.clone(), Arc::clone(&self.hot_state))?;
-            crate::sql2::register_read_table_functions(
-                session,
-                &read_ctx,
-                active_branch_commit_id.clone(),
-                catalog,
-                selection,
-            )?;
+            if requirements.needs_read_table_functions {
+                crate::sql2::register_read_table_functions(
+                    session,
+                    &read_ctx,
+                    active_branch_commit_id.clone(),
+                    Arc::clone(&catalog),
+                    &selection,
+                )?;
+            }
+            drop(selection);
+            if !requirements.read_relation_names.is_empty() {
+                crate::sql2::register_write_read_relations(
+                    session,
+                    &read_ctx,
+                    Arc::clone(&catalog),
+                    requirements.read_relation_names.clone(),
+                )?;
+            }
         }
 
         let active_branch_id = self.active_branch_id.clone();

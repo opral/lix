@@ -116,7 +116,7 @@ use super::upsert::{
     materialize_omitted_column, materialize_omitted_insert_default, validate_target_columns,
 };
 
-pub(super) async fn register_lix_file_active_provider(
+pub(super) fn register_lix_file_active_provider(
     session: &SessionContext,
     surface_name: &str,
     active_branch_id: &str,

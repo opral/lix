@@ -2471,7 +2471,7 @@ pub(crate) fn write_read_dependencies(
     state: &SessionState,
     plan: &LogicalWritePlan,
     target_table_name: &str,
-) -> Result<(ProviderSelection, bool), LixError> {
+) -> Result<(ProviderSelection, bool, Option<BTreeSet<String>>), LixError> {
     let mut statements = Vec::new();
     match (&plan.bound.op, &plan.bound.input) {
         (BoundWriteOp::Insert, BoundWriteInput::Query { query, .. }) => {
@@ -2511,6 +2511,26 @@ pub(crate) fn write_read_dependencies(
     }
 
     let source = crate::sql2::providers::read_provider_selection(state, &statements);
+    // Keep ordinary relation dependencies exact even when `read_provider_selection`
+    // widens provider registration for catalog-wide forms such as
+    // information_schema. If DataFusion cannot resolve the references here,
+    // `None` tells the provider layer to retain the existing conservative
+    // all-provider behavior for read-only dependencies.
+    let relation_names = match &source {
+        ProviderSelection::Only { names, .. }
+        | ProviderSelection::OnlyWithVisibleSchemas { names, .. } => Some(names.clone()),
+        ProviderSelection::All | ProviderSelection::AllWithHistory(_) => statements
+            .iter()
+            .try_fold(BTreeSet::new(), |mut names, statement| {
+                let references = state.resolve_table_references(statement).ok()?;
+                for reference in references {
+                    if reference.schema().is_none_or(|schema| schema == "public") {
+                        names.insert(reference.table().to_string());
+                    }
+                }
+                Some(names)
+            }),
+    };
     let needs_read_table_functions = match &source {
         ProviderSelection::Only { names, .. }
         | ProviderSelection::OnlyWithVisibleSchemas { names, .. } => names
@@ -2548,7 +2568,7 @@ pub(crate) fn write_read_dependencies(
         }
     };
 
-    Ok((selection, needs_read_table_functions))
+    Ok((selection, needs_read_table_functions, relation_names))
 }
 
 fn returning_expression_needs_provider_discovery(expression: &SqlExpr) -> bool {
@@ -5113,7 +5133,7 @@ mod tests {
             &mut self,
             _session: &SessionContext,
             _catalog: Arc<PublicCatalog>,
-            _selection: &crate::sql2::ProviderSelection,
+            _selection: crate::sql2::ProviderSelection,
             requirements: crate::sql2::SqlWriteReadRequirements,
             _active_branch_commit_id: Option<String>,
         ) -> Result<crate::sql2::ExecutionFunctionBindings, LixError> {
@@ -5121,6 +5141,12 @@ mod tests {
                 return Err(LixError::new(
                     LixError::CODE_UNSUPPORTED_SQL,
                     "read-only Lix table functions require a transaction read snapshot",
+                ));
+            }
+            if !requirements.read_relation_names.is_empty() {
+                return Err(LixError::new(
+                    LixError::CODE_UNSUPPORTED_SQL,
+                    "read-only Lix relation providers require a transaction read snapshot",
                 ));
             }
             Ok(crate::sql2::ExecutionFunctionBindings {
@@ -5228,7 +5254,7 @@ mod tests {
             &mut self,
             session: &SessionContext,
             catalog: Arc<PublicCatalog>,
-            selection: &crate::sql2::ProviderSelection,
+            selection: crate::sql2::ProviderSelection,
             requirements: crate::sql2::SqlWriteReadRequirements,
             active_branch_commit_id: Option<String>,
         ) -> Result<crate::sql2::ExecutionFunctionBindings, LixError> {
@@ -5354,13 +5380,14 @@ mod tests {
             };
             let table_name = write_target_table_name(&plan.plan).expect("target should resolve");
             let planning_session = ctx.datafusion_session();
-            let (selection, needs_read_table_functions) = write_read_dependencies(
+            let (selection, needs_read_table_functions, relation_names) = write_read_dependencies(
                 &planning_session.state(),
                 &plan.plan,
                 &table_name,
             )
             .unwrap();
             assert!(!needs_read_table_functions, "{sql}");
+            assert_eq!(relation_names.as_ref().map(BTreeSet::len), Some(0), "{sql}");
 
             assert_eq!(
                 selection,
@@ -5407,13 +5434,14 @@ mod tests {
         let table_name =
             write_target_table_name(&insert_select.plan).expect("target should resolve");
         let planning_session = ctx.datafusion_session();
-        let (selection, needs_read_table_functions) = write_read_dependencies(
+        let (selection, needs_read_table_functions, relation_names) = write_read_dependencies(
             &planning_session.state(),
             &insert_select.plan,
             &table_name,
         )
         .unwrap();
         assert!(!needs_read_table_functions);
+        assert_eq!(relation_names.as_ref().map(BTreeSet::len), Some(0));
 
         assert_eq!(
             selection,
@@ -5478,6 +5506,15 @@ mod tests {
                  SELECT table_name, table_type FROM information_schema.tables",
                 crate::sql2::providers::ProviderSelection::All,
             ),
+            (
+                "INSERT INTO lix_file(id, path) \
+                 SELECT 'from-change', '/from-change.md' \
+                WHERE (SELECT COUNT(*) FROM lix_change) >= 0",
+                crate::sql2::providers::ProviderSelection::Only {
+                    names: BTreeSet::from(["lix_change".to_string(), "lix_file".to_string()]),
+                    history_relations: BTreeSet::new(),
+                },
+            ),
         ] {
             let (mut ctx, _, _) = counting_write_context(Vec::new());
             let logical = create_write_logical_plan(&mut ctx, sql)
@@ -5488,19 +5525,37 @@ mod tests {
             };
             let table_name = write_target_table_name(&plan.plan).expect("target should resolve");
             let planning_session = ctx.datafusion_session();
-            let (actual, _) = write_read_dependencies(
+            let (actual, _, relation_names) = write_read_dependencies(
                 &planning_session.state(),
                 &plan.plan,
                 &table_name,
             )
             .unwrap();
             assert_eq!(actual, expected, "{sql}");
+            if sql.contains("FROM lix_file") {
+                assert!(relation_names
+                    .as_ref()
+                    .is_some_and(|names| names.contains("lix_file")), "{sql}");
+            }
+            if sql.contains("FROM lix_change") {
+                assert!(relation_names
+                    .as_ref()
+                    .is_some_and(|names| names.contains("lix_change")), "{sql}");
+            }
+            if sql.contains("information_schema") {
+                assert!(crate::sql2::providers::write_read_relation_selection(
+                    &ctx.public_catalog().unwrap(),
+                    &actual,
+                    relation_names.as_ref(),
+                )
+                .is_empty(), "{sql}");
+            }
         }
     }
 
     #[tokio::test]
     async fn returning_subqueries_register_relation_and_table_function_dependencies() {
-        for (sql, expected_selection, expected_table_function) in [
+        for (sql, expected_selection, expected_table_function, expected_read_relations) in [
             (
                 "UPDATE lix_file SET path = '/after.md' WHERE path = '/before.md' \
                  RETURNING (SELECT value FROM lix_key_value WHERE key = 'returning-probe') AS related_value",
@@ -5512,6 +5567,7 @@ mod tests {
                     history_relations: BTreeSet::new(),
                 },
                 false,
+                BTreeSet::new(),
             ),
             (
                 "UPDATE lix_file SET path = '/after.md' WHERE path = '/before.md' \
@@ -5521,6 +5577,20 @@ mod tests {
                     history_relations: BTreeSet::new(),
                 },
                 true,
+                BTreeSet::new(),
+            ),
+            (
+                "UPDATE lix_file SET path = '/after.md' WHERE path = '/before.md' \
+                 RETURNING (SELECT COUNT(*) FROM lix_change) AS change_count",
+                crate::sql2::providers::ProviderSelection::Only {
+                    names: BTreeSet::from([
+                        "lix_change".to_string(),
+                        "lix_file".to_string(),
+                    ]),
+                    history_relations: BTreeSet::new(),
+                },
+                false,
+                BTreeSet::from(["lix_change".to_string()]),
             ),
         ] {
             let (mut ctx, _, _) = counting_write_context(Vec::new());
@@ -5532,16 +5602,45 @@ mod tests {
             };
             let table_name = write_target_table_name(&plan.plan).expect("target should resolve");
             let planning_session = ctx.datafusion_session();
-            let (selection, needs_read_table_functions) = write_read_dependencies(
-                &planning_session.state(),
-                &plan.plan,
-                &table_name,
-            )
-            .unwrap();
+            let (selection, needs_read_table_functions, relation_names) =
+                write_read_dependencies(&planning_session.state(), &plan.plan, &table_name)
+                    .unwrap();
 
             assert_eq!(selection, expected_selection, "{sql}");
             assert_eq!(needs_read_table_functions, expected_table_function, "{sql}");
+            assert!(relation_names.is_some(), "{sql}");
+            let catalog = ctx.public_catalog().unwrap();
+            assert_eq!(
+                crate::sql2::providers::write_read_relation_selection(
+                    &catalog,
+                    &selection,
+                    relation_names.as_ref(),
+                ),
+                expected_read_relations,
+                "{sql}"
+            );
         }
+
+        let (mut ctx, _, _) = counting_write_context(Vec::new());
+        let logical = create_write_logical_plan(
+            &mut ctx,
+            "UPDATE lix_file SET path = '/after.md' \
+             RETURNING (SELECT COUNT(*) FROM lix_change) AS changes",
+        )
+        .await
+        .expect("read-only RETURNING dependency should bind");
+        let crate::sql2::exec::SqlLogicalPlan::Write(plan) = logical else {
+            panic!("UPDATE should produce a write plan");
+        };
+        let error = build_write_session_with_options(
+            &mut ctx,
+            write_session_options(&plan.plan),
+            &plan.plan,
+        )
+        .await
+        .err()
+        .expect("contexts without a transaction read snapshot must reject this dependency");
+        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
     }
 
     #[tokio::test]

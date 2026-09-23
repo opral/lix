@@ -149,7 +149,7 @@ pub(crate) async fn execute_exact_lix_directory_root_listing(
     })
 }
 
-pub(super) async fn register_lix_directory_active_provider(
+pub(super) fn register_lix_directory_active_provider(
     session: &SessionContext,
     surface_name: &str,
     active_branch_id: &str,

@@ -104,6 +104,7 @@ pub(crate) use planning_cache::{
 pub(crate) use providers::{
     ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
     ProviderSelection, register_read_table_functions,
+    register_write_read_relations,
     execute_exact_lix_directory_root_listing, execute_exact_lix_file_batch_read,
     execute_exact_lix_file_id_manifest_batch_read, execute_exact_lix_file_read,
     execute_exact_lix_file_root_listing, execute_exact_schema_batch_read,

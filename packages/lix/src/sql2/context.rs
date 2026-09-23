@@ -177,7 +177,7 @@ pub(crate) trait SqlWriteExecutionContext: Send {
         &mut self,
         session: &datafusion::prelude::SessionContext,
         catalog: Arc<PublicCatalog>,
-        selection: &super::providers::ProviderSelection,
+        selection: super::providers::ProviderSelection,
         requirements: super::session::SqlWriteReadRequirements,
         _active_branch_commit_id: Option<String>,
     ) -> Result<super::session::ExecutionFunctionBindings, LixError> {
@@ -185,6 +185,12 @@ pub(crate) trait SqlWriteExecutionContext: Send {
             return Err(LixError::new(
                 LixError::CODE_UNSUPPORTED_SQL,
                 "read-only Lix table functions require a transaction read snapshot",
+            ));
+        }
+        if !requirements.read_relation_names.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "read-only Lix relation providers require a transaction read snapshot",
             ));
         }
         if requirements.needs_root_commit_id

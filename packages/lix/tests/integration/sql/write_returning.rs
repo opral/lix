@@ -934,6 +934,66 @@ simulation_test!(
 );
 
 simulation_test!(
+    writes_register_selected_read_only_relation_providers_from_the_read_snapshot,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        let path = "/returning-read-only-dependency.txt";
+
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+                &[Value::Text(path.into()), Value::Blob(b"before".to_vec().into())],
+            )
+            .await
+            .unwrap();
+
+        let expected_changes = session
+            .execute("SELECT COUNT(*) AS n FROM lix_change", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<i64>("n")
+            .unwrap();
+        let expected_commits = session
+            .execute("SELECT COUNT(*) AS n FROM lix_commit", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<i64>("n")
+            .unwrap();
+
+        let updated = session
+            .execute(
+                "UPDATE lix_file SET path = path WHERE path = $1 \
+                 RETURNING (SELECT COUNT(*) FROM lix_change) AS prior_changes, \
+                           (SELECT COUNT(*) FROM lix_commit) AS prior_commits",
+                &[Value::Text(path.into())],
+            )
+            .await
+            .expect("RETURNING subqueries should read selected read-only relations");
+        assert_rows_eq(
+            updated,
+            vec![vec![
+                Value::Integer(expected_changes),
+                Value::Integer(expected_commits),
+            ]],
+        );
+
+        let inserted = session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) \
+                 SELECT 'read-only-source', 'from change' FROM lix_change LIMIT 1 \
+                 RETURNING key",
+                &[],
+            )
+            .await
+            .expect("INSERT source should read a selected read-only relation");
+        assert_rows_eq(inserted, vec![vec![Value::Text("read-only-source".into())]]);
+    }
+);
+
+simulation_test!(
     returning_subqueries_respect_nested_local_columns,
     |sim| async move {
         let engine = sim.boot_engine().await;

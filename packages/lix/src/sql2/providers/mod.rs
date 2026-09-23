@@ -36,7 +36,9 @@ mod upsert;
 pub(crate) use upsert::take_upsert_source_batches;
 mod values;
 
-use crate::sql2::catalog::{PublicCatalog, PublicSurfaceContract, PublicSurfaceKind};
+use crate::sql2::catalog::{
+    PublicCatalog, PublicSurfaceClass, PublicSurfaceContract, PublicSurfaceKind,
+};
 use crate::sql2::session::SqlWriteSessionOptions;
 use crate::sql2::{SqlExecutionContext, SqlWriteContext};
 
@@ -94,9 +96,55 @@ where
         &catalog,
         ReadProviderScope::All,
         selection,
-    )
-    .await?;
+    )?;
     register_information_schema(session, selection, catalog)
+}
+
+/// Registers just the selected read-only relations needed while planning a
+/// write. Writable surfaces are installed separately from the transaction's
+/// write overlay.
+pub(crate) fn register_write_read_relations<C>(
+    session: &SessionContext,
+    ctx: &C,
+    catalog: Arc<PublicCatalog>,
+    relation_names: BTreeSet<String>,
+) -> Result<(), LixError>
+where
+    C: SqlExecutionContext + ?Sized,
+{
+    let selection = ProviderSelection::Only {
+        names: relation_names,
+        history_relations: BTreeSet::new(),
+    };
+    let branch_ref = Arc::new(super::branch_ref::CachingBranchRefReader::new(ctx.branch_ref()));
+    register_read_from_catalog(
+        session,
+        ctx,
+        branch_ref,
+        &catalog,
+        ReadProviderScope::ReadOnly,
+        &selection,
+    )
+}
+
+/// Narrows DataFusion's relation references to read-only catalog surfaces.
+/// `None` means DataFusion could not resolve the reference list, so retain the
+/// conservative provider-selection behavior.
+pub(crate) fn write_read_relation_selection(
+    catalog: &PublicCatalog,
+    selection: &ProviderSelection,
+    relation_names: Option<&BTreeSet<String>>,
+) -> BTreeSet<String> {
+    catalog
+        .surfaces()
+        .filter(|surface| {
+            matches!(surface.class, PublicSurfaceClass::Relation(_))
+                && !is_write_surface(surface)
+                && selection.includes(surface)
+                && relation_names.is_none_or(|names| names.contains(&surface.name))
+        })
+        .map(|surface| surface.name.clone())
+        .collect()
 }
 
 /// Installs the `information_schema` views only for statements that can reach
@@ -557,7 +605,7 @@ fn is_write_surface(surface: &PublicSurfaceContract) -> bool {
     surface.capabilities.insert || surface.capabilities.update || surface.capabilities.delete
 }
 
-async fn register_read_from_catalog<C>(
+fn register_read_from_catalog<C>(
     session: &SessionContext,
     ctx: &C,
     branch_ref: Arc<dyn BranchRefReader>,
@@ -589,8 +637,7 @@ where
                     &surface.name,
                     ctx.hot_state(),
                     Arc::clone(&branch_ref),
-                )
-                .await?;
+                )?;
             }
             PublicSurfaceKind::Change => {
                 change::register_lix_change_read_provider(
@@ -598,8 +645,7 @@ where
                     &surface.name,
                     ctx.changelog_query_source(),
                     ctx.hot_state().is_partial_replica(),
-                )
-                .await?;
+                )?;
             }
             PublicSurfaceKind::CommitAncestryFunction => {}
             PublicSurfaceKind::File => {
@@ -614,8 +660,7 @@ where
                     ctx.plugin_host(),
                     ctx.functions(),
                     ctx.session_file_views(),
-                )
-                .await?;
+                )?;
             }
             PublicSurfaceKind::Directory => {
                 directory::register_lix_directory_active_provider(
@@ -626,8 +671,7 @@ where
                     ctx.filesystem_path_index(),
                     Arc::clone(&branch_ref),
                     ctx.functions(),
-                )
-                .await?;
+                )?;
             }
             PublicSurfaceKind::SchemaBase { .. }
             | PublicSurfaceKind::LogFunction
@@ -647,8 +691,7 @@ where
         catalog,
         scope == ReadProviderScope::All,
         selection,
-    )
-    .await?;
+    )?;
 
     Ok(())
 }
@@ -699,8 +742,7 @@ where
         &catalog,
         ReadProviderScope::ReadOnly,
         selection,
-    )
-    .await?;
+    )?;
     register_write_from_catalog(
         session,
         write_ctx,
@@ -1198,7 +1240,6 @@ mod tests {
             true,
             &ProviderSelection::All,
         )
-        .await
         .expect("row providers should register");
 
         assert_registered_table_schema_matches_catalog(&session, &catalog, "phase8_row").await;
