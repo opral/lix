@@ -213,7 +213,7 @@ fn deleting_block_row_removes_separator_in_adapter_and_restore() {
         effect: sdk::ChangeEffect::Content,
     };
     let updated = harness
-        .serialize_changes(&file, &[deletion.clone()])
+        .serialize_changes(&file, std::slice::from_ref(&deletion))
         .unwrap();
     assert_eq!(updated.snapshot().bytes, b"# Title\n\nOne.\n");
     accept_rows(&mut rows, &[deletion], creates);
