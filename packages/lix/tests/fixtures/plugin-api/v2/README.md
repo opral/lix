@@ -1,7 +1,7 @@
 # Frozen Plugin API v2 archives
 
-These ZIPs were built with `npm run build:plugins` in `packages/js-sdk` during
-the migration to `lix:plugin-v2`, based on revision
+These frozen ZIPs were built from the plugin crates during the migration to
+`lix:plugin-v2`, based on revision
 `852c1151f9fad27b640570c18a2caebbc5e41d55` plus the API identifier changes in
 this change. They establish the compiled baseline for the canonical major-only
 identifier; they are test artifacts, not published releases.

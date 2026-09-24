@@ -1851,14 +1851,11 @@ mod tests {
     #[tokio::test]
     async fn strict_remote_sessions_merge_disjoint_markdown_blob_edits() {
         let archive_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join(
-                "../vendor/lix/packages/js-sdk/dist/bundled-plugins/plugin_markdown_incremental_v2.lixplugin",
-            );
+            .join("../lix/tests/fixtures/plugin-api/v2/plugin_markdown.lixplugin");
         let Ok(markdown_plugin) = std::fs::read(&archive_path) else {
-            // The root pnpm install supplies bundled plugins. Keep standalone
-            // Rust development usable before that generated artifact exists.
+            // Keep standalone Rust development usable if test fixtures were omitted.
             eprintln!(
-                "skipping native Markdown protocol test; build {} first",
+                "skipping native Markdown protocol test; restore {} first",
                 archive_path.display()
             );
             return;
@@ -1875,7 +1872,7 @@ mod tests {
                 "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
                 vec![
                     wire_value(LixValue::Text(
-                        "/.lix/plugins/plugin_markdown_incremental_v2.lixplugin".to_string(),
+                        "/.lix/plugins/plugin_markdown.lixplugin".to_string(),
                     )),
                     wire_value(LixValue::Blob(markdown_plugin.into())),
                 ],

@@ -357,7 +357,9 @@ impl PublicCatalog {
         // catalog. Ignore that exact retired bootstrap schema while reading
         // old repositories; transaction normalization still rejects every
         // attempt to register a new reserved `lix_*` schema at runtime.
-        if parsed.key == "lix_commit_edge" {
+        if parsed.key == "lix_commit_edge"
+            || crate::schema::is_private_builtin_schema_key(&parsed.key)
+        {
             return Ok(());
         }
         if Self::runtime_schema_key_uses_reserved_namespace(&parsed.key)

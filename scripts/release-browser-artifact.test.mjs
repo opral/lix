@@ -26,7 +26,6 @@ function fixture(t) {
 	for (const path of [
 		"wasm/lix_js_sdk.js", "wasm/lix_js_sdk.d.ts", "wasm/lix_js_sdk_bg.wasm",
 		"migration-wasm/lix_js_sdk.js", "migration-wasm/lix_js_sdk.d.ts", "migration-wasm/lix_js_sdk_bg.wasm",
-		"bundled-plugins/plugin_csv.lixplugin", "bundled-plugins/plugin_markdown.lixplugin",
 	]) write(`packages/js-sdk/dist/${path}`, path);
 	const manifest = describeBrowser(root, revision, {});
 	write("ci-artifact/browser.json", JSON.stringify(manifest));
@@ -37,7 +36,7 @@ function fixture(t) {
 	return { root, write, git, revision, tree, manifest, downloaded };
 }
 
-test("same-tree merge restores both WASM variants and plugins, but never downloaded TypeScript", t => {
+test("same-tree merge restores both WASM variants, but never downloaded TypeScript", t => {
 	const f = fixture(t);
 	f.git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--quiet", "--allow-empty", "-m", "merge");
 	f.write("download/packages/js-sdk/dist/index.js", "untrusted TypeScript output");
@@ -54,7 +53,6 @@ for (const [name, mutate] of [
 	["changed build script or toolchain", f => f.write("rust-toolchain.toml", "different toolchain")],
 	["missing migration WASM", f => rmSync(join(f.downloaded, "packages/js-sdk/dist/migration-wasm/lix_js_sdk_bg.wasm"))],
 	["corrupt binary", f => f.write("download/packages/js-sdk/dist/wasm/lix_js_sdk_bg.wasm", "corrupt")],
-	["corrupt bundled plugin", f => f.write("download/packages/js-sdk/dist/bundled-plugins/plugin_csv.lixplugin", "corrupt")],
 	["legacy provenance", f => { delete f.manifest.releaseBuild; f.write("download/ci-artifact/browser.json", JSON.stringify(f.manifest)); }],
 	["symlink payload", f => { rmSync(join(f.downloaded, "packages/js-sdk/dist/wasm"), { recursive: true }); symlinkSync(join(f.root, "packages/js-sdk/dist/wasm"), join(f.downloaded, "packages/js-sdk/dist/wasm")); }],
 ]) {

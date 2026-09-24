@@ -4,7 +4,7 @@ description: "Reference for opening local, remote, and synchronized Lix instance
 
 # JavaScript API Reference
 
-`@lix-js/sdk` exports `openLix()`, `createLix()`, `deleteLix()`, the generic JavaScript storage protocol, `Value` and `bundledPluginArchives`. `@lix-js/storage-opfs` and `@lix-js/storage-filesystem` provide concrete storage implementations. `openLix()` returns a local repository, a thin remote client, or a partial replica with on-demand sync.
+`@lix-js/sdk` exports `openLix()`, `createLix()`, `deleteLix()`, the generic JavaScript storage protocol and `Value`. `@lix-js/storage-opfs` and `@lix-js/storage-filesystem` provide concrete storage implementations. `openLix()` returns a local repository, a thin remote client, or a partial replica with on-demand sync. Plugins are installed by writing a released `.lixplugin` archive to `/.lix/plugins/<plugin-key>.lixplugin` in the active branch; see [Installing and managing plugins](plugins.md).
 
 ```ts
 import { openLix } from "@lix-js/sdk";

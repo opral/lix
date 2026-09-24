@@ -5,7 +5,7 @@ import { sdkBuildPlan, executeBuildPlan } from './ci-build-sdk.mjs';
 for (const runtime of ['native', 'browser']) {
   test(`${runtime} builds isolate artifacts, preserve profiles, and share one runner budget`, () => {
     const plan = sdkBuildPlan(runtime, '/repo', {RUNNER_TEMP:'/temp', LIX_NATIVE_PROFILE:'test'}, 30);
-    assert.equal(plan.length, runtime === 'native' ? 5 : 3);
+    assert.equal(plan.length, runtime === 'native' ? 4 : 2);
     assert.equal(new Set(plan.map(p => p.env.CARGO_TARGET_DIR)).size, plan.length);
     assert.ok(plan.reduce((sum,p)=>sum+Number(p.env.CARGO_BUILD_JOBS),0)<=30);
     for (const phase of plan) {
@@ -13,7 +13,7 @@ for (const runtime of ['native', 'browser']) {
       if (phase.name.includes('wasm')) assert.equal(phase.env.LIX_WASM_PROFILE, runtime==='native'?'dev':'release');
       assert.equal(phase.env.LIX_NATIVE_PROFILE,'test');
     }
-    assert.equal(plan.filter(p=>p.name==='plugins').length,1);
+    assert.equal(plan.filter(p=>p.name==='plugins').length,0);
   });
 }
 

@@ -1,4 +1,4 @@
-import { bundledPluginArchives, openLix } from "@lix-js/sdk";
+import { openLix } from "@lix-js/sdk";
 
 globalThis.__lixProductionSmoke = run();
 
@@ -6,13 +6,22 @@ async function run() {
 	const lix = await openLix();
 	try {
 		const query = await lix.execute("SELECT $1 AS message", ["production"]);
-		const archives = await bundledPluginArchives();
-		const csvPlugin = archives.find((plugin) => plugin.key === "plugin_csv");
-		const markdownPlugin = archives.find(
-			(plugin) => plugin.key === "plugin_markdown",
+		const pluginArchives = await Promise.all(
+			["plugin_csv", "plugin_markdown"].map(async (key) => {
+				const response = await fetch(
+					`${import.meta.env.BASE_URL}plugins/${key}.lixplugin`,
+				);
+				if (!response.ok) throw new Error(`Released ${key} plugin asset is missing`);
+				return {
+					key,
+					fileName: `${key}.lixplugin`,
+					archiveBytes: new Uint8Array(await response.arrayBuffer()),
+				};
+			}),
 		);
-		if (!csvPlugin) throw new Error("Bundled CSV plugin is missing");
-		if (!markdownPlugin) throw new Error("Bundled Markdown plugin is missing");
+		const csvPlugin = pluginArchives.find((plugin) => plugin.key === "plugin_csv");
+		const markdownPlugin = pluginArchives.find((plugin) => plugin.key === "plugin_markdown");
+		if (!csvPlugin || !markdownPlugin) throw new Error("Released plugin assets are missing");
         await lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
             `/.lix/plugins/${csvPlugin.fileName}`, csvPlugin.archiveBytes,
         ]);
@@ -25,7 +34,7 @@ async function run() {
         }
 		return {
 			message: query.rows[0]?.message,
-			bundledPluginKeys: [csvPlugin.key, markdownPlugin.key].sort(),
+			installedPluginKeys: [csvPlugin.key, markdownPlugin.key].sort(),
 		};
 	} finally {
 		await lix.close();

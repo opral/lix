@@ -435,11 +435,6 @@ jobs:
         working-directory: packages/js-sdk
         run: npm run build:migration:wasm
 
-      - name: Build bundled plugins
-        if: steps.browser.outputs.reuse != 'true'
-        working-directory: packages/js-sdk
-        run: npm run build:plugins
-
       - name: Upload release browser binaries
         uses: actions/upload-artifact@v4
         with:

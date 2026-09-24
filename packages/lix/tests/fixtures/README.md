@@ -19,8 +19,8 @@ provenance here, and explain why the old evidence is no longer retained.
 `v78_deployed_markdown.lixplugin.gz` freezes the actual Markdown plugin shipped in
 LixRay's prepared browser SDK at Lix revision
 `0b940f913a8bec633098036ed91a961b78d86069`. It was copied on 2026-09-09 from
-`vendor/lix/packages/js-sdk/dist/bundled-plugins/plugin_markdown.lixplugin` in the
-LixRay migration worktree. The adjacent `.lixray-browser-build.json` records:
+the LixRay prepared browser SDK artifact. The adjacent
+`.lixray-browser-build.json` records:
 
 - Producer run: [34398308943](https://github.com/opral/lix/actions/runs/34398308943).
 - Artifact ID: `10122869169`.

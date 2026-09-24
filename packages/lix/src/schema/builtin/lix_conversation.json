@@ -7,6 +7,7 @@
       "name": "id",
       "type": "uuid",
       "nullable": false,
+      "default_expression": "uuidv7()",
       "description": "Stable conversation identifier."
     },
     {

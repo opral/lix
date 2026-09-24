@@ -13,7 +13,6 @@ export function sdkBuildPlan(runtime, root, env = process.env, cpus = availableP
     ] : []),
     ["wasm", "build-wasm.js", { LIX_OFFLINE_MIGRATION: "0", LIX_WASM_PROFILE: runtime === "native" ? "dev" : "release" }],
     ["migration-wasm", "build-wasm.js", { LIX_OFFLINE_MIGRATION: "1", LIX_WASM_PROFILE: runtime === "native" ? "dev" : "release" }],
-    ["plugins", "build-bundled-plugins.js", { LIX_OFFLINE_MIGRATION: "0" }],
   ];
   // Isolate target directories: sharing one would serialize Cargo on its lock
   // and allow regular/migration cdylibs to overwrite each other before copying.
