@@ -18,7 +18,7 @@ use crate::hot_state::{
 };
 use crate::row_pk::RowPk;
 use crate::schema::{
-    registered_schema_row_pk, schema_key_from_definition, seed_schema_definitions,
+    registered_schema_row_pk, registered_seed_schema_definitions, schema_key_from_definition,
 };
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{PointReadPlan, StorageAdapterRead};
@@ -1117,7 +1117,7 @@ struct RegisteredSchemaSeedRow {
 fn registered_schema_seed_rows() -> &'static [RegisteredSchemaSeedRow] {
     static ROWS: std::sync::OnceLock<Vec<RegisteredSchemaSeedRow>> = std::sync::OnceLock::new();
     ROWS.get_or_init(|| {
-        seed_schema_definitions()
+        registered_seed_schema_definitions()
             .into_iter()
             .map(|schema| {
                 let key = schema_key_from_definition(schema)
@@ -1212,7 +1212,7 @@ mod tests {
     fn plan_init_seed_returns_tracked_repository_bootstrap_changes() {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
 
-        assert_eq!(plan.changes.len(), seed_schema_definitions().len() + 6);
+        assert_eq!(plan.changes.len(), registered_seed_schema_definitions().len() + 6);
         assert_eq!(plan.receipt.global_branch_id, GLOBAL_BRANCH_ID);
         assert_eq!(plan.receipt.main_branch_id, test_uuid(1));
         assert_eq!(plan.receipt.lix_id, test_uuid(2));
@@ -1246,7 +1246,7 @@ mod tests {
             .iter()
             .map(|change| change.id.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(change_ids.len(), seed_schema_definitions().len() + 6);
+        assert_eq!(change_ids.len(), registered_seed_schema_definitions().len() + 6);
         let first_seed_change_id = test_uuid(5);
         assert!(change_ids.contains(&first_seed_change_id));
         assert!(!change_ids.contains(&plan.global_commit.change_id.to_string()));
@@ -1274,7 +1274,7 @@ mod tests {
 
         assert_eq!(
             registered_schema_changes.len(),
-            seed_schema_definitions().len()
+            registered_seed_schema_definitions().len()
         );
         assert!(registered_schema_changes.iter().any(|change| {
             snapshot(change)
@@ -1376,7 +1376,7 @@ mod tests {
             crate::tracked_state::load_commit_delta_change_ids(&membership_read, record.commit_id)
                 .await
                 .expect("initial commit membership should load");
-        assert_eq!(change_refs.len(), seed_schema_definitions().len() + 6);
+        assert_eq!(change_refs.len(), registered_seed_schema_definitions().len() + 6);
         assert!(
             !change_refs.contains(&record.change_id()),
             "initial commit row is derived from changelog.commit, not stored in its packed delta"

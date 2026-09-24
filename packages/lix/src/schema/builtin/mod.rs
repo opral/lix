@@ -67,11 +67,31 @@ const BUILTIN_SCHEMA_KEYS: &[&str] = &[
     LIX_FILE_DESCRIPTOR_SCHEMA_KEY,
     LIX_DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
     LIX_BINARY_BLOB_REF_SCHEMA_KEY,
+    // Retained only to decode checkpoint rows in older snapshot migrations.
     LIX_CHECKPOINT_SCHEMA_KEY,
     LIX_UNDO_REDO_MARKER_SCHEMA_KEY,
     LIX_UNDO_STATE_SCHEMA_KEY,
     LIX_COLLECTION_GENERATION_SCHEMA_KEY,
 ];
+
+// These are engine storage or retired keys, not public schema registrations.
+// The checkpoint definition remains in the builtin decoder for old snapshots.
+const PRIVATE_BUILTIN_SCHEMA_KEYS: &[&str] = &[
+    LIX_BRANCH_DESCRIPTOR_SCHEMA_KEY,
+    LIX_BRANCH_REF_SCHEMA_KEY,
+    LIX_FILE_DESCRIPTOR_SCHEMA_KEY,
+    LIX_DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+    LIX_BINARY_BLOB_REF_SCHEMA_KEY,
+    "lix_commit_edge",
+    LIX_CHECKPOINT_SCHEMA_KEY,
+    LIX_UNDO_REDO_MARKER_SCHEMA_KEY,
+    LIX_UNDO_STATE_SCHEMA_KEY,
+    LIX_COLLECTION_GENERATION_SCHEMA_KEY,
+];
+
+pub(super) fn is_private_builtin_schema_key(schema_key: &str) -> bool {
+    PRIVATE_BUILTIN_SCHEMA_KEYS.contains(&schema_key)
+}
 
 pub(super) fn is_seed_schema_key(schema_key: &str) -> bool {
     BUILTIN_SCHEMA_KEYS.contains(&schema_key)
@@ -83,6 +103,17 @@ pub(super) fn seed_schema_definitions() -> Vec<&'static JsonValue> {
         .map(|schema_key| {
             seed_schema_definition(schema_key)
                 .unwrap_or_else(|| panic!("missing seed schema definition for '{schema_key}'"))
+        })
+        .collect()
+}
+
+pub(super) fn registered_seed_schema_definitions() -> Vec<&'static JsonValue> {
+    seed_schema_definitions()
+        .into_iter()
+        .filter(|schema| {
+            !is_private_builtin_schema_key(
+                schema["key"].as_str().expect("seed schema has a key"),
+            )
         })
         .collect()
 }

@@ -74,7 +74,7 @@ where
                 .await?;
             }
             _ => {
-                schema_diff_rows(diff, &projection, &from_global, &to_global)?;
+                schema_diff_rows(diff, relation, &projection, &from_global, &to_global)?;
             }
         }
         Ok::<(), DataFusionError>(())

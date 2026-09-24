@@ -96,8 +96,6 @@ for (const runtime of ["native", "browser"]) {
 		"dist/migration-wasm/lix_js_sdk.js",
 		"dist/migration-wasm/lix_js_sdk.d.ts",
 		"dist/migration-wasm/lix_js_sdk_bg.wasm",
-			"dist/bundled-plugins/plugin_csv.lixplugin",
-			"dist/bundled-plugins/plugin_markdown.lixplugin",
 			...(runtime === "native" ? ["lix_js_sdk.node", "lix_js_sdk_migration.node"] : []),
 		])
 			write(`sdk/${path}`);
@@ -118,7 +116,7 @@ for (const runtime of ["native", "browser"]) {
 			/validation failed/,
 		);
 		saveBinaries(sdk, cache, runtime, "key");
-		rmSync(join(cache, "dist/bundled-plugins/plugin_csv.lixplugin"));
+		rmSync(join(cache, "dist/wasm/lix_js_sdk_bg.wasm"));
 		assert.equal(validCache(cache, runtime, "key"), false);
 	});
 }

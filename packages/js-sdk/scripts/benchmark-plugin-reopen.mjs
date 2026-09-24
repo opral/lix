@@ -1,12 +1,18 @@
 import { performance } from "node:perf_hooks";
 
-import { bundledPluginArchives, openLix } from "../dist/index.js";
+import { readFile } from "node:fs/promises";
+import { openLix } from "../dist/index.js";
 
 const warmupIterations = Number(process.env.WARMUP_ITERATIONS ?? 2);
 const measuredIterations = Number(process.env.MEASURED_ITERATIONS ?? 12);
-const archives = await bundledPluginArchives();
-const csvPlugin = archives.find((plugin) => plugin.key === "plugin_csv");
-if (!csvPlugin) throw new Error("expected bundled CSV plugin");
+const csvPlugin = {
+	key: "plugin_csv",
+	archiveBytes: new Uint8Array(
+		await readFile(
+			new URL("../../lix/tests/fixtures/plugin-api/v2/plugin_csv.lixplugin", import.meta.url),
+		),
+	),
+};
 
 for (let index = 0; index < warmupIterations; index += 1) {
 	await runCycle(index);

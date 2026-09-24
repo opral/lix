@@ -15,7 +15,7 @@ function fixture(t) {
   git('init'); git('config', 'user.name', 'CI'); git('config', 'user.email', 'ci@example.invalid');
   write('packages/js-sdk/src/index.ts', 'source'); git('add', '.'); git('commit', '-qm', 'code');
   const source = git('rev-parse', 'HEAD');
-  for (const file of ['wasm/lix_js_sdk.js', 'wasm/lix_js_sdk.d.ts', 'wasm/lix_js_sdk_bg.wasm', 'migration-wasm/lix_js_sdk.js', 'migration-wasm/lix_js_sdk.d.ts', 'migration-wasm/lix_js_sdk_bg.wasm', 'bundled-plugins/plugin_csv.lixplugin', 'bundled-plugins/plugin_markdown.lixplugin']) write(`packages/js-sdk/dist/${file}`, file);
+  for (const file of ['wasm/lix_js_sdk.js', 'wasm/lix_js_sdk.d.ts', 'wasm/lix_js_sdk_bg.wasm', 'migration-wasm/lix_js_sdk.js', 'migration-wasm/lix_js_sdk.d.ts', 'migration-wasm/lix_js_sdk_bg.wasm']) write(`packages/js-sdk/dist/${file}`, file);
   const manifest = describeBrowser(root, source, {});
   write('ci-artifact/browser.json', JSON.stringify(manifest));
   write('blog/post.md', 'post'); git('add', 'blog'); git('commit', '-qm', 'docs');

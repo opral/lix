@@ -85,7 +85,6 @@ function outputs(runtime) {
 	return [
 		"dist/wasm",
 		"dist/migration-wasm",
-		"dist/bundled-plugins",
 		...(runtime === "native" ? ["lix_js_sdk.node", "lix_js_sdk_migration.node"] : []),
 	];
 }
@@ -109,8 +108,6 @@ export function binaryManifest(root, runtime, key) {
 		"dist/migration-wasm/lix_js_sdk.js",
 		"dist/migration-wasm/lix_js_sdk.d.ts",
 		"dist/migration-wasm/lix_js_sdk_bg.wasm",
-		"dist/bundled-plugins/plugin_csv.lixplugin",
-		"dist/bundled-plugins/plugin_markdown.lixplugin",
 	]) {
 		if (!entries.includes(path))
 			throw new Error(`Missing binary output: ${path}`);

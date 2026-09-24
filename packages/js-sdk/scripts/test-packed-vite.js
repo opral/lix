@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
-import { cp, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, extname, join, normalize, relative } from "node:path";
@@ -25,6 +25,12 @@ let browser;
 
 try {
 	await cp(fixtureSource, fixtureDir, { recursive: true });
+	const pluginFixtureDir = join(packageDir, "..", "lix", "tests", "fixtures", "plugin-api", "v2");
+	const publicPlugins = join(fixtureDir, "public", "plugins");
+	await mkdir(publicPlugins, { recursive: true });
+	for (const key of ["plugin_csv", "plugin_markdown"]) {
+		await cp(join(pluginFixtureDir, `${key}.lixplugin`), join(publicPlugins, `${key}.lixplugin`));
+	}
 	const packOutput = await output(
 		"npm",
 		[
@@ -204,7 +210,7 @@ async function runConcurrentBrowserSmoke(browser, port) {
 		for (const result of results) {
 			assert.deepEqual(result, {
 				message: "production",
-				bundledPluginKeys: ["plugin_csv", "plugin_markdown"],
+				installedPluginKeys: ["plugin_csv", "plugin_markdown"],
 			});
 		}
 		assert.deepEqual(browserErrors, [[], []]);
@@ -254,7 +260,7 @@ async function runBrowserSmoke(browser, port, cspMode) {
 
 		assert.deepEqual(result, {
 			message: "production",
-			bundledPluginKeys: [
+			installedPluginKeys: [
 				"plugin_csv",
 				"plugin_markdown",
 			],

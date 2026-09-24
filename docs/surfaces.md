@@ -119,7 +119,7 @@ FROM lix_registered_schema
 ORDER BY schema_key;
 ```
 
-The registry contains both application schemas and schemas bootstrapped by Lix. Registration does not imply that a Lix bootstrap schema has a public SQL relation. The storage-level schemas `lix_file_descriptor`, `lix_directory_descriptor`, and `lix_binary_blob_ref` are registered for interoperability while their implementation relations are private.
+The registry contains application schemas and built-in schemas with public SQL relations. Internal storage schemas remain embedded in the engine for validation but are not listed in `lix_registered_schema`. Use `information_schema.lix_surfaces` to discover public SQL relations; the registry is not an inventory of engine storage structures.
 
 Applications and plugins cannot register the exact Schema v1 key `lix` or a key beginning with `lix_`; their base or generated SQL names occupy the namespace reserved for Lix bootstrap schemas. Use an owner-specific prefix such as `acme_task`.
 

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import type * as LixSdk from "../src/index.js";
+import type { TestPluginArchive } from "../src/plugin-test-archives.node.js";
 
 type Sdk = typeof LixSdk;
 type Lix = Awaited<ReturnType<Sdk["openLix"]>>;
@@ -8,19 +9,18 @@ type Lix = Awaited<ReturnType<Sdk["openLix"]>>;
 export function registerPluginExecutionContract(
   name: string,
   loadSdk: () => Promise<Sdk>,
-  loadArchives?: Sdk["bundledPluginArchives"],
+  loadArchives: () => Promise<TestPluginArchive[]>,
 ): void {
   describe(`${name} plugin execution`, () => {
     test("CSV detects file edits, renders SQL edits, and merges independent rows", async () => {
       const sdk = await loadSdk();
       const { openLix } = sdk;
-      const bundledPluginArchives = loadArchives ?? sdk.bundledPluginArchives;
       const lix = await openLix();
       try {
-        const csv = (await bundledPluginArchives()).find(
+        const csv = (await loadArchives()).find(
           (p) => p.key === "plugin_csv",
         );
-        if (!csv) throw new Error("expected bundled CSV archive");
+        if (!csv) throw new Error("expected CSV test archive");
         await write(lix, `/.lix/plugins/${csv.fileName}`, csv.archiveBytes);
         await write(lix, "/people.csv", "name,age\nAda,36\nGrace,37\n");
         expect(await cells(lix)).toEqual([
@@ -73,13 +73,12 @@ export function registerPluginExecutionContract(
     test("CSV merges different cells of the same row through the plugin column merger", async () => {
       const sdk = await loadSdk();
       const { openLix } = sdk;
-      const bundledPluginArchives = loadArchives ?? sdk.bundledPluginArchives;
       const lix = await openLix();
       try {
-        const csv = (await bundledPluginArchives()).find(
+        const csv = (await loadArchives()).find(
           (p) => p.key === "plugin_csv",
         );
-        if (!csv) throw new Error("expected bundled CSV archive");
+        if (!csv) throw new Error("expected CSV test archive");
         await write(lix, `/.lix/plugins/${csv.fileName}`, csv.archiveBytes);
         await write(lix, "/same-row.csv", "name,age\nAda,36\n");
         const rows = (
@@ -132,14 +131,13 @@ export function registerPluginExecutionContract(
     test("Markdown detects nodes and renders a SQL edit after snapshot restore", async () => {
       const sdk = await loadSdk();
       const { openLix } = sdk;
-      const bundledPluginArchives = loadArchives ?? sdk.bundledPluginArchives;
       const source = await openLix();
       let restored: Lix | undefined;
       try {
-        const markdown = (await bundledPluginArchives()).find(
+        const markdown = (await loadArchives()).find(
           (p) => p.key === "plugin_markdown",
         );
-        if (!markdown) throw new Error("expected bundled Markdown archive");
+        if (!markdown) throw new Error("expected Markdown test archive");
         await write(
           source,
           `/.lix/plugins/${markdown.fileName}`,

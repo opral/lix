@@ -12,6 +12,14 @@ pub(crate) fn seed_schema_definitions() -> Vec<&'static JsonValue> {
     super::builtin::seed_schema_definitions()
 }
 
+pub(crate) fn registered_seed_schema_definitions() -> Vec<&'static JsonValue> {
+    super::builtin::registered_seed_schema_definitions()
+}
+
+pub(crate) fn is_private_builtin_schema_key(schema_key: &str) -> bool {
+    super::builtin::is_private_builtin_schema_key(schema_key)
+}
+
 /// What a seed schema, or one of its columns, means, for the seed documents
 /// that shipped without `description` annotations.
 ///

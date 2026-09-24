@@ -517,7 +517,7 @@ npm run test:browser
 
 `npm run test:browser:production` additionally packs the SDK, installs the
 tarball into a minimal Vite app, makes a production build, and exercises SQL
-plus bundled-plugin installation and CSV row extraction in Chromium. It runs with both
+plus installation of externally served plugin release assets and CSV row extraction in Chromium. It runs with both
 worker-scoped and global strict CSP headers.
 
 Use `npm run build:wasm:dev` while iterating on the Rust bridge when release

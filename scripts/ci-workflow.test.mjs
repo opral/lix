@@ -375,7 +375,7 @@ test("release browser reuse validates provenance before skipping each expensive 
 	const browser = publishWorkflow.split("\n  build-js-sdk-browser:\n")[1].split("\n  build-js-sdk:\n")[0];
 	assert.match(browser, /run-id: \$\{\{ needs\.release-version\.outputs\.browser_run \}\}/);
 	assert.match(browser, /node scripts\/release-browser-artifact\.mjs restore/);
-	for (const name of ["Activate repository Rust toolchain", "Restore Rust cache", "Restore compiler cache", "Build browser WASM", "Build migration WASM", "Build bundled plugins"]) {
+	for (const name of ["Activate repository Rust toolchain", "Restore Rust cache", "Restore compiler cache", "Build browser WASM", "Build migration WASM"]) {
 		const step = browser.split(`- name: ${name}\n`)[1].split("\n      - name:")[0];
 		assert.match(step, /if: steps\.browser\.outputs\.reuse != 'true'/);
 	}

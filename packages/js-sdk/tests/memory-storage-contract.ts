@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import type * as LixSdk from "../src/index.js";
+import type { TestPluginArchive } from "../src/plugin-test-archives.node.js";
 
 type ContractSdk = typeof LixSdk;
 type ContractLix = Awaited<ReturnType<ContractSdk["openLix"]>>;
@@ -7,6 +8,7 @@ type ContractLix = Awaited<ReturnType<ContractSdk["openLix"]>>;
 export type MemoryStorageContractOptions = {
 	name: string;
 	loadSdk: () => Promise<ContractSdk>;
+	loadPluginArchives: () => Promise<TestPluginArchive[]>;
 	openStorage?: () => Promise<ContractLix>;
 	operationTimeoutMs?: number;
 	supportsPluginExecution?: boolean;
@@ -15,6 +17,7 @@ export type MemoryStorageContractOptions = {
 export function registerMemoryStorageContract({
 	name,
 	loadSdk,
+	loadPluginArchives,
 	openStorage,
 	operationTimeoutMs = 5_000,
 	supportsPluginExecution = true,
@@ -558,17 +561,17 @@ export function registerMemoryStorageContract({
 		});
 
 		test.skipIf(!supportsPluginExecution)(
-			"executes the bundled CSV plugin",
+			"executes an installed CSV plugin",
 			async () => {
-				const { bundledPluginArchives, openLix } = await loadSdk();
+				const { openLix } = await loadSdk();
 				const lix = await wait((openStorage ?? openLix)(), "open Lix");
 				try {
 					const archives = await wait(
-						bundledPluginArchives(),
-						"load bundled plugin archives",
+						loadPluginArchives(),
+						"load plugin test archives",
 					);
 					const csv = archives.find((plugin) => plugin.key === "plugin_csv");
-					if (!csv) throw new Error("expected bundled CSV plugin");
+					if (!csv) throw new Error("expected CSV test plugin");
 					await writeBytes(
 						lix,
 						`/.lix/plugins/${csv.key}.lixplugin`,

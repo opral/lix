@@ -5,16 +5,20 @@ import { expect, test } from "vitest";
 const execFileAsync = promisify(execFile);
 
 test("closing a native plugin runtime releases Node's event loop while the binding stays reachable", async () => {
-  const bindingUrl = new URL("../dist/binding.node.js", import.meta.url).href;
-  const sdkUrl = new URL("../dist/index.js", import.meta.url).href;
-  const script = `
+	const bindingUrl = new URL("../dist/binding.node.js", import.meta.url).href;
+	const pluginArchivePath = new URL(
+		"../../lix/tests/fixtures/plugin-api/v2/plugin_csv.lixplugin",
+		import.meta.url,
+	).pathname;
+	const script = `
+  import { readFile } from "node:fs/promises";
   import { openNativeLixBinding } from ${JSON.stringify(bindingUrl)};
-  import { bundledPluginArchives, Value } from ${JSON.stringify(sdkUrl)};
+  import { Value } from ${JSON.stringify(new URL("../dist/value.js", import.meta.url).href)};
   const binding = await openNativeLixBinding({ kind: "memory" });
   globalThis.closedBinding = binding;
   const execute = (sql, params) => binding.execute(sql, params.map(value => Value.from(value)._toNative()));
-  const csv = (await bundledPluginArchives()).find(plugin => plugin.key === "plugin_csv");
-  await execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", ["/.lix/plugins/plugin_csv.lixplugin", csv.archiveBytes]);
+  const csvArchive = new Uint8Array(await readFile(${JSON.stringify(pluginArchivePath)}));
+  await execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", ["/.lix/plugins/plugin_csv.lixplugin", csvArchive]);
   await execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", ["/lifecycle.csv", new TextEncoder().encode("name\\nAda\\n")]);
   const rows = await execute("SELECT cells FROM csv_row ORDER BY order_key", []);
   if (rows.rows.length !== 2) throw new Error("Plugin did not execute");
