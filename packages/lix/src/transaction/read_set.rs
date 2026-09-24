@@ -56,7 +56,27 @@ struct SqlReadSetInner {
     unvalidated: Option<String>,
 }
 
+/// State before one SQL statement began recording its reads.
+pub(crate) struct SqlReadSetCheckpoint {
+    entry_count: usize,
+    unvalidated: Option<String>,
+}
+
 impl SqlReadSet {
+    pub(crate) fn checkpoint(&self) -> SqlReadSetCheckpoint {
+        let inner = self.lock();
+        SqlReadSetCheckpoint {
+            entry_count: inner.entries.len(),
+            unvalidated: inner.unvalidated.clone(),
+        }
+    }
+
+    pub(crate) fn restore(&self, checkpoint: SqlReadSetCheckpoint) {
+        let mut inner = self.lock();
+        inner.entries.truncate(checkpoint.entry_count);
+        inner.unvalidated = checkpoint.unvalidated;
+    }
+
     pub(crate) fn record_scan(&self, request: &HotStateScanRequest) {
         self.record(SqlReadFootprint::Scan(request.clone()));
     }
@@ -285,10 +305,6 @@ pub(crate) async fn changed_footprint_rows(
             ),
         };
         diff_fingerprints(&before, &after, &mut overlaps);
-        if !overlaps.is_empty() {
-            // One changed footprint is enough to reject the commit.
-            break;
-        }
     }
     overlaps.sort();
     overlaps.dedup();
@@ -480,6 +496,21 @@ mod tests {
         set.mark_unvalidated("lix_branch");
         set.mark_unvalidated("lix_change");
         assert_eq!(set.unvalidated_source().as_deref(), Some("lix_branch"));
+    }
+
+    #[test]
+    fn restoring_failed_statement_reads_keeps_prior_reads() {
+        let set = SqlReadSet::default();
+        let prior = HotStateScanRequest::default();
+        set.record_scan(&prior);
+        let checkpoint = set.checkpoint();
+        let mut failed = HotStateScanRequest::default();
+        failed.filter.schema_keys.push("failed".to_owned());
+        set.record_scan(&failed);
+        set.mark_unvalidated("failed statement");
+        set.restore(checkpoint);
+        assert_eq!(set.entries(), vec![SqlReadFootprint::Scan(prior)]);
+        assert_eq!(set.unvalidated_source(), None);
     }
 
     #[test]

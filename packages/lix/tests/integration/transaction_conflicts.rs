@@ -446,6 +446,73 @@ fn assert_read_conflict(error: &LixError) {
     );
 }
 
+#[tokio::test]
+async fn conflict_counts_changes_across_separate_read_statements() {
+    let lix = open_lix().await.unwrap();
+    lix.execute(
+        "INSERT INTO lix_key_value (key, value) VALUES ('left', 0), ('right', 0)",
+        &[],
+    )
+    .await
+    .unwrap();
+    let mut tx = lix.begin_transaction().await.unwrap();
+    tx.execute("SELECT value FROM lix_key_value WHERE key = 'left'", &[])
+        .await
+        .unwrap();
+    tx.execute("SELECT value FROM lix_key_value WHERE key = 'right'", &[])
+        .await
+        .unwrap();
+    tx.execute(
+        "INSERT INTO lix_key_value (key, value) VALUES ('decision', 1)",
+        &[],
+    )
+    .await
+    .unwrap();
+    lix.execute(
+        "UPDATE lix_key_value SET value = 1 WHERE key IN ('left', 'right')",
+        &[],
+    )
+    .await
+    .unwrap();
+    let error = tx.commit().await.unwrap_err();
+    assert_read_conflict(&error);
+    assert_eq!(error.details.as_ref().unwrap()["overlapCount"], 2);
+}
+
+#[tokio::test]
+async fn failed_select_does_not_protect_rows_it_scanned() {
+    let lix = open_lix().await.unwrap();
+    lix.execute(
+        "INSERT INTO lix_key_value (key, value) VALUES ('observed', 'not-a-number')",
+        &[],
+    )
+    .await
+    .unwrap();
+    let mut tx = lix.begin_transaction().await.unwrap();
+    assert!(
+        tx.execute(
+            "SELECT CAST(value AS BIGINT) FROM lix_key_value WHERE key = 'observed'",
+            &[],
+        )
+        .await
+        .is_err()
+    );
+    tx.execute(
+        "INSERT INTO lix_key_value (key, value) VALUES ('decision', 1)",
+        &[],
+    )
+    .await
+    .unwrap();
+    lix.execute(
+        "UPDATE lix_key_value SET value = 'changed' WHERE key = 'observed'",
+        &[],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(key_value(&lix, "decision").await, Some(serde_json::json!(1)));
+}
+
 /// A row read only through a join still belongs to the read set.
 #[tokio::test]
 async fn join_read_conflicts_when_the_joined_row_changes() {
@@ -705,9 +772,8 @@ async fn conversation_target(lix: &Lix, id: &str) -> Option<Option<String>> {
 
 const CONVERSATION: &str = "01950000-0000-7000-8000-00000000c001";
 
-/// A delete's referential actions are planned against the commit snapshot:
-/// a conversation that concurrently started targeting the deleted file is
-/// detached instead of left dangling.
+/// A conversation that concurrently started targeting a deleted file keeps
+/// its reference: `detach` permits that target to outlive the referenced row.
 #[tokio::test]
 async fn delete_applies_referential_actions_to_concurrently_added_references() {
     let lix = open_lix().await.unwrap();
@@ -738,7 +804,12 @@ async fn delete_applies_referential_actions_to_concurrently_added_references() {
                 .await
                 .unwrap();
             assert!(exists.rows().is_empty());
-            assert_eq!(conversation_target(&lix, CONVERSATION).await, Some(None));
+            assert!(
+                conversation_target(&lix, CONVERSATION)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
         }
         Err(error) => {
             assert_conflict(&error);

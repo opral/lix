@@ -4524,6 +4524,7 @@ where
             // statement fails, including errors before a direct RETURNING
             // write reaches staging.
             let function_checkpoint = transaction.functions().statement_checkpoint();
+            let read_set_checkpoint = transaction.checkpoint_sql_statement_reads();
             let result = async {
                 let result = if is_read {
                     execute_transaction_statement(
@@ -4556,6 +4557,7 @@ where
             .await;
             transaction.finish_sql_statement_reads();
             if result.is_err() {
+                transaction.restore_sql_statement_reads(read_set_checkpoint);
                 if let Some(function_checkpoint) = function_checkpoint {
                     transaction
                         .functions()

@@ -112,7 +112,7 @@ use crate::transaction::normalization::{
     remember_pending_registered_schema,
 };
 use crate::transaction::read_set::{
-    SnapshotOverlapKind, SqlReadSet, WrittenRowIdentity, changed_footprint_rows,
+    SnapshotOverlapKind, SqlReadSet, SqlReadSetCheckpoint, WrittenRowIdentity, changed_footprint_rows,
     changed_write_set_rows, snapshot_overlap_conflict, unvalidated_read_conflict,
     write_set_footprints,
 };
@@ -9987,6 +9987,14 @@ where
             include_tombstones: true,
             ..HotStateExactBatchRequest::default()
         });
+    }
+
+    pub(crate) fn checkpoint_sql_statement_reads(&self) -> SqlReadSetCheckpoint {
+        self.sql_read_set.checkpoint()
+    }
+
+    pub(crate) fn restore_sql_statement_reads(&self, checkpoint: SqlReadSetCheckpoint) {
+        self.sql_read_set.restore(checkpoint);
     }
 
     /// Ends read-set recording for the statement that just finished.
