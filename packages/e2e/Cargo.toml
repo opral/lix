@@ -553,3 +553,8 @@ required-features = ["plugin-tests"]
 name = "plugin_file_observation"
 path = "tests/plugin_file_observation.rs"
 required-features = ["plugin-tests"]
+
+[[test]]
+name = "transaction_conflicts"
+path = "tests/transaction_conflicts.rs"
+required-features = ["plugin-tests"]

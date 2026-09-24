@@ -3568,11 +3568,13 @@ async fn execute_fast_lix_file_content_update_by_id_impl(
     };
     // The revisioned path index contains every visible descriptor together with
     // its already-derived path. Reuse it instead of scanning every directory
-    // descriptor just to reconstruct this one file's path.
+    // descriptor just to reconstruct this one file's path. The update's
+    // decision still depends only on this file's descriptor and parents.
     let index = ctx
-        .filesystem_path_index(&FilesystemPathIndexRequest::new(vec![
-            active_branch_id.clone(),
-        ]))
+        .filesystem_path_index_for_files(
+            &FilesystemPathIndexRequest::new(vec![active_branch_id.clone()]),
+            std::slice::from_ref(&file_id),
+        )
         .await?;
     let target_file_ids = BTreeSet::from([file_id.clone()]);
     let indexed_matches = indexed_file_id_matches(index, &target_file_ids, &FilePathPredicate::All);

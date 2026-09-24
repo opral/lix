@@ -71,7 +71,7 @@ Merge previews have no `conflicts` field. Overlapping row edits reconcile automa
 
 `POST /transaction/commit` returns HTTP 200 with `{ commit: { before, after } | null }`. Repeating the same transaction capability returns the same receipt. Rollback continues to return HTTP 204. Explicit transaction statements carry no durable receipt until commit succeeds. Single `/execute` responses include `commit` for writes and omit it for reads; the JavaScript SDK normalizes that omitted field to `null`.
 
-Explicit SQL reads used to decide later writes are fenced against concurrent branch changes when the transaction commits. A concurrent change can cause `LIX_TRANSACTION_CONFLICT`, including changes to unrelated files. Retry the entire transaction and its checks; do not replay arbitrary application side effects. A read-only transaction does not require this write fence. Never retry unknown commit outcomes or errors marked `nonRetryableAfterCommit` or `nonRetryableAfterExecution`.
+Explicit SQL reads and `UPDATE`/`DELETE` predicates used to decide later writes are validated when the transaction commits. A concurrent change causes `LIX_TRANSACTION_CONFLICT` only when it changed, inserted, or deleted a row those decisions depended on, a row the transaction writes, or (for plugin-backed content) the same file; unrelated concurrent commits are rebased. Reads of branch, history, or change state keep a whole-branch check. The error's `details.overlaps` names what overlapped. Retry the entire transaction and its checks; do not replay arbitrary application side effects. A read-only transaction does not require this write fence. Never retry unknown commit outcomes or errors marked `nonRetryableAfterCommit` or `nonRetryableAfterExecution`.
 
 ## Sync
 

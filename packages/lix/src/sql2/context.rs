@@ -133,6 +133,11 @@ pub(crate) trait SqlExecutionContext: Sync {
     fn session_file_views(&self) -> Option<SessionFileViews> {
         None
     }
+
+    /// Notes that the statement reads a source without row-level conflict
+    /// validation, such as branch heads or change history. Explicit
+    /// transactions then conflict with any concurrent change to the branch.
+    fn note_unvalidated_read(&self, _source: &str) {}
 }
 
 /// Write-capable SQL runtime boundary.
@@ -284,6 +289,18 @@ pub(crate) trait SqlWriteExecutionContext: Send {
             .scan_hot_state_batch(&request.hot_state_request())
             .await?;
         Ok(Arc::new(FilesystemPathIndex::from_live_batch(&rows)?))
+    }
+
+    /// Returns the index for `request` when the caller's decision depends only
+    /// on the entries for `file_ids` (and their parent directories). Contexts
+    /// that validate a read footprint may record the narrower dependency while
+    /// still serving a shared, cached index.
+    async fn filesystem_path_index_for_files(
+        &mut self,
+        request: &FilesystemPathIndexRequest,
+        _file_ids: &[String],
+    ) -> Result<Arc<FilesystemPathIndex>, LixError> {
+        self.filesystem_path_index(request).await
     }
 
     async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<CommitId>, LixError>;

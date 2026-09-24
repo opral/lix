@@ -4524,6 +4524,7 @@ where
             // statement fails, including errors before a direct RETURNING
             // write reaches staging.
             let function_checkpoint = transaction.functions().statement_checkpoint();
+            let read_set_checkpoint = transaction.checkpoint_sql_statement_reads();
             let result = async {
                 let result = if is_read {
                     execute_transaction_statement(
@@ -4554,7 +4555,9 @@ where
                 Ok(result)
             }
             .await;
+            transaction.finish_sql_statement_reads();
             if result.is_err() {
+                transaction.restore_sql_statement_reads(read_set_checkpoint);
                 if let Some(function_checkpoint) = function_checkpoint {
                     transaction
                         .functions()
@@ -12828,7 +12831,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_complete_journal_replacement_rejects_changed_branch() {
+    async fn stale_complete_journal_replacement_rebases_over_a_disjoint_insert() {
         const ROW_COUNT: usize = 1_024;
         let storage = Memory::default();
         Engine::initialize(storage.clone())
@@ -12915,24 +12918,24 @@ mod tests {
             )
             .await
             .expect("disjoint insert should commit first");
-        let conflict = replacement
+        // The insert matches none of the updates' key predicates (#1900): the
+        // complete-set journal is lowered and rebased instead of rejected.
+        replacement
             .commit()
             .await
-            .expect_err("prepared SQL updates must reject a changed opening snapshot");
-        assert_eq!(conflict.code, LixError::CODE_TRANSACTION_CONFLICT);
+            .expect("prepared SQL updates must rebase over a disjoint insert");
 
-        let unchanged = session
+        let replaced = session
             .execute(
-                "SELECT value FROM stale_journal_replacement_probe WHERE path = '0000'",
+                "SELECT COUNT(*) AS count FROM stale_journal_replacement_probe \
+                 WHERE value ->> 'state' = 'replacement'",
                 &[],
             )
             .await
-            .expect("rejected journal must leave the original row readable");
+            .expect("replaced rows should be readable");
         assert_eq!(
-            unchanged.rows()[0]
-                .get::<serde_json::Value>("value")
-                .unwrap(),
-            serde_json::json!({"state": "base"})
+            replaced.rows()[0].get::<i64>("count").unwrap(),
+            ROW_COUNT as i64
         );
 
         let rows = concurrent_session
@@ -12945,7 +12948,7 @@ mod tests {
         assert_eq!(
             rows.rows()[0].get::<i64>("count").unwrap(),
             (ROW_COUNT + 1) as i64,
-            "rejecting the stale complete-set proof must preserve the disjoint insert"
+            "rebasing the stale complete-set journal must preserve the disjoint insert"
         );
         let concurrent = concurrent_session
             .execute(
@@ -12966,7 +12969,7 @@ mod tests {
                 &[],
             )
             .await
-            .expect("unchanged lifecycle should be readable")
+            .expect("updated lifecycle should be readable")
             .rows()[0]
             .get::<String>("lixcol_created_at")
             .unwrap()

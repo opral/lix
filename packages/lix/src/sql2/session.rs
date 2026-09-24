@@ -405,6 +405,7 @@ async fn resolve_working_diff_checkpoint_commit_id<C>(
 where
     C: SqlExecutionContext + ?Sized,
 {
+    context.note_unvalidated_read("lix_working_diff_checkpoint_commit_id()");
     let store = context.changelog_query_source().store;
     let branch_id = context.active_branch_id().to_string();
     resolve_working_diff_checkpoint_commit_id_from_store(store, branch_id, active_branch_commit_id)
