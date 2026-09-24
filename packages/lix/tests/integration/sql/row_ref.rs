@@ -40,7 +40,7 @@ simulation_test!(row_ref_parts_is_jsonb_and_reads_canonical_identity, |sim| asyn
             session.execute("DELETE FROM lix_file WHERE id = $1", &[Value::Text(id.into())]).await.unwrap();
         }
         let anchor = session.execute(
-            "SELECT lix_row_ref_parts(COALESCE(target, detached_target)) ->> 'relation' \
+            "SELECT lix_row_ref_parts(target) ->> 'relation' \
              FROM lix_conversation WHERE id = $1",
             &[Value::Text(conversation_id.into())],
         ).await.unwrap();

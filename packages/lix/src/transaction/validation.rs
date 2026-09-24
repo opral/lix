@@ -48,7 +48,7 @@ use crate::transaction::staging::{
 use crate::transaction_types::TransactionWriteOrigin;
 use crate::transaction_types::duplicate_insert_identity_message;
 use crate::transaction_types::{
-    PreparedStateBatch, PreparedStateRowRef, StagedIndexRow, StagedIndexValues, TransactionJson,
+    PreparedStateBatch, PreparedStateRowRef, StagedIndexRow, StagedIndexValues,
     TransactionWriteOperation,
 };
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
@@ -585,6 +585,7 @@ pub(crate) async fn validate_prepared_writes(
                 "lix.perf.validation.committed_row_refs"
             ))
             .await?;
+    let unresolved_row_refs = retain_written_row_refs(&input, unresolved_row_refs).await?;
     reject_unresolved_row_refs(&unresolved_row_refs)?;
     validate_committed_delete_restrictions(&input, input.schema_catalog, &pending_constraints)
         .instrument(tracing::debug_span!(
@@ -827,10 +828,15 @@ fn resolved_constraint_row(
     row: MaterializedHotStateRowRef<'_>,
 ) -> Result<Arc<WasmTypedRow>, LixError> {
     let typed = match row.materialize_decoded_snapshot()? {
-        Some(typed) if typed.schema_fingerprint != plan.fingerprint().bytes() => {
-            // Match SQL amendment reads: rows written before a compatible
-            // amendment (registered, or an appended built-in column) are
-            // rebound to the current definition with literal defaults applied.
+        Some(typed)
+            if typed.schema_fingerprint != plan.fingerprint().bytes()
+                && CatalogSnapshot::builtin()
+                    .plan_for_key(row.schema_key())
+                    .is_none() =>
+        {
+            // Match SQL amendment reads: only custom schemas are rebound.
+            // Historical built-ins retain their validated native values even
+            // when descriptive schema metadata changed their fingerprint.
             let schema = crate::schema::parse_lix_schema(&plan.schema)?;
             Arc::new(typed.revalidate_resolved_schema(
                 row.schema_key(),
@@ -2962,17 +2968,6 @@ impl PendingConstraintIndexes {
             else {
                 continue;
             };
-            if row_ref
-                .detached_column
-                .as_deref()
-                .is_some_and(|column| payload_field_is_non_null(payload.clone(), column))
-            {
-                return Err(row_ref_constraint_error(
-                    row.schema_key(),
-                    &row_ref.column,
-                    "active and detached reference columns cannot both be set",
-                ));
-            }
             let target = resolve_row_ref_target(
                 catalog,
                 &row.domain(),
@@ -2980,12 +2975,14 @@ impl PendingConstraintIndexes {
                 row.schema_key(),
                 &row_ref.column,
             )?;
+            let detach = row_ref.on_delete == lix_schema::DeleteAction::Detach;
             self.row_ref_references
                 .entry(target.clone())
                 .or_default()
                 .push(PendingRowRefReference {
                     identity: row.domain_row_identity(),
                     column: row_ref.column.clone(),
+                    detach,
                 });
             self.row_ref_targets
                 .entry(row.domain_row_identity())
@@ -2994,6 +2991,7 @@ impl PendingConstraintIndexes {
                     column: row_ref.column.clone(),
                     encoded_target: encoded,
                     target: target.clone(),
+                    detach,
                 });
         }
         Ok(())
@@ -3136,7 +3134,9 @@ impl PendingConstraintIndexes {
                     .into_iter()
                     .flat_map(|references| references.iter())
             })
-            .filter(|reference| !self.tombstones_target_identity(&reference.identity))
+            .filter(|reference| {
+                !reference.detach && !self.tombstones_target_identity(&reference.identity)
+            })
             .collect()
     }
 
@@ -3204,6 +3204,8 @@ struct PendingForeignKeyReference {
 struct PendingRowRefReference {
     identity: DomainRowIdentity,
     column: String,
+    /// A `detach` reference never restricts deleting its target.
+    detach: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3211,6 +3213,7 @@ struct PendingRowRefTarget {
     column: String,
     encoded_target: String,
     target: DomainRowIdentity,
+    detach: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -3361,7 +3364,6 @@ pub(super) async fn plan_delete_actions(
     candidate: &dyn HotStateReader,
     catalog: &CatalogSnapshot,
     seeds: Vec<crate::hot_state::MaterializedHotStateRow>,
-    reset_created_at: Option<&BTreeSet<crate::tracked_state::TrackedStateKey>>,
 ) -> Result<crate::transaction_types::RawWriteBatch, LixError> {
     let mut indexed_probes = 0usize;
     let mut scan_probes = 0usize;
@@ -3371,14 +3373,6 @@ pub(super) async fn plan_delete_actions(
     let mut enqueued = BTreeSet::new();
     let mut visited = BTreeSet::new();
     let mut output = crate::transaction_types::RawWriteBatch::new();
-    let mut detached_rows = BTreeMap::<
-        DomainRowIdentity,
-        (
-            crate::hot_state::MaterializedHotStateRow,
-            Option<Arc<WasmTypedRow>>,
-            BTreeMap<String, Option<String>>,
-        ),
-    >::new();
     while !frontier.is_empty() {
         levels += 1;
         let mut batches =
@@ -3454,7 +3448,7 @@ pub(super) async fn plan_delete_actions(
             ) {
                 let target = UniqueConstraintValue::from_row_ref(target.as_str());
                 for reference in catalog.row_ref_references().iter().filter(|reference| {
-                    reference.row_ref.on_delete != lix_schema::DeleteAction::NoAction
+                    reference.row_ref.on_delete == lix_schema::DeleteAction::Cascade
                 }) {
                     for domain in row_ref_source_domains(&identity) {
                         row_ref_batches
@@ -3462,8 +3456,6 @@ pub(super) async fn plan_delete_actions(
                                 source_key: reference.source_key.clone(),
                                 source_domain: domain,
                                 column: reference.row_ref.column.clone(),
-                                action: reference.row_ref.on_delete,
-                                detached_column: reference.row_ref.detached_column.clone(),
                             })
                             .or_default()
                             .insert(target.clone());
@@ -3528,7 +3520,7 @@ pub(super) async fn plan_delete_actions(
                     row.untracked(),
                     row.branch_id().into(),
                 );
-                if catalog.has_row_ref_delete_actions()
+                if catalog.has_row_ref_cascades()
                     || catalog
                         .delete_plan_for_key(row.schema_key())
                         .foreign_key_references
@@ -3589,196 +3581,40 @@ pub(super) async fn plan_delete_actions(
                 {
                     continue;
                 }
-                match batch.action {
-                    lix_schema::DeleteAction::Cascade => {
-                        if !enqueued.insert(identity) {
-                            continue;
-                        }
-                        output.push_parts(
-                            Some(row.row_pk().clone()),
-                            row.schema_key().into(),
-                            row.file_id().map(Into::into),
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            row.global(),
-                            None,
-                            None,
-                            row.untracked(),
-                            row.branch_id().into(),
-                        );
-                        if catalog.has_row_ref_delete_actions()
-                            || catalog
-                                .delete_plan_for_key(row.schema_key())
-                                .foreign_key_references
-                                .iter()
-                                .any(|reference| {
-                                    reference.foreign_key.on_delete
-                                        == lix_schema::DeleteAction::Cascade
-                                })
-                        {
-                            frontier.push(delete_action_seed(row)?);
-                        }
-                    }
-                    lix_schema::DeleteAction::SetNull => {
-                        if enqueued.contains(&identity) {
-                            continue;
-                        }
-                        if !detached_rows.contains_key(&identity) {
-                            detached_rows.insert(
-                                identity.clone(),
-                                (
-                                    row.to_owned(),
-                                    row.materialize_decoded_snapshot()?,
-                                    BTreeMap::new(),
-                                ),
-                            );
-                        }
-                        detached_rows
-                            .get_mut(&identity)
-                            .expect("detached row was inserted")
-                            .2
-                            .insert(batch.column.clone(), batch.detached_column.clone());
-                    }
-                    lix_schema::DeleteAction::NoAction => unreachable!("filtered above"),
+                if !enqueued.insert(identity) {
+                    continue;
+                }
+                output.push_parts(
+                    Some(row.row_pk().clone()),
+                    row.schema_key().into(),
+                    row.file_id().map(Into::into),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    row.global(),
+                    None,
+                    None,
+                    row.untracked(),
+                    row.branch_id().into(),
+                );
+                if catalog.has_row_ref_cascades()
+                    || catalog
+                        .delete_plan_for_key(row.schema_key())
+                        .foreign_key_references
+                        .iter()
+                        .any(|reference| {
+                            reference.foreign_key.on_delete == lix_schema::DeleteAction::Cascade
+                        })
+                {
+                    frontier.push(delete_action_seed(row)?);
                 }
             }
         }
-    }
-    for (identity, (row, typed_snapshot, detached_columns)) in detached_rows {
-        if visited.contains(&identity) || enqueued.contains(&identity) {
-            continue;
-        }
-        let key =
-            crate::tracked_state::TrackedStateKey {
-                schema_key: identity.schema_key().to_owned(),
-                file_id: identity.domain().file_filters().into_iter().find_map(
-                    |filter| match filter {
-                        NullableKeyFilter::Any => None,
-                        NullableKeyFilter::Null => None,
-                        NullableKeyFilter::Value(file_id) => Some(file_id),
-                    },
-                ),
-                row_pk: identity.row_pk().clone(),
-            };
-        let preserve_created_at = !reset_created_at.is_some_and(|keys| keys.contains(&key));
-        let batch = MaterializedHotStateBatch::from_rows(vec![row]);
-        output.append(detach_row_ref_targets(
-            batch.row(0),
-            typed_snapshot,
-            preserve_created_at,
-            &detached_columns.into_iter().collect::<Vec<_>>(),
-        )?);
     }
     tracing::debug!(target: "lix_perf", indexed_probes, scan_probes, candidates, levels, generated = output.len(), "referential action closure");
     Ok(output)
-}
-
-fn detach_row_ref_targets(
-    row: MaterializedHotStateRowRef<'_>,
-    typed_snapshot: Option<Arc<WasmTypedRow>>,
-    preserve_created_at: bool,
-    detached_columns: &[(String, Option<String>)],
-) -> Result<crate::transaction_types::RawWriteBatch, LixError> {
-    let metadata = row
-        .metadata()
-        .cloned()
-        .map(TransactionJson::from_unvalidated_shared_normalized_content);
-    let created_at =
-        preserve_created_at.then(|| crate::common::SharedStr::from(row.created_at().to_string()));
-    let updated_at = None;
-    let branch_id = crate::common::SharedStr::from(row.branch_id());
-    let mut writes = crate::transaction_types::RawWriteBatch::new();
-    if let Some(mut typed) = typed_snapshot.or(row.materialize_decoded_snapshot()?) {
-        let typed = Arc::make_mut(&mut typed);
-        for (column, detached_column) in detached_columns {
-            let former_target = match typed.row.get(column) {
-                Some(lix_schema::Value::Text(value)) => value.clone(),
-                _ => {
-                    return Err(row_ref_constraint_error(
-                        row.schema_key(),
-                        column,
-                        "set_null source must contain a non-null text row reference",
-                    ));
-                }
-            };
-            typed.row.insert(column.clone(), lix_schema::Value::Null);
-            if let Some(detached_column) = detached_column {
-                typed.row.insert(
-                    detached_column.clone(),
-                    lix_schema::Value::Text(former_target),
-                );
-            }
-        }
-        writes.push_typed_parts(
-            Some(row.row_pk().clone()),
-            row.schema_key().into(),
-            row.file_id().map(Into::into),
-            Some(Arc::new((*typed).clone())),
-            metadata,
-            None,
-            created_at,
-            updated_at,
-            row.global(),
-            None,
-            None,
-            row.untracked(),
-            branch_id,
-        );
-    } else {
-        let mut snapshot = row.snapshot_json_value()?.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "live row '{}' has no snapshot for row-reference detachment",
-                    row.schema_key()
-                ),
-            )
-        })?;
-        let object = snapshot.as_object_mut().ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_SCHEMA_VALIDATION,
-                format!("live row '{}' snapshot must be an object", row.schema_key()),
-            )
-        })?;
-        for (column, detached_column) in detached_columns {
-            let former_target = object
-                .get(column)
-                .and_then(JsonValue::as_str)
-                .ok_or_else(|| {
-                    row_ref_constraint_error(
-                        row.schema_key(),
-                        column,
-                        "set_null source must contain a non-null text row reference",
-                    )
-                })?
-                .to_owned();
-            object.insert(column.clone(), JsonValue::Null);
-            if let Some(detached_column) = detached_column {
-                object.insert(detached_column.clone(), JsonValue::String(former_target));
-            }
-        }
-        writes.push_parts(
-            Some(row.row_pk().clone()),
-            row.schema_key().into(),
-            row.file_id().map(Into::into),
-            Some(TransactionJson::from_unvalidated_shared_normalized_content(
-                crate::common::SharedStr::from(snapshot.to_string()),
-            )),
-            metadata,
-            None,
-            created_at,
-            updated_at,
-            row.global(),
-            None,
-            None,
-            row.untracked(),
-            branch_id,
-        );
-    }
-    Ok(writes)
 }
 
 fn delete_action_probe(
@@ -3878,7 +3714,11 @@ async fn validate_committed_delete_restrictions(
             tombstone.identity.row_pk(),
         ) {
             let value = UniqueConstraintValue::from_row_ref(encoded.as_str());
-            for reference in delete_schema_catalog.row_ref_references() {
+            for reference in delete_schema_catalog
+                .row_ref_references()
+                .iter()
+                .filter(|reference| reference.row_ref.on_delete != lix_schema::DeleteAction::Detach)
+            {
                 for source_domain in row_ref_source_domains(&tombstone.identity) {
                     normal_batches
                         .entry(NormalDeleteRestrictionBatchKey {
@@ -3953,8 +3793,6 @@ struct RowRefDeleteActionBatchKey {
     source_key: SchemaCatalogKey,
     source_domain: Domain,
     column: String,
-    action: lix_schema::DeleteAction,
-    detached_column: Option<String>,
 }
 
 fn row_ref_source_domains(identity: &DomainRowIdentity) -> Vec<Domain> {
@@ -4119,6 +3957,8 @@ struct UnresolvedRowRefCheck {
     encoded_target: String,
     target: DomainRowIdentity,
     target_exists_in_global_scope: bool,
+    detach: bool,
+    selects_existing_change: bool,
 }
 
 fn row_ref_text_from_payload(
@@ -4146,19 +3986,6 @@ fn row_ref_text_from_payload(
                 "row-reference value is not valid text",
             )
         })
-}
-
-fn payload_field_is_non_null(payload: ValidatedRowPayload<'_>, field: &str) -> bool {
-    match payload {
-        ValidatedRowPayload::Deleted => false,
-        ValidatedRowPayload::Json(snapshot) => {
-            snapshot.get(field).is_some_and(|value| !value.is_null())
-        }
-        ValidatedRowPayload::Typed(typed) => typed
-            .row
-            .get(field)
-            .is_some_and(|value| !matches!(value, lix_schema::Value::Null)),
-    }
 }
 
 fn row_ref_constraint_error(
@@ -4214,6 +4041,8 @@ fn validate_pending_row_refs(
                 encoded_target: target.encoded_target.clone(),
                 target: target.target.clone(),
                 target_exists_in_global_scope: false,
+                detach: target.detach,
+                selects_existing_change: row.selects_existing_change(),
             });
         }
     }
@@ -4372,6 +4201,54 @@ async fn committed_global_row_ref_targets(
         }
     }
     Ok(matched)
+}
+
+/// A `detach` reference may outlive its target, so it must resolve only when a
+/// write sets it. A merge pick selects a change whose value resolved when it
+/// was written, and a write that keeps the committed value, such as an UPDATE
+/// of another column of a detached row, does not set it.
+async fn retain_written_row_refs(
+    input: &TransactionValidationInput<'_>,
+    unresolved_checks: Vec<UnresolvedRowRefCheck>,
+) -> Result<Vec<UnresolvedRowRefCheck>, LixError> {
+    let mut retained = Vec::with_capacity(unresolved_checks.len());
+    for check in unresolved_checks {
+        if !check.detach {
+            retained.push(check);
+            continue;
+        }
+        if check.selects_existing_change {
+            continue;
+        }
+        let domain = check.source_identity.domain();
+        let committed = load_committed_constraint_rows(
+            input.hot_state,
+            domain,
+            &check.source_schema_key,
+            check.source_identity.row_pk_owned(),
+            false,
+        )
+        .await?;
+        let written_value = Some(UniqueConstraintValue::from_row_ref(&check.encoded_target));
+        let mut unchanged = false;
+        for row in committed.iter() {
+            if !domain.contains_canonical_ref(row) || row.row_pk() != check.source_identity.row_pk()
+            {
+                continue;
+            }
+            unchanged = committed_constraint_value(
+                input.schema_catalog,
+                row,
+                &[vec![check.source_column.clone()]],
+                true,
+            )? == written_value;
+            break;
+        }
+        if !unchanged {
+            retained.push(check);
+        }
+    }
+    Ok(retained)
 }
 
 fn reject_unresolved_row_refs(unresolved_checks: &[UnresolvedRowRefCheck]) -> Result<(), LixError> {
@@ -10064,10 +9941,9 @@ mod tests {
             "key": "row_ref_child_schema",
             "columns": [
                 { "name": "id", "type": "text", "nullable": false },
-                { "name": "target", "type": "text", "nullable": true },
+                { "name": "target", "type": "row_ref", "nullable": true },
             ],
             "primary_key": ["id"],
-            "row_refs": [{ "column": "target" }],
         })
     }
 
@@ -10797,10 +10673,9 @@ mod tests {
             "key": "native_row_ref_child",
             "columns": [
                 { "name": "id", "type": "text", "nullable": false },
-                { "name": "target", "type": "text", "nullable": true }
+                { "name": "target", "type": "row_ref", "nullable": true }
             ],
-            "primary_key": ["id"],
-            "row_refs": [{ "column": "target" }]
+            "primary_key": ["id"]
         });
         let catalog = CatalogSnapshot::from_visible_schemas(&[parent, child])
             .expect("native row-reference catalog should build");

@@ -21,8 +21,8 @@ async fn collection_census(
         let schema = serde_json::json!({
             "$schema":"https://lix.dev/schema-v1.json", "key":"audit_empty_refs",
             "columns":[{"name":"id","type":"int8","nullable":false},
-                {"name":"target","type":"text","nullable":true}],
-            "primary_key":["id"], "row_refs":[{"column":"target"}]
+                {"name":"target","type":"row_ref","nullable":true}],
+            "primary_key":["id"]
         });
         db.execute(
             "INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)",

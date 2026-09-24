@@ -347,66 +347,83 @@ fn deletion_policy_defaults_roundtrips_and_is_not_a_safe_amendment() {
         from_json(&serde_json::to_string(&cascade).unwrap()).unwrap(),
         cascade
     );
-    for invalid in ["restrict", "set_null", "CASCADE", ""] {
+    for invalid in ["restrict", "set_null", "detach", "CASCADE", ""] {
         json["foreign_keys"][0]["on_delete"] = invalid.into();
         assert!(from_json(&json.to_string()).is_err());
     }
 }
 
 #[test]
-fn row_reference_constraints_validate_and_preserve_default_policy_omission() {
+fn row_ref_columns_are_references_and_row_refs_names_their_delete_action() {
     let json = serde_json::json!({
         "$schema":"https://lix.dev/schema-v1.json", "key":"row_ref_child",
         "columns":[
             {"name":"id","type":"uuid","nullable":false},
-            {"name":"target","type":"text","nullable":false},
-            {"name":"optional_target","type":"text","nullable":true}
+            {"name":"target","type":"row_ref","nullable":false},
+            {"name":"cascading_target","type":"row_ref","nullable":true},
+            {"name":"detached_target","type":"row_ref","nullable":true}
         ],
         "primary_key":["id"],
         "row_refs":[
-            {"column":"target"},
-            {"column":"optional_target","on_delete":"cascade"}
+            {"column":"cascading_target","on_delete":"cascade"},
+            {"column":"detached_target","on_delete":"detach"}
         ]
     });
     let schema = from_json(&json.to_string()).unwrap();
-    assert_eq!(schema.row_refs.len(), 2);
+    assert_eq!(schema.columns[1].data_type, lix_schema::DataType::RowRef);
     assert_eq!(
         schema.row_refs[0].on_delete,
-        lix_schema::DeleteAction::NoAction
+        lix_schema::DeleteAction::Cascade
     );
     assert_eq!(
         schema.row_refs[1].on_delete,
-        lix_schema::DeleteAction::Cascade
+        lix_schema::DeleteAction::Detach
     );
     let serialized = serde_json::to_value(&schema).unwrap();
-    assert_eq!(
-        serialized["row_refs"][0],
-        serde_json::json!({"column":"target"})
-    );
-    assert_eq!(
-        serialized["row_refs"][1],
-        serde_json::json!({"column":"optional_target","on_delete":"cascade"})
-    );
+    assert_eq!(serialized["columns"][1]["type"], "row_ref");
+    assert_eq!(serialized["row_refs"], json["row_refs"]);
     let ddl_error = lix_schema::to_postgres_ddl(&schema).unwrap_err();
     assert_eq!(ddl_error.kind, ErrorKind::Serialization);
-    assert!(ddl_error.message.contains("row-reference"));
+    assert!(ddl_error.message.contains("row_ref"));
+
+    // A row_ref column without an entry uses no_action.
+    let mut plain = json.clone();
+    plain["row_refs"] = serde_json::json!([]);
+    let plain = from_json(&plain.to_string()).unwrap();
+    assert!(plain.row_refs.is_empty());
+    assert!(
+        lix_schema::to_postgres_ddl(&plain)
+            .unwrap_err()
+            .message
+            .contains("row_ref")
+    );
+
+    // A row_ref may be part of a primary key, but has no literal default.
+    let mut keyed = json.clone();
+    keyed["primary_key"] = serde_json::json!(["id", "target"]);
+    from_json(&keyed.to_string()).unwrap();
+    let mut defaulted = json;
+    defaulted["columns"][1]["default_value"] = "lix_row_ref:v2:AAAA".into();
+    let error = from_json(&defaulted.to_string()).unwrap_err();
+    assert_eq!(error.path, "/columns/1/default_value");
 }
 
 #[test]
-fn row_reference_constraints_require_unique_existing_text_columns() {
+fn row_refs_entries_name_an_existing_row_ref_column_once_with_an_action() {
     let base = serde_json::json!({
         "$schema":"https://lix.dev/schema-v1.json", "key":"row_ref_child",
         "columns":[
             {"name":"id","type":"uuid","nullable":false},
-            {"name":"target","type":"text","nullable":true},
-            {"name":"count","type":"int8","nullable":true}
+            {"name":"target","type":"row_ref","nullable":true},
+            {"name":"label","type":"text","nullable":true}
         ],
         "primary_key":["id"],
-        "row_refs":[{"column":"target"}]
+        "row_refs":[{"column":"target","on_delete":"detach"}]
     });
     from_json(&base.to_string()).unwrap();
 
-    for (column, expected_message) in [("missing", "unknown column"), ("count", "must use text")] {
+    for (column, expected_message) in [("missing", "unknown column"), ("label", "must use row_ref")]
+    {
         let mut invalid = base.clone();
         invalid["row_refs"][0]["column"] = column.into();
         let error = from_json(&invalid.to_string()).unwrap_err();
@@ -415,9 +432,25 @@ fn row_reference_constraints_require_unique_existing_text_columns() {
         assert!(error.message.contains(expected_message));
     }
 
+    let mut no_action = base.clone();
+    no_action["row_refs"][0]["on_delete"] = "no_action".into();
+    let error = from_json(&no_action.to_string()).unwrap_err();
+    assert_eq!(error.path, "/row_refs/0/on_delete");
+    let mut omitted = base.clone();
+    omitted["row_refs"] = serde_json::json!([{"column":"target"}]);
+    assert!(from_json(&omitted.to_string()).is_err());
+    for removed in ["set_null", "restrict"] {
+        let mut invalid = base.clone();
+        invalid["row_refs"][0]["on_delete"] = removed.into();
+        assert!(from_json(&invalid.to_string()).is_err());
+    }
+    let mut detached_column = base.clone();
+    detached_column["row_refs"][0]["detached_column"] = "label".into();
+    assert!(from_json(&detached_column.to_string()).is_err());
+
     let mut duplicate = base;
     duplicate["row_refs"] = serde_json::json!([
-        {"column":"target"},
+        {"column":"target","on_delete":"detach"},
         {"column":"target","on_delete":"cascade"}
     ]);
     let error = from_json(&duplicate.to_string()).unwrap_err();
@@ -433,10 +466,10 @@ fn row_reference_constraint_changes_are_not_safe_amendments() {
           "$schema":"https://lix.dev/schema-v1.json", "key":"row_ref_child",
           "columns":[
             {"name":"id","type":"uuid","nullable":false},
-            {"name":"target","type":"text","nullable":true}
+            {"name":"target","type":"row_ref","nullable":true}
           ],
           "primary_key":["id"],
-          "row_refs":[{"column":"target"}]
+          "row_refs":[{"column":"target","on_delete":"detach"}]
         }"#,
     )
     .unwrap();
@@ -446,4 +479,18 @@ fn row_reference_constraint_changes_are_not_safe_amendments() {
     let error = validate_amendment(&previous, &changed).unwrap_err();
     assert_eq!(error.kind, ErrorKind::Amendment);
     assert_eq!(error.path, "/");
+
+    let mut dropped = serde_json::to_value(&previous).unwrap();
+    dropped["row_refs"] = serde_json::json!([]);
+    let dropped = from_json(&dropped.to_string()).unwrap();
+    assert!(validate_amendment(&previous, &dropped).is_err());
+
+    // Appending a nullable row_ref column appends a no_action reference.
+    let mut appended = serde_json::to_value(&previous).unwrap();
+    appended["columns"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"name":"source","type":"row_ref","nullable":true}));
+    let appended = from_json(&appended.to_string()).unwrap();
+    validate_amendment(&previous, &appended).unwrap();
 }

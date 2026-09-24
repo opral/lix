@@ -26,7 +26,7 @@ use serde_json::Value;
 
 fn kind_of(data_type: DataType) -> BodyKind {
     match data_type {
-        DataType::Text => BodyKind::Text,
+        DataType::Text | DataType::RowRef => BodyKind::Text,
         DataType::Uuid => BodyKind::Uuid,
         DataType::Int8 => BodyKind::Int8,
         DataType::Float8 => BodyKind::Float8,
@@ -52,6 +52,10 @@ fn synthesise(name: &str, data_type: DataType, example: Option<&Value>) -> (Body
         DataType::Boolean => (BodyValue::Boolean(true), Value::Bool(true)),
         DataType::Int8 => (BodyValue::Int8(42), Value::from(42)),
         DataType::Float8 => (BodyValue::Float8(1.5), Value::from(1.5)),
+        DataType::RowRef => {
+            let text = "lix_row_ref:v2:AAAACGxpeF9maWxlAAEDAAAAJDAxOTUwMDAwLTAwMDAtNzAwMC04MDAwLTAwMDAwMDAwMDEwMQ".to_owned();
+            (BodyValue::Text(text.clone()), Value::String(text))
+        }
         DataType::Text => {
             // Length-realistic by role: hashes and timestamps are the common
             // long text columns; everything else gets a short identifier.
@@ -87,7 +91,7 @@ fn synthesise(name: &str, data_type: DataType, example: Option<&Value>) -> (Body
 
 fn from_json(data_type: DataType, value: &Value) -> Option<BodyValue> {
     Some(match data_type {
-        DataType::Text => BodyValue::Text(value.as_str()?.to_owned()),
+        DataType::Text | DataType::RowRef => BodyValue::Text(value.as_str()?.to_owned()),
         DataType::Uuid => BodyValue::Uuid(uuid::Uuid::parse_str(value.as_str()?).ok()?),
         DataType::Int8 => BodyValue::Int8(value.as_i64()?),
         DataType::Float8 => {
@@ -245,7 +249,12 @@ fn metadata_bytes_per_row_over_every_schema_v1_fixture() {
         let nullable = body_columns.iter().filter(|column| column.nullable).count();
         let nvar = body_columns
             .iter()
-            .filter(|column| matches!(column.data_type, DataType::Text | DataType::Jsonb))
+            .filter(|column| {
+                matches!(
+                    column.data_type,
+                    DataType::Text | DataType::RowRef | DataType::Jsonb
+                )
+            })
             .count();
         // header + bitmap + offsets. Fixed-area widths are value bytes.
         candidate_total += 1 + nullable.div_ceil(8) + 2 * nvar.saturating_sub(1);

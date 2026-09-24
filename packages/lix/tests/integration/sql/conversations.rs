@@ -158,7 +158,7 @@ simulation_test!(
                 "SELECT table_name,column_name,data_type,is_nullable
              FROM information_schema.columns
              WHERE table_name IN ('lix_comment','lix_conversation')
-               AND column_name IN ('id','target','detached_target','title','resolved','conversation_id','body','author_id','order_key')
+               AND column_name IN ('id','target','title','resolved','conversation_id','body','author_id','order_key')
              ORDER BY table_name,ordinal_position",
                 &[],
             )
@@ -194,13 +194,7 @@ simulation_test!(
                 vec![
                     Value::Text("lix_conversation".into()),
                     Value::Text("target".into()),
-                    Value::Text("TEXT".into()),
-                    Value::Text("YES".into()),
-                ],
-                vec![
-                    Value::Text("lix_conversation".into()),
-                    Value::Text("detached_target".into()),
-                    Value::Text("TEXT".into()),
+                    Value::Text("ROW_REF".into()),
                     Value::Text("YES".into()),
                 ],
                 vec![
@@ -538,8 +532,133 @@ simulation_test!(
     }
 );
 
+simulation_test!(conversation_target_is_typed_row_ref, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    install_local_targets(&session).await;
+    insert_local_conversations_and_comments(&session).await;
+    let expected = session
+        .execute(
+            "SELECT lix_row_ref('conversation_custom_target',NULL,'custom-1')",
+            &[],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .values()[0]
+        .clone();
+    let Value::RowRef(canonical) = expected.clone() else {
+        panic!("lix_row_ref returns ROW_REF, got {expected:?}");
+    };
+    let inserted = session
+        .execute(
+            "INSERT INTO lix_conversation(id,target) VALUES ($1,$2) RETURNING target",
+            &[
+                Value::Text(TARGET_CONVERSATION.into()),
+                Value::Text(canonical.as_str().to_owned()),
+            ],
+        )
+        .await
+        .expect("canonical reference text is accepted for a ROW_REF column");
+    assert_eq!(inserted.column_types(), &[lix::ResultColumnType::RowRef]);
+    assert_rows_eq(inserted, vec![vec![expected.clone()]]);
+
+    let selected = session
+        .execute(
+            "SELECT target, target = lix_row_ref('conversation_custom_target',NULL,'custom-1')
+                 FROM lix_conversation WHERE id=$1",
+            &[Value::Text(TARGET_CONVERSATION.into())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        selected.column_types(),
+        &[
+            lix::ResultColumnType::RowRef,
+            lix::ResultColumnType::Boolean
+        ]
+    );
+    assert_rows_eq(selected, vec![vec![expected.clone(), Value::Boolean(true)]]);
+
+    // A TEXT parameter compared with the ROW_REF is read as a reference;
+    // so is a ROW_REF parameter, as returned by an earlier query.
+    for parameter in [Value::Text(canonical.as_str().to_owned()), expected.clone()] {
+        for sql in [
+            "SELECT id FROM lix_conversation WHERE target = $1",
+            "SELECT id FROM lix_conversation WHERE target IN ($1)",
+        ] {
+            assert_rows_eq(
+                session.execute(sql, &[parameter.clone()]).await.unwrap(),
+                vec![vec![Value::Text(TARGET_CONVERSATION.into())]],
+            );
+        }
+    }
+    assert_rows_eq(
+        session
+            .execute(
+                "SELECT c.id, t.label FROM lix_conversation c
+                     JOIN conversation_custom_target t
+                       ON c.target = lix_row_ref('conversation_custom_target', NULL, t.id)",
+                &[],
+            )
+            .await
+            .unwrap(),
+        vec![vec![
+            Value::Text(TARGET_CONVERSATION.into()),
+            Value::Text("Custom target".into()),
+        ]],
+    );
+    assert_rows_eq(
+        session
+            .execute(
+                "SELECT id FROM lix_conversation WHERE CAST(target AS TEXT) = $1",
+                &[Value::Text(canonical.as_str().to_owned())],
+            )
+            .await
+            .unwrap(),
+        vec![vec![Value::Text(TARGET_CONVERSATION.into())]],
+    );
+    let updated = session
+        .execute(
+            "UPDATE lix_conversation SET title='Typed' WHERE target = $1 RETURNING id",
+            &[Value::Text(canonical.as_str().to_owned())],
+        )
+        .await
+        .unwrap();
+    assert_rows_eq(updated, vec![vec![Value::Text(TARGET_CONVERSATION.into())]]);
+
+    for (sql, params) in [
+        (
+            "SELECT id FROM lix_conversation WHERE target = $1",
+            vec![Value::Text("not-a-row-ref".into())],
+        ),
+        (
+            "SELECT id FROM lix_conversation WHERE target = 'not-a-row-ref'",
+            vec![],
+        ),
+        (
+            "SELECT id FROM lix_conversation WHERE target = title",
+            vec![],
+        ),
+        (
+            "INSERT INTO lix_conversation(id,target) VALUES ('01950000-0000-7000-8000-000000000410',$1)",
+            vec![Value::Text("not-a-row-ref".into())],
+        ),
+    ] {
+        let error = session
+            .execute(sql, &params)
+            .await
+            .expect_err("TEXT that is not a canonical reference is not a ROW_REF");
+        assert_eq!(
+            error.code,
+            lix::LixError::CODE_TYPE_MISMATCH,
+            "{sql}: {error:?}"
+        );
+    }
+});
+
 simulation_test!(
-    conversation_retargeting_requires_clearing_detached_target,
+    conversation_detached_target_is_checked_only_when_written,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
@@ -560,32 +679,131 @@ simulation_test!(
             .await
             .expect("deleting the target should detach the conversation");
 
+        // Other columns of a detached conversation remain writable, alone and
+        // alongside writes that validate the whole transaction.
+        session
+            .execute(
+                "UPDATE lix_conversation SET title='Detached', resolved=true WHERE id=$1",
+                &[Value::Text(TARGET_CONVERSATION.into())],
+            )
+            .await
+            .expect("an unchanged detached target is not re-checked");
+        session
+            .execute(
+                "UPDATE lix_conversation SET target=target, title='Still detached' WHERE id=$1",
+                &[Value::Text(TARGET_CONVERSATION.into())],
+            )
+            .await
+            .expect("assigning the unchanged value does not write a new reference");
+        let mut transaction = session.begin_transaction().await.unwrap();
+        transaction
+            .execute(
+                "UPDATE lix_conversation SET resolved=false WHERE id=$1",
+                &[Value::Text(TARGET_CONVERSATION.into())],
+            )
+            .await
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO lix_comment(id,conversation_id,body) VALUES ($1,$2,CAST($3 AS JSONB))",
+                &[
+                    Value::Text(TARGET_COMMENT.into()),
+                    Value::Text(TARGET_CONVERSATION.into()),
+                    Value::Text(BODY.into()),
+                ],
+            )
+            .await
+            .unwrap();
+        transaction
+            .commit()
+            .await
+            .expect("reopening a detached conversation with a note commits");
+
+        // A written reference must resolve.
         let error = session
             .execute(
                 "UPDATE lix_conversation
-                 SET target=lix_row_ref('lix_file',NULL,$2)
+                 SET target=lix_row_ref('conversation_custom_target',NULL,'missing')
                  WHERE id=$1",
+                &[Value::Text(TARGET_CONVERSATION.into())],
+            )
+            .await
+            .expect_err("a new target must exist");
+        assert_eq!(error.code, lix::LixError::CODE_FOREIGN_KEY);
+        let error = session
+            .execute(
+                "INSERT INTO lix_conversation(id,target) VALUES
+                 ($1,lix_row_ref('conversation_custom_target',NULL,'custom-1'))",
+                &[Value::Text("01950000-0000-7000-8000-000000000411".into())],
+            )
+            .await
+            .expect_err("a new conversation cannot start detached");
+        assert_eq!(error.code, lix::LixError::CODE_FOREIGN_KEY);
+
+        session
+            .execute(
+                "UPDATE lix_conversation SET target=lix_row_ref('lix_file',NULL,$2) WHERE id=$1",
                 &[
                     Value::Text(TARGET_CONVERSATION.into()),
                     Value::Text(FILE_TARGET.into()),
                 ],
             )
             .await
-            .expect_err("reattaching must clear the archived target in the same write");
-        assert_eq!(error.code, lix::LixError::CODE_FOREIGN_KEY);
+            .expect("re-attaching to an existing row is an ordinary update");
         assert_rows_eq(
             session
                 .execute(
-                    "SELECT target,detached_target IS NOT NULL
+                    "SELECT target = lix_row_ref('lix_file',NULL,$2), title, resolved
                      FROM lix_conversation WHERE id=$1",
-                    &[Value::Text(TARGET_CONVERSATION.into())],
+                    &[
+                        Value::Text(TARGET_CONVERSATION.into()),
+                        Value::Text(FILE_TARGET.into()),
+                    ],
                 )
                 .await
                 .unwrap(),
-            vec![vec![Value::Null, Value::Boolean(true)]],
+            vec![vec![
+                Value::Boolean(true),
+                Value::Text("Still detached".into()),
+                Value::Boolean(false),
+            ]],
         );
+        session
+            .execute(
+                "UPDATE lix_conversation SET target=NULL WHERE id=$1",
+                &[Value::Text(TARGET_CONVERSATION.into())],
+            )
+            .await
+            .expect("a conversation can become standalone");
     }
 );
+
+/// A conversation whose target is non-null and does not resolve, for every
+/// target relation the fixtures use (see docs/conversations.md).
+const DETACHED_CONVERSATIONS: &str = "SELECT c.id FROM lix_conversation c
+     LEFT JOIN conversation_paragraph_target p
+       ON c.target = lix_row_ref('conversation_paragraph_target', p.lixcol_file_id, p.id)
+     LEFT JOIN conversation_csv_target v
+       ON c.target = lix_row_ref('conversation_csv_target', v.lixcol_file_id, v.id)
+     LEFT JOIN conversation_custom_target t
+       ON c.target = lix_row_ref('conversation_custom_target', NULL, t.id)
+     LEFT JOIN lix_file f ON c.target = lix_row_ref('lix_file', NULL, f.id)
+     WHERE c.target IS NOT NULL
+       AND p.id IS NULL AND v.id IS NULL AND t.id IS NULL AND f.id IS NULL
+     ORDER BY c.id";
+
+async fn conversation_change_count(session: &SimSession) -> Value {
+    session
+        .execute(
+            "SELECT COUNT(*) FROM lix_change WHERE schema_key='lix_conversation'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .values()[0]
+        .clone()
+}
 
 simulation_test!(
     conversation_target_deletion_detaches_threads_and_preserves_comments,
@@ -594,16 +812,19 @@ simulation_test!(
         let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
         install_local_targets(&session).await;
         insert_local_conversations_and_comments(&session).await;
-        let original_created_at = session
+        let before = session
             .execute(
-                "SELECT lixcol_created_at FROM lix_conversation WHERE id=$1",
-                &[Value::Text(LOCAL_FILE_CONVERSATION.into())],
+                "SELECT id,target,lixcol_change_id,lixcol_created_at FROM lix_conversation ORDER BY id",
+                &[],
             )
             .await
-            .unwrap()
-            .rows()[0]
-            .values()[0]
-            .clone();
+            .unwrap();
+        let changes = conversation_change_count(&session).await;
+        assert_rows_eq(
+            session.execute(DETACHED_CONVERSATIONS, &[]).await.unwrap(),
+            vec![],
+        );
+        let opened = checkpoint(&session).await;
 
         session
             .execute(
@@ -612,109 +833,190 @@ simulation_test!(
             )
             .await
             .expect("file target deletion should detach its conversation");
+        session
+            .execute(
+                "DELETE FROM conversation_paragraph_target WHERE id='paragraph-1'",
+                &[],
+            )
+            .await
+            .expect("file-scoped target deletion should detach its conversation");
+        session
+            .execute(
+                "DELETE FROM conversation_csv_target WHERE id='csv-row-1'",
+                &[],
+            )
+            .await
+            .expect("custom target deletion should detach its conversation");
+        let deleted = checkpoint(&session).await;
+
+        // The conversations are not written: same values, change, and
+        // creation time, and no conversation change in history or diff.
         assert_rows_eq(
             session
                 .execute(
-                    "SELECT id,target IS NULL,detached_target=CAST(lix_row_ref('lix_file',NULL,$2) AS TEXT)
+                    "SELECT id,target,lixcol_change_id,lixcol_created_at FROM lix_conversation ORDER BY id",
+                    &[],
+                )
+                .await
+                .unwrap(),
+            before.rows().iter().map(|row| row.values().to_vec()).collect(),
+        );
+        assert_eq!(conversation_change_count(&session).await, changes);
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT id FROM lix_diff('lix_conversation', $1, $2)",
+                    &[Value::Text(opened.clone()), Value::Text(deleted.clone())],
+                )
+                .await
+                .unwrap(),
+            vec![],
+        );
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT id FROM lix_history('lix_conversation') WHERE lixcol_to_commit_id=$1",
+                    &[Value::Text(deleted)],
+                )
+                .await
+                .unwrap(),
+            vec![],
+        );
+        assert_rows_eq(
+            session.execute(DETACHED_CONVERSATIONS, &[]).await.unwrap(),
+            vec![
+                vec![Value::Text(LOCAL_PARAGRAPH_CONVERSATION.into())],
+                vec![Value::Text(LOCAL_CSV_CONVERSATION.into())],
+                vec![Value::Text(LOCAL_FILE_CONVERSATION.into())],
+            ],
+        );
+        // The former target stays readable.
+        assert_rows_eq(
+            session
+                .execute(
+                    "SELECT lix_row_ref_parts(target) ->> 'relation'
                      FROM lix_conversation WHERE id=$1",
-                    &[
-                        Value::Text(LOCAL_FILE_CONVERSATION.into()),
-                        Value::Text(FILE_TARGET.into()),
-                    ],
+                    &[Value::Text(LOCAL_CSV_CONVERSATION.into())],
                 )
                 .await
                 .unwrap(),
-            vec![vec![
-                Value::Text(LOCAL_FILE_CONVERSATION.into()),
-                Value::Boolean(true),
-                Value::Boolean(true),
-            ]],
+            vec![vec![Value::Text("conversation_csv_target".into())]],
         );
         assert_rows_eq(
             session
-                .execute(
-                    "SELECT lixcol_created_at FROM lix_conversation WHERE id=$1",
-                    &[Value::Text(LOCAL_FILE_CONVERSATION.into())],
-                )
+                .execute("SELECT id FROM lix_comment ORDER BY id", &[])
                 .await
                 .unwrap(),
-            vec![vec![original_created_at]],
+            vec![
+                vec![Value::Text(PARAGRAPH_COMMENT.into())],
+                vec![Value::Text(CSV_COMMENT.into())],
+                vec![Value::Text(FILE_COMMENT.into())],
+                vec![Value::Text(STANDALONE_COMMENT.into())],
+            ],
         );
+    }
+);
+
+simulation_test!(
+    conversation_target_restore_reattaches_without_writing,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        install_local_targets(&session).await;
+        insert_local_conversations_and_comments(&session).await;
+        let before_delete = session
+            .execute("SELECT lix_active_branch_commit_id()", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .values()[0]
+            .clone();
+        session
+            .execute(
+                "DELETE FROM conversation_csv_target WHERE id='csv-row-1'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let changes = conversation_change_count(&session).await;
         assert_rows_eq(
-            session
-                .execute(
-                    "SELECT id FROM lix_comment WHERE id=$1",
-                    &[Value::Text(FILE_COMMENT.into())],
-                )
-                .await
-                .unwrap(),
-            vec![vec![Value::Text(FILE_COMMENT.into())]],
+            session.execute(DETACHED_CONVERSATIONS, &[]).await.unwrap(),
+            vec![vec![Value::Text(LOCAL_CSV_CONVERSATION.into())]],
         );
 
-        for (target_key, target_id, file_id, conversation_id, comment_id) in [
-            (
-                "conversation_paragraph_target",
-                "paragraph-1",
-                FILE_PARAGRAPH,
-                LOCAL_PARAGRAPH_CONVERSATION,
-                PARAGRAPH_COMMENT,
-            ),
-            (
-                "conversation_csv_target",
-                "csv-row-1",
-                FILE_CSV,
-                LOCAL_CSV_CONVERSATION,
-                CSV_COMMENT,
-            ),
-        ] {
-            session
-                .execute(
-                    &format!("DELETE FROM {target_key} WHERE id=$1"),
-                    &[Value::Text(target_id.into())],
-                )
-                .await
-                .expect("custom target deletion should detach the conversation");
-            assert_rows_eq(
-                session
-                    .execute(
-                        "SELECT id,target IS NULL,
-                                detached_target=CAST(lix_row_ref($2,$3,$4) AS TEXT)
-                         FROM lix_conversation WHERE id=$1",
-                        &[
-                            Value::Text(conversation_id.into()),
-                            Value::Text(target_key.into()),
-                            Value::Text(file_id.into()),
-                            Value::Text(target_id.into()),
-                        ],
-                    )
-                    .await
-                    .unwrap(),
-                vec![vec![
-                    Value::Text(conversation_id.into()),
-                    Value::Boolean(true),
-                    Value::Boolean(true),
-                ]],
-            );
-            assert_rows_eq(
-                session
-                    .execute(
-                        "SELECT id FROM lix_comment WHERE id=$1",
-                        &[Value::Text(comment_id.into())],
-                    )
-                    .await
-                    .unwrap(),
-                vec![vec![Value::Text(comment_id.into())]],
-            );
-        }
+        session
+            .execute("SELECT commit_id FROM lix_undo()", &[])
+            .await
+            .expect("undo restores the target");
         assert_rows_eq(
-            session
-                .execute(
-                    "SELECT id FROM lix_conversation WHERE id=$1",
-                    &[Value::Text(STANDALONE_CONVERSATION.into())],
-                )
-                .await
-                .unwrap(),
-            vec![vec![Value::Text(STANDALONE_CONVERSATION.into())]],
+            session.execute(DETACHED_CONVERSATIONS, &[]).await.unwrap(),
+            vec![],
+        );
+        assert_eq!(conversation_change_count(&session).await, changes);
+
+        session
+            .execute(
+                "DELETE FROM conversation_csv_target WHERE id='csv-row-1'",
+                &[],
+            )
+            .await
+            .unwrap();
+        session
+            .execute(
+                "SELECT commit_id FROM lix_restore($1, ARRAY[lix_row_ref('conversation_csv_target', $2, 'csv-row-1')])",
+                &[before_delete, Value::Text(FILE_CSV.into())],
+            )
+            .await
+            .expect("restore returns the target");
+        assert_rows_eq(
+            session.execute(DETACHED_CONVERSATIONS, &[]).await.unwrap(),
+            vec![],
+        );
+        assert_eq!(conversation_change_count(&session).await, changes);
+    }
+);
+
+simulation_test!(
+    conversation_scoped_checkpoints_select_detached_threads,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        install_local_targets(&session).await;
+        checkpoint(&session).await;
+        session
+            .execute(
+                "INSERT INTO lix_conversation(id,target) VALUES
+                 ($1,lix_row_ref('conversation_custom_target',NULL,'custom-1'))",
+                &[Value::Text(TARGET_CONVERSATION.into())],
+            )
+            .await
+            .unwrap();
+        session
+            .execute(
+                "DELETE FROM conversation_custom_target WHERE id='custom-1'",
+                &[],
+            )
+            .await
+            .unwrap();
+        // A detached reference is not a dependency: either side can cross a
+        // scoped checkpoint without the other.
+        session
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_conversation', NULL, $1)])",
+                &[Value::Text(TARGET_CONVERSATION.into())],
+            )
+            .await
+            .expect("a detached conversation checkpoints without its deleted target");
+        session
+            .execute(
+                "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('conversation_custom_target', NULL, 'custom-1')])",
+                &[],
+            )
+            .await
+            .expect("the target deletion checkpoints without its conversation");
+        assert_rows_eq(
+            session.execute(DETACHED_CONVERSATIONS, &[]).await.unwrap(),
+            vec![vec![Value::Text(TARGET_CONVERSATION.into())]],
         );
     }
 );
@@ -977,14 +1279,17 @@ async fn assert_conversation_merge_target_delete_and_reply(
     );
     assert_rows_eq(
         main.execute(
-            "SELECT target IS NULL,
-                    detached_target=CAST(lix_row_ref('conversation_custom_target',NULL,'custom-1') AS TEXT)
+            "SELECT target = lix_row_ref('conversation_custom_target',NULL,'custom-1')
              FROM lix_conversation WHERE id=$1",
             &[Value::Text(TARGET_CONVERSATION.into())],
         )
         .await
         .unwrap(),
-        vec![vec![Value::Boolean(true), Value::Boolean(true)]],
+        vec![vec![Value::Boolean(true)]],
+    );
+    assert_rows_eq(
+        main.execute(DETACHED_CONVERSATIONS, &[]).await.unwrap(),
+        vec![vec![Value::Text(TARGET_CONVERSATION.into())]],
     );
     assert_rows_eq(
         main.execute("SELECT id FROM lix_comment ORDER BY id", &[])
@@ -1085,14 +1390,17 @@ async fn assert_conversation_generation_delete_merge(
     );
     assert_rows_eq(
         main.execute(
-            "SELECT target IS NULL,
-                    detached_target=CAST(lix_row_ref('conversation_custom_target',NULL,'custom-1') AS TEXT)
+            "SELECT target = lix_row_ref('conversation_custom_target',NULL,'custom-1')
              FROM lix_conversation WHERE id=$1",
             &[Value::Text(GENERATION_CONVERSATION.into())],
         )
         .await
         .unwrap(),
-        vec![vec![Value::Boolean(true), Value::Boolean(true)]],
+        vec![vec![Value::Boolean(true)]],
+    );
+    assert_rows_eq(
+        main.execute(DETACHED_CONVERSATIONS, &[]).await.unwrap(),
+        vec![vec![Value::Text(GENERATION_CONVERSATION.into())]],
     );
     assert_rows_eq(
         main.execute("SELECT id FROM lix_comment ORDER BY id", &[])
@@ -1138,10 +1446,7 @@ simulation_test!(
 
         assert_rows_eq(
             session
-                .execute(
-                    "SELECT id,resolved FROM lix_conversation ORDER BY id",
-                    &[],
-                )
+                .execute("SELECT id,resolved FROM lix_conversation ORDER BY id", &[])
                 .await
                 .unwrap(),
             vec![
@@ -1221,7 +1526,11 @@ simulation_test!(
             )
             .await
             .expect_err("resolved is NOT NULL");
-        assert_eq!(error.code, lix::LixError::CODE_SCHEMA_VALIDATION, "{error:?}");
+        assert_eq!(
+            error.code,
+            lix::LixError::CODE_SCHEMA_VALIDATION,
+            "{error:?}"
+        );
     }
 );
 
@@ -1439,93 +1748,94 @@ simulation_test!(
     }
 );
 
-simulation_test!(
-    detached_conversations_can_be_resolved,
-    |sim| async move {
-        let engine = sim.boot_engine().await;
-        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
-        install_local_targets(&session).await;
-        insert_local_conversations_and_comments(&session).await;
-        session
-            .execute(
-                "UPDATE lix_conversation SET resolved=true WHERE id=$1",
-                &[Value::Text(LOCAL_CSV_CONVERSATION.into())],
-            )
-            .await
-            .unwrap();
-        session
-            .execute(
-                "DELETE FROM conversation_paragraph_target WHERE id='paragraph-1'",
-                &[],
-            )
-            .await
-            .unwrap();
-        session
-            .execute(
-                "DELETE FROM conversation_csv_target WHERE id='csv-row-1'",
-                &[],
-            )
-            .await
-            .unwrap();
+simulation_test!(detached_conversations_can_be_resolved, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    install_local_targets(&session).await;
+    insert_local_conversations_and_comments(&session).await;
+    session
+        .execute(
+            "UPDATE lix_conversation SET resolved=true WHERE id=$1",
+            &[Value::Text(LOCAL_CSV_CONVERSATION.into())],
+        )
+        .await
+        .unwrap();
+    session
+        .execute(
+            "DELETE FROM conversation_paragraph_target WHERE id='paragraph-1'",
+            &[],
+        )
+        .await
+        .unwrap();
+    session
+        .execute(
+            "DELETE FROM conversation_csv_target WHERE id='csv-row-1'",
+            &[],
+        )
+        .await
+        .unwrap();
 
-        // Detaching keeps an existing resolution and leaves open threads open.
-        assert_rows_eq(
-            session
-                .execute(
-                    "SELECT id, target IS NULL, detached_target IS NOT NULL, resolved
+    // Detaching keeps an existing resolution and leaves open threads open.
+    assert_rows_eq(
+        session.execute(DETACHED_CONVERSATIONS, &[]).await.unwrap(),
+        vec![
+            vec![Value::Text(LOCAL_PARAGRAPH_CONVERSATION.into())],
+            vec![Value::Text(LOCAL_CSV_CONVERSATION.into())],
+        ],
+    );
+    assert_rows_eq(
+        session
+            .execute(
+                "SELECT id, target IS NOT NULL, resolved
                      FROM lix_conversation WHERE id IN ($1,$2) ORDER BY id",
-                    &[
-                        Value::Text(LOCAL_PARAGRAPH_CONVERSATION.into()),
-                        Value::Text(LOCAL_CSV_CONVERSATION.into()),
-                    ],
-                )
-                .await
-                .unwrap(),
-            vec![
-                vec![
+                &[
                     Value::Text(LOCAL_PARAGRAPH_CONVERSATION.into()),
-                    Value::Boolean(true),
-                    Value::Boolean(true),
-                    Value::Boolean(false),
-                ],
-                vec![
                     Value::Text(LOCAL_CSV_CONVERSATION.into()),
-                    Value::Boolean(true),
-                    Value::Boolean(true),
-                    Value::Boolean(true),
                 ],
-            ],
-        );
-
-        session
-            .execute(
-                "UPDATE lix_conversation SET resolved=true
-                 WHERE target IS NULL AND detached_target IS NOT NULL AND resolved = false",
-                &[],
             )
             .await
-            .expect("detached conversations should be resolvable");
-        assert_eq!(
-            conversation_resolved(&session, LOCAL_PARAGRAPH_CONVERSATION).await,
-            Value::Boolean(true)
-        );
+            .unwrap(),
+        vec![
+            vec![
+                Value::Text(LOCAL_PARAGRAPH_CONVERSATION.into()),
+                Value::Boolean(true),
+                Value::Boolean(false),
+            ],
+            vec![
+                Value::Text(LOCAL_CSV_CONVERSATION.into()),
+                Value::Boolean(true),
+                Value::Boolean(true),
+            ],
+        ],
+    );
+
+    session
+        .execute(
+            "UPDATE lix_conversation SET resolved=true WHERE id=$1 AND resolved = false",
+            &[Value::Text(LOCAL_PARAGRAPH_CONVERSATION.into())],
+        )
+        .await
+        .expect("detached conversations should be resolvable");
+    assert_eq!(
+        conversation_resolved(&session, LOCAL_PARAGRAPH_CONVERSATION).await,
+        Value::Boolean(true)
+    );
+    session
+        .execute(
+            "UPDATE lix_conversation SET resolved=false WHERE id=$1",
+            &[Value::Text(LOCAL_CSV_CONVERSATION.into())],
+        )
+        .await
+        .expect("detached conversations should be reopenable");
+    assert_rows_eq(
         session
             .execute(
-                "UPDATE lix_conversation SET resolved=false WHERE id=$1",
+                "SELECT resolved, target IS NOT NULL
+                     FROM lix_conversation WHERE id=$1",
                 &[Value::Text(LOCAL_CSV_CONVERSATION.into())],
             )
             .await
-            .expect("detached conversations should be reopenable");
-        assert_rows_eq(
-            session
-                .execute(
-                    "SELECT resolved, detached_target IS NOT NULL
-                     FROM lix_conversation WHERE id=$1",
-                    &[Value::Text(LOCAL_CSV_CONVERSATION.into())],
-                )
-                .await
-                .unwrap(),
-            vec![vec![Value::Boolean(false), Value::Boolean(true)]],
-        );
-    }
-);
+            .unwrap(),
+        vec![vec![Value::Boolean(false), Value::Boolean(true)]],
+    );
+});

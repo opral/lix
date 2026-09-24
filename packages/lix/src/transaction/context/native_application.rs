@@ -92,9 +92,13 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
                     let snapshot = native_file_descriptor_json(row)?;
                     incoming_row_refs |= snapshot
                         .get("value")
-                        .and_then(|schema| schema.get("row_refs"))
+                        .and_then(|schema| schema.get("columns"))
                         .and_then(JsonValue::as_array)
-                        .is_some_and(|references| !references.is_empty());
+                        .is_some_and(|columns| {
+                            columns.iter().any(|column| {
+                                column.get("type").and_then(JsonValue::as_str) == Some("row_ref")
+                            })
+                        });
                     if let Some(schema_key) = snapshot
                         .get("schema_key")
                         .or_else(|| snapshot.get("value").and_then(|schema| schema.get("key")))
@@ -215,7 +219,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
         };
         let row_ref_sources_present = incoming_row_ref_sources || live_row_ref_sources;
         let has_action = |schema: &str| {
-            catalog.has_row_ref_delete_actions()
+            catalog.has_row_ref_cascades()
                 || catalog
                     .delete_plan_for_key(schema)
                     .foreign_key_references
@@ -227,7 +231,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
         let file_delete_scopes_enabled = !file_delete_ids.is_empty()
             && (incoming_row_refs
                 || !catalog.row_ref_references().is_empty()
-                || catalog.has_row_ref_delete_actions());
+                || catalog.has_row_ref_cascades());
         let mut file_delete_schema_keys = self
             .sql_schema_snapshot
             .plans()
@@ -344,7 +348,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
                 .row_ref_references()
                 .iter()
                 .filter(|reference| {
-                    reference.row_ref.on_delete != lix_schema::DeleteAction::NoAction
+                    reference.row_ref.on_delete == lix_schema::DeleteAction::Cascade
                 })
                 .map(|reference| reference.source_key.schema_key.clone()),
         );
@@ -675,41 +679,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
             base: &selected_candidate,
             staged: &staged,
         };
-        let destination_candidate =
-            super::super::schema_resolver::TransactionSchemaHotStateReader {
-                base: &base,
-                staged: &staged,
-            };
-        let reset_created_at = if incoming_row_ref_picks.is_empty() {
-            BTreeSet::new()
-        } else {
-            let destination_rows = destination_candidate
-                .load_exact_batch(&HotStateExactBatchRequest {
-                    rows: incoming_row_ref_picks
-                        .iter()
-                        .map(|pick| HotStateExactRowRequest {
-                            schema_key: pick.identity.schema_key().to_owned(),
-                            file_id: pick.identity.file_id().map(str::to_owned),
-                            row_pk: pick.identity.row_pk().clone(),
-                            branch_id: branch.clone(),
-                        })
-                        .collect(),
-                    projection: Default::default(),
-                    untracked: Some(false),
-                    include_tombstones: false,
-                })
-                .await?;
-            incoming_row_ref_picks
-                .iter()
-                .enumerate()
-                .filter(|(slot, _)| destination_rows.row(*slot).is_none())
-                .map(|(_, pick)| TrackedStateKey {
-                    schema_key: pick.identity.schema_key().into(),
-                    file_id: pick.identity.file_id().map(str::to_owned),
-                    row_pk: pick.identity.row_pk().clone(),
-                })
-                .collect::<BTreeSet<_>>()
-        };
         let current = candidate
             .load_exact_batch(&HotStateExactBatchRequest {
                 rows: seed_keys
@@ -799,13 +768,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
                 &Domain::schema_catalog(branch.clone(), false),
             )
             .await?;
-        let mut deletes = super::super::validation::plan_delete_actions(
-            &candidate,
-            catalog,
-            seeds,
-            Some(&reset_created_at),
-        )
-        .await?;
+        let mut deletes =
+            super::super::validation::plan_delete_actions(&candidate, catalog, seeds).await?;
         deletes.append(generation_deletes);
         // Current state has one physical key across durability modes. A
         // cascaded untracked delete cannot also install a tracked selection at

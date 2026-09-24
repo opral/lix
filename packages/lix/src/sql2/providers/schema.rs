@@ -1953,6 +1953,11 @@ fn row_update_json_value(
     };
     match column_type {
         SchemaColumnType::String => scalar_utf8(value, column_name, spec).map(JsonValue::String),
+        SchemaColumnType::RowRef => {
+            let raw = scalar_utf8(value, column_name, spec)?;
+            crate::row_ref::decode_str(&raw).map_err(lix_error_to_datafusion_error)?;
+            Ok(JsonValue::String(raw))
+        }
         SchemaColumnType::Jsonb => {
             let raw = scalar_utf8(value, column_name, spec)?;
             serde_json::from_str(&raw).map_err(|error| {
@@ -2763,6 +2768,7 @@ impl<'a> RowFilterAnalyzer<'a> {
         let column = self.spec.visible_column(column_name)?;
         match column.column_type {
             SchemaColumnType::String
+            | SchemaColumnType::RowRef
             | SchemaColumnType::Boolean
             | SchemaColumnType::Integer
             | SchemaColumnType::Number => {
@@ -3174,7 +3180,9 @@ fn row_filter_value_literal(expr: &Expr, column_type: SchemaColumnType) -> Optio
         (RowFilterValue::Boolean(_), SchemaColumnType::Boolean)
         | (RowFilterValue::Integer(_), SchemaColumnType::Integer)
         | (RowFilterValue::Integer(_) | RowFilterValue::Number(_), SchemaColumnType::Number)
-        | (RowFilterValue::String(_), SchemaColumnType::String) => Some(value),
+        | (RowFilterValue::String(_), SchemaColumnType::String | SchemaColumnType::RowRef) => {
+            Some(value)
+        }
         _ => None,
     }
 }
@@ -3189,7 +3197,7 @@ fn row_snapshot_value(
         return Ok(None);
     };
     Ok(match column_type {
-        SchemaColumnType::String => match value {
+        SchemaColumnType::String | SchemaColumnType::RowRef => match value {
             JsonValue::String(value) => Some(RowFilterValue::String(value.clone())),
             _ => None,
         },
@@ -3218,7 +3226,7 @@ fn row_typed_value(
     };
     Ok(match (column_type, value) {
         (_, lix_schema::Value::Null) => None,
-        (SchemaColumnType::String, lix_schema::Value::Text(value)) => {
+        (SchemaColumnType::String | SchemaColumnType::RowRef, lix_schema::Value::Text(value)) => {
             Some(RowFilterValue::String(value.clone()))
         }
         (SchemaColumnType::String, lix_schema::Value::Uuid(value)) => {
@@ -3267,7 +3275,7 @@ fn row_typed_filter_value_eq(
     let equal = match (column_type, actual, expected) {
         (_, lix_schema::Value::Null, _) => false,
         (
-            SchemaColumnType::String,
+            SchemaColumnType::String | SchemaColumnType::RowRef,
             lix_schema::Value::Text(actual),
             RowFilterValue::String(expected),
         ) => actual == expected,
@@ -3384,13 +3392,18 @@ fn apply_row_filters(rows: &mut Vec<MaterializedHotStateRow>, filters: &[RowFilt
     Ok(())
 }
 
-/// Rebind only rows whose schema certificate was revoked by a compatible
-/// amendment, including built-in columns appended by a newer engine. The
+/// Rebind only rows whose custom schema certificate was revoked. The
 /// common matching-fingerprint path retains its original compact batch.
 pub(crate) fn revalidate_schema_amended_rows(
     spec: &SchemaSurfaceSpec,
     rows: &MaterializedHotStateBatch,
 ) -> Result<Option<MaterializedHotStateBatch>> {
+    if crate::catalog::CatalogSnapshot::builtin()
+        .plan_for_key(&spec.schema_key)
+        .is_some()
+    {
+        return Ok(None);
+    }
     let needs_revalidation = |row: crate::hot_state::MaterializedHotStateRowRef<'_>| {
         if row.deleted() {
             return false;
@@ -4097,12 +4110,14 @@ fn row_column_array(
         .map(|snapshot| snapshot.as_ref().and_then(|value| value.get(column_name)))
         .collect::<Vec<_>>();
     Ok(match column_type {
-        SchemaColumnType::String | SchemaColumnType::Jsonb => Arc::new(StringArray::from(
-            values
-                .iter()
-                .map(|value| row_json_text_value(*value, column_type))
-                .collect::<Result<Vec<_>>>()?,
-        )) as ArrayRef,
+        SchemaColumnType::String | SchemaColumnType::RowRef | SchemaColumnType::Jsonb => {
+            Arc::new(StringArray::from(
+                values
+                    .iter()
+                    .map(|value| row_json_text_value(*value, column_type))
+                    .collect::<Result<Vec<_>>>()?,
+            )) as ArrayRef
+        }
         SchemaColumnType::Integer => Arc::new(Int64Array::from(
             values
                 .iter()
@@ -4390,6 +4405,7 @@ pub(super) fn row_json_text_value(
         }),
         (SchemaColumnType::String, Some(JsonValue::String(value))) => Some(value.clone()),
         (SchemaColumnType::String, Some(other)) => Some(json_to_string(other)?),
+        (SchemaColumnType::RowRef, Some(JsonValue::String(value))) => Some(value.clone()),
         (SchemaColumnType::Jsonb, Some(other)) => Some(json_to_string(other)?),
         _ => None,
     })

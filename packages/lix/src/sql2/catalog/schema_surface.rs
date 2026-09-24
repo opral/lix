@@ -5,7 +5,7 @@ use serde_json::Value as JsonValue;
 
 use crate::LixError;
 use crate::row_pk::RowPkComponentType;
-use crate::sql2::result_metadata::{json_field, mark_json_field};
+use crate::sql2::result_metadata::{json_field, mark_json_field, mark_row_ref_field};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SchemaSurfaceShape {
@@ -32,6 +32,8 @@ pub(crate) const SCHEMA_V1_TYPE_METADATA_KEY: &str = "lix.schema_v1.type";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SchemaColumnType {
     String,
+    /// A canonical row reference, stored as UTF-8 and typed `ROW_REF` in SQL.
+    RowRef,
     Jsonb,
     Integer,
     Number,
@@ -125,6 +127,7 @@ impl SchemaSurfaceSpec {
                 SchemaColumnType::Number => 4,
                 SchemaColumnType::Boolean => 5,
                 SchemaColumnType::Timestamptz => 6,
+                SchemaColumnType::RowRef => 7,
             }]);
             hasher.update(&[u8::from(column.read_nullable)]);
         }
@@ -211,7 +214,9 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
             match column.data_type {
                 lix_schema::DataType::Uuid => RowPkComponentType::Uuid,
                 lix_schema::DataType::Int8 => RowPkComponentType::Integer,
-                lix_schema::DataType::Text => RowPkComponentType::String,
+                lix_schema::DataType::Text | lix_schema::DataType::RowRef => {
+                    RowPkComponentType::String
+                }
                 _ => unreachable!("validated Schema v1 primary-key type"),
             }
         })
@@ -230,6 +235,7 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
             native_type: column.data_type,
             column_type: match column.data_type {
                 lix_schema::DataType::Text | lix_schema::DataType::Uuid => SchemaColumnType::String,
+                lix_schema::DataType::RowRef => SchemaColumnType::RowRef,
                 lix_schema::DataType::Int8 => SchemaColumnType::Integer,
                 lix_schema::DataType::Float8 => SchemaColumnType::Number,
                 lix_schema::DataType::Boolean => SchemaColumnType::Boolean,
@@ -267,13 +273,26 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
                 && column.default_expression.is_none()
         });
     let indexed_columns = derive_indexed_columns(&parsed, &columns);
-    let mut groups = parsed.unique.iter().chain(parsed.foreign_keys.iter().map(|fk| &fk.columns))
-        .filter(|group| group.len() > 1).cloned().collect::<Vec<_>>();
+    let mut groups = parsed
+        .unique
+        .iter()
+        .chain(parsed.foreign_keys.iter().map(|fk| &fk.columns))
+        .filter(|group| group.len() > 1)
+        .cloned()
+        .collect::<Vec<_>>();
     groups.sort();
     groups.dedup();
-    let indexed_groups = groups.into_iter().enumerate().map(|(index, group)| {
-        (u16::try_from(indexed_columns.len() + index).expect("schema index ordinal overflow"), group)
-    }).collect();
+    let indexed_groups = groups
+        .into_iter()
+        .enumerate()
+        .map(|(index, group)| {
+            (
+                u16::try_from(indexed_columns.len() + index)
+                    .expect("schema index ordinal overflow"),
+                group,
+            )
+        })
+        .collect();
     let columnar_snapshot_bijective = columns.iter().all(|column| {
         !column.read_nullable
             && column.default_expression.is_none()
@@ -299,7 +318,10 @@ pub(crate) fn derive_schema_surface_spec_from_schema(
         defaults: crate::catalog::DefaultPlan::from_schema(schema),
         has_inter_row_constraints: !parsed.unique.is_empty()
             || !parsed.foreign_keys.is_empty()
-            || !parsed.row_refs.is_empty(),
+            || parsed
+                .columns
+                .iter()
+                .any(|column| column.data_type == lix_schema::DataType::RowRef),
         certifies_path_value_replacement,
         columnar_snapshot_bijective,
     })
@@ -321,8 +343,8 @@ pub(crate) struct SchemaIndexedColumn {
 /// - single-column groups only — a composite group needs a composite key
 ///   encoding and no measured workload asks for one yet;
 /// - `String` and `Integer` only — those are the types with an order-preserving
-///   key encoding. Row-reference declarations are validated as `text`, so
-///   their source columns always use the `String` encoding;
+///   key encoding. `row_ref` columns are stored as canonical text, so their
+///   index entries use the `String` encoding;
 /// - primary-key columns are skipped — the hot row key already indexes them —
 ///   unless a row-reference declaration names the column. A row-reference
 ///   source needs a reverse lookup by its encoded value, including when that
@@ -347,29 +369,36 @@ fn derive_indexed_columns(
             push(name);
         }
     }
-    for row_ref in &schema.row_refs {
-        push(&row_ref.column);
+    let row_ref_columns = schema
+        .columns
+        .iter()
+        .filter(|column| column.data_type == lix_schema::DataType::RowRef)
+        .map(|column| column.name.as_str())
+        .collect::<Vec<_>>();
+    for name in &row_ref_columns {
+        push(name);
     }
     names.sort();
     names
         .into_iter()
         .filter(|name| {
-            !schema.primary_key.contains(name)
-                || schema
-                    .row_refs
-                    .iter()
-                    .any(|row_ref| row_ref.column == *name)
+            !schema.primary_key.contains(name) || row_ref_columns.contains(&name.as_str())
         })
         .filter_map(|name| {
             let column = columns.iter().find(|column| column.name == name)?;
+            // A row reference is indexed by its canonical text.
+            let column_type = match column.column_type {
+                SchemaColumnType::RowRef => SchemaColumnType::String,
+                other => other,
+            };
             matches!(
-                column.column_type,
+                column_type,
                 SchemaColumnType::String | SchemaColumnType::Integer
             )
             .then(|| SchemaIndexedColumn {
                 name,
                 ordinal: 0,
-                column_type: column.column_type,
+                column_type,
             })
         })
         .enumerate()
@@ -425,10 +454,10 @@ pub(crate) fn schema_surface_schema(
                 arrow_data_type_for_schema_column_type(column.column_type),
                 column.read_nullable,
             );
-            let field = if column.column_type == SchemaColumnType::Jsonb {
-                mark_json_field(field)
-            } else {
-                field
+            let field = match column.column_type {
+                SchemaColumnType::Jsonb => mark_json_field(field),
+                SchemaColumnType::RowRef => mark_row_ref_field(field),
+                _ => field,
             };
             let mut metadata = field.metadata().clone();
             metadata.insert(
@@ -485,7 +514,9 @@ pub(crate) fn row_system_fields(_shape: SchemaSurfaceShape) -> Vec<Field> {
 
 fn arrow_data_type_for_schema_column_type(column_type: SchemaColumnType) -> DataType {
     match column_type {
-        SchemaColumnType::String | SchemaColumnType::Jsonb => DataType::Utf8,
+        SchemaColumnType::String | SchemaColumnType::RowRef | SchemaColumnType::Jsonb => {
+            DataType::Utf8
+        }
         SchemaColumnType::Integer => DataType::Int64,
         SchemaColumnType::Number => DataType::Float64,
         SchemaColumnType::Boolean => DataType::Boolean,
@@ -742,10 +773,9 @@ mod tests {
                 "key": "bypass_row_ref",
                 "columns": [
                     { "name": "id", "type": "text", "nullable": false },
-                    { "name": "target", "type": "text", "nullable": true },
+                    { "name": "target", "type": "row_ref", "nullable": true },
                 ],
                 "primary_key": ["id"],
-                "row_refs": [{ "column": "target" }],
             }),
         ];
         for schema in cases {
@@ -779,10 +809,9 @@ mod tests {
             "key": "row_ref_index",
             "columns": [
                 { "name": "id", "type": "text", "nullable": false },
-                { "name": "target", "type": "text", "nullable": true },
+                { "name": "target", "type": "row_ref", "nullable": true },
             ],
             "primary_key": ["id"],
-            "row_refs": [{ "column": "target" }],
         }))
         .expect("row-reference spec");
         assert_eq!(
@@ -799,11 +828,10 @@ mod tests {
             "$schema": "https://lix.dev/schema-v1.json",
             "key": "row_ref_primary_key_index",
             "columns": [
-                { "name": "target", "type": "text", "nullable": false },
+                { "name": "target", "type": "row_ref", "nullable": false },
                 { "name": "ordinal", "type": "int8", "nullable": false },
             ],
             "primary_key": ["target", "ordinal"],
-            "row_refs": [{ "column": "target" }],
         }))
         .expect("row-reference primary-key spec");
         assert_eq!(

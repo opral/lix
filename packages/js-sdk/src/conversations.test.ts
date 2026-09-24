@@ -58,3 +58,55 @@ test("lix_conversation.resolved is a typed boolean that defaults to false", asyn
 		await lix.close();
 	}
 });
+
+test("lix_conversation.target is a ROW_REF that detaches when its target is deleted", async () => {
+	const lix = await openLix();
+	try {
+		const fileId = "01950000-0000-7000-8000-000000000f01";
+		const conversation = "01950000-0000-7000-8000-000000000a03";
+		await lix.execute(
+			"INSERT INTO lix_file (id, path, content) VALUES ($1, '/target.txt', CAST('x' AS BYTEA))",
+			[fileId],
+		);
+		const inserted = await lix.execute<{ target: string }>(
+			"INSERT INTO lix_conversation (id, target) VALUES ($1, lix_row_ref('lix_file', NULL, $2)) RETURNING target",
+			[conversation, fileId],
+		);
+		expect(inserted.columns).toEqual([{ name: "target", type: "row_ref" }]);
+		const target = inserted.rows[0]!.target;
+		expect(target).toMatch(/^lix_row_ref:v2:/);
+
+		// A reference returned by one query is a plain string parameter for the next.
+		const found = await lix.execute<{ id: string }>(
+			"SELECT id FROM lix_conversation WHERE target = $1",
+			[target],
+		);
+		expect(found.rows).toEqual([{ id: conversation }]);
+		const discovered = await lix.execute(
+			`SELECT data_type FROM information_schema.columns
+			 WHERE table_name = 'lix_conversation' AND column_name = 'target'`,
+		);
+		expect(discovered.rows).toEqual([{ data_type: "ROW_REF" }]);
+
+		await lix.execute("DELETE FROM lix_file WHERE id = $1", [fileId]);
+		const detached = await lix.execute<{ id: string; target: string }>(
+			`SELECT c.id, c.target FROM lix_conversation c
+			 LEFT JOIN lix_file f ON c.target = lix_row_ref('lix_file', NULL, f.id)
+			 WHERE c.target IS NOT NULL AND f.id IS NULL`,
+		);
+		expect(detached.rows).toEqual([{ id: conversation, target }]);
+
+		await lix.execute(
+			"UPDATE lix_conversation SET resolved = true, title = 'Detached' WHERE id = $1",
+			[conversation],
+		);
+		await expect(
+			lix.execute(
+				"UPDATE lix_conversation SET target = lix_row_ref('lix_file', NULL, $2) WHERE id = $1",
+				[conversation, "01950000-0000-7000-8000-000000000f02"],
+			),
+		).rejects.toThrow();
+	} finally {
+		await lix.close();
+	}
+});

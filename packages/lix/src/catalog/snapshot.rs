@@ -351,12 +351,15 @@ impl CatalogSnapshot {
         &self.row_ref_references
     }
 
-    /// Whether any row reference declares a delete action (`cascade` or
-    /// `set_null`) that the referential-action planner must expand.
-    pub(crate) fn has_row_ref_delete_actions(&self) -> bool {
-        self.row_ref_references
-            .iter()
-            .any(|reference| !reference.row_ref.on_delete.is_no_action())
+    /// Whether any row reference cascades deletes, which the
+    /// referential-action planner must expand. `detach` writes nothing.
+    pub(crate) fn has_row_ref_cascades(&self) -> bool {
+        self.row_ref_references.iter().any(|reference| {
+            matches!(
+                reference.row_ref.on_delete,
+                lix_schema::DeleteAction::Cascade
+            )
+        })
     }
 }
 
@@ -569,13 +572,21 @@ impl SchemaPlan {
             key_index,
             schema_index,
         )?;
+        // Every `row_ref` column is a reference; `row_refs` only names a
+        // non-default delete action for one.
         let row_refs = parsed_schema
-            .row_refs
-            .into_iter()
-            .map(|row_ref| RowRefPlan {
-                column: row_ref.column,
-                on_delete: row_ref.on_delete,
-                detached_column: row_ref.detached_column,
+            .columns
+            .iter()
+            .filter(|column| column.data_type == lix_schema::DataType::RowRef)
+            .map(|column| RowRefPlan {
+                column: column.name.clone(),
+                on_delete: parsed_schema
+                    .row_refs
+                    .iter()
+                    .find(|row_ref| row_ref.column == column.name)
+                    .map_or(lix_schema::DeleteAction::NoAction, |row_ref| {
+                        row_ref.on_delete
+                    }),
             })
             .collect();
         Ok(Self {
@@ -622,7 +633,9 @@ fn primary_key_component_types(
             match column.data_type {
                 lix_schema::DataType::Int8 => Ok(crate::row_pk::RowPkComponentType::Integer),
                 lix_schema::DataType::Uuid => Ok(crate::row_pk::RowPkComponentType::Uuid),
-                lix_schema::DataType::Text => Ok(crate::row_pk::RowPkComponentType::String),
+                lix_schema::DataType::Text | lix_schema::DataType::RowRef => {
+                    Ok(crate::row_pk::RowPkComponentType::String)
+                }
                 _ => Err(LixError::new(
                     LixError::CODE_SCHEMA_DEFINITION,
                     format!("primary-key column at index {index} must be bigint, text, or uuid"),
@@ -648,9 +661,11 @@ impl FastObjectValidationPlan {
         for column in schema.columns {
             let nullable = column.nullable;
             let validation = match column.data_type {
-                lix_schema::DataType::Text => FastValueValidation::Types(FastJsonTypes(
-                    FastJsonTypes::STRING | if nullable { FastJsonTypes::NULL } else { 0 },
-                )),
+                lix_schema::DataType::Text | lix_schema::DataType::RowRef => {
+                    FastValueValidation::Types(FastJsonTypes(
+                        FastJsonTypes::STRING | if nullable { FastJsonTypes::NULL } else { 0 },
+                    ))
+                }
                 lix_schema::DataType::Uuid => {
                     let validation = FastStringValidation::Uuid;
                     if nullable {
@@ -904,8 +919,6 @@ pub(crate) struct DeleteReferencePlan {
 pub(crate) struct RowRefPlan {
     pub(crate) column: String,
     pub(crate) on_delete: lix_schema::DeleteAction,
-    /// Column that records the reference cleared by `set_null`.
-    pub(crate) detached_column: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1518,7 +1531,7 @@ mod tests {
                 "key": "row_ref_source",
                 "columns": [
                     { "name": "id", "type": "text", "nullable": false },
-                    { "name": "target", "type": "text", "nullable": true }
+                    { "name": "target", "type": "row_ref", "nullable": true }
                 ],
                 "primary_key": ["id"],
                 "row_refs": [{ "column": "target", "on_delete": "cascade" }]
@@ -1538,7 +1551,7 @@ mod tests {
             references[0].row_ref.on_delete,
             lix_schema::DeleteAction::Cascade
         );
-        assert!(catalog.has_row_ref_delete_actions());
+        assert!(catalog.has_row_ref_cascades());
     }
 
     fn schema_json(schema_key: &str) -> JsonValue {
