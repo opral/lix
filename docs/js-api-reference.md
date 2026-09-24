@@ -4,7 +4,7 @@ description: "Reference for opening local, remote, and synchronized Lix instance
 
 # JavaScript API Reference
 
-`@lix-js/sdk` exports `openLix()`, `createLix()`, `deleteLix()`, `decodeRowRef()`, the generic JavaScript storage protocol, `Value` and `bundledPluginArchives`. `@lix-js/storage-opfs` and `@lix-js/storage-filesystem` provide concrete storage implementations. `openLix()` returns a local repository, a thin remote client, or a partial replica with on-demand sync.
+`@lix-js/sdk` exports `openLix()`, `createLix()`, `deleteLix()`, the generic JavaScript storage protocol, `Value` and `bundledPluginArchives`. `@lix-js/storage-opfs` and `@lix-js/storage-filesystem` provide concrete storage implementations. `openLix()` returns a local repository, a thin remote client, or a partial replica with on-demand sync.
 
 ```ts
 import { openLix } from "@lix-js/sdk";
@@ -484,21 +484,6 @@ const row = result.rows[0]!;
 ```
 
 Use `row.column_name`, `row[dynamicColumn]`, destructuring, spread, or `JSON.stringify(row)` directly. Duplicate output names use the last value in object mode while every descriptor remains in `columns`; pass `{ rowMode: "array" }` to `execute()` or `executeBatch()` when positional duplicates are required.
-
-## decodeRowRef()
-
-`decodeRowRef(ref)` reads an opaque row reference in the client without a SQL query. It returns `{ relation, fileId, primaryKey }`, where `fileId` is `null` for fileless rows and `primaryKey` is an ordered array of `{ type, value }` components. Every value is a string, including integer keys, to preserve the full signed 64-bit range. Invalid or noncanonical references throw `TypeError`. Construct references with the SQL `lix_row_ref(...)` function; the encoded value remains the identity to store and pass to commands.
-
-```ts
-import { decodeRowRef } from "@lix-js/sdk";
-
-const { rows } = await lix.execute(
-  "SELECT COALESCE(target, detached_target) AS anchor FROM lix_conversation WHERE id = $1",
-  [conversationId],
-);
-const anchor = rows[0]?.anchor;
-const parts = anchor == null ? null : decodeRowRef(anchor);
-```
 
 ## Value
 

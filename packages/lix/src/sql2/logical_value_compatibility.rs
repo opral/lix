@@ -596,7 +596,7 @@ fn validate_expr_node(
                         }
                     }
                 }
-                "lix_row_ref" => {}
+                "lix_row_ref" | "lix_row_ref_parts" => {}
                 _ => {
                     for argument in args {
                         reject_text_operation(argument, schemas, func.name())?;
@@ -678,7 +678,7 @@ fn identity_of_expr(expr: &Expr, schemas: &[&DFSchema]) -> ValueIdentity {
         Expr::ScalarFunction(function) => {
             let name = function.func.name().to_ascii_lowercase();
             match name.as_str() {
-                "__lix_jsonb" | "__lix_json_get" | "__lix_json_path_get" => {
+                "__lix_jsonb" | "__lix_json_get" | "__lix_json_path_get" | "lix_row_ref_parts" => {
                     ValueIdentity::Jsonb
                 }
                 "lix_row_ref" => ValueIdentity::RowRef,

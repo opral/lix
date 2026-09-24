@@ -3771,7 +3771,7 @@ fn returning_expr_column_type(
         BoundExpr::Function { name, .. }
             if matches!(
                 name.as_str(),
-                "__lix_json_get" | "__lix_json_path_get" | "__lix_jsonb"
+                "__lix_json_get" | "__lix_json_path_get" | "__lix_jsonb" | "lix_row_ref_parts"
             ) =>
         {
             Some(crate::ResultColumnType::Jsonb)
