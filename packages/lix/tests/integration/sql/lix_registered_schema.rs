@@ -348,7 +348,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    hidden_storage_schemas_remain_registered_without_public_sql_relations,
+    internal_storage_schemas_are_not_registered_as_public_schemas,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -378,20 +378,33 @@ simulation_test!(
 
         for schema_key in [
             "lix_account",
-            "lix_binary_blob_ref",
-            "lix_branch_descriptor",
-            "lix_branch_ref",
             "lix_change",
-            "lix_checkpoint",
+            "lix_comment",
             "lix_commit",
-            "lix_directory_descriptor",
-            "lix_file_descriptor",
+            "lix_conversation",
             "lix_key_value",
             "lix_registered_schema",
         ] {
             assert!(
                 registered_keys.contains(schema_key),
                 "{schema_key} should remain registered"
+            );
+        }
+        for schema_key in [
+            "lix_binary_blob_ref",
+            "lix_branch_descriptor",
+            "lix_branch_ref",
+            "lix_checkpoint",
+            "lix_commit_edge",
+            "lix_collection_generation",
+            "lix_directory_descriptor",
+            "lix_file_descriptor",
+            "lix_undo_redo_marker",
+            "lix_undo_state",
+        ] {
+            assert!(
+                !registered_keys.contains(schema_key),
+                "{schema_key} must remain private"
             );
         }
 
@@ -412,6 +425,23 @@ simulation_test!(
             assert!(
                 public_table_names.contains(surface_name),
                 "{surface_name} should remain public"
+            );
+        }
+        for private_name in [
+            "lix_binary_blob_ref",
+            "lix_branch_descriptor",
+            "lix_branch_ref",
+            "lix_checkpoint",
+            "lix_collection_generation",
+            "lix_commit_edge",
+            "lix_directory_descriptor",
+            "lix_file_descriptor",
+            "lix_undo_redo_marker",
+            "lix_undo_state",
+        ] {
+            assert!(
+                !public_table_names.contains(private_name),
+                "{private_name} must not have a public SQL table"
             );
         }
         let table_functions = session

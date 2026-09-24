@@ -65,6 +65,14 @@ use super::spec::{
 };
 use super::values::{optional_bool_value, optional_string_value, string_expr_literal};
 
+pub(super) fn hidden_registered_schema_row(schema_key: &str, row_pk: &RowPk) -> bool {
+    schema_key == "lix_registered_schema"
+        && row_pk
+            .as_single_string_owned()
+            .ok()
+            .is_some_and(|key| crate::schema::is_private_builtin_schema_key(&key))
+}
+
 /// Executes a bound registered-schema primary-key predicate without
 /// constructing a DataFusion plan or Arrow batch. The retained hot-state
 /// reader resolves every file-scoped identity and remains the sole
@@ -97,6 +105,7 @@ pub(crate) async fn execute_exact_schema_point_read(
     let column_types = decoder.column_types();
     let rows = batch
         .iter()
+        .filter(|row| !hidden_registered_schema_row(&spec.schema_key, row.row_pk()))
         .map(|row| {
             if let Some(typed) = row.decoded_snapshot() {
                 let typed = decoder.bind_typed_row(typed, row.schema_key(), row.row_pk())?;
@@ -155,6 +164,9 @@ pub(crate) async fn execute_exact_schema_batch_read(
         let Some(row) = exact.row(slot) else {
             continue;
         };
+        if hidden_registered_schema_row(&spec.schema_key, row.row_pk()) {
+            continue;
+        }
         rows.push(if let Some(typed) = row.decoded_snapshot() {
             let typed = decoder.bind_typed_row(typed, row.schema_key(), row.row_pk())?;
             decoder.decode_typed_public_values(&typed.row)?
@@ -702,16 +714,24 @@ impl TableSpec for SchemaSpec {
         limit: Option<usize>,
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
-        let (schema, request, row_filters) =
+        let (schema, mut request, row_filters) =
             self.plan_scan_parts(projection, filters, limit).await?;
         let batch_projection = RowBatchProjection::for_request(&request);
         let staged_read_context = self.write_ctx.clone();
-        let direct_primary_key_projection =
-            direct_primary_key_projection_eligible(&self.spec, &schema, &request, &row_filters);
+        let private_registry = self.spec.schema_key == "lix_registered_schema";
+        // Older repositories contain private bootstrap registrations. Apply
+        // their visibility policy before LIMIT, so a scan still returns the
+        // requested number of public rows.
+        if private_registry {
+            request.limit = None;
+        }
+        let direct_primary_key_projection = !private_registry
+            && direct_primary_key_projection_eligible(&self.spec, &schema, &request, &row_filters);
         let direct_primary_key_reader = direct_primary_key_projection
             .then(|| self.row_snapshot_reader.clone())
             .flatten();
-        let direct_snapshot_reader = direct_row_batch_eligible(&schema, &request, &row_filters)
+        let direct_snapshot_reader = (!private_registry
+            && direct_row_batch_eligible(&schema, &request, &row_filters))
             .then(|| self.row_snapshot_reader.clone())
             .flatten();
         let direct_snapshot_decoder = direct_snapshot_reader
@@ -730,7 +750,8 @@ impl TableSpec for SchemaSpec {
         // Ask the reader whether the same filtered/projection scan has a
         // columnar layout; DataFusion retains the semantic LimitExec above it.
         columnar_request.limit = None;
-        if let Some(reader) = self.row_snapshot_reader.as_ref()
+        if !private_registry
+            && let Some(reader) = self.row_snapshot_reader.as_ref()
             && row_columnar_projection_eligible(&schema)
             && let Some(layout) = reader
                 .plan_row_columnar_scan(columnar_request)
@@ -3538,7 +3559,12 @@ fn apply_row_batch_filters(
     // Public schema scans never expose tombstones. Some overlay paths retain
     // a deletion slot so later layers can reconcile it; compact those slots
     // before Arrow projection even when the SQL query has no predicate.
-    let rows = rows.filter(|row| !row.deleted(), None);
+    let rows = rows.filter(
+        |row| {
+            !row.deleted() && !hidden_registered_schema_row(&spec.schema_key, row.row_pk())
+        },
+        None,
+    );
     let rows = revalidate_schema_amended_rows(spec, &rows)?.unwrap_or(rows);
     if filters.is_empty() {
         validate_typed_row_schema_bindings(spec, &rows)?;

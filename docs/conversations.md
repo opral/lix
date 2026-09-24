@@ -42,7 +42,7 @@ For a CSV row use `lix_row_ref('csv_row', file_id, row_id)`. For a fileless appl
 A standalone conversation omits the target:
 
 ```sql
-INSERT INTO lix_conversation (id) VALUES (uuidv7()) RETURNING id;
+INSERT INTO lix_conversation DEFAULT VALUES RETURNING id;
 ```
 
 ## Discuss a commit globally

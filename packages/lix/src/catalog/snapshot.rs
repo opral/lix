@@ -97,8 +97,8 @@ impl CatalogSnapshot {
             // `lix_*` key; filtering all known built-ins here also lets the
             // migration chain read historical definitions while an older
             // schema amendment is still being upgraded.
-            crate::schema::seed_schema_definition(&fact.catalog_key.schema_key)
-                .is_none()
+            (crate::schema::seed_schema_definition(&fact.catalog_key.schema_key).is_none()
+                && !crate::schema::is_private_builtin_schema_key(&fact.catalog_key.schema_key))
                 .then(|| CatalogEntry {
                     identity: fact.identity.clone(),
                     key: fact.catalog_key.clone(),

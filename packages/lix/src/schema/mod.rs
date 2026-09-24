@@ -17,5 +17,6 @@ pub use definition::{
 pub(crate) use key::registered_schema_row_pk;
 pub use key::{SchemaKey, schema_from_registered_snapshot, schema_key_from_definition};
 pub(crate) use seed::{
-    is_seed_schema_key, seed_schema_definition, seed_schema_definitions, seed_schema_description,
+    is_private_builtin_schema_key, is_seed_schema_key, registered_seed_schema_definitions,
+    seed_schema_definition, seed_schema_definitions, seed_schema_description,
 };

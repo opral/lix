@@ -1339,41 +1339,6 @@ mod tests {
         assert_eq!(snapshot["name"], "foo.bar");
     }
 
-    #[test]
-    fn normalization_supports_global_checkpoint_row() {
-        let mut catalog = catalog_with(vec![
-            builtin_schema("lix_commit"),
-            builtin_schema(crate::checkpoint::CHECKPOINT_SCHEMA_KEY),
-        ]);
-        let commit_id = "01920000-0000-7000-8000-0000000000c6";
-        let row = TransactionWriteRow {
-            row_pk: None,
-            schema_key: crate::checkpoint::CHECKPOINT_SCHEMA_KEY.into(),
-            snapshot: Some(transaction_json(json!({
-                "id": commit_id,
-                "commit_id": commit_id,
-            }))),
-            global: true,
-            untracked: false,
-            branch_id: crate::GLOBAL_BRANCH_ID.into(),
-            ..base_stage_row()
-        };
-
-        let normalized = normalize_test_row(row, &mut catalog, functions())
-            .expect("checkpoint should normalize through its registered row schema");
-
-        assert_eq!(
-            normalized.row_pk,
-            Some(RowPk::uuid_from_canonical(commit_id).expect("checkpoint commit ID"))
-        );
-        assert!(
-            catalog
-                .snapshot()
-                .schema(crate::checkpoint::CHECKPOINT_SCHEMA_KEY)
-                .is_some()
-        );
-    }
-
     fn normalize_test_row(
         row: TransactionWriteRow,
         catalog: &mut TransactionCatalog,

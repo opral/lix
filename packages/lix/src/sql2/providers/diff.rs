@@ -739,8 +739,9 @@ where
                         (HashSet::new(), HashSet::new())
                     };
                     let mut rows = match &relation.kind {
-                        DiffRelationKind::Schema { .. } => schema_diff_rows(
+                        DiffRelationKind::Schema { schema_key } => schema_diff_rows(
                             diff,
+                            schema_key,
                             &filter_schema,
                             &from_global_rows,
                             &to_global_rows,
@@ -1470,6 +1471,7 @@ fn diff_row(
 
 fn schema_diff_rows(
     diff: TrackedStateDiff,
+    schema_key: &str,
     projection: &Schema,
     from_global_rows: &HashSet<TrackedStateKey>,
     to_global_rows: &HashSet<TrackedStateKey>,
@@ -1480,6 +1482,9 @@ fn schema_diff_rows(
         .any(|field| side_column(field.name()).is_some());
     diff.entries
         .iter()
+        .filter(|entry| {
+            !super::schema::hidden_registered_schema_row(schema_key, entry.identity.row_pk())
+        })
         .map(|entry| {
             Ok(DiffSqlRow {
                 row_pk: entry.identity.row_pk().clone(),
@@ -1963,7 +1968,7 @@ where
         .iter()
         .any(|field| matches!(field.name().as_str(), "from_path" | "to_path"));
     let should_expand = !diff.entries.is_empty() || !exact_row_pks.is_empty();
-    let mut rows = schema_diff_rows(diff, projection, from_global_rows, to_global_rows)?;
+    let mut rows = schema_diff_rows(diff, "", projection, from_global_rows, to_global_rows)?;
     if should_expand {
         let exact_ids = exact_row_pks
             .iter()

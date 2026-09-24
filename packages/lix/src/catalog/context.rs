@@ -255,7 +255,9 @@ impl CatalogContext {
             .collect::<Result<BTreeMap<String, JsonValue>, LixError>>()?;
         for fact in facts {
             let schema_key = fact.catalog_key().schema_key.clone();
-            if crate::schema::seed_schema_definition(&schema_key).is_some() {
+            if crate::schema::seed_schema_definition(&schema_key).is_some()
+                || crate::schema::is_private_builtin_schema_key(&schema_key)
+            {
                 continue;
             }
             if schemas
@@ -362,11 +364,11 @@ where
                     && committed_row_ref_is_exact_branch_scoped(*row, schema_domain.branch_id())
             })
             .filter(|row| {
-                row.row_pk()
-                    .as_single_string()
-                    .ok()
-                    .and_then(crate::schema::seed_schema_definition)
-                    .is_none()
+                let Ok(schema_key) = row.row_pk().as_single_string() else {
+                    return true;
+                };
+                crate::schema::seed_schema_definition(schema_key).is_none()
+                    && !crate::schema::is_private_builtin_schema_key(schema_key)
             })
             .map(|row| HotStateExactRowRequest {
                 schema_key: REGISTERED_SCHEMA_KEY.to_owned(),

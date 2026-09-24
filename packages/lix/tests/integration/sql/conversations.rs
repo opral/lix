@@ -301,6 +301,49 @@ simulation_test!(
 );
 
 simulation_test!(
+    conversation_and_comment_ids_default_to_uuidv7,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+        let conversation = session
+            .execute(
+                "INSERT INTO lix_conversation (title) VALUES ('Generated') RETURNING id",
+                &[],
+            )
+            .await
+            .expect("conversation ID should default");
+        let conversation_id = conversation.rows()[0]
+            .get::<String>("id")
+            .expect("generated conversation ID");
+        assert_eq!(
+            uuid::Uuid::parse_str(&conversation_id)
+                .expect("valid UUID")
+                .get_version_num(),
+            7
+        );
+        let comment = session
+            .execute(
+                "INSERT INTO lix_comment (conversation_id, body) VALUES ($1, $2::jsonb) RETURNING id",
+                &[
+                    Value::Text(conversation_id.clone()),
+                    Value::Text(BODY.into()),
+                ],
+            )
+            .await
+            .expect("comment ID should default");
+        let comment_id = comment.rows()[0]
+            .get::<String>("id")
+            .expect("generated comment ID");
+        assert_eq!(
+            uuid::Uuid::parse_str(&comment_id)
+                .expect("valid UUID")
+                .get_version_num(),
+            7
+        );
+    }
+);
+
+simulation_test!(
     conversation_local_targets_body_and_standalone_contract,
     |sim| async move {
         let engine = sim.boot_engine().await;

@@ -406,7 +406,11 @@ where
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
         let output_schema = projected_schema(&self.schema, projection);
-        let scan_limit = filters.is_empty().then_some(limit).flatten();
+        let private_registry = matches!(
+            &self.kind,
+            StateRelationKind::Schema { schema_key, .. } if schema_key == "lix_registered_schema"
+        );
+        let scan_limit = (!private_registry && filters.is_empty()).then_some(limit).flatten();
         let row_pks = match &self.kind {
             StateRelationKind::Schema { spec, .. } => {
                 row_pks_from_primary_key_filters(spec, filters)?
@@ -540,6 +544,19 @@ where
                         descriptor.global_scope,
                         &local_replacement_scopes,
                     )?;
+                    let hot = if private_registry {
+                        hot.filter(
+                            |row| {
+                                !super::schema::hidden_registered_schema_row(
+                                    "lix_registered_schema",
+                                    row.row_pk(),
+                                )
+                            },
+                            None,
+                        )
+                    } else {
+                        hot
+                    };
                     let mut result = match kind {
                         StateRelationKind::Schema { spec, .. } => {
                             let request = HotStateScanRequest {
