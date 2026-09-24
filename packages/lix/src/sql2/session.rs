@@ -12,7 +12,7 @@ use crate::LixError;
 use crate::branch::{BranchHead, BranchRefReader};
 use crate::checkpoint::checkpoint_commit_id_at_head;
 
-use super::branch_ref::CachingBranchRefReader;
+use super::branch_ref::{CachingBranchRefReader, RecordingBranchRefReader};
 use super::planning_cache::PooledReadSession;
 use super::providers;
 use super::udfs::{
@@ -153,6 +153,10 @@ where
     let write_branch_ref: Arc<dyn BranchRefReader> = Arc::new(CachingBranchRefReader::new(
         Arc::new(super::WriteContextBranchRefReader::new(write_ctx.clone())),
     ));
+    let write_branch_ref: Arc<dyn BranchRefReader> = match read_ctx.branch_head_read_observer() {
+        Some(record) => Arc::new(RecordingBranchRefReader::new(write_branch_ref, record)),
+        None => write_branch_ref,
+    };
     let provider_selection =
         providers::read_provider_selection(pooled.state(), std::slice::from_ref(statement));
     providers::register_transaction(

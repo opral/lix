@@ -1,7 +1,7 @@
 //! Explicit transactions conflict only when a concurrent commit changed state
 //! that the transaction read for a decision or writes itself (#1900).
 
-use lix::{Lix, LixError, Value, open_lix};
+use lix::{CreateBranchOptions, Lix, LixError, SwitchBranchOptions, Value, open_lix};
 
 async fn insert_file(lix: &Lix, path: &str, content: &[u8]) -> String {
     lix.execute(
@@ -416,6 +416,56 @@ async fn reading_branch_state_keeps_the_conservative_branch_check() {
     )
     .await
     .unwrap();
+    let error = tx.commit().await.unwrap_err();
+    assert_conflict(&error);
+    assert_eq!(
+        error.details.as_ref().unwrap()["reason"],
+        "unvalidatedReadChanged"
+    );
+}
+
+#[tokio::test]
+async fn reading_another_branch_head_conflicts_when_that_branch_advances() {
+    let lix = open_lix().await.unwrap();
+    let other = lix
+        .create_branch(CreateBranchOptions {
+            id: None,
+            name: "Other branch".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .unwrap();
+    let other_session = lix.open_another_session().await.unwrap();
+    other_session
+        .switch_branch(SwitchBranchOptions {
+            branch_id: other.id.clone(),
+        })
+        .await
+        .unwrap();
+
+    let mut tx = lix.begin_transaction().await.unwrap();
+    let observed = tx
+        .execute(
+            "SELECT commit_id FROM lix_branch WHERE id = $1",
+            &[Value::Text(other.id.clone())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(observed.rows().len(), 1);
+    tx.execute(
+        "INSERT INTO lix_key_value (key, value) VALUES ('based-on-other-head', 1)",
+        &[],
+    )
+    .await
+    .unwrap();
+    other_session
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('advance-other-head', 1)",
+            &[],
+        )
+        .await
+        .unwrap();
+
     let error = tx.commit().await.unwrap_err();
     assert_conflict(&error);
     assert_eq!(

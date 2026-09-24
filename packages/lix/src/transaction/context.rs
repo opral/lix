@@ -13211,6 +13211,13 @@ where
         self.read_set.mark_unvalidated(source);
     }
 
+    fn branch_head_read_observer(&self) -> Option<Arc<dyn Fn(&str) + Send + Sync>> {
+        let read_set = Arc::clone(&self.read_set);
+        Some(Arc::new(move |branch_id| {
+            read_set.record_branch_head(branch_id);
+        }))
+    }
+
     fn functions(&self) -> FunctionProviderHandle {
         self.functions.clone()
     }

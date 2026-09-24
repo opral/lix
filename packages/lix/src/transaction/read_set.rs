@@ -53,12 +53,14 @@ pub(crate) struct SqlReadSet {
 #[derive(Debug, Default)]
 struct SqlReadSetInner {
     entries: Vec<SqlReadFootprint>,
+    branch_head_ids: BTreeSet<String>,
     unvalidated: Option<String>,
 }
 
 /// State before one SQL statement began recording its reads.
 pub(crate) struct SqlReadSetCheckpoint {
     entry_count: usize,
+    branch_head_ids: BTreeSet<String>,
     unvalidated: Option<String>,
 }
 
@@ -67,6 +69,7 @@ impl SqlReadSet {
         let inner = self.lock();
         SqlReadSetCheckpoint {
             entry_count: inner.entries.len(),
+            branch_head_ids: inner.branch_head_ids.clone(),
             unvalidated: inner.unvalidated.clone(),
         }
     }
@@ -74,6 +77,7 @@ impl SqlReadSet {
     pub(crate) fn restore(&self, checkpoint: SqlReadSetCheckpoint) {
         let mut inner = self.lock();
         inner.entries.truncate(checkpoint.entry_count);
+        inner.branch_head_ids = checkpoint.branch_head_ids;
         inner.unvalidated = checkpoint.unvalidated;
     }
 
@@ -99,6 +103,10 @@ impl SqlReadSet {
         self.record(SqlReadFootprint::PathIndex(request.clone()));
     }
 
+    pub(crate) fn record_branch_head(&self, branch_id: &str) {
+        self.lock().branch_head_ids.insert(branch_id.to_owned());
+    }
+
     /// Records that a protected statement read state which has no row-level
     /// validation, such as branch heads or change history.
     pub(crate) fn mark_unvalidated(&self, source: &str) {
@@ -121,7 +129,7 @@ impl SqlReadSet {
     /// branch moves, even if the transaction's own branch did not.
     pub(crate) fn branch_ids(&self) -> BTreeSet<String> {
         let inner = self.lock();
-        let mut branch_ids = BTreeSet::new();
+        let mut branch_ids = inner.branch_head_ids.clone();
         for entry in &inner.entries {
             match entry {
                 SqlReadFootprint::Scan(request) => {

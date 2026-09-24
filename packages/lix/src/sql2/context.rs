@@ -138,6 +138,11 @@ pub(crate) trait SqlExecutionContext: Sync {
     /// validation, such as branch heads or change history. Explicit
     /// transactions then conflict with any concurrent change to the branch.
     fn note_unvalidated_read(&self, _source: &str) {}
+
+    /// Records branch refs consulted by a protected transaction statement.
+    fn branch_head_read_observer(&self) -> Option<Arc<dyn Fn(&str) + Send + Sync>> {
+        None
+    }
 }
 
 /// Write-capable SQL runtime boundary.
