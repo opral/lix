@@ -989,3 +989,108 @@ async fn file_update_by_path_conflicts_with_a_concurrent_file_at_that_path() {
     assert_conflict(&tx.commit().await.unwrap_err());
     assert_eq!(key_value(&lix, "missing").await, None);
 }
+
+/// Updating every row of a collection by key stages a complete-set journal.
+/// A concurrent insert of a new key matches none of the updates, so the
+/// journal is lowered and rebased; the insert survives.
+#[tokio::test]
+async fn complete_set_update_rebases_over_a_disjoint_insert() {
+    const ROW_COUNT: usize = 1_024;
+    let lix = open_lix().await.unwrap();
+    lix.execute(
+        "INSERT INTO lix_registered_schema (value) VALUES ($1::jsonb)",
+        &[Value::Text(
+            serde_json::json!({
+                "$schema": "https://lix.dev/schema-v1.json",
+                "key": "journal_probe",
+                "columns": [
+                    { "name": "path", "type": "text", "nullable": false },
+                    { "name": "value", "type": "jsonb", "nullable": false },
+                ],
+                "primary_key": ["path"],
+            })
+            .to_string(),
+        )],
+    )
+    .await
+    .unwrap();
+    let inserts = (0..ROW_COUNT)
+        .map(|row| lix::ExecuteBatchStatement {
+            label: None,
+            sql: "INSERT INTO journal_probe (path, value) VALUES ($1, CAST($2 AS JSONB))".into(),
+            params: vec![
+                Value::Text(format!("{row:04}")),
+                Value::Text(r#"{"state":"base"}"#.into()),
+            ],
+        })
+        .collect::<Vec<_>>();
+    lix.execute_batch(&inserts).await.unwrap();
+    let other = lix.open_another_session().await.unwrap();
+
+    let mut tx = lix.begin_transaction().await.unwrap();
+    for row in 0..ROW_COUNT {
+        let result = tx
+            .execute(
+                "UPDATE journal_probe SET value = CAST($1 AS JSONB) WHERE path = $2",
+                &[
+                    Value::Text(r#"{"state":"replacement"}"#.into()),
+                    Value::Text(format!("{row:04}")),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.rows_affected(), 1);
+    }
+    other
+        .execute(
+            "INSERT INTO journal_probe (path, value) VALUES ('2000', CAST('{\"state\":\"concurrent\"}' AS JSONB))",
+            &[],
+        )
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let counts = lix
+        .execute(
+            "SELECT value ->> 'state' AS state, COUNT(*) AS n FROM journal_probe \
+             GROUP BY value ->> 'state' ORDER BY state",
+            &[],
+        )
+        .await
+        .unwrap();
+    let counts = counts
+        .rows()
+        .iter()
+        .map(|row| (row.get::<String>("state").unwrap(), row.get::<i64>("n").unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        counts,
+        [
+            ("concurrent".to_owned(), 1),
+            ("replacement".to_owned(), ROW_COUNT as i64)
+        ]
+    );
+    other.close().await.unwrap();
+
+    // The same updates still conflict when the concurrent commit touches
+    // one of the updated keys.
+    let mut tx = lix.begin_transaction().await.unwrap();
+    for row in 0..ROW_COUNT {
+        tx.execute(
+            "UPDATE journal_probe SET value = CAST($1 AS JSONB) WHERE path = $2",
+            &[
+                Value::Text(r#"{"state":"second"}"#.into()),
+                Value::Text(format!("{row:04}")),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+    lix.execute(
+        "UPDATE journal_probe SET value = CAST('{\"state\":\"raced\"}' AS JSONB) WHERE path = '0512'",
+        &[],
+    )
+    .await
+    .unwrap();
+    assert_conflict(&tx.commit().await.unwrap_err());
+}
