@@ -1,9 +1,10 @@
 use crate::{Value, sql2};
 use datafusion::sql::parser::Statement as DataFusionStatement;
 use datafusion::sql::sqlparser::ast::{
-    BinaryOperator, Expr, GroupByExpr, Ident, LimitClause, OrderByKind, Query, Select,
-    SelectFlavor, SelectItem, SetExpr, Statement as SqlStatement, TableAlias, TableFactor,
-    Value as SqlValue, Visit, Visitor,
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
+    LimitClause, OrderByKind, Query, Select, SelectFlavor, SelectItem, SetExpr,
+    Statement as SqlStatement, TableAlias, TableFactor, UnaryOperator, Value as SqlValue, Visit,
+    Visitor,
 };
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
@@ -180,6 +181,20 @@ fn simple_point_read(statement: &DataFusionStatement) -> Option<SimplePointRead<
 pub(crate) struct LateMaterializedLixFileContentRead {
     pub(crate) statement: Box<DataFusionStatement>,
     pub(crate) data_column_index: usize,
+    pub(crate) projection: LateLixFileProjection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LateLixFileProjection {
+    Content,
+    OctetLength,
+    Substring { start: i64, length: u64 },
+}
+
+impl LateLixFileProjection {
+    pub(crate) fn acknowledges_content(&self) -> bool {
+        matches!(self, Self::Content | Self::Substring { .. })
+    }
 }
 
 /// Defers an unchanged `lix_file.content` projection until DataFusion has applied
@@ -187,6 +202,7 @@ pub(crate) struct LateMaterializedLixFileContentRead {
 /// DataFusion while preventing large file bytes from entering Arrow at all.
 pub(crate) fn late_materialized_lix_file_content_read(
     statement: &DataFusionStatement,
+    params: &[Value],
 ) -> Option<LateMaterializedLixFileContentRead> {
     let simple = simple_single_table_select(statement)?;
     if simple.table_name != "lix_file"
@@ -213,33 +229,36 @@ pub(crate) fn late_materialized_lix_file_content_read(
 
     let mut data_column_index = None;
     let mut data_output_name = None;
-    for (index, item) in select.projection.iter_mut().enumerate() {
-        let expression = match item {
-            SelectItem::UnnamedExpr(expression)
-            | SelectItem::ExprWithAlias {
-                expr: expression, ..
-            } => expression,
-            SelectItem::QualifiedWildcard(..)
-            | SelectItem::Wildcard(..)
-            | SelectItem::ExprWithAliases { .. } => return None,
-        };
-        let projected_column = direct_projection_identifier(expression)?;
-        if identifier_matches(projected_column, "content") {
+    let mut data_projection = None;
+    let mut replacement = None;
+    let mut removed_parameters = Vec::new();
+    for (index, item) in select.projection.iter().enumerate() {
+        let expression = projection_source_expression(item)?;
+        if let Some((projection, output_name, path_expression, projection_parameters)) =
+            replaceable_lix_file_content_projection(item, expression, &qualifier, params)
+        {
             if data_column_index.is_some() {
                 return None;
             }
-            let (path_expression, output_name) =
-                replaceable_lix_file_content_projection(item, &qualifier)?;
-            *item = SelectItem::ExprWithAlias {
-                expr: path_expression,
-                alias: output_name.clone(),
-            };
             data_column_index = Some(index);
             data_output_name = Some(output_name.value.to_ascii_lowercase());
+            data_projection = Some(projection);
+            replacement = Some((path_expression, output_name));
+            removed_parameters.extend(projection_parameters);
+        } else if direct_projection_identifier(expression).is_none()
+            || expression_mentions_column(expression, "content")
+        {
+            return None;
         }
     }
     let data_column_index = data_column_index?;
     let data_output_name = data_output_name?;
+    let data_projection = data_projection?;
+    let (path_expression, output_name) = replacement?;
+    select.projection[data_column_index] = SelectItem::ExprWithAlias {
+        expr: path_expression,
+        alias: output_name,
+    };
 
     if select
         .selection
@@ -257,35 +276,194 @@ pub(crate) fn late_materialized_lix_file_content_read(
         };
         if expressions.iter().any(|order| {
             order.with_fill.is_some()
+                || expression_mentions_column(&order.expr, "content")
                 || direct_column_name(&order.expr)
-                    .is_none_or(|column| column == "content" || column == data_output_name)
+                    .is_none_or(|column| column == data_output_name)
         }) {
             return None;
         }
     }
 
+    // The SQL executor binds positional parameters by the highest placeholder
+    // number in the rewritten statement. SUBSTRING's slice arguments are
+    // removed from its SELECT expression, but still occupy their original
+    // positions in the caller's parameter list. Since these arguments were
+    // validated as integers, non-null checks preserve those positions without
+    // changing the selected rows.
+    for parameter in removed_parameters {
+        let predicate = Expr::IsNotNull(Box::new(parameter));
+        select.selection = Some(match select.selection.take() {
+            Some(selection) => Expr::BinaryOp {
+                left: Box::new(selection),
+                op: BinaryOperator::And,
+                right: Box::new(predicate),
+            },
+            None => predicate,
+        });
+    }
+
     Some(LateMaterializedLixFileContentRead {
         statement: Box::new(statement),
         data_column_index,
+        projection: data_projection,
     })
+}
+
+fn projection_source_expression(item: &SelectItem) -> Option<&Expr> {
+    match item {
+        SelectItem::UnnamedExpr(expression)
+        | SelectItem::ExprWithAlias {
+            expr: expression, ..
+        } => Some(expression),
+        SelectItem::QualifiedWildcard(..)
+        | SelectItem::Wildcard(..)
+        | SelectItem::ExprWithAliases { .. } => None,
+    }
 }
 
 fn replaceable_lix_file_content_projection(
     item: &SelectItem,
+    expression: &Expr,
     qualifier: &Ident,
-) -> Option<(Expr, Ident)> {
-    let (expression, output_name) = match item {
-        SelectItem::UnnamedExpr(expression) => {
-            let output_name = direct_projection_identifier(expression)?.clone();
-            (expression, output_name)
-        }
-        SelectItem::ExprWithAlias { expr, alias } => (expr, alias.clone()),
+    params: &[Value],
+) -> Option<(LateLixFileProjection, Ident, Expr, Vec<Expr>)> {
+    let projection = if direct_file_content_path_expression(expression, qualifier).is_some() {
+        LateLixFileProjection::Content
+    } else if is_octet_length_of_content(expression, qualifier) {
+        LateLixFileProjection::OctetLength
+    } else if let Some((start, length)) = substring_of_content(expression, qualifier, params) {
+        LateLixFileProjection::Substring { start, length }
+    } else {
+        return None;
+    };
+    let output_name = match item {
+        SelectItem::ExprWithAlias { alias, .. } => alias.clone(),
+        SelectItem::UnnamedExpr(_) => match &projection {
+            LateLixFileProjection::Content => direct_projection_identifier(expression)?.clone(),
+            LateLixFileProjection::OctetLength | LateLixFileProjection::Substring { .. } => {
+                Ident::with_quote('"', expression.to_string())
+            }
+        },
         SelectItem::QualifiedWildcard(..)
         | SelectItem::Wildcard(..)
         | SelectItem::ExprWithAliases { .. } => return None,
     };
-    let path_expression = direct_file_content_path_expression(expression, qualifier)?;
-    Some((path_expression, output_name))
+    let content_expression = match expression {
+        Expr::Function(function) if matches!(projection, LateLixFileProjection::OctetLength) => {
+            let FunctionArguments::List(arguments) = &function.args else {
+                return None;
+            };
+            let [FunctionArg::Unnamed(FunctionArgExpr::Expr(content))] =
+                arguments.args.as_slice()
+            else {
+                return None;
+            };
+            content
+        }
+        Expr::Substring { expr, .. } => expr.as_ref(),
+        _ => expression,
+    };
+    let path_expression = direct_file_content_path_expression(content_expression, qualifier)?;
+    let preserved_parameters = match expression {
+        Expr::Substring {
+            substring_from: Some(start),
+            substring_for: Some(length),
+            ..
+        } if matches!(projection, LateLixFileProjection::Substring { .. }) => {
+            [start.as_ref(), length.as_ref()]
+                .into_iter()
+                .filter(|expression| {
+                    matches!(
+                        expression,
+                        Expr::Value(value)
+                            if matches!(&value.value, SqlValue::Placeholder(_))
+                    )
+                })
+                .cloned()
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    Some((projection, output_name, path_expression, preserved_parameters))
+}
+
+fn is_octet_length_of_content(expression: &Expr, qualifier: &Ident) -> bool {
+    let Expr::Function(function) = expression else {
+        return false;
+    };
+    let [name] = function.name.0.as_slice() else {
+        return false;
+    };
+    let Some(name) = name.as_ident() else {
+        return false;
+    };
+    if !identifier_matches(name, "octet_length")
+        || function.uses_odbc_syntax
+        || function.parameters != FunctionArguments::None
+        || function.filter.is_some()
+        || function.null_treatment.is_some()
+        || function.over.is_some()
+        || !function.within_group.is_empty()
+    {
+        return false;
+    }
+    let FunctionArguments::List(arguments) = &function.args else {
+        return false;
+    };
+    if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() {
+        return false;
+    }
+    let [FunctionArg::Unnamed(FunctionArgExpr::Expr(content))] = arguments.args.as_slice() else {
+        return false;
+    };
+    direct_file_content_path_expression(content, qualifier).is_some()
+}
+
+fn substring_of_content(
+    expression: &Expr,
+    qualifier: &Ident,
+    params: &[Value],
+) -> Option<(i64, u64)> {
+    let Expr::Substring {
+        expr,
+        substring_from: Some(start),
+        substring_for: Some(length),
+        ..
+    } = expression
+    else {
+        return None;
+    };
+    direct_file_content_path_expression(expr, qualifier)?;
+    let start = integer_expression(start, params)?;
+    let length = integer_expression(length, params)?;
+    Some((start, u64::try_from(length).ok()?))
+}
+
+fn integer_expression(expression: &Expr, params: &[Value]) -> Option<i64> {
+    match expression {
+        Expr::Value(value) => match &value.value {
+            SqlValue::Number(number, _) => number.parse::<i64>().ok(),
+            SqlValue::Placeholder(placeholder) => {
+                let index = placeholder.strip_prefix('$')?.parse::<usize>().ok()?.checked_sub(1)?;
+                match params.get(index)? {
+                    Value::Integer(value) => Some(*value),
+                    _ => None,
+                }
+            }
+            _ => None,
+        },
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => match expr.as_ref() {
+            Expr::Value(value) => match &value.value {
+                SqlValue::Number(number, _) => number.parse::<i64>().ok()?.checked_neg(),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn direct_file_content_path_expression(expression: &Expr, qualifier: &Ident) -> Option<Expr> {
@@ -830,7 +1008,7 @@ pub(crate) fn plan_read_statement(
     // never suppress file hydration or acknowledgement in the SQL fallback.
     let late_content = filesystem
         .is_none()
-        .then(|| late_materialized_lix_file_content_read(statement))
+        .then(|| late_materialized_lix_file_content_read(statement, params))
         .flatten();
     let native = filesystem.map(NativeReadPlan::Filesystem).or_else(|| {
         late_content
@@ -848,7 +1026,9 @@ pub(crate) fn plan_read_statement(
                 ExactFilesystemRead::PathContentBatch(_)
             ))
         )
-        || late_content.is_some();
+        || late_content
+            .as_ref()
+            .is_some_and(|plan| plan.projection.acknowledges_content());
     StatementReadPlan {
         native,
         late_content,
@@ -875,5 +1055,84 @@ mod tests {
         assert!(plan.native.is_none());
         assert!(plan.late_content.is_some());
         assert!(plan.acknowledge_file_views);
+    }
+
+    #[test]
+    fn file_size_and_bounded_substring_projections_late_materialize() {
+        let size_statement = sql2::parse_statement(
+            "SELECT f.path AS path, OCTET_LENGTH(f.content) AS size_bytes \
+             FROM lix_file AS f WHERE f.path = $1",
+        )
+        .unwrap();
+        let params = [Value::Text("/large.bin".into())];
+        let size_plan = late_materialized_lix_file_content_read(&size_statement, &params)
+            .expect("OCTET_LENGTH(content) should use blob-ref size metadata");
+        assert_eq!(size_plan.data_column_index, 1);
+        assert_eq!(size_plan.projection, LateLixFileProjection::OctetLength);
+        assert!(size_plan.statement.to_string().contains("f.path AS size_bytes"));
+        assert!(!plan_read_statement(&size_statement, &params).acknowledge_file_views);
+
+        let substring_statement = sql2::parse_statement(
+            "SELECT SUBSTRING(f.content FROM $2 FOR $3) AS slice \
+             FROM lix_file AS f WHERE f.path = $1 ORDER BY f.path",
+        )
+        .unwrap();
+        let params = [
+            Value::Text("/large.bin".into()),
+            Value::Integer(-1),
+            Value::Integer(3),
+        ];
+        let substring_plan = late_materialized_lix_file_content_read(&substring_statement, &params)
+            .expect("bounded SUBSTRING(content) should use CAS ranges");
+        assert_eq!(substring_plan.data_column_index, 0);
+        assert_eq!(
+            substring_plan.projection,
+            LateLixFileProjection::Substring {
+                start: -1,
+                length: 3,
+            }
+        );
+        assert!(substring_plan.statement.to_string().contains("f.path AS slice"));
+        let rewritten = substring_plan.statement.to_string();
+        assert!(rewritten.contains("$2 IS NOT NULL"));
+        assert!(rewritten.contains("$3 IS NOT NULL"));
+        assert!(plan_read_statement(&substring_statement, &params).acknowledge_file_views);
+
+        let slice_parameters_only = sql2::parse_statement(
+            "SELECT SUBSTRING(content FROM $1 FOR $2) AS slice \
+             FROM lix_file WHERE path = '/large.bin'",
+        )
+        .unwrap();
+        let slice_params = [Value::Integer(1), Value::Integer(3)];
+        let slice_plan = late_materialized_lix_file_content_read(
+            &slice_parameters_only,
+            &slice_params,
+        )
+        .expect("slice-only parameters should remain bindable after rewrite");
+        let rewritten = slice_plan.statement.to_string();
+        assert!(rewritten.contains("$1 IS NOT NULL"));
+        assert!(rewritten.contains("$2 IS NOT NULL"));
+    }
+
+    #[test]
+    fn unsupported_substring_shapes_keep_the_ordinary_sql_path() {
+        for sql in [
+            "SELECT SUBSTRING(content FROM 1) FROM lix_file",
+            "SELECT SUBSTRING(content FROM 1 FOR -2) FROM lix_file",
+            "SELECT SUBSTRING(content FROM 1 FOR 2) AS part FROM lix_file ORDER BY part",
+            "SELECT SUBSTRING(content FROM 1 FOR 2) FROM lix_file WHERE content IS NOT NULL",
+            "SELECT public.OCTET_LENGTH(content) FROM lix_file",
+            "SELECT OCTET_LENGTH(content) FILTER (WHERE path IS NOT NULL) FROM lix_file",
+            "SELECT OCTET_LENGTH(content) OVER () FROM lix_file",
+            "SELECT OCTET_LENGTH(content) WITHIN GROUP (ORDER BY path) FROM lix_file",
+            "SELECT OCTET_LENGTH(content) RESPECT NULLS FROM lix_file",
+        ] {
+            let statement = sql2::parse_statement(sql).unwrap();
+            assert_eq!(
+                late_materialized_lix_file_content_read(&statement, &[]),
+                None,
+                "unsupported range shape should not be rewritten: {sql}"
+            );
+        }
     }
 }
