@@ -704,6 +704,10 @@ pub(crate) async fn execute_exact_lix_file_read(
     let index = filesystem_path_index
         .path_index(
             &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
+                .with_file_ids(match selector {
+                    ExactLixFileReadSelector::Id(id) => Some(vec![id.clone()]),
+                    ExactLixFileReadSelector::Path(_) => None,
+                })
                 .with_blob_refs(true)
                 .with_cached_blob_data(column == ExactLixFileReadColumn::Content),
         )
@@ -1110,6 +1114,7 @@ pub(crate) async fn execute_exact_lix_file_id_manifest_batch_read(
     let index = filesystem_path_index
         .path_index(
             &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
+                .with_file_ids(Some(file_ids.iter().cloned().collect()))
                 .with_blob_refs(true)
                 .with_cached_blob_data(true),
         )
