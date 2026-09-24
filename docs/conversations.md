@@ -8,7 +8,7 @@ description: "SQL conversations and comments on rows and commits, with same-scop
 
 | Relation | Payload columns |
 | --- | --- |
-| `lix_conversation` | `id UUID PRIMARY KEY`, `target TEXT NULL`, `title TEXT NULL` |
+| `lix_conversation` | `id UUID PRIMARY KEY`, `target TEXT NULL`, `detached_target TEXT NULL`, `title TEXT NULL`, `resolved BOOLEAN NOT NULL DEFAULT false` |
 | `lix_comment` | `id UUID PRIMARY KEY`, `conversation_id UUID NOT NULL`, `body JSONB NOT NULL` |
 
 `target` is a canonical `lix_row_ref` constrained to an existing row in the conversation's scope. It is nullable for standalone conversations. Deleting the target cascades its conversations; deleting a conversation cascades its comments. Scope and durability follow the ordinary FK and row-reference rules. Global rows remain visible through the normal branch read overlay, but visibility does not allow cross-scope references.
@@ -17,7 +17,9 @@ The [vendored Zettel JSON Schema](../packages/lix/vendor/zettel/schema.json) def
 
 `body` stores a Zettel document, for example `{"_type":"zettel_doc","blocks":[]}`. The SQL column enforces JSONB and non-nullability, not the complete Zettel document grammar. Applications must validate imported or authored documents before writing. No editor, renderer, or Markdown converter is part of this SQL API.
 
-There are no separate author, timestamp, or ordering columns. Use Lix row/change metadata for attribution and chronology. For live display, `ORDER BY lixcol_created_at, id` supplies a timestamp order with an ID tie-breaker; this is not a causal ordering guarantee for distributed writers.
+`resolved` marks a conversation as resolved. It defaults to `false`, including for conversations written before the column existed: an existing repository opens without migration and reads them as unresolved.
+
+There are no separate author, timestamp, or ordering columns, and no `resolved_by` or `resolved_at`. Use Lix row/change metadata for attribution and chronology. For live display, `ORDER BY lixcol_created_at, id` supplies a timestamp order with an ID tie-breaker; this is not a causal ordering guarantee for distributed writers.
 
 ## Comment on a row in the current branch
 
@@ -83,6 +85,58 @@ FROM lix_comment
 WHERE conversation_id = $1 AND lixcol_global = $2
 ORDER BY lixcol_created_at, id;
 ```
+
+## Resolve and reopen
+
+Resolving and reopening are ordinary updates:
+
+```sql
+UPDATE lix_conversation SET resolved = true WHERE id = $1;   -- resolve
+UPDATE lix_conversation SET resolved = false WHERE id = $1;  -- reopen
+```
+
+To resolve with a closing note, post a comment in the same transaction. Both rows land in one commit:
+
+```sql
+BEGIN;
+
+UPDATE lix_conversation SET resolved = true WHERE id = $1;
+
+INSERT INTO lix_comment (id, conversation_id, body)
+VALUES ($2, $1, $3::jsonb);
+
+COMMIT;
+```
+
+Filter open threads with `WHERE resolved = false`. Detached conversations can be resolved and reopened like any other; detaching does not change `resolved`.
+
+### Who resolved this and when
+
+Every write records a `lix_change` with the writing session's `account_id` and `created_at`. A row's `lixcol_change_id` names the change that wrote its current state, so for a conversation whose latest write was the resolution:
+
+```sql
+SELECT c.resolved, ch.account_id, a.name, ch.created_at
+FROM lix_conversation c
+JOIN lix_change ch ON ch.id = c.lixcol_change_id
+LEFT JOIN lix_account a ON a.id = ch.account_id
+WHERE c.id = $1;
+```
+
+A later write, such as a title edit, becomes the current change. To find the most recent resolution regardless of later edits or a reopen, read the transition from history:
+
+```sql
+SELECT ch.account_id, a.name, ch.created_at
+FROM lix_history('lix_conversation') h
+JOIN lix_change ch ON ch.id = h.to_lixcol_change_id
+LEFT JOIN lix_account a ON a.id = ch.account_id
+WHERE h.id = $1
+  AND h.to_resolved
+  AND NOT COALESCE(h.from_resolved, false)
+ORDER BY h.lixcol_position
+LIMIT 1;
+```
+
+History compares each retained commit with its first parent. After a checkpoint compacts automatic commits, the resolution and a later edit inside the same compacted range appear as one net change, attributed to the range's final change. `lix_diff('lix_conversation', $from, $to)` reports `from_resolved` / `to_resolved` between two checkpoints.
 
 ## Deletion and history
 

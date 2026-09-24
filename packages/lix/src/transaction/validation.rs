@@ -827,15 +827,10 @@ fn resolved_constraint_row(
     row: MaterializedHotStateRowRef<'_>,
 ) -> Result<Arc<WasmTypedRow>, LixError> {
     let typed = match row.materialize_decoded_snapshot()? {
-        Some(typed)
-            if typed.schema_fingerprint != plan.fingerprint().bytes()
-                && CatalogSnapshot::builtin()
-                    .plan_for_key(row.schema_key())
-                    .is_none() =>
-        {
-            // Match SQL amendment reads: only custom schemas are rebound.
-            // Historical built-ins retain their validated native values even
-            // when descriptive schema metadata changed their fingerprint.
+        Some(typed) if typed.schema_fingerprint != plan.fingerprint().bytes() => {
+            // Match SQL amendment reads: rows written before a compatible
+            // amendment (registered, or an appended built-in column) are
+            // rebound to the current definition with literal defaults applied.
             let schema = crate::schema::parse_lix_schema(&plan.schema)?;
             Arc::new(typed.revalidate_resolved_schema(
                 row.schema_key(),

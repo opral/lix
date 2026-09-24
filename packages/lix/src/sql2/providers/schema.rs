@@ -3384,18 +3384,13 @@ fn apply_row_filters(rows: &mut Vec<MaterializedHotStateRow>, filters: &[RowFilt
     Ok(())
 }
 
-/// Rebind only rows whose custom schema certificate was revoked. The
+/// Rebind only rows whose schema certificate was revoked by a compatible
+/// amendment, including built-in columns appended by a newer engine. The
 /// common matching-fingerprint path retains its original compact batch.
 pub(crate) fn revalidate_schema_amended_rows(
     spec: &SchemaSurfaceSpec,
     rows: &MaterializedHotStateBatch,
 ) -> Result<Option<MaterializedHotStateBatch>> {
-    if crate::catalog::CatalogSnapshot::builtin()
-        .plan_for_key(&spec.schema_key)
-        .is_some()
-    {
-        return Ok(None);
-    }
     let needs_revalidation = |row: crate::hot_state::MaterializedHotStateRowRef<'_>| {
         if row.deleted() {
             return false;

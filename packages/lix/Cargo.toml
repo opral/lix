@@ -150,6 +150,10 @@ path = "tests/migration_v75.rs"
 required-features = ["offline-migration"]
 
 [[test]]
+name = "conversation_resolved_upgrade"
+path = "tests/conversation_resolved_upgrade.rs"
+
+[[test]]
 name = "snapshot_untracked"
 path = "tests/snapshot_untracked.rs"
 

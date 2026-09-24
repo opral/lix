@@ -652,10 +652,12 @@ impl TypedRow {
         Ok(())
     }
 
-    /// A durable custom row can outlive a compatible registered-schema
-    /// amendment. A different fingerprint revokes the fast validation
-    /// certificate; it does not make otherwise valid historical values unreadable.
-    /// Revalidate every value and the storage identity before rebinding.
+    /// A durable row can outlive a compatible schema amendment: a registered
+    /// schema amendment, or a built-in definition that a newer engine extended
+    /// with an appended nullable or literal-default column. A different
+    /// fingerprint revokes the fast validation certificate; it does not make
+    /// otherwise valid historical values unreadable. Revalidate every value and
+    /// the storage identity before rebinding.
     pub(crate) fn revalidate_resolved_schema(
         &self,
         stored_schema_key: &str,
@@ -664,11 +666,7 @@ impl TypedRow {
         compiled: &lix_schema::CompiledSchema,
         fingerprint: [u8; 32],
     ) -> Result<Self, LixError> {
-        if stored_schema_key != schema.key
-            || crate::catalog::CatalogSnapshot::builtin()
-                .plan_for_key(stored_schema_key)
-                .is_some()
-        {
+        if stored_schema_key != schema.key {
             self.validate_resolved_schema_binding(stored_schema_key, &schema.key, &fingerprint)?;
         }
         self.validate_durable_envelope(stored_schema_key, stored_row_pk)?;
@@ -1013,6 +1011,87 @@ mod tests {
             &std::collections::BTreeMap::new(),
         )
         .expect("path/value schema should compile")
+    }
+
+    fn plan_for_test(schema: serde_json::Value) -> crate::catalog::SchemaPlan {
+        crate::catalog::SchemaPlan::compile_standalone_for_test(
+            crate::catalog::SchemaCatalogKey {
+                schema_key: schema["key"].as_str().unwrap().to_owned(),
+            },
+            schema,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("test schema should compile")
+    }
+
+    #[test]
+    fn builtin_rows_written_before_an_appended_column_rebind_with_its_default() {
+        let (_, current) = crate::catalog::CatalogSnapshot::builtin()
+            .plan_for_key("lix_conversation")
+            .unwrap();
+        // The definition an older engine stored rows under: no `resolved`.
+        let mut older = current.schema.as_ref().clone();
+        older["columns"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|column| column["name"] != "resolved");
+        let older = plan_for_test(older);
+        assert_ne!(older.fingerprint(), current.fingerprint());
+
+        let id = "01950000-0000-7000-8000-000000000001";
+        let pk = RowPk::from_schema_values(&[lix_schema::Value::Uuid(id.parse().unwrap())])
+            .unwrap();
+        let stored = TypedRow::from_normalized_json(
+            &older,
+            &pk,
+            &serde_json::json!({"id": id, "title": "Before resolved"}),
+        )
+        .unwrap();
+        let schema = crate::schema::parse_lix_schema(&current.schema).unwrap();
+        let rebound = stored
+            .revalidate_resolved_schema(
+                "lix_conversation",
+                &pk,
+                &schema,
+                &current.compiled_schema,
+                current.fingerprint().bytes(),
+            )
+            .expect("an appended literal-default built-in column is compatible");
+        assert_eq!(rebound.schema_fingerprint, current.fingerprint().bytes());
+        assert_eq!(
+            rebound.row.get("resolved"),
+            Some(&lix_schema::Value::Boolean(false))
+        );
+        assert_eq!(
+            rebound.row.get("title"),
+            Some(&lix_schema::Value::Text("Before resolved".into()))
+        );
+
+        // A stored column the current built-in no longer declares is not a
+        // compatible amendment and still requires an explicit migration.
+        let mut widened = older.schema.as_ref().clone();
+        widened["columns"].as_array_mut().unwrap().push(
+            serde_json::json!({"name": "retired", "type": "text", "nullable": true}),
+        );
+        let widened = plan_for_test(widened);
+        let stored = TypedRow::from_normalized_json(
+            &widened,
+            &pk,
+            &serde_json::json!({"id": id, "retired": "x"}),
+        )
+        .unwrap();
+        assert!(
+            stored
+                .revalidate_resolved_schema(
+                    "lix_conversation",
+                    &pk,
+                    &schema,
+                    &current.compiled_schema,
+                    current.fingerprint().bytes(),
+                )
+                .is_err()
+        );
     }
 
     #[test]

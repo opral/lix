@@ -26,6 +26,13 @@
       "type": "text",
       "nullable": true,
       "description": "Optional human-readable conversation title."
+    },
+    {
+      "name": "resolved",
+      "type": "boolean",
+      "nullable": false,
+      "default_value": false,
+      "description": "Whether the conversation is resolved. Set true to resolve and false to reopen; the row's change metadata records who changed it and when."
     }
   ],
   "primary_key": [

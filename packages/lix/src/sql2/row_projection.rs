@@ -96,19 +96,17 @@ fn visit_projection_native_payload<'a>(
 }
 
 impl RowProjectionDecoder {
-    /// SQL reads may revalidate a custom row after a compatible schema
-    /// amendment. Built-ins and callers of `new` retain exact fingerprint checks.
+    /// SQL reads may revalidate a row written before a compatible schema
+    /// amendment. This covers registered schemas and built-ins that gained an
+    /// appended nullable or literal-default column in a newer engine, so rows
+    /// from existing repositories read with the current definition. Callers of
+    /// `new` retain exact fingerprint checks.
     pub(crate) fn with_schema_amendments<'a>(
         spec: &SchemaSurfaceSpec,
         columns: impl IntoIterator<Item = &'a str>,
     ) -> Result<Self, LixError> {
         let mut decoder = Self::new(spec, columns)?;
-        if crate::catalog::CatalogSnapshot::builtin()
-            .plan_for_key(&spec.schema_key)
-            .is_none()
-        {
-            decoder.compatibility_document = Some(Arc::clone(&spec.schema_document));
-        }
+        decoder.compatibility_document = Some(Arc::clone(&spec.schema_document));
         Ok(decoder)
     }
 
