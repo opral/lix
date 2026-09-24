@@ -32,11 +32,11 @@ pub(crate) fn validate_schema(schema: &Schema) -> Result<(), Error> {
             .unwrap();
         if !matches!(
             value.data_type,
-            DataType::Text | DataType::Uuid | DataType::Int8
+            DataType::Text | DataType::Uuid | DataType::Int8 | DataType::RowRef
         ) {
             return definition(
                 "/primary_key",
-                format!("primary-key column '{column}' must use text, uuid, or int8"),
+                format!("primary-key column '{column}' must use text, uuid, int8, or row_ref"),
             );
         }
         if value.nullable {
@@ -79,10 +79,10 @@ pub(crate) fn validate_schema(schema: &Schema) -> Result<(), Error> {
         if foreign_key.columns.len() != foreign_key.references.columns.len() {
             return definition(path, "local and referenced column counts must match");
         }
-        if foreign_key.on_delete == DeleteAction::SetNull {
+        if foreign_key.on_delete == DeleteAction::Detach {
             return definition(
                 format!("{path}/on_delete"),
-                "set_null is supported only for row_refs",
+                "detach is supported only for row_refs",
             );
         }
     }
@@ -102,61 +102,20 @@ pub(crate) fn validate_schema(schema: &Schema) -> Result<(), Error> {
         if !row_ref_columns.insert(row_ref.column.as_str()) {
             return definition(
                 format!("{path}/column"),
-                "duplicates an earlier row-reference constraint",
+                "duplicates an earlier row-reference delete action",
             );
         }
-        if column.data_type != DataType::Text {
+        if column.data_type != DataType::RowRef {
             return definition(
                 format!("{path}/column"),
-                format!("row-reference column '{}' must use text", row_ref.column),
+                format!("column '{}' must use row_ref", row_ref.column),
             );
         }
-        if row_ref.on_delete == DeleteAction::SetNull && !column.nullable {
+        if row_ref.on_delete == DeleteAction::NoAction {
             return definition(
                 format!("{path}/on_delete"),
-                format!(
-                    "set_null requires row-reference column '{}' to be nullable",
-                    row_ref.column
-                ),
+                "must be cascade or detach; omit the entry for no_action",
             );
-        }
-    }
-    let mut detached_columns = BTreeSet::new();
-    for (index, row_ref) in schema.row_refs.iter().enumerate() {
-        let Some(detached) = &row_ref.detached_column else {
-            continue;
-        };
-        let path = format!("/row_refs/{index}/detached_column");
-        if row_ref.on_delete != DeleteAction::SetNull {
-            return definition(path, "detached_column requires on_delete set_null");
-        }
-        let Some(column) = schema
-            .columns
-            .iter()
-            .find(|candidate| &candidate.name == detached)
-        else {
-            return definition(path, format!("unknown column '{detached}'"));
-        };
-        if column.data_type != DataType::Text || !column.nullable {
-            return definition(
-                path,
-                format!("detached column '{detached}' must be nullable text"),
-            );
-        }
-        if row_ref_columns.contains(detached.as_str()) {
-            return definition(
-                path,
-                format!("detached column '{detached}' must not be a row-reference column"),
-            );
-        }
-        if schema.primary_key.contains(detached) {
-            return definition(
-                path,
-                format!("detached column '{detached}' must not be part of the primary key"),
-            );
-        }
-        if !detached_columns.insert(detached.as_str()) {
-            return definition(path, "duplicates an earlier detached column");
         }
     }
     Ok(())
@@ -207,6 +166,8 @@ fn validate_default(data_type: DataType, value: &Value, path: &str) -> Result<()
         DataType::Boolean => value.is_boolean(),
         DataType::Jsonb => true,
         DataType::Timestamptz => value.as_str().is_some_and(crate::row::is_rfc3339_timestamp),
+        // A reference must resolve when it is written; a constant cannot.
+        DataType::RowRef => false,
     };
     if valid {
         Ok(())

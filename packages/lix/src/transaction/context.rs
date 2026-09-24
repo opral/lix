@@ -12634,6 +12634,10 @@ fn close_and_validate_diff_command_selection(
                         .get(target_diff_id)
                         .expect("row-reference target index is coherent");
                     if target_entry.after.as_ref().is_none_or(|row| row.deleted) {
+                        // A detached reference may outlive its target.
+                        if reference.on_delete == lix_schema::DeleteAction::Detach {
+                            continue;
+                        }
                         return Err(LixError::new(
                             LixError::CODE_CONSTRAINT_VIOLATION,
                             format!("{operation} selection references a removed row"),
@@ -12755,7 +12759,9 @@ fn close_and_validate_diff_command_selection(
                         target_entry.identity.file_id(),
                         target_entry.identity.row_pk(),
                     )?;
-                    for reference in &child_plan.row_refs {
+                    for reference in child_plan.row_refs.iter().filter(|reference| {
+                        reference.on_delete != lix_schema::DeleteAction::Detach
+                    }) {
                         let points_to_target = |snapshot: &JsonValue| {
                             snapshot.get(&reference.column).and_then(JsonValue::as_str)
                                 == Some(target.as_str())
@@ -12914,7 +12920,11 @@ fn close_and_validate_diff_command_selection(
         let Some((_, plan)) = catalog.plan_for_key(entry.identity.schema_key()) else {
             continue;
         };
-        for reference in &plan.row_refs {
+        for reference in plan
+            .row_refs
+            .iter()
+            .filter(|reference| reference.on_delete != lix_schema::DeleteAction::Detach)
+        {
             let Some(target) = snapshot.get(&reference.column).and_then(JsonValue::as_str) else {
                 continue;
             };

@@ -5,19 +5,26 @@ use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
 use crate::{LixError, ResultColumnType};
 
 pub(crate) const LIX_VALUE_TYPE_METADATA_KEY: &str = "lix.value_type";
-pub(crate) const LIX_ARRAY_ELEMENT_VALUE_TYPE_METADATA_KEY: &str =
-    "lix.array_element_value_type";
+pub(crate) const LIX_ARRAY_ELEMENT_VALUE_TYPE_METADATA_KEY: &str = "lix.array_element_value_type";
 pub(crate) const LIX_VALUE_SHAPE_METADATA_KEY: &str = "lix.value_shape";
 pub(crate) const LIX_VALUE_TYPE_JSONB: &str = "jsonb";
 pub(crate) const LIX_VALUE_TYPE_ROW_REF: &str = "row_ref";
 
 pub(crate) fn json_field(name: impl Into<String>, nullable: bool) -> Field {
-    Field::new(name, DataType::Utf8, nullable)
-        .with_metadata(json_field_metadata_map())
+    Field::new(name, DataType::Utf8, nullable).with_metadata(json_field_metadata_map())
 }
 
 pub(crate) fn mark_json_field(field: Field) -> Field {
     field.with_metadata(json_field_metadata_map())
+}
+
+pub(crate) fn mark_row_ref_field(field: Field) -> Field {
+    let mut metadata = field.metadata().clone();
+    metadata.insert(
+        LIX_VALUE_TYPE_METADATA_KEY.to_string(),
+        LIX_VALUE_TYPE_ROW_REF.to_string(),
+    );
+    field.with_metadata(metadata)
 }
 
 pub(crate) fn row_ref_field(name: impl Into<String>, nullable: bool) -> Field {

@@ -1416,6 +1416,14 @@ impl<'a> PreparedValidationRow<'a> {
         }
     }
 
+    /// Whether the row selects a change that already exists, such as a merge
+    /// pick, instead of carrying a new write of this transaction.
+    pub(crate) fn selects_existing_change(&self) -> bool {
+        match self {
+            Self::State(row) => !row.addressable_change_id,
+        }
+    }
+
     pub(crate) fn is_tombstone(&self) -> bool {
         match self {
             Self::State(row) => row.is_deleted(),
@@ -3643,7 +3651,9 @@ pub(crate) struct PreparedSchemaOverlay<'a> {
 
 impl<'a> PreparedSchemaOverlay<'a> {
     pub(crate) fn all_rows(rows: &'a PreparedStateBatch) -> Self {
-        Self { rows: rows.iter().collect() }
+        Self {
+            rows: rows.iter().collect(),
+        }
     }
 
     pub(crate) fn new(rows: &'a PreparedStateBatch) -> Self {

@@ -24,7 +24,7 @@ async fn delete_census(
     let (parent, child) = if matches!(mode, "row_ref" | "row_ref_churn") {
         (
             serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"audit_ref_parent","columns":[{"name":"id","type":"int8","nullable":false}],"primary_key":["id"]}),
-            serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"audit_ref_child","columns":[{"name":"id","type":"int8","nullable":false},{"name":"target","type":"text","nullable":false}],"primary_key":["id"],"row_refs":[{"column":"target"}]}),
+            serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"audit_ref_child","columns":[{"name":"id","type":"int8","nullable":false},{"name":"target","type":"row_ref","nullable":false}],"primary_key":["id"]}),
         )
     } else {
         (

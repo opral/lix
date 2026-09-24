@@ -81,9 +81,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
                     .schema_resolver
                     .catalogs_for_validation(&base, &staged, &Domain::schema_catalog(branch, true))
                     .await?;
-                deletes.append(
-                    validation::plan_delete_actions(&candidate, catalog, seeds, None).await?,
-                );
+                deletes.append(validation::plan_delete_actions(&candidate, catalog, seeds).await?);
             }
         }
         let pending = prepared
@@ -103,14 +101,13 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
             .iter()
             .enumerate()
             .filter_map(|(index, row)| {
-                (row.snapshot.is_some()
-                    || !pending.contains(&(
-                        row.branch_id.to_string(),
-                        row.untracked,
-                        row.schema_key.to_string(),
-                        row.file_id.map(ToString::to_string),
-                        row.row_pk.expect("cascade identity").clone(),
-                    )))
+                (!pending.contains(&(
+                    row.branch_id.to_string(),
+                    row.untracked,
+                    row.schema_key.to_string(),
+                    row.file_id.map(ToString::to_string),
+                    row.row_pk.expect("cascade identity").clone(),
+                )))
                 .then_some(index)
             })
             .collect::<Vec<_>>();
@@ -141,18 +138,16 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
             .map(|descriptor| descriptor.file_id.as_str())
             .collect::<BTreeSet<_>>();
         if generated.state_rows.iter().any(|row| {
-            (row.is_deleted()
-                && pending.contains(&(
-                    row.branch_id.to_string(),
-                    row.untracked,
-                    row.schema_key.to_string(),
-                    row.file_id.map(ToString::to_string),
-                    row.row_pk.clone(),
-                )))
-                || row.file_id.is_some_and(|file| {
-                    pending_files.contains(file.as_str())
-                        && !(row.is_deleted() && deleted_file_ids.contains(file.as_str()))
-                })
+            pending.contains(&(
+                row.branch_id.to_string(),
+                row.untracked,
+                row.schema_key.to_string(),
+                row.file_id.map(ToString::to_string),
+                row.row_pk.clone(),
+            )) || row.file_id.is_some_and(|file| {
+                pending_files.contains(file.as_str())
+                    && !(row.is_deleted() && deleted_file_ids.contains(file.as_str()))
+            })
         }) || generated
             .file_content_writes
             .iter()
@@ -394,7 +389,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
                 .schema_resolver
                 .catalogs_for_validation(&base, catalog_overlay, &domain)
                 .await?;
-            if catalog.has_row_ref_delete_actions()
+            if catalog.has_row_ref_cascades()
                 || catalog
                     .delete_plan_for_key(row.schema_key.as_str())
                     .foreign_key_references
@@ -500,9 +495,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
                     .schema_resolver
                     .catalogs_for_validation(&base, &staged, &Domain::schema_catalog(branch, true))
                     .await?;
-                deletes.append(
-                    validation::plan_delete_actions(&candidate, catalog, seeds, None).await?,
-                );
+                deletes.append(validation::plan_delete_actions(&candidate, catalog, seeds).await?);
             }
         }
         if !deletes.is_empty() {

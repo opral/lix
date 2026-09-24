@@ -1528,8 +1528,11 @@ mod tests {
         let mut manifest: JsonValue = serde_json::from_str(&insensitive_entry.manifest_json)
             .expect("test manifest should parse");
         manifest["file_match"]["case_insensitive"] = json!(true);
-        insensitive_entry.manifest_json =
-            serde_json::to_string(&manifest).expect("test manifest should serialize");
+        insensitive_entry.manifest_json = canonicalize_json_text(
+            &serde_json::to_string(&manifest).expect("test manifest should serialize"),
+            "test manifest",
+        )
+        .expect("test manifest should canonicalize");
 
         let insensitive_registry = PluginRegistry::new(vec![insensitive_entry])
             .expect("case-insensitive test registry should be valid");

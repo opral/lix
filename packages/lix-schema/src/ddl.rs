@@ -8,9 +8,13 @@ use crate::{DataType, Error, ErrorKind, Schema};
 /// testable instead of relying on a resemblance between two JSON formats.
 pub fn to_postgres_ddl(schema: &Schema) -> Result<String, Error> {
     schema.validate()?;
-    if !schema.row_refs.is_empty() {
+    if schema
+        .columns
+        .iter()
+        .any(|column| column.data_type == DataType::RowRef)
+    {
         return Err(ddl_error(
-            "row-reference constraints cannot be represented in PostgreSQL DDL",
+            "row_ref columns cannot be represented in PostgreSQL DDL",
         ));
     }
     let mut declarations = Vec::new();
@@ -44,7 +48,7 @@ pub fn to_postgres_ddl(schema: &Schema) -> Result<String, Error> {
             match foreign_key.on_delete {
                 crate::DeleteAction::NoAction => "",
                 crate::DeleteAction::Cascade => " ON DELETE CASCADE",
-                crate::DeleteAction::SetNull => " ON DELETE SET NULL",
+                crate::DeleteAction::Detach => unreachable!("validated foreign-key action"),
             }
         )
     }));
@@ -60,7 +64,7 @@ fn postgres_literal(data_type: DataType, value: &Value) -> Result<String, Error>
         return Ok("NULL".to_string());
     }
     match data_type {
-        DataType::Text | DataType::Uuid => value
+        DataType::Text | DataType::Uuid | DataType::RowRef => value
             .as_str()
             .map(quote_string)
             .ok_or_else(|| ddl_error("string default became invalid after validation")),

@@ -11,21 +11,22 @@
     },
     {
       "name": "target",
-      "type": "text",
+      "type": "row_ref",
       "nullable": true,
-      "description": "Canonical row reference to an existing target in the same branch and compatible durability scope. Null for a standalone or detached conversation."
-    },
-    {
-      "name": "detached_target",
-      "type": "text",
-      "nullable": true,
-      "description": "Canonical row reference to the former target when the target row was deleted."
+      "description": "Row reference to the discussed row, in the same branch and compatible durability scope. Null for a standalone conversation. Deleting the target leaves the conversation and this value unchanged; the conversation is detached while the reference does not resolve."
     },
     {
       "name": "title",
       "type": "text",
       "nullable": true,
       "description": "Optional human-readable conversation title."
+    },
+    {
+      "name": "resolved",
+      "type": "boolean",
+      "nullable": false,
+      "default_value": false,
+      "description": "Whether the conversation is resolved. Set true to resolve and false to reopen; the row's change metadata records who changed it and when."
     }
   ],
   "primary_key": [
@@ -34,8 +35,7 @@
   "row_refs": [
     {
       "column": "target",
-      "on_delete": "set_null",
-      "detached_column": "detached_target"
+      "on_delete": "detach"
     }
   ]
 }

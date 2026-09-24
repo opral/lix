@@ -61,14 +61,19 @@ fn parent_schema(key: &str) -> JsonValue {
     )
 }
 
+/// A `row_ref` column without a `row_refs` entry uses `no_action`.
+fn row_ref_delete_action(on_delete: &str) -> Option<JsonValue> {
+    (on_delete != "no_action").then(|| json!([{"column":"target","on_delete":on_delete}]))
+}
+
 fn row_ref_child_schema(key: &str, on_delete: &str) -> JsonValue {
     schema(
         key,
         json!([
             {"name":"id","type":"text","nullable":false},
-            {"name":"target","type":"text"}
+            {"name":"target","type":"row_ref"}
         ]),
-        Some(json!([{"column":"target","on_delete":on_delete}])),
+        row_ref_delete_action(on_delete),
     )
 }
 
@@ -77,22 +82,15 @@ fn row_ref_child_value_schema(key: &str, on_delete: &str) -> JsonValue {
         key,
         json!([
             {"name":"id","type":"text","nullable":false},
-            {"name":"target","type":"text"},
+            {"name":"target","type":"row_ref"},
             {"name":"value","type":"text"}
         ]),
-        Some(json!([{"column":"target","on_delete":on_delete}])),
+        row_ref_delete_action(on_delete),
     )
 }
 
 fn row_ref_child_default_schema(key: &str) -> JsonValue {
-    schema(
-        key,
-        json!([
-            {"name":"id","type":"text","nullable":false},
-            {"name":"target","type":"text"}
-        ]),
-        Some(json!([{"column":"target"}])),
-    )
+    row_ref_child_schema(key, "no_action")
 }
 
 fn foreign_key_child_schema(key: &str, parent_key: &str, on_delete: &str) -> JsonValue {
@@ -447,8 +445,8 @@ simulation_test!(
         };
         assert_eq!(
             updated.rows()[0].values(),
-            &[Value::Text(expected.as_str().to_owned())],
-            "RETURNING a declared text column preserves its text type",
+            &[Value::RowRef(expected.clone())],
+            "RETURNING a row_ref column returns a typed row reference",
         );
 
         session
@@ -2195,10 +2193,7 @@ simulation_test!(
                 .execute("SELECT id,target FROM rr_historical_only_child", &[])
                 .await
                 .unwrap(),
-            vec![vec![
-                Value::Text("c".into()),
-                Value::Text(parent_ref.as_str().to_owned()),
-            ]],
+            vec![vec![Value::Text("c".into()), Value::RowRef(parent_ref)]],
         );
     }
 );
