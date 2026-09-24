@@ -360,7 +360,20 @@ Subscribes to successful branch switches made through this Lix handle. The `list
 
 ### Checkpoints
 
-Checkpointing uses the canonical SQL surface rather than a separate typed SDK method:
+Describe a milestone in plain text with the typed SDK method:
+
+```ts
+const { commitId } = await lix.createCheckpoint({
+  description: "Completed the import validator so invalid rows are rejected before storage.",
+});
+```
+
+The SDK stores the description as a Zettel comment attached to the checkpoint
+commit. If description storage fails after the checkpoint was made, the thrown
+`CheckpointDescriptionError` contains `commitId`. Retry with
+`lix.describeCheckpoint({ commitId, description })` without making another
+checkpoint. That call can also correct the description later while keeping one
+opening comment. The SQL form remains available for unannotated or scoped checkpoints:
 
 ```ts
 const result = await lix.execute(

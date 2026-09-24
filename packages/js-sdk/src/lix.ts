@@ -11,6 +11,10 @@ import {
 	wrapExecuteResult,
 } from "./result.js";
 import { normalizeParam, toNativeValue } from "./value.js";
+import {
+	checkpointDescriptionDocument,
+	checkpointDescriptionStatements,
+} from "./checkpoint-description.js";
 import type {
 	CreateBranchOptions,
 	CreateBranchReceipt,
@@ -60,6 +64,16 @@ const hostedCreators = new WeakMap<
 		>,
 	) => Promise<import("./types.js").HostedLix>
 >();
+
+export class CheckpointDescriptionError extends Error {
+	constructor(readonly commitId: string, cause: unknown) {
+		super(
+		`Checkpoint ${commitId} was created, but its description was not saved. Retry with describeCheckpoint({ commitId, description }).`,
+		{ cause },
+	);
+		this.name = "CheckpointDescriptionError";
+	}
+}
 
 /** @internal Used by createLix without adding another method to Lix. */
 export function createHostedFromLix(
@@ -203,6 +217,28 @@ export class Lix {
 				commit: results.commit ?? null,
 			};
 		});
+	}
+
+	/** Mark a milestone and attach plain-text historical context to its commit. */
+	async createCheckpoint(options: { description: string }): Promise<{ commitId: string }> {
+		// Validate before creating a checkpoint, since the note is a later write.
+		checkpointDescriptionDocument(options.description);
+		const result = await this.execute<{ commit_id: string }>(
+			"SELECT commit_id FROM lix_create_checkpoint()",
+		);
+		const commitId = result.rows[0]?.commit_id;
+		if (!commitId) throw new Error("Checkpoint did not return a commit ID");
+		try {
+			await this.describeCheckpoint({ commitId, description: options.description });
+		} catch (cause) {
+			throw new CheckpointDescriptionError(commitId, cause);
+		}
+		return { commitId };
+	}
+
+	/** Retry or correct a checkpoint's opening description without adding a second comment. */
+	async describeCheckpoint(options: { commitId: string; description: string }): Promise<void> {
+		await this.executeBatch(checkpointDescriptionStatements(options.commitId, options.description));
 	}
 
 	observe(

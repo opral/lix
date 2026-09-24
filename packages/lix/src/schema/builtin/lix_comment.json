@@ -19,7 +19,7 @@
       "name": "body",
       "type": "jsonb",
       "nullable": false,
-      "description": "Zettel document JSON. Applications validate the document format; the SQL column enforces JSONB storage and non-nullability."
+      "description": "Zettel document JSON; schema: https://github.com/opral/lix/blob/main/packages/lix/vendor/zettel/schema.json (vendored at packages/lix/vendor/zettel/schema.json). Minimal plain-text body: {\"_type\":\"zettel_doc\",\"blocks\":[{\"_type\":\"zettel_block\",\"_key\":\"p1\",\"style\":\"normal\",\"markDefs\":[],\"children\":[{\"_type\":\"zettel_span\",\"_key\":\"s1\",\"text\":\"A note\",\"marks\":[]}]}]}. Applications validate the document format; SQL enforces JSONB and non-nullability."
     }
   ],
   "primary_key": [

@@ -6,6 +6,39 @@ description: Create restore points and query relation-specific changes between c
 
 Every tracked write becomes a commit automatically. You never run a commit command. A checkpoint marks one of those commits as a restore point. Compare its commit with the active branch head to inspect subsequent changes at the relation level your interface uses.
 
+For a milestone that another person or agent may revisit, describe what changed,
+why, and any caveat. The JavaScript SDK accepts plain text and saves it as a
+global Zettel comment linked to the checkpoint commit:
+
+```ts
+const { commitId } = await lix.createCheckpoint({
+  description: "Added import validation so malformed rows cannot enter the ledger. Existing imports need no migration; retry behavior still needs review.",
+});
+```
+
+An empty description is rejected before checkpoint creation. If the checkpoint
+succeeds but the comment write fails, `CheckpointDescriptionError.commitId`
+identifies the created checkpoint. Retry the note with
+`lix.describeCheckpoint({ commitId, description })`; do not create another
+checkpoint. Repeating that call for the same commit ID updates its one opening
+comment, so a corrected description can be saved without a duplicate.
+
+To read a checkpoint's description from the current branch, bind its commit ID:
+
+```sql
+SELECT c.body
+FROM lix_conversation AS thread
+JOIN lix_comment AS c
+  ON c.conversation_id = thread.id AND c.lixcol_global = thread.lixcol_global
+WHERE thread.target = lix_row_ref('lix_commit', NULL, $1)
+  AND thread.lixcol_global = true
+ORDER BY c.lixcol_created_at, c.id;
+```
+
+The description is a later global write, so query from a head that includes it.
+Use the SQL form below when intentionally creating an unannotated or scoped
+checkpoint.
+
 ```ts
 const checkpoint = await lix.execute(
   "SELECT commit_id FROM lix_create_checkpoint()",

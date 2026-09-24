@@ -1,4 +1,6 @@
 export { Lix, LixTransaction, openLix } from "./open-lix.js";
+export { CheckpointDescriptionError } from "./lix.js";
+export { checkpointDescriptionDocument } from "./checkpoint-description.js";
 export type {
 	LixStorage,
 	LixStorageBound,
