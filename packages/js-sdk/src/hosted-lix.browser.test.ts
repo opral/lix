@@ -3,7 +3,11 @@ import { openLixBinding } from "./binding.browser.js";
 import { createLix } from "./hosted-lix.js";
 import { Lix } from "./lix.js";
 import { initializeWasm } from "./wasm-init.js";
-beforeAll(() => initializeWasm(), 60_000);
+import { initializeComponentCompiler } from "./component-host/index.js";
+beforeAll(async () => {
+	await initializeWasm();
+	await initializeComponentCompiler();
+}, 60_000);
 
 // Direct WASM binding keeps the test fetch in the same realm. Production browser
 // usage runs this same Rust transport in the Lix worker.

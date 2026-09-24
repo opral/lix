@@ -16,6 +16,11 @@ vi.mock("./wasm/lix_js_sdk.js", () => ({
 	openJsStorageFromSnapshot: vi.fn(),
 }));
 
+vi.mock("./component-host/index.js", () => ({
+	compileComponent: vi.fn(),
+	initializeComponentCompiler: vi.fn(async () => {}),
+}));
+
 vi.mock("node:fs/promises", () => ({
 	readFile: vi.fn(async () => new Uint8Array()),
 }));
