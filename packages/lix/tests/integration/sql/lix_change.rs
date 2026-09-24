@@ -251,7 +251,7 @@ simulation_test!(
 
         assert_eq!(error.code, lix::LixError::CODE_SCHEMA_DEFINITION);
         assert!(
-            error.message.contains("must use text, uuid, or int8"),
+            error.message.contains("must use text, uuid, int8, or row_ref"),
             "error should explain unsupported primary-key schema: {error:?}"
         );
     }
