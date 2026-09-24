@@ -10487,9 +10487,11 @@ where
             .load_visible_exact_hot_state_batch(&request)
             .await?
             .into_rows();
-        // Only engine-owned plugin files need trusted lifecycle restoration.
-        // Plugin archives themselves have no file owner: their install/uninstall
-        // mutations must continue through ordinary plugin lifecycle validation.
+        // File-scoped engine state belongs to the file's historical snapshot.
+        // A selected file that changes its owner or create reservations must
+        // replay those rows with its content, rather than submitting them as
+        // external writes to plugin reconciliation. A plugin archive has no
+        // file-scoped owner and continues through plugin lifecycle validation.
         let plugin_owned_files = records
             .values()
             .filter_map(|record| {
@@ -10540,7 +10542,17 @@ where
             }
         }
         let mut target_change_ids = Vec::new();
-        let mut historical_files = BTreeSet::new();
+        let mut historical_files = plans
+            .iter()
+            .filter_map(|(_, (schema_key, row_pk, file_id), _, _)| {
+                let file_id = file_id.as_ref()?;
+                let key = row_pk.as_single_string().ok()?;
+                (selected_files.contains(file_id)
+                    && schema_key == KEY_VALUE_SCHEMA_KEY
+                    && (key == PLUGIN_OWNER_KEY || is_reservation_key(key)))
+                .then(|| file_id.clone())
+            })
+            .collect::<BTreeSet<_>>();
         let mut rows = RawWriteBatch::with_capacity(plans.len());
         for ((diff_id, (schema_key, row_pk, file_id), expected, target), current) in
             plans.into_iter().zip(current)
