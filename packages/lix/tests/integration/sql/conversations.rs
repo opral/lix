@@ -594,7 +594,7 @@ simulation_test!(
         assert_rows_eq(
             session
                 .execute(
-                    "SELECT id,target IS NULL,detached_target=lix_row_ref('lix_file',NULL,$2)
+                    "SELECT id,target IS NULL,detached_target=CAST(lix_row_ref('lix_file',NULL,$2) AS TEXT)
                      FROM lix_conversation WHERE id=$1",
                     &[
                         Value::Text(LOCAL_FILE_CONVERSATION.into()),
@@ -657,7 +657,7 @@ simulation_test!(
                 session
                     .execute(
                         "SELECT id,target IS NULL,
-                                detached_target=lix_row_ref($2,$3,$4)
+                                detached_target=CAST(lix_row_ref($2,$3,$4) AS TEXT)
                          FROM lix_conversation WHERE id=$1",
                         &[
                             Value::Text(conversation_id.into()),
@@ -957,7 +957,7 @@ async fn assert_conversation_merge_target_delete_and_reply(
     assert_rows_eq(
         main.execute(
             "SELECT target IS NULL,
-                    detached_target=lix_row_ref('conversation_custom_target',NULL,'custom-1')
+                    detached_target=CAST(lix_row_ref('conversation_custom_target',NULL,'custom-1') AS TEXT)
              FROM lix_conversation WHERE id=$1",
             &[Value::Text(TARGET_CONVERSATION.into())],
         )
@@ -1065,7 +1065,7 @@ async fn assert_conversation_generation_delete_merge(
     assert_rows_eq(
         main.execute(
             "SELECT target IS NULL,
-                    detached_target=lix_row_ref('conversation_custom_target',NULL,'custom-1')
+                    detached_target=CAST(lix_row_ref('conversation_custom_target',NULL,'custom-1') AS TEXT)
              FROM lix_conversation WHERE id=$1",
             &[Value::Text(GENERATION_CONVERSATION.into())],
         )
