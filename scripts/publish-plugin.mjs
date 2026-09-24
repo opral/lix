@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { PLUGIN_RELEASE_TARGETS, releaseTarget, releaseTag } from "./release.mjs";
+import { PLUGIN_RELEASE_TARGETS, releaseTarget, releaseTag, hasReleaseHistory } from "./release.mjs";
 
 const hash = bytes => createHash("sha256").update(bytes).digest("hex");
 const git = (root, ...args) => execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
@@ -53,7 +53,12 @@ function selectPluginReleasesAt(root, sha, before, target) {
       }
       const a = version.split(".").map(Number), b = previous.split(".").map(Number);
       const changed = a.findIndex((value, index) => value !== b[index]);
-      if (changed < 0 || a[changed] < b[changed]) throw new Error(`${key} release version must increase`);
+      if (changed < 0 || a[changed] < b[changed]) {
+        const firstRelease = version === "0.1.0" && previous === "0.16.1" &&
+          !hasReleaseHistory(git(root, "show", `${before}:${path}/CHANGELOG.md`)) &&
+          hasReleaseHistory(git(root, "show", `${sha}:${path}/CHANGELOG.md`));
+        if (!firstRelease) throw new Error(`${key} release version must increase`);
+      }
     }
     return [{ target: key, version, sha, tag: releaseTag(key, version) }];
   });
