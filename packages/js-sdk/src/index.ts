@@ -23,10 +23,6 @@ export type {
 	LixStorageWriteStats,
 } from "./storage-adapter.js";
 export { LixStorageError } from "./storage-adapter.js";
-export {
-	bundledPluginArchives,
-	type BundledPluginArchive,
-} from "./bundled-plugins.js";
 export { Value } from "./value.js";
 export type {
 	CreateBranchOptions,

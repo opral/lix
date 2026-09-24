@@ -1,5 +1,6 @@
 import { expect, test } from "vitest";
-import { bundledPluginArchives, openLix, type Lix } from "./index.js";
+import { openLix, type Lix } from "./index.js";
+import { loadTestPluginArchives } from "./plugin-test-archives.node.js";
 
 const encode = (text: string) => new TextEncoder().encode(text);
 const decode = (bytes: unknown) => new TextDecoder().decode(bytes as Uint8Array);
@@ -21,10 +22,10 @@ async function readFile(lix: Lix, id: string) {
 }
 
 async function installMarkdownPlugin(lix: Lix) {
-	const plugin = (await bundledPluginArchives()).find(
+	const plugin = (await loadTestPluginArchives()).find(
 		(candidate) => candidate.key === "plugin_markdown",
 	);
-	if (!plugin) throw new Error("expected bundled Markdown plugin");
+	if (!plugin) throw new Error("expected Markdown test plugin");
 	await lix.execute("INSERT INTO lix_file (path, content) VALUES ($1, $2)", [
 		`/.lix/plugins/${plugin.key}.lixplugin`,
 		plugin.archiveBytes,

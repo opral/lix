@@ -1,7 +1,7 @@
 # CSV description-amendment fixture
 
-Built with `npm run build:plugins` in `packages/js-sdk` at Lix revision
-`83b47246d` (September 18, 2026). The compiled guest and packaged schemas
+Built from the CSV plugin crate at Lix revision `83b47246d` (September 18,
+2026). The compiled guest and packaged schemas
 match. Compared with `../v2/plugin_csv.lixplugin`, the CSV row schema adds
 column descriptions without changing its structure.
 

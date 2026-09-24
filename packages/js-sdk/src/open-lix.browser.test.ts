@@ -1,9 +1,27 @@
 import { expect, test } from "vitest";
 import { registerMemoryStorageContract } from "../tests/memory-storage-contract.js";
 
+async function loadPluginTestArchives() {
+	return await Promise.all(
+		(["plugin_csv", "plugin_markdown"] as const).map(async (key) => {
+			const response = await fetch(
+				new URL(`../../lix/tests/fixtures/plugin-api/v2/${key}.lixplugin`, import.meta.url),
+			);
+			if (!response.ok)
+				throw new Error(`Could not load frozen plugin archive: ${response.status}`);
+			return {
+				key,
+				fileName: `${key}.lixplugin`,
+				archiveBytes: new Uint8Array(await response.arrayBuffer()),
+			};
+		}),
+	);
+}
+
 registerMemoryStorageContract({
 	name: "browser WASM",
 	loadSdk: async () => await import("@lix-js/sdk"),
+	loadPluginArchives: loadPluginTestArchives,
 	operationTimeoutMs: 30_000,
 });
 

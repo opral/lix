@@ -16,12 +16,12 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { expect, test } from "vitest";
 import {
-	bundledPluginArchives,
 	openLix,
 	Value,
 	type ExecuteResult,
 	type Lix,
 } from "./index.js";
+import { loadTestPluginArchives } from "./plugin-test-archives.node.js";
 import { FilesystemStorage } from "../../storage-filesystem/dist/index.js";
 import { registerMemoryStorageContract } from "../tests/memory-storage-contract.js";
 import { wrapExecuteResult } from "./result.js";
@@ -33,6 +33,7 @@ const CONFLICT_DRAFT_BRANCH_ID = "01920000-0000-7000-8000-000000000403";
 registerMemoryStorageContract({
 	name: "Node native",
 	loadSdk: async () => await import("./index.js"),
+	loadPluginArchives: loadTestPluginArchives,
 });
 
 test("SQLite is not part of the JavaScript SDK export surface", async () => {
@@ -45,6 +46,11 @@ test("parseSqlScript is not part of the JavaScript SDK export surface", async ()
 	expect("parseSqlScript" in sdk).toBe(false);
 	expect("SqlScriptPlan" in sdk).toBe(false);
 	expect("SqlScriptStatement" in sdk).toBe(false);
+});
+
+test("plugin archives are not part of the JavaScript SDK export surface", async () => {
+	const sdk = await import("./index.js");
+	expect("bundledPluginArchives" in sdk).toBe(false);
 });
 
 test("snapshot streams restore a complete Lix deterministically", async () => {
@@ -1481,10 +1487,10 @@ test("fs storage imports files through installed WASM plugins", async () => {
 		syncAllFiles: false,
 	});
 	const lix = await openLix({ storage });
-	const markdownPlugin = (await bundledPluginArchives()).find(
+	const markdownPlugin = (await loadTestPluginArchives()).find(
 		(plugin) => plugin.key === "plugin_markdown",
 	);
-	if (!markdownPlugin) throw new Error("expected bundled Markdown plugin");
+	if (!markdownPlugin) throw new Error("expected Markdown test plugin");
 
 	await upsertPluginArchive(
 		lix,
@@ -1771,9 +1777,9 @@ test("transaction SQL file writes use transaction execution", async () => {
 	await lix.close();
 });
 
-test("SQL plugin archive upsert installs bundled plugin archive schemas", async () => {
+test("SQL plugin archive upsert installs plugin archive schemas", async () => {
 	const lix = await openLix();
-	const plugins = await bundledPluginArchives();
+	const plugins = await loadTestPluginArchives();
 
 	for (const plugin of plugins) {
 		await upsertPluginArchive(lix, plugin.key, plugin.archiveBytes);
@@ -1802,11 +1808,11 @@ test("SQL plugin archive upsert installs bundled plugin archive schemas", async 
 
 test("SQL plugin archive upsert stores the archive and installs schemas", async () => {
 	const lix = await openLix();
-	const csvPlugin = (await bundledPluginArchives()).find(
+	const csvPlugin = (await loadTestPluginArchives()).find(
 		(plugin) => plugin.key === "plugin_csv",
 	);
 	if (!csvPlugin) {
-		throw new Error("expected bundled CSV plugin");
+		throw new Error("expected CSV test plugin");
 	}
 
 	await upsertPluginArchive(lix, csvPlugin.key, csvPlugin.archiveBytes);
@@ -1834,10 +1840,10 @@ test("SQL plugin archive upsert stores the archive and installs schemas", async 
 
 test("transactions preserve acknowledged plugin files when saving stale bytes", async () => {
 	const lix = await openLix();
-	const csvPlugin = (await bundledPluginArchives()).find(
+	const csvPlugin = (await loadTestPluginArchives()).find(
 		(plugin) => plugin.key === "plugin_csv",
 	);
-	if (!csvPlugin) throw new Error("expected bundled CSV plugin");
+	if (!csvPlugin) throw new Error("expected CSV test plugin");
 	await upsertPluginArchive(lix, csvPlugin.key, csvPlugin.archiveBytes);
 	const path = "/transaction-views.csv";
 	const write =
@@ -1874,13 +1880,13 @@ test("transactions preserve acknowledged plugin files when saving stale bytes", 
 	}
 });
 
-test("bundled Markdown plugin executes detect-changes and render", async () => {
+test("Markdown plugin executes detect-changes and render", async () => {
 	const lix = await openLix();
-	const markdownPlugin = (await bundledPluginArchives()).find(
+	const markdownPlugin = (await loadTestPluginArchives()).find(
 		(plugin) => plugin.key === "plugin_markdown",
 	);
 	if (!markdownPlugin) {
-		throw new Error("expected bundled Markdown plugin");
+		throw new Error("expected Markdown test plugin");
 	}
 
 	await upsertPluginArchive(

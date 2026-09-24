@@ -40,8 +40,4 @@ Use the plugin publishing workflow's manual retry with the original plugin and r
 
 A retry verifies the source tag and asset checksums. Matching published releases are left unchanged; missing draft assets can be uploaded. A different tag target or different existing asset bytes causes a failure instead of overwriting a published version. Correct the source or investigate the mismatch before retrying.
 
-## SDK transition
-
-The SDK's existing CSV and Markdown bundling temporarily delegates to the same packager. Removing bundled SDK archives and `bundledPluginArchives()` is a separate follow-up after compiled GitHub releases are available.
-
 See [Installing and managing plugins](plugins.md) for the user-facing download and installation flow, and [Plugin API compatibility](plugin-api-versioning.md) for the compatibility contract.
