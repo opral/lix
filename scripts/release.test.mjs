@@ -387,6 +387,7 @@ function releaseFixture() {
 	put("packages/lix/Cargo.toml", '[package]\nname = "lix"\nversion.workspace = true\n');
 	for (const key of ["json", "csv"]) {
 		put(`plugins/${key}/Cargo.toml`, `[package]\nname = "plugin_${key}"\nversion = "0.16.1"\n`);
+		put(`plugins/${key}/CHANGELOG.md`, "# Changelog\n\n## 0.16.1\n\nPrevious release.\n");
 	}
 	for (const path of ["js-sdk", "storage-filesystem", "storage-opfs"]) {
 		put(`packages/${path}/package.json`, JSON.stringify({ name: `@lix-js/${path === "js-sdk" ? "sdk" : path}`, version: "0.16.1" }));
@@ -429,7 +430,7 @@ test("default Lix release leaves plugin versions and fragments independent", () 
 	assert.equal(currentVersion(root, "plugin_csv"), "0.16.1");
 	assert.deepEqual(loadChanges(root).map(change => change.target).sort(), ["plugin_csv", "plugin_json"]);
 	assert.doesNotMatch(readFileSync(join(root, "CHANGELOG.md"), "utf8"), /JSON feature|CSV fix/);
-	assert.equal(existsSync(join(root, "plugins/json/CHANGELOG.md")), false);
+	assert.doesNotMatch(readFileSync(join(root, "plugins/json/CHANGELOG.md"), "utf8"), /JSON feature/);
 });
 
 test("manual Lix releases never consume plugin fragments", () => {
@@ -475,4 +476,15 @@ test("mistyped or duplicate target metadata cannot silently become a Lix note", 
 		put(".changenotes/invalid.md", `---\ntype: patch\n${metadata}\n---\n\nInvalid.\n`);
 		assert.throws(() => loadChanges(root), /frontmatter field/);
 	}
+});
+
+
+test("first plugin releases start at 0.1.0 and subsequent releases increment", () => {
+  const { root, put } = releaseFixture();
+  put("plugins/json/CHANGELOG.md", "# Changelog\n");
+  const first = prepareRelease(root, { ...preparation, target: "plugin_json" });
+  assert.equal(first.version, "0.1.0");
+  assert.equal(first.tag, "plugin_json/v0.1.0");
+  put(".changenotes/json-next.md", "---\ntype: patch\ntarget: plugin_json\n---\n\nNext fix.\n");
+  assert.equal(prepareRelease(root, { ...preparation, target: "plugin_json" }).version, "0.1.1");
 });
