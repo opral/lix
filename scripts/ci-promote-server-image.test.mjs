@@ -56,6 +56,36 @@ test("promotion retains tested layers and rewrites both receipt and image identi
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("release promotion sets and checks the version label", () => {
+  const directory = mkdtempSync(join(tmpdir(), "server-promotion-test-"));
+  try {
+    writeFileSync(join(directory, "server-linux-x64.json"), JSON.stringify(manifest));
+    const run = (_command, args) => {
+      if (args[0] === "build") {
+        assert.match(readFileSync(join(args.at(-1), "Dockerfile"), "utf8"),
+          /LABEL org\.opencontainers\.image\.version=1\.2\.3\n/);
+      }
+      if (args[0] === "image") return JSON.stringify([args.at(-1).endsWith(revision)
+        ? { ...source, Config: { ...source.Config,
+          Env: ["TEST_VALUE=preserved", `LIX_SOURCE_REVISION=${revision}`],
+          Labels: { "org.opencontainers.image.revision": revision,
+            "org.opencontainers.image.version": "1.2.3" } } } : source]);
+    };
+    promoteServerImage({ directory, sourceRevision, revision, sourceRun: "42", version: "1.2.3", run });
+    const missingVersion = (_command, args) => {
+      if (args[0] === "image") return JSON.stringify([args.at(-1).endsWith(revision)
+        ? { ...source, Config: { ...source.Config,
+          Env: ["TEST_VALUE=preserved", `LIX_SOURCE_REVISION=${revision}`],
+          Labels: { "org.opencontainers.image.revision": revision } } } : source]);
+    };
+    writeFileSync(join(directory, "server-linux-x64.json"), JSON.stringify(manifest));
+    assert.throws(() => promoteServerImage({ directory, sourceRevision, revision, sourceRun: "42",
+      version: "1.2.3", run: missingVersion }), /version label/);
+    assert.throws(() => promoteServerImage({ directory, sourceRevision, revision, sourceRun: "42",
+      version: "1.2.3\\nRUN evil", run }), /Invalid server image version label/);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("changed filesystem layers fail without publishing a replacement receipt", () => {
   const directory = mkdtempSync(join(tmpdir(), "server-promotion-test-"));
   try {
@@ -79,11 +109,12 @@ test("real Docker archive loads with landed revision and unchanged layers", { sk
     docker(["build", "--tag", manifest.image, directory]);
     docker(["save", "--output", join(directory, "lix-server-image.tar"), manifest.image]);
     writeFileSync(join(directory, "server-linux-x64.json"), JSON.stringify(manifest));
-    const result = promoteServerImage({ directory, sourceRevision, revision, sourceRun: "42", run: (_cmd, args) => docker(args) });
+    const result = promoteServerImage({ directory, sourceRevision, revision, sourceRun: "42", version: "1.2.3", run: (_cmd, args) => docker(args) });
     docker(["image", "rm", result.image]);
     docker(["load", "--input", join(directory, "lix-server-image.tar")]);
     const loaded = JSON.parse(docker(["image", "inspect", result.image]))[0];
     validateServerImage(result, loaded, revision);
+    assert.equal(loaded.Config.Labels["org.opencontainers.image.version"], "1.2.3");
     const original = JSON.parse(docker(["image", "inspect", manifest.image]))[0];
     assert.deepEqual(loaded.RootFS.Layers, original.RootFS.Layers);
     assert.deepEqual(loaded.Config.Cmd, ["do-not-run"]);
