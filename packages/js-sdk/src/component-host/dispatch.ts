@@ -1,8 +1,5 @@
-import type {
-  compileComponent,
-  ComponentInstance,
-  ComponentLimits,
-} from "./index.js";
+import { compileComponent } from "./index.js";
+import type { ComponentInstance, ComponentLimits } from "./index.js";
 
 export type ComponentRequest = {
   operation: string;
@@ -63,7 +60,6 @@ export function createComponentDispatch(): (
         try {
           if (!(request.bytes instanceof Uint8Array))
             throw new Error("Missing component bytes");
-          const { compileComponent } = await import("./index.js");
           const factory = await compileComponent(
             request.bytes,
             data.limits as ComponentLimits,
