@@ -1266,7 +1266,7 @@ pub(crate) async fn build_path_index(
 /// Read only selected file owners and the directory ancestry needed to resolve
 /// their paths. Each depth batches independent parents; visited IDs bound cycles,
 /// whose semantic error remains the ordinary path constructor's responsibility.
-async fn read_path_index_rows(
+pub(crate) async fn read_path_index_rows(
     hot_state: &dyn HotStateReader,
     request: &FilesystemPathIndexRequest,
 ) -> Result<MaterializedHotStateBatch, LixError> {

@@ -13,9 +13,12 @@ Lix exposes a small set of runtime functions. JSON uses PostgreSQL casts and ope
 | `lix_active_branch_commit_id()`         | text        | Active branch head pinned for the statement.                                      |
 | `lix_root_commit_id()`                  | text        | Repository bootstrap root.                                                        |
 | `lix_row_ref(relation, file_id, primary_key...)` | row_ref     | Opaque address of one relation row, including file scope and composite keys.       |
+| `lix_row_ref_parts(ref)`            | jsonb       | Read a canonical row reference as relation, file ID, and typed primary-key parts. |
 | `lix_order_between(previous, next)`     | text        | Allocate a plugin row order key between exclusive bounds; NULL means an open end. |
 | `uuidv7()`                              | uuid        | Generate a UUIDv7 value.                                                          |
 | `CURRENT_TIMESTAMP`                     | timestamptz | Transaction-start instant at microsecond precision.                               |
+
+## Row references
 
 `lix_row_ref` always takes the relation name, its file scope, and the typed
 primary-key values in declared order. Pass SQL `NULL` for fileless rows,
@@ -35,23 +38,44 @@ candidate state. Construction validates the relation and key types without
 requiring the target row to exist. References are opaque; store and pass them
 unchanged. The v2 encoding rejects legacy v1 references.
 
-ROW_REF values support identity equality with other ROW_REF values. Cast a
-reference to `TEXT` explicitly to compare or order its encoded representation.
+`lix_row_ref_parts` reads a reference without changing its stored identity. It
+returns `{"relation": ..., "file_id": ..., "primary_key": [{"type": ..., "value": ...}]}`.
+The key components stay in primary-key order; every `value` is a string, including
+integer and byte keys. A fileless reference has JSON `null` for `file_id`.
+SQL `NULL` returns SQL `NULL`, while a malformed reference raises an error.
+Use PostgreSQL JSON operators to read individual parts:
 
-To enforce a stored reference, declare a `text` column and a schema-level
-`row_refs` constraint:
+```sql
+SELECT lix_row_ref_parts(target) ->> 'relation'
+FROM lix_conversation WHERE id = $1;
+```
+
+ROW_REF values support identity equality with other ROW_REF values. As in
+PostgreSQL, a string literal or a TEXT parameter compared with a ROW_REF takes
+the ROW_REF type, so it must be a canonical reference; a malformed one raises a
+type error. Any other TEXT value, such as a text column, requires an explicit
+cast: `CAST(target AS TEXT) = title`. Cast a reference to `TEXT` to compare or
+order its encoded representation.
+
+To store a reference, declare a `row_ref` column. Its SQL type is `ROW_REF`
+in queries, `RETURNING`, `lix_diff`, `lix_history`, and `information_schema`.
+Writes accept a `ROW_REF` value or the canonical reference text:
 
 ```json
+"columns": [{"name": "target", "type": "row_ref", "nullable": true}],
 "row_refs": [{"column": "target", "on_delete": "cascade"}]
 ```
 
-The referenced row must exist in the current branch, including pending writes.
-The target may belong to another file or relation. SQL NULL is allowed when the
-column is nullable. Omitting `on_delete` uses `no_action`, which rejects an
-invalid final relationship. `cascade` deletes referencing rows as part of the
-modifying statement, so subsequent statements see the deletion and rollback
-restores both rows. Merge preview and execution apply the same actions to the
-candidate state. Merely constructing a reference does not enable enforcement.
+A written reference must resolve to a row in the current branch, including
+pending writes. The target may belong to another file or relation. SQL NULL is
+allowed when the column is nullable. `row_refs` sets what deleting the target
+does; a column without an entry uses `no_action`, which rejects the delete while
+a row references it. `cascade` deletes referencing rows as part of the modifying
+statement, so subsequent statements see the deletion and rollback restores both
+rows. `detach` leaves referencing rows untouched: the reference keeps its value
+and is no longer enforced for that row until its target returns. Merge preview
+and execution apply the same actions to the candidate state. See
+[Schema v1](../packages/lix-schema/schema/schema-v1.md#row-references).
 
 Construct references directly in writes as well as queries:
 

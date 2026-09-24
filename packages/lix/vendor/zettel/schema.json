@@ -1,0 +1,591 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zettel.dev/schema/1/schema.json",
+  "title": "Zettel document",
+  "description": "Canonical GFM document. Node keys are document-unique; marks reference definitions local to a text block or table cell.",
+  "type": "object",
+  "properties": {
+    "_type": {
+      "const": "zettel_doc"
+    },
+    "blocks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/block"
+      },
+      "minItems": 0
+    }
+  },
+  "required": [
+    "_type",
+    "blocks"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "link": {
+      "type": "object",
+      "properties": {
+        "_type": {
+          "const": "zettel_link"
+        },
+        "_key": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "href": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "_type",
+        "_key",
+        "href"
+      ],
+      "additionalProperties": false,
+      "description": "Shared annotation referenced by its _key from inline marks."
+    },
+    "span": {
+      "type": "object",
+      "properties": {
+        "_type": {
+          "const": "zettel_span"
+        },
+        "_key": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1
+        },
+        "marks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 0
+        }
+      },
+      "required": [
+        "_type",
+        "_key",
+        "text",
+        "marks"
+      ],
+      "additionalProperties": false,
+      "description": "Nonempty text run. Marks are decorators or local link keys. LF is a soft break."
+    },
+    "break": {
+      "type": "object",
+      "properties": {
+        "_type": {
+          "const": "zettel_break"
+        },
+        "_key": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "marks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 0
+        }
+      },
+      "required": [
+        "_type",
+        "_key",
+        "marks"
+      ],
+      "additionalProperties": false,
+      "description": "Explicit hard line break, distinct from a soft newline in text."
+    },
+    "image": {
+      "type": "object",
+      "properties": {
+        "_type": {
+          "const": "zettel_image"
+        },
+        "_key": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "src": {
+          "type": "string"
+        },
+        "alt": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "marks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 0
+        }
+      },
+      "required": [
+        "_type",
+        "_key",
+        "src",
+        "alt",
+        "marks"
+      ],
+      "additionalProperties": false,
+      "description": "Inline image; marks allow linked images. Asset storage is outside the format."
+    },
+    "inlineHtml": {
+      "type": "object",
+      "properties": {
+        "_type": {
+          "const": "zettel_html_inline"
+        },
+        "_key": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "value": {
+          "type": "string"
+        },
+        "marks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 0
+        }
+      },
+      "required": [
+        "_type",
+        "_key",
+        "value",
+        "marks"
+      ],
+      "additionalProperties": false,
+      "description": "Literal inline HTML source, preserved for Markdown and displayed inertly by default."
+    },
+    "text": {
+      "type": "object",
+      "properties": {
+        "_type": {
+          "const": "zettel_block"
+        },
+        "_key": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "style": {
+          "enum": [
+            "normal",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6"
+          ]
+        },
+        "children": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/inline"
+          },
+          "minItems": 0
+        },
+        "markDefs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/link"
+          },
+          "minItems": 0
+        }
+      },
+      "required": [
+        "_type",
+        "_key",
+        "style",
+        "children",
+        "markDefs"
+      ],
+      "additionalProperties": false,
+      "description": "Paragraph or heading; annotations are local to this block."
+    },
+    "listItem": {
+      "type": "object",
+      "properties": {
+        "_type": {
+          "const": "zettel_list_item"
+        },
+        "_key": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "blocks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/block"
+          },
+          "minItems": 0
+        },
+        "spread": {
+          "type": "boolean"
+        },
+        "checked": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "_type",
+        "_key",
+        "blocks",
+        "spread"
+      ],
+      "additionalProperties": false,
+      "description": "One item owns all its blocks. checked is present only for task items."
+    },
+    "list": {
+      "type": "object",
+      "properties": {
+        "_type": {
+          "const": "zettel_list"
+        },
+        "_key": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "kind": {
+          "enum": [
+            "bullet",
+            "number"
+          ]
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 999999999
+        },
+        "spread": {
+          "type": "boolean"
+        },
+        "items": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/listItem"
+          },
+          "minItems": 1
+        }
+      },
+      "required": [
+        "_type",
+        "_key",
+        "kind",
+        "spread",
+        "items"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "number"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "start"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "start"
+              ]
+            }
+          }
+        }
+      ],
+      "description": "Explicit list container; numbered lists require start. spread denotes loose layout."
+    },
+    "quote": {
+      "type": "object",
+      "properties": {
+        "_type": {
+          "const": "zettel_quote"
+        },
+        "_key": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "blocks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/block"
+          },
+          "minItems": 0
+        }
+      },
+      "required": [
+        "_type",
+        "_key",
+        "blocks"
+      ],
+      "additionalProperties": false,
+      "description": "An ordered sequence of blocks inside a quotation."
+    },
+    "code": {
+      "type": "object",
+      "properties": {
+        "_type": {
+          "const": "zettel_code"
+        },
+        "_key": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "code": {
+          "type": "string"
+        },
+        "language": {
+          "type": "string"
+        },
+        "meta": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "_type",
+        "_key",
+        "code"
+      ],
+      "additionalProperties": false,
+      "description": "Literal code with optional fence language and metadata."
+    },
+    "rule": {
+      "type": "object",
+      "properties": {
+        "_type": {
+          "const": "zettel_rule"
+        },
+        "_key": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+$"
+        }
+      },
+      "required": [
+        "_type",
+        "_key"
+      ],
+      "additionalProperties": false,
+      "description": "Thematic break."
+    },
+    "tableCell": {
+      "type": "object",
+      "properties": {
+        "_type": {
+          "const": "zettel_table_cell"
+        },
+        "_key": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "children": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/inline"
+          },
+          "minItems": 0
+        },
+        "markDefs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/link"
+          },
+          "minItems": 0
+        }
+      },
+      "required": [
+        "_type",
+        "_key",
+        "children",
+        "markDefs"
+      ],
+      "additionalProperties": false,
+      "description": "Inline table content with local annotation definitions."
+    },
+    "tableRow": {
+      "type": "object",
+      "properties": {
+        "_type": {
+          "const": "zettel_table_row"
+        },
+        "_key": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "cells": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/tableCell"
+          },
+          "minItems": 1
+        }
+      },
+      "required": [
+        "_type",
+        "_key",
+        "cells"
+      ],
+      "additionalProperties": false,
+      "description": "One ordered row of table cells."
+    },
+    "table": {
+      "type": "object",
+      "properties": {
+        "_type": {
+          "const": "zettel_table"
+        },
+        "_key": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "align": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "left",
+              "right",
+              "center",
+              null
+            ]
+          },
+          "minItems": 1
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/tableRow"
+          },
+          "minItems": 1
+        }
+      },
+      "required": [
+        "_type",
+        "_key",
+        "align",
+        "rows"
+      ],
+      "additionalProperties": false,
+      "description": "Rectangular GFM table; first row is header. align has one entry per column."
+    },
+    "html": {
+      "type": "object",
+      "properties": {
+        "_type": {
+          "const": "zettel_html"
+        },
+        "_key": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "_type",
+        "_key",
+        "value"
+      ],
+      "additionalProperties": false,
+      "description": "Literal HTML block source. Rendering is inert by default."
+    },
+    "inline": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/span"
+        },
+        {
+          "$ref": "#/$defs/break"
+        },
+        {
+          "$ref": "#/$defs/image"
+        },
+        {
+          "$ref": "#/$defs/inlineHtml"
+        },
+        {
+          "$ref": "#/$defs/extensionInline"
+        }
+      ]
+    },
+    "block": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/text"
+        },
+        {
+          "$ref": "#/$defs/list"
+        },
+        {
+          "$ref": "#/$defs/quote"
+        },
+        {
+          "$ref": "#/$defs/code"
+        },
+        {
+          "$ref": "#/$defs/rule"
+        },
+        {
+          "$ref": "#/$defs/table"
+        },
+        {
+          "$ref": "#/$defs/html"
+        },
+        {
+          "$ref": "#/$defs/extensionBlock"
+        }
+      ]
+    },
+    "extensionInline": {
+      "not": {},
+      "description": "Application-defined inline nodes; disabled in the core schema."
+    },
+    "extensionBlock": {
+      "not": {},
+      "description": "Application-defined blocks; disabled in the core schema."
+    }
+  },
+  "examples": [
+    {
+      "_type": "zettel_doc",
+      "blocks": [
+        {
+          "_type": "zettel_block",
+          "_key": "p1",
+          "style": "normal",
+          "markDefs": [],
+          "children": [
+            {
+              "_type": "zettel_span",
+              "_key": "s1",
+              "text": "Hello, world.",
+              "marks": []
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

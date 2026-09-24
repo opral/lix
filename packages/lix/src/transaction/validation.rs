@@ -585,6 +585,7 @@ pub(crate) async fn validate_prepared_writes(
                 "lix.perf.validation.committed_row_refs"
             ))
             .await?;
+    let unresolved_row_refs = retain_written_row_refs(&input, unresolved_row_refs).await?;
     reject_unresolved_row_refs(&unresolved_row_refs)?;
     validate_committed_delete_restrictions(&input, input.schema_catalog, &pending_constraints)
         .instrument(tracing::debug_span!(
@@ -2974,12 +2975,14 @@ impl PendingConstraintIndexes {
                 row.schema_key(),
                 &row_ref.column,
             )?;
+            let detach = row_ref.on_delete == lix_schema::DeleteAction::Detach;
             self.row_ref_references
                 .entry(target.clone())
                 .or_default()
                 .push(PendingRowRefReference {
                     identity: row.domain_row_identity(),
                     column: row_ref.column.clone(),
+                    detach,
                 });
             self.row_ref_targets
                 .entry(row.domain_row_identity())
@@ -2988,6 +2991,7 @@ impl PendingConstraintIndexes {
                     column: row_ref.column.clone(),
                     encoded_target: encoded,
                     target: target.clone(),
+                    detach,
                 });
         }
         Ok(())
@@ -3130,7 +3134,9 @@ impl PendingConstraintIndexes {
                     .into_iter()
                     .flat_map(|references| references.iter())
             })
-            .filter(|reference| !self.tombstones_target_identity(&reference.identity))
+            .filter(|reference| {
+                !reference.detach && !self.tombstones_target_identity(&reference.identity)
+            })
             .collect()
     }
 
@@ -3198,6 +3204,8 @@ struct PendingForeignKeyReference {
 struct PendingRowRefReference {
     identity: DomainRowIdentity,
     column: String,
+    /// A `detach` reference never restricts deleting its target.
+    detach: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3205,6 +3213,7 @@ struct PendingRowRefTarget {
     column: String,
     encoded_target: String,
     target: DomainRowIdentity,
+    detach: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -3705,7 +3714,11 @@ async fn validate_committed_delete_restrictions(
             tombstone.identity.row_pk(),
         ) {
             let value = UniqueConstraintValue::from_row_ref(encoded.as_str());
-            for reference in delete_schema_catalog.row_ref_references() {
+            for reference in delete_schema_catalog
+                .row_ref_references()
+                .iter()
+                .filter(|reference| reference.row_ref.on_delete != lix_schema::DeleteAction::Detach)
+            {
                 for source_domain in row_ref_source_domains(&tombstone.identity) {
                     normal_batches
                         .entry(NormalDeleteRestrictionBatchKey {
@@ -3944,6 +3957,8 @@ struct UnresolvedRowRefCheck {
     encoded_target: String,
     target: DomainRowIdentity,
     target_exists_in_global_scope: bool,
+    detach: bool,
+    selects_existing_change: bool,
 }
 
 fn row_ref_text_from_payload(
@@ -4026,6 +4041,8 @@ fn validate_pending_row_refs(
                 encoded_target: target.encoded_target.clone(),
                 target: target.target.clone(),
                 target_exists_in_global_scope: false,
+                detach: target.detach,
+                selects_existing_change: row.selects_existing_change(),
             });
         }
     }
@@ -4184,6 +4201,54 @@ async fn committed_global_row_ref_targets(
         }
     }
     Ok(matched)
+}
+
+/// A `detach` reference may outlive its target, so it must resolve only when a
+/// write sets it. A merge pick selects a change whose value resolved when it
+/// was written, and a write that keeps the committed value, such as an UPDATE
+/// of another column of a detached row, does not set it.
+async fn retain_written_row_refs(
+    input: &TransactionValidationInput<'_>,
+    unresolved_checks: Vec<UnresolvedRowRefCheck>,
+) -> Result<Vec<UnresolvedRowRefCheck>, LixError> {
+    let mut retained = Vec::with_capacity(unresolved_checks.len());
+    for check in unresolved_checks {
+        if !check.detach {
+            retained.push(check);
+            continue;
+        }
+        if check.selects_existing_change {
+            continue;
+        }
+        let domain = check.source_identity.domain();
+        let committed = load_committed_constraint_rows(
+            input.hot_state,
+            domain,
+            &check.source_schema_key,
+            check.source_identity.row_pk_owned(),
+            false,
+        )
+        .await?;
+        let written_value = Some(UniqueConstraintValue::from_row_ref(&check.encoded_target));
+        let mut unchanged = false;
+        for row in committed.iter() {
+            if !domain.contains_canonical_ref(row) || row.row_pk() != check.source_identity.row_pk()
+            {
+                continue;
+            }
+            unchanged = committed_constraint_value(
+                input.schema_catalog,
+                row,
+                &[vec![check.source_column.clone()]],
+                true,
+            )? == written_value;
+            break;
+        }
+        if !unchanged {
+            retained.push(check);
+        }
+    }
+    Ok(retained)
 }
 
 fn reject_unresolved_row_refs(unresolved_checks: &[UnresolvedRowRefCheck]) -> Result<(), LixError> {
@@ -9876,10 +9941,9 @@ mod tests {
             "key": "row_ref_child_schema",
             "columns": [
                 { "name": "id", "type": "text", "nullable": false },
-                { "name": "target", "type": "text", "nullable": true },
+                { "name": "target", "type": "row_ref", "nullable": true },
             ],
             "primary_key": ["id"],
-            "row_refs": [{ "column": "target" }],
         })
     }
 
@@ -10609,10 +10673,9 @@ mod tests {
             "key": "native_row_ref_child",
             "columns": [
                 { "name": "id", "type": "text", "nullable": false },
-                { "name": "target", "type": "text", "nullable": true }
+                { "name": "target", "type": "row_ref", "nullable": true }
             ],
-            "primary_key": ["id"],
-            "row_refs": [{ "column": "target" }]
+            "primary_key": ["id"]
         });
         let catalog = CatalogSnapshot::from_visible_schemas(&[parent, child])
             .expect("native row-reference catalog should build");

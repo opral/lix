@@ -63,14 +63,14 @@ VALUES ('acme_section', '{
 Schema v1 supports:
 
 - PostgreSQL type names `text`, `uuid`, `int8`, `float8`, `boolean`, `jsonb`,
-  and `timestamptz`;
+  and `timestamptz`, plus the Lix type `row_ref`;
 - ordered columns, a required non-empty `primary_key`, unique constraints,
-  and foreign keys;
+  foreign keys, and row-reference delete actions;
 - `nullable`, `default_value`, and the `uuidv7()` and `CURRENT_TIMESTAMP`
   default expressions; and
 - `description`, `examples`, and `deprecated` annotations.
 
-Identifiers must be lowercase `snake_case` and no longer than PostgreSQL's 63-byte identifier limit. Primary-key columns must be non-null `text`, `uuid`, or `int8`. Composite keys preserve their declared order:
+Identifiers must be lowercase `snake_case` and no longer than PostgreSQL's 63-byte identifier limit. Primary-key columns must be non-null `text`, `uuid`, `int8`, or `row_ref`. Composite keys preserve their declared order:
 
 ```json
 "primary_key": ["order_id", "line_number"],
@@ -93,9 +93,18 @@ Omitted options use PostgreSQL defaults: `MATCH SIMPLE`, `ON DELETE NO ACTION`, 
 
 `jsonb` accepts any JSON value but does not validate nested structure. It discards whitespace, object-key order, duplicate keys, and numeric spelling. Use `text` when lexical preservation matters.
 
+A `row_ref` column stores a reference to a row of any relation, as returned by `lix_row_ref(relation, file_id, key...)`, and reads as SQL `ROW_REF`. A reference must resolve to an existing row when it is written. `row_refs` sets what deleting the referenced row does: `cascade` deletes the referencing row, `detach` leaves it untouched with its reference unenforced, and a column without an entry rejects the delete:
+
+```json
+"columns": [{ "name": "target", "type": "row_ref", "nullable": true }],
+"row_refs": [{ "column": "target", "on_delete": "detach" }]
+```
+
+See [SQL functions](./sql-functions.md#row-references) and [Schema v1](../packages/lix-schema/schema/schema-v1.md#row-references).
+
 ## Amendments
 
-Re-registering the same key is an amendment. Lix permits documentation-only changes and appending a nullable column or a column with a compatible default. Lix rejects everything else: key changes, removing or renaming or reordering or retyping a column, changing a column's nullability or default, and changing a primary key, unique constraint, or foreign key. Use a new schema key for an incompatible model until an explicit migration API exists.
+Re-registering the same key is an amendment. Lix permits documentation-only changes and appending a nullable column or a column with a compatible default. Lix rejects everything else: key changes, removing or renaming or reordering or retyping a column, changing a column's nullability or default, and changing a primary key, unique constraint, foreign key, or `row_refs` entry. Use a new schema key for an incompatible model until an explicit migration API exists.
 
 When an amendment adds a literal or expression default (`uuidv7()` or `CURRENT_TIMESTAMP`), Lix materializes the default once for each existing row in the affected schema scope, in the same transaction as the amendment. Explicit values remain unchanged. Materialized values survive repeated reads, updates, and reopening; rolling back the amendment also rolls back its row changes. Historical commits retain their original snapshots.
 

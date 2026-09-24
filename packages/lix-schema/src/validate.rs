@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use serde_json::Value;
 
-use crate::{Column, DataType, Error, ErrorKind, SCHEMA_V1_URI, Schema};
+use crate::{Column, DataType, DeleteAction, Error, ErrorKind, SCHEMA_V1_URI, Schema};
 
 pub(crate) fn validate_schema(schema: &Schema) -> Result<(), Error> {
     if schema.schema != SCHEMA_V1_URI {
@@ -32,11 +32,11 @@ pub(crate) fn validate_schema(schema: &Schema) -> Result<(), Error> {
             .unwrap();
         if !matches!(
             value.data_type,
-            DataType::Text | DataType::Uuid | DataType::Int8
+            DataType::Text | DataType::Uuid | DataType::Int8 | DataType::RowRef
         ) {
             return definition(
                 "/primary_key",
-                format!("primary-key column '{column}' must use text, uuid, or int8"),
+                format!("primary-key column '{column}' must use text, uuid, int8, or row_ref"),
             );
         }
         if value.nullable {
@@ -79,6 +79,12 @@ pub(crate) fn validate_schema(schema: &Schema) -> Result<(), Error> {
         if foreign_key.columns.len() != foreign_key.references.columns.len() {
             return definition(path, "local and referenced column counts must match");
         }
+        if foreign_key.on_delete == DeleteAction::Detach {
+            return definition(
+                format!("{path}/on_delete"),
+                "detach is supported only for row_refs",
+            );
+        }
     }
     let mut row_ref_columns = BTreeSet::new();
     for (index, row_ref) in schema.row_refs.iter().enumerate() {
@@ -96,13 +102,19 @@ pub(crate) fn validate_schema(schema: &Schema) -> Result<(), Error> {
         if !row_ref_columns.insert(row_ref.column.as_str()) {
             return definition(
                 format!("{path}/column"),
-                "duplicates an earlier row-reference constraint",
+                "duplicates an earlier row-reference delete action",
             );
         }
-        if column.data_type != DataType::Text {
+        if column.data_type != DataType::RowRef {
             return definition(
                 format!("{path}/column"),
-                format!("row-reference column '{}' must use text", row_ref.column),
+                format!("column '{}' must use row_ref", row_ref.column),
+            );
+        }
+        if row_ref.on_delete == DeleteAction::NoAction {
+            return definition(
+                format!("{path}/on_delete"),
+                "must be cascade or detach; omit the entry for no_action",
             );
         }
     }
@@ -154,6 +166,8 @@ fn validate_default(data_type: DataType, value: &Value, path: &str) -> Result<()
         DataType::Boolean => value.is_boolean(),
         DataType::Jsonb => true,
         DataType::Timestamptz => value.as_str().is_some_and(crate::row::is_rfc3339_timestamp),
+        // A reference must resolve when it is written; a constant cannot.
+        DataType::RowRef => false,
     };
     if valid {
         Ok(())

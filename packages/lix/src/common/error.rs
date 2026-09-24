@@ -475,7 +475,11 @@ impl From<crate::storage_adapter::StorageError> for LixError {
                 Self::CODE_TRANSACTION_CONFLICT,
                 "transaction snapshot is stale because tracked state changed before commit",
             )
-            .with_hint("Retry the transaction against the latest committed state."),
+            .with_hint("Retry the transaction against the latest committed state.")
+            .with_details(json!({
+                "retryable": true,
+                "reason": "commitRaced",
+            })),
             crate::storage_adapter::StorageError::Fenced => Self::new(
                 Self::CODE_STORAGE_FENCED,
                 "the storage writer was fenced by a newer client",

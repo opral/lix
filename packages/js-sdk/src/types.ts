@@ -297,6 +297,21 @@ export type CommitReceipt = {
 	commit: CommitSpan | null;
 };
 
+export type TransactionOptions = {
+	/**
+	 * How many times `lix.transaction()` reruns its callback after a
+	 * `LIX_TRANSACTION_CONFLICT`. Defaults to 3; `0` fails on the first conflict.
+	 */
+	maxRetries?: number;
+};
+
+export type TransactionResult<T> = CommitReceipt & {
+	/** The callback's return value from the attempt that committed. */
+	value: T;
+	/** How many times the callback was rerun after a conflict. */
+	retries: number;
+};
+
 export type ExecuteBatchStatementResult<TRow extends object = ResultObjectRow> =
 	StatementResult<TRow> & { statementIndex: number };
 

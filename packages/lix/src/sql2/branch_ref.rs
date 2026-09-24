@@ -14,6 +14,39 @@ pub(super) struct CachingBranchRefReader {
     heads: Mutex<HashMap<String, Option<BranchHead>>>,
 }
 
+/// Records the branch heads a transaction actually consulted, including heads
+/// outside its active branch. The commit fence can then validate those refs.
+pub(super) struct RecordingBranchRefReader {
+    inner: Arc<dyn BranchRefReader>,
+    record: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
+impl RecordingBranchRefReader {
+    pub(super) fn new(
+        inner: Arc<dyn BranchRefReader>,
+        record: Arc<dyn Fn(&str) + Send + Sync>,
+    ) -> Self {
+        Self { inner, record }
+    }
+}
+
+#[async_trait]
+impl BranchRefReader for RecordingBranchRefReader {
+    async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
+        let head = self.inner.load_head(branch_id).await?;
+        (self.record)(branch_id);
+        Ok(head)
+    }
+
+    async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
+        let heads = self.inner.scan_heads().await?;
+        for head in &heads {
+            (self.record)(&head.branch_id);
+        }
+        Ok(heads)
+    }
+}
+
 impl CachingBranchRefReader {
     pub(super) fn new(inner: Arc<dyn BranchRefReader>) -> Self {
         Self {

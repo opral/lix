@@ -2,6 +2,7 @@
   "key": "plugin_markdown",
   "file_match": {
     "path_glob": "*.{md,markdown}",
+    "case_insensitive": true,
     "content": "text"
   },
   "entry": "plugin.wasm",

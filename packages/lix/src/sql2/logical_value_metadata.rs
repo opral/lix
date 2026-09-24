@@ -256,7 +256,7 @@ fn expr_lix_value_shape_with_lookup<'a>(
         ),
         Expr::ScalarFunction(ScalarFunction { func, args }) => {
             match func.name().to_ascii_lowercase().as_str() {
-                "__lix_jsonb" | "__lix_json_get" | "__lix_json_path_get" => {
+                "__lix_jsonb" | "__lix_json_get" | "__lix_json_path_get" | "lix_row_ref_parts" => {
                     Some(LixValueShape::scalar(LIX_VALUE_TYPE_JSONB))
                 }
                 "lix_row_ref" => Some(LixValueShape::scalar(LIX_VALUE_TYPE_ROW_REF)),

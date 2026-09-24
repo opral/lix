@@ -583,7 +583,8 @@ impl CompiledSchema {
 
 fn value_matches(data_type: DataType, value: &Value) -> bool {
     match (data_type, value) {
-        (DataType::Text, Value::Text(value)) => !value.contains('\0'),
+        // The engine decodes and resolves every row reference it writes.
+        (DataType::Text | DataType::RowRef, Value::Text(value)) => !value.contains('\0'),
         (DataType::Uuid, Value::Uuid(_))
         | (DataType::Int8, Value::Int8(_))
         | (DataType::Boolean, Value::Boolean(_)) => true,
@@ -622,7 +623,7 @@ fn jsonb_value_valid(value: &Jsonb) -> bool {
 fn body_column(column: &CompiledColumn) -> crate::value_layout::BodyColumn {
     crate::value_layout::BodyColumn {
         kind: match column.data_type {
-            DataType::Text => crate::value_layout::BodyKind::Text,
+            DataType::Text | DataType::RowRef => crate::value_layout::BodyKind::Text,
             DataType::Uuid => crate::value_layout::BodyKind::Uuid,
             DataType::Int8 => crate::value_layout::BodyKind::Int8,
             DataType::Float8 => crate::value_layout::BodyKind::Float8,
@@ -642,7 +643,7 @@ fn body_value(
     use crate::value_layout::BodyValue;
     let value = match (data_type, value) {
         (_, Value::Null) => BodyValue::Null,
-        (DataType::Text, Value::Text(value)) => BodyValue::Text(value.clone()),
+        (DataType::Text | DataType::RowRef, Value::Text(value)) => BodyValue::Text(value.clone()),
         (DataType::Uuid, Value::Uuid(value)) => BodyValue::Uuid(*value),
         (DataType::Int8, Value::Int8(value)) => BodyValue::Int8(*value),
         (DataType::Float8, Value::Float8(value)) => BodyValue::Float8(*value),
@@ -678,7 +679,7 @@ fn json_value_matches(data_type: DataType, nullable: bool, value: &JsonValue) ->
         return data_type == DataType::Jsonb || nullable;
     }
     match data_type {
-        DataType::Text => value.is_string(),
+        DataType::Text | DataType::RowRef => value.is_string(),
         DataType::Uuid => value
             .as_str()
             .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok()),
@@ -698,7 +699,9 @@ fn json_value(data_type: DataType, value: &JsonValue, name: &str) -> Result<Valu
         });
     }
     let value = match data_type {
-        DataType::Text => Value::Text(value.as_str().expect("validated text value").to_owned()),
+        DataType::Text | DataType::RowRef => {
+            Value::Text(value.as_str().expect("validated text value").to_owned())
+        }
         DataType::Uuid => Value::Uuid(
             uuid::Uuid::parse_str(value.as_str().expect("validated UUID value")).map_err(
                 |error| Error::new(ErrorKind::Row, format!("/{name}"), error.to_string()),

@@ -12,7 +12,7 @@ use crate::LixError;
 use crate::branch::{BranchHead, BranchRefReader};
 use crate::checkpoint::checkpoint_commit_id_at_head;
 
-use super::branch_ref::CachingBranchRefReader;
+use super::branch_ref::{CachingBranchRefReader, RecordingBranchRefReader};
 use super::planning_cache::PooledReadSession;
 use super::providers;
 use super::udfs::{
@@ -148,10 +148,15 @@ where
         working_diff_checkpoint_commit_id.as_deref(),
         root_commit_id.as_deref(),
     );
-    let write_ctx = SqlWriteContext::new(write_ctx);
+    let write_ctx =
+        SqlWriteContext::new(write_ctx).with_session_file_views(read_ctx.session_file_views());
     let write_branch_ref: Arc<dyn BranchRefReader> = Arc::new(CachingBranchRefReader::new(
         Arc::new(super::WriteContextBranchRefReader::new(write_ctx.clone())),
     ));
+    let write_branch_ref: Arc<dyn BranchRefReader> = match read_ctx.branch_head_read_observer() {
+        Some(record) => Arc::new(RecordingBranchRefReader::new(write_branch_ref, record)),
+        None => write_branch_ref,
+    };
     let provider_selection =
         providers::read_provider_selection(pooled.state(), std::slice::from_ref(statement));
     providers::register_transaction(
@@ -404,6 +409,7 @@ async fn resolve_working_diff_checkpoint_commit_id<C>(
 where
     C: SqlExecutionContext + ?Sized,
 {
+    context.note_unvalidated_read("lix_working_diff_checkpoint_commit_id()");
     let store = context.changelog_query_source().store;
     let branch_id = context.active_branch_id().to_string();
     resolve_working_diff_checkpoint_commit_id_from_store(store, branch_id, active_branch_commit_id)

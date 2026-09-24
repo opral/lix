@@ -461,16 +461,17 @@ jobs:
       # dropping it would recreate exactly the `storage_bench.rs` blind spot
       # described above.
       - name: Run Rust workspace tests with nextest
-        # Deliberately no stack-size override here. Production operations and
-        # their tests must fit the default worker stack, so the command a
-        # developer runs by hand behaves like CI's. The checked-in CI profile
-        # runs every test after failures, reports slow tests, and terminates a
-        # test that exceeds five minutes.
+        # Unoptimized async test poll chains exceed Rust's 2 MiB test-thread
+        # stack in existing file and sync paths. Give test threads enough
+        # space to exercise the behavior instead of aborting before assertions.
+        # This does not change the stack of production worker threads.
         #
         # `fail-fast = false` is required, not cosmetic. #1329 broke two tests;
         # the second sat invisible behind the first for hours because CI could
         # only ever report one.
         if: matrix.task == 'test'
+        env:
+          RUST_MIN_STACK: "16777216"
         run: cargo nextest run --config-file .config/nextest.toml --profile ci --cargo-profile test --workspace --all-features --lib --tests --timings
 
       - name: Run Rust tooling tests with nextest
@@ -484,6 +485,8 @@ jobs:
       # target, so passing --lib would fail before any tests could run.
       - name: Run Rust E2E tests with nextest
         if: matrix.task == 'e2e'
+        env:
+          RUST_MIN_STACK: "16777216"
         run: cargo nextest run --config-file .config/nextest.toml --profile ci-e2e --locked --manifest-path tooling/Cargo.toml --cargo-profile test -p lix_e2e --features sdk-tests,plugin-tests,server-protocol,storage-benches,slatedb,root-replay-trace --tests --timings
 
       - name: Upload Rust test timing reports

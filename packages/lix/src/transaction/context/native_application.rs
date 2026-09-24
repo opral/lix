@@ -92,9 +92,13 @@ impl<S: Storage + Clone + Send + Sync + 'static> Transaction<S> {
                     let snapshot = native_file_descriptor_json(row)?;
                     incoming_row_refs |= snapshot
                         .get("value")
-                        .and_then(|schema| schema.get("row_refs"))
+                        .and_then(|schema| schema.get("columns"))
                         .and_then(JsonValue::as_array)
-                        .is_some_and(|references| !references.is_empty());
+                        .is_some_and(|columns| {
+                            columns.iter().any(|column| {
+                                column.get("type").and_then(JsonValue::as_str) == Some("row_ref")
+                            })
+                        });
                     if let Some(schema_key) = snapshot
                         .get("schema_key")
                         .or_else(|| snapshot.get("value").and_then(|schema| schema.get("key")))

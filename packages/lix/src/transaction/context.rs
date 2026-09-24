@@ -111,6 +111,11 @@ use crate::transaction::normalization::{
     NormalizedRowFacts, REGISTERED_SCHEMA_KEY, normalize_raw_write_row_in_place,
     remember_pending_registered_schema,
 };
+use crate::transaction::read_set::{
+    SnapshotOverlapKind, SqlReadSet, SqlReadSetCheckpoint, WrittenRowIdentity, changed_footprint_rows,
+    changed_write_set_rows, snapshot_overlap_conflict, unvalidated_read_conflict,
+    write_set_footprints,
+};
 use crate::transaction::schema_resolver::TransactionSchemaResolver;
 use crate::transaction::staged_commit_changes::{
     StagedCommitChangeBatch, StagedCommitChangeBatchBuilder,
@@ -521,6 +526,67 @@ struct VisibleMaterialization {
     bytes: VisibleMaterializationBytes,
 }
 
+fn visible_materialization_request(
+    key: &PluginFileWriteKey,
+) -> Result<HotStateScanRequest, LixError> {
+    Ok(HotStateScanRequest {
+        filter: HotStateFilter {
+            schema_keys: vec![BLOB_REF_SCHEMA_KEY.to_string()],
+            row_pks: vec![validated_uuid_row_pk(&key.file_id)?],
+            branch_ids: vec![key.branch_id.clone()],
+            file_ids: vec![NullableKeyFilter::Value(key.file_id.clone())],
+            untracked: Some(key.untracked),
+            ..Default::default()
+        },
+        projection: plugin_registry_hot_state_projection(),
+        ..Default::default()
+    })
+}
+
+fn decode_single_visible_materialization(
+    rows: &MaterializedHotStateBatch,
+    key: &PluginFileWriteKey,
+) -> Result<Option<VisibleMaterialization>, LixError> {
+    if rows.len() > 1 {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "component materialization lookup returned duplicate rows for file '{}'",
+                key.file_id
+            ),
+        ));
+    }
+    rows.get(0)
+        .map(|row| decode_visible_materialization_ref(row, &key.file_id))
+        .transpose()
+}
+
+/// The plugin actor already accepted a newer committed document than this
+/// transaction's snapshot shows. The write must be replanned on a fresh
+/// snapshot; the actor itself is current and stays live.
+fn stale_plugin_snapshot_conflict(key: &PluginFileWriteKey) -> LixError {
+    LixError::new(
+        LixError::CODE_TRANSACTION_CONFLICT,
+        format!(
+            "transaction conflict: file '{}' was changed by a concurrent commit after this transaction's snapshot",
+            key.file_id
+        ),
+    )
+    .with_hint("Retry the transaction against the latest committed state.")
+    .with_details(serde_json::json!({
+        "retryable": true,
+        "reason": "writeSetChanged",
+        "overlapKind": "write",
+        "overlaps": [{
+            "branchId": key.branch_id,
+            "schemaKey": BLOB_REF_SCHEMA_KEY,
+            "fileId": key.file_id,
+            "rowPk": null,
+        }],
+        "overlapCount": 1,
+    }))
+}
+
 #[derive(Debug, Clone)]
 enum VisibleMaterializationBytes {
     Blob { hash: BlobId },
@@ -741,6 +807,13 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     /// Explicit SQL reads and UPDATE/DELETE predicates are decisions against
     /// the opening snapshot, not edits that may be silently reconciled later.
     protect_sql_write_snapshot: bool,
+    /// Live-state reads issued by those protected decisions. A stale commit
+    /// conflicts only if one of them, or a row this transaction writes, now
+    /// observes different state.
+    sql_read_set: Arc<SqlReadSet>,
+    /// Whether the statement currently executing is a protected decision
+    /// whose write-context reads belong to `sql_read_set`.
+    record_sql_reads: bool,
     /// A successful SQL undo/redo owns the transaction's one mutation slot.
     /// Keep this at the SQL execution boundary so commit-internal staging can
     /// still materialize the already-authorized receipt commit.
@@ -773,6 +846,9 @@ pub(crate) struct Transaction<StorageImpl: Storage + 'static = Memory> {
     await_durable_commit: bool,
     requires_individual_commit_span: bool,
     session_file_views: SessionFileViews,
+    /// Observations made by successful reads in this transaction. They are
+    /// private until commit and take precedence over the session's older view.
+    transaction_file_views: SessionFileViews,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
     pending_plugin_actor_publications: Vec<PendingPluginActorPublication>,
     pending_checkpoint_gc_sequence: Option<u64>,
@@ -1522,9 +1598,8 @@ where
             let mut keys = hydrated.keys.clone();
             let mut prefixes = Vec::new();
             for blob in &hydrated.blob_manifests {
-                let manifest_key = crate::storage_adapter::StorageKey(
-                    Bytes::copy_from_slice(blob.as_bytes()),
-                );
+                let manifest_key =
+                    crate::storage_adapter::StorageKey(Bytes::copy_from_slice(blob.as_bytes()));
                 let staged = self
                     .staged_writes
                     .load_staged_file_bytes_many(&[*blob])?
@@ -1765,9 +1840,13 @@ where
         self.protect_sql_write_snapshot = true;
     }
 
-    async fn fence_sql_write_snapshot<S>(&mut self, read: &S) -> Result<(), LixError>
+    async fn fence_sql_write_snapshot<S>(
+        &mut self,
+        read: &S,
+        prepared_writes: &PreparedWriteSet,
+    ) -> Result<(), LixError>
     where
-        S: StorageAdapterRead,
+        S: StorageAdapterRead + Clone + Send + Sync + 'static,
     {
         if !self.protect_sql_write_snapshot {
             return Ok(());
@@ -1776,28 +1855,102 @@ where
         if self.active_branch_id != GLOBAL_BRANCH_ID {
             branches.push(GLOBAL_BRANCH_ID.to_owned());
         }
+        for branch_id in self.sql_read_set.branch_ids() {
+            if !branches.contains(&branch_id) {
+                branches.push(branch_id);
+            }
+        }
         let controls = BranchHeadControlContext::new();
         let opening = controls
             .reader(self.opening_read())
             .load_observed(&branches)
             .await?;
         let current = controls.reader(read).load_observed(&branches).await?;
-        for ((branch_id, opening), current) in branches.iter().zip(opening).zip(current) {
-            if opening.raw_token != current.raw_token {
-                return Err(LixError::new(
-                    LixError::CODE_TRANSACTION_CONFLICT,
-                    "SQL transaction snapshot is stale because branch state changed",
-                )
-                .with_hint("Retry the transaction against the latest committed state."));
-            }
-            // The opening token includes history-free untracked mutations.
-            // Compare it again in the atomic storage commit so another engine
-            // cannot invalidate the decision after this coherent read.
+        let branch_changed = opening
+            .iter()
+            .zip(&current)
+            .any(|(opening, current)| opening.raw_token != current.raw_token);
+        if branch_changed {
+            // The opening token includes history-free untracked mutations, so a
+            // changed token does not by itself say which rows moved. Re-issue
+            // the protected decisions' reads and check the write set instead
+            // of refusing every concurrent change on the branch.
+            self.validate_sql_snapshot_footprint(read, prepared_writes)
+                .instrument(tracing::debug_span!(
+                    target: "lix_transaction",
+                    "lix.transaction.stale.validate_read_write_set"
+                ))
+                .await?;
+        }
+        for (branch_id, current) in branches.iter().zip(current) {
+            // Pin the validated state in the atomic storage commit so another
+            // engine cannot invalidate the decision after this coherent read.
             self.atomic_metadata_preconditions
                 .push(branch_head_control_precondition(
                     branch_id,
-                    opening.raw_token,
+                    current.raw_token,
                 )?);
+        }
+        Ok(())
+    }
+
+    /// Rejects a stale protected commit only when a protected read would now
+    /// observe different rows, or a row this transaction writes changed.
+    async fn validate_sql_snapshot_footprint<S>(
+        &mut self,
+        read: &S,
+        prepared_writes: &PreparedWriteSet,
+    ) -> Result<(), LixError>
+    where
+        S: StorageAdapterRead + Clone + Send + Sync + 'static,
+    {
+        if let Some(source) = self.sql_read_set.unvalidated_source() {
+            return Err(unvalidated_read_conflict(&source));
+        }
+        // SQL statements were bound and planned against the opening schema
+        // catalog. A concurrent schema change can alter what those decisions
+        // meant, so it is never rebased row by row.
+        if load_catalog_revision(&self.opening_read()).await? != load_catalog_revision(read).await?
+        {
+            return Err(unvalidated_read_conflict("lix_registered_schema catalog"));
+        }
+        let read_footprints = self.sql_read_set.entries();
+        let registry = &self.opening_plugin_registry;
+        let file_scoped =
+            |schema_key: &str| schema_key == BLOB_REF_SCHEMA_KEY || registry.owns_schema(schema_key);
+        let write_footprints = write_set_footprints(
+            prepared_writes
+                .state_rows
+                .iter()
+                .map(|row| WrittenRowIdentity {
+                    branch_id: row.branch_id.as_str(),
+                    schema_key: row.schema_key.as_str(),
+                    file_id: row.file_id.map(SharedStr::as_str),
+                    row_pk: row.row_pk,
+                }),
+            file_scoped,
+        );
+        let opening = self.hot_state.transaction_reader(
+            self.opening_read(),
+            Arc::new(BranchHeadControlCache::default()),
+        );
+        let current = self
+            .hot_state
+            .transaction_reader(read.clone(), Arc::new(BranchHeadControlCache::default()));
+        let read_overlaps = changed_footprint_rows(&opening, &current, &read_footprints).await?;
+        if !read_overlaps.is_empty() {
+            return Err(snapshot_overlap_conflict(
+                SnapshotOverlapKind::Read,
+                &read_overlaps,
+            ));
+        }
+        let write_overlaps =
+            changed_write_set_rows(&opening, &current, &write_footprints, file_scoped).await?;
+        if !write_overlaps.is_empty() {
+            return Err(snapshot_overlap_conflict(
+                SnapshotOverlapKind::Write,
+                &write_overlaps,
+            ));
         }
         Ok(())
     }
@@ -1819,6 +1972,10 @@ where
         let conflict = |message: &'static str| {
             LixError::new(LixError::CODE_TRANSACTION_CONFLICT, message)
                 .with_hint("Retry the transaction against the latest committed state.")
+                .with_details(serde_json::json!({
+                    "retryable": true,
+                    "reason": "staleSnapshotNotRebased",
+                }))
         };
         if !prepared_writes.branch_heads.is_empty()
             || prepared_writes.state_rows.iter().any(|row| {
@@ -2472,6 +2629,8 @@ where
             opening_active_branch_head,
             opening_global_branch_head,
             protect_sql_write_snapshot: false,
+            sql_read_set: Arc::new(SqlReadSet::default()),
+            record_sql_reads: false,
             successful_undo_redo: false,
             commit_boundary: None,
             trust_filesystem_planner: false,
@@ -2491,6 +2650,7 @@ where
             await_durable_commit: false,
             requires_individual_commit_span: false,
             session_file_views,
+            transaction_file_views: SessionFileViews::default(),
             pending_file_view_mutations: BTreeMap::new(),
             pending_plugin_actor_publications: Vec::new(),
             pending_checkpoint_gc_sequence: None,
@@ -2707,6 +2867,9 @@ where
                         }
                     }
                 }
+                transaction
+                    .session_file_views
+                    .apply_mutations(transaction.transaction_file_views.plugin_file_mutations());
                 transaction.session_file_views.apply_mutations(
                     std::mem::take(&mut transaction.pending_file_view_mutations).into_values(),
                 );
@@ -2810,7 +2973,8 @@ where
                 let hydrated = retry
                     .hydrate_pinned_for_retry(Some(&sender), error.clone())
                     .await?;
-                self.refresh_hydrated_native_inputs(&error, &hydrated).await?;
+                self.refresh_hydrated_native_inputs(&error, &hydrated)
+                    .await?;
             }
         })
     }
@@ -2858,7 +3022,9 @@ where
                 // Preserve the original statement snapshot until its SQL decisions
                 // have been fenced; reconciliation below uses the current read.
                 if requires_tracked_snapshot_fence {
-                    transaction.fence_sql_write_snapshot(&read).await?;
+                    transaction
+                        .fence_sql_write_snapshot(&read, &prepared_writes)
+                        .await?;
                 }
                 // Commit-time reconciliation and validation must all observe this
                 // current coherent snapshot, while user statements above observed the
@@ -3339,16 +3505,15 @@ where
     /// Releases private plugin actor leases after an explicit write statement.
     ///
     /// The durable semantic rows and checkpoints remain staged in this
-    /// transaction. Keeping the live actor leased until commit would serialize
-    /// another same-base transaction that edits the same file, so explicit
-    /// transactions retain only the cold-open marker between statements.
+    /// transaction. The validated successor stays in the actor Store, while
+    /// the mutex is released until the durable commit publishes that successor.
     pub(crate) async fn release_pending_plugin_actor_leases(&mut self) {
         let publications = std::mem::take(&mut self.pending_plugin_actor_publications);
-        let mut uncached = Vec::with_capacity(publications.len());
+        let mut detached = Vec::with_capacity(publications.len());
         for publication in publications {
-            uncached.push(publication.into_uncached().await);
+            detached.push(publication.detach_lease());
         }
-        self.pending_plugin_actor_publications = uncached;
+        self.pending_plugin_actor_publications = detached;
     }
 
     /// Stages one decoded write batch into this transaction.
@@ -4390,6 +4555,50 @@ where
             .collect()
     }
 
+    /// The transaction-visible path index, without joining the protected
+    /// read set. Engine-internal plugin and filesystem bookkeeping uses this;
+    /// SQL decisions go through the recorded trait method.
+    async fn transaction_filesystem_path_index(
+        &mut self,
+        request: &FilesystemPathIndexRequest,
+    ) -> Result<Arc<FilesystemPathIndex>, LixError> {
+        let read = self.opening_read();
+        let descriptor_epoch = self.filesystem_path_index_epoch.load(Ordering::SeqCst);
+        if descriptor_epoch == 0 {
+            return self
+                .hot_state
+                .snapshot_reader(read)
+                .path_index(request)
+                .await;
+        }
+        // The revision probe is only a cache-freshness optimization. Preserve the
+        // pre-cache overlay behavior if a storage fault affects that single key.
+        let cache_revision = load_path_index_revision(&read)
+            .await
+            .ok()
+            .map(|revision| transaction_path_index_cache_revision(revision, descriptor_epoch));
+        if let Some(cache_revision) = cache_revision.as_deref()
+            && let Some(index) = self
+                .filesystem_path_index_cache
+                .get(request, Some(cache_revision))
+        {
+            return Ok(index);
+        }
+        let staged = self.staged_writes.staging_overlay()?;
+        let base = self.hot_state.snapshot_reader(read);
+        let rows = overlay_scan_batch(&base, &staged, &request.hot_state_request()).await?;
+        #[cfg(test)]
+        record_transaction_path_index_build(rows.len());
+        let index = Arc::new(FilesystemPathIndex::from_live_batch(&rows)?);
+        Ok(match cache_revision {
+            Some(cache_revision) => {
+                self.filesystem_path_index_cache
+                    .insert(request, Some(&cache_revision), index)
+            }
+            None => index,
+        })
+    }
+
     async fn scan_visible_hot_state_batch(
         &mut self,
         request: &HotStateScanRequest,
@@ -4451,7 +4660,26 @@ where
         key: &PluginFileWriteKey,
     ) -> Result<Option<VisibleMaterialization>, LixError> {
         let rows = self
-            .scan_visible_hot_state_batch(&HotStateScanRequest {
+            .scan_visible_hot_state_batch(&visible_materialization_request(key)?)
+            .await?;
+        decode_single_visible_materialization(&rows, key)
+    }
+
+    /// Read the durable root outside the transaction's opening snapshot. This
+    /// is only used to classify a root mismatch after waiting for an actor.
+    async fn current_durable_materialization_root(
+        &mut self,
+        key: &PluginFileWriteKey,
+    ) -> Result<Option<String>, LixError> {
+        let read = SharedStorageAdapterRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
+        let rows = self
+            .hot_state
+            .reader(read)
+            .scan_batch(&HotStateScanRequest {
                 filter: HotStateFilter {
                     schema_keys: vec![BLOB_REF_SCHEMA_KEY.to_string()],
                     row_pks: vec![validated_uuid_row_pk(&key.file_id)?],
@@ -4467,15 +4695,13 @@ where
         if rows.len() > 1 {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "component materialization lookup returned duplicate rows for file '{}'",
-                    key.file_id
-                ),
+                "current durable materialization lookup returned duplicate rows",
             ));
         }
         rows.get(0)
             .map(|row| decode_visible_materialization_ref(row, &key.file_id))
             .transpose()
+            .map(|materialization| materialization.map(|value| value.semantic_root))
     }
 
     async fn cold_open_semantic_actor(
@@ -4697,6 +4923,14 @@ where
                 else {
                     return Err(error);
                 };
+                if self
+                    .current_durable_materialization_root(file_key)
+                    .await?
+                    .as_deref()
+                    != Some(visible_materialization.semantic_root.as_str())
+                {
+                    return Err(stale_plugin_snapshot_conflict(file_key));
+                }
                 if visible_materialization.semantic_root != observation.semantic_root() {
                     return Err(error);
                 }
@@ -5210,6 +5444,18 @@ where
                     None
                 }
             };
+        }
+        if self
+            .transaction_file_views
+            .unfiltered_plugin_file_view(key)
+            .is_some()
+        {
+            return self.transaction_file_views.plugin_file_view(
+                key,
+                plugin.key(),
+                plugin.archive_blob_hash(),
+                owner_change_id,
+            );
         }
         self.session_file_views.plugin_file_view(
             key,
@@ -6006,7 +6252,7 @@ where
                     .map(|key| key.branch_id.clone())
                     .collect(),
             );
-            let path_index = self.filesystem_path_index(&request).await?;
+            let path_index = self.transaction_filesystem_path_index(&request).await?;
             for (file_key, (plugin, owner_change_id, row_indices)) in unresolved_semantic_groups {
                 let entries = path_index
                     .exact_file_id_entries(&file_key.file_id)
@@ -6884,6 +7130,9 @@ where
                         None => {
                             !self.pending_file_view_mutations.contains_key(&session_key)
                                 && !self
+                                    .transaction_file_views
+                                    .has_plugin_file_at_path(&actor_key.branch_id, &actor_key.path)
+                                && !self
                                     .session_file_views
                                     .has_plugin_file_at_path(&actor_key.branch_id, &actor_key.path)
                         }
@@ -6902,7 +7151,8 @@ where
                             // plugin silently retains the old dialect.
                             let request =
                                 FilesystemPathIndexRequest::new(vec![write.branch_id.clone()]);
-                            let path_index = self.filesystem_path_index(&request).await?;
+                            let path_index =
+                                self.transaction_filesystem_path_index(&request).await?;
                             let entries = path_index
                                 .exact_file_id_entries(&write.file_id)
                                 .into_iter()
@@ -7244,6 +7494,9 @@ where
                         },
                         None if self.pending_file_view_mutations.contains_key(&session_key)
                             || self
+                                .transaction_file_views
+                                .has_plugin_file_at_path(&actor_key.branch_id, &actor_key.path)
+                            || self
                                 .session_file_views
                                 .has_plugin_file_at_path(&actor_key.branch_id, &actor_key.path) =>
                         {
@@ -7338,7 +7591,32 @@ where
                         )
                         .with_hint("read the exact file bytes again before retrying the edit")
                     })?;
-                    lease.require_accepted_semantic_root(&visible_materialization.semantic_root)?;
+                    if lease.accepted_semantic_root() != visible_materialization.semantic_root {
+                        if observation.semantic_root() != visible_materialization.semantic_root {
+                            if self
+                                .plugin_host
+                                .actor_cache()
+                                .has_pending_publication(&actor_key)
+                                && !self
+                                    .pending_plugin_actor_publications
+                                    .iter()
+                                    .any(|publication| publication.key() == &actor_key)
+                            {
+                                return Err(stale_plugin_snapshot_conflict(&file_key));
+                            }
+                            return Err(LixError::new(
+                                LixError::CODE_PLUGIN_OBSERVATION_STALE,
+                                "the observed file version no longer matches this transaction's visible file",
+                            )
+                            .with_hint("read the exact file bytes again before retrying the edit"));
+                        }
+                        // Durable commit and actor publication are separate
+                        // steps. Either the snapshot or the actor may be behind
+                        // while another session is between those steps. Neither
+                        // case proves this actor is obsolete, so retain it and
+                        // retry the SQL write from a new transaction snapshot.
+                        return Err(stale_plugin_snapshot_conflict(&file_key));
+                    }
                     let observation_is_current =
                         observation.semantic_root() == visible_materialization.semantic_root;
                     let observed_bytes = lease.observed_bytes();
@@ -7800,7 +8078,7 @@ where
                 prior_index.map(|index| self.pending_plugin_actor_publications.remove(index));
             let was_chained = prior_publication.is_some();
             let (lease, successor_key, publication_view) = match prior_publication {
-                Some(publication) => match publication.into_chainable(&actor_key) {
+                Some(publication) => match publication.into_chainable(&actor_key).await {
                     ChainablePublication::Chainable(lease, key, policy) => (lease, key, policy),
                     ChainablePublication::Pending(publication) => {
                         self.pending_plugin_actor_publications.push(publication);
@@ -8724,6 +9002,10 @@ where
     ) -> Result<crate::sql2::SqlLogicalPlan, LixError> {
         if let Some(plan) = crate::sql2::checkpoint_function_plan(statement)? {
             self.protect_sql_write_snapshot = true;
+            // Checkpoint, restore and undo/redo decisions read branch history
+            // and heads, which have no row-level validation.
+            self.sql_read_set.mark_unvalidated("lix checkpoint function");
+            self.record_sql_reads = true;
             return Ok(crate::sql2::SqlLogicalPlan::Checkpoint(plan));
         }
         let fingerprint = self.sql_catalog_fingerprint();
@@ -8747,7 +9029,12 @@ where
             );
             plan
         };
-        self.protect_sql_write_snapshot |= plan.requires_current_write_snapshot();
+        let protected = plan.requires_current_write_snapshot();
+        self.protect_sql_write_snapshot |= protected;
+        self.record_sql_reads = protected;
+        // A value derived from the opening branch head would be stale after a
+        // rebase onto a newer head.
+        self.note_branch_head_function_reads(statement);
         Ok(crate::sql2::create_write_logical_plan_from_template(plan))
     }
 
@@ -8768,6 +9055,7 @@ where
         }
         let program = Arc::clone(program);
         let primary_key = program.primary_key(params)?;
+        self.record_prepared_mutation_read(&program.schema_key, primary_key);
         let schema_catalog = Arc::clone(&self.sql_schema_snapshot);
         let schema_plan = schema_catalog.plan(program.schema_plan_id).ok_or_else(|| {
             LixError::new(
@@ -8993,6 +9281,14 @@ where
             }
             self.prepared_mutation_overlay_empty = !self.staged_writes.has_staged_state_rows()?;
         }
+        let schema_key = self
+            .prepared_mutation_program
+            .as_ref()
+            .expect("packed literal mutation retains its prepared program")
+            .1
+            .schema_key
+            .clone();
+        self.record_prepared_mutation_read(&schema_key, primary_key);
         let opening_read = self.opening_read();
         let PreparedMutationMembership::Packed(membership) = &mut self.prepared_mutation_membership
         else {
@@ -9562,6 +9858,9 @@ where
             || Arc::clone(&self.hot_state),
             |(hot, _)| Arc::new(hot.clone()),
         );
+        let file_view_collector = crate::sql2::plan_read_statement(&statement, &params)
+            .acknowledge_file_views
+            .then(|| self.transaction_file_views.fork_for_read());
 
         if let Some((_, capture)) = &capture {
             crate::session::seed_foreground_filesystem_interest(
@@ -9572,15 +9871,26 @@ where
             )?;
         }
 
-        let read_ctx = self.sql_read_execution_context(read_store, hot_state)?;
+        let read_ctx =
+            self.sql_read_execution_context(read_store, hot_state, file_view_collector.clone())?;
+        self.note_branch_head_function_reads(&statement);
+        // Explicit reads may decide later writes. Every live-state read they
+        // issue, including exact reads served through the write context,
+        // belongs to the protected read set.
+        let previous_recording = std::mem::replace(&mut self.record_sql_reads, true);
         let result = crate::sql2::execute_transaction_read_statement_from_parsed(
             &read_ctx, self, &sql, statement, &params,
         )
         .await;
+        self.record_sql_reads = previous_recording;
         match result {
             Ok(result) => {
                 if let Some((_, capture)) = capture {
                     capture.publish_capture()?;
+                }
+                if let Some(file_view_collector) = file_view_collector {
+                    self.transaction_file_views
+                        .apply_mutations(file_view_collector.plugin_file_mutations());
                 }
                 Ok(result)
             }
@@ -9599,6 +9909,7 @@ where
         &self,
         read_store: SharedStorageAdapterRead<StorageImpl::Read<'static>>,
         hot_state: Arc<HotStateContext>,
+        file_views: Option<SessionFileViews>,
     ) -> Result<
         TransactionSqlReadExecutionContext<StorageImpl::Read<'static>>,
         LixError,
@@ -9620,7 +9931,79 @@ where
             plugin_host: self.plugin_host.clone(),
             sql_planning_cache: Arc::clone(&self.sql_planning_cache),
             sql_catalog_fingerprint: self.sql_catalog_fingerprint().clone(),
+            file_views,
+            read_set: Arc::clone(&self.sql_read_set),
         })
+    }
+
+    /// Statements that call a function resolving the branch head or commit
+    /// graph depend on branch state that has no row-level validation.
+    fn note_branch_head_function_reads(&self, statement: &DataFusionStatement) {
+        for function in [
+            "lix_active_branch_commit_id",
+            "lix_root_commit_id",
+            "lix_working_diff_checkpoint_commit_id",
+        ] {
+            if crate::sql2::statement_uses_execution_function(statement, function) {
+                self.sql_read_set.mark_unvalidated(&format!("{function}()"));
+                return;
+            }
+        }
+    }
+
+    /// A collection summary (emptiness or live count) depends on every row of
+    /// the collection.
+    fn record_collection_read(
+        &self,
+        branch_id: &str,
+        scope: crate::collection_generation::CollectionScopeRef<'_>,
+    ) {
+        if let Some(read_set) = self.recording_sql_read_set() {
+            read_set.record_scan(&HotStateScanRequest {
+                filter: HotStateFilter {
+                    schema_keys: vec![scope.schema_key.to_owned()],
+                    branch_ids: vec![branch_id.to_owned()],
+                    file_ids: scope
+                        .file_id
+                        .map(|file_id| vec![NullableKeyFilter::Value(file_id.to_owned())])
+                        .unwrap_or_default(),
+                    ..HotStateFilter::default()
+                },
+                ..HotStateScanRequest::default()
+            });
+        }
+    }
+
+    /// A prepared path-value replacement is an UPDATE by primary key. Its
+    /// matched/unmatched decision depends on exactly this row.
+    fn record_prepared_mutation_read(&self, schema_key: &str, primary_key: &str) {
+        self.sql_read_set.record_exact(&HotStateExactBatchRequest {
+            rows: vec![HotStateExactRowRequest {
+                schema_key: schema_key.to_owned(),
+                branch_id: self.active_branch_id.clone(),
+                row_pk: RowPk::single(primary_key.to_owned()),
+                file_id: None,
+            }],
+            include_tombstones: true,
+            ..HotStateExactBatchRequest::default()
+        });
+    }
+
+    pub(crate) fn checkpoint_sql_statement_reads(&self) -> SqlReadSetCheckpoint {
+        self.sql_read_set.checkpoint()
+    }
+
+    pub(crate) fn restore_sql_statement_reads(&self, checkpoint: SqlReadSetCheckpoint) {
+        self.sql_read_set.restore(checkpoint);
+    }
+
+    /// Ends read-set recording for the statement that just finished.
+    pub(crate) fn finish_sql_statement_reads(&mut self) {
+        self.record_sql_reads = false;
+    }
+
+    fn recording_sql_read_set(&self) -> Option<&SqlReadSet> {
+        self.record_sql_reads.then_some(self.sql_read_set.as_ref())
     }
 
     /// Returns the immutable Schema v1 plan used by plugin merge admission.
@@ -12259,6 +12642,10 @@ fn close_and_validate_diff_command_selection(
                         .get(target_diff_id)
                         .expect("row-reference target index is coherent");
                     if target_entry.after.as_ref().is_none_or(|row| row.deleted) {
+                        // A detached reference may outlive its target.
+                        if reference.on_delete == lix_schema::DeleteAction::Detach {
+                            continue;
+                        }
                         return Err(LixError::new(
                             LixError::CODE_CONSTRAINT_VIOLATION,
                             format!("{operation} selection references a removed row"),
@@ -12380,7 +12767,9 @@ fn close_and_validate_diff_command_selection(
                         target_entry.identity.file_id(),
                         target_entry.identity.row_pk(),
                     )?;
-                    for reference in &child_plan.row_refs {
+                    for reference in child_plan.row_refs.iter().filter(|reference| {
+                        reference.on_delete != lix_schema::DeleteAction::Detach
+                    }) {
                         let points_to_target = |snapshot: &JsonValue| {
                             snapshot.get(&reference.column).and_then(JsonValue::as_str)
                                 == Some(target.as_str())
@@ -12539,7 +12928,11 @@ fn close_and_validate_diff_command_selection(
         let Some((_, plan)) = catalog.plan_for_key(entry.identity.schema_key()) else {
             continue;
         };
-        for reference in &plan.row_refs {
+        for reference in plan
+            .row_refs
+            .iter()
+            .filter(|reference| reference.on_delete != lix_schema::DeleteAction::Detach)
+        {
             let Some(target) = snapshot.get(&reference.column).and_then(JsonValue::as_str) else {
                 continue;
             };
@@ -12758,6 +13151,10 @@ pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage_adapter::
     plugin_host: PluginRuntimeHost,
     sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     sql_catalog_fingerprint: CatalogFingerprint,
+    file_views: Option<SessionFileViews>,
+    /// Protected read set that every live-state read through this context
+    /// joins.
+    read_set: Arc<SqlReadSet>,
 }
 
 #[async_trait]
@@ -12803,29 +13200,22 @@ where
     }
 
     fn hot_state(&self) -> Arc<dyn HotStateReader> {
-        Arc::new(TransactionReadHotStateReader {
-            base: self.hot_state.transaction_reader(
-                self.read_store.clone(),
-                Arc::clone(&self.branch_head_control_cache),
-            ),
-            read_store: self.read_store.clone(),
-            staged: self.staged.clone(),
-            filesystem_path_index_cache: Arc::clone(&self.filesystem_path_index_cache),
-            filesystem_path_index_epoch: Arc::clone(&self.filesystem_path_index_epoch),
-        })
+        Arc::new(self.recording_hot_state_reader())
     }
 
     fn filesystem_path_index(&self) -> Arc<dyn FilesystemPathIndexReader> {
-        Arc::new(TransactionReadHotStateReader {
-            base: self.hot_state.transaction_reader(
-                self.read_store.clone(),
-                Arc::clone(&self.branch_head_control_cache),
-            ),
-            read_store: self.read_store.clone(),
-            staged: self.staged.clone(),
-            filesystem_path_index_cache: Arc::clone(&self.filesystem_path_index_cache),
-            filesystem_path_index_epoch: Arc::clone(&self.filesystem_path_index_epoch),
-        })
+        Arc::new(self.recording_hot_state_reader())
+    }
+
+    fn note_unvalidated_read(&self, source: &str) {
+        self.read_set.mark_unvalidated(source);
+    }
+
+    fn branch_head_read_observer(&self) -> Option<Arc<dyn Fn(&str) + Send + Sync>> {
+        let read_set = Arc::clone(&self.read_set);
+        Some(Arc::new(move |branch_id| {
+            read_set.record_branch_head(branch_id);
+        }))
     }
 
     fn functions(&self) -> FunctionProviderHandle {
@@ -12859,6 +13249,29 @@ where
 
     fn plugin_host(&self) -> PluginRuntimeHost {
         self.plugin_host.clone()
+    }
+
+    fn session_file_views(&self) -> Option<SessionFileViews> {
+        self.file_views.clone()
+    }
+}
+
+impl<R> TransactionSqlReadExecutionContext<R>
+where
+    R: crate::storage_adapter::StorageRead + 'static,
+{
+    fn recording_hot_state_reader(&self) -> TransactionReadHotStateReader<R> {
+        TransactionReadHotStateReader {
+            base: self.hot_state.transaction_reader(
+                self.read_store.clone(),
+                Arc::clone(&self.branch_head_control_cache),
+            ),
+            read_store: self.read_store.clone(),
+            staged: self.staged.clone(),
+            filesystem_path_index_cache: Arc::clone(&self.filesystem_path_index_cache),
+            filesystem_path_index_epoch: Arc::clone(&self.filesystem_path_index_epoch),
+            read_set: Arc::clone(&self.read_set),
+        }
     }
 }
 
@@ -12939,6 +13352,7 @@ struct TransactionReadHotStateReader<R: crate::storage_adapter::StorageRead> {
     staged: PreparedStateRowOverlay,
     filesystem_path_index_cache: Arc<FilesystemPathIndexCache>,
     filesystem_path_index_epoch: Arc<AtomicUsize>,
+    read_set: Arc<SqlReadSet>,
 }
 
 #[async_trait]
@@ -12956,6 +13370,7 @@ where
         &self,
         request: &HotStateScanRequest,
     ) -> Result<MaterializedHotStateBatch, LixError> {
+        self.read_set.record_scan(request);
         overlay_scan_batch(&self.base, &self.staged, request).await
     }
 
@@ -12963,6 +13378,7 @@ where
         &self,
         request: &HotStateExactBatchRequest,
     ) -> Result<MaterializedHotStateExactBatch, LixError> {
+        self.read_set.record_exact(request);
         overlay_load_exact_batch(&self.base, &self.staged, request).await
     }
 }
@@ -12980,6 +13396,7 @@ where
         &self,
         request: &FilesystemPathIndexRequest,
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
+        self.read_set.record_path_index(request);
         let descriptor_epoch = self.filesystem_path_index_epoch.load(Ordering::SeqCst);
         if descriptor_epoch == 0 {
             return self.base.path_index(request).await;
@@ -13495,7 +13912,11 @@ where
         let read_store = self.opening_read();
         if requirements.needs_read_table_functions || !requirements.read_relation_names.is_empty() {
             let read_ctx =
-                self.sql_read_execution_context(read_store.clone(), Arc::clone(&self.hot_state))?;
+                self.sql_read_execution_context(
+                    read_store.clone(),
+                    Arc::clone(&self.hot_state),
+                    None,
+                )?;
             if requirements.needs_read_table_functions {
                 crate::sql2::register_read_table_functions(
                     session,
@@ -13525,6 +13946,10 @@ where
         } else {
             None
         };
+        if requirements.needs_working_diff_checkpoint_commit_id {
+            self.sql_read_set
+                .mark_unvalidated("lix_working_diff_checkpoint_commit_id()");
+        }
         let working_diff_store = requirements
             .needs_working_diff_checkpoint_commit_id
             .then_some(read_store);
@@ -13656,6 +14081,9 @@ where
         &mut self,
         request: &HotStateScanRequest,
     ) -> Result<MaterializedHotStateBatch, LixError> {
+        if let Some(read_set) = self.recording_sql_read_set() {
+            read_set.record_scan(request);
+        }
         self.scan_visible_hot_state_batch(request).await
     }
 
@@ -13663,48 +14091,33 @@ where
         &mut self,
         request: &HotStateExactBatchRequest,
     ) -> Result<MaterializedHotStateExactBatch, LixError> {
+        if let Some(read_set) = self.recording_sql_read_set() {
+            read_set.record_exact(request);
+        }
         self.load_visible_exact_hot_state_batch(request).await
+    }
+
+    async fn filesystem_path_index_for_files(
+        &mut self,
+        request: &FilesystemPathIndexRequest,
+        file_ids: &[String],
+    ) -> Result<Arc<FilesystemPathIndex>, LixError> {
+        if let Some(read_set) = self.recording_sql_read_set() {
+            read_set.record_path_index(
+                &request.clone().with_file_ids(Some(file_ids.to_vec())),
+            );
+        }
+        self.transaction_filesystem_path_index(request).await
     }
 
     async fn filesystem_path_index(
         &mut self,
         request: &FilesystemPathIndexRequest,
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
-        let read = self.opening_read();
-        let descriptor_epoch = self.filesystem_path_index_epoch.load(Ordering::SeqCst);
-        if descriptor_epoch == 0 {
-            return self
-                .hot_state
-                .snapshot_reader(read)
-                .path_index(request)
-                .await;
+        if let Some(read_set) = self.recording_sql_read_set() {
+            read_set.record_path_index(request);
         }
-        // The revision probe is only a cache-freshness optimization. Preserve the
-        // pre-cache overlay behavior if a storage fault affects that single key.
-        let cache_revision = load_path_index_revision(&read)
-            .await
-            .ok()
-            .map(|revision| transaction_path_index_cache_revision(revision, descriptor_epoch));
-        if let Some(cache_revision) = cache_revision.as_deref()
-            && let Some(index) = self
-                .filesystem_path_index_cache
-                .get(request, Some(cache_revision))
-        {
-            return Ok(index);
-        }
-        let staged = self.staged_writes.staging_overlay()?;
-        let base = self.hot_state.snapshot_reader(read);
-        let rows = overlay_scan_batch(&base, &staged, &request.hot_state_request()).await?;
-        #[cfg(test)]
-        record_transaction_path_index_build(rows.len());
-        let index = Arc::new(FilesystemPathIndex::from_live_batch(&rows)?);
-        Ok(match cache_revision {
-            Some(cache_revision) => {
-                self.filesystem_path_index_cache
-                    .insert(request, Some(&cache_revision), index)
-            }
-            None => index,
-        })
+        self.transaction_filesystem_path_index(request).await
     }
 
     async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<CommitId>, LixError> {
@@ -13732,6 +14145,7 @@ where
         branch_id: &str,
         scope: crate::collection_generation::CollectionScopeRef<'_>,
     ) -> Result<Option<crate::collection_generation::CollectionGeneration>, LixError> {
+        self.record_collection_read(branch_id, scope);
         let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
@@ -13765,6 +14179,7 @@ where
         branch_id: &str,
         scope: crate::collection_generation::CollectionScopeRef<'_>,
     ) -> Result<Option<u64>, LixError> {
+        self.record_collection_read(branch_id, scope);
         let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())

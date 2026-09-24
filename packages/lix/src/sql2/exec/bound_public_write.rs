@@ -2149,14 +2149,11 @@ fn plan_references_active_branch_commit_id(plan: &LogicalWritePlan) -> bool {
                 .any(|assignment| bound_expr_references_active_branch_commit_id(&assignment.value))
         })
         || plan.bound.returning.as_ref().is_some_and(|returning| {
-            returning
-                .items
-                .iter()
-                .any(|item| {
-                    item.expr
-                        .as_ref()
-                        .is_some_and(bound_expr_references_active_branch_commit_id)
-                })
+            returning.items.iter().any(|item| {
+                item.expr
+                    .as_ref()
+                    .is_some_and(bound_expr_references_active_branch_commit_id)
+            })
         })
 }
 
@@ -3249,14 +3246,11 @@ async fn stage_rows_with_postimage_returning(
         .unwrap_or_default();
     let returning_requires_staged_postimage =
         plan.bound.returning.as_ref().is_some_and(|returning| {
-            returning
-                .items
-                .iter()
-                .any(|item| {
-                    item.expr
-                        .as_ref()
-                        .is_none_or(returning_expr_requires_staged_postimage)
-                })
+            returning.items.iter().any(|item| {
+                item.expr
+                    .as_ref()
+                    .is_none_or(returning_expr_requires_staged_postimage)
+            })
         });
     let returning_rows = if returning_requires_staged_postimage {
         None
@@ -3687,21 +3681,21 @@ fn returning_column_types(
                 .as_ref()
                 .and_then(|expr| returning_expr_column_type(expr, spec, params))
                 .unwrap_or_else(|| {
-                rows.iter()
-                    .filter_map(|row| row.get(index))
-                    .find(|value| !matches!(value, Value::Null))
-                    .map_or(crate::ResultColumnType::Null, |value| match value {
-                        Value::Null => crate::ResultColumnType::Null,
-                        Value::Boolean(_) => crate::ResultColumnType::Boolean,
-                        Value::Integer(_) => crate::ResultColumnType::Integer,
-                        Value::Real(_) => crate::ResultColumnType::Real,
-                        Value::Text(_) => crate::ResultColumnType::Text,
-                        Value::Jsonb(_) => crate::ResultColumnType::Jsonb,
-                        Value::RowRef(_) => crate::ResultColumnType::RowRef,
-                        Value::Timestamptz(_) => crate::ResultColumnType::Timestamptz,
-                        Value::Blob(_) => crate::ResultColumnType::Blob,
-                    })
-            })
+                    rows.iter()
+                        .filter_map(|row| row.get(index))
+                        .find(|value| !matches!(value, Value::Null))
+                        .map_or(crate::ResultColumnType::Null, |value| match value {
+                            Value::Null => crate::ResultColumnType::Null,
+                            Value::Boolean(_) => crate::ResultColumnType::Boolean,
+                            Value::Integer(_) => crate::ResultColumnType::Integer,
+                            Value::Real(_) => crate::ResultColumnType::Real,
+                            Value::Text(_) => crate::ResultColumnType::Text,
+                            Value::Jsonb(_) => crate::ResultColumnType::Jsonb,
+                            Value::RowRef(_) => crate::ResultColumnType::RowRef,
+                            Value::Timestamptz(_) => crate::ResultColumnType::Timestamptz,
+                            Value::Blob(_) => crate::ResultColumnType::Blob,
+                        })
+                })
         })
         .collect()
 }
@@ -3714,6 +3708,7 @@ fn returning_expr_column_type(
     if let Some(column) = visible_row_column(expr, spec) {
         return Some(match column.column_type {
             SchemaColumnType::String => crate::ResultColumnType::Text,
+            SchemaColumnType::RowRef => crate::ResultColumnType::RowRef,
             SchemaColumnType::Jsonb => crate::ResultColumnType::Jsonb,
             SchemaColumnType::Integer => crate::ResultColumnType::Integer,
             SchemaColumnType::Number => crate::ResultColumnType::Real,
@@ -3771,7 +3766,7 @@ fn returning_expr_column_type(
         BoundExpr::Function { name, .. }
             if matches!(
                 name.as_str(),
-                "__lix_json_get" | "__lix_json_path_get" | "__lix_jsonb"
+                "__lix_json_get" | "__lix_json_path_get" | "__lix_jsonb" | "lix_row_ref_parts"
             ) =>
         {
             Some(crate::ResultColumnType::Jsonb)
@@ -3830,14 +3825,7 @@ fn row_returning_row(
                     "RETURNING expression requires DataFusion projection",
                 )
             })?;
-            row_returning_value(
-                expr,
-                context,
-                spec,
-                ctx,
-                params,
-                active_branch_commit_id,
-            )
+            row_returning_value(expr, context, spec, ctx, params, active_branch_commit_id)
         })
         .collect()
 }
@@ -4932,10 +4920,7 @@ fn certified_direct_parameter_insert_batch(
                     .expect("resolved INSERT column belongs to schema");
                 typed_row.insert(
                     column.name.clone(),
-                    typed_value_from_eval(
-                        eval_value,
-                        data_type,
-                    )?,
+                    typed_value_from_eval(eval_value, data_type)?,
                 );
             }
             schema_plan
@@ -5141,8 +5126,10 @@ fn certified_direct_parameter_insert_batch(
                     (SchemaColumnType::Timestamptz, None) => Arc::new(
                         TimestampMicrosecondArray::new_null(row_count).with_timezone("UTC"),
                     ),
+                    (SchemaColumnType::RowRef, None) => Arc::new(StringArray::new_null(row_count)),
                     (
                         SchemaColumnType::Jsonb
+                        | SchemaColumnType::RowRef
                         | SchemaColumnType::Integer
                         | SchemaColumnType::Number,
                         Some(_),
@@ -5542,18 +5529,9 @@ fn append_row_insert_row(
                         format!("schema '{}' has no column '{name}'", layout.schema_key),
                     )
                 })?;
-                typed_row.insert(
-                    name.clone(),
-                    typed_value_from_eval(
-                        eval_value,
-                        data_type,
-                    )?,
-                );
+                typed_row.insert(name.clone(), typed_value_from_eval(eval_value, data_type)?);
             } else {
-                snapshot.insert(
-                    name.clone(),
-                    row_json_value(eval_value, *column_type)?,
-                );
+                snapshot.insert(name.clone(), row_json_value(eval_value, *column_type)?);
             }
             continue;
         }
@@ -6391,6 +6369,22 @@ fn comparison_values_equal(
     if let Some(equal) = left_value.same_type_equal(&right_value) {
         return Ok(equal);
     }
+    // A TEXT operand of a ROW_REF comparison is read as a row reference, as a
+    // DataFusion query reads an untyped literal or parameter.
+    match (&left_value, &right_value) {
+        (RowEvalValue::RowRef(row_ref), RowEvalValue::SqlText(text))
+        | (RowEvalValue::SqlText(text), RowEvalValue::RowRef(row_ref)) => {
+            crate::row_ref::decode_str(text)?;
+            return Ok(row_ref.as_str() == text);
+        }
+        (RowEvalValue::RowRef(_), _) | (_, RowEvalValue::RowRef(_)) => {
+            return Err(LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                "ROW_REF values require matching logical types for comparison",
+            ));
+        }
+        _ => {}
+    }
     let left = left_value.scalar();
     let right = right_value.scalar();
     if left.data_type() == right.data_type() {
@@ -6464,14 +6458,11 @@ pub(crate) fn row_returning_projects_before_stage(plan: &LogicalWritePlan) -> bo
         BoundWriteOp::Delete => true,
         BoundWriteOp::Insert | BoundWriteOp::Update => {
             plan.bound.returning.as_ref().is_some_and(|returning| {
-                returning
-                    .items
-                    .iter()
-                    .all(|item| {
-                        item.expr.as_ref().is_some_and(|expr| {
-                            !returning_expr_requires_staged_postimage(expr)
-                        })
-                    })
+                returning.items.iter().all(|item| {
+                    item.expr
+                        .as_ref()
+                        .is_some_and(|expr| !returning_expr_requires_staged_postimage(expr))
+                })
             })
         }
     }
@@ -6570,14 +6561,11 @@ fn bound_public_write_shape_supported(plan: &LogicalWritePlan) -> bool {
                 .all(|assignment| validate_expr_supported(&assignment.value).is_ok())
         })
         && plan.bound.returning.as_ref().is_none_or(|returning| {
-            returning
-                .items
-                .iter()
-                .all(|item| {
-                    item.expr
-                        .as_ref()
-                        .is_some_and(|expr| validate_expr_supported(expr).is_ok())
-                })
+            returning.items.iter().all(|item| {
+                item.expr
+                    .as_ref()
+                    .is_some_and(|expr| validate_expr_supported(expr).is_ok())
+            })
         })
 }
 
@@ -6782,10 +6770,7 @@ fn set_owned_row_image_eval_value(
                     format!("row for schema '{schema_key}' is not an object"),
                 )
             })?;
-            object.insert(
-                column_name.to_owned(),
-                row_json_value(value, column_type)?,
-            );
+            object.insert(column_name.to_owned(), row_json_value(value, column_type)?);
         }
         OwnedRowImage::Typed(typed) => {
             typed.invalidate_durable_payload();
@@ -6921,6 +6906,7 @@ fn row_json_value(
 ) -> Result<JsonValue, LixError> {
     let target = match column_type {
         SchemaColumnType::String => lix_schema::DataType::Text,
+        SchemaColumnType::RowRef => lix_schema::DataType::RowRef,
         SchemaColumnType::Jsonb => lix_schema::DataType::Jsonb,
         SchemaColumnType::Integer => lix_schema::DataType::Int8,
         SchemaColumnType::Number => lix_schema::DataType::Float8,
@@ -7157,6 +7143,9 @@ fn visible_column_eval_value(
         (Some(SchemaColumnType::String), JsonValue::String(value)) => {
             RowEvalValue::SqlText(value.clone())
         }
+        (Some(SchemaColumnType::RowRef), JsonValue::String(value)) => {
+            RowEvalValue::RowRef(crate::RowRef(value.clone()))
+        }
         (Some(SchemaColumnType::Integer), JsonValue::Number(value)) if value.as_i64().is_some() => {
             RowEvalValue::Integer(value.as_i64().unwrap())
         }
@@ -7175,9 +7164,14 @@ fn visible_column_eval_value(
 
 fn typed_column_eval_value(
     value: &lix_schema::Value,
-    _column_type: Option<SchemaColumnType>,
+    column_type: Option<SchemaColumnType>,
 ) -> Result<RowEvalValue, LixError> {
-    Ok(RowEvalValue::from_schema(value))
+    Ok(match (column_type, value) {
+        (Some(SchemaColumnType::RowRef), lix_schema::Value::Text(value)) => {
+            RowEvalValue::RowRef(crate::RowRef(value.clone()))
+        }
+        _ => RowEvalValue::from_schema(value),
+    })
 }
 
 fn scan_branch_ids(scope: &BranchScope) -> Result<Vec<String>, LixError> {
@@ -7705,7 +7699,7 @@ mod constraints_unchanged_tests {
                 { "name": "id", "type": "text", "nullable": false },
                 { "name": "slug", "type": "text", "nullable": false },
                 { "name": "parent_id", "type": "text", "nullable": false },
-                { "name": "target_ref", "type": "text", "nullable": true },
+                { "name": "target_ref", "type": "row_ref", "nullable": true },
                 { "name": "payload", "type": "text", "nullable": false },
             ],
             "primary_key": ["id"],
@@ -7714,7 +7708,6 @@ mod constraints_unchanged_tests {
                 "columns": ["parent_id"],
                 "references": { "schema_key": "constraint_probe_parent", "columns": ["id"] }
             }],
-            "row_refs": [{"column": "target_ref"}],
         })
     }
 

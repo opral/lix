@@ -277,7 +277,19 @@ impl SqlValue {
         // Fast identity conversions avoid Arrow's one-element array allocation.
         let value = match (self, target) {
             (Self::SqlText(v), T::Text) => return Ok(V::Text(v)),
-            (Self::RowRef(v), T::Text) => return Ok(V::Text(v.as_str().to_owned())),
+            (Self::RowRef(v), T::Text | T::RowRef) => return Ok(V::Text(v.as_str().to_owned())),
+            // A TEXT value assigned to a ROW_REF column is read as a row
+            // reference and must already be its canonical encoding.
+            (Self::SqlText(v), T::RowRef) => {
+                crate::row_ref::decode_str(&v)?;
+                return Ok(V::Text(v));
+            }
+            (_, T::RowRef) => {
+                return Err(LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    "a ROW_REF column requires a row reference such as lix_row_ref(...)",
+                ));
+            }
             (Self::Uuid(v), T::Uuid) => return Ok(V::Uuid(v)),
             (Self::Integer(v), T::Int8) => return Ok(V::Int8(v)),
             (Self::Real(v), T::Float8) if v.is_finite() => return Ok(V::Float8(v)),
@@ -288,6 +300,7 @@ impl SqlValue {
         };
         let arrow_type = match target {
             T::Text | T::Uuid | T::Jsonb => A::Utf8,
+            T::RowRef => unreachable!("ROW_REF assignments return above"),
             T::Int8 => A::Int64,
             T::Float8 => A::Float64,
             T::Boolean => A::Boolean,

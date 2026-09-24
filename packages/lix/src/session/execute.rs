@@ -1229,7 +1229,7 @@ where
             if sql2::bind_statement_route(&statement)? != sql2::BoundStatementRoute::Read
                 || sql2::statement_has_durable_runtime_function(&statement)
                 || exact_filesystem_read_route(&statement, params).is_some()
-                || late_materialized_lix_file_content_read(&statement).is_some()
+                || late_materialized_lix_file_content_read(&statement, params).is_some()
             {
                 return Err(LixError::new(
                     LixError::CODE_UNSUPPORTED_SQL,
@@ -2737,7 +2737,8 @@ where
     ) -> Result<ReadBatchResult, LixError> {
         let acknowledge_file_views = parsed.iter().zip(statements).any(|(parsed, (_, params))| {
             is_acknowledgeable_file_content_read(parsed, params)
-                || late_materialized_lix_file_content_read(parsed).is_some()
+                || late_materialized_lix_file_content_read(parsed, params)
+                    .is_some_and(|plan| plan.projection.acknowledges_content())
         });
         let _operation_guard = self.begin_waitable_session_operation().await?;
         let (results, file_view_mutations, captured_interests) =
@@ -2832,7 +2833,10 @@ where
                         {
                             let acknowledge_statement =
                                 is_acknowledgeable_file_content_read(&parsed, params)
-                                    || late_materialized_lix_file_content_read(&parsed).is_some();
+                                    || late_materialized_lix_file_content_read(&parsed, params)
+                                        .is_some_and(|plan| {
+                                            plan.projection.acknowledges_content()
+                                        });
                             // A mixed batch may return file bytes alongside metadata or
                             // aggregates. Only the exact byte-returning statement may
                             // update the session's private plugin observation.
@@ -2850,7 +2854,8 @@ where
                                 })
                                 .flatten();
                             let operation = async {
-                                if let Some(plan) = late_materialized_lix_file_content_read(&parsed)
+                                if let Some(plan) =
+                                    late_materialized_lix_file_content_read(&parsed, params)
                                 {
                                     // Resolve filters and LIMIT on file metadata first. A
                                     // provider scan may render files absent from the result;
@@ -2864,8 +2869,10 @@ where
                                             true,
                                             sql2::StatementReadPlan {
                                                 native: None,
+                                                acknowledge_file_views: plan
+                                                    .projection
+                                                    .acknowledges_content(),
                                                 late_content: Some(plan),
-                                                acknowledge_file_views: true,
                                             },
                                             false,
                                         )
@@ -3270,14 +3277,23 @@ where
         // when logical interests are retained, including zero-row queries.
         // This may materialize extra content before LIMIT; restoring the
         // optimization requires retaining its original predicate, not only IDs.
-        let late_content = read_plan
-            .late_content
-            .filter(|_| read_hot.read_interest_registry().is_none());
-        let (statement, late_file_content_column, rewritten_sql) = match late_content {
+        let late_content = read_plan.late_content.filter(|plan| {
+            read_hot.read_interest_registry().is_none()
+                || matches!(
+                    plan.projection,
+                    sql2::LateLixFileProjection::OctetLength
+                        | sql2::LateLixFileProjection::Substring { .. }
+                )
+        });
+        let (statement, late_file_projection, rewritten_sql) = match late_content {
             Some(plan) => {
                 let statement = *plan.statement;
                 let rewritten_sql = statement.to_string();
-                (statement, Some(plan.data_column_index), Some(rewritten_sql))
+                (
+                    statement,
+                    Some((plan.data_column_index, plan.projection)),
+                    Some(rewritten_sql),
+                )
             }
             None => (statement, None, None),
         };
@@ -3306,7 +3322,7 @@ where
         .await?;
         drop(read_session);
         drop(ctx);
-        if let Some(data_column_index) = late_file_content_column {
+        if let Some((data_column_index, projection)) = late_file_projection {
             let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
                 Arc::new(read_hot.reader(read_store.clone()));
             let branch_ref: Arc<dyn BranchRefReader> =
@@ -3314,18 +3330,51 @@ where
             let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
                 Arc::new(self.binary_cas.reader(read_store));
             let mut materialized = query.query.into_sql_query_result()?;
-            hydrate_lix_file_content_result(
-                &active_branch_id,
-                Arc::clone(&hot_state),
-                filesystem_path_index,
-                branch_ref,
-                blob_reader,
-                self.plugin_host.clone(),
-                file_view_collector.clone(),
-                &mut materialized,
-                data_column_index,
-            )
-            .await?;
+            match projection {
+                sql2::LateLixFileProjection::Content => {
+                    hydrate_lix_file_content_result(
+                        &active_branch_id,
+                        Arc::clone(&hot_state),
+                        filesystem_path_index,
+                        branch_ref,
+                        blob_reader,
+                        self.plugin_host.clone(),
+                        file_view_collector.clone(),
+                        &mut materialized,
+                        data_column_index,
+                    )
+                    .await?;
+                }
+                sql2::LateLixFileProjection::OctetLength => {
+                    hydrate_lix_file_size_result(
+                        &active_branch_id,
+                        Arc::clone(&hot_state),
+                        filesystem_path_index,
+                        branch_ref,
+                        blob_reader,
+                        self.plugin_host.clone(),
+                        &mut materialized,
+                        data_column_index,
+                    )
+                    .await?;
+                }
+                sql2::LateLixFileProjection::Substring { start, length } => {
+                    hydrate_lix_file_substring_result(
+                        &active_branch_id,
+                        Arc::clone(&hot_state),
+                        filesystem_path_index,
+                        branch_ref,
+                        blob_reader,
+                        self.plugin_host.clone(),
+                        file_view_collector.clone(),
+                        &mut materialized,
+                        data_column_index,
+                        start,
+                        length,
+                    )
+                    .await?;
+                }
+            }
             query.query = sql2::SessionReadResult::Rows(materialized);
         }
         drop(hot_state);
@@ -3626,6 +3675,223 @@ async fn hydrate_lix_file_content_result(
         })?;
     }
     Ok(())
+}
+
+async fn hydrate_lix_file_size_result(
+    active_branch_id: &str,
+    hot_state: Arc<dyn crate::hot_state::HotStateReader>,
+    filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader>,
+    branch_ref: Arc<dyn BranchRefReader>,
+    blob_reader: Arc<dyn crate::binary_cas::BlobDataReader>,
+    plugin_host: crate::plugin::runtime::PluginRuntimeHost,
+    query: &mut SqlQueryResult,
+    data_column_index: usize,
+) -> Result<(), LixError> {
+    let Some(column_type) = query.column_types.get_mut(data_column_index) else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "late lix_file size result was missing its column type",
+        ));
+    };
+    *column_type = ResultColumnType::Integer;
+    let paths = late_lix_file_placeholder_paths(query, data_column_index)?;
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let sizes = sql2::execute_exact_lix_file_size_batch_read(
+        active_branch_id,
+        hot_state,
+        filesystem_path_index,
+        branch_ref,
+        blob_reader,
+        plugin_host,
+        None,
+        &paths,
+    )
+    .await?;
+    let mut size_by_path = BTreeMap::new();
+    for row in sizes.rows {
+        let [Value::Text(path), size @ Value::Integer(_)] = row.as_slice() else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "late lix_file size lookup returned an invalid row",
+            ));
+        };
+        size_by_path.insert(path.clone(), size.clone());
+    }
+    for row in &mut query.rows {
+        let Some(placeholder) = row.get_mut(data_column_index) else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "late lix_file size result was missing its placeholder column",
+            ));
+        };
+        let Value::Text(path) = std::mem::replace(placeholder, Value::Null) else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "late lix_file size placeholder was not a path",
+            ));
+        };
+        *placeholder = size_by_path.get(&path).cloned().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("late lix_file size lookup did not return '{path}'"),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+async fn hydrate_lix_file_substring_result(
+    active_branch_id: &str,
+    hot_state: Arc<dyn crate::hot_state::HotStateReader>,
+    filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader>,
+    branch_ref: Arc<dyn BranchRefReader>,
+    blob_reader: Arc<dyn crate::binary_cas::BlobDataReader>,
+    plugin_host: crate::plugin::runtime::PluginRuntimeHost,
+    session_file_views: Option<sql2::SessionFileViews>,
+    query: &mut SqlQueryResult,
+    data_column_index: usize,
+    start: i64,
+    length: u64,
+) -> Result<(), LixError> {
+    let Some(column_type) = query.column_types.get_mut(data_column_index) else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "late lix_file substring result was missing its column type",
+        ));
+    };
+    *column_type = ResultColumnType::Blob;
+    let paths = late_lix_file_placeholder_paths(query, data_column_index)?;
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let sizes = sql2::execute_exact_lix_file_size_batch_read(
+        active_branch_id,
+        Arc::clone(&hot_state),
+        Arc::clone(&filesystem_path_index),
+        Arc::clone(&branch_ref),
+        Arc::clone(&blob_reader),
+        plugin_host.clone(),
+        None,
+        &paths,
+    )
+    .await?;
+    let mut size_by_path = BTreeMap::new();
+    for row in sizes.rows {
+        let [Value::Text(path), Value::Integer(size)] = row.as_slice() else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "late lix_file size lookup returned an invalid row",
+            ));
+        };
+        let size = u64::try_from(*size).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "late lix_file size lookup returned a negative size",
+            )
+        })?;
+        size_by_path.insert(path.clone(), size);
+    }
+
+    let mut data_by_path = BTreeMap::new();
+    let mut paths_by_range = BTreeMap::<(u64, u64), BTreeSet<String>>::new();
+    for path in &paths {
+        let size = size_by_path.get(path).copied().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("late lix_file size lookup did not return '{path}'"),
+            )
+        })?;
+        let (range_start, range_end) = sql_substring_byte_range(start, length, size);
+        if range_start == range_end {
+            data_by_path.insert(path.clone(), Value::Blob(Vec::new().into()));
+        } else {
+            paths_by_range
+                .entry((range_start, range_end))
+                .or_default()
+                .insert(path.clone());
+        }
+    }
+
+    for ((range_start, range_end), selected_paths) in paths_by_range {
+        let ranged = sql2::execute_exact_lix_file_batch_read(
+            active_branch_id,
+            Arc::clone(&hot_state),
+            Arc::clone(&filesystem_path_index),
+            Arc::clone(&branch_ref),
+            Arc::clone(&blob_reader),
+            plugin_host.clone(),
+            session_file_views.clone(),
+            None,
+            &selected_paths,
+            Some(range_start..range_end),
+        )
+        .await?;
+        query.notices.extend(ranged.notices);
+        for row in ranged.rows {
+            let [Value::Text(path), Value::Blob(bytes), ..] = row.as_slice() else {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "late lix_file substring read returned an invalid row",
+                ));
+            };
+            data_by_path.insert(path.clone(), Value::Blob(bytes.clone()));
+        }
+    }
+
+    for row in &mut query.rows {
+        let Some(placeholder) = row.get_mut(data_column_index) else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "late lix_file substring result was missing its placeholder column",
+            ));
+        };
+        let Value::Text(path) = std::mem::replace(placeholder, Value::Null) else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "late lix_file substring placeholder was not a path",
+            ));
+        };
+        *placeholder = data_by_path.get(&path).cloned().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("late lix_file substring read did not return '{path}'"),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn late_lix_file_placeholder_paths(
+    query: &SqlQueryResult,
+    data_column_index: usize,
+) -> Result<BTreeSet<String>, LixError> {
+    let mut paths = BTreeSet::new();
+    for row in &query.rows {
+        let Some(Value::Text(path)) = row.get(data_column_index) else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "late lix_file projection placeholder was not a path",
+            ));
+        };
+        paths.insert(path.clone());
+    }
+    Ok(paths)
+}
+
+/// Applies the SQL substring position rules in byte coordinates. Positions
+/// before byte one reduce the requested length; positions past EOF produce an
+/// empty range. The SQL result size remains a separate checked BIGINT value.
+fn sql_substring_byte_range(start: i64, length: u64, size: u64) -> (u64, u64) {
+    let zero_based_start = i128::from(start) - 1;
+    let effective_start = zero_based_start.max(0).min(i128::from(size));
+    let effective_end = (zero_based_start + i128::from(length))
+        .max(0)
+        .min(i128::from(size));
+    let effective_start = effective_start as u64;
+    let effective_end = effective_end.max(i128::from(effective_start)) as u64;
+    (effective_start, effective_end)
 }
 
 #[cfg(feature = "storage-benches")]
@@ -4258,6 +4524,7 @@ where
             // statement fails, including errors before a direct RETURNING
             // write reaches staging.
             let function_checkpoint = transaction.functions().statement_checkpoint();
+            let read_set_checkpoint = transaction.checkpoint_sql_statement_reads();
             let result = async {
                 let result = if is_read {
                     execute_transaction_statement(
@@ -4288,7 +4555,9 @@ where
                 Ok(result)
             }
             .await;
+            transaction.finish_sql_statement_reads();
             if result.is_err() {
+                transaction.restore_sql_statement_reads(read_set_checkpoint);
                 if let Some(function_checkpoint) = function_checkpoint {
                     transaction
                         .functions()
@@ -6504,7 +6773,7 @@ mod tests {
             "SELECT path, content FROM lix_file WHERE path LIKE $1 ORDER BY path LIMIT 2",
         )
         .unwrap();
-        let plan = late_materialized_lix_file_content_read(&statement).unwrap();
+        let plan = late_materialized_lix_file_content_read(&statement, &[]).unwrap();
         assert_eq!(plan.data_column_index, 1);
         assert_eq!(
             plan.statement.to_string(),
@@ -6515,7 +6784,7 @@ mod tests {
             "SELECT file.content AS bytes, file.path AS label FROM lix_file AS file WHERE file.path LIKE $1 ORDER BY file.path",
         )
         .unwrap();
-        let plan = late_materialized_lix_file_content_read(&aliased).unwrap();
+        let plan = late_materialized_lix_file_content_read(&aliased, &[]).unwrap();
         assert_eq!(plan.data_column_index, 0);
         assert_eq!(
             plan.statement.to_string(),
@@ -6536,11 +6805,21 @@ mod tests {
         ] {
             let statement = sql2::parse_statement(sql).unwrap();
             assert_eq!(
-                late_materialized_lix_file_content_read(&statement),
+                late_materialized_lix_file_content_read(&statement, &[]),
                 None,
                 "unexpected late materialization for {sql}"
             );
         }
+    }
+
+    #[test]
+    fn sql_substring_byte_ranges_follow_one_based_positions_and_clip_boundaries() {
+        assert_eq!(sql_substring_byte_range(1, 3, 5), (0, 3));
+        assert_eq!(sql_substring_byte_range(0, 3, 5), (0, 2));
+        assert_eq!(sql_substring_byte_range(-2, 4, 5), (0, 1));
+        assert_eq!(sql_substring_byte_range(7, 5, 5), (5, 5));
+        assert_eq!(sql_substring_byte_range(1, 8, 0), (0, 0));
+        assert_eq!(sql_substring_byte_range(3, 0, 5), (2, 2));
     }
 
     #[test]
@@ -11352,6 +11631,176 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn sql_file_octet_length_and_bounded_substring_use_metadata_and_ranges() {
+        let session = open_session().await;
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2), ($3, $4)",
+                &[
+                    Value::Text("/large.bin".to_string()),
+                    Value::Blob(b"abcde".to_vec().into()),
+                    Value::Text("/empty.bin".to_string()),
+                    Value::Blob(Vec::new().into()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let sizes = session
+            .execute(
+                "SELECT f.path, OCTET_LENGTH(f.content) AS size_bytes \
+                 FROM lix_file AS f WHERE f.path IN ($1, $2) ORDER BY f.path",
+                &[
+                    Value::Text("/empty.bin".into()),
+                    Value::Text("/large.bin".into()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(sizes.columns(), &["path", "size_bytes"]);
+        assert_eq!(sizes.rows()[0].values(), &[Value::Text("/empty.bin".into()), Value::Integer(0)]);
+        assert_eq!(sizes.rows()[1].values(), &[Value::Text("/large.bin".into()), Value::Integer(5)]);
+
+        let unaliased_size = session
+            .execute(
+                "SELECT OCTET_LENGTH(content) FROM lix_file WHERE path = '/large.bin'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(unaliased_size.columns(), &["OCTET_LENGTH(content)"]);
+        assert_eq!(
+            unaliased_size.rows()[0].values(),
+            &[Value::Integer(5)]
+        );
+
+        let unaliased_slice = session
+            .execute(
+                "SELECT SUBSTRING(content FROM 2 FOR 3) \
+                 FROM lix_file WHERE path = '/large.bin'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(unaliased_slice.columns(), &["SUBSTRING(content FROM 2 FOR 3)"]);
+        assert_eq!(
+            unaliased_slice.rows()[0].values(),
+            &[Value::Blob(b"bcd".to_vec().into())]
+        );
+
+        let negative_start = session
+            .execute(
+                "SELECT SUBSTRING(f.content FROM $2 FOR $3) AS slice \
+                 FROM lix_file AS f WHERE f.path = $1",
+                &[
+                    Value::Text("/large.bin".into()),
+                    Value::Integer(-2),
+                    Value::Integer(4),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(negative_start.columns(), &["slice"]);
+        assert_eq!(
+            negative_start.rows()[0].value("slice").unwrap(),
+            &Value::Blob(b"a".to_vec().into())
+        );
+
+        let slice_params_only = session
+            .execute(
+                "SELECT SUBSTRING(content FROM $1 FOR $2) AS slice \
+                 FROM lix_file WHERE path = '/large.bin'",
+                &[Value::Integer(2), Value::Integer(3)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            slice_params_only.rows()[0].value("slice").unwrap(),
+            &Value::Blob(b"bcd".to_vec().into())
+        );
+
+        let past_end = session
+            .execute(
+                "SELECT SUBSTRING(content FROM $1 FOR $2) AS slice \
+                 FROM lix_file WHERE path = $3",
+                &[
+                    Value::Integer(8),
+                    Value::Integer(2),
+                    Value::Text("/large.bin".into()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            past_end.rows()[0].value("slice").unwrap(),
+            &Value::Blob(Vec::new().into())
+        );
+
+        let empty_file = session
+            .execute(
+                "SELECT SUBSTRING(content FROM 1 FOR 2) AS slice \
+                 FROM lix_file WHERE path = $1",
+                &[Value::Text("/empty.bin".into())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            empty_file.rows()[0].value("slice").unwrap(),
+            &Value::Blob(Vec::new().into())
+        );
+    }
+
+    #[tokio::test]
+    async fn sql_file_substring_reads_a_bounded_range_across_cas_chunks() {
+        let session = open_session().await;
+        let size = crate::binary_cas::CHUNK_ANCHOR_BYTES + 4096;
+        let content = (0..size).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+        session
+            .execute(
+                "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
+                &[
+                    Value::Text("/chunked.bin".to_string()),
+                    Value::Blob(content.clone().into()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let size_result = session
+            .execute(
+                "SELECT OCTET_LENGTH(content) AS size_bytes FROM lix_file WHERE path = $1",
+                &[Value::Text("/chunked.bin".into())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            size_result.rows()[0].value("size_bytes").unwrap(),
+            &Value::Integer(size as i64)
+        );
+
+        let start = crate::binary_cas::CHUNK_ANCHOR_BYTES as i64 - 3;
+        let length = 12_i64;
+        let selected = session
+            .execute(
+                "SELECT SUBSTRING(content FROM $1 FOR $2) AS slice \
+                 FROM lix_file WHERE path = $3",
+                &[
+                    Value::Integer(start),
+                    Value::Integer(length),
+                    Value::Text("/chunked.bin".into()),
+                ],
+            )
+            .await
+            .unwrap();
+        let byte_start = usize::try_from(start - 1).unwrap();
+        let byte_end = byte_start + usize::try_from(length).unwrap();
+        assert_eq!(
+            selected.rows()[0].value("slice").unwrap(),
+            &Value::Blob(content[byte_start..byte_end].to_vec().into())
+        );
+    }
+
     #[test]
     fn row_get_converts_native_values_and_value_keeps_wrapper() {
         let result = ExecuteResult::from_rows(
@@ -12382,7 +12831,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_complete_journal_replacement_rejects_changed_branch() {
+    async fn stale_complete_journal_replacement_rebases_over_a_disjoint_insert() {
         const ROW_COUNT: usize = 1_024;
         let storage = Memory::default();
         Engine::initialize(storage.clone())
@@ -12469,24 +12918,24 @@ mod tests {
             )
             .await
             .expect("disjoint insert should commit first");
-        let conflict = replacement
+        // The insert matches none of the updates' key predicates (#1900): the
+        // complete-set journal is lowered and rebased instead of rejected.
+        replacement
             .commit()
             .await
-            .expect_err("prepared SQL updates must reject a changed opening snapshot");
-        assert_eq!(conflict.code, LixError::CODE_TRANSACTION_CONFLICT);
+            .expect("prepared SQL updates must rebase over a disjoint insert");
 
-        let unchanged = session
+        let replaced = session
             .execute(
-                "SELECT value FROM stale_journal_replacement_probe WHERE path = '0000'",
+                "SELECT COUNT(*) AS count FROM stale_journal_replacement_probe \
+                 WHERE value ->> 'state' = 'replacement'",
                 &[],
             )
             .await
-            .expect("rejected journal must leave the original row readable");
+            .expect("replaced rows should be readable");
         assert_eq!(
-            unchanged.rows()[0]
-                .get::<serde_json::Value>("value")
-                .unwrap(),
-            serde_json::json!({"state": "base"})
+            replaced.rows()[0].get::<i64>("count").unwrap(),
+            ROW_COUNT as i64
         );
 
         let rows = concurrent_session
@@ -12499,7 +12948,7 @@ mod tests {
         assert_eq!(
             rows.rows()[0].get::<i64>("count").unwrap(),
             (ROW_COUNT + 1) as i64,
-            "rejecting the stale complete-set proof must preserve the disjoint insert"
+            "rebasing the stale complete-set journal must preserve the disjoint insert"
         );
         let concurrent = concurrent_session
             .execute(
@@ -12520,7 +12969,7 @@ mod tests {
                 &[],
             )
             .await
-            .expect("unchanged lifecycle should be readable")
+            .expect("updated lifecycle should be readable")
             .rows()[0]
             .get::<String>("lixcol_created_at")
             .unwrap()

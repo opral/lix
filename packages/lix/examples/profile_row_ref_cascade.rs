@@ -24,7 +24,7 @@ async fn main() -> Result<(), LixError> {
     let db = open_lix().await?;
     for schema in [
         serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"bench_ref_parent","columns":[{"name":"id","type":"int8","nullable":false}],"primary_key":["id"]}),
-        serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"bench_ref_child","columns":[{"name":"id","type":"int8","nullable":false},{"name":"target","type":"text","nullable":false}],"primary_key":["id"],"row_refs":[{"column":"target","on_delete":"cascade"}]}),
+        serde_json::json!({"$schema":"https://lix.dev/schema-v1.json","key":"bench_ref_child","columns":[{"name":"id","type":"int8","nullable":false},{"name":"target","type":"row_ref","nullable":false}],"primary_key":["id"],"row_refs":[{"column":"target","on_delete":"cascade"}]}),
     ] {
         db.execute(
             "INSERT INTO lix_registered_schema(value) VALUES ($1::jsonb)",

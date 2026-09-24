@@ -1,0 +1,42 @@
+{
+  "$schema": "https://lix.dev/schema-v1.json",
+  "key": "lix_comment",
+  "description": "A comment belonging to a conversation in the same scope. Authorship and timestamps use Lix change and row metadata.",
+  "columns": [
+    {
+      "name": "id",
+      "type": "uuid",
+      "nullable": false,
+      "description": "Stable comment identifier."
+    },
+    {
+      "name": "conversation_id",
+      "type": "uuid",
+      "nullable": false,
+      "description": "Conversation containing the comment, in the same scope."
+    },
+    {
+      "name": "body",
+      "type": "jsonb",
+      "nullable": false,
+      "description": "Zettel document JSON. Applications validate the document format; the SQL column enforces JSONB storage and non-nullability."
+    }
+  ],
+  "primary_key": [
+    "id"
+  ],
+  "foreign_keys": [
+    {
+      "columns": [
+        "conversation_id"
+      ],
+      "references": {
+        "schema_key": "lix_conversation",
+        "columns": [
+          "id"
+        ]
+      },
+      "on_delete": "cascade"
+    }
+  ]
+}

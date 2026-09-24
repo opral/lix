@@ -36,6 +36,8 @@ import type {
 	ResultRow,
 	SwitchBranchOptions,
 	SwitchBranchReceipt,
+	TransactionOptions,
+	TransactionResult,
 } from "./types.js";
 
 const transactionFinalizer = new FinalizationRegistry<{
@@ -254,6 +256,50 @@ export class Lix {
 				this.#transactionsOpening -= 1;
 			}
 		});
+	}
+
+	/**
+	 * Runs `fn` in an explicit transaction and commits it.
+	 *
+	 * A commit fails with `LIX_TRANSACTION_CONFLICT` only when a concurrent
+	 * commit changed rows this transaction read for a decision or writes
+	 * itself. On such a conflict the transaction is rolled back and `fn` runs
+	 * again on a fresh transaction, up to `maxRetries` times (default 3; `0`
+	 * never reruns). Any other error rolls back and rejects immediately.
+	 *
+	 * `fn` must not commit or roll back `tx` itself, and side effects outside
+	 * the transaction must tolerate a rerun.
+	 */
+	async transaction<T>(
+		fn: (tx: LixTransaction) => Promise<T> | T,
+		options: TransactionOptions = {},
+	): Promise<TransactionResult<T>> {
+		if (typeof fn !== "function") {
+			throw invalidArgument("transaction", "fn", "function", typeof fn);
+		}
+		const maxRetries = options.maxRetries ?? DEFAULT_TRANSACTION_RETRIES;
+		if (!Number.isSafeInteger(maxRetries) || maxRetries < 0) {
+			throw invalidArgument(
+				"transaction",
+				"options.maxRetries",
+				"non-negative integer",
+				String(maxRetries),
+			);
+		}
+		for (let retries = 0; ; retries += 1) {
+			const tx = await this.beginTransaction();
+			try {
+				const value = await fn(tx);
+				const { commit } = await tx.commit();
+				return { value, commit, retries };
+			} catch (error) {
+				await tx.rollback().catch(() => undefined);
+				if (isTransactionConflict(error) && retries < maxRetries) continue;
+				if (isTransactionConflict(error))
+					annotateTransactionRetries(error, retries, maxRetries);
+				throw error;
+			}
+		}
 	}
 
 	/** Lists preserved generations belonging to this local repository. */
@@ -652,6 +698,37 @@ class ObservationLifecycle {
 		// a `next()` promise can hang forever for bindings that don't reject pending reads.
 		this.drainPromise ??= this.bindingClosePromise;
 		this.onClose(this.drainPromise);
+	}
+}
+
+const DEFAULT_TRANSACTION_RETRIES = 3;
+
+function isTransactionConflict(error: unknown): boolean {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		(error as { code?: unknown }).code === "LIX_TRANSACTION_CONFLICT"
+	);
+}
+
+function annotateTransactionRetries(
+	error: unknown,
+	retries: number,
+	maxRetries: number,
+) {
+	const target = error as { details?: unknown };
+	const details =
+		typeof target.details === "object" && target.details !== null
+			? (target.details as Record<string, unknown>)
+			: {};
+	try {
+		target.details = {
+			...details,
+			transactionRetryCount: retries,
+			maxTransactionRetries: maxRetries,
+		};
+	} catch {
+		// Frozen error objects keep their original details.
 	}
 }
 

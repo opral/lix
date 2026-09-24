@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use globset::{GlobBuilder, GlobMatcher};
+use globset::{Glob, GlobBuilder, GlobMatcher};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
@@ -28,6 +28,8 @@ pub struct PluginManifest {
 #[serde(deny_unknown_fields)]
 pub struct PluginMatch {
     pub path_glob: String,
+    #[serde(default)]
+    pub case_insensitive: bool,
     #[serde(default, rename = "content")]
     pub content: Option<PluginContentMatcher>,
 }
@@ -102,15 +104,17 @@ pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, 
         })?;
     validate_plugin_manifest(&manifest)?;
     if let Some(file_match) = &manifest.file_match {
-        compile_path_glob(&file_match.path_glob).map_err(|error| {
-            LixError::new(
-                LixError::CODE_INVALID_PLUGIN,
-                format!(
-                    "Plugin manifest path_glob '{}' is invalid: {error}",
-                    file_match.path_glob
-                ),
-            )
-        })?;
+        compile_path_glob_with_case(&file_match.path_glob, file_match.case_insensitive).map_err(
+            |error| {
+                LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    format!(
+                        "Plugin manifest path_glob '{}' is invalid: {error}",
+                        file_match.path_glob
+                    ),
+                )
+            },
+        )?;
     }
     let normalized_json = serde_json::to_string(&manifest_json).map_err(|error| {
         LixError::new(
@@ -140,10 +144,17 @@ pub fn glob_matches_path(glob: &str, path: &str) -> bool {
 }
 
 fn compile_path_glob(glob: &str) -> Result<GlobMatcher, globset::Error> {
+    compile_path_glob_with_case(glob, false).map(|compiled| compiled.compile_matcher())
+}
+
+pub(super) fn compile_path_glob_with_case(
+    glob: &str,
+    case_insensitive: bool,
+) -> Result<Glob, globset::Error> {
     GlobBuilder::new(glob)
         .literal_separator(false)
+        .case_insensitive(case_insensitive)
         .build()
-        .map(|compiled| compiled.compile_matcher())
 }
 
 fn validate_plugin_manifest(manifest: &PluginManifest) -> Result<(), LixError> {
@@ -208,7 +219,10 @@ fn is_catch_all_glob(glob: &str) -> bool {
 mod tests {
     use crate::LixError;
 
-    use super::{PluginContentMatcher, glob_matches_path, parse_plugin_manifest_json};
+    use super::{
+        PluginContentMatcher, compile_path_glob_with_case, glob_matches_path,
+        parse_plugin_manifest_json,
+    };
 
     #[test]
     fn parses_valid_manifest() {
@@ -405,6 +419,45 @@ mod tests {
         assert!(!glob_matches_path(" *.md", "/docs/readme.md"));
         assert!(!glob_matches_path("/docs/*.md", " /docs/readme.md"));
         assert!(!glob_matches_path("*.MD", "/docs/readme.md"));
+    }
+
+    #[test]
+    fn markdown_manifest_matches_case_insensitive_extensions() {
+        let manifest = parse_plugin_manifest_json(include_str!(
+            "../../../../../plugins/markdown/manifest.json"
+        ))
+        .expect("Markdown manifest should parse");
+        let matcher = manifest.manifest.file_match.expect("file matcher");
+        assert!(matcher.case_insensitive);
+        let path_glob = compile_path_glob_with_case(&matcher.path_glob, matcher.case_insensitive)
+            .expect("Markdown glob should compile")
+            .compile_matcher();
+
+        for path in [
+            "/docs/readme.md",
+            "/docs/readme.MD",
+            "/docs/readme.mD",
+            "/docs/readme.markdown",
+            "/docs/readme.MARKDOWN",
+            "/docs/readme.MarkDown",
+        ] {
+            assert!(path_glob.is_match(path), "expected match: {path}");
+        }
+        assert!(!path_glob.is_match("/docs/readme.mdx"));
+    }
+
+    #[test]
+    fn case_insensitive_glob_matching_is_opt_in() {
+        let sensitive = compile_path_glob_with_case("/Docs/*.md", false)
+            .expect("case-sensitive glob should compile")
+            .compile_matcher();
+        assert!(sensitive.is_match("/Docs/readme.md"));
+        assert!(!sensitive.is_match("/docs/readme.MD"));
+
+        let insensitive = compile_path_glob_with_case("/Docs/*.md", true)
+            .expect("case-insensitive glob should compile")
+            .compile_matcher();
+        assert!(insensitive.is_match("/docs/README.MD"));
     }
 
     #[test]

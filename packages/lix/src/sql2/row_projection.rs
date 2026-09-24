@@ -249,6 +249,7 @@ impl RowProjectionDecoder {
             .iter()
             .map(|field| match field.column_type {
                 SchemaColumnType::String => ResultColumnType::Text,
+                SchemaColumnType::RowRef => ResultColumnType::RowRef,
                 SchemaColumnType::Jsonb => ResultColumnType::Jsonb,
                 SchemaColumnType::Integer => ResultColumnType::Integer,
                 SchemaColumnType::Number => ResultColumnType::Real,
@@ -1179,6 +1180,9 @@ impl RowProjectionSink for PublicProjectionSink {
                 SchemaColumnType::String => raw_string_text(raw)?
                     .map(crate::Value::Text)
                     .unwrap_or(crate::Value::Null),
+                SchemaColumnType::RowRef => raw_string_text(raw)?
+                    .map(|value| crate::Value::RowRef(crate::RowRef(value)))
+                    .unwrap_or(crate::Value::Null),
                 SchemaColumnType::Jsonb => raw_json_text(raw)
                     .map(|json| crate::Value::Jsonb(crate::Json::from_canonical_text(json)))
                     .unwrap_or(crate::Value::Null),
@@ -1378,7 +1382,7 @@ impl VariableWidthProjection {
 impl RowProjectionColumn {
     fn new(column_type: SchemaColumnType, capacity: usize) -> Self {
         match column_type {
-            SchemaColumnType::String => {
+            SchemaColumnType::String | SchemaColumnType::RowRef => {
                 Self::String(VariableWidthProjection::with_capacity(capacity))
             }
             SchemaColumnType::Jsonb => {
@@ -1408,7 +1412,12 @@ impl RowProjectionColumn {
         schema_key: &str,
     ) -> Result<(), LixError> {
         match self {
-            Self::String(values) if field.column_type == SchemaColumnType::String => {
+            Self::String(values)
+                if matches!(
+                    field.column_type,
+                    SchemaColumnType::String | SchemaColumnType::RowRef
+                ) =>
+            {
                 let value = raw_string_text(raw)?;
                 values.replace_last(value.as_deref())?;
             }
@@ -1494,6 +1503,9 @@ impl RowProjectionColumn {
             }
             (Self::String(values), crate::Value::Text(value)) => {
                 values.replace_last(Some(&value))?;
+            }
+            (Self::String(values), crate::Value::RowRef(value)) => {
+                values.replace_last(Some(value.as_str()))?;
             }
             (Self::Jsonb(values), crate::Value::Jsonb(value)) => {
                 let value = value.to_string();
@@ -1748,8 +1760,10 @@ fn certified_kind_matches_data_type(
 ) -> bool {
     matches!(
         (kind, data_type),
-        (CertifiedNativeScalarKind::Text, lix_schema::DataType::Text)
-            | (CertifiedNativeScalarKind::Uuid, lix_schema::DataType::Uuid)
+        (
+            CertifiedNativeScalarKind::Text,
+            lix_schema::DataType::Text | lix_schema::DataType::RowRef
+        ) | (CertifiedNativeScalarKind::Uuid, lix_schema::DataType::Uuid)
             | (CertifiedNativeScalarKind::Int8, lix_schema::DataType::Int8)
             | (
                 CertifiedNativeScalarKind::Float8,
@@ -1777,7 +1791,10 @@ fn borrowed_value_matches_schema(
 ) -> bool {
     match value {
         BorrowedNativeValue::Null => nullable,
-        BorrowedNativeValue::Text(_) => data_type == lix_schema::DataType::Text,
+        BorrowedNativeValue::Text(_) => matches!(
+            data_type,
+            lix_schema::DataType::Text | lix_schema::DataType::RowRef
+        ),
         BorrowedNativeValue::Uuid(_) => data_type == lix_schema::DataType::Uuid,
         BorrowedNativeValue::Int8(_) => data_type == lix_schema::DataType::Int8,
         BorrowedNativeValue::Float8(_) => data_type == lix_schema::DataType::Float8,
@@ -1806,6 +1823,9 @@ fn typed_public_value(
         (_, lix_schema::Value::Null) => crate::Value::Null,
         (SchemaColumnType::String, lix_schema::Value::Text(value)) => {
             crate::Value::Text(value.clone())
+        }
+        (SchemaColumnType::RowRef, lix_schema::Value::Text(value)) => {
+            crate::Value::RowRef(crate::RowRef(value.clone()))
         }
         (SchemaColumnType::String, lix_schema::Value::Uuid(value)) => {
             crate::Value::Text(value.to_string())

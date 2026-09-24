@@ -55,6 +55,7 @@ pub(crate) use file::{
     ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
     execute_exact_lix_file_batch_read, execute_exact_lix_file_id_manifest_batch_read,
     execute_exact_lix_file_read, execute_exact_lix_file_root_listing,
+    execute_exact_lix_file_size_batch_read,
     execute_fast_lix_file_content_update_by_id,
     execute_fast_lix_file_content_update_by_id_with_metadata, execute_fast_lix_file_id_path_writes,
     execute_fast_lix_file_path_writes, execute_fast_lix_file_prepared_path_write,
@@ -268,6 +269,7 @@ where
         .surface("lix_diff")
         .is_some_and(|surface| selection.includes(surface))
     {
+        ctx.note_unvalidated_read("lix_diff");
         diff::register_diff_function(
             session,
             ctx.changelog_query_source(),
@@ -281,6 +283,7 @@ where
         .surface("lix_as_of")
         .is_some_and(|surface| selection.includes(surface))
     {
+        ctx.note_unvalidated_read("lix_as_of");
         state_at::register_state_at_function(
             session,
             ctx.changelog_query_source(),
@@ -294,6 +297,7 @@ where
             .surface(name)
             .is_some_and(|surface| selection.includes(surface))
     }) {
+        ctx.note_unvalidated_read("lix_history");
         mainline::register_functions(
             session,
             ctx.changelog_query_source(),
@@ -312,6 +316,7 @@ where
                 "active branch",
             )
         })?;
+        ctx.note_unvalidated_read(&surface.name);
         commit_ancestry::register_commit_ancestry_function(
             session,
             &surface.name,
@@ -632,6 +637,7 @@ where
         }
         match &surface.kind {
             PublicSurfaceKind::Branch => {
+                ctx.note_unvalidated_read(&surface.name);
                 branch::register_lix_branch_read_provider(
                     session,
                     &surface.name,
@@ -640,6 +646,7 @@ where
                 )?;
             }
             PublicSurfaceKind::Change => {
+                ctx.note_unvalidated_read(&surface.name);
                 change::register_lix_change_read_provider(
                     session,
                     &surface.name,
@@ -743,6 +750,13 @@ where
         ReadProviderScope::ReadOnly,
         selection,
     )?;
+    // Writable branch surfaces are served by the write providers below, but a
+    // read of them still observes branch heads without row-level validation.
+    for surface in catalog.surfaces() {
+        if selection.includes(surface) && matches!(surface.kind, PublicSurfaceKind::Branch) {
+            read_ctx.note_unvalidated_read(&surface.name);
+        }
+    }
     register_write_from_catalog(
         session,
         write_ctx,

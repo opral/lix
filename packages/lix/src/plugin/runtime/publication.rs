@@ -5,9 +5,9 @@
 //! publication is derived state and must happen only after durable success.
 
 use super::{
-    PluginActorCache, PluginActorKey, PluginActorLease, PluginActorStagedCheckpoint,
-    PluginActorStore, PluginObservation, PluginRowAuthorities, WasmDocumentCheckpoint,
-    WasmDocumentHandle,
+    PluginActorCache, PluginActorDetachedSuccessor, PluginActorKey, PluginActorLease,
+    PluginActorPendingPublication, PluginActorStagedCheckpoint, PluginActorStore,
+    PluginObservation, PluginRowAuthorities, WasmDocumentCheckpoint, WasmDocumentHandle,
 };
 use crate::{Blob, LixError};
 use std::sync::Arc;
@@ -22,10 +22,12 @@ pub(crate) struct PendingPluginActorPublication {
     key: PluginActorKey,
     policy: PluginPublicationPolicy,
     state: PendingActorState,
+    _publication_marker: Option<PluginActorPendingPublication>,
 }
 
 enum PendingActorState {
     Existing(PluginActorLease),
+    Detached(PluginActorDetachedSuccessor),
     New {
         cache: PluginActorCache,
         store: PluginActorStore,
@@ -58,6 +60,7 @@ impl PendingPluginActorPublication {
             key,
             policy,
             state: PendingActorState::Existing(lease),
+            _publication_marker: None,
         }
     }
 
@@ -72,6 +75,7 @@ impl PendingPluginActorPublication {
         row_authorities: PluginRowAuthorities,
         policy: PluginPublicationPolicy,
     ) -> Self {
+        let publication_marker = cache.track_publication(&key);
         Self {
             key,
             policy,
@@ -84,6 +88,7 @@ impl PendingPluginActorPublication {
                 semantic_root,
                 row_authorities,
             },
+            _publication_marker: Some(publication_marker),
         }
     }
 
@@ -91,26 +96,62 @@ impl PendingPluginActorPublication {
         &self.key
     }
 
+    pub(crate) fn detach_lease(mut self) -> Self {
+        self.state = match self.state {
+            PendingActorState::Existing(lease) => {
+                self._publication_marker = Some(lease.pending_publication_marker(&self.key));
+                PendingActorState::Detached(lease.detach_successor())
+            }
+            state => state,
+        };
+        self
+    }
+
     pub(crate) fn retains_large_import_actor(&self) -> bool {
         self.policy.retain_large_import_actor
     }
 
-    pub(crate) fn into_chainable(self, expected: &PluginActorKey) -> ChainablePublication {
+    pub(crate) async fn into_chainable(self, expected: &PluginActorKey) -> ChainablePublication {
         if self.key == *expected
             && self.policy.semantic_chainable
-            && matches!(self.state, PendingActorState::Existing(_))
+            && matches!(
+                self.state,
+                PendingActorState::Existing(_) | PendingActorState::Detached(_)
+            )
         {
-            let PendingActorState::Existing(lease) = self.state else {
-                unreachable!()
-            };
-            ChainablePublication::Chainable(lease, self.key, self.policy)
+            let Self {
+                key,
+                policy,
+                state,
+                _publication_marker,
+            } = self;
+            match state {
+                PendingActorState::Existing(lease) => {
+                    ChainablePublication::Chainable(lease, key, policy)
+                }
+                PendingActorState::Detached(detached) => match detached.chain().await {
+                    Ok(lease) => ChainablePublication::Chainable(lease, key, policy),
+                    Err(_) => ChainablePublication::Pending(Self {
+                        key,
+                        policy,
+                        state: PendingActorState::Uncached(None),
+                        _publication_marker: None,
+                    }),
+                },
+                _ => unreachable!(),
+            }
         } else {
             ChainablePublication::Pending(self)
         }
     }
 
     pub(crate) async fn into_uncached(self) -> Self {
-        let Self { key, policy, state } = self;
+        let Self {
+            key,
+            policy,
+            state,
+            _publication_marker,
+        } = self;
         let checkpoint = match state {
             PendingActorState::Existing(lease) => {
                 let checkpoint =
@@ -120,6 +161,16 @@ impl PendingPluginActorPublication {
                             cache.stage_checkpoint(key.clone(), root, checkpoint)
                         });
                 let _ = lease.discard_successor().await;
+                checkpoint
+            }
+            PendingActorState::Detached(detached) => {
+                let checkpoint =
+                    detached
+                        .successor_checkpoint()
+                        .and_then(|(cache, root, checkpoint)| {
+                            cache.stage_checkpoint(key.clone(), root, checkpoint)
+                        });
+                let _ = detached.discard().await;
                 checkpoint
             }
             PendingActorState::New {
@@ -141,6 +192,7 @@ impl PendingPluginActorPublication {
             key,
             policy,
             state: PendingActorState::Uncached(checkpoint),
+            _publication_marker: None,
         }
     }
 
@@ -148,6 +200,9 @@ impl PendingPluginActorPublication {
         match self.state {
             PendingActorState::Existing(lease) => {
                 let _ = lease.discard_successor().await;
+            }
+            PendingActorState::Detached(lease) => {
+                let _ = lease.discard().await;
             }
             PendingActorState::New {
                 mut store,
@@ -166,6 +221,7 @@ impl PendingPluginActorPublication {
             PendingActorState::Existing(lease) => {
                 Some(lease.commit_successor_as(self.key.clone()).await?)
             }
+            PendingActorState::Detached(lease) => Some(lease.publish(self.key.clone()).await?),
             PendingActorState::New {
                 cache,
                 store,

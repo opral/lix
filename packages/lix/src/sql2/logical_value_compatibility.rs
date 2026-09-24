@@ -310,11 +310,7 @@ fn validate_expr_node(
             | Operator::NotEq
             | Operator::IsDistinctFrom
             | Operator::IsNotDistinctFrom => {
-                ensure_compatible(
-                    identity_of_expr(&binary.left, schemas),
-                    identity_of_expr(&binary.right, schemas),
-                    "comparison",
-                )?;
+                ensure_comparable(&binary.left, &binary.right, schemas, "comparison")?;
             }
             Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => {
                 reject_ordering(&binary.left, schemas, "range comparisons (<, <=, >, >=)")?;
@@ -335,9 +331,8 @@ fn validate_expr_node(
             _ => {}
         },
         Expr::InList(InList { expr, list, .. }) => {
-            let value = identity_of_expr(expr, schemas);
             for item in list {
-                ensure_compatible(value, identity_of_expr(item, schemas), "IN")?;
+                ensure_comparable(expr, item, schemas, "IN")?;
             }
         }
         Expr::Between(Between { expr, low, high, .. }) => {
@@ -596,7 +591,7 @@ fn validate_expr_node(
                         }
                     }
                 }
-                "lix_row_ref" => {}
+                "lix_row_ref" | "lix_row_ref_parts" => {}
                 _ => {
                     for argument in args {
                         reject_text_operation(argument, schemas, func.name())?;
@@ -678,7 +673,7 @@ fn identity_of_expr(expr: &Expr, schemas: &[&DFSchema]) -> ValueIdentity {
         Expr::ScalarFunction(function) => {
             let name = function.func.name().to_ascii_lowercase();
             match name.as_str() {
-                "__lix_jsonb" | "__lix_json_get" | "__lix_json_path_get" => {
+                "__lix_jsonb" | "__lix_json_get" | "__lix_json_path_get" | "lix_row_ref_parts" => {
                     ValueIdentity::Jsonb
                 }
                 "lix_row_ref" => ValueIdentity::RowRef,
@@ -867,6 +862,53 @@ fn ensure_compatible(
             Err(logical_type_mismatch(left, right, operation))
         }
         (left, right) => Err(logical_type_mismatch(left, right, operation)),
+    }
+}
+
+/// Equality between two expressions. As in PostgreSQL, an untyped string
+/// literal (including a bound TEXT parameter) takes the type of a ROW_REF
+/// operand, so it must be a canonical row reference. Any other TEXT value
+/// requires an explicit CAST of the ROW_REF side to TEXT.
+fn ensure_comparable(
+    left: &Expr,
+    right: &Expr,
+    schemas: &[&DFSchema],
+    operation: &str,
+) -> Result<(), LixError> {
+    let left_identity = identity_of_expr(left, schemas);
+    let right_identity = identity_of_expr(right, schemas);
+    for (identity, other) in [(left_identity, right), (right_identity, left)] {
+        if identity == ValueIdentity::RowRef
+            && let Some(text) = untyped_string_literal(other)
+        {
+            crate::row_ref::decode_str(text).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    format!(
+                        "a TEXT value compared with a ROW_REF must be a canonical row reference: {}",
+                        error.message
+                    ),
+                )
+                .with_hint(
+                    "Compare with lix_row_ref(...), or CAST the ROW_REF to TEXT for a text comparison.",
+                )
+            })?;
+            return Ok(());
+        }
+    }
+    ensure_compatible(left_identity, right_identity, operation)
+}
+
+fn untyped_string_literal(expr: &Expr) -> Option<&str> {
+    match expr {
+        Expr::Alias(alias) => untyped_string_literal(&alias.expr),
+        Expr::Literal(
+            ScalarValue::Utf8(Some(text))
+            | ScalarValue::LargeUtf8(Some(text))
+            | ScalarValue::Utf8View(Some(text)),
+            None,
+        ) => Some(text),
+        _ => None,
     }
 }
 

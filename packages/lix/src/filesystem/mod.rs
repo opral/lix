@@ -14,7 +14,7 @@ pub(crate) use self::path_index::{
     FilesystemPathEntry, FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
     FilesystemPathIndexRequest, FilesystemPathKind, FilesystemPathSelection,
     HistoricalPathIndexCache, UncachedFilesystemPathIndexReader, build_path_index,
-    load_path_index_revision, stage_path_index_revision,
+    load_path_index_revision, read_path_index_rows, stage_path_index_revision,
 };
 #[cfg(test)]
 pub(crate) use self::path_index::{

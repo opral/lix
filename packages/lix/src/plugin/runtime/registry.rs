@@ -10,7 +10,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use globset::{GlobSet, GlobSetBuilder};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
@@ -28,8 +28,8 @@ use crate::transaction_types::{TransactionJson, TransactionWriteRow};
 use crate::{GLOBAL_BRANCH_ID, LixError, NullableKeyFilter};
 
 use super::manifest::{
-    PluginContentMatcher, PluginManifest, PluginRuntime, parse_plugin_manifest_json,
-    validate_runtime_api_version,
+    PluginContentMatcher, PluginManifest, PluginRuntime, compile_path_glob_with_case,
+    parse_plugin_manifest_json, validate_runtime_api_version,
 };
 use super::storage::{plugin_storage_archive_file_id, plugin_storage_archive_path};
 use super::{InstalledPlugin, PluginCapabilities};
@@ -174,11 +174,28 @@ impl PluginRegistryEntry {
         &self,
         replacement: &Self,
     ) -> Result<(), LixError> {
+        let matcher_case_insensitive = |entry: &Self| {
+            parse_plugin_manifest_json(&entry.manifest_json)
+                .map(|manifest| {
+                    manifest
+                        .manifest
+                        .file_match
+                        .as_ref()
+                        .is_some_and(|matcher| matcher.case_insensitive)
+                })
+                .map_err(|error| {
+                    invalid_registry(format!(
+                        "plugin '{}' has invalid manifest_json: {}",
+                        entry.key, error.message
+                    ))
+                })
+        };
         let incompatible = self.key != replacement.key
             || normalized_api_version(&self.api_version)
                 != normalized_api_version(&replacement.api_version)
             || self.capabilities != replacement.capabilities
             || self.path_glob != replacement.path_glob
+            || matcher_case_insensitive(self)? != matcher_case_insensitive(replacement)?
             || self.content != replacement.content
             || self.schema_keys != replacement.schema_keys
             || self.create_schema_keys != replacement.create_schema_keys;
@@ -894,10 +911,14 @@ impl CompiledPluginCatalog {
                     plugin.key
                 ))
             })?;
-            let glob = GlobBuilder::new(path_glob)
-                .literal_separator(false)
-                .build()
-                .map_err(|error| {
+            let manifest = parse_plugin_manifest_json(&plugin.manifest_json)?;
+            let case_insensitive = manifest
+                .manifest
+                .file_match
+                .as_ref()
+                .is_some_and(|matcher| matcher.case_insensitive);
+            let glob =
+                compile_path_glob_with_case(path_glob, case_insensitive).map_err(|error| {
                     invalid_registry(format!(
                         "plugin '{}' has invalid path_glob '{}': {error}",
                         plugin.key, path_glob
@@ -1499,6 +1520,41 @@ mod tests {
             wasm_blob_hash: Some(hash(hash_byte)),
         })
         .expect("test registry entry should be valid")
+    }
+
+    #[test]
+    fn compiled_catalog_uses_manifest_case_insensitive_flag() {
+        let mut insensitive_entry = entry("plugin_md", "/Docs/*.md", 'a');
+        let mut manifest: JsonValue = serde_json::from_str(&insensitive_entry.manifest_json)
+            .expect("test manifest should parse");
+        manifest["file_match"]["case_insensitive"] = json!(true);
+        insensitive_entry.manifest_json = canonicalize_json_text(
+            &serde_json::to_string(&manifest).expect("test manifest should serialize"),
+            "test manifest",
+        )
+        .expect("test manifest should canonicalize");
+
+        let insensitive_registry = PluginRegistry::new(vec![insensitive_entry])
+            .expect("case-insensitive test registry should be valid");
+        let insensitive_catalog = CompiledPluginCatalog::compile(&insensitive_registry)
+            .expect("case-insensitive catalog should compile");
+        assert_eq!(
+            insensitive_catalog
+                .select_for_bytes("/docs/README.MD", b"")
+                .expect("case-insensitive manifest should match")
+                .key(),
+            "plugin_md"
+        );
+
+        let sensitive_registry = PluginRegistry::new(vec![entry("plugin_md", "/Docs/*.md", 'b')])
+            .expect("case-sensitive test registry should be valid");
+        let sensitive_catalog = CompiledPluginCatalog::compile(&sensitive_registry)
+            .expect("case-sensitive catalog should compile");
+        assert!(
+            sensitive_catalog
+                .select_for_bytes("/docs/README.MD", b"")
+                .is_none()
+        );
     }
 
     fn component_entry(hash_byte: char) -> PluginRegistryEntry {

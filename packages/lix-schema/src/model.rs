@@ -71,9 +71,16 @@ pub enum DataType {
     Jsonb,
     #[serde(rename = "timestamptz")]
     Timestamptz,
+    /// A canonical Lix row reference (`lix_row_ref(...)`). Stored as text, but
+    /// it is its own SQL type (`ROW_REF`) and every value must resolve to an
+    /// existing row when it is written. `row_refs` may set its delete action.
+    #[serde(rename = "row_ref")]
+    RowRef,
 }
 
 impl DataType {
+    /// The Schema v1 type name. Every type except the Lix-specific `row_ref`
+    /// is also its PostgreSQL type name.
     pub const fn postgres_name(self) -> &'static str {
         match self {
             Self::Text => "text",
@@ -83,6 +90,7 @@ impl DataType {
             Self::Boolean => "boolean",
             Self::Jsonb => "jsonb",
             Self::Timestamptz => "timestamptz",
+            Self::RowRef => "row_ref",
         }
     }
 }
@@ -103,27 +111,33 @@ pub struct ForeignKeyReference {
     pub columns: Vec<String>,
 }
 
-/// A Lix logical row-reference constraint.
+/// The delete action of a `row_ref` column.
 ///
-/// Unlike a [`ForeignKey`], a row reference can target any schema key at
-/// runtime, so the constrained value is represented by a text column and the
-/// target relation, optional file scope, and typed primary key are carried by
-/// the row-reference value itself. PostgreSQL has no direct DDL equivalent.
+/// Every [`DataType::RowRef`] column is a Lix logical row reference: unlike a
+/// [`ForeignKey`], it can target any schema key at runtime, and the target
+/// relation, optional file scope, and typed primary key are carried by the
+/// value itself. A `row_ref` column without an entry uses
+/// [`DeleteAction::NoAction`], so an entry names `cascade` or `detach`.
+/// PostgreSQL has no direct DDL equivalent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RowRefConstraint {
     pub column: String,
-    #[serde(default, skip_serializing_if = "DeleteAction::is_no_action")]
+    /// `cascade` or `detach`; a column without an entry uses `no_action`.
     pub on_delete: DeleteAction,
 }
 
 /// Action executed when a referenced row is deleted.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeleteAction {
     #[default]
     NoAction,
     Cascade,
+    /// Keep the referencing row unchanged, including its reference value. The
+    /// reference is no longer enforced once its target is gone; it resolves
+    /// again if the target returns. Supported for row references only.
+    Detach,
 }
 
 impl DeleteAction {

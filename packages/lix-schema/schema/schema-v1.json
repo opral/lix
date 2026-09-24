@@ -54,7 +54,7 @@
       "properties": {
         "name": { "$ref": "#/$defs/identifier" },
         "type": {
-          "enum": ["text", "uuid", "int8", "float8", "boolean", "jsonb", "timestamptz"]
+          "enum": ["text", "uuid", "int8", "float8", "boolean", "jsonb", "timestamptz", "row_ref"]
         },
         "nullable": { "type": "boolean", "default": true },
         "default_value": true,
@@ -99,10 +99,10 @@
     "row_ref": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["column"],
+      "required": ["column", "on_delete"],
       "properties": {
         "column": { "$ref": "#/$defs/identifier" },
-        "on_delete": { "enum": ["no_action", "cascade"], "default": "no_action" }
+        "on_delete": { "enum": ["cascade", "detach"] }
       }
     }
   }

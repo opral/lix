@@ -389,7 +389,7 @@ async fn explicit_transaction_receipt_describes_the_durable_transition() {
 }
 
 #[tokio::test]
-async fn explicit_read_guard_fences_writes_and_retry_accepts_unrelated_changes() {
+async fn explicit_read_guard_accepts_unrelated_concurrent_changes() {
     let lix = open_lix().await.unwrap();
     lix.execute(
         "INSERT INTO lix_key_value (key, value) VALUES ('guard-target', 'A')",
@@ -398,13 +398,19 @@ async fn explicit_read_guard_fences_writes_and_retry_accepts_unrelated_changes()
     .await
     .unwrap();
     let mut tx = lix.begin_transaction().await.unwrap();
-    tx.execute(
-        "SELECT value FROM lix_key_value WHERE key = 'guard-target'",
-        &[],
-    )
-    .await
-    .unwrap();
-    // This write is disjoint from the guarded row and from the eventual insert.
+    let guarded = tx
+        .execute(
+            "SELECT value FROM lix_key_value WHERE key = 'guard-target'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        guarded.rows()[0].get::<serde_json::Value>("value").unwrap(),
+        "A"
+    );
+    // This write is disjoint from the guarded row and from the eventual
+    // insert, so the guarded decision is still current at commit (#1900).
     lix.execute(
         "INSERT INTO lix_key_value (key, value) VALUES ('unrelated', 'X')",
         &[],
@@ -417,38 +423,19 @@ async fn explicit_read_guard_fences_writes_and_retry_accepts_unrelated_changes()
     )
     .await
     .unwrap();
-    let error = tx.commit().await.unwrap_err();
-    assert_eq!(error.code, lix::LixError::CODE_TRANSACTION_CONFLICT);
-    assert!(
-        lix.execute(
-            "SELECT * FROM lix_key_value WHERE key = 'guard-result'",
-            &[]
+    assert!(tx.commit().await.unwrap().commit.is_some());
+    let keys = lix
+        .execute(
+            "SELECT key FROM lix_key_value WHERE key IN ('guard-result', 'unrelated') ORDER BY key",
+            &[],
         )
         .await
         .unwrap()
         .rows()
-        .is_empty()
-    );
-    let mut retry = lix.begin_transaction().await.unwrap();
-    let guarded = retry
-        .execute(
-            "SELECT value FROM lix_key_value WHERE key = 'guard-target'",
-            &[],
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        guarded.rows()[0].get::<serde_json::Value>("value").unwrap(),
-        "A"
-    );
-    retry
-        .execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('guard-result', 'B')",
-            &[],
-        )
-        .await
-        .unwrap();
-    assert!(retry.commit().await.unwrap().commit.is_some());
+        .iter()
+        .map(|row| row.get::<String>("key").unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(keys, ["guard-result", "unrelated"]);
 }
 
 #[tokio::test]

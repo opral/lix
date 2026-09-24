@@ -139,6 +139,29 @@ pub(crate) fn decode(row_ref: &RowRef) -> Result<ResolvedRowRef, LixError> {
     decode_str(row_ref.as_str())
 }
 
+/// Lossless JSONB read shape for a canonical row reference.
+pub(crate) fn parts_json(resolved: &ResolvedRowRef) -> serde_json::Value {
+    let primary_key = resolved
+        .row_pk
+        .components
+        .iter()
+        .map(|component| {
+            let kind = match component {
+                RowPkComponent::Uuid(_) => "uuid",
+                RowPkComponent::Integer(_) => "integer",
+                RowPkComponent::String(_) => "string",
+                RowPkComponent::Bytes(_) => "bytes",
+            };
+            serde_json::json!({ "type": kind, "value": component.external_string() })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "relation": resolved.relation,
+        "file_id": resolved.file_id,
+        "primary_key": primary_key,
+    })
+}
+
 pub(crate) fn decode_str(encoded: &str) -> Result<ResolvedRowRef, LixError> {
     let payload = encoded
         .strip_prefix(PREFIX)
@@ -415,6 +438,27 @@ fn invalid(message: impl Into<String>) -> LixError {
 mod tests {
     use super::*;
     use crate::row_pk::RowPkComponent;
+
+    #[test]
+    fn parts_preserve_composite_types_and_large_integer_values() {
+        let row_pk = RowPk::from_components(smallvec::smallvec![
+            RowPkComponent::Integer(i64::MIN),
+            RowPkComponent::String("héllo".into()),
+            RowPkComponent::Bytes(Bytes::from_static(b"\0binary\xff")),
+        ])
+        .unwrap();
+        let encoded = encode("mixed_relation", Some("file-a"), &row_pk).unwrap();
+        let parts = parts_json(&decode(&encoded).unwrap());
+        assert_eq!(parts, serde_json::json!({
+            "relation": "mixed_relation",
+            "file_id": "file-a",
+            "primary_key": [
+                {"type": "integer", "value": i64::MIN.to_string()},
+                {"type": "string", "value": "héllo"},
+                {"type": "bytes", "value": "AGJpbmFyef8="},
+            ],
+        }));
+    }
 
     #[test]
     fn round_trips_composite_typed_identity_without_json() {

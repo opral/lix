@@ -133,6 +133,16 @@ pub(crate) trait SqlExecutionContext: Sync {
     fn session_file_views(&self) -> Option<SessionFileViews> {
         None
     }
+
+    /// Notes that the statement reads a source without row-level conflict
+    /// validation, such as branch heads or change history. Explicit
+    /// transactions then conflict with any concurrent change to the branch.
+    fn note_unvalidated_read(&self, _source: &str) {}
+
+    /// Records branch refs consulted by a protected transaction statement.
+    fn branch_head_read_observer(&self) -> Option<Arc<dyn Fn(&str) + Send + Sync>> {
+        None
+    }
 }
 
 /// Write-capable SQL runtime boundary.
@@ -284,6 +294,18 @@ pub(crate) trait SqlWriteExecutionContext: Send {
             .scan_hot_state_batch(&request.hot_state_request())
             .await?;
         Ok(Arc::new(FilesystemPathIndex::from_live_batch(&rows)?))
+    }
+
+    /// Returns the index for `request` when the caller's decision depends only
+    /// on the entries for `file_ids` (and their parent directories). Contexts
+    /// that validate a read footprint may record the narrower dependency while
+    /// still serving a shared, cached index.
+    async fn filesystem_path_index_for_files(
+        &mut self,
+        request: &FilesystemPathIndexRequest,
+        _file_ids: &[String],
+    ) -> Result<Arc<FilesystemPathIndex>, LixError> {
+        self.filesystem_path_index(request).await
     }
 
     async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<CommitId>, LixError>;
@@ -531,6 +553,16 @@ impl SqlWriteContext {
             explicit_insert_columns: None,
             write_targets: Some(Arc::new(super::providers::WriteTargetRegistry::default())),
         }
+    }
+
+    /// Transaction SELECTs use writable providers for their staged overlay.
+    /// Give those providers the read's private observation collector rather
+    /// than the transaction's ordinary write context view.
+    pub(crate) fn with_session_file_views(mut self, views: Option<SessionFileViews>) -> Self {
+        Arc::get_mut(&mut self.shared)
+            .expect("new SQL write context has no shared clones")
+            .session_file_views = views;
+        self
     }
 
     pub(crate) fn with_explicit_insert_columns(

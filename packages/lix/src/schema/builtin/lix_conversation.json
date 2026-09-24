@@ -1,0 +1,41 @@
+{
+  "$schema": "https://lix.dev/schema-v1.json",
+  "key": "lix_conversation",
+  "description": "A discussion in the same scope as its target. A null target creates a standalone conversation.",
+  "columns": [
+    {
+      "name": "id",
+      "type": "uuid",
+      "nullable": false,
+      "description": "Stable conversation identifier."
+    },
+    {
+      "name": "target",
+      "type": "row_ref",
+      "nullable": true,
+      "description": "Row reference to the discussed row, in the same branch and compatible durability scope. Null for a standalone conversation. Deleting the target leaves the conversation and this value unchanged; the conversation is detached while the reference does not resolve."
+    },
+    {
+      "name": "title",
+      "type": "text",
+      "nullable": true,
+      "description": "Optional human-readable conversation title."
+    },
+    {
+      "name": "resolved",
+      "type": "boolean",
+      "nullable": false,
+      "default_value": false,
+      "description": "Whether the conversation is resolved. Set true to resolve and false to reopen; the row's change metadata records who changed it and when."
+    }
+  ],
+  "primary_key": [
+    "id"
+  ],
+  "row_refs": [
+    {
+      "column": "target",
+      "on_delete": "detach"
+    }
+  ]
+}

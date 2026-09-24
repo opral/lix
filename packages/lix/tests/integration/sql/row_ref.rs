@@ -1,6 +1,62 @@
 use lix::{ResultColumnType, RowRef, Value};
 use serde_json::json;
 
+simulation_test!(row_ref_parts_is_jsonb_and_reads_canonical_identity, |sim| async move {
+    let engine = sim.boot_engine().await;
+    let session = sim.wrap_session(engine.open_session().await.unwrap(), &engine);
+    let id = "01991b1d-6d8b-7000-8000-0000000000f1";
+
+    let result = session
+        .execute(
+            "SELECT lix_row_ref_parts(lix_row_ref('lix_file', NULL, $1)) AS parts, \
+                    lix_row_ref_parts(lix_row_ref('lix_file', NULL, $1)) ->> 'relation' AS relation, \
+                    lix_row_ref_parts(lix_row_ref('lix_file', NULL, $1)) -> 'primary_key' -> 0 ->> 'value' AS key",
+            &[Value::Text(id.into())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.column_types()[0], ResultColumnType::Jsonb);
+    assert_eq!(result.rows()[0].values(), &[
+        Value::Jsonb(json!({
+            "relation": "lix_file",
+            "file_id": null,
+            "primary_key": [{"type": "uuid", "value": id}],
+        }).into()),
+        Value::Text("lix_file".into()),
+        Value::Text(id.into()),
+    ]);
+
+    let conversation_id = "01991b1d-6d8b-7000-8000-0000000000f2";
+    session.execute(
+        "INSERT INTO lix_file (id, path, content) VALUES ($1, '/row-ref-parts.txt', CAST('body' AS BYTEA))",
+        &[Value::Text(id.into())],
+    ).await.unwrap();
+    session.execute(
+        "INSERT INTO lix_conversation (id, target) VALUES ($1, lix_row_ref('lix_file', NULL, $2))",
+        &[Value::Text(conversation_id.into()), Value::Text(id.into())],
+    ).await.unwrap();
+    for detached in [false, true] {
+        if detached {
+            session.execute("DELETE FROM lix_file WHERE id = $1", &[Value::Text(id.into())]).await.unwrap();
+        }
+        let anchor = session.execute(
+            "SELECT lix_row_ref_parts(target) ->> 'relation' \
+             FROM lix_conversation WHERE id = $1",
+            &[Value::Text(conversation_id.into())],
+        ).await.unwrap();
+        assert_eq!(anchor.rows()[0].values(), &[Value::Text("lix_file".into())]);
+    }
+
+    let null = session.execute("SELECT lix_row_ref_parts(NULL)", &[]).await.unwrap();
+    assert_eq!(null.column_types(), &[ResultColumnType::Jsonb]);
+    assert_eq!(null.rows()[0].values(), &[Value::Null]);
+
+    let bad = session.execute("SELECT lix_row_ref_parts('invalid')", &[]).await.unwrap_err();
+    assert!(bad.to_string().contains("canonical lix_row_ref"), "{bad}");
+    let arity = session.execute("SELECT lix_row_ref_parts()", &[]).await.unwrap_err();
+    assert!(arity.to_string().contains("requires exactly 1"), "{arity}");
+});
+
 simulation_test!(
     row_ref_constructor_and_default_diff_are_typed_and_canonical,
     |sim| async move {
