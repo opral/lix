@@ -26,14 +26,26 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-test("loads the component compiler only when a plugin is compiled", async () => {
+test("loads the component compiler only when a plugin is compiled by default", async () => {
   expect(loader.loads).toBe(0);
   const dispatch = createComponentDispatch();
   await dispatch({ operation: "disposeGuest", data: '{"id":1}' });
   expect(loader.loads).toBe(0);
   loader.compile.mockResolvedValueOnce(factory());
-  await dispatch(compile("lazy"));
+  await dispatch(compile("first-plugin"));
   expect(loader.loads).toBe(1);
+  expect(loader.compile).toHaveBeenCalledOnce();
+});
+
+test("a supplied browser compiler is used without a dispatch-time import", async () => {
+  const loads = loader.loads;
+  const suppliedCompiler = vi.fn().mockResolvedValue(factory());
+  const dispatch = createComponentDispatch(suppliedCompiler);
+  await dispatch({ operation: "disposeGuest", data: '{"id":1}' });
+  expect(suppliedCompiler).not.toHaveBeenCalled();
+  await dispatch(compile("browser-plugin"));
+  expect(suppliedCompiler).toHaveBeenCalledOnce();
+  expect(loader.loads).toBe(loads);
 });
 
 test("cancellation while compiling disposes the eventual factory", async () => {
