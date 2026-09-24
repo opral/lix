@@ -952,6 +952,116 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     })
 }
 
+/// Reads only the stored byte sizes for selected files. The size lives on the
+/// `lix_binary_blob_ref` row, so this path deliberately requests blob-reference
+/// metadata without asking the path index to cache or hydrate payload bytes.
+pub(crate) async fn execute_exact_lix_file_size_batch_read(
+    active_branch_id: &str,
+    hot_state: Arc<dyn HotStateReader>,
+    filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
+    branch_ref: Arc<dyn BranchRefReader>,
+    blob_reader: Arc<dyn BlobDataReader>,
+    plugin_host: PluginRuntimeHost,
+    plugin_cache_snapshot: Option<u128>,
+    paths: &BTreeSet<String>,
+) -> Result<SqlQueryResult, LixError> {
+    let mut request = lix_file_scan_request(Some(active_branch_id), None, None);
+    let branch_binding = BranchBinding::active(active_branch_id);
+    request.filter.branch_ids = resolve_provider_branch_ids(
+        branch_ref.as_ref(),
+        &branch_binding,
+        request.filter.branch_ids,
+    )
+    .await?;
+    let index = filesystem_path_index
+        .path_index(
+            &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
+                .with_blob_refs(true),
+        )
+        .await?;
+    let matches = indexed_file_matches(index, &FilePathPredicate::In(paths.clone()));
+    let rows = scan_indexed_file_batch(&matches, true)?;
+    let prepared = prepare_indexed_lix_file_rows(&matches, rows)?;
+    let plugin_render = if prepared.needs_plugin_render(true) {
+        plugin_render_context_for_lix_file_scan_cached(
+            Arc::clone(&hot_state),
+            &request,
+            plugin_host,
+            &prepared,
+            false,
+            plugin_cache_snapshot,
+        )
+        .await?
+    } else {
+        None
+    };
+    let PreparedLixFileRows {
+        live_rows,
+        file_rows,
+        blob_rows,
+        file_paths,
+        path_ordered_file_keys,
+        ..
+    } = prepared;
+    let file_keys = path_ordered_file_keys.unwrap_or_else(|| file_rows.keys().cloned().collect());
+    let rendered_plugin_bytes = match &plugin_render {
+        Some(plugin_render) => {
+            render_plugin_files_for_sql(
+                plugin_render,
+                &blob_reader,
+                &live_rows,
+                &file_keys,
+                &file_rows,
+                &blob_rows,
+                &file_paths,
+            )
+            .await?
+        }
+        None => BTreeMap::new(),
+    };
+
+    let mut rows = Vec::with_capacity(file_keys.len());
+    for key in file_keys {
+        let path = file_paths.get(&key).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "indexed lix_file size read lost its path",
+            )
+        })?;
+        let blob_key = file_rows
+            .get(&key)
+            .expect("indexed lix_file size read should retain its descriptor")
+            .blob_ref_key(&live_rows);
+        let size_bytes = match rendered_plugin_bytes.get(&key) {
+            Some(bytes) => u64::try_from(bytes.len())
+                .map_err(|_| LixError::new(LixError::CODE_INTERNAL_ERROR, "file size exceeds u64"))?,
+            None => blob_rows
+                .get(&blob_key)
+                .map(|blob_ref| match &blob_ref.inline_data {
+                    Some(bytes) => u64::try_from(bytes.len()).map_err(|_| {
+                        LixError::new(LixError::CODE_INTERNAL_ERROR, "file size exceeds u64")
+                    }),
+                    None => Ok(blob_ref.size_bytes),
+                })
+                .transpose()?
+                .unwrap_or(0),
+        };
+        let size_bytes = i64::try_from(size_bytes).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "file size exceeds SQL BIGINT",
+            )
+        })?;
+        rows.push(vec![Value::Text(path.clone()), Value::Integer(size_bytes)]);
+    }
+    Ok(SqlQueryResult {
+        columns: vec!["path".to_string(), "size_bytes".to_string()],
+        column_types: vec![crate::ResultColumnType::Text, crate::ResultColumnType::Integer],
+        rows,
+        notices: Vec::new(),
+    })
+}
+
 /// Executes an exact active-branch manifest batch selected by file id without
 /// constructing a DataFusion catalog or plan. This is the multi-row analogue
 /// of [`execute_exact_lix_file_read`] for callers that need to verify durable
@@ -2459,6 +2569,7 @@ impl PluginRenderContext {
 #[derive(Debug, Clone)]
 struct BlobRefRecord {
     blob_hash: String,
+    size_bytes: u64,
     inline_data: Option<Vec<u8>>,
     live: HotStateRowHandle,
 }
@@ -2506,6 +2617,7 @@ struct FileDescriptorSnapshot {
 struct BlobRefSnapshot {
     id: String,
     blob_hash: String,
+    size_bytes: u64,
 }
 
 fn typed_row_string(
@@ -2519,6 +2631,21 @@ fn typed_row_string(
         _ => Err(LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
             format!("{schema_key} typed payload field '{field}' must be a string"),
+        )),
+    }
+}
+
+fn typed_row_integer(row: &lix_schema::Row, schema_key: &str, field: &str) -> Result<u64, LixError> {
+    match row.get(field) {
+        Some(lix_schema::Value::Int8(value)) => u64::try_from(*value).map_err(|_| {
+            LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!("{schema_key} typed payload field '{field}' must be non-negative"),
+            )
+        }),
+        _ => Err(LixError::new(
+            LixError::CODE_SCHEMA_VALIDATION,
+            format!("{schema_key} typed payload field '{field}' must be an integer"),
         )),
     }
 }
@@ -2546,6 +2673,7 @@ fn blob_ref_snapshot_from_live_row(
         return Ok(Some(BlobRefSnapshot {
             id: typed_row_string(&typed.row, BLOB_REF_SCHEMA_KEY, "id")?,
             blob_hash: typed_row_string(&typed.row, BLOB_REF_SCHEMA_KEY, "blob_hash")?,
+            size_bytes: typed_row_integer(&typed.row, BLOB_REF_SCHEMA_KEY, "size_bytes")?,
         }));
     }
     row.snapshot_json_value()?
@@ -2575,6 +2703,7 @@ fn blob_ref_record_from_live_row(
         key,
         BlobRefRecord {
             blob_hash: snapshot.blob_hash,
+            size_bytes: snapshot.size_bytes,
             inline_data: None,
             live: handle,
         },
@@ -7116,7 +7245,7 @@ mod tests {
     use crate::transaction_types::{
         TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
     };
-    use crate::{LixError, NullableKeyFilter};
+    use crate::{LixError, NullableKeyFilter, Value};
 
     use super::{
         BranchBinding, DirectoryDescriptorRecord, LixFileInsertSink, LixFileSpec, TableSpec,
@@ -7651,6 +7780,119 @@ mod tests {
             },
             true,
         ));
+    }
+
+    #[tokio::test]
+    async fn file_size_projection_uses_blob_ref_metadata_without_hydrating_large_payloads() {
+        let branch = "01920000-0000-7000-8000-0000000000b1";
+        let large_id = "01920000-0000-7000-8000-0000000000d2";
+        let empty_id = "01920000-0000-7000-8000-0000000000d3";
+        let large_size = 64 * 1024 * 1024;
+        let rows = vec![
+            live_file_row(
+                large_id,
+                branch,
+                &format!(r#"{{"id":"{large_id}","directory_id":null,"name":"large.bin"}}"#),
+            ),
+            live_blob_ref_row(
+                large_id,
+                branch,
+                large_id,
+                &"00".repeat(32),
+                large_size,
+            ),
+            live_file_row(
+                empty_id,
+                branch,
+                &format!(r#"{{"id":"{empty_id}","directory_id":null,"name":"empty.bin"}}"#),
+            ),
+            live_blob_ref_row(
+                empty_id,
+                branch,
+                empty_id,
+                &BlobId::from_content(b"").to_hex(),
+                0,
+            ),
+        ];
+        let index = Arc::new(path_index_from_rows(rows).expect("path index should build"));
+        let blob_reads = Arc::new(CapturingWriteContext::default());
+        let paths = BTreeSet::from(["/empty.bin".to_string(), "/large.bin".to_string()]);
+        let result = super::execute_exact_lix_file_size_batch_read(
+            branch,
+            Arc::new(RowsHotStateReader::default()),
+            Arc::new(StaticFilesystemPathIndexReader {
+                index,
+                request_count: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(TestBranchRefReader),
+            blob_reads.clone(),
+            PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
+            None,
+            &paths,
+        )
+        .await
+        .expect("size metadata should be readable without payloads");
+
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Text("/empty.bin".into()), Value::Integer(0)],
+                vec![Value::Text("/large.bin".into()), Value::Integer(large_size as i64)],
+            ]
+        );
+        assert_eq!(blob_reads.blob_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn ranged_file_projection_uses_range_reader_without_loading_full_blob() {
+        let branch = "01920000-0000-7000-8000-0000000000b1";
+        let file_id = "01920000-0000-7000-8000-0000000000d4";
+        let content = b"abcdefghij".to_vec();
+        let blob_id = BlobId::from_content(&content);
+        let rows = vec![
+            live_file_row(
+                file_id,
+                branch,
+                &format!(r#"{{"id":"{file_id}","directory_id":null,"name":"ranged.bin"}}"#),
+            ),
+            live_blob_ref_row(
+                file_id,
+                branch,
+                file_id,
+                &blob_id.to_hex(),
+                content.len(),
+            ),
+        ];
+        let index = Arc::new(path_index_from_rows(rows).expect("path index should build"));
+        let blob_reader = Arc::new(CapturingWriteContext {
+            blob_bytes_by_hash: BTreeMap::from([(blob_id, content)]),
+            ..CapturingWriteContext::default()
+        });
+        let paths = BTreeSet::from(["/ranged.bin".to_string()]);
+        let result = super::execute_exact_lix_file_batch_read(
+            branch,
+            Arc::new(RowsHotStateReader::default()),
+            Arc::new(StaticFilesystemPathIndexReader {
+                index,
+                request_count: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(TestBranchRefReader),
+            blob_reader.clone(),
+            PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime)),
+            None,
+            None,
+            &paths,
+            Some(2..5),
+        )
+        .await
+        .expect("bounded range projection should be readable");
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0][0], Value::Text("/ranged.bin".into()));
+        assert_eq!(result.rows[0][1], Value::Blob(b"cde".to_vec().into()));
+        assert_eq!(result.rows[0][2], Value::Integer(10));
+        assert_eq!(blob_reader.range_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(blob_reader.blob_reads.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -8544,6 +8786,7 @@ mod tests {
     #[derive(Default)]
     struct CapturingWriteContext {
         blob_reads: AtomicUsize,
+        range_reads: AtomicUsize,
         rows: Vec<MaterializedHotStateRow>,
         blob_bytes_by_hash: BTreeMap<BlobId, Vec<u8>>,
         writes: Vec<TransactionWrite>,
@@ -8590,6 +8833,24 @@ mod tests {
                     .map(|hash| self.blob_bytes_by_hash.get(hash).cloned())
                     .collect(),
             ))
+        }
+
+        async fn load_ranges_many(
+            &self,
+            requests: &[(BlobId, std::ops::Range<u64>)],
+        ) -> Result<crate::binary_cas::BlobRangeBytesBatch, LixError> {
+            self.range_reads.fetch_add(requests.len(), Ordering::SeqCst);
+            let entries = requests
+                .iter()
+                .map(|(hash, range)| {
+                    self.blob_bytes_by_hash
+                        .get(hash)
+                        .cloned()
+                        .map(|bytes| super::materialize_vec_range(bytes, range.clone()))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(crate::binary_cas::BlobRangeBytesBatch::new(entries))
         }
     }
 

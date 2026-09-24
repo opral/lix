@@ -107,7 +107,8 @@ pub(crate) use providers::{
     register_write_read_relations,
     execute_exact_lix_directory_root_listing, execute_exact_lix_file_batch_read,
     execute_exact_lix_file_id_manifest_batch_read, execute_exact_lix_file_read,
-    execute_exact_lix_file_root_listing, execute_exact_schema_batch_read,
+    execute_exact_lix_file_root_listing, execute_exact_lix_file_size_batch_read,
+    execute_exact_schema_batch_read,
     execute_exact_schema_point_read, execute_fast_lix_file_path_writes,
     execute_fast_lix_file_prepared_path_write,
 };
@@ -129,7 +130,7 @@ pub(crate) use plan::read::statement::{
     exact_filesystem_read_interest_route, exact_filesystem_read_route,
 };
 pub(crate) use plan::read::statement::{
-    StatementReadPlan, is_acknowledgeable_file_content_read,
+    LateLixFileProjection, StatementReadPlan, is_acknowledgeable_file_content_read,
     late_materialized_lix_file_content_read, plan_read_statement,
 };
 
