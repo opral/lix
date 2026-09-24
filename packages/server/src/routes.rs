@@ -1872,7 +1872,7 @@ mod tests {
                 "INSERT INTO lix_file (path, content) VALUES ($1, $2)",
                 vec![
                     wire_value(LixValue::Text(
-                        "/.lix/plugins/plugin_markdown_incremental_v2.lixplugin".to_string(),
+                        "/.lix/plugins/plugin_markdown.lixplugin".to_string(),
                     )),
                     wire_value(LixValue::Blob(markdown_plugin.into())),
                 ],
