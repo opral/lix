@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.18.0 - 2026-09-25
+
+### Minor
+
+- Add universal commenting with built-in `lix_conversation` and `lix_comment` SQL tables. Attach a discussion to any versioned row, including file content or a commit, or leave it standalone. Conversations support titles, replies, and a resolved flag; their comments travel with repository history and branches.
+
+  Deleting a target keeps its conversation and comments available as a detached discussion. If the target returns, the conversation reattaches. See [Conversations and comments](docs/conversations.md) for SQL examples and scope rules.
+- Make concurrent edits and large repositories easier to work with. Transactions now rebase over unrelated writes, and `lix.transaction()` can retry real conflicts. Partial replicas fetch missing data on demand after remote updates, while supported older repositories upgrade during normal opening with progress reporting.
+
+  SQL also supports `INSERT ... SELECT` into registered tables, typed row references, foreign-key delete cascades, and OpenTelemetry engine spans.
+- Update integrations for the 0.18 SQL and JavaScript APIs. `lix_row_ref` now requires a file ID argument (use `NULL` for fileless rows), and encoded references use v2. Read checkpoint status from `lix_log().is_checkpoint`. Recovery uses `SELECT commit_id FROM lix_restore(...)`, `lix_revert(...)`, or `lix_apply(...)` instead of the former `INSERT` commands.
+
+  In JavaScript, `lix.observe()` returns a standard async iterator, and the SDK no longer bundles plugin archives. SQL discovery reports logical types in `data_type` and removes `lix_value_kind`. Upgrade clients and servers together. See the [JavaScript API](docs/js-api-reference.md), [SQL functions](docs/sql-functions.md), and [plugin installation](docs/plugins.md) guides for migration details.
+
+### Patch
+
+- Fix partial replica reads, sync recovery, and offline reopening after undo. Missing history now comes from the authority, and incomplete results are not returned as empty data.
+
+  Improve browser repository recovery after a worker or storage failure, retry transient network errors, and keep plugin upgrades compatible with supported schema additions. Foreign-key deletes now reject orphaned references, and repository migration uses less I/O.
+
 ## 0.17.1 - 2026-09-16
 
 ### Faster partial replica history hydration

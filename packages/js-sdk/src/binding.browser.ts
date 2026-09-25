@@ -32,8 +32,14 @@ export async function openLixBinding(
 	openProgress?: OpenProgressDispatch,
 	snapshot?: ReadableStream<Uint8Array>,
 ): Promise<LixBinding> {
+	// Load the plugin runtime alongside WASM and finish before the repository
+	// can be used offline. Start after the worker has initialized its module
+	// loader: Vite's dynamic-import wrapper is unavailable at module evaluation.
+	const componentCompiler = import("./component-host/index.js");
 	await initializeWasm();
-	const componentDispatch = createComponentDispatch();
+	const { compileComponent, initializeComponentCompiler } = await componentCompiler;
+	await initializeComponentCompiler();
+	const componentDispatch = createComponentDispatch(compileComponent);
 	switch (storage.kind) {
 		case "memory":
 			return (

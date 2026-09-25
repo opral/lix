@@ -21,7 +21,9 @@ type Guest = {
 };
 
 /** One isolated handle registry per engine runtime, shared by Node and browsers. */
-export function createComponentDispatch(): (
+export function createComponentDispatch(
+  browserCompiler?: typeof compileComponent,
+): (
   request: ComponentRequest,
 ) => Promise<string> {
   const factories = new Map<number, Factory>();
@@ -63,8 +65,9 @@ export function createComponentDispatch(): (
         try {
           if (!(request.bytes instanceof Uint8Array))
             throw new Error("Missing component bytes");
-          const { compileComponent } = await import("./index.js");
-          const factory = await compileComponent(
+          const compile =
+            browserCompiler ?? (await import("./index.js")).compileComponent;
+          const factory = await compile(
             request.bytes,
             data.limits as ComponentLimits,
           );

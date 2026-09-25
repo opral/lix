@@ -18,6 +18,11 @@ export type ComponentInstance = {
   setDeadline(milliseconds: number): void;
 };
 
+/** Finish the component host's WASM initialization before an offline edit. */
+export async function initializeComponentCompiler(): Promise<void> {
+  await $init;
+}
+
 /** Compile once, instantiate separately for every engine actor. */
 export async function compileComponent(
   bytes: Uint8Array,
@@ -29,7 +34,7 @@ export async function compileComponent(
     throw new Error(
       "Instruction fuel limits are unsupported by the JavaScript Component host",
     );
-  await $init;
+  await initializeComponentCompiler();
   const output = generate(bytes, {
     name: "plugin",
     instantiation: { tag: "async" },
