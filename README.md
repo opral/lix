@@ -11,7 +11,7 @@
   <a href="https://x.com/lixCCS"><img src="https://img.shields.io/badge/Follow-@lixCCS-black?logo=x&logoColor=white" alt="X (Twitter)"></a>
 </p>
 
-Lix is a version control system for files and tables. Store files of any format alongside SQL tables you define in Lix in one repository. Branch, diff, merge, and roll back changes to both. Embed Lix in a product or connect to a server:
+Lix is a version control system for files and tables. Store files of any format alongside SQL tables you define in Lix in one repository. Branch, diff, merge, and roll back changes to both. Embed Lix in a product or connect to a server.
 
 **[Try Lix in the cloud →](https://lixray.com)**
 
