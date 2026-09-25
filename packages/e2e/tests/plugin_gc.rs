@@ -54,14 +54,14 @@ async fn repository_gc_keeps_graph_reachable_file_history_content() {
         .get::<String>("id")
         .unwrap();
     let historical_checkpoint = lix
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
         .await
         .unwrap()
         .rows()[0]
         .get::<String>("commit_id")
         .unwrap();
     write_file(&lix, "/history.txt", b"after gc").await;
-    lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
         .await
         .unwrap();
 
@@ -116,7 +116,7 @@ async fn repository_gc_reclaims_plugin_wasm_after_final_registry_root_releases()
     )
     .await
     .unwrap();
-    lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
         .await
         .unwrap();
     collect_repository_gc_for_bench(&storage).await.unwrap();

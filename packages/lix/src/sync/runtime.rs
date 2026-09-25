@@ -2309,6 +2309,7 @@ mod tests {
 
     fn blob_ref_commit(blob_id: &str) -> super::super::SyncCommit {
         super::super::SyncCommit {
+            checkpoint_conversation_id: None,
             is_checkpoint: false,
             commit_id: crate::changelog::CommitId::for_test_label("runtime-inline-commit")
                 .to_string(),

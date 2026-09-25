@@ -54,7 +54,7 @@ test("native hosted lifecycle sends complete snapshots and preserves source hist
 		await local.execute(
 			"INSERT INTO lix_key_value (key, value, lixcol_untracked) VALUES ('untracked-fixture', 'retained', true)",
 		);
-		await local.execute("SELECT commit_id FROM lix_create_checkpoint()");
+		await local.execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)");
 		const expected = Buffer.from(
 			await new Response(local.exportSnapshot()).arrayBuffer(),
 		);

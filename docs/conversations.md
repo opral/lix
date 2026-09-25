@@ -49,6 +49,8 @@ INSERT INTO lix_conversation DEFAULT VALUES RETURNING id;
 
 ## Discuss a commit globally
 
+For a new checkpoint, use `lix_create_checkpoint(title, comment)` instead of separate inserts. Either argument may be `NULL`. A title or comment creates a canonical conversation atomically with the checkpoint; a non-null comment creates the opening Zettel comment. `lix_log().conversation_id` identifies that conversation, and is `NULL` when both values are null. Later comments use `ORDER BY lixcol_created_at, id` for chronological display. Other conversations may also target the same commit.
+
 A repository-wide commit discussion stores both conversation and comments globally. `$1` and `$2` are fresh conversation/comment UUIDs; `$3` is an existing commit UUID; `$4` is the Zettel body.
 
 ```sql

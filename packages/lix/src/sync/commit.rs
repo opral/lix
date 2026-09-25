@@ -124,6 +124,8 @@ pub(crate) fn stage_delete_sync_checkpoint_source(
 pub struct SyncCommit {
     /// Immutable commit membership; required by the current protocol.
     pub is_checkpoint: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_conversation_id: Option<String>,
     pub commit_id: String,
     pub parent_commit_ids: Vec<String>,
     pub base_commit_id: Option<String>,
@@ -408,6 +410,11 @@ impl SyncCommit {
     /// them. Member order is part of the canonical wire representation.
     pub(crate) fn validate(&self) -> Result<(), LixError> {
         let commit_id = CommitId::parse_lix(&self.commit_id, "sync commit id")?;
+        if let Some(id) = &self.checkpoint_conversation_id {
+            if !self.is_checkpoint || uuid::Uuid::parse_str(id).is_err() {
+                return invalid("sync checkpoint conversation id requires a checkpoint and UUID");
+            }
+        }
         parse_timestamp("sync commit createdAt", &self.created_at)?;
         if self.account_id.is_empty() {
             return invalid("sync commit accountId must not be empty");
@@ -693,6 +700,7 @@ where
         };
     let exported = SyncCommit {
         is_checkpoint: record.is_checkpoint,
+        checkpoint_conversation_id: crate::checkpoint_conversation::load_checkpoint_conversation(store, commit_id).await?,
         commit_id: record.commit_id.to_string(),
         parent_commit_ids: record
             .parent_commit_ids
@@ -1101,6 +1109,7 @@ mod tests {
     #[test]
     fn incorporation_wire_preserves_unknown_and_rejects_contradictory_proofs() {
         let mut commit = SyncCommit {
+            checkpoint_conversation_id: None,
             is_checkpoint: true,
             commit_id: CommitId::for_test_label("incorporation-target").to_string(),
             parent_commit_ids: vec![CommitId::for_test_label("incorporation-parent").to_string()],
@@ -1160,6 +1169,7 @@ mod tests {
             }
         };
         let mut commit = SyncCommit {
+            checkpoint_conversation_id: None,
             is_checkpoint: false,
             commit_id: commit_id.to_string(),
             parent_commit_ids: Vec::new(),
@@ -1227,6 +1237,7 @@ mod tests {
         let parent = CommitId::for_test_label("alias-parent");
         let source = CommitId::for_test_label("alias-source");
         let mut commit = SyncCommit {
+            checkpoint_conversation_id: None,
             is_checkpoint: false,
             commit_id: commit_id.to_string(),
             parent_commit_ids: vec![parent.to_string()],

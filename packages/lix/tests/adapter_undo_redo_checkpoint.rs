@@ -47,7 +47,7 @@ where
     )
     .await
     .expect("seed rows commit");
-    lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
         .await
         .expect("seed checkpoint commits");
     lix.execute(
@@ -56,7 +56,7 @@ where
     )
     .await
     .expect("A commits");
-    lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
         .await
         .expect("A checkpoint commits");
     lix.execute(

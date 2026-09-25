@@ -234,7 +234,7 @@ async fn certified_hot_state_profile_scorecard() {
 async fn profile_net_zero_tombstone_checkpoint(churn_rows: usize) -> JsonValue {
     let (authority_storage, authority) = open_authority().await;
     authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
         .await
         .expect("checkpoint tombstone profile baseline");
     for index in 0..churn_rows {
@@ -280,7 +280,7 @@ async fn profile_net_zero_tombstone_checkpoint(churn_rows: usize) -> JsonValue {
     let (_, checkpoint_server_task, checkpoint_authority) =
         serve_with_authority_session(authority_storage.clone(), Arc::default()).await;
     checkpoint_authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
         .await;
     drop(checkpoint_authority);
     stop_server(checkpoint_server_task).await;
@@ -342,7 +342,7 @@ async fn profile_certified_hot_case(
         .await;
     }
     authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
         .await
         .expect("checkpoint HOT profile baseline");
     let updates = (0..dirty_rows)
@@ -492,7 +492,7 @@ async fn connected_api_routes_local_work_and_hot_reads_need_no_round_trip() {
     let (authority_storage, authority) = open_authority().await;
     put_value(&authority, "authority-fence", "before").await;
     authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
         .await
         .expect("checkpoint authoritative baseline");
     authority.close().await.expect("close authority setup");
@@ -1718,7 +1718,7 @@ async fn local_writes_checkpoints_and_folder_moves_survive_offline_reopen() {
         .await
         .expect("seed nested file");
     authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
         .await
         .expect("seed checkpoint");
     authority.close().await.unwrap();
@@ -1778,11 +1778,11 @@ async fn local_writes_checkpoints_and_folder_moves_survive_offline_reopen() {
         Some(b"original".to_vec())
     );
     let partial = replica.execute(
-        "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_key_value', NULL, 'offline-marker')])", &[])
+        "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY[lix_row_ref('lix_key_value', NULL, 'offline-marker')])", &[])
         .await.expect("create partial checkpoint offline").rows()[0]
         .get::<String>("commit_id").unwrap();
     let full = replica
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
         .await
         .expect("create full checkpoint offline")
         .rows()[0]
@@ -1919,7 +1919,7 @@ async fn scoped_checkpoint_from_uncheckpointed_authority_survives_reconnect(
     }
     let checkpoint = replica
         .execute(
-            "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_file') WHERE to_path = '/b/a/note.txt'))",
+            "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY(SELECT row_ref FROM lix_diff('lix_file') WHERE to_path = '/b/a/note.txt'))",
             &[],
         )
         .await
@@ -2137,7 +2137,7 @@ async fn fetched_immutable_history_is_cached_across_offline_reopen() {
     let (storage, authority) = open_authority().await;
     put_value(&authority, "history-marker", "historical").await;
     let checkpoint = authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
         .await
         .unwrap()
         .rows()[0]
@@ -2145,7 +2145,7 @@ async fn fetched_immutable_history_is_cached_across_offline_reopen() {
         .unwrap();
     put_value(&authority, "history-marker", "current").await;
     authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
         .await
         .unwrap();
     authority.close().await.unwrap();
@@ -2241,7 +2241,7 @@ async fn partial_replica_open_profile() {
             put_value(&authority, "unopened-history", &index.to_string()).await;
         }
         authority
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
             .await
             .unwrap();
         for index in 0..branches {
@@ -2366,7 +2366,7 @@ async fn local_first_foreground_profile_scorecard() {
                 .unwrap();
             put_value(&authority, "profile-marker", "before").await;
             authority
-                .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+                .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
                 .await
                 .unwrap();
             authority.close().await.unwrap();
@@ -2386,7 +2386,7 @@ async fn local_first_foreground_profile_scorecard() {
                 ),
                 (
                     "partial_checkpoint",
-                    "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_key_value', NULL, 'profile-marker')])",
+                    "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY[lix_row_ref('lix_key_value', NULL, 'profile-marker')])",
                 ),
                 (
                     "folder_move",
@@ -2394,7 +2394,7 @@ async fn local_first_foreground_profile_scorecard() {
                 ),
                 (
                     "full_checkpoint",
-                    "SELECT commit_id FROM lix_create_checkpoint()",
+                    "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)",
                 ),
             ] {
                 let scope = AllocationScope::start();
@@ -3049,7 +3049,7 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
         .await
         .expect("create /docs/handbook/inside.md");
     let first_checkpoint = authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
         .await
         .expect("checkpoint seeded filesystem")
         .rows()[0]
@@ -3063,7 +3063,7 @@ async fn fresh_replica_reads_point_in_time_filesystem_state() {
         .await
         .expect("create /brand/logo.md");
     let second_checkpoint = authority
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
         .await
         .expect("checkpoint second filesystem state")
         .rows()[0]

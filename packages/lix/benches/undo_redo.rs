@@ -212,7 +212,7 @@ fn seeded_checkpoint_inventory_storage(
             .await
             .expect("checkpoint inventory rows commit");
         let checkpoint = session
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
             .await
             .expect("checkpoint inventory checkpoint succeeds")
             .rows()[0]

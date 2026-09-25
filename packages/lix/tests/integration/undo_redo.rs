@@ -25,7 +25,7 @@ async fn command(lix: &Lix, sql: &str, ids: &[&str]) -> Option<String> {
     }
 }
 async fn checkpoint(lix: &Lix) -> String {
-    command(lix, "SELECT commit_id FROM lix_create_checkpoint()", &[])
+    command(lix, "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
         .await
         .unwrap()
 }

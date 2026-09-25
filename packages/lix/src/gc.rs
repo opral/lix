@@ -207,6 +207,7 @@ impl CheckpointGcState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CheckpointPublication {
     pub(crate) recovery_ref: CheckpointRecoveryRef,
+    pub(crate) conversation_id: Option<String>,
     pub(crate) gc_state: CheckpointGcState,
     /// The selected interval came from the certified HOT index, or a complete
     /// canonical diff over an admitted partial replica root plus HOT overlay.
@@ -2225,6 +2226,9 @@ where
     crate::tracked_state::stage_change_locators(writes, &relocated_locators);
 
     crate::changelog::stage_delete_commits(writes, sweep_commits.iter().copied());
+    for commit_id in &sweep_commits {
+        crate::checkpoint_conversation::stage_delete_checkpoint_conversation(writes, *commit_id);
+    }
     crate::tracked_state::stage_sweep_unreachable_content_nodes(
         store,
         writes,

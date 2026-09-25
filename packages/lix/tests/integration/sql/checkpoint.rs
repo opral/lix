@@ -4,6 +4,36 @@ use serde_json::json;
 use super::select_rows;
 
 #[tokio::test(flavor = "current_thread")]
+async fn checkpoint_creates_canonical_zettel_conversation() {
+    let lix = crate::open_lix().await.expect("repository opens");
+    let body = json!({
+        "_type": "zettel_doc",
+        "blocks": [{
+            "_type": "zettel_block", "_key": "context", "style": "normal",
+            "markDefs": [],
+            "children": [{"_type": "zettel_span", "_key": "summary", "text": "Changed validation to reject malformed rows; retries still use the old policy.", "marks": []}]
+        }]
+    });
+    let checkpoint = lix.execute(
+        "SELECT commit_id FROM lix_create_checkpoint($1, $2)",
+        &[Value::Text("Validate imports".into()), Value::Jsonb(body.clone().into())],
+    ).await.expect("described checkpoint succeeds");
+    let commit_id = checkpoint.rows()[0].get::<String>("commit_id").unwrap();
+    let rows = lix.execute(
+        "SELECT l.conversation_id, c.title, m.body
+         FROM lix_log() AS l
+         JOIN lix_conversation AS c ON c.id = l.conversation_id
+         JOIN lix_comment AS m ON m.conversation_id = c.id
+         WHERE l.commit_id = $1 AND l.is_checkpoint",
+        &[Value::Text(commit_id)],
+    ).await.expect("checkpoint conversation is readable through log");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows.rows()[0].get::<String>("title").unwrap(), "Validate imports");
+    assert_eq!(rows.rows()[0].get::<Value>("body").unwrap(), Value::Jsonb(body.into()));
+    lix.close().await.expect("repository closes");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn checkpoints_example_sql_contract() {
     let lix = crate::open_lix().await.expect("example repository opens");
     let root_commit_id = lix
@@ -352,7 +382,7 @@ simulation_test!(
 
         let checkpoint = session
             .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(ARRAY[\
+                "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY[\
                     lix_row_ref('checkpoint_child', NULL, 'child-a')\
                  ])",
                 &[],
@@ -417,7 +447,7 @@ simulation_test!(
             .await
             .expect("baseline rows should insert");
         session
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
             .await
             .expect("baseline checkpoint should succeed");
 
@@ -437,7 +467,7 @@ simulation_test!(
             .expect("swapped rows should insert together");
         session
             .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('checkpoint_unique_swap', NULL, 'a')])",
+                "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY[lix_row_ref('checkpoint_unique_swap', NULL, 'a')])",
                 &[],
             )
             .await
@@ -498,7 +528,7 @@ simulation_test!(
             .expect("file-owned semantic row should insert");
         session
             .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('checkpoint_file_member', $1, 'member')])",
+                "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY[lix_row_ref('checkpoint_file_member', $1, 'member')])",
                 &[Value::Text(file_id.into())],
             )
             .await
@@ -535,7 +565,7 @@ simulation_test!(scoped_checkpoint_closes_file_path_swaps, |sim| async move {
         .await
         .expect("baseline files should insert");
     session
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
         .await
         .expect("baseline checkpoint should succeed");
 
@@ -557,7 +587,7 @@ simulation_test!(scoped_checkpoint_closes_file_path_swaps, |sim| async move {
         .expect("swapped files should insert together");
     session
         .execute(
-            "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_file', NULL, $1)])",
+            "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY[lix_row_ref('lix_file', NULL, $1)])",
             &[Value::Text(first_id.into())],
         )
         .await
@@ -596,7 +626,7 @@ simulation_test!(
             .await
             .expect("same names in different directories should insert");
         session
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
             .await
             .expect("baseline checkpoint should succeed");
 
@@ -611,7 +641,7 @@ simulation_test!(
             .expect("both files should change");
         session
             .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref(\
+                "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY[lix_row_ref(\
                  'lix_file', NULL, '01950000-0000-7000-8000-000000000043')])",
                 &[],
             )
@@ -658,7 +688,7 @@ simulation_test!(
             .await
             .expect("nested file should insert");
         session
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
             .await
             .expect("baseline checkpoint should succeed");
 
@@ -696,7 +726,7 @@ simulation_test!(
             .expect("file should take the former directory name");
         session
             .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(ARRAY[lix_row_ref('lix_file', NULL, $1)])",
+                "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY[lix_row_ref('lix_file', NULL, $1)])",
                 &[Value::Text(file_id.into())],
             )
             .await
@@ -751,7 +781,7 @@ simulation_test!(
 
         session
             .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(ARRAY[\
+                "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY[\
                     lix_row_ref('lix_directory', NULL, '01950000-0000-7000-8000-000000000011'),\
                     lix_row_ref('lix_key_value', NULL, 'mixed-row')\
                  ])",
@@ -833,7 +863,7 @@ simulation_test!(
             .await
             .expect("child should insert");
         session
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
             .await
             .expect("baseline checkpoint should succeed");
 
@@ -853,7 +883,7 @@ simulation_test!(
             .expect("parent should delete after child");
         session
             .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(ARRAY[\
+                "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY[\
                     lix_row_ref('checkpoint_delete_parent', NULL, 'parent-a')\
                  ])",
                 &[],
@@ -891,13 +921,10 @@ simulation_test!(
             .await
             .expect("working row should insert");
         let head_before_empty = select_rows(&session, "SELECT lix_active_branch_commit_id()").await;
-        assert!(
-            session
-                .execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY[])", &[],)
-                .await
-                .expect("empty scoped checkpoint is a no-op")
-                .is_empty()
-        );
+        session
+            .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY[])", &[])
+            .await
+            .expect_err("empty scoped checkpoint is rejected");
         assert_eq!(
             select_rows(&session, "SELECT lix_active_branch_commit_id()").await,
             head_before_empty,
@@ -909,7 +936,7 @@ simulation_test!(
             .await
             .expect("transaction opens");
         rolled_back
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
             .await
             .expect("checkpoint may stage in transaction");
         rolled_back.rollback().await.expect("rollback succeeds");
@@ -931,7 +958,7 @@ simulation_test!(
             .await
             .expect("tracked write should stage");
         let error = write_then_checkpoint
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
             .await
             .expect_err("checkpoint planning cannot ignore an earlier staged write");
         assert_eq!(error.code, "LIX_INVALID_TRANSACTION_STATE");
@@ -945,11 +972,11 @@ simulation_test!(
             .await
             .expect("transaction opens");
         committed
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
             .await
             .expect("first checkpoint stages");
         let duplicate = committed
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
             .await
             .expect_err("one transaction cannot publish two checkpoints");
         assert_eq!(duplicate.code, "LIX_INVALID_TRANSACTION_STATE");

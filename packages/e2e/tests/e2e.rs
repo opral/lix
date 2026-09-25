@@ -2063,7 +2063,7 @@ where
         .await
         .expect("main Markdown branch should reactivate");
     }
-    lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
         .await
         .expect("Markdown checkpoint should commit");
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2196,7 +2196,7 @@ async fn v3_markdown_byte_roundtrip_slatedb_server_style_runtime_stack_guard() {
         Some(expected.clone())
     );
     qualify_markdown_server_style_branch(&lix, &expected).await;
-    lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
         .await
         .expect("server-style SlateDB branch checkpoint");
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2228,7 +2228,7 @@ async fn v3_markdown_byte_roundtrip_slatedb_server_style_checkpoint_guard() {
     write_file(&lix, "/company/competitors.md", expected.clone())
         .await
         .expect("server-style SlateDB Markdown write");
-    lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+    lix.execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
         .await
         .expect("server-style SlateDB Markdown checkpoint");
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -6396,7 +6396,7 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
     .await
     .unwrap();
     let baseline_checkpoint = lix
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
         .await
         .unwrap()
         .rows()[0]
@@ -6437,7 +6437,7 @@ async fn partial_checkpoint_rebases_all_plugin_rows_for_one_file() {
     assert!(selected_diff_count > 1, "CSV must fan out beyond lix_file");
     let selected_checkpoint = lix
         .execute(
-            "SELECT commit_id FROM lix_create_checkpoint(ARRAY( \
+            "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY( \
          SELECT row_ref \
          FROM lix_diff('lix_file', lix_root_commit_id(), lix_active_branch_commit_id()) \
          WHERE id = $1))",

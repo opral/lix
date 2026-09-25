@@ -37,7 +37,7 @@ simulation_test!(
             .unwrap();
         let baseline = commit(
             &session,
-            "SELECT commit_id FROM lix_create_checkpoint()",
+            "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)",
             &[],
         )
         .await;
@@ -258,7 +258,7 @@ simulation_test!(
             .unwrap();
         let checkpoint = commit(
             &session,
-            "SELECT commit_id FROM lix_create_checkpoint()",
+            "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)",
             &[],
         )
         .await;

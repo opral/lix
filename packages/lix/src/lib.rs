@@ -70,6 +70,7 @@ pub mod changelog;
 #[cfg(not(feature = "storage-benches"))]
 pub(crate) mod changelog;
 pub(crate) mod checkpoint;
+pub(crate) mod checkpoint_conversation;
 pub(crate) mod collection_generation;
 pub(crate) mod columnar_row_group;
 pub(crate) mod commit_graph;

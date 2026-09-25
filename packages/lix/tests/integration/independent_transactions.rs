@@ -510,7 +510,7 @@ async fn rejected_checkpoint_preserves_staged_write_and_commit_receipt() {
     .await
     .unwrap();
     let checkpoint_error = tx
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
         .await
         .unwrap_err();
     assert_eq!(checkpoint_error.code, "LIX_INVALID_TRANSACTION_STATE");
@@ -530,7 +530,7 @@ async fn rejected_checkpoint_preserves_staged_write_and_commit_receipt() {
     );
     let mut checkpoint_only = lix.begin_transaction().await.unwrap();
     checkpoint_only
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
         .await
         .unwrap();
     assert!(checkpoint_only.commit().await.unwrap().commit.is_some());

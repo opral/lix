@@ -77,7 +77,7 @@ async fn full_and_sparse_migrations_produce_identical_headers_and_accept_native_
         .rows()[0]
         .get::<String>("id")
         .unwrap();
-    let checkpoint = authority.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
+    let checkpoint = authority.execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap().rows()[0].get::<String>("commit_id").unwrap();
     authority
         .execute(
             "UPDATE lix_key_value SET value='ordinary' WHERE key='other'",
@@ -266,9 +266,9 @@ async fn legacy_sql_checkpoints_preserve_members_without_inferred_provenance() {
             .unwrap();
         session.execute("INSERT INTO lix_key_value (key,value,lixcol_global) VALUES ('migration-global','advanced',true)", &[]).await.unwrap();
         let sql = if full {
-            "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))"
+            "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))"
         } else {
-            "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key='migration-pending'))"
+            "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key='migration-pending'))"
         };
         let checkpoint = session.execute(sql, &[]).await.unwrap().rows()[0]
             .get::<String>("commit_id")

@@ -180,7 +180,90 @@ where
 #[cfg(test)]
 mod metadata_tests {
     use super::*;
+    use crate::Value;
     use crate::storage_adapter::StorageReadOptions;
+
+    #[tokio::test]
+    async fn described_checkpoint_exposes_its_conversation() {
+        let lix = crate::open_lix().await.expect("open repository");
+        let body = serde_json::json!({
+            "_type": "zettel_doc",
+            "blocks": [{
+                "_type": "zettel_block", "_key": "context", "style": "normal",
+                "markDefs": [],
+                "children": [{
+                    "_type": "zettel_span", "_key": "summary",
+                    "text": "Malformed rows now fail before insertion; retries are unchanged.",
+                    "marks": []
+                }]
+            }]
+        });
+        let created = lix.execute(
+            "SELECT commit_id FROM lix_create_checkpoint($1, $2)",
+            &[Value::Text("Validate imports".into()), Value::Jsonb(body.clone().into())],
+        ).await.expect("create described checkpoint");
+        let commit_id = created.rows()[0].get::<String>("commit_id").unwrap();
+        let rows = lix.execute(
+            "SELECT l.conversation_id, c.title, m.body
+             FROM lix_log() AS l
+             JOIN lix_conversation AS c ON c.id = l.conversation_id
+             JOIN lix_comment AS m ON m.conversation_id = c.id
+             WHERE l.commit_id = $1 AND l.is_checkpoint",
+            &[Value::Text(commit_id)],
+        ).await.expect("read checkpoint conversation");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.rows()[0].get::<String>("title").unwrap(), "Validate imports");
+        assert_eq!(rows.rows()[0].get::<Value>("body").unwrap(), Value::Jsonb(body.into()));
+        for params in [
+            vec![Value::Text("  ".into()), Value::Jsonb(serde_json::json!({"_type":"zettel_doc","blocks":[]}).into())],
+            vec![Value::Text("Wrong type".into()), Value::Text("plain text".into())],
+            vec![Value::Text("Wrong document".into()), Value::Jsonb(serde_json::json!({"blocks":[]}).into())],
+        ] {
+            lix.execute("SELECT commit_id FROM lix_create_checkpoint($1, $2)", &params)
+                .await
+                .expect_err("invalid checkpoint arguments must fail");
+        }
+        let checkpoints = lix.execute("SELECT commit_id FROM lix_log() WHERE is_checkpoint", &[]).await.unwrap();
+        assert_eq!(checkpoints.len(), 1, "rejected arguments must not create checkpoints");
+
+        for (title, comment, expected_title, expects_comment) in [
+            (Value::Null, Value::Jsonb(serde_json::json!({"_type":"zettel_doc","blocks":[]}).into()), None, true),
+            (Value::Text("Title only".into()), Value::Null, Some("Title only"), false),
+            (Value::Null, Value::Null, None, false),
+        ] {
+            let created = lix.execute(
+                "SELECT commit_id FROM lix_create_checkpoint($1, $2)",
+                &[title, comment],
+            ).await.expect("nullable checkpoint arguments");
+            let commit_id = created.rows()[0].get::<String>("commit_id").unwrap();
+            let log = lix.execute(
+                "SELECT conversation_id FROM lix_log() WHERE commit_id = $1",
+                &[Value::Text(commit_id)],
+            ).await.unwrap();
+            let conversation_id = log.rows()[0].get::<Value>("conversation_id").unwrap();
+            if expected_title.is_none() && !expects_comment {
+                assert_eq!(conversation_id, Value::Null);
+                continue;
+            }
+            let Value::Text(conversation_id) = conversation_id else {
+                panic!("described checkpoint needs a conversation");
+            };
+            let conversation = lix.execute(
+                "SELECT title FROM lix_conversation WHERE id = $1",
+                &[Value::Text(conversation_id.clone())],
+            ).await.unwrap();
+            assert_eq!(
+                conversation.rows()[0].get::<Value>("title").unwrap(),
+                expected_title.map_or(Value::Null, |value| Value::Text(value.into())),
+            );
+            let comments = lix.execute(
+                "SELECT body FROM lix_comment WHERE conversation_id = $1",
+                &[Value::Text(conversation_id)],
+            ).await.unwrap();
+            assert_eq!(comments.len(), usize::from(expects_comment));
+        }
+        lix.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn checkpoint_flags_inventory_and_partial_remainder_are_atomic() {
@@ -188,7 +271,7 @@ mod metadata_tests {
         lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('selected', 'one'), ('remaining', 'two')", &[])
             .await.expect("write two rows");
         let selected = lix.execute(
-            "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key = 'selected'))", &[])
+            "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value') WHERE key = 'selected'))", &[])
             .await.expect("partial checkpoint").rows()[0].get::<String>("commit_id").unwrap();
         let head = lix
             .execute("SELECT lix_active_branch_commit_id() AS id", &[])
@@ -232,7 +315,7 @@ mod metadata_tests {
         assert_ne!(full, empty, "empty checkpoint is a new immutable commit");
         lix.execute(
             "SELECT commit_id FROM lix_restore($1)",
-            &[crate::Value::Text(selected)],
+            &[Value::Text(selected)],
         )
         .await
         .unwrap();

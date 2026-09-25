@@ -4060,6 +4060,9 @@ async fn validate_committed_row_refs(
         if pending_constraints.has_reachable_row_ref_target(&check.target) {
             continue;
         }
+        if staged_commit_row_ref_is_satisfied(input, check) {
+            continue;
+        }
         for domain in check.target.domain().fk_target_domains() {
             batches
                 .entry((domain, check.target.schema_key_owned()))
@@ -4095,6 +4098,7 @@ async fn validate_committed_row_refs(
     }
     for check in unresolved_checks {
         if pending_constraints.has_reachable_row_ref_target(&check.target)
+            || staged_commit_row_ref_is_satisfied(input, check)
             || check
                 .target
                 .domain()
@@ -4134,6 +4138,20 @@ async fn validate_committed_row_refs(
         check.target_exists_in_global_scope = global_matches.contains(&check.target);
     }
     Ok(unresolved)
+}
+
+fn staged_commit_row_ref_is_satisfied(
+    input: &TransactionValidationInput<'_>,
+    check: &UnresolvedRowRefCheck,
+) -> bool {
+    // A checkpoint conversation can target the commit created by this
+    // transaction. Its virtual lix_commit row is published in the same write.
+    check.target.schema_key() == COMMIT_SCHEMA_KEY
+        && check.target.domain().branch_id() == crate::GLOBAL_BRANCH_ID
+        && input.staged_commit_ids.iter().any(|commit_id| {
+            RowPk::uuid_from_canonical(&commit_id.to_string())
+                .is_ok_and(|row_pk| row_pk == *check.target.row_pk())
+        })
 }
 
 /// Finds global rows that match already-unresolved local row-reference targets.

@@ -311,7 +311,7 @@ mod tests {
             )
             .await
             .unwrap();
-            lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            lix.execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
                 .await
                 .unwrap();
         }

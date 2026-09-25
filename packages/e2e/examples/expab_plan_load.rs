@@ -150,7 +150,7 @@ where
     let _ = take_plan_load_attribution();
     let checkpoint_start = Instant::now();
     session
-        .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+        .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
         .await
         .expect("checkpoint should publish");
     let checkpoint_wall = checkpoint_start.elapsed();

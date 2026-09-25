@@ -364,10 +364,13 @@ Checkpointing uses the canonical SQL surface rather than a separate typed SDK me
 
 ```ts
 const result = await lix.execute(
-  "SELECT commit_id FROM lix_create_checkpoint()",
+  "SELECT commit_id FROM lix_create_checkpoint($1, $2)",
+  ["Validate imports", { _type: "zettel_doc", blocks: [] }],
 );
 const commitId = result.rows[0].commit_id;
 ```
+
+Pass `null` for either argument when no title or comment is needed. If both are `null`, `lix_log().conversation_id` is also `NULL`.
 
 See [Checkpoints](./checkpoints.md) for scoped row-reference selections.
 

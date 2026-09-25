@@ -20,7 +20,7 @@
       "name": "body",
       "type": "jsonb",
       "nullable": false,
-      "description": "Zettel document JSON. Applications validate the document format; the SQL column enforces JSONB storage and non-nullability."
+      "description": "Zettel document JSONB. Minimum shape: {\"_type\":\"zettel_doc\",\"blocks\":[]}. Full schema: https://github.com/opral/zettel/blob/84074511c6fffc5c67d6929365390fed7153459f/packages/zettel-ast/schema.json (vendored at packages/lix/vendor/zettel/schema.json). Applications validate the full document format; this SQL column enforces JSONB storage and non-nullability."
     }
   ],
   "primary_key": [

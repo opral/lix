@@ -269,6 +269,13 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     for publication in &prepared_writes.checkpoint_publications {
         crate::gc::stage_recovery_ref_rotation(&mut writes, &publication.recovery_ref)?;
         crate::gc::stage_checkpoint_gc_state(&mut writes, &publication.gc_state)?;
+        if let Some(conversation_id) = &publication.conversation_id {
+            crate::checkpoint_conversation::stage_checkpoint_conversation(
+                &mut writes,
+                publication.recovery_ref.checkpoint_commit_id,
+                conversation_id,
+            )?;
+        }
     }
     let ordered_replacements = prepared_writes
         .commit_change_refs_by_branch
@@ -788,6 +795,9 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
             &staged_delta_index,
             &checkpoint_state_sources,
             &checkpoint_incorporation_sources,
+            &prepared_writes.checkpoint_publications.iter().filter_map(|publication| {
+                publication.conversation_id.as_ref().map(|id| (publication.recovery_ref.checkpoint_commit_id, id.clone()))
+            }).collect(),
             &staged_snapshot_roots,
             &commit_rows
                 .iter()
@@ -2284,6 +2294,7 @@ fn materialize_staged_sync_commits(
     staged_delta_index: &StagedCommitDeltaIndex,
     checkpoint_state_sources: &BTreeMap<CommitId, CommitId>,
     checkpoint_incorporation_sources: &BTreeMap<CommitId, CommitId>,
+    checkpoint_conversations: &BTreeMap<CommitId, String>,
     staged_snapshot_roots: &BTreeMap<CommitId, TrackedStateCommitRoot>,
     global_commit_ids: &BTreeSet<CommitId>,
 ) -> Result<Vec<crate::sync::SyncCommit>, LixError> {
@@ -2458,6 +2469,7 @@ fn materialize_staged_sync_commits(
             })
             .transpose()?;
         let commit = SyncCommit {
+            checkpoint_conversation_id: checkpoint_conversations.get(commit_id).cloned(),
             complete_incorporation_source_commit_id: checkpoint_incorporation_sources
                 .get(commit_id)
                 .map(ToString::to_string),
@@ -8092,6 +8104,7 @@ mod tests {
         let error = stage_checkpoint_working_diff_epochs(
             &mut writes,
             &[crate::gc::CheckpointPublication {
+                conversation_id: None,
                 recovery_ref: crate::gc::CheckpointRecoveryRef {
                     branch_id: "01960000-0000-7000-8000-0000000000b2".to_owned(),
                     recovered_head_commit_id: commit_id("missing-hot-recovered-head"),

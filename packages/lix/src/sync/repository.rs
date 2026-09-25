@@ -474,11 +474,13 @@ fn sync_live_value_root<'a>(
 
 fn sync_header_from_record(
     record: &CommitRecord,
+    checkpoint_conversation_id: Option<String>,
     global_scope: bool,
     incorporation: crate::tracked_state::CommitStateIncorporation,
 ) -> SyncCommitHeader {
     SyncCommitHeader {
         is_checkpoint: record.is_checkpoint,
+        checkpoint_conversation_id,
         commit_id: record.commit_id.to_string(),
         parent_commit_ids: record
             .parent_commit_ids
@@ -2071,6 +2073,7 @@ struct ParsedUndoBaselineTransition {
 struct ParsedSyncHeader {
     incorporation: crate::tracked_state::CommitStateIncorporation,
     is_checkpoint: bool,
+    checkpoint_conversation_id: Option<String>,
     commit_id: CommitId,
     parent_commit_ids: Vec<CommitId>,
     base_commit_id: Option<CommitId>,
@@ -2085,6 +2088,11 @@ struct ParsedSyncHeader {
 impl ParsedSyncHeader {
     fn parse(header: &SyncCommitHeader) -> Result<Self, LixError> {
         let commit_id = CommitId::parse_lix(&header.commit_id, "sync commit header")?;
+        if let Some(id) = &header.checkpoint_conversation_id {
+            if !header.is_checkpoint || uuid::Uuid::parse_str(id).is_err() {
+                return Err(LixError::new(LixError::CODE_INVALID_PARAM, "sync checkpoint conversation id requires a checkpoint and UUID"));
+            }
+        }
         let incorporation = if let Some(source) = &header.complete_incorporation_source_commit_id {
             let source = CommitId::parse_lix(source, "sync header incorporation source")?;
             if source == commit_id
@@ -2171,6 +2179,7 @@ impl ParsedSyncHeader {
         }
         Ok(Self {
             is_checkpoint: header.is_checkpoint,
+            checkpoint_conversation_id: header.checkpoint_conversation_id.clone(),
             incorporation,
             commit_id,
             parent_commit_ids,
@@ -5223,6 +5232,11 @@ where
                 if !header.matches_record(&existing) {
                     return Err(immutable_object_mismatch("commit", header.commit_id));
                 }
+                if crate::checkpoint_conversation::load_checkpoint_conversation(&read, header.commit_id).await?
+                    != header.checkpoint_conversation_id
+                {
+                    return Err(immutable_object_mismatch("checkpoint conversation", header.commit_id));
+                }
                 let existing_scope =
                     match load_published_commit_state_topology(&read, header.commit_id).await? {
                         Some(topology) => Some(topology.global_scope()),
@@ -5251,6 +5265,7 @@ where
                 )
             })?;
             if header.is_checkpoint != commit.wire.is_checkpoint
+                || header.checkpoint_conversation_id != commit.wire.checkpoint_conversation_id
                 || header.parent_commit_ids != commit.parent_commit_ids
                 || header.base_commit_id != commit.base_commit_id
                 || header.account_id != commit.account_id
@@ -5424,6 +5439,11 @@ where
         }
 
         let mut writes = adapter.new_write_set();
+        for header in header_by_id.values() {
+            if let Some(conversation_id) = &header.checkpoint_conversation_id {
+                crate::checkpoint_conversation::stage_checkpoint_conversation(&mut writes, header.commit_id, conversation_id)?;
+            }
+        }
         let mut preconditions = Vec::new();
         let mut omitted_sources = BTreeMap::new();
         for row in &parsed_rows {
@@ -5877,6 +5897,11 @@ where
                 if !header.matches_record(&existing) {
                     return Err(immutable_object_mismatch("commit", header.commit_id));
                 }
+                if crate::checkpoint_conversation::load_checkpoint_conversation(&read, header.commit_id).await?
+                    != header.checkpoint_conversation_id
+                {
+                    return Err(immutable_object_mismatch("checkpoint conversation", header.commit_id));
+                }
                 let existing_scope =
                     match load_published_commit_state_topology(&read, header.commit_id).await? {
                         Some(topology) => Some(topology.global_scope()),
@@ -5895,6 +5920,9 @@ where
                 }
             } else {
                 new_records.push(header.record());
+                if let Some(conversation_id) = &header.checkpoint_conversation_id {
+                    crate::checkpoint_conversation::stage_checkpoint_conversation(&mut writes, header.commit_id, conversation_id)?;
+                }
                 stage_commit_history_deferred_with_scope(
                     &mut writes,
                     header.commit_id,
@@ -7293,6 +7321,9 @@ where
                 created_at: commit.created_at,
                 touched_scope_digest,
             };
+            if let Some(conversation_id) = &commit.wire.checkpoint_conversation_id {
+                crate::checkpoint_conversation::stage_checkpoint_conversation(&mut writes, commit_id, conversation_id)?;
+            }
             if deferred_existing.contains(&commit_id) {
                 let certified = records
                     .get(&commit_id)
@@ -7311,6 +7342,11 @@ where
                             "sync history body '{commit_id}' disagrees with its certified topology"
                         ),
                     ));
+                }
+                if crate::checkpoint_conversation::load_checkpoint_conversation(&read, commit_id).await?
+                    != commit.wire.checkpoint_conversation_id
+                {
+                    return Err(immutable_object_mismatch("checkpoint conversation", commit_id));
                 }
             }
             if !deferred_existing.contains(&commit_id) {
@@ -8138,6 +8174,7 @@ where
                 };
             commit_headers.push(sync_header_from_record(
                 &record,
+                crate::checkpoint_conversation::load_checkpoint_conversation(&read, record.commit_id).await?,
                 global_scope,
                 incorporation,
             ));
@@ -8387,6 +8424,7 @@ where
                 .incorporation();
             commit_headers.push(sync_header_from_record(
                 &record,
+                crate::checkpoint_conversation::load_checkpoint_conversation(&read, record.commit_id).await?,
                 record.base_commit_id.is_none(),
                 incorporation,
             ));
@@ -8892,6 +8930,7 @@ mod tests {
         drop(read);
         let mut merge_header = sync_header_from_record(
             &ancestor_record,
+            None,
             false,
             crate::tracked_state::CommitStateIncorporation::None,
         );
@@ -11324,7 +11363,7 @@ mod tests {
         for value in ["intermediate", "second"] {
             write_key_value(&replica, "pending", value).await;
             replica.execute(
-                "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))",
+                "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))",
                 &[],
             ).await.expect("scoped checkpoint");
         }
@@ -13461,6 +13500,7 @@ mod tests {
 
     fn sparse_checkpoint_header() -> ParsedSyncHeader {
         ParsedSyncHeader {
+            checkpoint_conversation_id: None,
             is_checkpoint: true,
             commit_id: CommitId::for_test_label("sparse-inventory-checkpoint"),
             parent_commit_ids: vec![CommitId::for_test_label("sparse-inventory-parent")],
@@ -13537,6 +13577,7 @@ mod tests {
         let record = load_commit_record(&read, head).await.unwrap().unwrap();
         let mut wire = sync_header_from_record(
             &record,
+            None,
             false,
             crate::tracked_state::CommitStateIncorporation::None,
         );

@@ -541,7 +541,7 @@ mod tests {
         .await
         .unwrap();
         let checkpoint = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
             .await
             .unwrap()
             .rows()[0]

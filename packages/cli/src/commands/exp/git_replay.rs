@@ -450,7 +450,7 @@ where
         let checkpoint_ms = if checkpoint_every.is_some_and(|interval| (index + 1) % interval == 0)
         {
             let checkpoint_started = Instant::now();
-            db::block_on(lix.execute("SELECT commit_id FROM lix_create_checkpoint()", &[]))
+            db::block_on(lix.execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[]))
                 .map_err(|error| {
                     CliError::msg(format!(
                         "failed to checkpoint after replay commit {commit_sha}: {error}"

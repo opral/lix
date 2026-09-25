@@ -189,7 +189,7 @@ async fn conflicting_file_case_at_path(
     let captured_checkpoint = if checkpoint {
         for sql in [
             "SELECT row_ref FROM lix_diff('lix_file')",
-            "SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_file')))",
+            "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY(SELECT row_ref FROM lix_diff('lix_file')))",
         ] {
             for attempt in 0..128 {
                 match session.execute(sql, &[]).await {
@@ -258,7 +258,7 @@ async fn conflicting_file_case_at_path(
     };
     let captured_remote = transport.partial_replica_descriptor(None).await.unwrap();
     if checkpoint {
-        authority.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_file')))", &[]).await.unwrap();
+        authority.execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY(SELECT row_ref FROM lix_diff('lix_file')))", &[]).await.unwrap();
     }
     let mut prepared = prepare_descriptor_with_merge(
         engine.clone(),

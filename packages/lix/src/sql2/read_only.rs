@@ -47,7 +47,7 @@ fn read_only_schema_message(schema_key: &str) -> Option<&'static str> {
             "Commit graph and changelog surfaces are read-only; Lix creates them when transactions commit.",
         ),
         "lix_checkpoint" => {
-            Some("Create checkpoints with SELECT commit_id FROM lix_create_checkpoint().")
+            Some("Create checkpoints with SELECT commit_id FROM lix_create_checkpoint(title, comment); title may be NULL and comment is Zettel JSONB or NULL.")
         }
         "lix_undo_redo_marker" | "lix_undo_state" => Some(
             "Undo/redo markers are internal; use SELECT commit_id FROM lix_undo() or lix_redo() to change branch history.",

@@ -52,6 +52,7 @@ where
         ));
     }
     writes.delete(COMMIT_SPACE, StorageKey(Bytes::from(commit_key(commit_id))));
+    crate::checkpoint_conversation::stage_delete_checkpoint_conversation(writes, commit_id);
     writes.delete(
         CHANGE_SPACE,
         StorageKey(Bytes::from(change_key(record.change_id()))),

@@ -2582,7 +2582,7 @@ mod tests {
         .await
         .unwrap();
         let before = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
             .await
             .unwrap()
             .rows()[0]
@@ -2805,7 +2805,7 @@ mod tests {
             .unwrap();
         let directory_id = nested.rows()[0].get::<String>("id").unwrap();
         let checkpoint = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
             .await
             .expect("baseline checkpoint");
         let baseline = checkpoint.rows()[0].get::<String>("commit_id").unwrap();
@@ -2836,7 +2836,7 @@ mod tests {
             assert_eq!(result.rows()[0].get::<i64>("n").unwrap(), expected_rows);
         }
         let target = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
             .await
             .expect("seal ancestor move");
         let target = target.rows()[0].get::<String>("commit_id").unwrap();
@@ -2918,7 +2918,7 @@ mod tests {
             .unwrap();
         }
         let before = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
             .await
             .unwrap()
             .rows()[0]
@@ -2940,7 +2940,7 @@ mod tests {
         .await
         .unwrap();
         let after = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
             .await
             .unwrap()
             .rows()[0]
@@ -3009,7 +3009,7 @@ mod tests {
         .await
         .unwrap();
         let before = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
             .await
             .unwrap()
             .rows()[0]
@@ -3022,7 +3022,7 @@ mod tests {
         .await
         .unwrap();
         let after = lix
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
             .await
             .unwrap()
             .rows()[0]

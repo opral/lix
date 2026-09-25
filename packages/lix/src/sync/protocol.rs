@@ -126,6 +126,8 @@ pub struct SyncPushResponse {
 pub struct SyncCommitHeader {
     /// Immutable commit membership; required by the current protocol.
     pub is_checkpoint: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_conversation_id: Option<String>,
     pub commit_id: String,
     pub parent_commit_ids: Vec<String>,
     pub base_commit_id: Option<String>,

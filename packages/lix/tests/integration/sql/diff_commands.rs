@@ -164,7 +164,7 @@ simulation_test!(
 
         let checkpointed = session
             .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(ARRAY( \
+                "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY( \
                  SELECT row_ref \
                  FROM lix_diff('lix_key_value') \
                  WHERE key = 'a'))",
@@ -384,7 +384,7 @@ simulation_test!(
             .await
             .expect("first insert should succeed");
         let first = session
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
             .await
             .expect("full metadata-only SQL checkpoint should succeed");
         assert_eq!(first.columns(), &["commit_id"]);
@@ -394,7 +394,7 @@ simulation_test!(
             .await
             .expect("delete should succeed");
         let deleted_checkpoint = session
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
             .await
             .expect("checkpoint of the delete should succeed");
         let checkpoint_id = match deleted_checkpoint.get(&deleted_checkpoint.rows()[0], "commit_id")
@@ -476,7 +476,7 @@ simulation_test!(
 
         let checkpointed = session
             .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(ARRAY( \
+                "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY( \
                  SELECT row_ref \
                  FROM lix_diff('lix_key_value', $1, $2) \
                  WHERE key IN ('a', 'b', 'c')))",
@@ -536,7 +536,7 @@ simulation_test!(
             .to_string();
         let checkpoint = session
             .execute(
-                "SELECT commit_id FROM lix_create_checkpoint(ARRAY( \
+                "SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY( \
                  SELECT row_ref FROM lix_diff('lix_file', $1, $2) \
                  WHERE to_path = '/docs/nested/readme.txt'))",
                 &[Value::Text(baseline), Value::Text(head)],
@@ -601,7 +601,7 @@ simulation_test!(
             .await
             .expect("child file should insert");
         session
-            .execute("SELECT commit_id FROM lix_create_checkpoint()", &[])
+            .execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB)", &[])
             .await
             .expect("baseline checkpoint should succeed");
 

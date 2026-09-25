@@ -104,7 +104,7 @@ SQL functions when the content operation itself is the intent:
 | Reverse one historical commit | `lix_revert(commit [, row_refs])` | Applies the inverse of that commit against its actual first parent. |
 | Reverse a historical span | `lix_revert_range(before, after [, row_refs])` | Applies the inverse of the endpoint difference. |
 | Replay a historical span | `lix_apply(before, after [, row_refs])` | Applies the forward endpoint difference. |
-| Mark the current working state | `lix_create_checkpoint([row_refs])` | Creates a checkpoint boundary; it is not an undo receipt. |
+| Mark the current working state | `lix_create_checkpoint(title, comment [, row_refs])` | Creates a checkpoint boundary. Title and comment may each be `NULL`; a conversation is created when either is present. |
 | Navigate recent logical actions | `lix_undo` / `lix_redo` | Creates receipt commits and maintains the branch's undo/redo state. |
 
 Restore, revert, apply, and checkpoint creation do not consume undo receipts.

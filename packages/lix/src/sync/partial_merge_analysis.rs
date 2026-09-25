@@ -461,7 +461,7 @@ mod tests {
             .await
             .unwrap();
         if checkpoint {
-            local.execute("SELECT commit_id FROM lix_create_checkpoint(ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
+            local.execute("SELECT commit_id FROM lix_create_checkpoint('Checkpoint', '{\"_type\":\"zettel_doc\",\"blocks\":[]}'::JSONB, ARRAY(SELECT row_ref FROM lix_diff('lix_key_value')))", &[]).await.unwrap();
         }
         let storage = local.storage_adapter();
         let mut writes = storage.new_write_set();
